@@ -95,6 +95,72 @@ pub fn offsetToPosition(text: []const u8, offset: usize, enc: Encoding) types.Po
     return .{ .line = line, .character = units };
 }
 
+/// 行起始偏移表：O(log n) 把字节偏移换算为 LSP 位置。
+pub const LineIndex = struct {
+    text: []const u8,
+    line_starts: []const u32,
+
+    pub fn init(gpa: Allocator, text: []const u8) Allocator.Error!LineIndex {
+        var starts: std.ArrayList(u32) = .empty;
+        errdefer starts.deinit(gpa);
+        try starts.append(gpa, 0);
+        var i: usize = 0;
+        while (std.mem.indexOfAnyPos(u8, text, i, "\r\n")) |nl| {
+            i = nl + 1;
+            if (text[nl] == '\r' and i < text.len and text[i] == '\n') i += 1;
+            try starts.append(gpa, @intCast(i));
+        }
+        return .{ .text = text, .line_starts = try starts.toOwnedSlice(gpa) };
+    }
+
+    pub fn deinit(li: *LineIndex, gpa: Allocator) void {
+        gpa.free(li.line_starts);
+    }
+
+    pub fn lineOf(li: LineIndex, offset: usize) u32 {
+        const target: u32 = @intCast(@min(offset, li.text.len));
+        // 最后一个 <= target 的行起点
+        var lo: usize = 0;
+        var hi: usize = li.line_starts.len;
+        while (hi - lo > 1) {
+            const mid = (lo + hi) / 2;
+            if (li.line_starts[mid] <= target) lo = mid else hi = mid;
+        }
+        return @intCast(lo);
+    }
+
+    pub fn position(li: LineIndex, offset: usize, enc: Encoding) types.Position {
+        const line = li.lineOf(offset);
+        const start = li.line_starts[line];
+        const target = @min(offset, li.text.len);
+        const end = lineEnd(li.text, start);
+        var i: usize = start;
+        var units: u32 = 0;
+        while (i < @min(target, end)) {
+            const w = charWidth(li.text[i..end], enc);
+            if (i + w.len > target) break;
+            units += w.units;
+            i += w.len;
+        }
+        return .{ .line = line, .character = units };
+    }
+
+    pub fn range(li: LineIndex, start: usize, end: usize, enc: Encoding) types.Range {
+        return .{ .start = li.position(start, enc), .end = li.position(end, enc) };
+    }
+};
+
+test LineIndex {
+    const text = "x\r\na😀b\nlast";
+    var li: LineIndex = try .init(testing.allocator, text);
+    defer li.deinit(testing.allocator);
+    for ([_]Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        for (0..text.len + 1) |off| {
+            try testing.expectEqual(offsetToPosition(text, off, enc), li.position(off, enc));
+        }
+    }
+}
+
 /// 依次应用增量变更，返回新文本（调用方拥有）。
 pub fn applyChanges(
     gpa: Allocator,
