@@ -1,0 +1,90 @@
+const std = @import("std");
+const testing = std.testing;
+const engine = @import("../db/engine.zig");
+const Vfs = @import("../base/Vfs.zig");
+const FileText = @import("../base/inputs.zig").FileText;
+const q = @import("queries.zig");
+
+/// 依赖 ItemTree 的下游 query：统计成员数
+const ItemCount = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = usize;
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        return (try ctx.get(q.FileItemTree, file)).items.len;
+    }
+};
+
+const Db = engine.Engine(void, &.{ FileText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, ItemCount });
+
+fn setText(db: *Db, file: Vfs.FileId, text: []const u8) !void {
+    db.beginWrite();
+    defer db.endWrite();
+    try db.set(FileText, file, try testing.allocator.dupe(u8, text), .low);
+}
+
+fn count(db: *Db, file: Vfs.FileId) !usize {
+    var ctx = db.beginRead(testing.allocator);
+    defer ctx.end();
+    return ctx.get(ItemCount, file);
+}
+
+fn executions(db: *Db, comptime Q: type) u64 {
+    return db.executions[Db.queryIndex(Q)].load(.monotonic);
+}
+
+test "只改函数体：重新解析与构建 ItemTree，但下游不重算" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+
+    try setText(&db, file, "const a = 1;\nfn f() void { _ = a; }\n");
+    try testing.expectEqual(2, try count(&db, file));
+
+    try setText(&db, file, "const a = 1;\nfn f() void {\n    _ = a + 1;\n}\n");
+    try testing.expectEqual(2, try count(&db, file));
+    try testing.expectEqual(2, executions(&db, q.ParseFile));
+    try testing.expectEqual(2, executions(&db, q.FileItemTree));
+    try testing.expectEqual(1, executions(&db, ItemCount));
+
+    // 新增声明：ItemTree 变化，下游重算
+    try setText(&db, file, "const a = 1;\nconst b = 2;\nfn f() void {}\n");
+    try testing.expectEqual(3, try count(&db, file));
+    try testing.expectEqual(2, executions(&db, ItemCount));
+}
+
+test "AstIdMap 指向最新语法树" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    try setText(&db, file, "fn f() void {}");
+    try setText(&db, file, "\n\nfn f() void {}");
+
+    var ctx = db.beginRead(testing.allocator);
+    defer ctx.end();
+    const items = try ctx.get(q.FileItemTree, file);
+    const map = try ctx.get(q.FileAstIdMap, file);
+    const node = map.get(items.items[0].ast_id).?;
+    try testing.expectEqual(2, node.range().start);
+}
+
+test "ParseFile 在函数体内编辑后走局部重解析" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    try setText(&db, file, "fn f() void {\n    a();\n}\n");
+    {
+        var ctx = db.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectEqual(null, (try ctx.get(q.ParseFile, file)).base);
+    }
+    try setText(&db, file, "fn f() void {\n    b();\n}\n");
+    try setText(&db, file, "fn f() void {\n    b(1);\n}\n");
+    var ctx = db.beginRead(testing.allocator);
+    defer ctx.end();
+    const parse = try ctx.get(q.ParseFile, file);
+    try testing.expect(parse.base != null);
+    const full = try @import("Parse.zig").create(testing.allocator, "fn f() void {\n    b(1);\n}\n");
+    defer full.destroy();
+    try testing.expect(parse.sameAs(full));
+}
