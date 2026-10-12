@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0 已完成（2026-10-12），下一步 M1，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1 已完成（2026-10-12），下一步 M2，详见 §19。
 
 ---
 
@@ -98,23 +98,23 @@ src/
   db/           engine.zig（查询引擎）
   base/         Vfs.zig uri.zig inputs.zig ProjectModel.zig Config.zig
   util/         offsets.zig
-  syntax/       lexer.zig parser/ green.zig red.zig ast.zig(生成) ItemTree.zig AstId.zig reparse.zig
+  syntax/       kind.zig lexer.zig parser.zig grammar.zig green.zig tree.zig Parse.zig ItemTree.zig queries.zig
   names/        ModuleGraph.zig Namespace.zig resolve.zig
   hir/          Body.zig lower.zig SourceMap.zig Scopes.zig
   sema/         InternPool.zig infer.zig eval.zig instantiate.zig builtins.zig coerce.zig
   semantics/    Semantics.zig
   ide_db/       search.zig symbol_index.zig render.zig edits.zig
-  ide/          hover.zig completion.zig goto.zig references.zig rename.zig
-                inlay_hints.zig signature_help.zig semantic_tokens.zig
-                folding.zig selection_range.zig document_symbol.zig
-                workspace_symbol.zig code_actions/ format.zig
-  diagnostics/  Collector.zig live.zig compiler.zig remap.zig compile_set.zig
+  ide/          document_symbol.zig folding.zig selection_range.zig semantic_tokens.zig format.zig（已实现）
+                hover.zig completion.zig goto.zig references.zig rename.zig
+                inlay_hints.zig signature_help.zig workspace_symbol.zig code_actions/
+  diagnostics/  live.zig（已实现） Collector.zig compiler.zig remap.zig compile_set.zig
   project/      bsp_client.zig configuration.zig zig_env.zig
 tools/
   gen_lsp_types.zig     # metaModel.json → lsp/types.zig
   gen_syntax.zig        # grammar.zon → syntax/ast.zig（类型化访问器）
   gen_builtins.zig      # builtins.zon → sema/builtins_data.zig
   gen_config.zig        # config.zon → base/Config.zig + schema.json + 文档
+  corpus.zig            # 语料对拍：zig build corpus -- <目录>...
 tests/
   fixtures/ syntax/ sema/ ide/ incremental/ corpus/ bench/
 ```
@@ -181,7 +181,15 @@ pub const SyntaxNode = struct { green: *const GreenNode, parent: ?*const SyntaxN
 - **解析器**：手写递归下降，以 Zig 官方 PEG 语法为准；**永不失败**，错误处产出 `ERROR` 节点，缺失子节点即「缺失」。
 - **恢复集**：容器成员级（`pub`/`fn`/`const`/`var`/`test`/`comptime`）、语句级（`;`、`}`）、表达式级（分隔符）。
 - **类型化访问层**：`tools/gen_syntax.zig` 从 `grammar.zon` 生成 `ast.zig`，如 `FnDecl.name() ?Name`、`FieldAccess.lhs() ?Expr`，所有访问器返回可选值。
-- **局部重解析**：编辑落在某个 `{ ... }` 内且花括号仍平衡时，只重解析该块；否则整文件重解析（Zig 文件通常不大，整文件解析也应在毫秒级）。
+  - 作用：把「某信息位于哪个子节点」的知识集中到一处；调用方按语义访问（`proto().name()`），树结构调整时只改生成源；错用节点类型在编译期报错。
+  - 时机：M1 暂不生成，语法类功能直接使用 `SyntaxNode.childNode / childToken`；在 M3 编写 HIR 降级之前生成（此时访问需求最多、最清晰），并把已有调用点迁移过去。
+- **局部重解析**（`Parse.reparse`）：编辑落在某个 `{ ... }` 内且花括号仍平衡时，只重解析该块；否则整文件重解析。
+  1. 新旧文本的公共前缀 / 后缀之外即编辑区间；在旧树中找包含它的最深 `block` / `container_decl`，要求编辑严格位于其 `{` 之后、`}` 之前，且 `}` 是该节点的最后一个 token。
+  2. 对该节点的新文本单独做词法分析，校验最后一个 token 为 `}` 且花括号恰好在结尾配平；再用对应语法入口（`blockExpr` / `containerDecl`）解析，要求消费全部 token、产出单个同种类节点。任一条件不满足即回退全量解析。
+  3. 只复制根到目标节点路径上的祖先，其余绿节点原样复用；节点外的旧错误保留并按长度差平移，节点内的换成新错误。
+  4. 内存：新结果复用旧结果的节点，因此以引用计数持有旧结果（链式）；链上累计内存超过链底全量解析的 2 倍时改做全量解析，旧 arena 随之释放。
+  5. 接入：查询引擎支持可选的 `computeIncremental(ctx, key, prev)`，重算 `ParseFile` 时传入上一次的结果。
+  6. 正确性约束：增量结果必须与全量解析**完全相同**（语法树与错误逐项相等），由语料对拍中的随机编辑测试保证（§18）。
 
 **与 `std.zig.Ast` 的关系**：只在两处使用标准库解析器——格式化（`zig fmt` 结果必须逐字一致）与 AstGen 校验（§11）。CI 用 `tests/corpus/` 对 Zig 标准库和编译器源码做对拍：两个解析器在无语法错误的文件上必须得到相同的声明结构。
 
@@ -788,9 +796,9 @@ pub fn make() std.ArrayList(u8) { ... }
 | 阶段 | 状态 | 交付 | 验收标准 |
 |---|---|---|---|
 | **M0 基础** | ✅ 已完成 | `db/` 引擎、Vfs、`lsp/` 代码生成、Server 骨架、取消机制 | 引擎单测：增量、cutoff、环、取消；能与编辑器握手 |
-| **M1 语法** | ⏳ 下一步 | CST 解析器 + 类型化 AST、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
-| **M2 构建与诊断** | 未开始 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
-| **M3 名字** | 未开始 | 模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
+| **M1 语法** | ✅ 已完成 | CST 解析器、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
+| **M2 构建与诊断** | ⏳ 下一步 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
+| **M3 名字** | 未开始 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
 | **M4 类型** | 未开始 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
 | **M5 comptime** | 未开始 | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
 | **M6 引用** | 未开始 | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
@@ -811,6 +819,30 @@ pub fn make() std.ArrayList(u8) { ... }
 - 与设计的差异：查询引擎合并为单文件 `db/engine.zig`；Server 的调度与 handler 暂在同一文件中。
 - 未完成：CI 工作流（`zig build test` + 校验 `zig build gen` 输出与提交一致）。
 - 实施中的设计修正：构建集成改用 Zig 0.17 官方构建系统协议（§13），不再维护自定义 build runner。
+
+### 19.2 M1 完成情况（2026-10-12）
+
+| 模块 | 文件 | 内容 |
+|---|---|---|
+| 词法 | `src/syntax/lexer.zig`、`kind.zig` | 复用 `std.zig.Tokenizer` 保证 token 语义与编译器一致，token 间隙切分为 trivia，做到无损 |
+| 解析器 | `src/syntax/parser.zig`、`grammar.zig`、`green.zig`、`tree.zig`、`Parse.zig` | 事件式递归下降（Marker / `precede`），决策与 `std.zig.Parse` 对应；容器成员、语句、参数 / 参数列表 / 初始化列表等多级恢复；红绿树、按偏移定位、覆盖路径 |
+| ItemTree | `src/syntax/ItemTree.zig` | 声明骨架（含函数体内的容器）、签名哈希、文档文本；基于（父 ID, 种类, 名字, 序号）的稳定 AstId 与 AstIdMap |
+| query | `src/syntax/queries.zig`、`src/diagnostics/live.zig` | `ParseFile`、`FileItemTree`（cutoff 点）、`FileAstIdMap`、`AstCheck` |
+| 功能 | `src/ide/` | documentSymbol、foldingRange、selectionRange、semanticTokens/full（纯语法分类）、formatting（`std.zig.Ast.render`，按行最小替换） |
+| live 诊断 | `src/diagnostics/live.zig`、Server | 进程内 `Ast.parse` + `AstGen` / `ZonGen`，打开与修改后异步推送 `publishDiagnostics`，被后续编辑取消 |
+| 语料对拍 | `tools/corpus.zig`（`zig build corpus -- <目录>`） | 无损、零误报、逐容器成员结构与 `std.zig.Ast` 一致、截断健壮性、ItemTree 映射 |
+
+- 语料结果：`lib/zig` 全部 + ZLS 源码共 1013 个文件（28 MB）：无损失败 0、误报 0、结构不一致 0，7091 次截断解析无崩溃；CST 解析约 90 MB/s，ItemTree 12.9 万个成员全部正确映射。
+- 实测（`std/zig/AstGen.zig`，554 KB / 1.37 万行）：首次 documentSymbol 22 ms、缓存命中 1.7 ms、编辑后 10 ms；semanticTokens 21 ms；formatting 8 ms。
+- 测试：`zig build test` 共 67 个，包括 ItemTree 的 early cutoff 断言（只改函数体时下游 query 不重算）与 live 诊断（预期值取自 `zig ast-check` 实际输出）。
+- 与设计的差异：
+  - 词法层复用 `std.zig.Tokenizer`，只自研解析器部分（§5.1）。
+  - 类型化 AST 访问层（`gen_syntax.zig` + `grammar.zon`）延后到 M3、HIR 降级之前生成（§5.1）。当前用到语法树的只有 ItemTree 与 5 个语法功能，访问模式尚少，过早设计生成器容易生成用不上的接口；现阶段功能代码直接使用 `SyntaxNode.childNode / childToken`，生成后统一迁移。
+  - 局部重解析已实现（§5.1）：语料上 11208 次随机编辑（含连续编辑形成的复用链）中 5600 次走局部重解析，与全量解析的不一致为 0；走局部重解析的编辑平均比全量快 6.2 倍。实测在 554 KB 文件的函数体内逐字输入时，ItemTree 因 cutoff 不再重算，单次编辑后请求约 8 ms，主要耗时已不在解析（全量约 5.6 ms，局部 < 1 ms），而在功能计算、行索引、JSON 序列化与同时运行的 AstGen。
+  - 已知问题：live 诊断的 AstGen 是标准库代码，计算过程中不检查取消，写事务需要等它结束；大文件上会增加编辑延迟，后续考虑防抖或把 AstGen 放到单独的计算队列。
+  - ItemTree 存文档文本而非文档位置（位置会随编辑平移、破坏 cutoff），并收录函数体内定义的容器（名字解析需要其成员）。
+  - 查询引擎增加只读环境参数 `Env`（当前为 `*Vfs`），供 query 获取不变的文件路径信息。
+- 留到 M2：live 诊断的编译集合限制（§11.4）、内置标准库与用户 zig 版本不一致时回退 `zig ast-check`（§11.2，依赖 `zig env`）、CI 工作流。
 
 ---
 
