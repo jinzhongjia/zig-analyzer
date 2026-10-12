@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  test:
+    name: 测试 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: 单元测试（Debug）
+        run: zig build test --summary all
+      - name: 单元测试（ReleaseSafe）
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+      - name: 构建可执行文件
+        run: zig build -Doptimize=ReleaseSafe
+      - name: 语料对拍（Zig 标准库 + 本仓库源码）
+        run: zig build corpus -Doptimize=ReleaseSafe -- src tools
+
+  lint:
+    name: 格式与生成代码
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: zig fmt
+        run: zig fmt --check src tools build.zig
+      - name: 生成代码与提交一致
+        run: |
+          zig build gen
+          git diff --exit-code -- src/lsp/types.zig
+
+  fuzz:
+    name: 覆盖率引导模糊测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # 每个模糊目标 2 万次（插桩构建约 400 次/秒，3 个目标约 3 分钟）
+      - name: zig build test --fuzz
+        run: zig build test --fuzz=20K

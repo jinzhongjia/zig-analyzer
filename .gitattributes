@@ -1,0 +1,4 @@
+# Zig 源码统一使用 LF，避免 Windows 检出后 zig fmt 与生成代码校验误报
+* text=auto eol=lf
+*.zig text eol=lf
+*.zon text eol=lf

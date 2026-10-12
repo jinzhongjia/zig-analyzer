@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
     update_sources.addCopyFileToSource(lsp_types, "src/lsp/types.zig");
     gen_step.dependOn(&update_sources.step);
 
-    // 语料对拍：zig build corpus -- <目录>...
+    // 语料对拍：默认校验当前 Zig 的标准库，可追加目录：zig build corpus -- <目录>...
     const corpus = b.addExecutable(.{
         .name = "corpus",
         .root_module = b.createModule(.{
@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const corpus_run = b.addRunArtifact(corpus);
+    corpus_run.addDirectoryArg(std.Build.LazyPath.zig_lib.path(b, "std"));
     corpus_run.addPassthruArgs();
     b.step("corpus", "在 Zig 源码语料上校验 CST 解析器").dependOn(&corpus_run.step);
 
