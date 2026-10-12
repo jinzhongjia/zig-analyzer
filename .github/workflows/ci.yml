@@ -60,6 +60,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      # 每个模糊目标 2 万次（插桩构建约 400 次/秒，3 个目标约 3 分钟）
+      # 使用 ReleaseSafe：Linux x86_64 的 Debug 构建默认走自研后端，不支持覆盖率插桩
+      # （覆盖率文件 pcs_len 为 0）；ReleaseSafe 走 LLVM，吞吐量也更高。每个模糊目标 5 万次。
       - name: zig build test --fuzz
-        run: zig build test --fuzz=20K
+        run: zig build test -Doptimize=ReleaseSafe --fuzz=50K

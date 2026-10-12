@@ -849,7 +849,7 @@ pub fn make() std.ArrayList(u8) { ... }
 - `.github/workflows/ci.yml`：
   - **测试**（ubuntu / macos / windows）：Debug 与 ReleaseSafe 两遍 `zig build test`、构建可执行文件、语料对拍（当前 Zig 标准库 + 本仓库源码）；
   - **格式与生成代码**（ubuntu）：`zig fmt --check`；`zig build gen` 后 `types.zig` 必须与提交一致；
-  - **覆盖率引导模糊测试**（ubuntu）：`zig build test --fuzz=20K`（每个模糊目标 2 万次；插桩构建约 400 次/秒，3 个目标约 3 分钟）。本地可加大次数做长时间模糊测试，覆盖率数据保存在 `.zig-cache` 中跨次累积。
+  - **覆盖率引导模糊测试**（ubuntu）：`zig build test -Doptimize=ReleaseSafe --fuzz=50K`（每个模糊目标 5 万次）。必须用优化构建：Linux x86_64 的 Debug 构建默认走 Zig 自研后端，不支持覆盖率插桩（覆盖率文件 `pcs_len` 为 0）；ReleaseSafe 走 LLVM，吞吐量也比 Debug 高一个数量级。本地可加大次数做长时间模糊测试，覆盖率数据保存在 `.zig-cache` 中跨次累积。
 - `.gitattributes` 统一 LF，避免 Windows 检出后格式与生成代码校验误报。
 - `zig build corpus` 默认校验当前 Zig 的标准库（由 `build.zig` 传入路径），可追加目录。
 - 路径处理（`base/uri.zig`、`Vfs.normalize`）改为显式的 posix / windows 风格参数，两种规则在任何平台都能测试。模糊测试发现并修复：URI 中原始控制字符（含 NUL）未被拒绝；UNC 主机名含路径分隔符时拼出非法路径。同时补充 UNC（`file://server/share/x` ↔ `\\server\share\x`）、`%00` 拒绝、Windows 盘符统一大写。
