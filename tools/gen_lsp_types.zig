@@ -1,0 +1,428 @@
+//! 从 LSP 官方 metaModel.json 生成 `src/lsp/types.zig`。
+//!
+//! 用法：gen_lsp_types <metaModel.json> <输出路径>
+
+const std = @import("std");
+const json = std.json;
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
+
+const Gen = struct {
+    arena: Allocator,
+    w: *Writer,
+    structures: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
+    enumerations: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
+    aliases: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
+    /// 可取自定义值的字符串枚举，字段类型直接用 `[]const u8`
+    open_string_enums: std.StringHashMapUnmanaged(void) = .empty,
+    /// 按值包含关系图上的可达性缓存，key = "from\x00to"
+    reach_cache: std.StringHashMapUnmanaged(bool) = .empty,
+
+    /// 在 LSP 中直接映射到 std.json 的别名
+    const special_aliases = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "LSPAny", "std.json.Value" },
+        .{ "LSPObject", "std.json.ArrayHashMap(std.json.Value)" },
+        .{ "LSPArray", "[]const std.json.Value" },
+    });
+
+    fn str(v: json.Value, key: []const u8) ?[]const u8 {
+        const field = v.object.get(key) orelse return null;
+        return if (field == .string) field.string else null;
+    }
+
+    fn arr(v: json.Value, key: []const u8) []const json.Value {
+        const field = v.object.get(key) orelse return &.{};
+        return field.array.items;
+    }
+
+    fn flag(v: json.Value, key: []const u8) bool {
+        const field = v.object.get(key) orelse return false;
+        return field == .bool and field.bool;
+    }
+
+    // ── 文档注释 ───────────────────────────────────────────────────────
+
+    fn doc(g: *Gen, v: json.Value) !void {
+        if (str(v, "documentation")) |text| {
+            var it = std.mem.splitScalar(u8, text, '\n');
+            while (it.next()) |line| {
+                try g.w.print("/// {s}\n", .{std.mem.trimEnd(u8, line, " \r")});
+            }
+        }
+        if (str(v, "deprecated")) |text| {
+            const documented = if (str(v, "documentation")) |d| std.mem.indexOf(u8, d, "@deprecated") != null else false;
+            if (!documented) try g.w.print("/// @deprecated {s}\n", .{text});
+        }
+    }
+
+    // ── 递归检测：按值包含形成环时需要用指针 ─────────────────────────────
+
+    fn byValueRefs(g: *Gen, t: json.Value, out: *std.ArrayList([]const u8)) !void {
+        const kind = str(t, "kind").?;
+        if (std.mem.eql(u8, kind, "reference")) {
+            try out.append(g.arena, str(t, "name").?);
+        } else if (std.mem.eql(u8, kind, "or") or std.mem.eql(u8, kind, "and") or std.mem.eql(u8, kind, "tuple")) {
+            for (arr(t, "items")) |item| try g.byValueRefs(item, out);
+        } else if (std.mem.eql(u8, kind, "literal")) {
+            for (arr(t.object.get("value").?, "properties")) |p| try g.byValueRefs(p.object.get("type").?, out);
+        }
+        // array / map 是间接引用，不形成按值环
+    }
+
+    fn edges(g: *Gen, name: []const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        if (g.structures.get(name)) |s| {
+            const props = try g.flattenProperties(s);
+            for (props) |p| try g.byValueRefs(p.object.get("type").?, &out);
+        } else if (g.aliases.get(name)) |a| {
+            if (special_aliases.get(name) == null) try g.byValueRefs(a.object.get("type").?, &out);
+        }
+        return out.items;
+    }
+
+    fn reaches(g: *Gen, from: []const u8, to: []const u8) !bool {
+        const key = try g.arena.print("{s}\x00{s}", .{ from, to });
+        if (g.reach_cache.get(key)) |r| return r;
+        var visited: std.StringHashMapUnmanaged(void) = .empty;
+        var stack: std.ArrayList([]const u8) = .empty;
+        try stack.append(g.arena, from);
+        const result = while (stack.pop()) |cur| {
+            if (std.mem.eql(u8, cur, to)) break true;
+            if ((try visited.getOrPut(g.arena, cur)).found_existing) continue;
+            try stack.appendSlice(g.arena, try g.edges(cur));
+        } else false;
+        try g.reach_cache.put(g.arena, key, result);
+        return result;
+    }
+
+    // ── 结构体属性展开（extends + mixins） ───────────────────────────────
+
+    fn flattenProperties(g: *Gen, s: json.Value) ![]const json.Value {
+        var out: std.ArrayList(json.Value) = .empty;
+        for ([_][]const u8{ "extends", "mixins" }) |key| {
+            for (arr(s, key)) |base| {
+                const base_struct = g.structures.get(str(base, "name").?).?;
+                try out.appendSlice(g.arena, try g.flattenProperties(base_struct));
+            }
+        }
+        for (arr(s, "properties")) |p| {
+            const name = str(p, "name").?;
+            // 子结构覆盖同名属性
+            for (out.items, 0..) |existing, i| {
+                if (std.mem.eql(u8, str(existing, "name").?, name)) {
+                    _ = out.orderedRemove(i);
+                    break;
+                }
+            }
+            try out.append(g.arena, p);
+        }
+        return out.items;
+    }
+
+    // ── 类型表达式 ─────────────────────────────────────────────────────
+
+    const Ctx = struct {
+        /// 正在生成的命名类型（结构体或别名），用于判断是否需要指针
+        owner: []const u8,
+        /// 当前位置是否为按值位置（不在 array/map 内）
+        by_value: bool = true,
+    };
+
+    fn isNullable(t: json.Value) bool {
+        const kind = str(t, "kind").?;
+        if (std.mem.eql(u8, kind, "base")) return std.mem.eql(u8, str(t, "name").?, "null");
+        if (std.mem.eql(u8, kind, "or")) {
+            for (arr(t, "items")) |item| if (isNullable(item)) return true;
+        }
+        return false;
+    }
+
+    fn baseType(name: []const u8) []const u8 {
+        const map = std.StaticStringMap([]const u8).initComptime(.{
+            .{ "string", "[]const u8" },
+            .{ "URI", "[]const u8" },
+            .{ "DocumentUri", "[]const u8" },
+            .{ "RegExp", "[]const u8" },
+            .{ "integer", "i32" },
+            .{ "uinteger", "u32" },
+            .{ "decimal", "f64" },
+            .{ "boolean", "bool" },
+            .{ "null", "?void" },
+        });
+        return map.get(name) orelse std.debug.panic("未知 base 类型: {s}", .{name});
+    }
+
+    /// 输出类型表达式。nullable 的 `or` 输出为 `?T`。
+    fn emitType(g: *Gen, t: json.Value, ctx: Ctx) anyerror!void {
+        const kind = str(t, "kind").?;
+        const w = g.w;
+        if (std.mem.eql(u8, kind, "base")) {
+            try w.writeAll(baseType(str(t, "name").?));
+        } else if (std.mem.eql(u8, kind, "reference")) {
+            const name = str(t, "name").?;
+            if (g.open_string_enums.contains(name)) {
+                try w.writeAll("[]const u8");
+            } else if (ctx.by_value and (std.mem.eql(u8, name, ctx.owner) or try g.reaches(name, ctx.owner))) {
+                try w.print("*const {f}", .{std.zig.fmtId(name)});
+            } else {
+                try w.print("{f}", .{std.zig.fmtId(name)});
+            }
+        } else if (std.mem.eql(u8, kind, "array")) {
+            try w.writeAll("[]const ");
+            var inner = ctx;
+            inner.by_value = false;
+            try g.emitType(t.object.get("element").?, inner);
+        } else if (std.mem.eql(u8, kind, "map")) {
+            try w.writeAll("std.json.ArrayHashMap(");
+            var inner = ctx;
+            inner.by_value = false;
+            try g.emitType(t.object.get("value").?, inner);
+            try w.writeAll(")");
+        } else if (std.mem.eql(u8, kind, "tuple")) {
+            try w.writeAll("struct { ");
+            for (arr(t, "items")) |item| {
+                try g.emitType(item, ctx);
+                try w.writeAll(", ");
+            }
+            try w.writeAll("}");
+        } else if (std.mem.eql(u8, kind, "stringLiteral")) {
+            try w.print("json_ext.StringLiteral(\"{f}\")", .{std.zig.fmtString(str(t, "value").?)});
+        } else if (std.mem.eql(u8, kind, "literal")) {
+            try w.writeAll("struct {\n");
+            for (arr(t.object.get("value").?, "properties")) |p| try g.emitProperty(p, ctx);
+            try w.writeAll("}");
+        } else if (std.mem.eql(u8, kind, "or")) {
+            try g.emitOr(t, ctx);
+        } else {
+            std.debug.panic("未支持的类型种类: {s}", .{kind});
+        }
+    }
+
+    fn collectOrItems(g: *Gen, t: json.Value, out: *std.ArrayList(json.Value)) !void {
+        for (arr(t, "items")) |item| {
+            const kind = str(item, "kind").?;
+            if (std.mem.eql(u8, kind, "or")) {
+                try g.collectOrItems(item, out);
+            } else if (!(std.mem.eql(u8, kind, "base") and std.mem.eql(u8, str(item, "name").?, "null"))) {
+                try out.append(g.arena, item);
+            }
+        }
+    }
+
+    fn emitOr(g: *Gen, t: json.Value, ctx: Ctx) !void {
+        var items: std.ArrayList(json.Value) = .empty;
+        try g.collectOrItems(t, &items);
+        if (isNullable(t)) try g.w.writeAll("?");
+        if (items.items.len == 1) return g.emitType(items.items[0], ctx);
+
+        try g.w.writeAll("union(enum) {\n");
+        var used: std.StringHashMapUnmanaged(void) = .empty;
+        for (items.items) |item| {
+            var name = try g.variantName(item);
+            var n: usize = 2;
+            while ((try used.getOrPut(g.arena, name)).found_existing) : (n += 1) {
+                name = try g.arena.print("{s}_{d}", .{ try g.variantName(item), n });
+            }
+            try g.w.print("{f}: ", .{std.zig.fmtId(name)});
+            try g.emitType(item, ctx);
+            try g.w.writeAll(",\n");
+        }
+        try g.w.writeAll(
+            \\pub const jsonParse = json_ext.Union(@This()).jsonParse;
+            \\pub const jsonParseFromValue = json_ext.Union(@This()).jsonParseFromValue;
+            \\pub const jsonStringify = json_ext.Union(@This()).jsonStringify;
+            \\}
+        );
+    }
+
+    fn variantName(g: *Gen, t: json.Value) ![]const u8 {
+        const kind = str(t, "kind").?;
+        if (std.mem.eql(u8, kind, "reference") or std.mem.eql(u8, kind, "base")) return str(t, "name").?;
+        if (std.mem.eql(u8, kind, "array")) return g.arena.print("array_of_{s}", .{try g.variantName(t.object.get("element").?)});
+        if (std.mem.eql(u8, kind, "stringLiteral")) return str(t, "value").?;
+        return kind;
+    }
+
+    fn emitProperty(g: *Gen, p: json.Value, ctx: Ctx) !void {
+        try g.doc(p);
+        const t = p.object.get("type").?;
+        const optional = flag(p, "optional");
+        try g.w.print("{f}: ", .{std.zig.fmtId(str(p, "name").?)});
+        if (optional and !isNullable(t)) try g.w.writeAll("?");
+        try g.emitType(t, ctx);
+        if (optional or isNullable(t)) {
+            try g.w.writeAll(" = null");
+        } else if (std.mem.eql(u8, str(t, "kind").?, "stringLiteral")) {
+            try g.w.writeAll(" = .{}");
+        }
+        try g.w.writeAll(",\n");
+    }
+
+    // ── 顶层声明 ───────────────────────────────────────────────────────
+
+    fn emitStructure(g: *Gen, name: []const u8, s: json.Value) !void {
+        try g.doc(s);
+        try g.w.print("pub const {f} = struct {{\n", .{std.zig.fmtId(name)});
+        for (try g.flattenProperties(s)) |p| try g.emitProperty(p, .{ .owner = name });
+        try g.w.writeAll("};\n\n");
+    }
+
+    fn emitEnumeration(g: *Gen, name: []const u8, e: json.Value) !void {
+        try g.doc(e);
+        const base = str(e.object.get("type").?, "name").?;
+        const values = arr(e, "values");
+        if (std.mem.eql(u8, base, "string")) {
+            if (flag(e, "supportsCustomValues")) {
+                // 开放枚举：字段类型为 []const u8，这里只提供常量
+                try g.w.print("pub const {f} = struct {{\n", .{std.zig.fmtId(name)});
+                for (values) |v| {
+                    try g.doc(v);
+                    try g.w.print("pub const {f}: []const u8 = \"{f}\";\n", .{ std.zig.fmtId(str(v, "name").?), std.zig.fmtString(str(v, "value").?) });
+                }
+            } else {
+                // 闭合字符串枚举：tag 名即 JSON 值，std.json 可直接解析与序列化
+                try g.w.print("pub const {f} = enum {{\n", .{std.zig.fmtId(name)});
+                for (values) |v| {
+                    try g.doc(v);
+                    try g.w.print("{f},\n", .{std.zig.fmtId(str(v, "value").?)});
+                }
+            }
+        } else {
+            const tag = if (std.mem.eql(u8, base, "uinteger")) "u32" else "i32";
+            try g.w.print("pub const {f} = enum({s}) {{\n", .{ std.zig.fmtId(name), tag });
+            for (values) |v| {
+                try g.doc(v);
+                try g.w.print("{f} = {d},\n", .{ std.zig.fmtId(str(v, "name").?), v.object.get("value").?.integer });
+            }
+            try g.w.writeAll("_,\n\npub const jsonStringify = json_ext.IntEnum(@This()).jsonStringify;\n");
+        }
+        try g.w.writeAll("};\n\n");
+    }
+
+    fn emitAlias(g: *Gen, name: []const u8, a: json.Value) !void {
+        try g.doc(a);
+        try g.w.print("pub const {f} = ", .{std.zig.fmtId(name)});
+        if (special_aliases.get(name)) |target| {
+            try g.w.writeAll(target);
+        } else {
+            try g.emitType(a.object.get("type").?, .{ .owner = name });
+        }
+        try g.w.writeAll(";\n\n");
+    }
+
+    fn emitMessages(g: *Gen, items: []const json.Value, is_request: bool) !void {
+        try g.w.print("pub const {s} = [_]{s}{{\n", .{
+            if (is_request) "requests" else "notifications",
+            if (is_request) "RequestInfo" else "NotificationInfo",
+        });
+        for (items) |m| {
+            const method = str(m, "method").?;
+            try g.w.print(".{{ .method = \"{f}\", .direction = .{s}, .Params = ", .{ std.zig.fmtString(method), str(m, "messageDirection").? });
+            if (m.object.get("params")) |params| {
+                try g.emitType(params, .{ .owner = "", .by_value = false });
+            } else {
+                try g.w.writeAll("void");
+            }
+            if (is_request) {
+                try g.w.writeAll(", .Result = ");
+                try g.emitType(m.object.get("result").?, .{ .owner = "", .by_value = false });
+            }
+            try g.w.writeAll(" },\n");
+        }
+        try g.w.writeAll("};\n\n");
+    }
+
+    fn run(g: *Gen, model: json.Value) !void {
+        for (arr(model, "structures")) |s| try g.structures.put(g.arena, str(s, "name").?, s);
+        for (arr(model, "enumerations")) |e| {
+            try g.enumerations.put(g.arena, str(e, "name").?, e);
+            if (std.mem.eql(u8, str(e.object.get("type").?, "name").?, "string") and flag(e, "supportsCustomValues")) {
+                try g.open_string_enums.put(g.arena, str(e, "name").?, {});
+            }
+        }
+        for (arr(model, "typeAliases")) |a| try g.aliases.put(g.arena, str(a, "name").?, a);
+
+        const version = str(model.object.get("metaData").?, "version").?;
+        try g.w.print(
+            \\//! 由 tools/gen_lsp_types.zig 从 metaModel.json（LSP {s}）生成，请勿手改。
+            \\
+            \\const std = @import("std");
+            \\const json_ext = @import("json_ext.zig");
+            \\
+            \\pub const version = "{s}";
+            \\
+            \\pub const MessageDirection = enum {{ clientToServer, serverToClient, both }};
+            \\
+            \\pub const RequestInfo = struct {{
+            \\    method: []const u8,
+            \\    direction: MessageDirection,
+            \\    Params: type,
+            \\    Result: type,
+            \\}};
+            \\
+            \\pub const NotificationInfo = struct {{
+            \\    method: []const u8,
+            \\    direction: MessageDirection,
+            \\    Params: type,
+            \\}};
+            \\
+            \\pub fn ParamsType(comptime method: []const u8) type {{
+            \\    for (requests) |r| if (std.mem.eql(u8, r.method, method)) return r.Params;
+            \\    for (notifications) |n| if (std.mem.eql(u8, n.method, method)) return n.Params;
+            \\    @compileError("未知 LSP 方法: " ++ method);
+            \\}}
+            \\
+            \\pub fn ResultType(comptime method: []const u8) type {{
+            \\    for (requests) |r| if (std.mem.eql(u8, r.method, method)) return r.Result;
+            \\    @compileError("未知 LSP 请求: " ++ method);
+            \\}}
+            \\
+            \\pub fn isRequest(comptime method: []const u8) bool {{
+            \\    for (requests) |r| if (std.mem.eql(u8, r.method, method)) return true;
+            \\    return false;
+            \\}}
+            \\
+            \\
+        , .{ version, version });
+
+        try g.emitMessages(arr(model, "requests"), true);
+        try g.emitMessages(arr(model, "notifications"), false);
+        for (g.structures.keys(), g.structures.values()) |name, s| try g.emitStructure(name, s);
+        for (g.enumerations.keys(), g.enumerations.values()) |name, e| try g.emitEnumeration(name, e);
+        for (g.aliases.keys(), g.aliases.values()) |name, a| try g.emitAlias(name, a);
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len != 3) {
+        std.debug.print("用法: {s} <metaModel.json> <输出路径>\n", .{args[0]});
+        std.process.exit(1);
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const input = try cwd.readFileAlloc(io, args[1], arena, .limited(16 * 1024 * 1024));
+    const model = try json.parseFromSliceLeaky(json.Value, arena, input, .{});
+
+    var out: Writer.Allocating = .init(arena);
+    var gen: Gen = .{ .arena = arena, .w = &out.writer };
+    try gen.run(model);
+
+    // 用 std.zig 格式化输出，失败时打印错误便于排查生成器问题
+    const source = try out.toOwnedSliceSentinel(0);
+    var tree = try std.zig.Ast.parse(arena, source, .{});
+    if (tree.errors.len != 0) {
+        var stderr = std.Io.File.stderr().writer(io, &.{});
+        for (tree.errors) |err| {
+            const loc = tree.tokenLocation(0, err.token);
+            try stderr.interface.print("{s}:{d}:{d}: ", .{ args[2], loc.line + 1, loc.column + 1 });
+            try tree.renderError(err, &stderr.interface);
+            try stderr.interface.writeAll("\n");
+        }
+        try cwd.writeFile(io, .{ .sub_path = args[2], .data = source });
+        std.process.exit(1);
+    }
+    try cwd.writeFile(io, .{ .sub_path = args[2], .data = try tree.renderAlloc(arena) });
+}
