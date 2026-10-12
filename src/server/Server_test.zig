@@ -21,7 +21,7 @@ const Session = struct {
     fn run(s: *Session, input: []const u8) !void {
         s.out = .init(testing.allocator);
         s.writer = .{ .io = testing.io, .inner = &s.out.writer };
-        s.server = .init(testing.io, testing.allocator, &s.writer);
+        s.server.init(testing.io, testing.allocator, &s.writer);
         s.arena = .init(testing.allocator);
         var reader: std.Io.Reader = .fixed(input);
         s.exit_code = try s.server.run(&reader);
@@ -33,13 +33,24 @@ const Session = struct {
         s.arena.deinit();
     }
 
-    /// 按顺序解析服务器输出的全部消息
+    /// 按顺序解析服务器输出的全部响应（不含服务器主动发出的通知）
     fn messages(s: *Session) ![]std.json.Value {
+        return s.collect(.responses);
+    }
+
+    /// 服务器主动发出的通知（如 publishDiagnostics）
+    fn notifications(s: *Session) ![]std.json.Value {
+        return s.collect(.notifications);
+    }
+
+    fn collect(s: *Session, which: enum { responses, notifications }) ![]std.json.Value {
         var reader: std.Io.Reader = .fixed(s.out.written());
         var list: std.ArrayList(std.json.Value) = .empty;
         const a = s.arena.allocator();
         while (transport.readMessage(&reader, a)) |body| {
-            try list.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}));
+            const msg = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+            const is_notification = msg.object.get("method") != null;
+            if (is_notification == (which == .notifications)) try list.append(a, msg);
         } else |err| if (err != error.EndOfStream) return err;
         return list.items;
     }
@@ -93,6 +104,100 @@ test "完整生命周期：初始化、文档同步、读请求、关闭" {
     var ctx = s.server.db.beginRead(testing.allocator);
     defer ctx.end();
     try testing.expectEqualStrings("const a = 42;\n", (try ctx.get(FileText, id)).?);
+
+    // 合法代码：最后一次推送的诊断为空
+    const notes = try s.notifications();
+    try testing.expect(notes.len >= 1);
+    const last = notes[notes.len - 1].object;
+    try testing.expectEqualStrings("textDocument/publishDiagnostics", last.get("method").?.string);
+    try testing.expectEqual(0, last.get("params").?.object.get("diagnostics").?.array.items.len);
+}
+
+test "推送 live 诊断，关闭文档后清空" {
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+
+    const notes = try s.notifications();
+    try testing.expectEqual(2, notes.len);
+    const diags = notes[0].object.get("params").?.object.get("diagnostics").?.array.items;
+    try testing.expectEqual(1, diags.len);
+    const d = diags[0].object;
+    try testing.expectEqualStrings("unused local variable", d.get("message").?.string);
+    try testing.expectEqualStrings("zig ast-check", d.get("source").?.string);
+    const start = d.get("range").?.object.get("start").?.object;
+    try testing.expectEqual(1, start.get("line").?.integer);
+    try testing.expectEqual(8, start.get("character").?.integer);
+    // didClose 后清空
+    try testing.expectEqual(0, notes[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
+}
+
+test "语法类功能端到端" {
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\","languageId":"zig","version":1,"text":"const  S = struct {\n    a: u32,\n};\n"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"},"options":{"tabSize":4,"insertSpaces":true}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/selectionRange","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"},"positions":[{"line":1,"character":4}]}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":7,"method":"shutdown"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+
+    const msgs = try s.messages();
+    var by_id: [8]?std.json.ObjectMap = @splat(null);
+    for (msgs) |m| by_id[@intCast(m.object.get("id").?.integer)] = m.object;
+
+    const symbols = by_id[2].?.get("result").?.array.items;
+    try testing.expectEqualStrings("S", symbols[0].object.get("name").?.string);
+    try testing.expectEqual(1, symbols[0].object.get("children").?.array.items.len);
+
+    const edits = by_id[3].?.get("result").?.array.items;
+    try testing.expectEqual(1, edits.len);
+    try testing.expectEqualStrings("const S = struct {\n", edits[0].object.get("newText").?.string);
+
+    try testing.expectEqual(1, by_id[4].?.get("result").?.array.items.len);
+    try testing.expect(by_id[5].?.get("result").?.object.get("data").?.array.items.len > 0);
+
+    const sel = by_id[6].?.get("result").?.array.items[0].object;
+    try testing.expectEqual(4, sel.get("range").?.object.get("start").?.object.get("character").?.integer);
 }
 
 test "初始化前的请求返回 ServerNotInitialized，未知方法返回 MethodNotFound" {

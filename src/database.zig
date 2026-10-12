@@ -2,7 +2,15 @@
 
 const engine = @import("db/engine.zig");
 pub const inputs = @import("base/inputs.zig");
+pub const syntax = @import("syntax/queries.zig");
+pub const live = @import("diagnostics/live.zig");
 
-pub const Db = engine.Engine(&.{
+const Vfs = @import("base/Vfs.zig");
+
+pub const Db = engine.Engine(*Vfs, &.{
     inputs.FileText,
+    syntax.ParseFile,
+    syntax.FileItemTree,
+    syntax.FileAstIdMap,
+    live.AstCheck,
 });

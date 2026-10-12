@@ -34,7 +34,8 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
     var writer: za.lsp.transport.Writer = .{ .io = io, .inner = &stdout.interface };
 
-    var server: za.Server = .init(io, init.gpa, &writer);
+    var server: za.Server = undefined;
+    server.init(io, init.gpa, &writer);
     defer server.deinit();
     return server.run(&stdin.interface);
 }

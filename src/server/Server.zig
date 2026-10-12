@@ -19,6 +19,9 @@ const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const syntax_q = database.syntax;
+const live = database.live;
+const ide = za.ide;
 
 const log = std.log.scoped(.server);
 
@@ -45,8 +48,10 @@ const Pending = struct {
 
 pub const HandlerError = error{ Canceled, OutOfMemory, InvalidParams };
 
-pub fn init(io: Io, gpa: Allocator, out: *transport.Writer) Server {
-    return .{ .io = io, .gpa = gpa, .db = .init(io, gpa), .vfs = .init(io, gpa), .out = out };
+/// 原地初始化：查询引擎持有指向 `server.vfs` 的指针，因此 Server 不能在初始化后移动。
+pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) void {
+    server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .out = out };
+    server.db = .init(io, gpa, &server.vfs);
 }
 
 pub fn deinit(server: *Server) void {
@@ -114,6 +119,11 @@ const request_handlers = .{
     .{ "initialize", Mode.sync, initialize },
     .{ "shutdown", Mode.sync, shutdown },
     .{ "zig-analyzer/status", Mode.read, status },
+    .{ "textDocument/formatting", Mode.read, formatting },
+    .{ "textDocument/documentSymbol", Mode.read, documentSymbol },
+    .{ "textDocument/foldingRange", Mode.read, foldingRange },
+    .{ "textDocument/selectionRange", Mode.read, selectionRange },
+    .{ "textDocument/semanticTokens/full", Mode.read, semanticTokensFull },
 };
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
@@ -265,15 +275,19 @@ fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
     try server.setFileText(id, params.textDocument.text);
+    try server.scheduleDiagnostics(id, params.textDocument.uri);
 }
 
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
-    server.db.beginWrite();
-    defer server.db.endWrite();
-    const old = server.db.peek(FileText, id) orelse "";
-    const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
-    try server.db.set(FileText, id, new, .low);
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        const old = server.db.peek(FileText, id) orelse "";
+        const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
+        try server.db.set(FileText, id, new, .low);
+    }
+    try server.scheduleDiagnostics(id, params.textDocument.uri);
 }
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
@@ -284,9 +298,109 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         else => |e| return e,
     };
     try server.setFileText(id, disk);
+    // 关闭的文档不再显示 live 诊断（M2 起由编译器诊断接管）
+    server.sendNotification("textDocument/publishDiagnostics", types.PublishDiagnosticsParams{ .uri = params.textDocument.uri, .diagnostics = &.{} });
+}
+
+// ── live 诊断推送 ─────────────────────────────────────────────────────
+
+/// 在后台计算并推送诊断。之后的编辑会通过写事务取消尚未完成的计算。
+fn scheduleDiagnostics(server: *Server, file: Vfs.FileId, document_uri: []const u8) !void {
+    const owned_uri = try server.gpa.dupe(u8, document_uri);
+    server.group.async(server.io, diagnosticsTask, .{ server, file, owned_uri });
+}
+
+fn diagnosticsTask(server: *Server, file: Vfs.FileId, document_uri: []u8) Io.Cancelable!void {
+    defer server.gpa.free(document_uri);
+    var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ctx = server.db.beginRead(arena);
+    defer ctx.end();
+    const params = buildDiagnostics(server, &ctx, arena, file, document_uri) catch |err| switch (err) {
+        // 被新的编辑取消：新的编辑会重新调度
+        error.Canceled => return,
+        error.OutOfMemory => return log.err("计算诊断时内存不足", .{}),
+    };
+    server.sendNotification("textDocument/publishDiagnostics", params);
+}
+
+fn buildDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, document_uri: []const u8) !types.PublishDiagnosticsParams {
+    const result = try ctx.get(live.AstCheck, file);
+    const text = try ctx.get(FileText, file) orelse "";
+    const lines = try offsets.LineIndex.init(arena, text);
+    const diags = try arena.alloc(types.Diagnostic, result.items.len);
+    for (result.items, diags) |d, *out| {
+        const related = try arena.alloc(types.DiagnosticRelatedInformation, d.notes.len);
+        for (d.notes, related) |n, *r| r.* = .{
+            .location = .{ .uri = document_uri, .range = lines.range(n.start, n.end, server.encoding) },
+            .message = n.message,
+        };
+        out.* = .{
+            .range = lines.range(d.start, d.end, server.encoding),
+            .severity = .Error,
+            .source = "zig ast-check",
+            .message = .{ .string = d.message },
+            .relatedInformation = if (related.len == 0) null else related,
+        };
+    }
+    return .{ .uri = document_uri, .diagnostics = diags };
 }
 
 // ── 请求处理函数 ──────────────────────────────────────────────────────
+
+/// 读请求中把 URI 换成已知文件；未打开或不存在的文件返回 null
+fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
+    const path = uri.toPath(arena, document_uri) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedScheme, error.InvalidUri => return null,
+    };
+    if (!std.fs.path.isAbsolute(path)) return null;
+    return try server.vfs.lookup(path);
+}
+
+/// 文件文本与行索引
+fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineIndex {
+    const text = try ctx.get(FileText, file) orelse "";
+    return offsets.LineIndex.init(arena, text);
+}
+
+fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!types.ResultType("textDocument/formatting") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const lines = try fileLines(ctx, arena, file);
+    const mode: ide.format.Mode = if (std.mem.endsWith(u8, server.vfs.path(file), ".zon")) .zon else .zig;
+    return ide.format.format(arena, lines, mode, server.encoding);
+}
+
+fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const items = try ctx.get(syntax_q.FileItemTree, file);
+    const map = try ctx.get(syntax_q.FileAstIdMap, file);
+    const lines = try fileLines(ctx, arena, file);
+    return .{ .array_of_DocumentSymbol = try ide.document_symbol.documentSymbols(arena, items, map, lines, server.encoding) };
+}
+
+fn foldingRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.FoldingRangeParams) HandlerError!types.ResultType("textDocument/foldingRange") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    const lines = try fileLines(ctx, arena, file);
+    return try ide.folding.foldingRanges(arena, parse.rootNode(), lines);
+}
+
+fn selectionRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.SelectionRangeParams) HandlerError!types.ResultType("textDocument/selectionRange") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    const lines = try fileLines(ctx, arena, file);
+    return try ide.selection_range.selectionRanges(arena, parse.rootNode(), lines, server.encoding, params.positions);
+}
+
+fn semanticTokensFull(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.SemanticTokensParams) HandlerError!types.ResultType("textDocument/semanticTokens/full") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    const lines = try fileLines(ctx, arena, file);
+    return .{ .data = try ide.semantic_tokens.semanticTokens(arena, parse.rootNode(), lines, server.encoding) };
+}
 
 fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
     // 优先 UTF-8（与内部字节偏移一致），否则回落到协议默认的 UTF-16
@@ -306,6 +420,14 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .textDocumentSync = .{ .TextDocumentSyncOptions = .{
                 .openClose = true,
                 .change = .Incremental,
+            } },
+            .documentFormattingProvider = .{ .boolean = true },
+            .documentSymbolProvider = .{ .boolean = true },
+            .foldingRangeProvider = .{ .boolean = true },
+            .selectionRangeProvider = .{ .boolean = true },
+            .semanticTokensProvider = .{ .SemanticTokensOptions = .{
+                .legend = ide.semantic_tokens.legend,
+                .full = .{ .boolean = true },
             } },
         },
         .serverInfo = .{ .name = "zig-analyzer", .version = za.version },
@@ -352,6 +474,11 @@ fn send(server: *Server, bytes: []u8) void {
 
 fn sendResponse(server: *Server, id: jsonrpc.Id, result: anytype) void {
     const bytes = jsonrpc.response(server.gpa, id, result) catch return log.err("构造响应时内存不足", .{});
+    server.send(bytes);
+}
+
+fn sendNotification(server: *Server, method: []const u8, params: anytype) void {
+    const bytes = jsonrpc.notification(server.gpa, method, params) catch return log.err("构造通知时内存不足", .{});
     server.send(bytes);
 }
 
