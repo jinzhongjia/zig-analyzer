@@ -227,3 +227,7 @@ test applyChanges {
     defer gpa.free(out2);
     try testing.expectEqualStrings("new", out2);
 }
+
+test {
+    _ = @import("offsets_fuzz.zig");
+}

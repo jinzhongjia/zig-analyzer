@@ -340,4 +340,5 @@ fn entryContainer(p: *parser.Parser) Allocator.Error!void {
 test {
     _ = @import("parse_test.zig");
     _ = @import("reparse_test.zig");
+    _ = @import("parse_fuzz.zig");
 }
