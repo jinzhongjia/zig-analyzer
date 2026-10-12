@@ -21,6 +21,9 @@
 //! };
 //! ```
 //!
+//! derived query 可改为声明 `computeIncremental(ctx, key, prev: ?Value)`，重算时引擎传入上一次的值
+//! （首次计算为 null）。结果必须与从零计算完全相同，prev 只用于加速；读取 prev 不记录依赖。
+//!
 //! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先置位
 //! `pending_write` 使进行中的读查询尽快以 `error.Canceled` 退出，再获取独占锁。
 //! 读事务内拿到的 query 值在该事务结束前一直有效：被替换的旧值延迟到下一次写事务才释放。
@@ -69,7 +72,8 @@ pub const Stats = struct {
     revision: Revision,
 };
 
-pub fn Engine(comptime queries: []const type) type {
+/// `Env`：query 可通过 `ctx.db.env` 访问的只读环境（必须在 Db 生命周期内不变）。
+pub fn Engine(comptime Env: type, comptime queries: []const type) type {
     comptime for (queries) |Q| validate(Q);
 
     return struct {
@@ -79,6 +83,7 @@ pub fn Engine(comptime queries: []const type) type {
 
         io: Io,
         gpa: Allocator,
+        env: Env,
 
         /// 读事务共享、写事务独占
         rw: Io.RwLock = .init,
@@ -143,8 +148,8 @@ pub fn Engine(comptime queries: []const type) type {
             value: struct { ptr: *anyopaque, free: *const fn (*anyopaque, Allocator) void },
         };
 
-        pub fn init(io: Io, gpa: Allocator) Db {
-            return .{ .io = io, .gpa = gpa };
+        pub fn init(io: Io, gpa: Allocator, env: Env) Db {
+            return .{ .io = io, .gpa = gpa, .env = env };
         }
 
         pub fn deinit(db: *Db) void {
@@ -391,7 +396,14 @@ pub fn Engine(comptime queries: []const type) type {
                 _ = db.executions[qi].fetchAdd(1, .monotonic);
 
                 try ctx.stack.append(ctx.gpa, .{ .key = .{ .query = qi, .index = index } });
-                var value = Q.compute(ctx, key) catch |err| {
+                const computed = if (@hasDecl(Q, "computeIncremental")) blk: {
+                    // 上一次的值在下一次写事务前不会被释放，可安全地作为增量计算的基础
+                    db.mutex.lockUncancelable(db.io);
+                    const prev: ?Q.Value = if (db.tables[qi].slots.items[index].memo) |m| m.value else null;
+                    db.mutex.unlock(db.io);
+                    break :blk Q.computeIncremental(ctx, key, prev);
+                } else Q.compute(ctx, key);
+                var value = computed catch |err| {
                     var frame = ctx.stack.pop().?;
                     frame.deps.deinit(ctx.db.gpa);
                     return err;
@@ -488,7 +500,7 @@ fn validate(comptime Q: type) void {
     }
     switch (Q.kind) {
         .input => if (!@hasDecl(Q, "default")) @compileError(@typeName(Q) ++ " 是 input，必须声明 default"),
-        .derived => if (!@hasDecl(Q, "compute")) @compileError(@typeName(Q) ++ " 是 derived，必须声明 compute"),
+        .derived => if (!@hasDecl(Q, "compute") and !@hasDecl(Q, "computeIncremental")) @compileError(@typeName(Q) ++ " 是 derived，必须声明 compute 或 computeIncremental"),
     }
     if (!@hasDecl(Q, "eql") and containsPointer(Q.Value)) {
         @compileError(@typeName(Q) ++ " 的 Value 含指针，必须声明 eql");

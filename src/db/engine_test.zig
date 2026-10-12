@@ -119,7 +119,7 @@ const Spin = struct {
 };
 var spin_started: std.atomic.Value(bool) = .init(false);
 
-const Db = db.Engine(&.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Spin });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Spin });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions[Db.queryIndex(Q)].load(.monotonic);
@@ -138,13 +138,13 @@ fn read(d: *Db, comptime Q: type, key: u32) !Q.Value {
 }
 
 test "未设置的 input 返回 default" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try testing.expectEqual(1, try read(&d, Plus, 7));
 }
 
 test "memo 跨读事务复用" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Number, 1, 42, .low);
 
@@ -155,7 +155,7 @@ test "memo 跨读事务复用" {
 }
 
 test "early cutoff：中间结果不变时上层不重算" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Number, 1, 42, .low);
     try testing.expectEqual(5, try read(&d, Plus, 1));
@@ -174,7 +174,7 @@ test "early cutoff：中间结果不变时上层不重算" {
 }
 
 test "设置相同的 input 值不推进 revision" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Number, 1, 42, .low);
     const rev = d.revision;
@@ -183,7 +183,7 @@ test "设置相同的 input 值不推进 revision" {
 }
 
 test "不相关 key 的变化不触发重算" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Number, 1, 42, .low);
     try testing.expectEqual(5, try read(&d, Plus, 1));
@@ -193,7 +193,7 @@ test "不相关 key 的变化不触发重算" {
 }
 
 test "durability：低层输入变化时跳过高 durability memo 的依赖检查" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Stable, 1, 21, .high);
     try testing.expectEqual(42, try read(&d, OnlyStable, 1));
@@ -211,7 +211,7 @@ test "durability：低层输入变化时跳过高 durability memo 的依赖检�
 }
 
 test "durability：输入从 high 降为 low 后仍能正确失效" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Stable, 1, 1, .high);
     try testing.expectEqual(2, try read(&d, OnlyStable, 1));
@@ -222,7 +222,7 @@ test "durability：输入从 high 降为 low 后仍能正确失效" {
 }
 
 test "带指针的 Value：值不变时保留旧值，变化时延迟释放" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     const gpa = testing.allocator;
 
@@ -253,7 +253,7 @@ test "带指针的 Value：值不变时保留旧值，变化时延迟释放" {
 }
 
 test "环：使用 cycleFallback 且不写入 memo" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     // CycleA → CycleB → CycleA(fallback = -100)，CycleB = -100，CycleA = -99
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
@@ -262,7 +262,7 @@ test "环：使用 cycleFallback 且不写入 memo" {
 }
 
 test "取消：pending_write 置位时读查询返回 Canceled" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     var ctx = d.beginRead(testing.allocator);
     defer ctx.end();
@@ -272,7 +272,7 @@ test "取消：pending_write 置位时读查询返回 Canceled" {
 }
 
 test "取消：单个请求的取消标志" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     var cancel: std.atomic.Value(bool) = .init(true);
     var ctx = d.beginRead(testing.allocator);
@@ -282,7 +282,7 @@ test "取消：单个请求的取消标志" {
 }
 
 test "取消：写事务打断进行中的读查询" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     spin_started.store(false, .release);
 
@@ -304,7 +304,7 @@ test "取消：写事务打断进行中的读查询" {
 }
 
 test "并发读：多个读者读取同一 query 结果一致" {
-    var d: Db = .init(testing.io, testing.allocator);
+    var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Number, 1, 42, .low);
 
