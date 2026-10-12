@@ -784,7 +784,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | `sema/` | 类型推导断言，覆盖泛型、comptime、peer type、结果类型 |
 | `ide/` | 各功能快照测试 |
 | `incremental/` | 编辑序列：增量结果 ≡ 从零计算结果；断言指定 query **未被重算**（验证 cutoff） |
-| `fuzz/` | 随机编辑 + 不变式（不崩溃、增量一致） |
+| 模糊 / 性质测试 | 每个性质写成以字节流为熵的函数，两种驱动方式共用：固定种子的伪随机循环（每次 `zig build test` 在所有平台运行，Debug 下取十分之一迭代）与 `std.testing.fuzz`（`zig build test --fuzz=<次数>` 覆盖率引导）。现有性质：URI ↔ 路径往返（posix / windows 两种风格在所有平台都测）、任意输入不崩溃、路径规范化幂等与盘符大小写统一；解析器任意输入无损、随机编辑下增量与全量一致；位置换算与增量变更 |
 | `bench/` | 冷启动各阶段耗时（§1 冷启动预算）、典型请求延迟、内存，CI 中跟踪回归 |
 | 分配失败 | 用失败分配器跑全部测试，验证 OOM 路径 |
 | `diagnostics/` | **一致性对拍**：错误样例语料（解析、AstGen、Sema、链接、多 step、无 build.zig、`.zon`）上，LSP 发布结果与 `zig build` 的 ErrorBundle 逐条比较（文件、span、级别、文案、note）；覆盖快路径与 `ast-check` 慢路径；位置平移用随机编辑序列测试 |
@@ -817,7 +817,7 @@ pub fn make() std.ArrayList(u8) { ... }
 
 - 测试：`zig build test` 共 37 个，覆盖引擎（含跨线程取消与并发读）、JSON 往返、Server 生命周期与错误码。
 - 与设计的差异：查询引擎合并为单文件 `db/engine.zig`；Server 的调度与 handler 暂在同一文件中。
-- 未完成：CI 工作流（`zig build test` + 校验 `zig build gen` 输出与提交一致）。
+- CI 已补充，见 §19.3。
 - 实施中的设计修正：构建集成改用 Zig 0.17 官方构建系统协议（§13），不再维护自定义 build runner。
 
 ### 19.2 M1 完成情况（2026-10-12）
@@ -842,7 +842,19 @@ pub fn make() std.ArrayList(u8) { ... }
   - 已知问题：live 诊断的 AstGen 是标准库代码，计算过程中不检查取消，写事务需要等它结束；大文件上会增加编辑延迟，后续考虑防抖或把 AstGen 放到单独的计算队列。
   - ItemTree 存文档文本而非文档位置（位置会随编辑平移、破坏 cutoff），并收录函数体内定义的容器（名字解析需要其成员）。
   - 查询引擎增加只读环境参数 `Env`（当前为 `*Vfs`），供 query 获取不变的文件路径信息。
-- 留到 M2：live 诊断的编译集合限制（§11.4）、内置标准库与用户 zig 版本不一致时回退 `zig ast-check`（§11.2，依赖 `zig env`）、CI 工作流。
+- 留到 M2：live 诊断的编译集合限制（§11.4）、内置标准库与用户 zig 版本不一致时回退 `zig ast-check`（§11.2，依赖 `zig env`）。
+
+### 19.3 CI 与模糊测试（2026-10-12）
+
+- `.github/workflows/ci.yml`：
+  - **测试**（ubuntu / macos / windows）：Debug 与 ReleaseSafe 两遍 `zig build test`、构建可执行文件、语料对拍（当前 Zig 标准库 + 本仓库源码）；
+  - **格式与生成代码**（ubuntu）：`zig fmt --check`；`zig build gen` 后 `types.zig` 必须与提交一致；
+  - **覆盖率引导模糊测试**（ubuntu）：`zig build test --fuzz=20K`（每个模糊目标 2 万次；插桩构建约 400 次/秒，3 个目标约 3 分钟）。本地可加大次数做长时间模糊测试，覆盖率数据保存在 `.zig-cache` 中跨次累积。
+- `.gitattributes` 统一 LF，避免 Windows 检出后格式与生成代码校验误报。
+- `zig build corpus` 默认校验当前 Zig 的标准库（由 `build.zig` 传入路径），可追加目录。
+- 路径处理（`base/uri.zig`、`Vfs.normalize`）改为显式的 posix / windows 风格参数，两种规则在任何平台都能测试。模糊测试发现并修复：URI 中原始控制字符（含 NUL）未被拒绝；UNC 主机名含路径分隔符时拼出非法路径。同时补充 UNC（`file://server/share/x` ↔ `\\server\share\x`）、`%00` 拒绝、Windows 盘符统一大写。
+- 大小写不敏感的文件系统：Vfs 的文件身份键在 Windows / macOS（默认）上统一 ASCII 字母大小写，`C:\Work\A.zig` 与 `c:/work/a.zig` 是同一个 FileId；对外（显示、构造 URI）保留第一次见到的写法。采用纯字符串处理而非查询磁盘真实大小写，因为编辑器中新建未保存的文件在磁盘上不存在。路径风格与大小写模式都是 Vfs 的参数，测试在所有平台覆盖四种组合，模糊测试随机翻转字母大小写验证身份判定。
+- 已知限制：只统一 ASCII 字母；NTFS 的 Unicode 大写映射、APFS 对 Unicode 规范化形式（组合 / 分解）不敏感的行为未处理，需要 Unicode 数据表。大小写模式按平台默认，尚未开放配置（macOS 可格式化为大小写敏感卷，Linux ext4 可对目录开启不敏感）。
 
 ---
 
