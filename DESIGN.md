@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1
+> 状态：草案 v0.1 ｜ 实施进度：M0 已完成（2026-10-12），下一步 M1，详见 §19。
 
 ---
 
@@ -785,17 +785,32 @@ pub fn make() std.ArrayList(u8) { ... }
 
 ## 19. 里程碑
 
-| 阶段 | 交付 | 验收标准 |
+| 阶段 | 状态 | 交付 | 验收标准 |
+|---|---|---|---|
+| **M0 基础** | ✅ 已完成 | `db/` 引擎、Vfs、`lsp/` 代码生成、Server 骨架、取消机制 | 引擎单测：增量、cutoff、环、取消；能与编辑器握手 |
+| **M1 语法** | ⏳ 下一步 | CST 解析器 + 类型化 AST、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
+| **M2 构建与诊断** | 未开始 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
+| **M3 名字** | 未开始 | 模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
+| **M4 类型** | 未开始 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
+| **M5 comptime** | 未开始 | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
+| **M6 引用** | 未开始 | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
+| **M7 性能** | 未开始 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
+| **v1.0** | 未开始 | 稳定性、文档、发布流程 | — |
+
+### 19.1 M0 完成情况（2026-10-12）
+
+| 模块 | 文件 | 内容 |
 |---|---|---|
-| **M0 基础** | `db/` 引擎、Vfs、`lsp/` 代码生成、Server 骨架、取消机制 | 引擎单测：增量、cutoff、环、取消；能与编辑器握手 |
-| **M1 语法** | CST 解析器 + 类型化 AST、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
-| **M2 构建与诊断** | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
-| **M3 名字** | 模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
-| **M4 类型** | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
-| **M5 comptime** | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
-| **M6 引用** | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
-| **M7 性能** | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
-| **v1.0** | 稳定性、文档、发布流程 | — |
+| 查询引擎 | `src/db/engine.zig` | input / derived query、红绿验证与 early cutoff、durability、读写事务与取消、环检测与 `cycleFallback`、旧值延迟释放 |
+| LSP 类型 | `tools/gen_lsp_types.zig` → `src/lsp/types.zig` | 由 `zig build gen` 从 `tools/metaModel.json`（LSP 3.18）生成；联合类型按 JSON 形状匹配、字符串字面量校验、递归类型自动用指针 |
+| 协议层 | `src/lsp/jsonrpc.zig`、`src/lsp/transport.zig`、`src/lsp/json_ext.zig` | 消息分类解析与构造、Content-Length 分帧、线程安全写出 |
+| 基础层 | `src/base/`、`src/util/offsets.zig` | Vfs 路径驻留、file URI 互转（含 Windows）、`FileText` input、UTF-8/16/32 位置换算与增量变更 |
+| Server | `src/server/Server.zig`、`src/main.zig` | 写消息串行、读请求并发；`ContentModified` / `RequestCancelled`；`initialize`（协商位置编码）、`shutdown`、`exit`、文档同步、`zig-analyzer/status` |
+
+- 测试：`zig build test` 共 37 个，覆盖引擎（含跨线程取消与并发读）、JSON 往返、Server 生命周期与错误码。
+- 与设计的差异：查询引擎合并为单文件 `db/engine.zig`；Server 的调度与 handler 暂在同一文件中。
+- 未完成：CI 工作流（`zig build test` + 校验 `zig build gen` 输出与提交一致）。
+- 实施中的设计修正：构建集成改用 Zig 0.17 官方构建系统协议（§13），不再维护自定义 build runner。
 
 ---
 
