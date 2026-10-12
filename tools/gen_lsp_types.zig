@@ -25,19 +25,58 @@ const Gen = struct {
         .{ "LSPArray", "[]const std.json.Value" },
     });
 
+    // ── metaModel 取值：格式不符合预期时带上下文 panic，便于升级 metaModel 时排查 ──
+
+    fn invalid(v: json.Value, comptime fmt: []const u8, args: anytype) noreturn {
+        var buf: [512]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        json.Stringify.value(v, .{}, &w) catch {};
+        const shown = w.buffered();
+        std.debug.panic("metaModel 格式不符合预期：" ++ fmt ++ "\n节点：{s}{s}", args ++ .{ shown, if (shown.len == buf.len) "…" else "" });
+    }
+
+    fn obj(v: json.Value) json.ObjectMap {
+        if (v != .object) invalid(v, "期望对象", .{});
+        return v.object;
+    }
+
+    /// 可选字段
+    fn opt(v: json.Value, key: []const u8) ?json.Value {
+        return obj(v).get(key);
+    }
+
+    /// 必需字段
+    fn field(v: json.Value, key: []const u8) json.Value {
+        return opt(v, key) orelse invalid(v, "缺少字段 \"{s}\"", .{key});
+    }
+
+    /// 可选字符串字段；存在但不是字符串时 panic
     fn str(v: json.Value, key: []const u8) ?[]const u8 {
-        const field = v.object.get(key) orelse return null;
-        return if (field == .string) field.string else null;
+        const f = opt(v, key) orelse return null;
+        if (f != .string) invalid(v, "字段 \"{s}\" 应为字符串", .{key});
+        return f.string;
+    }
+
+    /// 必需字符串字段
+    fn req(v: json.Value, key: []const u8) []const u8 {
+        return str(v, key) orelse invalid(v, "缺少字符串字段 \"{s}\"", .{key});
+    }
+
+    fn int(v: json.Value, key: []const u8) i64 {
+        const f = field(v, key);
+        if (f != .integer) invalid(v, "字段 \"{s}\" 应为整数", .{key});
+        return f.integer;
     }
 
     fn arr(v: json.Value, key: []const u8) []const json.Value {
-        const field = v.object.get(key) orelse return &.{};
-        return field.array.items;
+        const f = opt(v, key) orelse return &.{};
+        if (f != .array) invalid(v, "字段 \"{s}\" 应为数组", .{key});
+        return f.array.items;
     }
 
     fn flag(v: json.Value, key: []const u8) bool {
-        const field = v.object.get(key) orelse return false;
-        return field == .bool and field.bool;
+        const f = opt(v, key) orelse return false;
+        return f == .bool and f.bool;
     }
 
     // ── 文档注释 ───────────────────────────────────────────────────────
@@ -58,13 +97,13 @@ const Gen = struct {
     // ── 递归检测：按值包含形成环时需要用指针 ─────────────────────────────
 
     fn byValueRefs(g: *Gen, t: json.Value, out: *std.ArrayList([]const u8)) !void {
-        const kind = str(t, "kind").?;
+        const kind = req(t, "kind");
         if (std.mem.eql(u8, kind, "reference")) {
-            try out.append(g.arena, str(t, "name").?);
+            try out.append(g.arena, req(t, "name"));
         } else if (std.mem.eql(u8, kind, "or") or std.mem.eql(u8, kind, "and") or std.mem.eql(u8, kind, "tuple")) {
             for (arr(t, "items")) |item| try g.byValueRefs(item, out);
         } else if (std.mem.eql(u8, kind, "literal")) {
-            for (arr(t.object.get("value").?, "properties")) |p| try g.byValueRefs(p.object.get("type").?, out);
+            for (arr(field(t, "value"), "properties")) |p| try g.byValueRefs(field(p, "type"), out);
         }
         // array / map 是间接引用，不形成按值环
     }
@@ -73,9 +112,9 @@ const Gen = struct {
         var out: std.ArrayList([]const u8) = .empty;
         if (g.structures.get(name)) |s| {
             const props = try g.flattenProperties(s);
-            for (props) |p| try g.byValueRefs(p.object.get("type").?, &out);
+            for (props) |p| try g.byValueRefs(field(p, "type"), &out);
         } else if (g.aliases.get(name)) |a| {
-            if (special_aliases.get(name) == null) try g.byValueRefs(a.object.get("type").?, &out);
+            if (special_aliases.get(name) == null) try g.byValueRefs(field(a, "type"), &out);
         }
         return out.items;
     }
@@ -101,15 +140,16 @@ const Gen = struct {
         var out: std.ArrayList(json.Value) = .empty;
         for ([_][]const u8{ "extends", "mixins" }) |key| {
             for (arr(s, key)) |base| {
-                const base_struct = g.structures.get(str(base, "name").?).?;
+                const base_name = req(base, "name");
+                const base_struct = g.structures.get(base_name) orelse invalid(s, "引用了不存在的结构体 {s}", .{base_name});
                 try out.appendSlice(g.arena, try g.flattenProperties(base_struct));
             }
         }
         for (arr(s, "properties")) |p| {
-            const name = str(p, "name").?;
+            const name = req(p, "name");
             // 子结构覆盖同名属性
             for (out.items, 0..) |existing, i| {
-                if (std.mem.eql(u8, str(existing, "name").?, name)) {
+                if (std.mem.eql(u8, req(existing, "name"), name)) {
                     _ = out.orderedRemove(i);
                     break;
                 }
@@ -129,8 +169,8 @@ const Gen = struct {
     };
 
     fn isNullable(t: json.Value) bool {
-        const kind = str(t, "kind").?;
-        if (std.mem.eql(u8, kind, "base")) return std.mem.eql(u8, str(t, "name").?, "null");
+        const kind = req(t, "kind");
+        if (std.mem.eql(u8, kind, "base")) return std.mem.eql(u8, req(t, "name"), "null");
         if (std.mem.eql(u8, kind, "or")) {
             for (arr(t, "items")) |item| if (isNullable(item)) return true;
         }
@@ -154,12 +194,12 @@ const Gen = struct {
 
     /// 输出类型表达式。nullable 的 `or` 输出为 `?T`。
     fn emitType(g: *Gen, t: json.Value, ctx: Ctx) anyerror!void {
-        const kind = str(t, "kind").?;
+        const kind = req(t, "kind");
         const w = g.w;
         if (std.mem.eql(u8, kind, "base")) {
-            try w.writeAll(baseType(str(t, "name").?));
+            try w.writeAll(baseType(req(t, "name")));
         } else if (std.mem.eql(u8, kind, "reference")) {
-            const name = str(t, "name").?;
+            const name = req(t, "name");
             if (g.open_string_enums.contains(name)) {
                 try w.writeAll("[]const u8");
             } else if (ctx.by_value and (std.mem.eql(u8, name, ctx.owner) or try g.reaches(name, ctx.owner))) {
@@ -171,12 +211,12 @@ const Gen = struct {
             try w.writeAll("[]const ");
             var inner = ctx;
             inner.by_value = false;
-            try g.emitType(t.object.get("element").?, inner);
+            try g.emitType(field(t, "element"), inner);
         } else if (std.mem.eql(u8, kind, "map")) {
             try w.writeAll("std.json.ArrayHashMap(");
             var inner = ctx;
             inner.by_value = false;
-            try g.emitType(t.object.get("value").?, inner);
+            try g.emitType(field(t, "value"), inner);
             try w.writeAll(")");
         } else if (std.mem.eql(u8, kind, "tuple")) {
             try w.writeAll("struct { ");
@@ -186,10 +226,10 @@ const Gen = struct {
             }
             try w.writeAll("}");
         } else if (std.mem.eql(u8, kind, "stringLiteral")) {
-            try w.print("json_ext.StringLiteral(\"{f}\")", .{std.zig.fmtString(str(t, "value").?)});
+            try w.print("json_ext.StringLiteral(\"{f}\")", .{std.zig.fmtString(req(t, "value"))});
         } else if (std.mem.eql(u8, kind, "literal")) {
             try w.writeAll("struct {\n");
-            for (arr(t.object.get("value").?, "properties")) |p| try g.emitProperty(p, ctx);
+            for (arr(field(t, "value"), "properties")) |p| try g.emitProperty(p, ctx);
             try w.writeAll("}");
         } else if (std.mem.eql(u8, kind, "or")) {
             try g.emitOr(t, ctx);
@@ -200,10 +240,10 @@ const Gen = struct {
 
     fn collectOrItems(g: *Gen, t: json.Value, out: *std.ArrayList(json.Value)) !void {
         for (arr(t, "items")) |item| {
-            const kind = str(item, "kind").?;
+            const kind = req(item, "kind");
             if (std.mem.eql(u8, kind, "or")) {
                 try g.collectOrItems(item, out);
-            } else if (!(std.mem.eql(u8, kind, "base") and std.mem.eql(u8, str(item, "name").?, "null"))) {
+            } else if (!(std.mem.eql(u8, kind, "base") and std.mem.eql(u8, req(item, "name"), "null"))) {
                 try out.append(g.arena, item);
             }
         }
@@ -236,23 +276,23 @@ const Gen = struct {
     }
 
     fn variantName(g: *Gen, t: json.Value) ![]const u8 {
-        const kind = str(t, "kind").?;
-        if (std.mem.eql(u8, kind, "reference") or std.mem.eql(u8, kind, "base")) return str(t, "name").?;
-        if (std.mem.eql(u8, kind, "array")) return g.arena.print("array_of_{s}", .{try g.variantName(t.object.get("element").?)});
-        if (std.mem.eql(u8, kind, "stringLiteral")) return str(t, "value").?;
+        const kind = req(t, "kind");
+        if (std.mem.eql(u8, kind, "reference") or std.mem.eql(u8, kind, "base")) return req(t, "name");
+        if (std.mem.eql(u8, kind, "array")) return g.arena.print("array_of_{s}", .{try g.variantName(field(t, "element"))});
+        if (std.mem.eql(u8, kind, "stringLiteral")) return req(t, "value");
         return kind;
     }
 
     fn emitProperty(g: *Gen, p: json.Value, ctx: Ctx) !void {
         try g.doc(p);
-        const t = p.object.get("type").?;
+        const t = field(p, "type");
         const optional = flag(p, "optional");
-        try g.w.print("{f}: ", .{std.zig.fmtId(str(p, "name").?)});
+        try g.w.print("{f}: ", .{std.zig.fmtId(req(p, "name"))});
         if (optional and !isNullable(t)) try g.w.writeAll("?");
         try g.emitType(t, ctx);
         if (optional or isNullable(t)) {
             try g.w.writeAll(" = null");
-        } else if (std.mem.eql(u8, str(t, "kind").?, "stringLiteral")) {
+        } else if (std.mem.eql(u8, req(t, "kind"), "stringLiteral")) {
             try g.w.writeAll(" = .{}");
         }
         try g.w.writeAll(",\n");
@@ -269,7 +309,7 @@ const Gen = struct {
 
     fn emitEnumeration(g: *Gen, name: []const u8, e: json.Value) !void {
         try g.doc(e);
-        const base = str(e.object.get("type").?, "name").?;
+        const base = req(field(e, "type"), "name");
         const values = arr(e, "values");
         if (std.mem.eql(u8, base, "string")) {
             if (flag(e, "supportsCustomValues")) {
@@ -277,14 +317,14 @@ const Gen = struct {
                 try g.w.print("pub const {f} = struct {{\n", .{std.zig.fmtId(name)});
                 for (values) |v| {
                     try g.doc(v);
-                    try g.w.print("pub const {f}: []const u8 = \"{f}\";\n", .{ std.zig.fmtId(str(v, "name").?), std.zig.fmtString(str(v, "value").?) });
+                    try g.w.print("pub const {f}: []const u8 = \"{f}\";\n", .{ std.zig.fmtId(req(v, "name")), std.zig.fmtString(req(v, "value")) });
                 }
             } else {
                 // 闭合字符串枚举：tag 名即 JSON 值，std.json 可直接解析与序列化
                 try g.w.print("pub const {f} = enum {{\n", .{std.zig.fmtId(name)});
                 for (values) |v| {
                     try g.doc(v);
-                    try g.w.print("{f},\n", .{std.zig.fmtId(str(v, "value").?)});
+                    try g.w.print("{f},\n", .{std.zig.fmtId(req(v, "value"))});
                 }
             }
         } else {
@@ -292,7 +332,7 @@ const Gen = struct {
             try g.w.print("pub const {f} = enum({s}) {{\n", .{ std.zig.fmtId(name), tag });
             for (values) |v| {
                 try g.doc(v);
-                try g.w.print("{f} = {d},\n", .{ std.zig.fmtId(str(v, "name").?), v.object.get("value").?.integer });
+                try g.w.print("{f} = {d},\n", .{ std.zig.fmtId(req(v, "name")), int(v, "value") });
             }
             try g.w.writeAll("_,\n\npub const jsonStringify = json_ext.IntEnum(@This()).jsonStringify;\n");
         }
@@ -305,7 +345,7 @@ const Gen = struct {
         if (special_aliases.get(name)) |target| {
             try g.w.writeAll(target);
         } else {
-            try g.emitType(a.object.get("type").?, .{ .owner = name });
+            try g.emitType(field(a, "type"), .{ .owner = name });
         }
         try g.w.writeAll(";\n\n");
     }
@@ -316,16 +356,16 @@ const Gen = struct {
             if (is_request) "RequestInfo" else "NotificationInfo",
         });
         for (items) |m| {
-            const method = str(m, "method").?;
-            try g.w.print(".{{ .method = \"{f}\", .direction = .{s}, .Params = ", .{ std.zig.fmtString(method), str(m, "messageDirection").? });
-            if (m.object.get("params")) |params| {
+            const method = req(m, "method");
+            try g.w.print(".{{ .method = \"{f}\", .direction = .{s}, .Params = ", .{ std.zig.fmtString(method), req(m, "messageDirection") });
+            if (opt(m, "params")) |params| {
                 try g.emitType(params, .{ .owner = "", .by_value = false });
             } else {
                 try g.w.writeAll("void");
             }
             if (is_request) {
                 try g.w.writeAll(", .Result = ");
-                try g.emitType(m.object.get("result").?, .{ .owner = "", .by_value = false });
+                try g.emitType(field(m, "result"), .{ .owner = "", .by_value = false });
             }
             try g.w.writeAll(" },\n");
         }
@@ -333,16 +373,16 @@ const Gen = struct {
     }
 
     fn run(g: *Gen, model: json.Value) !void {
-        for (arr(model, "structures")) |s| try g.structures.put(g.arena, str(s, "name").?, s);
+        for (arr(model, "structures")) |s| try g.structures.put(g.arena, req(s, "name"), s);
         for (arr(model, "enumerations")) |e| {
-            try g.enumerations.put(g.arena, str(e, "name").?, e);
-            if (std.mem.eql(u8, str(e.object.get("type").?, "name").?, "string") and flag(e, "supportsCustomValues")) {
-                try g.open_string_enums.put(g.arena, str(e, "name").?, {});
+            try g.enumerations.put(g.arena, req(e, "name"), e);
+            if (std.mem.eql(u8, req(field(e, "type"), "name"), "string") and flag(e, "supportsCustomValues")) {
+                try g.open_string_enums.put(g.arena, req(e, "name"), {});
             }
         }
-        for (arr(model, "typeAliases")) |a| try g.aliases.put(g.arena, str(a, "name").?, a);
+        for (arr(model, "typeAliases")) |a| try g.aliases.put(g.arena, req(a, "name"), a);
 
-        const version = str(model.object.get("metaData").?, "version").?;
+        const version = req(field(model, "metaData"), "version");
         try g.w.print(
             \\//! 由 tools/gen_lsp_types.zig 从 metaModel.json（LSP {s}）生成，请勿手改。
             \\
