@@ -454,9 +454,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
     inline for (Db.query_types, 0..) |Q, i| {
         queries[i] = .{ .name = @typeName(Q), .executions = counts[i] };
     }
-    server.vfs.mutex.lockUncancelable(server.io);
-    const files = server.vfs.paths.count();
-    server.vfs.mutex.unlock(server.io);
+    const files = server.vfs.count();
     return .{
         .revision = stats.revision,
         .files = files,
