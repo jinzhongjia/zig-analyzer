@@ -61,6 +61,21 @@ pub fn build(b: *std.Build) void {
     corpus_run.addPassthruArgs();
     b.step("corpus", "Validate the CST parser against a Zig source corpus").dependOn(&corpus_run.step);
 
+    // 在标准库上运行类型推导：zig build sema-corpus -Doptimize=ReleaseSafe
+    const sema_corpus = b.addExecutable(.{
+        .name = "sema-corpus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/sema_corpus.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zig_analyzer", .module = mod }},
+        }),
+    });
+    const sema_corpus_run = b.addRunArtifact(sema_corpus);
+    sema_corpus_run.addDirectoryArg(std.Build.LazyPath.zig_lib.path(b, "std"));
+    sema_corpus_run.addPassthruArgs();
+    b.step("sema-corpus", "Run type inference over the standard library").dependOn(&sema_corpus_run.step);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
 }

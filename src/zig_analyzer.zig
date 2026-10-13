@@ -26,6 +26,7 @@ pub const names = struct {
     pub const ModuleGraph = @import("names/ModuleGraph.zig");
     pub const resolve = @import("names/resolve.zig");
 };
+pub const database = @import("database.zig");
 pub const sema = struct {
     pub const InternPool = @import("sema/InternPool.zig");
     pub const infer = @import("sema/infer.zig");
