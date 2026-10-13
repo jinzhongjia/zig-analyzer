@@ -7,6 +7,7 @@ pub const syntax = @import("syntax/queries.zig");
 pub const live = @import("diagnostics/live.zig");
 pub const hir = @import("hir/queries.zig");
 pub const ModuleGraph = @import("names/ModuleGraph.zig");
+pub const sema = @import("sema/queries.zig");
 
 const Vfs = @import("base/Vfs.zig");
 const InternPool = @import("sema/InternPool.zig");
@@ -27,4 +28,6 @@ pub const Db = engine.Engine(*const Env, &.{
     live.AstCheck,
     ModuleGraph.Input,
     hir.ItemBody,
+    sema.Infer,
+    sema.DeclType,
 });

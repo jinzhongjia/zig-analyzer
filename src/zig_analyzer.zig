@@ -28,6 +28,9 @@ pub const names = struct {
 };
 pub const sema = struct {
     pub const InternPool = @import("sema/InternPool.zig");
+    pub const infer = @import("sema/infer.zig");
+    pub const queries = @import("sema/queries.zig");
+    pub const render = @import("sema/render.zig");
 };
 pub const project = struct {
     pub const ZigEnv = @import("project/ZigEnv.zig");
