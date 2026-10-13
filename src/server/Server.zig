@@ -204,7 +204,7 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
 const Mode = enum {
     /// 在主循环中同步执行（改变服务器状态的请求）
     sync,
-    /// 在独立任务中持有读事务并发执行
+    /// 在独立任务中持有读事务并发执行（线程数达到上限时在主循环中同步执行）
     read,
     /// 在独立任务中执行，不持有读事务（会长时间等待的请求，不能阻塞主循环）
     background,
@@ -263,7 +263,12 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     }
                     server.group.async(server.io, ReadTask(func).run, .{ server, arena, pending, params });
                 },
-                .background => server.group.async(server.io, BackgroundTask(func).run, .{ server, arena, id, params }),
+                // 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
+                // 会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
+                .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
+                    server.destroyArena(arena);
+                    server.sendError(id, jsonrpc.error_codes.internal_error, "failed to start background task");
+                },
             }
             return;
         }
@@ -445,7 +450,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
         if (!ws.owns(id)) continue;
         if (is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) {
             // 非 watch 模式下 maker 不会自动重新配置：重启
-            server.restartWorkspace(ws);
+            server.restartWorkspace(ws, 0);
         } else {
             ws.requestBuild();
         }
@@ -485,7 +490,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         server.workspaces_mutex.unlock(server.io);
         defer server.gpa.free(list);
         if (list.len != 0) log.info("build settings changed, restarting projects", .{});
-        for (list) |ws| server.restartWorkspace(ws);
+        for (list) |ws| server.restartWorkspace(ws, 0);
     }
 }
 
@@ -585,7 +590,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         const build_zig = std.fs.path.join(server.gpa, &.{ root, "build.zig" }) catch return;
         defer server.gpa.free(build_zig);
         Io.Dir.cwd().access(server.io, build_zig, .{}) catch continue;
-        const ws = Workspace.start(server, root) catch |err| {
+        const ws = Workspace.start(server, root, 0) catch |err| {
             log.err("{s}: failed to start build system protocol: {t}", .{ root, err });
             continue;
         };
@@ -633,7 +638,9 @@ fn compileSingle(server: *Server, file: Vfs.FileId) void {
         gop.value_ptr.running = true;
     }
     server.busyBegin();
-    server.bg_group.async(server.io, singleFileTask, .{ server, file });
+    // 编译耗时数秒，尽量不在主循环中同步执行（否则期间无法处理进度 token 的响应等消息）
+    server.bg_group.concurrent(server.io, singleFileTask, .{ server, file }) catch
+        server.bg_group.async(server.io, singleFileTask, .{ server, file });
 }
 
 fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
@@ -677,11 +684,12 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
     return Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
 }
 
-fn restartWorkspace(server: *Server, ws: *Workspace) void {
+/// 停止 `ws` 并以新实例替换。`crash_restarts` 为 maker 连续崩溃后自动重启的次数（正常重启为 0）
+pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
     ws.stop();
     const root = server.gpa.dupe(u8, ws.root) catch return;
     defer server.gpa.free(root);
-    const fresh = Workspace.start(server, root) catch |err| {
+    const fresh = Workspace.start(server, root, crash_restarts) catch |err| {
         log.err("{s}: failed to restart build system protocol: {t}", .{ root, err });
         return;
     };
@@ -702,6 +710,9 @@ fn restartWorkspace(server: *Server, ws: *Workspace) void {
         server.retired.append(server.gpa, ws) catch {};
         return;
     };
+    // `ws` 已被其他重启替换（并发的崩溃重启与配置变化）：新实例作废
+    fresh.stop();
+    server.retired.append(server.gpa, fresh) catch {};
 }
 
 fn stopWorkspaces(server: *Server) void {

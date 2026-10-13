@@ -36,6 +36,8 @@ gpa: Allocator,
 root: []const u8,
 /// 启动时的配置副本（构建参数、诊断 step）；配置变化时整个实例被重启替换
 config: Server.Config,
+/// 本实例是 maker 连续崩溃后自动重启的第几次（0 表示正常启动）
+crash_restarts: u8 = 0,
 
 mutex: Io.Mutex = .init,
 // ── 以下字段受 mutex 保护 ──
@@ -47,6 +49,8 @@ result: ?compiler.BuildResult = null,
 /// FileId → `result` 中的条目
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
 building: bool = false,
+/// 至少完成过一次构建（用于判断崩溃是否「连续」）
+built: bool = false,
 /// 构建期间又收到构建请求：本轮结果作废，结束后立即重建
 rebuild: bool = false,
 stopping: bool = false,
@@ -68,12 +72,12 @@ bundles: std.ArrayList(ErrorBundle) = .empty,
 loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
 
 /// 启动 maker 并在后台读取事件
-pub fn start(server: *Server, root: []const u8) !*Workspace {
+pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
     const gpa = server.gpa;
     const env = server.zigEnv() orelse return error.ZigNotFound;
     const ws = try gpa.create(Workspace);
     errdefer gpa.destroy(ws);
-    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined };
+    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined, .crash_restarts = crash_restarts };
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
@@ -94,6 +98,9 @@ pub fn stop(ws: *Workspace) void {
     ws.stopping = true;
     if (ws.client) |c| c.requestStop();
 }
+
+/// maker 连续崩溃时自动重启的次数上限
+const max_crash_restarts = 3;
 
 /// 后台任务全部结束后调用
 pub fn destroy(ws: *Workspace) void {
@@ -181,7 +188,18 @@ fn run(ws: *Workspace) Io.Cancelable!void {
             if (config_failed) {
                 log.info("{s}: build.zig failed to compile, build system exited; will restart when build.zig is saved", .{ws.root});
             } else if (!ws.isStopping()) {
-                log.err("{s}: build system exited unexpectedly: {t}", .{ ws.root, err });
+                // maker 崩溃（如 0.17 的 maker 在收到新的构建请求时存在竞态，核数少时容易触发）：自动重启
+                ws.mutex.lockUncancelable(ws.server.io);
+                const next = if (ws.built) 1 else ws.crash_restarts + 1;
+                ws.mutex.unlock(ws.server.io);
+                if (next > max_crash_restarts) {
+                    log.err("{s}: build system exited unexpectedly: {t}", .{ ws.root, err });
+                    ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
+                } else {
+                    log.info("{s}: build system exited unexpectedly ({t}), restarting", .{ ws.root, err });
+                    // 新实例计为忙碌后本实例才结束，waitIdle 不会在两者之间返回
+                    ws.server.restartWorkspace(ws, next);
+                }
             }
             break;
         };
@@ -296,6 +314,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         },
         .build_completed => {
             ws.mutex.lockUncancelable(io);
+            ws.built = true;
             const rebuild = ws.rebuild;
             ws.rebuild = false;
             ws.mutex.unlock(io);
