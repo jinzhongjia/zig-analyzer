@@ -4,6 +4,7 @@ pub const db = @import("db/engine.zig");
 pub const Server = @import("server/Server.zig");
 pub const base = struct {
     pub const Vfs = @import("base/Vfs.zig");
+    pub const ProjectModel = @import("base/ProjectModel.zig");
     pub const uri = @import("base/uri.zig");
 };
 pub const syntax = struct {
@@ -16,8 +17,17 @@ pub const syntax = struct {
     pub const TextRange = tree.TextRange;
     const tree = @import("syntax/tree.zig");
 };
+pub const project = struct {
+    pub const ZigEnv = @import("project/ZigEnv.zig");
+    pub const bsp = @import("project/bsp.zig");
+    pub const configuration = @import("project/configuration.zig");
+    /// 仅供测试：在临时目录中创建示例项目
+    pub const fixture = @import("project/fixture.zig");
+};
 pub const diagnostics = struct {
     pub const live = @import("diagnostics/live.zig");
+    pub const compiler = @import("diagnostics/compiler.zig");
+    pub const compile_set = @import("diagnostics/compile_set.zig");
 };
 pub const ide = struct {
     pub const document_symbol = @import("ide/document_symbol.zig");
@@ -44,6 +54,7 @@ test {
     std.testing.refAllDecls(syntax);
     std.testing.refAllDecls(diagnostics);
     std.testing.refAllDecls(ide);
+    std.testing.refAllDecls(project);
     std.testing.refAllDecls(lsp);
     _ = @import("lsp/types_test.zig");
 }

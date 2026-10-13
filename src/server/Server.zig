@@ -22,6 +22,11 @@ const FileText = database.inputs.FileText;
 const syntax_q = database.syntax;
 const live = database.live;
 const ide = za.ide;
+const compiler = za.diagnostics.compiler;
+const ZigEnv = za.project.ZigEnv;
+const Workspace = @import("Workspace.zig");
+pub const Progress = @import("progress.zig");
+pub const Config = @import("Config.zig");
 
 const log = std.log.scoped(.server);
 
@@ -34,12 +39,66 @@ vfs: Vfs,
 out: *transport.Writer,
 state: State = .uninitialized,
 encoding: offsets.Encoding = .utf16,
-/// 并发执行中的读请求
+/// 并发执行中的读请求。只有主循环向其中提交任务，因此主循环可以安全地 await 它。
 group: Io.Group = .init,
 pending_mutex: Io.Mutex = .init,
 pending: std.ArrayList(*Pending) = .empty,
 
+/// 后台任务：项目的构建系统协议读取、诊断发布。多个线程都会向其中提交任务，
+/// 而 `Io.Group` 不允许在 await 期间提交，因此只在退出时（所有项目停止后）cancel 一次；
+/// 平时用 `busy` 计数判断是否空闲。
+bg_group: Io.Group = .init,
+busy_mutex: Io.Mutex = .init,
+busy_cond: Io.Condition = .init,
+busy: usize = 0,
+
+/// 客户端在 initialize 中给出的工作区根目录（绝对路径）
+roots: std.ArrayList([]u8) = .empty,
+/// 与 `roots` 一一对应：根目录下是否有 build.zig（在 initialize 时同步检查，避免项目加载完成前误判）
+root_has_build: std.ArrayList(bool) = .empty,
+
+single_mutex: Io.Mutex = .init,
+/// 单文件模式（不属于任何带 build.zig 的工作区）的编译结果
+single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
+env_mutex: Io.Mutex = .init,
+/// 启动后在后台查询；查询完成前为 null
+zig_env: ?ZigEnv = null,
+warned: bool = false,
+workspaces_mutex: Io.Mutex = .init,
+workspaces: std.ArrayList(*Workspace) = .empty,
+/// 已被重启替换的实例：其后台任务可能仍在收尾，退出时统一释放
+retired: std.ArrayList(*Workspace) = .empty,
+
+progress: Progress = .{},
+config_mutex: Io.Mutex = .init,
+config: Config = .{},
+// ── 拉取配置（只在主循环中访问）──
+/// 客户端支持 `workspace/configuration`
+pull_config: bool = false,
+/// 客户端支持动态注册 `workspace/didChangeConfiguration`（注册后客户端在配置变化时通知，内容由服务器拉取）
+register_config: bool = false,
+/// 已发出的拉取请求数；只采纳最近一次请求的响应
+config_requests: u32 = 0,
+/// 尚未收到响应的拉取请求数：等待期间计为忙碌（waitIdle 会等待配置生效）
+config_outstanding: u32 = 0,
+/// 首次拉取的响应到达前推迟项目启动（启动要用 zig.path 与构建参数）
+startup_pending: bool = false,
+/// 项目已启动：此后修改 zig.path 需要重启服务器
+started: bool = false,
+
+docs_mutex: Io.Mutex = .init,
+/// 已打开的文档：客户端使用的 URI（发布诊断时原样使用）
+open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
+/// 当前显示着非空诊断的文件（需要时发布空列表清除）
+published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
+
 pub const State = enum { uninitialized, running, shutdown };
+
+const SingleFile = struct {
+    result: ?compiler.BuildResult = null,
+    running: bool = false,
+    rerun: bool = false,
+};
 
 const Pending = struct {
     id: jsonrpc.Id,
@@ -56,6 +115,24 @@ pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) voi
 
 pub fn deinit(server: *Server) void {
     server.group.cancel(server.io);
+    server.stopWorkspaces();
+    server.waitIdle();
+    server.bg_group.cancel(server.io);
+    for (server.workspaces.items) |ws| ws.destroy();
+    server.workspaces.deinit(server.gpa);
+    for (server.retired.items) |ws| ws.destroy();
+    server.retired.deinit(server.gpa);
+    for (server.roots.items) |r| server.gpa.free(r);
+    server.roots.deinit(server.gpa);
+    server.root_has_build.deinit(server.gpa);
+    for (server.single.values()) |*sf| if (sf.result) |*r| r.deinit(server.gpa);
+    server.single.deinit(server.gpa);
+    if (server.zig_env) |*env| env.deinit(server.gpa);
+    for (server.open_docs.values()) |u| server.gpa.free(u);
+    server.open_docs.deinit(server.gpa);
+    server.published.deinit(server.gpa);
+    server.progress.deinit(server.gpa);
+    server.config.deinit(server.gpa);
     server.pending.deinit(server.gpa);
     server.db.deinit();
     server.vfs.deinit();
@@ -63,7 +140,10 @@ pub fn deinit(server: *Server) void {
 }
 
 /// 运行主循环直到收到 `exit` 或输入结束，返回进程退出码。
+/// 返回前等待已调度的后台任务（诊断发布等）收尾；收到 `exit` 时还会停止各项目的构建系统进程。
+/// 输入结束而未收到 `exit` 时项目继续运行，可以用新的输入再次调用（测试中用于在两段输入之间修改磁盘文件）。
 pub fn run(server: *Server, reader: *Io.Reader) !u8 {
+    var exited = false;
     while (true) {
         const arena = try server.gpa.create(std.heap.ArenaAllocator);
         arena.* = .init(server.gpa);
@@ -73,14 +153,19 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
             switch (err) {
                 error.EndOfStream => break,
                 else => {
-                    log.err("读取消息失败: {t}", .{err});
+                    log.err("failed to read message: {t}", .{err});
                     break;
                 },
             }
         };
-        if (try server.processMessage(arena, body) == .exit) break;
+        if (try server.processMessage(arena, body) == .exit) {
+            exited = true;
+            break;
+        }
     }
     server.group.await(server.io) catch {};
+    if (exited) server.stopWorkspaces();
+    server.waitIdle();
     return if (server.state == .shutdown) 0 else 1;
 }
 
@@ -92,7 +177,7 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
     const message = jsonrpc.parse(a, body) catch |err| {
         server.destroyArena(arena);
         if (err == error.OutOfMemory) return err;
-        server.sendError(null, jsonrpc.error_codes.parse_error, "无法解析 JSON-RPC 消息");
+        server.sendError(null, jsonrpc.error_codes.parse_error, "failed to parse JSON-RPC message");
         return .@"continue";
     };
     switch (message) {
@@ -101,7 +186,15 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
             defer server.destroyArena(arena);
             return server.processNotification(a, n.method, n.params);
         },
-        .response => server.destroyArena(arena),
+        .response => |resp| {
+            defer server.destroyArena(arena);
+            if (resp.id) |id| switch (id) {
+                .integer => |i| _ = server.progress.handleResponse(server, i, resp.@"error" == null),
+                .string => |s| if (std.mem.startsWith(u8, s, config_request_prefix)) {
+                    try server.handleConfigResponse(s, resp.result, resp.@"error" != null);
+                },
+            };
+        },
     }
     return .@"continue";
 }
@@ -113,11 +206,14 @@ const Mode = enum {
     sync,
     /// 在独立任务中持有读事务并发执行
     read,
+    /// 在独立任务中执行，不持有读事务（会长时间等待的请求，不能阻塞主循环）
+    background,
 };
 
 const request_handlers = .{
     .{ "initialize", Mode.sync, initialize },
     .{ "shutdown", Mode.sync, shutdown },
+    .{ "zig-analyzer/waitIdle", Mode.background, waitIdleRequest },
     .{ "zig-analyzer/status", Mode.read, status },
     .{ "textDocument/formatting", Mode.read, formatting },
     .{ "textDocument/documentSymbol", Mode.read, documentSymbol },
@@ -133,11 +229,11 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
             const is_initialize = comptime std.mem.eql(u8, h[0], "initialize");
             if (server.state == .uninitialized and !is_initialize) {
                 server.destroyArena(arena);
-                return server.sendError(id, jsonrpc.error_codes.server_not_initialized, "服务器尚未初始化");
+                return server.sendError(id, jsonrpc.error_codes.server_not_initialized, "server not initialized");
             }
             if (server.state != .uninitialized and is_initialize or server.state == .shutdown) {
                 server.destroyArena(arena);
-                return server.sendError(id, jsonrpc.error_codes.invalid_request, "当前状态下不能处理该请求");
+                return server.sendError(id, jsonrpc.error_codes.invalid_request, "request not allowed in current state");
             }
 
             const func = h[2];
@@ -145,7 +241,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
             const params = jsonrpc.parseParams(Params, a, params_value) catch |err| {
                 server.destroyArena(arena);
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                return server.sendError(id, jsonrpc.error_codes.invalid_params, "参数格式错误");
+                return server.sendError(id, jsonrpc.error_codes.invalid_params, "malformed params");
             };
 
             switch (h[1]) {
@@ -167,18 +263,30 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     }
                     server.group.async(server.io, ReadTask(func).run, .{ server, arena, pending, params });
                 },
+                .background => server.group.async(server.io, BackgroundTask(func).run, .{ server, arena, id, params }),
             }
             return;
         }
     }
     server.destroyArena(arena);
-    server.sendError(id, jsonrpc.error_codes.method_not_found, "不支持的方法");
+    server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
 }
 
 /// 处理函数最后一个参数即请求参数类型
 fn LastParam(comptime F: type) type {
     const param_types = @typeInfo(F).@"fn".param_types;
     return param_types[param_types.len - 1].?;
+}
+
+fn BackgroundTask(comptime func: anytype) type {
+    const Params = LastParam(@TypeOf(func));
+    return struct {
+        fn run(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, params: Params) Io.Cancelable!void {
+            defer server.destroyArena(arena);
+            const result = func(server, arena.allocator(), params) catch |err| return server.sendHandlerError(id, err, false);
+            server.sendResponse(id, result);
+        }
+    };
 }
 
 fn ReadTask(comptime func: anytype) type {
@@ -233,15 +341,18 @@ fn processNotification(server: *Server, arena: Allocator, method: []const u8, pa
         .{ "textDocument/didOpen", didOpen },
         .{ "textDocument/didChange", didChange },
         .{ "textDocument/didClose", didClose },
+        .{ "textDocument/didSave", didSave },
+        .{ "workspace/didChangeConfiguration", didChangeConfiguration },
+        .{ "initialized", initialized },
     };
     inline for (handlers) |h| {
         if (std.mem.eql(u8, method, h[0])) {
             const Params = types.ParamsType(h[0]);
             const params = jsonrpc.parseParams(Params, arena, params_value) catch |err| {
-                log.warn("{s}: 参数格式错误: {t}", .{ h[0], err });
+                log.warn("{s}: malformed params: {t}", .{ h[0], err });
                 return .@"continue";
             };
-            h[1](server, arena, params) catch |err| log.err("{s} 处理失败: {t}", .{ h[0], err });
+            h[1](server, arena, params) catch |err| log.err("{s} failed: {t}", .{ h[0], err });
             return .@"continue";
         }
     }
@@ -274,8 +385,20 @@ fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
 
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    {
+        const owned = try server.gpa.dupe(u8, params.textDocument.uri);
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        const gop = server.open_docs.getOrPut(server.gpa, id) catch |err| {
+            server.gpa.free(owned);
+            return err;
+        };
+        if (gop.found_existing) server.gpa.free(gop.value_ptr.*);
+        gop.value_ptr.* = owned;
+    }
     try server.setFileText(id, params.textDocument.text);
-    try server.scheduleDiagnostics(id, params.textDocument.uri);
+    server.publishFiles(&.{id}, false);
+    if (server.isSingleFile(id)) server.compileSingle(id);
 }
 
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
@@ -287,7 +410,7 @@ fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocum
         const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
         try server.db.set(FileText, id, new, .low);
     }
-    try server.scheduleDiagnostics(id, params.textDocument.uri);
+    server.publishFiles(&.{id}, false);
 }
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
@@ -298,52 +421,474 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         else => |e| return e,
     };
     try server.setFileText(id, disk);
-    // 关闭的文档不再显示 live 诊断（M2 起由编译器诊断接管）
-    server.sendNotification("textDocument/publishDiagnostics", types.PublishDiagnosticsParams{ .uri = params.textDocument.uri, .diagnostics = &.{} });
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
+    }
+    // 关闭后按磁盘内容重新发布（编译集合中的文件仍可能有编译器诊断）
+    server.publishFiles(&.{id}, true);
 }
 
-// ── live 诊断推送 ─────────────────────────────────────────────────────
+fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentParams) !void {
+    const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    const path = server.vfs.path(id);
+    const base = std.fs.path.basename(path);
+    const is_build_file = std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon");
 
-/// 在后台计算并推送诊断。之后的编辑会通过写事务取消尚未完成的计算。
-fn scheduleDiagnostics(server: *Server, file: Vfs.FileId, document_uri: []const u8) !void {
-    const owned_uri = try server.gpa.dupe(u8, document_uri);
-    server.group.async(server.io, diagnosticsTask, .{ server, file, owned_uri });
+    if (server.isSingleFile(id)) return server.compileSingle(id);
+
+    server.workspaces_mutex.lockUncancelable(server.io);
+    const list = try arena.dupe(*Workspace, server.workspaces.items);
+    server.workspaces_mutex.unlock(server.io);
+    for (list) |ws| {
+        if (!ws.owns(id)) continue;
+        if (is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) {
+            // 非 watch 模式下 maker 不会自动重新配置：重启
+            server.restartWorkspace(ws);
+        } else {
+            ws.requestBuild();
+        }
+    }
 }
 
-fn diagnosticsTask(server: *Server, file: Vfs.FileId, document_uri: []u8) Io.Cancelable!void {
-    defer server.gpa.free(document_uri);
+fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChangeConfigurationParams) !void {
+    // 只通知「配置已变化」而不带内容的客户端（如 VS Code）：向客户端拉取
+    if (params.settings == .null) {
+        if (server.pull_config) server.requestConfig();
+        return;
+    }
+    const fresh = Config.parse(server.gpa, params.settings) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidConfig => return server.showWarning("invalid zig-analyzer settings, keeping the previous ones"),
+    };
+    try server.applyConfig(fresh);
+}
+
+/// 替换当前配置；构建相关配置变化时重启各项目
+fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
+    var new = fresh;
+    server.config_mutex.lockUncancelable(server.io);
+    const zig_changed = !server.config.sameZig(&new);
+    const build_changed = !server.config.sameBuild(&new);
+    server.config.deinit(server.gpa);
+    server.config = new;
+    server.config_mutex.unlock(server.io);
+
+    if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
+    if (build_changed) {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch {
+            server.workspaces_mutex.unlock(server.io);
+            return error.OutOfMemory;
+        };
+        server.workspaces_mutex.unlock(server.io);
+        defer server.gpa.free(list);
+        if (list.len != 0) log.info("build settings changed, restarting projects", .{});
+        for (list) |ws| server.restartWorkspace(ws);
+    }
+}
+
+const config_request_prefix = "zig-analyzer/configuration/";
+
+/// 向客户端拉取 `zig-analyzer` 配置节；响应由 `handleConfigResponse` 处理
+fn requestConfig(server: *Server) void {
+    var buf: [64]u8 = undefined;
+    const id = std.fmt.bufPrint(&buf, config_request_prefix ++ "{d}", .{server.config_requests}) catch unreachable;
+    server.config_requests += 1;
+    server.config_outstanding += 1;
+    server.busyBegin();
+    server.sendRequest(.{ .string = id }, "workspace/configuration", types.ConfigurationParams{ .items = &.{.{ .section = "zig-analyzer" }} });
+}
+
+fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value, failed: bool) Allocator.Error!void {
+    const n = std.fmt.parseInt(u32, id[config_request_prefix.len..], 10) catch return;
+    // shutdown 时已不再等待
+    if (server.config_outstanding == 0) return;
+    defer {
+        server.config_outstanding -= 1;
+        server.busyEnd();
+    }
+    // 之后又发出了新的请求：等待最新的响应
+    if (n + 1 != server.config_requests) return;
+    defer if (server.startup_pending) {
+        server.startup_pending = false;
+        server.startProjects();
+    };
+    if (failed) return log.info("client failed to provide configuration", .{});
+    // 结果与请求的 items 一一对应；该节未设置时为 null，即全部使用默认值
+    const section: json.Value = if (result == .array and result.array.items.len == 1) result.array.items[0] else .null;
+    const fresh: Config = if (section == .null) .{} else Config.parse(server.gpa, section) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidConfig => return server.showWarning("invalid zig-analyzer settings, keeping the previous ones"),
+    };
+    try server.applyConfig(fresh);
+}
+
+/// 当前配置的副本（调用方释放）
+pub fn configSnapshot(server: *Server) Allocator.Error!Config {
+    server.config_mutex.lockUncancelable(server.io);
+    defer server.config_mutex.unlock(server.io);
+    return server.config.clone(server.gpa);
+}
+
+fn initialized(server: *Server, _: Allocator, _: types.InitializedParams) !void {
+    if (server.register_config) {
+        server.sendRequest(.{ .string = "zig-analyzer/register" }, "client/registerCapability", types.RegistrationParams{ .registrations = &.{
+            .{ .id = "zig-analyzer/didChangeConfiguration", .method = "workspace/didChangeConfiguration" },
+        } });
+    }
+    if (server.pull_config) {
+        // 拉取到配置后再启动项目
+        server.startup_pending = true;
+        server.requestConfig();
+    } else {
+        server.startProjects();
+    }
+}
+
+fn startProjects(server: *Server) void {
+    server.started = true;
+    server.busyBegin();
+    server.bg_group.concurrent(server.io, startup, .{server}) catch |err| {
+        server.busyEnd();
+        log.err("failed to start project loading task: {t}", .{err});
+    };
+}
+
+// ── 项目与后台任务 ───────────────────────────────────────────────────
+
+/// 查询 zig 环境，并为每个带 build.zig 的工作区启动构建系统协议
+fn startup(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    var config = server.configSnapshot() catch return;
+    defer config.deinit(server.gpa);
+    const env = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
+        log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
+        return;
+    };
+    {
+        server.env_mutex.lockUncancelable(server.io);
+        defer server.env_mutex.unlock(server.io);
+        server.zig_env = env;
+    }
+    log.info("zig {s}（{s}）", .{ env.version, env.zig_exe });
+    if (!env.matchesBuiltin()) {
+        // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check（§11.2）
+        server.showWarningOnce("zig version differs from the one zig-analyzer was built with: live diagnostics fall back to zig ast-check, compiler diagnostics are unavailable");
+        const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
+    }
+    for (server.roots.items) |root| {
+        const build_zig = std.fs.path.join(server.gpa, &.{ root, "build.zig" }) catch return;
+        defer server.gpa.free(build_zig);
+        Io.Dir.cwd().access(server.io, build_zig, .{}) catch continue;
+        const ws = Workspace.start(server, root) catch |err| {
+            log.err("{s}: failed to start build system protocol: {t}", .{ root, err });
+            continue;
+        };
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        server.workspaces.append(server.gpa, ws) catch ws.stop();
+    }
+    // 启动前已打开的单文件：zig 环境就绪后补一次编译
+    server.docs_mutex.lockUncancelable(server.io);
+    const open = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
+        server.docs_mutex.unlock(server.io);
+        return;
+    };
+    server.docs_mutex.unlock(server.io);
+    defer server.gpa.free(open);
+    for (open) |file| if (server.isSingleFile(file)) server.compileSingle(file);
+}
+
+// ── 单文件模式 ───────────────────────────────────────────────────────
+
+/// 不在任何带 build.zig 的工作区根目录之下的 .zig 文件
+fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
+    const path = server.vfs.path(file);
+    if (!std.mem.endsWith(u8, path, ".zig")) return false;
+    for (server.roots.items, server.root_has_build.items) |root, has_build| {
+        if (has_build and Workspace.isUnder(path, root)) return false;
+    }
+    return true;
+}
+
+/// 在后台用 `zig build-obj -fno-emit-bin` 编译单个文件；编译期间再次请求时，结束后重新编译
+fn compileSingle(server: *Server, file: Vfs.FileId) void {
+    if (server.zigEnv() == null) return; // 启动完成后会补编译
+    // 编译器读取磁盘：尚未保存到磁盘的新文件不编译
+    Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch return;
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        const gop = server.single.getOrPut(server.gpa, file) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (gop.value_ptr.running) {
+            gop.value_ptr.rerun = true;
+            return;
+        }
+        gop.value_ptr.running = true;
+    }
+    server.busyBegin();
+    server.bg_group.async(server.io, singleFileTask, .{ server, file });
+}
+
+fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
+    defer server.busyEnd();
+    const env = server.zigEnv().?;
+    const path = server.vfs.path(file);
+    var title_buf: [256]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "Compiling {s}", .{std.fs.path.basename(path)}) catch "Compiling";
+    const progress = server.progress.begin(server, title, false);
+    var errors: usize = 0;
+    defer server.progress.end(server, progress, if (errors == 0) "Done" else "Has errors");
+    while (true) {
+        var result: ?compiler.BuildResult = blk: {
+            var eb = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
+                log.warn("{s}: single-file compile failed: {t}", .{ path, err });
+                break :blk null;
+            };
+            defer eb.deinit(server.gpa);
+            errors = eb.errorMessageCount();
+            break :blk compiler.collect(server.gpa, &.{eb}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
+        };
+        server.single_mutex.lockUncancelable(server.io);
+        const sf = server.single.getPtr(file).?;
+        if (sf.rerun) {
+            sf.rerun = false;
+            server.single_mutex.unlock(server.io);
+            if (result) |*r| r.deinit(server.gpa);
+            continue;
+        }
+        if (sf.result) |*old| old.deinit(server.gpa);
+        sf.result = result;
+        sf.running = false;
+        server.single_mutex.unlock(server.io);
+        server.publishFiles(&.{file}, true);
+        return;
+    }
+}
+
+fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
+    const server: *Server = @ptrCast(@alignCast(ctx));
+    return Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
+}
+
+fn restartWorkspace(server: *Server, ws: *Workspace) void {
+    ws.stop();
+    const root = server.gpa.dupe(u8, ws.root) catch return;
+    defer server.gpa.free(root);
+    const fresh = Workspace.start(server, root) catch |err| {
+        log.err("{s}: failed to restart build system protocol: {t}", .{ root, err });
+        return;
+    };
+    // 旧实例发布过的编译器诊断由新实例在首次构建后清除（新结果中没有的文件）。
+    // 新实例的后台任务已在运行，两边都要加锁（先后各持一把，不同时持有）
+    ws.mutex.lockUncancelable(server.io);
+    const stale = server.gpa.dupe(Vfs.FileId, ws.result_files.keys()) catch &.{};
+    ws.mutex.unlock(server.io);
+    defer server.gpa.free(stale);
+    fresh.mutex.lockUncancelable(server.io);
+    fresh.stale_files.appendSlice(server.gpa, stale) catch {};
+    fresh.mutex.unlock(server.io);
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    // 旧实例保留在列表中直到退出时统一释放（其后台任务可能仍在运行），但不再参与调度
+    for (server.workspaces.items) |*w| if (w.* == ws) {
+        w.* = fresh;
+        server.retired.append(server.gpa, ws) catch {};
+        return;
+    };
+}
+
+fn stopWorkspaces(server: *Server) void {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| ws.stop();
+}
+
+pub fn zigEnv(server: *Server) ?*const ZigEnv {
+    server.env_mutex.lockUncancelable(server.io);
+    defer server.env_mutex.unlock(server.io);
+    return if (server.zig_env) |*e| e else null;
+}
+
+pub fn showWarning(server: *Server, message: []const u8) void {
+    log.warn("{s}", .{message});
+    server.sendNotification("window/showMessage", types.ShowMessageParams{ .type = .Warning, .message = message });
+}
+
+pub fn showWarningOnce(server: *Server, message: []const u8) void {
+    server.env_mutex.lockUncancelable(server.io);
+    const first = !server.warned;
+    server.warned = true;
+    server.env_mutex.unlock(server.io);
+    if (first) server.showWarning(message);
+}
+
+pub fn busyBegin(server: *Server) void {
+    server.busy_mutex.lockUncancelable(server.io);
+    defer server.busy_mutex.unlock(server.io);
+    server.busy += 1;
+}
+
+pub fn busyEnd(server: *Server) void {
+    server.busy_mutex.lockUncancelable(server.io);
+    defer server.busy_mutex.unlock(server.io);
+    server.busy -= 1;
+    if (server.busy == 0) server.busy_cond.broadcast(server.io);
+}
+
+/// 等待所有后台任务（构建、编译集合计算、诊断发布）完成
+fn waitIdle(server: *Server) void {
+    server.busy_mutex.lockUncancelable(server.io);
+    defer server.busy_mutex.unlock(server.io);
+    while (server.busy != 0) server.busy_cond.waitUncancelable(server.io, &server.busy_mutex);
+}
+
+fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
+    server.waitIdle();
+}
+
+// ── 诊断发布（设计 §11.5） ───────────────────────────────────────────
+
+/// 在后台重新计算并发布这些文件的诊断。`clear` 为 true 时即使没有诊断也发布（用于清除旧诊断）。
+pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
+    for (files) |file| {
+        server.busyBegin();
+        server.bg_group.async(server.io, publishTask, .{ server, file, clear });
+    }
+}
+
+pub fn publishOpenFiles(server: *Server) void {
+    server.docs_mutex.lockUncancelable(server.io);
+    const files = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
+        server.docs_mutex.unlock(server.io);
+        return;
+    };
+    server.docs_mutex.unlock(server.io);
+    defer server.gpa.free(files);
+    server.publishFiles(files, false);
+}
+
+fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!void {
+    defer server.busyEnd();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // 被写事务取消时重试：构建结果触发的发布不能因无关的编辑而丢失
+    var attempt: usize = 0;
+    while (attempt < 100) : (attempt += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const arena = arena_state.allocator();
+        var ctx = server.db.beginRead(arena);
+        const params = server.computeDiagnostics(&ctx, arena, file) catch |err| {
+            ctx.end();
+            switch (err) {
+                error.Canceled => continue,
+                error.OutOfMemory => return log.err("out of memory while computing diagnostics", .{}),
+            }
+        };
+        ctx.end();
+        server.sendDiagnostics(file, params, clear);
+        return;
+    }
+}
 
-    var ctx = server.db.beginRead(arena);
-    defer ctx.end();
-    const params = buildDiagnostics(server, &ctx, arena, file, document_uri) catch |err| switch (err) {
-        // 被新的编辑取消：新的编辑会重新调度
-        error.Canceled => return,
-        error.OutOfMemory => return log.err("计算诊断时内存不足", .{}),
-    };
+fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool) void {
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        const was_published = server.published.contains(file);
+        if (params.diagnostics.len == 0) {
+            // 从未显示过诊断的文件不必发送空列表（已打开的文件除外，客户端可能仍显示着旧结果）
+            if (!was_published and !clear and !server.open_docs.contains(file)) return;
+            _ = server.published.swapRemove(file);
+        } else {
+            server.published.put(server.gpa, file, {}) catch {};
+        }
+    }
     server.sendNotification("textDocument/publishDiagnostics", params);
 }
 
-fn buildDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, document_uri: []const u8) !types.PublishDiagnosticsParams {
-    const result = try ctx.get(live.AstCheck, file);
-    const text = try ctx.get(FileText, file) orelse "";
-    const lines = try offsets.LineIndex.init(arena, text);
-    const diags = try arena.alloc(types.Diagnostic, result.items.len);
-    for (result.items, diags) |d, *out| {
-        const related = try arena.alloc(types.DiagnosticRelatedInformation, d.notes.len);
-        for (d.notes, related) |n, *r| r.* = .{
-            .location = .{ .uri = document_uri, .range = lines.range(n.start, n.end, server.encoding) },
-            .message = n.message,
-        };
-        out.* = .{
-            .range = lines.range(d.start, d.end, server.encoding),
-            .severity = .Error,
-            .source = "zig ast-check",
-            .message = .{ .string = d.message },
-            .relatedInformation = if (related.len == 0) null else related,
-        };
+/// 文件所属的项目（第一个包含它的工作区）
+fn workspaceFor(server: *Server, file: Vfs.FileId) ?*Workspace {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| if (ws.owns(file)) return ws;
+    return null;
+}
+
+fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    if (server.open_docs.get(file)) |u| return arena.dupe(u8, u);
+    return uri.fromPath(arena, server.vfs.path(file));
+}
+
+const OtherFiles = struct {
+    server: *Server,
+    ctx: *Db.Ctx,
+
+    fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
+        const self: *OtherFiles = @ptrCast(@alignCast(opaque_ctx));
+        const file = self.server.vfs.lookup(path) catch return null;
+        const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
+        const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
+        const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
+        return .{ .uri = u, .text = text };
+    }
+};
+
+fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !types.PublishDiagnosticsParams {
+    const document_uri = try server.uriFor(arena, file);
+    const text = try ctx.get(FileText, file);
+    const ws = server.workspaceFor(file);
+
+    // live 诊断：文件已加载，且（不属于任何项目，或编译集合尚未算出，或在编译集合中）
+    var live_result: ?*live.Result = null;
+    if (text != null) {
+        const eligible = if (ws) |w| w.liveEligible(file) else true;
+        if (eligible) live_result = try ctx.get(live.AstCheck, file);
+    }
+
+    var other: OtherFiles = .{ .server = server, .ctx = ctx };
+    var diags: []const types.Diagnostic = &.{};
+    if (ws) |w| {
+        w.mutex.lockUncancelable(server.io);
+        defer w.mutex.unlock(server.io);
+        const fr = w.result_files.get(file);
+        const current = text orelse if (fr) |r| r.base_text else "";
+        diags = try compiler.merge(arena, .{
+            .text = current,
+            .lines = try offsets.LineIndex.init(arena, current),
+            .encoding = server.encoding,
+            .uri = document_uri,
+            .live = live_result,
+            .compiler = fr,
+            .other_file = OtherFiles.get,
+            .other_ctx = &other,
+        });
+    } else if (text) |current| {
+        // 单文件模式：只使用编译结果中本文件的诊断
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        const fr: ?*const compiler.FileResult = if (server.single.getPtr(file)) |sf|
+            if (sf.result) |*r| r.files.getPtr(server.vfs.path(file)) else null
+        else
+            null;
+        diags = try compiler.merge(arena, .{
+            .text = current,
+            .lines = try offsets.LineIndex.init(arena, current),
+            .encoding = server.encoding,
+            .uri = document_uri,
+            .live = live_result,
+            .compiler = fr,
+            .other_file = OtherFiles.get,
+            .other_ctx = &other,
+        });
     }
     return .{ .uri = document_uri, .diagnostics = diags };
 }
@@ -412,7 +957,44 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         }
     }
     server.state = .running;
-    log.info("初始化完成，位置编码 {t}", .{server.encoding});
+    if (params.capabilities.window) |window| server.progress.enabled = window.workDoneProgress orelse false;
+    if (params.capabilities.workspace) |ws| {
+        server.pull_config = ws.configuration orelse false;
+        if (ws.didChangeConfiguration) |d| server.register_config = d.dynamicRegistration orelse false;
+    }
+    if (params.initializationOptions) |options| if (options != .null) {
+        server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidConfig => blk: {
+                server.showWarning("invalid zig-analyzer initializationOptions, using defaults");
+                break :blk .{};
+            },
+        };
+    };
+    log.info("initialized, position encoding {t}", .{server.encoding});
+
+    // 工作区根目录：优先 workspaceFolders，其次 rootUri / rootPath
+    var root_uris: std.ArrayList([]const u8) = .empty;
+    defer root_uris.deinit(server.gpa);
+    if (params.workspaceFolders) |folders| for (folders) |f| try root_uris.append(server.gpa, f.uri);
+    if (root_uris.items.len == 0) if (params.rootUri) |r| try root_uris.append(server.gpa, r);
+    for (root_uris.items) |root_uri| {
+        const path = uri.toPath(server.gpa, root_uri) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        errdefer server.gpa.free(path);
+        const normalized = try Vfs.normalize(.native, server.gpa, path) orelse {
+            server.gpa.free(path);
+            continue;
+        };
+        server.gpa.free(path);
+        try server.roots.append(server.gpa, normalized);
+        const build_zig = try std.fs.path.join(server.gpa, &.{ normalized, "build.zig" });
+        defer server.gpa.free(build_zig);
+        const has_build = if (Io.Dir.cwd().access(server.io, build_zig, .{})) |_| true else |_| false;
+        try server.root_has_build.append(server.gpa, has_build);
+    }
 
     return .{
         .capabilities = .{
@@ -420,6 +1002,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .textDocumentSync = .{ .TextDocumentSyncOptions = .{
                 .openClose = true,
                 .change = .Incremental,
+                .save = .{ .boolean = true },
             } },
             .documentFormattingProvider = .{ .boolean = true },
             .documentSymbolProvider = .{ .boolean = true },
@@ -435,8 +1018,13 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
 }
 
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
-    // 等待进行中的读请求完成
+    // 等待进行中的读请求完成；停止各项目的构建系统进程，并等后台任务（诊断发布等）收尾
     server.group.await(server.io) catch {};
+    // 客户端一直没有回复配置请求：不再等待
+    server.startup_pending = false;
+    while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
+    server.stopWorkspaces();
+    server.waitIdle();
     server.state = .shutdown;
 }
 
@@ -467,31 +1055,36 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
 
 fn send(server: *Server, bytes: []u8) void {
     defer server.gpa.free(bytes);
-    server.out.writeMessage(bytes) catch |err| log.err("写出消息失败: {t}", .{err});
+    server.out.writeMessage(bytes) catch |err| log.err("failed to write message: {t}", .{err});
 }
 
 fn sendResponse(server: *Server, id: jsonrpc.Id, result: anytype) void {
-    const bytes = jsonrpc.response(server.gpa, id, result) catch return log.err("构造响应时内存不足", .{});
+    const bytes = jsonrpc.response(server.gpa, id, result) catch return log.err("out of memory while building response", .{});
     server.send(bytes);
 }
 
-fn sendNotification(server: *Server, method: []const u8, params: anytype) void {
-    const bytes = jsonrpc.notification(server.gpa, method, params) catch return log.err("构造通知时内存不足", .{});
+pub fn sendRequest(server: *Server, id: jsonrpc.Id, method: []const u8, params: anytype) void {
+    const bytes = jsonrpc.request(server.gpa, id, method, params) catch return log.err("out of memory while building request", .{});
+    server.send(bytes);
+}
+
+pub fn sendNotification(server: *Server, method: []const u8, params: anytype) void {
+    const bytes = jsonrpc.notification(server.gpa, method, params) catch return log.err("out of memory while building notification", .{});
     server.send(bytes);
 }
 
 fn sendError(server: *Server, id: ?jsonrpc.Id, code: i32, message: []const u8) void {
-    const bytes = jsonrpc.errorResponse(server.gpa, id, code, message) catch return log.err("构造错误响应时内存不足", .{});
+    const bytes = jsonrpc.errorResponse(server.gpa, id, code, message) catch return log.err("out of memory while building error response", .{});
     server.send(bytes);
 }
 
 fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_client: bool) void {
     switch (err) {
         error.Canceled => if (canceled_by_client)
-            server.sendError(id, jsonrpc.error_codes.request_cancelled, "请求已取消")
+            server.sendError(id, jsonrpc.error_codes.request_cancelled, "request cancelled")
         else
-            server.sendError(id, jsonrpc.error_codes.content_modified, "文档已修改"),
-        error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "参数无效"),
+            server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
+        error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
 }
@@ -503,4 +1096,5 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 
 test {
     _ = @import("Server_test.zig");
+    _ = @import("compiler_e2e_test.zig");
 }
