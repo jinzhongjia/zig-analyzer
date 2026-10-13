@@ -922,7 +922,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
 | 读请求用 `async` 提交 | hover、补全等读请求与诊断发布用 `group.async`；线程池满时（核数少或常驻任务多）会在主循环中同步执行，期间收不到 `$/cancelRequest`，后续请求排队。不会死锁：这些任务不等待主循环 | 用户感到请求卡顿或取消不及时 | 读请求改为 `concurrent`（与 `waitIdle` 相同） | M4 |
 | 泛型实例的内存 | 每个实例（函数 + 实参）的推导结果按 query 缓存，InternPool 中的实例与类型只增不减 | 长时间运行、大量不同的实例化 | 实例结果的 LRU 回收；InternPool 代际回收（§9.1） | M5 |
-| 实例化带来的推导耗时 | 标准库全量推导从 0.8 秒增加到 2.2 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
+| 实例化带来的推导耗时 | 标准库全量推导从 0.8 秒增加到 1.1 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
 | Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
 
 ### 19.7 M4 完成情况（2026-10-13）
@@ -954,20 +954,20 @@ pub fn make() std.ArrayList(u8) { ... }
 |---|---|---|
 | 实例 | `src/sema/InternPool.zig` | `instance { 函数, 各参数的值, 外层实例 }`；容器类型与函数值带上所属实例（`ArrayList(u8)` 与 `ArrayList(i32)` 是不同的类型）；`opaque_param` 表示没有具体实例时的 comptime 类型参数 |
 | 按实例推导 | `src/sema/queries.zig` | `Infer` / `DeclType` 的键带实例；`normalizeInst` 把实例规范化为成员自身或其最内层外层函数的实例，不在泛型函数中的成员只有一份结果；`Infer(函数, 完整, 实例)` 即记忆化的 call_eval |
-| comptime 求值 | `src/sema/infer.zig` | 调用带 comptime / anytype 参数或返回 `type` 的函数时创建实例：参数绑定到实参值（anytype 取实参类型），返回类型在实例中求值，返回 `type` 时取实际执行到的 `return` 的值；条件已知的 `if` / `switch` / `orelse` 只走执行到的分支（未执行分支中的 `return` 不计入），无条件 `return` 之后的语句不执行；整数运算与比较、布尔运算、类型相等比较做常量折叠；嵌套实例化深度上限 256 |
+| comptime 求值 | `src/sema/infer.zig` | 调用带 comptime / anytype 参数或返回 `type` 的函数时创建实例：参数绑定到实参值（anytype 取实参类型），返回类型在实例中求值，返回 `type` 时取实际执行到的 `return` 的值；条件已知的 `if` / `switch` / `orelse` 只走执行到的分支（未执行分支中的 `return` 不计入），无条件 `return` 之后的语句不执行；整数运算与比较、布尔运算、类型相等比较做常量折叠；嵌套 query 深度上限 64（每层实例化在 Debug 构建下约占 60 KB 原生栈；上限 256 时 x86_64 Debug 的测试在 8 MB 主线程栈上溢出，降到 64 后标准库统计结果不变）|
 | 抽象实例 | 同上 | 没有具体实例时 `comptime T: type` 为抽象参数 `T`，泛型代码中的 hover 显示 `[]T` 而不是 unknown |
 | 内置函数 | 同上 | `@typeInfo` 与 `@src` 给出标准库中的类型（`std.builtin.Type`、`SourceLocation`，不构造值）；`@FieldType`；`@Int` |
 | 显示 | `src/sema/render.zig` | 实例显示为 `Aligned(u8, null)`；体内的局部容器显示局部变量名；未知的 comptime 实参显示为 `_` |
 | HIR | `src/hir/` | 参数记录 `comptime`；指针与数组类型保留哨兵（`[:0]const u8`） |
 
 - 真实标准库上的推导（测试用本机 zig 的标准库）：`std.ArrayList(u8)` 的 `items` / `getLast` / `pop`，`AutoHashMap` 经 `HashMap` → `HashMapUnmanaged` 的 `get` / `getOrPut`，`StringHashMapUnmanaged`，`MultiArrayList` 的 `len`，`std.fmt.parseInt`，`std.mem.splitScalar` 的迭代器与 `next()`，`gpa.alloc(u32, n)`，`@typeInfo(T).@"struct".field_names`，`@FieldType`，`@src()` 均推导正确；端到端测试经 LSP 验证 `std.ArrayList(u32)` 的 hover、成员补全与 inlay hint。
-- 标准库全量统计（`zig build sema-corpus`）：局部变量类型已知 74.2% → 86.2%，表达式 78.7% → 86.6%，声明 95.7% → 96.3%；耗时 0.8 → 2.2 秒，无崩溃。
+- 标准库全量统计（`zig build sema-corpus`）：局部变量类型已知 74.2% → 86.2%，表达式 78.7% → 86.6%，声明 95.7% → 96.3%；耗时 0.8 → 1.1 秒，无崩溃。
 - 准确率抽查：从类型带实例的局部变量中按固定间隔抽取 15 个，与标准库源码核对，全部正确（据此修正了体内局部容器的显示名）；实参为结构体 / 数组值的实例显示为 `_`。
 - 测试：`zig build test` 共 152 个。
 - 未实现（与设计的差异）：
   - 没有完整的解释器：不执行循环（含 `inline for`）、不跟踪局部变量的修改；`@typeInfo` 只给类型不给值，`@Type` / `@Struct` / `@Enum` 等构造类型的内置函数为 unknown，因此依赖它们的 `std.meta.FieldEnum`、`MultiArrayList.items(.field)` 等仍为 unknown。
   - 聚合值（结构体、数组、切片、浮点值）不表示：以它们为 comptime 实参的实例无法区分（显示为 `_`）。
-  - 燃料只有嵌套深度上限，没有步数上限。
+  - 燃料只有嵌套深度上限（64 层 query），没有步数上限。
   - 调用点种子（泛型函数体以某个调用点的实例推导）未实现，泛型函数体内使用抽象参数。
   - 推导的错误集仍以 `anyerror` 表示。
 

@@ -59,8 +59,9 @@ pub const Mode = enum {
     full,
 };
 
-/// 嵌套实例化的深度上限（递归的类型构造函数）
-const max_query_depth = 256;
+/// 嵌套 query 的深度上限（递归的类型构造函数）。每层实例化在 Debug 构建下约占 60 KB 原生栈，
+/// 上限需保证在 8 MB 的主线程栈内（256 时 x86_64 Debug 会栈溢出）
+const max_query_depth = 64;
 
 pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Result {
     const gpa = ctx.db.gpa;
