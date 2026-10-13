@@ -170,22 +170,33 @@ pub const Client = struct {
         return c;
     }
 
-    /// 阻塞读取下一个 BSP 事件；maker 退出时返回 `error.EndOfStream`。
-    pub fn next(c: *Client) (DecodeError || error{ EndOfStream, ReadFailed })!Event {
+    /// 阻塞读取下一个 BSP 事件；maker 退出时返回 `error.EndOfStream`，读取任务被取消时返回
+    /// `error.Canceled`，其他读取错误为 `error.ReadFailed`（具体原因见 `readError`）。
+    pub fn next(c: *Client) (DecodeError || error{ EndOfStream, ReadFailed, Canceled })!Event {
         const r = &c.reader.interface;
         while (true) {
             const header = r.takeStruct(ServerMessage.Header, .little) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
-                error.ReadFailed => return error.ReadFailed,
+                error.ReadFailed => return c.readFailure(),
             };
             const body = r.readAlloc(c.gpa, header.bytes_len) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.EndOfStream => return error.EndOfStream,
-                error.ReadFailed => return error.ReadFailed,
+                error.ReadFailed => return c.readFailure(),
             };
             defer c.gpa.free(body);
             if (try decode(c.gpa, header.tag, body)) |event| return event;
         }
+    }
+
+    fn readFailure(c: *Client) error{ ReadFailed, Canceled } {
+        if (c.reader.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.ReadFailed;
+    }
+
+    /// `next` 返回 `error.ReadFailed` 时的底层错误
+    pub fn readError(c: *Client) ?anyerror {
+        return if (c.reader.err) |e| e else null;
     }
 
     pub fn buildSteps(c: *Client, steps: []const u32) Io.Writer.Error!void {

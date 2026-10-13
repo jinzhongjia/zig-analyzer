@@ -185,7 +185,9 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     const client = ws.client.?;
     while (true) {
         var event = client.next() catch |err| {
-            if (config_failed) {
+            if (err == error.Canceled or ws.server.isShuttingDown()) {
+                // 服务器退出：读取任务被取消，不是 maker 的问题
+            } else if (config_failed) {
                 log.info("{s}: build.zig failed to compile, build system exited; will restart when build.zig is saved", .{ws.root});
             } else if (!ws.isStopping()) {
                 // maker 崩溃（如 0.17 的 maker 在收到新的构建请求时存在竞态，核数少时容易触发）：自动重启
@@ -193,10 +195,10 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 const next = if (ws.built) 1 else ws.crash_restarts + 1;
                 ws.mutex.unlock(ws.server.io);
                 if (next > max_crash_restarts) {
-                    log.err("{s}: build system exited unexpectedly: {t}", .{ ws.root, err });
+                    log.err("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
                 } else {
-                    log.info("{s}: build system exited unexpectedly ({t}), restarting", .{ ws.root, err });
+                    log.info("{s}: build system exited unexpectedly ({t}, {?t}), restarting", .{ ws.root, err, client.readError() });
                     // 新实例计为忙碌后本实例才结束，waitIdle 不会在两者之间返回
                     ws.server.restartWorkspace(ws, next);
                 }

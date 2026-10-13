@@ -71,6 +71,8 @@ zig_env: ?ZigEnv = null,
 warned: bool = false,
 workspaces_mutex: Io.Mutex = .init,
 workspaces: std.ArrayList(*Workspace) = .empty,
+/// 已开始停止所有项目（shutdown / exit / deinit）：此后不再重启项目
+shutting_down: bool = false,
 /// 已被重启替换的实例：其后台任务可能仍在收尾，退出时统一释放
 retired: std.ArrayList(*Workspace) = .empty,
 
@@ -776,6 +778,7 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 /// 停止 `ws` 并以新实例替换。`crash_restarts` 为 maker 连续崩溃后自动重启的次数（正常重启为 0）
 pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
     ws.stop();
+    if (server.isShuttingDown()) return;
     const root = server.gpa.dupe(u8, ws.root) catch return;
     defer server.gpa.free(root);
     const fresh = Workspace.start(server, root, crash_restarts) catch |err| {
@@ -794,6 +797,8 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     // 旧实例保留在列表中直到退出时统一释放（其后台任务可能仍在运行），但不再参与调度
+    // 启动新实例期间服务器开始关闭：新实例同样停止
+    if (server.shutting_down) fresh.stop();
     for (server.workspaces.items) |*w| if (w.* == ws) {
         w.* = fresh;
         server.retired.append(server.gpa, ws) catch {};
@@ -807,7 +812,14 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
 fn stopWorkspaces(server: *Server) void {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
+    server.shutting_down = true;
     for (server.workspaces.items) |ws| ws.stop();
+}
+
+pub fn isShuttingDown(server: *Server) bool {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    return server.shutting_down;
 }
 
 pub fn zigEnv(server: *Server) ?*const ZigEnv {
