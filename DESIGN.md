@@ -883,8 +883,8 @@ pub fn make() std.ArrayList(u8) { ... }
   - 配置只实现了最小版本（见上表「配置」）：只来自客户端，没有项目 / 全局配置文件、多来源合并与 `config.zon` 代码生成，也没有作为查询引擎 input；`zig.path` 运行中修改需重启服务器；拉取时只取全局配置节，不按工作区（`scopeUri`）区分。其余配置项随 M4 起的功能一起加入。
   - 单文件模式只发布被编译文件自身的诊断。
   - 未保存修改时，同一文件内附注（note）的位置不随编辑平移。
-- 并发：`Io.Threaded` 的 `async` 在忙碌任务数达到「CPU 核数 - 1」时（长期阻塞的项目读取任务也计入）会在调用方同步执行。会等待主循环处理后续消息的任务（`waitIdle` 等后台请求）与耗时数秒的单文件编译必须用 `concurrent`，否则核数少的机器上会死锁或阻塞主循环；有测试把 `async` 上限设为 0 覆盖这种情况。
-- 0.17 的 maker 存在竞态：收到新的 `bsp_build_steps` 时 `select.cancelDiscard()` 可能在接收任务结束前关闭队列，随后 `select.await()` 因 `error.Closed` panic，核数越少越容易触发（单核时每次都会）。maker 意外退出时自动重启项目，连续 3 次（期间没有完成过构建）后放弃并提示。
+- 并发：`Io.Threaded` 的 `async` 在忙碌任务数达到「CPU 核数 - 1」时（长期阻塞的项目读取任务也计入）会在调用方同步执行。会等待主循环处理后续消息的任务（`waitIdle` 等后台请求）与耗时数秒的单文件编译必须用 `concurrent`，否则核数少的机器上会死锁或阻塞主循环；有测试把 `async` 上限设为 0 覆盖这种情况。已报告上游：[ziglang/zig#37218](https://codeberg.org/ziglang/zig/issues/37218)（本仓库 #2）。
+- 0.17 的 maker 存在竞态：收到新的 `bsp_build_steps` 时 `select.cancelDiscard()` 可能在接收任务结束前关闭队列，随后 `select.await()` 因 `error.Closed` panic，核数越少越容易触发（单核时每次都会）。maker 意外退出时自动重启项目，连续 3 次（期间没有完成过构建）后放弃并提示。已报告上游：[ziglang/zig#37217](https://codeberg.org/ziglang/zig/issues/37217)（本仓库 #1）。
 - 已知问题：同一文件可能被重复发布一次相同的诊断（构建完成与编译集合更新各触发一次），不影响结果。
 
 ## 20. 风险与对策
