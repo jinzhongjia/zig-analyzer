@@ -1,0 +1,248 @@
+//! HIR：BodyOwner（函数、const/var、字段、test、comptime 块）中表达式的容错中间表示（设计 §8）。
+//!
+//! 由 CST 降级而来（`lower.zig`），语法缺失处为 `.missing`。位置都相对于 owner 节点的起点，
+//! owner 之前的编辑不改变 Body 的内容。体内定义的容器只记录为 `.container`，其成员属于 ItemTree。
+//!
+//! 作用域（§8.3）在降级时一并算出：每个表达式记录其求值时所在的作用域，作用域链上是可见的
+//! 参数、局部变量、捕获与标签。
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
+const deepEql = @import("../util/deep_eql.zig").deepEql;
+
+const Body = @This();
+
+arena: std.heap.ArenaAllocator.State,
+exprs: []const Expr,
+/// 与 `exprs` 一一对应
+expr_ranges: []const Range,
+/// 与 `exprs` 一一对应：表达式求值时所在的作用域
+expr_scopes: []const ScopeId,
+bindings: []const Binding,
+scopes: []const Scope,
+/// 函数参数（按顺序）
+params: []const BindingId,
+/// owner 的主体：函数体、变量初始化、字段默认值、test / comptime 块
+value: ?ExprId,
+/// 变量与字段的类型标注、函数的返回类型
+type_expr: ?ExprId,
+
+pub const ExprId = enum(u32) { _ };
+pub const BindingId = enum(u32) { _ };
+pub const ScopeId = enum(u32) { root = 0, _ };
+
+/// 相对 owner 起点的字节区间
+pub const Range = struct {
+    start: u32,
+    end: u32,
+
+    pub const none: Range = .{ .start = 0, .end = 0 };
+
+    pub fn contains(r: Range, offset: u32) bool {
+        return r.start <= offset and offset < r.end;
+    }
+};
+
+pub const Expr = union(enum) {
+    /// 语法缺失
+    missing,
+    name_ref: []const u8,
+    /// `foo.` 尚未写完时 `field` 为 null
+    field_access: struct { lhs: ExprId, field: ?[]const u8 },
+    enum_literal: []const u8,
+    error_value: []const u8,
+    /// 数字、字符串、字符字面量：原文（多行字符串只取第一行）
+    literal: []const u8,
+    /// `name` 含 `@`
+    builtin_call: struct { name: []const u8, args: []const ExprId },
+    call: struct { callee: ExprId, args: []const ExprId },
+    block: Block,
+    @"if": struct { cond: ExprId, capture: []const BindingId, then: ExprId, else_capture: []const BindingId, @"else": ?ExprId },
+    loop: Loop,
+    @"switch": struct { operand: ExprId, prongs: []const Prong },
+    @"catch": struct { lhs: ExprId, capture: ?BindingId, rhs: ExprId },
+    binary: struct { op: SyntaxKind, lhs: ExprId, rhs: ExprId },
+    /// 含 `try`、`&`、`-`、`!`、`~`
+    prefix: struct { op: SyntaxKind, operand: ExprId },
+    assign: struct { op: SyntaxKind, lhs: ExprId, rhs: ExprId },
+    index: struct { lhs: ExprId, index: ExprId },
+    slice: struct { lhs: ExprId, start: ExprId, end: ?ExprId, sentinel: ?ExprId },
+    deref: ExprId,
+    unwrap_optional: ExprId,
+    /// `T{ ... }` / `.{ ... }`
+    init: struct { ty: ?ExprId, fields: []const FieldInit },
+    /// 体内定义的容器（内容见 ItemTree），按位置对应
+    container,
+    /// 函数类型 `fn (A, B) R`
+    fn_type: struct { params: []const ExprId, ret: ?ExprId },
+    @"return": ?ExprId,
+    @"break": struct { label: ?[]const u8, value: ?ExprId },
+    /// labeled switch 的 `continue :l value` 带值
+    @"continue": struct { label: ?[]const u8, value: ?ExprId },
+    @"comptime": ExprId,
+    @"unreachable",
+    optional_type: ExprId,
+    error_union_type: struct { err: ExprId, payload: ExprId },
+    ptr_type: struct { size: PtrSize, is_const: bool, child: ExprId },
+    array_type: struct { len: ExprId, child: ExprId },
+    error_set: []const []const u8,
+    /// 其他结构（asm、nosuspend、语法错误节点等）：只保留子表达式，使其中的名字仍可解析
+    other: []const ExprId,
+};
+
+pub const PtrSize = enum { one, many, slice, c };
+
+pub const Block = struct {
+    label: ?[]const u8,
+    stmts: []const Stmt,
+    /// 块内第一条语句所在的作用域
+    scope: ScopeId,
+};
+
+pub const Stmt = struct {
+    kind: union(enum) {
+        expr: ExprId,
+        /// 局部变量声明
+        local: BindingId,
+        @"defer": ExprId,
+        @"errdefer": struct { capture: ?BindingId, body: ExprId },
+        /// `a, const b = expr;`
+        destructure: struct { targets: []const DestructureTarget, value: ExprId },
+    },
+    /// 语句结束位置（相对 owner）
+    end: u32,
+    /// 本语句之后的语句所在的作用域
+    scope_after: ScopeId,
+};
+
+pub const DestructureTarget = union(enum) { binding: BindingId, expr: ExprId };
+
+pub const Loop = struct {
+    kind: enum { @"while", @"for" },
+    label: ?[]const u8,
+    /// while 的条件；for 的各个输入
+    inputs: []const ExprId,
+    capture: []const BindingId,
+    /// while 的 `: (cont)`
+    cont: ?ExprId,
+    body: ExprId,
+    else_capture: []const BindingId,
+    @"else": ?ExprId,
+    is_inline: bool,
+};
+
+pub const Prong = struct {
+    items: []const ExprId,
+    is_else: bool,
+    capture: []const BindingId,
+    body: ExprId,
+};
+
+pub const FieldInit = struct {
+    /// 元组形式 `.{ a, b }` 没有字段名
+    name: ?[]const u8,
+    value: ExprId,
+};
+
+pub const Binding = struct {
+    name: []const u8,
+    kind: Kind,
+    /// 名字 token 的位置
+    range: Range,
+    /// 类型标注（参数类型、`const x: T`）
+    ty: ?ExprId = null,
+    /// 局部变量的初始化表达式
+    init: ?ExprId = null,
+    /// `|*x|`
+    is_ptr: bool = false,
+
+    pub const Kind = enum { param, local_const, local_var, capture };
+};
+
+pub const Scope = struct {
+    parent: ?ScopeId,
+    bindings: []const BindingId,
+    /// 带标签的块或循环
+    label: ?struct { name: []const u8, expr: ExprId } = null,
+};
+
+pub fn deinit(b: *Body, gpa: Allocator) void {
+    var arena = b.arena.promote(gpa);
+    arena.deinit();
+    b.* = undefined;
+}
+
+/// 结构相等（不比较 arena）：Body 内容不变时下游 query 不必重算
+pub fn eql(a: *const Body, b: *const Body) bool {
+    inline for (@typeInfo(Body).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "arena")) continue;
+        if (!deepEql(@field(a, name), @field(b, name))) return false;
+    }
+    return true;
+}
+
+pub fn expr(b: *const Body, id: ExprId) Expr {
+    return b.exprs[@backingInt(id)];
+}
+
+pub fn range(b: *const Body, id: ExprId) Range {
+    return b.expr_ranges[@backingInt(id)];
+}
+
+pub fn binding(b: *const Body, id: BindingId) Binding {
+    return b.bindings[@backingInt(id)];
+}
+
+pub fn scope(b: *const Body, id: ScopeId) Scope {
+    return b.scopes[@backingInt(id)];
+}
+
+/// 包含 `offset`（相对 owner）的最小表达式
+pub fn exprAt(b: *const Body, offset: u32) ?ExprId {
+    var best: ?ExprId = null;
+    var best_len: u32 = std.math.maxInt(u32);
+    for (b.expr_ranges, 0..) |r, i| {
+        if (!r.contains(offset)) continue;
+        if (r.end - r.start < best_len) {
+            best_len = r.end - r.start;
+            best = @fromBackingInt(@as(u32, @intCast(i)));
+        }
+    }
+    return best;
+}
+
+/// `offset` 处可见局部名字所在的作用域
+pub fn scopeAt(b: *const Body, offset: u32) ScopeId {
+    const e = b.exprAt(offset) orelse return .root;
+    switch (b.expr(e)) {
+        .block => |blk| {
+            // 块内：取 offset 之前最后一条语句之后的作用域
+            var s = blk.scope;
+            for (blk.stmts) |stmt| {
+                if (stmt.end > offset) break;
+                s = stmt.scope_after;
+            }
+            return s;
+        },
+        else => return b.expr_scopes[@backingInt(e)],
+    }
+}
+
+/// 沿作用域链查找名字
+pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
+    var s: ?ScopeId = from;
+    while (s) |id| : (s = b.scope(id).parent) {
+        const bindings = b.scope(id).bindings;
+        var i = bindings.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, b.binding(bindings[i]).name, name)) return bindings[i];
+        }
+    }
+    return null;
+}
+
+test {
+    _ = @import("lower.zig");
+}

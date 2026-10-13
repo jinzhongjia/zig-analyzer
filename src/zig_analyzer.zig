@@ -18,6 +18,10 @@ pub const syntax = struct {
     pub const TextRange = tree.TextRange;
     const tree = @import("syntax/tree.zig");
 };
+pub const hir = struct {
+    pub const Body = @import("hir/Body.zig");
+    pub const lower = @import("hir/lower.zig");
+};
 pub const project = struct {
     pub const ZigEnv = @import("project/ZigEnv.zig");
     pub const bsp = @import("project/bsp.zig");
@@ -55,6 +59,7 @@ test {
     std.testing.refAllDecls(base);
     std.testing.refAllDecls(util);
     std.testing.refAllDecls(syntax);
+    std.testing.refAllDecls(hir);
     std.testing.refAllDecls(diagnostics);
     std.testing.refAllDecls(ide);
     std.testing.refAllDecls(project);
