@@ -117,6 +117,29 @@ pub fn errorResponse(gpa: Allocator, id: ?Id, code: i32, message: []const u8) Al
     return error.OutOfMemory;
 }
 
+/// 服务器发往客户端的请求
+pub fn request(gpa: Allocator, id: Id, method: []const u8, params: anytype) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var s: json.Stringify = .{ .writer = &out.writer, .options = stringify_options };
+    build: {
+        s.beginObject() catch break :build;
+        s.objectField("jsonrpc") catch break :build;
+        s.write("2.0") catch break :build;
+        s.objectField("id") catch break :build;
+        s.write(id) catch break :build;
+        s.objectField("method") catch break :build;
+        s.write(method) catch break :build;
+        if (@TypeOf(params) != void) {
+            s.objectField("params") catch break :build;
+            s.write(params) catch break :build;
+        }
+        s.endObject() catch break :build;
+        return out.toOwnedSlice();
+    }
+    return error.OutOfMemory;
+}
+
 pub fn notification(gpa: Allocator, method: []const u8, params: anytype) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -151,7 +174,7 @@ pub const error_codes = struct {
 
 const testing = std.testing;
 
-test "分类请求、通知与响应" {
+test "classify requests, notifications and responses" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -178,7 +201,16 @@ test "分类请求、通知与响应" {
     try testing.expectError(error.InvalidMessage, parse(a, "{"));
 }
 
-test "构造响应：void 结果输出 null，可选字段省略" {
+test request {
+    const gpa = testing.allocator;
+    const a = try request(gpa, .{ .integer = 7 }, "window/workDoneProgress/create", .{ .token = "t" });
+    defer gpa.free(a);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":7,"method":"window/workDoneProgress/create","params":{"token":"t"}}
+    , a);
+}
+
+test "build response: void result is null, optional fields omitted" {
     const gpa = testing.allocator;
     const a = try response(gpa, .{ .integer = 3 }, {});
     defer gpa.free(a);

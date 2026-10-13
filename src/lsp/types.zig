@@ -21,17 +21,20 @@ pub const NotificationInfo = struct {
 };
 
 pub fn ParamsType(comptime method: []const u8) type {
+    @setEvalBranchQuota(10_000);
     for (requests) |r| if (std.mem.eql(u8, r.method, method)) return r.Params;
     for (notifications) |n| if (std.mem.eql(u8, n.method, method)) return n.Params;
-    @compileError("未知 LSP 方法: " ++ method);
+    @compileError("unknown LSP method: " ++ method);
 }
 
 pub fn ResultType(comptime method: []const u8) type {
+    @setEvalBranchQuota(10_000);
     for (requests) |r| if (std.mem.eql(u8, r.method, method)) return r.Result;
-    @compileError("未知 LSP 请求: " ++ method);
+    @compileError("unknown LSP request: " ++ method);
 }
 
 pub fn isRequest(comptime method: []const u8) bool {
+    @setEvalBranchQuota(10_000);
     for (requests) |r| if (std.mem.eql(u8, r.method, method)) return true;
     return false;
 }

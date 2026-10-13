@@ -32,11 +32,11 @@ const Gen = struct {
         var w: Writer = .fixed(&buf);
         json.Stringify.value(v, .{}, &w) catch {};
         const shown = w.buffered();
-        std.debug.panic("metaModel 格式不符合预期：" ++ fmt ++ "\n节点：{s}{s}", args ++ .{ shown, if (shown.len == buf.len) "…" else "" });
+        std.debug.panic("unexpected metaModel format: " ++ fmt ++ "\nnode: {s}{s}", args ++ .{ shown, if (shown.len == buf.len) "…" else "" });
     }
 
     fn obj(v: json.Value) json.ObjectMap {
-        if (v != .object) invalid(v, "期望对象", .{});
+        if (v != .object) invalid(v, "expected object", .{});
         return v.object;
     }
 
@@ -47,30 +47,30 @@ const Gen = struct {
 
     /// 必需字段
     fn field(v: json.Value, key: []const u8) json.Value {
-        return opt(v, key) orelse invalid(v, "缺少字段 \"{s}\"", .{key});
+        return opt(v, key) orelse invalid(v, "missing field \"{s}\"", .{key});
     }
 
     /// 可选字符串字段；存在但不是字符串时 panic
     fn str(v: json.Value, key: []const u8) ?[]const u8 {
         const f = opt(v, key) orelse return null;
-        if (f != .string) invalid(v, "字段 \"{s}\" 应为字符串", .{key});
+        if (f != .string) invalid(v, "field \"{s}\" should be a string", .{key});
         return f.string;
     }
 
     /// 必需字符串字段
     fn req(v: json.Value, key: []const u8) []const u8 {
-        return str(v, key) orelse invalid(v, "缺少字符串字段 \"{s}\"", .{key});
+        return str(v, key) orelse invalid(v, "missing string field \"{s}\"", .{key});
     }
 
     fn int(v: json.Value, key: []const u8) i64 {
         const f = field(v, key);
-        if (f != .integer) invalid(v, "字段 \"{s}\" 应为整数", .{key});
+        if (f != .integer) invalid(v, "field \"{s}\" should be an integer", .{key});
         return f.integer;
     }
 
     fn arr(v: json.Value, key: []const u8) []const json.Value {
         const f = opt(v, key) orelse return &.{};
-        if (f != .array) invalid(v, "字段 \"{s}\" 应为数组", .{key});
+        if (f != .array) invalid(v, "field \"{s}\" should be an array", .{key});
         return f.array.items;
     }
 
@@ -141,7 +141,7 @@ const Gen = struct {
         for ([_][]const u8{ "extends", "mixins" }) |key| {
             for (arr(s, key)) |base| {
                 const base_name = req(base, "name");
-                const base_struct = g.structures.get(base_name) orelse invalid(s, "引用了不存在的结构体 {s}", .{base_name});
+                const base_struct = g.structures.get(base_name) orelse invalid(s, "references unknown structure {s}", .{base_name});
                 try out.appendSlice(g.arena, try g.flattenProperties(base_struct));
             }
         }
@@ -189,7 +189,7 @@ const Gen = struct {
             .{ "boolean", "bool" },
             .{ "null", "?void" },
         });
-        return map.get(name) orelse std.debug.panic("未知 base 类型: {s}", .{name});
+        return map.get(name) orelse std.debug.panic("unknown base type: {s}", .{name});
     }
 
     /// 输出类型表达式。nullable 的 `or` 输出为 `?T`。
@@ -234,7 +234,7 @@ const Gen = struct {
         } else if (std.mem.eql(u8, kind, "or")) {
             try g.emitOr(t, ctx);
         } else {
-            std.debug.panic("未支持的类型种类: {s}", .{kind});
+            std.debug.panic("unsupported type kind: {s}", .{kind});
         }
     }
 
@@ -407,17 +407,20 @@ const Gen = struct {
             \\}};
             \\
             \\pub fn ParamsType(comptime method: []const u8) type {{
+            \\    @setEvalBranchQuota(10_000);
             \\    for (requests) |r| if (std.mem.eql(u8, r.method, method)) return r.Params;
             \\    for (notifications) |n| if (std.mem.eql(u8, n.method, method)) return n.Params;
-            \\    @compileError("未知 LSP 方法: " ++ method);
+            \\    @compileError("unknown LSP method: " ++ method);
             \\}}
             \\
             \\pub fn ResultType(comptime method: []const u8) type {{
+            \\    @setEvalBranchQuota(10_000);
             \\    for (requests) |r| if (std.mem.eql(u8, r.method, method)) return r.Result;
-            \\    @compileError("未知 LSP 请求: " ++ method);
+            \\    @compileError("unknown LSP request: " ++ method);
             \\}}
             \\
             \\pub fn isRequest(comptime method: []const u8) bool {{
+            \\    @setEvalBranchQuota(10_000);
             \\    for (requests) |r| if (std.mem.eql(u8, r.method, method)) return true;
             \\    return false;
             \\}}
@@ -438,7 +441,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     if (args.len != 3) {
-        std.debug.print("用法: {s} <metaModel.json> <输出路径>\n", .{args[0]});
+        std.debug.print("usage: {s} <metaModel.json> <output path>\n", .{args[0]});
         std.process.exit(1);
     }
 
