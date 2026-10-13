@@ -452,7 +452,8 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
             if (ws.compile_set) |*old| old.deinit(ws.gpa);
             ws.compile_set = result;
             ws.mutex.unlock(io);
-            // 编译集合变化会影响已打开文件的 live 诊断
+            // 编译集合变化会影响模块归属与已打开文件的 live 诊断
+            ws.server.updateModuleGraph();
             ws.server.publishOpenFiles();
             return;
         }

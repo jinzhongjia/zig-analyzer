@@ -25,6 +25,8 @@ const ide = za.ide;
 const compiler = za.diagnostics.compiler;
 const ZigEnv = za.project.ZigEnv;
 const Workspace = @import("Workspace.zig");
+const ModuleGraph = za.names.ModuleGraph;
+const Resolver = za.names.resolve.Resolver;
 pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
 
@@ -70,6 +72,12 @@ workspaces: std.ArrayList(*Workspace) = .empty,
 retired: std.ArrayList(*Workspace) = .empty,
 
 progress: Progress = .{},
+
+/// 串行化模块图的更新，避免较旧的快照覆盖较新的
+graph_mutex: Io.Mutex = .init,
+disk_mutex: Io.Mutex = .init,
+/// 为名字解析从磁盘加载过的文件（不存在的也记录，避免反复尝试）
+disk_loaded: std.AutoHashMapUnmanaged(Vfs.FileId, void) = .empty,
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── 拉取配置（只在主循环中访问）──
@@ -132,6 +140,7 @@ pub fn deinit(server: *Server) void {
     server.open_docs.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.progress.deinit(server.gpa);
+    server.disk_loaded.deinit(server.gpa);
     server.config.deinit(server.gpa);
     server.pending.deinit(server.gpa);
     server.db.deinit();
@@ -208,6 +217,8 @@ const Mode = enum {
     read,
     /// 在独立任务中执行，不持有读事务（会长时间等待的请求，不能阻塞主循环）
     background,
+    /// 同 `read`，处理函数通过 Resolver 做名字解析；遇到尚未加载的文件时加载后重新计算
+    semantic,
 };
 
 const request_handlers = .{
@@ -220,6 +231,8 @@ const request_handlers = .{
     .{ "textDocument/foldingRange", Mode.read, foldingRange },
     .{ "textDocument/selectionRange", Mode.read, selectionRange },
     .{ "textDocument/semanticTokens/full", Mode.read, semanticTokensFull },
+    .{ "textDocument/definition", Mode.semantic, definition },
+    .{ "textDocument/completion", Mode.semantic, completion },
 };
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
@@ -265,6 +278,19 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                 },
                 // 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
                 // 会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
+                .semantic => {
+                    const pending = try a.create(Pending);
+                    pending.* = .{ .id = id };
+                    {
+                        server.pending_mutex.lockUncancelable(server.io);
+                        defer server.pending_mutex.unlock(server.io);
+                        server.pending.append(server.gpa, pending) catch |err| {
+                            server.destroyArena(arena);
+                            return err;
+                        };
+                    }
+                    server.group.async(server.io, SemanticTask(func).run, .{ server, arena, pending, params });
+                },
                 .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
                     server.destroyArena(arena);
                     server.sendError(id, jsonrpc.error_codes.internal_error, "failed to start background task");
@@ -313,6 +339,118 @@ fn ReadTask(comptime func: anytype) type {
             server.sendResponse(pending.id, result);
         }
     };
+}
+
+/// 名字解析可能经过尚未加载的文件（如单文件模式下的标准库）：加载后重新计算，最多 `max_rounds` 轮
+fn SemanticTask(comptime func: anytype) type {
+    const Params = LastParam(@TypeOf(func));
+    const max_rounds = 16;
+    return struct {
+        fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
+            defer {
+                server.removePending(pending);
+                server.destroyArena(arena);
+            }
+            const a = arena.allocator();
+            var round: usize = 0;
+            while (true) : (round += 1) {
+                var ctx = server.db.beginRead(a);
+                ctx.cancel = &pending.cancel;
+                var r: Resolver = .{ .ctx = &ctx, .arena = a };
+                const result = func(server, &r, a, params) catch |err| {
+                    ctx.end();
+                    return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
+                };
+                const missing = server.unloaded(a, r.missing.items) catch &.{};
+                if (missing.len == 0 or round == max_rounds) {
+                    // 结果可能引用 query 的值：在读事务结束前发送
+                    server.sendResponse(pending.id, result);
+                    ctx.end();
+                    return;
+                }
+                ctx.end();
+                server.loadFromDisk(missing) catch |err| return server.sendHandlerError(pending.id, err, false);
+            }
+        }
+    };
+}
+
+/// `files` 中尚未尝试从磁盘加载的
+fn unloaded(server: *Server, arena: Allocator, files: []const Vfs.FileId) Allocator.Error![]const Vfs.FileId {
+    server.disk_mutex.lockUncancelable(server.io);
+    defer server.disk_mutex.unlock(server.io);
+    var out: std.ArrayList(Vfs.FileId) = .empty;
+    for (files) |f| if (!server.disk_loaded.contains(f)) try out.append(arena, f);
+    return out.items;
+}
+
+/// 从磁盘加载文件内容（已被打开或已有内容的文件保持不变）
+fn loadFromDisk(server: *Server, files: []const Vfs.FileId) (Allocator.Error || Io.Cancelable)!void {
+    const Loaded = struct { file: Vfs.FileId, text: ?[]u8 };
+    var batch: std.ArrayList(Loaded) = .empty;
+    defer batch.deinit(server.gpa);
+    defer for (batch.items) |l| if (l.text) |t| server.gpa.free(t);
+    for (files) |file| {
+        {
+            server.disk_mutex.lockUncancelable(server.io);
+            defer server.disk_mutex.unlock(server.io);
+            if ((try server.disk_loaded.getOrPut(server.gpa, file)).found_existing) continue;
+        }
+        const text = server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            error.FileTooBig => null,
+        };
+        try batch.append(server.gpa, .{ .file = file, .text = text });
+    }
+    const env = server.zigEnv();
+    server.db.beginWrite();
+    defer server.db.endWrite();
+    for (batch.items) |*l| {
+        if (server.db.peek(FileText, l.file) != null) continue;
+        const path = server.vfs.path(l.file);
+        const durability: database.Durability = if (env) |e| (if (Workspace.isUnder(path, e.lib_dir)) .high else if (Workspace.isUnder(path, e.global_cache_dir)) .medium else .low) else .low;
+        // 不存在的文件记为空内容，与「尚未加载」区分
+        const text = l.text orelse try server.gpa.dupe(u8, "");
+        l.text = null;
+        try server.db.set(FileText, l.file, text, durability);
+    }
+}
+
+/// 汇总各项目的构建图与编译集合，更新模块图 input
+pub fn updateModuleGraph(server: *Server) void {
+    server.updateModuleGraphInner() catch |err| log.err("failed to update module graph: {t}", .{err});
+}
+
+fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
+    server.graph_mutex.lockUncancelable(server.io);
+    defer server.graph_mutex.unlock(server.io);
+    var b: ModuleGraph.Builder = .init(server.gpa, &server.vfs);
+    errdefer b.deinit();
+    server.workspaces_mutex.lockUncancelable(server.io);
+    const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch |err| {
+        server.workspaces_mutex.unlock(server.io);
+        return err;
+    };
+    server.workspaces_mutex.unlock(server.io);
+    defer server.gpa.free(list);
+    for (list) |ws| {
+        ws.mutex.lockUncancelable(server.io);
+        defer ws.mutex.unlock(server.io);
+        if (ws.model) |*m| if (ws.compile_set) |*cs| try b.add(m, cs);
+    }
+    const std_root: ?Vfs.FileId = if (server.zigEnv()) |env| blk: {
+        const p = try std.fs.path.join(server.gpa, &.{ env.std_dir, "std.zig" });
+        defer server.gpa.free(p);
+        break :blk try server.vfs.intern(p);
+    } else null;
+    const graph = try server.gpa.create(ModuleGraph);
+    errdefer server.gpa.destroy(graph);
+    graph.* = try b.finish(std_root);
+    // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
+    server.db.beginWrite();
+    defer server.db.endWrite();
+    try server.db.set(ModuleGraph.Input, {}, graph, .medium);
 }
 
 fn removePending(server: *Server, pending: *Pending) void {
@@ -586,6 +724,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         defer server.db.endWrite();
         server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
     }
+    server.updateModuleGraph();
     for (server.roots.items) |root| {
         const build_zig = std.fs.path.join(server.gpa, &.{ root, "build.zig" }) catch return;
         defer server.gpa.free(build_zig);
@@ -1019,6 +1158,8 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .documentSymbolProvider = .{ .boolean = true },
             .foldingRangeProvider = .{ .boolean = true },
             .selectionRangeProvider = .{ .boolean = true },
+            .definitionProvider = .{ .boolean = true },
+            .completionProvider = .{ .triggerCharacters = &.{"."} },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .boolean = true },
@@ -1045,6 +1186,39 @@ const StatusResult = struct {
     deep_verifications: u64,
     queries: []const struct { name: []const u8, executions: u64 },
 };
+
+fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const text = try r.ctx.get(FileText, file) orelse return null;
+    const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
+    const target = try ide.definition.definition(r, file, offset) orelse return null;
+    const target_text = try r.ctx.get(FileText, target.file) orelse "";
+    const lines = try offsets.LineIndex.init(arena, target_text);
+    return .{ .Definition = .{ .Location = .{
+        .uri = try server.uriFor(arena, target.file),
+        .range = lines.range(target.start, target.end, server.encoding),
+    } } };
+}
+
+fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const text = try r.ctx.get(FileText, file) orelse return null;
+    const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
+    const items = try ide.completion.complete(r, file, offset);
+    const out = try arena.alloc(types.CompletionItem, items.len);
+    for (items, out) |it, *o| o.* = .{
+        .label = it.label,
+        .kind = switch (it.kind) {
+            .param, .local, .capture, .variable => .Variable,
+            .function => .Function,
+            .constant => .Constant,
+            .field => .Field,
+            .enum_member => .EnumMember,
+        },
+        .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+    };
+    return .{ .array_of_CompletionItem = out };
+}
 
 fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!StatusResult {
     var counts: [Db.query_types.len]u64 = undefined;
@@ -1108,4 +1282,5 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 test {
     _ = @import("Server_test.zig");
     _ = @import("compiler_e2e_test.zig");
+    _ = @import("names_e2e_test.zig");
 }
