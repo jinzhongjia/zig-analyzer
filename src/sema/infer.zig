@@ -2,7 +2,11 @@
 //! 分支汇合处做 peer type resolution 的常用子集。未知部分为 `unknown`，吸收一切且不产生诊断。
 //!
 //! 类型表达式（`?*const T`、`[]u8`、`struct {...}`）也是表达式，求值得到 `type` 类型的值。
-//! 不做 comptime 函数求值（M5）：泛型类型构造函数的调用、依赖 comptime 参数的返回类型为 unknown。
+//!
+//! comptime 求值（设计 §9.4）：调用带 comptime / anytype 参数或返回 `type` 的函数时创建实例
+//! （InternPool 的 `instance`），在实例中推导函数体：参数绑定到实参值，条件已知的
+//! `if` / `switch` 只走实际执行的分支，整数、布尔与类型相等比较做常量折叠，返回 `type` 的函数
+//! 取实际执行到的 `return` 的值。没有具体实例时 `comptime T: type` 为抽象参数 `T`。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,9 +39,11 @@ pub const Result = struct {
     bindings: []const TypedValue,
     /// 与 `Body.exprs` 一一对应：字段访问解析到的成员（字段或声明）
     members: []const ?hir.OwnerKey,
+    /// 函数实际执行到的 `return` 的值（类型构造函数的结果）
+    ret: TypedValue,
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -53,7 +59,10 @@ pub const Mode = enum {
     full,
 };
 
-pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode) Error!Result {
+/// 嵌套实例化的深度上限（递归的类型构造函数）
+const max_query_depth = 256;
+
+pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Result {
     const gpa = ctx.db.gpa;
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
@@ -78,17 +87,19 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode) Error!Result {
         .bindings = try a.alloc(TypedValue, body.bindings.len),
         .members = try a.alloc(?hir.OwnerKey, body.exprs.len),
         .scratch = scratch.allocator(),
+        .inst = inst,
     };
     @memset(inf.exprs, .unknown);
     @memset(inf.bindings, .unknown);
     @memset(inf.members, null);
     try inf.runOwner(tree.items[item].kind, mode);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members };
+    const ret = try inf.returnValue();
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret };
 }
 
 fn empty(gpa: Allocator) Result {
     _ = gpa;
-    return .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{} };
+    return .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{}, .ret = .unknown };
 }
 
 const Inferrer = struct {
@@ -108,6 +119,12 @@ const Inferrer = struct {
     labels: std.ArrayList(LabelFrame) = .empty,
     /// 方法调用：字段访问解析到实例上的函数声明（调用时跳过 self 参数）
     bound: std.AutoHashMapUnmanaged(ExprId, void) = .empty,
+    /// 实例上下文（owner 自身或外层泛型函数的实例）
+    inst: ?Index,
+    /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
+    dead: u32 = 0,
+    /// 实际执行到的 return 的值
+    returns: std.ArrayList(TypedValue) = .empty,
 
     const LabelFrame = struct { name: ?[]const u8, is_loop: bool, types: std.ArrayList(Index) = .empty };
 
@@ -115,7 +132,8 @@ const Inferrer = struct {
         const b = inf.body;
         switch (kind) {
             .@"fn" => {
-                for (b.params) |p| inf.bindings[@backingInt(p)] = try inf.typeOfAnnotation(b.binding(p).ty);
+                const own = inf.ownInstance();
+                for (b.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null);
                 if (b.type_expr) |t| inf.ret_type = (try inf.infer(t, null)).asType();
                 if (mode == .full) if (b.value) |v| {
                     _ = try inf.infer(v, null);
@@ -133,12 +151,64 @@ const Inferrer = struct {
         }
     }
 
-    /// 绑定的类型标注：求值得到类型；`anytype`（没有标注）为 unknown
-    fn typeOfAnnotation(inf: *Inferrer, ty: ?ExprId) Error!TypedValue {
-        const t = ty orelse return .unknown;
-        const tv = try inf.infer(t, null);
-        // `comptime T: type`：值未知的类型（M5 以抽象实例表示）
-        return .{ .ty = tv.asType() orelse .unknown };
+    /// owner 自身（函数）的实例
+    fn ownInstance(inf: *Inferrer) ?InternPool.Instance {
+        const i = inf.inst orelse return null;
+        const key = inf.ip.key(i).instance;
+        if (key.file != inf.file) return null;
+        const tree = inf.r.itemTree(inf.file) catch return null;
+        return if (key.decl == tree.items[inf.item].ast_id) key else null;
+    }
+
+    /// 参数的值：实例中 comptime 参数取实参值，anytype 参数取实参的类型；
+    /// 没有实例时 `comptime T: type` 为抽象参数
+    fn paramValue(inf: *Inferrer, p: Body.BindingId, arg: ?Index) Error!TypedValue {
+        const binding = inf.body.binding(p);
+        const ty: Index = if (binding.ty) |t| (try inf.infer(t, null)).asType() orelse .unknown else .unknown;
+        if (binding.ty == null) {
+            // anytype：实例记录的是实参类型
+            return .{ .ty = if (arg) |a| a else .unknown };
+        }
+        if (!binding.is_comptime) return .{ .ty = ty };
+        if (arg) |a| if (a != .unknown) return .{ .ty = ty, .val = a };
+        if (ty == .type_type) return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = inf.body_owner(), .binding = @backingInt(p), .name = binding.name } }));
+        return .{ .ty = ty };
+    }
+
+    fn body_owner(inf: *Inferrer) ItemTree.AstId {
+        return (inf.r.itemTree(inf.file) catch unreachable).items[inf.item].ast_id;
+    }
+
+    /// 实际执行到的 return 的值：都相同时带值，否则为类型的 peer
+    fn returnValue(inf: *Inferrer) Error!TypedValue {
+        const rs = inf.returns.items;
+        if (rs.len == 0) return .unknown;
+        const first = rs[0];
+        for (rs[1..]) |x| if (!deepEql(x, first)) {
+            var types: std.ArrayList(Index) = .empty;
+            for (rs) |y| try types.append(inf.scratch, y.ty);
+            return .{ .ty = try inf.peer(types.items) };
+        };
+        return first;
+    }
+
+    /// comptime 已知的条件：bool 值，或 optional 是否为 null
+    fn condValue(inf: *Inferrer, cond: TypedValue) ?bool {
+        const v = cond.val orelse return null;
+        if (v == .true_value) return true;
+        if (v == .false_value) return false;
+        if (v == .null_value) return false;
+        _ = inf;
+        return null;
+    }
+
+    /// 在 `dead_branch` 为真时以「不会执行」的状态推导
+    fn inferBranch(inf: *Inferrer, e: ExprId, expected: ?Index, dead_branch: bool) Error!TypedValue {
+        if (dead_branch) inf.dead += 1;
+        defer if (dead_branch) {
+            inf.dead -= 1;
+        };
+        return inf.infer(e, expected);
     }
 
     fn get(inf: *Inferrer, e: ExprId) TypedValue {
@@ -202,21 +272,31 @@ const Inferrer = struct {
             .block => |blk| return inf.block(blk, expected),
             .@"if" => |x| {
                 const cond = try inf.infer(x.cond, null);
-                try inf.bindCaptures(x.capture, cond.ty, .if_then);
-                try inf.bindCaptures(x.else_capture, cond.ty, .if_else);
-                const then = try inf.infer(x.then, expected);
-                const other: TypedValue = if (x.@"else") |el| try inf.infer(el, expected) else .{ .ty = .void_type };
+                try inf.bindCaptures(x.capture, cond, .if_then);
+                try inf.bindCaptures(x.else_capture, cond, .if_else);
+                const taken = inf.condValue(cond);
+                const then = try inf.inferBranch(x.then, expected, taken == false);
+                const other: TypedValue = if (x.@"else") |el| try inf.inferBranch(el, expected, taken == true) else .{ .ty = .void_type };
+                if (taken) |t| return if (t) then else other;
                 return .{ .ty = try inf.peer(&.{ then.ty, other.ty }) };
             },
             .loop => |l| return inf.loop(l, expected),
             .@"switch" => |s| {
                 const operand = try inf.infer(s.operand, null);
+                for (s.prongs) |prong| for (prong.items) |item| {
+                    _ = try inf.infer(item, operand.ty);
+                };
+                // comptime 已知的操作数：只有匹配的分支会执行
+                const chosen = inf.chooseProng(s.prongs, operand);
                 var types: std.ArrayList(Index) = .empty;
-                for (s.prongs) |prong| {
-                    for (prong.items) |item| _ = try inf.infer(item, operand.ty);
+                var chosen_tv: TypedValue = .unknown;
+                for (s.prongs, 0..) |prong, i| {
                     try inf.bindSwitchCapture(prong, operand.ty);
-                    try types.append(inf.scratch, (try inf.infer(prong.body, expected)).ty);
+                    const tv = try inf.inferBranch(prong.body, expected, chosen != null and chosen.? != i);
+                    if (chosen != null and chosen.? == i) chosen_tv = tv;
+                    try types.append(inf.scratch, tv.ty);
                 }
+                if (chosen != null) return chosen_tv;
                 return .{ .ty = try inf.peer(types.items) };
             },
             .@"catch" => |c| {
@@ -263,7 +343,7 @@ const Inferrer = struct {
             .init => |x| return inf.initExpr(x.ty, x.fields, expected),
             .container => {
                 const ns = try inf.containerAt(e) orelse return .unknown;
-                return TypedValue.ofType(try queries.containerType(inf.r, ns));
+                return TypedValue.ofType(try queries.containerType(inf.r, ns, inf.inst));
             },
             .fn_type => |f| {
                 const params = try inf.scratch.alloc(Index, f.params.len);
@@ -272,7 +352,8 @@ const Inferrer = struct {
                 return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret } }));
             },
             .@"return" => |v| {
-                if (v) |x| _ = try inf.infer(x, inf.ret_type);
+                const value: TypedValue = if (v) |x| try inf.infer(x, inf.ret_type) else .{ .ty = .void_type };
+                if (inf.dead == 0) try inf.returns.append(inf.scratch, value);
                 return .{ .ty = .noreturn_type };
             },
             .@"break" => |br| {
@@ -298,7 +379,9 @@ const Inferrer = struct {
             },
             .ptr_type => |p| {
                 const child = (try inf.infer(p.child, null)).asType() orelse return typeUnknown();
-                return TypedValue.ofType(try ip.ptrTo(child, @fromBackingInt(@intCast(@backingInt(p.size))), p.is_const));
+                const sentinel: ?Index = if (p.sentinel) |x| (try inf.infer(x, child)).val else null;
+                if (child == .unknown) return typeUnknown();
+                return TypedValue.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel } }));
             },
             .array_type => |arr| {
                 const len = try inf.infer(arr.len, .usize_type);
@@ -307,7 +390,8 @@ const Inferrer = struct {
                     .int_value => |iv| std.math.cast(u64, iv.value) orelse return typeUnknown(),
                     else => return typeUnknown(),
                 } else return typeUnknown();
-                return TypedValue.ofType(try ip.get(.{ .array_type = .{ .len = n, .child = child } }));
+                const sentinel: ?Index = if (arr.sentinel) |x| (try inf.infer(x, child)).val else null;
+                return TypedValue.ofType(try ip.get(.{ .array_type = .{ .len = n, .child = child, .sentinel = sentinel } }));
             },
             .error_set => |names| return TypedValue.ofType(try ip.errorSet(inf.scratch, names)),
             .other => |children| {
@@ -323,7 +407,7 @@ const Inferrer = struct {
         const b = inf.body;
         if (try primitive(inf.ip, name)) |tv| return tv;
         const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .unknown;
-        return queries.defType(inf.r, def, .{ .file = inf.file, .item = inf.item, .bindings = inf.bindings });
+        return queries.defType(inf.r, def, .{ .file = inf.file, .item = inf.item, .bindings = inf.bindings }, inf.inst);
     }
 
     fn literal(inf: *Inferrer, text: []const u8) Error!TypedValue {
@@ -365,7 +449,7 @@ const Inferrer = struct {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .unknown;
                     const def = try inf.r.memberDef(ns, name) orelse return .unknown;
                     inf.members[@backingInt(e)] = try defKey(inf.r, def);
-                    return queries.defType(inf.r, def, null);
+                    return queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 },
                 .error_set_type => return .{ .ty = t, .val = try ip.get(.{ .error_value = name }) },
                 else => return .unknown,
@@ -385,12 +469,12 @@ const Inferrer = struct {
                 const tree = try inf.r.itemTree(ns.file);
                 if (fieldItem(tree, ns.container, name)) |f| {
                     inf.members[@backingInt(e)] = .{ .file = ns.file, .item = tree.items[f].ast_id };
-                    return .{ .ty = (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null)).ty };
+                    return .{ .ty = (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(ip, t))).ty };
                 }
                 // 方法
                 const def = try inf.r.memberDef(ns, name) orelse return .unknown;
                 inf.members[@backingInt(e)] = try defKey(inf.r, def);
-                const tv = try queries.defType(inf.r, def, null);
+                const tv = try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 if (ip.key(tv.ty) == .fn_type) try inf.bound.put(inf.scratch, e, {});
                 return tv;
             },
@@ -421,7 +505,20 @@ const Inferrer = struct {
         const m = Resolver.lookupDecl(tree, ns.container, name) orelse return null;
         const def: resolve.Def = .{ .item = .{ .file = ns.file, .item = m } };
         inf.members[@backingInt(e)] = try defKey(inf.r, def);
-        return try queries.defType(inf.r, def, null);
+        return try queries.defType(inf.r, def, null, c.inst);
+    }
+
+    /// 标准库中按路径查找的类型（如 `builtin.Type`）
+    fn stdType(inf: *Inferrer, path: []const []const u8) Error!?Index {
+        const graph = try inf.r.ctx.get(database.ModuleGraph.Input, {}) orelse return null;
+        var ns: Namespace = .{ .file = graph.std_root orelse return null, .container = 0 };
+        var t: Index = .unknown;
+        for (path, 0..) |name, i| {
+            const def = try inf.r.memberDef(ns, name) orelse return null;
+            t = (try queries.defType(inf.r, def, null, null)).asType() orelse return null;
+            if (i + 1 < path.len) ns = try queries.namespaceOfType(inf.r, t) orelse return null;
+        }
+        return t;
     }
 
     // ── 调用 ─────────────────────────────────────────────────────────
@@ -441,7 +538,93 @@ const Inferrer = struct {
             const p: ?Index = if (i + skip < f.params.len and f.params[i + skip] != .unknown) f.params[i + skip] else null;
             _ = try inf.infer(a, p);
         }
+        if (try inf.instantiate(callee, args, skip)) |tv| return tv;
         return .{ .ty = f.ret };
+    }
+
+    /// 调用泛型函数（有 comptime / anytype 参数）或返回 `type` 的函数：在实例中求返回类型，
+    /// 返回 `type` 时还求出返回的值。非泛型函数返回 null，由调用方使用签名中的返回类型
+    fn instantiate(inf: *Inferrer, callee: TypedValue, args: []const ExprId, skip: usize) Error!?TypedValue {
+        const ip = inf.ip;
+        const fv = switch (ip.key(callee.val orelse return null)) {
+            .fn_value => |v| v,
+            else => return null,
+        };
+        const owner: hir.OwnerKey = .{ .file = fv.file, .item = fv.decl };
+        const body = try inf.r.ctx.get(hir.ItemBody, owner);
+        var generic = false;
+        for (body.params) |p| {
+            const b = body.binding(p);
+            if (b.is_comptime or b.ty == null) generic = true;
+        }
+        const f = ip.key(callee.ty).fn_type;
+        if (!generic and f.ret != .type_type) return null;
+        if (inf.r.ctx.stack.items.len > max_query_depth) return .{ .ty = f.ret };
+
+        // 实参：comptime 参数取值，anytype 参数取类型，其他为 unknown
+        const inst_args = try inf.scratch.alloc(Index, body.params.len);
+        for (body.params, inst_args, 0..) |p, *out, i| {
+            const b = body.binding(p);
+            out.* = .unknown;
+            if (i < skip) continue;
+            const ai = i - skip;
+            if (ai >= args.len) continue;
+            const tv = inf.get(args[ai]);
+            if (b.ty == null) {
+                out.* = tv.ty;
+            } else if (b.is_comptime) {
+                out.* = tv.val orelse .unknown;
+            }
+        }
+        const inst = try ip.get(.{ .instance = .{ .file = fv.file, .decl = fv.decl, .args = inst_args, .parent = fv.inst } });
+        const sig = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = inst });
+        var ret: Index = if (body.type_expr) |t| (if (@backingInt(t) < sig.exprs.len) sig.exprs[@backingInt(t)].asType() orelse .unknown else .unknown) else .unknown;
+        // 签名中的错误集推导（`!T`）与 DeclType 一致
+        if (f.ret != .unknown and ip.key(f.ret) == .error_union_type and ret != .unknown and ip.key(ret) != .error_union_type) {
+            ret = try ip.get(.{ .error_union_type = .{ .err = ip.key(f.ret).error_union_type.err, .payload = ret } });
+        }
+        if (ret == .type_type) {
+            const full = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+            return if (full.ret.ty == .type_type) full.ret else .{ .ty = .type_type };
+        }
+        return .{ .ty = ret };
+    }
+
+    /// switch 的操作数与分支项都 comptime 已知时，会执行的分支
+    fn chooseProng(inf: *Inferrer, prongs: []const Body.Prong, operand: TypedValue) ?usize {
+        const v = operand.val orelse return null;
+        var else_prong: ?usize = null;
+        for (prongs, 0..) |prong, i| {
+            if (prong.is_else) {
+                else_prong = i;
+                continue;
+            }
+            for (prong.items) |item| {
+                const iv = inf.get(item).val orelse return null;
+                if (iv == v) return i;
+            }
+        }
+        return else_prong;
+    }
+
+    /// comptime 已知的比较
+    fn compare(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs: TypedValue) ?bool {
+        const ip = inf.ip;
+        const a = lhs.val orelse return null;
+        const b = rhs.val orelse return null;
+        if (intOf(ip, lhs)) |x| if (intOf(ip, rhs)) |y| return switch (op) {
+            .equal_equal => x == y,
+            .bang_equal => x != y,
+            .angle_bracket_left => x < y,
+            .angle_bracket_right => x > y,
+            .angle_bracket_left_equal => x <= y,
+            .angle_bracket_right_equal => x >= y,
+            else => null,
+        };
+        // 类型、枚举成员、bool、null 等：驻留值相等即相等（抽象参数与未知值不参与）
+        if (op != .equal_equal and op != .bang_equal) return null;
+        if (!comparable(ip, a) or !comparable(ip, b)) return null;
+        return (a == b) == (op == .equal_equal);
     }
 
     fn builtin(inf: *Inferrer, e: ExprId, name: []const u8, args: []const ExprId, expected: ?Index) Error!TypedValue {
@@ -449,11 +632,11 @@ const Inferrer = struct {
         const eq = std.mem.eql;
         if (eq(u8, name, "@import")) {
             const target = try inf.r.importTarget(inf.file, inf.body, args) orelse return .unknown;
-            return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = target, .container = 0 }));
+            return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = target, .container = 0 }, null));
         }
         if (eq(u8, name, "@This")) {
             const tree = try inf.r.itemTree(inf.file);
-            return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = inf.file, .container = tree.items[inf.item].container }));
+            return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = inf.file, .container = tree.items[inf.item].container }, inf.inst));
         }
         if (eq(u8, name, "@as")) {
             if (args.len != 2) return .unknown;
@@ -481,6 +664,26 @@ const Inferrer = struct {
             } else null;
             if (sign == null or n == null) return typeUnknown();
             return TypedValue.ofType(try ip.intType(sign.?, n.?));
+        }
+        // 结果是标准库中定义的类型：只给出类型（不构造值）
+        if (eq(u8, name, "@typeInfo")) {
+            for (args) |x| _ = try inf.infer(x, null);
+            return .{ .ty = (try inf.stdType(&.{ "builtin", "Type" })) orelse .unknown };
+        }
+        if (eq(u8, name, "@src")) return .{ .ty = (try inf.stdType(&.{ "builtin", "SourceLocation" })) orelse .unknown };
+        if (eq(u8, name, "@FieldType")) {
+            if (args.len != 2) return typeUnknown();
+            const t = (try inf.infer(args[0], null)).asType() orelse return typeUnknown();
+            _ = try inf.infer(args[1], null);
+            const field = switch (inf.body.expr(args[1])) {
+                .literal => |text| std.zig.string_literal.parseAlloc(inf.scratch, text) catch return typeUnknown(),
+                else => return typeUnknown(),
+            };
+            const ns = try queries.namespaceOfType(inf.r, t) orelse return typeUnknown();
+            const tree = try inf.r.itemTree(ns.file);
+            const f = fieldItem(tree, ns.container, field) orelse return typeUnknown();
+            const ft = (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(ip, t))).ty;
+            return if (ft == .unknown) typeUnknown() else TypedValue.ofType(ft);
         }
         if (eq(u8, name, "@field")) {
             if (args.len != 2) return .unknown;
@@ -542,7 +745,15 @@ const Inferrer = struct {
     fn block(inf: *Inferrer, blk: Body.Block, expected: ?Index) Error!TypedValue {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false });
         var last: Index = .void_type;
-        for (blk.stmts) |s| last = try inf.stmt(s);
+        var dead_rest = false;
+        for (blk.stmts) |s| {
+            last = try inf.stmt(s);
+            if (last == .noreturn_type and !dead_rest) {
+                dead_rest = true;
+                inf.dead += 1;
+            }
+        }
+        if (dead_rest) inf.dead -= 1;
         const frame = inf.labels.pop().?;
         if (blk.label != null) {
             var types = frame.types;
@@ -595,8 +806,8 @@ const Inferrer = struct {
         switch (l.kind) {
             .@"while" => {
                 const cond = try inf.infer(l.inputs[0], null);
-                try inf.bindCaptures(l.capture, cond.ty, .if_then);
-                try inf.bindCaptures(l.else_capture, cond.ty, .if_else);
+                try inf.bindCaptures(l.capture, cond, .if_then);
+                try inf.bindCaptures(l.else_capture, cond, .if_else);
             },
             .@"for" => {
                 for (l.inputs, 0..) |input, i| {
@@ -641,9 +852,10 @@ const Inferrer = struct {
     const CaptureSource = enum { if_then, if_else };
 
     /// if / while 的捕获：optional 取子类型，error union 取载荷（else 分支取错误集）
-    fn bindCaptures(inf: *Inferrer, caps: []const Body.BindingId, cond: Index, source: CaptureSource) Error!void {
+    fn bindCaptures(inf: *Inferrer, caps: []const Body.BindingId, cond_tv: TypedValue, source: CaptureSource) Error!void {
         if (caps.len == 0) return;
         const ip = inf.ip;
+        const cond = cond_tv.ty;
         const t: Index = switch (ip.key(cond)) {
             .optional_type => |c| if (source == .if_then) c else .unknown,
             .error_union_type => |eu| if (source == .if_then) eu.payload else eu.err,
@@ -665,7 +877,7 @@ const Inferrer = struct {
                 t = .unknown;
                 if (ns) |n| {
                     const tree = try inf.r.itemTree(n.file);
-                    if (fieldItem(tree, n.container, name)) |f| t = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = f } }, null)).ty;
+                    if (fieldItem(tree, n.container, name)) |f| t = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = f } }, null, queries.instOfType(ip, operand))).ty;
                 }
             } else t = .unknown;
         } else if (ip.key(operand) == .container_type and ip.key(operand).container_type.kind == .@"union") t = .unknown;
@@ -685,16 +897,23 @@ const Inferrer = struct {
                     else => .unknown,
                 };
                 const rhs = try inf.infer(rhs_e, if (child != .unknown) child else null);
+                if (lhs.val == .null_value) return rhs;
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
             .keyword_and, .keyword_or => {
-                _ = try inf.infer(lhs_e, .bool_type);
-                _ = try inf.infer(rhs_e, .bool_type);
+                const lhs = inf.condValue(try inf.infer(lhs_e, .bool_type));
+                const rhs = inf.condValue(try inf.infer(rhs_e, .bool_type));
+                const is_and = op == .keyword_and;
+                // 短路：一侧已决定结果
+                if (lhs) |l| if (l != is_and) return boolValue(l);
+                if (rhs) |r| if (r != is_and) return boolValue(r);
+                if (lhs != null and rhs != null) return boolValue(is_and);
                 return .{ .ty = .bool_type };
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
                 const lhs = try inf.infer(lhs_e, null);
-                _ = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
+                const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
+                if (inf.compare(op, lhs, rhs)) |result| return boolValue(result);
                 return .{ .ty = .bool_type };
             },
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .angle_bracket_angle_bracket_left_pipe => {
@@ -717,10 +936,14 @@ const Inferrer = struct {
                 return TypedValue.ofType(try ip.errorSet(inf.scratch, names));
             },
             else => {
-                // 算术与位运算：两侧 peer
+                // 算术与位运算：两侧 peer；两侧都是已知整数时折叠
                 const lhs = try inf.infer(lhs_e, expected);
                 const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else expected);
-                return .{ .ty = try inf.peer(&.{ lhs.ty, rhs.ty }) };
+                const ty = try inf.peer(&.{ lhs.ty, rhs.ty });
+                if (intOf(inf.ip, lhs)) |a| if (intOf(inf.ip, rhs)) |b| if (fold(op, a, b)) |v| {
+                    return .{ .ty = ty, .val = try inf.ip.get(.{ .int_value = .{ .ty = ty, .value = v } }) };
+                };
+                return .{ .ty = ty };
             },
         }
     }
@@ -734,7 +957,8 @@ const Inferrer = struct {
                 return .{ .ty = payload };
             },
             .bang => {
-                _ = try inf.infer(operand_e, .bool_type);
+                const v = inf.condValue(try inf.infer(operand_e, .bool_type));
+                if (v) |b| if (inf.get(operand_e).ty == .bool_type) return boolValue(!b);
                 return .{ .ty = .bool_type };
             },
             .ampersand => {
@@ -761,7 +985,7 @@ const Inferrer = struct {
             var field_ty: ?Index = elem;
             if (f.name) |name| if (ns) |n| {
                 const tree = try inf.r.itemTree(n.file);
-                if (fieldItem(tree, n.container, name)) |fi| field_ty = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = fi } }, null)).ty;
+                if (fieldItem(tree, n.container, name)) |fi| field_ty = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = fi } }, null, queries.instOfType(ip, t))).ty;
             };
             _ = try inf.infer(f.value, if (field_ty) |x| (if (x != .unknown) x else null) else null);
         }
@@ -903,6 +1127,45 @@ const Inferrer = struct {
         return null;
     }
 };
+
+fn boolValue(b: bool) TypedValue {
+    return .{ .ty = .bool_type, .val = if (b) .true_value else .false_value };
+}
+
+fn intOf(ip: *InternPool, tv: TypedValue) ?i128 {
+    const v = tv.val orelse return null;
+    return switch (ip.key(v)) {
+        .int_value => |i| i.value,
+        else => null,
+    };
+}
+
+/// 整数运算的 comptime 折叠；溢出或除零时不折叠
+fn fold(op: SyntaxKind, a: i128, b: i128) ?i128 {
+    return switch (op) {
+        .plus, .plus_percent, .plus_pipe => std.math.add(i128, a, b) catch null,
+        .minus, .minus_percent, .minus_pipe => std.math.sub(i128, a, b) catch null,
+        .asterisk, .asterisk_percent, .asterisk_pipe => std.math.mul(i128, a, b) catch null,
+        .slash => if (b == 0) null else @divTrunc(a, b),
+        .percent => if (b == 0) null else @rem(a, b),
+        .ampersand => a & b,
+        .pipe => a | b,
+        .caret => a ^ b,
+        .angle_bracket_angle_bracket_left => if (b < 0 or b > 126) null else std.math.shlExact(i128, a, @intCast(b)) catch null,
+        .angle_bracket_angle_bracket_right => if (b < 0 or b > 127) null else a >> @intCast(b),
+        else => null,
+    };
+}
+
+/// 可以按驻留值比较相等的 comptime 值
+fn comparable(ip: *InternPool, v: Index) bool {
+    return switch (ip.key(v)) {
+        .opaque_param, .unknown, .instance => false,
+        .ptr_type => |p| comparable(ip, p.child),
+        .optional_type => |c| comparable(ip, c),
+        else => true,
+    };
+}
 
 fn typeUnknown() TypedValue {
     return .{ .ty = .type_type };

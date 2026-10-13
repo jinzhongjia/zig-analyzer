@@ -32,7 +32,7 @@ fn typeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, nth: us
         return render.typedValueAlloc(&r, res.exprs[i]);
     };
     // 成员自身：声明类型
-    const tv = try ctx.get(queries.DeclType, owner);
+    const tv = try ctx.get(queries.DeclType, .{ .owner = owner });
     return render.typedValueAlloc(&r, tv);
 }
 
@@ -235,18 +235,177 @@ test "decl literals" {
     });
 }
 
-test "generic calls and unknown parts stay unknown" {
+test "generic type constructors and instances" {
     try expectTypes(
-        \\fn List(comptime T: type) type { return struct { items: []T }; }
-        \\fn max(comptime T: type, a: T, b: T) T { return if (a > b) a else b; }
-        \\fn g() void {
-        \\    const L = List(u8);
-        \\    const m = max(u32, 1, 2);
-        \\    _ = .{ L, m };
+        \\fn List(comptime T: type) type {
+        \\    return struct {
+        \\        items: []T,
+        \\        const Self = @This();
+        \\        pub fn get(self: Self, i: usize) T { return self.items[i]; }
+        \\        pub fn first(self: *Self) ?*T { _ = self; return null; }
+        \\    };
+        \\}
+        \\fn Wrapper(comptime T: type) type { return List(T); }
+        \\fn g(l: List(u8), w: Wrapper(i32)) void {
+        \\    const its = l.items;
+        \\    const x = l.get(0);
+        \\    const y = w.get(1);
+        \\    const f = (&l).first();
+        \\    _ = .{ its, x, y, f };
         \\}
     , &.{
-        // 返回类型声明为 type：类型已知、值未知（需要 comptime 求值，M5）
-        .{ "L", "type" },
-        .{ "m", "unknown" },
+        .{ "l", "List(u8)" },
+        .{ "w", "List(i32)" },
+        .{ "its", "[]u8" },
+        // 泛型定义处（没有具体实例）：抽象参数
+        .{ "items", "[]T" },
+        .{ "x", "u8" },
+        .{ "y", "i32" },
+        .{ "f", "?*u8" },
+    });
+}
+
+test "generic functions, anytype and comptime branches" {
+    try expectTypes(
+        \\fn max(comptime T: type, a: T, b: T) T { return if (a > b) a else b; }
+        \\fn id(x: anytype) @TypeOf(x) { return x; }
+        \\fn Pick(comptime wide: bool) type {
+        \\    if (wide) return u64;
+        \\    return u8;
+        \\}
+        \\fn Aligned(comptime T: type, comptime alignment: ?u8) type {
+        \\    if (alignment) |a| {
+        \\        if (a == 1) return Aligned(T, null);
+        \\    }
+        \\    return struct { items: []T, pub const Slice = if (alignment) |_| []const T else []T; };
+        \\}
+        \\fn Bits(comptime n: u16) type { return @Int(.unsigned, n * 2); }
+        \\fn Rec(comptime n: u32) type { return Rec(n + 1); }
+        \\fn g() void {
+        \\    const m = max(u32, 1, 2);
+        \\    const v = id(@as(u16, 1));
+        \\    const P = Pick(true);
+        \\    const Q = Pick(false);
+        \\    const S = Aligned(u8, null).Slice;
+        \\    const B = Bits(4);
+        \\    const R = Rec(0);
+        \\    _ = .{ m, v, P, Q, S, B, R };
+        \\}
+    , &.{
+        .{ "m", "u32" },
+        .{ "v", "u16" },
+        .{ "P", "type = u64" },
+        .{ "Q", "type = u8" },
+        .{ "S", "type = []u8" },
+        .{ "B", "type = u8" },
+        // 无限递归的类型构造：到达深度上限后为未知值，不会卡住
+        .{ "R", "type" },
+    });
+}
+
+test "names of containers defined in bodies" {
+    try expectTypes(
+        \\fn Box(comptime T: type) type { return struct { v: T }; }
+        \\fn g() void {
+        \\    const E = enum { a, b };
+        \\    const bx = Box(E){ .v = .a };
+        \\    _ = bx;
+        \\}
+    , &.{
+        .{ "bx", "Box(E)" },
+    });
+}
+
+test "generic bodies without an instance use abstract parameters" {
+    try expectTypes(
+        \\fn List(comptime T: type) type {
+        \\    return struct {
+        \\        items: []T,
+        \\        pub fn get(self: @This(), i: usize) T { const it = self.items[i]; return it; }
+        \\    };
+        \\}
+    , &.{
+        .{ "it", "T" },
+    });
+}
+
+test "unknown parts stay unknown" {
+    try expectTypes(
+        \\fn opaqueFn(x: u8) type { _ = x; return u8; }
+        \\fn g(n: u8) void {
+        \\    const T = opaqueFn(n);
+        \\    _ = T;
+        \\}
+    , &.{
+        // 返回 type 的函数：实参不是 comptime 值时仍按实例求值（函数体不依赖参数时可以求出）
+        .{ "T", "type = u8" },
+    });
+}
+
+/// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
+fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
+    defer testing.allocator.free(std_root_path);
+    const std_root = try w.vfs.intern(std_root_path);
+    const f = try w.add("/p/main.zig", src);
+    try w.setGraph(std_root, &.{}, &.{});
+    for (cases) |c| {
+        const actual = try typeAt(&w, f.file, src, c[0], 0);
+        testing.expectEqualStrings(c[1], actual) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "std generic containers" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Point = struct { x: i32, y: i32 };
+        \\fn g(gpa: std.mem.Allocator) !void {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    const items = list.items;
+        \\    const last = list.getLast();
+        \\    const popped = list.pop();
+        \\    var map: std.AutoHashMap(u32, []const u8) = .init(gpa);
+        \\    const got = map.get(1);
+        \\    const entry = try map.getOrPut(2);
+        \\    var points: std.MultiArrayList(Point) = .empty;
+        \\    const n = points.len;
+        \\    var sm: std.StringHashMapUnmanaged(bool) = .empty;
+        \\    const flag = sm.get("a");
+        \\    const fs = @typeInfo(Point).@"struct".field_names;
+        \\    const info = @typeInfo(Point);
+        \\    const FT = @FieldType(Point, "y");
+        \\    const num = try std.fmt.parseInt(u32, "1", 10);
+        \\    var it = std.mem.splitScalar(u8, "a,b", ',');
+        \\    const part = it.next();
+        \\    const buf = try gpa.alloc(u32, 4);
+        \\    const loc = @src();
+        \\    _ = .{ items, last, popped, got, entry, n, flag, fs, info, FT, num, part, buf, loc };
+        \\}
+    , &.{
+        .{ "list", "Aligned(u8, null)" },
+        .{ "items", "[]u8" },
+        .{ "last", "u8" },
+        .{ "popped", "?u8" },
+        .{ "got", "?[]const u8" },
+        .{ "n", "usize" },
+        .{ "flag", "?bool" },
+        .{ "entry", "GetOrPutResult(u32, []const u8, AutoContext(u32), 80)" },
+        .{ "fs", "[]const [:0]const u8" },
+        .{ "info", "Type" },
+        .{ "FT", "type = i32" },
+        .{ "num", "u32" },
+        .{ "it", "SplitIterator(u8, .scalar)" },
+        .{ "part", "?[]const u8" },
+        .{ "buf", "[]u32" },
+        .{ "loc", "SourceLocation" },
     });
 }

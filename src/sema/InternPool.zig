@@ -102,14 +102,29 @@ pub const Key = union(enum) {
     /// 枚举类型的某个成员
     enum_tag: struct { ty: Index, name: []const u8 },
     error_value: []const u8,
-    /// 函数声明
-    fn_value: struct { ty: Index, file: FileId, decl: AstId },
+    /// 函数声明；`inst` 为函数所在的实例（泛型容器的方法）
+    fn_value: struct { ty: Index, file: FileId, decl: AstId, inst: ?Index = null },
+
+    /// 泛型函数的一次实例化：函数 + 各参数的值（非 comptime 参数为 unknown）。
+    /// `parent` 为函数自身所在的实例（定义在另一个实例化容器中的函数）
+    instance: Instance,
+    /// 没有具体实例时的 comptime 类型参数（抽象实例，设计 §9.4），显示为参数名
+    opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
+};
+
+pub const Instance = struct {
+    file: FileId,
+    decl: AstId,
+    args: []const Index,
+    parent: ?Index = null,
 };
 
 pub const Container = struct {
     file: FileId,
     ast_id: AstId,
     kind: Kind,
+    /// 容器定义在泛型函数体内时，该函数的实例（`ArrayList(u8)` 与 `ArrayList(i32)` 是不同的类型）
+    inst: ?Index = null,
 
     pub const Kind = enum { file, @"struct", @"enum", @"union", @"opaque" };
 };
@@ -212,6 +227,8 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
+        .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent } },
+        .opaque_param => |o| .{ .opaque_param = .{ .file = o.file, .owner = o.owner, .binding = o.binding, .name = try a.dupe(u8, o.name) } },
         else => k,
     };
 }
@@ -355,6 +372,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         .enum_tag => |t| try w.print(".{s}", .{t.name}),
         .error_value => |n| try w.print("error.{s}", .{n}),
         .fn_value => |f| try ip.print(f.ty, w, container_name),
+        .instance => try w.writeAll("instance"),
+        .opaque_param => |o| try w.writeAll(o.name),
     }
 }
 

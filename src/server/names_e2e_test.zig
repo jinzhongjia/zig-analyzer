@@ -158,3 +158,50 @@ test "types through the real std: hover, member completion and inlay hints" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "generic std containers through LSP: hover, completion and inlay hints" {
+    const text =
+        \\const std = @import("std");
+        \\fn use(gpa: std.mem.Allocator) !void {
+        \\    var list: std.ArrayList(u32) = .empty;
+        \\    try list.append(gpa, 1);
+        \\    const last = list.getLast();
+        \\    _ = last;
+        \\    list.
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "one.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const hover_resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = position(text, "list:") });
+    const value = hover_resp.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expectEqualStrings("```zig\nvar list: Aligned(u32, null)\n```", value);
+
+    const p = position(text, "list.\n");
+    const labels = try completionLabels(&h, uri, p.line, p.character + 5);
+    for ([_][]const u8{ "items", "capacity", "append", "getLast", "deinit" }) |l| {
+        testing.expect(contains(labels, l)) catch |err| {
+            std.debug.print("missing completion `{s}`\n", .{l});
+            return err;
+        };
+    }
+
+    const hints = try h.request("textDocument/inlayHint", .{ .textDocument = .{ .uri = uri }, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 8, .character = 0 } } });
+    var found = false;
+    for (hints.object.get("result").?.array.items) |hint| {
+        if (std.mem.eql(u8, hint.object.get("label").?.string, ": u32")) found = true;
+    }
+    try testing.expect(found);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
         for (tree.items) |item| {
             const owner: database.hir.OwnerKey = .{ .file = file, .item = item.ast_id };
             members += 1;
-            const decl = try ctx.get(queries.DeclType, owner);
+            const decl = try ctx.get(queries.DeclType, .{ .owner = owner });
             switch (item.kind) {
                 .@"const", .@"var", .@"fn" => decls.add(decl.ty),
                 else => {},

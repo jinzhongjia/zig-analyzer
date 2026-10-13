@@ -20,6 +20,13 @@ const FileId = @import("../base/Vfs.zig").FileId;
 pub const InferKey = struct {
     owner: hir.OwnerKey,
     mode: infer.Mode,
+    /// owner 自身或其外层泛型函数的实例（已规范化，见 `normalizeInst`）；null 为非泛型或抽象实例
+    inst: ?Index = null,
+};
+
+pub const DeclKey = struct {
+    owner: hir.OwnerKey,
+    inst: ?Index = null,
 };
 
 /// BodyOwner 的类型推导结果。签名模式不读取函数体与初始化表达式，
@@ -33,7 +40,7 @@ pub const Infer = struct {
         const gpa = ctx.db.gpa;
         const result = try gpa.create(infer.Result);
         errdefer gpa.destroy(result);
-        result.* = try infer.run(ctx, key.owner, key.mode);
+        result.* = try infer.run(ctx, key.owner, key.mode, key.inst);
         return result;
     }
 
@@ -53,15 +60,16 @@ pub const Infer = struct {
     }
 };
 
-const empty_result: infer.Result = .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{} };
+const empty_result: infer.Result = .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{}, .ret = .unknown };
 
 /// 声明的类型；const 的值 comptime 已知时附带值（如 `const S = struct {...}` 的值为类型 S）
 pub const DeclType = struct {
     pub const kind: engine.Kind = .derived;
-    pub const Key = hir.OwnerKey;
+    pub const Key = DeclKey;
     pub const Value = TypedValue;
 
-    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+    pub fn compute(ctx: *Db.Ctx, dk: Key) engine.Error!Value {
+        const key = dk.owner;
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
@@ -73,7 +81,7 @@ pub const DeclType = struct {
         const b = try ctx.get(hir.ItemBody, key);
         switch (tree.items[item].kind) {
             .@"fn" => {
-                const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature });
+                const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
                 const node = try r.itemNode(key.file, item) orelse return .unknown;
                 const proto = (ast.cast(ast.FnDecl, node) orelse return .unknown).proto() orelse return .unknown;
@@ -92,10 +100,10 @@ pub const DeclType = struct {
                 // 推导的错误集暂以 anyerror 表示（由函数体推导属于后续工作）
                 if (proto.inferredErrorSet() and ret != .unknown) ret = try ip.get(.{ .error_union_type = .{ .err = .anyerror_type, .payload = ret } });
                 const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = ret } });
-                return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item } }) };
+                return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item, .inst = dk.inst } }) };
             },
             .@"const", .@"var" => {
-                const res = try ctx.get(Infer, .{ .owner = key, .mode = .full });
+                const res = try ctx.get(Infer, .{ .owner = key, .mode = .full, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
                 const annotation: ?Index = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else null;
                 const value: TypedValue = if (b.value) |v| res.exprs[@backingInt(v)] else .unknown;
@@ -106,10 +114,10 @@ pub const DeclType = struct {
             .field => {
                 const container = tree.items[item].container;
                 if (tree.containers[container].kind == .@"enum") {
-                    const ty = try containerType(&r, .{ .file = key.file, .container = container });
+                    const ty = try containerType(&r, .{ .file = key.file, .container = container }, dk.inst);
                     return .{ .ty = ty, .val = try ip.get(.{ .enum_tag = .{ .ty = ty, .name = tree.items[item].name orelse "" } }) };
                 }
-                const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature });
+                const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
                 return .{ .ty = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else .unknown };
             },
@@ -129,34 +137,58 @@ pub const LocalScope = struct {
     bindings: []const TypedValue,
 };
 
-/// 名字解析结果的类型
-pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope) resolve.Error!TypedValue {
+/// 名字解析结果的类型。`inst` 为解析发生处的实例上下文
+pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Index) resolve.Error!TypedValue {
     switch (def) {
         .item => |it| {
             const tree = try r.itemTree(it.file);
-            return r.ctx.get(DeclType, .{ .file = it.file, .item = tree.items[it.item].ast_id });
+            return r.ctx.get(DeclType, .{ .owner = .{ .file = it.file, .item = tree.items[it.item].ast_id }, .inst = try normalizeInst(r, it.file, it.item, inst) });
         },
         .local => |l| {
             if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
-            const res = try r.ctx.get(Infer, .{ .owner = try r.ownerKey(l.file, l.item), .mode = .full });
+            const res = try r.ctx.get(Infer, .{ .owner = try r.ownerKey(l.file, l.item), .mode = .full, .inst = try normalizeInst(r, l.file, l.item, inst) });
             if (@backingInt(l.binding) >= res.bindings.len) return .unknown;
             return res.bindings[@backingInt(l.binding)];
         },
-        .file => |f| return TypedValue.ofType(try containerType(r, .{ .file = f, .container = 0 })),
+        .file => |f| return TypedValue.ofType(try containerType(r, .{ .file = f, .container = 0 }, null)),
     }
 }
 
-/// 命名空间（文件中的容器）对应的容器类型
-pub fn containerType(r: *Resolver, ns: Namespace) resolve.Error!Index {
+/// 实例上下文中适用于成员 `item` 的实例：沿实例链找第一个属于 `item` 自身（函数）
+/// 或其外层函数的实例。成员不在任何泛型函数中时为 null，保证同一成员不会因上下文不同而重复推导
+pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
+    const ip = r.ctx.db.env.ip;
+    var cur = inst;
+    while (cur) |c| : (cur = ip.key(c).instance.parent) {
+        const i = ip.key(c).instance;
+        if (i.file == file and try enclosedBy(r, file, item, i.decl)) return c;
+    }
+    return null;
+}
+
+/// `item` 是否为 `fn_decl` 本身或位于其内部（经由体内定义的容器）
+fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../syntax/ItemTree.zig").AstId) resolve.Error!bool {
+    const tree = try r.itemTree(file);
+    var cur: ?u32 = item;
+    while (cur) |it| {
+        if (tree.items[it].ast_id == fn_decl) return true;
+        cur = tree.containers[tree.items[it].container].parent_item;
+    }
+    return false;
+}
+
+/// 命名空间（文件中的容器）对应的容器类型；容器定义在泛型函数体内时带上适用的实例
+pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!Index {
     const tree = try r.itemTree(ns.file);
     const c = tree.containers[ns.container];
+    const container_inst = if (c.parent_item) |p| try normalizeInst(r, ns.file, p, inst) else null;
     return r.ctx.db.env.ip.get(.{ .container_type = .{ .file = ns.file, .ast_id = c.ast_id, .kind = switch (c.kind) {
         .file => .file,
         .@"struct" => .@"struct",
         .@"enum" => .@"enum",
         .@"union" => .@"union",
         .@"opaque" => .@"opaque",
-    } } });
+    }, .inst = container_inst } });
 }
 
 pub fn namespaceOfType(r: *Resolver, t: Index) resolve.Error!?Namespace {
@@ -167,6 +199,14 @@ pub fn namespaceOfType(r: *Resolver, t: Index) resolve.Error!?Namespace {
     const tree = try r.itemTree(c.file);
     for (tree.containers, 0..) |x, i| if (x.ast_id == c.ast_id) return .{ .file = c.file, .container = @intCast(i) };
     return null;
+}
+
+/// 容器类型所属的实例
+pub fn instOfType(ip: *InternPool, t: Index) ?Index {
+    return switch (ip.key(t)) {
+        .container_type => |c| c.inst,
+        else => null,
+    };
 }
 
 test {

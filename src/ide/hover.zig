@@ -29,7 +29,7 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
     var tv: TypedValue = .unknown;
     if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
         def = .{ .item = .{ .file = file, .item = a.item } };
-        tv = try r.ctx.get(queries.DeclType, a.owner);
+        tv = try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
     };
     if (def == null) for (b.bindings, 0..) |binding, i| {
         if (binding.range.start != tok.offset - a.node.offset) continue;
@@ -51,9 +51,10 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
             .builtin_call => {},
             else => return null,
         }
-        // 声明以其声明类型显示（表达式可能经过了结果类型转换）
-        if (def) |d| switch (d) {
-            .item => |it| tv = try r.ctx.get(queries.DeclType, try r.ownerKey(it.file, it.item)),
+        // 直接引用的声明以其声明类型显示（表达式可能经过了结果类型转换）；
+        // 成员访问保留表达式的类型（泛型实例中的成员类型由实例决定）
+        if (b.expr(e) == .name_ref) if (def) |d| switch (d) {
+            .item => |it| tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(it.file, it.item) }),
             else => {},
         };
     }
