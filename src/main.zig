@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !u8 {
     var writer: za.lsp.transport.Writer = .{ .io = io, .inner = &stdout.interface };
 
     var server: za.Server = undefined;
-    server.init(io, init.gpa, &writer);
+    try server.init(io, init.gpa, &writer);
     defer server.deinit();
     return server.run(&stdin.interface);
 }

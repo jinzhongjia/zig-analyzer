@@ -9,10 +9,18 @@ pub const hir = @import("hir/queries.zig");
 pub const ModuleGraph = @import("names/ModuleGraph.zig");
 
 const Vfs = @import("base/Vfs.zig");
+const InternPool = @import("sema/InternPool.zig");
 
-pub const Db = engine.Engine(*Vfs, &.{
+/// query 可访问的只读环境（`ctx.db.env`）
+pub const Env = struct {
+    vfs: *Vfs,
+    ip: *InternPool,
+};
+
+pub const Db = engine.Engine(*const Env, &.{
     inputs.FileText,
     live.LiveBackend,
+    syntax.SourceText,
     syntax.ParseFile,
     syntax.FileItemTree,
     syntax.FileAstIdMap,

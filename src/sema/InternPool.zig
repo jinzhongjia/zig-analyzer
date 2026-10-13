@@ -1,0 +1,386 @@
+//! InternPool：类型与 comptime 值的唯一表示（设计 §9.1）。
+//!
+//! 类型本身也是值（其类型为 `type`）。相同的 Key 总是得到相同的 Index，与驻留顺序无关，
+//! 因此 query 结果中的 Index 可以直接比较。只追加不删除：类型身份在整个进程内稳定。
+//! 多个 query 并发驻留，以互斥锁保护（见 §19.6）。
+
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const FileId = @import("../base/Vfs.zig").FileId;
+const AstId = @import("../syntax/ItemTree.zig").AstId;
+const deepEql = @import("../util/deep_eql.zig").deepEql;
+
+const InternPool = @This();
+
+gpa: Allocator,
+io: Io,
+mutex: Io.Mutex = .init,
+/// Key 中切片的存储
+arena: std.heap.ArenaAllocator,
+items: std.ArrayList(Key) = .empty,
+map: std.HashMapUnmanaged(Key, Index, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+
+pub const Index = enum(u32) {
+    /// 未知类型（吸收一切：参与运算的结果也是 unknown，不产生诊断）
+    unknown,
+    type_type,
+    void_type,
+    bool_type,
+    noreturn_type,
+    anyerror_type,
+    anyopaque_type,
+    comptime_int_type,
+    comptime_float_type,
+    null_type,
+    undefined_type,
+    enum_literal_type,
+    usize_type,
+    isize_type,
+    u8_type,
+    u1_type,
+    void_value,
+    true_value,
+    false_value,
+    null_value,
+    undefined_value,
+    _,
+};
+
+pub const Simple = enum {
+    type,
+    void,
+    bool,
+    noreturn,
+    anyerror,
+    anyopaque,
+    comptime_int,
+    comptime_float,
+    null,
+    undefined,
+    enum_literal,
+    usize,
+    isize,
+    c_char,
+    c_short,
+    c_ushort,
+    c_int,
+    c_uint,
+    c_long,
+    c_ulong,
+    c_longlong,
+    c_ulonglong,
+    c_longdouble,
+    f16,
+    f32,
+    f64,
+    f80,
+    f128,
+};
+
+pub const SimpleValue = enum { void, true, false, null, undefined };
+
+pub const PtrSize = enum { one, many, slice, c };
+
+pub const Key = union(enum) {
+    unknown,
+    simple_type: Simple,
+    int_type: struct { signedness: std.builtin.Signedness, bits: u16 },
+    ptr_type: struct { child: Index, size: PtrSize, is_const: bool = false, sentinel: ?Index = null },
+    array_type: struct { len: u64, child: Index, sentinel: ?Index = null },
+    optional_type: Index,
+    error_union_type: struct { err: Index, payload: Index },
+    /// 名字按字典序排列、去重
+    error_set_type: []const []const u8,
+    fn_type: struct { params: []const Index, ret: Index, varargs: bool = false },
+    /// 身份 = 定义位置（文件 + 容器的 AstId）
+    container_type: Container,
+
+    simple_value: SimpleValue,
+    int_value: struct { ty: Index, value: i128 },
+    enum_literal: []const u8,
+    /// 枚举类型的某个成员
+    enum_tag: struct { ty: Index, name: []const u8 },
+    error_value: []const u8,
+    /// 函数声明
+    fn_value: struct { ty: Index, file: FileId, decl: AstId },
+};
+
+pub const Container = struct {
+    file: FileId,
+    ast_id: AstId,
+    kind: Kind,
+
+    pub const Kind = enum { file, @"struct", @"enum", @"union", @"opaque" };
+};
+
+/// 类型与（若 comptime 已知）值。`ty == .unknown` 表示未知
+pub const TypedValue = struct {
+    ty: Index,
+    val: ?Index = null,
+
+    pub const unknown: TypedValue = .{ .ty = .unknown };
+
+    pub fn isType(tv: TypedValue) bool {
+        return tv.ty == .type_type;
+    }
+
+    /// 值为某个类型时返回该类型
+    pub fn asType(tv: TypedValue) ?Index {
+        return if (tv.ty == .type_type) tv.val else null;
+    }
+
+    pub fn ofType(t: Index) TypedValue {
+        return .{ .ty = .type_type, .val = t };
+    }
+};
+
+const KeyContext = struct {
+    pub fn hash(_: KeyContext, k: Key) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        // 错误集是切片的切片：要逐层跟随指针
+        std.hash.autoHashStrat(&h, k, .DeepRecursive);
+        return h.final();
+    }
+    pub fn eql(_: KeyContext, a: Key, b: Key) bool {
+        return deepEql(a, b);
+    }
+};
+
+/// 与 `Index` 的预置成员一一对应
+const preset = [_]Key{
+    .unknown,
+    .{ .simple_type = .type },
+    .{ .simple_type = .void },
+    .{ .simple_type = .bool },
+    .{ .simple_type = .noreturn },
+    .{ .simple_type = .anyerror },
+    .{ .simple_type = .anyopaque },
+    .{ .simple_type = .comptime_int },
+    .{ .simple_type = .comptime_float },
+    .{ .simple_type = .null },
+    .{ .simple_type = .undefined },
+    .{ .simple_type = .enum_literal },
+    .{ .simple_type = .usize },
+    .{ .simple_type = .isize },
+    .{ .int_type = .{ .signedness = .unsigned, .bits = 8 } },
+    .{ .int_type = .{ .signedness = .unsigned, .bits = 1 } },
+    .{ .simple_value = .void },
+    .{ .simple_value = .true },
+    .{ .simple_value = .false },
+    .{ .simple_value = .null },
+    .{ .simple_value = .undefined },
+};
+
+pub fn init(gpa: Allocator, io: Io) Allocator.Error!InternPool {
+    var ip: InternPool = .{ .gpa = gpa, .io = io, .arena = .init(gpa) };
+    errdefer ip.deinit();
+    for (preset, 0..) |k, i| std.debug.assert(@backingInt(try ip.get(k)) == i);
+    return ip;
+}
+
+pub fn deinit(ip: *InternPool) void {
+    ip.items.deinit(ip.gpa);
+    ip.map.deinit(ip.gpa);
+    ip.arena.deinit();
+    ip.* = undefined;
+}
+
+/// 驻留：相同的 Key 返回相同的 Index
+pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
+    ip.mutex.lockUncancelable(ip.io);
+    defer ip.mutex.unlock(ip.io);
+    if (ip.map.get(k)) |i| return i;
+    const owned = try ip.own(k);
+    const index: Index = @fromBackingInt(@as(u32, @intCast(ip.items.items.len)));
+    try ip.items.append(ip.gpa, owned);
+    errdefer _ = ip.items.pop();
+    try ip.map.put(ip.gpa, owned, index);
+    return index;
+}
+
+/// Key 中的切片复制到 arena
+fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
+    const a = ip.arena.allocator();
+    return switch (k) {
+        .error_set_type => |names| blk: {
+            const out = try a.alloc([]const u8, names.len);
+            for (names, out) |n, *o| o.* = try a.dupe(u8, n);
+            break :blk .{ .error_set_type = out };
+        },
+        .fn_type => |f| .{ .fn_type = .{ .params = try a.dupe(Index, f.params), .ret = f.ret, .varargs = f.varargs } },
+        .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
+        .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
+        .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
+        else => k,
+    };
+}
+
+/// 返回的 Key 中的切片在 InternPool 生命周期内有效
+pub fn key(ip: *InternPool, index: Index) Key {
+    ip.mutex.lockUncancelable(ip.io);
+    defer ip.mutex.unlock(ip.io);
+    return ip.items.items[@backingInt(index)];
+}
+
+// ── 常用构造 ─────────────────────────────────────────────────────────
+
+pub fn intType(ip: *InternPool, signedness: std.builtin.Signedness, bits: u16) Allocator.Error!Index {
+    return ip.get(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
+}
+
+pub fn optionalOf(ip: *InternPool, child: Index) Allocator.Error!Index {
+    if (child == .unknown) return .unknown;
+    return ip.get(.{ .optional_type = child });
+}
+
+pub fn ptrTo(ip: *InternPool, child: Index, size: PtrSize, is_const: bool) Allocator.Error!Index {
+    if (child == .unknown) return .unknown;
+    return ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const } });
+}
+
+/// 错误集：名字排序去重
+pub fn errorSet(ip: *InternPool, gpa: Allocator, names: []const []const u8) Allocator.Error!Index {
+    const sorted = try gpa.dupe([]const u8, names);
+    defer gpa.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var n: usize = 0;
+    for (sorted) |s| {
+        if (n > 0 and std.mem.eql(u8, sorted[n - 1], s)) continue;
+        sorted[n] = s;
+        n += 1;
+    }
+    return ip.get(.{ .error_set_type = sorted[0..n] });
+}
+
+/// 字符串字面量的类型 `*const [len:0]u8`
+pub fn stringLiteralType(ip: *InternPool, len: u64) Allocator.Error!Index {
+    const zero = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
+    const array = try ip.get(.{ .array_type = .{ .len = len, .child = .u8_type, .sentinel = zero } });
+    return ip.ptrTo(array, .one, true);
+}
+
+pub fn isInt(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .int_type => true,
+        .simple_type => |s| switch (s) {
+            .usize, .isize, .comptime_int, .c_char, .c_short, .c_ushort, .c_int, .c_uint, .c_long, .c_ulong, .c_longlong, .c_ulonglong => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+pub fn isFloat(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .simple_type => |s| switch (s) {
+            .f16, .f32, .f64, .f80, .f128, .comptime_float, .c_longdouble => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+// ── 显示 ─────────────────────────────────────────────────────────────
+
+/// 以 Zig 语法输出类型或值。`container_name` 给出容器类型的名字（如 `mem.Allocator`）
+pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+    switch (ip.key(index)) {
+        .unknown => try w.writeAll("unknown"),
+        .simple_type => |s| try w.writeAll(@tagName(s)),
+        .int_type => |i| try w.print("{c}{d}", .{ @as(u8, if (i.signedness == .signed) 'i' else 'u'), i.bits }),
+        .ptr_type => |p| {
+            switch (p.size) {
+                .one => try w.writeAll("*"),
+                .many, .slice, .c => {
+                    try w.writeAll(switch (p.size) {
+                        .many => "[*",
+                        .slice => "[",
+                        else => "[*c",
+                    });
+                    if (p.sentinel) |s| {
+                        try w.writeAll(":");
+                        try ip.print(s, w, container_name);
+                    }
+                    try w.writeAll("]");
+                },
+            }
+            if (p.is_const) try w.writeAll("const ");
+            try ip.print(p.child, w, container_name);
+        },
+        .array_type => |a| {
+            try w.print("[{d}", .{a.len});
+            if (a.sentinel) |s| {
+                try w.writeAll(":");
+                try ip.print(s, w, container_name);
+            }
+            try w.writeAll("]");
+            try ip.print(a.child, w, container_name);
+        },
+        .optional_type => |c| {
+            try w.writeAll("?");
+            try ip.print(c, w, container_name);
+        },
+        .error_union_type => |e| {
+            try ip.print(e.err, w, container_name);
+            try w.writeAll("!");
+            try ip.print(e.payload, w, container_name);
+        },
+        .error_set_type => |names| {
+            try w.writeAll("error{");
+            for (names, 0..) |n, i| {
+                if (i != 0) try w.writeAll(",");
+                try w.writeAll(n);
+            }
+            try w.writeAll("}");
+        },
+        .fn_type => |f| {
+            try w.writeAll("fn (");
+            for (f.params, 0..) |p, i| {
+                if (i != 0) try w.writeAll(", ");
+                try ip.print(p, w, container_name);
+            }
+            if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
+            try w.writeAll(") ");
+            try ip.print(f.ret, w, container_name);
+        },
+        .container_type => |c| try container_name.write(c, w),
+        .simple_value => |v| try w.writeAll(@tagName(v)),
+        .int_value => |v| try w.print("{d}", .{v.value}),
+        .enum_literal => |n| try w.print(".{s}", .{n}),
+        .enum_tag => |t| try w.print(".{s}", .{t.name}),
+        .error_value => |n| try w.print("error.{s}", .{n}),
+        .fn_value => |f| try ip.print(f.ty, w, container_name),
+    }
+}
+
+const testing = std.testing;
+
+test "interning is idempotent and presets are stable" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
+    const a = try ip.ptrTo(.u8_type, .slice, true);
+    const b = try ip.ptrTo(.u8_type, .slice, true);
+    try testing.expectEqual(a, b);
+    try testing.expect(a != try ip.ptrTo(.u8_type, .slice, false));
+    try testing.expectEqual(try ip.errorSet(testing.allocator, &.{ "B", "A", "B" }), try ip.errorSet(testing.allocator, &.{ "A", "B" }));
+
+    const Names = struct {
+        fn write(_: @This(), _: Container, w: *Io.Writer) Io.Writer.Error!void {
+            try w.writeAll("S");
+        }
+    };
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try ip.print(try ip.stringLiteralType(5), &w, Names{});
+    try testing.expectEqualStrings("*const [5:0]u8", w.buffered());
+    w.end = 0;
+    const eu = try ip.get(.{ .error_union_type = .{ .err = .anyerror_type, .payload = try ip.optionalOf(a) } });
+    try ip.print(eu, &w, Names{});
+    try testing.expectEqualStrings("anyerror!?[]const u8", w.buffered());
+}

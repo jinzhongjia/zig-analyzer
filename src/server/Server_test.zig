@@ -21,7 +21,7 @@ const Session = struct {
     fn run(s: *Session, input: []const u8) !void {
         s.out = .init(testing.allocator);
         s.writer = .{ .io = testing.io, .inner = &s.out.writer };
-        s.server.init(testing.io, testing.allocator, &s.writer);
+        try s.server.init(testing.io, testing.allocator, &s.writer);
         s.arena = .init(testing.allocator);
         var reader: std.Io.Reader = .fixed(input);
         s.exit_code = try s.server.run(&reader);

@@ -113,7 +113,7 @@ pub const Harness = struct {
         h.arena = .init(testing.allocator);
         h.input.reader.buffer = &h.input.read_buf;
         h.writer = .{ .io = testing.io, .inner = &h.output.writer };
-        h.server.init(testing.io, testing.allocator, &h.writer);
+        try h.server.init(testing.io, testing.allocator, &h.writer);
         h.thread = try std.Thread.spawn(.{}, runServer, .{h});
     }
 

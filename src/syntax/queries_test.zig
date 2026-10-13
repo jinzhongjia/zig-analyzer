@@ -15,7 +15,7 @@ const ItemCount = struct {
     }
 };
 
-const Db = engine.Engine(void, &.{ FileText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, ItemCount });
+const Db = engine.Engine(void, &.{ FileText, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, ItemCount });
 
 fn setText(db: *Db, file: Vfs.FileId, text: []const u8) !void {
     db.beginWrite();

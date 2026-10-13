@@ -11,27 +11,33 @@ const resolve = @import("resolve.zig");
 const definition = @import("../ide/definition.zig");
 const completion = @import("../ide/completion.zig");
 const native = @import("../util/test_path.zig").native;
+const InternPool = @import("../sema/InternPool.zig");
 
 /// 内存中的项目：文件内容直接设置为 input，模块图手工构造
-const World = struct {
+pub const World = struct {
     vfs: Vfs,
+    ip: InternPool,
+    env: database.Env,
     db: Db,
     arena: std.heap.ArenaAllocator,
 
-    fn init(w: *World) void {
+    pub fn init(w: *World) !void {
         w.vfs = .init(testing.io, testing.allocator);
-        w.db = .init(testing.io, testing.allocator, &w.vfs);
+        w.ip = try .init(testing.allocator, testing.io);
+        w.env = .{ .vfs = &w.vfs, .ip = &w.ip };
+        w.db = .init(testing.io, testing.allocator, &w.env);
         w.arena = .init(testing.allocator);
     }
 
-    fn deinit(w: *World) void {
+    pub fn deinit(w: *World) void {
         w.db.deinit();
+        w.ip.deinit();
         w.vfs.deinit();
         w.arena.deinit();
     }
 
     /// 添加文件；返回去掉 `<|>` 后的光标位置（没有标记时为 0）
-    fn add(w: *World, comptime path: []const u8, text: []const u8) !struct { file: FileId, cursor: u32 } {
+    pub fn add(w: *World, comptime path: []const u8, text: []const u8) !struct { file: FileId, cursor: u32 } {
         const file = try w.vfs.intern(native(path));
         const cursor = std.mem.indexOf(u8, text, "<|>");
         const clean = if (cursor) |c| try std.mem.concat(testing.allocator, u8, &.{ text[0..c], text[c + 3 ..] }) else try testing.allocator.dupe(u8, text);
@@ -41,7 +47,7 @@ const World = struct {
         return .{ .file = file, .cursor = @intCast(cursor orelse 0) };
     }
 
-    fn setGraph(w: *World, std_root: ?FileId, modules: []const ModuleGraph.Module, files: []const ModuleGraph.FileEntry) !void {
+    pub fn setGraph(w: *World, std_root: ?FileId, modules: []const ModuleGraph.Module, files: []const ModuleGraph.FileEntry) !void {
         const g = try testing.allocator.create(ModuleGraph);
         const sorted = try w.arena.allocator().dupe(ModuleGraph.FileEntry, files);
         std.mem.sort(ModuleGraph.FileEntry, sorted, {}, struct {
@@ -61,7 +67,7 @@ const World = struct {
         defer ctx.end();
         var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
         const t = try definition.definition(&r, file, offset) orelse return "null";
-        const text = (try ctx.get(FileText, t.file)) orelse "";
+        const text = (try ctx.get(database.syntax.SourceText, t.file)).text;
         return std.fmt.allocPrint(w.arena.allocator(), "{s}:{s}", .{ std.fs.path.basename(w.vfs.path(t.file)), text[t.start..t.end] });
     }
 
@@ -84,7 +90,7 @@ const World = struct {
 
 test "locals, params and container declarations" {
     var w: World = undefined;
-    w.init();
+    try w.init();
     defer w.deinit();
     const src =
         \\const limit = 10;
@@ -120,7 +126,7 @@ test "locals, params and container declarations" {
 
 test "imports: relative files, modules, std and root" {
     var w: World = undefined;
-    w.init();
+    try w.init();
     defer w.deinit();
     const std_root = try w.add("/zig/std/std.zig", "pub const mem = @import(\"mem.zig\");\nconst hidden = 1;\n");
     const mem = try w.add("/zig/std/mem.zig", "pub const Allocator = @import(\"mem/Allocator.zig\");\npub fn eql() bool {}\nfn private() void {}\n");
@@ -172,7 +178,7 @@ test "imports: relative files, modules, std and root" {
 
 test "@This, enums, nested containers and generic functions" {
     var w: World = undefined;
-    w.init();
+    try w.init();
     defer w.deinit();
     const src =
         \\const Color = enum { red, green, pub fn dark() void {} };
@@ -200,16 +206,24 @@ test "@This, enums, nested containers and generic functions" {
     try testing.expectEqualStrings("Color List Self T first len self", try w.complete(f.file, f.cursor));
 }
 
-test "files not yet loaded are reported as missing" {
+test "files that are not loaded are read from disk" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "pub const thing = 1;\n" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+
     var w: World = undefined;
-    w.init();
+    try w.init();
     defer w.deinit();
-    const src = "const other = @import(\"other.zig\");\nconst x = other.thing<|>;\n";
-    const f = try w.add("/p/main.zig", src);
-    var ctx = w.db.beginRead(w.arena.allocator());
-    defer ctx.end();
-    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    try testing.expect(try definition.definition(&r, f.file, f.cursor - 1) == null);
-    try testing.expectEqual(1, r.missing.items.len);
-    try testing.expectEqualStrings("other.zig", std.fs.path.basename(w.vfs.path(r.missing.items[0])));
+    const main_path = try std.fs.path.join(testing.allocator, &.{ dir, "main.zig" });
+    defer testing.allocator.free(main_path);
+    const file = try w.vfs.intern(main_path);
+    const text = "const other = @import(\"other.zig\");\nconst x = other.thing;\n";
+    {
+        w.db.beginWrite();
+        defer w.db.endWrite();
+        try w.db.set(FileText, file, try testing.allocator.dupe(u8, text), .low);
+    }
+    try testing.expectEqualStrings("other.zig:thing", try w.goto(file, @intCast(std.mem.indexOf(u8, text, "thing").?)));
 }

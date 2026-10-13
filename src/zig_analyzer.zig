@@ -26,6 +26,9 @@ pub const names = struct {
     pub const ModuleGraph = @import("names/ModuleGraph.zig");
     pub const resolve = @import("names/resolve.zig");
 };
+pub const sema = struct {
+    pub const InternPool = @import("sema/InternPool.zig");
+};
 pub const project = struct {
     pub const ZigEnv = @import("project/ZigEnv.zig");
     pub const bsp = @import("project/bsp.zig");
@@ -67,6 +70,7 @@ test {
     std.testing.refAllDecls(syntax);
     std.testing.refAllDecls(hir);
     std.testing.refAllDecls(names);
+    std.testing.refAllDecls(sema);
     std.testing.refAllDecls(diagnostics);
     std.testing.refAllDecls(ide);
     std.testing.refAllDecls(project);

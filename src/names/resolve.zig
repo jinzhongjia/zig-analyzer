@@ -1,14 +1,11 @@
 //! 名字解析（设计 §7.3）：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、
 //! `@This()` 与别名链求出命名空间后查找成员。不做类型推导：经由函数调用、变量类型得到的
 //! 命名空间（如 `std.ArrayList(u8)`、`var x: S` 的 `x.`）留给 sema（M4 / M5）。
-//!
-//! 解析中遇到内容尚未加载的文件时记入 `missing`，调用方加载后重新解析即可得到完整结果。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const database = @import("../database.zig");
 const Db = database.Db;
-const FileText = database.inputs.FileText;
 const syntax = database.syntax;
 const hir = database.hir;
 const ModuleGraph = @import("ModuleGraph.zig");
@@ -43,20 +40,13 @@ const max_depth = 64;
 pub const Resolver = struct {
     ctx: *Db.Ctx,
     arena: Allocator,
-    /// 解析中遇到的、内容尚未加载的文件
-    missing: std.ArrayList(FileId) = .empty,
 
     fn vfs(r: *Resolver) *Vfs {
-        return r.ctx.db.env;
+        return r.ctx.db.env.vfs;
     }
 
     pub fn itemTree(r: *Resolver, file: FileId) Error!*const ItemTree {
-        if (try r.ctx.get(FileText, file) == null) try r.noteMissing(file);
         return r.ctx.get(syntax.FileItemTree, file);
-    }
-
-    fn noteMissing(r: *Resolver, file: FileId) Error!void {
-        if (std.mem.indexOfScalar(FileId, r.missing.items, file) == null) try r.missing.append(r.arena, file);
     }
 
     pub fn ownerKey(r: *Resolver, file: FileId, item: u32) Error!hir.OwnerKey {
@@ -138,10 +128,7 @@ pub const Resolver = struct {
     fn namespaceOfDepth(r: *Resolver, def: Def, depth: u32) Error!?Namespace {
         if (depth > max_depth) return null;
         switch (def) {
-            .file => |f| {
-                _ = try r.itemTree(f);
-                return .{ .file = f, .container = 0 };
-            },
+            .file => |f| return .{ .file = f, .container = 0 },
             .item => |it| {
                 const tree = try r.itemTree(it.file);
                 switch (tree.items[it.item].kind) {

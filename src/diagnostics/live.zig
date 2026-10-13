@@ -149,7 +149,7 @@ pub const AstCheck = struct {
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const text = try ctx.get(inputs.FileText, file) orelse "";
-        const vfs: *Vfs = ctx.db.env;
+        const vfs: *Vfs = ctx.db.env.vfs;
         const mode: Mode = if (std.mem.endsWith(u8, vfs.path(file), ".zon")) .zon else .zig;
         return switch (try ctx.get(LiveBackend, {})) {
             .in_process => check(ctx.db.gpa, text, mode),

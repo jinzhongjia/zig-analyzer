@@ -27,6 +27,7 @@ const ZigEnv = za.project.ZigEnv;
 const Workspace = @import("Workspace.zig");
 const ModuleGraph = za.names.ModuleGraph;
 const Resolver = za.names.resolve.Resolver;
+const InternPool = za.sema.InternPool;
 pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
 
@@ -38,6 +39,8 @@ io: Io,
 gpa: Allocator,
 db: Db,
 vfs: Vfs,
+ip: InternPool,
+env: database.Env,
 out: *transport.Writer,
 state: State = .uninitialized,
 encoding: offsets.Encoding = .utf16,
@@ -75,9 +78,6 @@ progress: Progress = .{},
 
 /// 串行化模块图的更新，避免较旧的快照覆盖较新的
 graph_mutex: Io.Mutex = .init,
-disk_mutex: Io.Mutex = .init,
-/// 为名字解析从磁盘加载过的文件（不存在的也记录，避免反复尝试）
-disk_loaded: std.AutoHashMapUnmanaged(Vfs.FileId, void) = .empty,
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── 拉取配置（只在主循环中访问）──
@@ -115,10 +115,11 @@ const Pending = struct {
 
 pub const HandlerError = error{ Canceled, OutOfMemory, InvalidParams };
 
-/// 原地初始化：查询引擎持有指向 `server.vfs` 的指针，因此 Server 不能在初始化后移动。
-pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) void {
-    server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .out = out };
-    server.db = .init(io, gpa, &server.vfs);
+/// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
+pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) Allocator.Error!void {
+    server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .ip = try .init(gpa, io), .env = undefined, .out = out };
+    server.env = .{ .vfs = &server.vfs, .ip = &server.ip };
+    server.db = .init(io, gpa, &server.env);
 }
 
 pub fn deinit(server: *Server) void {
@@ -140,10 +141,10 @@ pub fn deinit(server: *Server) void {
     server.open_docs.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.progress.deinit(server.gpa);
-    server.disk_loaded.deinit(server.gpa);
     server.config.deinit(server.gpa);
     server.pending.deinit(server.gpa);
     server.db.deinit();
+    server.ip.deinit();
     server.vfs.deinit();
     server.* = undefined;
 }
@@ -217,7 +218,7 @@ const Mode = enum {
     read,
     /// 在独立任务中执行，不持有读事务（会长时间等待的请求，不能阻塞主循环）
     background,
-    /// 同 `read`，处理函数通过 Resolver 做名字解析；遇到尚未加载的文件时加载后重新计算
+    /// 同 `read`，处理函数通过 Resolver 做名字解析与类型查询
     semantic,
 };
 
@@ -341,10 +342,9 @@ fn ReadTask(comptime func: anytype) type {
     };
 }
 
-/// 名字解析可能经过尚未加载的文件（如单文件模式下的标准库）：加载后重新计算，最多 `max_rounds` 轮
+/// 同 ReadTask，处理函数拿到的是 Resolver
 fn SemanticTask(comptime func: anytype) type {
     const Params = LastParam(@TypeOf(func));
-    const max_rounds = 16;
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
             defer {
@@ -352,69 +352,16 @@ fn SemanticTask(comptime func: anytype) type {
                 server.destroyArena(arena);
             }
             const a = arena.allocator();
-            var round: usize = 0;
-            while (true) : (round += 1) {
-                var ctx = server.db.beginRead(a);
-                ctx.cancel = &pending.cancel;
-                var r: Resolver = .{ .ctx = &ctx, .arena = a };
-                const result = func(server, &r, a, params) catch |err| {
-                    ctx.end();
-                    return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
-                };
-                const missing = server.unloaded(a, r.missing.items) catch &.{};
-                if (missing.len == 0 or round == max_rounds) {
-                    // 结果可能引用 query 的值：在读事务结束前发送
-                    server.sendResponse(pending.id, result);
-                    ctx.end();
-                    return;
-                }
-                ctx.end();
-                server.loadFromDisk(missing) catch |err| return server.sendHandlerError(pending.id, err, false);
-            }
+            var ctx = server.db.beginRead(a);
+            ctx.cancel = &pending.cancel;
+            defer ctx.end();
+            var r: Resolver = .{ .ctx = &ctx, .arena = a };
+            const result = func(server, &r, a, params) catch |err| {
+                return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
+            };
+            server.sendResponse(pending.id, result);
         }
     };
-}
-
-/// `files` 中尚未尝试从磁盘加载的
-fn unloaded(server: *Server, arena: Allocator, files: []const Vfs.FileId) Allocator.Error![]const Vfs.FileId {
-    server.disk_mutex.lockUncancelable(server.io);
-    defer server.disk_mutex.unlock(server.io);
-    var out: std.ArrayList(Vfs.FileId) = .empty;
-    for (files) |f| if (!server.disk_loaded.contains(f)) try out.append(arena, f);
-    return out.items;
-}
-
-/// 从磁盘加载文件内容（已被打开或已有内容的文件保持不变）
-fn loadFromDisk(server: *Server, files: []const Vfs.FileId) (Allocator.Error || Io.Cancelable)!void {
-    const Loaded = struct { file: Vfs.FileId, text: ?[]u8 };
-    var batch: std.ArrayList(Loaded) = .empty;
-    defer batch.deinit(server.gpa);
-    defer for (batch.items) |l| if (l.text) |t| server.gpa.free(t);
-    for (files) |file| {
-        {
-            server.disk_mutex.lockUncancelable(server.io);
-            defer server.disk_mutex.unlock(server.io);
-            if ((try server.disk_loaded.getOrPut(server.gpa, file)).found_existing) continue;
-        }
-        const text = server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return error.Canceled,
-            error.FileTooBig => null,
-        };
-        try batch.append(server.gpa, .{ .file = file, .text = text });
-    }
-    const env = server.zigEnv();
-    server.db.beginWrite();
-    defer server.db.endWrite();
-    for (batch.items) |*l| {
-        if (server.db.peek(FileText, l.file) != null) continue;
-        const path = server.vfs.path(l.file);
-        const durability: database.Durability = if (env) |e| (if (Workspace.isUnder(path, e.lib_dir)) .high else if (Workspace.isUnder(path, e.global_cache_dir)) .medium else .low) else .low;
-        // 不存在的文件记为空内容，与「尚未加载」区分
-        const text = l.text orelse try server.gpa.dupe(u8, "");
-        l.text = null;
-        try server.db.set(FileText, l.file, text, durability);
-    }
 }
 
 /// 汇总各项目的构建图与编译集合，更新模块图 input
@@ -1192,7 +1139,7 @@ fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.Def
     const text = try r.ctx.get(FileText, file) orelse return null;
     const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
     const target = try ide.definition.definition(r, file, offset) orelse return null;
-    const target_text = try r.ctx.get(FileText, target.file) orelse "";
+    const target_text = (try r.ctx.get(syntax_q.SourceText, target.file)).text;
     const lines = try offsets.LineIndex.init(arena, target_text);
     return .{ .Definition = .{ .Location = .{
         .uri = try server.uriFor(arena, target.file),
