@@ -37,7 +37,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode) Error!Body {
                     const param = ast.cast(ast.Param, p).?;
                     const ty = try l.optExpr(param.typeExpr());
                     const name = param.name() orelse continue;
-                    const b = try l.bind(name, .param, .{ .ty = ty });
+                    const b = try l.bind(name, .param, .{ .ty = ty, .is_comptime = param.isComptime() });
                     try params.append(l.a, b);
                     _ = try l.pushScope(&.{b});
                 }
@@ -142,7 +142,7 @@ const Lowerer = struct {
         return id;
     }
 
-    fn bind(l: *Lowerer, name: SyntaxToken, kind: Body.Binding.Kind, extra: struct { ty: ?ExprId = null, init: ?ExprId = null, is_ptr: bool = false }) Error!BindingId {
+    fn bind(l: *Lowerer, name: SyntaxToken, kind: Body.Binding.Kind, extra: struct { ty: ?ExprId = null, init: ?ExprId = null, is_ptr: bool = false, is_comptime: bool = false }) Error!BindingId {
         const id: BindingId = @fromBackingInt(@as(u32, @intCast(l.bindings.items.len)));
         const r = name.range();
         try l.bindings.append(l.gpa, .{
@@ -152,6 +152,7 @@ const Lowerer = struct {
             .ty = extra.ty,
             .init = extra.init,
             .is_ptr = extra.is_ptr,
+            .is_comptime = extra.is_comptime,
         });
         return id;
     }
@@ -299,11 +300,11 @@ const Lowerer = struct {
                 var it = ast.childNodes(n);
                 const len = try l.exprOrMissing(it.next());
                 var child: ?ExprId = null;
+                var sentinel: ?ExprId = null;
                 while (it.next()) |c| {
-                    const id = try l.expr(c);
-                    if (c.kind() != .sentinel) child = id;
+                    if (c.kind() == .sentinel) sentinel = try l.exprOrMissing(firstChild(c)) else child = try l.expr(c);
                 }
-                break :blk .{ .array_type = .{ .len = len, .child = child orelse try l.add(.missing, .none) } };
+                break :blk .{ .array_type = .{ .len = len, .child = child orelse try l.add(.missing, .none), .sentinel = sentinel } };
             },
             .error_set_decl => blk: {
                 var names: std.ArrayList([]const u8) = .empty;
@@ -491,18 +492,18 @@ const Lowerer = struct {
         else
             .one;
         var child: ?ExprId = null;
+        var sentinel: ?ExprId = null;
         var it = ast.childNodes(n);
-        while (it.next()) |c| {
-            const e = try l.expr(c);
-            switch (c.kind()) {
-                .sentinel, .align_clause, .addrspace_clause => {},
-                else => child = e,
-            }
-        }
+        while (it.next()) |c| switch (c.kind()) {
+            .sentinel => sentinel = try l.exprOrMissing(firstChild(c)),
+            .align_clause, .addrspace_clause => _ = try l.expr(c),
+            else => child = try l.expr(c),
+        };
         return l.add(.{ .ptr_type = .{
             .size = size,
             .is_const = n.childToken(.keyword_const) != null,
             .child = child orelse try l.add(.missing, .none),
+            .sentinel = sentinel,
         } }, l.nodeRange(n));
     }
 };

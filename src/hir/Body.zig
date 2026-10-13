@@ -84,8 +84,8 @@ pub const Expr = union(enum) {
     @"unreachable",
     optional_type: ExprId,
     error_union_type: struct { err: ExprId, payload: ExprId },
-    ptr_type: struct { size: PtrSize, is_const: bool, child: ExprId },
-    array_type: struct { len: ExprId, child: ExprId },
+    ptr_type: struct { size: PtrSize, is_const: bool, child: ExprId, sentinel: ?ExprId = null },
+    array_type: struct { len: ExprId, child: ExprId, sentinel: ?ExprId = null },
     error_set: []const []const u8,
     /// 其他结构（asm、nosuspend、语法错误节点等）：只保留子表达式，使其中的名字仍可解析
     other: []const ExprId,
@@ -156,6 +156,8 @@ pub const Binding = struct {
     init: ?ExprId = null,
     /// `|*x|`
     is_ptr: bool = false,
+    /// `comptime` 参数
+    is_comptime: bool = false,
 
     pub const Kind = enum { param, local_const, local_var, capture };
 };
