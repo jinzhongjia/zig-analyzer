@@ -22,6 +22,10 @@ pub const hir = struct {
     pub const Body = @import("hir/Body.zig");
     pub const lower = @import("hir/lower.zig");
 };
+pub const names = struct {
+    pub const ModuleGraph = @import("names/ModuleGraph.zig");
+    pub const resolve = @import("names/resolve.zig");
+};
 pub const project = struct {
     pub const ZigEnv = @import("project/ZigEnv.zig");
     pub const bsp = @import("project/bsp.zig");
@@ -40,6 +44,8 @@ pub const ide = struct {
     pub const selection_range = @import("ide/selection_range.zig");
     pub const semantic_tokens = @import("ide/semantic_tokens.zig");
     pub const format = @import("ide/format.zig");
+    pub const definition = @import("ide/definition.zig");
+    pub const completion = @import("ide/completion.zig");
 };
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");
@@ -60,6 +66,7 @@ test {
     std.testing.refAllDecls(util);
     std.testing.refAllDecls(syntax);
     std.testing.refAllDecls(hir);
+    std.testing.refAllDecls(names);
     std.testing.refAllDecls(diagnostics);
     std.testing.refAllDecls(ide);
     std.testing.refAllDecls(project);

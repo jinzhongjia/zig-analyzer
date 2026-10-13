@@ -7,7 +7,8 @@ const ProjectModel = @import("../base/ProjectModel.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 pub const Result = struct {
-    files: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
+    /// 文件 → 第一次到达它时所在的模块
+    files: std.AutoArrayHashMapUnmanaged(FileId, Membership) = .empty,
     /// 可达但尚未加载内容的文件；调用方加载后应重新计算
     missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 
@@ -22,7 +23,14 @@ pub const Result = struct {
 };
 
 /// 标准库在遍历中使用的模块编号
-const std_module = std.math.maxInt(u32);
+pub const std_module = std.math.maxInt(u32);
+
+pub const Membership = struct {
+    /// `ProjectModel.modules` 下标；标准库为 `std_module`
+    module: u32,
+    /// 所在 compile step 的根模块（`@import("root")` 的目标）
+    root_module: u32,
+};
 
 /// `resolver` 需提供：
 /// - `intern(path: []const u8) !FileId`：绝对路径 → FileId
@@ -51,7 +59,8 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
 
         while (stack.pop()) |node| {
             if ((try visited.getOrPut(gpa, node)).found_existing) continue;
-            try result.files.put(gpa, node.file, {});
+            const gop = try result.files.getOrPut(gpa, node.file);
+            if (!gop.found_existing) gop.value_ptr.* = .{ .module = node.module, .root_module = root_module };
             const imports = try resolver.imports(node.file) orelse {
                 try result.missing.put(gpa, node.file, {});
                 continue;
@@ -150,4 +159,15 @@ test compute {
     try testing.expectEqual(6, names.items.len);
     // 未加载的文件：std.zig 与 deep.zig
     try testing.expectEqual(2, r.missing.count());
+    // 模块归属：相对 import 留在原模块，按名字 import 进入目标模块
+    const member = struct {
+        fn of(res: *const Result, f: *FakeFs, path: []const u8) Membership {
+            for (f.paths.items, 0..) |p, i| if (std.mem.eql(u8, p, path)) return res.files.get(@fromBackingInt(@as(u32, @intCast(i)))).?;
+            unreachable;
+        }
+    }.of;
+    try testing.expectEqual(0, member(&r, &fs, native("/p/src/util.zig")).module);
+    try testing.expectEqual(1, member(&r, &fs, native("/p/lib/nested/deep.zig")).module);
+    try testing.expectEqual(std_module, member(&r, &fs, native("/zig/std/std.zig")).module);
+    try testing.expectEqual(0, member(&r, &fs, native("/p/lib/lib.zig")).root_module);
 }

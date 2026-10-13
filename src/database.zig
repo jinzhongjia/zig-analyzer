@@ -6,6 +6,7 @@ pub const inputs = @import("base/inputs.zig");
 pub const syntax = @import("syntax/queries.zig");
 pub const live = @import("diagnostics/live.zig");
 pub const hir = @import("hir/queries.zig");
+pub const ModuleGraph = @import("names/ModuleGraph.zig");
 
 const Vfs = @import("base/Vfs.zig");
 
@@ -16,5 +17,6 @@ pub const Db = engine.Engine(*Vfs, &.{
     syntax.FileItemTree,
     syntax.FileAstIdMap,
     live.AstCheck,
+    ModuleGraph.Input,
     hir.ItemBody,
 });
