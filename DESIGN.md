@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0、M1 已完成（2026-10-12），下一步 M2，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），下一步 M3，详见 §19。
 
 ---
 
@@ -797,8 +797,8 @@ pub fn make() std.ArrayList(u8) { ... }
 |---|---|---|---|
 | **M0 基础** | ✅ 已完成 | `db/` 引擎、Vfs、`lsp/` 代码生成、Server 骨架、取消机制 | 引擎单测：增量、cutoff、环、取消；能与编辑器握手 |
 | **M1 语法** | ✅ 已完成 | CST 解析器、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
-| **M2 构建与诊断** | ⏳ 下一步 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
-| **M3 名字** | 未开始 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
+| **M2 构建与诊断** | ✅ 已完成 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
+| **M3 名字** | ⏳ 下一步 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
 | **M4 类型** | 未开始 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
 | **M5 comptime** | 未开始 | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
 | **M6 引用** | 未开始 | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
@@ -857,6 +857,33 @@ pub fn make() std.ArrayList(u8) { ... }
 - 已知限制：只统一 ASCII 字母；NTFS 的 Unicode 大写映射、APFS 对 Unicode 规范化形式（组合 / 分解）不敏感的行为未处理，需要 Unicode 数据表。大小写模式按平台默认，尚未开放配置（macOS 可格式化为大小写敏感卷，Linux ext4 可对目录开启不敏感）。
 
 ---
+
+### 19.4 M2 完成情况（2026-10-12）
+
+| 模块 | 文件 | 内容 |
+|---|---|---|
+| zig 环境 | `src/project/ZigEnv.zig` | 运行 `zig env` 获取 zig 路径、标准库、缓存目录与版本；与编译时版本比较 |
+| 构建系统协议 | `src/project/bsp.zig` | `zig build --listen=-` 客户端：消息编解码、ErrorBundle 解码、构建请求；单文件模式 `zig build-obj -fno-emit-bin --listen=-` |
+| 项目模型 | `src/base/ProjectModel.zig`、`src/project/configuration.zig` | 从 `std.Build.Configuration` 提取 step、依赖、模块、根文件（LazyPath 解析为绝对路径）与 import 表 |
+| 编译集合 | `src/diagnostics/compile_set.zig` | 每个 compile step 从根模块与 `std.zig` 出发，沿 ZIR 的 import 列表遍历；缺失文件从磁盘加载后重算（std 为 high durability） |
+| 编译器诊断 | `src/diagnostics/compiler.zig` | ErrorBundle → 按文件的诊断（以构建完成时的磁盘文本为基准，标记 AstGen 错误）；按 §11.5 与 live 诊断合并，未保存修改时按文本差异平移、修改区域内隐藏 |
+| live 诊断 | `src/diagnostics/live.zig` | 同一查询产出诊断与 ZIR import 列表；`LiveBackend` input 决定进程内 AstGen 或 `zig ast-check` 子进程（版本不一致时） |
+| 项目管理 | `src/server/Workspace.zig`、Server | 每个带 build.zig 的工作区一个后台任务；保存时构建（构建中再保存则丢弃本轮并重建）；保存 build.zig 时重启；单文件模式；`zig-analyzer/waitIdle` |
+| 生成文件 | `src/project/bsp.zig`、`src/project/configuration.zig`、`ProjectModel` | 模块根为生成文件（`addOptions`、`addWriteFiles`、`addTranslateC`、Run 输出等）时，从 `bsp_step_completed` 的生成文件列表得到真实路径，立即更新编译集合；构建请求额外包含所有生成模块根的产出 step，诊断 step 不依赖的模块（如只在 test step 中使用的）也能得知路径；这些额外 step 的错误不作为诊断发布 |
+| 配置（最小版本） | `src/server/Config.zig` | 来自 `initializationOptions`、`workspace/didChangeConfiguration` 推送的 settings，以及向客户端拉取（`workspace/configuration`，节名 `zig-analyzer`：启动项目前拉取一次；客户端支持时动态注册配置变化通知，收到不带内容的通知后重新拉取）：`zig.path`、`build.args`（传给 `zig build` 的 `-D` 等参数）、`diagnostics.step`（不存在时提示并回落到默认规则）；构建相关配置变化时重启各项目，旧实例发布过的诊断由新实例在首次构建后清除 |
+| 进度通知 | `src/server/progress.zig` | 客户端声明 `window.workDoneProgress` 时，项目加载（读取构建图、分析编译集合）、构建（`zig build <step>`，按 step 完成数给百分比与当前 step 名，结束时给错误数）与单文件编译通过 `$/progress` 报告；create 请求不阻塞构建，响应到达后补发 begin，被拒绝则不再发送 |
+
+- 实测验证的编译器行为：编译器对从模块根沿 `@import` 可达的全部文件做 AstGen，包括只在未被调用的函数中导入的文件；根结构有致命 AstGen 错误（或解析错误）时不追踪其 import；标准库总会参与编译。编译集合按此实现，import 列表直接取自 ZIR。
+- 端到端测试（真实运行 `zig build --listen=-`）：打开文件后 Sema / AstGen 错误与编译器一致，未导入的文件无诊断；未保存修改时 Sema 错误随编辑平移；保存修复后的版本重建后诊断更新（编译器继续分析到新的错误）；build.zig 本身的错误；错误前有多字节字符时 UTF-16 列号正确；单文件模式；生成的模块根文件（含 check 不依赖的）都能得知路径，且只有 check 用到的进入编译集合；进度的 begin / report / end 成对出现，客户端拒绝 token 或不支持时不发送。测试通过内存管道与独立线程中的 Server 交互（`src/server/test_harness.zig`），可等待响应并当场回复服务器请求。配置传入 `-D` 参数后被条件屏蔽的错误出现，运行中切换诊断 step 后项目重启、旧诊断清除；启动时与收到不带内容的变化通知时拉取配置。子进程后端与进程内后端在样例上结果一致。
+- 实测：示例项目从启动到首次构建与编译集合完成约 1 秒（加载并 AstGen 560 个文件，含标准库）。
+- 测试：`zig build test` 共 116 个；Debug 下约 30 秒，主要为集成测试启动 `zig build`。
+- 与设计的差异：
+  - 不使用 watch 模式：0.17 的 maker 在 watch 期间收到新的构建请求会 panic，因此改为保存时发送一次 `bsp_build_steps`；build.zig 变化时重启 maker。
+  - `ProjectModel` 暂由 Workspace 持有，尚未作为查询引擎 input；M3 的名字解析需要时再接入。
+  - 配置只实现了最小版本（见上表「配置」）：只来自客户端，没有项目 / 全局配置文件、多来源合并与 `config.zon` 代码生成，也没有作为查询引擎 input；`zig.path` 运行中修改需重启服务器；拉取时只取全局配置节，不按工作区（`scopeUri`）区分。其余配置项随 M4 起的功能一起加入。
+  - 单文件模式只发布被编译文件自身的诊断。
+  - 未保存修改时，同一文件内附注（note）的位置不随编辑平移。
+- 已知问题：同一文件可能被重复发布一次相同的诊断（构建完成与编译集合更新各触发一次），不影响结果。
 
 ## 20. 风险与对策
 
