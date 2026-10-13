@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3 已完成（2026-10-13），下一步 M4，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4 已完成（2026-10-13），下一步 M5，详见 §19。
 
 ---
 
@@ -799,8 +799,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | **M1 语法** | ✅ 已完成 | CST 解析器、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
 | **M2 构建与诊断** | ✅ 已完成 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
 | **M3 名字** | ✅ 已完成 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
-| **M4 类型** | ⏳ 下一步 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
-| **M5 comptime** | 未开始 | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
+| **M4 类型** | ✅ 已完成 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
+| **M5 comptime** | ⏳ 下一步 | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
 | **M6 引用** | 未开始 | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
 | **M7 性能** | 未开始 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
 | **v1.0** | 未开始 | 稳定性、文档、发布流程 | — |
@@ -918,7 +918,30 @@ pub fn make() std.ArrayList(u8) { ... }
 | 行索引 | 每个请求现场计算 `LineIndex`，未做成 `line_index(file)` query（§12.2） | 大文件上高频请求（逐字输入时的补全、semantic tokens） | 做成 query 缓存 | M1 |
 | live 诊断防抖 | 每次编辑都重新计算 live 诊断，没有防抖（§11.2） | 大文件上快速输入 | 发布前等待 ~50ms 内无新编辑 | M1 |
 | live 诊断的 AstGen 不可取消 | 标准库 AstGen 计算中不检查取消，写事务需要等它结束 | 大文件上的编辑延迟 | 防抖，或把 AstGen 放到单独的计算队列 | M1 |
+| InternPool 的锁 | 读写共用一把互斥锁，`key()` 读取也要加锁 | 类型推导并发请求多、InternPool 很大时的锁竞争 | 分片，或读路径改为无锁（只追加的分段数组） | M4 |
+| 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
 | Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
+
+### 19.7 M4 完成情况（2026-10-13）
+
+| 模块 | 文件 | 内容 |
+|---|---|---|
+| InternPool | `src/sema/InternPool.zig` | 类型与 comptime 值的唯一表示：原生类型、整数、指针（单项 / 多项 / 切片 / C）、数组、optional、error union、错误集、函数类型、容器（身份 = 文件 + 容器 AstId）；整数、枚举成员、enum literal、错误值、函数值；按 Zig 语法输出 |
+| 类型推导 | `src/sema/infer.zig` | 双向推导：期望类型从参数、返回值、类型标注、字段初始化、`@as`、比较另一侧下推；`comptime_int`、enum literal、decl literal（`.empty`、`.init(...)`）、`null` 按期望类型转换；`if` / `switch` / `orelse` / `catch` / 带标签的块做 peer type（整数提升、`T` 与 `?T`、`null`、指针 const 合并）；捕获（optional、error union、for 元素与索引、tagged union 分支）；字段、方法（自动解引用单指针）、切片与数组的 `len`；约 60 个内置函数的结果类型；类型表达式求值为 `type` 类型的值 |
+| query | `src/sema/queries.zig` | `DeclType`（函数取签名推导，const 附带 comptime 值，枚举成员为枚举值）；`Infer(成员, 签名/完整)`：签名模式不读函数体与初始化表达式；两者都有环的回退值 |
+| 文件内容 | `src/syntax/queries.zig` | 新增 `SourceText`：有 `FileText` 时用它，否则从磁盘读取；名字解析与类型推导因此可以在 query 内跨文件访问任意文件，M3 的「请求层加载缺失文件后重试」随之删除 |
+| 功能 | `src/ide/hover.zig`、`signature_help.zig`、`inlay_hints.zig`、`context.zig`，补全与 goto definition | hover（函数显示原型源码，其他显示 `const name: T = v`，附文档）；按类型的成员补全（实例的字段与方法、经由指针、切片与数组的 `len`，字段带类型）；跳转到字段、方法、decl literal；signature help（方法调用跳过 self）；inlay hints（无标注的局部变量类型、调用处参数名，实参与参数同名时省略） |
+
+- 测试：`zig build test` 共 146 个。sema 测试覆盖字面量与标注、字段 / 方法 / 指针 / 切片、optional 与 error union 的各种用法、循环与捕获、带标签的块、枚举与 tagged union、decl literal、跨文件经由标准库；IDE 测试覆盖 hover、补全、跳转、signature help、inlay hints；端到端测试在真实标准库上验证 `std.mem.Allocator` 的 hover、成员补全与 inlay hint。
+- 标准库上的推导（`zig build sema-corpus`，563 个文件、9 万个成员、100 万个表达式，ReleaseSafe 0.8 秒，无崩溃）：声明类型已知 95.7%，局部变量 74.2%，表达式 78.7%。未知部分主要来自泛型与依赖 comptime 参数的返回类型（M5）。
+- 准确率抽查：从推出类型的局部变量中按固定间隔抽取 15 个，与源码逐个核对，全部正确；其中一个是带对齐的切片，显示时省略了对齐。
+- 与设计的差异与未实现：
+  - 推导的错误集（`!T`）暂以 `anyerror` 表示；由函数体推导错误集未实现。
+  - 指针类型不记录对齐与 `volatile` / `allowzero`；没有向量、元组与匿名结构体类型（`.{ a, b }` 为 unknown）；浮点值与算术的 comptime 折叠未实现。
+  - 期望类型驱动的 `.` 补全（`const c: Color = .|`）未实现：`.` 后没有标识符时语法树里没有对应的表达式节点。
+  - 容器类型只显示声明它的成员名（`Allocator`），不显示完整路径。
+  - `SourceText` 从磁盘读到的内容不会随磁盘变化而失效（编辑器打开的文件与项目编译集合中的文件不受影响，它们由 `FileText` 管理）。
+  - 泛型实例与 comptime 调用求值（`std.ArrayList(u8)`、`fn max(comptime T: type, ...) T` 的返回类型）属于 M5。
 
 ## 20. 风险与对策
 
