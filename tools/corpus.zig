@@ -7,6 +7,7 @@
 //! 2. 无误报：`std.zig.Ast` 无错误的文件，CST 也必须无错误
 //! 3. 结构一致：容器顶层成员的（种类, 名字）序列与 `std.zig.Ast` 一致
 //! 4. 健壮性：在多个位置截断文件后解析不崩溃且仍然无损
+//! 5. HIR：每个成员都能降级，表达式位置落在成员范围内，且没有遗漏任何名字引用
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -33,6 +34,9 @@ const Stats = struct {
     items: usize = 0,
     item_failures: usize = 0,
     item_tree_ns: u64 = 0,
+    hir_exprs: usize = 0,
+    hir_failures: usize = 0,
+    hir_ns: u64 = 0,
     parse_ns: u64 = 0,
     reported: usize = 0,
 };
@@ -80,22 +84,25 @@ pub fn main(init: std.process.Init) !u8 {
         \\truncated parses: {d}, no crashes
         \\CST parse time: {d:.2}s ({d:.1} MB/s)
         \\ItemTree: {d} members, {d} mapping failures, build time {d:.2}s
+        \\HIR: {d} exprs, {d} failures, lowering time {d:.2}s
         \\incremental reparse: {d} random edits, {d} block reparses, {d} mismatches with full parse; time incremental {d:.2}s / full {d:.2}s
         \\  block-reparse edits only: incremental {d:.3}s / full parse of same text {d:.3}s ({d:.1}x)
         \\
     , .{
-        stats.files,                                         mb,
-        stats.std_errors,                                    stats.lossless_failures,
-        stats.false_errors,                                  stats.structure_mismatches,
-        stats.truncations,                                   secs,
-        mb / secs,                                           stats.items,
-        stats.item_failures,                                 @as(f64, @floatFromInt(stats.item_tree_ns)) / ns,
-        stats.reparse_edits,                                 stats.reparse_incremental,
-        stats.reparse_mismatches,                            @as(f64, @floatFromInt(stats.reparse_inc_ns)) / ns,
-        @as(f64, @floatFromInt(stats.reparse_full_ns)) / ns, @as(f64, @floatFromInt(stats.local_inc_ns)) / ns,
-        @as(f64, @floatFromInt(stats.local_full_ns)) / ns,   @as(f64, @floatFromInt(stats.local_full_ns)) / @as(f64, @floatFromInt(@max(stats.local_inc_ns, 1))),
+        stats.files,                                                                                         mb,
+        stats.std_errors,                                                                                    stats.lossless_failures,
+        stats.false_errors,                                                                                  stats.structure_mismatches,
+        stats.truncations,                                                                                   secs,
+        mb / secs,                                                                                           stats.items,
+        stats.item_failures,                                                                                 @as(f64, @floatFromInt(stats.item_tree_ns)) / ns,
+        stats.hir_exprs,                                                                                     stats.hir_failures,
+        @as(f64, @floatFromInt(stats.hir_ns)) / ns,                                                          stats.reparse_edits,
+        stats.reparse_incremental,                                                                           stats.reparse_mismatches,
+        @as(f64, @floatFromInt(stats.reparse_inc_ns)) / ns,                                                  @as(f64, @floatFromInt(stats.reparse_full_ns)) / ns,
+        @as(f64, @floatFromInt(stats.local_inc_ns)) / ns,                                                    @as(f64, @floatFromInt(stats.local_full_ns)) / ns,
+        @as(f64, @floatFromInt(stats.local_full_ns)) / @as(f64, @floatFromInt(@max(stats.local_inc_ns, 1))),
     });
-    const failed = stats.lossless_failures + stats.false_errors + stats.structure_mismatches + stats.item_failures + stats.reparse_mismatches;
+    const failed = stats.lossless_failures + stats.false_errors + stats.structure_mismatches + stats.item_failures + stats.reparse_mismatches + stats.hir_failures;
     return if (failed == 0) 0 else 1;
 }
 
@@ -147,6 +154,26 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
         if (!ok) {
             stats.item_failures += 1;
             report(stats, "[ItemTree mapping failure] {s}", .{path});
+        }
+
+        for (items.items) |item| {
+            const node = map.get(item.ast_id) orelse continue;
+            const t2 = std.Io.Clock.awake.now(io);
+            var body = try za.hir.lower.lower(gpa, node);
+            defer body.deinit(gpa);
+            stats.hir_ns += @intCast(t2.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+            stats.hir_exprs += body.exprs.len;
+            var name_refs: usize = 0;
+            for (body.exprs) |e| if (e == .name_ref) {
+                name_refs += 1;
+            };
+            const in_range = for (body.expr_ranges) |r| {
+                if (r.start > r.end or r.end > node.green.text_len) break false;
+            } else true;
+            if (!in_range or name_refs != countNameRefs(node)) {
+                stats.hir_failures += 1;
+                report(stats, "[HIR failure] {s}: member at {d} (name refs {d} / {d})", .{ path, node.offset, name_refs, countNameRefs(node) });
+            }
         }
     }
 
@@ -234,6 +261,18 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
         chain.destroy();
         chain = inc;
     }
+}
+
+/// 成员子树中的 name_ref 节点数（不进入嵌套容器）
+fn countNameRefs(node: SyntaxNode) usize {
+    var n: usize = 0;
+    var it = node.children();
+    while (it.nextNode()) |c| switch (c.kind()) {
+        .name_ref => n += 1,
+        .container_decl => {},
+        else => n += countNameRefs(c),
+    };
+    return n;
 }
 
 fn isLossless(gpa: Allocator, root: SyntaxNode, source: []const u8) !bool {
