@@ -13,6 +13,7 @@ const tree = @import("tree.zig");
 const SyntaxNode = tree.SyntaxNode;
 const SyntaxKind = @import("kind.zig").SyntaxKind;
 const isTrivia = @import("kind.zig").isTrivia;
+const ast = @import("ast.zig");
 
 const ItemTree = @This();
 
@@ -147,7 +148,7 @@ const Builder = struct {
                 .comptime_decl => .@"comptime",
                 else => continue,
             };
-            const name = memberName(member, kind);
+            const name = if (ast.memberName(member, b.containers.items[index].kind == .@"enum")) |t| t.text else null;
             const item_index: u32 = @intCast(b.items.items.len);
             try b.items.append(b.gpa, .{
                 .ast_id = try b.uniqueId(container_id, @tagName(kind), name orelse ""),
@@ -216,15 +217,6 @@ fn mixId(parent: u32, kind: []const u8, name: []const u8, ordinal: u32) AstId {
     h.update(name);
     h.update(std.mem.asBytes(&ordinal));
     return @fromBackingInt(@as(u32, @truncate(h.final())));
-}
-
-fn memberName(member: SyntaxNode, kind: Item.Kind) ?[]const u8 {
-    return switch (kind) {
-        .@"fn" => if (member.childNode(.fn_proto)) |proto| if (proto.childToken(.identifier)) |t| t.text else null else null,
-        .@"const", .@"var", .field => if (member.childToken(.identifier)) |t| t.text else null,
-        .@"test" => if (member.childToken(.string_literal) orelse member.childToken(.identifier)) |t| t.text else null,
-        .@"comptime" => null,
-    };
 }
 
 fn memberFlags(member: SyntaxNode) Item.Flags {

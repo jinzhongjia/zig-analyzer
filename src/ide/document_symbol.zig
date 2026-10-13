@@ -6,6 +6,7 @@ const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
 const ItemTree = @import("../syntax/ItemTree.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
+const ast = @import("../syntax/ast.zig");
 
 pub fn documentSymbols(
     arena: Allocator,
@@ -32,7 +33,7 @@ const Builder = struct {
             const item = b.items.items[i];
             if (item.kind == .@"comptime") continue;
             const node = b.map.get(item.ast_id) orelse continue;
-            const name_tok = nameToken(node, item.kind);
+            const name_tok = ast.memberName(node, kind == .@"enum");
             const children = try b.childrenOf(i);
             const r = node.range();
             const sel = if (name_tok) |t| t.range() else r;
@@ -81,14 +82,6 @@ fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.Conta
     };
 }
 
-fn nameToken(node: SyntaxNode, kind: ItemTree.Item.Kind) ?@import("../syntax/tree.zig").SyntaxToken {
-    return switch (kind) {
-        .@"fn" => if (node.childNode(.fn_proto)) |p| p.childToken(.identifier) else null,
-        .@"test" => node.childToken(.string_literal) orelse node.childToken(.identifier),
-        else => node.childToken(.identifier),
-    };
-}
-
 const testing = std.testing;
 const Parse = @import("../syntax/Parse.zig");
 
@@ -121,6 +114,7 @@ test documentSymbols {
     try testing.expectEqual(types.SymbolKind.Method, syms[0].children.?[1].kind);
     try testing.expectEqual(types.SymbolKind.Enum, syms[1].kind);
     try testing.expectEqual(types.SymbolKind.EnumMember, syms[1].children.?[0].kind);
+    try testing.expectEqualStrings("x", syms[1].children.?[0].name);
     try testing.expectEqualStrings("t", syms[2].name);
     // selectionRange 指向名字
     try testing.expectEqual(types.Position{ .line = 0, .character = 6 }, syms[0].selectionRange.start);
