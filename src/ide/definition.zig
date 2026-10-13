@@ -9,6 +9,7 @@ const ast = @import("../syntax/ast.zig");
 const SyntaxToken = ast.SyntaxToken;
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const context = @import("context.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
@@ -49,9 +50,14 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
         .field_access => |fa| {
             // 光标在字段名上（不在左侧表达式内）
             if (rel < b.range(fa.lhs).end) return null;
-            const ns = try r.evalNamespace(file, item, b, fa.lhs) orelse return null;
-            return r.memberDef(ns, fa.field orelse return null);
+            if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
+                if (try r.memberDef(ns, fa.field orelse return null)) |def| return def;
+            }
+            // 经由类型：字段、方法
+            return memberViaTypes(r, file, tok.offset, e);
         },
+        // decl literal（`.init(...)`、`.empty`）
+        .enum_literal => return memberViaTypes(r, file, tok.offset, e),
         .builtin_call => |call| return importDef(r, file, b, call),
         .literal => {
             // `@import("...")` 的字符串
@@ -63,6 +69,12 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
         },
         else => return null,
     }
+}
+
+fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Def {
+    const a = try context.at(r, file, offset, false) orelse return null;
+    const key = a.member(e) orelse return null;
+    return context.defOfKey(r, key);
 }
 
 fn importDef(r: *Resolver, file: FileId, b: *const Body, call: @FieldType(Body.Expr, "builtin_call")) resolve.Error!?Def {

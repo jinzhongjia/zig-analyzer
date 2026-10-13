@@ -234,6 +234,9 @@ const request_handlers = .{
     .{ "textDocument/semanticTokens/full", Mode.read, semanticTokensFull },
     .{ "textDocument/definition", Mode.semantic, definition },
     .{ "textDocument/completion", Mode.semantic, completion },
+    .{ "textDocument/hover", Mode.semantic, hover },
+    .{ "textDocument/signatureHelp", Mode.semantic, signatureHelp },
+    .{ "textDocument/inlayHint", Mode.semantic, inlayHint },
 };
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
@@ -1107,6 +1110,9 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .selectionRangeProvider = .{ .boolean = true },
             .definitionProvider = .{ .boolean = true },
             .completionProvider = .{ .triggerCharacters = &.{"."} },
+            .hoverProvider = .{ .boolean = true },
+            .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
+            .inlayHintProvider = .{ .boolean = true },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .boolean = true },
@@ -1163,8 +1169,61 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             .enum_member => .EnumMember,
         },
         .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+        .detail = it.detail,
     };
     return .{ .array_of_CompletionItem = out };
+}
+
+/// 请求中的文件、内容与位置
+fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { file: Vfs.FileId, text: []const u8, offset: u32 } {
+    const file = try server.lookupFile(arena, document_uri) orelse return null;
+    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
+    return .{ .file = file, .text = text, .offset = @intCast(offsets.positionToOffset(text, pos, server.encoding)) };
+}
+
+fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverParams) HandlerError!types.ResultType("textDocument/hover") {
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const info = try ide.hover.hover(r, at.file, at.offset) orelse return null;
+    const lines = try offsets.LineIndex.init(arena, at.text);
+    return .{
+        .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = info.text } },
+        .range = lines.range(info.start, info.end, server.encoding),
+    };
+}
+
+fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.SignatureHelpParams) HandlerError!types.ResultType("textDocument/signatureHelp") {
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const sig = try ide.signature_help.signatureHelp(r, at.file, at.offset) orelse return null;
+    const ps = try arena.alloc(types.ParameterInformation, sig.params.len);
+    for (sig.params, ps) |p, *o| o.* = .{ .label = .{ .string = p } };
+    const info = try arena.alloc(types.SignatureInformation, 1);
+    info[0] = .{
+        .label = sig.label,
+        .parameters = ps,
+        .activeParameter = sig.active,
+        .documentation = if (sig.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+    };
+    return .{ .signatures = info, .activeSignature = 0, .activeParameter = sig.active };
+}
+
+fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.InlayHintParams) HandlerError!types.ResultType("textDocument/inlayHint") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
+    const start: u32 = @intCast(offsets.positionToOffset(text, params.range.start, server.encoding));
+    const end: u32 = @intCast(offsets.positionToOffset(text, params.range.end, server.encoding));
+    const hints = try ide.inlay_hints.inlayHints(r, file, start, end);
+    const lines = try offsets.LineIndex.init(arena, text);
+    const out = try arena.alloc(types.InlayHint, hints.len);
+    for (hints, out) |h, *o| o.* = .{
+        .position = lines.position(h.offset, server.encoding),
+        .label = .{ .string = h.label },
+        .kind = switch (h.kind) {
+            .type => .Type,
+            .parameter => .Parameter,
+        },
+        .paddingRight = if (h.kind == .parameter) true else null,
+    };
+    return out;
 }
 
 fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!StatusResult {

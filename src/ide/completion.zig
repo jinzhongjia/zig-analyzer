@@ -8,12 +8,18 @@ const Namespace = resolve.Namespace;
 const ItemTree = @import("../syntax/ItemTree.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const context = @import("context.zig");
+const queries = @import("../sema/queries.zig");
+const render = @import("../sema/render.zig");
+const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 
 pub const Item = struct {
     label: []const u8,
     kind: Kind,
     /// 文档注释
     doc: ?[]const u8 = null,
+    /// 类型
+    detail: ?[]const u8 = null,
 
     pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member };
 };
@@ -28,8 +34,13 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
     // `lhs.` / `lhs.na`：光标前一个字符在字段访问内、且不在左侧表达式内
     if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .field_access => |fa| if (rel - 1 >= b.range(fa.lhs).end) {
-            const ns = try r.evalNamespace(file, item, b, fa.lhs) orelse return &.{};
-            try members(r, &out, ns, ns.file == file);
+            if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
+                try members(r, &out, ns, ns.file == file);
+                return out.items.items;
+            }
+            // 经由类型：实例的字段与方法
+            const a = try context.at(r, file, offset, true) orelse return &.{};
+            try typedMembers(r, &out, a.exprType(fa.lhs), file);
             return out.items.items;
         },
         else => {},
@@ -99,6 +110,44 @@ fn decls(out: *Collector, tree: *const ItemTree, container: u32, private: bool) 
         };
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
         try out.add(.{ .label = name, .kind = kind, .doc = it.doc });
+    }
+}
+
+/// 按类型列出成员：值为类型时列出声明；实例（含单指针）列出字段与方法；切片与数组有 len
+fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) resolve.Error!void {
+    const ip = r.ctx.db.env.ip;
+    if (tv.asType()) |t| {
+        const ns = try queries.namespaceOfType(r, t) orelse return;
+        return members(r, out, ns, ns.file == from);
+    }
+    var t = tv.ty;
+    switch (ip.key(t)) {
+        .ptr_type => |p| switch (p.size) {
+            .one => t = p.child,
+            .slice => {
+                try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
+                try out.add(.{ .label = "ptr", .kind = .field });
+                return;
+            },
+            else => return,
+        },
+        .array_type => return out.add(.{ .label = "len", .kind = .field, .detail = "usize" }),
+        else => {},
+    }
+    const ns = try queries.namespaceOfType(r, t) orelse return;
+    const tree = try r.itemTree(ns.file);
+    const same_file = ns.file == from;
+    for (tree.containerMembers(ns.container)) |m| {
+        const it = tree.items[m];
+        const name = it.name orelse continue;
+        switch (it.kind) {
+            .field => {
+                const fty = (try r.ctx.get(queries.DeclType, .{ .file = ns.file, .item = it.ast_id })).ty;
+                try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
+            },
+            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = .function, .doc = it.doc }),
+            else => {},
+        }
     }
 }
 

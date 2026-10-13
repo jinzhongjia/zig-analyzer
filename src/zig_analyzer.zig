@@ -52,6 +52,10 @@ pub const ide = struct {
     pub const format = @import("ide/format.zig");
     pub const definition = @import("ide/definition.zig");
     pub const completion = @import("ide/completion.zig");
+    pub const context = @import("ide/context.zig");
+    pub const hover = @import("ide/hover.zig");
+    pub const signature_help = @import("ide/signature_help.zig");
+    pub const inlay_hints = @import("ide/inlay_hints.zig");
 };
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");
