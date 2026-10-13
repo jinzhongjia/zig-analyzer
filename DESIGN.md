@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），下一步 M3，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3 已完成（2026-10-13），下一步 M4，详见 §19。
 
 ---
 
@@ -180,9 +180,9 @@ pub const SyntaxNode = struct { green: *const GreenNode, parent: ?*const SyntaxN
 
 - **解析器**：手写递归下降，以 Zig 官方 PEG 语法为准；**永不失败**，错误处产出 `ERROR` 节点，缺失子节点即「缺失」。
 - **恢复集**：容器成员级（`pub`/`fn`/`const`/`var`/`test`/`comptime`）、语句级（`;`、`}`）、表达式级（分隔符）。
-- **类型化访问层**：`tools/gen_syntax.zig` 从 `grammar.zon` 生成 `ast.zig`，如 `FnDecl.name() ?Name`、`FieldAccess.lhs() ?Expr`，所有访问器返回可选值。
+- **类型化访问层**：`syntax/ast.zig`，如 `FnDecl.proto()`、`FieldAccess.lhs()`，所有访问器返回可选值；表达式统一用 `SyntaxNode`，由使用方按种类分派。
   - 作用：把「某信息位于哪个子节点」的知识集中到一处；调用方按语义访问（`proto().name()`），树结构调整时只改生成源；错用节点类型在编译期报错。
-  - 时机：M1 暂不生成，语法类功能直接使用 `SyntaxNode.childNode / childToken`；在 M3 编写 HIR 降级之前生成（此时访问需求最多、最清晰），并把已有调用点迁移过去。
+  - 手写而不是从 `grammar.zon` 生成：Zig 去掉 `usingnamespace` 后生成器能省的只是每个访问器一两行的样板，却要多维护一个工具、一个 build step 和一份语法描述（M3 决定）。
 - **局部重解析**（`Parse.reparse`）：编辑落在某个 `{ ... }` 内且花括号仍平衡时，只重解析该块；否则整文件重解析。
   1. 新旧文本的公共前缀 / 后缀之外即编辑区间；在旧树中找包含它的最深 `block` / `container_decl`，要求编辑严格位于其 `{` 之后、`}` 之前，且 `}` 是该节点的最后一个 token。
   2. 对该节点的新文本单独做词法分析，校验最后一个 token 为 `}` 且花括号恰好在结尾配平；再用对应语法入口（`blockExpr` / `containerDecl`）解析，要求消费全部 token、产出单个同种类节点。任一条件不满足即回退全量解析。
@@ -798,8 +798,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | **M0 基础** | ✅ 已完成 | `db/` 引擎、Vfs、`lsp/` 代码生成、Server 骨架、取消机制 | 引擎单测：增量、cutoff、环、取消；能与编辑器握手 |
 | **M1 语法** | ✅ 已完成 | CST 解析器、ItemTree、AstId、语法类功能、formatting、`live` 诊断 | corpus 对拍通过；语法功能日常可用 |
 | **M2 构建与诊断** | ✅ 已完成 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
-| **M3 名字** | ⏳ 下一步 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
-| **M4 类型** | 未开始 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
+| **M3 名字** | ✅ 已完成 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
+| **M4 类型** | ⏳ 下一步 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
 | **M5 comptime** | 未开始 | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
 | **M6 引用** | 未开始 | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
 | **M7 性能** | 未开始 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
@@ -886,6 +886,39 @@ pub fn make() std.ArrayList(u8) { ... }
 - 并发：`Io.Threaded` 的 `async` 在忙碌任务数达到「CPU 核数 - 1」时（长期阻塞的项目读取任务也计入）会在调用方同步执行。会等待主循环处理后续消息的任务（`waitIdle` 等后台请求）与耗时数秒的单文件编译必须用 `concurrent`，否则核数少的机器上会死锁或阻塞主循环；有测试把 `async` 上限设为 0 覆盖这种情况。已报告上游：[ziglang/zig#37218](https://codeberg.org/ziglang/zig/issues/37218)（本仓库 #2）。
 - 0.17 的 maker 存在竞态：收到新的 `bsp_build_steps` 时 `select.cancelDiscard()` 可能在接收任务结束前关闭队列，随后 `select.await()` 因 `error.Closed` panic，核数越少越容易触发（单核时每次都会）。maker 意外退出时自动重启项目，连续 3 次（期间没有完成过构建）后放弃并提示。已报告上游：[ziglang/zig#37217](https://codeberg.org/ziglang/zig/issues/37217)（本仓库 #1）。
 - 已知问题：同一文件可能被重复发布一次相同的诊断（构建完成与编译集合更新各触发一次），不影响结果。
+
+### 19.5 M3 完成情况（2026-10-13）
+
+| 模块 | 文件 | 内容 |
+|---|---|---|
+| 类型化访问层 | `src/syntax/ast.zig` | 声明、函数原型、参数、字段、语句与控制流、表达式的语义访问器；`memberName` 统一取成员名字（枚举成员的名字位于类型表达式位置）。ItemTree 与 documentSymbol 已迁移 |
+| HIR | `src/hir/Body.zig`、`lower.zig`、`queries.zig` | 每个容器成员一个 Body（参数类型、返回类型、函数体、初始化、字段类型与默认值）；表达式、绑定、作用域与位置映射一遍算出；位置相对 owner，Body 按结构比较，内容不变时下游不重算；`ItemBody` query 以（文件, AstId）为键 |
+| 模块图 | `src/names/ModuleGraph.zig` | 汇总各项目的模块（根文件、import 表）与编译集合中每个文件的模块归属，作为 input；zig 环境就绪与编译集合更新时重建 |
+| 名字解析 | `src/names/resolve.zig` | 局部作用域 → 外层容器链（体内容器继续查外层函数在该位置可见的局部名字）；`a.b.c` 沿 `@import`、容器定义、`@This()` 与别名链求命名空间；import 支持相对路径、模块名、`std`、`root`；遇到未加载的文件记为缺失 |
+| 功能 | `src/ide/definition.zig`、`completion.zig`、Server | goto definition（名字、成员访问、import 字符串）；补全（`a.` 之后列出成员，跨文件只列 pub；否则列出局部名字与外层容器的声明）；请求处理中遇到未加载的文件时从磁盘加载并重新计算 |
+
+- 端到端测试：真实 `zig build` 项目中跨模块跳转、跳到 `@import` 的文件、跳进标准库（`std.mem.Allocator`）、`std.mem.` 之后的补全；单文件模式下标准库按需加载后跳转。单元测试覆盖参数 / 局部变量 / 捕获 / 标签的作用域、泛型函数返回的容器引用外层参数、`@This()`、枚举成员、缺失文件的记录。
+- 语料对拍新增 HIR 检查：标准库与本仓库源码共 130 万个表达式全部降级成功，位置都在成员范围内，且每个 `name_ref` 节点在 Body 中都有对应的表达式（据此修复了 labeled switch 的 `continue :l value` 丢失操作数）；降级耗时 0.13 秒。
+- 实测：单文件模式下首次跳转到 `std.mem.Allocator`（需从磁盘加载并解析 std.zig、mem.zig）约 3.5 ms，之后约 0.13 ms。
+- 测试：`zig build test` 共 132 个。
+- 与设计的差异：
+  - 类型化访问层手写（§5.1）。
+  - 命名空间没有单独的 query：成员查找直接在 ItemTree 上线性扫描，目前足够快。
+  - 不依赖类型的解析范围：经由函数调用（`std.ArrayList(u8)`）、变量类型（`var x: S` 的 `x.`）、结构体字段得到的命名空间留给 M4 / M5；字段的跳转与补全同样依赖类型。
+  - `@import("builtin")` 不解析（由编译器生成，不在磁盘上）；一个文件属于多个模块时固定取第一个，`zig-analyzer/setActiveModule` 未实现；`ContainerId` 的泛型实例区分（`inst`）留到 M5。
+  - 补全还不包括关键字、内置函数、原生类型与 `@import` 路径。
+
+### 19.6 待测量的优化项
+
+有意暂不处理、等有测量数据（M4 的类型推导或 M7 的性能评估）再决定是否处理的问题。新发现的同类问题记在这里。
+
+| 问题 | 现状 | 何时可能成为瓶颈 | 处理方式 | 记录于 |
+|---|---|---|---|---|
+| 容器成员按名字查找 | `lookupDecl` 线性扫描 ItemTree 中该容器的成员，没有按容器缓存的哈希表（§7.2 的 `namespace` query） | 类型推导时大文件中大量名字查找，或成员特别多的容器 | 加一个以容器为键、值为「名字 → 成员」表的 query；只改 `lookupDecl` / `memberDef` 内部 | M3 |
+| 行索引 | 每个请求现场计算 `LineIndex`，未做成 `line_index(file)` query（§12.2） | 大文件上高频请求（逐字输入时的补全、semantic tokens） | 做成 query 缓存 | M1 |
+| live 诊断防抖 | 每次编辑都重新计算 live 诊断，没有防抖（§11.2） | 大文件上快速输入 | 发布前等待 ~50ms 内无新编辑 | M1 |
+| live 诊断的 AstGen 不可取消 | 标准库 AstGen 计算中不检查取消，写事务需要等它结束 | 大文件上的编辑延迟 | 防抖，或把 AstGen 放到单独的计算队列 | M1 |
+| Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
 
 ## 20. 风险与对策
 
