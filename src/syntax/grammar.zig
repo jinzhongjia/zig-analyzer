@@ -24,7 +24,7 @@ pub fn sourceFile(p: *Parser) Error!void {
     try containerMembers(p);
     // 顶层多余的 `}` 等
     while (!p.atEof()) {
-        try p.errBump("意外的 token");
+        try p.errBump("unexpected token");
         try containerMembers(p);
     }
     _ = try m.complete(p, .source_file);
@@ -40,7 +40,7 @@ fn containerMembers(p: *Parser) Error!void {
         }
         const before = p.pos;
         try containerMember(p);
-        if (p.pos == before) try p.errBump("期望容器成员");
+        if (p.pos == before) try p.errBump("expected container member");
     }
 }
 
@@ -63,7 +63,7 @@ fn containerMember(p: *Parser) Error!void {
         },
         .eof, .r_brace => {
             if (has_doc) {
-                try p.err("文档注释没有附着到声明");
+                try p.err("doc comment not attached to a declaration");
                 _ = try m.complete(p, .error_node);
             } else m.abandon(p);
             return;
@@ -73,20 +73,20 @@ fn containerMember(p: *Parser) Error!void {
 
     if (!atTypeExprStart(p) and !p.at(.keyword_comptime)) {
         if (has_doc) _ = try m.complete(p, .error_node) else m.abandon(p);
-        return p.errBump("期望容器成员");
+        return p.errBump("expected container member");
     }
     try containerField(p, m);
     switch (p.peek()) {
         .comma => try p.bump(),
         .r_brace, .eof => {},
-        else => try p.err("字段后期望 ','"),
+        else => try p.err("expected ',' after field"),
     }
 }
 
 fn testDecl(p: *Parser, m: Marker) Error!void {
     try p.bump(); // test
     if (p.at(.string_literal) or p.at(.identifier)) try p.bump();
-    if (try block(p, null) == null) try p.err("期望代码块");
+    if (try block(p, null) == null) try p.err("expected block");
     _ = try m.complete(p, .test_decl);
 }
 
@@ -111,7 +111,7 @@ fn decl(p: *Parser, m: Marker) Error!void {
         if (p.at(.l_brace)) {
             _ = try block(p, null);
         } else if (!try p.eat(.semicolon)) {
-            try p.err("期望 ';' 或 '{'");
+            try p.err("expected ';' or '{'");
         }
         _ = try m.complete(p, .fn_decl);
         return;
@@ -124,7 +124,7 @@ fn decl(p: *Parser, m: Marker) Error!void {
         _ = try m.complete(p, .var_decl);
         return;
     }
-    try p.err("期望函数或变量声明");
+    try p.err("expected function or variable declaration");
     _ = try m.complete(p, .error_node);
 }
 
@@ -133,7 +133,7 @@ fn varDeclProto(p: *Parser) Error!void {
     try p.bump();
     _ = try p.expect(.identifier);
     if (try p.eat(.colon)) {
-        if (try typeExpr(p) == null) try p.err("期望类型");
+        if (try typeExpr(p) == null) try p.err("expected type");
     }
     _ = try byteAlign(p);
     _ = try clause(p, .keyword_addrspace, .addrspace_clause);
@@ -142,9 +142,9 @@ fn varDeclProto(p: *Parser) Error!void {
 
 fn varDeclInit(p: *Parser) Error!void {
     if (p.at(.equal) or p.at(.equal_equal)) {
-        if (p.at(.equal_equal)) try p.err("变量声明应使用 '='");
+        if (p.at(.equal_equal)) try p.err("variable declaration should use '='");
         try p.bump();
-        if (try expr(p) == null) try p.err("期望表达式");
+        if (try expr(p) == null) try p.err("expected expression");
     }
 }
 
@@ -154,10 +154,10 @@ fn containerField(p: *Parser, m: Marker) Error!void {
         try p.bump();
         try p.bump();
     }
-    if (try typeExpr(p) == null) try p.err("期望字段类型");
+    if (try typeExpr(p) == null) try p.err("expected field type");
     _ = try byteAlign(p);
     if (try p.eat(.equal)) {
-        if (try expr(p) == null) try p.err("期望表达式");
+        if (try expr(p) == null) try p.err("expected expression");
     }
     _ = try m.complete(p, .container_field);
 }
@@ -172,7 +172,7 @@ fn fnProto(p: *Parser) Error!CompletedMarker {
     _ = try clause(p, .keyword_linksection, .linksection_clause);
     _ = try clause(p, .keyword_callconv, .callconv_clause);
     _ = try p.eat(.bang);
-    if (try typeExpr(p) == null) try p.err("期望返回类型");
+    if (try typeExpr(p) == null) try p.err("expected return type");
     return m.complete(p, .fn_proto);
 }
 
@@ -186,7 +186,7 @@ fn paramList(p: *Parser) Error!void {
         if (try p.eat(.r_paren)) break;
         switch (p.peek()) {
             .eof, .l_brace, .r_brace, .semicolon => {
-                try p.err("期望 ')'");
+                try p.err("expected ')'");
                 break;
             },
             else => {},
@@ -194,17 +194,17 @@ fn paramList(p: *Parser) Error!void {
         const before = p.pos;
         try param(p);
         if (p.pos == before) {
-            try p.errBump("期望参数");
+            try p.errBump("expected parameter");
             continue;
         }
         switch (p.peek()) {
             .comma => try p.bump(),
             .r_paren => {},
             .colon, .r_brace, .r_bracket => {
-                try p.err("期望 ')'");
+                try p.err("expected ')'");
                 break;
             },
-            else => try p.err("参数后期望 ','"),
+            else => try p.err("expected ',' after parameter"),
         }
     }
     _ = try m.complete(p, .param_list);
@@ -229,7 +229,7 @@ fn param(p: *Parser) Error!void {
                 m.abandon(p);
                 return;
             }
-            try p.err("期望参数类型");
+            try p.err("expected parameter type");
         }
     }
     _ = try m.complete(p, .param);
@@ -241,11 +241,11 @@ fn byteAlign(p: *Parser) Error!CM {
     const m = try p.start();
     try p.bump();
     _ = try p.expect(.l_paren);
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     if (try p.eat(.colon)) {
-        if (try expr(p) == null) try p.err("期望表达式");
+        if (try expr(p) == null) try p.err("expected expression");
         _ = try p.expect(.colon);
-        if (try expr(p) == null) try p.err("期望表达式");
+        if (try expr(p) == null) try p.err("expected expression");
     }
     _ = try p.expect(.r_paren);
     return try m.complete(p, .align_clause);
@@ -257,7 +257,7 @@ fn clause(p: *Parser, comptime keyword: SyntaxKind, comptime kind: SyntaxKind) E
     const m = try p.start();
     try p.bump();
     _ = try p.expect(.l_paren);
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     _ = try p.expect(.r_paren);
     return try m.complete(p, kind);
 }
@@ -268,7 +268,7 @@ fn clause(p: *Parser, comptime keyword: SyntaxKind, comptime kind: SyntaxKind) E
 fn block(p: *Parser, started: ?Marker) Error!CM {
     if (!p.at(.l_brace)) {
         if (started) |m| {
-            try p.err("期望 '{'");
+            try p.err("expected '{'");
             return try m.complete(p, .block);
         }
         return null;
@@ -282,7 +282,7 @@ fn block(p: *Parser, started: ?Marker) Error!CM {
         }
         const before = p.pos;
         try statement(p, true);
-        if (p.pos == before) try p.errBump("期望语句");
+        if (p.pos == before) try p.errBump("expected statement");
     }
     _ = try p.expect(.r_brace);
     return try m.complete(p, .block);
@@ -322,7 +322,7 @@ fn statement(p: *Parser, block_level: bool) Error!void {
             if (block_level) return varAssignStatement(p);
             const m = try p.start();
             try p.bump();
-            if (try assignExpr(p) == null) try p.err("期望表达式");
+            if (try assignExpr(p) == null) try p.err("expected expression");
             _ = try p.expect(.semicolon);
             _ = try m.complete(p, .comptime_stmt);
             return;
@@ -362,7 +362,7 @@ fn prefixedStatement(p: *Parser, kind: SyntaxKind) Error!void {
 fn blockExprStatement(p: *Parser) Error!void {
     if (try blockExpr(p) != null) return;
     if (try assignExpr(p) == null) {
-        try p.err("期望代码块或表达式");
+        try p.err("expected block or expression");
         return;
     }
     _ = try p.expect(.semicolon);
@@ -404,7 +404,7 @@ fn varAssignStatement(p: *Parser) Error!void {
             try varDeclProto(p);
             if (lhs_count == 0 and !p.at(.comma)) {
                 // 单个变量声明：`var x = expr;`
-                if (!p.at(.equal) and !p.at(.equal_equal)) try p.err("期望 '='");
+                if (!p.at(.equal) and !p.at(.equal_equal)) try p.err("expected '='");
                 try varDeclInit(p);
                 _ = try p.expect(.semicolon);
                 _ = try vm.complete(p, .var_decl);
@@ -416,12 +416,12 @@ fn varAssignStatement(p: *Parser) Error!void {
             const e = try expr(p) orelse {
                 if (lhs_count == 0) {
                     if (has_comptime) {
-                        try p.err("期望语句");
+                        try p.err("expected statement");
                         _ = try sm.complete(p, .comptime_stmt);
                     } else sm.abandon(p);
                     return;
                 }
-                try p.err("期望表达式或变量声明");
+                try p.err("expected expression or variable declaration");
                 break;
             };
             if (lhs_count == 0) first_expr = e;
@@ -434,7 +434,7 @@ fn varAssignStatement(p: *Parser) Error!void {
         if (isAssignOp(p.peek())) {
             const am = try first_expr.?.precede(p);
             try p.bump();
-            if (try expr(p) == null) try p.err("期望表达式");
+            if (try expr(p) == null) try p.err("expected expression");
             _ = try am.complete(p, .assign_expr);
         }
         _ = try p.expect(.semicolon);
@@ -444,7 +444,7 @@ fn varAssignStatement(p: *Parser) Error!void {
 
     // 解构：`a, var b = expr;`
     _ = try p.expect(.equal);
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     _ = try p.expect(.semicolon);
     _ = try sm.complete(p, .destructure);
 }
@@ -480,10 +480,10 @@ fn assignExpr(p: *Parser) Error!CM {
     if (p.at(.comma)) {
         const m = try lhs.precede(p);
         while (try p.eat(.comma)) {
-            if (try expr(p) == null) try p.err("期望表达式");
+            if (try expr(p) == null) try p.err("expected expression");
         }
         _ = try p.expect(.equal);
-        if (try expr(p) == null) try p.err("期望表达式");
+        if (try expr(p) == null) try p.err("expected expression");
         return try m.complete(p, .destructure);
     }
     return try finishAssign(p, lhs);
@@ -498,7 +498,7 @@ fn finishAssign(p: *Parser, lhs: CompletedMarker) Error!CompletedMarker {
     if (!isAssignOp(p.peek())) return lhs;
     const m = try lhs.precede(p);
     try p.bump();
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     return m.complete(p, .assign_expr);
 }
 
@@ -510,7 +510,7 @@ const Form = enum { statement, expr, type };
 fn ifExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     try p.bump(); // if
     _ = try p.expect(.l_paren);
-    if (try expr(p) == null) try p.err("期望条件表达式");
+    if (try expr(p) == null) try p.err("expected condition expression");
     _ = try p.expect(.r_paren);
     try optPayload(p);
     try bodyAndElse(p, form, true);
@@ -520,14 +520,14 @@ fn ifExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
 fn whileExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     try p.bump(); // while
     _ = try p.expect(.l_paren);
-    if (try expr(p) == null) try p.err("期望条件表达式");
+    if (try expr(p) == null) try p.err("expected condition expression");
     _ = try p.expect(.r_paren);
     try optPayload(p);
     if (p.at(.colon)) {
         const cm = try p.start();
         try p.bump();
         _ = try p.expect(.l_paren);
-        if (try assignExpr(p) == null) try p.err("期望表达式");
+        if (try assignExpr(p) == null) try p.err("expected expression");
         _ = try p.expect(.r_paren);
         _ = try cm.complete(p, .while_continue);
     }
@@ -538,7 +538,7 @@ fn whileExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
 fn forExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     try p.bump(); // for
     try forInputs(p);
-    if (p.at(.pipe)) try optPayload(p) else try p.err("期望循环变量");
+    if (p.at(.pipe)) try optPayload(p) else try p.err("expected loop capture");
     try bodyAndElse(p, form, false);
     return m.complete(p, .for_expr);
 }
@@ -553,13 +553,13 @@ fn forInputs(p: *Parser) Error!void {
         if (try p.eat(.r_paren)) break;
         switch (p.peek()) {
             .eof, .l_brace, .r_brace, .pipe => {
-                try p.err("期望 ')'");
+                try p.err("expected ')'");
                 break;
             },
             else => {},
         }
         const input = try expr(p) orelse {
-            try p.errBump("期望表达式");
+            try p.errBump("expected expression");
             continue;
         };
         if (p.at(.ellipsis2)) {
@@ -572,10 +572,10 @@ fn forInputs(p: *Parser) Error!void {
             .comma => try p.bump(),
             .r_paren => {},
             .colon, .r_brace, .r_bracket => {
-                try p.err("期望 ')'");
+                try p.err("expected ')'");
                 break;
             },
-            else => try p.err("期望 ','"),
+            else => try p.err("expected ','"),
         }
     }
     _ = try m.complete(p, .for_inputs);
@@ -588,7 +588,7 @@ fn loop(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
         .keyword_for => forExpr(p, m, form),
         .keyword_while => whileExpr(p, m, form),
         else => {
-            try p.err("期望 'for' 或 'while'");
+            try p.err("expected 'for' or 'while'");
             return m.complete(p, .error_node);
         },
     };
@@ -608,14 +608,14 @@ fn body(p: *Parser, form: Form) Error!BodyEnd {
         .statement => {
             if (try blockExpr(p) != null) return .block;
             if (try assignExpr(p) == null) {
-                try p.err("期望代码块或表达式");
+                try p.err("expected block or expression");
                 return .closed;
             }
             if (try p.eat(.semicolon)) return .closed;
             return .open;
         },
-        .expr => if (try expr(p) == null) try p.err("期望表达式"),
-        .type => if (try typeExpr(p) == null) try p.err("期望类型表达式"),
+        .expr => if (try expr(p) == null) try p.err("expected expression"),
+        .type => if (try typeExpr(p) == null) try p.err("expected type expression"),
     }
     return .block;
 }
@@ -630,7 +630,7 @@ fn bodyAndElse(p: *Parser, form: Form, allow_payload: bool) Error!void {
 
 fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error!void {
     if (!p.at(.keyword_else)) {
-        if (required) try p.err("期望 ';' 或 'else'");
+        if (required) try p.err("expected ';' or 'else'");
         return;
     }
     const m = try p.start();
@@ -638,8 +638,8 @@ fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error
     if (allow_payload) try optPayload(p);
     switch (form) {
         .statement => try statement(p, false),
-        .expr => if (try expr(p) == null) try p.err("期望表达式"),
-        .type => if (try typeExpr(p) == null) try p.err("期望类型表达式"),
+        .expr => if (try expr(p) == null) try p.err("expected expression"),
+        .type => if (try typeExpr(p) == null) try p.err("expected type expression"),
     }
     _ = try m.complete(p, .else_clause);
 }
@@ -662,7 +662,7 @@ fn optPayload(p: *Parser) Error!void {
 fn switchExpr(p: *Parser, m: Marker) Error!CompletedMarker {
     try p.bump(); // switch
     _ = try p.expect(.l_paren);
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     _ = try p.expect(.r_paren);
     if (try p.expect(.l_brace)) {
         while (true) {
@@ -673,13 +673,13 @@ fn switchExpr(p: *Parser, m: Marker) Error!CompletedMarker {
             const before = p.pos;
             try switchProng(p);
             if (p.pos == before) {
-                try p.errBump("期望 switch 分支");
+                try p.errBump("expected switch prong");
                 continue;
             }
             switch (p.peek()) {
                 .comma => try p.bump(),
                 .r_brace => {},
-                else => try p.err("switch 分支后期望 ','"),
+                else => try p.err("expected ',' after switch prong"),
             }
         }
         _ = try p.expect(.r_brace);
@@ -698,7 +698,7 @@ fn switchProng(p: *Parser) Error!void {
             if (p.at(.ellipsis3)) {
                 const rm = try item.precede(p);
                 try p.bump();
-                if (try expr(p) == null) try p.err("期望表达式");
+                if (try expr(p) == null) try p.err("expected expression");
                 _ = try rm.complete(p, .switch_item);
             }
             items += 1;
@@ -711,7 +711,7 @@ fn switchProng(p: *Parser) Error!void {
                 m.abandon(p);
                 return;
             }
-            try p.err("期望 switch 分支");
+            try p.err("expected switch prong");
             _ = try m.complete(p, .error_node);
             return;
         }
@@ -719,7 +719,7 @@ fn switchProng(p: *Parser) Error!void {
     _ = try cm.complete(p, .switch_case);
     _ = try p.expect(.equal_angle_bracket_right);
     try optPayload(p);
-    if (try singleAssignExpr(p) == null) try p.err("期望表达式");
+    if (try singleAssignExpr(p) == null) try p.err("expected expression");
     _ = try m.complete(p, .switch_prong);
 }
 
@@ -728,7 +728,7 @@ fn asmExpr(p: *Parser) Error!CompletedMarker {
     try p.bump(); // asm
     _ = try p.eat(.keyword_volatile);
     _ = try p.expect(.l_paren);
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     if (try p.eat(.r_paren)) return m.complete(p, .asm_expr);
     _ = try p.expect(.colon);
     try asmItems(p, .asm_output);
@@ -737,7 +737,7 @@ fn asmExpr(p: *Parser) Error!CompletedMarker {
         if (p.at(.colon)) {
             const cm = try p.start();
             try p.bump();
-            if (try expr(p) == null) try p.err("期望表达式");
+            if (try expr(p) == null) try p.err("expected expression");
             _ = try cm.complete(p, .asm_clobbers);
         }
     }
@@ -758,14 +758,14 @@ fn asmItems(p: *Parser, comptime kind: SyntaxKind) Error!void {
         } else {
             if (kind == .asm_output) try p.bump(); // ->
             const parsed = if (kind == .asm_output) try typeExpr(p) else try expr(p);
-            if (parsed == null) try p.err("期望表达式");
+            if (parsed == null) try p.err("expected expression");
         }
         _ = try p.expect(.r_paren);
         _ = try m.complete(p, kind);
         switch (p.peek()) {
             .comma => try p.bump(),
             .colon, .r_paren, .r_brace, .r_bracket => break,
-            else => try p.err("期望 ','"),
+            else => try p.err("expected ','"),
         }
     }
 }
@@ -798,7 +798,7 @@ fn exprPrec(p: *Parser, min_prec: u8) Error!CM {
         const m = try lhs.precede(p);
         try p.bump();
         if (op == .keyword_catch) try optPayload(p);
-        if (try exprPrec(p, prec + 1) == null) try p.err("期望表达式");
+        if (try exprPrec(p, prec + 1) == null) try p.err("expected expression");
         lhs = try m.complete(p, .binary_expr);
     }
     return lhs;
@@ -809,7 +809,7 @@ fn prefixExpr(p: *Parser) Error!CM {
         .bang, .minus, .tilde, .minus_percent, .ampersand, .keyword_try => {
             const m = try p.start();
             try p.bump();
-            if (try prefixExpr(p) == null) try p.err("期望表达式");
+            if (try prefixExpr(p) == null) try p.err("expected expression");
             return try m.complete(p, .prefix_expr);
         },
         else => return primaryExpr(p),
@@ -855,7 +855,7 @@ fn primaryExpr(p: *Parser) Error!CM {
 fn prefixed(p: *Parser, kind: SyntaxKind) Error!CompletedMarker {
     const m = try p.start();
     try p.bump();
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     return m.complete(p, kind);
 }
 
@@ -883,7 +883,7 @@ fn initList(p: *Parser) Error!void {
     while (true) {
         if (try p.eat(.r_brace)) break;
         if (p.atEof()) {
-            try p.err("期望 '}'");
+            try p.err("expected '}'");
             break;
         }
         if (p.at(.period) and p.nth(1) == .identifier and p.nth(2) == .equal) {
@@ -891,16 +891,16 @@ fn initList(p: *Parser) Error!void {
             try p.bump();
             try p.bump();
             try p.bump();
-            if (try expr(p) == null) try p.err("期望表达式");
+            if (try expr(p) == null) try p.err("expected expression");
             _ = try fm.complete(p, .field_init);
         } else if (try expr(p) == null) {
             switch (p.peek()) {
                 .r_paren, .r_bracket, .semicolon => {
-                    try p.err("期望 '}'");
+                    try p.err("expected '}'");
                     break;
                 },
                 else => {
-                    try p.errBump("期望初始化表达式");
+                    try p.errBump("expected initializer");
                     continue;
                 },
             }
@@ -909,10 +909,10 @@ fn initList(p: *Parser) Error!void {
             .comma => try p.bump(),
             .r_brace => {},
             .colon, .r_paren, .r_bracket => {
-                try p.err("期望 '}'");
+                try p.err("expected '}'");
                 break;
             },
-            else => try p.err("期望 ','"),
+            else => try p.err("expected ','"),
         }
     }
     _ = try m.complete(p, .init_list);
@@ -926,7 +926,7 @@ fn typeExpr(p: *Parser) Error!CM {
             const m = try p.start();
             try p.bump();
             try ptrModifiers(p);
-            if (try typeExpr(p) == null) try p.err("期望类型表达式");
+            if (try typeExpr(p) == null) try p.err("expected type expression");
             return try m.complete(p, .ptr_type);
         },
         .l_bracket => {
@@ -941,14 +941,14 @@ fn typeExpr(p: *Parser) Error!CM {
                 }
                 _ = try p.expect(.r_bracket);
                 try ptrModifiers(p);
-                if (try typeExpr(p) == null) try p.err("期望类型表达式");
+                if (try typeExpr(p) == null) try p.err("expected type expression");
                 return try m.complete(p, .ptr_type);
             }
             const has_len = try expr(p) != null;
             if (p.at(.colon)) try sentinel(p);
             _ = try p.expect(.r_bracket);
             if (!has_len) try ptrModifiers(p);
-            if (try typeExpr(p) == null) try p.err("期望类型表达式");
+            if (try typeExpr(p) == null) try p.err("expected type expression");
             return try m.complete(p, if (has_len) .array_type else .slice_type);
         },
         else => {},
@@ -959,14 +959,14 @@ fn typeExpr(p: *Parser) Error!CM {
 fn prefixedType(p: *Parser, kind: SyntaxKind, tokens: u8) Error!CompletedMarker {
     const m = try p.start();
     for (0..tokens) |_| try p.bump();
-    if (try typeExpr(p) == null) try p.err("期望类型表达式");
+    if (try typeExpr(p) == null) try p.err("expected type expression");
     return m.complete(p, kind);
 }
 
 fn sentinel(p: *Parser) Error!void {
     const m = try p.start();
     try p.bump(); // :
-    if (try expr(p) == null) try p.err("期望表达式");
+    if (try expr(p) == null) try p.err("expected expression");
     _ = try m.complete(p, .sentinel);
 }
 
@@ -984,7 +984,7 @@ fn errorUnionExpr(p: *Parser) Error!CM {
     if (!p.at(.bang)) return lhs;
     const m = try lhs.precede(p);
     try p.bump();
-    if (try typeExpr(p) == null) try p.err("期望类型表达式");
+    if (try typeExpr(p) == null) try p.err("expected type expression");
     return try m.complete(p, .error_union_type);
 }
 
@@ -995,7 +995,7 @@ fn suffixExpr(p: *Parser) Error!CM {
             .l_bracket => {
                 const m = try lhs.precede(p);
                 try p.bump();
-                if (try expr(p) == null) try p.err("期望表达式");
+                if (try expr(p) == null) try p.err("expected expression");
                 if (try p.eat(.ellipsis2)) {
                     _ = try expr(p);
                     if (p.at(.colon)) try sentinel(p);
@@ -1029,7 +1029,7 @@ fn suffixExpr(p: *Parser) Error!CM {
                     // `foo.` 尚未写完：保留字段访问结构，补全依赖它
                     const m = try lhs.precede(p);
                     try p.bump();
-                    try p.err("期望字段名");
+                    try p.err("expected field name");
                     lhs = try m.complete(p, .field_access);
                 },
             },
@@ -1049,17 +1049,17 @@ fn argList(p: *Parser) Error!void {
     while (true) {
         if (try p.eat(.r_paren)) break;
         if (p.atEof()) {
-            try p.err("期望 ')'");
+            try p.err("expected ')'");
             break;
         }
         if (try expr(p) == null) {
             switch (p.peek()) {
                 .r_brace, .r_bracket, .semicolon => {
-                    try p.err("期望 ')'");
+                    try p.err("expected ')'");
                     break;
                 },
                 else => {
-                    try p.errBump("期望参数");
+                    try p.errBump("expected parameter");
                     continue;
                 },
             }
@@ -1068,10 +1068,10 @@ fn argList(p: *Parser) Error!void {
             .comma => try p.bump(),
             .r_paren => {},
             .colon, .r_brace, .r_bracket => {
-                try p.err("期望 ')'");
+                try p.err("expected ')'");
                 break;
             },
-            else => try p.err("参数后期望 ','"),
+            else => try p.err("expected ',' after parameter"),
         }
     }
     _ = try m.complete(p, .arg_list);
@@ -1090,7 +1090,7 @@ fn primaryTypeExpr(p: *Parser) Error!CM {
         .builtin => {
             const m = try p.start();
             try p.bump();
-            if (p.at(.l_paren)) try argList(p) else try p.err("期望参数列表");
+            if (p.at(.l_paren)) try argList(p) else try p.err("expected argument list");
             return try m.complete(p, .builtin_call);
         },
         .keyword_fn => return try fnProto(p),
@@ -1149,7 +1149,7 @@ fn primaryTypeExpr(p: *Parser) Error!CM {
         .l_paren => {
             const m = try p.start();
             try p.bump();
-            if (try expr(p) == null) try p.err("期望表达式");
+            if (try expr(p) == null) try p.err("expected expression");
             _ = try p.expect(.r_paren);
             return try m.complete(p, .paren_expr);
         },
@@ -1169,20 +1169,20 @@ fn errorSetBody(p: *Parser) Error!void {
         if (try p.eat(.r_brace)) break;
         switch (p.peek()) {
             .eof, .semicolon, .r_paren, .r_bracket => {
-                try p.err("期望 '}'");
+                try p.err("expected '}'");
                 break;
             },
             else => {},
         }
         while (p.at(.doc_comment)) try p.bump();
         if (!try p.eat(.identifier)) {
-            try p.errBump("期望错误名");
+            try p.errBump("expected error name");
             continue;
         }
         switch (p.peek()) {
             .comma => try p.bump(),
             .r_brace => {},
-            else => try p.err("期望 ','"),
+            else => try p.err("expected ','"),
         }
     }
 }
@@ -1194,7 +1194,7 @@ pub fn containerDecl(p: *Parser) Error!CompletedMarker {
         .keyword_struct, .keyword_enum => {
             try p.bump();
             if (try p.eat(.l_paren)) {
-                if (try expr(p) == null) try p.err("期望表达式");
+                if (try expr(p) == null) try p.err("expected expression");
                 _ = try p.expect(.r_paren);
             }
         },
@@ -1203,15 +1203,15 @@ pub fn containerDecl(p: *Parser) Error!CompletedMarker {
             if (try p.eat(.l_paren)) {
                 if (try p.eat(.keyword_enum)) {
                     if (try p.eat(.l_paren)) {
-                        if (try expr(p) == null) try p.err("期望表达式");
+                        if (try expr(p) == null) try p.err("expected expression");
                         _ = try p.expect(.r_paren);
                     }
-                } else if (try expr(p) == null) try p.err("期望表达式");
+                } else if (try expr(p) == null) try p.err("expected expression");
                 _ = try p.expect(.r_paren);
             }
         },
         .keyword_opaque => try p.bump(),
-        else => try p.err("期望 struct、enum、union 或 opaque"),
+        else => try p.err("expected struct, enum, union or opaque"),
     }
     if (try p.expect(.l_brace)) {
         try containerMembers(p);

@@ -145,7 +145,7 @@ pub fn readFromDisk(vfs: *Vfs, id: FileId, gpa: Allocator) ReadError!?[]u8 {
 /// 超过此大小的文件不加载（与 Zig 编译器对单个源文件的限制同量级）
 pub const max_file_size = 64 * 1024 * 1024;
 
-test "驻留与规范化" {
+test "interning and normalization" {
     var vfs: Vfs = .init(std.testing.io, std.testing.allocator);
     defer vfs.deinit();
     const root = if (@import("builtin").target.os.tag == .windows) "C:\\" else "/";
@@ -161,7 +161,7 @@ test "驻留与规范化" {
     try std.testing.expect(std.mem.endsWith(u8, vfs.path(id_a), "a.zig"));
 }
 
-test "大小写不敏感：不同写法映射到同一文件，对外保留第一次的写法" {
+test "case-insensitive: spellings map to one file, first spelling is kept for display" {
     const t = std.testing;
     inline for (.{ Style.posix, Style.windows }) |style| {
         var vfs: Vfs = .initOptions(t.io, t.allocator, .{ .style = style, .case = .insensitive });
@@ -179,7 +179,7 @@ test "大小写不敏感：不同写法映射到同一文件，对外保留第�
     }
 }
 
-test "大小写敏感：不同写法是不同文件" {
+test "case-sensitive: different spellings are different files" {
     const t = std.testing;
     var vfs: Vfs = .initOptions(t.io, t.allocator, .{ .style = .posix, .case = .sensitive });
     defer vfs.deinit();

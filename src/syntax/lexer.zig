@@ -79,7 +79,7 @@ fn expectLossless(source: [:0]const u8) !void {
     try testing.expectEqual(source.len, pos);
 }
 
-test "trivia 切分" {
+test "trivia splitting" {
     const source = "const a = 1; // hi\n/// doc\nfn f() void {}\n";
     const tokens = try tokenize(testing.allocator, source);
     defer testing.allocator.free(tokens);
@@ -94,7 +94,7 @@ test "trivia 切分" {
     }, kinds.items);
 }
 
-test "无损：BOM、非法字符、内嵌 0 字节、CRLF" {
+test "lossless: BOM, invalid characters, embedded NUL, CRLF" {
     try expectLossless("\xEF\xBB\xBFconst x = 1;");
     try expectLossless("const x = $;\r\n// c\r\n");
     try expectLossless("a\x00b c");

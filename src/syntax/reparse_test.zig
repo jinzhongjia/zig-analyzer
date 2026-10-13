@@ -17,7 +17,7 @@ fn expectReparse(old_text: []const u8, new_text: []const u8, expect_incremental:
     }
 }
 
-test "函数体内的编辑走局部重解析" {
+test "edits inside a function body use block reparse" {
     const base = "const a = 1;\nfn f() void {\n    g();\n}\nconst b = 2;\n";
     try expectReparse(base, "const a = 1;\nfn f() void {\n    g(1, 2);\n}\nconst b = 2;\n", true);
     try expectReparse(base, "const a = 1;\nfn f() void {\n    g();\n    var x = y.;\n}\nconst b = 2;\n", true);
@@ -26,12 +26,12 @@ test "函数体内的编辑走局部重解析" {
     try expectReparse(base, "const a = 1;\nfn f() void {\n    if (x) { g(); }\n}\nconst b = 2;\n", true);
 }
 
-test "容器内部的编辑走局部重解析" {
+test "edits inside a container use block reparse" {
     try expectReparse("const S = struct {\n    a: u32,\n};\n", "const S = struct {\n    a: u32,\n    b: u8,\n};\n", true);
     try expectReparse("const S = struct {\n    a: u32,\n};\n", "const S = struct {\n    a: u32 = ,\n};\n", true);
 }
 
-test "选择最深的块" {
+test "picks the deepest block" {
     const old = try Parse.create(testing.allocator, "fn f() void {\n    while (true) {\n        a();\n    }\n}\n");
     defer old.destroy();
     const inc = (try Parse.reparseBlock(testing.allocator, old, "fn f() void {\n    while (true) {\n        b();\n    }\n}\n")).?;
@@ -43,7 +43,7 @@ test "选择最深的块" {
     try testing.expect(old_fn.children[0].node == new_fn.children[0].node); // fn_proto 复用
 }
 
-test "不满足条件时回退全量解析" {
+test "falls back to full parse when conditions are not met" {
     const base = "fn f() void {\n    g();\n}\n";
     // 改动了花括号本身
     try expectReparse(base, "fn f() void \n    g();\n}\n", false);
@@ -58,14 +58,14 @@ test "不满足条件时回退全量解析" {
     try expectReparse(base, base, false);
 }
 
-test "外层错误在增量后保持并正确平移" {
+test "outer errors are kept and shifted after incremental parse" {
     // 第一行的错误在块之前，最后一行的错误在块之后
     try expectReparse("const a = ;\nfn f() void {\n    g();\n}\nconst b = ;\n", "const a = ;\nfn f() void {\n    g(1, 2, 3);\n}\nconst b = ;\n", true);
     // `1 {}` 是初始化列表；其中出现 `;` 后函数体花括号无法由块语法消费完，回退全量解析
     try expectReparse("fn f() void {\n    x = 1 {}\n}\n", "fn f() void {\n    x = 1 { y(); }\n}\n", false);
 }
 
-test "引用计数：旧结果在增量结果释放前保持有效" {
+test "ref counting: old result stays valid until the incremental result is freed" {
     const old = try Parse.create(testing.allocator, "fn f() void {\n    g();\n}\n");
     const inc = (try Parse.reparseBlock(testing.allocator, old, "fn f() void {\n    h();\n}\n")).?;
     old.destroy(); // 查询引擎释放旧值

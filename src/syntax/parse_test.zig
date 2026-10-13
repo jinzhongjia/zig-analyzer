@@ -48,7 +48,7 @@ fn expectNoErrors(source: []const u8) !void {
     }
 }
 
-test "变量声明与 trivia 归属" {
+test "variable declarations and trivia attachment" {
     try expectTree("// c\nconst a: u32 = 1 + 2 * 3;\n",
         \\source_file@0..31
         \\  var_decl@5..30
@@ -73,7 +73,7 @@ test "变量声明与 trivia 归属" {
     );
 }
 
-test "函数声明、参数与语句" {
+test "function declarations, parameters and statements" {
     try expectTree(
         \\/// doc
         \\pub fn add(a: i32, comptime T: type) !T {
@@ -135,7 +135,7 @@ test "函数声明、参数与语句" {
     );
 }
 
-test "容错：未写完的字段访问保留结构" {
+test "recovery: incomplete field access keeps structure" {
     try expectTree(
         \\fn f() void {
         \\    list.
@@ -159,13 +159,13 @@ test "容错：未写完的字段访问保留结构" {
         \\            identifier "list"
         \\          period "."
         \\      r_brace "}"
-        \\error@24: 期望字段名
-        \\error@24: 期望 ';'
+        \\error@24: expected field name
+        \\error@24: expected ';'
         \\
     );
 }
 
-test "容错：语句中的垃圾 token 不影响后续语句" {
+test "recovery: garbage tokens in a statement do not affect later statements" {
     try expectTree(
         \\fn f() void {
         \\    ) ;
@@ -197,13 +197,13 @@ test "容错：语句中的垃圾 token 不影响后续语句" {
         \\            r_paren ")"
         \\        semicolon ";"
         \\      r_brace "}"
-        \\error@18: 期望语句
-        \\error@20: 期望语句
+        \\error@18: expected statement
+        \\error@20: expected statement
         \\
     );
 }
 
-test "无损：各种畸形输入" {
+test "lossless: malformed inputs" {
     const inputs = [_][]const u8{
         "",
         "   \n// only comment\n",
@@ -222,7 +222,7 @@ test "无损：各种畸形输入" {
     for (inputs) |input| try expectLossless(input);
 }
 
-test "合法代码无解析错误" {
+test "valid code has no parse errors" {
     const sources = [_][]const u8{
         \\const std = @import("std");
         \\pub const Point = extern struct {

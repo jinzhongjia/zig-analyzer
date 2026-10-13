@@ -93,7 +93,7 @@ fn checkPathProperties(comptime style: Style, e: *Entropy) !void {
     for (u["file://".len..]) |c| {
         const ok = std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._~/%:", c) != null;
         if (!ok) {
-            std.debug.print("URI 含非法字符 '{c}': {s}\n", .{ c, u });
+            std.debug.print("URI contains invalid character '{c}': {s}\n", .{ c, u });
             return error.TestUnexpectedResult;
         }
     }
@@ -104,7 +104,7 @@ fn checkPathProperties(comptime style: Style, e: *Entropy) !void {
 
 fn expectEqualPaths(expected: []const u8, actual: []const u8, raw: []const u8) !void {
     if (std.mem.eql(u8, expected, actual)) return;
-    std.debug.print("路径不一致\n  原始: {s}\n  期望: {s}\n  实际: {s}\n", .{ raw, expected, actual });
+    std.debug.print("path mismatch\n  raw: {s}\n  expected: {s}\n  actual: {s}\n", .{ raw, expected, actual });
     return error.TestUnexpectedResult;
 }
 
@@ -126,7 +126,7 @@ fn checkArbitraryUri(comptime style: Style, input: []const u8) !void {
     const u = try uri.fromPathStyle(style, a, path);
     defer a.free(u);
     const path2 = uri.toPathStyle(style, a, u) catch |err| {
-        std.debug.print("二次转换失败 {t}\n  输入: {s}\n  路径: {s}\n  URI: {s}\n", .{ err, buf.items, path, u });
+        std.debug.print("round trip failed {t}\n  input: {s}\n  path: {s}\n  URI: {s}\n", .{ err, buf.items, path, u });
         return error.TestUnexpectedResult;
     };
     defer a.free(path2);
@@ -179,7 +179,7 @@ fn checkAll(input: []const u8) !void {
     try checkArbitraryUri(.windows, input);
 }
 
-test "路径性质：固定种子随机输入" {
+test "path properties: fixed-seed random input" {
     var prng: std.Random.DefaultPrng = .init(0x5eed_9a7f);
     var buf: [96]u8 = undefined;
     for (0..Entropy.iterations(20_000)) |_| {
@@ -189,7 +189,7 @@ test "路径性质：固定种子随机输入" {
     }
 }
 
-test "路径性质：覆盖率引导模糊测试" {
+test "path properties: coverage-guided fuzzing" {
     try testing.fuzz({}, struct {
         fn one(_: void, smith: *testing.Smith) anyerror!void {
             var buf: [256]u8 = undefined;
@@ -199,7 +199,7 @@ test "路径性质：覆盖率引导模糊测试" {
     }.one, .{ .corpus = &.{ "C:\\a", "/a b/c", "\\\\server\\share", "%3A%2F%00", "///c%3A/x" } });
 }
 
-test "Windows 盘符大小写与分隔符规范化为同一路径" {
+test "Windows drive letter case and separators normalize to the same path" {
     const a = testing.allocator;
     const forms = [_][]const u8{ "c:\\Work\\x.zig", "C:/Work/x.zig", "c:\\Work\\.\\sub\\..\\x.zig", "C:\\\\Work\\x.zig\\" };
     for (forms) |f| {
@@ -213,7 +213,7 @@ test "Windows 盘符大小写与分隔符规范化为同一路径" {
     try testing.expectEqualStrings("\\\\server\\share\\x.zig", unc);
 }
 
-test "相对路径不是绝对路径" {
+test "relative paths are not absolute" {
     try testing.expectEqual(null, try Vfs.normalize(.posix, testing.allocator, "a/b"));
     try testing.expectEqual(null, try Vfs.normalize(.windows, testing.allocator, "a\\b"));
     try testing.expectEqual(null, try Vfs.normalize(.windows, testing.allocator, "C:a\\b"));

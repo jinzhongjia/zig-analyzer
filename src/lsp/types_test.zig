@@ -3,7 +3,7 @@ const types = @import("types.zig");
 const json = std.json;
 const testing = std.testing;
 
-test "所有消息的 Params / Result 类型都能实例化 JSON 解析与序列化" {
+test "Params / Result types of all messages instantiate JSON parse and stringify" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -21,7 +21,7 @@ fn instantiate(comptime T: type, a: std.mem.Allocator) !void {
     _ = try json.Stringify.valueAlloc(a, @as(?T, null), .{});
 }
 
-test "解析 initialize 请求参数" {
+test "parse initialize request params" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const params = try json.parseFromSliceLeaky(types.InitializeParams, arena.allocator(),
@@ -37,7 +37,7 @@ test "解析 initialize 请求参数" {
     try testing.expectEqual(types.TraceValue.off, params.trace.?);
 }
 
-test "序列化：整数枚举输出数字，字符串字面量与联合类型" {
+test "stringify: integer enums as numbers, string literals and unions" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

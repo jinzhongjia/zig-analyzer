@@ -54,7 +54,7 @@ pub const Parser = struct {
 
     /// 第 n 个尚未消费的非 trivia token 的种类；越界时为 eof。
     pub fn nth(p: *Parser, n: u32) SyntaxKind {
-        if (p.fuel == 0) std.debug.panic("解析器卡住：位置 {d}", .{p.currentOffset()});
+        if (p.fuel == 0) std.debug.panic("parser stuck at offset {d}", .{p.currentOffset()});
         p.fuel -= 1;
         const i = p.pos + n;
         if (i >= p.significant.len) return .eof;
@@ -229,5 +229,5 @@ fn emitTrivia(builder: *green.Builder, source: []const u8, tokens: []const lexer
 
 fn expectedMessage(comptime kind: SyntaxKind) []const u8 {
     const lexeme = if (kind_mod.toTokenTag(kind)) |tag| tag.lexeme() else null;
-    return if (lexeme) |l| "期望 '" ++ l ++ "'" else "期望 " ++ @tagName(kind);
+    return if (lexeme) |l| "expected '" ++ l ++ "'" else "expected " ++ @tagName(kind);
 }

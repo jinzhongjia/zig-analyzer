@@ -2,13 +2,13 @@ const std = @import("std");
 const za = @import("zig_analyzer");
 
 const usage =
-    \\用法: zig-analyzer [选项]
+    \\Usage: zig-analyzer [options]
     \\
-    \\通过 stdio 提供 Zig 语言服务（LSP）。
+    \\Zig language server (LSP) over stdio.
     \\
-    \\选项:
-    \\  --version   打印版本
-    \\  --help      打印本帮助
+    \\Options:
+    \\  --version   print version
+    \\  --help      print this help
     \\
 ;
 
@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !u8 {
             try std.Io.File.stdout().writeStreamingAll(io, usage);
             return 0;
         } else {
-            std.log.err("未知参数: {s}", .{arg});
+            std.log.err("unknown argument: {s}", .{arg});
             return 1;
         }
     }

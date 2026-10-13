@@ -24,13 +24,13 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
-    b.step("run", "运行 zig-analyzer").dependOn(&run_cmd.step);
+    b.step("run", "Run zig-analyzer").dependOn(&run_cmd.step);
 
-    const check = b.step("check", "检查是否能编译");
+    const check = b.step("check", "Check that everything compiles");
     check.dependOn(&exe.step);
 
     // 生成代码：结果写回 src/，与源码一起提交
-    const gen_step = b.step("gen", "重新生成 LSP 类型等代码");
+    const gen_step = b.step("gen", "Regenerate LSP types and other generated code");
     const gen_lsp = b.addExecutable(.{
         .name = "gen_lsp_types",
         .root_module = b.createModule(.{
@@ -59,8 +59,8 @@ pub fn build(b: *std.Build) void {
     const corpus_run = b.addRunArtifact(corpus);
     corpus_run.addDirectoryArg(std.Build.LazyPath.zig_lib.path(b, "std"));
     corpus_run.addPassthruArgs();
-    b.step("corpus", "在 Zig 源码语料上校验 CST 解析器").dependOn(&corpus_run.step);
+    b.step("corpus", "Validate the CST parser against a Zig source corpus").dependOn(&corpus_run.step);
 
-    const test_step = b.step("test", "运行全部测试");
+    const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
 }

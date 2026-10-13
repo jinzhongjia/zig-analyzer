@@ -59,7 +59,7 @@ fn checkAll(input: []const u8) !void {
     try testing.expectEqualStrings(expected, applied);
 }
 
-test "位置换算性质：固定种子随机输入" {
+test "position conversion properties: fixed-seed random input" {
     var prng: std.Random.DefaultPrng = .init(0x0ff5_e7a1);
     var buf: [128]u8 = undefined;
     for (0..Entropy.iterations(5_000)) |_| {
@@ -69,7 +69,7 @@ test "位置换算性质：固定种子随机输入" {
     }
 }
 
-test "位置换算性质：覆盖率引导模糊测试" {
+test "position conversion properties: coverage-guided fuzzing" {
     try testing.fuzz({}, struct {
         fn one(_: void, smith: *testing.Smith) anyerror!void {
             var buf: [256]u8 = undefined;

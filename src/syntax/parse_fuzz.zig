@@ -69,14 +69,14 @@ fn checkAll(input: []const u8) !void {
         const full = try Parse.create(a, text.items);
         defer full.destroy();
         if (!inc.sameAs(full)) {
-            std.debug.print("增量与全量不一致：\n---\n{s}\n---\n", .{text.items});
+            std.debug.print("incremental and full parse differ:\n---\n{s}\n---\n", .{text.items});
             return error.TestUnexpectedResult;
         }
         try expectLossless(inc, text.items);
     }
 }
 
-test "解析器性质：固定种子随机输入" {
+test "parser properties: fixed-seed random input" {
     var prng: std.Random.DefaultPrng = .init(0x9a25_e11e);
     var buf: [192]u8 = undefined;
     for (0..Entropy.iterations(3_000)) |_| {
@@ -86,7 +86,7 @@ test "解析器性质：固定种子随机输入" {
     }
 }
 
-test "解析器性质：覆盖率引导模糊测试" {
+test "parser properties: coverage-guided fuzzing" {
     try testing.fuzz({}, struct {
         fn one(_: void, smith: *testing.Smith) anyerror!void {
             var buf: [1024]u8 = undefined;

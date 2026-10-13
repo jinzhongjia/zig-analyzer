@@ -38,7 +38,7 @@ fn expectItems(source: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, out.written());
 }
 
-test "收录顶层与嵌套容器成员" {
+test "collects top-level and nested container members" {
     try expectItems(
         \\/// 点
         \\pub const Point = struct {
@@ -81,7 +81,7 @@ fn treesEqual(a: []const u8, b: []const u8) !bool {
     return x.items.eql(&y.items);
 }
 
-test "只改函数体、注释或空白时 ItemTree 不变" {
+test "ItemTree unchanged by body, comment or whitespace edits" {
     const base =
         \\const S = struct { a: u32 };
         \\fn f(x: u32) u32 { return x + 1; }
@@ -97,7 +97,7 @@ test "只改函数体、注释或空白时 ItemTree 不变" {
     ));
 }
 
-test "签名、字段或成员变化时 ItemTree 改变" {
+test "ItemTree changes when signatures, fields or members change" {
     const base = "const S = struct { a: u32 };\nfn f(x: u32) u32 { return x; }";
     try testing.expect(!try treesEqual(base, "const S = struct { a: u64 };\nfn f(x: u32) u32 { return x; }"));
     try testing.expect(!try treesEqual(base, "const S = struct { a: u32, b: u8 };\nfn f(x: u32) u32 { return x; }"));
@@ -106,7 +106,7 @@ test "签名、字段或成员变化时 ItemTree 改变" {
     try testing.expect(!try treesEqual(base, "const S = union { a: u32 };\nfn f(x: u32) u32 { return x; }"));
 }
 
-test "AstId 跨编辑稳定，AstIdMap 能找回节点" {
+test "AstId stable across edits, AstIdMap finds the node" {
     var a = try buildTree("const A = 1;\nfn f() void {}\n");
     defer a.parse.destroy();
     defer a.items.deinit(testing.allocator);
@@ -126,7 +126,7 @@ test "AstId 跨编辑稳定，AstIdMap 能找回节点" {
     try testing.expect(std.mem.startsWith(u8, node.text(b.parse.source), "fn f()"));
 }
 
-test "同名成员通过序号区分" {
+test "same-name members are distinguished by index" {
     var r = try buildTree("test {}\ntest {}\ncomptime {}\ncomptime {}");
     defer r.parse.destroy();
     defer r.items.deinit(testing.allocator);

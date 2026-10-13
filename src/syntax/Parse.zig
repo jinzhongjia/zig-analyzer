@@ -129,7 +129,7 @@ fn runParser(gpa: Allocator, source: []const u8, tokens: []const lexer.Token, co
     return .{ .events = events, .errors = try p.errors.toOwnedSlice(gpa) };
 }
 
-const unconsumed = "局部重解析：存在未消费的 token";
+const unconsumed = "block reparse: unconsumed tokens";
 
 /// 可以独立重解析的节点：编辑必须严格位于其 `{` 与 `}` 之间
 fn isReparsable(kind: SyntaxKind) bool {

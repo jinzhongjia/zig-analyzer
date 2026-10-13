@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
-        std.debug.print("用法: {s} <目录或文件>...\n", .{args[0]});
+        std.debug.print("usage: {s} <dir or file>...\n", .{args[0]});
         return 1;
     }
 
@@ -73,15 +73,15 @@ pub fn main(init: std.process.Init) !u8 {
     const secs = @as(f64, @floatFromInt(stats.parse_ns)) / std.time.ns_per_s;
     const ns = std.time.ns_per_s;
     std.debug.print(
-        \\文件数: {d}（{d:.1} MB，其中 std.zig.Ast 报错 {d} 个）
-        \\无损失败: {d}
-        \\误报错误: {d}
-        \\结构不一致: {d}
-        \\截断解析: {d} 次，均未崩溃
-        \\CST 解析耗时: {d:.2}s（{d:.1} MB/s）
-        \\ItemTree: {d} 个成员，映射失败 {d}，构建耗时 {d:.2}s
-        \\增量重解析: {d} 次随机编辑，局部重解析 {d} 次，与全量不一致 {d}；耗时 增量 {d:.2}s / 全量 {d:.2}s
-        \\  其中局部重解析的编辑：增量 {d:.3}s / 同文本全量 {d:.3}s（{d:.1}x）
+        \\files: {d} ({d:.1} MB, {d} with std.zig.Ast errors)
+        \\lossless failures: {d}
+        \\false errors: {d}
+        \\structure mismatches: {d}
+        \\truncated parses: {d}, no crashes
+        \\CST parse time: {d:.2}s ({d:.1} MB/s)
+        \\ItemTree: {d} members, {d} mapping failures, build time {d:.2}s
+        \\incremental reparse: {d} random edits, {d} block reparses, {d} mismatches with full parse; time incremental {d:.2}s / full {d:.2}s
+        \\  block-reparse edits only: incremental {d:.3}s / full parse of same text {d:.3}s ({d:.1}x)
         \\
     , .{
         stats.files,                                         mb,
@@ -106,7 +106,7 @@ fn report(stats: *Stats, comptime fmt: []const u8, args: anytype) void {
 
 fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stats: *Stats) !void {
     const source = dir.readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch |err| {
-        std.debug.print("无法读取 {s}: {t}\n", .{ path, err });
+        std.debug.print("cannot read {s}: {t}\n", .{ path, err });
         return;
     };
     defer gpa.free(source);
@@ -121,7 +121,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     // 1. 无损
     if (!try isLossless(gpa, parse.rootNode(), source)) {
         stats.lossless_failures += 1;
-        report(stats, "[无损失败] {s}", .{path});
+        report(stats, "[lossless failure] {s}", .{path});
     }
 
     // ItemTree 与 AstIdMap：每个成员都能映射回对应种类的节点
@@ -146,7 +146,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
         } else true;
         if (!ok) {
             stats.item_failures += 1;
-            report(stats, "[ItemTree 映射失败] {s}", .{path});
+            report(stats, "[ItemTree mapping failure] {s}", .{path});
         }
     }
 
@@ -162,12 +162,12 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             stats.false_errors += 1;
             const e = parse.errors[0];
             const loc = lineCol(source, e.offset);
-            report(stats, "[误报] {s}:{d}:{d}: {s}（共 {d} 个）", .{ path, loc.line, loc.col, e.message, parse.errors.len });
+            report(stats, "[false error] {s}:{d}:{d}: {s} ({d} total)", .{ path, loc.line, loc.col, e.message, parse.errors.len });
         }
         // 3. 顶层结构
         if (!try sameStructure(gpa, &ast, parse.rootNode(), source)) {
             stats.structure_mismatches += 1;
-            report(stats, "[结构不一致] {s}", .{path});
+            report(stats, "[structure mismatch] {s}", .{path});
         }
     }
 
@@ -183,7 +183,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
         stats.truncations += 1;
         if (!try isLossless(gpa, partial.rootNode(), source[0..end])) {
             stats.lossless_failures += 1;
-            report(stats, "[截断无损失败] {s} @ {d}", .{ path, end });
+            report(stats, "[truncated lossless failure] {s} @ {d}", .{ path, end });
         }
     }
 }
@@ -229,7 +229,7 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
         stats.reparse_full_ns += @intCast(t1.durationTo(t2).nanoseconds);
         if (!inc.sameAs(full)) {
             stats.reparse_mismatches += 1;
-            report(stats, "[增量不一致] {s}：在 {d} 处删除 {d} 字节并插入 \"{s}\"", .{ path, at, del, ins });
+            report(stats, "[incremental mismatch] {s}: at {d} deleted {d} bytes and inserted \"{s}\"", .{ path, at, del, ins });
         }
         chain.destroy();
         chain = inc;
@@ -284,7 +284,7 @@ fn sameStructure(gpa: Allocator, ast: *const std.zig.Ast, root: SyntaxNode, sour
     var same = expected.count() == actual.count();
     for (expected.keys(), expected.values()) |key, exp| {
         const act = actual.get(key) orelse {
-            if (debug) std.debug.print("  CST 缺少容器 @{d}\n", .{key});
+            if (debug) std.debug.print("  CST missing container @{d}\n", .{key});
             same = false;
             continue;
         };
@@ -294,7 +294,7 @@ fn sameStructure(gpa: Allocator, ast: *const std.zig.Ast, root: SyntaxNode, sour
         if (!equal) {
             same = false;
             if (debug) {
-                std.debug.print("  容器 @{d} 成员不同\n    std:", .{key});
+                std.debug.print("  container @{d} members differ\n    std:", .{key});
                 for (exp) |e| std.debug.print(" {s}:{s}", .{ e.kind, e.name });
                 std.debug.print("\n    cst:", .{});
                 for (act) |a| std.debug.print(" {s}:{s}", .{ a.kind, a.name });
@@ -303,7 +303,7 @@ fn sameStructure(gpa: Allocator, ast: *const std.zig.Ast, root: SyntaxNode, sour
         }
     }
     if (debug) for (actual.keys()) |key| {
-        if (!expected.contains(key)) std.debug.print("  CST 多出容器 @{d}\n", .{key});
+        if (!expected.contains(key)) std.debug.print("  CST extra container @{d}\n", .{key});
     };
     return same;
 }

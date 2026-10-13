@@ -33,7 +33,7 @@ fn executions(db: *Db, comptime Q: type) u64 {
     return db.executions[Db.queryIndex(Q)].load(.monotonic);
 }
 
-test "只改函数体：重新解析与构建 ItemTree，但下游不重算" {
+test "body-only edit: reparse and rebuild ItemTree, downstream not recomputed" {
     var db: Db = .init(testing.io, testing.allocator, {});
     defer db.deinit();
     const file: Vfs.FileId = @fromBackingInt(@intCast(0));
@@ -53,7 +53,7 @@ test "只改函数体：重新解析与构建 ItemTree，但下游不重算" {
     try testing.expectEqual(2, executions(&db, ItemCount));
 }
 
-test "AstIdMap 指向最新语法树" {
+test "AstIdMap points to the latest tree" {
     var db: Db = .init(testing.io, testing.allocator, {});
     defer db.deinit();
     const file: Vfs.FileId = @fromBackingInt(@intCast(0));
@@ -68,7 +68,7 @@ test "AstIdMap 指向最新语法树" {
     try testing.expectEqual(2, node.range().start);
 }
 
-test "ParseFile 在函数体内编辑后走局部重解析" {
+test "ParseFile uses block reparse after edits inside a function body" {
     var db: Db = .init(testing.io, testing.allocator, {});
     defer db.deinit();
     const file: Vfs.FileId = @fromBackingInt(@intCast(0));

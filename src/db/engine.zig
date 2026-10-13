@@ -174,7 +174,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             inline for (queries, 0..) |Candidate, i| {
                 if (Candidate == Q) return i;
             }
-            @compileError("query 未注册: " ++ @typeName(Q));
+            @compileError("query not registered: " ++ @typeName(Q));
         }
 
         pub fn stats(db: *Db, buf: *[queries.len]u64) Stats {
@@ -325,7 +325,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             fn onCycle(ctx: *Ctx, comptime Q: type, head: usize, key: Q.Key) Q.Value {
                 if (!@hasDecl(Q, "cycleFallback")) {
-                    std.debug.panic("query 环且未声明 cycleFallback: {s}", .{@typeName(Q)});
+                    std.debug.panic("query cycle without cycleFallback: {s}", .{@typeName(Q)});
                 }
                 for (ctx.stack.items[head..]) |*frame| frame.in_cycle = true;
                 return Q.cycleFallback(key);
@@ -496,14 +496,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
 fn validate(comptime Q: type) void {
     for (.{ "kind", "Key", "Value" }) |name| {
-        if (!@hasDecl(Q, name)) @compileError(@typeName(Q) ++ " 缺少声明: " ++ name);
+        if (!@hasDecl(Q, name)) @compileError(@typeName(Q) ++ " is missing declaration: " ++ name);
     }
     switch (Q.kind) {
-        .input => if (!@hasDecl(Q, "default")) @compileError(@typeName(Q) ++ " 是 input，必须声明 default"),
-        .derived => if (!@hasDecl(Q, "compute") and !@hasDecl(Q, "computeIncremental")) @compileError(@typeName(Q) ++ " 是 derived，必须声明 compute 或 computeIncremental"),
+        .input => if (!@hasDecl(Q, "default")) @compileError(@typeName(Q) ++ " is an input and must declare default"),
+        .derived => if (!@hasDecl(Q, "compute") and !@hasDecl(Q, "computeIncremental")) @compileError(@typeName(Q) ++ " is derived and must declare compute or computeIncremental"),
     }
     if (!@hasDecl(Q, "eql") and containsPointer(Q.Value)) {
-        @compileError(@typeName(Q) ++ " 的 Value 含指针，必须声明 eql");
+        @compileError(@typeName(Q) ++ " has a Value containing pointers and must declare eql");
     }
 }
 

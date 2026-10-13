@@ -157,7 +157,7 @@ test "posix" {
     try testing.expectError(error.InvalidUri, toPathStyle(.posix, testing.allocator, "file://server/share/x"));
 }
 
-test "windows 盘符" {
+test "windows drive letters" {
     try expectFromPath(.windows, "C:\\work\\x y.zig", "file:///C:/work/x%20y.zig");
     try expectFromPath(.windows, "c:\\work", "file:///C:/work");
     // VS Code：盘符小写、冒号编码
@@ -172,7 +172,7 @@ test "windows UNC" {
     try expectToPath(.windows, "file://server/share/a%20b.zig", "\\\\server\\share\\a b.zig");
 }
 
-test "非法 URI" {
+test "invalid URI" {
     const bad = [_][]const u8{ "untitled:Untitled-1", "file:", "file://", "file:///a%zz", "file:///a%2", "file:///a%00b", "file:///a\x00b", "file:///a\nb" };
     for (bad) |b| {
         try testing.expect(std.meta.isError(toPathStyle(.posix, testing.allocator, b)));

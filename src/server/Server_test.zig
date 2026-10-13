@@ -60,7 +60,7 @@ fn errorCode(msg: std.json.Value) i64 {
     return msg.object.get("error").?.object.get("code").?.integer;
 }
 
-test "完整生命周期：初始化、文档同步、读请求、关闭" {
+test "full lifecycle: initialize, document sync, read requests, shutdown" {
     var s: Session = undefined;
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-16","utf-8"]}}}}
@@ -113,7 +113,7 @@ test "完整生命周期：初始化、文档同步、读请求、关闭" {
     try testing.expectEqual(0, last.get("params").?.object.get("diagnostics").?.array.items.len);
 }
 
-test "推送 live 诊断，关闭文档后清空" {
+test "push live diagnostics, clear on close" {
     var s: Session = undefined;
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
@@ -146,7 +146,7 @@ test "推送 live 诊断，关闭文档后清空" {
     try testing.expectEqual(0, notes[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
 }
 
-test "语法类功能端到端" {
+test "syntax features end to end" {
     var s: Session = undefined;
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
@@ -200,7 +200,7 @@ test "语法类功能端到端" {
     try testing.expectEqual(4, sel.get("range").?.object.get("start").?.object.get("character").?.integer);
 }
 
-test "初始化前的请求返回 ServerNotInitialized，未知方法返回 MethodNotFound" {
+test "requests before initialize return ServerNotInitialized, unknown methods return MethodNotFound" {
     var s: Session = undefined;
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"zig-analyzer/status"}
@@ -228,7 +228,7 @@ test "初始化前的请求返回 ServerNotInitialized，未知方法返回 Meth
     try testing.expectEqual(-32700, errorCode(msgs[4]));
 }
 
-test "参数格式错误返回 InvalidParams" {
+test "malformed params return InvalidParams" {
     var s: Session = undefined;
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":42}}

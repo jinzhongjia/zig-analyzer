@@ -188,7 +188,7 @@ pub fn applyChanges(
 
 const testing = std.testing;
 
-test "positionToOffset / offsetToPosition 在三种编码下往返" {
+test "positionToOffset / offsetToPosition round trip in all three encodings" {
     // "a😀b" 中 😀 为 4 字节、2 个 UTF-16 单元、1 个码点
     const text = "x\r\na😀b\nlast";
     const b_offset = std.mem.indexOfScalar(u8, text, 'b').?;
@@ -206,7 +206,7 @@ test "positionToOffset / offsetToPosition 在三种编码下往返" {
     }
 }
 
-test "越界位置被钳制" {
+test "out-of-range positions are clamped" {
     const text = "ab\ncd";
     try testing.expectEqual(2, positionToOffset(text, .{ .line = 0, .character = 100 }, .utf16));
     try testing.expectEqual(text.len, positionToOffset(text, .{ .line = 9, .character = 0 }, .utf16));

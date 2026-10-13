@@ -57,7 +57,7 @@ pub const Writer = struct {
     }
 };
 
-test "读取多条消息" {
+test "read multiple messages" {
     const input = "Content-Length: 2\r\n\r\n{}" ++
         "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\ncontent-length: 4\r\n\r\nnull";
     var reader: Io.Reader = .fixed(input);
@@ -72,12 +72,12 @@ test "读取多条消息" {
     try std.testing.expectError(error.EndOfStream, readMessage(&reader, gpa));
 }
 
-test "缺少 Content-Length" {
+test "missing Content-Length" {
     var reader: Io.Reader = .fixed("X: 1\r\n\r\n");
     try std.testing.expectError(error.InvalidHeader, readMessage(&reader, std.testing.allocator));
 }
 
-test "写出消息" {
+test "write message" {
     var buf: [64]u8 = undefined;
     var inner: Io.Writer = .fixed(&buf);
     var w: Writer = .{ .io = std.testing.io, .inner = &inner };
