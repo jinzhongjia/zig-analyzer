@@ -5,6 +5,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 const compiler = @import("compiler.zig");
 const live = @import("live.zig");
 const offsets = @import("../util/offsets.zig");
+const native = @import("../util/test_path.zig").native;
 
 const main_text =
     \\pub fn main() void {
@@ -50,17 +51,17 @@ fn buildResult() !compiler.BuildResult {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    return compiler.collect(gpa, &.{eb}, "/proj", "/proj/build.zig", &dummy, Disk.read);
+    return compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
 }
 
 test "collect: path resolution, dedup, errors without location, AstGen flag" {
     var r = try buildResult();
     defer r.deinit(testing.allocator);
-    const main = r.files.get("/proj/src/main.zig").?;
+    const main = r.files.get(native("/proj/src/main.zig")).?;
     try testing.expectEqual(2, main.items.len);
     try testing.expect(main.items[0].is_astgen); // unused local variable 也是 ast-check 错误
     try testing.expect(!main.items[1].is_astgen); // 类型错误来自 Sema
-    const build_zig = r.files.get("/proj/build.zig").?;
+    const build_zig = r.files.get(native("/proj/build.zig")).?;
     try testing.expectEqualStrings("undefined symbol: foo", build_zig.items[0].message);
 }
 
@@ -93,7 +94,7 @@ test "merge: only compiler diagnostics when the buffer matches the build" {
     defer arena.deinit();
     var r = try buildResult();
     defer r.deinit(testing.allocator);
-    const msgs = try mergeMessages(arena.allocator(), main_text, true, r.files.getPtr("/proj/src/main.zig").?);
+    const msgs = try mergeMessages(arena.allocator(), main_text, true, r.files.getPtr(native("/proj/src/main.zig")).?);
     try testing.expectEqual(2, msgs.len);
     try testing.expectEqualStrings("zig@1:8: unused local variable", msgs[0]);
     try testing.expectEqualStrings("zig@2:19: expected type 'u32', found '*const [1:0]u8'", msgs[1]);
@@ -104,7 +105,7 @@ test "merge: live diagnostics plus remapped Sema errors with unsaved edits" {
     defer arena.deinit();
     var r = try buildResult();
     defer r.deinit(testing.allocator);
-    const result = r.files.getPtr("/proj/src/main.zig").?;
+    const result = r.files.getPtr(native("/proj/src/main.zig")).?;
 
     // 在文件开头插入一行：Sema 错误整体下移一行；AstGen 错误改由 live 提供
     const edited = try std.mem.concat(arena.allocator(), u8, &.{ "// 新注释\n", main_text });

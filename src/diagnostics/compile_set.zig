@@ -84,6 +84,7 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
 }
 
 const testing = std.testing;
+const native = @import("../util/test_path.zig").native;
 
 /// 测试用：内存中的文件系统
 const FakeFs = struct {
@@ -113,21 +114,21 @@ test compute {
     const gpa = testing.allocator;
     // main（模块 0）import "lib"（模块 1）、"std"、相对文件；std 内部 import "root"
     var modules = [_]ProjectModel.Module{
-        .{ .root_file = "/p/src/main.zig", .imports = &.{.{ .name = "lib", .module = 1 }} },
-        .{ .root_file = "/p/lib/lib.zig", .imports = &.{} },
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{.{ .name = "lib", .module = 1 }} },
+        .{ .root_file = native("/p/lib/lib.zig"), .imports = &.{} },
     };
     const steps = [_]ProjectModel.Step{
         .{ .name = "check", .kind = .{ .top_level = .{ .description = "" } }, .deps = &.{1} },
         .{ .name = "compile", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
     };
-    const model: ProjectModel = .{ .arena = .{}, .build_root = "/p", .std_root = "/zig/std/std.zig", .steps = &steps, .modules = &modules, .default_step = 0 };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
 
     var fs: FakeFs = .{};
     defer fs.deinit();
-    try fs.files.put(gpa, "/p/src/main.zig", &.{ "lib", "std", "util.zig", "builtin" });
-    try fs.files.put(gpa, "/p/src/util.zig", &.{"../data.zon"});
-    try fs.files.put(gpa, "/p/data.zon", &.{});
-    try fs.files.put(gpa, "/p/lib/lib.zig", &.{ "std", "nested/deep.zig", "unknown_module" });
+    try fs.files.put(gpa, native("/p/src/main.zig"), &.{ "lib", "std", "util.zig", "builtin" });
+    try fs.files.put(gpa, native("/p/src/util.zig"), &.{"../data.zon"});
+    try fs.files.put(gpa, native("/p/data.zon"), &.{});
+    try fs.files.put(gpa, native("/p/lib/lib.zig"), &.{ "std", "nested/deep.zig", "unknown_module" });
     // std.zig 尚未加载
 
     var r = try compute(gpa, &model, &.{1}, &fs);
@@ -140,12 +141,12 @@ test compute {
             return std.mem.lessThan(u8, a, b);
         }
     }.lt);
-    try testing.expectEqualStrings("/p/data.zon", names.items[0]);
-    try testing.expectEqualStrings("/p/lib/lib.zig", names.items[1]);
-    try testing.expectEqualStrings("/p/lib/nested/deep.zig", names.items[2]);
-    try testing.expectEqualStrings("/p/src/main.zig", names.items[3]);
-    try testing.expectEqualStrings("/p/src/util.zig", names.items[4]);
-    try testing.expectEqualStrings("/zig/std/std.zig", names.items[5]);
+    try testing.expectEqualStrings(native("/p/data.zon"), names.items[0]);
+    try testing.expectEqualStrings(native("/p/lib/lib.zig"), names.items[1]);
+    try testing.expectEqualStrings(native("/p/lib/nested/deep.zig"), names.items[2]);
+    try testing.expectEqualStrings(native("/p/src/main.zig"), names.items[3]);
+    try testing.expectEqualStrings(native("/p/src/util.zig"), names.items[4]);
+    try testing.expectEqualStrings(native("/zig/std/std.zig"), names.items[5]);
     try testing.expectEqual(6, names.items.len);
     // 未加载的文件：std.zig 与 deep.zig
     try testing.expectEqual(2, r.missing.count());

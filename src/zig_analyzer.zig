@@ -38,6 +38,8 @@ pub const ide = struct {
 };
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");
+    /// 仅供测试：posix 写法的路径转为本机路径
+    pub const test_path = @import("util/test_path.zig");
 };
 pub const lsp = struct {
     pub const types = @import("lsp/types.zig");
