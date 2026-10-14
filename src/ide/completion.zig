@@ -11,6 +11,7 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const context = @import("context.zig");
 const queries = @import("../sema/queries.zig");
 const render = @import("../sema/render.zig");
+const eval = @import("../sema/eval.zig");
 const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 
 pub const Item = struct {
@@ -119,6 +120,14 @@ fn decls(out: *Collector, tree: *const ItemTree, container: u32, private: bool) 
 fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
+        // 构造的枚举（`@Enum`、union(enum) 的标签枚举）：成员
+        switch (ip.key(t)) {
+            .reified_type, .union_tag_type => {
+                for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
+                return;
+            },
+            else => {},
+        }
         const ns = try queries.namespaceOfType(r, t) orelse return;
         return members(r, out, ns, ns.file == from);
     }
@@ -134,6 +143,12 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
             else => return,
         },
         .array_type => return out.add(.{ .label = "len", .kind = .field, .detail = "usize" }),
+        // 元组、匿名结构体、构造的结构体与 union：字段
+        .tuple_type, .anon_struct_type, .reified_type => {
+            for (try eval.fieldNames(r, t)) |f| try out.add(.{ .label = f.name, .kind = .field, .detail = if (f.ty != .unknown) try render.typeAlloc(r, f.ty) else null });
+            if (ip.key(t) == .tuple_type) try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
+            return;
+        },
         else => {},
     }
     const ns = try queries.namespaceOfType(r, t) orelse return;

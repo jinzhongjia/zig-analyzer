@@ -11,6 +11,8 @@ const render = @import("../sema/render.zig");
 const queries = @import("../sema/queries.zig");
 const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 const FileId = @import("../base/Vfs.zig").FileId;
+const Body = @import("../hir/Body.zig");
+const seed = @import("seed.zig");
 
 pub const Info = struct {
     /// markdown
@@ -27,20 +29,25 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
 
     var def: ?Def = null;
     var tv: TypedValue = .unknown;
+    // tv 来自哪个绑定或表达式（以调用点的实例重新推导时取同一位置）
+    var binding_id: ?Body.BindingId = null;
+    var expr_id: ?Body.ExprId = null;
     if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
         def = .{ .item = .{ .file = file, .item = a.item } };
         tv = try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
     };
     if (def == null) for (b.bindings, 0..) |binding, i| {
         if (binding.range.start != tok.offset - a.node.offset) continue;
-        const id: @import("../hir/Body.zig").BindingId = @fromBackingInt(@as(u32, @intCast(i)));
+        const id: Body.BindingId = @fromBackingInt(@as(u32, @intCast(i)));
         def = .{ .local = .{ .file = file, .item = a.item, .binding = id } };
         tv = a.bindingType(id);
+        binding_id = id;
         break;
     };
     if (def == null) {
         const e = b.exprAt(tok.offset - a.node.offset) orelse return null;
         tv = a.exprType(e);
+        expr_id = e;
         switch (b.expr(e)) {
             .name_ref => |name| def = try r.resolveName(file, a.item, b, b.expr_scopes[@backingInt(e)], name),
             .field_access, .enum_literal => if (a.member(e)) |key| {
@@ -59,11 +66,29 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
         };
     }
 
+    // 泛型函数体内没有具体实例：以调用点的实例推导（设计 §9.4 的调用点种子）
+    var seeded_from: ?seed.Seed = null;
+    if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) if (try seed.find(r, file, a.item)) |s| {
+        const res = s.res;
+        const better: TypedValue = if (binding_id) |id|
+            (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
+        else if (@backingInt(expr_id.?) < res.exprs.len) res.exprs[@backingInt(expr_id.?)] else .unknown;
+        if (!seed.wanted(r.ctx.db.env.ip, better)) {
+            tv = better;
+            seeded_from = s;
+        }
+    };
+
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
     const code = if (def) |d| try context.signature(r, d, tv) else try render.typedValueAlloc(r, tv);
     if (tv.ty == .unknown and def == null) return null;
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
+    if (seeded_from) |s| {
+        const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
+        const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
+        w.print("\n\ninferred from the call at {s}:{d}", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(s.file)), line }) catch return error.OutOfMemory;
+    }
     if (def) |d| if (try context.doc(r, d)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
 }

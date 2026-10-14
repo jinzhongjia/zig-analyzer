@@ -131,3 +131,79 @@ test "signature help and inlay hints" {
     // 局部变量类型；调用处参数名（实参与参数同名时省略）
     try testing.expectEqualStrings("x: y: : u32 scale: : u32 a: b: ", out.items);
 }
+
+test "member completion of reified, tuple and anonymous struct types" {
+    const text =
+        \\fn Fields() type { return @Enum(u8, .exhaustive, &.{ "alpha", "beta" }, &.{ 0, 1 }); }
+        \\fn run() void {
+        \\    const F = Fields();
+        \\    const t = .{ @as(u8, 1), true };
+        \\    const a = .{ .name = @as(u32, 1), .@"type" = u8 };
+        \\    _ = .{ F.alpha, t.len, a.name };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "F.alpha", "alpha beta" },
+        // 元组字段不是合法标识符，以引号形式插入
+        .{ "t.len", "@\"0\" @\"1\" len" },
+        // 与原生类型同名的字段可以直接访问
+        .{ "a.name", "name type" },
+    };
+    for (cases) |c| {
+        const at: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).? + std.mem.indexOfScalar(u8, c[0], '.').? + 1);
+        const items = try completion.complete(&r, file, at);
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("completion after `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "hover in generic bodies is inferred from a call site" {
+    const text =
+        \\fn List(comptime T: type) type {
+        \\    return struct {
+        \\        items: []T,
+        \\        pub fn first(self: @This()) T { const it = self.items[0]; return it; }
+        \\    };
+        \\}
+        \\fn max(comptime T: type, a: T, b: T) T {
+        \\    const bigger = if (a > b) a else b;
+        \\    return bigger;
+        \\}
+        \\fn run() void {
+        \\    const l: List(u16) = undefined;
+        \\    _ = l.first();
+        \\    _ = max(u32, 1, 2);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "it =", "```zig\nconst it: u16\n```\n\ninferred from the call at main.zig:12" },
+        .{ "bigger =", "```zig\nconst bigger: u32\n```\n\ninferred from the call at main.zig:14" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
