@@ -933,6 +933,24 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
     });
 }
 
+test "union fields without a type are void, enum member names are not expressions" {
+    try expectTypes(
+        \\fn read() void {}
+        \\const E = enum(u8) { read = 1, write };
+        \\const U = union(enum) { a: u32, b };
+        \\const w = @intFromEnum(E.write);
+        \\fn g() void {
+        \\    const ft = @FieldType(U, "b");
+        \\    const size_u = @sizeOf(U);
+        \\    _ = .{ ft, size_u };
+        \\}
+    , &.{
+        .{ "ft", "type = void" },
+        .{ "size_u", "comptime_int = 8" },
+        .{ "w", "u8 = 2" },
+    });
+}
+
 test "labeled blocks, array literals and type queries" {
     try expectTypes(
         \\fn Pick(comptime wide: bool) type {

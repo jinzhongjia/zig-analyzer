@@ -6,8 +6,21 @@ const engine = @import("../db/engine.zig");
 const Vfs = @import("../base/Vfs.zig");
 const ItemTree = @import("../syntax/ItemTree.zig");
 const syntax = @import("../syntax/queries.zig");
+const ast = @import("../syntax/ast.zig");
 const Body = @import("Body.zig");
 const lower = @import("lower.zig").lower;
+
+/// enum 成员与 union 中只写名字的字段（没有 `:`）：类型表达式的位置是名字。元组式结构体的字段同样
+/// 没有 `:`，那里是类型，因此须由 ItemTree 得到所在容器的种类
+fn fieldIsName(ctx: anytype, key: OwnerKey, node: ast.SyntaxNode) engine.Error!bool {
+    if (node.kind() != .container_field or (ast.ContainerField{ .syntax = node }).name() != null) return false;
+    const tree = try ctx.get(syntax.FileItemTree, key.file);
+    for (tree.items) |it| if (it.ast_id == key.item) {
+        const kind = tree.containers[it.container].kind;
+        return kind == .@"enum" or kind == .@"union";
+    };
+    return false;
+}
 
 /// BodyOwner：文件中的一个容器成员（按稳定的 AstId 标识）
 pub const OwnerKey = struct {
@@ -30,7 +43,7 @@ pub const ItemBody = struct {
         errdefer gpa.destroy(result);
         // 找不到时（成员已被删除）降级根节点：不是成员，得到空 Body
         const node = map.get(key.item) orelse (try ctx.get(syntax.ParseFile, key.file)).rootNode();
-        result.* = try lower(gpa, node);
+        result.* = try lower(gpa, node, try fieldIsName(ctx, key, node));
         return result;
     }
 

@@ -158,8 +158,12 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
 
         for (items.items) |item| {
             const node = map.get(item.ast_id) orelse continue;
+            // enum 成员与 union 中只写名字的字段：名字不是表达式（同 `ItemBody`）
+            const container_kind = items.containers[item.container].kind;
+            const field_is_name = item.kind == .field and (container_kind == .@"enum" or container_kind == .@"union") and
+                (syntax.ast.ContainerField{ .syntax = node }).name() == null;
             const t2 = std.Io.Clock.awake.now(io);
-            var body = try za.hir.lower.lower(gpa, node);
+            var body = try za.hir.lower.lower(gpa, node, field_is_name);
             defer body.deinit(gpa);
             stats.hir_ns += @intCast(t2.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
             stats.hir_exprs += body.exprs.len;
@@ -170,9 +174,11 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             const in_range = for (body.expr_ranges) |r| {
                 if (r.start > r.end or r.end > node.green.text_len) break false;
             } else true;
-            if (!in_range or name_refs != countNameRefs(node)) {
+            const name_node = if (field_is_name) (syntax.ast.ContainerField{ .syntax = node }).typeExpr() else null;
+            const expected = countNameRefs(node) - @intFromBool(name_node != null and name_node.?.kind() == .name_ref);
+            if (!in_range or name_refs != expected) {
                 stats.hir_failures += 1;
-                report(stats, "[HIR failure] {s}: member at {d} (name refs {d} / {d})", .{ path, node.offset, name_refs, countNameRefs(node) });
+                report(stats, "[HIR failure] {s}: member at {d} (name refs {d} / {d})", .{ path, node.offset, name_refs, expected });
             }
         }
     }

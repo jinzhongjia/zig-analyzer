@@ -105,3 +105,22 @@ test "find references" {
     // 只在一个文件中查找（document highlight）
     try testing.expectEqualStrings("lib:3:add* lib:7:add", try refs(&w, fs, fs.lib, at(lib_src, "add", 0), fs.lib));
 }
+
+test "enum member names are not references to declarations of the same name" {
+    const src =
+        \\pub fn read() void {}
+        \\pub const SYS = enum(u32) { read = 0, write = 1 };
+        \\pub const Tag = enum { read, other };
+        \\test {
+        \\    read();
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:read* x:5:read", try refs(&w, fs, f, at(src, "read", 0), null));
+    // 在成员名处查找：是该成员自身，不是同名的函数
+    try testing.expectEqualStrings("x:2:read*", try refs(&w, fs, f, at(src, "read", 1), null));
+}

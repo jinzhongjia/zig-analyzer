@@ -16,8 +16,10 @@ const Range = Body.Range;
 
 const Error = Allocator.Error;
 
-/// 降级一个容器成员（fn_decl / var_decl / container_field / test_decl / comptime_decl）
-pub fn lower(gpa: Allocator, member: SyntaxNode) Error!Body {
+/// 降级一个容器成员（fn_decl / var_decl / container_field / test_decl / comptime_decl）。
+/// `field_is_name`：成员是 enum 成员或 union 中只写名字的字段（`red`、`red = 1`、`union(enum) { b }`），
+/// 类型表达式的位置是它的名字，不是表达式
+pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     var l: Lowerer = .{ .gpa = gpa, .a = arena.allocator(), .base = member.offset };
@@ -57,7 +59,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode) Error!Body {
         },
         .container_field => {
             const field = ast.cast(ast.ContainerField, member).?;
-            type_expr = try l.optExpr(field.typeExpr());
+            type_expr = if (field_is_name) null else try l.optExpr(field.typeExpr());
             align_expr = try l.clauses(member);
             value = try l.optExpr(field.defaultValue());
         },
@@ -543,7 +545,7 @@ fn lowerFirst(text: []const u8) !struct { parse: *Parse, body: Body } {
     const p = try Parse.create(testing.allocator, text);
     errdefer p.destroy();
     var it = ast.childNodes(p.rootNode());
-    return .{ .parse = p, .body = try lower(testing.allocator, it.next().?) };
+    return .{ .parse = p, .body = try lower(testing.allocator, it.next().?, false) };
 }
 
 fn offsetOf(text: []const u8, needle: []const u8) u32 {

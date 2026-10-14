@@ -134,6 +134,8 @@ pub const DeclType = struct {
                     const ty = try containerType(&r, .{ .file = key.file, .container = container }, dk.inst);
                     return .{ .ty = ty, .val = try ip.get(.{ .enum_tag = .{ .ty = ty, .name = tree.items[item].name orelse "" } }) };
                 }
+                // union 中只写名字的字段（`union(enum) { a: u8, b }` 的 `b`）类型为 void
+                if (b.type_expr == null and tree.containers[container].kind == .@"union") return .{ .ty = .void_type };
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
                 return .{ .ty = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else .unknown };
