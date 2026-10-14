@@ -76,6 +76,21 @@ pub fn build(b: *std.Build) void {
     sema_corpus_run.addPassthruArgs();
     b.step("sema-corpus", "Run type inference over the standard library").dependOn(&sema_corpus_run.step);
 
+    // LSP 基准：zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件>...
+    const bench = b.addExecutable(.{
+        .name = "lsp-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/lsp_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zig_analyzer", .module = mod }},
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench);
+    bench_run.addArtifactArg(exe);
+    bench_run.addPassthruArgs();
+    b.step("bench", "Measure LSP latencies against a project (see tools/lsp_bench.zig)").dependOn(&bench_run.step);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
 }
