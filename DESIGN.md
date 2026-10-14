@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4 已完成（2026-10-13），M5、M6 已完成（2026-10-14），下一步 M7，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4 已完成（2026-10-13），M5、M6、M7 已完成（2026-10-14），下一步 v1.0，详见 §19。
 
 ---
 
@@ -811,8 +811,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | **M4 类型** | ✅ 已完成 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
 | **M5 comptime** | ✅ 已完成（见 §19.8） | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
 | **M6 引用** | ✅ 已完成（见 §19.12） | file_index、references、rename、document highlight、workspace symbol、code actions、跨文件的调用点种子（§9.4） | rename 在大项目上正确且 < 1s |
-| **M7 性能** | ⏳ 下一步 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
-| **v1.0** | 未开始 | 稳定性、文档、发布流程 | — |
+| **M7 性能** | ✅ 已完成（见 §19.13；两项预算受上游限制） | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
+| **v1.0** | ⏳ 下一步 | 稳定性、文档、发布流程 | — |
 
 ### 19.1 M0 完成情况（2026-10-12）
 
@@ -925,15 +925,18 @@ pub fn make() std.ArrayList(u8) { ... }
 |---|---|---|---|---|
 | 容器成员按名字查找 | `lookupDecl` 线性扫描 ItemTree 中该容器的成员，没有按容器缓存的哈希表（§7.2 的 `namespace` query） | 类型推导时大文件中大量名字查找，或成员特别多的容器 | 加一个以容器为键、值为「名字 → 成员」表的 query；只改 `lookupDecl` / `memberDef` 内部 | M3 |
 | 行索引 | 每个请求现场计算 `LineIndex`，未做成 `line_index(file)` query（§12.2） | 大文件上高频请求（逐字输入时的补全、semantic tokens） | 做成 query 缓存 | M1 |
-| live 诊断防抖 | 每次编辑都重新计算 live 诊断，没有防抖（§11.2） | 大文件上快速输入 | 发布前等待 ~50ms 内无新编辑 | M1 |
+| live 诊断防抖 | 每次编辑都重新计算 live 诊断，没有防抖（§11.2）。M7 实测：Zig 编译器源码中最大的 Sema.zig（3.5 万行）上编辑到诊断 9～45 ms，其余文件 ≤ 9 ms，暂不需要 | 大文件上快速输入 | 发布前等待 ~50ms 内无新编辑 | M1 |
+| 超大文件的 AstGen | 合法代码的 live 诊断需要完整 AstGen：Sema.zig 上约 45 ms，超出 30 ms 预算（有语法错误时只解析，约 9 ms）。AstGen 是官方实现，无法局部重做 | 编辑数万行的单个文件 | 只能等上游；或对超大文件放宽预算 | M7 |
+| 保存后的编译器诊断 | 由编译器决定：Zig 编译器项目以 `-Dno-bin` 检查约 5 秒；`-fincremental` 约 2.6 秒，但 0.17 中漏报部分错误（文件级 `comptime` 块中的错误），macOS 上输出二进制时直接崩溃（`TODO(MachO2): load archive`），因此不自动启用，用户可经 `build.args` 自行传入。小项目约 120 ms | 大项目保存后等待诊断 | 上游增量编译成熟后默认启用 | M7 |
 | live 诊断的 AstGen 不可取消 | 标准库 AstGen 计算中不检查取消，写事务需要等它结束 | 大文件上的编辑延迟 | 防抖，或把 AstGen 放到单独的计算队列 | M1 |
 | InternPool 的锁 | 读写共用一把互斥锁，`key()` 读取也要加锁 | 类型推导并发请求多、InternPool 很大时的锁竞争 | 分片，或读路径改为无锁（只追加的分段数组） | M4 |
 | 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
 | 读请求用 `async` 提交 | hover、补全等读请求与诊断发布用 `group.async`；线程池满时（核数少或常驻任务多）会在主循环中同步执行，期间收不到 `$/cancelRequest`，后续请求排队。不会死锁：这些任务不等待主循环 | 用户感到请求卡顿或取消不及时 | 读请求改为 `concurrent`（与 `waitIdle` 相同） | M4 |
-| 泛型实例的内存 | 每个实例（函数 + 实参）的推导结果按 query 缓存，InternPool 中的实例与类型只增不减。实测：标准库全量推导的最大 RSS 1.24 GB，与引入解释器之前（1.25 GB）持平；InternPool 17 万项 | 长时间运行、大量不同的实例化 | 实例结果的 LRU 回收；InternPool 代际回收（§9.1） | M5 |
+| 泛型实例的内存 | 推导结果已按 LRU 回收（M7，`Infer` 上限 16384 个）；InternPool 中的实例与类型仍只增不减。实测：标准库全量推导的最大 RSS 1.24 GB；InternPool 17 万项 | 长时间运行、大量不同的实例化 | InternPool 代际回收（§9.1） | M5 |
 | 实例化与 comptime 求值的推导耗时 | 同一台机器上标准库全量推导：M4 1.44 秒 → M5（实例化）1.92 秒 → M5（解释器）2.91 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
 | workspace symbol 的匹配 | 每次请求遍历全部项目文件的 ItemTree 做子序列匹配，没有 trigram 索引（§10.2） | 文件很多的项目中逐字输入查询 | `file_index` 增加声明名的 trigram，先粗筛文件 | M6 |
-| 引用查找的反向 import 图 | 每次查找引用都对范围内全部文件解析 `@import` 并现场构建反向图（各文件的 `FileIndex` 有缓存）。实测冷缓存下在标准库（563 个文件）上查找 `mem.Allocator` 的引用 0.36～0.43 秒（含全部文件的解析），热缓存下几十毫秒 | 更大的项目，或频繁的 document highlight | 反向 import 图做成 query | M6 |
+| 引用查找的反向 import 图 | 每次查找引用都现场构建反向图；各文件的 `FileIndex` 由后台索引预先算好（M7），构建只需读取缓存。实测冷缓存下在标准库（563 个文件）上查找 `mem.Allocator` 的引用 0.36～0.43 秒（含全部文件的解析），热缓存下几十毫秒 | 更大的项目，或频繁的 document highlight | 反向 import 图做成 query | M6 |
+| ProjectModel 磁盘缓存 | 未实现（§13.1）。M7 实测：Zig 编译器项目上 `zig build` 配置有 Zig 自身的缓存，项目加载约 1 秒（builtin.zig 生成按参数缓存后），冷启动预算已满足 | 配置特别慢的 build.zig | 按 §13.1 实现 | M7 |
 | Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
 
 ### 19.7 M4 完成情况（2026-10-13）
@@ -1033,6 +1036,36 @@ pub fn make() std.ArrayList(u8) { ... }
 - 验收：`sema-corpus` 在标准库上（563 个文件、冷缓存）查找 `mem.Allocator`、`mem.eql`、`std.ArrayList` 的引用分别为 0.36～0.43 秒、约 50 毫秒、不到 10 毫秒，满足 < 1 秒。
 - 已知限制：经由别名的使用不计入（`const Allocator = std.mem.Allocator;` 之后的 `Allocator` 是别名的引用，与 rust-analyzer 一致）；标准库内部的引用不搜索；推导不出类型的字段访问找不到。
 - 测试：`zig build test` 共 185 个。
+
+### 19.13 M7 完成情况（2026-10-14）
+
+基准工具 `tools/lsp_bench.zig`（`zig build bench -Doptimize=ReleaseSafe -- <项目> <文件>...`）以子进程启动服务器，按编辑器的方式交互，测量 §1 的各项预算。以下数据取自 Zig 0.17.0 编译器源码（182 个文件、54 万行，另加标准库），Apple Silicon，ReleaseSafe。
+
+| 预算 | 目标 | 实测 | |
+|---|---|---|---|
+| hover / goto | p95 < 50 ms | 首轮最慢 34 ms；热状态 p95 ≤ 1.3 ms | ✅ |
+| completion | p95 < 100 ms | 首轮最慢 13 ms；热状态 p95 ≤ 0.9 ms | ✅ |
+| 编辑 → 语法 / AstGen 诊断 | < 30 ms | Sema.zig（3.5 万行）9～45 ms，其余文件 ≤ 9 ms | ⚠️ 超大文件受 AstGen 限制 |
+| 保存 → 编译器诊断 | < 1 s | 小项目约 120 ms；Zig 编译器 5.2 s（编译器耗时） | ⚠️ 受编译器限制，见 §19.6 |
+| 常驻内存 | < 500 MB | 打开三个大文件、各做 600 次请求后 361 MB | ✅ |
+| initialize | < 100 ms | 1～9 ms（新编译的二进制首次启动受系统校验影响约 0.4 s） | ✅ |
+| 打开文件 → 语法功能 | < 200 ms | Sema.zig 53 ms | ✅ |
+| 打开文件 → hover 可用 | < 3 s | 项目加载 1.5 s；加载前的 hover 也可用（名字解析不完整） | ✅ |
+| 工作区索引 | < 30 s | 1.9 s 完成 | ✅ |
+
+冷启动预算已满足，不需要把 §6.7 的分析结果持久化提前。
+
+| 改动 | 文件 | 测量依据与效果 |
+|---|---|---|
+| 绿树压缩 | `src/syntax/green.zig` | 解析结果占源码的 20 倍：每个 token（含空白、注释）一个 32 字节的标签联合。改为 16 字节的紧凑结构（指针 + 长度 + 种类 + 是否节点），降到 12.7 倍（Zig 编译器源码 504 MB → 316 MB） |
+| 查询结果淘汰（§6.6） | `src/db/engine.zig` | derived query 可声明 `lru` 容量；超出后在写事务开始时或读请求结束后（`sweep`，不取消其他读事务）淘汰最久未使用的值，保留依赖与 changed_at。被淘汰的值在验证通过时重算并沿用原 changed_at，下游不重算；验证依赖时不恢复值。`ParseFile`、`FileAstIdMap` 上限 64（AstIdMap 持有 Parse 的引用，二者可各自淘汰），`ItemBody`、`Infer` 上限 16384。常驻内存 805 MB → 361 MB |
+| 后台索引 | `src/server/Server.zig` | 一次 hover 的跨文件调用点种子为构建反向 import 图在请求中解析了 174 个文件（352 ms、+400 MB）。模块图更新后在后台为全部项目文件计算 `FileIndex` 与 ItemTree（同时只运行一个任务，模块图又变化时再做一遍；超过 200 ms 才显示进度），该 hover 降到 34 ms |
+| 调用点种子 | `src/ide/seed.zig` | 只推导提到该函数名的成员 |
+| builtin.zig 生成 | `src/project/builtin.zig`、`Workspace.zig` | 项目加载 16.6 s 中几乎全部用于为每组模块参数串行运行 `zig --show-builtin`。按「zig 版本 + 参数」记录生成结果，并行生成：首次 3.2 s，之后约 1 s |
+
+- 验证：`sema-corpus` 每个文件之后按需淘汰（标准库上 114 次），统计结果与不淘汰时完全相同，Debug 与 ReleaseSafe 下均无崩溃与泄漏；引擎单测覆盖淘汰后恢复不使下游重算、依赖变化照常重算。
+- 同时修复：一条日志中的中文标点。
+- 测试：`zig build test` 共 186 个。
 
 ## 20. 风险与对策
 
