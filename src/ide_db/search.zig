@@ -143,10 +143,10 @@ const Finder = struct {
     /// 检查文件 `file` 中的成员 `item`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
         const r = f.r;
+        if (!try r.mayMention(file, item_index, f.name)) return;
         const body = try r.body(file, item_index);
         if (!mentions(body, f.name)) return;
-        const node = try r.itemNode(file, item_index) orelse return;
-        const base = node.offset;
+        const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
         for (body.exprs, 0..) |e, i| {
             const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
@@ -201,11 +201,12 @@ const Finder = struct {
         try f.out.append(f.r.arena, .{ .file = file, .start = start, .end = end });
     }
 
-    /// 以表达式的最后一个 token（字段名、枚举字面量的名字）为引用位置
+    /// 以表达式末尾的名字（字段名、枚举字面量的名字）为引用位置。直接在源码上回扫，
+    /// 不依赖解析结果（可能已被淘汰）
     fn addLastToken(f: *Finder, file: FileId, end: u32) resolve.Error!void {
-        const root = (try f.r.ctx.get(database.syntax.ParseFile, file)).rootNode();
-        const t = root.tokenAtOffset(end - 1) orelse return;
-        try f.add(file, t.offset, t.offset + @as(u32, @intCast(t.text.len)));
+        const text = (try f.r.ctx.get(database.syntax.SourceText, file)).text;
+        const start = lastNameStart(text, end) orelse return;
+        try f.add(file, start, end);
     }
 };
 
@@ -219,6 +220,25 @@ pub fn mentions(body: *const Body, name: []const u8) bool {
         else => {},
     };
     return false;
+}
+
+/// 结束于 `end` 的名字（标识符或 `@"..."`）的起始位置
+fn lastNameStart(text: []const u8, end: u32) ?u32 {
+    if (end == 0 or end > text.len) return null;
+    if (text[end - 1] == '"') {
+        const q = std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '"') orelse return null;
+        if (q == 0 or text[q - 1] != '@') return null;
+        return @intCast(q - 1);
+    }
+    var i = end;
+    while (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) i -= 1;
+    return if (i == end) null else i;
+}
+
+test lastNameStart {
+    try std.testing.expectEqual(4, lastNameStart("a.b.cde", 7));
+    try std.testing.expectEqual(2, lastNameStart("x.@\"a b\"", 8));
+    try std.testing.expectEqual(null, lastNameStart("a.", 2));
 }
 
 fn keyDef(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {

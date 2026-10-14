@@ -1790,16 +1790,7 @@ const Evaluator = struct {
     // ── 位置 ─────────────────────────────────────────────────────────
 
     fn containerAt(ev: *Evaluator, f: *Frame, e: ExprId) Error!?Namespace {
-        const tree = try ev.r.itemTree(f.file);
-        const owner = try ev.r.itemNode(f.file, f.item) orelse return null;
-        const map = try ev.r.ctx.get(syntax.FileAstIdMap, f.file);
-        const rel = f.body.range(e).start;
-        for (tree.containers, 0..) |c, i| {
-            if (c.parent_item != f.item) continue;
-            const node = map.get(c.ast_id) orelse continue;
-            if (node.offset == owner.offset + rel) return .{ .file = f.file, .container = @intCast(i) };
-        }
-        return null;
+        return ev.r.containerAt(f.file, f.item, f.body.range(e).start);
     }
 
     // ── 内置函数 ─────────────────────────────────────────────────────
@@ -2448,10 +2439,8 @@ const Evaluator = struct {
     fn containerArg(ev: *Evaluator, ns: Namespace, inst: ?Index) Error!?Index {
         const tree = try ev.r.itemTree(ns.file);
         const parent = tree.containers[ns.container].parent_item orelse return null;
-        const owner_node = try ev.r.itemNode(ns.file, parent) orelse return null;
-        const node = try ev.r.containerNode(ns) orelse return null;
+        const rel = try ev.r.containerRel(ns) orelse return null;
         const body = try ev.r.body(ns.file, parent);
-        const rel = node.offset - owner_node.offset;
         for (body.exprs, 0..) |x, i| switch (x) {
             .container => |c| if (body.expr_ranges[i].start == rel) {
                 const arg = c.arg orelse return null;

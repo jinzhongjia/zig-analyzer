@@ -28,6 +28,7 @@ pub const Db = engine.Engine(*const Env, &.{
     syntax.ParseFile,
     syntax.FileItemTree,
     syntax.FileAstIdMap,
+    syntax.ItemSummaries,
     live.AstCheck,
     ModuleGraph.Input,
     hir.ItemBody,

@@ -9,6 +9,7 @@ const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
 const Parse = @import("Parse.zig");
 const ItemTree = @import("ItemTree.zig");
+const ast = @import("ast.zig");
 
 /// 文件内容：有 `FileText`（打开的文档、项目加载的文件）时用它，否则从磁盘读取。
 ///
@@ -96,6 +97,90 @@ pub const FileItemTree = struct {
 };
 
 /// AstId → 当前语法树节点。随每次解析重建，只在读取时使用，不应作为其他缓存结果的一部分。
+/// 成员的摘要：位置与可能提到的名字
+pub const ItemSummary = struct {
+    /// 成员节点在文件中的起始位置；找不到节点时为 null
+    offset: ?u32,
+    /// 成员节点内出现的标识符（含嵌套成员）的布隆过滤器：判断「可能提到某个名字」，
+    /// 有假阳性、无假阴性
+    names: [4]u64 = @splat(0),
+
+    pub fn mayMention(s: ItemSummary, name: []const u8) bool {
+        const bits = bloomBits(name);
+        return s.names[bits[0] / 64] & bitMask(bits[0]) != 0 and s.names[bits[1] / 64] & bitMask(bits[1]) != 0;
+    }
+
+    fn add(s: *ItemSummary, name: []const u8) void {
+        for (bloomBits(name)) |b| s.names[b / 64] |= bitMask(b);
+    }
+
+    fn bloomBits(name: []const u8) [2]u8 {
+        const h = std.hash.Wyhash.hash(0, name);
+        return .{ @truncate(h), @truncate(h >> 8) };
+    }
+
+    fn bitMask(b: u8) u64 {
+        return @as(u64, 1) << @intCast(b % 64);
+    }
+};
+
+/// 文件中各成员与容器的摘要（与 `ItemTree.items` / `containers` 一一对应）。值很小且不淘汰：
+/// 只需要位置或只需判断成员是否提到某个名字的场景（引用查找、调用点种子、定位体内的容器），
+/// 不必为已被淘汰的解析结果重新解析，也不必为不相关的成员生成 Body。
+/// 单独作为一个 query，不放进 ItemTree：函数体内的编辑会改变它，而 ItemTree 必须保持不变
+pub const ItemSummaries = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = *const Summaries;
+
+    pub const Summaries = struct {
+        items: []ItemSummary,
+        /// 容器节点在文件中的起始位置；找不到节点时为 null
+        container_offsets: []?u32,
+    };
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        const items = try ctx.get(FileItemTree, file);
+        const map = try ctx.get(FileAstIdMap, file);
+        const gpa = ctx.db.gpa;
+        const out = try gpa.create(Summaries);
+        errdefer gpa.destroy(out);
+        out.items = try gpa.alloc(ItemSummary, items.items.len);
+        errdefer gpa.free(out.items);
+        out.container_offsets = try gpa.alloc(?u32, items.containers.len);
+        for (items.items, out.items) |it, *o| {
+            const node = map.get(it.ast_id) orelse {
+                o.* = .{ .offset = null };
+                continue;
+            };
+            o.* = .{ .offset = node.offset };
+            collectNames(node, o);
+        }
+        for (items.containers, out.container_offsets) |c, *o| o.* = if (map.get(c.ast_id)) |n| n.offset else null;
+        return out;
+    }
+
+    fn collectNames(node: ast.SyntaxNode, s: *ItemSummary) void {
+        var it = node.children();
+        while (it.next()) |e| switch (e) {
+            .token => |t| if (t.kind == .identifier) s.add(ast.identName(t.text)),
+            .node => |c| collectNames(c, s),
+        };
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, std.mem.sliceAsBytes(a.items), std.mem.sliceAsBytes(b.items)) and
+            std.mem.eql(?u32, a.container_offsets, b.container_offsets);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        const s: *Summaries = @constCast(v.*);
+        gpa.free(s.items);
+        gpa.free(s.container_offsets);
+        gpa.destroy(s);
+    }
+};
+
 /// 值中的节点指向解析结果：持有其一份引用，`ParseFile` 的值被淘汰后仍然有效
 pub const FileAstIdMap = struct {
     pub const kind: engine.Kind = .derived;

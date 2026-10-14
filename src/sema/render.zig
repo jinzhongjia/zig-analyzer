@@ -93,10 +93,8 @@ const ContainerNames = struct {
 
     /// 体内 `const E = enum {...}` 的局部变量名
     fn localName(n: ContainerNames, file: @import("../base/Vfs.zig").FileId, item: u32, container: u32) resolve.Error!?[]const u8 {
-        const owner = try n.r.itemNode(file, item) orelse return null;
-        const node = try n.r.containerNode(.{ .file = file, .container = container }) orelse return null;
+        const rel = try n.r.containerRel(.{ .file = file, .container = container }) orelse return null;
         const b = try n.r.body(file, item);
-        const rel = node.offset - owner.offset;
         for (b.bindings) |binding| {
             const init = binding.init orelse continue;
             if (b.expr(init) == .container and b.range(init).start == rel) return binding.name;

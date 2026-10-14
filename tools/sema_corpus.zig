@@ -93,10 +93,27 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // 查找引用（冷缓存）：标准库中常用的声明
-    for ([_][2][]const u8{ .{ "mem.zig", "Allocator" }, .{ "mem.zig", "eql" }, .{ "std.zig", "ArrayList" } }) |target| {
+    const ref_targets = [_][2][]const u8{ .{ "mem.zig", "Allocator" }, .{ "mem.zig", "eql" }, .{ "std.zig", "ArrayList" } };
+    for (ref_targets) |target| {
         const path = try std.fs.path.join(gpa, &.{ std_dir, target[0] });
         defer gpa.free(path);
         try findRefs(gpa, io, &db, files.items, try vfs.intern(path), target[1]);
+    }
+    // 淘汰解析结果后再查一次（函数体仍在缓存中）：不应重新解析
+    {
+        _ = db.trySweep();
+        var counts_before: [database.Db.query_types.len]u64 = undefined;
+        _ = db.stats(&counts_before);
+        const before = db.executions[database.Db.queryIndex(database.syntax.ParseFile)].load(.monotonic);
+        for (ref_targets) |target| {
+            const path = try std.fs.path.join(gpa, &.{ std_dir, target[0] });
+            defer gpa.free(path);
+            try findRefs(gpa, io, &db, files.items, try vfs.intern(path), target[1]);
+        }
+        std.debug.print("files re-parsed by references after evicting parses: {d}\n", .{db.executions[database.Db.queryIndex(database.syntax.ParseFile)].load(.monotonic) - before});
+        var counts_after: [database.Db.query_types.len]u64 = undefined;
+        _ = db.stats(&counts_after);
+        inline for (database.Db.query_types, 0..) |Q, qi| if (counts_after[qi] != counts_before[qi]) std.debug.print("  {s}: +{d}\n", .{ @typeName(Q), counts_after[qi] - counts_before[qi] });
     }
 
     var locals: Counts = .{};
@@ -136,6 +153,14 @@ pub fn main(init: std.process.Init) !u8 {
             sweeps += 1;
         }
     }
+    // 再次查找引用：期间大部分解析结果已被淘汰，引用查找不应因此重新解析
+    const parses_before = db.executions[database.Db.queryIndex(database.syntax.ParseFile)].load(.monotonic);
+    for (ref_targets) |target| {
+        const path = try std.fs.path.join(gpa, &.{ std_dir, target[0] });
+        defer gpa.free(path);
+        try findRefs(gpa, io, &db, files.items, try vfs.intern(path), target[1]);
+    }
+    std.debug.print("files re-parsed by references after eviction: {d}\n", .{db.executions[database.Db.queryIndex(database.syntax.ParseFile)].load(.monotonic) - parses_before});
     const secs = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s;
     std.debug.print(
         \\files: {d}, members: {d}, time {d:.2}s, sweeps {d}

@@ -1353,16 +1353,7 @@ const Inferrer = struct {
     }
 
     fn containerAt(inf: *Inferrer, e: ExprId) Error!?Namespace {
-        const tree = try inf.r.itemTree(inf.file);
-        const owner = try inf.r.itemNode(inf.file, inf.item) orelse return null;
-        const map = try inf.r.ctx.get(syntax.FileAstIdMap, inf.file);
-        const rel = inf.body.range(e).start;
-        for (tree.containers, 0..) |c, i| {
-            if (c.parent_item != inf.item) continue;
-            const node = map.get(c.ast_id) orelse continue;
-            if (node.offset == owner.offset + rel) return .{ .file = inf.file, .container = @intCast(i) };
-        }
-        return null;
+        return inf.r.containerAt(inf.file, inf.item, inf.body.range(e).start);
     }
 };
 

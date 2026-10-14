@@ -63,6 +63,43 @@ pub const Resolver = struct {
         return (try r.ctx.get(syntax.FileAstIdMap, file)).get(tree.items[item].ast_id);
     }
 
+    /// 成员在文件中的起始位置：只需要位置时用它，不依赖解析结果（可能已被淘汰）
+    pub fn itemOffset(r: *Resolver, file: FileId, item: u32) Error!?u32 {
+        return (try r.ctx.get(syntax.ItemSummaries, file)).items[item].offset;
+    }
+
+    /// 容器在文件中的起始位置（同 `itemOffset`，不依赖解析结果）
+    pub fn containerOffset(r: *Resolver, ns: Namespace) Error!?u32 {
+        const s = try r.ctx.get(syntax.ItemSummaries, ns.file);
+        if (ns.container >= s.container_offsets.len) return null;
+        return s.container_offsets[ns.container];
+    }
+
+    /// 成员 `item` 体内、相对其起始位置 `rel` 处定义的容器
+    pub fn containerAt(r: *Resolver, file: FileId, item: u32, rel: u32) Error!?Namespace {
+        const tree = try r.itemTree(file);
+        const owner = try r.itemOffset(file, item) orelse return null;
+        const s = try r.ctx.get(syntax.ItemSummaries, file);
+        for (tree.containers, s.container_offsets, 0..) |c, offset, i| {
+            if (c.parent_item != item) continue;
+            if (offset == owner + rel) return .{ .file = file, .container = @intCast(i) };
+        }
+        return null;
+    }
+
+    /// 体内定义的容器 `ns` 相对于其外层成员起始位置的位置
+    pub fn containerRel(r: *Resolver, ns: Namespace) Error!?u32 {
+        const parent = (try r.itemTree(ns.file)).containers[ns.container].parent_item orelse return null;
+        const owner = try r.itemOffset(ns.file, parent) orelse return null;
+        const offset = try r.containerOffset(ns) orelse return null;
+        return offset - owner;
+    }
+
+    /// 成员是否可能提到名字 `name`（有假阳性）：在生成 Body 之前粗筛
+    pub fn mayMention(r: *Resolver, file: FileId, item: u32, name: []const u8) Error!bool {
+        return (try r.ctx.get(syntax.ItemSummaries, file)).items[item].mayMention(name);
+    }
+
     pub fn containerNode(r: *Resolver, ns: Namespace) Error!?SyntaxNode {
         const tree = try r.itemTree(ns.file);
         return (try r.ctx.get(syntax.FileAstIdMap, ns.file)).get(tree.containers[ns.container].ast_id);
@@ -85,10 +122,9 @@ pub const Resolver = struct {
     }
 
     fn localAtContainer(r: *Resolver, file: FileId, parent: u32, container: u32, name: []const u8) Error!?Def {
-        const owner = try r.itemNode(file, parent) orelse return null;
-        const node = try r.containerNode(.{ .file = file, .container = container }) orelse return null;
+        const rel = try r.containerRel(.{ .file = file, .container = container }) orelse return null;
         const pb = try r.body(file, parent);
-        const binding = pb.lookup(pb.scopeAt(node.offset - owner.offset), name) orelse return null;
+        const binding = pb.lookup(pb.scopeAt(rel), name) orelse return null;
         return .{ .local = .{ .file = file, .item = parent, .binding = binding } };
     }
 
@@ -178,19 +214,6 @@ pub const Resolver = struct {
             .@"comptime" => |inner| return r.evalDepth(file, item, b, inner, depth + 1),
             else => return null,
         }
-    }
-
-    /// BodyOwner `item` 体内、相对位置 `rel` 处定义的容器
-    fn containerAt(r: *Resolver, file: FileId, item: u32, rel: u32) Error!?Namespace {
-        const tree = try r.itemTree(file);
-        const owner = try r.itemNode(file, item) orelse return null;
-        const map = try r.ctx.get(syntax.FileAstIdMap, file);
-        for (tree.containers, 0..) |c, i| {
-            if (c.parent_item != item) continue;
-            const node = map.get(c.ast_id) orelse continue;
-            if (node.offset == owner.offset + rel) return .{ .file = file, .container = @intCast(i) };
-        }
-        return null;
     }
 
     // ── import ───────────────────────────────────────────────────────
