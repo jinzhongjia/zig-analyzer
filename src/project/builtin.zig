@@ -1,16 +1,34 @@
 //! `@import("builtin")` 的内容由编译器按目标与编译选项生成，不在磁盘上。
 //! 用与构建系统相同的参数运行 `zig <子命令> --show-builtin` 取得，按内容哈希写入缓存目录
 //! （内容不变则路径不变；落盘使 goto definition 可以打开它）。
+//! 另按「zig 版本 + 参数」的哈希记录对应的内容哈希，相同参数再次生成时不必启动编译器。
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+const ZigEnv = @import("ZigEnv.zig");
+
 const log = std.log.scoped(.builtin);
 
 /// 生成 builtin.zig，返回其路径（调用方释放）。`args[0]` 为子命令（`build-exe` 等），其余为编译参数。
 /// 编译器无法运行或参数无效时返回 null
-pub fn generate(gpa: Allocator, io: Io, zig_exe: []const u8, cache_dir: []const u8, args: []const []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
+pub fn generate(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
+    const zig_exe = env.zig_exe;
+    const cache_dir = env.global_cache_dir;
+    // 参数 → 内容哈希的记录：`<缓存>/zig-analyzer/builtin/args/<参数哈希>`
+    var hasher: std.hash.Wyhash = .init(0);
+    hasher.update(env.version);
+    for (args) |a| {
+        hasher.update(&.{0});
+        hasher.update(a);
+    }
+    var key_buf: [16]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{x:0>16}", .{hasher.final()}) catch unreachable;
+    const index_path = try std.fs.path.join(gpa, &.{ cache_dir, "zig-analyzer", "builtin", "args", key });
+    defer gpa.free(index_path);
+    if (try cached(gpa, io, cache_dir, index_path)) |path| return path;
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, zig_exe);
@@ -59,6 +77,22 @@ pub fn generate(gpa: Allocator, io: Io, zig_exe: []const u8, cache_dir: []const 
             return null;
         };
     };
+    // 记录失败不影响结果：下次重新生成
+    if (std.fs.path.dirname(index_path)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = name }) catch {};
+    return path;
+}
+
+/// 按参数记录找到的已生成文件
+fn cached(gpa: Allocator, io: Io, cache_dir: []const u8, index_path: []const u8) Allocator.Error!?[]u8 {
+    var name_buf: [16]u8 = undefined;
+    const name = Io.Dir.cwd().readFile(io, index_path, &name_buf) catch return null;
+    if (name.len != name_buf.len) return null;
+    const path = try std.fs.path.join(gpa, &.{ cache_dir, "zig-analyzer", "builtin", name, "builtin.zig" });
+    Io.Dir.cwd().access(io, path, .{}) catch {
+        gpa.free(path);
+        return null;
+    };
     return path;
 }
 
@@ -80,14 +114,15 @@ fn tagAfter(text: []const u8, prefix: []const u8) ?[]const u8 {
 
 test generate {
     const testing = std.testing;
-    var env = @import("ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    var env = ZigEnv.query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(cache);
+    env.global_cache_dir = cache;
 
-    const a = (try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "test", "-target", "x86_64-linux", "-Ofast" })).?;
+    const a = (try generate(testing.allocator, testing.io, &env, &.{ "test", "-target", "x86_64-linux", "-Ofast" })).?;
     defer testing.allocator.free(a);
     const text = try Io.Dir.cwd().readFileAlloc(testing.io, a, testing.allocator, .unlimited);
     defer testing.allocator.free(text);
@@ -95,15 +130,15 @@ test generate {
     try testing.expect(std.mem.indexOf(u8, text, ".tag = .linux") != null);
     try testing.expectEqualStrings("builtin.zig", std.fs.path.basename(a));
 
-    // 相同参数得到相同路径；无效参数为 null
-    const b = (try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "test", "-target", "x86_64-linux", "-Ofast" })).?;
+    // 相同参数得到相同路径（经由参数记录，不再运行编译器）；无效参数为 null
+    const b = (try generate(testing.allocator, testing.io, &env, &.{ "test", "-target", "x86_64-linux", "-Ofast" })).?;
     defer testing.allocator.free(b);
     try testing.expectEqualStrings(a, b);
-    try testing.expect(try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "build-obj", "-target", "no-such-target" }) == null);
+    try testing.expect(try generate(testing.allocator, testing.io, &env, &.{ "build-obj", "-target", "no-such-target" }) == null);
 
     // 指针宽度
     try testing.expectEqual(64, pointerBits(text));
-    const wasm = (try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "build-obj", "-target", "wasm32-freestanding" })).?;
+    const wasm = (try generate(testing.allocator, testing.io, &env, &.{ "build-obj", "-target", "wasm32-freestanding" })).?;
     defer testing.allocator.free(wasm);
     const wasm_text = try Io.Dir.cwd().readFileAlloc(testing.io, wasm, testing.allocator, .unlimited);
     defer testing.allocator.free(wasm_text);

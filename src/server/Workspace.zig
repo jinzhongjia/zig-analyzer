@@ -15,6 +15,7 @@ const za = @import("../zig_analyzer.zig");
 const Server = @import("Server.zig");
 const bsp = za.project.bsp;
 const builtin = za.project.builtin;
+const ZigEnv = za.project.ZigEnv;
 const configuration = za.project.configuration;
 const ProjectModel = za.base.ProjectModel;
 const Vfs = za.base.Vfs;
@@ -354,30 +355,48 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
 /// 为每个模块生成 builtin.zig（相同参数只生成一次）
 fn generateBuiltins(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     const env = ws.server.zigEnv().?;
+    const io = ws.server.io;
     ws.reportLoading("Generating builtin.zig");
-    var cache: std.StringHashMapUnmanaged(?[]u8) = .empty;
+    // 参数相同的模块共用一份；不同的参数并行生成（每份要启动一次编译器，命中参数记录时不启动）
+    var unique: std.StringArrayHashMapUnmanaged(?[]u8) = .empty;
     defer {
-        var it = cache.iterator();
-        while (it.next()) |e| {
-            ws.gpa.free(e.key_ptr.*);
-            if (e.value_ptr.*) |p| ws.gpa.free(p);
+        for (unique.keys(), unique.values()) |k, v| {
+            ws.gpa.free(k);
+            if (v) |p| ws.gpa.free(p);
         }
-        cache.deinit(ws.gpa);
+        unique.deinit(ws.gpa);
     }
-    for (model.modules, 0..) |m, i| {
+    const slots = try ws.gpa.alloc(?usize, model.modules.len);
+    defer ws.gpa.free(slots);
+    for (model.modules, slots) |m, *slot| {
+        slot.* = null;
         if (m.builtin_args.len == 0) continue;
         const key = try std.mem.join(ws.gpa, "\x00", m.builtin_args);
-        const gop = try cache.getOrPut(ws.gpa, key);
-        if (gop.found_existing) {
-            ws.gpa.free(key);
-        } else {
-            gop.value_ptr.* = builtin.generate(ws.gpa, ws.server.io, env.zig_exe, env.global_cache_dir, m.builtin_args) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Canceled => null,
-            };
-        }
-        if (gop.value_ptr.*) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
+        const gop = try unique.getOrPut(ws.gpa, key);
+        if (gop.found_existing) ws.gpa.free(key) else gop.value_ptr.* = null;
+        slot.* = gop.index;
     }
+    const args = try ws.gpa.alloc([]const []const u8, unique.count());
+    defer ws.gpa.free(args);
+    for (model.modules, slots) |m, slot| if (slot) |i| {
+        args[i] = m.builtin_args;
+    };
+    var failed: std.atomic.Value(bool) = .init(false);
+    var group: Io.Group = .init;
+    for (args, unique.values()) |a, *out| group.async(io, generateOne, .{ ws.gpa, io, env, a, out, &failed });
+    group.await(io) catch {};
+    if (failed.load(.acquire)) return error.OutOfMemory;
+    for (slots, 0..) |slot, i| if (slot) |u| if (unique.values()[u]) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
+}
+
+fn generateOne(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const u8, out: *?[]u8, failed: *std.atomic.Value(bool)) Io.Cancelable!void {
+    out.* = builtin.generate(gpa, io, env, args) catch |err| switch (err) {
+        error.OutOfMemory => blk: {
+            failed.store(true, .release);
+            break :blk null;
+        },
+        error.Canceled => return error.Canceled,
+    };
 }
 
 fn reportLoading(ws: *Workspace, message: ?[]const u8) void {

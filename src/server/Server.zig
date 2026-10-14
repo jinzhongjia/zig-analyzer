@@ -719,9 +719,9 @@ fn startup(server: *Server) Io.Cancelable!void {
         defer server.env_mutex.unlock(server.io);
         server.zig_env = env;
     }
-    log.info("zig {s}（{s}）", .{ env.version, env.zig_exe });
+    log.info("zig {s} ({s})", .{ env.version, env.zig_exe });
     // 默认的 builtin.zig：与单文件编译（`zig build-obj -fno-emit-bin`）的设置一致
-    const default_builtin = za.project.builtin.generate(server.gpa, server.io, env.zig_exe, env.global_cache_dir, &.{"build-obj"}) catch |err| switch (err) {
+    const default_builtin = za.project.builtin.generate(server.gpa, server.io, &env, &.{"build-obj"}) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => null,
     };
