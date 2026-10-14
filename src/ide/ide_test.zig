@@ -207,3 +207,30 @@ test "hover in generic bodies is inferred from a call site" {
         };
     }
 }
+
+test "hover in generic bodies is inferred from a call site in another file" {
+    const lib_text =
+        \\pub fn max(comptime T: type, a: T, b: T) T {
+        \\    const bigger = if (a > b) a else b;
+        \\    return bigger;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = (try w.add("/p/lib.zig", lib_text)).file;
+    // 不导入 lib.zig 的文件即使有同名调用也不参与
+    const other = (try w.add("/p/a.zig", "fn max(comptime T: type, a: T, b: T) T { return a; }\nfn f() void { _ = max(u8, 1, 2); }\n")).file;
+    const main = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\nfn run() void {\n    _ = lib.max(i64, 1, 2);\n}\n")).file;
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+        .{ .file = other, .module = 0, .root_module = 0 },
+        .{ .file = main, .module = 0, .root_module = 0 },
+        .{ .file = lib, .module = 0, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst bigger: i64\n```\n\ninferred from the call at main.zig:3", info.text);
+}
