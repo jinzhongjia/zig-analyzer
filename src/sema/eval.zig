@@ -1,0 +1,2532 @@
+//! comptime 解释器（设计 §9.4）：在 HIR 上解释执行 comptime 求值的函数调用（类型构造函数、
+//! comptime 上下文中的调用）与容器级常量的初始化表达式，值为 InternPool 中的类型与值。
+//!
+//! 解释器内的值可以修改：局部变量、数组与结构体的元素、经由指针写入（指针表示为存储单元 +
+//! 元素路径）。只在离开解释器时（返回值、query 结果）驻留，避免只增不减的 InternPool 中堆积
+//! 中间结果。遇到未知值、运行时才能确定的操作、不支持的语法或 `@compileError` 时放弃求值，
+//! 结果为未知。燃料：每次求值有步数上限，解释器内的嵌套调用有深度上限，经由 query 的调用与
+//! 深层递归受查询引擎的栈深度保护。
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const database = @import("../database.zig");
+const Db = database.Db;
+const hir = database.hir;
+const syntax = database.syntax;
+const InternPool = @import("InternPool.zig");
+const Index = InternPool.Index;
+const TypedValue = InternPool.TypedValue;
+const Body = @import("../hir/Body.zig");
+const ExprId = Body.ExprId;
+const resolve = @import("../names/resolve.zig");
+const Resolver = resolve.Resolver;
+const Namespace = resolve.Namespace;
+const FileId = @import("../base/Vfs.zig").FileId;
+const ast = @import("../syntax/ast.zig");
+const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
+const queries = @import("queries.zig");
+const infer = @import("infer.zig");
+const value = @import("value.zig");
+
+/// 单次求值的步数上限（求值的表达式个数）
+const max_steps = 200_000;
+/// 解释器内（不经 query）嵌套调用的深度上限
+const max_inline_calls = 64;
+/// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃
+const max_eval_bytes = 64 * 1024 * 1024;
+/// 解释器内展开的单个聚合的元素个数上限（在分配前检查）
+const max_agg_elems = 1 << 16;
+
+const Error = resolve.Error;
+/// 放弃求值与控制流
+const EvalError = Error || error{ Abort, Break, Continue, Return };
+
+/// comptime 调用：被调函数的实例与各参数的值
+pub const CallKey = struct {
+    /// 与类型推导中的实例相同（comptime 参数取值、anytype 取类型、其他为 `runtime`），
+    /// 决定体内定义的容器的身份
+    inst: Index,
+    /// 各参数的值：`aggregate`（类型为 unknown），元素与形参一一对应，未知的为 unknown
+    values: Index,
+};
+
+/// 以实例 `inst` 与实参 `args`（与形参一一对应）执行 comptime 调用
+pub fn call(r: *Resolver, inst: Index, args: []const TypedValue) Error!TypedValue {
+    const ip = r.ctx.db.env.ip;
+    const values = try r.arena.alloc(Index, args.len);
+    for (args, values) |a, *v| v.* = a.val orelse .unknown;
+    const key: CallKey = .{ .inst = inst, .values = try ip.get(.{ .aggregate = .{ .ty = .unknown, .elems = values } }) };
+    return r.ctx.get(queries.CallEval, key);
+}
+
+/// `CallEval` 的计算
+pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
+    var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+    defer scratch.deinit();
+    var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+    var ev: Evaluator = .{ .r = &r, .ip = ctx.db.env.ip, .a = scratch.allocator(), .arena = &scratch };
+    const ip = ev.ip;
+    const inst = ip.key(key.inst).instance;
+    const args = switch (ip.key(key.values)) {
+        .aggregate => |agg| agg.elems,
+        else => &.{},
+    };
+    const vals = try ev.a.alloc(Val, args.len);
+    for (args, vals) |x, *v| v.* = if (x == .unknown) .unknown else Val.of(value.typeOfValue(ip, x), x);
+    const result = ev.runFunction(.{ .file = inst.file, .item = inst.decl }, key.inst, vals) catch |err| return giveUp(err);
+    return ev.toTyped(result) catch |err| giveUp(err);
+}
+
+/// 成员（容器级常量、字段默认值）主体的 comptime 值。`want` 为类型标注
+pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index) Error!TypedValue {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    const item = try ev.itemIndex(owner) orelse return .unknown;
+    const body = try r.ctx.get(hir.ItemBody, owner);
+    const main = body.value orelse return .unknown;
+    var frame = try ev.newFrame(owner.file, item, body, inst);
+    const v = ev.eval(&frame, main, want) catch |err| return giveUp(err);
+    return ev.toTyped(v) catch |err| giveUp(err);
+}
+
+/// 表达式在给定绑定下的 comptime 值：类型推导在 comptime 上下文中求不出值时使用
+pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index) Error!TypedValue {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    var frame = try ev.newFrame(file, item, body, inst);
+    for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
+    const v = ev.eval(&frame, e, want) catch |err| return giveUp(err);
+    return ev.toTyped(v) catch |err| giveUp(err);
+}
+
+/// 值的字段（聚合、union、切片与数组的 `len`）；求不出时为 null
+pub fn fieldValue(r: *Resolver, base: TypedValue, name: []const u8) Error!?TypedValue {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    const v = ev.fieldAccess(Evaluator.thaw(base), name) catch |err| return abortToNull(err);
+    const tv = ev.toTyped(v) catch |err| return abortToNull(err);
+    return if (tv.val != null) tv else null;
+}
+
+/// 值的第 `i` 个元素；求不出时为 null
+pub fn elemValue(r: *Resolver, base: TypedValue, i: usize) Error!?TypedValue {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    const v = ev.elemAt(Evaluator.thaw(base), i) catch |err| return abortToNull(err);
+    const tv = ev.toTyped(v) catch |err| return abortToNull(err);
+    return if (tv.val != null) tv else null;
+}
+
+/// 元组、匿名结构体、构造的类型与源码容器中字段的类型
+pub fn fieldType(r: *Resolver, t: Index, name: []const u8) Error!?Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    const fields = try ev.fieldsOf(t) orelse return null;
+    for (fields) |f| if (std.mem.eql(u8, f.name, name)) return f.ty;
+    return null;
+}
+
+/// 字段名（按声明顺序）：补全构造的类型、元组与匿名结构体的成员
+pub fn fieldNames(r: *Resolver, t: Index) Error![]const Field {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return try ev.fieldsOf(t) orelse &.{};
+}
+
+/// 构造的枚举（`@Enum`、`union(enum)` 的标签枚举）的成员名
+pub fn enumMemberNames(r: *Resolver, t: Index) Error![]const []const u8 {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return try ev.enumNames(t) orelse &.{};
+}
+
+/// 类型上的成员（声明、枚举成员）
+pub fn typeMember(r: *Resolver, t: Index, name: []const u8) Error!?TypedValue {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    const v = ev.typeMember(t, name) catch |err| return abortToNull(err);
+    return ev.toTyped(v) catch |err| abortToNull(err);
+}
+
+fn abortToNull(err: EvalError) Error!?TypedValue {
+    return switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// 两个值是否相等：`value.eqlValues` 之外，同一位置、不同实例的两个容器按它们捕获的值判断
+/// （Zig 中容器的身份 = 定义位置 + 捕获的值：不捕获实参的容器在不同实例间是同一个类型）
+pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
+    const ip = r.ctx.db.env.ip;
+    if (value.eqlValues(ip, a, b)) |eq| return eq;
+    const ca = switch (ip.key(a)) {
+        .container_type => |c| c,
+        else => return null,
+    };
+    const cb = switch (ip.key(b)) {
+        .container_type => |c| c,
+        else => return null,
+    };
+    if (ca.file != cb.file or ca.ast_id != cb.ast_id) return false;
+    const ia = ca.inst orelse return null;
+    const ib = cb.inst orelse return null;
+    const ns = try queries.namespaceOfType(r, a) orelse return null;
+    var unknown = false;
+    for (try captures(r, ns)) |cap| {
+        const def: resolve.Def = .{ .local = .{ .file = ns.file, .item = cap.item, .binding = cap.binding } };
+        const va = (try queries.defType(r, def, null, ia)).val orelse return null;
+        const vb = (try queries.defType(r, def, null, ib)).val orelse return null;
+        const eq = value.eqlValues(ip, va, vb) orelse {
+            unknown = true;
+            continue;
+        };
+        if (!eq) return false;
+    }
+    return if (unknown) null else true;
+}
+
+const Capture = struct { item: u32, binding: Body.BindingId };
+
+/// 容器（含嵌套的容器）的成员引用的外层函数的参数与局部变量
+fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
+    const tree = try r.itemTree(ns.file);
+    var out: std.ArrayList(Capture) = .empty;
+    for (tree.items, 0..) |_, i| {
+        // 成员是否位于容器内（经由嵌套的容器）
+        var c: u32 = tree.items[i].container;
+        const inside = while (true) {
+            if (c == ns.container) break true;
+            const parent = tree.containers[c].parent_item orelse break false;
+            c = tree.items[parent].container;
+        };
+        if (!inside) continue;
+        const body = try r.body(ns.file, @intCast(i));
+        for (body.exprs, 0..) |e, ei| {
+            const name = switch (e) {
+                .name_ref => |n| n,
+                else => continue,
+            };
+            const def = try r.resolveName(ns.file, @intCast(i), body, body.expr_scopes[ei], name) orelse continue;
+            const l = switch (def) {
+                .local => |l| l,
+                else => continue,
+            };
+            // 成员自身的局部变量不是捕获
+            if (l.item == i) continue;
+            for (out.items) |x| {
+                if (x.item == l.item and x.binding == l.binding) break;
+            } else try out.append(r.arena, .{ .item = l.item, .binding = l.binding });
+        }
+    }
+    return out.items;
+}
+
+/// 只能在 comptime 存在的类型，包括字段为这类类型的结构体与 union（如 `std.builtin.Type`、
+/// `std.meta.fieldInfo` 的结果）：返回它的调用在 comptime 执行
+pub fn isComptimeOnly(r: *Resolver, t: Index) Error!bool {
+    return comptimeOnly(r, t, 0);
+}
+
+fn comptimeOnly(r: *Resolver, t: Index, depth: u32) Error!bool {
+    const ip = r.ctx.db.env.ip;
+    if (value.isComptimeOnly(ip, t)) return true;
+    // 嵌套的容器只看两层，避免递归类型
+    if (depth >= 2) return false;
+    switch (ip.key(t)) {
+        .container_type => |c| if (c.kind == .@"struct" or c.kind == .@"union") {
+            var ev: Evaluator = .{ .r = r, .ip = ip, .a = r.arena };
+            for (try ev.fieldsOf(t) orelse return false) |f| if (try comptimeOnly(r, f.ty, depth + 1)) return true;
+        },
+        .optional_type => |c| return comptimeOnly(r, c, depth + 1),
+        .error_union_type => |e| return comptimeOnly(r, e.payload, depth + 1),
+        else => {},
+    }
+    return false;
+}
+
+/// `@typeInfo(t)` 的值；`t` 含未知部分时为 null
+pub fn typeInfo(r: *Resolver, t: Index) Error!?Index {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    return ev.typeInfo(t) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        else => |e| e,
+    };
+}
+
+fn giveUp(err: EvalError) Error!TypedValue {
+    return switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => .unknown,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+// ── 值 ───────────────────────────────────────────────────────────────
+
+/// 解释器中的值
+const Val = struct {
+    ty: Index,
+    v: Repr = .unknown,
+
+    const unknown: Val = .{ .ty = .unknown };
+    const void_val: Val = .{ .ty = .void_type, .v = .{ .ip = .void_value } };
+
+    fn of(ty: Index, v: Index) Val {
+        return .{ .ty = ty, .v = if (v == .undefined_value) .undef else .{ .ip = v } };
+    }
+
+    fn ofType(t: Index) Val {
+        return .{ .ty = .type_type, .v = .{ .ip = t } };
+    }
+
+    fn ip(v: Val) ?Index {
+        return switch (v.v) {
+            .ip => |x| x,
+            else => null,
+        };
+    }
+};
+
+const Repr = union(enum) {
+    unknown,
+    undef,
+    /// 驻留的值
+    ip: Index,
+    /// 解释器内可修改的聚合：数组、向量、元组、结构体（按字段顺序）
+    agg: *Agg,
+    /// 指针：指向存储单元中的某个元素
+    ref: Ref,
+};
+
+const Agg = struct { elems: []Val };
+
+const Ref = struct {
+    cell: *Val,
+    /// 从存储单元的值逐层取元素的下标
+    path: []const u32,
+};
+
+const Frame = struct {
+    file: FileId,
+    item: u32,
+    body: *const Body,
+    inst: ?Index,
+    /// 与 `body.bindings` 一一对应
+    slots: []Val,
+    ret_type: ?Index = null,
+    labels: std.ArrayList(Label) = .empty,
+};
+
+/// break / continue 的目标
+const Label = struct {
+    name: ?[]const u8,
+    kind: enum { block, loop, @"switch" },
+    want: ?Index,
+};
+
+pub const Field = struct { name: []const u8, ty: Index, item: ?u32 = null };
+
+const Evaluator = struct {
+    r: *Resolver,
+    ip: *InternPool,
+    a: Allocator,
+    /// `a` 的来源：检查求值占用的内存
+    arena: ?*std.heap.ArenaAllocator = null,
+    steps: u32 = 0,
+    inline_calls: u32 = 0,
+    /// break / continue 的目标（`Frame.labels` 下标）与值；return 的值
+    jump_target: usize = 0,
+    jump_value: Val = .unknown,
+
+    fn tick(ev: *Evaluator) EvalError!void {
+        const ctx = ev.r.ctx;
+        ev.steps += 1;
+        if (ev.steps > max_steps) return error.Abort;
+        if (ev.steps % 256 == 0) {
+            try ctx.checkCanceled();
+            if (ev.arena) |arena| if (arena.queryCapacity() > max_eval_bytes) return error.Abort;
+        }
+        // 本次请求的燃料耗尽或嵌套过深：结果取决于请求，不写入 memo
+        if (ctx.fuel == 0) {
+            ctx.markIncomplete();
+            return error.Abort;
+        }
+        if (ctx.stackExhausted()) {
+            ctx.exhausted();
+            return error.Abort;
+        }
+        ctx.fuel -= 1;
+    }
+
+    fn itemIndex(ev: *Evaluator, owner: hir.OwnerKey) Error!?u32 {
+        const tree = try ev.r.itemTree(owner.file);
+        for (tree.items, 0..) |it, i| if (it.ast_id == owner.item) return @intCast(i);
+        return null;
+    }
+
+    fn newFrame(ev: *Evaluator, file: FileId, item: u32, body: *const Body, inst: ?Index) Error!Frame {
+        const slots = try ev.a.alloc(Val, body.bindings.len);
+        @memset(slots, .unknown);
+        return .{ .file = file, .item = item, .body = body, .inst = inst, .slots = slots };
+    }
+
+    // ── 驻留 ─────────────────────────────────────────────────────────
+
+    fn toTyped(ev: *Evaluator, v: Val) EvalError!TypedValue {
+        return .{ .ty = v.ty, .val = try ev.freeze(v) };
+    }
+
+    fn thaw(tv: TypedValue) Val {
+        return if (tv.val) |x| Val.of(tv.ty, x) else .{ .ty = tv.ty };
+    }
+
+    /// 驻留后的值；值未知时为 null
+    fn freeze(ev: *Evaluator, v: Val) EvalError!?Index {
+        switch (v.v) {
+            .unknown => return null,
+            .undef => return .undefined_value,
+            .ip => |x| return x,
+            .agg => |agg| {
+                const elems = try ev.a.alloc(Index, agg.elems.len);
+                for (agg.elems, elems) |e, *out| out.* = try ev.freeze(e) orelse return null;
+                return try ev.aggregate(v.ty, elems);
+            },
+            .ref => |ref| {
+                const target = try ev.load(ref);
+                const pointee = try ev.freeze(target) orelse return null;
+                return try ev.pointerTo(v.ty, pointee);
+            },
+        }
+    }
+
+    fn aggregate(ev: *Evaluator, ty: Index, elems: []const Index) Error!Index {
+        return value.aggregate(ev.ip, ev.a, ty, elems);
+    }
+
+    /// 指针值：指向数组的指针与切片以所指向的元素表示，其他为 `ptr_value`
+    fn pointerTo(ev: *Evaluator, ptr_ty: Index, pointee: Index) Error!Index {
+        const ip = ev.ip;
+        if (ev.isArrayPtr(ptr_ty)) switch (ip.key(pointee)) {
+            .aggregate => |agg| return ip.get(.{ .aggregate = .{ .ty = ptr_ty, .elems = agg.elems } }),
+            .bytes => |b| return ip.get(.{ .bytes = .{ .ty = ptr_ty, .bytes = b.bytes } }),
+            else => {},
+        };
+        return ip.get(.{ .ptr_value = .{ .ty = ptr_ty, .pointee = pointee } });
+    }
+
+    /// 切片、多项指针，或指向数组 / 元组 / 向量的单项指针
+    fn isArrayPtr(ev: *Evaluator, t: Index) bool {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| p.size != .one or switch (ev.ip.key(p.child)) {
+                .array_type, .tuple_type, .vector_type => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// 深复制可修改的聚合（值语义）
+    fn copy(ev: *Evaluator, v: Val) Error!Val {
+        const agg = switch (v.v) {
+            .agg => |x| x,
+            else => return v,
+        };
+        const out = try ev.a.create(Agg);
+        out.* = .{ .elems = try ev.a.alloc(Val, agg.elems.len) };
+        for (agg.elems, out.elems) |e, *o| o.* = try ev.copy(e);
+        return .{ .ty = v.ty, .v = .{ .agg = out } };
+    }
+
+    // ── 聚合 ─────────────────────────────────────────────────────────
+
+    /// 第 `i` 个元素的类型（数组、切片、指向数组的指针、向量、元组、结构体）
+    fn elemTypeOf(ev: *Evaluator, t: Index, i: usize) Index {
+        const ip = ev.ip;
+        return switch (ip.key(t)) {
+            .array_type => |a| a.child,
+            .vector_type => |v| v.child,
+            .tuple_type => |types| if (i < types.len) types[i] else .unknown,
+            .anon_struct_type => |s| if (i < s.types.len) s.types[i] else .unknown,
+            .reified_type => |rt| if (i < rt.types.len) rt.types[i] else .unknown,
+            .ptr_type => |p| if (p.size != .one) p.child else ev.elemTypeOf(p.child, i),
+            .container_type => blk: {
+                const fields = ev.fieldsOf(t) catch break :blk .unknown;
+                break :blk if (fields != null and i < fields.?.len) fields.?[i].ty else .unknown;
+            },
+            else => .unknown,
+        };
+    }
+
+    /// 由类型决定的元素个数（数组、向量、元组、结构体）
+    fn typeElemCount(ev: *Evaluator, t: Index) Error!?usize {
+        return switch (ev.ip.key(t)) {
+            .array_type => |a| std.math.cast(usize, a.len),
+            .vector_type => |v| v.len,
+            .tuple_type => |types| types.len,
+            .anon_struct_type => |s| s.names.len,
+            .reified_type => |rt| if (rt.kind == .@"struct") rt.names.len else null,
+            .ptr_type => |p| if (p.size == .one) try ev.typeElemCount(p.child) else null,
+            .container_type => |c| if (c.kind == .@"struct" or c.kind == .file) (if (try ev.fieldsOf(t)) |f| f.len else null) else null,
+            else => null,
+        };
+    }
+
+    /// 元素个数；值未知时取类型决定的个数
+    fn elemCount(ev: *Evaluator, v: Val) EvalError!?usize {
+        switch (v.v) {
+            .agg => |agg| return agg.elems.len,
+            .ref => |ref| return ev.elemCount(try ev.load(ref)),
+            .ip => |x| switch (ev.ip.key(x)) {
+                .aggregate => |agg| return agg.elems.len,
+                .bytes => |b| return b.bytes.len,
+                .ptr_value => |p| return ev.elemCount(Val.of(ev.pointeeType(v.ty), p.pointee)),
+                else => {},
+            },
+            else => {},
+        }
+        return ev.typeElemCount(v.ty);
+    }
+
+    fn pointeeType(ev: *Evaluator, t: Index) Index {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| p.child,
+            else => .unknown,
+        };
+    }
+
+    /// 第 `i` 个元素；值未知时元素也未知
+    fn elemAt(ev: *Evaluator, v: Val, i: usize) EvalError!Val {
+        const ty = ev.elemTypeOf(v.ty, i);
+        switch (v.v) {
+            .unknown => return .{ .ty = ty },
+            .undef => return .{ .ty = ty, .v = .undef },
+            .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
+            .ref => |ref| return ev.elemAt(try ev.load(ref), i),
+            .ip => |x| switch (ev.ip.key(x)) {
+                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
+                .bytes => |b| return if (i < b.bytes.len) Val.of(.u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
+                .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
+                .union_value => |u| return if (i == 0) Val.of(ty, u.payload) else error.Abort,
+                else => return error.Abort,
+            },
+        }
+    }
+
+    fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
+        var cur = ref.cell.*;
+        for (ref.path) |i| cur = try ev.elemAt(cur, i);
+        return cur;
+    }
+
+    fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
+        var cell = ref.cell;
+        for (ref.path) |i| {
+            const agg = try ev.mutableAgg(cell);
+            if (i >= agg.elems.len) return error.Abort;
+            cell = &agg.elems[i];
+        }
+        cell.* = try ev.copy(try ev.coerce(v, if (cell.ty != .unknown) cell.ty else null));
+    }
+
+    /// 存储单元中的值展开为可修改的聚合
+    fn mutableAgg(ev: *Evaluator, cell: *Val) EvalError!*Agg {
+        if (cell.v == .agg) return cell.v.agg;
+        if (cell.v == .ref) return error.Abort;
+        const n = try ev.elemCount(cell.*) orelse return error.Abort;
+        if (n > max_agg_elems) return error.Abort;
+        const agg = try ev.a.create(Agg);
+        agg.* = .{ .elems = try ev.a.alloc(Val, n) };
+        for (agg.elems, 0..) |*e, i| e.* = try ev.elemAt(cell.*, i);
+        cell.v = .{ .agg = agg };
+        return agg;
+    }
+
+    /// 容器类型的字段（按声明顺序）
+    fn fieldsOf(ev: *Evaluator, t: Index) Error!?[]const Field {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .container_type => |c| {
+                if (c.kind == .@"enum" or c.kind == .@"opaque") return &.{};
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+                const tree = try ev.r.itemTree(ns.file);
+                var out: std.ArrayList(Field) = .empty;
+                for (tree.containerMembers(ns.container)) |m| {
+                    const it = tree.items[m];
+                    if (it.kind != .field) continue;
+                    const ty = (try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, c.inst)).ty;
+                    try out.append(ev.a, .{ .name = it.name orelse "", .ty = ty, .item = m });
+                }
+                return out.items;
+            },
+            .tuple_type => |types| {
+                const out = try ev.a.alloc(Field, types.len);
+                for (types, out, 0..) |ty, *o, i| o.* = .{ .name = try std.fmt.allocPrint(ev.a, "{d}", .{i}), .ty = ty };
+                return out;
+            },
+            .anon_struct_type => |s| {
+                const out = try ev.a.alloc(Field, s.names.len);
+                for (s.names, s.types, out) |n, ty, *o| o.* = .{ .name = n, .ty = ty };
+                return out;
+            },
+            .reified_type => |rt| {
+                if (rt.kind == .@"enum") return &.{};
+                const out = try ev.a.alloc(Field, rt.names.len);
+                for (rt.names, out, 0..) |n, *o, i| o.* = .{ .name = n, .ty = if (i < rt.types.len) rt.types[i] else .unknown };
+                return out;
+            },
+            else => return null,
+        }
+    }
+
+    fn fieldIndex(ev: *Evaluator, t: Index, name: []const u8) Error!?usize {
+        const fields = try ev.fieldsOf(t) orelse return null;
+        for (fields, 0..) |f, i| if (std.mem.eql(u8, f.name, name)) return i;
+        return null;
+    }
+
+    /// 结构体字段的默认值
+    fn fieldDefault(ev: *Evaluator, t: Index, field: Field) EvalError!Val {
+        const item = field.item orelse return error.Abort;
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
+        const owner = try ev.r.ownerKey(ns.file, item);
+        const body = try ev.r.ctx.get(hir.ItemBody, owner);
+        const default = body.value orelse return error.Abort;
+        const inst = queries.instOfType(ev.ip, t);
+        const res = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+        if (@backingInt(default) < res.exprs.len) if (res.exprs[@backingInt(default)].val) |v| return try ev.coerce(Val.of(res.exprs[@backingInt(default)].ty, v), field.ty);
+        return thaw(try ownerValue(ev.r, owner, inst, field.ty));
+    }
+
+    // ── 求值 ─────────────────────────────────────────────────────────
+
+    fn eval(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!Val {
+        try ev.tick();
+        const raw = try ev.evalInner(f, e, want);
+        return ev.coerce(raw, want);
+    }
+
+    /// 求值得到类型
+    fn evalType(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Index {
+        const v = try ev.eval(f, e, null);
+        if (v.ty != .type_type) return error.Abort;
+        return v.ip() orelse error.Abort;
+    }
+
+    fn evalInt(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!i128 {
+        const v = try ev.eval(f, e, want);
+        return value.intOf(ev.ip, v.ip()) orelse error.Abort;
+    }
+
+    fn evalInner(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!Val {
+        const ip = ev.ip;
+        const b = f.body;
+        switch (b.expr(e)) {
+            .missing, .other, .@"unreachable" => return error.Abort,
+            .name_ref => |name| return ev.nameRef(f, e, name),
+            .literal => |text| return ev.literal(text),
+            .field_access => |fa| return ev.fieldAccess(try ev.eval(f, fa.lhs, null), fa.field orelse return error.Abort),
+            .enum_literal => |name| {
+                if (want) |t| if (try ev.declLiteral(t, name)) |v| return v;
+                return Val.of(.enum_literal_type, try ip.get(.{ .enum_literal = name }));
+            },
+            .error_value => |name| return Val.of(try ip.errorSet(ev.a, &.{name}), try ip.get(.{ .error_value = name })),
+            .builtin_call => |bc| return ev.builtin(f, e, bc.name, bc.args, want),
+            .call => |c| return ev.callExpr(f, c.callee, c.args, want),
+            .block => |blk| return ev.block(f, blk, want),
+            .@"if" => |x| {
+                const cond = try ev.eval(f, x.cond, null);
+                const taken = try ev.condition(cond);
+                if (taken.yes) {
+                    if (x.capture.len != 0) try ev.bindCapture(f, x.capture[0], taken.payload);
+                    return ev.eval(f, x.then, want);
+                }
+                if (x.else_capture.len != 0) try ev.bindCapture(f, x.else_capture[0], taken.payload);
+                return if (x.@"else") |el| ev.eval(f, el, want) else Val.void_val;
+            },
+            .loop => |l| return ev.loop(f, l, want),
+            .@"switch" => |s| return ev.switchExpr(f, e, s, want),
+            .@"catch" => |c| {
+                const lhs = try ev.eval(f, c.lhs, null);
+                const eu = switch (ip.key(lhs.ty)) {
+                    .error_union_type => |eu| eu,
+                    else => return error.Abort,
+                };
+                const x = lhs.ip() orelse return error.Abort;
+                if (ip.key(x) != .error_value) return .{ .ty = eu.payload, .v = lhs.v };
+                if (c.capture) |cap| f.slots[@backingInt(cap)] = Val.of(eu.err, x);
+                return ev.eval(f, c.rhs, eu.payload);
+            },
+            .binary => |bin| return ev.binary(f, bin.op, bin.lhs, bin.rhs, want),
+            .prefix => |p| return ev.prefix(f, p.op, p.operand, want),
+            .assign => |a| {
+                try ev.assign(f, a.op, a.lhs, a.rhs);
+                return Val.void_val;
+            },
+            .index => |x| {
+                const lhs = try ev.eval(f, x.lhs, null);
+                const i = try ev.evalInt(f, x.index, .usize_type);
+                return ev.elemAt(lhs, std.math.cast(usize, i) orelse return error.Abort);
+            },
+            .slice => |s| return ev.slice(f, s),
+            .deref => |x| return ev.deref(try ev.eval(f, x, null)),
+            .unwrap_optional => |x| {
+                const v = try ev.eval(f, x, null);
+                const child = switch (ip.key(v.ty)) {
+                    .optional_type => |c| c,
+                    else => return error.Abort,
+                };
+                if (v.ip() == .null_value or v.v == .unknown or v.v == .undef) return error.Abort;
+                return .{ .ty = child, .v = v.v };
+            },
+            .init => |x| return ev.initExpr(f, x.ty, x.fields, want),
+            .container => |c| {
+                if (c.arg) |arg| _ = try ev.eval(f, arg, null);
+                const ns = try ev.containerAt(f, e) orelse return error.Abort;
+                return Val.ofType(try queries.containerType(ev.r, ns, f.inst));
+            },
+            .fn_type => |ft| {
+                const params = try ev.a.alloc(Index, ft.params.len);
+                for (ft.params, params) |p, *out| out.* = try ev.evalType(f, p);
+                const ret = if (ft.ret) |rt| try ev.evalType(f, rt) else .void_type;
+                return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret } }));
+            },
+            .@"return" => |x| {
+                ev.jump_value = if (x) |rv| try ev.eval(f, rv, f.ret_type) else Val.void_val;
+                return error.Return;
+            },
+            .@"break" => |br| {
+                const target = labelTarget(f, br.label) orelse return error.Abort;
+                ev.jump_value = if (br.value) |v| try ev.eval(f, v, f.labels.items[target].want) else Val.void_val;
+                ev.jump_target = target;
+                return error.Break;
+            },
+            .@"continue" => |c| {
+                const target = labelTarget(f, c.label) orelse return error.Abort;
+                ev.jump_value = if (c.value) |v| try ev.eval(f, v, null) else Val.void_val;
+                ev.jump_target = target;
+                return error.Continue;
+            },
+            .@"comptime" => |x| return ev.eval(f, x, want),
+            .optional_type => |x| return Val.ofType(try ip.optionalOf(try ev.evalType(f, x))),
+            .error_union_type => |eu| {
+                const err = try ev.evalType(f, eu.err);
+                const payload = try ev.evalType(f, eu.payload);
+                return Val.ofType(try ip.get(.{ .error_union_type = .{ .err = err, .payload = payload } }));
+            },
+            .ptr_type => |p| {
+                const child = try ev.evalType(f, p.child);
+                const sentinel = if (p.sentinel) |s| try ev.freeze(try ev.eval(f, s, child)) orelse return error.Abort else null;
+                return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel } }));
+            },
+            .array_type => |arr| {
+                const len = try ev.evalInt(f, arr.len, .usize_type);
+                const child = try ev.evalType(f, arr.child);
+                const sentinel = if (arr.sentinel) |s| try ev.freeze(try ev.eval(f, s, child)) orelse return error.Abort else null;
+                return Val.ofType(try ip.get(.{ .array_type = .{ .len = std.math.cast(u64, len) orelse return error.Abort, .child = child, .sentinel = sentinel } }));
+            },
+            .error_set => |names| return Val.ofType(try ip.errorSet(ev.a, names)),
+        }
+    }
+
+    fn nameRef(ev: *Evaluator, f: *Frame, e: ExprId, name: []const u8) EvalError!Val {
+        if (try infer.primitive(ev.ip, name)) |tv| return thaw(tv);
+        const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
+        switch (def) {
+            .local => |l| if (l.file == f.file and l.item == f.item) return f.slots[@backingInt(l.binding)],
+            else => {},
+        }
+        return thaw(try queries.defType(ev.r, def, null, f.inst));
+    }
+
+    fn literal(ev: *Evaluator, text: []const u8) EvalError!Val {
+        const ip = ev.ip;
+        if (text.len == 0) return error.Abort;
+        switch (text[0]) {
+            '"' => {
+                const s = std.zig.string_literal.parseAlloc(ev.a, text) catch return error.Abort;
+                const ty = try ip.stringLiteralType(s.len);
+                return Val.of(ty, try ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
+            },
+            // 多行字符串在 HIR 中只保留第一行
+            '\\' => return .{ .ty = try ip.ptrTo(.u8_type, .slice, true) },
+            '\'' => switch (std.zig.parseCharLiteral(text)) {
+                .success => |c| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = c } })),
+                .failure => return error.Abort,
+            },
+            else => switch (std.zig.parseNumberLiteral(text)) {
+                .int => |v| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } })),
+                .float => {
+                    const x = std.fmt.parseFloat(f128, text) catch return error.Abort;
+                    return Val.of(.comptime_float_type, (try value.floatValue(ip, .comptime_float_type, x)).?);
+                },
+                .big_int, .failure => return error.Abort,
+            },
+        }
+    }
+
+    // ── 成员 ─────────────────────────────────────────────────────────
+
+    fn fieldAccess(ev: *Evaluator, base: Val, name: []const u8) EvalError!Val {
+        const ip = ev.ip;
+        if (base.ty == .type_type) return ev.typeMember(base.ip() orelse return error.Abort, name);
+        var v = base;
+        // 自动解引用指向非数组的单项指针
+        switch (ip.key(v.ty)) {
+            .ptr_type => |p| if (p.size == .one and !ev.isArrayPtr(v.ty)) {
+                v = try ev.deref(v);
+            },
+            else => {},
+        }
+        if (std.mem.eql(u8, name, "len")) if (ev.isSequence(v.ty)) {
+            const n = try ev.elemCount(v) orelse return .{ .ty = .usize_type };
+            return Val.of(.usize_type, try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = n } }));
+        };
+        switch (ip.key(v.ty)) {
+            .container_type => |c| if (c.kind == .@"union") {
+                const x = v.ip() orelse return error.Abort;
+                const u = switch (ip.key(x)) {
+                    .union_value => |u| u,
+                    else => return error.Abort,
+                };
+                if (!std.mem.eql(u8, u.tag, name)) return error.Abort;
+                return Val.of(try ev.unionFieldType(v.ty, name), u.payload);
+            },
+            .reified_type => |rt| if (rt.kind == .@"union") {
+                const x = v.ip() orelse return error.Abort;
+                const u = ip.key(x).union_value;
+                if (!std.mem.eql(u8, u.tag, name)) return error.Abort;
+                return Val.of(try ev.unionFieldType(v.ty, name), u.payload);
+            },
+            else => {},
+        }
+        const i = try ev.fieldIndex(v.ty, name) orelse return error.Abort;
+        return ev.elemAt(v, i);
+    }
+
+    fn isSequence(ev: *Evaluator, t: Index) bool {
+        return switch (ev.ip.key(t)) {
+            .array_type, .vector_type, .tuple_type => true,
+            .ptr_type => ev.isArrayPtr(t),
+            else => false,
+        };
+    }
+
+    fn unionFieldType(ev: *Evaluator, t: Index, name: []const u8) Error!Index {
+        const fields = try ev.fieldsOf(t) orelse return .unknown;
+        for (fields) |fl| if (std.mem.eql(u8, fl.name, name)) return fl.ty;
+        return .unknown;
+    }
+
+    /// 类型上的成员：声明、枚举成员、错误集成员
+    fn typeMember(ev: *Evaluator, t: Index, name: []const u8) EvalError!Val {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .container_type => {
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
+                const def = try ev.r.memberDef(ns, name) orelse return error.Abort;
+                return thaw(try queries.defType(ev.r, def, null, queries.instOfType(ip, t)));
+            },
+            .error_set_type => return Val.of(t, try ip.get(.{ .error_value = name })),
+            .reified_type, .union_tag_type => if (value.isEnumType(ip, t)) {
+                for (try ev.enumNames(t) orelse return error.Abort) |n| if (std.mem.eql(u8, n, name)) {
+                    return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = name } }));
+                };
+                return error.Abort;
+            },
+            else => {},
+        }
+        return error.Abort;
+    }
+
+    /// decl literal：结果类型中的声明 `.name`
+    fn declLiteral(ev: *Evaluator, t: Index, name: []const u8) EvalError!?Val {
+        const ip = ev.ip;
+        if (ip.key(t) != .container_type) return null;
+        if (value.isEnumType(ip, t)) {
+            const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+            if (infer.fieldItem(try ev.r.itemTree(ns.file), ns.container, name) != null) return null;
+        }
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+        const m = Resolver.lookupDecl(try ev.r.itemTree(ns.file), ns.container, name) orelse return null;
+        return thaw(try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, queries.instOfType(ip, t)));
+    }
+
+    /// 枚举类型的成员名（按声明顺序，不含非穷尽枚举的 `_`）
+    fn enumNames(ev: *Evaluator, t: Index) Error!?[]const []const u8 {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .container_type => |c| {
+                if (c.kind != .@"enum") return null;
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+                const tree = try ev.r.itemTree(ns.file);
+                var out: std.ArrayList([]const u8) = .empty;
+                for (tree.containerMembers(ns.container)) |m| {
+                    const it = tree.items[m];
+                    if (it.kind == .field and it.name != null and !std.mem.eql(u8, it.name.?, "_")) try out.append(ev.a, it.name.?);
+                }
+                return out.items;
+            },
+            .reified_type => |rt| return if (rt.kind == .@"enum") rt.names else null,
+            .union_tag_type => |u| {
+                const fields = try ev.fieldsOf(u) orelse return null;
+                const out = try ev.a.alloc([]const u8, fields.len);
+                for (fields, out) |fl, *o| o.* = fl.name;
+                return out;
+            },
+            else => return null,
+        }
+    }
+
+    /// 枚举成员的整数值（按 `enumNames` 的顺序）
+    fn enumValues(ev: *Evaluator, t: Index) EvalError![]const i128 {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .reified_type => |rt| if (rt.values.len == rt.names.len) return rt.values,
+            .container_type => |c| {
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
+                const tree = try ev.r.itemTree(ns.file);
+                var out: std.ArrayList(i128) = .empty;
+                var next: i128 = 0;
+                for (tree.containerMembers(ns.container)) |m| {
+                    const it = tree.items[m];
+                    if (it.kind != .field or it.name == null or std.mem.eql(u8, it.name.?, "_")) continue;
+                    // 显式的值 `a = 5`
+                    const owner = try ev.r.ownerKey(ns.file, m);
+                    const body = try ev.r.ctx.get(hir.ItemBody, owner);
+                    if (body.value != null) {
+                        const tv = try ownerValue(ev.r, owner, c.inst, null);
+                        next = value.intOf(ip, tv.val) orelse return error.Abort;
+                    }
+                    try out.append(ev.a, next);
+                    next += 1;
+                }
+                return out.items;
+            },
+            else => {},
+        }
+        const names = try ev.enumNames(t) orelse return error.Abort;
+        const out = try ev.a.alloc(i128, names.len);
+        for (out, 0..) |*o, i| o.* = @intCast(i);
+        return out;
+    }
+
+    /// 方法：值的类型（经由单项指针）中的函数声明
+    fn method(ev: *Evaluator, lhs: Val, name: []const u8) EvalError!?Val {
+        var t = lhs.ty;
+        switch (ev.ip.key(t)) {
+            .ptr_type => |p| if (p.size == .one) {
+                t = p.child;
+            },
+            else => {},
+        }
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+        const def = try ev.r.memberDef(ns, name) orelse return null;
+        const tv = try queries.defType(ev.r, def, null, queries.instOfType(ev.ip, t));
+        if (ev.ip.key(tv.ty) != .fn_type) return null;
+        return thaw(tv);
+    }
+
+    // ── 调用 ─────────────────────────────────────────────────────────
+
+    fn callExpr(ev: *Evaluator, f: *Frame, callee_e: ExprId, args: []const ExprId, want: ?Index) EvalError!Val {
+        const ip = ev.ip;
+        var self: ?Val = null;
+        const callee: Val = switch (f.body.expr(callee_e)) {
+            .field_access => |fa| blk: {
+                const name = fa.field orelse return error.Abort;
+                const lhs = try ev.eval(f, fa.lhs, null);
+                if (lhs.ty != .type_type) if (try ev.method(lhs, name)) |m| {
+                    self = lhs;
+                    // 接收者按第一个参数的类型传递：需要指针时取地址
+                    const fty = ip.key(m.ty).fn_type;
+                    if (fty.params.len > 0) switch (ip.key(fty.params[0])) {
+                        .ptr_type => |p| if (p.size == .one and ip.key(lhs.ty) != .ptr_type) {
+                            self = try ev.addressOf(f, fa.lhs, lhs);
+                        },
+                        else => {},
+                    };
+                    break :blk m;
+                };
+                break :blk try ev.fieldAccess(lhs, name);
+            },
+            .enum_literal => |name| blk: {
+                const t = want orelse return error.Abort;
+                break :blk try ev.declLiteral(t, name) orelse return error.Abort;
+            },
+            else => try ev.eval(f, callee_e, null),
+        };
+        const fty = switch (ip.key(callee.ty)) {
+            .fn_type => |ft| ft,
+            else => return error.Abort,
+        };
+        const skip: usize = if (self != null) 1 else 0;
+        const vals = try ev.a.alloc(Val, args.len + skip);
+        if (self) |s| vals[0] = s;
+        for (args, vals[skip..], skip..) |a, *out, i| {
+            const pt = if (i < fty.params.len and value.isConcrete(ip, fty.params[i])) fty.params[i] else null;
+            out.* = try ev.eval(f, a, pt);
+        }
+        return ev.callFn(callee, fty, vals);
+    }
+
+    /// 调用函数值：实参都可驻留时经 `CallEval`（结果缓存），否则（实参含指向解释器内存储的
+    /// 指针，被调函数可能经由它写入）在当前解释器中执行
+    fn callFn(ev: *Evaluator, callee: Val, fty: infer.FnType, args: []const Val) EvalError!Val {
+        const ip = ev.ip;
+        const fv = switch (ip.key(callee.ip() orelse return error.Abort)) {
+            .fn_value => |v| v,
+            else => return error.Abort,
+        };
+        const callee_tv: TypedValue = .{ .ty = callee.ty, .val = callee.ip() };
+        const g = try infer.genericCallee(ev.r, ev.a, callee_tv, fty);
+        // 实参驻留后经 query 调用（结果缓存）。传给非 comptime 参数的可修改聚合与指针不驻留：
+        // 被调函数可能经由指针写入，大的中间值也不应留在只增不减的 InternPool 中
+        const tvs = try ev.a.alloc(TypedValue, args.len);
+        var local = false;
+        for (args, tvs, 0..) |a, *tv, i| {
+            const comptime_param = if (g) |gg| gg.kind(i) != .runtime else false;
+            if (!comptime_param and (a.v == .agg or a.v == .ref)) {
+                local = true;
+                tv.* = .{ .ty = a.ty };
+                continue;
+            }
+            tv.* = .{ .ty = a.ty, .val = try ev.freeze(a) };
+        }
+        const inst = if (g) |gg|
+            try infer.instanceOf(ev.r, ev.a, gg, fty, tvs)
+        else
+            try infer.runtimeInstance(ip, ev.a, fv, args.len);
+        if (!local) {
+            const tv = try call(ev.r, inst, tvs);
+            if (tv.val == null) return error.Abort;
+            return thaw(tv);
+        }
+        if (ev.inline_calls >= max_inline_calls) return error.Abort;
+        ev.inline_calls += 1;
+        defer ev.inline_calls -= 1;
+        return ev.runFunction(.{ .file = fv.file, .item = fv.decl }, inst, args);
+    }
+
+    /// 在实例 `inst` 中执行函数体
+    fn runFunction(ev: *Evaluator, owner: hir.OwnerKey, inst: Index, args: []const Val) EvalError!Val {
+        const ip = ev.ip;
+        const item = try ev.itemIndex(owner) orelse return error.Abort;
+        const body = try ev.r.ctx.get(hir.ItemBody, owner);
+        const sig = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = inst });
+        const inst_args = ip.key(inst).instance.args;
+        var frame = try ev.newFrame(owner.file, item, body, inst);
+        for (body.params, 0..) |p, i| {
+            const arg: Val = if (i < args.len) args[i] else .unknown;
+            // anytype 参数的类型为实参类型（实例中记录的也是它）
+            const ty: Index = if (body.binding(p).ty == null)
+                (if (i < inst_args.len and inst_args[i] != .unknown and inst_args[i] != .runtime) inst_args[i] else arg.ty)
+            else if (@backingInt(p) < sig.bindings.len) sig.bindings[@backingInt(p)].ty else .unknown;
+            frame.slots[@backingInt(p)] = try ev.copy(try ev.coerce(.{ .ty = if (arg.ty == .unknown) ty else arg.ty, .v = arg.v }, if (ty != .unknown) ty else null));
+        }
+        frame.ret_type = try queries.returnType(ev.r, owner, body, sig, inst);
+        if (frame.ret_type == .unknown) frame.ret_type = null;
+        const main = body.value orelse return error.Abort;
+        _ = ev.eval(&frame, main, null) catch |err| switch (err) {
+            error.Return => return ev.coerce(ev.jump_value, frame.ret_type),
+            else => |e| return e,
+        };
+        return Val.void_val;
+    }
+
+    // ── 块与控制流 ───────────────────────────────────────────────────
+
+    /// break / continue 的目标：带标签时为同名的块、循环或 switch，否则为最内层的循环
+    fn labelTarget(f: *Frame, label: ?[]const u8) ?usize {
+        var i = f.labels.items.len;
+        while (i > 0) {
+            i -= 1;
+            const l = f.labels.items[i];
+            if (label) |name| {
+                if (l.name != null and std.mem.eql(u8, l.name.?, name)) return i;
+            } else if (l.kind == .loop) return i;
+        }
+        return null;
+    }
+
+    fn block(ev: *Evaluator, f: *Frame, blk: Body.Block, want: ?Index) EvalError!Val {
+        const index = f.labels.items.len;
+        try f.labels.append(ev.a, .{ .name = blk.label, .kind = .block, .want = want });
+        defer f.labels.shrinkRetainingCapacity(index);
+        var defers: std.ArrayList(ExprId) = .empty;
+        ev.statements(f, blk.stmts, &defers) catch |err| {
+            // 离开块时执行 defer（break 的值已保存在 jump_value 中）
+            const saved_value = ev.jump_value;
+            const saved_target = ev.jump_target;
+            try ev.runDefers(f, defers.items);
+            ev.jump_value = saved_value;
+            ev.jump_target = saved_target;
+            if (err == error.Break and ev.jump_target == index) return ev.coerce(ev.jump_value, want);
+            return err;
+        };
+        try ev.runDefers(f, defers.items);
+        return Val.void_val;
+    }
+
+    fn runDefers(ev: *Evaluator, f: *Frame, defers: []const ExprId) EvalError!void {
+        var i = defers.len;
+        while (i > 0) {
+            i -= 1;
+            _ = try ev.eval(f, defers[i], null);
+        }
+    }
+
+    fn statements(ev: *Evaluator, f: *Frame, stmts: []const Body.Stmt, defers: *std.ArrayList(ExprId)) EvalError!void {
+        for (stmts) |s| switch (s.kind) {
+            .expr => |x| _ = try ev.eval(f, x, null),
+            .local => |bid| {
+                const binding = f.body.binding(bid);
+                const ty: ?Index = if (binding.ty) |t| try ev.evalType(f, t) else null;
+                const init: Val = if (binding.init) |x| try ev.eval(f, x, ty) else .{ .ty = ty orelse .unknown, .v = .undef };
+                f.slots[@backingInt(bid)] = try ev.copy(.{ .ty = ty orelse init.ty, .v = init.v });
+            },
+            .@"defer" => |x| try defers.append(ev.a, x),
+            .@"errdefer" => {},
+            .destructure => |d| {
+                const v = try ev.eval(f, d.value, null);
+                for (d.targets, 0..) |t, i| {
+                    const elem = try ev.elemAt(v, i);
+                    switch (t) {
+                        .binding => |bid| {
+                            const ty: ?Index = if (f.body.binding(bid).ty) |te| try ev.evalType(f, te) else null;
+                            f.slots[@backingInt(bid)] = try ev.copy(try ev.coerce(elem, ty));
+                        },
+                        .expr => |x| {
+                            if (f.body.expr(x) == .name_ref and std.mem.eql(u8, f.body.expr(x).name_ref, "_")) continue;
+                            try ev.store(try ev.place(f, x), elem);
+                        },
+                    }
+                }
+            },
+        };
+    }
+
+    const Condition = struct { yes: bool, payload: Val = .unknown };
+
+    /// if / while 的条件：bool、optional（非 null 时载荷）、error union（成功时载荷，否则错误）
+    fn condition(ev: *Evaluator, v: Val) EvalError!Condition {
+        const ip = ev.ip;
+        const x = v.ip();
+        switch (ip.key(v.ty)) {
+            .simple_type => |s| if (s == .bool) {
+                if (x == .true_value) return .{ .yes = true };
+                if (x == .false_value) return .{ .yes = false };
+                return error.Abort;
+            },
+            .optional_type => |child| {
+                if (x == .null_value) return .{ .yes = false };
+                if (v.v == .unknown or v.v == .undef) return error.Abort;
+                return .{ .yes = true, .payload = .{ .ty = child, .v = v.v } };
+            },
+            .error_union_type => |eu| {
+                if (v.v == .unknown or v.v == .undef) return error.Abort;
+                if (x != null and ip.key(x.?) == .error_value) return .{ .yes = false, .payload = Val.of(eu.err, x.?) };
+                return .{ .yes = true, .payload = .{ .ty = eu.payload, .v = v.v } };
+            },
+            else => {},
+        }
+        return error.Abort;
+    }
+
+    fn bindCapture(ev: *Evaluator, f: *Frame, b: Body.BindingId, v: Val) EvalError!void {
+        if (f.body.binding(b).is_ptr) return error.Abort;
+        f.slots[@backingInt(b)] = try ev.copy(v);
+    }
+
+    fn loop(ev: *Evaluator, f: *Frame, l: Body.Loop, want: ?Index) EvalError!Val {
+        const index = f.labels.items.len;
+        try f.labels.append(ev.a, .{ .name = l.label, .kind = .loop, .want = want });
+        defer f.labels.shrinkRetainingCapacity(index);
+        switch (l.kind) {
+            .@"while" => while (true) {
+                try ev.tick();
+                const taken = try ev.condition(try ev.eval(f, l.inputs[0], null));
+                if (!taken.yes) {
+                    if (l.else_capture.len != 0) try ev.bindCapture(f, l.else_capture[0], taken.payload);
+                    break;
+                }
+                if (l.capture.len != 0) try ev.bindCapture(f, l.capture[0], taken.payload);
+                if (try ev.loopBody(f, l.body, index)) |v| return ev.coerce(v, want);
+                if (l.cont) |c| _ = try ev.eval(f, c, null);
+            },
+            .@"for" => {
+                const Input = union(enum) { range: i128, seq: Val };
+                const inputs = try ev.a.alloc(Input, l.inputs.len);
+                var n: ?usize = null;
+                for (l.inputs, inputs) |x, *in| {
+                    const len: ?usize = switch (f.body.expr(x)) {
+                        // `a..b` / `a..`
+                        .other => |range| blk: {
+                            if (range.len == 0 or range.len > 2) return error.Abort;
+                            const start = try ev.evalInt(f, range[0], .usize_type);
+                            in.* = .{ .range = start };
+                            if (range.len == 1) break :blk null;
+                            const end = try ev.evalInt(f, range[1], .usize_type);
+                            break :blk std.math.cast(usize, end - start) orelse return error.Abort;
+                        },
+                        else => blk: {
+                            const v = try ev.eval(f, x, null);
+                            // 元素未知：循环体无法执行
+                            if (v.v == .unknown or v.v == .undef) return error.Abort;
+                            in.* = .{ .seq = v };
+                            break :blk try ev.elemCount(v) orelse return error.Abort;
+                        },
+                    };
+                    if (len) |m| {
+                        if (n != null and n.? != m) return error.Abort;
+                        n = m;
+                    }
+                }
+                for (0..n orelse return error.Abort) |i| {
+                    try ev.tick();
+                    for (inputs, 0..) |in, k| {
+                        if (k >= l.capture.len) break;
+                        const cap = l.capture[k];
+                        const elem: Val = switch (in) {
+                            .range => |start| Val.of(.usize_type, try ev.ip.get(.{ .int_value = .{ .ty = .usize_type, .value = start + @as(i128, @intCast(i)) } })),
+                            .seq => |v| if (f.body.binding(cap).is_ptr) try ev.elemRef(v, i) else try ev.elemAt(v, i),
+                        };
+                        f.slots[@backingInt(cap)] = try ev.copy(elem);
+                    }
+                    if (try ev.loopBody(f, l.body, index)) |v| return ev.coerce(v, want);
+                }
+            },
+        }
+        if (l.@"else") |el| return ev.eval(f, el, want);
+        return Val.void_val;
+    }
+
+    /// 执行一次循环体：break 到本循环时返回其值，continue 到本循环时继续
+    fn loopBody(ev: *Evaluator, f: *Frame, body: ExprId, index: usize) EvalError!?Val {
+        _ = ev.eval(f, body, null) catch |err| switch (err) {
+            error.Break => if (ev.jump_target == index) return ev.jump_value else return err,
+            error.Continue => if (ev.jump_target == index) return null else return err,
+            else => |e| return e,
+        };
+        return null;
+    }
+
+    /// 指针捕获 `|*x|`：指向序列第 `i` 个元素的指针
+    fn elemRef(ev: *Evaluator, seq: Val, i: usize) EvalError!Val {
+        const ref = switch (seq.v) {
+            .ref => |r| r,
+            else => return error.Abort,
+        };
+        const path = try ev.a.alloc(u32, ref.path.len + 1);
+        @memcpy(path[0..ref.path.len], ref.path);
+        path[ref.path.len] = @intCast(i);
+        const target = try ev.load(ref);
+        const child = ev.elemTypeOf(target.ty, i);
+        const is_const = switch (ev.ip.key(seq.ty)) {
+            .ptr_type => |p| p.is_const,
+            else => false,
+        };
+        return .{ .ty = try ev.ip.ptrTo(child, .one, is_const), .v = .{ .ref = .{ .cell = ref.cell, .path = path } } };
+    }
+
+    fn switchExpr(ev: *Evaluator, f: *Frame, e: ExprId, s: @FieldType(Body.Expr, "switch"), want: ?Index) EvalError!Val {
+        const index = f.labels.items.len;
+        // 带标签的 switch：`continue :sw x` 以新的操作数重新分派
+        const label: ?[]const u8 = for (f.body.scopes) |sc| {
+            if (sc.label) |lab| if (lab.expr == e) break lab.name;
+        } else null;
+        try f.labels.append(ev.a, .{ .name = label, .kind = .@"switch", .want = want });
+        defer f.labels.shrinkRetainingCapacity(index);
+        var operand = try ev.eval(f, s.operand, null);
+        while (true) {
+            try ev.tick();
+            const chosen = try ev.chooseProng(f, s.prongs, operand) orelse return error.Abort;
+            const prong = s.prongs[chosen];
+            if (prong.capture.len > 0) try ev.bindCapture(f, prong.capture[0], try ev.switchPayload(operand));
+            if (prong.capture.len > 1) f.slots[@backingInt(prong.capture[1])] = try ev.switchTag(operand);
+            return ev.eval(f, prong.body, want) catch |err| switch (err) {
+                error.Continue => if (ev.jump_target == index) {
+                    operand = ev.jump_value;
+                    continue;
+                } else return err,
+                error.Break => if (ev.jump_target == index) return ev.coerce(ev.jump_value, want) else return err,
+                else => |x| return x,
+            };
+        }
+    }
+
+    fn chooseProng(ev: *Evaluator, f: *Frame, prongs: []const Body.Prong, operand: Val) EvalError!?usize {
+        const ip = ev.ip;
+        const v = try ev.freeze(operand) orelse return error.Abort;
+        var else_prong: ?usize = null;
+        for (prongs, 0..) |prong, i| {
+            if (prong.is_else) {
+                else_prong = i;
+                continue;
+            }
+            for (prong.items) |item| switch (f.body.expr(item)) {
+                // `a...b`
+                .other => |range| {
+                    if (range.len != 2) return error.Abort;
+                    const x = value.intOf(ip, v) orelse return error.Abort;
+                    const lo = try ev.evalInt(f, range[0], operand.ty);
+                    const hi = try ev.evalInt(f, range[1], operand.ty);
+                    if (lo <= x and x <= hi) return i;
+                },
+                else => {
+                    // union 的分支项是标签
+                    const item_want: ?Index = if (ev.isUnion(operand.ty)) null else operand.ty;
+                    const iv = try ev.freeze(try ev.eval(f, item, item_want)) orelse return error.Abort;
+                    if (try eqlValues(ev.r, iv, v) orelse return error.Abort) return i;
+                },
+            };
+        }
+        return else_prong;
+    }
+
+    fn switchPayload(ev: *Evaluator, operand: Val) EvalError!Val {
+        const x = operand.ip() orelse return operand;
+        return switch (ev.ip.key(x)) {
+            .union_value => |u| Val.of(try ev.unionFieldType(operand.ty, u.tag), u.payload),
+            else => operand,
+        };
+    }
+
+    fn switchTag(ev: *Evaluator, operand: Val) EvalError!Val {
+        const x = operand.ip() orelse return .unknown;
+        return switch (ev.ip.key(x)) {
+            .union_value => |u| blk: {
+                const tag_ty = try ev.unionTagType(operand.ty) orelse break :blk Val.of(.enum_literal_type, try ev.ip.get(.{ .enum_literal = u.tag }));
+                break :blk Val.of(tag_ty, try ev.ip.get(.{ .enum_tag = .{ .ty = tag_ty, .name = u.tag } }));
+            },
+            else => operand,
+        };
+    }
+
+    // ── 运算 ─────────────────────────────────────────────────────────
+
+    fn binary(ev: *Evaluator, f: *Frame, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId, want: ?Index) EvalError!Val {
+        const ip = ev.ip;
+        switch (op) {
+            .keyword_and, .keyword_or => {
+                const lhs = try ev.condition(try ev.eval(f, lhs_e, .bool_type));
+                if (lhs.yes != (op == .keyword_and)) return boolVal(lhs.yes);
+                return boolVal((try ev.condition(try ev.eval(f, rhs_e, .bool_type))).yes);
+            },
+            .keyword_orelse => {
+                const lhs = try ev.eval(f, lhs_e, null);
+                const child = switch (ip.key(lhs.ty)) {
+                    .optional_type => |c| c,
+                    else => return error.Abort,
+                };
+                const c = try ev.condition(lhs);
+                if (c.yes) return c.payload;
+                return ev.eval(f, rhs_e, if (child != .unknown) child else want);
+            },
+            .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
+                const lhs = try ev.eval(f, lhs_e, null);
+                // 带标签的 union 与标签比较：另一侧不按 union 类型转换
+                const rhs_want: ?Index = if (lhs.ty == .unknown or lhs.ty == .comptime_int_type or lhs.ty == .enum_literal_type or ev.isUnion(lhs.ty)) null else lhs.ty;
+                const rhs = try ev.eval(f, rhs_e, rhs_want);
+                const a = try ev.freeze(lhs) orelse return error.Abort;
+                const b = try ev.freeze(rhs) orelse return error.Abort;
+                if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
+                if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
+                if (op != .equal_equal and op != .bang_equal) return error.Abort;
+                const eq = try eqlValues(ev.r, a, b) orelse return error.Abort;
+                return boolVal(eq == (op == .equal_equal));
+            },
+            .plus_plus => return ev.concat(try ev.eval(f, lhs_e, null), try ev.eval(f, rhs_e, null)),
+            .pipe_pipe => {
+                const a = try ev.evalType(f, lhs_e);
+                const b = try ev.evalType(f, rhs_e);
+                const x = try queries.errorSetMembers(ev.r, a) orelse return error.Abort;
+                const y = try queries.errorSetMembers(ev.r, b) orelse return error.Abort;
+                const names = try std.mem.concat(ev.a, []const u8, &.{ x, y });
+                return Val.ofType(try ip.errorSet(ev.a, names));
+            },
+            else => {
+                const lhs = try ev.eval(f, lhs_e, want);
+                const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
+                const rhs = try ev.eval(f, rhs_e, if (is_shift) null else if (lhs.ty != .comptime_int_type) lhs.ty else want);
+                // bool 的位运算
+                if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
+                    const x = (try ev.condition(lhs)).yes;
+                    const y = (try ev.condition(rhs)).yes;
+                    return boolVal(switch (op) {
+                        .ampersand => x and y,
+                        .pipe => x or y,
+                        .caret => x != y,
+                        else => return error.Abort,
+                    });
+                }
+                if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
+                    const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+                    const x = value.floatOf(ip, lhs.ip()) orelse return error.Abort;
+                    const y = value.floatOf(ip, rhs.ip()) orelse return error.Abort;
+                    return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
+                }
+                const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+                const a = value.intOf(ip, lhs.ip()) orelse return error.Abort;
+                const b = value.intOf(ip, rhs.ip()) orelse return error.Abort;
+                const r = value.binaryInt(ip, op, ty, a, b) orelse return error.Abort;
+                return Val.of(ty, try ip.get(.{ .int_value = .{ .ty = ty, .value = r } }));
+            },
+        }
+    }
+
+    /// `++`：数组、字符串、元组的拼接
+    fn concat(ev: *Evaluator, lhs: Val, rhs: Val) EvalError!Val {
+        const ip = ev.ip;
+        if (lhs.v == .unknown or rhs.v == .unknown) return error.Abort;
+        const n = try ev.elemCount(lhs) orelse return error.Abort;
+        const m = try ev.elemCount(rhs) orelse return error.Abort;
+        if (n + m > max_agg_elems) return error.Abort;
+        const elems = try ev.a.alloc(Val, n + m);
+        for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
+        for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
+        const lt = ev.arrayOf(lhs.ty);
+        const rt = ev.arrayOf(rhs.ty);
+        var ty: Index = undefined;
+        if (ip.key(lt) == .array_type and ip.key(rt) == .array_type) {
+            const la = ip.key(lt).array_type;
+            const ra = ip.key(rt).array_type;
+            const sentinel = if (la.sentinel != null and ra.sentinel != null and la.sentinel.? == ra.sentinel.?) la.sentinel else null;
+            const array = try ip.get(.{ .array_type = .{ .len = n + m, .child = la.child, .sentinel = sentinel } });
+            // 两侧有一个是指针时结果为指向数组的指针（字符串字面量）
+            ty = if (ip.key(lhs.ty) == .ptr_type or ip.key(rhs.ty) == .ptr_type) try ip.ptrTo(array, .one, true) else array;
+        } else {
+            const types = try ev.a.alloc(Index, n + m);
+            for (elems, types) |e, *t| t.* = e.ty;
+            ty = try ip.get(.{ .tuple_type = types });
+        }
+        // 中间结果留在解释器内，不驻留
+        if (ip.key(ty) == .ptr_type) return ev.pointerToNew(ty, try ev.makeAgg(ip.key(ty).ptr_type.child, elems));
+        return ev.makeAgg(ty, elems);
+    }
+
+    /// 指向一个新的存储单元（保存 `target`）的指针
+    fn pointerToNew(ev: *Evaluator, ptr_ty: Index, target: Val) Error!Val {
+        const cell = try ev.a.create(Val);
+        cell.* = target;
+        return .{ .ty = ptr_ty, .v = .{ .ref = .{ .cell = cell, .path = &.{} } } };
+    }
+
+    /// 数组类型：指向数组的指针取其所指向的数组；切片按其元素与已知长度视为数组
+    fn arrayOf(ev: *Evaluator, t: Index) Index {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| if (p.size == .one) p.child else t,
+            else => t,
+        };
+    }
+
+    fn prefix(ev: *Evaluator, f: *Frame, op: SyntaxKind, operand_e: ExprId, want: ?Index) EvalError!Val {
+        const ip = ev.ip;
+        switch (op) {
+            .bang => return boolVal(!(try ev.condition(try ev.eval(f, operand_e, .bool_type))).yes),
+            .minus, .minus_percent, .tilde => {
+                const v = try ev.eval(f, operand_e, if (f.body.expr(operand_e) == .literal) null else want);
+                if (op == .minus and ip.isFloat(v.ty)) {
+                    const x = value.floatOf(ip, v.ip()) orelse return error.Abort;
+                    return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
+                }
+                const a = value.intOf(ip, v.ip()) orelse return error.Abort;
+                const r = switch (op) {
+                    .tilde => value.bitNot(ip, v.ty, a),
+                    else => value.negate(ip, v.ty, a, op == .minus_percent),
+                } orelse return error.Abort;
+                return Val.of(v.ty, try ip.get(.{ .int_value = .{ .ty = v.ty, .value = r } }));
+            },
+            .ampersand => {
+                const child_want: ?Index = if (want) |w| switch (ip.key(w)) {
+                    .ptr_type => |p| if (p.size == .one) p.child else null,
+                    else => null,
+                } else null;
+                return ev.addressOf(f, operand_e, try ev.eval(f, operand_e, child_want));
+            },
+            .keyword_try => {
+                const v = try ev.eval(f, operand_e, null);
+                const c = try ev.condition(v);
+                if (c.yes) return c.payload;
+                // comptime 中返回错误
+                ev.jump_value = c.payload;
+                return error.Return;
+            },
+            else => return error.Abort,
+        }
+    }
+
+    /// `&x`：x 是局部变量（或其元素）时指向它，否则指向一个临时的存储单元
+    fn addressOf(ev: *Evaluator, f: *Frame, e: ExprId, v: Val) EvalError!Val {
+        const ref = ev.place(f, e) catch |err| switch (err) {
+            error.Abort => blk: {
+                const cell = try ev.a.create(Val);
+                cell.* = try ev.copy(v);
+                break :blk Ref{ .cell = cell, .path = &.{} };
+            },
+            else => |x| return x,
+        };
+        return .{ .ty = try ev.ip.ptrTo(v.ty, .one, false), .v = .{ .ref = ref } };
+    }
+
+    /// 赋值目标与取地址的位置
+    fn place(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
+        switch (f.body.expr(e)) {
+            .name_ref => |name| {
+                const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
+                switch (def) {
+                    .local => |l| if (l.file == f.file and l.item == f.item) return .{ .cell = &f.slots[@backingInt(l.binding)], .path = &.{} },
+                    else => {},
+                }
+                return error.Abort;
+            },
+            .field_access => |fa| {
+                const name = fa.field orelse return error.Abort;
+                const base = try ev.placeOrPointee(f, fa.lhs);
+                const target = try ev.load(base);
+                const i = try ev.fieldIndex(target.ty, name) orelse return error.Abort;
+                return ev.extend(base, @intCast(i));
+            },
+            .index => |x| {
+                const base = try ev.placeOrPointee(f, x.lhs);
+                const i = try ev.evalInt(f, x.index, .usize_type);
+                return ev.extend(base, std.math.cast(u32, i) orelse return error.Abort);
+            },
+            .deref => |x| {
+                const p = try ev.eval(f, x, null);
+                return switch (p.v) {
+                    .ref => |r| r,
+                    else => error.Abort,
+                };
+            },
+            .@"comptime" => |x| return ev.place(f, x),
+            else => return error.Abort,
+        }
+    }
+
+    /// 位置；值为指向局部存储的指针时取它所指向的位置（自动解引用）
+    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
+        const ref = try ev.place(f, e);
+        const v = try ev.load(ref);
+        return switch (v.v) {
+            .ref => |r| r,
+            else => ref,
+        };
+    }
+
+    fn extend(ev: *Evaluator, base: Ref, i: u32) Error!Ref {
+        const path = try ev.a.alloc(u32, base.path.len + 1);
+        @memcpy(path[0..base.path.len], base.path);
+        path[base.path.len] = i;
+        return .{ .cell = base.cell, .path = path };
+    }
+
+    fn assign(ev: *Evaluator, f: *Frame, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId) EvalError!void {
+        // `_ = x`
+        if (f.body.expr(lhs_e) == .name_ref and std.mem.eql(u8, f.body.expr(lhs_e).name_ref, "_")) {
+            _ = try ev.eval(f, rhs_e, null);
+            return;
+        }
+        const ref = try ev.place(f, lhs_e);
+        const old = try ev.load(ref);
+        const rhs_want: ?Index = if (old.ty != .unknown) old.ty else null;
+        if (op == .equal) return ev.store(ref, try ev.eval(f, rhs_e, rhs_want));
+        // 复合赋值 `a += b`
+        const bin: SyntaxKind = switch (op) {
+            .plus_equal => .plus,
+            .minus_equal => .minus,
+            .asterisk_equal => .asterisk,
+            .slash_equal => .slash,
+            .percent_equal => .percent,
+            .plus_percent_equal => .plus_percent,
+            .minus_percent_equal => .minus_percent,
+            .asterisk_percent_equal => .asterisk_percent,
+            .plus_pipe_equal => .plus_pipe,
+            .minus_pipe_equal => .minus_pipe,
+            .asterisk_pipe_equal => .asterisk_pipe,
+            .ampersand_equal => .ampersand,
+            .pipe_equal => .pipe,
+            .caret_equal => .caret,
+            .angle_bracket_angle_bracket_left_equal => .angle_bracket_angle_bracket_left,
+            .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
+            else => return error.Abort,
+        };
+        const rhs = try ev.eval(f, rhs_e, if (bin == .angle_bracket_angle_bracket_left or bin == .angle_bracket_angle_bracket_right) null else rhs_want);
+        if (old.ty == .bool_type) {
+            const x = (try ev.condition(old)).yes;
+            const y = (try ev.condition(rhs)).yes;
+            return ev.store(ref, boolVal(switch (bin) {
+                .ampersand => x and y,
+                .pipe => x or y,
+                .caret => x != y,
+                else => return error.Abort,
+            }));
+        }
+        const a = value.intOf(ev.ip, old.ip()) orelse return error.Abort;
+        const b = value.intOf(ev.ip, rhs.ip()) orelse return error.Abort;
+        const r = value.binaryInt(ev.ip, bin, old.ty, a, b) orelse return error.Abort;
+        try ev.store(ref, Val.of(old.ty, try ev.ip.get(.{ .int_value = .{ .ty = old.ty, .value = r } })));
+    }
+
+    fn deref(ev: *Evaluator, p: Val) EvalError!Val {
+        const ip = ev.ip;
+        const child = ev.pointeeType(p.ty);
+        switch (p.v) {
+            .ref => |r| return ev.load(r),
+            .ip => |x| switch (ip.key(x)) {
+                .ptr_value => |pv| return Val.of(child, pv.pointee),
+                // 指向数组的指针以元素表示：解引用得到数组
+                .aggregate => |agg| return Val.of(child, try ip.get(.{ .aggregate = .{ .ty = child, .elems = agg.elems } })),
+                .bytes => |b| return Val.of(child, try ip.get(.{ .bytes = .{ .ty = child, .bytes = b.bytes } })),
+                else => return error.Abort,
+            },
+            else => return error.Abort,
+        }
+    }
+
+    fn slice(ev: *Evaluator, f: *Frame, s: @FieldType(Body.Expr, "slice")) EvalError!Val {
+        const ip = ev.ip;
+        const base = try ev.eval(f, s.lhs, null);
+        // 值未知时不展开元素
+        if (base.v == .unknown) return error.Abort;
+        const start = std.math.cast(usize, try ev.evalInt(f, s.start, .usize_type)) orelse return error.Abort;
+        const count = try ev.elemCount(base) orelse return error.Abort;
+        const end = if (s.end) |e| std.math.cast(usize, try ev.evalInt(f, e, .usize_type)) orelse return error.Abort else count;
+        if (start > end or end > count or end - start > max_agg_elems) return error.Abort;
+        const elems = try ev.a.alloc(Val, end - start);
+        for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
+        const child = ev.elemTypeOf(base.ty, 0);
+        const is_const = switch (ip.key(base.ty)) {
+            .ptr_type => |p| p.is_const,
+            else => true,
+        };
+        // comptime 已知的区间：指向数组的指针（元素为复制，不驻留）
+        const array = try ip.get(.{ .array_type = .{ .len = elems.len, .child = child } });
+        return ev.pointerToNew(try ip.ptrTo(array, .one, is_const), try ev.makeAgg(array, elems));
+    }
+
+    // ── 初始化 ───────────────────────────────────────────────────────
+
+    fn initExpr(ev: *Evaluator, f: *Frame, ty_e: ?ExprId, fields: []const Body.FieldInit, want: ?Index) EvalError!Val {
+        const ip = ev.ip;
+        var t: ?Index = want;
+        if (ty_e) |te| t = switch (f.body.expr(te)) {
+            // `[_]T{ ... }`
+            .array_type => |arr| if (f.body.expr(arr.len) == .name_ref and std.mem.eql(u8, f.body.expr(arr.len).name_ref, "_")) blk: {
+                const child = try ev.evalType(f, arr.child);
+                const sentinel = if (arr.sentinel) |x| try ev.freeze(try ev.eval(f, x, child)) orelse return error.Abort else null;
+                break :blk try ip.get(.{ .array_type = .{ .len = fields.len, .child = child, .sentinel = sentinel } });
+            } else try ev.evalType(f, te),
+            else => try ev.evalType(f, te),
+        };
+        const target = t orelse return ev.anonInit(f, fields);
+        switch (ip.key(target)) {
+            .optional_type => |child| {
+                const inner = try ev.initExpr(f, null, fields, child);
+                return .{ .ty = target, .v = inner.v };
+            },
+            .array_type, .vector_type, .tuple_type => {
+                if (try ev.typeElemCount(target)) |n| if (n != fields.len) return error.Abort;
+                const elems = try ev.a.alloc(Val, fields.len);
+                for (fields, elems, 0..) |fl, *o, i| o.* = try ev.copy(try ev.eval(f, fl.value, ev.elemTypeOf(target, i)));
+                return ev.makeAgg(target, elems);
+            },
+            .container_type, .reified_type, .anon_struct_type => {
+                if (ev.isUnion(target)) {
+                    if (fields.len != 1) return error.Abort;
+                    const name = fields[0].name orelse return error.Abort;
+                    const payload = try ev.eval(f, fields[0].value, try ev.unionFieldType(target, name));
+                    return Val.of(target, try ip.get(.{ .union_value = .{ .ty = target, .tag = name, .payload = try ev.freeze(payload) orelse return error.Abort } }));
+                }
+                const decl = try ev.fieldsOf(target) orelse return error.Abort;
+                const elems = try ev.a.alloc(Val, decl.len);
+                for (decl, elems) |d, *o| {
+                    o.* = for (fields) |fl| {
+                        if (fl.name != null and std.mem.eql(u8, fl.name.?, d.name)) break try ev.copy(try ev.eval(f, fl.value, d.ty));
+                    } else try ev.fieldDefault(target, d);
+                }
+                // 不存在的字段
+                for (fields) |fl| if ((fl.name == null and ip.key(target) != .tuple_type) or (fl.name != null and try ev.fieldIndex(target, fl.name.?) == null)) return error.Abort;
+                return ev.makeAgg(target, elems);
+            },
+            else => return error.Abort,
+        }
+    }
+
+    /// 没有结果类型的 `.{ ... }`：元组或匿名结构体
+    fn anonInit(ev: *Evaluator, f: *Frame, fields: []const Body.FieldInit) EvalError!Val {
+        const ip = ev.ip;
+        const elems = try ev.a.alloc(Val, fields.len);
+        const types = try ev.a.alloc(Index, fields.len);
+        for (fields, elems, types) |fl, *o, *t| {
+            o.* = try ev.copy(try ev.eval(f, fl.value, null));
+            t.* = o.ty;
+        }
+        const named = fields.len > 0 and fields[0].name != null;
+        const ty = if (named) blk: {
+            const names = try ev.a.alloc([]const u8, fields.len);
+            for (fields, names) |fl, *n| n.* = fl.name orelse return error.Abort;
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types } });
+        } else try ip.get(.{ .tuple_type = types });
+        return ev.makeAgg(ty, elems);
+    }
+
+    fn makeAgg(ev: *Evaluator, ty: Index, elems: []Val) Error!Val {
+        const agg = try ev.a.create(Agg);
+        agg.* = .{ .elems = elems };
+        return .{ .ty = ty, .v = .{ .agg = agg } };
+    }
+
+    fn isUnion(ev: *Evaluator, t: Index) bool {
+        return switch (ev.ip.key(t)) {
+            .container_type => |c| c.kind == .@"union",
+            .reified_type => |rt| rt.kind == .@"union",
+            else => false,
+        };
+    }
+
+    // ── 转换 ─────────────────────────────────────────────────────────
+
+    /// 按结果类型转换
+    fn coerce(ev: *Evaluator, v: Val, want: ?Index) EvalError!Val {
+        const t = want orelse return v;
+        if (t == .unknown or v.ty == t) return v;
+        const ip = ev.ip;
+        if (v.v == .undef) return .{ .ty = t, .v = .undef };
+        switch (ip.key(t)) {
+            .optional_type => |child| {
+                if (v.ip() == .null_value) return Val.of(t, .null_value);
+                const inner = try ev.coerce(v, child);
+                return .{ .ty = t, .v = inner.v };
+            },
+            .error_union_type => |eu| {
+                if (v.ip()) |x| if (ip.key(x) == .error_value) return Val.of(t, x);
+                const inner = try ev.coerce(v, eu.payload);
+                return .{ .ty = t, .v = inner.v };
+            },
+            else => {},
+        }
+        switch (v.v) {
+            .ip => |x| switch (ip.key(x)) {
+                .int_value, .enum_literal => {
+                    // 整数越界、不是枚举成员等：编译错误
+                    const cx = try value.coerceValue(ip, x, t) orelse return error.Abort;
+                    if (ip.key(cx) == .enum_tag and !try ev.isEnumMember(t, ip.key(cx).enum_tag.name)) return error.Abort;
+                    if (ip.key(x) == .enum_literal and cx == x) {
+                        // union 中 void 字段的标签
+                        if (ev.isUnion(t)) return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = ip.key(x).enum_literal, .payload = .void_value } }));
+                    }
+                    return Val.of(t, cx);
+                },
+                .union_value => |u| if (value.isEnumType(ip, t)) {
+                    // union 转换为其标签
+                    return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = u.tag } }));
+                },
+                else => {},
+            },
+            .unknown => return .{ .ty = t },
+            else => {},
+        }
+        // 指向元组的指针 → 切片：元素逐个转换；元组 / 匿名结构体字面量 → 数组、结构体
+        switch (ip.key(t)) {
+            .ptr_type => |p| if (p.size == .slice or p.size == .many) {
+                const target_ty = ev.pointeeType(v.ty);
+                if (target_ty != .unknown and (ip.key(target_ty) == .tuple_type or ip.key(target_ty) == .anon_struct_type)) {
+                    const n = try ev.elemCount(v) orelse return error.Abort;
+                    const elems = try ev.a.alloc(Val, n);
+                    for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), p.child);
+                    const array = try ip.get(.{ .array_type = .{ .len = n, .child = p.child, .sentinel = p.sentinel } });
+                    const frozen = try ev.freeze(try ev.makeAgg(array, elems)) orelse return error.Abort;
+                    return Val.of(t, try ev.pointerTo(t, frozen));
+                }
+            },
+            .array_type, .vector_type => if (ev.isAnon(v.ty)) {
+                const n = try ev.elemCount(v) orelse return error.Abort;
+                const elems = try ev.a.alloc(Val, n);
+                for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), ev.elemTypeOf(t, i));
+                return ev.makeAgg(t, elems);
+            },
+            .container_type, .reified_type => if (ev.isAnon(v.ty)) {
+                const src = try ev.fieldsOf(v.ty) orelse return error.Abort;
+                if (ev.isUnion(t)) {
+                    if (src.len != 1) return error.Abort;
+                    const payload = try ev.coerce(try ev.elemAt(v, 0), try ev.unionFieldType(t, src[0].name));
+                    return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = src[0].name, .payload = try ev.freeze(payload) orelse return error.Abort } }));
+                }
+                const decl = try ev.fieldsOf(t) orelse return error.Abort;
+                const elems = try ev.a.alloc(Val, decl.len);
+                for (decl, elems) |d, *o| {
+                    o.* = for (src, 0..) |s, i| {
+                        if (std.mem.eql(u8, s.name, d.name)) break try ev.coerce(try ev.elemAt(v, i), d.ty);
+                    } else try ev.fieldDefault(t, d);
+                }
+                return ev.makeAgg(t, elems);
+            },
+            else => {},
+        }
+        return .{ .ty = t, .v = v.v };
+    }
+
+    fn isAnon(ev: *Evaluator, t: Index) bool {
+        return switch (ev.ip.key(t)) {
+            .tuple_type, .anon_struct_type => true,
+            else => false,
+        };
+    }
+
+    fn isEnumMember(ev: *Evaluator, t: Index, name: []const u8) Error!bool {
+        const names = try ev.enumNames(t) orelse return true;
+        for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+        // 非穷尽枚举没有名字的成员不能用名字引用
+        return false;
+    }
+
+    // ── 位置 ─────────────────────────────────────────────────────────
+
+    fn containerAt(ev: *Evaluator, f: *Frame, e: ExprId) Error!?Namespace {
+        const tree = try ev.r.itemTree(f.file);
+        const owner = try ev.r.itemNode(f.file, f.item) orelse return null;
+        const map = try ev.r.ctx.get(syntax.FileAstIdMap, f.file);
+        const rel = f.body.range(e).start;
+        for (tree.containers, 0..) |c, i| {
+            if (c.parent_item != f.item) continue;
+            const node = map.get(c.ast_id) orelse continue;
+            if (node.offset == owner.offset + rel) return .{ .file = f.file, .container = @intCast(i) };
+        }
+        return null;
+    }
+
+    // ── 内置函数 ─────────────────────────────────────────────────────
+
+    fn builtin(ev: *Evaluator, f: *Frame, e: ExprId, name: []const u8, args: []const ExprId, want: ?Index) EvalError!Val {
+        const ip = ev.ip;
+        const eq = std.mem.eql;
+        if (eq(u8, name, "@import")) {
+            const target = try ev.r.importTarget(f.file, f.body, args) orelse return error.Abort;
+            return Val.ofType(try queries.containerType(ev.r, .{ .file = target, .container = 0 }, null));
+        }
+        if (eq(u8, name, "@This")) {
+            const tree = try ev.r.itemTree(f.file);
+            return Val.ofType(try queries.containerType(ev.r, .{ .file = f.file, .container = tree.items[f.item].container }, f.inst));
+        }
+        if (eq(u8, name, "@compileError") or eq(u8, name, "@panic") or eq(u8, name, "@trap") or eq(u8, name, "@breakpoint")) return error.Abort;
+        // 不影响 comptime 结果的提示
+        const hints = [_][]const u8{ "@setEvalBranchQuota", "@compileLog", "@setRuntimeSafety", "@setFloatMode", "@branchHint", "@disableInstrumentation", "@declareSideEffect", "@prefetch", "@export" };
+        for (hints) |h| if (eq(u8, name, h)) return Val.void_val;
+        if (eq(u8, name, "@inComptime")) return boolVal(true);
+        if (eq(u8, name, "@EnumLiteral")) return Val.ofType(.enum_literal_type);
+        if (eq(u8, name, "@as")) {
+            if (args.len != 2) return error.Abort;
+            const t = try ev.evalType(f, args[0]);
+            return ev.eval(f, args[1], t);
+        }
+        const vals = try ev.a.alloc(Val, args.len);
+        // 参数的结果类型
+        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, builtinParamType(name, i));
+        if (eq(u8, name, "@TypeOf")) {
+            if (vals.len == 0) return error.Abort;
+            var t = vals[0].ty;
+            for (vals[1..]) |v| t = value.peerIntType(ip, t, v.ty) orelse if (t == v.ty) t else return error.Abort;
+            if (t == .unknown) return error.Abort;
+            return Val.ofType(t);
+        }
+        if (eq(u8, name, "@typeInfo")) {
+            if (vals.len != 1) return error.Abort;
+            const info = try ev.typeInfo(try asType(vals[0]));
+            return Val.of(ip.key(info).union_value.ty, info);
+        }
+        if (eq(u8, name, "@typeName")) {
+            if (vals.len != 1) return error.Abort;
+            var out: std.Io.Writer.Allocating = .init(ev.a);
+            @import("render.zig").writeType(ev.r, try asType(vals[0]), &out.writer) catch return error.OutOfMemory;
+            return ev.string(out.written());
+        }
+        if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
+            if (vals.len != 1) return error.Abort;
+            const x = try ev.freeze(vals[0]) orelse return error.Abort;
+            return ev.string(switch (ip.key(x)) {
+                .enum_tag => |t| t.name,
+                .enum_literal => |n| n,
+                .union_value => |u| u.tag,
+                .error_value => |n| n,
+                else => return error.Abort,
+            });
+        }
+        if (eq(u8, name, "@field")) {
+            if (vals.len != 2) return error.Abort;
+            return ev.fieldAccess(vals[0], try ev.stringOf(vals[1]));
+        }
+        if (eq(u8, name, "@hasDecl") or eq(u8, name, "@hasField")) {
+            if (vals.len != 2) return error.Abort;
+            const t = try asType(vals[0]);
+            const field = try ev.stringOf(vals[1]);
+            if (eq(u8, name, "@hasField")) return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
+            const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);
+            const tree = try ev.r.itemTree(ns.file);
+            const m = Resolver.lookupDecl(tree, ns.container, field) orelse return boolVal(false);
+            return boolVal(tree.items[m].flags.is_pub);
+        }
+        if (eq(u8, name, "@FieldType")) {
+            if (vals.len != 2) return error.Abort;
+            const t = try asType(vals[0]);
+            const field = try ev.stringOf(vals[1]);
+            const fields = try ev.fieldsOf(t) orelse return error.Abort;
+            for (fields) |fl| if (eq(u8, fl.name, field)) return Val.ofType(fl.ty);
+            return error.Abort;
+        }
+        if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
+            if (vals.len != 1) return error.Abort;
+            const l = value.typeLayout(ip, try asType(vals[0])) orelse return error.Abort;
+            const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits;
+            return ev.int(.comptime_int_type, n);
+        }
+        if (eq(u8, name, "@Int")) {
+            if (vals.len != 2) return error.Abort;
+            const sign = try ev.tagName(vals[0]);
+            const bits = std.math.cast(u16, try ev.intArg(vals[1])) orelse return error.Abort;
+            const s = std.meta.stringToEnum(std.builtin.Signedness, sign) orelse return error.Abort;
+            return Val.ofType(try ip.intType(s, bits));
+        }
+        if (eq(u8, name, "@Vector")) {
+            if (vals.len != 2) return error.Abort;
+            const len = std.math.cast(u32, try ev.intArg(vals[0])) orelse return error.Abort;
+            return Val.ofType(try ip.get(.{ .vector_type = .{ .len = len, .child = try asType(vals[1]) } }));
+        }
+        if (eq(u8, name, "@Tuple")) {
+            if (vals.len != 1) return error.Abort;
+            return Val.ofType(try ip.get(.{ .tuple_type = try ev.typesOf(vals[0]) }));
+        }
+        if (eq(u8, name, "@Pointer")) {
+            if (vals.len != 4) return error.Abort;
+            const size = std.meta.stringToEnum(InternPool.PtrSize, try ev.tagName(vals[0])) orelse return error.Abort;
+            const is_const = try ev.boolField(vals[1], "const");
+            const child = try asType(vals[2]);
+            const sentinel = try ev.freeze(try ev.coerce(vals[3], try ip.optionalOf(child))) orelse return error.Abort;
+            return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const, .sentinel = if (sentinel == .null_value) null else sentinel } }));
+        }
+        if (eq(u8, name, "@Fn")) {
+            if (vals.len != 4) return error.Abort;
+            const varargs = try ev.boolField(vals[3], "varargs");
+            return Val.ofType(try ip.get(.{ .fn_type = .{ .params = try ev.typesOf(vals[0]), .ret = try asType(vals[2]), .varargs = varargs } }));
+        }
+        if (eq(u8, name, "@Enum")) {
+            if (vals.len != 4) return error.Abort;
+            const names = try ev.stringsOf(vals[2]);
+            // 成员的值求不出时按声明顺序编号
+            const values = ev.intsOf(vals[3]) catch |err| switch (err) {
+                error.Abort => blk: {
+                    const out = try ev.a.alloc(i128, names.len);
+                    for (out, 0..) |*o, i| o.* = @intCast(i);
+                    break :blk out;
+                },
+                else => |x| return x,
+            };
+            if (values.len != names.len) return error.Abort;
+            return Val.ofType(try ev.reify(f, e, .{ .kind = .@"enum", .tag = try asType(vals[0]), .names = names, .values = values, .nonexhaustive = std.mem.eql(u8, try ev.tagName(vals[1]), "nonexhaustive") }));
+        }
+        if (eq(u8, name, "@Struct") or eq(u8, name, "@Union")) {
+            if (vals.len != 5) return error.Abort;
+            const layout = std.meta.stringToEnum(InternPool.Reified.Layout, try ev.tagName(vals[0])) orelse return error.Abort;
+            const tag = try ev.freeze(vals[1]) orelse return error.Abort;
+            const names = try ev.stringsOf(vals[2]);
+            const types = try ev.typesOf(vals[3]);
+            if (types.len != names.len) return error.Abort;
+            const is_union = eq(u8, name, "@Union");
+            return Val.ofType(try ev.reify(f, e, .{ .kind = if (is_union) .@"union" else .@"struct", .layout = layout, .tag = if (tag == .null_value) null else tag, .names = names, .types = types }));
+        }
+        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
+            if (vals.len != 1) return error.Abort;
+            // 指针类转换不改变值：没有结果类型时（如嵌套的 `@ptrCast(@alignCast(p))`）原样传递
+            const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
+            if (want == null and pointer_cast) return vals[0];
+            return ev.cast(name, vals[0], want orelse return error.Abort);
+        }
+        if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
+            if (vals.len != 1) return error.Abort;
+            return ev.enumInt(vals[0]);
+        }
+        if (eq(u8, name, "@intFromBool")) {
+            if (vals.len != 1) return error.Abort;
+            return ev.int(.u1_type, @intFromBool((try ev.condition(vals[0])).yes));
+        }
+        if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
+            if (vals.len == 0) return error.Abort;
+            var ty = vals[0].ty;
+            var best = try ev.intArg(vals[0]);
+            for (vals[1..]) |v| {
+                ty = value.peerIntType(ip, ty, v.ty) orelse return error.Abort;
+                const x = try ev.intArg(v);
+                best = if (eq(u8, name, "@min")) @min(best, x) else @max(best, x);
+            }
+            return ev.int(ty, best);
+        }
+        if (eq(u8, name, "@abs")) {
+            if (vals.len != 1) return error.Abort;
+            const x = try ev.intArg(vals[0]);
+            const ty = if (value.intInfo(ip, vals[0].ty)) |info| (if (info.signed) try ip.intType(.unsigned, info.bits) else vals[0].ty) else vals[0].ty;
+            return ev.int(ty, if (x < 0) -x else x);
+        }
+        if (eq(u8, name, "@divTrunc") or eq(u8, name, "@divFloor") or eq(u8, name, "@divExact") or eq(u8, name, "@divCeil") or eq(u8, name, "@mod") or eq(u8, name, "@rem")) {
+            if (vals.len != 2) return error.Abort;
+            const ty = value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
+            const x = try ev.intArg(vals[0]);
+            const y = try ev.intArg(vals[1]);
+            if (y == 0) return error.Abort;
+            const r: i128 = if (eq(u8, name, "@divTrunc"))
+                @divTrunc(x, y)
+            else if (eq(u8, name, "@divFloor"))
+                @divFloor(x, y)
+            else if (eq(u8, name, "@divCeil"))
+                -@divFloor(-x, y)
+            else if (eq(u8, name, "@divExact")) blk: {
+                if (@rem(x, y) != 0) return error.Abort;
+                break :blk @divExact(x, y);
+            } else if (eq(u8, name, "@mod")) @mod(x, y) else @rem(x, y);
+            if (!value.intFits(ip, ty, r)) return error.Abort;
+            return ev.int(ty, r);
+        }
+        if (eq(u8, name, "@clz") or eq(u8, name, "@ctz") or eq(u8, name, "@popCount")) {
+            if (vals.len != 1) return error.Abort;
+            const info = value.intInfo(ip, vals[0].ty) orelse return error.Abort;
+            if (info.bits > 128) return error.Abort;
+            const x = try ev.intArg(vals[0]);
+            // 按位宽取二进制补码表示
+            const bits: u128 = if (info.bits == 128) @bitCast(x) else @as(u128, @bitCast(x)) & ((@as(u128, 1) << @intCast(info.bits)) - 1);
+            const n: u16 = if (eq(u8, name, "@popCount"))
+                @popCount(bits)
+            else if (bits == 0)
+                info.bits
+            else if (eq(u8, name, "@clz"))
+                @intCast(@clz(bits) - (128 - info.bits))
+            else
+                @ctz(bits);
+            // 结果类型：能容纳位宽的无符号整数
+            const result_bits: u16 = @intCast(128 - @clz(@as(u128, info.bits)));
+            return ev.int(try ip.intType(.unsigned, result_bits), n);
+        }
+        if (eq(u8, name, "@splat")) {
+            const t = want orelse return error.Abort;
+            if (vals.len != 1) return error.Abort;
+            const n = try ev.typeElemCount(t) orelse return error.Abort;
+            if (n > max_agg_elems) return error.Abort;
+            const elems = try ev.a.alloc(Val, n);
+            for (elems) |*o| o.* = try ev.coerce(vals[0], ev.elemTypeOf(t, 0));
+            return ev.makeAgg(t, elems);
+        }
+        if (eq(u8, name, "@unionInit")) {
+            if (vals.len != 3) return error.Abort;
+            const t = try asType(vals[0]);
+            const field = try ev.stringOf(vals[1]);
+            const payload = try ev.freeze(try ev.coerce(vals[2], try ev.unionFieldType(t, field))) orelse return error.Abort;
+            return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = field, .payload = payload } }));
+        }
+        if (eq(u8, name, "@memcpy")) {
+            if (vals.len != 2) return error.Abort;
+            const dest = switch (vals[0].v) {
+                .ref => |r| r,
+                else => return error.Abort,
+            };
+            const n = try ev.elemCount(vals[1]) orelse return error.Abort;
+            for (0..n) |i| try ev.store(try ev.extend(dest, @intCast(i)), try ev.elemAt(vals[1], i));
+            return Val.void_val;
+        }
+        return error.Abort;
+    }
+
+    /// 内置函数参数的结果类型
+    fn builtinParamType(name: []const u8, i: usize) ?Index {
+        const eq = std.mem.eql;
+        if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf"))) return .type_type;
+        return null;
+    }
+
+    fn cast(ev: *Evaluator, name: []const u8, v: Val, t: Index) EvalError!Val {
+        const ip = ev.ip;
+        const eq = std.mem.eql;
+        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast")) {
+            const x = value.intOf(ip, v.ip()) orelse return .{ .ty = t };
+            if (eq(u8, name, "@intCast")) {
+                if (!value.intFits(ip, t, x)) return error.Abort;
+                return ev.int(t, x);
+            }
+            const info = value.intInfo(ip, t) orelse return error.Abort;
+            if (eq(u8, name, "@bitCast")) {
+                const src = value.intInfo(ip, v.ty) orelse return error.Abort;
+                if (src.bits != info.bits) return error.Abort;
+            }
+            const r = value.binaryInt(ip, .plus_percent, t, x, 0) orelse return error.Abort;
+            return ev.int(t, r);
+        }
+        if (eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt")) {
+            const x = value.intOf(ip, v.ip()) orelse return .{ .ty = t };
+            if (!value.isEnumType(ip, t)) return error.Abort;
+            const names = try ev.enumNames(t) orelse return error.Abort;
+            const values = try ev.enumValues(t);
+            for (names, values) |n, val| if (val == x) return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = n } }));
+            return error.Abort;
+        }
+        if (eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt")) {
+            const x = value.floatOf(ip, v.ip()) orelse return .{ .ty = t };
+            return Val.of(t, try value.floatValue(ip, t, x) orelse return error.Abort);
+        }
+        if (eq(u8, name, "@intFromFloat")) {
+            const x = value.floatOf(ip, v.ip()) orelse return .{ .ty = t };
+            if (@abs(x) > 1e38) return error.Abort;
+            const i: i128 = @intFromFloat(@trunc(x));
+            if (!value.intFits(ip, t, i)) return error.Abort;
+            return ev.int(t, i);
+        }
+        return .{ .ty = t, .v = v.v };
+    }
+
+    fn enumInt(ev: *Evaluator, v: Val) EvalError!Val {
+        const ip = ev.ip;
+        const x = try ev.freeze(v) orelse return error.Abort;
+        const tag = switch (ip.key(x)) {
+            .enum_tag => |t| t,
+            else => return error.Abort,
+        };
+        const names = try ev.enumNames(tag.ty) orelse return error.Abort;
+        const values = try ev.enumValues(tag.ty);
+        const int_ty = try ev.enumTagType(tag.ty) orelse .comptime_int_type;
+        for (names, values) |n, val| if (std.mem.eql(u8, n, tag.name)) return ev.int(int_ty, val);
+        return error.Abort;
+    }
+
+    fn int(ev: *Evaluator, ty: Index, x: anytype) Error!Val {
+        return Val.of(ty, try ev.ip.get(.{ .int_value = .{ .ty = ty, .value = @intCast(x) } }));
+    }
+
+    fn intArg(ev: *Evaluator, v: Val) EvalError!i128 {
+        return value.intOf(ev.ip, v.ip()) orelse error.Abort;
+    }
+
+    fn asType(v: Val) EvalError!Index {
+        if (v.ty != .type_type) return error.Abort;
+        const t = v.ip() orelse return error.Abort;
+        if (t == .unknown) return error.Abort;
+        return t;
+    }
+
+    /// 字符串值：`[:0]const u8`
+    fn string(ev: *Evaluator, s: []const u8) Error!Val {
+        const ty = try ev.stringSliceType();
+        return Val.of(ty, try ev.ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
+    }
+
+    fn stringSliceType(ev: *Evaluator) Error!Index {
+        const zero = try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
+        return ev.ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = zero } });
+    }
+
+    /// 字符串的内容
+    fn stringOf(ev: *Evaluator, v: Val) EvalError![]const u8 {
+        const x = try ev.freeze(v) orelse return error.Abort;
+        return switch (ev.ip.key(x)) {
+            .bytes => |b| b.bytes,
+            .aggregate => |agg| blk: {
+                const out = try ev.a.alloc(u8, agg.elems.len);
+                for (agg.elems, out) |e, *o| o.* = std.math.cast(u8, value.intOf(ev.ip, e) orelse return error.Abort) orelse return error.Abort;
+                break :blk out;
+            },
+            .ptr_value => |p| ev.stringOf(Val.of(ev.pointeeType(v.ty), p.pointee)),
+            else => error.Abort,
+        };
+    }
+
+    fn stringsOf(ev: *Evaluator, v: Val) EvalError![]const []const u8 {
+        const n = try ev.elemCount(v) orelse return error.Abort;
+        const out = try ev.a.alloc([]const u8, n);
+        for (out, 0..) |*o, i| o.* = try ev.stringOf(try ev.elemAt(v, i));
+        return out;
+    }
+
+    fn typesOf(ev: *Evaluator, v: Val) EvalError![]const Index {
+        const n = try ev.elemCount(v) orelse return error.Abort;
+        const out = try ev.a.alloc(Index, n);
+        for (out, 0..) |*o, i| {
+            const elem = try ev.elemAt(v, i);
+            // `[]const ?type` 中的 optional 载荷
+            o.* = if (elem.ip()) |x| (if (x == .null_value) return error.Abort else x) else return error.Abort;
+        }
+        return out;
+    }
+
+    fn intsOf(ev: *Evaluator, v: Val) EvalError![]const i128 {
+        const n = try ev.elemCount(v) orelse return error.Abort;
+        const out = try ev.a.alloc(i128, n);
+        for (out, 0..) |*o, i| o.* = try ev.intArg(try ev.elemAt(v, i));
+        return out;
+    }
+
+    fn tagName(ev: *Evaluator, v: Val) EvalError![]const u8 {
+        const x = try ev.freeze(v) orelse return error.Abort;
+        return switch (ev.ip.key(x)) {
+            .enum_tag => |t| t.name,
+            .enum_literal => |n| n,
+            .union_value => |u| u.tag,
+            else => error.Abort,
+        };
+    }
+
+    fn boolField(ev: *Evaluator, v: Val, name: []const u8) EvalError!bool {
+        const fv = ev.fieldAccess(v, name) catch |err| switch (err) {
+            error.Abort => return false,
+            else => |x| return x,
+        };
+        return (try ev.condition(fv)).yes;
+    }
+
+    /// 构造的类型：身份含构造位置与构造时的实例
+    fn reify(ev: *Evaluator, f: *Frame, e: ExprId, spec: struct {
+        kind: InternPool.Reified.Kind,
+        layout: InternPool.Reified.Layout = .auto,
+        tag: ?Index = null,
+        names: []const []const u8,
+        types: []const Index = &.{},
+        values: []const i128 = &.{},
+        nonexhaustive: bool = false,
+    }) Error!Index {
+        const tree = try ev.r.itemTree(f.file);
+        return ev.ip.get(.{ .reified_type = .{
+            .kind = spec.kind,
+            .file = f.file,
+            .owner = tree.items[f.item].ast_id,
+            .expr = @backingInt(e),
+            .inst = f.inst,
+            .layout = spec.layout,
+            .tag = spec.tag,
+            .names = spec.names,
+            .types = spec.types,
+            .values = spec.values,
+            .nonexhaustive = spec.nonexhaustive,
+        } });
+    }
+
+    // ── @typeInfo ────────────────────────────────────────────────────
+
+    /// 标准库中按路径查找的类型（如 `builtin.Type`）
+    fn stdType(ev: *Evaluator, path: []const []const u8) EvalError!Index {
+        const graph = try ev.r.ctx.get(database.ModuleGraph.Input, {}) orelse return error.Abort;
+        var t = try queries.containerType(ev.r, .{ .file = graph.std_root orelse return error.Abort, .container = 0 }, null);
+        for (path) |name| t = try asType(try ev.typeMember(t, name));
+        return t;
+    }
+
+    fn member(ev: *Evaluator, t: Index, name: []const u8) EvalError!Index {
+        return asType(try ev.typeMember(t, name));
+    }
+
+    /// 类型 `t` 的值：字段按名字给出，其余取默认值
+    fn structValue(ev: *Evaluator, t: Index, fields: []const struct { []const u8, Index }) EvalError!Index {
+        const decl = try ev.fieldsOf(t) orelse return error.Abort;
+        const elems = try ev.a.alloc(Index, decl.len);
+        for (decl, elems) |d, *o| {
+            o.* = for (fields) |fl| {
+                if (std.mem.eql(u8, fl[0], d.name)) break fl[1];
+            } else try ev.freeze(try ev.fieldDefault(t, d)) orelse return error.Abort;
+        }
+        return ev.aggregate(t, elems);
+    }
+
+    fn enumTag(ev: *Evaluator, t: Index, name: []const u8) Error!Index {
+        return ev.ip.get(.{ .enum_tag = .{ .ty = t, .name = name } });
+    }
+
+    /// `[]const [:0]const u8`
+    fn namesValue(ev: *Evaluator, names: []const []const u8) Error!Index {
+        const ip = ev.ip;
+        const str = try ev.stringSliceType();
+        const ty = try ip.ptrTo(str, .slice, true);
+        const elems = try ev.a.alloc(Index, names.len);
+        for (names, elems) |n, *o| o.* = try ip.get(.{ .bytes = .{ .ty = str, .bytes = n } });
+        return ip.get(.{ .aggregate = .{ .ty = ty, .elems = elems } });
+    }
+
+    fn sliceValue(ev: *Evaluator, child: Index, elems: []const Index) Error!Index {
+        return ev.aggregate(try ev.ip.ptrTo(child, .slice, true), elems);
+    }
+
+    fn typeInfo(ev: *Evaluator, t: Index) EvalError!Index {
+        const ip = ev.ip;
+        const type_ty = try ev.stdType(&.{ "builtin", "Type" });
+        const Payload = struct { []const u8, Index };
+        const payload: Payload = switch (ip.key(t)) {
+            .simple_type => |s| switch (s) {
+                .type, .void, .bool, .noreturn, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .{ @tagName(s), .void_value },
+                .anyerror => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", .null_value }}) },
+                .anyopaque => .{ "opaque", try ev.structValue(try ev.member(type_ty, "Opaque"), &.{.{ "decl_names", try ev.namesValue(&.{}) }}) },
+                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), (value.typeLayout(ip, t) orelse return error.Abort).bits) }}) },
+                else => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t) orelse return error.Abort) },
+            },
+            .int_type => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t).?) },
+            .ptr_type => |p| .{ "pointer", try ev.structValue(try ev.member(type_ty, "Pointer"), &.{
+                .{ "size", try ev.enumTag(try ev.member(try ev.member(type_ty, "Pointer"), "Size"), @tagName(p.size)) },
+                .{ "attrs", try ev.structValue(try ev.member(try ev.member(type_ty, "Pointer"), "Attributes"), &.{.{ "const", if (p.is_const) .true_value else .false_value }}) },
+                .{ "child", p.child },
+                .{ "sentinel_ptr", try ev.sentinelPtr(p.sentinel) },
+            }) },
+            .array_type => |a| .{ "array", try ev.structValue(try ev.member(type_ty, "Array"), &.{
+                .{ "len", try ev.intIndex(.comptime_int_type, a.len) },
+                .{ "child", a.child },
+                .{ "sentinel_ptr", try ev.sentinelPtr(a.sentinel) },
+            }) },
+            .vector_type => |v| .{ "vector", try ev.structValue(try ev.member(type_ty, "Vector"), &.{
+                .{ "len", try ev.intIndex(.comptime_int_type, v.len) },
+                .{ "child", v.child },
+            }) },
+            .optional_type => |c| .{ "optional", try ev.structValue(try ev.member(type_ty, "Optional"), &.{.{ "child", c }}) },
+            .error_union_type => |eu| .{ "error_union", try ev.structValue(try ev.member(type_ty, "ErrorUnion"), &.{ .{ "error_set", eu.err }, .{ "payload", eu.payload } }) },
+            .error_set_type => |names| .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", try ev.namesValue(names) }}) },
+            .inferred_error_set => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", if (try queries.errorSetMembers(ev.r, t)) |names| try ev.namesValue(names) else .null_value }}) },
+            .fn_type => |ft| blk: {
+                const fn_ty = try ev.member(type_ty, "Fn");
+                const cc = try ev.stdType(&.{ "builtin", "CallingConvention" });
+                const params = try ev.a.alloc(Index, ft.params.len);
+                @memcpy(params, ft.params);
+                const param_attrs = try ev.a.alloc(Index, ft.params.len);
+                const pa_ty = try ev.member(fn_ty, "ParamAttributes");
+                for (param_attrs) |*o| o.* = try ev.structValue(pa_ty, &.{});
+                break :blk .{ "fn", try ev.structValue(fn_ty, &.{
+                    .{ "attrs", try ev.structValue(try ev.member(fn_ty, "Attributes"), &.{
+                        .{ "callconv", try ip.get(.{ .union_value = .{ .ty = cc, .tag = "auto", .payload = .void_value } }) },
+                        .{ "varargs", if (ft.varargs) .true_value else .false_value },
+                    }) },
+                    .{ "is_generic", .false_value },
+                    .{ "return_type", ft.ret },
+                    .{ "param_types", try ev.sliceValue(try ip.optionalOf(.type_type), params) },
+                    .{ "param_attrs", try ev.sliceValue(pa_ty, param_attrs) },
+                }) };
+            },
+            .container_type, .reified_type, .tuple_type, .anon_struct_type, .union_tag_type => try ev.containerInfo(type_ty, t),
+            else => return error.Abort,
+        };
+        return ip.get(.{ .union_value = .{ .ty = type_ty, .tag = payload[0], .payload = payload[1] } });
+    }
+
+    fn intIndex(ev: *Evaluator, ty: Index, x: anytype) Error!Index {
+        return ev.ip.get(.{ .int_value = .{ .ty = ty, .value = @intCast(x) } });
+    }
+
+    fn intInfoValue(ev: *Evaluator, type_ty: Index, info: value.IntInfo) EvalError!Index {
+        const signedness = try ev.stdType(&.{ "builtin", "Signedness" });
+        return ev.structValue(try ev.member(type_ty, "Int"), &.{
+            .{ "signedness", try ev.enumTag(signedness, if (info.signed) "signed" else "unsigned") },
+            .{ "bits", try ev.intIndex(try ev.ip.intType(.unsigned, 16), info.bits) },
+        });
+    }
+
+    /// 指向哨兵值的指针（`?*const anyopaque`）
+    fn sentinelPtr(ev: *Evaluator, sentinel: ?Index) Error!Index {
+        const s = sentinel orelse return .null_value;
+        const ty = try ev.ip.ptrTo(.anyopaque_type, .one, true);
+        return ev.ip.get(.{ .ptr_value = .{ .ty = ty, .pointee = s } });
+    }
+
+    /// 容器（结构体、枚举、union、opaque、元组）的 `@typeInfo`
+    fn containerInfo(ev: *Evaluator, type_ty: Index, t: Index) EvalError!struct { []const u8, Index } {
+        const ip = ev.ip;
+        const layout_ty = try ev.member(type_ty, "ContainerLayout");
+        const decls = try ev.namesValue(try ev.declNames(t));
+        if (value.isEnumType(ip, t)) {
+            const names = try ev.enumNames(t) orelse return error.Abort;
+            const values = try ev.enumValues(t);
+            const value_elems = try ev.a.alloc(Index, values.len);
+            for (values, value_elems) |v, *o| o.* = try ev.intIndex(.comptime_int_type, v);
+            const enum_ty = try ev.member(type_ty, "Enum");
+            return .{ "enum", try ev.structValue(enum_ty, &.{
+                .{ "tag_type", try ev.enumTagType(t) orelse return error.Abort },
+                .{ "mode", try ev.enumTag(try ev.member(enum_ty, "Mode"), if (try ev.nonexhaustive(t)) "nonexhaustive" else "exhaustive") },
+                .{ "field_names", try ev.namesValue(names) },
+                .{ "field_values", try ev.sliceValue(.comptime_int_type, value_elems) },
+                .{ "decl_names", decls },
+            }) };
+        }
+        switch (ip.key(t)) {
+            .container_type => |c| if (c.kind == .@"opaque") return .{ "opaque", try ev.structValue(try ev.member(type_ty, "Opaque"), &.{.{ "decl_names", decls }}) },
+            else => {},
+        }
+        const fields = try ev.fieldsOf(t) orelse return error.Abort;
+        const names = try ev.a.alloc([]const u8, fields.len);
+        const types = try ev.a.alloc(Index, fields.len);
+        for (fields, names, types) |fl, *n, *ty| {
+            n.* = fl.name;
+            ty.* = fl.ty;
+            if (fl.ty == .unknown) return error.Abort;
+        }
+        const layout = try ev.layoutOf(t);
+        if (ev.isUnion(t)) {
+            const union_ty = try ev.member(type_ty, "Union");
+            const fa_ty = try ev.member(union_ty, "FieldAttributes");
+            const attrs = try ev.a.alloc(Index, fields.len);
+            for (attrs) |*o| o.* = try ev.structValue(fa_ty, &.{});
+            const tag = try ev.unionTagType(t);
+            return .{ "union", try ev.structValue(union_ty, &.{
+                .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
+                .{ "tag_type", tag orelse .null_value },
+                .{ "backing_integer", .null_value },
+                .{ "field_names", try ev.namesValue(names) },
+                .{ "field_types", try ev.sliceValue(.type_type, types) },
+                .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
+                .{ "decl_names", decls },
+            }) };
+        }
+        const struct_ty = try ev.member(type_ty, "Struct");
+        const fa_ty = try ev.member(struct_ty, "FieldAttributes");
+        const attrs = try ev.a.alloc(Index, fields.len);
+        for (fields, attrs) |fl, *o| o.* = try ev.structValue(fa_ty, &.{.{ "default_value_ptr", try ev.defaultPtr(t, fl) }});
+        return .{ "struct", try ev.structValue(struct_ty, &.{
+            .{ "is_tuple", if (ip.key(t) == .tuple_type) .true_value else .false_value },
+            .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
+            .{ "backing_integer", try ev.backingInteger(t, layout, types) },
+            .{ "field_names", try ev.namesValue(names) },
+            .{ "field_types", try ev.sliceValue(.type_type, types) },
+            .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
+            .{ "decl_names", decls },
+        }) };
+    }
+
+    /// 字段默认值的指针；有默认值但求不出时指向未知值
+    fn defaultPtr(ev: *Evaluator, t: Index, field: Field) EvalError!Index {
+        const item = field.item orelse return .null_value;
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return .null_value;
+        const body = try ev.r.ctx.get(hir.ItemBody, try ev.r.ownerKey(ns.file, item));
+        if (body.value == null) return .null_value;
+        const v = ev.fieldDefault(t, field) catch |err| switch (err) {
+            error.Abort => Val.unknown,
+            else => |x| return x,
+        };
+        const ty = try ev.ip.ptrTo(.anyopaque_type, .one, true);
+        return ev.ip.get(.{ .ptr_value = .{ .ty = ty, .pointee = try ev.freeze(v) orelse .unknown } });
+    }
+
+    /// 源码容器的 pub 声明名
+    fn declNames(ev: *Evaluator, t: Index) Error![]const []const u8 {
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return &.{};
+        const tree = try ev.r.itemTree(ns.file);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (tree.containerMembers(ns.container)) |m| {
+            const it = tree.items[m];
+            switch (it.kind) {
+                .@"fn", .@"const", .@"var" => if (it.flags.is_pub) if (it.name) |n| try out.append(ev.a, n),
+                else => {},
+            }
+        }
+        return out.items;
+    }
+
+    const ContainerSyntax = struct { layout: InternPool.Reified.Layout = .auto, auto_enum: bool = false, arg: ?Index = null };
+
+    /// 容器声明的语法信息：布局、`union(enum)`、参数表达式的值
+    fn containerSyntax(ev: *Evaluator, t: Index) EvalError!ContainerSyntax {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .reified_type => |rt| return .{ .layout = rt.layout, .arg = rt.tag },
+            .container_type => |c| {
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return .{};
+                const node = try ev.r.containerNode(ns) orelse return .{};
+                var out: ContainerSyntax = .{};
+                if (node.kind() == .container_decl) {
+                    if (node.childToken(.keyword_packed) != null) out.layout = .@"packed";
+                    if (node.childToken(.keyword_extern) != null) out.layout = .@"extern";
+                    out.auto_enum = c.kind == .@"union" and node.childToken(.keyword_enum) != null;
+                }
+                out.arg = try ev.containerArg(ns, c.inst);
+                return out;
+            },
+            else => return .{},
+        }
+    }
+
+    /// `enum(u8)` / `union(E)` / `packed struct(u32)` 的参数（在外层成员的推导结果中）
+    fn containerArg(ev: *Evaluator, ns: Namespace, inst: ?Index) Error!?Index {
+        const tree = try ev.r.itemTree(ns.file);
+        const parent = tree.containers[ns.container].parent_item orelse return null;
+        const owner_node = try ev.r.itemNode(ns.file, parent) orelse return null;
+        const node = try ev.r.containerNode(ns) orelse return null;
+        const body = try ev.r.body(ns.file, parent);
+        const rel = node.offset - owner_node.offset;
+        for (body.exprs, 0..) |x, i| switch (x) {
+            .container => |c| if (body.expr_ranges[i].start == rel) {
+                const arg = c.arg orelse return null;
+                const owner = try ev.r.ownerKey(ns.file, parent);
+                const res = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = try queries.normalizeInst(ev.r, ns.file, parent, inst) });
+                if (@backingInt(arg) >= res.exprs.len) return null;
+                return res.exprs[@backingInt(arg)].asType();
+            },
+            else => {},
+        };
+        return null;
+    }
+
+    fn layoutOf(ev: *Evaluator, t: Index) EvalError!InternPool.Reified.Layout {
+        return (try ev.containerSyntax(t)).layout;
+    }
+
+    /// 枚举的标签整数类型：显式的 `enum(u8)`，否则为容纳最大值的无符号整数
+    fn enumTagType(ev: *Evaluator, t: Index) EvalError!?Index {
+        const ip = ev.ip;
+        if (ip.key(t) == .container_type or ip.key(t) == .reified_type) if ((try ev.containerSyntax(t)).arg) |arg| return arg;
+        const values = try ev.enumValues(t);
+        var max: i128 = 0;
+        for (values) |v| max = @max(max, v);
+        const bits: u16 = if (max == 0) 0 else @intCast(128 - @clz(@as(u128, @intCast(max))));
+        return try ip.intType(.unsigned, bits);
+    }
+
+    fn nonexhaustive(ev: *Evaluator, t: Index) Error!bool {
+        switch (ev.ip.key(t)) {
+            .reified_type => |rt| return rt.nonexhaustive,
+            .container_type => {
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return false;
+                const tree = try ev.r.itemTree(ns.file);
+                return infer.fieldItem(tree, ns.container, "_") != null;
+            },
+            else => return false,
+        }
+    }
+
+    /// union 的标签类型：`union(E)` 为 E，`union(enum)` 为自动生成的标签枚举，否则为 null
+    fn unionTagType(ev: *Evaluator, t: Index) EvalError!?Index {
+        const s = try ev.containerSyntax(t);
+        if (s.auto_enum) return try ev.ip.get(.{ .union_tag_type = t });
+        return s.arg;
+    }
+
+    /// packed 结构体的 backing 整数（`?type` 的值）
+    fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index) EvalError!Index {
+        if (layout != .@"packed") return .null_value;
+        if ((try ev.containerSyntax(t)).arg) |arg| return arg;
+        var bits: u64 = 0;
+        for (types) |ty| bits += (value.typeLayout(ev.ip, ty) orelse return error.Abort).bits;
+        return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
+    }
+};
+
+fn compareNumbers(op: SyntaxKind, x: anytype, y: @TypeOf(x)) bool {
+    return switch (op) {
+        .equal_equal => x == y,
+        .bang_equal => x != y,
+        .angle_bracket_left => x < y,
+        .angle_bracket_right => x > y,
+        .angle_bracket_left_equal => x <= y,
+        else => x >= y,
+    };
+}
+
+/// 浮点运算的结果类型：comptime_float 取另一侧，整数与浮点混合时取浮点类型
+fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
+    if (a == b) return a;
+    if (a == .comptime_float_type or a == .comptime_int_type) return if (ip.isFloat(b)) b else null;
+    if (b == .comptime_float_type or b == .comptime_int_type) return if (ip.isFloat(a)) a else null;
+    return null;
+}
+
+fn boolVal(b: bool) Val {
+    return .{ .ty = .bool_type, .v = .{ .ip = if (b) .true_value else .false_value } };
+}

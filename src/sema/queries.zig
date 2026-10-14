@@ -10,12 +10,14 @@ const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
 const TypedValue = InternPool.TypedValue;
 const infer = @import("infer.zig");
+const eval = @import("eval.zig");
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const Namespace = resolve.Namespace;
 const ast = @import("../syntax/ast.zig");
 const ItemTree = @import("../syntax/ItemTree.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const Body = @import("../hir/Body.zig");
 
 pub const InferKey = struct {
     owner: hir.OwnerKey,
@@ -96,18 +98,20 @@ pub const DeclType = struct {
                         named += 1;
                     } else try params.append(r.arena, .unknown);
                 }
-                var ret: Index = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else .unknown;
-                // 推导的错误集暂以 anyerror 表示（由函数体推导属于后续工作）
-                if (proto.inferredErrorSet() and ret != .unknown) ret = try ip.get(.{ .error_union_type = .{ .err = .anyerror_type, .payload = ret } });
-                const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = ret } });
+                const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = try returnType(&r, key, b, res, dk.inst) } });
                 return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item, .inst = dk.inst } }) };
             },
             .@"const", .@"var" => {
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .full, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
                 const annotation: ?Index = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else null;
-                const value: TypedValue = if (b.value) |v| res.exprs[@backingInt(v)] else .unknown;
+                var value: TypedValue = if (b.value) |v| res.exprs[@backingInt(v)] else .unknown;
                 const is_const = tree.items[item].kind == .@"const";
+                // 容器级常量在 comptime 求值：推导求不出值时由解释器执行初始化表达式
+                if (is_const and value.val == null and b.value != null and !ctx.incomplete()) {
+                    const ev = try eval.ownerValue(&r, key, dk.inst, annotation);
+                    if (ev.val != null and (value.ty == .unknown or ev.ty == value.ty or annotation != null)) value = ev;
+                }
                 if (annotation) |t| return .{ .ty = t, .val = if (is_const and value.ty == t) value.val else null };
                 return if (is_const) value else .{ .ty = value.ty };
             },
@@ -130,6 +134,113 @@ pub const DeclType = struct {
     }
 };
 
+/// 函数在签名推导结果 `sig`（实例 `inst`）中的返回类型。`!T` 的错误集是由函数体推导的错误集，
+/// 签名中只记录标记（不读取函数体），成员由 `ErrorSetOf` 求出
+pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *const infer.Result, inst: ?Index) resolve.Error!Index {
+    const t = body.type_expr orelse return .unknown;
+    if (@backingInt(t) >= sig.exprs.len) return .unknown;
+    const ret = sig.exprs[@backingInt(t)].asType() orelse return .unknown;
+    if (ret == .unknown or !try inferredErrorSet(r, owner)) return ret;
+    const ip = r.ctx.db.env.ip;
+    const set = try ip.get(.{ .inferred_error_set = .{ .file = owner.file, .decl = owner.item, .inst = inst } });
+    return ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
+}
+
+/// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误。含未知部分或参与递归时为 anyerror
+pub const ErrorSetOf = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = DeclKey;
+    pub const Value = Index;
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const ip = ctx.db.env.ip;
+        const body = try ctx.get(hir.ItemBody, key.owner);
+        const res = try ctx.get(Infer, .{ .owner = key.owner, .mode = .full, .inst = key.inst });
+        if (res.exprs.len != body.exprs.len) return .anyerror_type;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (body.exprs) |e| {
+            const t: Index = switch (e) {
+                .@"return" => |v| if (v) |x| res.exprs[@backingInt(x)].ty else continue,
+                .prefix => |p| if (p.op == .keyword_try) res.exprs[@backingInt(p.operand)].ty else continue,
+                else => continue,
+            };
+            if (!try collectErrors(&r, t, &names, e == .prefix)) return .anyerror_type;
+        }
+        return ip.errorSet(r.arena, names.items);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return .anyerror_type;
+    }
+};
+
+/// 类型中可能出现的错误（错误集、error union 的错误集）加入 `names`；含 anyerror 或未知时返回 false。
+/// `required` 时类型必须带有错误（`try` 的操作数）
+fn collectErrors(r: *Resolver, t: Index, names: *std.ArrayList([]const u8), required: bool) resolve.Error!bool {
+    const ip = r.ctx.db.env.ip;
+    if (t == .unknown) return false;
+    switch (ip.key(t)) {
+        .error_union_type => |eu| return collectErrors(r, eu.err, names, true),
+        .error_set_type => |set| {
+            try names.appendSlice(r.arena, set);
+            return true;
+        },
+        .inferred_error_set => {
+            const set = try errorSetMembers(r, t) orelse return false;
+            try names.appendSlice(r.arena, set);
+            return true;
+        },
+        .simple_type => |s| return s != .anyerror and !required,
+        // `return` 的其他值（载荷）不带错误
+        else => return !required,
+    }
+}
+
+/// 错误集的成员；anyerror 或无法求出时为 null
+pub fn errorSetMembers(r: *Resolver, t: Index) resolve.Error!?[]const []const u8 {
+    const ip = r.ctx.db.env.ip;
+    switch (ip.key(t)) {
+        .error_set_type => |names| return names,
+        .inferred_error_set => |s| {
+            const set = try r.ctx.get(ErrorSetOf, .{ .owner = .{ .file = s.file, .item = s.decl }, .inst = s.inst });
+            return switch (ip.key(set)) {
+                .error_set_type => |names| names,
+                else => null,
+            };
+        },
+        else => return null,
+    }
+}
+
+/// 函数的返回类型是否为 `!T`（推导的错误集）
+fn inferredErrorSet(r: *Resolver, owner: hir.OwnerKey) resolve.Error!bool {
+    const tree = try r.itemTree(owner.file);
+    for (tree.items, 0..) |it, i| if (it.ast_id == owner.item) {
+        const node = try r.itemNode(owner.file, @intCast(i)) orelse return false;
+        const proto = (ast.cast(ast.FnDecl, node) orelse return false).proto() orelse return false;
+        return proto.inferredErrorSet();
+    };
+    return false;
+}
+
+/// comptime 调用的结果（设计 §9.2 的 call_eval）：由解释器执行函数体，结果按实例与实参缓存
+pub const CallEval = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = eval.CallKey;
+    pub const Value = TypedValue;
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        return eval.compute(ctx, key);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return .unknown;
+    }
+};
+
 /// 推导进行中的局部绑定（同一 owner 内直接读取，避免循环）
 pub const LocalScope = struct {
     file: FileId,
@@ -142,7 +253,7 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
     switch (def) {
         .item => |it| {
             const tree = try r.itemTree(it.file);
-            return r.ctx.get(DeclType, .{ .owner = .{ .file = it.file, .item = tree.items[it.item].ast_id }, .inst = try normalizeInst(r, it.file, it.item, inst) });
+            return r.ctx.get(DeclType, .{ .owner = .{ .file = it.file, .item = tree.items[it.item].ast_id }, .inst = try declInst(r, it.file, it.item, inst) });
         },
         .local => |l| {
             if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
@@ -164,6 +275,15 @@ pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolv
         if (i.file == file and try enclosedBy(r, file, item, i.decl)) return c;
     }
     return null;
+}
+
+/// 成员声明（DeclType）适用的实例。函数取包含它的泛型函数的实例，不取它自身的实例：
+/// 函数体内递归引用自身时，函数值不能带上当前调用的实例（否则每层递归都是新的实例，无法识别为环）
+pub fn declInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
+    const tree = try r.itemTree(file);
+    if (tree.items[item].kind != .@"fn") return normalizeInst(r, file, item, inst);
+    const parent = tree.containers[tree.items[item].container].parent_item orelse return null;
+    return normalizeInst(r, file, parent, inst);
 }
 
 /// `item` 是否为 `fn_decl` 本身或位于其内部（经由体内定义的容器）

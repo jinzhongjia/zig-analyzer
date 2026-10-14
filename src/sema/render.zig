@@ -17,16 +17,52 @@ const ContainerNames = struct {
         const found = n.name(c) catch null;
         try w.writeAll(found orelse @tagName(c.kind));
         // 泛型实例：`List(u8)`，只列出 comptime 已知的实参
-        const inst = c.inst orelse return;
+        try n.writeArgs(c.inst orelse return, w);
+    }
+
+    /// 内置函数构造的类型：以构造它的函数实例命名（`FieldEnum(S)`），否则按内容显示
+    pub fn writeReified(n: ContainerNames, t: InternPool.Reified, w: *Io.Writer) Io.Writer.Error!void {
+        const ip = n.r.ctx.db.env.ip;
+        const inst = t.inst orelse return ip.printReified(t, w, n);
+        const i = ip.key(inst).instance;
+        const tree = n.r.itemTree(i.file) catch return ip.printReified(t, w, n);
+        for (tree.items) |it| if (it.ast_id == i.decl) {
+            try w.writeAll(it.name orelse return ip.printReified(t, w, n));
+            return n.writeArgs(inst, w);
+        };
+        return ip.printReified(t, w, n);
+    }
+
+    /// 推导的错误集：显示由函数体求出的成员
+    pub fn writeInferredErrorSet(n: ContainerNames, t: Index, w: *Io.Writer) Io.Writer.Error!void {
+        const ip = n.r.ctx.db.env.ip;
+        const names = queries.errorSetMembers(n.r, t) catch null orelse return w.writeAll("anyerror");
+        const set = ip.errorSet(n.r.arena, names) catch return w.writeAll("anyerror");
+        return ip.print(set, w, n);
+    }
+
+    /// 结构体值显示时的字段名；不是结构体（数组、元组等）时为 null
+    pub fn fieldNames(n: ContainerNames, t: Index) ?[]const []const u8 {
+        const ip = n.r.ctx.db.env.ip;
+        switch (ip.key(t)) {
+            .container_type => |c| if (c.kind != .@"struct" and c.kind != .file) return null,
+            .anon_struct_type => |s| return s.names,
+            .reified_type => |rt| if (rt.kind != .@"struct") return null,
+            else => return null,
+        }
+        const fields = @import("eval.zig").fieldNames(n.r, t) catch return null;
+        const out = n.r.arena.alloc([]const u8, fields.len) catch return null;
+        for (fields, out) |f, *o| o.* = f.name;
+        return out;
+    }
+
+    fn writeArgs(n: ContainerNames, inst: Index, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
         try w.writeAll("(");
         var first = true;
-        // 非 comptime 参数（实参为 unknown）不属于实例的身份，不显示；未知的 comptime 实参显示为 `_`
-        const inst_key = ip.key(inst).instance;
-        const body = n.r.ctx.get(@import("../database.zig").hir.ItemBody, .{ .file = inst_key.file, .item = inst_key.decl }) catch null;
-        for (inst_key.args, 0..) |arg, i| {
-            const comptime_param = if (body) |b| (i < b.params.len and (b.binding(b.params[i]).is_comptime or b.binding(b.params[i]).ty == null)) else arg != .unknown;
-            if (!comptime_param) continue;
+        // 非 comptime 参数不属于实例的身份，不显示；未知的 comptime 实参显示为 `_`
+        for (ip.key(inst).instance.args) |arg| {
+            if (arg == .runtime) continue;
             if (!first) try w.writeAll(", ");
             first = false;
             if (arg == .unknown) try w.writeAll("_") else try ip.print(arg, w, n);
@@ -89,9 +125,18 @@ pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const 
             .fn_value, .simple_value => {},
             else => {
                 w.writeAll(" = ") catch |e| break :blk e;
+                const start = out.written().len;
                 writeType(r, v, w) catch |e| break :blk e;
+                // 很长的值（如 `@typeInfo` 的结果）截断显示
+                if (out.written().len - start > max_value_len) {
+                    out.shrinkRetainingCapacity(start + max_value_len);
+                    w.writeAll("...") catch |e| break :blk e;
+                }
             },
         };
     }) catch return error.OutOfMemory;
     return out.written();
 }
+
+/// 值显示的最大长度（字节）
+const max_value_len = 120;

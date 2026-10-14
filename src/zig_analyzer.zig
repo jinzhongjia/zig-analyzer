@@ -30,6 +30,8 @@ pub const database = @import("database.zig");
 pub const sema = struct {
     pub const InternPool = @import("sema/InternPool.zig");
     pub const infer = @import("sema/infer.zig");
+    pub const value = @import("sema/value.zig");
+    pub const eval = @import("sema/eval.zig");
     pub const queries = @import("sema/queries.zig");
     pub const render = @import("sema/render.zig");
 };

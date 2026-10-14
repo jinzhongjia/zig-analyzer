@@ -84,7 +84,7 @@ test "literals, annotations and primitives" {
         .{ "a", "u32 = 5" },
         .{ "b", "comptime_int = 5" },
         .{ "s", "*const [2:0]u8" },
-        .{ "x", "comptime_float" },
+        .{ "x", "comptime_float = 1.5" },
         .{ "flag", "bool" },
         .{ "n", "?u8" },
     });
@@ -226,7 +226,8 @@ test "decl literals" {
         \\    _ = .{ a, b, m, s, T };
         \\}
     , &.{
-        .{ "a", "Buf" },
+        // 容器级常量的值由解释器求出
+        .{ "a", "Buf = .{ .len = 0 }" },
         .{ "b", "Buf" },
         .{ "init", "fn (usize) Buf" },
         .{ "m", "Mode = .fast" },
@@ -342,6 +343,282 @@ test "unknown parts stay unknown" {
     });
 }
 
+test "comptime integer arithmetic follows the result type" {
+    try expectTypes(
+        \\fn f() void {
+        \\    const a: u8 = 255;
+        \\    const wrapped = a +% 1;
+        \\    const b: u8 = 0;
+        \\    const below = b -% 1;
+        \\    const c: u8 = 250;
+        \\    const sat = c +| 10;
+        \\    const d: u8 = 200;
+        \\    const overflow = d + 100;
+        \\    const e: i8 = -128;
+        \\    const shifted = @as(u8, 0x81) << 1;
+        \\    const inverted = ~@as(u8, 1);
+        \\    _ = .{ wrapped, below, sat, overflow, e, shifted, inverted };
+        \\}
+    , &.{
+        .{ "wrapped", "u8 = 0" },
+        .{ "below", "u8 = 255" },
+        .{ "sat", "u8 = 255" },
+        // 越界是编译错误：不给出值
+        .{ "overflow", "u8" },
+        .{ "e", "i8 = -128" },
+        .{ "shifted", "u8 = 2" },
+        .{ "inverted", "u8 = 254" },
+    });
+}
+
+test "comptime arguments are coerced to their instantiated parameter types" {
+    try expectTypes(
+        \\const E = enum { a, b };
+        \\fn SelInt(comptime T: type, comptime n: T) type {
+        \\    return switch (n) { 3 => u16, else => u32 };
+        \\}
+        \\fn SelEnum(comptime T: type, comptime e: T) type {
+        \\    return switch (e) { .a => u16, else => u32 };
+        \\}
+        \\fn Box(comptime T: type, comptime n: T) type {
+        \\    return struct { pub const v = n; };
+        \\}
+        \\fn Implicit(T: type) type { return struct { x: T }; }
+        \\fn max(T: type, a: T, b: T) T { return if (a > b) a else b; }
+        \\fn Array(n: usize) type { return [n]u8; }
+        \\fn g() void {
+        \\    const si = SelInt(u8, 3);
+        \\    const se = SelEnum(E, .a);
+        \\    const same = if (Box(u8, 3) == Box(u8, @as(u8, 3))) u8 else u16;
+        \\    const imp = Implicit(u8);
+        \\    const m = max(u32, 1, 2);
+        \\    const arr = Array(3);
+        \\    _ = .{ si, se, same, imp, m, arr };
+        \\}
+    , &.{
+        .{ "si", "type = u16" },
+        .{ "se", "type = u16" },
+        .{ "same", "type = u8" },
+        // 类型为 `type` 的参数不写 comptime 也是 comptime 参数
+        .{ "imp", "type = Implicit(u8)" },
+        .{ "m", "u32" },
+        // 返回 type 的函数在 comptime 执行，所有实参都参与实例
+        .{ "arr", "type = [3]u8" },
+    });
+}
+
+test "comparisons that depend on unknown parts stay unknown" {
+    try expectTypes(
+        \\fn Id(comptime n: usize) type { return struct { pub const N = n; }; }
+        \\fn g(comptime T: type, x: usize) void {
+        \\    const arr_eq = if ([2]T == [2]u8) @as(u8, 1) else @as(u8, 2);
+        \\    const eu_eq = if ((anyerror!T) == (anyerror!u8)) @as(u8, 1) else @as(u8, 2);
+        \\    const unknown_args = if (Id(x) == Id(x + 1)) @as(u8, 1) else @as(u8, 2);
+        \\    const same_param = if ([2]T == [2]T) @as(u8, 1) else @as(u8, 2);
+        \\    _ = .{ arr_eq, eu_eq, unknown_args, same_param };
+        \\}
+    , &.{
+        .{ "arr_eq", "u8" },
+        .{ "eu_eq", "u8" },
+        // 实参未知的两个实例可能是不同的类型
+        .{ "unknown_args", "u8" },
+        .{ "same_param", "u8 = 1" },
+    });
+}
+
+test "comptime float values" {
+    try expectTypes(
+        \\const pi = 3.14159;
+        \\const half: f32 = 0.5;
+        \\const conv = @as(u8, @intFromFloat(pi));
+        \\fn Scale(comptime x: f32) type { return if (x > 1.0) u16 else u8; }
+        \\fn g() void {
+        \\    const area = pi * 2.0 * 2.0;
+        \\    const neg = -half;
+        \\    const S = Scale(2.5);
+        \\    _ = .{ area, neg, S };
+        \\}
+    , &.{
+        .{ "area", "comptime_float = 12.56636" },
+        .{ "neg", "f32 = -0.5" },
+        .{ "S", "type = u16" },
+        .{ "conv", "u8 = 3" },
+    });
+}
+
+test "instances of the same container compare by their captured values" {
+    // 与编译器一致：容器的身份 = 定义位置 + 捕获的值
+    try expectTypes(
+        \\fn NoCapture(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct { x: u8 };
+        \\}
+        \\fn Capture(comptime T: type) type { return struct { x: T }; }
+        \\fn Id(comptime n: usize) type { return struct { pub const N = n; }; }
+        \\fn g() void {
+        \\    const nc = if (NoCapture(u8) == NoCapture(u16)) @as(u8, 1) else @as(u8, 2);
+        \\    const cap = if (Capture(u8) == Capture(u16)) @as(u8, 1) else @as(u8, 2);
+        \\    const id = if (Id(@sizeOf(u8)) == Id(@sizeOf(u64))) @as(u8, 1) else @as(u8, 2);
+        \\    const same = if (Capture(u8) == Capture(u8)) @as(u8, 1) else @as(u8, 2);
+        \\    _ = .{ nc, cap, id, same };
+        \\}
+    , &.{
+        .{ "nc", "u8 = 1" },
+        .{ "cap", "u8 = 2" },
+        .{ "id", "u8 = 2" },
+        .{ "same", "u8 = 1" },
+    });
+}
+
+test "inferred error sets from function bodies" {
+    try expectTypes(
+        \\fn wrap(x: anytype) !@TypeOf(x) { return x; }
+        \\const E = error{Bad};
+        \\fn a() !u8 { return error.Oops; }
+        \\fn b(x: bool) !u8 {
+        \\    if (x) return E.Bad;
+        \\    return try a();
+        \\}
+        \\fn c() !void {}
+        \\fn rec(n: u32) !u32 {
+        \\    if (n == 0) return error.Done;
+        \\    return rec(n - 1);
+        \\}
+        \\fn g() void {
+        \\    const w = wrap(@as(u8, 1));
+        \\    const ra = a();
+        \\    const rb = b(true);
+        \\    const rc = c();
+        \\    const rr = rec(3);
+        \\    _ = .{ w, ra, rb, rc, rr };
+        \\}
+    , &.{
+        .{ "w", "error{}!u8" },
+        .{ "ra", "error{Oops}!u8" },
+        // return 的错误与 try 传播的错误
+        .{ "rb", "error{Bad,Oops}!u8" },
+        .{ "rc", "error{}!void" },
+        // 递归的函数：错误集取 anyerror
+        .{ "rr", "anyerror!u32" },
+    });
+}
+
+test "labeled blocks, array literals and type queries" {
+    try expectTypes(
+        \\fn Pick(comptime wide: bool) type {
+        \\    const T = blk: {
+        \\        if (wide) break :blk u64;
+        \\        break :blk u8;
+        \\    };
+        \\    return T;
+        \\}
+        \\const Top = blk: {
+        \\    break :blk u32;
+        \\};
+        \\const S = struct { a: u8, pub const k = 1; const hidden = 2; };
+        \\fn g() void {
+        \\    const P = Pick(true);
+        \\    const Q = Top;
+        \\    const arr = [_]u16{ 1, 2, 3 };
+        \\    const sz = @sizeOf(?u32);
+        \\    const has_hidden = if (@hasDecl(S, "hidden")) @as(u8, 1) else @as(u16, 2);
+        \\    const has_a = if (@hasField(S, "a")) @as(u8, 1) else @as(u16, 2);
+        \\    _ = .{ P, Q, arr, sz, has_hidden, has_a };
+        \\}
+    , &.{
+        .{ "P", "type = u64" },
+        .{ "Q", "type = u32" },
+        .{ "arr", "[3]u16" },
+        .{ "sz", "comptime_int = 8" },
+        // @hasDecl 只计 pub 声明
+        .{ "has_hidden", "u16 = 2" },
+        .{ "has_a", "u8 = 1" },
+    });
+}
+
+test "deep dependency chains neither overflow nor pollute shallower results" {
+    // 链的顶端远超栈上限：最先查询它，链底的结果仍然正确
+    const n = 3000;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "fn List(comptime T: type) type { return struct { items: []T }; }\n");
+    for (0..n) |i| try src.print(testing.allocator, "const a{d} = a{d};\n", .{ n - i, n - i - 1 });
+    try src.appendSlice(testing.allocator, "const a0 = List(u8);\nconst b0: u32 = 1;\nconst b1 = b0 + 1;\n");
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", src.items);
+    _ = try typeAt(&w, f.file, src.items, "a3000", 0);
+    try testing.expectEqualStrings("type = List(u8)", try typeAt(&w, f.file, src.items, "a0", 1));
+    try testing.expectEqualStrings("u32 = 2", try typeAt(&w, f.file, src.items, "b1", 0));
+}
+
+test "comptime evaluation runs loops, mutation and calls" {
+    try expectTypes(
+        \\fn double(n: usize) usize { return n * 2; }
+        \\fn Nest(comptime n: usize) type {
+        \\    var T: type = u8;
+        \\    for (0..n) |_| T = ?T;
+        \\    return T;
+        \\}
+        \\fn First16(comptime Ts: []const type) type {
+        \\    inline for (Ts) |T| {
+        \\        if (T == u16) return T;
+        \\    }
+        \\    return void;
+        \\}
+        \\fn Count(comptime n: usize) type {
+        \\    comptime var i = 0;
+        \\    inline while (i < n) : (i += 1) {}
+        \\    return [i]u8;
+        \\}
+        \\fn Table(comptime n: usize) [n]u8 {
+        \\    var out: [n]u8 = undefined;
+        \\    for (&out, 0..) |*e, i| e.* = @intCast(i * 2);
+        \\    return out;
+        \\}
+        \\fn Strip(comptime T: type) type {
+        \\    return switch (T) {
+        \\        ?u8 => Strip(u8),
+        \\        else => T,
+        \\    };
+        \\}
+        \\const table = Table(4);
+        \\fn g() void {
+        \\    const A = [double(4)]u8;
+        \\    const N = Nest(2);
+        \\    const F = First16(&.{ u8, u16 });
+        \\    const C = Count(3);
+        \\    const third = table[2];
+        \\    const S = Strip(?u8);
+        \\    _ = .{ A, N, F, C, third, S };
+        \\}
+    , &.{
+        // 数组长度是 comptime 上下文：普通函数的调用也由解释器求值
+        .{ "A", "type = [8]u8" },
+        .{ "N", "type = ??u8" },
+        .{ "F", "type = u16" },
+        .{ "C", "type = [3]u8" },
+        // 经由指针捕获写入的数组
+        .{ "third", "u8 = 4" },
+        .{ "S", "type = u8" },
+    });
+}
+
+test "anytype arguments do not expand large arrays" {
+    // 曾经：anytype 实参被当作 comptime 上下文求值，巨大数组的切片在解释器中逐个展开元素
+    try expectTypes(
+        \\var memory: [1 << 30]u8 = undefined;
+        \\fn Wrapper(comptime T: type) type { return struct { inner: T }; }
+        \\fn wrap(a: anytype) Wrapper(@TypeOf(a)) { return .{ .inner = a }; }
+        \\fn id(buf: []u8) []u8 { return buf; }
+        \\fn g() void {
+        \\    const w = wrap(id(memory[0..]));
+        \\    _ = w;
+        \\}
+    , &.{.{ "w", "Wrapper([]u8)" }});
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
@@ -363,6 +640,82 @@ fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u
     }
 }
 
+test "std.meta type functions" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const E = enum(u8) { a, b, c };
+        \\const U = union(E) { a: u8, b: u16, c: void };
+        \\const S = struct { x: i32, y: []const u8, pub const k: u8 = 1; pub fn m(_: S) void {} };
+        \\fn f(a: u32, b: f16) void { _ = .{ a, b }; }
+        \\fn g(u: U) void {
+        \\    const child = std.meta.Child(?u16);
+        \\    const elem = std.meta.Elem([]const u32);
+        \\    const sent = std.meta.Sentinel([]u8, 0);
+        \\    const tag_e = std.meta.Tag(E);
+        \\    const tag_u = std.meta.Tag(U);
+        \\    const active = std.meta.activeTag(u);
+        \\    const FE = std.meta.FieldEnum(S);
+        \\    const fe: FE = .y;
+        \\    const DE = std.meta.DeclEnum(S);
+        \\    const args = std.meta.ArgsTuple(@TypeOf(f));
+        \\    const backing = std.meta.BackingInt(E);
+        \\    const slice = std.meta.Slice(*[10]i32);
+        \\    const tags = std.meta.tags(E);
+        \\    const field_ty = std.meta.fieldInfo(S, .x).type;
+        \\    const sliced = std.mem.SliceTo([:0]const u8, 0);
+        \\    _ = .{ child, elem, sent, tag_e, tag_u, active, FE, fe, DE, args, backing, slice, tags, field_ty, sliced };
+        \\}
+    , &.{
+        .{ "child", "type = u16" },
+        .{ "elem", "type = u32" },
+        .{ "sent", "type = [:0]u8" },
+        .{ "tag_e", "type = u8" },
+        .{ "tag_u", "type = E" },
+        .{ "active", "E" },
+        // @Enum 构造的类型以构造它的函数实例命名（编译器显示为 meta.FieldEnum(main.S)）
+        .{ "FE", "type = FieldEnum(S)" },
+        .{ "fe", "FieldEnum(S) = .y" },
+        .{ "DE", "type = DeclEnum(S)" },
+        .{ "args", "type = struct { u32, f16 }" },
+        .{ "backing", "type = u8" },
+        .{ "slice", "type = []i32" },
+        .{ "tags", "*const [3]E" },
+        .{ "field_ty", "type = i32" },
+        // 函数体内递归调用自身的类型函数（std.meta.Elem）能正常结束
+        .{ "sliced", "type = [:0]const u8" },
+    });
+}
+
+test "type reflection and reification" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const S = struct { a: u8, b: bool };
+        \\fn Pair(comptime A: type, comptime B: type) type { return @Tuple(&.{ A, B }); }
+        \\fn Fields(comptime T: type) type {
+        \\    const names = @typeInfo(T).@"struct".field_names;
+        \\    return @Enum(u8, .exhaustive, names, &.{ 0, 1 });
+        \\}
+        \\fn g() void {
+        \\    const n = @typeInfo(S).@"struct".field_names.len;
+        \\    const P = Pair(u8, bool);
+        \\    const F = Fields(S);
+        \\    const fb: F = .b;
+        \\    const Ptr = @Pointer(.slice, .{ .@"const" = true }, u8, null);
+        \\    const tuple = .{ @as(u8, 1), true };
+        \\    const first = tuple[0];
+        \\    _ = .{ n, P, F, fb, Ptr, first };
+        \\}
+    , &.{
+        .{ "n", "usize = 2" },
+        .{ "P", "type = struct { u8, bool }" },
+        .{ "F", "type = Fields(S)" },
+        .{ "fb", "Fields(S) = .b" },
+        .{ "Ptr", "type = []const u8" },
+        .{ "tuple", "struct { u8, bool } = .{ 1, true }" },
+        .{ "first", "u8 = 1" },
+    });
+}
+
 test "std generic containers" {
     try expectStdTypes(
         \\const std = @import("std");
@@ -378,6 +731,7 @@ test "std generic containers" {
         \\    const entry = try map.getOrPut(2);
         \\    var points: std.MultiArrayList(Point) = .empty;
         \\    const n = points.len;
+        \\    const xs = points.items(.x);
         \\    var sm: std.StringHashMapUnmanaged(bool) = .empty;
         \\    const flag = sm.get("a");
         \\    const fs = @typeInfo(Point).@"struct".field_names;
@@ -388,7 +742,7 @@ test "std generic containers" {
         \\    const part = it.next();
         \\    const buf = try gpa.alloc(u32, 4);
         \\    const loc = @src();
-        \\    _ = .{ items, last, popped, got, entry, n, flag, fs, info, FT, num, part, buf, loc };
+        \\    _ = .{ items, last, popped, got, entry, n, xs, flag, fs, info, FT, num, part, buf, loc };
         \\}
     , &.{
         .{ "list", "Aligned(u8, null)" },
@@ -397,10 +751,13 @@ test "std generic containers" {
         .{ "popped", "?u8" },
         .{ "got", "?[]const u8" },
         .{ "n", "usize" },
+        // FieldEnum 构造的枚举、@FieldType 与 @tagName
+        .{ "xs", "[]i32" },
         .{ "flag", "?bool" },
         .{ "entry", "GetOrPutResult(u32, []const u8, AutoContext(u32), 80)" },
-        .{ "fs", "[]const [:0]const u8" },
-        .{ "info", "Type" },
+        // @typeInfo 的结果 comptime 已知
+        .{ "fs", "[]const [:0]const u8 = &.{ \"x\", \"y\" }" },
+        .{ "info", "Type = .{ .@\"struct\" = .{ .is_tuple = false, .layout = .auto, .backing_integer = null, .field_names = &.{ \"x\", \"y\" }, .field_ty..." },
         .{ "FT", "type = i32" },
         .{ "num", "u32" },
         .{ "it", "SplitIterator(u8, .scalar)" },

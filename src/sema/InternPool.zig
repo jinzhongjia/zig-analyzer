@@ -44,6 +44,8 @@ pub const Index = enum(u32) {
     false_value,
     null_value,
     undefined_value,
+    /// 实例实参中非 comptime 参数的占位（不属于实例的身份）
+    runtime,
     _,
 };
 
@@ -92,12 +94,26 @@ pub const Key = union(enum) {
     error_union_type: struct { err: Index, payload: Index },
     /// 名字按字典序排列、去重
     error_set_type: []const []const u8,
+    /// 函数 `!T` 中由函数体推导的错误集（设计 §9.4）。签名只记录这个标记，成员由 `ErrorSetOf` 按需求出
+    inferred_error_set: struct { file: FileId, decl: AstId, inst: ?Index = null },
     fn_type: struct { params: []const Index, ret: Index, varargs: bool = false },
     /// 身份 = 定义位置（文件 + 容器的 AstId）
     container_type: Container,
+    /// 元组 `struct { A, B }`（`@Tuple`、元组字面量）
+    tuple_type: []const Index,
+    /// `@Vector(len, T)`
+    vector_type: struct { len: u32, child: Index },
+    /// 没有结果类型的匿名结构体字面量 `.{ .a = x }` 的类型
+    anon_struct_type: struct { names: []const []const u8, types: []const Index },
+    /// `@Enum` / `@Struct` / `@Union` 构造的类型
+    reified_type: Reified,
+    /// `union(enum)` 自动生成的标签枚举（值为 union 类型）
+    union_tag_type: Index,
 
     simple_value: SimpleValue,
     int_value: struct { ty: Index, value: i128 },
+    /// 浮点值（f128 的位表示，已按类型的精度舍入）
+    float_value: struct { ty: Index, bits: u128 },
     enum_literal: []const u8,
     /// 枚举类型的某个成员
     enum_tag: struct { ty: Index, name: []const u8 },
@@ -105,11 +121,23 @@ pub const Key = union(enum) {
     /// 函数声明；`inst` 为函数所在的实例（泛型容器的方法）
     fn_value: struct { ty: Index, file: FileId, decl: AstId, inst: ?Index = null },
 
-    /// 泛型函数的一次实例化：函数 + 各参数的值（非 comptime 参数为 unknown）。
+    /// 数组、向量、元组、结构体（按字段顺序）的值。类型为切片或指向数组的指针时表示所指向的元素
+    aggregate: struct { ty: Index, elems: []const Index },
+    /// 元素为 u8 的聚合（字符串），类型的含义同 `aggregate`
+    bytes: struct { ty: Index, bytes: []const u8 },
+    /// union 的值
+    union_value: struct { ty: Index, tag: []const u8, payload: Index },
+    /// 指向 comptime 值的单项指针
+    ptr_value: struct { ty: Index, pointee: Index },
+
+    /// 泛型函数的一次实例化：函数 + 各参数的值（comptime 参数为实参值，未知时为 unknown；
+    /// anytype 参数为实参类型；非 comptime 参数为 `runtime`）。
     /// `parent` 为函数自身所在的实例（定义在另一个实例化容器中的函数）
     instance: Instance,
     /// 没有具体实例时的 comptime 类型参数（抽象实例，设计 §9.4），显示为参数名
     opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
+    /// 实例实参中非 comptime 参数的占位
+    runtime,
 };
 
 pub const Instance = struct {
@@ -117,6 +145,28 @@ pub const Instance = struct {
     decl: AstId,
     args: []const Index,
     parent: ?Index = null,
+};
+
+/// 内置函数构造的容器类型。身份 = 构造位置（成员 + 表达式）+ 构造时的实例 + 内容
+pub const Reified = struct {
+    kind: Kind,
+    file: FileId,
+    owner: AstId,
+    expr: u32,
+    /// 构造所在的实例（显示为 `FieldEnum(S)`）
+    inst: ?Index = null,
+    layout: Layout = .auto,
+    /// enum：标签的整数类型；union：标签枚举（untagged 为 null）；packed struct：backing 整数
+    tag: ?Index = null,
+    names: []const []const u8,
+    /// struct / union 的字段类型
+    types: []const Index = &.{},
+    /// enum 成员的值
+    values: []const i128 = &.{},
+    nonexhaustive: bool = false,
+
+    pub const Kind = enum { @"struct", @"enum", @"union" };
+    pub const Layout = enum { auto, @"extern", @"packed" };
 };
 
 pub const Container = struct {
@@ -185,6 +235,7 @@ const preset = [_]Key{
     .{ .simple_value = .false },
     .{ .simple_value = .null },
     .{ .simple_value = .undefined },
+    .runtime,
 };
 
 pub fn init(gpa: Allocator, io: Io) Allocator.Error!InternPool {
@@ -228,9 +279,27 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
         .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent } },
+        .tuple_type => |t| .{ .tuple_type = try a.dupe(Index, t) },
+        .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types) } },
+        .reified_type => |t| blk: {
+            var out = t;
+            out.names = try dupeNames(a, t.names);
+            out.types = try a.dupe(Index, t.types);
+            out.values = try a.dupe(i128, t.values);
+            break :blk .{ .reified_type = out };
+        },
+        .aggregate => |v| .{ .aggregate = .{ .ty = v.ty, .elems = try a.dupe(Index, v.elems) } },
+        .bytes => |v| .{ .bytes = .{ .ty = v.ty, .bytes = try a.dupe(u8, v.bytes) } },
+        .union_value => |v| .{ .union_value = .{ .ty = v.ty, .tag = try a.dupe(u8, v.tag), .payload = v.payload } },
         .opaque_param => |o| .{ .opaque_param = .{ .file = o.file, .owner = o.owner, .binding = o.binding, .name = try a.dupe(u8, o.name) } },
         else => k,
     };
+}
+
+fn dupeNames(a: Allocator, names: []const []const u8) Allocator.Error![]const []const u8 {
+    const out = try a.alloc([]const u8, names.len);
+    for (names, out) |n, *o| o.* = try a.dupe(u8, n);
+    return out;
 }
 
 /// 返回的 Key 中的切片在 InternPool 生命周期内有效
@@ -347,6 +416,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("!");
             try ip.print(e.payload, w, container_name);
         },
+        .inferred_error_set => if (@hasDecl(@TypeOf(container_name), "writeInferredErrorSet")) try container_name.writeInferredErrorSet(index, w) else try w.writeAll("anyerror"),
         .error_set_type => |names| {
             try w.writeAll("error{");
             for (names, 0..) |n, i| {
@@ -366,15 +436,90 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(f.ret, w, container_name);
         },
         .container_type => |c| try container_name.write(c, w),
+        .tuple_type => |types| {
+            try w.writeAll("struct {");
+            for (types, 0..) |t, i| {
+                try w.writeAll(if (i == 0) " " else ", ");
+                try ip.print(t, w, container_name);
+            }
+            try w.writeAll(if (types.len == 0) "}" else " }");
+        },
+        .vector_type => |v| {
+            try w.print("@Vector({d}, ", .{v.len});
+            try ip.print(v.child, w, container_name);
+            try w.writeAll(")");
+        },
+        .anon_struct_type => |t| {
+            try w.writeAll("struct {");
+            for (t.names, t.types, 0..) |n, ty, i| {
+                try w.print("{s}{s}: ", .{ if (i == 0) " " else ", ", n });
+                try ip.print(ty, w, container_name);
+            }
+            try w.writeAll(if (t.names.len == 0) "}" else " }");
+        },
+        .reified_type => |t| if (@hasDecl(@TypeOf(container_name), "writeReified")) try container_name.writeReified(t, w) else try ip.printReified(t, w, container_name),
+        .union_tag_type => |u| {
+            try w.writeAll("@typeInfo(");
+            try ip.print(u, w, container_name);
+            try w.writeAll(").@\"union\".tag_type.?");
+        },
         .simple_value => |v| try w.writeAll(@tagName(v)),
         .int_value => |v| try w.print("{d}", .{v.value}),
-        .enum_literal => |n| try w.print(".{s}", .{n}),
-        .enum_tag => |t| try w.print(".{s}", .{t.name}),
+        .float_value => |v| try w.print("{d}", .{@as(f128, @bitCast(v.bits))}),
+        .enum_literal => |n| try w.print(".{f}", .{std.zig.fmtId(n)}),
+        .enum_tag => |t| try w.print(".{f}", .{std.zig.fmtId(t.name)}),
         .error_value => |n| try w.print("error.{s}", .{n}),
         .fn_value => |f| try ip.print(f.ty, w, container_name),
+        .aggregate => |v| {
+            if (ip.key(v.ty) == .ptr_type) try w.writeAll("&");
+            // 结构体的值带字段名
+            const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
+            try w.writeAll(".{");
+            for (v.elems, 0..) |e, i| {
+                if (i == max_printed_elems) {
+                    try w.writeAll(", ...");
+                    break;
+                }
+                try w.writeAll(if (i == 0) " " else ", ");
+                if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
+                try ip.print(e, w, container_name);
+            }
+            try w.writeAll(if (v.elems.len == 0) "}" else " }");
+        },
+        .bytes => |v| try w.print("\"{f}\"", .{std.zig.fmtString(v.bytes[0..@min(v.bytes.len, 64)])}),
+        .union_value => |v| {
+            try w.print(".{{ .{f} = ", .{std.zig.fmtId(v.tag)});
+            try ip.print(v.payload, w, container_name);
+            try w.writeAll(" }");
+        },
+        .ptr_value => |v| {
+            try w.writeAll("&");
+            try ip.print(v.pointee, w, container_name);
+        },
         .instance => try w.writeAll("instance"),
         .opaque_param => |o| try w.writeAll(o.name),
+        .runtime => try w.writeAll("_"),
     }
+}
+
+/// 聚合值最多显示的元素个数
+const max_printed_elems = 16;
+
+/// 没有构造位置的名字时，按内容显示构造的类型
+pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+    try w.print("{t} {{", .{t.kind});
+    for (t.names, 0..) |n, i| {
+        if (i == max_printed_elems) {
+            try w.writeAll(", ...");
+            break;
+        }
+        try w.print("{s}{s}", .{ if (i == 0) " " else ", ", n });
+        if (i < t.types.len) {
+            try w.writeAll(": ");
+            try ip.print(t.types[i], w, container_name);
+        }
+    }
+    try w.writeAll(if (t.names.len == 0) "}" else " }");
 }
 
 const testing = std.testing;
