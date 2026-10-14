@@ -292,6 +292,12 @@ Zig 合法地存在递归类型（`const Node = struct { next: ?*Node }`）和�
 - 遇到环 → 调用该 query 声明的 `cycle_fallback`（通常返回 `unknown` 或「惰性占位类型」），并在 memo 上标记 `in_cycle`；
 - sema 层设计上保证：**容器类型的身份不依赖其字段类型**（字段解析是独立 query），因此 `*Node` 不会触发环。
 
+**深度上限**：很长的依赖链（上千个互相引用的常量）或无限的类型构造递归会耗尽原生栈。读事务记录开始时的栈位置，嵌套计算占用的原生栈超过 4 MB 时，有 `cycle_fallback` 的 query 不再深入：返回回退值，当前栈上的 query 都标记为 `in_cycle`（结果取决于求值时的栈深度，不写入 memo）。推导器与解释器在深入表达式前同样检查。
+
+- **迭代加深**：顶层读取因深度上限中断时，先从栈底计算中断处的 query（结果完整则写入 memo），再重新计算原来的 query。深链因此分段计算，总代价与链长成正比，结果也是完整的；每个读事务最多加深 16 次，无限递归也能结束。
+- 结果已标记为不完整时（`ctx.incomplete()`），调用方不再为改进结果而深入（如 DeclType 回退到解释器），否则每一层都会重新计算。
+- **燃料**：每个读事务有 comptime 求值的步数预算（默认 2000 万步），耗尽后的结果同样不写入 memo。
+
 ### 6.5 取消
 
 - 全局 `pending_write: atomic bool`；每次 `get` 入口检查，若置位则返回 `error.Canceled` 并逐层上抛。
@@ -467,20 +473,23 @@ fn infer(expr: ExprId, expected: Expected) TypedValue
 **核心思路：用真正的 comptime 求值替代启发式。**
 
 1. **comptime 解释器（`eval.zig`）**
-   - 在 HIR 上解释执行，值即 InternPool `Index`。
-   - 支持：算术/位运算/比较、`if`/`switch`/`while`/`for`（含 `inline`）、块与 label、函数调用（经 `call_eval` 记忆化）、容器构造、`@typeInfo`/`@Type`、`@field`/`@hasField`/`@hasDecl`/`@TypeOf`/`@This`、切片与数组字面量、错误与 optional。
-   - **燃料**：每次 `call_eval` 有步数上限（可配置，默认 10 万步）与递归深度上限；耗尽返回 `unknown`。
-   - 遇到运行时值、外部函数、`@cImport`、内联汇编 → `unknown`，不报错。
+   - 在 HIR 上解释执行。离开解释器的值（返回值、实参、query 结果）是 InternPool `Index`；解释器内的值可以修改（局部变量、数组与结构体元素、经由指针写入，指针表示为存储单元 + 元素路径），只在离开时驻留，避免只增不减的 InternPool 堆积中间结果。
+   - 支持：算术/位运算/比较（按类型位宽回绕、饱和、溢出检查；浮点以 f128 计算并按类型精度舍入）、`if`/`switch`（含范围、带标签的 `continue`）/`while`/`for`（含 `inline`、指针捕获、`else`）、块与 label、`defer`、函数调用（经 `call_eval` 记忆化）、容器与元组 / 匿名结构体构造、`@typeInfo` 与 `@Enum`/`@Struct`/`@Union`/`@Tuple`/`@Pointer`/`@Fn`/`@Int`/`@Vector`、`@field`/`@hasField`/`@hasDecl`/`@FieldType`/`@TypeOf`/`@This`/`@tagName`、切片与数组字面量、错误与 optional。
+   - **燃料**：单次求值 20 万步、内存 64 MB、单个聚合 65536 个元素、解释器内嵌套调用 64 层；每个读事务另有总步数预算（§6.4）。超出时放弃求值，结果为 `unknown`。
+   - 遇到运行时值、外部函数、`@cImport`、内联汇编、`@compileError` → `unknown`，不报错。
    - 三值格：`known(value)` / `typed_unknown(type)` / `unknown`。
+   - **与推导器的分工**：推导器给出每个表达式的类型（IDE 使用）；在 comptime 上下文中（类型标注、参数与返回类型、数组长度、comptime 实参）求不出值时交给解释器；容器级常量的值、返回 comptime-only 类型（`type`、含 `type` 字段的结构体等）的调用由解释器求出。
+   - **`call_eval`（`CallEval` query）**：键为「实例 + 各参数的值」。实例与类型推导中相同（comptime 参数取值并按实例中的参数类型转换，anytype 取类型，其他为 `runtime` 占位），保证两边得到的容器身份一致；运行时参数的值另存于键中。
 
 2. **类型构造函数**：`fn ArrayList(comptime T: type) type` 在 `decl_type` 遇到 `ArrayList(u8)` 时，经 `call_eval` 求值得到 `container_type{ item: <struct>, inst: Inst(ArrayList, [u8]) }`。std 的大部分泛型容器、`std.meta`、`std.enums` 因此无需特判即可工作。
 
 3. **泛型函数体（无具体实例时）**：
-   - 以「抽象实例」推导：`comptime T: type` 绑定为 `opaque_param(T)`；`anytype` 参数类型为 `opaque_param(x)`；
-   - 对 `opaque_param` 的成员访问 → `unknown`；hover 显示为 `T`；
-   - **调用点种子**（可选，默认开启）：经 `file_index` 找到若干调用点，取第一个可解析的具体实例做推导，hover 标注「基于 `file.zig:123` 的调用推导」。结果按实例缓存，可解释、可复现。
+   - 以「抽象实例」推导：`comptime T: type`（含不写 comptime 的 `T: type`）绑定为 `opaque_param(T)`；`anytype` 参数类型未知；
+   - 对 `opaque_param` 的成员访问 → `unknown`；hover 显示为 `T`；取决于抽象参数的比较（`[2]T == [2]u8`）为未知，不选择分支；
+   - 类型相等：同一位置、不同实例的容器按它捕获的外层参数与局部变量的值判断（不捕获实参的容器在不同实例间是同一个类型）；
+   - **调用点种子**（默认开启）：取第一个能求出具体实例的调用点做推导，hover 标注「inferred from the call at file.zig:123」。结果按实例缓存，可解释、可复现。M5 只在同一文件中查找调用点，跨文件经 `file_index` 查找在 M6 实现。
 
-4. **inferred error set**：`!T` 的错误集由函数体推导，属于 `infer` 结果，按需计算；签名层只记录「inferred」标记。
+4. **inferred error set**：`!T` 的错误集由函数体推导，按需计算；签名层只记录「inferred」标记（`inferred_error_set` 类型，不读取函数体），成员由 `ErrorSetOf` query 收集函数体中 `return` 的错误与 `try` 传播的错误；含未知部分或参与递归时为 `anyerror`。
 
 ### 9.5 Builtin
 
@@ -800,8 +809,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | **M2 构建与诊断** | ✅ 已完成 | 构建系统协议客户端 + ProjectModel、编译器 watch 进程、编译集合、未保存内容的位置平移、诊断发布 | 诊断一致性对拍 100% 通过 |
 | **M3 名字** | ✅ 已完成 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
 | **M4 类型** | ✅ 已完成 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
-| **M5 comptime** | ✅ 已完成（核心，见 §19.8） | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
-| **M6 引用** | ⏳ 下一步 | file_index、references、rename、document highlight、workspace symbol、code actions | rename 在大项目上正确且 < 1s |
+| **M5 comptime** | ✅ 已完成（见 §19.8） | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
+| **M6 引用** | ⏳ 下一步 | file_index、references、rename、document highlight、workspace symbol、code actions、跨文件的调用点种子（§9.4） | rename 在大项目上正确且 < 1s |
 | **M7 性能** | 未开始 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
 | **v1.0** | 未开始 | 稳定性、文档、发布流程 | — |
 
@@ -921,8 +930,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | InternPool 的锁 | 读写共用一把互斥锁，`key()` 读取也要加锁 | 类型推导并发请求多、InternPool 很大时的锁竞争 | 分片，或读路径改为无锁（只追加的分段数组） | M4 |
 | 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
 | 读请求用 `async` 提交 | hover、补全等读请求与诊断发布用 `group.async`；线程池满时（核数少或常驻任务多）会在主循环中同步执行，期间收不到 `$/cancelRequest`，后续请求排队。不会死锁：这些任务不等待主循环 | 用户感到请求卡顿或取消不及时 | 读请求改为 `concurrent`（与 `waitIdle` 相同） | M4 |
-| 泛型实例的内存 | 每个实例（函数 + 实参）的推导结果按 query 缓存，InternPool 中的实例与类型只增不减 | 长时间运行、大量不同的实例化 | 实例结果的 LRU 回收；InternPool 代际回收（§9.1） | M5 |
-| 实例化带来的推导耗时 | 标准库全量推导从 0.8 秒增加到 1.1 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
+| 泛型实例的内存 | 每个实例（函数 + 实参）的推导结果按 query 缓存，InternPool 中的实例与类型只增不减。实测：标准库全量推导的最大 RSS 1.24 GB，与引入解释器之前（1.25 GB）持平；InternPool 17 万项 | 长时间运行、大量不同的实例化 | 实例结果的 LRU 回收；InternPool 代际回收（§9.1） | M5 |
+| 实例化与 comptime 求值的推导耗时 | 同一台机器上标准库全量推导：M4 1.44 秒 → M5（实例化）1.92 秒 → M5（解释器）2.91 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
 | Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
 
 ### 19.7 M4 完成情况（2026-10-13）
@@ -946,30 +955,44 @@ pub fn make() std.ArrayList(u8) { ... }
   - `SourceText` 从磁盘读到的内容不会随磁盘变化而失效（编辑器打开的文件与项目编译集合中的文件不受影响，它们由 `FileText` 管理）。
   - 泛型实例与 comptime 调用求值（`std.ArrayList(u8)`、`fn max(comptime T: type, ...) T` 的返回类型）属于 M5。
 
-### 19.8 M5 完成情况（2026-10-13）
+### 19.8 M5 完成情况（2026-10-14）
 
-不另写解释器，而是在 M4 的推导器上增加「实例」：
+第一版（2026-10-13）在 M4 的推导器上增加「实例」，没有解释器。复查发现：交付中的解释器、`@typeInfo`/`@Type`、调用点种子缺失，`std.meta` 系列与 `MultiArrayList.items(.field)` 的验收不通过，并有多类给出错误结果（而非未知）的问题。2026-10-14 补全：
 
 | 部分 | 文件 | 内容 |
 |---|---|---|
-| 实例 | `src/sema/InternPool.zig` | `instance { 函数, 各参数的值, 外层实例 }`；容器类型与函数值带上所属实例（`ArrayList(u8)` 与 `ArrayList(i32)` 是不同的类型）；`opaque_param` 表示没有具体实例时的 comptime 类型参数 |
-| 按实例推导 | `src/sema/queries.zig` | `Infer` / `DeclType` 的键带实例；`normalizeInst` 把实例规范化为成员自身或其最内层外层函数的实例，不在泛型函数中的成员只有一份结果；`Infer(函数, 完整, 实例)` 即记忆化的 call_eval |
-| comptime 求值 | `src/sema/infer.zig` | 调用带 comptime / anytype 参数或返回 `type` 的函数时创建实例：参数绑定到实参值（anytype 取实参类型），返回类型在实例中求值，返回 `type` 时取实际执行到的 `return` 的值；条件已知的 `if` / `switch` / `orelse` 只走执行到的分支（未执行分支中的 `return` 不计入），无条件 `return` 之后的语句不执行；整数运算与比较、布尔运算、类型相等比较做常量折叠；嵌套 query 深度上限 64（每层实例化在 Debug 构建下约占 60 KB 原生栈；上限 256 时 x86_64 Debug 的测试在 8 MB 主线程栈上溢出，降到 64 后标准库统计结果不变）|
-| 抽象实例 | 同上 | 没有具体实例时 `comptime T: type` 为抽象参数 `T`，泛型代码中的 hover 显示 `[]T` 而不是 unknown |
-| 内置函数 | 同上 | `@typeInfo` 与 `@src` 给出标准库中的类型（`std.builtin.Type`、`SourceLocation`，不构造值）；`@FieldType`；`@Int` |
-| 显示 | `src/sema/render.zig` | 实例显示为 `Aligned(u8, null)`；体内的局部容器显示局部变量名；未知的 comptime 实参显示为 `_` |
-| HIR | `src/hir/` | 参数记录 `comptime`；指针与数组类型保留哨兵（`[:0]const u8`） |
+| 实例 | `src/sema/InternPool.zig` | `instance { 函数, 各参数的值, 外层实例 }`；非 comptime 参数的占位 `runtime`（与未知的 comptime 实参区分）；容器类型与函数值带上所属实例；`opaque_param` 为抽象参数 |
+| 值与类型 | `src/sema/InternPool.zig` | 聚合（数组、元组、结构体、切片）、字符串、union 值、指针值、浮点值；元组、向量、匿名结构体、内置函数构造的类型（身份 = 构造位置 + 内容）、`union(enum)` 的标签枚举、推导的错误集 |
+| 值的语义 | `src/sema/value.zig`、`eval.zig` | 按位宽的整数运算（回绕、饱和、溢出时无值）、浮点运算；值与类型的相等（`?bool`：取决于抽象参数或未知实参时为未知；同一位置、不同实例的容器按捕获的值判断，与编译器一致）；值的类型转换；comptime-only 类型；大小与对齐 |
+| 解释器 | `src/sema/eval.zig` | §9.4：可修改的值、循环、指针、`@typeInfo` 构造值、类型构造的内置函数；`CallEval` query；燃料 |
+| 推导 | `src/sema/infer.zig`、`queries.zig` | 实参按实例中的参数类型转换（参数类型依赖其他参数时分两步）；隐式 comptime 参数（`T: type`）；返回 comptime-only 类型的调用全部实参参与实例；comptime 上下文中求不出的值交给解释器；带标签的块、`[_]T{}`、元组与匿名结构体字面量、`@sizeOf`/`@hasDecl` 等的值；推导的错误集（`ErrorSetOf`）；函数声明不带自身的实例（递归的类型函数可识别为环） |
+| 引擎 | `src/db/engine.zig` | 原生栈深度上限、不完整的结果不写入 memo、迭代加深、读事务的燃料（§6.4） |
+| HIR / 语法 | `src/hir/`、`src/syntax/` | `.container` 记录参数表达式（`enum(u8)`、`union(E)`）；`@"name"` 形式的标识符以去掉引号的名字参与语义 |
+| IDE | `src/ide/` | 构造的类型、元组、匿名结构体的成员补全；hover 的调用点种子（`seed.zig`）；值的显示带字段名、过长时截断 |
 
-- 真实标准库上的推导（测试用本机 zig 的标准库）：`std.ArrayList(u8)` 的 `items` / `getLast` / `pop`，`AutoHashMap` 经 `HashMap` → `HashMapUnmanaged` 的 `get` / `getOrPut`，`StringHashMapUnmanaged`，`MultiArrayList` 的 `len`，`std.fmt.parseInt`，`std.mem.splitScalar` 的迭代器与 `next()`，`gpa.alloc(u32, n)`，`@typeInfo(T).@"struct".field_names`，`@FieldType`，`@src()` 均推导正确；端到端测试经 LSP 验证 `std.ArrayList(u32)` 的 hover、成员补全与 inlay hint。
-- 标准库全量统计（`zig build sema-corpus`）：局部变量类型已知 74.2% → 86.2%，表达式 78.7% → 86.6%，声明 95.7% → 96.3%；耗时 0.8 → 1.1 秒，无崩溃。
-- 准确率抽查：从类型带实例的局部变量中按固定间隔抽取 15 个，与标准库源码核对，全部正确（据此修正了体内局部容器的显示名）；实参为结构体 / 数组值的实例显示为 `_`。
-- 测试：`zig build test` 共 152 个。
-- 未实现（与设计的差异）：
-  - 没有完整的解释器：不执行循环（含 `inline for`）、不跟踪局部变量的修改；`@typeInfo` 只给类型不给值，`@Type` / `@Struct` / `@Enum` 等构造类型的内置函数为 unknown，因此依赖它们的 `std.meta.FieldEnum`、`MultiArrayList.items(.field)` 等仍为 unknown。
-  - 聚合值（结构体、数组、切片、浮点值）不表示：以它们为 comptime 实参的实例无法区分（显示为 `_`）。
-  - 燃料只有嵌套深度上限（64 层 query），没有步数上限。
-  - 调用点种子（泛型函数体以某个调用点的实例推导）未实现，泛型函数体内使用抽象参数。
-  - 推导的错误集仍以 `anyerror` 表示。
+- 验收（真实标准库，与编译器逐项核对）：`std.meta` 的 `Child`/`Elem`/`Sentinel`/`Tag`/`activeTag`/`FieldEnum`/`DeclEnum`/`ArgsTuple`/`BackingInt`/`Slice`/`tags`/`fieldInfo`，`MultiArrayList(T).items(.field)` 与 `Slice.items`，`std.mem.SliceTo`、`std.math.maxInt` 均推导正确；`FieldEnum(S)` 等构造的类型以构造它的函数实例命名（编译器显示为 `meta.FieldEnum(main.S)`）。
+- 修复的错误结果：依赖其他参数类型的 comptime 实参未转换（switch 选错分支、同一类型有两个身份）；实参未知的不同实例被合并为同一类型；常量折叠不按位宽；抽象参数下的类型比较给出确定结果；`!@TypeOf(x)` 丢失错误联合；嵌套深度上限使结果依赖求值顺序并泄漏抽象参数；长依赖链栈溢出；不写 `comptime` 的类型参数（`fn f(T: type)`）未识别为 comptime。
+- 标准库全量统计（`zig build sema-corpus`，同一台机器）：
+
+| 指标 | M4 | M5 第一版 | M5 |
+|---|---|---|---|
+| 声明类型已知 | 95.7% | 96.3% | 97.2% |
+| 局部变量类型已知 | 74.2% | 86.2% | 89.3% |
+| 表达式类型已知 | 78.7% | 86.6% | 90.7% |
+| 全量推导耗时（ReleaseSafe） | 1.44 秒 | 1.92 秒 | 2.91 秒 |
+
+- 测试：`zig build test` 共 169 个（Debug 与 ReleaseSafe 均通过），新增按位宽折叠、实参转换与实例身份（含按捕获值比较容器）、比较结果未知、推导的错误集、带标签的块、解释器（循环、修改、指针捕获、递归的类型函数）、深链、`std.meta` 系列、反射与类型构造、浮点、构造类型的补全、调用点种子等用例。
+- 未实现（与设计的差异）：调用点种子只在同一文件中查找，跨文件查找依赖 `file_index`，列入 M6 的交付；其余见 §19.9。
+
+### 19.9 M5 遗留事项
+
+尚未排入里程碑的已知限制，按优先级排列。除与目标相关的大小外，它们只会使结果为未知或不够精确，不会给出错误结果。
+
+| 优先级 | 事项 | 现状 | 做法 |
+|---|---|---|---|
+| 高 | `@import("builtin")` 的解析（M3 遗留） | 不解析：标准库中大量按 `builtin.os.tag`、`builtin.mode` 的分支为未知；与目标相关的大小（`usize`、指针）按 zig-analyzer 自身的构建目标，目标的指针宽度不同时（如 32 位目标）结果错误 | `builtin.zig` 由编译器按目标与优化模式生成：按构建系统给出的模块配置用 `zig build-obj --show-builtin` 取得，作为该模块的 `builtin` 文件 |
+| 中 | 递归函数的推导错误集 | 参与递归时取 `anyerror`（安全的上界） | 对递归的函数组做不动点迭代 |
+| 低 | 浮点的数学内置函数（`@sqrt`、`@sin` 等）、`@offsetOf`、auto 布局容器的大小 | 不求值 | 数学内置函数按 f128 计算；`@offsetOf` 与 auto 布局的大小需照搬编译器的布局算法（实现定义），只对 `extern` / `packed` 容器计算 |
 
 ## 20. 风险与对策
 
