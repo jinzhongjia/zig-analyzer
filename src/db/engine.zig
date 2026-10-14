@@ -18,8 +18,13 @@
 //!     pub const Value = u32;
 //!     pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value { ... }
 //!     pub fn cycleFallback(key: Key) Value { ... } // 可选：参与环时的回退值
+//!     pub fn depthFallback(key: Key) Value { ... } // 可选：栈深度超过上限时的回退值，默认同 cycleFallback
 //! };
 //! ```
+//!
+//! derived query 可声明 `pub const fixpoint = true`：`cycleFallback` 是值的最小元，环中对自身的读取
+//! 只把读到的值并入结果（如错误集）。这时环的入口算一遍即得最小不动点，入口的结果写入 memo，
+//! 环内其他 query 的结果仍不写入。栈深度超过上限不是环，回退值不能取最小元，须声明 `depthFallback`
 //!
 //! derived query 可改为声明 `computeIncremental(ctx, key, prev: ?Value)`，重算时引擎传入上一次的值
 //! （首次计算为 null）。结果必须与从零计算完全相同，prev 只用于加速；读取 prev 不记录依赖。
@@ -461,7 +466,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                             if (ctx.verifiedMemo(Q, index)) |fresh| break :blk fresh;
                             ctx.markIncomplete();
                             if (ctx.frontier == null) ctx.frontier = dep;
-                            return Q.cycleFallback(key);
+                            return if (@hasDecl(Q, "depthFallback")) Q.depthFallback(key) else Q.cycleFallback(key);
                         }
                         break :blk try ctx.ensureFresh(Q, index, key, true);
                     },
@@ -482,7 +487,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (!@hasDecl(Q, "cycleFallback")) {
                     std.debug.panic("query cycle without cycleFallback: {s}", .{@typeName(Q)});
                 }
-                for (ctx.stack.items[head..]) |*frame| frame.in_cycle = true;
+                // 不动点的入口算一遍即得完整结果，只有环内的其他 query 依赖回退值
+                const first = if (@hasDecl(Q, "fixpoint") and Q.fixpoint) head + 1 else head;
+                for (ctx.stack.items[first..]) |*frame| frame.in_cycle = true;
                 return Q.cycleFallback(key);
             }
 
@@ -698,6 +705,9 @@ fn validate(comptime Q: type) void {
     }
     if (!@hasDecl(Q, "eql") and containsPointer(Q.Value)) {
         @compileError(@typeName(Q) ++ " has a Value containing pointers and must declare eql");
+    }
+    if (@hasDecl(Q, "fixpoint") and !(@hasDecl(Q, "cycleFallback") and @hasDecl(Q, "depthFallback"))) {
+        @compileError(@typeName(Q) ++ " declares fixpoint and must declare cycleFallback and depthFallback");
     }
 }
 

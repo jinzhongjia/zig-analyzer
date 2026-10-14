@@ -116,6 +116,26 @@ const Depth = struct {
     }
 };
 
+/// 可达集（位集）：Reach(k) = {k} ∪ 各后继的 Reach。图 0 → 1，1 → 0、2，2 → 2，3 → 0
+const Reach = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = u8;
+    pub const fixpoint = true;
+    const next = [_][]const u32{ &.{1}, &.{ 0, 2 }, &.{2}, &.{0} };
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        var set: Value = @as(Value, 1) << @intCast(key);
+        for (next[key]) |n| set |= try ctx.get(Reach, n);
+        return set;
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return 0;
+    }
+    pub fn depthFallback(_: Key) Value {
+        return 0xff;
+    }
+};
+
 /// 读到 Number 后一直等待，直到被取消
 const Spin = struct {
     pub const kind: db.Kind = .derived;
@@ -176,7 +196,7 @@ const Burn = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Spin, Cached, CachedLen, Burn });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Cached, CachedLen, Burn });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions[Db.queryIndex(Q)].load(.monotonic);
@@ -316,6 +336,20 @@ test "cycle: uses cycleFallback without writing memo" {
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(2, executions(&d, CycleA));
+}
+
+test "fixpoint: the cycle head is complete and memoized" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    // 3 → 0 ⇄ 1 → 2 ↺：环中对入口的读取取空集，入口 0 与 2 算一遍即得完整结果
+    try testing.expectEqual(0b1111, try read(&d, Reach, 3));
+    const before = executions(&d, Reach);
+    try testing.expectEqual(0b0111, try read(&d, Reach, 0));
+    try testing.expectEqual(0b0100, try read(&d, Reach, 2));
+    try testing.expectEqual(before, executions(&d, Reach));
+    // 1 在 0 的环内，读到的是 0 的回退值，不写入 memo：单独读取时重算
+    try testing.expectEqual(0b0111, try read(&d, Reach, 1));
+    try testing.expectEqual(before + 1, executions(&d, Reach));
 }
 
 test "stack limit: deep recursion stops with the fallback and is not memoized" {
