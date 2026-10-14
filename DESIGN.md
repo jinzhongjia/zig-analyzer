@@ -1016,7 +1016,7 @@ pub fn make() std.ArrayList(u8) { ... }
 ### 19.11 与目标相关的大小（2026-10-14）
 
 - 指针位宽（`usize`、`isize`、指针与切片的大小）不再固定为 zig-analyzer 自身的构建目标：Server 更新模块图时从各模块的 builtin.zig 解析 `cpu.arch` 与 `abi`，按 `std.Target.ptrBitWidth_arch_abi` 计算；各模块一致时取该宽度，不一致时为未知；没有项目模块时取默认 builtin（本机）。
-- 位宽同时写入 `PointerBits` input 与 `InternPool.pointer_bits`（同一写事务），`value.zig` 的值运算读后者；`Infer`、`DeclType`、`CallEval`、`ErrorSetOf` 在计算开始时读前者以记录依赖，目标变化时依赖它的结果失效（只依赖 `@sizeOf(usize)`、不 import 任何文件的代码也会重算，由测试覆盖）。
+- 位宽同时写入 `PointerBits` input（后改为 `TargetAbi`，见 §19.15）与 `InternPool.pointer_bits`（同一写事务），`value.zig` 的值运算读后者；`Infer`、`DeclType`、`CallEval`、`ErrorSetOf` 在计算开始时读前者以记录依赖，目标变化时依赖它的结果失效（只依赖 `@sizeOf(usize)`、不 import 任何文件的代码也会重算，由测试覆盖）。
 - 端到端测试：wasm32 项目中 `@sizeOf(usize)` 为 4、`std.math.maxInt(usize)` 为 4294967295；同时有宿主与 wasm32 目标的项目中两者为未知；单文件模式为本机宽度；配置变更去掉 `-Dtarget` 后结果随之更新。
 - 同时修复：`zig env` 原样输出相对路径的 `ZIG_GLOBAL_CACHE_DIR`（CI 即如此设置），`ZigEnv` 现在把 `lib_dir`、`std_dir`、`global_cache_dir` 转为绝对路径；此前生成的 builtin.zig 路径为相对路径，导致 CI 上三个平台的测试失败。
 - 测试：`zig build test` 共 175 个。
@@ -1088,17 +1088,31 @@ pub fn make() std.ArrayList(u8) { ... }
 | 推导器 | `src/sema/infer.zig` | 参数都已知时，数学函数与布局由解释器计算（`eval.builtinValue`、`eval.typeLayout`）；有符号整数的 `@abs` 为同位宽的无符号整数 |
 | 构造类型 | `src/sema/eval.zig` | `@Struct` / `@Union` / `@Enum` 中按字段给出的参数带上结果类型 `*const [n]T`，与编译器一致，`&@splat(.{})` 等写法可以求值（如 `std.enums.EnumFieldStruct`）。字段属性带 comptime 或显式对齐时记录在类型中，这时布局为未知 |
 
-- 仍为未知（不会给出错误结果）：
-  - 不带标签的 auto union：Debug 与 ReleaseSafe 下有安全检查用的隐藏标签，大小取决于优化模式，而优化模式不是推导的输入。
-  - 字段带显式对齐（`align(N)`）：对齐表达式不求值。
-  - 元组与匿名结构体字面量：comptime 已知的字段是 comptime 字段，类型中没有记录。
-  - 向量：布局取决于后端与 CPU 特性。
-  - `c_long` 等取决于目标的 C 类型。
-  - 负除数的浮点 `@mod`：编译器在 comptime 的结果与运行时不同（f64 的 7 mod -3 得 1 而不是 -2）。
+- 当时仍为未知的：不带标签的 auto union、字段的显式对齐、元组与匿名结构体字面量、向量、负除数的浮点 `@mod`、`c_long` 等 C 类型。前五项其实都能求出，已在 §19.15 补全（原先「优化模式不是推导的输入」的判断有误：模块的 builtin.zig 中有优化模式）。
 - 同时修复：解释器中 i128 的最小值参与整数除法时溢出会触发安全检查（进程崩溃），现在放弃求值。
 - 验证：布局（含字段重排、comptime 字段、零大小字段、嵌套的容器、构造的类型）与浮点结果逐项与 zig 0.17.0 编译运行的结果核对（x86_64-linux）。
 - 标准库全量统计：声明类型已知 36997 → 37008（99.3%），局部变量 36926 → 37236（90.9% → 91.7%），表达式 940132 → 942393（92.1% → 92.4%），增加的主要来自 peer 类型；逐个成员对比，没有成员的未知表达式变多。耗时不变（ReleaseSafe 约 3.9 秒）。
 - 测试：`zig build test` 共 197 个（Debug 与 ReleaseSafe 均通过）。
+
+### 19.15 §19.14 遗留项的补全（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 浮点除法 | `src/sema/value.zig` | 编译器在 comptime 调用自身的 `@mod`、`@divTrunc` 等，发行版的编译器经 LLVM 编译，展开为固定形式（`@mod` 为 `lhs < 0 ? fmod(fmod(lhs, rhs) + rhs, rhs) : fmod(lhs, rhs)`，只按被除数的符号调整）。按同样的展开式计算，负除数时与编译器一致（f64 的 7 mod -3 得 1），结果也不随 zig-analyzer 自身的编译后端变化 |
+| 显式对齐 | `src/hir/`、`infer.zig`、`eval.zig` | HIR 记录字段与变量的 `align(...)` 表达式，签名模式的推导在 comptime 求值；布局使用它（可大于或小于类型的对齐，参与重排；泛型实例中按实参求值）。`@Struct` / `@Union` 字段属性中的对齐与 comptime 字段记录在构造的类型中；`@typeInfo` 报告字段的 `align` 与 `comptime` |
+| 不带标签的 union | `src/sema/eval.zig` | 与编译器的 `wantSafeTypes` 一致：所在模块的 builtin 中 `optimize` 为 Debug 或 ReleaseSafe 时有隐藏标签（取容纳字段序号的最小无符号整数），ReleaseFast / ReleaseSmall 时没有；`@Union` 构造的同样处理 |
+| 向量 | `src/project/`、`src/server/Server.zig`、`value.zig` | 布局取决于编译后端与 CPU 特性：自研 x86_64 后端对齐至少为 16（AVX 下超过 16 字节为 32，AVX-512 下超过 32 字节为 64），LLVM 等后端为不小于字节数的 2 的幂（aarch64 不超过 16），C 与 wasm 后端按元素对齐。从各模块 builtin.zig 的 `zig_backend` 与 `cpu.features` 取得，各模块一致时使用；生成 builtin 时补上 compile step 的 `use_llvm`（`-fllvm` / `-fno-llvm`），此前在 build.zig 中指定时 `zig_backend` 与实际不符。`PointerBits` input 改为 `TargetAbi`，同时携带指针位宽与向量的规则 |
+| 元组与匿名结构体字面量 | `src/sema/InternPool.zig`、`infer.zig`、`eval.zig`、`value.zig` | 类型记录各字段的 comptime 值：与编译器一致，字面量中 comptime 已知的字段（含 `{}`、字符串、只有一个可能值的类型）是 comptime 字段，`struct { comptime u8 = 1, u32 }` 与 `struct { u8, u32 }` 是不同的类型，显示也与编译器相同（空元组为 `@TypeOf(.{})`）。推导器按编译器的规则判断值未推出的字段：局部 var、参数、普通函数的调用、非 inline 循环的捕获、容器级 var 是运行时的；判断不了的（如 inline 函数的结果）标为未定，这时布局为未知。解释器构造的元组字段都是 comptime 字段。元组按声明顺序布局（不重排；对齐计入零大小的字段，大小不计入），匿名结构体与 auto 结构体相同；comptime 字段不占空间，也不使类型成为 comptime-only。下标已知时取元组字段的类型，comptime 字段的值属于类型；`@typeInfo` 报告 comptime 字段与其默认值 |
+
+- 验证：逐项与 zig 0.17.0 编译运行的结果核对。向量另在五种配置下核对：x86_64 自研后端（AVX、AVX-512、无 AVX）、`-fllvm`、aarch64；e2e 测试中 wasm32 项目的 `@sizeOf(@Vector(2, u8))` 为 2，宿主与 wasm32 混合时为未知。
+- 仍为未知（不会给出错误结果）：
+  - 声明所在的函数体中调用了 `@setRuntimeSafety` 时，不带标签的 union 是否有隐藏标签。
+  - 推导不出的对齐表达式。
+  - 元组字面量中是否 comptime 判断不了的字段（如 inline 函数的结果、多行字符串）：布局为未知，显示按运行时字段。
+  - 向量：各模块的后端或 CPU 特性不一致时；f80、f128 元素（是否软浮点取决于 long double）；x86 的软浮点；未覆盖的架构（ARM、s390x 的对齐上限为各自的栈对齐，MIPS 与 PowerPC 的 f16 为软浮点）。
+  - `c_long` 等 C 类型：目标可从 builtin.zig 得到，可用 `std.Target.cTypeBitSize` 计算，尚未实现。
+- 标准库全量统计：声明类型已知 37012（99.3%），局部变量 37246（91.7%），表达式 942857（92.4%）；与 82f1304 交替测量耗时，两者都在 4.1～4.7 秒之间，没有可测出的差别。
+- 测试：`zig build test` 共 201 个（Debug 与 ReleaseSafe 均通过）。
 
 ## 20. 风险与对策
 
