@@ -37,10 +37,10 @@ test "picks the deepest block" {
     const inc = (try Parse.reparseBlock(testing.allocator, old, "fn f() void {\n    while (true) {\n        b();\n    }\n}\n")).?;
     defer inc.destroy();
     // 外层函数体节点被复制，其中的 while 之外的子节点复用旧节点
-    const old_fn = old.root.children[0].node;
-    const new_fn = inc.root.children[0].node;
+    const old_fn = old.root.children[0].node().?;
+    const new_fn = inc.root.children[0].node().?;
     try testing.expect(old_fn != new_fn);
-    try testing.expect(old_fn.children[0].node == new_fn.children[0].node); // fn_proto 复用
+    try testing.expect(old_fn.children[0].node().? == new_fn.children[0].node().?); // fn_proto 复用
 }
 
 test "falls back to full parse when conditions are not met" {
@@ -70,6 +70,6 @@ test "ref counting: old result stays valid until the incremental result is freed
     const inc = (try Parse.reparseBlock(testing.allocator, old, "fn f() void {\n    h();\n}\n")).?;
     old.destroy(); // 查询引擎释放旧值
     // 复用的 fn_proto 节点仍可访问
-    try testing.expectEqualStrings("fn", inc.root.children[0].node.children[0].node.children[0].token.text);
+    try testing.expectEqualStrings("fn", inc.root.children[0].node().?.children[0].node().?.children[0].unpack().token.text);
     inc.destroy();
 }

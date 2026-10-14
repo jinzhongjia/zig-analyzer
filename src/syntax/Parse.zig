@@ -58,6 +58,12 @@ pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
     return result;
 }
 
+/// 增加一份引用（与 `destroy` 配对）
+pub fn retain(self: *Parse) *Parse {
+    _ = self.refs.fetchAdd(1, .monotonic);
+    return self;
+}
+
 /// 释放一份引用；最后一份引用释放时销毁 arena 并释放对 base 的引用。
 pub fn destroy(self: *Parse) void {
     if (self.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -91,9 +97,9 @@ pub fn sameAs(a: *const Parse, b: *const Parse) bool {
 fn greenEql(a: *const green.GreenNode, b: *const green.GreenNode) bool {
     if (a == b) return true;
     if (a.kind != b.kind or a.text_len != b.text_len or a.children.len != b.children.len) return false;
-    for (a.children, b.children) |x, y| switch (x) {
-        .node => |n| if (y != .node or !greenEql(n, y.node)) return false,
-        .token => |t| if (y != .token or t.kind != y.token.kind or !std.mem.eql(u8, t.text, y.token.text)) return false,
+    for (a.children, b.children) |x, y| switch (x.unpack()) {
+        .node => |n| if (y.node() == null or !greenEql(n, y.node().?)) return false,
+        .token => |t| if (y.is_node or t.kind != y.kind() or !std.mem.eql(u8, t.text, y.unpack().token.text)) return false,
     };
     return true;
 }
@@ -198,7 +204,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
         i -= 1;
         const entry = path.items[i];
         const children = try a.dupe(green.GreenElement, entry.node.children);
-        children[entry.child] = .{ .node = new_node };
+        children[entry.child] = .initNode(new_node);
         const copy = try a.create(green.GreenNode);
         copy.* = .{
             .kind = entry.node.kind,
@@ -234,7 +240,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
     };
     result.arena = arena;
     result.chain_bytes = old.chain_bytes + result.arena.queryCapacity();
-    _ = old.refs.fetchAdd(1, .monotonic);
+    _ = old.retain();
     return result;
 }
 

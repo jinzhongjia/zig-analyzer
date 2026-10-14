@@ -76,7 +76,7 @@ pub const SyntaxNode = struct {
             it.index += 1;
             const off = it.offset;
             it.offset += e.textLen();
-            return switch (e) {
+            return switch (e.unpack()) {
                 .node => |g| .{ .node = .{ .green = g, .offset = off } },
                 .token => |t| .{ .token = .{ .kind = t.kind, .text = t.text, .offset = off } },
             };

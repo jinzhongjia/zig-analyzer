@@ -17,22 +17,48 @@ pub const GreenNode = struct {
     children: []const GreenElement,
 };
 
-pub const GreenElement = union(enum) {
-    node: *const GreenNode,
-    token: GreenToken,
+/// 节点的子元素：节点或 token。压缩为 16 字节（标签联合需要 32 字节）：一个 token 一个元素，
+/// 绿树的内存主要花在这里
+pub const GreenElement = struct {
+    /// 节点：`*const GreenNode`；token：文本起始（指向 `Parse.source`）
+    ptr: [*]const u8,
+    /// 节点：`text_len`；token：文本长度
+    len: u32,
+    syntax_kind: SyntaxKind,
+    is_node: bool,
+
+    comptime {
+        std.debug.assert(@sizeOf(GreenElement) == 16);
+    }
+
+    pub const Unpacked = union(enum) {
+        node: *const GreenNode,
+        token: GreenToken,
+    };
+
+    pub fn initNode(n: *const GreenNode) GreenElement {
+        return .{ .ptr = @ptrCast(n), .len = n.text_len, .syntax_kind = n.kind, .is_node = true };
+    }
+
+    pub fn initToken(k: SyntaxKind, text: []const u8) GreenElement {
+        return .{ .ptr = text.ptr, .len = @intCast(text.len), .syntax_kind = k, .is_node = false };
+    }
+
+    pub fn unpack(e: GreenElement) Unpacked {
+        if (e.is_node) return .{ .node = @ptrCast(@alignCast(e.ptr)) };
+        return .{ .token = .{ .kind = e.syntax_kind, .text = e.ptr[0..e.len] } };
+    }
+
+    pub fn node(e: GreenElement) ?*const GreenNode {
+        return if (e.is_node) @ptrCast(@alignCast(e.ptr)) else null;
+    }
 
     pub fn kind(e: GreenElement) SyntaxKind {
-        return switch (e) {
-            .node => |n| n.kind,
-            .token => |t| t.kind,
-        };
+        return e.syntax_kind;
     }
 
     pub fn textLen(e: GreenElement) u32 {
-        return switch (e) {
-            .node => |n| n.text_len,
-            .token => |t| @intCast(t.text.len),
-        };
+        return e.len;
     }
 };
 
@@ -56,7 +82,7 @@ pub const Builder = struct {
     }
 
     pub fn token(b: *Builder, kind: SyntaxKind, text: []const u8) Allocator.Error!void {
-        try b.children.append(b.gpa, .{ .token = .{ .kind = kind, .text = text } });
+        try b.children.append(b.gpa, .initToken(kind, text));
     }
 
     pub fn finishNode(b: *Builder) Allocator.Error!void {
@@ -67,7 +93,7 @@ pub const Builder = struct {
         const node = try b.arena.create(GreenNode);
         node.* = .{ .kind = open.kind, .text_len = len, .children = try b.arena.dupe(GreenElement, elems) };
         b.children.shrinkRetainingCapacity(open.start);
-        try b.children.append(b.gpa, .{ .node = node });
+        try b.children.append(b.gpa, .initNode(node));
     }
 
     pub fn depth(b: *const Builder) usize {
@@ -77,6 +103,6 @@ pub const Builder = struct {
     /// 结束构造，返回根节点。
     pub fn finish(b: *Builder) *const GreenNode {
         std.debug.assert(b.stack.items.len == 0 and b.children.items.len == 1);
-        return b.children.items[0].node;
+        return b.children.items[0].node().?;
     }
 };
