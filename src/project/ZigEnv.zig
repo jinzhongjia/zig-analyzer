@@ -50,10 +50,34 @@ pub fn query(gpa: Allocator, io: Io, zig_exe: ?[]const u8) QueryError!ZigEnv {
         .exited => |code| if (code != 0) return error.ZigEnvFailed,
         else => return error.ZigEnvFailed,
     }
-    return parse(gpa, result.stdout) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ParseZon => error.ZigEnvFailed,
+    var env = parse(gpa, result.stdout) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => return error.ZigEnvFailed,
     };
+    errdefer env.deinit(gpa);
+    // `zig env` 原样输出 ZIG_GLOBAL_CACHE_DIR 等环境变量，可能是相对路径：按当前目录转为绝对路径
+    var arena = env.arena.promote(gpa);
+    defer env.arena = arena.state;
+    const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", arena.allocator()) catch return error.ZigEnvFailed;
+    inline for (.{ "lib_dir", "std_dir", "global_cache_dir" }) |field| {
+        @field(env, field) = try absolute(arena.allocator(), cwd, @field(env, field));
+    }
+    return env;
+}
+
+fn absolute(a: Allocator, cwd: []const u8, path: []const u8) Allocator.Error![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    return std.fs.path.resolveAlloc(a, &.{ cwd, path });
+}
+
+test absolute {
+    const a = std.testing.allocator;
+    const cwd = if (builtin.os.tag == .windows) "C:\\work" else "/work";
+    const rel = try absolute(a, cwd, ".zig-cache");
+    defer a.free(rel);
+    try std.testing.expect(std.fs.path.isAbsolute(rel));
+    try std.testing.expect(std.mem.endsWith(u8, rel, ".zig-cache"));
+    try std.testing.expectEqualStrings(cwd, try absolute(a, "/elsewhere", cwd));
 }
 
 /// 解析 `zig env` 的 ZON 输出
