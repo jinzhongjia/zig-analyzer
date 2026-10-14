@@ -1364,6 +1364,18 @@ const Inferrer = struct {
                 continue;
             }
             if (t == .comptime_float_type and ip.isFloat(cur)) continue;
+            // 整数之间：同符号取较宽者（位宽相同取前者），无符号且较窄时放入有符号，与编译器一致
+            if (value.peerIntType(ip, cur, t)) |p| {
+                result = p;
+                continue;
+            }
+            // 浮点之间取位宽较大者（c_longdouble 的位宽取决于目标）
+            if (ip.isFloat(cur) and ip.isFloat(t)) {
+                const x = (value.typeLayout(ip, cur) orelse return .unknown).bits orelse return .unknown;
+                const y = (value.typeLayout(ip, t) orelse return .unknown).bits orelse return .unknown;
+                if (y > x) result = t;
+                continue;
+            }
             // T 与 ?T
             if (ip.key(cur) == .optional_type and ip.key(cur).optional_type == t) continue;
             if (ip.key(t) == .optional_type and ip.key(t).optional_type == cur) {

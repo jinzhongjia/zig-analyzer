@@ -756,6 +756,37 @@ test "@min and @max narrow the result type like the compiler" {
     });
 }
 
+test "peer types of different integer and float types" {
+    // 期望值为 zig 0.17.0 的结果
+    try expectTypes(
+        \\fn h(a: usize, b: u64, c: u32, d: i64, x: f32, y: f64, u: u8, w: u16, g: bool) void {
+        \\    const s1 = a + b;
+        \\    const s2 = b + a;
+        \\    const s3 = a + c;
+        \\    const s4 = c + d;
+        \\    const s5 = x + y;
+        \\    const b1 = if (g) u else w;
+        \\    const b2 = if (g) x else y;
+        \\    const b3 = if (g) d else c;
+        \\    const skip = @max(a / c, @as(usize, 1));
+        \\    const next = a + skip;
+        \\    _ = .{ s1, s2, s3, s4, s5, b1, b2, b3, skip, next };
+        \\}
+    , &.{
+        // 位宽相同时取前者
+        .{ "s1", "usize" },
+        .{ "s2", "u64" },
+        .{ "s3", "usize" },
+        .{ "s4", "i64" },
+        .{ "s5", "f64" },
+        .{ "b1", "u16" },
+        .{ "b2", "f64" },
+        .{ "b3", "i64" },
+        .{ "skip", "u64" },
+        .{ "next", "usize" },
+    });
+}
+
 test "labeled blocks, array literals and type queries" {
     try expectTypes(
         \\fn Pick(comptime wide: bool) type {
