@@ -551,6 +551,12 @@ test "container layouts match the compiler" {
         \\fn Pair(comptime T: type) type {
         \\    return struct { a: u8, b: T };
         \\}
+        \\const L = struct { a: u8 align(4), b: u8 };
+        \\const XL = extern struct { a: u8, b: u32 align(1) };
+        \\fn Al(comptime n: u29) type {
+        \\    return struct { a: u8 align(n), b: u8 };
+        \\}
+        \\const UA = union(enum) { a: u8 align(8), b: u16 };
         \\const top = @sizeOf(D);
         \\fn g() void {
         \\    const size_a = @sizeOf(A);
@@ -586,7 +592,14 @@ test "container layouts match the compiler" {
         \\    const size_k = @sizeOf(K);
         \\    const k_a = @offsetOf(K, "a");
         \\    const pair_a = @offsetOf(Pair(u32), "a");
-        \\    _ = .{ size_a, align_a, a_a, a_b, a_c, size_b, b_c, size_c, bits_c, c_b, c_c, d_a, d_c, d_e, size_m, m_a, m_b, m_f, big_a, size_big, bits_h, bits_auto, size_u, size_ue, size_x, bits_p, size_one, size_opt_u, nest_c, size_nest, size_k, k_a, pair_a };
+        \\    const size_l = @sizeOf(L);
+        \\    const align_l = @alignOf(L);
+        \\    const l_b = @offsetOf(L, "b");
+        \\    const size_xl = @sizeOf(XL);
+        \\    const align_xl = @alignOf(XL);
+        \\    const size_al = @sizeOf(Al(8));
+        \\    const size_ua = @sizeOf(UA);
+        \\    _ = .{ size_a, align_a, a_a, a_b, a_c, size_b, b_c, size_c, bits_c, c_b, c_c, d_a, d_c, d_e, size_m, m_a, m_b, m_f, big_a, size_big, bits_h, bits_auto, size_u, size_ue, size_x, bits_p, size_one, size_opt_u, nest_c, size_nest, size_k, k_a, pair_a, size_l, align_l, l_b, size_xl, align_xl, size_al, size_ua };
         \\}
     , &.{
         .{ "size_a", "comptime_int = 8" },
@@ -628,19 +641,25 @@ test "container layouts match the compiler" {
         .{ "size_k", "comptime_int = 4" },
         .{ "k_a", "comptime_int = 2" },
         .{ "pair_a", "comptime_int = 4" },
+        // 显式对齐：可以大于或小于类型的对齐，参与重排；泛型实例中按实参求值
+        .{ "size_l", "comptime_int = 4" },
+        .{ "align_l", "comptime_int = 4" },
+        .{ "l_b", "comptime_int = 1" },
+        .{ "size_xl", "comptime_int = 5" },
+        .{ "align_xl", "comptime_int = 1" },
+        .{ "size_al", "comptime_int = 8" },
+        .{ "size_ua", "comptime_int = 8" },
     });
 }
 
 test "layouts that are invalid or depend on the build mode stay unknown" {
     try expectTypes(
         \\const Bare = union { a: u32, b: u8 };
-        \\const L = struct { a: u8 align(4), b: u8 };
         \\const S = struct { a: u8 };
         \\const Auto = enum { a, b, c };
         \\const Pa = packed struct { a: u4, b: Auto };
         \\fn g() void {
         \\    const size_bare = @sizeOf(Bare);
-        \\    const size_l = @sizeOf(L);
         \\    const bits_s = @bitSizeOf(S);
         \\    const bits_slice = @bitSizeOf([]u8);
         \\    const bits_opt = @bitSizeOf(?u32);
@@ -650,13 +669,11 @@ test "layouts that are invalid or depend on the build mode stay unknown" {
         \\    const bits_autos = @bitSizeOf([2]Auto);
         \\    const size_pa = @sizeOf(Pa);
         \\    const size_tuple = @sizeOf(@TypeOf(.{ @as(u8, 1), @as(u32, 2) }));
-        \\    _ = .{ size_bare, size_l, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa, size_tuple };
+        \\    _ = .{ size_bare, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa, size_tuple };
         \\}
     , &.{
         // 不带标签的 union 在 Debug 与 ReleaseSafe 下有隐藏的标签
         .{ "size_bare", "comptime_int" },
-        // 显式对齐不求值
-        .{ "size_l", "comptime_int" },
         // 没有位表示的类型（编译器报错）
         .{ "bits_s", "comptime_int" },
         .{ "bits_slice", "comptime_int" },
@@ -1011,6 +1028,9 @@ test "layouts of reified containers" {
         \\const Ra = @Struct(.auto, null, &.{ "x", "y" }, &.{ u8, u64 }, &.{ .{}, .{ .@"align" = 16 } });
         \\const Ru = @Union(.auto, E, &.{ "a", "b", "c" }, &.{ u8, u32, void }, &@splat(.{}));
         \\const Efs = std.enums.EnumFieldStruct(E, u16, 0);
+        \\const one: u8 = 1;
+        \\const Rc = @Struct(.auto, null, &.{ "k", "x" }, &.{ u8, u32 }, &.{ .{ .@"comptime" = true, .default_value_ptr = &one }, .{} });
+        \\const L = struct { a: u8 align(4), b: u8 };
         \\fn g() void {
         \\    const size_rf = @sizeOf(Rf);
         \\    const rf_x = @offsetOf(Rf, "x");
@@ -1018,13 +1038,24 @@ test "layouts of reified containers" {
         \\    const size_ru = @sizeOf(Ru);
         \\    const size_efs = @sizeOf(Efs);
         \\    const efs_c = @offsetOf(Efs, "c");
-        \\    _ = .{ size_rf, rf_x, size_ra, size_ru, size_efs, efs_c };
+        \\    const align_ra = @alignOf(Ra);
+        \\    const ra_x = @offsetOf(Ra, "x");
+        \\    const size_rc = @sizeOf(Rc);
+        \\    const la = @typeInfo(L).@"struct".field_attrs[0].@"align";
+        \\    const lb = @typeInfo(L).@"struct".field_attrs[1].@"align" orelse 0;
+        \\    _ = .{ size_rf, rf_x, size_ra, size_ru, size_efs, efs_c, align_ra, ra_x, size_rc, la, lb };
         \\}
     , &.{
         .{ "size_rf", "comptime_int = 16" },
         .{ "rf_x", "comptime_int = 8" },
-        // 字段属性带显式对齐：不求值
-        .{ "size_ra", "comptime_int" },
+        // 字段属性中的显式对齐与 comptime 字段
+        .{ "size_ra", "comptime_int = 16" },
+        .{ "align_ra", "comptime_int = 16" },
+        .{ "ra_x", "comptime_int = 8" },
+        .{ "size_rc", "comptime_int = 4" },
+        // @typeInfo 报告字段的显式对齐
+        .{ "la", "?usize = 4" },
+        .{ "lb", "usize = 0" },
         .{ "size_ru", "comptime_int = 8" },
         .{ "size_efs", "comptime_int = 6" },
         .{ "efs_c", "comptime_int = 4" },

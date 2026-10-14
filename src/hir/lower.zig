@@ -26,6 +26,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode) Error!Body {
 
     var value: ?ExprId = null;
     var type_expr: ?ExprId = null;
+    var align_expr: ?ExprId = null;
     var params: std.ArrayList(BindingId) = .empty;
     switch (member.kind()) {
         .fn_decl => {
@@ -51,13 +52,13 @@ pub fn lower(gpa: Allocator, member: SyntaxNode) Error!Body {
         .var_decl => {
             const decl = ast.cast(ast.VarDecl, member).?;
             type_expr = try l.optExpr(decl.typeExpr());
-            try l.clauses(member);
+            align_expr = try l.clauses(member);
             value = try l.optExpr(decl.initExpr());
         },
         .container_field => {
             const field = ast.cast(ast.ContainerField, member).?;
             type_expr = try l.optExpr(field.typeExpr());
-            try l.clauses(member);
+            align_expr = try l.clauses(member);
             value = try l.optExpr(field.defaultValue());
         },
         .test_decl => if (ast.cast(ast.TestDecl, member).?.body()) |b| {
@@ -79,6 +80,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode) Error!Body {
         .params = params.items,
         .value = value,
         .type_expr = type_expr,
+        .align_expr = align_expr,
     };
     body.arena = arena.state;
     return body;
@@ -182,13 +184,21 @@ const Lowerer = struct {
         return out.items;
     }
 
-    /// align / addrspace / linksection / callconv 子句中的表达式
-    fn clauses(l: *Lowerer, n: SyntaxNode) Error!void {
+    /// align / addrspace / linksection / callconv 子句中的表达式；返回 align 子句中的表达式
+    fn clauses(l: *Lowerer, n: SyntaxNode) Error!?ExprId {
+        var align_expr: ?ExprId = null;
         var it = n.children();
         while (it.nextNode()) |c| switch (c.kind()) {
-            .align_clause, .addrspace_clause, .linksection_clause, .callconv_clause => _ = try l.expr(c),
+            .align_clause, .addrspace_clause, .linksection_clause, .callconv_clause => {
+                const id = try l.expr(c);
+                if (c.kind() == .align_clause) align_expr = switch (l.exprs.items[@backingInt(id)]) {
+                    .other => |children| if (children.len == 1) children[0] else null,
+                    else => null,
+                };
+            },
             else => {},
         };
+        return align_expr;
     }
 
     fn expr(l: *Lowerer, n: SyntaxNode) Error!ExprId {
@@ -383,7 +393,7 @@ const Lowerer = struct {
     fn localDecl(l: *Lowerer, n: SyntaxNode) Error!BindingId {
         const v = ast.VarDecl{ .syntax = n };
         const ty = try l.optExpr(v.typeExpr());
-        try l.clauses(n);
+        _ = try l.clauses(n);
         const init = try l.optExpr(v.initExpr());
         // 缺名字时用空名占位，保证语句仍有绑定
         const name = v.name() orelse SyntaxToken{ .kind = .identifier, .text = "", .offset = n.offset };

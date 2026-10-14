@@ -1958,8 +1958,17 @@ const Evaluator = struct {
             const types = try ev.typesOf(vals[3]);
             if (types.len != names.len) return error.Abort;
             const is_union = eq(u8, name, "@Union");
-            const custom = try ev.customFieldAttrs(vals[4], is_union);
-            return Val.ofType(try ev.reify(f, e, .{ .kind = if (is_union) .@"union" else .@"struct", .layout = layout, .tag = if (tag == .null_value) null else tag, .names = names, .types = types, .custom_field_attrs = custom }));
+            const attrs = try ev.reifiedAttrs(vals[4], names.len, is_union);
+            return Val.ofType(try ev.reify(f, e, .{
+                .kind = if (is_union) .@"union" else .@"struct",
+                .layout = layout,
+                .tag = if (tag == .null_value) null else tag,
+                .names = names,
+                .types = types,
+                .field_aligns = attrs.aligns,
+                .comptime_fields = attrs.comptimes,
+                .attrs_unknown = attrs.unknown,
+            }));
         }
         if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
             if (vals.len != 1) return error.Abort;
@@ -2289,7 +2298,9 @@ const Evaluator = struct {
         types: []const Index = &.{},
         values: []const i128 = &.{},
         nonexhaustive: bool = false,
-        custom_field_attrs: bool = false,
+        field_aligns: []const u64 = &.{},
+        comptime_fields: []const bool = &.{},
+        attrs_unknown: bool = false,
     }) Error!Index {
         const tree = try ev.r.itemTree(f.file);
         return ev.ip.get(.{ .reified_type = .{
@@ -2304,7 +2315,9 @@ const Evaluator = struct {
             .types = spec.types,
             .values = spec.values,
             .nonexhaustive = spec.nonexhaustive,
-            .custom_field_attrs = spec.custom_field_attrs,
+            .field_aligns = spec.field_aligns,
+            .comptime_fields = spec.comptime_fields,
+            .attrs_unknown = spec.attrs_unknown,
         } });
     }
 
@@ -2365,34 +2378,58 @@ const Evaluator = struct {
         }
     }
 
-    /// 参与布局的字段：comptime 字段不占空间
-    const LayoutField = struct { ty: Index, layout: ?value.Layout, is_comptime: bool = false };
+    /// 参与布局的字段：comptime 字段不占空间。`alignment` 为显式对齐，未指定时为类型的对齐
+    const LayoutField = struct { ty: Index, layout: ?value.Layout, alignment: u64 = 0, explicit_align: bool = false, is_comptime: bool = false };
 
-    /// 结构体与 union 各字段的布局。字段的布局求不出、带显式对齐（不求值）或字段属性未知时为 null。
-    /// 元组与匿名结构体字面量中 comptime 已知的字段是 comptime 字段，类型中没有记录，布局同样未知
+    /// 结构体与 union 各字段的布局；字段的布局或属性求不出时为 null。元组与匿名结构体字面量中
+    /// comptime 已知的字段是 comptime 字段，类型中没有记录，布局同样未知
     fn layoutFields(ev: *Evaluator, t: Index, depth: u32) EvalError!?[]const LayoutField {
         switch (ev.ip.key(t)) {
             .container_type => |c| if (c.kind == .@"opaque") return null,
-            .reified_type => |rt| if (rt.custom_field_attrs) return null,
+            .reified_type => {},
             else => return null,
         }
         const fields = try ev.fieldsOf(t) orelse return null;
-        const ns = try queries.namespaceOfType(ev.r, t);
         const out = try ev.a.alloc(LayoutField, fields.len);
-        for (fields, out) |fl, *o| {
-            o.* = .{ .ty = fl.ty, .layout = null };
-            if (fl.item) |m| {
-                const n = ns orelse return null;
-                if ((try ev.r.itemTree(n.file)).items[m].flags.is_comptime) {
-                    o.is_comptime = true;
-                    continue;
-                }
-                const node = try ev.r.itemNode(n.file, m) orelse return null;
-                if (node.childNode(.align_clause) != null) return null;
-            }
-            o.layout = try ev.typeLayout(fl.ty, depth + 1) orelse return null;
+        for (fields, out, 0..) |fl, *o, i| {
+            const attrs = try ev.fieldAttrs(t, i, fl);
+            o.* = .{ .ty = fl.ty, .layout = null, .is_comptime = attrs.is_comptime };
+            if (attrs.is_comptime) continue;
+            const l = try ev.typeLayout(fl.ty, depth + 1) orelse return null;
+            o.layout = l;
+            o.alignment = attrs.alignment orelse l.alignment;
+            o.explicit_align = attrs.alignment != null;
         }
         return out;
+    }
+
+    const FieldAttrs = struct { is_comptime: bool = false, alignment: ?u64 = null };
+
+    /// 源码中的字段与构造的类型的字段的 comptime 与显式对齐；求不出时放弃
+    fn fieldAttrs(ev: *Evaluator, t: Index, i: usize, fl: Field) EvalError!FieldAttrs {
+        if (fl.item) |m| {
+            const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
+            if ((try ev.r.itemTree(ns.file)).items[m].flags.is_comptime) return .{ .is_comptime = true };
+            return .{ .alignment = try ev.explicitAlign(t, ns.file, m) };
+        }
+        return switch (ev.ip.key(t)) {
+            .reified_type => |rt| if (rt.attrs_unknown) error.Abort else .{
+                .is_comptime = i < rt.comptime_fields.len and rt.comptime_fields[i],
+                .alignment = if (i < rt.field_aligns.len and rt.field_aligns[i] != 0) rt.field_aligns[i] else null,
+            },
+            else => .{},
+        };
+    }
+
+    /// 源码中字段的显式对齐 `align(N)`（在签名模式的推导结果中）；没有时为 null，求不出时放弃
+    fn explicitAlign(ev: *Evaluator, t: Index, file: FileId, item: u32) EvalError!?u64 {
+        const owner = try ev.r.ownerKey(file, item);
+        const body = try ev.r.ctx.get(hir.ItemBody, owner);
+        const e = body.align_expr orelse return null;
+        const inst = try queries.declInst(ev.r, file, item, queries.instOfType(ev.ip, t));
+        const res = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = inst });
+        if (@backingInt(e) >= res.exprs.len) return error.Abort;
+        return try alignValue(ev.ip, res.exprs[@backingInt(e)].val);
     }
 
     const StructLayout = struct { layout: value.Layout, bit_offsets: []const ?u64 };
@@ -2406,7 +2443,8 @@ const Evaluator = struct {
             var bits: u64 = 0;
             for (fields, offsets) |fl, *o| {
                 const l = fl.layout orelse return null;
-                if (!try ev.packable(fl.ty)) return null;
+                // packed 的字段不能有显式对齐（编译器报错）
+                if (fl.explicit_align or !try ev.packable(fl.ty)) return null;
                 o.* = bits;
                 bits += l.bits orelse return null;
             }
@@ -2422,16 +2460,15 @@ const Evaluator = struct {
                 continue;
             }
             o.* = @intCast(i);
-            struct_align = @max(struct_align, fl.layout.?.alignment);
+            struct_align = @max(struct_align, fl.alignment);
         }
         if (decl.layout == .auto) std.mem.sortUnstable(u32, order, fields, RuntimeOrder.lessThan);
         var end: u64 = 0;
         for (order) |i| {
             if (i == RuntimeOrder.omitted) continue;
-            const l = fields[i].layout.?;
-            const offset = std.mem.alignForward(u64, end, l.alignment);
+            const offset = std.mem.alignForward(u64, end, fields[i].alignment);
             offsets[i] = offset * 8;
-            end = offset + l.size;
+            end = offset + fields[i].layout.?.size;
         }
         return .{ .layout = .{ .size = std.mem.alignForward(u64, end, struct_align), .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
     }
@@ -2443,7 +2480,7 @@ const Evaluator = struct {
         fn lessThan(fields: []const LayoutField, a: u32, b: u32) bool {
             if (a == omitted) return false;
             if (b == omitted) return true;
-            return fields[a].layout.?.alignment > fields[b].layout.?.alignment;
+            return fields[a].alignment > fields[b].alignment;
         }
     };
 
@@ -2454,13 +2491,13 @@ const Evaluator = struct {
         for (fields) |fl| {
             const l = fl.layout orelse return null;
             payload_size = @max(payload_size, l.size);
-            payload_align = @max(payload_align, l.alignment);
+            payload_align = @max(payload_align, fl.alignment);
         }
         const payload: value.Layout = .{ .size = std.mem.alignForward(u64, payload_size, payload_align), .alignment = payload_align, .bits = null };
         switch (decl.layout) {
             .@"packed" => {
                 if (fields.len == 0) return null;
-                for (fields) |fl| if (!try ev.packable(fl.ty)) return null;
+                for (fields) |fl| if (fl.explicit_align or !try ev.packable(fl.ty)) return null;
                 const bits = fields[0].layout.?.bits orelse return null;
                 for (fields[1..]) |fl| if ((fl.layout.?.bits orelse return null) != bits) return null;
                 if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
@@ -2477,25 +2514,31 @@ const Evaluator = struct {
         return .{ .size = std.mem.alignForward(u64, tag.size + payload_size, alignment), .alignment = alignment, .bits = null };
     }
 
-    /// `@Struct` / `@Union` 的字段属性中有 comptime 字段或显式对齐（这时布局不能只由字段类型求出）；
-    /// 求不出时按有处理
-    fn customFieldAttrs(ev: *Evaluator, attrs: Val, is_union: bool) EvalError!bool {
-        return ev.anyCustomAttr(attrs, if (is_union) &.{"align"} else &.{ "align", "comptime" }) catch |err| switch (err) {
-            error.Abort => true,
+    const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
+
+    /// `@Struct` / `@Union` 的字段属性中的显式对齐与 comptime 字段（都取默认值时为空）
+    fn reifiedAttrs(ev: *Evaluator, attrs: Val, n: usize, is_union: bool) EvalError!ReifiedAttrs {
+        return ev.readAttrs(attrs, n, is_union) catch |err| switch (err) {
+            error.Abort => .{ .unknown = true },
             else => |x| x,
         };
     }
 
-    fn anyCustomAttr(ev: *Evaluator, attrs: Val, names: []const []const u8) EvalError!bool {
-        const n = try ev.elemCount(attrs) orelse return true;
-        for (0..n) |i| {
+    fn readAttrs(ev: *Evaluator, attrs: Val, n: usize, is_union: bool) EvalError!ReifiedAttrs {
+        if (try ev.elemCount(attrs) != n) return error.Abort;
+        const aligns = try ev.a.alloc(u64, n);
+        const comptimes = try ev.a.alloc(bool, n);
+        var any_align = false;
+        var any_comptime = false;
+        for (aligns, comptimes, 0..) |*al, *ct, i| {
             const attr = try ev.elemAt(attrs, i);
-            for (names) |field| {
-                const x = try ev.freeze(try ev.fieldAccess(attr, field)) orelse return true;
-                if (x != .null_value and x != .false_value) return true;
-            }
+            const x = try ev.freeze(try ev.fieldAccess(attr, "align")) orelse return error.Abort;
+            al.* = if (x == .null_value) 0 else try alignValue(ev.ip, x);
+            ct.* = !is_union and (try ev.condition(try ev.fieldAccess(attr, "comptime"))).yes;
+            any_align = any_align or al.* != 0;
+            any_comptime = any_comptime or ct.*;
         }
-        return false;
+        return .{ .aligns = if (any_align) aligns else &.{}, .comptimes = if (any_comptime) comptimes else &.{} };
     }
 
     // ── @typeInfo ────────────────────────────────────────────────────
@@ -2654,7 +2697,10 @@ const Evaluator = struct {
             const union_ty = try ev.member(type_ty, "Union");
             const fa_ty = try ev.member(union_ty, "FieldAttributes");
             const attrs = try ev.a.alloc(Index, fields.len);
-            for (attrs) |*o| o.* = try ev.structValue(fa_ty, &.{});
+            for (fields, attrs, 0..) |fl, *o, i| {
+                const fa = try ev.fieldAttrs(t, i, fl);
+                o.* = try ev.structValue(fa_ty, &.{.{ "align", try ev.alignAttr(fa.alignment) }});
+            }
             const tag = try ev.unionTagType(t);
             return .{ "union", try ev.structValue(union_ty, &.{
                 .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
@@ -2669,7 +2715,14 @@ const Evaluator = struct {
         const struct_ty = try ev.member(type_ty, "Struct");
         const fa_ty = try ev.member(struct_ty, "FieldAttributes");
         const attrs = try ev.a.alloc(Index, fields.len);
-        for (fields, attrs) |fl, *o| o.* = try ev.structValue(fa_ty, &.{.{ "default_value_ptr", try ev.defaultPtr(t, fl) }});
+        for (fields, attrs, 0..) |fl, *o, i| {
+            const fa = try ev.fieldAttrs(t, i, fl);
+            o.* = try ev.structValue(fa_ty, &.{
+                .{ "comptime", if (fa.is_comptime) .true_value else .false_value },
+                .{ "align", try ev.alignAttr(fa.alignment) },
+                .{ "default_value_ptr", try ev.defaultPtr(t, fl) },
+            });
+        }
         return .{ "struct", try ev.structValue(struct_ty, &.{
             .{ "is_tuple", if (ip.key(t) == .tuple_type) .true_value else .false_value },
             .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
@@ -2679,6 +2732,11 @@ const Evaluator = struct {
             .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
             .{ "decl_names", decls },
         }) };
+    }
+
+    /// 字段属性中的 `align`（`?usize`）
+    fn alignAttr(ev: *Evaluator, alignment: ?u64) Error!Index {
+        return if (alignment) |a| ev.intIndex(.usize_type, a) else .null_value;
     }
 
     /// 字段默认值的指针；有默认值但求不出时指向未知值
@@ -2818,6 +2876,13 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     if (a == .comptime_float_type or a == .comptime_int_type) return if (ip.isFloat(b)) b else null;
     if (b == .comptime_float_type or b == .comptime_int_type) return if (ip.isFloat(a)) a else null;
     return null;
+}
+
+/// 对齐的值：须为 2 的幂（否则编译器报错），求不出时放弃
+fn alignValue(ip: *InternPool, v: ?Index) EvalError!u64 {
+    const x = value.intOf(ip, v) orelse return error.Abort;
+    if (x <= 0 or x & (x - 1) != 0) return error.Abort;
+    return @intCast(x);
 }
 
 /// 浮点运算的结果；求不出（不是浮点类型、除数为零等）时放弃

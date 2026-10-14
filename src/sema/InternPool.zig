@@ -169,8 +169,12 @@ pub const Reified = struct {
     /// enum 成员的值
     values: []const i128 = &.{},
     nonexhaustive: bool = false,
-    /// struct / union 的字段带 comptime 或显式对齐（布局不能只由字段类型求出）
-    custom_field_attrs: bool = false,
+    /// struct / union 字段的显式对齐（0 为未指定）；为空时都未指定
+    field_aligns: []const u64 = &.{},
+    /// struct 的 comptime 字段；为空时都不是
+    comptime_fields: []const bool = &.{},
+    /// 字段属性求不出（布局未知）
+    attrs_unknown: bool = false,
 
     pub const Kind = enum { @"struct", @"enum", @"union" };
     pub const Layout = enum { auto, @"extern", @"packed" };
@@ -304,6 +308,8 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
             out.names = try dupeNames(a, t.names);
             out.types = try a.dupe(Index, t.types);
             out.values = try a.dupe(i128, t.values);
+            out.field_aligns = try a.dupe(u64, t.field_aligns);
+            out.comptime_fields = try a.dupe(bool, t.comptime_fields);
             break :blk .{ .reified_type = out };
         },
         .aggregate => |v| .{ .aggregate = .{ .ty = v.ty, .elems = try a.dupe(Index, v.elems) } },

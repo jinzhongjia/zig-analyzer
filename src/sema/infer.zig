@@ -171,6 +171,8 @@ const Inferrer = struct {
             },
             .@"const", .@"var", .field => {
                 const annotation: ?Index = if (b.type_expr) |t| (try inf.inferComptime(t, null)).asType() else null;
+                // 对齐属于签名：字段的布局读取它
+                if (b.align_expr) |e| _ = try inf.inferComptime(e, null);
                 if (mode == .full) if (b.value) |v| {
                     _ = try inf.infer(v, annotation);
                 };

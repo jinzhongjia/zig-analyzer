@@ -27,6 +27,8 @@ params: []const BindingId,
 value: ?ExprId,
 /// 变量与字段的类型标注、函数的返回类型
 type_expr: ?ExprId,
+/// 变量与字段的 `align(...)` 中的表达式
+align_expr: ?ExprId,
 
 pub const ExprId = enum(u32) { _ };
 pub const BindingId = enum(u32) { _ };
