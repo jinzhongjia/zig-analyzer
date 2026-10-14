@@ -105,7 +105,7 @@ pub fn identName(text: []const u8) []const u8 {
 }
 
 /// 容器成员的名字 token：函数名、变量名、字段名、test 名（字符串或标识符）；没有名字时为 null。
-/// 枚举成员没有冒号，名字在类型表达式的位置，需要由调用方说明成员是否在枚举中
+/// 枚举成员与联合的 void 字段可以没有冒号，名字在类型表达式的位置，需要由调用方说明（`in_enum`）
 pub fn memberName(member: SyntaxNode, in_enum: bool) ?SyntaxToken {
     return switch (member.kind()) {
         .fn_decl => if ((FnDecl{ .syntax = member }).proto()) |p| p.name() else null,

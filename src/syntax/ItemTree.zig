@@ -69,6 +69,11 @@ pub fn deinit(self: *ItemTree, gpa: Allocator) void {
     self.* = undefined;
 }
 
+/// 字段可以只写名字（枚举成员、联合的 void 字段），名字位于类型表达式的位置
+pub fn bareFieldNames(kind: Container.Kind) bool {
+    return kind == .@"enum" or kind == .@"union";
+}
+
 pub fn containerMembers(self: *const ItemTree, container: u32) []const u32 {
     const m = self.containers[container].members;
     return self.member_list[m.start..][0..m.len];
@@ -148,7 +153,7 @@ const Builder = struct {
                 .comptime_decl => .@"comptime",
                 else => continue,
             };
-            const name = if (ast.memberName(member, b.containers.items[index].kind == .@"enum")) |t| ast.identName(t.text) else null;
+            const name = if (ast.memberName(member, bareFieldNames(b.containers.items[index].kind))) |t| ast.identName(t.text) else null;
             const item_index: u32 = @intCast(b.items.items.len);
             try b.items.append(b.gpa, .{
                 .ast_id = try b.uniqueId(container_id, @tagName(kind), name orelse ""),

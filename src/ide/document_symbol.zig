@@ -33,7 +33,7 @@ const Builder = struct {
             const item = b.items.items[i];
             if (item.kind == .@"comptime") continue;
             const node = b.map.get(item.ast_id) orelse continue;
-            const name_tok = ast.memberName(node, kind == .@"enum");
+            const name_tok = ast.memberName(node, ItemTree.bareFieldNames(kind));
             const children = try b.childrenOf(i);
             const r = node.range();
             const sel = if (name_tok) |t| t.range() else r;
@@ -64,7 +64,7 @@ fn displayName(item: ItemTree.Item) []const u8 {
     return name;
 }
 
-fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.Container.Kind) types.SymbolKind {
+pub fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.Container.Kind) types.SymbolKind {
     const item = items.items[index];
     return switch (item.kind) {
         .@"fn" => if (container_kind == .file) .Function else .Method,

@@ -248,10 +248,10 @@ pub const Resolver = struct {
         return best;
     }
 
-    /// 成员是否为枚举的成员（决定字段名字的位置）
+    /// 成员所在的容器是否允许只写名字的字段（枚举、联合；决定字段名字的位置）
     pub fn inEnum(r: *Resolver, file: FileId, item: u32) Error!bool {
         const tree = try r.itemTree(file);
-        return tree.containers[tree.items[item].container].kind == .@"enum";
+        return ItemTree.bareFieldNames(tree.containers[tree.items[item].container].kind);
     }
 
     /// 定义所在的文件与名字位置（文件为开头）
