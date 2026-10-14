@@ -991,7 +991,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | 优先级 | 事项 | 现状 | 做法 |
 |---|---|---|---|
 | ~~高~~ | ~~`@import("builtin")` 的解析（M3 遗留）~~ | 已完成，见 §19.10 | — |
-| 高 | 与目标相关的大小 | `usize`、指针的位宽（`value.zig` 的 `pointer_bits`）按 zig-analyzer 自身的构建目标；模块的目标指针宽度不同时（如 32 位目标）结果错误 | 推导上下文带上所在模块，位宽取该模块 builtin 的 `target.ptrBitWidth()` |
+| ~~高~~ | ~~与目标相关的大小给出错误结果~~ | 已消除，见 §19.11：位宽取项目的目标；各模块宽度不一致时与大小相关的值为未知 | — |
+| 低 | 混合指针宽度的项目中与大小相关的值 | 同一项目同时有不同指针宽度的目标（如宿主工具与 wasm32 产物）时，`@sizeOf(usize)`、`maxInt(usize)` 等为未知（不会出错） | 「目标」进入 `Infer` / `DeclType` / `CallEval` 的键，同一文件按所在模块各推导一份 |
 | 中 | 递归函数的推导错误集 | 参与递归时取 `anyerror`（安全的上界） | 对递归的函数组做不动点迭代 |
 | 低 | 浮点的数学内置函数（`@sqrt`、`@sin` 等）、`@offsetOf`、auto 布局容器的大小 | 不求值 | 数学内置函数按 f128 计算；`@offsetOf` 与 auto 布局的大小需照搬编译器的布局算法（实现定义），只对 `extern` / `packed` 容器计算 |
 
@@ -1006,6 +1007,14 @@ pub fn make() std.ArrayList(u8) { ... }
 - 端到端测试：配置 `-Dtarget=x86_64-linux -Doptimize=ReleaseFast` 的项目中 `builtin.os.tag` 为 `.linux`、`builtin.mode` 为 `.fast`，`@import("builtin")` 跳转到生成的文件；单文件模式下为本机目标与 Debug。
 - 标准库全量统计（`sema-corpus` 使用默认 builtin）：声明类型已知 97.2% → 99.4%，局部变量 89.3% → 90.9%，表达式 90.7% → 92.2%。
 - 测试：`zig build test` 共 172 个。
+
+### 19.11 与目标相关的大小（2026-10-14）
+
+- 指针位宽（`usize`、`isize`、指针与切片的大小）不再固定为 zig-analyzer 自身的构建目标：Server 更新模块图时从各模块的 builtin.zig 解析 `cpu.arch` 与 `abi`，按 `std.Target.ptrBitWidth_arch_abi` 计算；各模块一致时取该宽度，不一致时为未知；没有项目模块时取默认 builtin（本机）。
+- 位宽同时写入 `PointerBits` input 与 `InternPool.pointer_bits`（同一写事务），`value.zig` 的值运算读后者；`Infer`、`DeclType`、`CallEval`、`ErrorSetOf` 在计算开始时读前者以记录依赖，目标变化时依赖它的结果失效（只依赖 `@sizeOf(usize)`、不 import 任何文件的代码也会重算，由测试覆盖）。
+- 端到端测试：wasm32 项目中 `@sizeOf(usize)` 为 4、`std.math.maxInt(usize)` 为 4294967295；同时有宿主与 wasm32 目标的项目中两者为未知；单文件模式为本机宽度；配置变更去掉 `-Dtarget` 后结果随之更新。
+- 同时修复：`zig env` 原样输出相对路径的 `ZIG_GLOBAL_CACHE_DIR`（CI 即如此设置），`ZigEnv` 现在把 `lib_dir`、`std_dir`、`global_cache_dir` 转为绝对路径；此前生成的 builtin.zig 路径为相对路径，导致 CI 上三个平台的测试失败。
+- 测试：`zig build test` 共 175 个。
 
 ## 20. 风险与对策
 
