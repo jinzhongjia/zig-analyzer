@@ -343,14 +343,15 @@ fn binary(comptime T: type, f: FloatBinFn, a: T, b: T) ?T {
         else => {},
     }
     if (b == 0) return null;
-    // 负除数的 `@mod`：编译器在 comptime 的结果与运行时不同（f64 的 7 mod -3 得 1 而不是 -2），视为未知
-    if (f == .mod and b < 0) return null;
+    // 编译器在 comptime 调用自身的同名内置函数，发行版的编译器经 LLVM 编译，展开为以下形式。按同样的
+    // 展开式计算，结果不随 zig-analyzer 自身的编译后端变化。`@mod` 只按被除数的符号调整，除数为负时
+    // 与数学定义不同（f64 的 7 mod -3 得 1 而不是 -2）
     return switch (f) {
-        .mod => @mod(a, b),
+        .mod => if (a < 0) @rem(@rem(a, b) + b, b) else @rem(a, b),
         .rem => @rem(a, b),
-        .div_trunc => @divTrunc(a, b),
-        .div_floor => @divFloor(a, b),
-        .div_ceil => @divCeil(a, b),
+        .div_trunc => @trunc(a / b),
+        .div_floor => @floor(a / b),
+        .div_ceil => @ceil(a / b),
         .div_exact => if (@rem(a, b) != 0) null else a / b,
         .min, .max => unreachable,
     };

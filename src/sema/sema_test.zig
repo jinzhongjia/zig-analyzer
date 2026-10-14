@@ -697,7 +697,8 @@ test "float math builtins use the precision of the operand type" {
         \\    const mi = @mod(@as(i32, 7), -3);
         \\    const rn = @rem(@as(f64, -7), -3);
         \\    const mf = @mod(@as(f64, 7), -3);
-        \\    _ = .{ r32, r64, r16, rc, sn, lg, fl, rd, ab, md, rm, ma, mn, dc, df, ai, ic, mi, rn, mf };
+        \\    const mg = @mod(@as(f32, -7.5), -2);
+        \\    _ = .{ r32, r64, r16, rc, sn, lg, fl, rd, ab, md, rm, ma, mn, dc, df, ai, ic, mi, rn, mf, mg };
         \\}
     , &.{
         .{ "r32", "f32 = 1.4142135" },
@@ -718,10 +719,11 @@ test "float math builtins use the precision of the operand type" {
         // 有符号整数的绝对值为无符号整数
         .{ "ai", "u8 = 128" },
         .{ "ic", "i32 = -3" },
-        // 负除数：整数按向下取整的语义；浮点的 `@mod` 在 comptime 与运行时结果不同，视为未知
+        // 负除数：整数按向下取整的语义；浮点的 `@mod` 与编译器一致，只按被除数的符号调整
         .{ "mi", "i32 = -2" },
         .{ "rn", "f64 = -1" },
-        .{ "mf", "f64" },
+        .{ "mf", "f64 = 1" },
+        .{ "mg", "f32 = -1.5" },
     });
 }
 
