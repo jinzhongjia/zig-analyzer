@@ -998,8 +998,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | ~~高~~ | ~~`@import("builtin")` 的解析（M3 遗留）~~ | 已完成，见 §19.10 | — |
 | ~~高~~ | ~~与目标相关的大小给出错误结果~~ | 已消除，见 §19.11：位宽取项目的目标；各模块宽度不一致时与大小相关的值为未知 | — |
 | 低 | 混合指针宽度的项目中与大小相关的值 | 同一项目同时有不同指针宽度的目标（如宿主工具与 wasm32 产物）时，`@sizeOf(usize)`、`maxInt(usize)` 等为未知（不会出错） | 「目标」进入 `Infer` / `DeclType` / `CallEval` 的键，同一文件按所在模块各推导一份 |
-| 中 | 递归函数的推导错误集 | 参与递归时取 `anyerror`（安全的上界） | 对递归的函数组做不动点迭代 |
-| 低 | 浮点的数学内置函数（`@sqrt`、`@sin` 等）、`@offsetOf`、auto 布局容器的大小 | 不求值 | 数学内置函数按 f128 计算；`@offsetOf` 与 auto 布局的大小需照搬编译器的布局算法（实现定义），只对 `extern` / `packed` 容器计算 |
+| ~~中~~ | ~~递归函数的推导错误集~~ | 已完成，见 §19.14：取最小不动点 | — |
+| ~~低~~ | ~~浮点的数学内置函数（`@sqrt`、`@sin` 等）、`@offsetOf`、auto 布局容器的大小~~ | 已完成，见 §19.14：照搬编译器的布局算法；不带标签的 auto union、显式对齐的字段等仍为未知 | — |
 
 ### 19.10 `@import("builtin")` 的解析（2026-10-14）
 
@@ -1071,6 +1071,34 @@ pub fn make() std.ArrayList(u8) { ... }
 - 同时修复：一条日志中的中文标点；builtin.zig 写入缓存失败或被取消时泄漏路径字符串。
 - 测试运行器：构建时在 Zig 自带的运行器上开启测试分配器的调用栈记录（`tools/patch_test_runner.zig`），测试模块保留帧指针，ReleaseSafe 下的泄漏报告也带调用栈（CI 上曾偶发一次无法定位的泄漏）。
 - 测试：`zig build test` 共 189 个。
+
+### 19.14 递归函数的错误集、浮点数学函数与布局（2026-10-14）
+
+补全 §19.9 中的两项。对照编译器实现时，另外修正了 `@min` / `@max` 的结果类型，并补上了不同整数类型、不同浮点类型之间的 peer 类型。
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 不动点 | `src/db/engine.zig` | query 可声明 `fixpoint`：`cycleFallback` 是值的最小元，环中对自身的读取只把读到的值并入结果。这时环的入口算一遍即得最小不动点，入口的结果写入 memo，环内其他 query 的结果仍不写入。栈深度超过上限不是环，回退值改由 `depthFallback` 给出 |
+| 推导的错误集 | `src/sema/queries.zig` | `ErrorSetOf` 声明 `fixpoint`：环中取空错误集（InternPool 新增预置的 `empty_error_set`），栈深度超过上限取 anyerror。自身递归的函数与编译器一致，如 `return rec(n - 1)` 的错误集只含函数体中 `return` 的错误；相互递归（编译器报错）取各函数错误的并集 |
+| 布局 | `src/sema/eval.zig`、`value.zig` | 照搬编译器的算法（`Sema/type_resolution.zig`）。auto 结构体按对齐降序重排字段，与编译器同样用 `std.mem.sortUnstable` 和相同的比较函数，对齐相同的字段顺序也一致；comptime 字段不占空间。extern 按声明顺序。packed 的 backing 整数为各字段位宽之和，字段须为整数、浮点、bool、void、指定了标签类型的枚举或 packed 容器。带标签的 union 为最大字段加标签，只有一个字段时没有标签；extern union 不带标签；packed union 的各字段位宽相同。枚举取标签整数的布局。错误联合与非指针的 optional 由载荷求出。`@offsetOf` / `@bitOffsetOf` 由同一布局求出 |
+| `@bitSizeOf` | 同上 | 只对有位表示的类型给出值。切片、非指针的 optional、错误联合与非 packed 的容器没有位表示（编译器报错），此前给出了值。数组的位宽为（长度 + 哨兵）× 元素位宽，且要求元素有位表示 |
+| 浮点 | `src/sema/value.zig`、`eval.zig`、`InternPool.zig` | `@sqrt`、`@sin`、`@cos`、`@tan`、`@exp`、`@exp2`、`@log`、`@log2`、`@log10`、`@floor`、`@ceil`、`@trunc`、`@round`、`@abs`、`@mulAdd`，以及浮点参数的 `@min`/`@max`/`@mod`/`@rem`/`@divTrunc`/`@divFloor`/`@divCeil`/`@divExact`：按操作数的浮点类型计算（comptime_float 按 f128），与编译器一致。浮点值按其类型的精度显示（f32 的 √2 为 1.4142135） |
+| `@min` / `@max` | `src/sema/value.zig`、`eval.zig`、`infer.zig` | 结果类型与编译器一致（此前取 peer 类型）：有浮点参数时为位宽最大的浮点类型；整数为容纳结果范围的最小整数类型，各参数的范围在值已知时取该值、否则取类型的范围。如 `@min(x: u8, y: u16)` 为 u8，`@min(x, 10)` 为 u4，`@min(@as(u8, 3), @as(u16, 5))` 为 u2 |
+| peer 类型 | `src/sema/infer.zig` | 不同的整数类型之间、不同的浮点类型之间的 peer 类型（此前为未知，如 `usize + u32`）：整数同符号取较宽者、位宽相同取前者（`usize + u64` 为 usize），无符号且较窄时放入有符号；浮点取位宽较大者。与编译器一致 |
+| 推导器 | `src/sema/infer.zig` | 参数都已知时，数学函数与布局由解释器计算（`eval.builtinValue`、`eval.typeLayout`）；有符号整数的 `@abs` 为同位宽的无符号整数 |
+| 构造类型 | `src/sema/eval.zig` | `@Struct` / `@Union` / `@Enum` 中按字段给出的参数带上结果类型 `*const [n]T`，与编译器一致，`&@splat(.{})` 等写法可以求值（如 `std.enums.EnumFieldStruct`）。字段属性带 comptime 或显式对齐时记录在类型中，这时布局为未知 |
+
+- 仍为未知（不会给出错误结果）：
+  - 不带标签的 auto union：Debug 与 ReleaseSafe 下有安全检查用的隐藏标签，大小取决于优化模式，而优化模式不是推导的输入。
+  - 字段带显式对齐（`align(N)`）：对齐表达式不求值。
+  - 元组与匿名结构体字面量：comptime 已知的字段是 comptime 字段，类型中没有记录。
+  - 向量：布局取决于后端与 CPU 特性。
+  - `c_long` 等取决于目标的 C 类型。
+  - 负除数的浮点 `@mod`：编译器在 comptime 的结果与运行时不同（f64 的 7 mod -3 得 1 而不是 -2）。
+- 同时修复：解释器中 i128 的最小值参与整数除法时溢出会触发安全检查（进程崩溃），现在放弃求值。
+- 验证：布局（含字段重排、comptime 字段、零大小字段、嵌套的容器、构造的类型）与浮点结果逐项与 zig 0.17.0 编译运行的结果核对（x86_64-linux）。
+- 标准库全量统计：声明类型已知 36997 → 37008（99.3%），局部变量 36926 → 37236（90.9% → 91.7%），表达式 940132 → 942393（92.1% → 92.4%），增加的主要来自 peer 类型；逐个成员对比，没有成员的未知表达式变多。耗时不变（ReleaseSafe 约 3.9 秒）。
+- 测试：`zig build test` 共 197 个（Debug 与 ReleaseSafe 均通过）。
 
 ## 20. 风险与对策
 
