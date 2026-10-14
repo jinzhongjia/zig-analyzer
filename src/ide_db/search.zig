@@ -210,7 +210,7 @@ const Finder = struct {
 };
 
 /// Body 中是否出现了名字 `name`（名字引用、字段访问、枚举字面量、初始化字段）
-fn mentions(body: *const Body, name: []const u8) bool {
+pub fn mentions(body: *const Body, name: []const u8) bool {
     for (body.exprs) |e| switch (e) {
         .name_ref => |n| if (std.mem.eql(u8, n, name)) return true,
         .field_access => |fa| if (fa.field) |n| if (std.mem.eql(u8, n, name)) return true,

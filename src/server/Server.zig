@@ -82,6 +82,10 @@ progress: Progress = .{},
 
 /// 串行化模块图的更新，避免较旧的快照覆盖较新的
 graph_mutex: Io.Mutex = .init,
+/// 后台索引的代数：模块图每次更新加一
+index_generation: std.atomic.Value(u64) = .init(0),
+/// 是否有索引任务在运行（同时只运行一个）
+indexing: std.atomic.Value(bool) = .init(false),
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── 拉取配置（只在主循环中访问）──
@@ -415,7 +419,9 @@ fn builtinPointerBits(server: *Server, file: Vfs.FileId) ?u16 {
 
 /// 汇总各项目的构建图与编译集合，更新模块图 input
 pub fn updateModuleGraph(server: *Server) void {
-    server.updateModuleGraphInner() catch |err| log.err("failed to update module graph: {t}", .{err});
+    server.updateModuleGraphInner() catch |err| return log.err("failed to update module graph: {t}", .{err});
+    // 须在写事务结束之后：索引任务可能就地执行
+    server.scheduleIndexing();
 }
 
 fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
@@ -455,6 +461,88 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     try server.db.set(ModuleGraph.Input, {}, graph, .medium);
     try server.db.set(za.sema.queries.PointerBits, {}, bits, .medium);
     server.ip.setPointerBits(bits);
+}
+
+const index_progress_delay_ms = 200;
+
+/// 每批索引的文件数：每批一个读事务，编辑（写事务）最多等一批
+const index_batch = 8;
+
+/// 后台为项目文件建立索引（文件索引与 ItemTree）：引用查找、workspace symbol 与调用点种子
+/// 只需读取索引，不必在请求中解析全部文件。解析结果随后按 LRU 淘汰，索引保留。
+///
+/// 同时只运行一个任务：模块图在项目加载与构建期间会多次更新，运行中的任务不中断，做完一遍后
+/// 发现模块图变了就再做一遍（已建立的索引直接命中缓存）
+fn scheduleIndexing(server: *Server) void {
+    _ = server.index_generation.fetchAdd(1, .monotonic);
+    if (server.indexing.swap(true, .acq_rel)) return;
+    server.busyBegin();
+    server.bg_group.concurrent(server.io, indexTask, .{server}) catch
+        server.bg_group.async(server.io, indexTask, .{server});
+}
+
+fn indexTask(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    while (true) {
+        const generation = server.index_generation.load(.monotonic);
+        server.indexOnce() catch |err| {
+            server.indexing.store(false, .release);
+            return err;
+        };
+        if (server.index_generation.load(.monotonic) != generation) continue;
+        server.indexing.store(false, .release);
+        // 释放标志后又有更新，且没有其他任务接手：继续
+        if (server.index_generation.load(.monotonic) == generation or server.indexing.swap(true, .acq_rel)) return;
+    }
+}
+
+fn indexOnce(server: *Server) Io.Cancelable!void {
+    var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena_state.deinit();
+    const files = blk: {
+        var ctx = server.db.beginRead(arena_state.allocator());
+        defer ctx.end();
+        var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
+        break :blk za.ide_db.search.projectFiles(&r) catch return;
+    };
+    if (files.len == 0) return;
+    // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
+    const t0 = Io.Clock.awake.now(server.io);
+    var progress: ?*Progress.Progress = null;
+    var progress_started = false;
+    var done: usize = 0;
+    defer if (progress) |p| server.progress.end(server, p, if (done == files.len) "Done" else "Interrupted");
+    var scratch: std.heap.ArenaAllocator = .init(server.gpa);
+    defer scratch.deinit();
+    while (done < files.len) {
+        if (server.isShuttingDown()) return;
+        const end = @min(done + index_batch, files.len);
+        _ = scratch.reset(.retain_capacity);
+        {
+            var ctx = server.db.beginRead(scratch.allocator());
+            defer ctx.end();
+            indexFiles(&ctx, files[done..end]) catch |err| switch (err) {
+                // 被编辑打断：重试这一批
+                error.Canceled => continue,
+                error.OutOfMemory => return log.err("out of memory while indexing", .{}),
+            };
+        }
+        done = end;
+        if (server.db.wantsSweep()) server.db.sweep();
+        if (!progress_started and t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds > index_progress_delay_ms * std.time.ns_per_ms) {
+            progress = server.progress.begin(server, "Indexing", true);
+            progress_started = true;
+        }
+        var buf: [32]u8 = undefined;
+        if (progress) |p| server.progress.report(server, p, std.fmt.bufPrint(&buf, "{d}/{d} files", .{ done, files.len }) catch null, @intCast(done * 100 / files.len));
+    }
+}
+
+fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId) za.db.Error!void {
+    for (files) |f| {
+        _ = try ctx.get(za.ide_db.FileIndex.Query, f);
+        _ = try ctx.get(syntax_q.FileItemTree, f);
+    }
 }
 
 fn removePending(server: *Server, pending: *Pending) void {

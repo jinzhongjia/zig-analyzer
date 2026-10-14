@@ -31,17 +31,18 @@ pub const Seed = struct {
 /// 项目中其他能引用到该函数的文件
 pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     const root = try genericRoot(r, file, item) orelse return null;
-    if (try findIn(r, file, file, item, root)) |s| return s;
     const name = (try r.itemTree(file)).items[root].name orelse return null;
+    if (try findIn(r, file, file, item, root, name)) |s| return s;
     for (try search.importers(r, file, try search.projectFiles(r))) |f| {
         if (f == file or !(try r.ctx.get(FileIndex.Query, f)).contains(ast.identName(name))) continue;
-        if (try findIn(r, f, file, item, root)) |s| return s;
+        if (try findIn(r, f, file, item, root, name)) |s| return s;
     }
     return null;
 }
 
-/// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32) resolve.Error!?Seed {
+/// 在文件 `in` 中查找泛型函数 `root`（位于 `file`，名为 `name`）的调用点。
+/// 只推导提到该名字的成员：推导整个成员代价较高
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, name: []const u8) resolve.Error!?Seed {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
@@ -50,6 +51,7 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32) resolve.
         if (in == file and try enclosedBy(r, file, @intCast(i), root)) continue;
         const owner = try r.ownerKey(in, @intCast(i));
         const body = try r.ctx.get(hir.ItemBody, owner);
+        if (!search.mentions(body, name)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         if (res.exprs.len != body.exprs.len) continue;
         for (body.exprs, 0..) |e, ei| {
