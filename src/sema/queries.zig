@@ -19,13 +19,13 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 
-/// 目标的指针位宽（各模块一致时）；null 表示不一致。值同时存于 `InternPool.pointer_bits` 供值的运算读取，
-/// 用到值运算的 query 先读本 input 以记录依赖
-pub const PointerBits = struct {
+/// 与目标相关的值运算参数：指针位宽、向量的布局规则（各模块一致时）。值同时存于 InternPool 供值的运算
+/// 读取，用到值运算的 query 先读本 input 以记录依赖
+pub const TargetAbi = struct {
     pub const kind: engine.Kind = .input;
     pub const Key = void;
-    pub const Value = ?u16;
-    pub const default: Value = @bitSizeOf(usize);
+    pub const Value = InternPool.Target;
+    pub const default: Value = .{};
 };
 
 pub const InferKey = struct {
@@ -50,7 +50,7 @@ pub const Infer = struct {
     pub const lru = 16 * 1024;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
-        _ = try ctx.get(PointerBits, {});
+        _ = try ctx.get(TargetAbi, {});
         const gpa = ctx.db.gpa;
         const result = try gpa.create(infer.Result);
         errdefer gpa.destroy(result);
@@ -83,7 +83,7 @@ pub const DeclType = struct {
     pub const Value = TypedValue;
 
     pub fn compute(ctx: *Db.Ctx, dk: Key) engine.Error!Value {
-        _ = try ctx.get(PointerBits, {});
+        _ = try ctx.get(TargetAbi, {});
         const key = dk.owner;
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
@@ -169,7 +169,7 @@ pub const ErrorSetOf = struct {
     pub const fixpoint = true;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
-        _ = try ctx.get(PointerBits, {});
+        _ = try ctx.get(TargetAbi, {});
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
@@ -254,7 +254,7 @@ pub const CallEval = struct {
     pub const Value = TypedValue;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
-        _ = try ctx.get(PointerBits, {});
+        _ = try ctx.get(TargetAbi, {});
         return eval.compute(ctx, key);
     }
 

@@ -17,8 +17,10 @@ gpa: Allocator,
 io: Io,
 mutex: Io.Mutex = .init,
 /// 目标的指针位宽（usize、指针的大小）；0 表示未知（项目中各模块的宽度不一致）。
-/// 与 `PointerBits` input 在同一写事务中设置，读取它的 query 都先读该 input 以记录依赖
+/// 与 `queries.TargetAbi` input 在同一写事务中设置，读取它的 query 都先读该 input 以记录依赖
 pointer_bits: std.atomic.Value(u16) = .init(@bitSizeOf(usize)),
+/// 向量的布局规则；设置方式同 `pointer_bits`
+vector_abi: std.atomic.Value(VectorAbi) = .init(.unknown),
 /// Key 中切片的存储
 arena: std.heap.ArenaAllocator,
 items: std.ArrayList(Key) = .empty,
@@ -269,10 +271,53 @@ pub fn pointerBits(ip: *const InternPool) ?u16 {
     return if (bits == 0) null else bits;
 }
 
-/// 只能在写事务中调用
-pub fn setPointerBits(ip: *InternPool, bits: ?u16) void {
-    ip.pointer_bits.store(bits orelse 0, .monotonic);
+pub fn vectorAbi(ip: *const InternPool) VectorAbi {
+    return ip.vector_abi.load(.monotonic);
 }
+
+/// 只能在写事务中调用
+pub fn setTarget(ip: *InternPool, t: Target) void {
+    ip.pointer_bits.store(t.pointer_bits orelse 0, .monotonic);
+    ip.vector_abi.store(t.vector_abi, .monotonic);
+}
+
+/// 与目标相关的值运算参数（各模块一致时）
+pub const Target = struct {
+    /// 指针位宽；各模块不一致时为 null
+    pointer_bits: ?u16 = @bitSizeOf(usize),
+    vector_abi: VectorAbi = .unknown,
+};
+
+/// 向量的布局规则（`Type.abiAlignment` / `abiSize` 的 vector 分支），由编译后端、架构与 CPU 特性决定
+pub const VectorAbi = enum(u8) {
+    unknown,
+    /// 对齐为不小于字节数的 2 的幂（LLVM 等后端）
+    llvm,
+    /// 同 `llvm`，但不超过栈对齐 16（aarch64）
+    llvm_aarch64,
+    /// 自研 x86_64 后端：对齐至少为 16；有 AVX / AVX-512 时超过 16 / 32 字节的向量为 32 / 64
+    x86_64,
+    x86_64_avx,
+    x86_64_avx512,
+    /// 按元素的对齐（C、wasm 后端）
+    elem,
+
+    pub fn of(backend: std.lang.CompilerBackend, arch: std.Target.Cpu.Arch, avx: bool, avx512f: bool, soft_float: bool) VectorAbi {
+        // x86 的软浮点：浮点元素按元素布局，这里不区分元素类型
+        if (soft_float) return .unknown;
+        return switch (backend) {
+            .stage2_x86_64 => if (avx512f) .x86_64_avx512 else if (avx) .x86_64_avx else .x86_64,
+            .stage2_c, .stage2_wasm => .elem,
+            // 其余后端按字节数。ARM 与 s390x 的对齐不超过各自的栈对齐，MIPS 与 PowerPC 的 f16 为软浮点，
+            // 只处理常见的架构
+            else => switch (arch) {
+                .x86, .x86_64, .riscv32, .riscv64, .wasm32, .wasm64, .loongarch64 => .llvm,
+                .aarch64, .aarch64_be => .llvm_aarch64,
+                else => .unknown,
+            },
+        };
+    }
+};
 
 /// 驻留：相同的 Key 返回相同的 Index
 pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {

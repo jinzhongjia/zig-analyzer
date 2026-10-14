@@ -8,6 +8,7 @@ const World = @import("../names/resolve_test.zig").World;
 const ModuleGraph = @import("../names/ModuleGraph.zig");
 const queries = @import("queries.zig");
 const render = @import("render.zig");
+const InternPool = @import("InternPool.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 /// `needle` 第 `nth` 次出现处：名字与绑定重合时取绑定的类型，否则取区间恰好为 `needle` 的表达式的类型
@@ -56,9 +57,15 @@ fn isIdent(c: u8) bool {
 }
 
 fn expectTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    return expectTypesTargeted(.{}, src, cases);
+}
+
+/// 同 `expectTypes`，使用给定的目标参数（指针位宽、向量的布局规则）
+fn expectTypesTargeted(target: InternPool.Target, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
+    try w.setTarget(target);
     const f = try w.add("/p/main.zig", src);
     for (cases) |c| {
         const actual = try typeAt(&w, f.file, src, c[0], 0);
@@ -803,6 +810,58 @@ test "peer types of different integer and float types" {
         .{ "b3", "i64" },
         .{ "skip", "u64" },
         .{ "next", "usize" },
+    });
+}
+
+test "vector layouts follow the backend and CPU features" {
+    // 期望值为 zig 0.17.0 的结果：x86_64-linux 的 Debug 默认使用自研后端，`-fllvm` 为 LLVM
+    const src =
+        \\fn g() void {
+        \\    const v2u8 = @sizeOf(@Vector(2, u8));
+        \\    const v3u5 = @sizeOf(@Vector(3, u5));
+        \\    const v16f32 = @alignOf(@Vector(16, f32));
+        \\    const v8u32 = @alignOf(@Vector(8, u32));
+        \\    const v100bool = @sizeOf(@Vector(100, bool));
+        \\    const v3ptr = @sizeOf(@Vector(3, *u8));
+        \\    const bits = @bitSizeOf(@Vector(3, u5));
+        \\    _ = .{ v2u8, v3u5, v16f32, v8u32, v100bool, v3ptr, bits };
+        \\}
+    ;
+    // 自研 x86_64 后端：对齐至少为 16，AVX 下超过 16 字节为 32，AVX-512 下超过 32 字节为 64
+    try expectTypesTargeted(.{ .vector_abi = .x86_64_avx }, src, &.{
+        .{ "v2u8", "comptime_int = 16" },
+        .{ "v3u5", "comptime_int = 16" },
+        .{ "v16f32", "comptime_int = 32" },
+        .{ "v8u32", "comptime_int = 32" },
+        .{ "v100bool", "comptime_int = 16" },
+        .{ "v3ptr", "comptime_int = 32" },
+        .{ "bits", "comptime_int = 15" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .x86_64 }, src, &.{
+        .{ "v16f32", "comptime_int = 16" },
+        .{ "v8u32", "comptime_int = 16" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .x86_64_avx512 }, src, &.{
+        .{ "v16f32", "comptime_int = 64" },
+        .{ "v8u32", "comptime_int = 32" },
+    });
+    // LLVM：对齐为不小于字节数的 2 的幂；aarch64 不超过 16
+    try expectTypesTargeted(.{ .vector_abi = .llvm }, src, &.{
+        .{ "v2u8", "comptime_int = 2" },
+        .{ "v3u5", "comptime_int = 2" },
+        .{ "v16f32", "comptime_int = 64" },
+        .{ "v100bool", "comptime_int = 16" },
+        .{ "v3ptr", "comptime_int = 32" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+        .{ "v16f32", "comptime_int = 16" },
+        .{ "v8u32", "comptime_int = 16" },
+        .{ "v3ptr", "comptime_int = 32" },
+    });
+    // 后端未知（各模块不一致等）
+    try expectTypesTargeted(.{ .vector_abi = .unknown }, src, &.{
+        .{ "v2u8", "comptime_int" },
+        .{ "bits", "comptime_int" },
     });
 }
 

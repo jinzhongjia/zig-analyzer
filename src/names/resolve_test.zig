@@ -64,6 +64,14 @@ pub const World = struct {
         try w.db.set(ModuleGraph.Input, {}, g, .low);
     }
 
+    /// 设置与目标相关的值运算参数（同 Server 更新模块图时）
+    pub fn setTarget(w: *World, t: InternPool.Target) !void {
+        w.db.beginWrite();
+        defer w.db.endWrite();
+        try w.db.set(database.sema.TargetAbi, {}, t, .medium);
+        w.ip.setTarget(t);
+    }
+
     /// goto definition 的结果：「文件名:目标文本」
     fn goto(w: *World, file: FileId, offset: u32) ![]const u8 {
         var ctx = w.db.beginRead(w.arena.allocator());

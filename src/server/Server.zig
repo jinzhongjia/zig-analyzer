@@ -394,27 +394,35 @@ fn SemanticTask(comptime func: anytype) type {
     };
 }
 
-/// 目标的指针位宽：各模块的 builtin 一致时取该宽度，不一致时为 null（与大小相关的值为未知）；
-/// 没有项目模块时取默认 builtin（本机）
-fn pointerBits(server: *Server, graph: *const ModuleGraph) ?u16 {
-    var result: ?u16 = null;
+/// 与目标相关的值运算参数（指针位宽、向量的布局规则）：各模块的 builtin 一致时取该值，不一致时为未知
+/// （与大小相关的值为未知）；没有项目模块时取默认 builtin（本机）
+fn targetAbi(server: *Server, graph: *const ModuleGraph) za.sema.InternPool.Target {
+    var result: za.sema.InternPool.Target = .{};
     var any = false;
     for (graph.modules) |m| {
         const file = m.builtin orelse continue;
-        const bits = server.builtinPointerBits(file) orelse return null;
-        if (any and result != bits) return null;
-        result = bits;
-        any = true;
+        const t = server.builtinTarget(file);
+        if (!any) {
+            result = t;
+            any = true;
+            continue;
+        }
+        if (result.pointer_bits != t.pointer_bits) result.pointer_bits = null;
+        if (result.vector_abi != t.vector_abi) result.vector_abi = .unknown;
     }
     if (any) return result;
-    if (graph.default_builtin) |f| return server.builtinPointerBits(f);
-    return @bitSizeOf(usize);
+    if (graph.default_builtin) |f| return server.builtinTarget(f);
+    return .{};
 }
 
-fn builtinPointerBits(server: *Server, file: Vfs.FileId) ?u16 {
-    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return null;
+fn builtinTarget(server: *Server, file: Vfs.FileId) za.sema.InternPool.Target {
+    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return .{ .pointer_bits = null };
     defer server.gpa.free(text);
-    return za.project.builtin.pointerBits(text);
+    const facts = za.project.builtin.vectorFacts(text);
+    return .{
+        .pointer_bits = za.project.builtin.pointerBits(text),
+        .vector_abi = if (facts) |f| .of(f.backend, f.arch, f.avx, f.avx512f, f.soft_float) else .unknown,
+    };
 }
 
 /// 汇总各项目的构建图与编译集合，更新模块图 input
@@ -454,13 +462,13 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     const graph = try server.gpa.create(ModuleGraph);
     errdefer server.gpa.destroy(graph);
     graph.* = try b.finish(std_root, default_builtin);
-    const bits = server.pointerBits(graph);
+    const t = server.targetAbi(graph);
     // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
     server.db.beginWrite();
     defer server.db.endWrite();
     try server.db.set(ModuleGraph.Input, {}, graph, .medium);
-    try server.db.set(za.sema.queries.PointerBits, {}, bits, .medium);
-    server.ip.setPointerBits(bits);
+    try server.db.set(za.sema.queries.TargetAbi, {}, t, .medium);
+    server.ip.setTarget(t);
 }
 
 const index_progress_delay_ms = 200;

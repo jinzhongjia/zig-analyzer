@@ -63,7 +63,7 @@ pub fn call(r: *Resolver, inst: Index, args: []const TypedValue) Error!TypedValu
 
 /// `CallEval` 的计算
 pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
-    _ = try ctx.get(queries.PointerBits, {});
+    _ = try ctx.get(queries.TargetAbi, {});
     var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
     defer scratch.deinit();
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };

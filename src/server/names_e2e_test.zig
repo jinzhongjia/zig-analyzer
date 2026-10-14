@@ -276,13 +276,14 @@ const sizes_main =
     \\pub fn main() void {
     \\    const size = @sizeOf(usize);
     \\    const max = std.math.maxInt(usize);
-    \\    _ = .{ size, max };
+    \\    const vec = @sizeOf(@Vector(2, u8));
+    \\    _ = .{ size, max, vec };
     \\}
     \\
 ;
 
-/// 打开 `files` 组成的项目中的 main.zig，返回 `size` 与 `max` 的 hover
-fn sizesHover(files: []const fixture.File, build_args: ?[]const u8) !struct { size: []const u8, max: []const u8 } {
+/// 打开 `files` 组成的项目中的 main.zig，返回 `size`、`max` 与 `vec` 的 hover
+fn sizesHover(files: []const fixture.File, build_args: ?[]const u8) !struct { size: []const u8, max: []const u8, vec: []const u8 } {
     var project = try fixture.Project.create(files);
     defer project.deinit();
     var h: Harness = undefined;
@@ -301,9 +302,11 @@ fn sizesHover(files: []const fixture.File, build_args: ?[]const u8) !struct { si
     const size = try testing.allocator.dupe(u8, try hoverText(&h, uri, sizes_main, "size ="));
     errdefer testing.allocator.free(size);
     const max = try testing.allocator.dupe(u8, try hoverText(&h, uri, sizes_main, "max ="));
+    errdefer testing.allocator.free(max);
+    const vec = try testing.allocator.dupe(u8, try hoverText(&h, uri, sizes_main, "vec ="));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
-    return .{ .size = size, .max = max };
+    return .{ .size = size, .max = max, .vec = vec };
 }
 
 test "pointer width follows the project's target" {
@@ -316,8 +319,11 @@ test "pointer width follows the project's target" {
     );
     defer testing.allocator.free(wasm.size);
     defer testing.allocator.free(wasm.max);
+    defer testing.allocator.free(wasm.vec);
     try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", wasm.size);
     try testing.expectEqualStrings("```zig\nconst max: comptime_int = 4294967295\n```", wasm.max);
+    // wasm32 默认使用 LLVM 后端：向量按字节数对齐
+    try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", wasm.vec);
 
     // 同时有宿主与 wasm32 两个目标：宽度不一致，与大小相关的值为未知（不给出可能错误的值）
     const mixed = try sizesHover(&.{
@@ -342,20 +348,23 @@ test "pointer width follows the project's target" {
     }, null);
     defer testing.allocator.free(mixed.size);
     defer testing.allocator.free(mixed.max);
+    defer testing.allocator.free(mixed.vec);
     try testing.expectEqualStrings("```zig\nconst size: comptime_int\n```", mixed.size);
     try testing.expectEqualStrings("```zig\nconst max: comptime_int\n```", mixed.max);
+    try testing.expectEqualStrings("```zig\nconst vec: comptime_int\n```", mixed.vec);
 
     // 单文件模式：本机
     const single = try sizesHover(&.{.{ .path = "main.zig", .text = sizes_main }}, null);
     defer testing.allocator.free(single.size);
     defer testing.allocator.free(single.max);
+    defer testing.allocator.free(single.vec);
     const expected = try std.fmt.allocPrint(testing.allocator, "```zig\nconst size: comptime_int = {d}\n```", .{@sizeOf(usize)});
     defer testing.allocator.free(expected);
     try testing.expectEqualStrings(expected, single.size);
 }
 
 test "results depending on pointer width are recomputed when the target changes" {
-    // 不 import 任何文件：结果只经由 PointerBits 依赖目标（不依赖模块图）
+    // 不 import 任何文件：结果只经由 TargetAbi 依赖目标（不依赖模块图）
     const text =
         \\pub fn main() void {
         \\    const size = @sizeOf(usize);

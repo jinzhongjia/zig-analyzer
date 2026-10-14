@@ -416,8 +416,51 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
         .optional_type => |c| optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
         .array_type => |a| arrayLayout(typeLayout(ip, a.child) orelse return null, a, hasBitRepr(ip, a.child)),
         .error_union_type => |eu| errorUnionLayout(typeLayout(ip, eu.payload) orelse return null),
+        .vector_type => |v| vectorLayout(ip, v.len, v.child),
         else => null,
     };
+}
+
+/// `@Vector(len, T)`（`Type.abiAlignment` / `abiSize` 的 vector 分支）：规则取决于编译后端与 CPU 特性
+/// （`InternPool.VectorAbi`）。f80、f128 元素是否走软浮点取决于目标的 long double，为 null
+fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
+    const abi = ip.vectorAbi();
+    if (abi == .unknown) return null;
+    switch (ip.key(child)) {
+        .simple_type => |s| switch (s) {
+            .f80, .f128, .c_longdouble => return null,
+            else => {},
+        },
+        else => {},
+    }
+    const elem = typeLayout(ip, child) orelse return null;
+    const elem_bits = elem.bits orelse return null;
+    const bits = std.math.mul(u64, elem_bits, len) catch return null;
+    if (len == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
+    const alignment: u64, const bytes: u64 = switch (abi) {
+        .unknown => unreachable,
+        .llvm, .llvm_aarch64 => blk: {
+            const bytes = (bits + 7) / 8;
+            if (elem_bits == 0) break :blk .{ 1, bytes };
+            // aarch64：不超过栈对齐
+            const capped = if (abi == .llvm_aarch64) @min(bytes, 16) else bytes;
+            break :blk .{ std.math.ceilPowerOfTwo(u64, capped) catch return null, bytes };
+        },
+        .x86_64, .x86_64_avx, .x86_64_avx512 => blk: {
+            const avx = abi != .x86_64;
+            const avx512 = abi == .x86_64_avx512;
+            if (child == .bool_type) {
+                const bytes = (@as(u64, len) + 7) / 8;
+                const alignment: u64 = if (len > 256 and avx512) 64 else if (len > 128 and avx) 32 else if (len > 64) 16 else std.math.ceilPowerOfTwo(u64, bytes) catch return null;
+                break :blk .{ alignment, bytes };
+            }
+            const bytes = std.math.mul(u64, elem.size, len) catch return null;
+            if (elem.size == 0) break :blk .{ 1, bytes };
+            break :blk .{ if (bytes > 32 and avx512) 64 else if (bytes > 16 and avx) 32 else 16, bytes };
+        },
+        .elem => .{ elem.alignment, std.math.mul(u64, elem.size, len) catch return null },
+    };
+    return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = if (hasBitRepr(ip, child)) bits else null };
 }
 
 /// 无符号整数类型（packed 容器的 backing 整数、枚举的标签）的布局

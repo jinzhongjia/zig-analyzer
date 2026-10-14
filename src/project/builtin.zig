@@ -107,6 +107,60 @@ pub fn pointerBits(text: []const u8) ?u16 {
     return std.Target.ptrBitWidth_arch_abi(arch, abi);
 }
 
+/// builtin.zig 中决定向量布局的目标信息
+pub const VectorFacts = struct {
+    backend: std.lang.CompilerBackend,
+    arch: std.Target.Cpu.Arch,
+    /// x86 的 CPU 特性
+    avx: bool,
+    avx512f: bool,
+    soft_float: bool,
+};
+
+pub fn vectorFacts(text: []const u8) ?VectorFacts {
+    const backend = tagAfter(text, "pub const zig_backend = std.lang.CompilerBackend.") orelse return null;
+    const arch = tagAfter(text, "    .arch = .") orelse return null;
+    // `cpu.features` 的成员：`featureSet(&.{` 与 `})` 之间，每行一个
+    const start = (std.mem.indexOf(u8, text, "featureSet(&.{") orelse return null) + "featureSet(&.{".len;
+    const end = std.mem.indexOfPos(u8, text, start, "})") orelse return null;
+    const features = text[start..end];
+    return .{
+        .backend = std.meta.stringToEnum(std.lang.CompilerBackend, backend) orelse return null,
+        .arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null,
+        .avx = hasFeature(features, "avx"),
+        .avx512f = hasFeature(features, "avx512f"),
+        .soft_float = hasFeature(features, "soft_float"),
+    };
+}
+
+fn hasFeature(features: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, features, " \n,");
+    while (it.next()) |tok| {
+        if (tok.len == name.len + 1 and tok[0] == '.' and std.mem.eql(u8, tok[1..], name)) return true;
+    }
+    return false;
+}
+
+test vectorFacts {
+    const text =
+        \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
+        \\pub const cpu: std.Target.Cpu = .{
+        \\    .arch = .x86_64,
+        \\    .model = &std.Target.x86.cpu.znver4,
+        \\    .features = std.Target.x86.featureSet(&.{
+        \\        .@"64bit",
+        \\        .avx,
+        \\        .avx2,
+        \\        .avx512bw,
+        \\    }),
+        \\};
+    ;
+    const f = vectorFacts(text).?;
+    try std.testing.expectEqual(std.lang.CompilerBackend.stage2_x86_64, f.backend);
+    try std.testing.expectEqual(std.Target.Cpu.Arch.x86_64, f.arch);
+    try std.testing.expect(f.avx and !f.avx512f and !f.soft_float);
+}
+
 /// `prefix` 之后的标识符（到 `,` 或 `;`）
 fn tagAfter(text: []const u8, prefix: []const u8) ?[]const u8 {
     const start = (std.mem.indexOf(u8, text, prefix) orelse return null) + prefix.len;

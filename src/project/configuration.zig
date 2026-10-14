@@ -72,20 +72,24 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         });
     }
 
-    // builtin 的子命令取以该模块为根的 compile step（决定 output_mode / is_test），其他模块按 build-obj
+    // builtin 的子命令与编译后端取以该模块为根的 compile step（决定 output_mode / is_test / zig_backend），
+    // 其他模块按 build-obj
     for (c.steps) |*src| switch (src.extended.get(c.extra)) {
         .compile => |comp| {
             const index = module_ids.getIndex(comp.root_module) orelse continue;
             const mod = &modules.items[index];
             if (!std.mem.eql(u8, mod.builtin_args[0], "build-obj")) continue;
-            const args = try a.dupe([]const u8, mod.builtin_args);
-            args[0] = switch (comp.flags3.kind) {
+            var args: std.ArrayList([]const u8) = .empty;
+            try args.appendSlice(a, mod.builtin_args);
+            args.items[0] = switch (comp.flags3.kind) {
                 .exe => "build-exe",
                 .lib => "build-lib",
                 .obj, .test_obj => "build-obj",
                 .@"test" => "test",
             };
-            mod.builtin_args = args;
+            // 编译后端决定 builtin 中的 `zig_backend`（向量的布局取决于它）
+            if (comp.flags2.use_llvm.toBool()) |on| try args.append(a, if (on) "-fllvm" else "-fno-llvm");
+            mod.builtin_args = args.items;
         },
         else => {},
     };
