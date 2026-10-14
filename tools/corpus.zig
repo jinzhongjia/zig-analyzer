@@ -269,7 +269,10 @@ fn countNameRefs(node: SyntaxNode) usize {
     var it = node.children();
     while (it.nextNode()) |c| switch (c.kind()) {
         .name_ref => n += 1,
-        .container_decl => {},
+        // 嵌套容器的成员不在本成员的 HIR 中；参数表达式（`enum(u8)`）在
+        .container_decl => if ((syntax.ast.ContainerDecl{ .syntax = c }).argExpr()) |arg| {
+            n += if (arg.kind() == .name_ref) 1 else countNameRefs(arg);
+        },
         else => n += countNameRefs(c),
     };
     return n;

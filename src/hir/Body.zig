@@ -72,8 +72,9 @@ pub const Expr = union(enum) {
     unwrap_optional: ExprId,
     /// `T{ ... }` / `.{ ... }`
     init: struct { ty: ?ExprId, fields: []const FieldInit },
-    /// 体内定义的容器（内容见 ItemTree），按位置对应
-    container,
+    /// 体内定义的容器（内容见 ItemTree），按位置对应。`arg` 为 `enum(u8)` 的整数类型、
+    /// `union(E)` 的标签类型、`packed struct(u32)` 的 backing 整数
+    container: struct { arg: ?ExprId },
     /// 函数类型 `fn (A, B) R`
     fn_type: struct { params: []const ExprId, ret: ?ExprId },
     @"return": ?ExprId,

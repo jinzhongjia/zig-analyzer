@@ -268,7 +268,7 @@ const Lowerer = struct {
                 }
                 break :blk .{ .init = .{ .ty = ty, .fields = fields.items } };
             },
-            .container_decl => .container,
+            .container_decl => .{ .container = .{ .arg = try l.optExpr((ast.ContainerDecl{ .syntax = n }).argExpr()) } },
             .fn_proto => blk: {
                 const proto = ast.FnProto{ .syntax = n };
                 var params: std.ArrayList(ExprId) = .empty;
