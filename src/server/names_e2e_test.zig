@@ -325,15 +325,16 @@ test "pointer width follows the project's target" {
     // wasm32 默认使用 LLVM 后端：向量按字节数对齐
     try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", wasm.vec);
 
-    // 同时有宿主与 wasm32 两个目标：宽度不一致，与大小相关的值为未知（不给出可能错误的值）
+    // 同时有 x86_64（自研后端）与 wasm32（LLVM）两个目标：指针位宽与向量的规则都不一致，与大小相关的值
+    // 为未知（不给出可能错误的值）。不用宿主目标：x86_64-windows 的 Debug 默认也用 LLVM，向量的规则与 wasm32 相同
     const mixed = try sizesHover(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
         \\pub fn build(b: *std.Build) void {
         \\    const host = b.addObject(.{ .name = "host", .root_module = b.createModule(.{
         \\        .root_source_file = b.path("main.zig"),
-        \\        .target = b.graph.host,
-        \\    }) });
+        \\        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux }),
+        \\    }), .use_llvm = false });
         \\    const wasm = b.addObject(.{ .name = "wasm", .root_module = b.createModule(.{
         \\        .root_source_file = b.path("main.zig"),
         \\        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
