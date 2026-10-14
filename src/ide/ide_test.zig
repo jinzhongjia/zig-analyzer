@@ -261,3 +261,62 @@ test "hover in generic bodies: call sites through aliases" {
     const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst bigger: u16\n```\n\ninferred from the call at main.zig:3", info.text);
 }
+
+test "completion after `.` lists members of the expected type" {
+    const decls =
+        \\const E = enum {
+        \\    red,
+        \\    green,
+        \\    pub const default: E = .red;
+        \\    pub fn parse(s: []const u8) E {
+        \\        _ = s;
+        \\        return .red;
+        \\    }
+        \\    fn count() u8 {
+        \\        return 2;
+        \\    }
+        \\};
+        \\const U = union(enum) { num: u8, none };
+        \\const S = struct {
+        \\    x: u8,
+        \\    pub const empty: S = .{ .x = 0 };
+        \\    pub fn init() !S {
+        \\        return .empty;
+        \\    }
+        \\    pub fn size() usize {
+        \\        return 1;
+        \\    }
+        \\};
+        \\fn take(e: E) void {
+        \\    _ = e;
+        \\}
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const c: E = .<|>;", "red green default parse" },
+        .{ "fn f() void { take(.gr<|>); }", "red green default parse" },
+        .{ "fn f(e: E) void { switch (e) { .<|> => {}, else => {} } }", "red green default parse" },
+        .{ "const c: ?E = .<|>;", "red green default parse" },
+        .{ "const s: S = .<|>;", "empty init" },
+        .{ "const u: U = .<|>;", "num none" },
+        // 没有期望类型
+        .{ "const c = .<|>;", "" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ decls, c[0], "\n" });
+        const added = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = try completion.complete(&r, added.file, added.cursor);
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}

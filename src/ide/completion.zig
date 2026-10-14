@@ -12,7 +12,9 @@ const context = @import("context.zig");
 const queries = @import("../sema/queries.zig");
 const render = @import("../sema/render.zig");
 const eval = @import("../sema/eval.zig");
-const TypedValue = @import("../sema/InternPool.zig").TypedValue;
+const InternPool = @import("../sema/InternPool.zig");
+const TypedValue = InternPool.TypedValue;
+const Index = InternPool.Index;
 
 pub const Item = struct {
     label: []const u8,
@@ -45,6 +47,13 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
             return out.items.items;
         },
         else => {},
+    };
+
+    // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员
+    if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
+        const a = try context.at(r, file, offset, true) orelse return &.{};
+        try expectedMembers(r, &out, a.literalExpected(e) orelse return &.{}, file);
+        return out.items.items;
     };
 
     // 作用域中的名字：光标紧跟在名字之后时取该名字所在的作用域
@@ -166,6 +175,61 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
             else => {},
         }
     }
+}
+
+/// `.` 之后：期望类型（`?T` 取 `T`）的枚举成员、union 的字段，以及可以作为 decl literal 的声明
+/// （类型为 `T` 的常量、返回 `T` 或 `!T` 的函数；类型推导不出时也列出）
+fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resolve.Error!void {
+    const ip = r.ctx.db.env.ip;
+    const t = switch (ip.key(ty)) {
+        .optional_type => |c| c,
+        else => ty,
+    };
+    switch (ip.key(t)) {
+        .reified_type, .union_tag_type => {
+            for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
+            return;
+        },
+        .container_type => {},
+        else => return,
+    }
+    const ns = try queries.namespaceOfType(r, t) orelse return;
+    const tree = try r.itemTree(ns.file);
+    const kind = tree.containers[ns.container].kind;
+    const inst = queries.instOfType(ip, t);
+    for (tree.containerMembers(ns.container)) |m| {
+        const it = tree.items[m];
+        const name = it.name orelse continue;
+        switch (it.kind) {
+            .field => switch (kind) {
+                .@"enum" => try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc }),
+                .@"union" => try out.add(.{ .label = name, .kind = .field, .doc = it.doc }),
+                else => {},
+            },
+            .@"const", .@"fn" => {
+                if (ns.file != from and !it.flags.is_pub) continue;
+                const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
+                if (!producesType(ip, decl_ty, t, it.kind == .@"fn")) continue;
+                try out.add(.{ .label = name, .kind = if (it.kind == .@"fn") .function else .constant, .doc = it.doc });
+            },
+            else => {},
+        }
+    }
+}
+
+/// 声明能否作为类型 `t` 的 decl literal：常量的类型为 `t`，函数返回 `t` 或 `!t`；类型未知时视为可以
+fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
+    if (decl_ty == .unknown) return true;
+    if (!is_fn) return decl_ty == t;
+    const ret = switch (ip.key(decl_ty)) {
+        .fn_type => |f| f.ret,
+        else => return false,
+    };
+    if (ret == .unknown or ret == t) return true;
+    return switch (ip.key(ret)) {
+        .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
+        else => false,
+    };
 }
 
 /// `ns.` 之后的成员；同一文件中可以访问非 pub 声明

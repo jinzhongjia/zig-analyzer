@@ -955,7 +955,7 @@ pub fn make() std.ArrayList(u8) { ... }
 - 与设计的差异与未实现：
   - 推导的错误集（`!T`）暂以 `anyerror` 表示；由函数体推导错误集未实现。
   - 指针类型不记录对齐与 `volatile` / `allowzero`；没有向量、元组与匿名结构体类型（`.{ a, b }` 为 unknown）；浮点值与算术的 comptime 折叠未实现。
-  - 期望类型驱动的 `.` 补全（`const c: Color = .|`）未实现：`.` 后没有标识符时语法树里没有对应的表达式节点。
+  - ~~期望类型驱动的 `.` 补全（`const c: Color = .|`）未实现~~：已完成（2026-10-14）。`.` 后没有名字时解析为缺少名字的枚举字面量，推导结果记录枚举字面量的期望类型（`Result.literal_expected`），补全列出枚举成员、union 字段与可作为 decl literal 的声明（类型为 `T` 的常量、返回 `T` / `!T` 的函数）。
   - 容器类型只显示声明它的成员名（`Allocator`），不显示完整路径。
   - `SourceText` 从磁盘读到的内容不会随磁盘变化而失效（编辑器打开的文件与项目编译集合中的文件不受影响，它们由 `FileText` 管理）。
   - 泛型实例与 comptime 调用求值（`std.ArrayList(u8)`、`fn max(comptime T: type, ...) T` 的返回类型）属于 M5。

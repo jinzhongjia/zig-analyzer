@@ -45,6 +45,10 @@ pub const Result = struct {
     ret: TypedValue,
     /// 初始化表达式中字段名解析到的字段（`.{ .x = 1 }` 的 `x`）
     field_refs: []const FieldRef = &.{},
+    /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）及其期望类型：补全按它列出成员
+    literal_expected: []const LiteralExpected = &.{},
+
+    pub const LiteralExpected = struct { expr: ExprId, ty: Index };
 
     pub const FieldRef = struct {
         /// `init` 表达式
@@ -55,7 +59,7 @@ pub const Result = struct {
     };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -104,7 +108,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Re
     try inf.runOwner(tree.items[item].kind, mode);
     const ret = try inf.returnValue();
     const field_refs = try a.dupe(Result.FieldRef, inf.field_refs.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs };
+    const literal_expected = try a.dupe(Result.LiteralExpected, inf.literal_expected.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected };
 }
 
 fn empty(gpa: Allocator) Result {
@@ -133,6 +138,8 @@ const Inferrer = struct {
     field_refs: std.ArrayList(Result.FieldRef) = .empty,
     /// 正在推导的 init 表达式
     current_init: ?ExprId = null,
+    /// 见 `Result.literal_expected`
+    literal_expected: std.ArrayList(Result.LiteralExpected) = .empty,
     /// 实例上下文（owner 自身或外层泛型函数的实例）
     inst: ?Index,
     /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
@@ -330,6 +337,7 @@ const Inferrer = struct {
             .literal => |text| return inf.literal(text),
             .field_access => |fa| return inf.fieldAccess(e, fa.lhs, fa.field),
             .enum_literal => |name| {
+                if (expected) |want| if (want != .unknown) try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = want });
                 if (expected) |want| if (try inf.declLiteral(e, want, name)) |tv| return tv;
                 return .{ .ty = .enum_literal_type, .val = try ip.get(.{ .enum_literal = name }) };
             },

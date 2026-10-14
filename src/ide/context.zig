@@ -13,6 +13,7 @@ const Body = @import("../hir/Body.zig");
 const infer = @import("../sema/infer.zig");
 const render = @import("../sema/render.zig");
 const TypedValue = @import("../sema/InternPool.zig").TypedValue;
+const Index = @import("../sema/InternPool.zig").Index;
 const FileId = @import("../base/Vfs.zig").FileId;
 
 pub const At = struct {
@@ -33,6 +34,12 @@ pub const At = struct {
     pub fn bindingType(a: At, b: Body.BindingId) TypedValue {
         const i = @backingInt(b);
         return if (i < a.res.bindings.len) a.res.bindings[i] else .unknown;
+    }
+
+    /// 枚举字面量的期望类型（没有期望类型时为 null）
+    pub fn literalExpected(a: At, e: Body.ExprId) ?Index {
+        for (a.res.literal_expected) |x| if (x.expr == e) return x.ty;
+        return null;
     }
 
     pub fn member(a: At, e: Body.ExprId) ?hir.OwnerKey {
