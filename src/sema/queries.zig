@@ -159,11 +159,14 @@ pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *co
     return ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
 }
 
-/// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误。含未知部分或参与递归时为 anyerror
+/// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误，含未知部分时为 anyerror。
+/// 递归的函数取最小不动点（与编译器一致；编译器不允许相互递归，这里同样取各函数错误的并集）
 pub const ErrorSetOf = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = DeclKey;
     pub const Value = Index;
+    /// 函数体只把被调函数的错误并入结果：环中对自身的读取先视为空集，环的入口算一遍即得完整结果
+    pub const fixpoint = true;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
         _ = try ctx.get(PointerBits, {});
@@ -187,6 +190,10 @@ pub const ErrorSetOf = struct {
     }
 
     pub fn cycleFallback(_: Key) Value {
+        return .empty_error_set;
+    }
+
+    pub fn depthFallback(_: Key) Value {
         return .anyerror_type;
     }
 };

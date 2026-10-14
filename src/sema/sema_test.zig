@@ -482,7 +482,25 @@ test "inferred error sets from function bodies" {
         \\fn c() !void {}
         \\fn rec(n: u32) !u32 {
         \\    if (n == 0) return error.Done;
+        \\    if (n > 1000) return error.TooBig;
         \\    return rec(n - 1);
+        \\}
+        \\fn rec2(n: u32) !u32 {
+        \\    if (n == 0) return error.Done;
+        \\    const x = try rec2(n - 1);
+        \\    return x + 1;
+        \\}
+        \\fn user() !void {
+        \\    _ = try rec(1);
+        \\    return error.Own;
+        \\}
+        \\fn ping(n: u32) !void {
+        \\    if (n == 0) return error.Ping;
+        \\    return pong(n - 1);
+        \\}
+        \\fn pong(n: u32) !void {
+        \\    if (n == 0) return error.Pong;
+        \\    return ping(n - 1);
         \\}
         \\fn g() void {
         \\    const w = wrap(@as(u8, 1));
@@ -490,7 +508,11 @@ test "inferred error sets from function bodies" {
         \\    const rb = b(true);
         \\    const rc = c();
         \\    const rr = rec(3);
-        \\    _ = .{ w, ra, rb, rc, rr };
+        \\    const rr2 = rec2(3);
+        \\    const ru = user();
+        \\    const rp = ping(3);
+        \\    const rq = pong(3);
+        \\    _ = .{ w, ra, rb, rc, rr, rr2, ru, rp, rq };
         \\}
     , &.{
         .{ "w", "error{}!u8" },
@@ -498,8 +520,13 @@ test "inferred error sets from function bodies" {
         // return 的错误与 try 传播的错误
         .{ "rb", "error{Bad,Oops}!u8" },
         .{ "rc", "error{}!void" },
-        // 递归的函数：错误集取 anyerror
-        .{ "rr", "anyerror!u32" },
+        // 递归的函数取最小不动点（与编译器一致）
+        .{ "rr", "error{Done,TooBig}!u32" },
+        .{ "rr2", "error{Done}!u32" },
+        .{ "ru", "error{Done,Own,TooBig}!void" },
+        // 相互递归（编译器报错）：取两者的并集
+        .{ "rp", "error{Ping,Pong}!void" },
+        .{ "rq", "error{Ping,Pong}!void" },
     });
 }
 

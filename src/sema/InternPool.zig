@@ -49,6 +49,8 @@ pub const Index = enum(u32) {
     undefined_value,
     /// 实例实参中非 comptime 参数的占位（不属于实例的身份）
     runtime,
+    /// `error{}`
+    empty_error_set,
     _,
 };
 
@@ -239,6 +241,7 @@ const preset = [_]Key{
     .{ .simple_value = .null },
     .{ .simple_value = .undefined },
     .runtime,
+    .{ .error_set_type = &.{} },
 };
 
 pub fn init(gpa: Allocator, io: Io) Allocator.Error!InternPool {
