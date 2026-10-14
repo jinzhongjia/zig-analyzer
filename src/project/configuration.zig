@@ -97,10 +97,12 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         walkGeneratedFiles(c, step, &v);
     }
 
+    const std_root = try std.fs.path.join(a, &.{ env.std_dir, "std.zig" });
+    // arena 的状态复制进结果之后不能再分配：新增的缓冲区不在复制的状态中，释放时会泄漏
     return .{
         .arena = arena_state.state,
         .build_root = ctx.build_root,
-        .std_root = try std.fs.path.join(a, &.{ env.std_dir, "std.zig" }),
+        .std_root = std_root,
         .steps = steps,
         .modules = modules.items,
         .default_step = @backingInt(c.default_step),
