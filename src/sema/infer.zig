@@ -43,9 +43,19 @@ pub const Result = struct {
     members: []const ?hir.OwnerKey,
     /// 函数实际执行到的 `return` 的值（类型构造函数的结果）
     ret: TypedValue,
+    /// 初始化表达式中字段名解析到的字段（`.{ .x = 1 }` 的 `x`）
+    field_refs: []const FieldRef = &.{},
+
+    pub const FieldRef = struct {
+        /// `init` 表达式
+        init: ExprId,
+        /// 在 `Body.Expr.init.fields` 中的下标
+        index: u32,
+        member: hir.OwnerKey,
+    };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -93,7 +103,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Re
     @memset(inf.members, null);
     try inf.runOwner(tree.items[item].kind, mode);
     const ret = try inf.returnValue();
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret };
+    const field_refs = try a.dupe(Result.FieldRef, inf.field_refs.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs };
 }
 
 fn empty(gpa: Allocator) Result {
@@ -118,6 +129,10 @@ const Inferrer = struct {
     labels: std.ArrayList(LabelFrame) = .empty,
     /// 方法调用：字段访问解析到实例上的函数声明（调用时跳过 self 参数）
     bound: std.AutoHashMapUnmanaged(ExprId, void) = .empty,
+    /// 初始化表达式中字段名的引用（见 `Result.field_refs`）
+    field_refs: std.ArrayList(Result.FieldRef) = .empty,
+    /// 正在推导的 init 表达式
+    current_init: ?ExprId = null,
     /// 实例上下文（owner 自身或外层泛型函数的实例）
     inst: ?Index,
     /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
@@ -234,6 +249,8 @@ const Inferrer = struct {
         const raw = try inf.inferInner(e, expected);
         const tv = try inf.coerce(raw, expected);
         inf.exprs[i] = tv;
+        // 转换为枚举 / union 的枚举字面量（`.red`、`switch` 的 `.a =>`）引用对应的成员
+        if (inf.members[i] == null and inf.body.expr(e) == .enum_literal) try inf.recordTagMember(e, tv.ty);
         return tv;
     }
 
@@ -255,6 +272,22 @@ const Inferrer = struct {
         if (ev.val == null) return tv;
         inf.exprs[@backingInt(e)] = ev;
         return ev;
+    }
+
+    fn recordTagMember(inf: *Inferrer, e: ExprId, t: Index) Error!void {
+        const want = switch (inf.ip.key(t)) {
+            .optional_type => |c| c,
+            else => t,
+        };
+        const c = switch (inf.ip.key(want)) {
+            .container_type => |c| c,
+            else => return,
+        };
+        if (c.kind != .@"enum" and c.kind != .@"union") return;
+        const ns = try queries.namespaceOfType(inf.r, want) orelse return;
+        const tree = try inf.r.itemTree(ns.file);
+        const f = fieldItem(tree, ns.container, inf.body.expr(e).enum_literal) orelse return;
+        inf.members[@backingInt(e)] = .{ .file = ns.file, .item = tree.items[f].ast_id };
     }
 
     /// 结果类型转换：字面量类的值在有期望类型时取期望类型（optional 的期望类型先按载荷类型转换），
@@ -384,7 +417,12 @@ const Inferrer = struct {
                 // 已知的非 null optional 值即载荷值
                 return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) o.val else null };
             },
-            .init => |x| return inf.initExpr(x.ty, x.fields, expected),
+            .init => |x| {
+                const saved = inf.current_init;
+                inf.current_init = e;
+                defer inf.current_init = saved;
+                return inf.initExpr(x.ty, x.fields, expected);
+            },
             .container => |c| {
                 if (c.arg) |arg| _ = try inf.infer(arg, null);
                 const ns = try inf.containerAt(e) orelse return .unknown;
@@ -1131,11 +1169,14 @@ const Inferrer = struct {
             .array_type => |a| a.child,
             else => null,
         };
-        for (fields) |f| {
+        for (fields, 0..) |f, fi_index| {
             var field_ty: ?Index = elem;
             if (f.name) |name| if (ns) |n| {
                 const tree = try inf.r.itemTree(n.file);
-                if (fieldItem(tree, n.container, name)) |fi| field_ty = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = fi } }, null, queries.instOfType(ip, t))).ty;
+                if (fieldItem(tree, n.container, name)) |fi| {
+                    field_ty = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = fi } }, null, queries.instOfType(ip, t))).ty;
+                    if (inf.current_init) |init_e| try inf.field_refs.append(inf.scratch, .{ .init = init_e, .index = @intCast(fi_index), .member = .{ .file = n.file, .item = tree.items[fi].ast_id } });
+                }
             };
             _ = try inf.infer(f.value, if (field_ty) |x| (if (x != .unknown) x else null) else null);
         }

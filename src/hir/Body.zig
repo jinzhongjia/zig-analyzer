@@ -144,6 +144,8 @@ pub const FieldInit = struct {
     /// 元组形式 `.{ a, b }` 没有字段名
     name: ?[]const u8,
     value: ExprId,
+    /// 字段名 token 的位置（引用查找与重命名用）
+    name_range: Range = .none,
 };
 
 pub const Binding = struct {

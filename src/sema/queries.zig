@@ -300,7 +300,7 @@ pub fn declInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Err
 }
 
 /// `item` 是否为 `fn_decl` 本身或位于其内部（经由体内定义的容器）
-fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../syntax/ItemTree.zig").AstId) resolve.Error!bool {
+pub fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../syntax/ItemTree.zig").AstId) resolve.Error!bool {
     const tree = try r.itemTree(file);
     var cur: ?u32 = item;
     while (cur) |it| {

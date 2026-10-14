@@ -263,7 +263,8 @@ const Lowerer = struct {
                 var it = i.items();
                 while (it.next()) |item| {
                     if (ast.cast(ast.FieldInit, item)) |f| {
-                        try fields.append(l.a, .{ .name = try l.tokenText(f.name()), .value = try l.exprOrMissing(f.value()) });
+                        const name_range: Range = if (f.name()) |t| l.rel(t.offset, t.offset + @as(u32, @intCast(t.text.len))) else .none;
+                        try fields.append(l.a, .{ .name = try l.tokenText(f.name()), .value = try l.exprOrMissing(f.value()), .name_range = name_range });
                     } else try fields.append(l.a, .{ .name = null, .value = try l.expr(item) });
                 }
                 break :blk .{ .init = .{ .ty = ty, .fields = fields.items } };

@@ -61,6 +61,10 @@ pub const ide = struct {
     pub const signature_help = @import("ide/signature_help.zig");
     pub const inlay_hints = @import("ide/inlay_hints.zig");
 };
+pub const ide_db = struct {
+    pub const FileIndex = @import("ide_db/FileIndex.zig");
+    pub const search = @import("ide_db/search.zig");
+};
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");
     /// 仅供测试：posix 写法的路径转为本机路径
@@ -84,6 +88,7 @@ test {
     std.testing.refAllDecls(sema);
     std.testing.refAllDecls(diagnostics);
     std.testing.refAllDecls(ide);
+    std.testing.refAllDecls(ide_db);
     std.testing.refAllDecls(project);
     std.testing.refAllDecls(lsp);
     _ = @import("lsp/types_test.zig");

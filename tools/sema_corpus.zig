@@ -91,6 +91,13 @@ pub fn main(init: std.process.Init) !u8 {
         try db.set(ModuleGraph.Input, {}, g, .high);
     }
 
+    // 查找引用（冷缓存）：标准库中常用的声明
+    for ([_][2][]const u8{ .{ "mem.zig", "Allocator" }, .{ "mem.zig", "eql" }, .{ "std.zig", "ArrayList" } }) |target| {
+        const path = try std.fs.path.join(gpa, &.{ std_dir, target[0] });
+        defer gpa.free(path);
+        try findRefs(gpa, io, &db, files.items, try vfs.intern(path), target[1]);
+    }
+
     var locals: Counts = .{};
     var decls: Counts = .{};
     var exprs: Counts = .{};
@@ -129,4 +136,19 @@ pub fn main(init: std.process.Init) !u8 {
         \\
     , .{ files.items.len, members, secs, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct() });
     return 0;
+}
+
+/// 统计 `file` 顶层声明 `name` 的引用数与耗时
+fn findRefs(gpa: std.mem.Allocator, io: std.Io, db: *database.Db, files: []const FileId, file: FileId, name: []const u8) !void {
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    var ctx = db.beginRead(scratch.allocator());
+    defer ctx.end();
+    var r: za.names.resolve.Resolver = .{ .ctx = &ctx, .arena = scratch.allocator() };
+    const tree = try r.itemTree(file);
+    const item = za.names.resolve.Resolver.lookupDecl(tree, 0, name) orelse return;
+    const t0 = std.Io.Clock.awake.now(io);
+    const refs = try za.ide_db.search.findReferences(&r, .{ .item = .{ .file = file, .item = item } }, .{ .scope = files });
+    const ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_ms;
+    std.debug.print("references of {s}: {d} in {d:.0}ms\n", .{ name, refs.len, ms });
 }

@@ -8,6 +8,9 @@ pub const live = @import("diagnostics/live.zig");
 pub const hir = @import("hir/queries.zig");
 pub const ModuleGraph = @import("names/ModuleGraph.zig");
 pub const sema = @import("sema/queries.zig");
+pub const ide_db = struct {
+    pub const FileIndex = @import("ide_db/FileIndex.zig");
+};
 
 const Vfs = @import("base/Vfs.zig");
 const InternPool = @import("sema/InternPool.zig");
@@ -33,4 +36,5 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.DeclType,
     sema.CallEval,
     sema.ErrorSetOf,
+    ide_db.FileIndex.Query,
 });
