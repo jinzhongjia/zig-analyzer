@@ -170,6 +170,7 @@ pub const error_codes = struct {
     pub const server_not_initialized = @backingInt(types.ErrorCodes.ServerNotInitialized);
     pub const request_cancelled = @backingInt(types.LSPErrorCodes.RequestCancelled);
     pub const content_modified = @backingInt(types.LSPErrorCodes.ContentModified);
+    pub const request_failed = @backingInt(types.LSPErrorCodes.RequestFailed);
 };
 
 const testing = std.testing;

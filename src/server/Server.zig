@@ -117,7 +117,15 @@ const Pending = struct {
     cancel: std.atomic.Value(bool) = .init(false),
 };
 
-pub const HandlerError = error{ Canceled, OutOfMemory, InvalidParams };
+pub const HandlerError = error{
+    Canceled,
+    OutOfMemory,
+    InvalidParams,
+    /// 重命名的目标不在工作区内（标准库、依赖包）
+    RenameOutsideWorkspace,
+    /// 新名字不是合法的标识符
+    InvalidIdentifier,
+};
 
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
 pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) Allocator.Error!void {
@@ -242,6 +250,12 @@ const request_handlers = .{
     .{ "textDocument/hover", Mode.semantic, hover },
     .{ "textDocument/signatureHelp", Mode.semantic, signatureHelp },
     .{ "textDocument/inlayHint", Mode.semantic, inlayHint },
+    .{ "textDocument/references", Mode.semantic, references },
+    .{ "textDocument/documentHighlight", Mode.semantic, documentHighlight },
+    .{ "textDocument/prepareRename", Mode.semantic, prepareRename },
+    .{ "textDocument/rename", Mode.semantic, rename },
+    .{ "workspace/symbol", Mode.semantic, workspaceSymbol },
+    .{ "textDocument/codeAction", Mode.semantic, codeAction },
 };
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
@@ -1169,6 +1183,11 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .hoverProvider = .{ .boolean = true },
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
             .inlayHintProvider = .{ .boolean = true },
+            .referencesProvider = .{ .boolean = true },
+            .documentHighlightProvider = .{ .boolean = true },
+            .renameProvider = .{ .RenameOptions = .{ .prepareProvider = true } },
+            .workspaceSymbolProvider = .{ .boolean = true },
+            .codeActionProvider = .{ .CodeActionOptions = .{ .codeActionKinds = &.{types.CodeActionKind.QuickFix} } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .boolean = true },
@@ -1282,6 +1301,169 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     return out;
 }
 
+/// 引用查找与 workspace symbol 的范围：模块图中的项目文件（不含标准库）与打开的文档
+fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
+    var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    for (try za.ide_db.search.projectFiles(r)) |f| try set.put(r.arena, f, {});
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    for (server.open_docs.keys()) |f| try set.put(r.arena, f, {});
+    return set.keys();
+}
+
+/// 光标处的定义及其全部引用
+fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+    const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
+    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
+    const scope = try server.searchScope(r);
+    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null });
+    return .{ .def = def, .refs = refs };
+}
+
+/// 引用位置转为 LSP 区间（按文件缓存行索引）
+const RangeMapper = struct {
+    server: *Server,
+    r: *Resolver,
+    file: ?Vfs.FileId = null,
+    lines: offsets.LineIndex = undefined,
+
+    fn range(m: *RangeMapper, file: Vfs.FileId, start: u32, end: u32) !types.Range {
+        if (m.file != file) {
+            m.lines = try offsets.LineIndex.init(m.r.arena, (try m.r.ctx.get(syntax_q.SourceText, file)).text);
+            m.file = file;
+        }
+        return m.lines.range(start, end, m.server.encoding);
+    }
+};
+
+fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+    var out: std.ArrayList(types.Location) = .empty;
+    var m: RangeMapper = .{ .server = server, .r = r };
+    for (found.refs) |ref| {
+        if (ref.is_decl and !params.context.includeDeclaration) continue;
+        try out.append(arena, .{ .uri = try server.uriFor(arena, ref.file), .range = try m.range(ref.file, ref.start, ref.end) });
+    }
+    return out.items;
+}
+
+fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true) orelse return null;
+    const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
+    var m: RangeMapper = .{ .server = server, .r = r };
+    for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
+    return out;
+}
+
+/// 可以重命名的定义：位于某个工作区根目录内且不在其缓存目录中
+fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
+    if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
+    const file = switch (def) {
+        .item => |it| it.file,
+        .local => |l| l.file,
+        .file => unreachable,
+    };
+    const path = server.vfs.path(file);
+    for (server.roots.items) |root| {
+        if (!std.mem.startsWith(u8, path, root) or path.len <= root.len or !std.fs.path.isSep(path[root.len])) continue;
+        const rest = path[root.len + 1 ..];
+        if (std.mem.startsWith(u8, rest, ".zig-cache") or std.mem.startsWith(u8, rest, "zig-pkg")) continue;
+        return true;
+    }
+    return false;
+}
+
+fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!types.ResultType("textDocument/prepareRename") {
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
+    if (!try server.renamable(r, def)) return error.RenameOutsideWorkspace;
+    const lines = try offsets.LineIndex.init(arena, at.text);
+    return .{ .PrepareRenamePlaceholder = .{
+        .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
+        .placeholder = za.syntax.ast.identName(tok.text),
+    } };
+}
+
+fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
+    const new_name = try identifierText(arena, params.newName);
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+    if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
+    var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+    var m: RangeMapper = .{ .server = server, .r = r };
+    var i: usize = 0;
+    while (i < found.refs.len) {
+        const file = found.refs[i].file;
+        var edits: std.ArrayList(types.TextEdit) = .empty;
+        while (i < found.refs.len and found.refs[i].file == file) : (i += 1) {
+            const ref = found.refs[i];
+            try edits.append(arena, .{ .range = try m.range(file, ref.start, ref.end), .newText = new_name });
+        }
+        try changes.map.put(arena, try server.uriFor(arena, file), edits.items);
+    }
+    return .{ .changes = changes };
+}
+
+/// 新名字的源码写法：合法标识符原样使用，`@"..."` 原样使用，其余（关键字、含特殊字符）用 `@"..."` 包裹
+fn identifierText(arena: Allocator, name: []const u8) HandlerError![]const u8 {
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n\r\\") != null and !std.mem.startsWith(u8, name, "@\"")) return error.InvalidIdentifier;
+    if (std.mem.startsWith(u8, name, "@\"")) {
+        if (name.len < 3 or name[name.len - 1] != '"') return error.InvalidIdentifier;
+        return name;
+    }
+    if (std.zig.isValidId(name)) return name;
+    return std.fmt.allocPrint(arena, "@\"{s}\"", .{name});
+}
+
+fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
+    const scope = try server.searchScope(r);
+    const syms = try ide.workspace_symbol.search(r, scope, params.query);
+    const out = try arena.alloc(types.WorkspaceSymbol, syms.len);
+    var m: RangeMapper = .{ .server = server, .r = r };
+    for (syms, out) |s, *o| o.* = .{
+        .name = s.name,
+        .kind = s.kind,
+        .containerName = s.container,
+        .location = .{ .Location = .{ .uri = try server.uriFor(arena, s.file), .range = try m.range(s.file, s.start, s.end) } },
+    };
+    return .{ .array_of_WorkspaceSymbol = out };
+}
+
+fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
+    const start: u32 = @intCast(offsets.positionToOffset(text, params.range.start, server.encoding));
+    const end: u32 = @intCast(offsets.positionToOffset(text, params.range.end, server.encoding));
+    const actions = try ide.code_actions.codeActions(r, file, start, end);
+    const lines = try offsets.LineIndex.init(arena, text);
+    const doc_uri = try server.uriFor(arena, file);
+    const Item = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
+    const out = try arena.alloc(Item, actions.len);
+    for (actions, out) |a, *o| {
+        const edits = try arena.alloc(types.TextEdit, a.edits.len);
+        for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
+        var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+        try changes.map.put(arena, doc_uri, edits);
+        // 关联客户端传来的同一条诊断，使修复显示在诊断上
+        const diagnostics: ?[]const types.Diagnostic = if (a.diagnostic) |d| blk: {
+            const range = lines.range(d.start, d.end, server.encoding);
+            for (params.context.diagnostics) |cd| {
+                if (std.meta.eql(cd.range, range)) break :blk try arena.dupe(types.Diagnostic, &.{cd});
+            }
+            break :blk null;
+        } else null;
+        o.* = .{ .CodeAction = .{
+            .title = a.title,
+            .kind = types.CodeActionKind.QuickFix,
+            .diagnostics = diagnostics,
+            .isPreferred = if (a.diagnostic != null) true else null,
+            .edit = .{ .changes = changes },
+        } };
+    }
+    return out;
+}
+
 fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!StatusResult {
     var counts: [Db.query_types.len]u64 = undefined;
     const stats = server.db.stats(&counts);
@@ -1332,6 +1514,8 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
         else
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
+        error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
+        error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
 }
@@ -1345,4 +1529,5 @@ test {
     _ = @import("Server_test.zig");
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
+    _ = @import("refs_e2e_test.zig");
 }
