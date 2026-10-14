@@ -24,6 +24,11 @@
 //! derived query 可改为声明 `computeIncremental(ctx, key, prev: ?Value)`，重算时引擎传入上一次的值
 //! （首次计算为 null）。结果必须与从零计算完全相同，prev 只用于加速；读取 prev 不记录依赖。
 //!
+//! derived query 可声明 `pub const lru: usize = N`：保留值的 memo 超过 N 个时，最久未使用的 memo
+//! 被淘汰，只删除值，保留依赖与 changed_at。被淘汰的 memo 验证通过时重算并沿用原 changed_at
+//! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `sweep` 中进行
+//! （此时没有读事务持有值）。
+//!
 //! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先置位
 //! `pending_write` 使进行中的读查询尽快以 `error.Canceled` 退出，再获取独占锁。
 //! 读事务内拿到的 query 值在该事务结束前一直有效：被替换的旧值延迟到下一次写事务才释放。
@@ -113,6 +118,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         executions: [queries.len]std.atomic.Value(u64) = @splat(.init(0)),
         deep_verifications: std.atomic.Value(u64) = .init(0),
+        /// memo 最近使用时间的计数器（LRU）
+        access_tick: std.atomic.Value(u64) = .init(0),
+        /// 有声明了 `lru` 的 query 超出容量，等待 `sweep`
+        sweep_wanted: std.atomic.Value(bool) = .init(false),
 
         const Tables = @Tuple(&table_types);
         const table_types = blk: {
@@ -130,6 +139,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return struct {
                 keys: std.AutoArrayHashMapUnmanaged(Q.Key, void) = .empty,
                 slots: std.ArrayList(Slot) = .empty,
+                /// 保留着值的 memo 数（只对声明了 `lru` 的 query 统计）
+                live: usize = 0,
 
                 const Slot = switch (Q.kind) {
                     .input => struct {
@@ -144,11 +155,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 };
 
                 const Memo = struct {
+                    /// `evicted` 时无效
                     value: Q.Value,
                     verified_at: Revision,
                     changed_at: Revision,
                     durability: Durability,
                     deps: []const DepKey,
+                    evicted: bool = false,
+                    last_used: u64 = 0,
                 };
             };
         }
@@ -171,7 +185,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 for (table.slots.items) |*slot| switch (Q.kind) {
                     .input => if (slot.is_set) deinitValue(Q, &slot.value, db.gpa),
                     .derived => if (slot.memo) |*memo| {
-                        deinitValue(Q, &memo.value, db.gpa);
+                        if (!memo.evicted) deinitValue(Q, &memo.value, db.gpa);
                         db.gpa.free(memo.deps);
                     },
                 };
@@ -207,6 +221,60 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.writing = true;
             db.bumped_in_write = false;
             db.collectGarbage();
+            db.evictLocked();
+        }
+
+        /// 是否有 query 超出 `lru` 容量（调用方可在空闲时调用 `sweep`）
+        pub fn wantsSweep(db: *Db) bool {
+            return db.sweep_wanted.load(.monotonic);
+        }
+
+        /// 淘汰超出 `lru` 容量的 memo 值：等待进行中的读事务结束（不取消它们）
+        pub fn sweep(db: *Db) void {
+            db.rw.lockUncancelable(db.io);
+            defer db.rw.unlock(db.io);
+            db.collectGarbage();
+            db.evictLocked();
+        }
+
+        /// 每个超出容量的 query 淘汰最久未使用的 memo，降到容量的 3/4（留出余量，避免频繁清扫）。
+        /// 调用方须独占数据库（没有读事务持有值）
+        fn evictLocked(db: *Db) void {
+            if (!db.sweep_wanted.swap(false, .monotonic)) return;
+            inline for (queries, 0..) |Q, qi| {
+                if (comptime Q.kind == .derived and @hasDecl(Q, "lru")) {
+                    const table = &db.tables[qi];
+                    if (table.live > Q.lru) evictTable(Q, table, db.gpa, table.live - Q.lru * 3 / 4);
+                }
+            }
+        }
+
+        fn evictTable(comptime Q: type, table: *Table(Q), gpa: Allocator, count: usize) void {
+            // 第 count 小的最近使用时间之前（含）的都淘汰；内存不足时退而淘汰全部
+            const ticks = gpa.alloc(u64, table.live) catch {
+                for (table.slots.items) |*slot| if (slot.memo) |*m| if (!m.evicted) evictMemo(Q, table, m, gpa);
+                return;
+            };
+            defer gpa.free(ticks);
+            var n: usize = 0;
+            for (table.slots.items) |slot| if (slot.memo) |m| if (!m.evicted) {
+                ticks[n] = m.last_used;
+                n += 1;
+            };
+            std.mem.sort(u64, ticks[0..n], {}, std.sort.asc(u64));
+            const limit = ticks[@min(count, n) - 1];
+            var evicted: usize = 0;
+            for (table.slots.items) |*slot| if (slot.memo) |*m| if (!m.evicted and m.last_used <= limit and evicted < count) {
+                evictMemo(Q, table, m, gpa);
+                evicted += 1;
+            };
+        }
+
+        fn evictMemo(comptime Q: type, table: *Table(Q), m: *Table(Q).Memo, gpa: Allocator) void {
+            deinitValue(Q, &m.value, gpa);
+            m.value = undefined;
+            m.evicted = true;
+            table.live -= 1;
         }
 
         pub fn endWrite(db: *Db) void {
@@ -392,7 +460,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                             if (ctx.frontier == null) ctx.frontier = dep;
                             return Q.cycleFallback(key);
                         }
-                        break :blk try ctx.ensureFresh(Q, index, key);
+                        break :blk try ctx.ensureFresh(Q, index, key, true);
                     },
                 };
                 try ctx.recordDep(dep, fresh.durability);
@@ -423,32 +491,46 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const db = ctx.db;
                 db.mutex.lockUncancelable(db.io);
                 defer db.mutex.unlock(db.io);
-                const memo = db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null;
-                if (memo.verified_at != db.revision) return null;
+                const memo = &(db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null);
+                if (memo.verified_at != db.revision or memo.evicted) return null;
+                memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
-            /// 确保 derived memo 在当前 revision 有效，必要时验证或重算。
-            fn ensureFresh(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key) Error!Fresh(Q) {
+            /// 确保 derived memo 在当前 revision 有效，必要时验证或重算。`need_value` 为 false 时
+            /// （只验证依赖）不恢复被淘汰的值，返回的 `value` 无效
+            fn ensureFresh(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, need_value: bool) Error!Fresh(Q) {
                 const db = ctx.db;
                 const table = &db.tables[comptime queryIndex(Q)];
 
                 db.mutex.lockUncancelable(db.io);
                 const existing = table.slots.items[index].memo;
+                if (existing) |_| table.slots.items[index].memo.?.last_used = db.access_tick.fetchAdd(1, .monotonic);
                 db.mutex.unlock(db.io);
 
                 if (existing) |memo| {
-                    if (memo.verified_at == db.revision) return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
-                    if (try ctx.deepVerify(memo.verified_at, memo.durability, memo.deps)) {
+                    const valid = memo.verified_at == db.revision or try ctx.deepVerify(memo.verified_at, memo.durability, memo.deps);
+                    // 值已被淘汰：依赖未变，重算出的值必然相同，沿用原 changed_at
+                    if (valid and memo.evicted) {
+                        if (need_value) return ctx.execute(Q, index, key, true);
+                        db.mutex.lockUncancelable(db.io);
+                        defer db.mutex.unlock(db.io);
+                        const m = &table.slots.items[index].memo.?;
+                        m.verified_at = @max(m.verified_at, db.revision);
+                        return .{ .value = undefined, .changed_at = m.changed_at, .durability = m.durability };
+                    }
+                    if (valid) {
                         db.mutex.lockUncancelable(db.io);
                         defer db.mutex.unlock(db.io);
                         // 可能已被并发读者重算替换，以表中当前值为准
                         const m = &table.slots.items[index].memo.?;
-                        m.verified_at = @max(m.verified_at, db.revision);
-                        return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
+                        if (!m.evicted) {
+                            m.verified_at = @max(m.verified_at, db.revision);
+                            return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
+                        }
                     }
                 }
-                return ctx.execute(Q, index, key);
+                return ctx.execute(Q, index, key, false);
             }
 
             /// 所有依赖的 changed_at 都不晚于 `verified_at` 时返回 true。
@@ -478,14 +560,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                             }
                             // 栈深度超过上限：同样视为已变化，由重算处理（重算时以回退值代替）
                             if (ctx.stackExhausted()) return db.revision;
-                            return (try ctx.ensureFresh(Q, dep.index, key)).changed_at;
+                            return (try ctx.ensureFresh(Q, dep.index, key, false)).changed_at;
                         },
                     };
                 }
                 unreachable;
             }
 
-            fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key) Error!Fresh(Q) {
+            /// `restore`：memo 的值已被淘汰而依赖未变，重算只为恢复值，沿用原 changed_at
+            fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, restore: bool) Error!Fresh(Q) {
                 const db = ctx.db;
                 const qi = comptime queryIndex(Q);
                 _ = db.executions[qi].fetchAdd(1, .monotonic);
@@ -494,7 +577,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const computed = if (@hasDecl(Q, "computeIncremental")) blk: {
                     // 上一次的值在下一次写事务前不会被释放，可安全地作为增量计算的基础
                     db.mutex.lockUncancelable(db.io);
-                    const prev: ?Q.Value = if (db.tables[qi].slots.items[index].memo) |m| m.value else null;
+                    const prev: ?Q.Value = if (db.tables[qi].slots.items[index].memo) |m| (if (m.evicted) null else m.value) else null;
                     db.mutex.unlock(db.io);
                     break :blk Q.computeIncremental(ctx, key, prev);
                 } else Q.compute(ctx, key);
@@ -509,7 +592,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer db.mutex.unlock(db.io);
 
                 const slot = &db.tables[qi].slots.items[index];
-                const published = if (slot.memo) |old| old.verified_at == db.revision else false;
+                const published = if (slot.memo) |old| old.verified_at == db.revision and !old.evicted else false;
                 if (frame.in_cycle or published) {
                     frame.deps.deinit(db.gpa);
                     try db.discardLocked(Q, &value);
@@ -529,10 +612,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 errdefer db.gpa.free(deps);
 
                 var changed_at = db.revision;
+                const table = &db.tables[qi];
                 if (slot.memo) |*old| {
                     try db.garbage.ensureUnusedCapacity(db.gpa, 2);
                     db.garbage.appendAssumeCapacity(.{ .deps = old.deps });
-                    if (valueEql(Q, old.value, value)) {
+                    if (old.evicted) {
+                        if (restore) changed_at = old.changed_at;
+                        if (@hasDecl(Q, "lru")) table.live += 1;
+                    } else if (valueEql(Q, old.value, value)) {
                         // early cutoff：保留旧值与旧 changed_at
                         changed_at = old.changed_at;
                         deinitValue(Q, &value, db.gpa);
@@ -540,13 +627,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     } else {
                         try db.discardLocked(Q, &old.value);
                     }
-                }
+                } else if (@hasDecl(Q, "lru")) table.live += 1;
+                if (@hasDecl(Q, "lru") and table.live > Q.lru) db.sweep_wanted.store(true, .monotonic);
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,
                     .changed_at = changed_at,
                     .durability = frame.durability,
                     .deps = deps,
+                    .last_used = db.access_tick.fetchAdd(1, .monotonic),
                 };
                 return .{ .value = value, .changed_at = changed_at, .durability = frame.durability };
             }

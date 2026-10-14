@@ -44,10 +44,14 @@ pub const SourceText = struct {
 };
 
 /// 文件的语法树。文本变化后总是视为已变化（不做 cutoff），由 ItemTree 截断变化的传播。
+/// 解析结果占内存最多（约为源码的十几倍）：只保留最近使用的若干个，其余淘汰后按需重新解析
+pub const parse_lru = 64;
+
 pub const ParseFile = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *Parse;
+    pub const lru = parse_lru;
 
     /// 有上一次的结果时尝试局部重解析（结果与全量解析相同，见 `Parse.reparse`）
     pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
@@ -92,19 +96,26 @@ pub const FileItemTree = struct {
 };
 
 /// AstId → 当前语法树节点。随每次解析重建，只在读取时使用，不应作为其他缓存结果的一部分。
+/// 值中的节点指向解析结果：持有其一份引用，`ParseFile` 的值被淘汰后仍然有效
 pub const FileAstIdMap = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree.AstIdMap;
+    pub const lru = parse_lru;
+
+    const Owned = struct {
+        map: ItemTree.AstIdMap,
+        parse: *Parse,
+    };
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const parse = try ctx.get(ParseFile, file);
         const items = try ctx.get(FileItemTree, file);
         const gpa = ctx.db.gpa;
-        const result = try gpa.create(ItemTree.AstIdMap);
+        const result = try gpa.create(Owned);
         errdefer gpa.destroy(result);
-        result.* = try ItemTree.AstIdMap.build(gpa, items, parse.rootNode());
-        return result;
+        result.* = .{ .map = try ItemTree.AstIdMap.build(gpa, items, parse.rootNode()), .parse = parse.retain() };
+        return &result.map;
     }
 
     pub fn eql(a: Value, b: Value) bool {
@@ -112,9 +123,10 @@ pub const FileAstIdMap = struct {
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
-        const m: *ItemTree.AstIdMap = @constCast(v.*);
-        m.deinit(gpa);
-        gpa.destroy(m);
+        const owned: *Owned = @alignCast(@fieldParentPtr("map", @constCast(v.*)));
+        owned.map.deinit(gpa);
+        owned.parse.destroy();
+        gpa.destroy(owned);
     }
 };
 

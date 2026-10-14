@@ -46,6 +46,8 @@ pub const Infer = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = InferKey;
     pub const Value = *const infer.Result;
+    /// 约束长时间会话的内存（泛型实例的结果会不断累积）：被淘汰的结果按需重新推导
+    pub const lru = 16 * 1024;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
         _ = try ctx.get(PointerBits, {});

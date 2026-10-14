@@ -133,7 +133,33 @@ const Spin = struct {
 };
 var spin_started: std.atomic.Value(bool) = .init(false);
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Spin });
+/// 带 LRU 容量的 query：值含指针（淘汰时须释放）
+const Cached = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub const lru: usize = 2;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return ctx.db.gpa.dupe(u8, try ctx.get(Text, key));
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+const CachedLen = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = usize;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return (try ctx.get(Cached, key)).len;
+    }
+};
+
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Spin, Cached, CachedLen });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions[Db.queryIndex(Q)].load(.monotonic);
@@ -347,4 +373,40 @@ test "concurrent reads: readers of the same query agree" {
     for (&threads, &outs) |*t, *o| t.* = try std.Thread.spawn(.{}, Reader.run, .{ &d, o });
     for (threads) |t| t.join();
     for (outs) |o| try testing.expectEqual(5, o);
+}
+
+fn setText(d: *Db, key: u32, text: []const u8) !void {
+    d.beginWrite();
+    defer d.endWrite();
+    try d.set(Text, key, try testing.allocator.dupe(u8, text), .low);
+}
+
+test "lru: evicted values are restored without invalidating dependents" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    for (1..5) |k| try setText(&d, @intCast(k), "abc");
+    for (1..5) |k| try testing.expectEqual(3, try read(&d, CachedLen, @intCast(k)));
+    try testing.expect(d.wantsSweep());
+    // 容量 2：淘汰到 1 个，最久未使用的 1、2、3 被淘汰
+    d.sweep();
+    try testing.expect(!d.wantsSweep());
+    try testing.expectEqual(1, d.tables[comptime Db.queryIndex(Cached)].live);
+
+    // 无关的输入变化：验证 CachedLen(1) 只需要 Cached(1) 的 changed_at，不恢复其值
+    try setText(&d, 4, "abcd");
+    try testing.expectEqual(3, try read(&d, CachedLen, 1));
+    try testing.expectEqual(4, executions(&d, Cached));
+    try testing.expectEqual(4, executions(&d, CachedLen));
+
+    // 直接读取被淘汰的值：重算恢复，沿用原 changed_at，下游不重算
+    try testing.expectEqualStrings("abc", try read(&d, Cached, 1));
+    try testing.expectEqual(5, executions(&d, Cached));
+    try setText(&d, 3, "x");
+    try testing.expectEqual(3, try read(&d, CachedLen, 1));
+    try testing.expectEqual(4, executions(&d, CachedLen));
+
+    // 依赖变化：照常重算
+    try setText(&d, 1, "abcdef");
+    try testing.expectEqual(6, try read(&d, CachedLen, 1));
+    try testing.expectEqual(5, executions(&d, CachedLen));
 }

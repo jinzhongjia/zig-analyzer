@@ -5,6 +5,7 @@
 //! 标准库的全部文件都归入 std 模块：`@import("std")` 可解析，`builtin` 为本机目标、Debug 的
 //! builtin.zig（需要 PATH 中的 zig），`root` 不可解析。
 //! 依赖 comptime 求值的部分（泛型类型构造、依赖 comptime 参数的返回类型）属于 M5，计入未知。
+//! 每个文件之后与服务器一样按需淘汰缓存（§6.6），结果须与不淘汰时相同。
 
 const std = @import("std");
 const za = @import("zig_analyzer");
@@ -70,7 +71,7 @@ pub fn main(init: std.process.Init) !u8 {
     const default_builtin: ?FileId = blk: {
         var zig_env = za.project.ZigEnv.query(gpa, io, null) catch break :blk null;
         defer zig_env.deinit(gpa);
-        const path = try za.project.builtin.generate(gpa, io, zig_env.zig_exe, zig_env.global_cache_dir, &.{"build-obj"}) orelse break :blk null;
+        const path = try za.project.builtin.generate(gpa, io, &zig_env, &.{"build-obj"}) orelse break :blk null;
         defer gpa.free(path);
         break :blk try vfs.intern(path);
     };
@@ -102,39 +103,47 @@ pub fn main(init: std.process.Init) !u8 {
     var decls: Counts = .{};
     var exprs: Counts = .{};
     var members: usize = 0;
+    var sweeps: usize = 0;
     const t0 = std.Io.Clock.awake.now(io);
     for (files.items) |file| {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
-        var ctx = db.beginRead(scratch.allocator());
-        defer ctx.end();
-        const tree = try ctx.get(database.syntax.FileItemTree, file);
-        for (tree.items) |item| {
-            const owner: database.hir.OwnerKey = .{ .file = file, .item = item.ast_id };
-            members += 1;
-            const decl = try ctx.get(queries.DeclType, .{ .owner = owner });
-            switch (item.kind) {
-                .@"const", .@"var", .@"fn" => decls.add(decl.ty),
-                else => {},
+        {
+            var ctx = db.beginRead(scratch.allocator());
+            defer ctx.end();
+            const tree = try ctx.get(database.syntax.FileItemTree, file);
+            for (tree.items) |item| {
+                const owner: database.hir.OwnerKey = .{ .file = file, .item = item.ast_id };
+                members += 1;
+                const decl = try ctx.get(queries.DeclType, .{ .owner = owner });
+                switch (item.kind) {
+                    .@"const", .@"var", .@"fn" => decls.add(decl.ty),
+                    else => {},
+                }
+                const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+                const body = try ctx.get(database.hir.ItemBody, owner);
+                for (body.bindings, res.bindings) |b, tv| if (b.kind == .local_const or b.kind == .local_var) locals.add(tv.ty);
+                for (body.exprs, res.exprs) |e, tv| switch (e) {
+                    // 只统计有值的表达式（不含语句级的控制流与类型表达式）
+                    .name_ref, .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => exprs.add(tv.ty),
+                    else => {},
+                };
             }
-            const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-            const body = try ctx.get(database.hir.ItemBody, owner);
-            for (body.bindings, res.bindings) |b, tv| if (b.kind == .local_const or b.kind == .local_var) locals.add(tv.ty);
-            for (body.exprs, res.exprs) |e, tv| switch (e) {
-                // 只统计有值的表达式（不含语句级的控制流与类型表达式）
-                .name_ref, .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => exprs.add(tv.ty),
-                else => {},
-            };
+        }
+        // 与服务器相同：读事务结束后按需淘汰（同时检验淘汰后恢复的结果与从未淘汰时一致）
+        if (db.wantsSweep()) {
+            db.sweep();
+            sweeps += 1;
         }
     }
     const secs = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s;
     std.debug.print(
-        \\files: {d}, members: {d}, time {d:.2}s
+        \\files: {d}, members: {d}, time {d:.2}s, sweeps {d}
         \\declarations with known type: {d}/{d} ({d:.1}%)
         \\local variables with known type: {d}/{d} ({d:.1}%)
         \\expressions with known type: {d}/{d} ({d:.1}%)
         \\
-    , .{ files.items.len, members, secs, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct() });
+    , .{ files.items.len, members, secs, sweeps, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct() });
     return 0;
 }
 

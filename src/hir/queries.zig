@@ -20,6 +20,8 @@ pub const ItemBody = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = OwnerKey;
     pub const Value = *const Body;
+    /// 约束长时间会话的内存：被淘汰的 Body 按需重新降级
+    pub const lru = 16 * 1024;
 
     pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
         const map = try ctx.get(syntax.FileAstIdMap, key.file);

@@ -350,6 +350,8 @@ fn ReadTask(comptime func: anytype) type {
             defer {
                 server.removePending(pending);
                 server.destroyArena(arena);
+                // 读事务已结束：有 query 超出缓存容量时淘汰（等其他读事务结束，不取消它们）
+                if (server.db.wantsSweep()) server.db.sweep();
             }
             const a = arena.allocator();
             var ctx = server.db.beginRead(a);
@@ -372,6 +374,8 @@ fn SemanticTask(comptime func: anytype) type {
             defer {
                 server.removePending(pending);
                 server.destroyArena(arena);
+                // 读事务已结束：有 query 超出缓存容量时淘汰（等其他读事务结束，不取消它们）
+                if (server.db.wantsSweep()) server.db.sweep();
             }
             const a = arena.allocator();
             var ctx = server.db.beginRead(a);
