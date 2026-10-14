@@ -148,7 +148,7 @@ const Builder = struct {
                 .comptime_decl => .@"comptime",
                 else => continue,
             };
-            const name = if (ast.memberName(member, b.containers.items[index].kind == .@"enum")) |t| t.text else null;
+            const name = if (ast.memberName(member, b.containers.items[index].kind == .@"enum")) |t| ast.identName(t.text) else null;
             const item_index: u32 = @intCast(b.items.items.len);
             try b.items.append(b.gpa, .{
                 .ast_id = try b.uniqueId(container_id, @tagName(kind), name orelse ""),

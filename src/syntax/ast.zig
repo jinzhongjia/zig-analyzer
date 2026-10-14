@@ -94,6 +94,16 @@ pub fn isMember(k: SyntaxKind) bool {
     };
 }
 
+/// 标识符的名字：`@"name"` 形式去掉引号（含转义的保留原文）。语义层（名字解析、字段、枚举成员）
+/// 一律使用去掉引号的名字，显示时再按需加回（`std.zig.fmtId`）
+pub fn identName(text: []const u8) []const u8 {
+    if (text.len >= 3 and text[0] == '@' and text[1] == '"' and text[text.len - 1] == '"') {
+        const inner = text[2 .. text.len - 1];
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+    }
+    return text;
+}
+
 /// 容器成员的名字 token：函数名、变量名、字段名、test 名（字符串或标识符）；没有名字时为 null。
 /// 枚举成员没有冒号，名字在类型表达式的位置，需要由调用方说明成员是否在枚举中
 pub fn memberName(member: SyntaxNode, in_enum: bool) ?SyntaxToken {

@@ -105,7 +105,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .@"var" => "var ",
                 else => "",
             };
-            const name = item.name orelse "_";
+            const name = if (item.name) |n| (if (std.zig.isValidId(n)) n else try std.fmt.allocPrint(r.arena, "{f}", .{std.zig.fmtId(n)})) else "_";
             // 容器定义：`const S = struct`
             if (tv.asType()) |t| switch (ip.key(t)) {
                 .container_type => |c| if (c.kind != .file) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),

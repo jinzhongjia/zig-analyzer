@@ -126,8 +126,9 @@ const Lowerer = struct {
         return l.a.dupe(u8, s);
     }
 
+    /// token 的文本；`@"name"` 形式的标识符取去掉引号的名字
     fn tokenText(l: *Lowerer, t: ?SyntaxToken) Error!?[]const u8 {
-        return if (t) |tok| try l.str(tok.text) else null;
+        return if (t) |tok| try l.str(ast.identName(tok.text)) else null;
     }
 
     /// 新建当前作用域的子作用域并进入
@@ -146,7 +147,7 @@ const Lowerer = struct {
         const id: BindingId = @fromBackingInt(@as(u32, @intCast(l.bindings.items.len)));
         const r = name.range();
         try l.bindings.append(l.gpa, .{
-            .name = try l.str(name.text),
+            .name = try l.str(ast.identName(name.text)),
             .kind = kind,
             .range = l.rel(r.start, r.end),
             .ty = extra.ty,
@@ -195,7 +196,7 @@ const Lowerer = struct {
         const e: Expr = switch (n.kind()) {
             // 括号与语句形式的分支不单独成节点
             .paren_expr, .expr_stmt => return l.exprOrMissing(firstChild(n)),
-            .name_ref => .{ .name_ref = try l.str((ast.NameRef{ .syntax = n }).name().?.text) },
+            .name_ref => .{ .name_ref = try l.str(ast.identName((ast.NameRef{ .syntax = n }).name().?.text)) },
             .literal => .{ .literal = try l.tokenText(n.firstToken()) orelse "" },
             .field_access => blk: {
                 const fa = ast.FieldAccess{ .syntax = n };
@@ -309,7 +310,7 @@ const Lowerer = struct {
             .error_set_decl => blk: {
                 var names: std.ArrayList([]const u8) = .empty;
                 var it = n.children();
-                while (it.next()) |c| if (c == .token and c.token.kind == .identifier) try names.append(l.a, try l.str(c.token.text));
+                while (it.next()) |c| if (c == .token and c.token.kind == .identifier) try names.append(l.a, try l.str(ast.identName(c.token.text)));
                 break :blk .{ .error_set = names.items };
             },
             else => .{ .other = try l.exprList(ast.childNodes(n)) },
@@ -465,7 +466,7 @@ const Lowerer = struct {
         const saved = l.scope;
         defer l.scope = saved;
         if (s.label()) |lab| if (lab.name()) |name| {
-            _ = try l.pushScopeLabeled(&.{}, .{ .name = try l.str(name.text), .expr = id });
+            _ = try l.pushScopeLabeled(&.{}, .{ .name = try l.str(ast.identName(name.text)), .expr = id });
         };
         const outer = l.scope;
         const operand = try l.exprOrMissing(s.operand());

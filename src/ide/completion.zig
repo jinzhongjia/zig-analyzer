@@ -73,11 +73,13 @@ const Collector = struct {
     items: std.ArrayList(Item) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
 
-    /// 内层的名字遮蔽外层的同名名字
+    /// 内层的名字遮蔽外层的同名名字。不是合法标识符的名字（如 `@"struct"`）以引号形式插入
     fn add(c: *Collector, item: Item) Allocator.Error!void {
         if (item.label.len == 0) return;
         if ((try c.seen.getOrPut(c.arena, item.label)).found_existing) return;
-        try c.items.append(c.arena, item);
+        var out = item;
+        if (!std.zig.isValidId(item.label)) out.label = try std.fmt.allocPrint(c.arena, "{f}", .{std.zig.fmtId(item.label)});
+        try c.items.append(c.arena, out);
     }
 };
 
