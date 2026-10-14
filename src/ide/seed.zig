@@ -7,6 +7,7 @@ const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const database = @import("../database.zig");
 const hir = database.hir;
+const Body = @import("../hir/Body.zig");
 const queries = @import("../sema/queries.zig");
 const infer = @import("../sema/infer.zig");
 const eval = @import("../sema/eval.zig");
@@ -31,27 +32,79 @@ pub const Seed = struct {
 /// 项目中其他能引用到该函数的文件
 pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     const root = try genericRoot(r, file, item) orelse return null;
-    const name = (try r.itemTree(file)).items[root].name orelse return null;
-    if (try findIn(r, file, file, item, root, name)) |s| return s;
-    for (try search.importers(r, file, try search.projectFiles(r))) |f| {
-        if (f == file or !(try r.ctx.get(FileIndex.Query, f)).contains(ast.identName(name))) continue;
-        if (try findIn(r, f, file, item, root, name)) |s| return s;
+    const files = try search.importers(r, file, try search.projectFiles(r));
+    const names = try callNames(r, file, root, files);
+    if (try findIn(r, file, file, item, root, names)) |s| return s;
+    for (files) |f| {
+        if (f == file or !try containsAny(r, f, names)) continue;
+        if (try findIn(r, f, file, item, root, names)) |s| return s;
     }
     return null;
 }
 
-/// 在文件 `in` 中查找泛型函数 `root`（位于 `file`，名为 `name`）的调用点。
-/// 只推导提到该名字的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, name: []const u8) resolve.Error!?Seed {
+/// 调用泛型函数 `root` 可能使用的名字：函数名，以及 `files` 中指向它的容器级别名
+/// （`const biggest = lib.max;`，含别名的别名）。只检查文件索引中出现这些名字的文件
+fn callNames(r: *Resolver, file: FileId, root: u32, files: []const FileId) resolve.Error![]const []const u8 {
+    const target: resolve.Def = .{ .item = .{ .file = file, .item = root } };
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(r.arena, (try r.itemTree(file)).items[root].name orelse return &.{});
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (files) |f| {
+            if (!try containsAny(r, f, names.items)) continue;
+            const tree = try r.itemTree(f);
+            for (tree.items, 0..) |it, i| {
+                if (it.kind != .@"const") continue;
+                const name = it.name orelse continue;
+                if (contains(names.items, name)) continue;
+                if (!try mayMentionAny(r, f, @intCast(i), names.items)) continue;
+                if (!mentionsAny(try r.body(f, @intCast(i)), names.items)) continue;
+                const def = try r.aliasTarget(.{ .item = .{ .file = f, .item = @intCast(i) } });
+                if (!std.meta.eql(def, target)) continue;
+                try names.append(r.arena, name);
+                changed = true;
+            }
+        }
+    }
+    return names.items;
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+fn containsAny(r: *Resolver, f: FileId, names: []const []const u8) resolve.Error!bool {
+    const index = try r.ctx.get(FileIndex.Query, f);
+    for (names) |n| if (index.contains(n)) return true;
+    return false;
+}
+
+/// 先用成员摘要粗筛，避免为不相关的成员生成 Body
+fn mayMentionAny(r: *Resolver, f: FileId, item: u32, names: []const []const u8) resolve.Error!bool {
+    for (names) |n| if (try r.mayMention(f, item, n)) return true;
+    return false;
+}
+
+fn mentionsAny(body: *const Body, names: []const []const u8) bool {
+    for (names) |n| if (search.mentions(body, n)) return true;
+    return false;
+}
+
+/// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
+/// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8) resolve.Error!?Seed {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
         // 泛型函数自身体内的调用（递归）也是抽象的
         if (in == file and try enclosedBy(r, file, @intCast(i), root)) continue;
+        if (!try mayMentionAny(r, in, @intCast(i), names)) continue;
         const owner = try r.ownerKey(in, @intCast(i));
         const body = try r.ctx.get(hir.ItemBody, owner);
-        if (!search.mentions(body, name)) continue;
+        if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         if (res.exprs.len != body.exprs.len) continue;
         for (body.exprs, 0..) |e, ei| {

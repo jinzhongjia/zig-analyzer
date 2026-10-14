@@ -154,6 +154,26 @@ pub const Resolver = struct {
         return null;
     }
 
+    /// `const f = a.b.c;` 这类别名最终指向的定义；不是别名时为 `def` 本身
+    pub fn aliasTarget(r: *Resolver, def: Def) Error!Def {
+        var cur = def;
+        for (0..max_depth) |_| {
+            const it = switch (cur) {
+                .item => |it| it,
+                else => return cur,
+            };
+            if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return cur;
+            const b = try r.body(it.file, it.item);
+            const value = b.value orelse return cur;
+            cur = switch (b.expr(value)) {
+                .name_ref => |n| try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
+                .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse return cur) else null,
+                else => null,
+            } orelse return cur;
+        }
+        return cur;
+    }
+
     // ── 命名空间求值 ─────────────────────────────────────────────────
 
     /// 定义指向的命名空间（`const x = @import(...)`、`const S = struct {...}`、别名等）

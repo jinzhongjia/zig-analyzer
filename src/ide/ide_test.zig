@@ -234,3 +234,30 @@ test "hover in generic bodies is inferred from a call site in another file" {
     const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst bigger: i64\n```\n\ninferred from the call at main.zig:3", info.text);
 }
+
+test "hover in generic bodies: call sites through aliases" {
+    const lib_text =
+        \\pub fn max(comptime T: type, a: T, b: T) T {
+        \\    const bigger = if (a > b) a else b;
+        \\    return bigger;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = (try w.add("/p/lib.zig", lib_text)).file;
+    // 别名的别名：main.zig 中只出现 `top`，没有 `max`
+    const alias = (try w.add("/p/alias.zig", "const lib = @import(\"lib.zig\");\npub const biggest = lib.max;\npub const top = biggest;\n")).file;
+    const main = (try w.add("/p/main.zig", "const alias = @import(\"alias.zig\");\nfn run() void {\n    _ = alias.top(u16, 1, 2);\n}\n")).file;
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+        .{ .file = alias, .module = 0, .root_module = 0 },
+        .{ .file = main, .module = 0, .root_module = 0 },
+        .{ .file = lib, .module = 0, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst bigger: u16\n```\n\ninferred from the call at main.zig:3", info.text);
+}
