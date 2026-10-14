@@ -141,8 +141,9 @@ pub fn main(init: std.process.Init) !u8 {
                 const body = try ctx.get(database.hir.ItemBody, owner);
                 for (body.bindings, res.bindings) |b, tv| if (b.kind == .local_const or b.kind == .local_var) locals.add(tv.ty);
                 for (body.exprs, res.exprs) |e, tv| switch (e) {
-                    // 只统计有值的表达式（不含语句级的控制流与类型表达式）
-                    .name_ref, .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => exprs.add(tv.ty),
+                    // 只统计有值的表达式（不含语句级的控制流与类型表达式）；`_ = x;` 的 `_` 是丢弃，不是值
+                    .name_ref => |n| if (!std.mem.eql(u8, n, "_")) exprs.add(tv.ty),
+                    .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => exprs.add(tv.ty),
                     else => {},
                 };
             }
