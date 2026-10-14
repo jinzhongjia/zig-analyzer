@@ -64,7 +64,8 @@ pub fn generate(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []cons
     const dir_path = try std.fs.path.join(gpa, &.{ cache_dir, "zig-analyzer", "builtin", name });
     defer gpa.free(dir_path);
     const path = try std.fs.path.join(gpa, &.{ dir_path, "builtin.zig" });
-    errdefer gpa.free(path);
+    var ok = false;
+    defer if (!ok) gpa.free(path);
 
     // 同名文件内容必然相同：已存在则直接使用
     Io.Dir.cwd().access(io, path, .{}) catch {
@@ -80,6 +81,7 @@ pub fn generate(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []cons
     // 记录失败不影响结果：下次重新生成
     if (std.fs.path.dirname(index_path)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
     Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = name }) catch {};
+    ok = true;
     return path;
 }
 
