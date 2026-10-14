@@ -26,7 +26,7 @@
 //!
 //! derived query 可声明 `pub const lru: usize = N`：保留值的 memo 超过 N 个时，最久未使用的 memo
 //! 被淘汰，只删除值，保留依赖与 changed_at。被淘汰的 memo 验证通过时重算并沿用原 changed_at
-//! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `sweep` 中进行
+//! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `trySweep` 中进行
 //! （此时没有读事务持有值）。
 //!
 //! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先置位
@@ -224,17 +224,20 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.evictLocked();
         }
 
-        /// 是否有 query 超出 `lru` 容量（调用方可在空闲时调用 `sweep`）
+        /// 是否有 query 超出 `lru` 容量（调用方可在空闲时调用 `trySweep`）
         pub fn wantsSweep(db: *Db) bool {
             return db.sweep_wanted.load(.monotonic);
         }
 
-        /// 淘汰超出 `lru` 容量的 memo 值：等待进行中的读事务结束（不取消它们）
-        pub fn sweep(db: *Db) void {
-            db.rw.lockUncancelable(db.io);
+        /// 淘汰超出 `lru` 容量的 memo 值。只在没有读事务时进行：读写锁写者优先，排队等待的
+        /// 清扫会挡住之后的所有读事务，直到最慢的那个读事务结束。拿不到锁时返回 false，
+        /// 留到下一次写事务或下一次清扫
+        pub fn trySweep(db: *Db) bool {
+            if (!db.rw.tryLock(db.io)) return false;
             defer db.rw.unlock(db.io);
             db.collectGarbage();
             db.evictLocked();
+            return true;
         }
 
         /// 每个超出容量的 query 淘汰最久未使用的 memo，降到容量的 3/4（留出余量，避免频繁清扫）。

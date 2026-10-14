@@ -354,8 +354,8 @@ fn ReadTask(comptime func: anytype) type {
             defer {
                 server.removePending(pending);
                 server.destroyArena(arena);
-                // 读事务已结束：有 query 超出缓存容量时淘汰（等其他读事务结束，不取消它们）
-                if (server.db.wantsSweep()) server.db.sweep();
+                // 读事务已结束：有 query 超出缓存容量且没有其他读事务时淘汰
+                if (server.db.wantsSweep()) _ = server.db.trySweep();
             }
             const a = arena.allocator();
             var ctx = server.db.beginRead(a);
@@ -378,8 +378,8 @@ fn SemanticTask(comptime func: anytype) type {
             defer {
                 server.removePending(pending);
                 server.destroyArena(arena);
-                // 读事务已结束：有 query 超出缓存容量时淘汰（等其他读事务结束，不取消它们）
-                if (server.db.wantsSweep()) server.db.sweep();
+                // 读事务已结束：有 query 超出缓存容量且没有其他读事务时淘汰
+                if (server.db.wantsSweep()) _ = server.db.trySweep();
             }
             const a = arena.allocator();
             var ctx = server.db.beginRead(a);
@@ -528,7 +528,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
             };
         }
         done = end;
-        if (server.db.wantsSweep()) server.db.sweep();
+        if (server.db.wantsSweep()) _ = server.db.trySweep();
         if (!progress_started and t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds > index_progress_delay_ms * std.time.ns_per_ms) {
             progress = server.progress.begin(server, "Indexing", true);
             progress_started = true;

@@ -1058,13 +1058,14 @@ pub fn make() std.ArrayList(u8) { ... }
 | 改动 | 文件 | 测量依据与效果 |
 |---|---|---|
 | 绿树压缩 | `src/syntax/green.zig` | 解析结果占源码的 20 倍：每个 token（含空白、注释）一个 32 字节的标签联合。改为 16 字节的紧凑结构（指针 + 长度 + 种类 + 是否节点），降到 12.7 倍（Zig 编译器源码 504 MB → 316 MB） |
-| 查询结果淘汰（§6.6） | `src/db/engine.zig` | derived query 可声明 `lru` 容量；超出后在写事务开始时或读请求结束后（`sweep`，不取消其他读事务）淘汰最久未使用的值，保留依赖与 changed_at。被淘汰的值在验证通过时重算并沿用原 changed_at，下游不重算；验证依赖时不恢复值。`ParseFile`、`FileAstIdMap` 上限 64（AstIdMap 持有 Parse 的引用，二者可各自淘汰），`ItemBody`、`Infer` 上限 16384。常驻内存 805 MB → 361 MB |
+| 查询结果淘汰（§6.6） | `src/db/engine.zig` | derived query 可声明 `lru` 容量；超出后在写事务开始时或读请求结束后（`trySweep`：只在没有其他读事务时进行，读写锁写者优先，排队的清扫会挡住之后的读请求）淘汰最久未使用的值，保留依赖与 changed_at。被淘汰的值在验证通过时重算并沿用原 changed_at，下游不重算；验证依赖时不恢复值。`ParseFile`、`FileAstIdMap` 上限 64（AstIdMap 持有 Parse 的引用，二者可各自淘汰），`ItemBody`、`Infer` 上限 16384。常驻内存 805 MB → 361 MB |
 | 后台索引 | `src/server/Server.zig` | 一次 hover 的跨文件调用点种子为构建反向 import 图在请求中解析了 174 个文件（352 ms、+400 MB）。模块图更新后在后台为全部项目文件计算 `FileIndex` 与 ItemTree（同时只运行一个任务，模块图又变化时再做一遍；超过 200 ms 才显示进度），该 hover 降到 34 ms |
 | 调用点种子 | `src/ide/seed.zig` | 只推导提到该函数名的成员 |
 | builtin.zig 生成 | `src/project/builtin.zig`、`Workspace.zig` | 项目加载 16.6 s 中几乎全部用于为每组模块参数串行运行 `zig --show-builtin`。按「zig 版本 + 参数」记录生成结果，并行生成：首次 3.2 s，之后约 1 s |
 
 - 验证：`sema-corpus` 每个文件之后按需淘汰（标准库上 114 次），统计结果与不淘汰时完全相同，Debug 与 ReleaseSafe 下均无崩溃与泄漏；引擎单测覆盖淘汰后恢复不使下游重算、依赖变化照常重算。
-- 同时修复：一条日志中的中文标点。
+- 同时修复：一条日志中的中文标点；builtin.zig 写入缓存失败或被取消时泄漏路径字符串。
+- 测试运行器：构建时在 Zig 自带的运行器上开启测试分配器的调用栈记录（`tools/patch_test_runner.zig`），测试模块保留帧指针，ReleaseSafe 下的泄漏报告也带调用栈（CI 上曾偶发一次无法定位的泄漏）。
 - 测试：`zig build test` 共 186 个。
 
 ## 20. 风险与对策

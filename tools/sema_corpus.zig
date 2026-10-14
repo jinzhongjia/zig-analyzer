@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         // 与服务器相同：读事务结束后按需淘汰（同时检验淘汰后恢复的结果与从未淘汰时一致）
         if (db.wantsSweep()) {
-            db.sweep();
+            _ = db.trySweep();
             sweeps += 1;
         }
     }

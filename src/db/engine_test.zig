@@ -388,7 +388,7 @@ test "lru: evicted values are restored without invalidating dependents" {
     for (1..5) |k| try testing.expectEqual(3, try read(&d, CachedLen, @intCast(k)));
     try testing.expect(d.wantsSweep());
     // 容量 2：淘汰到 1 个，最久未使用的 1、2、3 被淘汰
-    d.sweep();
+    try testing.expect(d.trySweep());
     try testing.expect(!d.wantsSweep());
     try testing.expectEqual(1, d.tables[comptime Db.queryIndex(Cached)].live);
 
