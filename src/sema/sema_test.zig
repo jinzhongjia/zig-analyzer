@@ -675,8 +675,7 @@ test "layouts that are invalid or depend on the build mode stay unknown" {
         \\    const bits_sent = @bitSizeOf([2:0]u8);
         \\    const bits_autos = @bitSizeOf([2]Auto);
         \\    const size_pa = @sizeOf(Pa);
-        \\    const size_tuple = @sizeOf(@TypeOf(.{ @as(u8, 1), @as(u32, 2) }));
-        \\    _ = .{ size_bare, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa, size_tuple };
+        \\    _ = .{ size_bare, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa };
         \\}
     , &.{
         // 不带标签的 union：没有 builtin（不知道优化模式）
@@ -692,8 +691,6 @@ test "layouts that are invalid or depend on the build mode stay unknown" {
         .{ "bits_autos", "comptime_int" },
         // packed 结构体不能包含未指定标签类型的枚举
         .{ "size_pa", "comptime_int" },
-        // 元组字面量中 comptime 已知的字段是 comptime 字段
-        .{ "size_tuple", "comptime_int" },
     });
 }
 
@@ -862,6 +859,77 @@ test "vector layouts follow the backend and CPU features" {
     try expectTypesTargeted(.{ .vector_abi = .unknown }, src, &.{
         .{ "v2u8", "comptime_int" },
         .{ "bits", "comptime_int" },
+    });
+}
+
+test "tuple and anonymous struct literals have comptime fields like the compiler" {
+    // 期望值为 zig 0.17.0 的结果
+    try expectTypes(
+        \\fn foo() u32 {
+        \\    return 7;
+        \\}
+        \\inline fn inl() u32 {
+        \\    return 1;
+        \\}
+        \\fn g(p: u32, items: []const u8) void {
+        \\    var x: u32 = 2;
+        \\    var y: u8 = 1;
+        \\    var z: u64 = 3;
+        \\    _ = .{ &x, &y, &z };
+        \\    const k = 5;
+        \\    const t1 = .{ @as(u8, 1), x };
+        \\    const t2 = .{ y, x, z };
+        \\    const t3 = .{ y, {}, x };
+        \\    const t4 = .{ k, "hi", x };
+        \\    const t5 = .{p};
+        \\    const tc = .{foo()};
+        \\    const tu = .{inl()};
+        \\    const a1 = .{ .a = @as(u8, 1), .b = x };
+        \\    const a2 = .{ .a = y, .b = z, .c = x };
+        \\    const first = t1[0];
+        \\    for (items) |it| {
+        \\        const tl = .{it};
+        \\        _ = tl;
+        \\    }
+        \\    const s1 = @sizeOf(@TypeOf(t1));
+        \\    const s2 = @sizeOf(@TypeOf(t2));
+        \\    const o2 = @offsetOf(@TypeOf(t2), "1");
+        \\    const s3 = @sizeOf(@TypeOf(t3));
+        \\    const s4 = @sizeOf(@TypeOf(t4));
+        \\    const su = @sizeOf(@TypeOf(tu));
+        \\    const sa1 = @sizeOf(@TypeOf(a1));
+        \\    const sa2 = @sizeOf(@TypeOf(a2));
+        \\    const oa2 = @offsetOf(@TypeOf(a2), "a");
+        \\    const empty = .{};
+        \\    const s0 = @sizeOf(@TypeOf(.{ @as(u8, 1), @as(u32, 2) }));
+        \\    _ = .{ t1, t2, t3, t4, t5, tc, tu, a1, a2, first, s1, s2, o2, s3, s4, su, sa1, sa2, oa2, empty, s0 };
+        \\}
+    , &.{
+        // comptime 已知的值（含 `{}`、字符串）是 comptime 字段；var、参数、函数调用与循环的捕获是运行时的
+        .{ "t1", "struct { comptime u8 = 1, u32 }" },
+        .{ "t2", "struct { u8, u32, u64 }" },
+        .{ "t3", "struct { u8, comptime void = {}, u32 }" },
+        .{ "t4", "struct { comptime comptime_int = 5, comptime *const [2:0]u8 = \"hi\", u32 }" },
+        .{ "t5", "struct { u32 }" },
+        .{ "tc", "struct { u32 }" },
+        .{ "tl", "struct { u8 }" },
+        .{ "a1", "struct { comptime a: u8 = 1, b: u32 }" },
+        // comptime 字段的值属于类型
+        .{ "first", "u8 = 1" },
+        // 元组按声明顺序排列，comptime 字段不占空间；匿名结构体与 auto 结构体相同，按对齐重排
+        .{ "s1", "comptime_int = 4" },
+        .{ "s2", "comptime_int = 16" },
+        .{ "o2", "comptime_int = 4" },
+        .{ "s3", "comptime_int = 8" },
+        .{ "s4", "comptime_int = 4" },
+        .{ "sa1", "comptime_int = 4" },
+        .{ "sa2", "comptime_int = 16" },
+        .{ "oa2", "comptime_int = 12" },
+        // inline 函数的结果是否 comptime 已知取决于函数体：字段是否占空间未知
+        .{ "su", "comptime_int" },
+        .{ "empty", "@TypeOf(.{}) = .{}" },
+        // 字段都是 comptime 字段
+        .{ "s0", "comptime_int = 0" },
     });
 }
 
@@ -1082,7 +1150,8 @@ test "type reflection and reification" {
         .{ "F", "type = Fields(S)" },
         .{ "fb", "Fields(S) = .b" },
         .{ "Ptr", "type = []const u8" },
-        .{ "tuple", "struct { u8, bool } = .{ 1, true }" },
+        // 与编译器一致：字面量中 comptime 已知的字段是 comptime 字段
+        .{ "tuple", "struct { comptime u8 = 1, comptime bool = true } = .{ 1, true }" },
         .{ "first", "u8 = 1" },
     });
 }

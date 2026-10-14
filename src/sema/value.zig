@@ -542,15 +542,27 @@ pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
         .array_type => |a| isComptimeOnly(ip, a.child),
         .optional_type => |c| isComptimeOnly(ip, c),
         .error_union_type => |e| isComptimeOnly(ip, e.payload),
-        .tuple_type => |types| anyComptimeOnly(ip, types),
-        .anon_struct_type => |a| anyComptimeOnly(ip, a.types),
-        .reified_type => |r| r.kind != .@"enum" and anyComptimeOnly(ip, r.types),
+        .tuple_type => |tt| anyRuntimeComptimeOnly(ip, tt.types, tt.values),
+        .anon_struct_type => |a| anyRuntimeComptimeOnly(ip, a.types, a.values),
+        .reified_type => |r| r.kind != .@"enum" and for (r.types, 0..) |field_ty, i| {
+            const is_comptime = i < r.comptime_fields.len and r.comptime_fields[i];
+            if (!is_comptime and isComptimeOnly(ip, field_ty)) break true;
+        } else false,
         else => false,
     };
 }
 
 fn anyComptimeOnly(ip: *InternPool, types: []const Index) bool {
     for (types) |t| if (isComptimeOnly(ip, t)) return true;
+    return false;
+}
+
+/// 元组与匿名结构体：comptime 字段（如 `comptime comptime_int = 5`）不使类型成为 comptime-only
+fn anyRuntimeComptimeOnly(ip: *InternPool, types: []const Index, values: []const Index) bool {
+    for (types, 0..) |t, i| {
+        const v = InternPool.fieldValue(values, i);
+        if ((v == .runtime or v == .unknown) and isComptimeOnly(ip, t)) return true;
+    }
     return false;
 }
 
@@ -571,9 +583,9 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
             break :blk isPrecise(ip, f.ret);
         },
         .container_type => |c| c.inst == null or isPrecise(ip, c.inst.?),
-        .tuple_type => |types| allPrecise(ip, types),
+        .tuple_type => |t| allPrecise(ip, t.types) and allPrecise(ip, t.values),
         .vector_type => |vec| isPrecise(ip, vec.child),
-        .anon_struct_type => |a| allPrecise(ip, a.types),
+        .anon_struct_type => |a| allPrecise(ip, a.types) and allPrecise(ip, a.values),
         .reified_type => |r| allPrecise(ip, r.types) and (r.tag == null or isPrecise(ip, r.tag.?)) and (r.inst == null or isPrecise(ip, r.inst.?)),
         .union_tag_type => |u| isPrecise(ip, u),
         .aggregate => |agg| allPrecise(ip, agg.elems),
@@ -608,9 +620,9 @@ pub fn isConcrete(ip: *InternPool, t: Index) bool {
             break :blk isConcrete(ip, f.ret);
         },
         .container_type => |c| c.inst == null or isConcrete(ip, c.inst.?),
-        .tuple_type => |types| allConcrete(ip, types),
+        .tuple_type => |tt| allConcrete(ip, tt.types) and allConcrete(ip, tt.values),
         .vector_type => |v| isConcrete(ip, v.child),
-        .anon_struct_type => |a| allConcrete(ip, a.types),
+        .anon_struct_type => |a| allConcrete(ip, a.types) and allConcrete(ip, a.values),
         .reified_type => |r| allConcrete(ip, r.types) and (r.inst == null or isConcrete(ip, r.inst.?)),
         .union_tag_type => |u| isConcrete(ip, u),
         .instance => |i| blk: {
@@ -676,12 +688,12 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         },
         // 不同位置定义的容器一定不同；同一位置、不同实例的容器是否相同取决于它捕获的值
         .container_type => |c| if (c.file != kb.container_type.file or c.ast_id != kb.container_type.ast_id) false else null,
-        .tuple_type => |x| eqlTypeLists(ip, x, kb.tuple_type),
+        .tuple_type => |x| all(&.{ eqlTypeLists(ip, x.types, kb.tuple_type.types), eqlFieldValues(ip, x.values, kb.tuple_type.values, x.types.len) }),
         .vector_type => |v| if (v.len != kb.vector_type.len) false else eqlTypes(ip, v.child, kb.vector_type.child),
         .anon_struct_type => |x| blk: {
             const y = kb.anon_struct_type;
             if (!eqlNames(x.names, y.names)) break :blk false;
-            break :blk eqlTypeLists(ip, x.types, y.types);
+            break :blk all(&.{ eqlTypeLists(ip, x.types, y.types), eqlFieldValues(ip, x.values, y.values, x.types.len) });
         },
         // 同一位置以相同内容构造的类型相同（构造时的实例只影响显示）
         .reified_type => |x| blk: {
@@ -708,6 +720,27 @@ fn eqlTypeLists(ip: *InternPool, a: []const Index, b: []const Index) ?bool {
             continue;
         };
         if (!r) return false;
+    }
+    return if (unknown) null else true;
+}
+
+/// 元组与匿名结构体各字段的 comptime 值：运行时字段与 comptime 字段不同，comptime 字段按值比较
+fn eqlFieldValues(ip: *InternPool, a: []const Index, b: []const Index, n: usize) ?bool {
+    var unknown = false;
+    for (0..n) |i| {
+        const x = InternPool.fieldValue(a, i);
+        const y = InternPool.fieldValue(b, i);
+        if (x == .unknown or y == .unknown) {
+            unknown = true;
+            continue;
+        }
+        if ((x == .runtime) != (y == .runtime)) return false;
+        if (x == .runtime) continue;
+        const eq = eqlValues(ip, x, y) orelse {
+            unknown = true;
+            continue;
+        };
+        if (!eq) return false;
     }
     return if (unknown) null else true;
 }

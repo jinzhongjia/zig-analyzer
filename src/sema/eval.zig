@@ -486,7 +486,7 @@ const Evaluator = struct {
         return switch (ip.key(t)) {
             .array_type => |a| a.child,
             .vector_type => |v| v.child,
-            .tuple_type => |types| if (i < types.len) types[i] else .unknown,
+            .tuple_type => |tt| if (i < tt.types.len) tt.types[i] else .unknown,
             .anon_struct_type => |s| if (i < s.types.len) s.types[i] else .unknown,
             .reified_type => |rt| if (i < rt.types.len) rt.types[i] else .unknown,
             .ptr_type => |p| if (p.size != .one) p.child else ev.elemTypeOf(p.child, i),
@@ -503,7 +503,7 @@ const Evaluator = struct {
         return switch (ev.ip.key(t)) {
             .array_type => |a| std.math.cast(usize, a.len),
             .vector_type => |v| v.len,
-            .tuple_type => |types| types.len,
+            .tuple_type => |tt| tt.types.len,
             .anon_struct_type => |s| s.names.len,
             .reified_type => |rt| if (rt.kind == .@"struct") rt.names.len else null,
             .ptr_type => |p| if (p.size == .one) try ev.typeElemCount(p.child) else null,
@@ -599,9 +599,9 @@ const Evaluator = struct {
                 }
                 return out.items;
             },
-            .tuple_type => |types| {
-                const out = try ev.a.alloc(Field, types.len);
-                for (types, out, 0..) |ty, *o, i| o.* = .{ .name = try std.fmt.allocPrint(ev.a, "{d}", .{i}), .ty = ty };
+            .tuple_type => |tt| {
+                const out = try ev.a.alloc(Field, tt.types.len);
+                for (tt.types, out, 0..) |ty, *o, i| o.* = .{ .name = try std.fmt.allocPrint(ev.a, "{d}", .{i}), .ty = ty };
                 return out;
             },
             .anon_struct_type => |s| {
@@ -1438,7 +1438,7 @@ const Evaluator = struct {
         } else {
             const types = try ev.a.alloc(Index, n + m);
             for (elems, types) |e, *t| t.* = e.ty;
-            ty = try ip.get(.{ .tuple_type = types });
+            ty = try ip.get(.{ .tuple_type = .{ .types = types, .values = try ev.comptimeFieldValues(elems) } });
         }
         // 中间结果留在解释器内，不驻留
         if (ip.key(ty) == .ptr_type) return ev.pointerToNew(ty, try ev.makeAgg(ip.key(ty).ptr_type.child, elems));
@@ -1703,12 +1703,23 @@ const Evaluator = struct {
             t.* = o.ty;
         }
         const named = fields.len > 0 and fields[0].name != null;
+        const values = try ev.comptimeFieldValues(elems);
         const ty = if (named) blk: {
             const names = try ev.a.alloc([]const u8, fields.len);
             for (fields, names) |fl, *n| n.* = fl.name orelse return error.Abort;
-            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types } });
-        } else try ip.get(.{ .tuple_type = types });
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types, .values = values } });
+        } else try ip.get(.{ .tuple_type = .{ .types = types, .values = values } });
         return ev.makeAgg(ty, elems);
+    }
+
+    /// 解释器中构造的元组与匿名结构体：值都在 comptime 求出，字段都是 comptime 字段（与编译器一致）
+    fn comptimeFieldValues(ev: *Evaluator, elems: []const Val) EvalError![]const Index {
+        const values = try ev.a.alloc(Index, elems.len);
+        for (elems, values) |e, *v| v.* = ev.freeze(e) catch |err| switch (err) {
+            error.Abort => .unknown,
+            else => |x| return x,
+        } orelse .unknown;
+        return values;
     }
 
     fn makeAgg(ev: *Evaluator, ty: Index, elems: []Val) Error!Val {
@@ -1920,7 +1931,7 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@Tuple")) {
             if (vals.len != 1) return error.Abort;
-            return Val.ofType(try ip.get(.{ .tuple_type = try ev.typesOf(vals[0]) }));
+            return Val.ofType(try ip.get(.{ .tuple_type = .{ .types = try ev.typesOf(vals[0]) } }));
         }
         if (eq(u8, name, "@Pointer")) {
             if (vals.len != 4) return error.Abort;
@@ -2331,15 +2342,14 @@ const Evaluator = struct {
             .optional_type => |c| return value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
             .array_type => |a| return value.arrayLayout(try ev.typeLayout(a.child, depth + 1) orelse return null, a, try ev.hasBitRepr(a.child)),
             .error_union_type => |eu| return value.errorUnionLayout(try ev.typeLayout(eu.payload, depth + 1) orelse return null),
-            .container_type, .reified_type, .union_tag_type => {},
+            .container_type, .reified_type, .union_tag_type, .tuple_type, .anon_struct_type => {},
             else => return value.typeLayout(ip, t),
         }
         // 枚举：标签整数
         if (value.isEnumType(ip, t)) return value.typeLayout(ip, try ev.enumTagType(t) orelse return null);
         const fields = try ev.layoutFields(t, depth) orelse return null;
-        const decl = try ev.containerSyntax(t);
-        if (ev.isUnion(t)) return ev.unionLayout(t, decl, fields, depth);
-        return (try ev.structLayout(decl, fields) orelse return null).layout;
+        if (ev.isUnion(t)) return ev.unionLayout(t, try ev.containerSyntax(t), fields, depth);
+        return (try ev.structLayoutOf(t, fields) orelse return null).layout;
     }
 
     /// 结构体字段的位偏移；comptime 字段与求不出时为 null
@@ -2348,7 +2358,7 @@ const Evaluator = struct {
         if (ev.isUnion(t) or value.isEnumType(ev.ip, t)) return null;
         const i = try ev.fieldIndex(t, field) orelse return null;
         const fields = try ev.layoutFields(t, 0) orelse return null;
-        const sl = try ev.structLayout(try ev.containerSyntax(t), fields) orelse return null;
+        const sl = try ev.structLayoutOf(t, fields) orelse return null;
         return sl.bit_offsets[i];
     }
 
@@ -2381,12 +2391,11 @@ const Evaluator = struct {
     /// 参与布局的字段：comptime 字段不占空间。`alignment` 为显式对齐，未指定时为类型的对齐
     const LayoutField = struct { ty: Index, layout: ?value.Layout, alignment: u64 = 0, explicit_align: bool = false, is_comptime: bool = false };
 
-    /// 结构体与 union 各字段的布局；字段的布局或属性求不出时为 null。元组与匿名结构体字面量中
-    /// comptime 已知的字段是 comptime 字段，类型中没有记录，布局同样未知
+    /// 结构体（含元组、匿名结构体）与 union 各字段的布局；字段的布局或属性求不出时为 null
     fn layoutFields(ev: *Evaluator, t: Index, depth: u32) EvalError!?[]const LayoutField {
         switch (ev.ip.key(t)) {
             .container_type => |c| if (c.kind == .@"opaque") return null,
-            .reified_type => {},
+            .reified_type, .tuple_type, .anon_struct_type => {},
             else => return null,
         }
         const fields = try ev.fieldsOf(t) orelse return null;
@@ -2417,6 +2426,9 @@ const Evaluator = struct {
                 .is_comptime = i < rt.comptime_fields.len and rt.comptime_fields[i],
                 .alignment = if (i < rt.field_aligns.len and rt.field_aligns[i] != 0) rt.field_aligns[i] else null,
             },
+            // 字面量的字段是否 comptime 求不出时放弃
+            .tuple_type => |tt| literalFieldAttrs(tt.values, i),
+            .anon_struct_type => |a| literalFieldAttrs(a.values, i),
             else => .{},
         };
     }
@@ -2433,6 +2445,38 @@ const Evaluator = struct {
     }
 
     const StructLayout = struct { layout: value.Layout, bit_offsets: []const ?u64 };
+
+    /// 结构体（含元组、匿名结构体）的布局与各字段的位偏移
+    fn structLayoutOf(ev: *Evaluator, t: Index, fields: []const LayoutField) EvalError!?StructLayout {
+        if (ev.ip.key(t) == .tuple_type) return try ev.tupleLayout(fields);
+        return ev.structLayout(try ev.containerSyntax(t), fields);
+    }
+
+    /// 元组的布局（`Type.structFieldOffset` 与 `abiAlignment` 的元组分支）：按声明顺序，不重排；comptime 字段
+    /// 与零大小的字段不占位置。对齐计入零大小的字段，大小只按有大小的字段的对齐补齐（与编译器一致，
+    /// `struct { u8, [0]u64 }` 的大小为 1、对齐为 8）
+    fn tupleLayout(ev: *Evaluator, fields: []const LayoutField) Error!StructLayout {
+        const offsets = try ev.a.alloc(?u64, fields.len);
+        var end: u64 = 0;
+        var size_align: u64 = 1;
+        var alignment: u64 = 1;
+        for (fields, offsets) |fl, *o| {
+            if (fl.is_comptime) {
+                o.* = null;
+                continue;
+            }
+            alignment = @max(alignment, fl.alignment);
+            if (fl.layout.?.size == 0) {
+                o.* = 0;
+                continue;
+            }
+            size_align = @max(size_align, fl.alignment);
+            const offset = std.mem.alignForward(u64, end, fl.alignment);
+            o.* = offset * 8;
+            end = offset + fl.layout.?.size;
+        }
+        return .{ .layout = .{ .size = std.mem.alignForward(u64, end, size_align), .alignment = alignment, .bits = null }, .bit_offsets = offsets };
+    }
 
     /// 结构体的布局与各字段的位偏移（comptime 字段为 null）。auto 布局按对齐降序重排字段，
     /// 与编译器同样使用 `sortUnstable`，对齐相同的字段顺序也一致
@@ -2757,10 +2801,16 @@ const Evaluator = struct {
         const attrs = try ev.a.alloc(Index, fields.len);
         for (fields, attrs, 0..) |fl, *o, i| {
             const fa = try ev.fieldAttrs(t, i, fl);
+            // 元组与匿名结构体字面量的 comptime 字段：值属于类型
+            const literal_value: ?Index = switch (ip.key(t)) {
+                .tuple_type => |tt| InternPool.fieldValue(tt.values, i),
+                .anon_struct_type => |a| InternPool.fieldValue(a.values, i),
+                else => null,
+            };
             o.* = try ev.structValue(fa_ty, &.{
                 .{ "comptime", if (fa.is_comptime) .true_value else .false_value },
                 .{ "align", try ev.alignAttr(fa.alignment) },
-                .{ "default_value_ptr", try ev.defaultPtr(t, fl) },
+                .{ "default_value_ptr", if (fa.is_comptime and literal_value != null) try ev.anyopaquePtr(literal_value.?) else try ev.defaultPtr(t, fl) },
             });
         }
         return .{ "struct", try ev.structValue(struct_ty, &.{
@@ -2772,6 +2822,12 @@ const Evaluator = struct {
             .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
             .{ "decl_names", decls },
         }) };
+    }
+
+    /// 指向值的 `*const anyopaque`（字段的默认值）
+    fn anyopaquePtr(ev: *Evaluator, v: Index) Error!Index {
+        const ty = try ev.ip.ptrTo(.anyopaque_type, .one, true);
+        return ev.ip.get(.{ .ptr_value = .{ .ty = ty, .pointee = v } });
     }
 
     /// 字段属性中的 `align`（`?usize`）
@@ -2916,6 +2972,13 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     if (a == .comptime_float_type or a == .comptime_int_type) return if (ip.isFloat(b)) b else null;
     if (b == .comptime_float_type or b == .comptime_int_type) return if (ip.isFloat(a)) a else null;
     return null;
+}
+
+/// 元组与匿名结构体字面量的字段是否 comptime；求不出时放弃
+fn literalFieldAttrs(values: []const Index, i: usize) EvalError!Evaluator.FieldAttrs {
+    const v = InternPool.fieldValue(values, i);
+    if (v == .unknown) return error.Abort;
+    return .{ .is_comptime = v != .runtime };
 }
 
 /// 对齐的值：须为 2 的幂（否则编译器报错），求不出时放弃

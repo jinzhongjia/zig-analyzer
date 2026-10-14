@@ -396,6 +396,12 @@ const Inferrer = struct {
             .index => |x| {
                 const lhs = try inf.infer(x.lhs, null);
                 const i = try inf.infer(x.index, .usize_type);
+                // 元组（含指向元组的指针）：下标 comptime 已知时取字段的类型；comptime 字段的值属于类型
+                if (tupleOf(ip, lhs.ty)) |tt| if (value.intOf(ip, i.val)) |n| if (std.math.cast(usize, n)) |k| if (k < tt.types.len) {
+                    if (lhs.val != null) if (try eval.elemValue(inf.r, lhs, k)) |ev| return .{ .ty = tt.types[k], .val = ev.val };
+                    const v = InternPool.fieldValue(tt.values, k);
+                    return .{ .ty = tt.types[k], .val = if (v == .runtime or v == .unknown) null else v };
+                };
                 const elem = inf.elementType(lhs.ty);
                 // comptime 已知的聚合与下标：取出元素
                 if (lhs.val != null) if (value.intOf(ip, i.val)) |n| if (std.math.cast(usize, n)) |k| if (try eval.elemValue(inf.r, lhs, k)) |ev| {
@@ -603,8 +609,10 @@ const Inferrer = struct {
             },
             // 元组、匿名结构体、构造的结构体与 union
             .tuple_type, .anon_struct_type, .reified_type => {
-                if (ip.key(t) == .tuple_type and std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type, .val = try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = ip.key(t).tuple_type.len } }) };
-                return .{ .ty = try eval.fieldType(inf.r, t, name) orelse .unknown };
+                if (ip.key(t) == .tuple_type and std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type, .val = try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = ip.key(t).tuple_type.types.len } }) };
+                const ty = try eval.fieldType(inf.r, t, name) orelse .unknown;
+                // 字面量的 comptime 字段：值属于类型
+                return .{ .ty = ty, .val = literalFieldValue(ip, t, name) };
             },
             else => {},
         }
@@ -1238,13 +1246,147 @@ const Inferrer = struct {
             if (tv.val == null) known = false;
         }
         for (types) |t| if (t == .unknown) return .unknown;
+        // comptime 已知的字段是 comptime 字段，值属于类型（与编译器一致）
+        const values = try inf.scratch.alloc(Index, fields.len);
+        for (fields, types, vals, values) |f, t, v, *o| o.* = try inf.literalField(f.value, t, v);
+        const field_values = InternPool.fieldValues(values);
         const named = fields.len > 0 and fields[0].name != null;
         const ty = if (named) blk: {
             const names = try inf.scratch.alloc([]const u8, fields.len);
             for (fields, names) |f, *n| n.* = f.name orelse return .unknown;
-            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types } });
-        } else try ip.get(.{ .tuple_type = types });
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types, .values = field_values } });
+        } else try ip.get(.{ .tuple_type = .{ .types = types, .values = field_values } });
         return .{ .ty = ty, .val = if (known) try value.aggregate(ip, inf.scratch, ty, vals) else null };
+    }
+
+    /// 字面量字段的 comptime 值（见 `InternPool.fieldValue`）：值已知或类型只有一个可能值时为该值，
+    /// 运行时的值为 `runtime`，判断不了时为 `unknown`
+    fn literalField(inf: *Inferrer, e: ExprId, ty: Index, val: Index) Error!Index {
+        if (val != .unknown) return val;
+        if (ty == .void_type) return .void_value;
+        // 字符串字面量（推导器不为字符串生成值；多行字符串在 HIR 中只保留第一行）
+        switch (inf.body.expr(e)) {
+            .literal => |text| if (text.len > 0 and text[0] == '"') {
+                const str = std.zig.string_literal.parseAlloc(inf.scratch, text) catch return .unknown;
+                return inf.ip.get(.{ .bytes = .{ .ty = ty, .bytes = str } });
+            },
+            else => {},
+        }
+        if (value.intInfo(inf.ip, ty)) |info| if (info.bits == 0) return inf.ip.get(.{ .int_value = .{ .ty = ty, .value = 0 } });
+        if (inf.comptime_depth > 0) return .unknown;
+        return if (try inf.knownness(e, 0) == .runtime) .runtime else .unknown;
+    }
+
+    const Knownness = enum { comptime_known, runtime, uncertain };
+
+    /// 表达式的值是否 comptime 已知，覆盖与编译器判断一致的常见情形，判断不了时为 `uncertain`
+    fn knownness(inf: *Inferrer, e: ExprId, depth: u32) Error!Knownness {
+        const ip = inf.ip;
+        const tv = inf.get(e);
+        if (tv.val != null) return .comptime_known;
+        // comptime-only 类型的值一定 comptime 已知
+        if (tv.ty != .unknown and value.isComptimeOnly(ip, tv.ty)) return .comptime_known;
+        if (depth > 8) return .uncertain;
+        const b = inf.body;
+        switch (b.expr(e)) {
+            .name_ref => |name| {
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .uncertain;
+                switch (def) {
+                    .local => |l| {
+                        // 外层函数的局部变量（体内容器的成员中引用）
+                        if (l.file != inf.file or l.item != inf.item) return .uncertain;
+                        const binding = b.binding(l.binding);
+                        return switch (binding.kind) {
+                            .local_var => .runtime,
+                            .param => if (binding.is_comptime) .comptime_known else try inf.paramKnownness(),
+                            .local_const => if (binding.init) |init| inf.knownness(init, depth + 1) else .uncertain,
+                            .capture => inf.captureKnownness(l.binding, depth + 1),
+                        };
+                    },
+                    .item => |it| return declKnownness((try inf.r.itemTree(it.file)).items[it.item]),
+                    .file => return .comptime_known,
+                }
+            },
+            .field_access => |fa| {
+                // 容器的声明
+                if (inf.members[@backingInt(e)]) |owner| {
+                    const tree = try inf.r.itemTree(owner.file);
+                    for (tree.items) |it| if (it.ast_id == owner.item) return declKnownness(it);
+                    return .uncertain;
+                }
+                return inf.anyRuntime(&.{fa.lhs}, depth);
+            },
+            .call => |c| {
+                // 普通函数的调用在运行时执行（返回 comptime-only 类型的调用已在上面处理）
+                const fv = switch (ip.key(inf.get(c.callee).val orelse return .uncertain)) {
+                    .fn_value => |f| f,
+                    else => return .uncertain,
+                };
+                const tree = try inf.r.itemTree(fv.file);
+                for (tree.items) |it| if (it.ast_id == fv.decl) return if (it.flags.is_inline) .uncertain else .runtime;
+                return .uncertain;
+            },
+            .binary => |x| return inf.anyRuntime(&.{ x.lhs, x.rhs }, depth),
+            .prefix => |x| return if (x.op == .ampersand) inf.addressKnownness(x.operand, depth) else inf.anyRuntime(&.{x.operand}, depth),
+            .index => |x| return inf.anyRuntime(&.{ x.lhs, x.index }, depth),
+            .slice => |x| return inf.anyRuntime(&.{ x.lhs, x.start, x.end orelse x.start }, depth),
+            .deref, .unwrap_optional => |x| return inf.anyRuntime(&.{x}, depth),
+            .@"catch" => |x| return inf.anyRuntime(&.{x.lhs}, depth),
+            .builtin_call => |c| {
+                if (c.args.len == 0) return .uncertain;
+                // 转换类的内置函数取决于被转换的值（最后一个参数），`@field` 取决于对象
+                const casts = [_][]const u8{ "@as", "@intCast", "@truncate", "@bitCast", "@floatCast", "@floatFromInt", "@intFromFloat", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@intFromEnum", "@enumFromInt", "@intFromBool", "@intFromPtr", "@errorCast" };
+                for (casts) |n| if (std.mem.eql(u8, c.name, n)) return inf.anyRuntime(c.args[c.args.len - 1 ..], depth);
+                if (std.mem.eql(u8, c.name, "@field")) return inf.anyRuntime(c.args[0..1], depth);
+                return .uncertain;
+            },
+            else => return .uncertain,
+        }
+    }
+
+    /// 有一个运行时的值即为运行时
+    fn anyRuntime(inf: *Inferrer, es: []const ExprId, depth: u32) Error!Knownness {
+        for (es) |x| if (try inf.knownness(x, depth + 1) == .runtime) return .runtime;
+        return .uncertain;
+    }
+
+    /// 非 comptime 参数：返回 comptime-only 类型的函数在 comptime 调用，参数都 comptime 已知；
+    /// inline 函数的参数取决于调用处
+    fn paramKnownness(inf: *Inferrer) Error!Knownness {
+        const it = (try inf.r.itemTree(inf.file)).items[inf.item];
+        if (it.kind != .@"fn" or it.flags.is_inline) return .uncertain;
+        const ret = inf.ret_type orelse return .uncertain;
+        if (ret == .unknown) return .uncertain;
+        return if (try eval.isComptimeOnly(inf.r, ret)) .comptime_known else .runtime;
+    }
+
+    /// 捕获：非 inline 循环的捕获每次迭代不同，在运行时确定；if、catch 与 switch 的捕获取决于来源
+    /// （switch 只看载荷：inline 分支的标签捕获 comptime 已知）
+    fn captureKnownness(inf: *Inferrer, binding: Body.BindingId, depth: u32) Error!Knownness {
+        for (inf.body.exprs) |x| switch (x) {
+            .@"if" => |i| if (contains(i.capture, binding) or contains(i.else_capture, binding)) return inf.anyRuntime(&.{i.cond}, depth),
+            .loop => |l| if (contains(l.capture, binding) or contains(l.else_capture, binding)) return if (l.is_inline) .uncertain else .runtime,
+            .@"switch" => |sw| for (sw.prongs) |p| if (p.capture.len > 0 and p.capture[0] == binding) return inf.anyRuntime(&.{sw.operand}, depth),
+            .@"catch" => |c| if (c.capture == binding) return inf.anyRuntime(&.{c.lhs}, depth),
+            else => {},
+        };
+        return .uncertain;
+    }
+
+    /// `&x`：局部变量与参数的地址在运行时确定，全局声明的地址 comptime 已知
+    fn addressKnownness(inf: *Inferrer, e: ExprId, depth: u32) Error!Knownness {
+        const b = inf.body;
+        switch (b.expr(e)) {
+            .name_ref => |name| {
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .uncertain;
+                return switch (def) {
+                    .local => |l| if (l.file == inf.file and l.item == inf.item and b.binding(l.binding).kind != .local_const) .runtime else .uncertain,
+                    .item, .file => .comptime_known,
+                };
+            },
+            .field_access => |fa| return inf.addressKnownness(fa.lhs, depth + 1),
+            else => return inf.anyRuntime(&.{e}, depth),
+        }
     }
 
     /// `[_]T{ ... }`：数组长度由元素个数决定。不是这种形式时返回 null
@@ -1412,6 +1554,43 @@ const Inferrer = struct {
 };
 
 pub const FnType = @FieldType(InternPool.Key, "fn_type");
+
+/// 容器的声明的值：var 与 extern 声明在运行时读取，其余（const、函数）comptime 已知
+fn declKnownness(it: ItemTree.Item) Inferrer.Knownness {
+    return if (it.kind == .@"var" or it.flags.is_extern) .runtime else .comptime_known;
+}
+
+fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
+    return std.mem.indexOfScalar(Body.BindingId, list, b) != null;
+}
+
+/// 元组类型（含指向元组的单项指针）
+fn tupleOf(ip: *InternPool, t: Index) ?InternPool.Tuple {
+    return switch (ip.key(t)) {
+        .tuple_type => |tt| tt,
+        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
+            .tuple_type => |tt| tt,
+            else => null,
+        } else null,
+        else => null,
+    };
+}
+
+/// 元组与匿名结构体类型中名为 `name` 的 comptime 字段的值
+fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
+    const v = switch (ip.key(t)) {
+        .tuple_type => |tt| blk: {
+            const i = std.fmt.parseInt(usize, name, 10) catch return null;
+            if (i >= tt.types.len) return null;
+            break :blk InternPool.fieldValue(tt.values, i);
+        },
+        .anon_struct_type => |a| for (a.names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) break InternPool.fieldValue(a.values, i);
+        } else return null,
+        else => return null,
+    };
+    return if (v == .runtime or v == .unknown) null else v;
+}
 
 pub const ParamKind = enum { runtime, comptime_value, anytype_type };
 

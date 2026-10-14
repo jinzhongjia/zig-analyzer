@@ -49,7 +49,7 @@ pub const Index = enum(u32) {
     false_value,
     null_value,
     undefined_value,
-    /// 实例实参中非 comptime 参数的占位（不属于实例的身份）
+    /// 实例实参中非 comptime 参数的占位（不属于实例的身份）；元组与匿名结构体中运行时字段的标记
     runtime,
     /// `error{}`
     empty_error_set,
@@ -107,11 +107,11 @@ pub const Key = union(enum) {
     /// 身份 = 定义位置（文件 + 容器的 AstId）
     container_type: Container,
     /// 元组 `struct { A, B }`（`@Tuple`、元组字面量）
-    tuple_type: []const Index,
+    tuple_type: Tuple,
     /// `@Vector(len, T)`
     vector_type: struct { len: u32, child: Index },
-    /// 没有结果类型的匿名结构体字面量 `.{ .a = x }` 的类型
-    anon_struct_type: struct { names: []const []const u8, types: []const Index },
+    /// 没有结果类型的匿名结构体字面量 `.{ .a = x }` 的类型；`values` 同 `Tuple`
+    anon_struct_type: struct { names: []const []const u8, types: []const Index, values: []const Index = &.{} },
     /// `@Enum` / `@Struct` / `@Union` 构造的类型
     reified_type: Reified,
     /// `union(enum)` 自动生成的标签枚举（值为 union 类型）
@@ -146,6 +146,26 @@ pub const Key = union(enum) {
     /// 实例实参中非 comptime 参数的占位
     runtime,
 };
+
+/// 元组的字段
+pub const Tuple = struct {
+    types: []const Index,
+    /// 各字段的 comptime 值，见 `fieldValue`
+    values: []const Index = &.{},
+};
+
+/// 元组与匿名结构体第 `i` 个字段的 comptime 值。字面量中 comptime 已知的字段是 comptime 字段（与编译器
+/// 一致），值属于类型；运行时字段为 `runtime`，是否 comptime 或值求不出时为 `unknown`。`values` 为空时
+/// 都是运行时字段（`@Tuple` 构造的元组）
+pub fn fieldValue(values: []const Index, i: usize) Index {
+    return if (values.len == 0) .runtime else values[i];
+}
+
+/// 都是运行时字段时为空：与 `@Tuple` 构造的元组是同一个类型
+pub fn fieldValues(values: []const Index) []const Index {
+    for (values) |v| if (v != .runtime) return values;
+    return &.{};
+}
 
 pub const Instance = struct {
     file: FileId,
@@ -346,8 +366,8 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
         .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent } },
-        .tuple_type => |t| .{ .tuple_type = try a.dupe(Index, t) },
-        .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types) } },
+        .tuple_type => |t| .{ .tuple_type = .{ .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values) } },
+        .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values) } },
         .reified_type => |t| blk: {
             var out = t;
             out.names = try dupeNames(a, t.names);
@@ -505,13 +525,15 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(f.ret, w, container_name);
         },
         .container_type => |c| try container_name.write(c, w),
-        .tuple_type => |types| {
+        // 与编译器一致：`struct { comptime u8 = 1, u32 }`，空元组为 `@TypeOf(.{})`
+        .tuple_type => |t| {
+            if (t.types.len == 0) return w.writeAll("@TypeOf(.{})");
             try w.writeAll("struct {");
-            for (types, 0..) |t, i| {
+            for (t.types, 0..) |ty, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                try ip.print(t, w, container_name);
+                try ip.printField(null, ty, fieldValue(t.values, i), w, container_name);
             }
-            try w.writeAll(if (types.len == 0) "}" else " }");
+            try w.writeAll(" }");
         },
         .vector_type => |v| {
             try w.print("@Vector({d}, ", .{v.len});
@@ -521,8 +543,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         .anon_struct_type => |t| {
             try w.writeAll("struct {");
             for (t.names, t.types, 0..) |n, ty, i| {
-                try w.print("{s}{s}: ", .{ if (i == 0) " " else ", ", n });
-                try ip.print(ty, w, container_name);
+                try w.writeAll(if (i == 0) " " else ", ");
+                try ip.printField(n, ty, fieldValue(t.values, i), w, container_name);
             }
             try w.writeAll(if (t.names.len == 0) "}" else " }");
         },
@@ -586,6 +608,18 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
 
 /// 聚合值最多显示的元素个数
 const max_printed_elems = 16;
+
+/// 元组与匿名结构体的字段：comptime 字段带值（`comptime a: u8 = 1`）
+fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+    const is_comptime = v != .runtime and v != .unknown;
+    if (is_comptime) try w.writeAll("comptime ");
+    if (name) |n| try w.print("{f}: ", .{std.zig.fmtId(n)});
+    try ip.print(ty, w, container_name);
+    if (!is_comptime) return;
+    try w.writeAll(" = ");
+    // void 的值写作 `{}`
+    if (v == .void_value) try w.writeAll("{}") else try ip.print(v, w, container_name);
+}
 
 /// 没有构造位置的名字时，按内容显示构造的类型
 pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
