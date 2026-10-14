@@ -102,6 +102,20 @@ const CycleB = struct {
     }
 };
 
+/// 递归链：Depth(k) = Depth(k - 1) + 1
+const Depth = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        if (key == 0) return 0;
+        return try ctx.get(Depth, key - 1) + 1;
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return -1_000_000_000;
+    }
+};
+
 /// 读到 Number 后一直等待，直到被取消
 const Spin = struct {
     pub const kind: db.Kind = .derived;
@@ -119,7 +133,7 @@ const Spin = struct {
 };
 var spin_started: std.atomic.Value(bool) = .init(false);
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Spin });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Spin });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions[Db.queryIndex(Q)].load(.monotonic);
@@ -259,6 +273,19 @@ test "cycle: uses cycleFallback without writing memo" {
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(2, executions(&d, CycleA));
+}
+
+test "stack limit: deep recursion stops with the fallback and is not memoized" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    // 远超栈上限的递归链不会溢出，最深处以回退值代替
+    try testing.expect(try read(&d, Depth, 2_000_000) < 0);
+    // 结果取决于求值时的栈深度，不写入 memo：再次读取会重算
+    const before = executions(&d, Depth);
+    try testing.expect(try read(&d, Depth, 2_000_000) < 0);
+    try testing.expect(executions(&d, Depth) > before);
+    // 从浅处开始的计算不受影响
+    try testing.expectEqual(100, try read(&d, Depth, 100));
 }
 
 test "cancellation: reads return Canceled when pending_write is set" {

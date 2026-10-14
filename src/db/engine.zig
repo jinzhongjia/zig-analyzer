@@ -54,6 +54,17 @@ pub const Durability = enum(u2) {
 
 pub const Error = error{ Canceled, OutOfMemory };
 
+/// 一个读事务中嵌套计算可占用的原生栈。超过后有 `cycleFallback` 的 query 不再深入：返回回退值，
+/// 当前栈上的 query 都不写入 memo（结果取决于求值时的栈深度，不能缓存）。上限须明显小于最小的
+/// 线程栈（Linux 主线程 8 MB），为两次检查之间的栈占用留出余量
+pub const max_stack_bytes = 4 * 1024 * 1024;
+
+/// 一个读事务中 comptime 求值可用的步数（燃料）。耗尽后的结果同样不写入 memo
+pub const default_fuel = 20_000_000;
+
+/// 一个读事务中「先从栈底计算中断处」的次数上限（见 `Ctx.get`），使无限递归也能结束
+pub const max_deepening = 16;
+
 /// 依赖边：(query 序号, key 驻留后的下标)
 pub const DepKey = struct {
     query: u16,
@@ -255,7 +266,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         pub fn beginRead(db: *Db, gpa: Allocator) Ctx {
             db.rw.lockSharedUncancelable(db.io);
-            return .{ .db = db, .gpa = gpa };
+            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress() };
         }
 
         pub const Ctx = struct {
@@ -264,6 +275,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// 单个请求的取消标志（对应 `$/cancelRequest`）
             cancel: ?*const std.atomic.Value(bool) = null,
             stack: std.ArrayList(Frame) = .empty,
+            /// 读事务开始处的栈位置（栈向低地址增长）
+            stack_base: usize,
+            /// 剩余的 comptime 求值步数，由解释器扣减
+            fuel: u64 = default_fuel,
+            /// 本次顶层读取中第一次因栈深度上限中断的 query
+            frontier: ?DepKey = null,
+            /// 已经从栈底计算过的中断处个数
+            deepening: u32 = 0,
 
             /// `deps` 使用 `db.gpa` 分配，因为它最终归 memo 所有
             const Frame = struct {
@@ -281,6 +300,32 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 ctx.* = undefined;
             }
 
+            /// 本读事务的嵌套计算占用的原生栈超过 `max_stack_bytes`。递归的 compute 应在深入前检查，
+            /// 超过时以未知结果返回并调用 `markIncomplete`
+            pub fn stackExhausted(ctx: *const Ctx) bool {
+                const here = @frameAddress();
+                return ctx.stack_base > here and ctx.stack_base - here > max_stack_bytes;
+            }
+
+            /// 当前结果不完整（燃料耗尽等）：栈上的 query 都不写入 memo
+            pub fn markIncomplete(ctx: *Ctx) void {
+                for (ctx.stack.items) |*frame| frame.in_cycle = true;
+            }
+
+            /// compute 内部因栈深度上限中断：除 `markIncomplete` 外，记下正在计算的 query，
+            /// 顶层读取会先从栈底计算它
+            pub fn exhausted(ctx: *Ctx) void {
+                ctx.markIncomplete();
+                if (ctx.frontier == null and ctx.stack.items.len > 0) ctx.frontier = ctx.stack.items[ctx.stack.items.len - 1].key;
+            }
+
+            /// 当前计算的结果已经不完整（环、深度上限或燃料耗尽）：不应再为改进结果而深入计算，
+            /// 否则不写入 memo 的结果在每一层都会被重新计算
+            pub fn incomplete(ctx: *const Ctx) bool {
+                const n = ctx.stack.items.len;
+                return n > 0 and ctx.stack.items[n - 1].in_cycle;
+            }
+
             /// 长时间运行的 compute 应周期性调用。
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
                 if (ctx.db.pending_write.load(.acquire)) return error.Canceled;
@@ -289,7 +334,39 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             /// 读取 query 的值，并把它记为当前正在计算的 query 的依赖。
             /// 返回值在本读事务结束前有效。
+            ///
+            /// 顶层读取（不在其他 query 的计算中）的嵌套计算因栈深度上限中断时，先从栈底计算
+            /// 中断处的 query（结果完整时写入 memo），再重新计算，直到结果完整或没有进展。
+            /// 很深的依赖链因此分段计算，总代价与链长成正比，结果也是完整的
             pub fn get(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
+                if (Q.kind == .input or ctx.stack.items.len != 0) return ctx.getInner(Q, key);
+                while (true) {
+                    ctx.frontier = null;
+                    const v = try ctx.getInner(Q, key);
+                    const frontier = ctx.frontier orelse return v;
+                    if (ctx.deepening >= max_deepening) return v;
+                    ctx.deepening += 1;
+                    // 中断处仍然不完整时没有进展
+                    if (!try ctx.precompute(frontier)) return v;
+                }
+            }
+
+            /// 从栈底计算 `dep`；返回它的结果是否已写入 memo
+            fn precompute(ctx: *Ctx, dep: DepKey) Error!bool {
+                const db = ctx.db;
+                inline for (queries, 0..) |Q, qi| {
+                    if (Q.kind == .derived and dep.query == qi) {
+                        db.mutex.lockUncancelable(db.io);
+                        const key = db.tables[qi].keys.keys()[dep.index];
+                        db.mutex.unlock(db.io);
+                        _ = try ctx.get(Q, key);
+                        return ctx.verifiedMemo(Q, dep.index) != null;
+                    }
+                }
+                return false;
+            }
+
+            fn getInner(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
                 try ctx.checkCanceled();
                 const qi = comptime queryIndex(Q);
                 const db = ctx.db;
@@ -307,6 +384,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     .derived => blk: {
                         for (ctx.stack.items, 0..) |frame, i| {
                             if (frame.key.eql(dep)) return ctx.onCycle(Q, i, key);
+                        }
+                        if (@hasDecl(Q, "cycleFallback") and ctx.stackExhausted()) {
+                            // 本 revision 已验证的结果可以直接使用，不会再深入
+                            if (ctx.verifiedMemo(Q, index)) |fresh| break :blk fresh;
+                            ctx.markIncomplete();
+                            if (ctx.frontier == null) ctx.frontier = dep;
+                            return Q.cycleFallback(key);
                         }
                         break :blk try ctx.ensureFresh(Q, index, key);
                     },
@@ -333,6 +417,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             fn Fresh(comptime Q: type) type {
                 return struct { value: Q.Value, changed_at: Revision, durability: Durability };
+            }
+
+            fn verifiedMemo(ctx: *Ctx, comptime Q: type, index: u32) ?Fresh(Q) {
+                const db = ctx.db;
+                db.mutex.lockUncancelable(db.io);
+                defer db.mutex.unlock(db.io);
+                const memo = db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null;
+                if (memo.verified_at != db.revision) return null;
+                return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
             /// 确保 derived memo 在当前 revision 有效，必要时验证或重算。
@@ -383,6 +476,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                                 // 验证路径上遇到环：视为已变化，强制上层重算
                                 if (frame.key.eql(dep)) return db.revision;
                             }
+                            // 栈深度超过上限：同样视为已变化，由重算处理（重算时以回退值代替）
+                            if (ctx.stackExhausted()) return db.revision;
                             return (try ctx.ensureFresh(Q, dep.index, key)).changed_at;
                         },
                     };
