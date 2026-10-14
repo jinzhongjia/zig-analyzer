@@ -91,6 +91,28 @@ pub fn build(b: *std.Build) void {
     bench_run.addPassthruArgs();
     b.step("bench", "Measure LSP latencies against a project (see tools/lsp_bench.zig)").dependOn(&bench_run.step);
 
+    // 测试运行器：在 Zig 自带的运行器上开启测试分配器的调用栈记录（ReleaseSafe 下泄漏也能定位）
+    const patch_runner = b.addExecutable(.{
+        .name = "patch_test_runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/patch_test_runner.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const patch_run = b.addRunArtifact(patch_runner);
+    patch_run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "compiler/test_runner.zig"));
+    const test_runner = patch_run.addOutputFileArg("test_runner.zig");
+
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        // 保留帧指针：优化模式下泄漏报告的调用栈才完整
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zig_analyzer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .omit_frame_pointer = false,
+        }),
+        .test_runner = .{ .path = test_runner, .mode = .server },
+    })).step);
 }
