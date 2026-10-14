@@ -213,8 +213,12 @@ pub const Resolver = struct {
         }
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return null;
         if (std.mem.eql(u8, name, "std")) return graph.std_root;
-        // 由编译器生成，不在磁盘上
-        if (std.mem.eql(u8, name, "builtin")) return null;
+        if (std.mem.eql(u8, name, "builtin")) {
+            // 标准库使用所在 compile step 根模块的 builtin（与编译器一致）；不属于任何模块的文件用默认的
+            const entry = graph.entry(file) orelse return graph.default_builtin;
+            const m = if (entry.module == ModuleGraph.std_module) entry.root_module else entry.module;
+            return graph.modules[m].builtin orelse graph.default_builtin;
+        }
         const entry = graph.entry(file) orelse return null;
         if (std.mem.eql(u8, name, "root")) return graph.modules[entry.root_module].root;
         if (entry.module == ModuleGraph.std_module) return null;

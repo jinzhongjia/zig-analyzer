@@ -40,6 +40,10 @@ pub const Module = struct {
     /// 根文件是构建时生成的文件
     generated_root: ?GeneratedPath = null,
     imports: []const Import,
+    /// 生成该模块 `builtin.zig` 的编译器参数：子命令（`build-exe` 等）与影响 builtin 的模块参数
+    builtin_args: []const []const u8 = &.{},
+    /// 生成的 `builtin.zig` 的路径（由 Workspace 在加载构建图后填入）
+    builtin_file: ?[]const u8 = null,
 };
 
 /// 相对于生成文件的路径：从生成文件向上 `up` 级目录，再拼上 `sub_path`
@@ -102,6 +106,13 @@ pub fn buildSteps(m: *const ProjectModel, gpa: Allocator) Allocator.Error![]u32 
 }
 
 /// 记录生成文件 `file` 的绝对路径，更新以它为根的模块；有模块根文件变化时返回 true
+/// 记录模块 `builtin.zig` 的路径
+pub fn setBuiltinFile(m: *ProjectModel, gpa: Allocator, module: u32, path: []const u8) Allocator.Error!void {
+    var arena = m.arena.promote(gpa);
+    defer m.arena = arena.state;
+    m.modules[module].builtin_file = try arena.allocator().dupe(u8, path);
+}
+
 pub fn setGeneratedPath(m: *ProjectModel, gpa: Allocator, file: u32, path: []const u8) Allocator.Error!bool {
     var arena = m.arena.promote(gpa);
     defer m.arena = arena.state;

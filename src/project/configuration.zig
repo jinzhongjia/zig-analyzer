@@ -62,6 +62,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         }
         const root = if (m.root_source_file.unwrap()) |lp| lp.get(c) else null;
         try modules.append(a, .{
+            .builtin_args = try builtinArgs(a, c, &m),
             .root_file = if (root) |lp| try ctx.resolve(lp) else null,
             .generated_root = if (root) |lp| switch (lp) {
                 .generated => |g| .{ .file = @backingInt(g.index), .up = g.flags.up, .sub_path = try a.dupe(u8, g.sub_path.slice(c)) },
@@ -70,6 +71,24 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
             .imports = imports,
         });
     }
+
+    // builtin 的子命令取以该模块为根的 compile step（决定 output_mode / is_test），其他模块按 build-obj
+    for (c.steps) |*src| switch (src.extended.get(c.extra)) {
+        .compile => |comp| {
+            const index = module_ids.getIndex(comp.root_module) orelse continue;
+            const mod = &modules.items[index];
+            if (!std.mem.eql(u8, mod.builtin_args[0], "build-obj")) continue;
+            const args = try a.dupe([]const u8, mod.builtin_args);
+            args[0] = switch (comp.flags3.kind) {
+                .exe => "build-exe",
+                .lib => "build-lib",
+                .obj, .test_obj => "build-obj",
+                .@"test" => "test",
+            };
+            mod.builtin_args = args;
+        },
+        else => {},
+    };
 
     const producers = try a.alloc(?u32, c.generated_files_len);
     @memset(producers, null);
@@ -141,6 +160,43 @@ pub fn generatedPath(gpa: Allocator, build_root: []const u8, env: *const ZigEnv,
         .local_cache => return std.fs.path.resolveAlloc(gpa, &.{ build_root, ".zig-cache", sub_path }),
     };
     return std.fs.path.resolveAlloc(gpa, &.{ base, sub_path });
+}
+
+/// 影响 `builtin.zig` 的模块参数，与构建系统传给编译器的写法一致（见 Maker/Step/Compile.zig 的 appendModuleFlags）
+fn builtinArgs(a: Allocator, c: *const Configuration, m: *const Configuration.Module) Allocator.Error![]const []const u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.append(a, "build-obj");
+    const flags = .{
+        .{ "strip", m.flags.strip },
+        .{ "single-threaded", m.flags.single_threaded },
+        .{ "omit-frame-pointer", m.flags2.omit_frame_pointer },
+        .{ "error-tracing", m.flags2.error_tracing },
+        .{ "sanitize-thread", m.flags.sanitize_thread },
+        .{ "fuzz", m.flags.fuzz },
+        .{ "valgrind", m.flags2.valgrind },
+        .{ "PIC", m.flags2.pic },
+    };
+    inline for (flags) |f| if (f[1].toBool()) |on| try args.append(a, if (on) "-f" ++ f[0] else "-fno-" ++ f[0]);
+    switch (m.flags.unwind_tables) {
+        .none => try args.append(a, "-fno-unwind-tables"),
+        .sync => try args.append(a, "-funwind-tables"),
+        .async => try args.append(a, "-fasync-unwind-tables"),
+        .default => {},
+    }
+    switch (m.flags.optimize) {
+        .debug => try args.append(a, "-Odebug"),
+        .safe => try args.append(a, "-Osafe"),
+        .fast => try args.append(a, "-Ofast"),
+        .small => try args.append(a, "-Osmall"),
+        .default => {},
+    }
+    if (m.flags.code_model != .default) try args.appendSlice(a, &.{ "-mcmodel", @tagName(m.flags.code_model) });
+    if (m.resolved_target.get(c)) |rt| if (rt.unwrapQuery(c)) |query| {
+        try args.appendSlice(a, &.{ "-target", try query.zigTriple(a), "-mcpu", try query.serializeCpuAlloc(a) });
+    };
+    if (m.flags2.link_libc == .true) try args.append(a, "-lc");
+    if (m.flags2.link_libcpp == .true) try args.append(a, "-lc++");
+    return args.items;
 }
 
 fn internModule(gpa: Allocator, ids: *std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void), m: Configuration.Module.Index) Allocator.Error!u32 {

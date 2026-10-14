@@ -14,6 +14,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 const za = @import("../zig_analyzer.zig");
 const Server = @import("Server.zig");
 const bsp = za.project.bsp;
+const builtin = za.project.builtin;
 const configuration = za.project.configuration;
 const ProjectModel = za.base.ProjectModel;
 const Vfs = za.base.Vfs;
@@ -259,6 +260,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     return;
                 },
             };
+            try ws.generateBuiltins(&model);
             if (ws.config.diagnostics_step) |name| {
                 model.preferred_step = model.topLevelStep(name);
                 if (model.preferred_step == null) {
@@ -346,6 +348,35 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             ws.server.busyEnd();
         },
         else => {},
+    }
+}
+
+/// 为每个模块生成 builtin.zig（相同参数只生成一次）
+fn generateBuiltins(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
+    const env = ws.server.zigEnv().?;
+    ws.reportLoading("Generating builtin.zig");
+    var cache: std.StringHashMapUnmanaged(?[]u8) = .empty;
+    defer {
+        var it = cache.iterator();
+        while (it.next()) |e| {
+            ws.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.*) |p| ws.gpa.free(p);
+        }
+        cache.deinit(ws.gpa);
+    }
+    for (model.modules, 0..) |m, i| {
+        if (m.builtin_args.len == 0) continue;
+        const key = try std.mem.join(ws.gpa, "\x00", m.builtin_args);
+        const gop = try cache.getOrPut(ws.gpa, key);
+        if (gop.found_existing) {
+            ws.gpa.free(key);
+        } else {
+            gop.value_ptr.* = builtin.generate(ws.gpa, ws.server.io, env.zig_exe, env.global_cache_dir, m.builtin_args) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => null,
+            };
+        }
+        if (gop.value_ptr.*) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
     }
 }
 

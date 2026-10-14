@@ -205,3 +205,68 @@ test "generic std containers through LSP: hover, completion and inlay hints" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+const builtin_main =
+    \\const builtin = @import("builtin");
+    \\pub fn main() void {
+    \\    const os = builtin.os.tag;
+    \\    const m = builtin.mode;
+    \\    _ = .{ os, m };
+    \\}
+    \\
+;
+
+fn hoverText(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
+    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
+    const result = resp.object.get("result").?;
+    if (result == .null) return "null";
+    return result.object.get("contents").?.object.get("value").?.string;
+}
+
+test "@import(\"builtin\") follows the module's target and optimize mode" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = builtin_main },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    const options = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=x86_64-linux", "-Doptimize=ReleaseFast"]}}
+    , .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = options });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = builtin_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    try testing.expectEqualStrings("```zig\nconst os: Tag = .linux\n```", try hoverText(&h, uri, builtin_main, "os ="));
+    try testing.expectEqualStrings("```zig\nconst m: Optimize = .fast\n```", try hoverText(&h, uri, builtin_main, "m ="));
+    const target = try gotoAt(&h, uri, builtin_main, "\"builtin\"");
+    try testing.expect(std.mem.startsWith(u8, target, "builtin.zig:"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "@import(\"builtin\") in single-file mode is the host target" {
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = builtin_main }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "one.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = builtin_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const expected = try std.fmt.allocPrint(h.arena.allocator(), "```zig\nconst os: Tag = .{t}\n```", .{@import("builtin").os.tag});
+    try testing.expectEqualStrings(expected, try hoverText(&h, uri, builtin_main, "os ="));
+    try testing.expectEqualStrings("```zig\nconst m: Optimize = .debug\n```", try hoverText(&h, uri, builtin_main, "m ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

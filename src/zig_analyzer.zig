@@ -38,6 +38,7 @@ pub const sema = struct {
 pub const project = struct {
     pub const ZigEnv = @import("project/ZigEnv.zig");
     pub const bsp = @import("project/bsp.zig");
+    pub const builtin = @import("project/builtin.zig");
     pub const configuration = @import("project/configuration.zig");
     /// 仅供测试：在临时目录中创建示例项目
     pub const fixture = @import("project/fixture.zig");

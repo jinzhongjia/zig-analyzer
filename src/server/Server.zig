@@ -68,6 +68,8 @@ single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
 env_mutex: Io.Mutex = .init,
 /// 启动后在后台查询；查询完成前为 null
 zig_env: ?ZigEnv = null,
+/// 不属于任何项目的文件使用的 builtin.zig（本机目标、Debug）；受 env_mutex 保护
+default_builtin: ?[]u8 = null,
 warned: bool = false,
 workspaces_mutex: Io.Mutex = .init,
 workspaces: std.ArrayList(*Workspace) = .empty,
@@ -139,6 +141,7 @@ pub fn deinit(server: *Server) void {
     for (server.single.values()) |*sf| if (sf.result) |*r| r.deinit(server.gpa);
     server.single.deinit(server.gpa);
     if (server.zig_env) |*env| env.deinit(server.gpa);
+    if (server.default_builtin) |p| server.gpa.free(p);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
     server.published.deinit(server.gpa);
@@ -396,9 +399,14 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         defer server.gpa.free(p);
         break :blk try server.vfs.intern(p);
     } else null;
+    const default_builtin: ?Vfs.FileId = blk: {
+        server.env_mutex.lockUncancelable(server.io);
+        defer server.env_mutex.unlock(server.io);
+        break :blk if (server.default_builtin) |p| try server.vfs.intern(p) else null;
+    };
     const graph = try server.gpa.create(ModuleGraph);
     errdefer server.gpa.destroy(graph);
-    graph.* = try b.finish(std_root);
+    graph.* = try b.finish(std_root, default_builtin);
     // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
     server.db.beginWrite();
     defer server.db.endWrite();
@@ -668,6 +676,16 @@ fn startup(server: *Server) Io.Cancelable!void {
         server.zig_env = env;
     }
     log.info("zig {s}（{s}）", .{ env.version, env.zig_exe });
+    // 默认的 builtin.zig：与单文件编译（`zig build-obj -fno-emit-bin`）的设置一致
+    const default_builtin = za.project.builtin.generate(server.gpa, server.io, env.zig_exe, env.global_cache_dir, &.{"build-obj"}) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => null,
+    };
+    if (default_builtin) |path| {
+        server.env_mutex.lockUncancelable(server.io);
+        defer server.env_mutex.unlock(server.io);
+        server.default_builtin = path;
+    }
     if (!env.matchesBuiltin()) {
         // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check（§11.2）
         server.showWarningOnce("zig version differs from the one zig-analyzer was built with: live diagnostics fall back to zig ast-check, compiler diagnostics are unavailable");

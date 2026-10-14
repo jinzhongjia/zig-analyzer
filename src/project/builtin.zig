@@ -1,0 +1,87 @@
+//! `@import("builtin")` 的内容由编译器按目标与编译选项生成，不在磁盘上。
+//! 用与构建系统相同的参数运行 `zig <子命令> --show-builtin` 取得，按内容哈希写入缓存目录
+//! （内容不变则路径不变；落盘使 goto definition 可以打开它）。
+
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+
+const log = std.log.scoped(.builtin);
+
+/// 生成 builtin.zig，返回其路径（调用方释放）。`args[0]` 为子命令（`build-exe` 等），其余为编译参数。
+/// 编译器无法运行或参数无效时返回 null
+pub fn generate(gpa: Allocator, io: Io, zig_exe: []const u8, cache_dir: []const u8, args: []const []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, zig_exe);
+    try argv.append(gpa, if (args.len != 0) args[0] else "build-obj");
+    try argv.append(gpa, "--show-builtin");
+    if (args.len > 1) try argv.appendSlice(gpa, args[1..]);
+
+    const result = std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => {
+            log.info("failed to run zig --show-builtin: {t}", .{err});
+            return null;
+        },
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            log.info("zig --show-builtin failed: {s}", .{std.mem.trim(u8, result.stderr, " \n")});
+            return null;
+        },
+        else => return null,
+    }
+
+    const hash = std.hash.Wyhash.hash(0, result.stdout);
+    var name_buf: [16]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{x:0>16}", .{hash}) catch unreachable;
+    const dir_path = try std.fs.path.join(gpa, &.{ cache_dir, "zig-analyzer", "builtin", name });
+    defer gpa.free(dir_path);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, "builtin.zig" });
+    errdefer gpa.free(path);
+
+    // 同名文件内容必然相同：已存在则直接使用
+    Io.Dir.cwd().access(io, path, .{}) catch {
+        Io.Dir.cwd().createDirPath(io, dir_path) catch |err| {
+            log.info("cannot create {s}: {t}", .{ dir_path, err });
+            return null;
+        };
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = result.stdout }) catch |err| {
+            log.info("cannot write {s}: {t}", .{ path, err });
+            return null;
+        };
+    };
+    return path;
+}
+
+test generate {
+    const testing = std.testing;
+    var env = @import("ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cache);
+
+    const a = (try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "test", "-target", "x86_64-linux", "-Ofast" })).?;
+    defer testing.allocator.free(a);
+    const text = try Io.Dir.cwd().readFileAlloc(testing.io, a, testing.allocator, .unlimited);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "pub const is_test = true;") != null);
+    try testing.expect(std.mem.indexOf(u8, text, ".tag = .linux") != null);
+    try testing.expectEqualStrings("builtin.zig", std.fs.path.basename(a));
+
+    // 相同参数得到相同路径；无效参数为 null
+    const b = (try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "test", "-target", "x86_64-linux", "-Ofast" })).?;
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
+    try testing.expect(try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "build-obj", "-target", "no-such-target" }) == null);
+}

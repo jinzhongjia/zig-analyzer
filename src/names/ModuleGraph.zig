@@ -18,6 +18,8 @@ const ModuleGraph = @This();
 arena: std.heap.ArenaAllocator.State,
 /// `<std_dir>/std.zig`；zig 环境未知时为 null
 std_root: ?FileId,
+/// 不属于任何模块的文件使用的 builtin.zig（本机目标、Debug，与单文件编译一致）
+default_builtin: ?FileId = null,
 modules: []const Module,
 /// 按 FileId 排序
 files: []const FileEntry,
@@ -27,6 +29,8 @@ pub const std_module = CompileSet.std_module;
 pub const Module = struct {
     root: ?FileId,
     imports: []const Import,
+    /// 该模块的 builtin.zig（按模块的目标与编译选项生成）
+    builtin: ?FileId = null,
 };
 
 pub const Import = struct {
@@ -72,7 +76,11 @@ pub const Builder = struct {
         for (model.modules) |m| {
             const imports = try a.alloc(Import, m.imports.len);
             for (m.imports, imports) |src, *dst| dst.* = .{ .name = try a.dupe(u8, src.name), .module = offset + src.module };
-            try b.modules.append(a, .{ .root = if (m.root_file) |p| try b.vfs.intern(p) else null, .imports = imports });
+            try b.modules.append(a, .{
+                .root = if (m.root_file) |p| try b.vfs.intern(p) else null,
+                .imports = imports,
+                .builtin = if (m.builtin_file) |p| try b.vfs.intern(p) else null,
+            });
         }
         for (compile_set.files.keys(), compile_set.files.values()) |file, mem| {
             // 同一文件属于多个项目时取第一个
@@ -86,7 +94,7 @@ pub const Builder = struct {
         }
     }
 
-    pub fn finish(b: *Builder, std_root: ?FileId) Allocator.Error!ModuleGraph {
+    pub fn finish(b: *Builder, std_root: ?FileId, default_builtin: ?FileId) Allocator.Error!ModuleGraph {
         const entries = try b.arena.allocator().dupe(FileEntry, b.files.values());
         std.mem.sort(FileEntry, entries, {}, struct {
             fn lt(_: void, x: FileEntry, y: FileEntry) bool {
@@ -94,7 +102,7 @@ pub const Builder = struct {
             }
         }.lt);
         b.files.deinit(b.gpa);
-        return .{ .arena = b.arena.state, .std_root = std_root, .modules = b.modules.items, .files = entries };
+        return .{ .arena = b.arena.state, .std_root = std_root, .default_builtin = default_builtin, .modules = b.modules.items, .files = entries };
     }
 };
 
@@ -108,7 +116,7 @@ pub fn entry(g: *const ModuleGraph, file: FileId) ?FileEntry {
 }
 
 pub fn eql(a: *const ModuleGraph, b: *const ModuleGraph) bool {
-    return deepEql(a.std_root, b.std_root) and deepEql(a.modules, b.modules) and deepEql(a.files, b.files);
+    return deepEql(a.std_root, b.std_root) and deepEql(a.default_builtin, b.default_builtin) and deepEql(a.modules, b.modules) and deepEql(a.files, b.files);
 }
 
 /// 查询引擎 input；未设置时为 null（没有任何项目与 zig 环境信息）

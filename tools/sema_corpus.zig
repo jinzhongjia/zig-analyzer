@@ -2,7 +2,8 @@
 //!
 //! 用法：zig build sema-corpus [-- <std 目录>]
 //!
-//! 标准库的全部文件都归入 std 模块（`@import("std")` 可解析，`builtin` 与 `root` 不可解析）。
+//! 标准库的全部文件都归入 std 模块：`@import("std")` 可解析，`builtin` 为本机目标、Debug 的
+//! builtin.zig（需要 PATH 中的 zig），`root` 不可解析。
 //! 依赖 comptime 求值的部分（泛型类型构造、依赖 comptime 参数的返回类型）属于 M5，计入未知。
 
 const std = @import("std");
@@ -65,6 +66,14 @@ pub fn main(init: std.process.Init) !u8 {
     const std_root_path = try std.fs.path.join(gpa, &.{ std_dir, "std.zig" });
     defer gpa.free(std_root_path);
     const std_root = try vfs.intern(std_root_path);
+    // `@import("builtin")`：本机目标、Debug（需要 PATH 中的 zig）
+    const default_builtin: ?FileId = blk: {
+        var zig_env = za.project.ZigEnv.query(gpa, io, null) catch break :blk null;
+        defer zig_env.deinit(gpa);
+        const path = try za.project.builtin.generate(gpa, io, zig_env.zig_exe, zig_env.global_cache_dir, &.{"build-obj"}) orelse break :blk null;
+        defer gpa.free(path);
+        break :blk try vfs.intern(path);
+    };
     {
         const g = try gpa.create(ModuleGraph);
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -76,7 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }.lt);
         const root_module = try arena.allocator().dupe(ModuleGraph.Module, &.{.{ .root = std_root, .imports = &.{} }});
-        g.* = .{ .arena = arena.state, .std_root = std_root, .modules = root_module, .files = entries };
+        g.* = .{ .arena = arena.state, .std_root = std_root, .modules = root_module, .files = entries, .default_builtin = default_builtin };
         db.beginWrite();
         defer db.endWrite();
         try db.set(ModuleGraph.Input, {}, g, .high);
