@@ -20,8 +20,11 @@ pub const World = struct {
     env: database.Env,
     db: Db,
     arena: std.heap.ArenaAllocator,
+    /// `setGraph` 时不属于任何模块的文件使用的 builtin
+    default_builtin: ?FileId = null,
 
     pub fn init(w: *World) !void {
+        w.default_builtin = null;
         w.vfs = .init(testing.io, testing.allocator);
         w.ip = try .init(testing.allocator, testing.io);
         w.env = .{ .vfs = &w.vfs, .ip = &w.ip };
@@ -55,7 +58,7 @@ pub const World = struct {
                 return @backingInt(a.file) < @backingInt(b.file);
             }
         }.lt);
-        g.* = .{ .arena = .{}, .std_root = std_root, .modules = modules, .files = sorted };
+        g.* = .{ .arena = .{}, .std_root = std_root, .modules = modules, .files = sorted, .default_builtin = w.default_builtin };
         w.db.beginWrite();
         defer w.db.endWrite();
         try w.db.set(ModuleGraph.Input, {}, g, .low);

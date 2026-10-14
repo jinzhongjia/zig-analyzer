@@ -672,7 +672,7 @@ test "layouts that are invalid or depend on the build mode stay unknown" {
         \\    _ = .{ size_bare, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa, size_tuple };
         \\}
     , &.{
-        // 不带标签的 union 在 Debug 与 ReleaseSafe 下有隐藏的标签
+        // 不带标签的 union：没有 builtin（不知道优化模式）
         .{ "size_bare", "comptime_int" },
         // 没有位表示的类型（编译器报错）
         .{ "bits_s", "comptime_int" },
@@ -924,6 +924,11 @@ test "anytype arguments do not expand large arrays" {
 
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    return expectStdTypesOptimized(null, src, cases);
+}
+
+/// 同 `expectStdTypes`；`optimize` 不为 null 时提供该优化模式的 builtin（`std.lang.Optimize` 的成员名）
+fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     var w: World = undefined;
@@ -933,6 +938,10 @@ fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u
     defer testing.allocator.free(std_root_path);
     const std_root = try w.vfs.intern(std_root_path);
     const f = try w.add("/p/main.zig", src);
+    if (optimize) |o| {
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "const std = @import(\"std\");\npub const mode = optimize;\npub const optimize: std.lang.Optimize = .{s};\n", .{o});
+        w.default_builtin = (try w.add("/zig-cache/builtin.zig", text)).file;
+    }
     try w.setGraph(std_root, &.{}, &.{});
     for (cases) |c| {
         const actual = try typeAt(&w, f.file, src, c[0], 0);
@@ -1059,6 +1068,39 @@ test "layouts of reified containers" {
         .{ "size_ru", "comptime_int = 8" },
         .{ "size_efs", "comptime_int = 6" },
         .{ "efs_c", "comptime_int = 4" },
+    });
+}
+
+test "bare unions have a safety tag in safe build modes" {
+    // 期望值为 zig 0.17.0 的结果
+    const src =
+        \\const Bare = union { a: u32, b: u8 };
+        \\const One = union { a: u32 };
+        \\const Rb = @Union(.auto, null, &.{ "a", "b" }, &.{ u32, u8 }, &@splat(.{}));
+        \\fn Unsafe() type {
+        \\    @setRuntimeSafety(false);
+        \\    return union { a: u32, b: u8 };
+        \\}
+        \\fn g() void {
+        \\    const size_bare = @sizeOf(Bare);
+        \\    const size_one = @sizeOf(One);
+        \\    const size_rb = @sizeOf(Rb);
+        \\    const size_unsafe = @sizeOf(Unsafe());
+        \\    _ = .{ size_bare, size_one, size_rb, size_unsafe };
+        \\}
+    ;
+    try expectStdTypesOptimized("debug", src, &.{
+        .{ "size_bare", "comptime_int = 8" },
+        // 只有一个字段时没有标签
+        .{ "size_one", "comptime_int = 4" },
+        .{ "size_rb", "comptime_int = 8" },
+        // `@setRuntimeSafety` 的作用取决于调用的位置与参数
+        .{ "size_unsafe", "comptime_int" },
+    });
+    try expectStdTypesOptimized("fast", src, &.{
+        .{ "size_bare", "comptime_int = 4" },
+        .{ "size_one", "comptime_int = 4" },
+        .{ "size_rb", "comptime_int = 4" },
     });
 }
 

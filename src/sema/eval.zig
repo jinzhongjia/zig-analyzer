@@ -2508,13 +2508,53 @@ const Evaluator = struct {
         }
         // 只有一个字段时没有标签
         if (fields.len < 2) return payload;
-        // 不带标签的 union 在 Debug 与 ReleaseSafe 下有安全检查用的隐藏标签，大小取决于优化模式
-        const tag = try ev.typeLayout(try ev.unionTagType(t) orelse return null, depth + 1) orelse return null;
+        const tag: value.Layout = if (try ev.unionTagType(t)) |tag_ty|
+            try ev.typeLayout(tag_ty, depth + 1) orelse return null
+        else if (try ev.safetyTagged(t) orelse return null)
+            // 隐藏标签与 `union(enum)` 的标签相同：容纳字段序号的最小无符号整数
+            value.intLayout(@intCast(64 - @clz(@as(u64, fields.len - 1)))) orelse return null
+        else
+            return payload;
         const alignment = @max(tag.alignment, payload_align);
         return .{ .size = std.mem.alignForward(u64, tag.size + payload_size, alignment), .alignment = alignment, .bits = null };
     }
 
     const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
+
+    /// 不带标签的 auto union 是否有安全检查用的隐藏标签（与编译器的 `wantSafeTypes` 一致）：所在模块的
+    /// 优化模式为 Debug 或 ReleaseSafe 时有。声明位于函数体（含 test、comptime 块）且其中调用了
+    /// `@setRuntimeSafety` 时取决于调用的位置与参数，为 null
+    fn safetyTagged(ev: *Evaluator, t: Index) EvalError!?bool {
+        const file: FileId, const item: ?u32 = switch (ev.ip.key(t)) {
+            .container_type => blk: {
+                const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+                break :blk .{ ns.file, (try ev.r.itemTree(ns.file)).containers[ns.container].parent_item };
+            },
+            .reified_type => |rt| blk: {
+                const tree = try ev.r.itemTree(rt.file);
+                for (tree.items, 0..) |it, i| if (it.ast_id == rt.owner) break :blk .{ rt.file, @as(?u32, @intCast(i)) };
+                return null;
+            },
+            else => return null,
+        };
+        if (item) |i| switch ((try ev.r.itemTree(file)).items[i].kind) {
+            .@"fn", .@"test", .@"comptime" => for ((try ev.r.body(file, i)).exprs) |e| switch (e) {
+                .builtin_call => |c| if (std.mem.eql(u8, c.name, "@setRuntimeSafety")) return null,
+                else => {},
+            },
+            else => {},
+        };
+        const builtin_file = try ev.r.resolveImport(file, "builtin") orelse return null;
+        const builtin_ty = try queries.containerType(ev.r, .{ .file = builtin_file, .container = 0 }, null);
+        const optimize = try ev.freeze(try ev.typeMember(builtin_ty, "optimize")) orelse return null;
+        const name = switch (ev.ip.key(optimize)) {
+            .enum_tag => |tag| tag.name,
+            else => return null,
+        };
+        for ([_][]const u8{ "debug", "safe" }) |n| if (std.mem.eql(u8, name, n)) return true;
+        for ([_][]const u8{ "fast", "small" }) |n| if (std.mem.eql(u8, name, n)) return false;
+        return null;
+    }
 
     /// `@Struct` / `@Union` 的字段属性中的显式对齐与 comptime 字段（都取默认值时为空）
     fn reifiedAttrs(ev: *Evaluator, attrs: Val, n: usize, is_union: bool) EvalError!ReifiedAttrs {
