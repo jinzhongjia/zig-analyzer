@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4 已完成（2026-10-13），M5 已完成（2026-10-14），下一步 M6，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4 已完成（2026-10-13），M5、M6 已完成（2026-10-14），下一步 M7，详见 §19。
 
 ---
 
@@ -487,7 +487,7 @@ fn infer(expr: ExprId, expected: Expected) TypedValue
    - 以「抽象实例」推导：`comptime T: type`（含不写 comptime 的 `T: type`）绑定为 `opaque_param(T)`；`anytype` 参数类型未知；
    - 对 `opaque_param` 的成员访问 → `unknown`；hover 显示为 `T`；取决于抽象参数的比较（`[2]T == [2]u8`）为未知，不选择分支；
    - 类型相等：同一位置、不同实例的容器按它捕获的外层参数与局部变量的值判断（不捕获实参的容器在不同实例间是同一个类型）；
-   - **调用点种子**（默认开启）：取第一个能求出具体实例的调用点做推导，hover 标注「inferred from the call at file.zig:123」。结果按实例缓存，可解释、可复现。M5 只在同一文件中查找调用点，跨文件经 `file_index` 查找在 M6 实现。
+   - **调用点种子**（默认开启）：取第一个能求出具体实例的调用点做推导，hover 标注「inferred from the call at file.zig:123」。结果按实例缓存，可解释、可复现。先在同一文件中查找，再经 `file_index` 在能引用到该函数的其他项目文件中查找（M6）。
 
 4. **inferred error set**：`!T` 的错误集由函数体推导，按需计算；签名层只记录「inferred」标记（`inferred_error_set` 类型，不读取函数体），成员由 `ErrorSetOf` query 收集函数体中 `return` 的错误与 `try` 传播的错误；含未知部分或参与递归时为 `anyerror`。
 
@@ -523,7 +523,7 @@ CST 节点 → 所属 `BodyOwner` → `SourceMap` → `ExprId` → `infer` 结�
 
 ### 10.2 ide_db
 
-- `file_index(file)`：标识符 trigram + 精确名字表，用于引用候选、workspace symbol、调用点种子。
+- `file_index(file)`：精确名字表 + `@import` 字符串，用于引用候选、调用点种子（trigram 暂未实现，见 §19.6）。
 - `search.find_refs(def)`：按名字在索引中粗筛文件 → 对候选位置 `resolve` 精确确认；可按作用域裁剪（局部变量只搜当前 body）。
 - `render.type(ty)`：统一的类型展示（hover、inlay hint、补全 detail 共用），控制截断与泛型参数显示。
 - `edits`：基于 CST 的编辑构造器，保留 trivia。
@@ -810,8 +810,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | **M3 名字** | ✅ 已完成 | 类型化 AST 访问层生成（§5.1，先于 HIR）、模块图、namespace、import 解析、HIR 降级、局部作用域 | goto definition 跨文件/跨模块/进 std 可用；名字补全可用 |
 | **M4 类型** | ✅ 已完成 | InternPool、`decl_type`、`infer` 双向推导、peer type、hover/补全/inlay hints/signature help | sema 测试集覆盖语言主要特性；在 std 上 hover 抽查准确率达标 |
 | **M5 comptime** | ✅ 已完成（见 §19.8） | 解释器、`call_eval`、类型构造函数、`@typeInfo`/`@Type`、泛型抽象实例 + 调用点种子 | `std.ArrayList`/`HashMap`/`MultiArrayList`/`std.meta` 系列推导正确 |
-| **M6 引用** | ⏳ 下一步 | file_index、references、rename、document highlight、workspace symbol、code actions、跨文件的调用点种子（§9.4） | rename 在大项目上正确且 < 1s |
-| **M7 性能** | 未开始 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
+| **M6 引用** | ✅ 已完成（见 §19.12） | file_index、references、rename、document highlight、workspace symbol、code actions、跨文件的调用点种子（§9.4） | rename 在大项目上正确且 < 1s |
+| **M7 性能** | ⏳ 下一步 | 性能调优、内存回收、增量编译诊断延迟优化、冷启动优化 | 在 Zig 编译器源码上达到 §1 热状态与冷启动预算；未达标则评估将 §6.7 持久化提前 |
 | **v1.0** | 未开始 | 稳定性、文档、发布流程 | — |
 
 ### 19.1 M0 完成情况（2026-10-12）
@@ -932,6 +932,8 @@ pub fn make() std.ArrayList(u8) { ... }
 | 读请求用 `async` 提交 | hover、补全等读请求与诊断发布用 `group.async`；线程池满时（核数少或常驻任务多）会在主循环中同步执行，期间收不到 `$/cancelRequest`，后续请求排队。不会死锁：这些任务不等待主循环 | 用户感到请求卡顿或取消不及时 | 读请求改为 `concurrent`（与 `waitIdle` 相同） | M4 |
 | 泛型实例的内存 | 每个实例（函数 + 实参）的推导结果按 query 缓存，InternPool 中的实例与类型只增不减。实测：标准库全量推导的最大 RSS 1.24 GB，与引入解释器之前（1.25 GB）持平；InternPool 17 万项 | 长时间运行、大量不同的实例化 | 实例结果的 LRU 回收；InternPool 代际回收（§9.1） | M5 |
 | 实例化与 comptime 求值的推导耗时 | 同一台机器上标准库全量推导：M4 1.44 秒 → M5（实例化）1.92 秒 → M5（解释器）2.91 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
+| workspace symbol 的匹配 | 每次请求遍历全部项目文件的 ItemTree 做子序列匹配，没有 trigram 索引（§10.2） | 文件很多的项目中逐字输入查询 | `file_index` 增加声明名的 trigram，先粗筛文件 | M6 |
+| 引用查找的反向 import 图 | 每次查找引用都对范围内全部文件解析 `@import` 并现场构建反向图（各文件的 `FileIndex` 有缓存）。实测冷缓存下在标准库（563 个文件）上查找 `mem.Allocator` 的引用 0.36～0.43 秒（含全部文件的解析），热缓存下几十毫秒 | 更大的项目，或频繁的 document highlight | 反向 import 图做成 query | M6 |
 | Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
 
 ### 19.7 M4 完成情况（2026-10-13）
@@ -982,7 +984,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | 全量推导耗时（ReleaseSafe） | 1.44 秒 | 1.92 秒 | 2.91 秒 |
 
 - 测试：`zig build test` 共 169 个（Debug 与 ReleaseSafe 均通过），新增按位宽折叠、实参转换与实例身份（含按捕获值比较容器）、比较结果未知、推导的错误集、带标签的块、解释器（循环、修改、指针捕获、递归的类型函数）、深链、`std.meta` 系列、反射与类型构造、浮点、构造类型的补全、调用点种子等用例。
-- 未实现（与设计的差异）：调用点种子只在同一文件中查找，跨文件查找依赖 `file_index`，列入 M6 的交付；其余见 §19.9。
+- 未实现（与设计的差异）：调用点种子只在同一文件中查找（跨文件查找已在 M6 完成，见 §19.12）；其余见 §19.9。
 
 ### 19.9 M5 遗留事项
 
@@ -1015,6 +1017,22 @@ pub fn make() std.ArrayList(u8) { ... }
 - 端到端测试：wasm32 项目中 `@sizeOf(usize)` 为 4、`std.math.maxInt(usize)` 为 4294967295；同时有宿主与 wasm32 目标的项目中两者为未知；单文件模式为本机宽度；配置变更去掉 `-Dtarget` 后结果随之更新。
 - 同时修复：`zig env` 原样输出相对路径的 `ZIG_GLOBAL_CACHE_DIR`（CI 即如此设置），`ZigEnv` 现在把 `lib_dir`、`std_dir`、`global_cache_dir` 转为绝对路径；此前生成的 builtin.zig 路径为相对路径，导致 CI 上三个平台的测试失败。
 - 测试：`zig build test` 共 175 个。
+
+### 19.12 M6 完成情况（2026-10-14）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 文件索引 | `src/ide_db/FileIndex.zig` | 每个文件出现的标识符名字（去掉 `@"..."`，排序后二分查找）与 `@import` 字符串；derived query，名字与 import 不变时下游不重算 |
+| 引用查找 | `src/ide_db/search.zig` | 局部名字只搜所在成员及其体内容器的成员；声明先取能经由 `@import` 链到达定义所在文件的文件，再按文件索引粗筛，只解析提到该名字的成员。名字引用经名字解析确认；字段访问先求命名空间，求不出时读该成员的推导结果；枚举字面量（含 switch 分支）与初始化中的字段名读推导结果（`Result.members`、新增的 `Result.field_refs`） |
+| 服务器 | `src/server/Server.zig` | `textDocument/references`、`documentHighlight`、`prepareRename` / `rename`、`workspace/symbol`、`codeAction`。范围为模块图中的项目文件（不含标准库）与打开的文档。重命名只允许工作区根目录内（不含 `.zig-cache`、`zig-pkg`）的定义；新名字是关键字或含特殊字符时用 `@"..."` 包裹 |
+| workspace symbol | `src/ide/workspace_symbol.zig` | 忽略大小写的子序列匹配，完全相同、前缀、子序列依次排序，最多 256 个 |
+| code actions | `src/ide/code_actions.zig` | 未使用的局部常量 / 变量 / 参数 / 捕获插入 `_ = x;`；删除多余的丢弃；switch 补上缺少的枚举与联合分支；结构体初始化补上没有默认值的字段（`= undefined`） |
+| 调用点种子 | `src/ide/seed.zig` | 同一文件找不到时，在能引用到该泛型函数、且文件索引中有其名字的项目文件中查找 |
+
+- 同时修复：联合中只写名字的字段（`union(enum) { a: u8, b }` 的 `b`）此前在 ItemTree 中没有名字，跳转、补全、switch 分支都看不到它；现在与枚举成员一样取类型表达式位置的名字。
+- 验收：`sema-corpus` 在标准库上（563 个文件、冷缓存）查找 `mem.Allocator`、`mem.eql`、`std.ArrayList` 的引用分别为 0.36～0.43 秒、约 50 毫秒、不到 10 毫秒，满足 < 1 秒。
+- 已知限制：经由别名的使用不计入（`const Allocator = std.mem.Allocator;` 之后的 `Allocator` 是别名的引用，与 rust-analyzer 一致）；标准库内部的引用不搜索；推导不出类型的字段访问找不到。
+- 测试：`zig build test` 共 185 个。
 
 ## 20. 风险与对策
 
