@@ -795,9 +795,10 @@ const Inferrer = struct {
             return if (tv.val != null) tv else typeUnknown();
         };
         if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
-            const t = if (args.len == 1) (try inf.infer(args[0], null)).asType() else null;
-            const l = value.typeLayout(ip, t orelse return .{ .ty = .comptime_int_type }) orelse return .{ .ty = .comptime_int_type };
-            const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits;
+            const t = (if (args.len == 1) (try inf.infer(args[0], null)).asType() else null) orelse return .{ .ty = .comptime_int_type };
+            // 容器的布局读取字段类型的推导结果：当前结果已不完整时不再深入
+            const l = value.typeLayout(ip, t) orelse (if (inf.dead > 0 or inf.r.ctx.incomplete()) null else try eval.typeLayout(inf.r, t)) orelse return .{ .ty = .comptime_int_type };
+            const n = (if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits) orelse return .{ .ty = .comptime_int_type };
             return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = n } }) };
         }
         if (eq(u8, name, "@hasDecl") or eq(u8, name, "@hasField")) {
@@ -850,9 +851,19 @@ const Inferrer = struct {
         // 结果类型由期望类型决定的转换
         const result_typed = [_][]const u8{ "@intCast", "@truncate", "@floatCast", "@floatFromInt", "@intFromFloat", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@enumFromInt", "@errorCast", "@bitCast", "@fieldParentPtr", "@ptrFromInt", "@splat", "@errSetCast", "@addrSpaceCast" };
         for (result_typed) |n| if (eq(u8, name, n)) return .{ .ty = expected orelse .unknown };
+        if (eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf")) {
+            const t = if (args.len == 2) inf.get(args[0]).asType() else null;
+            const field = if (args.len == 2) try inf.stringArg(args[1]) else null;
+            if (t == null or field == null or inf.dead > 0 or inf.r.ctx.incomplete()) return .{ .ty = .comptime_int_type };
+            const bits = try eval.bitOffsetOf(inf.r, t.?, field.?) orelse return .{ .ty = .comptime_int_type };
+            const n = if (eq(u8, name, "@offsetOf")) bits / 8 else bits;
+            return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = n } }) };
+        }
+        if (eq(u8, name, "@mulAdd")) {
+            const t = if (args.len == 4) inf.get(args[0]).asType() orelse .unknown else .unknown;
+            return try inf.pureValue(name, args) orelse .{ .ty = t };
+        }
         const simple = [_]struct { []const u8, Index }{
-            .{ "@offsetOf", .comptime_int_type },
-            .{ "@bitOffsetOf", .comptime_int_type },
             .{ "@intFromPtr", .usize_type },
             .{ "@inComptime", .bool_type },
             .{ "@panic", .noreturn_type },
@@ -875,14 +886,35 @@ const Inferrer = struct {
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
         // 结果与第一个参数同类型
-        const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@shlExact", "@shrExact" };
+        const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil", "@shlExact", "@shrExact" };
         for (same) |n| if (eq(u8, name, n)) {
             if (args.len == 0) return .unknown;
+            if (try inf.pureValue(name, args)) |tv| return tv;
             var types: std.ArrayList(Index) = .empty;
             for (args) |a| try types.append(inf.scratch, inf.get(a).ty);
-            return .{ .ty = if (eq(u8, name, "@min") or eq(u8, name, "@max")) try inf.peer(types.items) else inf.get(args[0]).ty };
+            if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
+                // 与编译器一致：有浮点参数时取位宽最大的浮点类型，整数取容纳结果范围的最小整数类型
+                for (types.items) |t| if (ip.isFloat(t)) return .{ .ty = value.minMaxFloatType(ip, types.items) orelse try inf.peer(types.items) };
+                const operands = try inf.scratch.alloc(TypedValue, args.len);
+                for (args, operands) |a, *o| o.* = inf.get(a);
+                return .{ .ty = try value.minMaxIntType(ip, eq(u8, name, "@min"), operands) orelse try inf.peer(types.items) };
+            }
+            // 有符号整数的绝对值为同位宽的无符号整数
+            if (eq(u8, name, "@abs")) if (value.intInfo(ip, types.items[0])) |info| if (info.signed) return .{ .ty = try ip.intType(.unsigned, info.bits) };
+            return .{ .ty = types.items[0] };
         };
         return .unknown;
+    }
+
+    /// 参数都已知时只做计算的内置函数（数学函数、布局）的值，由解释器计算
+    fn pureValue(inf: *Inferrer, name: []const u8, args: []const ExprId) Error!?TypedValue {
+        if (inf.dead > 0 or inf.r.ctx.incomplete()) return null;
+        const tvs = try inf.scratch.alloc(TypedValue, args.len);
+        for (args, tvs) |a, *o| {
+            o.* = inf.get(a);
+            if (o.val == null) return null;
+        }
+        return eval.builtinValue(inf.r, name, tvs);
     }
 
     /// 字符串字面量实参的内容

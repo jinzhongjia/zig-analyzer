@@ -36,6 +36,8 @@ const max_inline_calls = 64;
 const max_eval_bytes = 64 * 1024 * 1024;
 /// 解释器内展开的单个聚合的元素个数上限（在分配前检查）
 const max_agg_elems = 1 << 16;
+/// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
+const max_layout_depth = 64;
 
 const Error = resolve.Error;
 /// 放弃求值与控制流
@@ -118,6 +120,38 @@ pub fn elemValue(r: *Resolver, base: TypedValue, i: usize) Error!?TypedValue {
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
     const v = ev.elemAt(Evaluator.thaw(base), i) catch |err| return abortToNull(err);
+    const tv = ev.toTyped(v) catch |err| return abortToNull(err);
+    return if (tv.val != null) tv else null;
+}
+
+/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），含容器的布局；求不出时为 null
+pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return ev.typeLayout(t, 0) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// 结构体字段的位偏移（`@bitOffsetOf`）；求不出时为 null
+pub fn bitOffsetOf(r: *Resolver, t: Index, field: []const u8) Error!?u64 {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return ev.bitOffsetOf(t, field) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// 参数都已知时只做计算的内置函数（数学函数、布局）的值，供推导器使用；不是这类函数或求不出时为 null
+pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Error!?TypedValue {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    const vals = try ev.a.alloc(Val, args.len);
+    for (args, vals) |a, *o| o.* = Evaluator.thaw(a);
+    const v = (ev.pureBuiltin(name, vals) catch |err| return abortToNull(err)) orelse return null;
     const tv = ev.toTyped(v) catch |err| return abortToNull(err);
     return if (tv.val != null) tv else null;
 }
@@ -1819,7 +1853,8 @@ const Evaluator = struct {
         }
         const vals = try ev.a.alloc(Val, args.len);
         // 参数的结果类型
-        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, builtinParamType(name, i));
+        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i]));
+        if (try ev.pureBuiltin(name, vals)) |v| return v;
         if (eq(u8, name, "@TypeOf")) {
             if (vals.len == 0) return error.Abort;
             var t = vals[0].ty;
@@ -1870,12 +1905,6 @@ const Evaluator = struct {
             const fields = try ev.fieldsOf(t) orelse return error.Abort;
             for (fields) |fl| if (eq(u8, fl.name, field)) return Val.ofType(fl.ty);
             return error.Abort;
-        }
-        if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
-            if (vals.len != 1) return error.Abort;
-            const l = value.typeLayout(ip, try asType(vals[0])) orelse return error.Abort;
-            const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits;
-            return ev.int(.comptime_int_type, n);
         }
         if (eq(u8, name, "@Int")) {
             if (vals.len != 2) return error.Abort;
@@ -1929,7 +1958,8 @@ const Evaluator = struct {
             const types = try ev.typesOf(vals[3]);
             if (types.len != names.len) return error.Abort;
             const is_union = eq(u8, name, "@Union");
-            return Val.ofType(try ev.reify(f, e, .{ .kind = if (is_union) .@"union" else .@"struct", .layout = layout, .tag = if (tag == .null_value) null else tag, .names = names, .types = types }));
+            const custom = try ev.customFieldAttrs(vals[4], is_union);
+            return Val.ofType(try ev.reify(f, e, .{ .kind = if (is_union) .@"union" else .@"struct", .layout = layout, .tag = if (tag == .null_value) null else tag, .names = names, .types = types, .custom_field_attrs = custom }));
         }
         if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
             if (vals.len != 1) return error.Abort;
@@ -1945,61 +1975,6 @@ const Evaluator = struct {
         if (eq(u8, name, "@intFromBool")) {
             if (vals.len != 1) return error.Abort;
             return ev.int(.u1_type, @intFromBool((try ev.condition(vals[0])).yes));
-        }
-        if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
-            if (vals.len == 0) return error.Abort;
-            var ty = vals[0].ty;
-            var best = try ev.intArg(vals[0]);
-            for (vals[1..]) |v| {
-                ty = value.peerIntType(ip, ty, v.ty) orelse return error.Abort;
-                const x = try ev.intArg(v);
-                best = if (eq(u8, name, "@min")) @min(best, x) else @max(best, x);
-            }
-            return ev.int(ty, best);
-        }
-        if (eq(u8, name, "@abs")) {
-            if (vals.len != 1) return error.Abort;
-            const x = try ev.intArg(vals[0]);
-            const ty = if (value.intInfo(ip, vals[0].ty)) |info| (if (info.signed) try ip.intType(.unsigned, info.bits) else vals[0].ty) else vals[0].ty;
-            return ev.int(ty, if (x < 0) -x else x);
-        }
-        if (eq(u8, name, "@divTrunc") or eq(u8, name, "@divFloor") or eq(u8, name, "@divExact") or eq(u8, name, "@divCeil") or eq(u8, name, "@mod") or eq(u8, name, "@rem")) {
-            if (vals.len != 2) return error.Abort;
-            const ty = value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
-            const x = try ev.intArg(vals[0]);
-            const y = try ev.intArg(vals[1]);
-            if (y == 0) return error.Abort;
-            const r: i128 = if (eq(u8, name, "@divTrunc"))
-                @divTrunc(x, y)
-            else if (eq(u8, name, "@divFloor"))
-                @divFloor(x, y)
-            else if (eq(u8, name, "@divCeil"))
-                -@divFloor(-x, y)
-            else if (eq(u8, name, "@divExact")) blk: {
-                if (@rem(x, y) != 0) return error.Abort;
-                break :blk @divExact(x, y);
-            } else if (eq(u8, name, "@mod")) @mod(x, y) else @rem(x, y);
-            if (!value.intFits(ip, ty, r)) return error.Abort;
-            return ev.int(ty, r);
-        }
-        if (eq(u8, name, "@clz") or eq(u8, name, "@ctz") or eq(u8, name, "@popCount")) {
-            if (vals.len != 1) return error.Abort;
-            const info = value.intInfo(ip, vals[0].ty) orelse return error.Abort;
-            if (info.bits > 128) return error.Abort;
-            const x = try ev.intArg(vals[0]);
-            // 按位宽取二进制补码表示
-            const bits: u128 = if (info.bits == 128) @bitCast(x) else @as(u128, @bitCast(x)) & ((@as(u128, 1) << @intCast(info.bits)) - 1);
-            const n: u16 = if (eq(u8, name, "@popCount"))
-                @popCount(bits)
-            else if (bits == 0)
-                info.bits
-            else if (eq(u8, name, "@clz"))
-                @intCast(@clz(bits) - (128 - info.bits))
-            else
-                @ctz(bits);
-            // 结果类型：能容纳位宽的无符号整数
-            const result_bits: u16 = @intCast(128 - @clz(@as(u128, info.bits)));
-            return ev.int(try ip.intType(.unsigned, result_bits), n);
         }
         if (eq(u8, name, "@splat")) {
             const t = want orelse return error.Abort;
@@ -2030,10 +2005,141 @@ const Evaluator = struct {
         return error.Abort;
     }
 
+    /// 只做计算的内置函数（数学函数、布局）：参数都已求出，不读取求值的上下文。不是这类函数时为 null
+    fn pureBuiltin(ev: *Evaluator, name: []const u8, vals: []const Val) EvalError!?Val {
+        const ip = ev.ip;
+        const eq = std.mem.eql;
+        if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
+            if (vals.len != 1) return error.Abort;
+            const l = try ev.typeLayout(try asType(vals[0]), 0) orelse return error.Abort;
+            const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits orelse return error.Abort;
+            return try ev.int(.comptime_int_type, n);
+        }
+        if (eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf")) {
+            if (vals.len != 2) return error.Abort;
+            const bits = try ev.bitOffsetOf(try asType(vals[0]), try ev.stringOf(vals[1])) orelse return error.Abort;
+            return try ev.int(.comptime_int_type, if (eq(u8, name, "@offsetOf")) bits / 8 else bits);
+        }
+        if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
+            if (vals.len == 0) return error.Abort;
+            const op: value.FloatBinFn = if (eq(u8, name, "@min")) .min else .max;
+            const operands = try ev.a.alloc(TypedValue, vals.len);
+            for (vals, operands) |v, *o| o.* = .{ .ty = v.ty, .val = v.ip() };
+            if (anyFloat(ip, vals)) {
+                const types = try ev.a.alloc(Index, vals.len);
+                for (vals, types) |v, *t| t.* = v.ty;
+                const ty = value.minMaxFloatType(ip, types) orelse return error.Abort;
+                var best = try ev.floatArg(vals[0]);
+                for (vals[1..]) |v| best = value.floatOf(ip, try value.floatBinary(ip, op, ty, best, try ev.floatArg(v))) orelse return error.Abort;
+                return try ev.float(ty, best);
+            }
+            // 结果类型为容纳结果的最小整数类型（如 `@min(@as(u8, 3), @as(u16, 5))` 为 u2）
+            const ty = try value.minMaxIntType(ip, op == .min, operands) orelse return error.Abort;
+            var best = try ev.intArg(vals[0]);
+            for (vals[1..]) |v| {
+                const x = try ev.intArg(v);
+                best = if (op == .min) @min(best, x) else @max(best, x);
+            }
+            return try ev.int(ty, best);
+        }
+        if (eq(u8, name, "@abs")) {
+            if (vals.len != 1) return error.Abort;
+            if (ip.isFloat(vals[0].ty)) return try floatResult(vals[0].ty, try value.floatUnary(ip, .abs, vals[0].ty, try ev.floatArg(vals[0])));
+            const x = try ev.intArg(vals[0]);
+            if (x == std.math.minInt(i128)) return error.Abort;
+            const ty = if (value.intInfo(ip, vals[0].ty)) |info| (if (info.signed) try ip.intType(.unsigned, info.bits) else vals[0].ty) else vals[0].ty;
+            return try ev.int(ty, @abs(x));
+        }
+        // 浮点的一元数学函数：按参数的浮点类型计算
+        if (name.len > 1) if (std.meta.stringToEnum(value.FloatFn, name[1..])) |op| {
+            if (vals.len != 1) return error.Abort;
+            return try floatResult(vals[0].ty, try value.floatUnary(ip, op, vals[0].ty, try ev.floatArg(vals[0])));
+        };
+        if (eq(u8, name, "@mulAdd")) {
+            if (vals.len != 4) return error.Abort;
+            const ty = try asType(vals[0]);
+            return try floatResult(ty, try value.floatMulAdd(ip, ty, try ev.floatArg(vals[1]), try ev.floatArg(vals[2]), try ev.floatArg(vals[3])));
+        }
+        const division = [_]struct { []const u8, value.FloatBinFn }{
+            .{ "@divTrunc", .div_trunc }, .{ "@divFloor", .div_floor }, .{ "@divCeil", .div_ceil },
+            .{ "@divExact", .div_exact }, .{ "@mod", .mod },            .{ "@rem", .rem },
+        };
+        for (division) |d| if (eq(u8, name, d[0])) {
+            if (vals.len != 2) return error.Abort;
+            if (anyFloat(ip, vals)) {
+                const ty = floatPeer(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
+                return try floatResult(ty, try value.floatBinary(ip, d[1], ty, try ev.floatArg(vals[0]), try ev.floatArg(vals[1])));
+            }
+            const ty = value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
+            const x = try ev.intArg(vals[0]);
+            const y = try ev.intArg(vals[1]);
+            // i128 的最小值除以 -1 溢出（解释器的安全检查会使进程崩溃）
+            if (y == 0 or x == std.math.minInt(i128)) return error.Abort;
+            const r: i128 = switch (d[1]) {
+                .div_trunc => @divTrunc(x, y),
+                .div_floor => @divFloor(x, y),
+                .div_ceil => @divCeil(x, y),
+                .div_exact => if (@divTrunc(x, y) * y != x) return error.Abort else @divTrunc(x, y),
+                .mod => @mod(x, y),
+                .rem => @rem(x, y),
+                .min, .max => unreachable,
+            };
+            if (!value.intFits(ip, ty, r)) return error.Abort;
+            return try ev.int(ty, r);
+        };
+        if (eq(u8, name, "@clz") or eq(u8, name, "@ctz") or eq(u8, name, "@popCount")) {
+            if (vals.len != 1) return error.Abort;
+            const info = value.intInfo(ip, vals[0].ty) orelse return error.Abort;
+            if (info.bits > 128) return error.Abort;
+            const x = try ev.intArg(vals[0]);
+            // 按位宽取二进制补码表示
+            const bits: u128 = if (info.bits == 128) @bitCast(x) else @as(u128, @bitCast(x)) & ((@as(u128, 1) << @intCast(info.bits)) - 1);
+            const n: u16 = if (eq(u8, name, "@popCount"))
+                @popCount(bits)
+            else if (bits == 0)
+                info.bits
+            else if (eq(u8, name, "@clz"))
+                @intCast(@clz(bits) - (128 - info.bits))
+            else
+                @ctz(bits);
+            // 结果类型：能容纳位宽的无符号整数
+            const result_bits: u16 = @intCast(128 - @clz(@as(u128, info.bits)));
+            return try ev.int(try ip.intType(.unsigned, result_bits), n);
+        }
+        return null;
+    }
+
+    fn float(ev: *Evaluator, ty: Index, x: f128) EvalError!Val {
+        return Val.of(ty, try value.floatValue(ev.ip, ty, x) orelse return error.Abort);
+    }
+
+    fn floatArg(ev: *Evaluator, v: Val) EvalError!f128 {
+        return value.floatOf(ev.ip, v.ip()) orelse error.Abort;
+    }
+
+    /// 内置函数第 `i` 个参数的结果类型（`prev` 为之前的参数）。构造类型的内置函数中按字段给出的参数为
+    /// `*const [n]T`，`&@splat(.{})` 等写法需要它
+    fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val) EvalError!?Index {
+        const eq = std.mem.eql;
+        const is_struct = eq(u8, name, "@Struct");
+        const elem: ?Index = if ((is_struct or eq(u8, name, "@Union")) and (i == 3 or i == 4)) blk: {
+            if (i == 3) break :blk .type_type;
+            break :blk ev.stdType(&.{ "builtin", "Type", if (is_struct) "Struct" else "Union", "FieldAttributes" }) catch |err| switch (err) {
+                error.Abort => return null,
+                else => |x| return x,
+            };
+        } else if (eq(u8, name, "@Enum") and i == 3) asType(prev[0]) catch return null else null;
+        if (elem) |t| {
+            const n = try ev.elemCount(prev[2]) orelse return null;
+            return try ev.ip.ptrTo(try ev.ip.get(.{ .array_type = .{ .len = n, .child = t } }), .one, true);
+        }
+        return builtinParamType(name, i);
+    }
+
     /// 内置函数参数的结果类型
     fn builtinParamType(name: []const u8, i: usize) ?Index {
         const eq = std.mem.eql;
-        if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf"))) return .type_type;
+        if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf") or eq(u8, name, "@mulAdd"))) return .type_type;
         return null;
     }
 
@@ -2183,6 +2289,7 @@ const Evaluator = struct {
         types: []const Index = &.{},
         values: []const i128 = &.{},
         nonexhaustive: bool = false,
+        custom_field_attrs: bool = false,
     }) Error!Index {
         const tree = try ev.r.itemTree(f.file);
         return ev.ip.get(.{ .reified_type = .{
@@ -2197,7 +2304,198 @@ const Evaluator = struct {
             .types = spec.types,
             .values = spec.values,
             .nonexhaustive = spec.nonexhaustive,
+            .custom_field_attrs = spec.custom_field_attrs,
         } });
+    }
+
+    // ── 布局 ─────────────────────────────────────────────────────────
+
+    /// 类型的布局；容器按编译器的布局算法（Sema/type_resolution.zig）
+    fn typeLayout(ev: *Evaluator, t: Index, depth: u32) EvalError!?value.Layout {
+        const ip = ev.ip;
+        if (depth > max_layout_depth) return null;
+        switch (ip.key(t)) {
+            .optional_type => |c| return value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
+            .array_type => |a| return value.arrayLayout(try ev.typeLayout(a.child, depth + 1) orelse return null, a, try ev.hasBitRepr(a.child)),
+            .error_union_type => |eu| return value.errorUnionLayout(try ev.typeLayout(eu.payload, depth + 1) orelse return null),
+            .container_type, .reified_type, .union_tag_type => {},
+            else => return value.typeLayout(ip, t),
+        }
+        // 枚举：标签整数
+        if (value.isEnumType(ip, t)) return value.typeLayout(ip, try ev.enumTagType(t) orelse return null);
+        const fields = try ev.layoutFields(t, depth) orelse return null;
+        const decl = try ev.containerSyntax(t);
+        if (ev.isUnion(t)) return ev.unionLayout(t, decl, fields, depth);
+        return (try ev.structLayout(decl, fields) orelse return null).layout;
+    }
+
+    /// 结构体字段的位偏移；comptime 字段与求不出时为 null
+    fn bitOffsetOf(ev: *Evaluator, t: Index, field: []const u8) EvalError!?u64 {
+        // 只有结构体有字段偏移
+        if (ev.isUnion(t) or value.isEnumType(ev.ip, t)) return null;
+        const i = try ev.fieldIndex(t, field) orelse return null;
+        const fields = try ev.layoutFields(t, 0) orelse return null;
+        const sl = try ev.structLayout(try ev.containerSyntax(t), fields) orelse return null;
+        return sl.bit_offsets[i];
+    }
+
+    /// 类型有位表示：数组的位宽要求元素有位表示（错误集与未指定标签类型的枚举虽可求 `@bitSizeOf`，却没有）
+    fn hasBitRepr(ev: *Evaluator, t: Index) EvalError!bool {
+        switch (ev.ip.key(t)) {
+            .error_set_type, .inferred_error_set => return false,
+            .simple_type => |s| return s != .anyerror,
+            .array_type => |a| return ev.hasBitRepr(a.child),
+            .union_tag_type => |u| return (try ev.containerSyntax(u)).arg != null,
+            .container_type => |c| return c.kind != .@"enum" or (try ev.containerSyntax(t)).arg != null,
+            else => return true,
+        }
+    }
+
+    /// packed 容器可以包含的字段类型：整数、浮点、bool、void、指定了标签类型的枚举与 packed 容器
+    fn packable(ev: *Evaluator, t: Index) EvalError!bool {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .int_type => return true,
+            .simple_type => |s| return s == .void or s == .bool or value.intInfo(ip, t) != null or (ip.isFloat(t) and s != .comptime_float),
+            .container_type, .reified_type, .union_tag_type => {
+                if (value.isEnumType(ip, t)) return ev.hasBitRepr(t);
+                return (try ev.containerSyntax(t)).layout == .@"packed";
+            },
+            else => return false,
+        }
+    }
+
+    /// 参与布局的字段：comptime 字段不占空间
+    const LayoutField = struct { ty: Index, layout: ?value.Layout, is_comptime: bool = false };
+
+    /// 结构体与 union 各字段的布局。字段的布局求不出、带显式对齐（不求值）或字段属性未知时为 null。
+    /// 元组与匿名结构体字面量中 comptime 已知的字段是 comptime 字段，类型中没有记录，布局同样未知
+    fn layoutFields(ev: *Evaluator, t: Index, depth: u32) EvalError!?[]const LayoutField {
+        switch (ev.ip.key(t)) {
+            .container_type => |c| if (c.kind == .@"opaque") return null,
+            .reified_type => |rt| if (rt.custom_field_attrs) return null,
+            else => return null,
+        }
+        const fields = try ev.fieldsOf(t) orelse return null;
+        const ns = try queries.namespaceOfType(ev.r, t);
+        const out = try ev.a.alloc(LayoutField, fields.len);
+        for (fields, out) |fl, *o| {
+            o.* = .{ .ty = fl.ty, .layout = null };
+            if (fl.item) |m| {
+                const n = ns orelse return null;
+                if ((try ev.r.itemTree(n.file)).items[m].flags.is_comptime) {
+                    o.is_comptime = true;
+                    continue;
+                }
+                const node = try ev.r.itemNode(n.file, m) orelse return null;
+                if (node.childNode(.align_clause) != null) return null;
+            }
+            o.layout = try ev.typeLayout(fl.ty, depth + 1) orelse return null;
+        }
+        return out;
+    }
+
+    const StructLayout = struct { layout: value.Layout, bit_offsets: []const ?u64 };
+
+    /// 结构体的布局与各字段的位偏移（comptime 字段为 null）。auto 布局按对齐降序重排字段，
+    /// 与编译器同样使用 `sortUnstable`，对齐相同的字段顺序也一致
+    fn structLayout(ev: *Evaluator, decl: ContainerSyntax, fields: []const LayoutField) EvalError!?StructLayout {
+        const offsets = try ev.a.alloc(?u64, fields.len);
+        @memset(offsets, null);
+        if (decl.layout == .@"packed") {
+            var bits: u64 = 0;
+            for (fields, offsets) |fl, *o| {
+                const l = fl.layout orelse return null;
+                if (!try ev.packable(fl.ty)) return null;
+                o.* = bits;
+                bits += l.bits orelse return null;
+            }
+            // 显式的 backing 整数须与各字段的位宽之和相等
+            if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
+            return .{ .layout = value.intLayout(std.math.cast(u16, bits) orelse return null) orelse return null, .bit_offsets = offsets };
+        }
+        const order = try ev.a.alloc(u32, fields.len);
+        var struct_align: u64 = 1;
+        for (fields, order, 0..) |fl, *o, i| {
+            if (fl.is_comptime) {
+                o.* = RuntimeOrder.omitted;
+                continue;
+            }
+            o.* = @intCast(i);
+            struct_align = @max(struct_align, fl.layout.?.alignment);
+        }
+        if (decl.layout == .auto) std.mem.sortUnstable(u32, order, fields, RuntimeOrder.lessThan);
+        var end: u64 = 0;
+        for (order) |i| {
+            if (i == RuntimeOrder.omitted) continue;
+            const l = fields[i].layout.?;
+            const offset = std.mem.alignForward(u64, end, l.alignment);
+            offsets[i] = offset * 8;
+            end = offset + l.size;
+        }
+        return .{ .layout = .{ .size = std.mem.alignForward(u64, end, struct_align), .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
+    }
+
+    /// 字段在内存中的顺序：与编译器的比较函数相同，comptime 字段排在最后
+    const RuntimeOrder = struct {
+        const omitted = std.math.maxInt(u32);
+
+        fn lessThan(fields: []const LayoutField, a: u32, b: u32) bool {
+            if (a == omitted) return false;
+            if (b == omitted) return true;
+            return fields[a].layout.?.alignment > fields[b].layout.?.alignment;
+        }
+    };
+
+    /// union 的布局：auto 与 extern 为最大的字段（与标签），packed 的各字段位宽相同
+    fn unionLayout(ev: *Evaluator, t: Index, decl: ContainerSyntax, fields: []const LayoutField, depth: u32) EvalError!?value.Layout {
+        var payload_size: u64 = 0;
+        var payload_align: u64 = 1;
+        for (fields) |fl| {
+            const l = fl.layout orelse return null;
+            payload_size = @max(payload_size, l.size);
+            payload_align = @max(payload_align, l.alignment);
+        }
+        const payload: value.Layout = .{ .size = std.mem.alignForward(u64, payload_size, payload_align), .alignment = payload_align, .bits = null };
+        switch (decl.layout) {
+            .@"packed" => {
+                if (fields.len == 0) return null;
+                for (fields) |fl| if (!try ev.packable(fl.ty)) return null;
+                const bits = fields[0].layout.?.bits orelse return null;
+                for (fields[1..]) |fl| if ((fl.layout.?.bits orelse return null) != bits) return null;
+                if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
+                return value.intLayout(std.math.cast(u16, bits) orelse return null);
+            },
+            .@"extern" => return payload,
+            .auto => {},
+        }
+        // 只有一个字段时没有标签
+        if (fields.len < 2) return payload;
+        // 不带标签的 union 在 Debug 与 ReleaseSafe 下有安全检查用的隐藏标签，大小取决于优化模式
+        const tag = try ev.typeLayout(try ev.unionTagType(t) orelse return null, depth + 1) orelse return null;
+        const alignment = @max(tag.alignment, payload_align);
+        return .{ .size = std.mem.alignForward(u64, tag.size + payload_size, alignment), .alignment = alignment, .bits = null };
+    }
+
+    /// `@Struct` / `@Union` 的字段属性中有 comptime 字段或显式对齐（这时布局不能只由字段类型求出）；
+    /// 求不出时按有处理
+    fn customFieldAttrs(ev: *Evaluator, attrs: Val, is_union: bool) EvalError!bool {
+        return ev.anyCustomAttr(attrs, if (is_union) &.{"align"} else &.{ "align", "comptime" }) catch |err| switch (err) {
+            error.Abort => true,
+            else => |x| x,
+        };
+    }
+
+    fn anyCustomAttr(ev: *Evaluator, attrs: Val, names: []const []const u8) EvalError!bool {
+        const n = try ev.elemCount(attrs) orelse return true;
+        for (0..n) |i| {
+            const attr = try ev.elemAt(attrs, i);
+            for (names) |field| {
+                const x = try ev.freeze(try ev.fieldAccess(attr, field)) orelse return true;
+                if (x != .null_value and x != .false_value) return true;
+            }
+        }
+        return false;
     }
 
     // ── @typeInfo ────────────────────────────────────────────────────
@@ -2253,7 +2551,7 @@ const Evaluator = struct {
                 .type, .void, .bool, .noreturn, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .{ @tagName(s), .void_value },
                 .anyerror => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", .null_value }}) },
                 .anyopaque => .{ "opaque", try ev.structValue(try ev.member(type_ty, "Opaque"), &.{.{ "decl_names", try ev.namesValue(&.{}) }}) },
-                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), (value.typeLayout(ip, t) orelse return error.Abort).bits) }}) },
+                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), (value.typeLayout(ip, t) orelse return error.Abort).bits orelse return error.Abort) }}) },
                 else => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t) orelse return error.Abort) },
             },
             .int_type => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t).?) },
@@ -2461,7 +2759,12 @@ const Evaluator = struct {
     /// 枚举的标签整数类型：显式的 `enum(u8)`，否则为容纳最大值的无符号整数
     fn enumTagType(ev: *Evaluator, t: Index) EvalError!?Index {
         const ip = ev.ip;
-        if (ip.key(t) == .container_type or ip.key(t) == .reified_type) if ((try ev.containerSyntax(t)).arg) |arg| return arg;
+        switch (ip.key(t)) {
+            .container_type, .reified_type => if ((try ev.containerSyntax(t)).arg) |arg| return arg,
+            // `union(enum(u8))` 的标签枚举
+            .union_tag_type => |u| if ((try ev.containerSyntax(u)).arg) |arg| return arg,
+            else => {},
+        }
         const values = try ev.enumValues(t);
         var max: i128 = 0;
         for (values) |v| max = @max(max, v);
@@ -2493,7 +2796,7 @@ const Evaluator = struct {
         if (layout != .@"packed") return .null_value;
         if ((try ev.containerSyntax(t)).arg) |arg| return arg;
         var bits: u64 = 0;
-        for (types) |ty| bits += (value.typeLayout(ev.ip, ty) orelse return error.Abort).bits;
+        for (types) |ty| bits += (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }
 };
@@ -2515,6 +2818,25 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     if (a == .comptime_float_type or a == .comptime_int_type) return if (ip.isFloat(b)) b else null;
     if (b == .comptime_float_type or b == .comptime_int_type) return if (ip.isFloat(a)) a else null;
     return null;
+}
+
+/// 浮点运算的结果；求不出（不是浮点类型、除数为零等）时放弃
+fn floatResult(ty: Index, v: ?Index) EvalError!Val {
+    return Val.of(ty, v orelse return error.Abort);
+}
+
+/// 有参数是浮点类型或 comptime_float
+fn anyFloat(ip: *InternPool, vals: []const Val) bool {
+    for (vals) |v| if (ip.isFloat(v.ty)) return true;
+    return false;
+}
+
+/// 浮点内置函数参数的结果类型：两侧都是 comptime 数值时为 comptime_float
+fn floatPeer(ip: *InternPool, a: Index, b: Index) ?Index {
+    const comptime_a = a == .comptime_float_type or a == .comptime_int_type;
+    const comptime_b = b == .comptime_float_type or b == .comptime_int_type;
+    if (comptime_a and comptime_b) return .comptime_float_type;
+    return peerFloatType(ip, a, b);
 }
 
 fn boolVal(b: bool) Val {

@@ -169,6 +169,8 @@ pub const Reified = struct {
     /// enum 成员的值
     values: []const i128 = &.{},
     nonexhaustive: bool = false,
+    /// struct / union 的字段带 comptime 或显式对齐（布局不能只由字段类型求出）
+    custom_field_attrs: bool = false,
 
     pub const Kind = enum { @"struct", @"enum", @"union" };
     pub const Layout = enum { auto, @"extern", @"packed" };
@@ -481,7 +483,20 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         .simple_value => |v| try w.writeAll(@tagName(v)),
         .int_value => |v| try w.print("{d}", .{v.value}),
-        .float_value => |v| try w.print("{d}", .{@as(f128, @bitCast(v.bits))}),
+        .float_value => |v| {
+            // 按值的类型输出最短表示（f32 的 √2 为 1.4142135，而不是 f128 下的展开）
+            const x: f128 = @bitCast(v.bits);
+            switch (ip.key(v.ty)) {
+                .simple_type => |t| switch (t) {
+                    .f16 => try w.print("{d}", .{@as(f16, @floatCast(x))}),
+                    .f32 => try w.print("{d}", .{@as(f32, @floatCast(x))}),
+                    .f64 => try w.print("{d}", .{@as(f64, @floatCast(x))}),
+                    .f80 => try w.print("{d}", .{@as(f80, @floatCast(x))}),
+                    else => try w.print("{d}", .{x}),
+                },
+                else => try w.print("{d}", .{x}),
+            }
+        },
         .enum_literal => |n| try w.print(".{f}", .{std.zig.fmtId(n)}),
         .enum_tag => |t| try w.print(".{f}", .{std.zig.fmtId(t.name)}),
         .error_value => |n| try w.print("error.{s}", .{n}),

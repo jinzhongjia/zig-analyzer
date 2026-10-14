@@ -530,6 +530,232 @@ test "inferred error sets from function bodies" {
     });
 }
 
+test "container layouts match the compiler" {
+    // 期望值为 zig 0.17.0 在 x86_64-linux 上的结果
+    try expectTypes(
+        \\const A = struct { a: u8, b: u32, c: u16 };
+        \\const B = extern struct { a: u8, b: u32, c: u16 };
+        \\const C = packed struct { a: u3, b: u5, c: u16 };
+        \\const D = struct { a: u8, b: u64, c: u8, d: u32, e: u16 };
+        \\const M = struct { a: [0]u32, b: u8, c: ?*u8, d: ?[]u8, e: anyerror!u8, f: ?anyerror };
+        \\const Big = struct { a: u8, b: u128, c: f80, d: u16 };
+        \\const H = enum(u16) { a, b };
+        \\const Auto = enum { a, b, c };
+        \\const U = union(enum) { a: u64, b: u8 };
+        \\const UE = union(H) { a: u32, b: u8 };
+        \\const X = extern union { a: u32, b: [6]u8 };
+        \\const P = packed union { a: u16, b: i16 };
+        \\const One = union(enum) { a: u32 };
+        \\const Nest = struct { a: M, b: U, c: Auto };
+        \\const K = struct { comptime k: u8 = 1, a: u8, b: u16 };
+        \\fn Pair(comptime T: type) type {
+        \\    return struct { a: u8, b: T };
+        \\}
+        \\const top = @sizeOf(D);
+        \\fn g() void {
+        \\    const size_a = @sizeOf(A);
+        \\    const align_a = @alignOf(A);
+        \\    const a_a = @offsetOf(A, "a");
+        \\    const a_b = @offsetOf(A, "b");
+        \\    const a_c = @offsetOf(A, "c");
+        \\    const size_b = @sizeOf(B);
+        \\    const b_c = @offsetOf(B, "c");
+        \\    const size_c = @sizeOf(C);
+        \\    const bits_c = @bitSizeOf(C);
+        \\    const c_b = @bitOffsetOf(C, "b");
+        \\    const c_c = @offsetOf(C, "c");
+        \\    const d_a = @offsetOf(D, "a");
+        \\    const d_c = @offsetOf(D, "c");
+        \\    const d_e = @offsetOf(D, "e");
+        \\    const size_m = @sizeOf(M);
+        \\    const m_a = @offsetOf(M, "a");
+        \\    const m_b = @offsetOf(M, "b");
+        \\    const m_f = @offsetOf(M, "f");
+        \\    const big_a = @offsetOf(Big, "a");
+        \\    const size_big = @sizeOf(Big);
+        \\    const bits_h = @bitSizeOf(H);
+        \\    const bits_auto = @bitSizeOf(Auto);
+        \\    const size_u = @sizeOf(U);
+        \\    const size_ue = @sizeOf(UE);
+        \\    const size_x = @sizeOf(X);
+        \\    const bits_p = @bitSizeOf(P);
+        \\    const size_one = @sizeOf(One);
+        \\    const size_opt_u = @sizeOf(?U);
+        \\    const nest_c = @offsetOf(Nest, "c");
+        \\    const size_nest = @sizeOf(Nest);
+        \\    const size_k = @sizeOf(K);
+        \\    const k_a = @offsetOf(K, "a");
+        \\    const pair_a = @offsetOf(Pair(u32), "a");
+        \\    _ = .{ size_a, align_a, a_a, a_b, a_c, size_b, b_c, size_c, bits_c, c_b, c_c, d_a, d_c, d_e, size_m, m_a, m_b, m_f, big_a, size_big, bits_h, bits_auto, size_u, size_ue, size_x, bits_p, size_one, size_opt_u, nest_c, size_nest, size_k, k_a, pair_a };
+        \\}
+    , &.{
+        .{ "size_a", "comptime_int = 8" },
+        .{ "align_a", "comptime_int = 4" },
+        // auto 布局按对齐降序重排字段
+        .{ "a_a", "comptime_int = 6" },
+        .{ "a_b", "comptime_int = 0" },
+        .{ "a_c", "comptime_int = 4" },
+        // extern 按声明顺序
+        .{ "size_b", "comptime_int = 12" },
+        .{ "b_c", "comptime_int = 8" },
+        .{ "size_c", "comptime_int = 4" },
+        .{ "bits_c", "comptime_int = 24" },
+        .{ "c_b", "comptime_int = 3" },
+        .{ "c_c", "comptime_int = 1" },
+        // 对齐相同的字段保持声明顺序
+        .{ "d_a", "comptime_int = 14" },
+        .{ "d_c", "comptime_int = 15" },
+        .{ "d_e", "comptime_int = 12" },
+        .{ "top", "comptime_int = 16" },
+        .{ "size_m", "comptime_int = 32" },
+        .{ "m_a", "comptime_int = 24" },
+        .{ "m_b", "comptime_int = 30" },
+        .{ "m_f", "comptime_int = 28" },
+        .{ "big_a", "comptime_int = 34" },
+        .{ "size_big", "comptime_int = 48" },
+        .{ "bits_h", "comptime_int = 16" },
+        .{ "bits_auto", "comptime_int = 2" },
+        .{ "size_u", "comptime_int = 16" },
+        .{ "size_ue", "comptime_int = 8" },
+        .{ "size_x", "comptime_int = 8" },
+        .{ "bits_p", "comptime_int = 16" },
+        // 只有一个字段的 union(enum) 没有运行时的标签
+        .{ "size_one", "comptime_int = 4" },
+        .{ "size_opt_u", "comptime_int = 24" },
+        .{ "nest_c", "comptime_int = 48" },
+        .{ "size_nest", "comptime_int = 56" },
+        // comptime 字段不占空间
+        .{ "size_k", "comptime_int = 4" },
+        .{ "k_a", "comptime_int = 2" },
+        .{ "pair_a", "comptime_int = 4" },
+    });
+}
+
+test "layouts that are invalid or depend on the build mode stay unknown" {
+    try expectTypes(
+        \\const Bare = union { a: u32, b: u8 };
+        \\const L = struct { a: u8 align(4), b: u8 };
+        \\const S = struct { a: u8 };
+        \\const Auto = enum { a, b, c };
+        \\const Pa = packed struct { a: u4, b: Auto };
+        \\fn g() void {
+        \\    const size_bare = @sizeOf(Bare);
+        \\    const size_l = @sizeOf(L);
+        \\    const bits_s = @bitSizeOf(S);
+        \\    const bits_slice = @bitSizeOf([]u8);
+        \\    const bits_opt = @bitSizeOf(?u32);
+        \\    const bits_ptr = @bitSizeOf(?*u32);
+        \\    const bits_arr = @bitSizeOf([3]u5);
+        \\    const bits_sent = @bitSizeOf([2:0]u8);
+        \\    const bits_autos = @bitSizeOf([2]Auto);
+        \\    const size_pa = @sizeOf(Pa);
+        \\    const size_tuple = @sizeOf(@TypeOf(.{ @as(u8, 1), @as(u32, 2) }));
+        \\    _ = .{ size_bare, size_l, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa, size_tuple };
+        \\}
+    , &.{
+        // 不带标签的 union 在 Debug 与 ReleaseSafe 下有隐藏的标签
+        .{ "size_bare", "comptime_int" },
+        // 显式对齐不求值
+        .{ "size_l", "comptime_int" },
+        // 没有位表示的类型（编译器报错）
+        .{ "bits_s", "comptime_int" },
+        .{ "bits_slice", "comptime_int" },
+        .{ "bits_opt", "comptime_int" },
+        .{ "bits_ptr", "comptime_int = 64" },
+        // 数组的位宽含哨兵
+        .{ "bits_arr", "comptime_int = 15" },
+        .{ "bits_sent", "comptime_int = 24" },
+        .{ "bits_autos", "comptime_int" },
+        // packed 结构体不能包含未指定标签类型的枚举
+        .{ "size_pa", "comptime_int" },
+        // 元组字面量中 comptime 已知的字段是 comptime 字段
+        .{ "size_tuple", "comptime_int" },
+    });
+}
+
+test "float math builtins use the precision of the operand type" {
+    // 期望值为 zig 0.17.0 的结果
+    try expectTypes(
+        \\fn g() void {
+        \\    const r32 = @sqrt(@as(f32, 2));
+        \\    const r64 = @sqrt(@as(f64, 2));
+        \\    const r16 = @sqrt(@as(f16, 2));
+        \\    const rc = @sqrt(2.0);
+        \\    const sn = @sin(@as(f64, 1));
+        \\    const lg = @log2(@as(f64, 8));
+        \\    const fl = @floor(@as(f32, -1.5));
+        \\    const rd = @round(@as(f64, 2.5));
+        \\    const ab = @abs(@as(f32, -3.5));
+        \\    const md = @mod(@as(f64, -7), 3);
+        \\    const rm = @rem(@as(f64, -7), 3);
+        \\    const ma = @mulAdd(f64, 2, 3, 4);
+        \\    const mn = @min(@as(f32, 1.5), 2.5);
+        \\    const dc = @divCeil(@as(f64, 7.5), 2);
+        \\    const df = @divFloor(@as(f64, -7.5), 2);
+        \\    const ai = @abs(@as(i8, -128));
+        \\    const ic = @divCeil(@as(i32, -7), 2);
+        \\    const mi = @mod(@as(i32, 7), -3);
+        \\    const rn = @rem(@as(f64, -7), -3);
+        \\    const mf = @mod(@as(f64, 7), -3);
+        \\    _ = .{ r32, r64, r16, rc, sn, lg, fl, rd, ab, md, rm, ma, mn, dc, df, ai, ic, mi, rn, mf };
+        \\}
+    , &.{
+        .{ "r32", "f32 = 1.4142135" },
+        .{ "r64", "f64 = 1.4142135623730951" },
+        .{ "r16", "f16 = 1.414" },
+        .{ "rc", "comptime_float = 1.414213562373095048801688724209698" },
+        .{ "sn", "f64 = 0.8414709848078965" },
+        .{ "lg", "f64 = 3" },
+        .{ "fl", "f32 = -2" },
+        .{ "rd", "f64 = 3" },
+        .{ "ab", "f32 = 3.5" },
+        .{ "md", "f64 = 2" },
+        .{ "rm", "f64 = -1" },
+        .{ "ma", "f64 = 10" },
+        .{ "mn", "f32 = 1.5" },
+        .{ "dc", "f64 = 4" },
+        .{ "df", "f64 = -4" },
+        // 有符号整数的绝对值为无符号整数
+        .{ "ai", "u8 = 128" },
+        .{ "ic", "i32 = -3" },
+        // 负除数：整数按向下取整的语义；浮点的 `@mod` 在 comptime 与运行时结果不同，视为未知
+        .{ "mi", "i32 = -2" },
+        .{ "rn", "f64 = -1" },
+        .{ "mf", "f64" },
+    });
+}
+
+test "@min and @max narrow the result type like the compiler" {
+    // 期望值为 zig 0.17.0 的结果
+    try expectTypes(
+        \\fn h(x: u8, y: u16, z: i8) void {
+        \\    const lo = @min(x, y);
+        \\    const hi = @max(x, y);
+        \\    const lim = @min(x, 10);
+        \\    const mixed = @max(z, x);
+        \\    const neg = @min(z, -3);
+        \\    const k_lo = @min(@as(u8, 3), @as(u16, 5));
+        \\    const k_hi = @max(@as(u8, 3), @as(u16, 5));
+        \\    const k_neg = @min(@as(i8, -3), 4);
+        \\    const k_ct = @min(3, 5);
+        \\    const k_f = @max(@as(f32, 1), @as(f64, 2));
+        \\    _ = .{ lo, hi, lim, mixed, neg, k_lo, k_hi, k_neg, k_ct, k_f };
+        \\}
+    , &.{
+        // 结果类型为容纳结果范围的最小整数类型：参数的值已知时取值，否则取类型的范围
+        .{ "lo", "u8" },
+        .{ "hi", "u16" },
+        .{ "lim", "u4" },
+        .{ "mixed", "u8" },
+        .{ "neg", "i8" },
+        .{ "k_lo", "u2 = 3" },
+        .{ "k_hi", "u3 = 5" },
+        .{ "k_neg", "i3 = -3" },
+        .{ "k_ct", "comptime_int = 3" },
+        .{ "k_f", "f64 = 2" },
+    });
+}
+
 test "labeled blocks, array literals and type queries" {
     try expectTypes(
         \\fn Pick(comptime wide: bool) type {
@@ -740,6 +966,35 @@ test "type reflection and reification" {
         .{ "Ptr", "type = []const u8" },
         .{ "tuple", "struct { u8, bool } = .{ 1, true }" },
         .{ "first", "u8 = 1" },
+    });
+}
+
+test "layouts of reified containers" {
+    // 期望值为 zig 0.17.0 的结果
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const E = enum { a, b, c };
+        \\const Rf = @Struct(.auto, null, &.{ "x", "y" }, &.{ u8, u64 }, &@splat(.{}));
+        \\const Ra = @Struct(.auto, null, &.{ "x", "y" }, &.{ u8, u64 }, &.{ .{}, .{ .@"align" = 16 } });
+        \\const Ru = @Union(.auto, E, &.{ "a", "b", "c" }, &.{ u8, u32, void }, &@splat(.{}));
+        \\const Efs = std.enums.EnumFieldStruct(E, u16, 0);
+        \\fn g() void {
+        \\    const size_rf = @sizeOf(Rf);
+        \\    const rf_x = @offsetOf(Rf, "x");
+        \\    const size_ra = @sizeOf(Ra);
+        \\    const size_ru = @sizeOf(Ru);
+        \\    const size_efs = @sizeOf(Efs);
+        \\    const efs_c = @offsetOf(Efs, "c");
+        \\    _ = .{ size_rf, rf_x, size_ra, size_ru, size_efs, efs_c };
+        \\}
+    , &.{
+        .{ "size_rf", "comptime_int = 16" },
+        .{ "rf_x", "comptime_int = 8" },
+        // 字段属性带显式对齐：不求值
+        .{ "size_ra", "comptime_int" },
+        .{ "size_ru", "comptime_int = 8" },
+        .{ "size_efs", "comptime_int = 6" },
+        .{ "efs_c", "comptime_int = 4" },
     });
 }
 

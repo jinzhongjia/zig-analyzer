@@ -183,6 +183,52 @@ pub fn intFits(ip: *InternPool, ty: Index, v: i128) bool {
     return fit(ip, ty, v, .check) != null;
 }
 
+/// 整数参数的 `@min` / `@max` 的结果类型（与编译器的 `analyzeMinMax` 一致）：各参数的范围（值已知时
+/// 为该值，否则为类型的范围）按 `@min` / `@max` 合并，取容纳结果范围的最小整数类型；参数都是
+/// comptime_int 时为 comptime_int。有参数不是整数或范围求不出时为 null
+pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool.TypedValue) Allocator.Error!?Index {
+    var result: Bounds = undefined;
+    var all_comptime = true;
+    for (operands, 0..) |o, i| {
+        const r: Bounds = if (intOf(ip, o.val)) |x| .{ .min = x, .max = x } else if (o.ty == .comptime_int_type)
+            return null
+        else
+            bounds(intInfo(ip, o.ty) orelse return null) orelse return null;
+        if (o.ty != .comptime_int_type) all_comptime = false;
+        result = if (i == 0) r else if (is_min)
+            .{ .min = @min(result.min, r.min), .max = @min(result.max, r.max) }
+        else
+            .{ .min = @max(result.min, r.min), .max = @max(result.max, r.max) };
+    }
+    if (all_comptime) return .comptime_int_type;
+    // 与编译器的 `intFittingRange` 相同
+    const signed = result.min < 0;
+    return try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
+}
+
+/// 容纳 `x` 的位宽，`signed` 时含符号位（`x` 为负时 `signed` 为 true）
+fn bitsFor(x: Wide, signed: bool) u16 {
+    const magnitude: u256 = @intCast(if (x >= 0) x else -(x + 1));
+    return @as(u16, @intCast(256 - @clz(magnitude))) + @intFromBool(signed);
+}
+
+/// 有浮点参数的 `@min` / `@max` 的结果类型：位宽最大的浮点类型，只有 comptime 数值时为 comptime_float
+pub fn minMaxFloatType(ip: *InternPool, types: []const Index) ?Index {
+    var best: ?Index = null;
+    var best_bits: u16 = 0;
+    for (types) |t| {
+        if (t == .comptime_float_type or ip.isInt(t)) continue;
+        if (!ip.isFloat(t)) return null;
+        // c_longdouble 的位宽取决于目标
+        const bits = (typeLayout(ip, t) orelse return null).bits orelse return null;
+        if (bits > best_bits) {
+            best = t;
+            best_bits = @intCast(bits);
+        }
+    }
+    return best orelse .comptime_float_type;
+}
+
 // ── 浮点 ─────────────────────────────────────────────────────────────
 
 pub fn floatOf(ip: *InternPool, v: ?Index) ?f128 {
@@ -226,6 +272,99 @@ pub fn binaryFloat(ip: *InternPool, op: SyntaxKind, ty: Index, a: f128, b: f128)
     return floatValue(ip, ty, r);
 }
 
+/// 浮点类型对应的 Zig 类型（comptime_float 按 f128 计算，与编译器一致）
+fn FloatOf(comptime k: InternPool.Simple) type {
+    return switch (k) {
+        .f16 => f16,
+        .f32 => f32,
+        .f64 => f64,
+        .f80 => f80,
+        else => f128,
+    };
+}
+
+fn floatKind(ip: *InternPool, ty: Index) ?InternPool.Simple {
+    return switch (ip.key(ty)) {
+        .simple_type => |s| switch (s) {
+            .f16, .f32, .f64, .f80, .f128, .comptime_float => s,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// 浮点的一元内置函数
+pub const FloatFn = enum { sqrt, sin, cos, tan, exp, exp2, log, log2, log10, abs, floor, ceil, trunc, round };
+
+/// 浮点一元内置函数（`@sqrt` 等）的值，按类型的精度计算；不是浮点类型时为 null
+pub fn floatUnary(ip: *InternPool, f: FloatFn, ty: Index, x: f128) Allocator.Error!?Index {
+    const r: f128 = switch (floatKind(ip, ty) orelse return null) {
+        inline .f16, .f32, .f64, .f80, .f128, .comptime_float => |k| unary(FloatOf(k), f, @floatCast(x)),
+        else => unreachable,
+    };
+    return floatValue(ip, ty, r);
+}
+
+fn unary(comptime T: type, f: FloatFn, x: T) T {
+    return switch (f) {
+        .sqrt => @sqrt(x),
+        .sin => @sin(x),
+        .cos => @cos(x),
+        .tan => @tan(x),
+        .exp => @exp(x),
+        .exp2 => @exp2(x),
+        .log => @log(x),
+        .log2 => @log2(x),
+        .log10 => @log10(x),
+        .abs => @abs(x),
+        .floor => @floor(x),
+        .ceil => @ceil(x),
+        .trunc => @trunc(x),
+        .round => @round(x),
+    };
+}
+
+/// 浮点的二元内置函数
+pub const FloatBinFn = enum { min, max, mod, rem, div_trunc, div_floor, div_ceil, div_exact };
+
+/// 浮点二元内置函数（`@mod`、`@min` 等）的值，按类型的精度计算；除数为零、不能整除等求不出时为 null
+pub fn floatBinary(ip: *InternPool, f: FloatBinFn, ty: Index, a: f128, b: f128) Allocator.Error!?Index {
+    const r: f128 = switch (floatKind(ip, ty) orelse return null) {
+        inline .f16, .f32, .f64, .f80, .f128, .comptime_float => |k| binary(FloatOf(k), f, @floatCast(a), @floatCast(b)) orelse return null,
+        else => unreachable,
+    };
+    return floatValue(ip, ty, r);
+}
+
+fn binary(comptime T: type, f: FloatBinFn, a: T, b: T) ?T {
+    switch (f) {
+        .min => return @min(a, b),
+        .max => return @max(a, b),
+        else => {},
+    }
+    if (b == 0) return null;
+    // 负除数的 `@mod`：编译器在 comptime 的结果与运行时不同（f64 的 7 mod -3 得 1 而不是 -2），视为未知
+    if (f == .mod and b < 0) return null;
+    return switch (f) {
+        .mod => @mod(a, b),
+        .rem => @rem(a, b),
+        .div_trunc => @divTrunc(a, b),
+        .div_floor => @divFloor(a, b),
+        .div_ceil => @divCeil(a, b),
+        .div_exact => if (@rem(a, b) != 0) null else a / b,
+        .min, .max => unreachable,
+    };
+}
+
+/// `@mulAdd(T, a, b, c)`：只舍入一次的 `a * b + c`
+pub fn floatMulAdd(ip: *InternPool, ty: Index, a: f128, b: f128, c: f128) Allocator.Error!?Index {
+    const r: f128 = switch (floatKind(ip, ty) orelse return null) {
+        inline .f16, .f32, .f64, .f80, .f128, .comptime_float => |k| @mulAdd(FloatOf(k), @floatCast(a), @floatCast(b), @floatCast(c)),
+        else => unreachable,
+    };
+    return floatValue(ip, ty, r);
+}
+
 pub fn intOf(ip: *InternPool, v: ?Index) ?i128 {
     return switch (ip.key(v orelse return null)) {
         .int_value => |i| i.value,
@@ -235,10 +374,17 @@ pub fn intOf(ip: *InternPool, v: ?Index) ?i128 {
 
 // ── 大小与对齐 ───────────────────────────────────────────────────────
 
-pub const Layout = struct { size: u64, alignment: u64, bits: u64 };
+pub const Layout = struct {
+    size: u64,
+    alignment: u64,
+    /// `@bitSizeOf`；没有位表示的类型（切片、非指针的 optional、error union、非 packed 的容器等）为 null
+    bits: ?u64,
+};
 
-/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`）。按 x86_64 / aarch64 的 ABI，
-/// 只处理不依赖容器布局的类型；auto 布局的容器等为 null
+const error_layout: Layout = .{ .size = 2, .alignment = 2, .bits = 16 };
+
+/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），按 x86_64 / aarch64 的 ABI。
+/// 只处理不含容器的类型（容器由 `eval.typeLayout` 处理），其余为 null
 pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
     const pointer_bits: u64 = ip.pointerBits() orelse 0;
     const ptr_bytes: u64 = pointer_bits / 8;
@@ -256,42 +402,68 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             .f64 => .{ .size = 8, .alignment = 8, .bits = 64 },
             .f80 => .{ .size = 16, .alignment = 16, .bits = 80 },
             .f128 => .{ .size = 16, .alignment = 16, .bits = 128 },
-            .anyerror => .{ .size = 2, .alignment = 2, .bits = 16 },
+            .anyerror => error_layout,
             else => null,
         },
-        .error_set_type, .inferred_error_set => .{ .size = 2, .alignment = 2, .bits = 16 },
+        .error_set_type, .inferred_error_set => error_layout,
         .ptr_type => |p| if (pointer_bits == 0)
             null
         else if (p.size == .slice)
-            .{ .size = 2 * ptr_bytes, .alignment = ptr_bytes, .bits = 2 * pointer_bits }
+            .{ .size = 2 * ptr_bytes, .alignment = ptr_bytes, .bits = null }
         else
             .{ .size = ptr_bytes, .alignment = ptr_bytes, .bits = pointer_bits },
-        .optional_type => |c| switch (ip.key(c)) {
-            // 非 C 指针的 optional 以空指针表示 null，与指针同大小
-            .ptr_type => |p| if (p.size == .c) null else typeLayout(ip, c),
-            else => blk: {
-                const l = typeLayout(ip, c) orelse break :blk null;
-                // 载荷之后一个字节的标记，按载荷的对齐补齐
-                const size = std.mem.alignForward(u64, l.size + 1, l.alignment);
-                break :blk .{ .size = size, .alignment = l.alignment, .bits = size * 8 };
-            },
-        },
-        .array_type => |a| blk: {
-            const l = typeLayout(ip, a.child) orelse break :blk null;
-            const size = std.math.mul(u64, l.size, a.len + @intFromBool(a.sentinel != null)) catch break :blk null;
-            break :blk .{ .size = size, .alignment = l.alignment, .bits = size * 8 };
-        },
+        .optional_type => |c| optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
+        .array_type => |a| arrayLayout(typeLayout(ip, a.child) orelse return null, a, hasBitRepr(ip, a.child)),
+        .error_union_type => |eu| errorUnionLayout(typeLayout(ip, eu.payload) orelse return null),
         else => null,
     };
 }
 
-fn intLayout(bits: u16) ?Layout {
+/// 无符号整数类型（packed 容器的 backing 整数、枚举的标签）的布局
+pub fn intLayout(bits: u16) ?Layout {
     if (bits == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
     if (bits > 128) return null;
     const bytes: u64 = (bits + 7) / 8;
     // 不超过 8 字节时对齐为不小于字节数的 2 的幂，更宽的为 16
     const alignment: u64 = if (bytes <= 1) 1 else if (bytes <= 2) 2 else if (bytes <= 4) 4 else if (bytes <= 8) 8 else 16;
     return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = bits };
+}
+
+/// `?T`：非 C 指针（含切片）与错误集以零值表示 null，与载荷同大小；其余在载荷之后加一个标记，
+/// 按载荷的对齐补齐。只有单项与多项指针的 optional 有位表示
+pub fn optionalLayout(ip: *InternPool, child: Index, payload: Layout) Layout {
+    switch (ip.key(child)) {
+        .ptr_type => |p| if (p.size != .c) return .{ .size = payload.size, .alignment = payload.alignment, .bits = if (p.size == .slice) null else payload.bits },
+        .error_set_type, .inferred_error_set => return .{ .size = payload.size, .alignment = payload.alignment, .bits = null },
+        .simple_type => |s| if (s == .anyerror) return .{ .size = payload.size, .alignment = payload.alignment, .bits = null },
+        else => {},
+    }
+    return .{ .size = payload.size + payload.alignment, .alignment = payload.alignment, .bits = null };
+}
+
+/// 数组（长度含哨兵）。`elem_bit_repr`：元素有位表示时数组才有位宽（错误集与未指定标签类型的枚举
+/// 虽可求 `@bitSizeOf`，却没有位表示）
+pub fn arrayLayout(elem: Layout, a: @FieldType(InternPool.Key, "array_type"), elem_bit_repr: bool) ?Layout {
+    const n = a.len + @intFromBool(a.sentinel != null);
+    const size = std.math.mul(u64, elem.size, n) catch return null;
+    const bits: ?u64 = if (elem_bit_repr) (if (elem.bits) |b| std.math.mul(u64, b, n) catch null else null) else null;
+    return .{ .size = size, .alignment = elem.alignment, .bits = bits };
+}
+
+/// `E!T`：错误码与载荷，按两者中较大的对齐补齐
+pub fn errorUnionLayout(payload: Layout) Layout {
+    const alignment = @max(error_layout.alignment, payload.alignment);
+    return .{ .size = std.mem.alignForward(u64, error_layout.size + payload.size, alignment), .alignment = alignment, .bits = null };
+}
+
+/// 不含容器的类型是否有位表示（错误集没有）
+fn hasBitRepr(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .error_set_type, .inferred_error_set => false,
+        .simple_type => |s| s != .anyerror,
+        .array_type => |a| hasBitRepr(ip, a.child),
+        else => true,
+    };
 }
 
 // ── 类型分类 ─────────────────────────────────────────────────────────
