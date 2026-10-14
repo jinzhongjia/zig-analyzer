@@ -1,6 +1,6 @@
 # zig-analyzer 设计方案
 
-> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4、M5 已完成（2026-10-13，M5 为核心部分，见 §19.8），下一步 M6，详见 §19。
+> 状态：草案 v0.1 ｜ 实施进度：M0、M1、M2 已完成（2026-10-12），M3、M4 已完成（2026-10-13），M5 已完成（2026-10-14），下一步 M6，详见 §19。
 
 ---
 
@@ -914,7 +914,7 @@ pub fn make() std.ArrayList(u8) { ... }
   - 类型化访问层手写（§5.1）。
   - 命名空间没有单独的 query：成员查找直接在 ItemTree 上线性扫描，目前足够快。
   - 不依赖类型的解析范围：经由函数调用（`std.ArrayList(u8)`）、变量类型（`var x: S` 的 `x.`）、结构体字段得到的命名空间留给 M4 / M5；字段的跳转与补全同样依赖类型。
-  - `@import("builtin")` 不解析（由编译器生成，不在磁盘上）；一个文件属于多个模块时固定取第一个，`zig-analyzer/setActiveModule` 未实现；`ContainerId` 的泛型实例区分（`inst`）留到 M5。
+  - `@import("builtin")` 不解析（由编译器生成，不在磁盘上；2026-10-14 补上，见 §19.10）；一个文件属于多个模块时固定取第一个，`zig-analyzer/setActiveModule` 未实现；`ContainerId` 的泛型实例区分（`inst`）留到 M5。
   - 补全还不包括关键字、内置函数、原生类型与 `@import` 路径。
 
 ### 19.6 待测量的优化项
@@ -990,9 +990,22 @@ pub fn make() std.ArrayList(u8) { ... }
 
 | 优先级 | 事项 | 现状 | 做法 |
 |---|---|---|---|
-| 高 | `@import("builtin")` 的解析（M3 遗留） | 不解析：标准库中大量按 `builtin.os.tag`、`builtin.mode` 的分支为未知；与目标相关的大小（`usize`、指针）按 zig-analyzer 自身的构建目标，目标的指针宽度不同时（如 32 位目标）结果错误 | `builtin.zig` 由编译器按目标与优化模式生成：按构建系统给出的模块配置用 `zig build-obj --show-builtin` 取得，作为该模块的 `builtin` 文件 |
+| ~~高~~ | ~~`@import("builtin")` 的解析（M3 遗留）~~ | 已完成，见 §19.10 | — |
+| 高 | 与目标相关的大小 | `usize`、指针的位宽（`value.zig` 的 `pointer_bits`）按 zig-analyzer 自身的构建目标；模块的目标指针宽度不同时（如 32 位目标）结果错误 | 推导上下文带上所在模块，位宽取该模块 builtin 的 `target.ptrBitWidth()` |
 | 中 | 递归函数的推导错误集 | 参与递归时取 `anyerror`（安全的上界） | 对递归的函数组做不动点迭代 |
 | 低 | 浮点的数学内置函数（`@sqrt`、`@sin` 等）、`@offsetOf`、auto 布局容器的大小 | 不求值 | 数学内置函数按 f128 计算；`@offsetOf` 与 auto 布局的大小需照搬编译器的布局算法（实现定义），只对 `extern` / `packed` 容器计算 |
+
+### 19.10 `@import("builtin")` 的解析（2026-10-14）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 模块参数 | `src/project/configuration.zig`、`ProjectModel` | 从构建图提取每个模块影响 builtin 的参数，写法与构建系统传给编译器的一致：`-target` / `-mcpu`、`-O`、`-f[no-]single-threaded` / `error-tracing` / `PIC` / `valgrind` / `fuzz` 等、unwind tables、code model、`-lc` / `-lc++`；子命令取以该模块为根的 compile step（`build-exe` / `build-lib` / `build-obj` / `test`，决定 `output_mode` 与 `is_test`） |
+| 生成 | `src/project/builtin.zig` | 运行 `zig <子命令> --show-builtin <参数>`，按内容哈希写入 `<全局缓存>/zig-analyzer/builtin/<hash>/builtin.zig`（内容不变路径不变；落盘使 goto definition 可以打开）；Workspace 加载构建图后为每种参数生成一次 |
+| 解析 | `ModuleGraph`、`resolve.zig` | 每个模块记录自己的 builtin；标准库文件取所在 compile step 根模块的 builtin（与编译器一致）；不属于任何模块的文件（单文件模式）取默认 builtin（本机目标、Debug，与单文件编译一致） |
+
+- 端到端测试：配置 `-Dtarget=x86_64-linux -Doptimize=ReleaseFast` 的项目中 `builtin.os.tag` 为 `.linux`、`builtin.mode` 为 `.fast`，`@import("builtin")` 跳转到生成的文件；单文件模式下为本机目标与 Debug。
+- 标准库全量统计（`sema-corpus` 使用默认 builtin）：声明类型已知 97.2% → 99.4%，局部变量 89.3% → 90.9%，表达式 90.7% → 92.2%。
+- 测试：`zig build test` 共 172 个。
 
 ## 20. 风险与对策
 
