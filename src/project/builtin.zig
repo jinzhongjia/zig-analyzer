@@ -62,6 +62,22 @@ pub fn generate(gpa: Allocator, io: Io, zig_exe: []const u8, cache_dir: []const 
     return path;
 }
 
+/// builtin.zig 中目标的指针位宽：由 `cpu.arch` 与 `abi` 计算（与 `std.Target.ptrBitWidth` 一致）
+pub fn pointerBits(text: []const u8) ?u16 {
+    const arch_name = tagAfter(text, "    .arch = .") orelse return null;
+    const abi_name = tagAfter(text, "pub const abi: std.Target.Abi = .") orelse return null;
+    const arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch_name) orelse return null;
+    const abi = std.meta.stringToEnum(std.Target.Abi, abi_name) orelse return null;
+    return std.Target.ptrBitWidth_arch_abi(arch, abi);
+}
+
+/// `prefix` 之后的标识符（到 `,` 或 `;`）
+fn tagAfter(text: []const u8, prefix: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, text, prefix) orelse return null) + prefix.len;
+    const end = std.mem.indexOfAnyPos(u8, text, start, ",;\n") orelse return null;
+    return text[start..end];
+}
+
 test generate {
     const testing = std.testing;
     var env = @import("ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
@@ -84,4 +100,12 @@ test generate {
     defer testing.allocator.free(b);
     try testing.expectEqualStrings(a, b);
     try testing.expect(try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "build-obj", "-target", "no-such-target" }) == null);
+
+    // 指针宽度
+    try testing.expectEqual(64, pointerBits(text));
+    const wasm = (try generate(testing.allocator, testing.io, env.zig_exe, cache, &.{ "build-obj", "-target", "wasm32-freestanding" })).?;
+    defer testing.allocator.free(wasm);
+    const wasm_text = try Io.Dir.cwd().readFileAlloc(testing.io, wasm, testing.allocator, .unlimited);
+    defer testing.allocator.free(wasm_text);
+    try testing.expectEqual(32, pointerBits(wasm_text));
 }

@@ -4,16 +4,14 @@
 //! 相等判断返回 `?bool`：抽象参数、未知值，或身份取决于捕获值的泛型实例无法判断时为 null，
 //! 调用方据此不选择任何分支，而不是给出可能错误的结果。
 //!
-//! 与目标相关的大小（usize、指针）按 zig-analyzer 自身构建目标的指针宽度计算。
+//! 与目标相关的大小（usize、指针）按目标的指针位宽（`InternPool.pointerBits`）计算；
+//! 位宽未知时（各模块的目标宽度不一致）这些值为未知。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
 const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
-
-/// usize 与指针的位宽
-pub const pointer_bits: u16 = @bitSizeOf(usize);
 
 // ── 整数 ─────────────────────────────────────────────────────────────
 
@@ -24,8 +22,8 @@ pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
     return switch (ip.key(t)) {
         .int_type => |i| .{ .signed = i.signedness == .signed, .bits = i.bits },
         .simple_type => |s| switch (s) {
-            .usize => .{ .signed = false, .bits = pointer_bits },
-            .isize => .{ .signed = true, .bits = pointer_bits },
+            .usize => .{ .signed = false, .bits = ip.pointerBits() orelse return null },
+            .isize => .{ .signed = true, .bits = ip.pointerBits() orelse return null },
             .c_short => .{ .signed = true, .bits = 16 },
             .c_ushort => .{ .signed = false, .bits = 16 },
             .c_int => .{ .signed = true, .bits = 32 },
@@ -242,13 +240,14 @@ pub const Layout = struct { size: u64, alignment: u64, bits: u64 };
 /// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`）。按 x86_64 / aarch64 的 ABI，
 /// 只处理不依赖容器布局的类型；auto 布局的容器等为 null
 pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
+    const pointer_bits: u64 = ip.pointerBits() orelse 0;
     const ptr_bytes: u64 = pointer_bits / 8;
     return switch (ip.key(t)) {
         .int_type => |i| intLayout(i.bits),
         .simple_type => |s| switch (s) {
             .bool => .{ .size = 1, .alignment = 1, .bits = 1 },
             .void => .{ .size = 0, .alignment = 1, .bits = 0 },
-            .usize, .isize => intLayout(pointer_bits),
+            .usize, .isize => if (pointer_bits == 0) null else intLayout(@intCast(pointer_bits)),
             .c_short, .c_ushort => intLayout(16),
             .c_int, .c_uint => intLayout(32),
             .c_longlong, .c_ulonglong => intLayout(64),
@@ -261,7 +260,9 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             else => null,
         },
         .error_set_type, .inferred_error_set => .{ .size = 2, .alignment = 2, .bits = 16 },
-        .ptr_type => |p| if (p.size == .slice)
+        .ptr_type => |p| if (pointer_bits == 0)
+            null
+        else if (p.size == .slice)
             .{ .size = 2 * ptr_bytes, .alignment = ptr_bytes, .bits = 2 * pointer_bits }
         else
             .{ .size = ptr_bytes, .alignment = ptr_bytes, .bits = pointer_bits },

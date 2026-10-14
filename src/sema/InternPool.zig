@@ -16,6 +16,9 @@ const InternPool = @This();
 gpa: Allocator,
 io: Io,
 mutex: Io.Mutex = .init,
+/// 目标的指针位宽（usize、指针的大小）；0 表示未知（项目中各模块的宽度不一致）。
+/// 与 `PointerBits` input 在同一写事务中设置，读取它的 query 都先读该 input 以记录依赖
+pointer_bits: std.atomic.Value(u16) = .init(@bitSizeOf(usize)),
 /// Key 中切片的存储
 arena: std.heap.ArenaAllocator,
 items: std.ArrayList(Key) = .empty,
@@ -250,6 +253,16 @@ pub fn deinit(ip: *InternPool) void {
     ip.map.deinit(ip.gpa);
     ip.arena.deinit();
     ip.* = undefined;
+}
+
+pub fn pointerBits(ip: *const InternPool) ?u16 {
+    const bits = ip.pointer_bits.load(.monotonic);
+    return if (bits == 0) null else bits;
+}
+
+/// 只能在写事务中调用
+pub fn setPointerBits(ip: *InternPool, bits: ?u16) void {
+    ip.pointer_bits.store(bits orelse 0, .monotonic);
 }
 
 /// 驻留：相同的 Key 返回相同的 Index

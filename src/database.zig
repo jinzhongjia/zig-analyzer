@@ -28,6 +28,7 @@ pub const Db = engine.Engine(*const Env, &.{
     live.AstCheck,
     ModuleGraph.Input,
     hir.ItemBody,
+    sema.PointerBits,
     sema.Infer,
     sema.DeclType,
     sema.CallEval,

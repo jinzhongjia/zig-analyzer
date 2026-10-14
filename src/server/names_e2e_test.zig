@@ -270,3 +270,125 @@ test "@import(\"builtin\") in single-file mode is the host target" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+const sizes_main =
+    \\const std = @import("std");
+    \\pub fn main() void {
+    \\    const size = @sizeOf(usize);
+    \\    const max = std.math.maxInt(usize);
+    \\    _ = .{ size, max };
+    \\}
+    \\
+;
+
+/// 打开 `files` 组成的项目中的 main.zig，返回 `size` 与 `max` 的 hover
+fn sizesHover(files: []const fixture.File, build_args: ?[]const u8) !struct { size: []const u8, max: []const u8 } {
+    var project = try fixture.Project.create(files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    const options: ?std.json.Value = if (build_args) |args| try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(), args, .{}) else null;
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = options });
+    try h.notify("initialized", Empty{});
+    const main_path = for (files) |f| {
+        if (std.mem.endsWith(u8, f.path, "main.zig")) break f.path;
+    } else unreachable;
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), main_path));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = sizes_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const size = try testing.allocator.dupe(u8, try hoverText(&h, uri, sizes_main, "size ="));
+    errdefer testing.allocator.free(size);
+    const max = try testing.allocator.dupe(u8, try hoverText(&h, uri, sizes_main, "max ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+    return .{ .size = size, .max = max };
+}
+
+test "pointer width follows the project's target" {
+    const wasm = try sizesHover(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = sizes_main },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+    },
+        \\{"build": {"args": ["-Dtarget=wasm32-freestanding"]}}
+    );
+    defer testing.allocator.free(wasm.size);
+    defer testing.allocator.free(wasm.max);
+    try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", wasm.size);
+    try testing.expectEqualStrings("```zig\nconst max: comptime_int = 4294967295\n```", wasm.max);
+
+    // 同时有宿主与 wasm32 两个目标：宽度不一致，与大小相关的值为未知（不给出可能错误的值）
+    const mixed = try sizesHover(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const host = b.addObject(.{ .name = "host", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.graph.host,
+        \\    }) });
+        \\    const wasm = b.addObject(.{ .name = "wasm", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+        \\    }) });
+        \\    const check = b.step("check", "Check");
+        \\    check.dependOn(&host.step);
+        \\    check.dependOn(&wasm.step);
+        \\}
+        \\
+        },
+        .{ .path = "main.zig", .text = sizes_main },
+    }, null);
+    defer testing.allocator.free(mixed.size);
+    defer testing.allocator.free(mixed.max);
+    try testing.expectEqualStrings("```zig\nconst size: comptime_int\n```", mixed.size);
+    try testing.expectEqualStrings("```zig\nconst max: comptime_int\n```", mixed.max);
+
+    // 单文件模式：本机
+    const single = try sizesHover(&.{.{ .path = "main.zig", .text = sizes_main }}, null);
+    defer testing.allocator.free(single.size);
+    defer testing.allocator.free(single.max);
+    const expected = try std.fmt.allocPrint(testing.allocator, "```zig\nconst size: comptime_int = {d}\n```", .{@sizeOf(usize)});
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, single.size);
+}
+
+test "results depending on pointer width are recomputed when the target changes" {
+    // 不 import 任何文件：结果只经由 PointerBits 依赖目标（不依赖模块图）
+    const text =
+        \\pub fn main() void {
+        \\    const size = @sizeOf(usize);
+        \\    _ = size;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = text },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    const wasm = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=wasm32-freestanding"]}}
+    , .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = wasm });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", try hoverText(&h, uri, text, "size ="));
+
+    // 去掉 -Dtarget：项目重启，目标变为本机
+    const host = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(), "{}", .{});
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = host });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const expected = try std.fmt.allocPrint(h.arena.allocator(), "```zig\nconst size: comptime_int = {d}\n```", .{@sizeOf(usize)});
+    try testing.expectEqualStrings(expected, try hoverText(&h, uri, text, "size ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

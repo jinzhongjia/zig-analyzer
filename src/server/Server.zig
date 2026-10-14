@@ -372,6 +372,29 @@ fn SemanticTask(comptime func: anytype) type {
     };
 }
 
+/// 目标的指针位宽：各模块的 builtin 一致时取该宽度，不一致时为 null（与大小相关的值为未知）；
+/// 没有项目模块时取默认 builtin（本机）
+fn pointerBits(server: *Server, graph: *const ModuleGraph) ?u16 {
+    var result: ?u16 = null;
+    var any = false;
+    for (graph.modules) |m| {
+        const file = m.builtin orelse continue;
+        const bits = server.builtinPointerBits(file) orelse return null;
+        if (any and result != bits) return null;
+        result = bits;
+        any = true;
+    }
+    if (any) return result;
+    if (graph.default_builtin) |f| return server.builtinPointerBits(f);
+    return @bitSizeOf(usize);
+}
+
+fn builtinPointerBits(server: *Server, file: Vfs.FileId) ?u16 {
+    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return null;
+    defer server.gpa.free(text);
+    return za.project.builtin.pointerBits(text);
+}
+
 /// 汇总各项目的构建图与编译集合，更新模块图 input
 pub fn updateModuleGraph(server: *Server) void {
     server.updateModuleGraphInner() catch |err| log.err("failed to update module graph: {t}", .{err});
@@ -407,10 +430,13 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     const graph = try server.gpa.create(ModuleGraph);
     errdefer server.gpa.destroy(graph);
     graph.* = try b.finish(std_root, default_builtin);
+    const bits = server.pointerBits(graph);
     // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
     server.db.beginWrite();
     defer server.db.endWrite();
     try server.db.set(ModuleGraph.Input, {}, graph, .medium);
+    try server.db.set(za.sema.queries.PointerBits, {}, bits, .medium);
+    server.ip.setPointerBits(bits);
 }
 
 fn removePending(server: *Server, pending: *Pending) void {
