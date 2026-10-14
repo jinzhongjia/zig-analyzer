@@ -577,6 +577,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 _ = db.executions[qi].fetchAdd(1, .monotonic);
 
                 try ctx.stack.append(ctx.gpa, .{ .key = .{ .query = qi, .index = index } });
+                // 恢复被淘汰的值：此前已完整算出过，给它一份独立的燃料，不受本次请求剩余燃料的影响，
+                // 否则恢复出的结果可能不完整（如 hover 偶尔显示 unknown）
+                const saved_fuel = ctx.fuel;
+                if (restore) ctx.fuel = default_fuel;
+                defer if (restore) {
+                    ctx.fuel = saved_fuel;
+                };
                 const computed = if (@hasDecl(Q, "computeIncremental")) blk: {
                     // 上一次的值在下一次写事务前不会被释放，可安全地作为增量计算的基础
                     db.mutex.lockUncancelable(db.io);

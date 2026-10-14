@@ -159,7 +159,24 @@ const CachedLen = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Spin, Cached, CachedLen });
+/// 消耗燃料的 query（模拟 comptime 求值）：燃料不足时结果不完整，不写入 memo
+const Burn = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub const lru: usize = 1;
+    pub const cost = 1000;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        if (ctx.fuel < cost) {
+            ctx.markIncomplete();
+            return -1;
+        }
+        ctx.fuel -= cost;
+        return try ctx.get(Number, key);
+    }
+};
+
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Spin, Cached, CachedLen, Burn });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions[Db.queryIndex(Q)].load(.monotonic);
@@ -409,4 +426,24 @@ test "lru: evicted values are restored without invalidating dependents" {
     try setText(&d, 1, "abcdef");
     try testing.expectEqual(6, try read(&d, CachedLen, 1));
     try testing.expectEqual(5, executions(&d, CachedLen));
+}
+
+test "lru: restoring an evicted value does not depend on the remaining fuel" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 42, .low);
+    try setNumber(&d, Number, 2, 7, .low);
+    try testing.expectEqual(42, try read(&d, Burn, 1));
+    try testing.expectEqual(7, try read(&d, Burn, 2));
+    try testing.expect(d.trySweep());
+
+    // 本次读取剩余的燃料不够重算，但恢复使用独立的燃料：结果完整且写入 memo
+    var ctx = d.beginRead(testing.allocator);
+    ctx.fuel = Burn.cost / 2;
+    try testing.expectEqual(42, try ctx.get(Burn, 1));
+    try testing.expectEqual(Burn.cost / 2, ctx.fuel);
+    ctx.end();
+    try testing.expectEqual(3, executions(&d, Burn));
+    try testing.expectEqual(42, try read(&d, Burn, 1));
+    try testing.expectEqual(3, executions(&d, Burn));
 }
