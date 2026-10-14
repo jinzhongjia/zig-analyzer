@@ -1133,7 +1133,14 @@ fn primaryTypeExpr(p: *Parser) Error!CM {
                 try initList(p);
                 return try m.complete(p, .init_expr);
             },
-            else => return null,
+            // `.` 后还没写名字（正在输入）：作为缺少名字的枚举字面量留在所在的表达式中，
+            // 补全可以按期望类型列出成员
+            else => {
+                const m = try p.start();
+                try p.bump();
+                _ = try p.expect(.identifier);
+                return try m.complete(p, .enum_literal);
+            },
         },
         .keyword_error => {
             const m = try p.start();
