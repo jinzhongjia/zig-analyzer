@@ -216,6 +216,13 @@ pub const Prepared = struct {
     }
 
     /// 放入 `check(text, mode)` 的结果，取得 `result` 的所有权
+    /// 文件的这个文本是否已经准备过
+    pub fn prepared(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) bool {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        return if (p.last.get(file)) |last| last == h else false;
+    }
+
     pub fn put(p: *Prepared, io: Io, text: []const u8, mode: Mode, result: *Result) Allocator.Error!void {
         errdefer result.destroy(p.gpa);
         const owned = try p.gpa.dupe(u8, text);

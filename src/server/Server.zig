@@ -1563,24 +1563,38 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         const ms = server.debounce_ms.load(.monotonic);
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
-    server.publishNow(file, false);
+    server.publishNow(file, false, seen);
+}
+
+fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
+    server.edits_mutex.lockUncancelable(server.io);
+    defer server.edits_mutex.unlock(server.io);
+    return if (server.edits.get(file)) |e| e.generation else 0;
 }
 
 fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!void {
     defer server.busyEnd();
-    server.publishNow(file, clear);
+    server.publishNow(file, clear, null);
 }
 
-fn publishNow(server: *Server, file: Vfs.FileId, clear: bool) void {
-    server.prepareLive(file);
+/// `generation`：编辑触发的发布所针对的编辑代数。被打断时若已有更新的编辑就放弃，由那次编辑触发的发布接替
+fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     // 被写事务取消时重试：构建结果触发的发布不能因无关的编辑而丢失
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
+        if (generation) |g| if (server.editGeneration(file) != g) return;
+        server.prepareLive(file);
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
         var ctx = server.db.beginRead(arena);
+        // 准备之后又有了编辑：重新在锁外准备，不在读事务中做 AstGen（逐字输入时 AstGen 可能慢于按键）
+        const ready = server.liveReady(&ctx, file) catch false;
+        if (!ready) {
+            ctx.end();
+            continue;
+        }
         const params = server.computeDiagnostics(&ctx, arena, file) catch |err| {
             ctx.end();
             switch (err) {
@@ -1616,6 +1630,14 @@ fn prepareLive(server: *Server, file: Vfs.FileId) void {
     if (!(server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode)) catch return)) return;
     const result = live.check(server.gpa, text, mode) catch return;
     server.live_prepared.put(server.io, text, mode, result) catch {};
+}
+
+/// 当前文本的 live 诊断已在读事务之外准备过（或不需要准备）
+fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
+    const eligible = if (server.workspaceFor(file)) |w| w.liveEligible(file) else true;
+    if (!eligible or try ctx.get(live.LiveBackend, {}) != .in_process) return true;
+    const text = try ctx.get(FileText, file) orelse return true;
+    return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file))));
 }
 
 fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool) void {
