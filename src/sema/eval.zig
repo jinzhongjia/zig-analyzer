@@ -2676,8 +2676,8 @@ const Evaluator = struct {
 
     /// 标准库中按路径查找的类型（如 `builtin.Type`）
     fn stdType(ev: *Evaluator, path: []const []const u8) EvalError!Index {
-        const graph = try ev.r.ctx.get(database.ModuleGraph.Input, {}) orelse return error.Abort;
-        var t = try queries.containerType(ev.r, .{ .file = graph.std_root orelse return error.Abort, .container = 0 }, null);
+        const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return error.Abort;
+        var t = try queries.containerType(ev.r, .{ .file = std_root, .container = 0 }, null);
         for (path) |name| t = try asType(try ev.typeMember(t, name));
         return t;
     }

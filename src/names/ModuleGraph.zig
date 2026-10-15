@@ -12,6 +12,7 @@ const FileId = Vfs.FileId;
 const ProjectModel = @import("../base/ProjectModel.zig");
 const CompileSet = @import("../diagnostics/compile_set.zig");
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const FileIndex = @import("../ide_db/FileIndex.zig");
 
 const ModuleGraph = @This();
 
@@ -115,6 +116,25 @@ pub fn entry(g: *const ModuleGraph, file: FileId) ?FileEntry {
     return g.files[i];
 }
 
+/// 文件 `file` 中 `@import(name)` 的目标（模块名：std、builtin、root 与所在模块 import 的模块；
+/// 相对路径不经过模块图，不在此处理）
+pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?FileId {
+    if (std.mem.eql(u8, name, "std")) return g.std_root;
+    if (std.mem.eql(u8, name, "builtin")) {
+        // 标准库使用所在 compile step 根模块的 builtin（与编译器一致）；不属于任何模块的文件用默认的
+        const e = g.entry(file) orelse return g.default_builtin;
+        const m = if (e.module == std_module) e.root_module else e.module;
+        return g.modules[m].builtin orelse g.default_builtin;
+    }
+    const e = g.entry(file) orelse return null;
+    if (std.mem.eql(u8, name, "root")) return g.modules[e.root_module].root;
+    if (e.module == std_module) return null;
+    for (g.modules[e.module].imports) |imp| {
+        if (std.mem.eql(u8, imp.name, name)) return g.modules[imp.module].root;
+    }
+    return null;
+}
+
 pub fn eql(a: *const ModuleGraph, b: *const ModuleGraph) bool {
     return deepEql(a.std_root, b.std_root) and deepEql(a.default_builtin, b.default_builtin) and deepEql(a.modules, b.modules) and deepEql(a.files, b.files);
 }
@@ -137,5 +157,70 @@ pub const Input = struct {
             m.deinit(gpa);
             gpa.destroy(m);
         }
+    }
+};
+
+/// 文件中各模块名 import 的目标（文件中出现的 `@import` 字符串，另加 std、builtin、root）。
+///
+/// 名字解析经由它读取模块图：模块图的其他变化（如加入新文件、其他模块的 import 表）在这里截断，
+/// 不使依赖它的推导重算。项目加载期间模块图会多次更新，此前每次都使已推导的结果全部重算
+pub const FileImports = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = *const Table;
+
+    pub const Table = struct {
+        arena: std.heap.ArenaAllocator.State,
+        names: []const []const u8,
+        targets: []const ?FileId,
+
+        /// 名字不在表中时为 null；在表中但没有目标时为 `.{ null }`
+        pub fn get(t: *const Table, name: []const u8) ??FileId {
+            for (t.names, t.targets) |n, target| if (std.mem.eql(u8, n, name)) return target;
+            return null;
+        }
+    };
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        const graph = try ctx.get(Input, {});
+        const index = try ctx.get(FileIndex.Query, file);
+        var arena: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var names: std.ArrayList([]const u8) = .empty;
+        for ([_][]const u8{ "std", "builtin", "root" }) |n| try names.append(a, n);
+        for (index.imports) |n| {
+            if (std.mem.endsWith(u8, n, ".zig") or std.mem.endsWith(u8, n, ".zon")) continue;
+            for (names.items) |x| {
+                if (std.mem.eql(u8, x, n)) break;
+            } else try names.append(a, try a.dupe(u8, n));
+        }
+        const targets = try a.alloc(?FileId, names.items.len);
+        for (names.items, targets) |n, *t| t.* = if (graph) |g| g.importTarget(file, n) else null;
+        const table = try a.create(Table);
+        table.* = .{ .arena = undefined, .names = names.items, .targets = targets };
+        table.arena = arena.state;
+        return table;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return deepEql(a.names, b.names) and deepEql(a.targets, b.targets);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        var arena = v.*.arena.promote(gpa);
+        arena.deinit();
+    }
+};
+
+/// 标准库的根文件：同 `FileImports`，截断模块图的其他变化
+pub const StdRoot = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = void;
+    pub const Value = ?FileId;
+
+    pub fn compute(ctx: anytype, _: Key) engine.Error!Value {
+        const graph = try ctx.get(Input, {}) orelse return null;
+        return graph.std_root;
     }
 };

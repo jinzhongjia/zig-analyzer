@@ -756,8 +756,7 @@ const Inferrer = struct {
 
     /// 标准库中按路径查找的类型（如 `builtin.Type`）
     fn stdType(inf: *Inferrer, path: []const []const u8) Error!?Index {
-        const graph = try inf.r.ctx.get(database.ModuleGraph.Input, {}) orelse return null;
-        var ns: Namespace = .{ .file = graph.std_root orelse return null, .container = 0 };
+        var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return null, .container = 0 };
         var t: Index = .unknown;
         for (path, 0..) |name, i| {
             const def = try inf.r.memberDef(ns, name) orelse return null;

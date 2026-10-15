@@ -254,21 +254,10 @@ pub const Resolver = struct {
             const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
             return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, name }));
         }
+        // 经由文件的 import 表：只依赖与本文件相关的部分（见 `FileImports`）
+        if ((try r.ctx.get(ModuleGraph.FileImports, file)).get(name)) |target| return target;
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return null;
-        if (std.mem.eql(u8, name, "std")) return graph.std_root;
-        if (std.mem.eql(u8, name, "builtin")) {
-            // 标准库使用所在 compile step 根模块的 builtin（与编译器一致）；不属于任何模块的文件用默认的
-            const entry = graph.entry(file) orelse return graph.default_builtin;
-            const m = if (entry.module == ModuleGraph.std_module) entry.root_module else entry.module;
-            return graph.modules[m].builtin orelse graph.default_builtin;
-        }
-        const entry = graph.entry(file) orelse return null;
-        if (std.mem.eql(u8, name, "root")) return graph.modules[entry.root_module].root;
-        if (entry.module == ModuleGraph.std_module) return null;
-        for (graph.modules[entry.module].imports) |imp| {
-            if (std.mem.eql(u8, imp.name, name)) return graph.modules[imp.module].root;
-        }
-        return null;
+        return graph.importTarget(file, name);
     }
 
     // ── 位置 ─────────────────────────────────────────────────────────
