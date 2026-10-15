@@ -459,3 +459,52 @@ test "completion: builtins, labels, init fields and import names" {
     try testing.expectEqual(added.cursor - 4, import.replace.?.start);
     try testing.expectEqual(added.cursor + 3, import.replace.?.end);
 }
+
+test "goto declaration, definition through aliases and type definition" {
+    const text =
+        \\const Point = struct { x: i32 };
+        \\const P = Point;
+        \\fn make() ?*Point {
+        \\    return null;
+        \\}
+        \\fn List(comptime T: type) type {
+        \\    return struct { item: T };
+        \\}
+        \\fn f() void {
+        \\    const p = make();
+        \\    const q: P = undefined;
+        \\    const l: List(u8) = undefined;
+        \\    _ = .{ p, q, l };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const Fn = *const fn (*resolve.Resolver, @import("../base/Vfs.zig").FileId, u32) resolve.Error!?definition.Target;
+    const cases = [_]struct { Fn, []const u8, []const u8 }{
+        // definition 沿别名追到 Point，declaration 停在 P
+        .{ definition.definition, "P = undefined", "Point = struct" },
+        .{ definition.declaration, "P = undefined", "P = Point" },
+        // type definition：剥去 optional 与指针；经别名的类型标注；类型名本身
+        .{ definition.typeDefinition, "p = make", "Point = struct" },
+        .{ definition.typeDefinition, "q: P", "Point = struct" },
+        .{ definition.typeDefinition, "Point {", "Point = struct" },
+        // 泛型函数返回的容器：跳到容器本身
+        .{ definition.typeDefinition, "l: List", "struct { item" },
+    };
+    for (cases, 0..) |c, i| {
+        const t = try c[0](&r, file, @intCast(std.mem.indexOf(u8, text, c[1]).?)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[2])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 20)] });
+            return err;
+        };
+    }
+}

@@ -1,4 +1,7 @@
-//! goto definition：名字、成员访问、`@import` 字符串。
+//! goto definition / declaration / type definition：名字、成员访问、`@import` 字符串。
+//!
+//! declaration 跳到名字直接解析到的声明；definition 再沿容器级的别名（`const A = std.mem.Allocator;`）
+//! 追到最终的定义；type definition 跳到光标处符号的类型（剥去指针、optional、数组、错误联合）的定义。
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -10,13 +13,60 @@ const SyntaxToken = ast.SyntaxToken;
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const context = @import("context.zig");
+const queries = @import("../sema/queries.zig");
+const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const def = try defAt(r, file, offset) orelse return null;
+    return target(r, try r.aliasTarget(def));
+}
+
+pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    return target(r, try defAt(r, file, offset) orelse return null);
+}
+
+fn target(r: *Resolver, def: Def) resolve.Error!?Target {
     const loc = try r.location(def) orelse return null;
     return .{ .file = loc.file, .start = loc.start, .end = loc.end };
+}
+
+/// 光标处符号的类型的定义：声明与局部变量取其类型，表达式取推导出的类型；值本身是类型时取该类型。
+/// 指针、optional、数组、切片、错误联合取其元素 / 载荷类型
+pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+    const rel = tok.offset - a.node.offset;
+    const tv: TypedValue = blk: {
+        if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
+            break :blk try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
+        };
+        for (a.body.bindings, 0..) |binding, i| if (binding.range.start == rel) break :blk a.bindingType(@fromBackingInt(@as(u32, @intCast(i))));
+        break :blk a.exprType(a.body.exprAt(rel) orelse return null);
+    };
+    const ip = r.ctx.db.env.ip;
+    var t = if (tv.ty == .type_type) tv.asType() orelse return null else tv.ty;
+    for (0..8) |_| t = switch (ip.key(t)) {
+        .ptr_type => |p| p.child,
+        .optional_type => |c| c,
+        .array_type => |arr| arr.child,
+        .vector_type => |v| v.child,
+        .error_union_type => |eu| eu.payload,
+        else => break,
+    };
+    const ns = try queries.namespaceOfType(r, t) orelse return null;
+    // 文件即容器：跳到文件开头
+    if (ns.container == 0) return .{ .file = ns.file, .start = 0, .end = 0 };
+    const tree = try r.itemTree(ns.file);
+    // `const S = struct {...}`：跳到声明的名字；其他（如泛型函数返回的容器）跳到容器本身
+    if (tree.containers[ns.container].parent_item) |p| if (tree.items[p].kind == .@"const") {
+        if (try r.containerRel(ns)) |rel_c| if ((try r.body(ns.file, p)).value) |v| if ((try r.body(ns.file, p)).range(v).start == rel_c) {
+            return target(r, .{ .item = .{ .file = ns.file, .item = p } });
+        };
+    };
+    const start = try r.containerOffset(ns) orelse return null;
+    return .{ .file = ns.file, .start = start, .end = start };
 }
 
 /// 光标处 token：优先取可跳转的 token，光标紧跟在标识符之后时取它

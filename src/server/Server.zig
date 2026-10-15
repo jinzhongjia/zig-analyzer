@@ -254,6 +254,8 @@ const request_handlers = .{
     .{ "textDocument/selectionRange", Mode.read, selectionRange },
     .{ "textDocument/semanticTokens/full", Mode.read, semanticTokensFull },
     .{ "textDocument/definition", Mode.semantic, definition },
+    .{ "textDocument/declaration", Mode.semantic, declaration },
+    .{ "textDocument/typeDefinition", Mode.semantic, typeDefinition },
     .{ "textDocument/completion", Mode.semantic, completion },
     .{ "textDocument/hover", Mode.semantic, hover },
     .{ "textDocument/signatureHelp", Mode.semantic, signatureHelp },
@@ -1502,6 +1504,8 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .foldingRangeProvider = .{ .boolean = true },
             .selectionRangeProvider = .{ .boolean = true },
             .definitionProvider = .{ .boolean = true },
+            .declarationProvider = .{ .boolean = true },
+            .typeDefinitionProvider = .{ .boolean = true },
             .completionProvider = .{ .triggerCharacters = &.{ ".", "@", "\"", "/" } },
             .hoverProvider = .{ .boolean = true },
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
@@ -1540,16 +1544,27 @@ const StatusResult = struct {
 };
 
 fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const text = try r.ctx.get(FileText, file) orelse return null;
-    const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
-    const target = try ide.definition.definition(r, file, offset) orelse return null;
-    const target_text = (try r.ctx.get(syntax_q.SourceText, target.file)).text;
+    const loc = try server.gotoTarget(r, arena, params.textDocument.uri, params.position, ide.definition.definition) orelse return null;
+    return .{ .Definition = .{ .Location = loc } };
+}
+
+fn declaration(server: *Server, r: *Resolver, arena: Allocator, params: types.DeclarationParams) HandlerError!types.ResultType("textDocument/declaration") {
+    const loc = try server.gotoTarget(r, arena, params.textDocument.uri, params.position, ide.definition.declaration) orelse return null;
+    return .{ .Declaration = .{ .Location = loc } };
+}
+
+fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types.TypeDefinitionParams) HandlerError!types.ResultType("textDocument/typeDefinition") {
+    const loc = try server.gotoTarget(r, arena, params.textDocument.uri, params.position, ide.definition.typeDefinition) orelse return null;
+    return .{ .Definition = .{ .Location = loc } };
+}
+
+/// 按 `find` 求光标处的跳转目标
+fn gotoTarget(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) !?types.Location {
+    const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
+    const t = try find(r, at.file, at.offset) orelse return null;
+    const target_text = (try r.ctx.get(syntax_q.SourceText, t.file)).text;
     const lines = try offsets.LineIndex.init(arena, target_text);
-    return .{ .Definition = .{ .Location = .{
-        .uri = try server.uriFor(arena, target.file),
-        .range = lines.range(target.start, target.end, server.encoding),
-    } } };
+    return .{ .uri = try server.uriFor(arena, t.file), .range = lines.range(t.start, t.end, server.encoding) };
 }
 
 fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
