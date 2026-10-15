@@ -2943,10 +2943,10 @@ const Evaluator = struct {
         for (body.exprs, 0..) |x, i| switch (x) {
             .container => |c| if (body.expr_ranges[i].start == rel) {
                 const arg = c.arg orelse return null;
+                // 只推导参数表达式：外层成员整体的推导可能正在进行（体内的容器），取它会形成环
                 const owner = try ev.r.ownerKey(ns.file, parent);
-                const res = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = try queries.normalizeInst(ev.r, ns.file, parent, inst) });
-                if (@backingInt(arg) >= res.exprs.len) return null;
-                return res.exprs[@backingInt(arg)].asType();
+                const v = try ev.r.ctx.get(queries.LocalValue, .{ .owner = owner, .target = .{ .expr = arg }, .inst = try queries.normalizeInst(ev.r, ns.file, parent, inst) });
+                return v.asType();
             },
             else => {},
         };

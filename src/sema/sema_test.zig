@@ -1777,3 +1777,70 @@ test "std generic containers" {
         .{ "loc", "SourceLocation" },
     });
 }
+
+test "local types used by containers in the body: no cycle through the whole function" {
+    // 体内容器的方法用到外层函数的局部类型，外层函数体又引用这个方法；体内有 `enum(u32)`。
+    // 此前取外层函数整体的推导结果，形成环，结果不完整、不写入 memo
+    const text =
+        \\fn f() u32 {
+        \\    const P = struct { a: u32 };
+        \\    const Id = enum(u32) { x, y };
+        \\    const S = struct {
+        \\        fn g(p: P) u32 {
+        \\            return p.a;
+        \\        }
+        \\    };
+        \\    const v = S.g(.{ .a = 1 });
+        \\    _ = Id.x;
+        \\    return v;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var executions: [2]u64 = undefined;
+    for (&executions) |*n| {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const owner = try r.ownerKey(file, resolve.Resolver.lookupDecl(try r.itemTree(file), 0, "f").?);
+        _ = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        n.* = w.db.executions(queries.Infer);
+    }
+    // 结果完整、写入 memo：第二次读取不再执行
+    try testing.expectEqual(executions[0], executions[1]);
+    var stats: [database.Db.query_types.len]@import("../db/engine.zig").QueryStats = undefined;
+    try testing.expectEqual(0, w.db.stats(&stats).incomplete_causes.get(.cycle));
+    try testing.expectEqualStrings("u32", try typeAt(&w, file, text, "v", 1));
+    try testing.expectEqualStrings("u32", try typeAt(&w, file, text, "p.a", 0));
+}
+
+test "container arguments that refer to locals of an outer function" {
+    // `enum(T)` 的参数只推导这一个表达式，其中的 `T` 是更外层函数的局部常量。
+    // `T` 在外层函数中的下标大于内层函数的绑定数（曾以内层函数的 Body 取外层的绑定而越界）
+    const text =
+        \\fn f() void {
+        \\    const a = 1;
+        \\    const b = 2;
+        \\    const c = 3;
+        \\    _ = .{ a, b, c };
+        \\    const T = u16;
+        \\    const S = struct {
+        \\        fn h() void {
+        \\            const E = enum(T) { a, b };
+        \\            const x = @intFromEnum(E.b);
+        \\            _ = x;
+        \\        }
+        \\    };
+        \\    _ = S;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings("u16 = 1", try typeAt(&w, file, text, "x", 0));
+}

@@ -266,6 +266,37 @@ pub const CallEval = struct {
 };
 
 /// 推导进行中的局部绑定（同一 owner 内直接读取，避免循环）
+pub const LocalKey = struct {
+    owner: hir.OwnerKey,
+    target: union(enum) {
+        binding: Body.BindingId,
+        /// 在 comptime 上下文中求值的表达式（如体内 `enum(u8)` 的参数）
+        expr: Body.ExprId,
+    },
+    inst: ?Index = null,
+};
+
+/// 成员中一个局部绑定（或一个 comptime 表达式）的类型与值：只推导这一个绑定（参数取实例；
+/// 局部常量 / 变量推导其类型标注与初始化表达式，其中引用的其他局部绑定同样按需查询）。
+///
+/// 体内定义的容器引用外层函数的局部名字（如 `const T = struct {...}; ... struct { fn f(x: T) }`）时
+/// 经由它，不依赖外层函数的整个函数体。此前取外层函数整体的推导结果：外层函数体又引用内层成员时
+/// 形成环，环中的结果不写入 memo，每次读取都要重算
+pub const LocalValue = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = LocalKey;
+    pub const Value = TypedValue;
+
+    pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
+        _ = try ctx.get(TargetAbi, {});
+        return infer.runLocal(ctx, key.owner, key.target, key.inst);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return .unknown;
+    }
+};
+
 pub const LocalScope = struct {
     file: FileId,
     item: u32,
@@ -281,9 +312,7 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
         },
         .local => |l| {
             if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
-            const res = try r.ctx.get(Infer, .{ .owner = try r.ownerKey(l.file, l.item), .mode = .full, .inst = try normalizeInst(r, l.file, l.item, inst) });
-            if (@backingInt(l.binding) >= res.bindings.len) return .unknown;
-            return res.bindings[@backingInt(l.binding)];
+            return r.ctx.get(LocalValue, .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) });
         },
         .file => |f| return TypedValue.ofType(try containerType(r, .{ .file = f, .container = 0 }, null)),
     }

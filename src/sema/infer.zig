@@ -116,6 +116,71 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Re
     return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive };
 }
 
+/// 只推导成员 `owner` 中的一个局部绑定或 comptime 表达式（见 `queries.LocalValue`）
+pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(queries.LocalKey, "target"), inst: ?Index) Error!TypedValue {
+    const gpa = ctx.db.gpa;
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var r: Resolver = .{ .ctx = ctx, .arena = a };
+    const tree = try r.itemTree(owner.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == owner.item) break @intCast(i);
+    } else return .unknown;
+    const body = try ctx.get(hir.ItemBody, owner);
+    var inf: Inferrer = .{
+        .r = &r,
+        .ip = ctx.db.env.ip,
+        .file = owner.file,
+        .item = item,
+        .body = body,
+        .exprs = try a.alloc(TypedValue, body.exprs.len),
+        .done = try std.DynamicBitSetUnmanaged.initEmpty(a, body.exprs.len),
+        .bindings = try a.alloc(TypedValue, body.bindings.len),
+        .members = try a.alloc(?hir.OwnerKey, body.exprs.len),
+        .scratch = a,
+        .inst = inst,
+    };
+    @memset(inf.exprs, .unknown);
+    @memset(inf.bindings, .unknown);
+    @memset(inf.members, null);
+    if (tree.items[item].kind == .@"fn") {
+        const own = inf.ownInstance();
+        for (body.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null);
+    }
+    const binding = switch (target_ref) {
+        .binding => |id| id,
+        .expr => |e| {
+            if (@backingInt(e) >= body.exprs.len) return .unknown;
+            inf.lazy = body.range(e);
+            return inf.inferComptime(e, null);
+        },
+    };
+    if (@backingInt(binding) >= body.bindings.len) return .unknown;
+    const target = body.binding(binding);
+    switch (target.kind) {
+        .param => return inf.bindings[@backingInt(binding)],
+        .local_const, .local_var => {
+            const init = target.init orelse return .unknown;
+            // 初始化表达式之外的局部绑定按需查询（见 `nameRef`）
+            inf.lazy = body.range(init);
+            const annotation: ?Index = if (target.ty) |t| (try inf.inferComptime(t, null)).asType() orelse .unknown else null;
+            const v = try inf.infer(init, annotation);
+            return if (annotation) |t|
+                .{ .ty = t, .val = if (target.kind == .local_const and v.ty == t) v.val else null }
+            else if (target.kind == .local_const)
+                v
+            else
+                .{ .ty = v.ty };
+        },
+        // 捕获的值取决于控制流：取整个成员的推导结果
+        .capture => {
+            const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+            return if (@backingInt(binding) < res.bindings.len) res.bindings[@backingInt(binding)] else .unknown;
+        },
+    }
+}
+
 fn empty(gpa: Allocator) Result {
     _ = gpa;
     return .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{}, .ret = .unknown };
@@ -142,6 +207,8 @@ const Inferrer = struct {
     field_refs: std.ArrayList(Result.FieldRef) = .empty,
     /// 正在推导的 init 表达式
     current_init: ?ExprId = null,
+    /// 只推导一个局部绑定（`runLocal`）时其初始化表达式的范围：范围外的局部绑定没有推导，按需查询
+    lazy: ?Body.Range = null,
     /// 见 `Result.literal_expected`
     literal_expected: std.ArrayList(Result.LiteralExpected) = .empty,
     /// 见 `Result.inactive`
@@ -584,6 +651,15 @@ const Inferrer = struct {
         const b = inf.body;
         if (try primitive(inf.ip, name)) |tv| return tv;
         const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .unknown;
+        if (inf.lazy) |range| if (def == .local) {
+            const l = def.local;
+            // 属于本成员的局部绑定（外层成员的由 defType 经 LocalValue 查询）
+            if (l.file != inf.file or l.item != inf.item) return queries.defType(inf.r, def, null, inf.inst);
+            const binding = b.binding(l.binding);
+            if (binding.kind != .param and !range.contains(binding.range.start)) {
+                return inf.r.ctx.get(queries.LocalValue, .{ .owner = try inf.r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = inf.inst });
+            }
+        };
         return queries.defType(inf.r, def, .{ .file = inf.file, .item = inf.item, .bindings = inf.bindings }, inf.inst);
     }
 
