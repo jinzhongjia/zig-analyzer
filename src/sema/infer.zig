@@ -1004,14 +1004,39 @@ const Inferrer = struct {
                 return .void_type;
             },
             .destructure => |d| {
-                _ = try inf.infer(d.value, null);
-                for (d.targets) |t| switch (t) {
-                    .binding => |b| inf.bindings[@backingInt(b)] = if (inf.body.binding(b).ty) |ty| .{ .ty = (try inf.infer(ty, null)).asType() orelse .unknown } else .unknown,
+                const v = try inf.infer(d.value, null);
+                for (d.targets, 0..) |t, i| switch (t) {
+                    .binding => |b| {
+                        const binding = inf.body.binding(b);
+                        const elem = try inf.destructureElem(v, i);
+                        inf.bindings[@backingInt(b)] = if (binding.ty) |ty| blk: {
+                            const annotation = (try inf.infer(ty, null)).asType() orelse .unknown;
+                            break :blk .{ .ty = annotation, .val = if (binding.kind == .local_const and elem.ty == annotation) elem.val else null };
+                        } else if (binding.kind == .local_const) elem else .{ .ty = elem.ty };
+                    },
                     .expr => |x| _ = try inf.infer(x, null),
                 };
                 return .void_type;
             },
         }
+    }
+
+    /// 解构 `const a, const b = x;` 的第 `i` 个元素：元组的字段、数组与向量的元素
+    fn destructureElem(inf: *Inferrer, v: TypedValue, i: usize) Error!TypedValue {
+        const ip = inf.ip;
+        const ty: Index = switch (ip.key(v.ty)) {
+            .tuple_type => |tt| if (i < tt.types.len) tt.types[i] else return .unknown,
+            .array_type => |a| a.child,
+            .vector_type => |vt| vt.child,
+            else => return .unknown,
+        };
+        if (v.val != null) if (try eval.elemValue(inf.r, v, i)) |ev| return .{ .ty = ty, .val = ev.val };
+        // 元组的 comptime 字段：值属于类型
+        const x: Index = switch (ip.key(v.ty)) {
+            .tuple_type => |tt| InternPool.fieldValue(tt.values, i),
+            else => .runtime,
+        };
+        return .{ .ty = ty, .val = if (x == .runtime or x == .unknown) null else x };
     }
 
     fn loop(inf: *Inferrer, l: Body.Loop, expected: ?Index) Error!TypedValue {

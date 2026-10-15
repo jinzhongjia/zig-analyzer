@@ -1111,6 +1111,29 @@ test "tuple declarations are structural" {
     });
 }
 
+test "destructuring infers each element" {
+    try expectTypes(
+        \\fn pair() struct { u32, bool } { return .{ 1, true }; }
+        \\fn f(arr: [3]u16, v: @Vector(2, f32)) void {
+        \\    const x, const y = pair();
+        \\    const a0, _, const a2 = arr;
+        \\    const v0, const v1 = v;
+        \\    const k0, const k1 = .{ 5, true };
+        \\    _ = .{ x, y, a0, a2, v0, v1, k0, k1 };
+        \\}
+    , &.{
+        .{ "x", "u32" },
+        .{ "y", "bool" },
+        .{ "a0", "u16" },
+        .{ "a2", "u16" },
+        .{ "v0", "f32" },
+        .{ "v1", "f32" },
+        // 元组字面量的 comptime 字段：值属于类型
+        .{ "k0", "comptime_int = 5" },
+        .{ "k1", "bool" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
