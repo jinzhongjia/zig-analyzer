@@ -269,3 +269,36 @@ test "read requests run on their own threads: a blocked read does not stall the 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "live diagnostics are debounced per file" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    // 防抖取得较长，使连续的编辑必然落在同一窗口内
+    const options = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"diagnostics": {"debounce_ms": 300}}
+    , .{});
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = options });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-1";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const a = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const before = (try h.notifications("textDocument/publishDiagnostics")).len;
+
+    const texts = [_][]const u8{ "const a = 1", "const a = 1;\nconst", "const a = 1;\nconst b", "const a = 1;\nconst b =", "const a = 1;\nconst b = ;\n" };
+    for (texts, 2..) |text, version| {
+        try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = text }} });
+    }
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const published = try h.notifications("textDocument/publishDiagnostics");
+    // 五次编辑只发布一次，按最后的文本
+    try testing.expectEqual(before + 1, published.len);
+    const diags = published[published.len - 1].object.get("params").?.object.get("diagnostics").?.array.items;
+    try testing.expectEqual(1, diags.len);
+    try testing.expectEqualStrings("expected expression, found ';'", diags[0].object.get("message").?.string);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

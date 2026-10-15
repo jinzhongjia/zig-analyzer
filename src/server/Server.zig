@@ -90,6 +90,11 @@ index_generation: std.atomic.Value(u64) = .init(0),
 callsite_seeding: std.atomic.Value(bool) = .init(true),
 /// 慢请求日志的阈值（毫秒，0 为关闭），来自配置 `log.slow_request_ms`
 slow_request_ms: std.atomic.Value(u32) = .init(100),
+/// 编辑触发的诊断发布的防抖（毫秒），来自配置 `diagnostics.debounce_ms`
+debounce_ms: std.atomic.Value(u32) = .init(50),
+/// 编辑触发的待发布文件（见 `publishDebounced`）
+edits_mutex: Io.Mutex = .init,
+edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
 /// 是否有索引任务在运行（同时只运行一个）
 indexing: std.atomic.Value(bool) = .init(false),
 /// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
@@ -159,6 +164,7 @@ pub fn deinit(server: *Server) void {
     for (server.workspaces.items) |ws| ws.destroy();
     server.workspaces.deinit(server.gpa);
     server.indexed.deinit(server.gpa);
+    server.edits.deinit(server.gpa);
     za.util.log.setFile(null) catch {};
     for (server.retired.items) |ws| ws.destroy();
     server.retired.deinit(server.gpa);
@@ -824,7 +830,7 @@ fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocum
         const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
         try server.db.set(FileText, id, new, .low);
     }
-    server.publishFiles(&.{id}, false);
+    server.publishDebounced(id);
 }
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
@@ -1084,6 +1090,7 @@ fn clearSingleFileResults(server: *Server) void {
 fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void {
     za.util.log.setLevel(config.log_level);
     server.slow_request_ms.store(config.slow_request_ms, .monotonic);
+    server.debounce_ms.store(config.debounce_ms, .monotonic);
     server.callsite_seeding.store(config.callsite_seeding, .monotonic);
     if (!reopen_file) return;
     za.util.log.setFile(config.log_file) catch |err| {
@@ -1515,8 +1522,52 @@ pub fn publishOpenFiles(server: *Server) void {
     server.publishFiles(files, false);
 }
 
+/// 文件的编辑代数，与是否已有等待中的发布任务
+const Edit = struct { generation: u64 = 0, scheduled: bool = false };
+
+/// 编辑触发的发布：同一文件最多一个等待中的任务，`diagnostics.debounce_ms` 内没有新的编辑时才计算。
+/// 逐字输入时不为每次按键计算诊断（AstGen 与非活动代码的推导），也不堆积被写事务反复打断的任务
+fn publishDebounced(server: *Server, file: Vfs.FileId) void {
+    {
+        server.edits_mutex.lockUncancelable(server.io);
+        defer server.edits_mutex.unlock(server.io);
+        const gop = server.edits.getOrPut(server.gpa, file) catch return server.publishFiles(&.{file}, false);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.generation += 1;
+        if (gop.value_ptr.scheduled) return;
+        gop.value_ptr.scheduled = true;
+    }
+    // 在锁外提交：退回 `async` 时任务在这里同步执行，会再获取 `edits_mutex`
+    server.busyBegin();
+    spawn(server.io, &server.bg_group, debounceTask, .{ server, file });
+}
+
+fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
+    defer server.busyEnd();
+    var seen: ?u64 = null;
+    while (true) {
+        {
+            server.edits_mutex.lockUncancelable(server.io);
+            defer server.edits_mutex.unlock(server.io);
+            const edit = server.edits.getPtr(file).?;
+            if (seen == edit.generation) {
+                edit.scheduled = false;
+                break;
+            }
+            seen = edit.generation;
+        }
+        const ms = server.debounce_ms.load(.monotonic);
+        if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
+    }
+    server.publishNow(file, false);
+}
+
 fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!void {
     defer server.busyEnd();
+    server.publishNow(file, clear);
+}
+
+fn publishNow(server: *Server, file: Vfs.FileId, clear: bool) void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     // 被写事务取消时重试：构建结果触发的发布不能因无关的编辑而丢失

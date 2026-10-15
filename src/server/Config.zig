@@ -5,7 +5,7 @@
 //!
 //!     { "zig": { "path": "/usr/local/bin/zig" },
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
-//!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true },
+//!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
 //!       "sema": { "callsite_seeding": true },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
@@ -34,6 +34,8 @@ diagnostics_step: ?[]const u8 = null,
 diagnostics_steps: []const []const u8 = &.{},
 /// 是否运行编译器得到诊断；关闭时只有 live 诊断（语法与 AstGen）
 compiler_diagnostics: bool = true,
+/// 编辑后等待这么多毫秒没有新的编辑才计算 live 诊断；0 为不等待
+debounce_ms: u32 = 50,
 /// 是否把当前构建配置下不编译的代码（comptime 已知不执行的分支）显示为非活动代码
 inactive_code: bool = true,
 /// inlay hints：推导出的类型
@@ -69,6 +71,7 @@ const settings = [_]Setting{
     .{ .section = "diagnostics", .key = "steps", .field = "diagnostics_steps" },
     .{ .section = "diagnostics", .key = "compiler", .field = "compiler_diagnostics" },
     .{ .section = "diagnostics", .key = "inactive_code", .field = "inactive_code" },
+    .{ .section = "diagnostics", .key = "debounce_ms", .field = "debounce_ms" },
     .{ .section = "inlay_hints", .key = "types", .field = "inlay_types" },
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
