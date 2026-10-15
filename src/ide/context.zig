@@ -53,6 +53,13 @@ pub const At = struct {
         return null;
     }
 
+    /// 初始化表达式 `init` 中第 `index` 个字段名解析到的字段
+    pub fn fieldRef(a: At, init: Body.ExprId, index: u32) ?hir.OwnerKey {
+        for (a.res.field_refs) |f| if (f.init == init and f.index == index) return f.member;
+        if (a.seeded) |s| for (s.res.field_refs) |f| if (f.init == init and f.index == index) return f.member;
+        return null;
+    }
+
     pub fn member(a: At, e: Body.ExprId) ?hir.OwnerKey {
         const i = @backingInt(e);
         if (i < a.res.members.len) if (a.res.members[i]) |m| return m;

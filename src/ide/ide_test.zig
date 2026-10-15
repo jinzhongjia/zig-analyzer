@@ -509,6 +509,51 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "goto declaration of labels and field names in initializers" {
+    const text =
+        \\const Point = struct { x: i32, y: i32 };
+        \\fn f(n: u32) Point {
+        \\    const v = blk: {
+        \\        if (n == 0) break :blk 1;
+        \\        break :blk 2;
+        \\    };
+        \\    outer: for (0..n) |_| {
+        \\        while (true) continue :outer;
+        \\    }
+        \\    const p: Point = .{ .x = v, .y = 0 };
+        \\    return Point{ .x = p.x, .y = 1 };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, usize, []const u8 }{
+        .{ "blk 1", 0, "blk: {" },
+        .{ "blk 2", 0, "blk: {" },
+        .{ "blk: {", 0, "blk: {" },
+        .{ "outer;", 0, "outer: for" },
+        .{ ".x = v", 1, "x: i32" },
+        .{ ".y = 0", 1, "y: i32" },
+        .{ ".x = p", 1, "x: i32" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).? + c[1];
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[2])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 20)] });
+            return err;
+        };
+    }
+}
+
 test "inlay hint options" {
     const text =
         \\fn add(a: u32, b: u32) u32 {

@@ -1,4 +1,4 @@
-//! goto definition / declaration / type definition：名字、成员访问、`@import` 字符串。
+//! goto definition / declaration / type definition：名字、成员访问、初始化中的字段名、标签、`@import` 字符串。
 //!
 //! declaration 跳到名字直接解析到的声明；definition 再沿容器级的别名（`const A = std.mem.Allocator;`）
 //! 追到最终的定义；type definition 跳到光标处符号的类型（剥去指针、optional、数组、错误联合）的定义。
@@ -19,12 +19,49 @@ const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    if (try labelTarget(r, file, offset)) |t| return t;
     const def = try defAt(r, file, offset) orelse return null;
     return target(r, try r.aliasTarget(def));
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    if (try labelTarget(r, file, offset)) |t| return t;
     return target(r, try defAt(r, file, offset) orelse return null);
+}
+
+/// 标签：`break :l` / `continue :l` 中的 `l` 跳到带标签的块或循环的标签处，标签自身返回自身
+fn labelTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const e = b.exprAt(rel) orelse return null;
+    const name = tok.text;
+    const self_target: Target = .{ .file = file, .start = tok.offset, .end = tok.offset + @as(u32, @intCast(name.len)) };
+    // 标签自身（块或循环的范围从标签开始）
+    switch (b.expr(e)) {
+        .block => |blk| if (blk.label) |l| if (b.range(e).start == rel and std.mem.eql(u8, l, name)) return self_target,
+        .loop => |lp| if (lp.label) |l| if (b.range(e).start == rel and std.mem.eql(u8, l, name)) return self_target,
+        else => {},
+    }
+    const label = switch (b.expr(e)) {
+        .@"break" => |x| x.label,
+        .@"continue" => |x| x.label,
+        else => null,
+    } orelse return null;
+    // 光标在标签上，而不在 break 的值中
+    const prev = (try r.ctx.get(database.syntax.ParseFile, file)).source[tok.offset - 1];
+    if (!std.mem.eql(u8, label, name) or prev != ':') return null;
+    var scope: ?Body.ScopeId = b.expr_scopes[@backingInt(e)];
+    while (scope) |sc| : (scope = b.scopes[@backingInt(sc)].parent) {
+        const l = b.scopes[@backingInt(sc)].label orelse continue;
+        if (!std.mem.eql(u8, l.name, label)) continue;
+        const start = node.offset + b.range(l.expr).start;
+        return .{ .file = file, .start = start, .end = start + @as(u32, @intCast(label.len)) };
+    }
+    return null;
 }
 
 fn target(r: *Resolver, def: Def) resolve.Error!?Target {
@@ -108,6 +145,12 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
         },
         // decl literal（`.init(...)`、`.empty`）
         .enum_literal => return memberViaTypes(r, file, tok.offset, e),
+        // 初始化中的字段名（`.{ .x = 1 }`、`S{ .x = 1 }`）：推导时按结果类型解析
+        .init => |x| for (x.fields, 0..) |fi, k| {
+            if (fi.name == null or rel < fi.name_range.start or rel >= fi.name_range.end) continue;
+            const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+            return context.defOfKey(r, a.fieldRef(e, @intCast(k)) orelse return null);
+        } else return null,
         .builtin_call => |call| return importDef(r, file, b, call),
         .literal => {
             // `@import("...")` 的字符串
