@@ -717,6 +717,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     frame.deps.deinit(ctx.db.gpa);
                     return err;
                 };
+                // compute 可能吞掉了内层读取的 `Canceled`（`catch null` 之类的回退），结果不完整，
+                // 不能写入 memo。取消标志在读事务结束前不会复位（写事务要等读者退出才清除
+                // `pending_write`），所以在这里检查一次即可发现
+                if (ctx.checkCanceled()) |_| {} else |err| {
+                    var frame = ctx.stack.pop().?;
+                    ctx.finishTiming(qi, &frame, t0, trace_index, true);
+                    frame.deps.deinit(db.gpa);
+                    db.mutex.lockUncancelable(db.io);
+                    defer db.mutex.unlock(db.io);
+                    try db.discardLocked(Q, &value);
+                    return err;
+                }
                 var frame = ctx.stack.pop().?;
                 ctx.finishTiming(qi, &frame, t0, trace_index, false);
 

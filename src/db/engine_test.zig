@@ -153,6 +153,18 @@ const Spin = struct {
 };
 var spin_started: std.atomic.Value(bool) = .init(false);
 
+/// 计算途中出现写事务，并以回退值吞掉内层读取的 `Canceled`
+const Swallow = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        if (swallow_cancel) ctx.db.pending_write.store(true, .release);
+        return ctx.get(Number, key) catch -1;
+    }
+};
+var swallow_cancel = false;
+
 /// 带 LRU 容量的 query：值含指针（淘汰时须释放）
 const Cached = struct {
     pub const kind: db.Kind = .derived;
@@ -196,7 +208,7 @@ const Burn = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Cached, CachedLen, Burn });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Swallow, Cached, CachedLen, Burn });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -405,6 +417,26 @@ test "cancellation: write interrupts in-flight read" {
     try setNumber(&d, Number, 1, 1, .low);
     thread.join();
     try testing.expectError(error.Canceled, result.?);
+}
+
+test "cancellation: result of a compute that swallowed Canceled is not memoized" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+
+    swallow_cancel = true;
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectError(error.Canceled, ctx.get(Swallow, 1));
+    }
+    d.pending_write.store(false, .release);
+    swallow_cancel = false;
+
+    // 被吞掉的取消没有留下回退值 -1：再次读取重新计算出正确结果
+    const before = executions(&d, Swallow);
+    try testing.expectEqual(7, try read(&d, Swallow, 1));
+    try testing.expectEqual(before + 1, executions(&d, Swallow));
 }
 
 test "concurrent reads: readers of the same query agree" {
