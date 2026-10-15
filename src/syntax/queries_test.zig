@@ -30,7 +30,7 @@ fn count(db: *Db, file: Vfs.FileId) !usize {
 }
 
 fn executions(db: *Db, comptime Q: type) u64 {
-    return db.executions[Db.queryIndex(Q)].load(.monotonic);
+    return db.executions(Q);
 }
 
 test "body-only edit: reparse and rebuild ItemTree, downstream not recomputed" {

@@ -146,6 +146,36 @@ test "references, highlight, rename and workspace symbol" {
         const edits = actions[0].object.get("edit").?.object.get("changes").?.object.get(extra_uri).?.array.items;
         try testing.expectEqualStrings("\n    _ = x;", edits[0].object.get("newText").?.string);
     }
+
+    // 可观测性（设计 §14）：status 的查询统计与慢请求报告
+    {
+        const st = try h.request("zig-analyzer/status", {});
+        var found = false;
+        for (st.object.get("result").?.object.get("queries").?.array.items) |q| {
+            if (!std.mem.endsWith(u8, q.object.get("name").?.string, ".Infer")) continue;
+            found = true;
+            try testing.expect(q.object.get("executions").?.integer > 0);
+            const total = q.object.get("total_ms").?.float;
+            try testing.expect(total >= q.object.get("self_ms").?.float);
+        }
+        try testing.expect(found);
+
+        // lib.zig 的 test 体尚未推导过：hover 时记录实际执行的 query 并生成报告
+        var ctx = h.server.db.beginRead(a);
+        defer ctx.end();
+        var trace: za.db.Trace = .{ .gpa = a };
+        ctx.trace = &trace;
+        var r: za.names.resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+        const lib = (try h.server.vfs.lookup(try project.path(a, "src/lib.zig"))).?;
+        _ = try za.ide.hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "hello();").?));
+        try testing.expect(trace.events.items.len > 0);
+        var out: std.Io.Writer.Allocating = .init(a);
+        try h.server.writeSlowReport(&out.writer, &ctx, &trace, 0);
+        const report = out.written();
+        try testing.expect(std.mem.indexOf(u8, report, "by query (self time):") != null);
+        // 调用树中的 key 以「文件名:成员名」显示（test 没有名字）
+        try testing.expect(std.mem.indexOf(u8, report, "queries.Infer {owner=lib.zig:_") != null);
+    }
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

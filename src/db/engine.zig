@@ -42,6 +42,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
+const tracy = @import("../util/tracy.zig");
 
 pub const Revision = u64;
 
@@ -86,11 +87,72 @@ pub const DepKey = struct {
 };
 
 pub const Stats = struct {
-    /// 各 query 执行 compute 的次数
-    executions: []const u64,
+    /// 与注册的 query 一一对应
+    queries: []const QueryStats,
     /// 逐个依赖检查（未被 durability 跳过）的次数
     deep_verifications: u64,
     revision: Revision,
+    /// 各原因导致结果不完整的次数
+    incomplete_causes: std.EnumArray(IncompleteCause, u64),
+};
+
+/// 一个 query 的累计统计（设计 §14）
+pub const QueryStats = struct {
+    /// 执行 compute 的次数
+    executions: u64,
+    /// 读取时直接使用 memo（无需执行）的次数
+    hits: u64,
+    /// 重新执行后结果与旧值相同（early cutoff）的次数
+    cutoffs: u64,
+    /// compute 的累计耗时（含其中执行的其他 query）
+    total_ns: u64,
+    /// 扣除其中执行的其他 query 后的累计耗时
+    self_ns: u64,
+    /// 单次 compute 的最长耗时（含其他 query）
+    max_ns: u64,
+    /// 当前保留着值的 memo 数
+    memos: usize,
+    /// 结果不完整（环、栈深度或燃料用尽）而未写入 memo 的次数：这些结果每次读取都要重算
+    incomplete: u64 = 0,
+};
+
+/// 结果不完整的原因
+pub const IncompleteCause = enum {
+    /// 参与了环（没有声明 fixpoint 的 query）
+    cycle,
+    /// 嵌套计算超出栈深度上限
+    stack,
+    /// comptime 求值的燃料耗尽
+    fuel,
+};
+
+/// 一次读事务中执行过的 query（先序，按深度可还原调用树），用于慢请求日志
+pub const Trace = struct {
+    gpa: Allocator,
+    events: std.ArrayList(Event) = .empty,
+
+    pub const Event = struct {
+        query: u16,
+        /// key 驻留后的下标（`Db.keyAt` 取回 key）
+        key: u32,
+        depth: u16,
+        /// 含其中执行的其他 query
+        ns: u64 = 0,
+        cutoff: bool = false,
+        failed: bool = false,
+        /// 结果不完整，未写入 memo
+        incomplete: bool = false,
+    };
+};
+
+const Counters = struct {
+    executions: std.atomic.Value(u64) = .init(0),
+    hits: std.atomic.Value(u64) = .init(0),
+    cutoffs: std.atomic.Value(u64) = .init(0),
+    total_ns: std.atomic.Value(u64) = .init(0),
+    self_ns: std.atomic.Value(u64) = .init(0),
+    max_ns: std.atomic.Value(u64) = .init(0),
+    incomplete: std.atomic.Value(u64) = .init(0),
 };
 
 /// `Env`：query 可通过 `ctx.db.env` 访问的只读环境（必须在 Db 生命周期内不变）。
@@ -121,7 +183,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         tables: Tables = tables_init,
         garbage: std.ArrayList(Garbage) = .empty,
 
-        executions: [queries.len]std.atomic.Value(u64) = @splat(.init(0)),
+        counters: [queries.len]Counters = @splat(.{}),
+        incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
         deep_verifications: std.atomic.Value(u64) = .init(0),
         /// memo 最近使用时间的计数器（LRU）
         access_tick: std.atomic.Value(u64) = .init(0),
@@ -207,13 +270,49 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             @compileError("query not registered: " ++ @typeName(Q));
         }
 
-        pub fn stats(db: *Db, buf: *[queries.len]u64) Stats {
-            for (buf, &db.executions) |*out, *count| out.* = count.load(.monotonic);
+        pub fn stats(db: *Db, buf: *[queries.len]QueryStats) Stats {
+            db.mutex.lockUncancelable(db.io);
+            defer db.mutex.unlock(db.io);
+            inline for (queries, 0..) |Q, qi| {
+                const c = &db.counters[qi];
+                var memos: usize = 0;
+                for (db.tables[qi].slots.items) |slot| switch (Q.kind) {
+                    .input => memos += @intFromBool(slot.is_set),
+                    .derived => if (slot.memo) |m| {
+                        memos += @intFromBool(!m.evicted);
+                    },
+                };
+                buf[qi] = .{
+                    .executions = c.executions.load(.monotonic),
+                    .hits = c.hits.load(.monotonic),
+                    .cutoffs = c.cutoffs.load(.monotonic),
+                    .total_ns = c.total_ns.load(.monotonic),
+                    .self_ns = c.self_ns.load(.monotonic),
+                    .max_ns = c.max_ns.load(.monotonic),
+                    .memos = memos,
+                    .incomplete = c.incomplete.load(.monotonic),
+                };
+            }
+            var causes: std.EnumArray(IncompleteCause, u64) = .initFill(0);
+            for (&db.incomplete_causes, 0..) |*n, i| causes.set(@fromBackingInt(@intCast(i)), n.load(.monotonic));
             return .{
-                .executions = buf,
+                .queries = buf,
                 .deep_verifications = db.deep_verifications.load(.monotonic),
                 .revision = db.revision,
+                .incomplete_causes = causes,
             };
+        }
+
+        /// 执行次数（测试与工具用）
+        pub fn executions(db: *Db, comptime Q: type) u64 {
+            return db.counters[comptime queryIndex(Q)].executions.load(.monotonic);
+        }
+
+        /// 第 `query` 个 query 中下标为 `index` 的 key（`Trace.Event` 的 key）
+        pub fn keyAt(db: *Db, comptime Q: type, index: u32) Q.Key {
+            db.mutex.lockUncancelable(db.io);
+            defer db.mutex.unlock(db.io);
+            return db.tables[comptime queryIndex(Q)].keys.keys()[index];
         }
 
         // ── 写事务 ─────────────────────────────────────────────────────────
@@ -350,6 +449,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             gpa: Allocator,
             /// 单个请求的取消标志（对应 `$/cancelRequest`）
             cancel: ?*const std.atomic.Value(bool) = null,
+            /// 记录执行过的 query（慢请求日志）；null 时不记录
+            trace: ?*Trace = null,
             stack: std.ArrayList(Frame) = .empty,
             /// 读事务开始处的栈位置（栈向低地址增长）
             stack_base: usize,
@@ -367,6 +468,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 durability: Durability = .high,
                 /// 本帧参与了环，结果不写入 memo
                 in_cycle: bool = false,
+                /// 本帧中执行的其他 query 的耗时（用于自身耗时）
+                child_ns: u64 = 0,
             };
 
             pub fn end(ctx: *Ctx) void {
@@ -384,14 +487,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             /// 当前结果不完整（燃料耗尽等）：栈上的 query 都不写入 memo
-            pub fn markIncomplete(ctx: *Ctx) void {
+            pub fn markIncomplete(ctx: *Ctx, cause: IncompleteCause) void {
+                _ = ctx.db.incomplete_causes[@backingInt(cause)].fetchAdd(1, .monotonic);
                 for (ctx.stack.items) |*frame| frame.in_cycle = true;
             }
 
             /// compute 内部因栈深度上限中断：除 `markIncomplete` 外，记下正在计算的 query，
             /// 顶层读取会先从栈底计算它
             pub fn exhausted(ctx: *Ctx) void {
-                ctx.markIncomplete();
+                ctx.markIncomplete(.stack);
                 if (ctx.frontier == null and ctx.stack.items.len > 0) ctx.frontier = ctx.stack.items[ctx.stack.items.len - 1].key;
             }
 
@@ -464,13 +568,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                         if (@hasDecl(Q, "cycleFallback") and ctx.stackExhausted()) {
                             // 本 revision 已验证的结果可以直接使用，不会再深入
                             if (ctx.verifiedMemo(Q, index)) |fresh| break :blk fresh;
-                            ctx.markIncomplete();
+                            ctx.markIncomplete(.stack);
                             if (ctx.frontier == null) ctx.frontier = dep;
                             return if (@hasDecl(Q, "depthFallback")) Q.depthFallback(key) else Q.cycleFallback(key);
                         }
                         break :blk try ctx.ensureFresh(Q, index, key, true);
                     },
                 };
+                if (Q.kind == .derived and !fresh.executed) _ = db.counters[qi].hits.fetchAdd(1, .monotonic);
                 try ctx.recordDep(dep, fresh.durability);
                 return fresh.value;
             }
@@ -489,12 +594,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 }
                 // 不动点的入口算一遍即得完整结果，只有环内的其他 query 依赖回退值
                 const first = if (@hasDecl(Q, "fixpoint") and Q.fixpoint) head + 1 else head;
+                _ = ctx.db.incomplete_causes[@backingInt(IncompleteCause.cycle)].fetchAdd(1, .monotonic);
                 for (ctx.stack.items[first..]) |*frame| frame.in_cycle = true;
                 return Q.cycleFallback(key);
             }
 
             fn Fresh(comptime Q: type) type {
-                return struct { value: Q.Value, changed_at: Revision, durability: Durability };
+                return struct { value: Q.Value, changed_at: Revision, durability: Durability, executed: bool = false };
             }
 
             fn verifiedMemo(ctx: *Ctx, comptime Q: type, index: u32) ?Fresh(Q) {
@@ -581,8 +687,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, restore: bool) Error!Fresh(Q) {
                 const db = ctx.db;
                 const qi = comptime queryIndex(Q);
-                _ = db.executions[qi].fetchAdd(1, .monotonic);
+                _ = db.counters[qi].executions.fetchAdd(1, .monotonic);
+                const zone = tracy.zone(@src(), @typeName(Q));
+                defer zone.end();
 
+                const t0 = Io.Clock.awake.now(db.io);
+                const trace_index: ?usize = if (ctx.trace) |t| blk: {
+                    t.events.append(t.gpa, .{ .query = qi, .key = index, .depth = @intCast(ctx.stack.items.len) }) catch break :blk null;
+                    break :blk t.events.items.len - 1;
+                } else null;
                 try ctx.stack.append(ctx.gpa, .{ .key = .{ .query = qi, .index = index } });
                 // 恢复被淘汰的值：此前已完整算出过，给它一份独立的燃料，不受本次请求剩余燃料的影响，
                 // 否则恢复出的结果可能不完整（如 hover 偶尔显示 unknown）
@@ -600,10 +713,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 } else Q.compute(ctx, key);
                 var value = computed catch |err| {
                     var frame = ctx.stack.pop().?;
+                    ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(ctx.db.gpa);
                     return err;
                 };
                 var frame = ctx.stack.pop().?;
+                ctx.finishTiming(qi, &frame, t0, trace_index, false);
 
                 db.mutex.lockUncancelable(db.io);
                 defer db.mutex.unlock(db.io);
@@ -616,10 +731,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     // 并发读者已在本 revision 发布结果，以它为准
                     if (published) {
                         const old = slot.memo.?;
-                        return .{ .value = old.value, .changed_at = old.changed_at, .durability = old.durability };
+                        return .{ .value = old.value, .changed_at = old.changed_at, .durability = old.durability, .executed = true };
                     }
                     // 环中的结果依赖于入口，不写入 memo
-                    return .{ .value = value, .changed_at = db.revision, .durability = .low };
+                    return .{ .value = value, .changed_at = db.revision, .durability = .low, .executed = true };
                 }
 
                 const deps = frame.deps.toOwnedSlice(db.gpa) catch |err| {
@@ -639,6 +754,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     } else if (valueEql(Q, old.value, value)) {
                         // early cutoff：保留旧值与旧 changed_at
                         changed_at = old.changed_at;
+                        _ = db.counters[qi].cutoffs.fetchAdd(1, .monotonic);
+                        if (ctx.trace) |t| if (trace_index) |ti| {
+                            t.events.items[ti].cutoff = true;
+                        };
                         deinitValue(Q, &value, db.gpa);
                         value = old.value;
                     } else {
@@ -654,7 +773,24 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     .deps = deps,
                     .last_used = db.access_tick.fetchAdd(1, .monotonic),
                 };
-                return .{ .value = value, .changed_at = changed_at, .durability = frame.durability };
+                return .{ .value = value, .changed_at = changed_at, .durability = frame.durability, .executed = true };
+            }
+
+            /// 记录一次 compute 的耗时：累计、自身（扣除其中执行的其他 query）与最长；计入外层帧的子耗时
+            fn finishTiming(ctx: *Ctx, comptime qi: usize, frame: *const Frame, t0: Io.Timestamp, trace_index: ?usize, failed: bool) void {
+                const db = ctx.db;
+                const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(db.io)).nanoseconds));
+                const c = &db.counters[qi];
+                _ = c.total_ns.fetchAdd(ns, .monotonic);
+                _ = c.self_ns.fetchAdd(ns -| frame.child_ns, .monotonic);
+                _ = c.max_ns.fetchMax(ns, .monotonic);
+                if (ctx.stack.items.len > 0) ctx.stack.items[ctx.stack.items.len - 1].child_ns += ns;
+                if (frame.in_cycle) _ = c.incomplete.fetchAdd(1, .monotonic);
+                if (ctx.trace) |t| if (trace_index) |ti| {
+                    t.events.items[ti].ns = ns;
+                    t.events.items[ti].failed = failed;
+                    t.events.items[ti].incomplete = frame.in_cycle;
+                };
             }
         };
 

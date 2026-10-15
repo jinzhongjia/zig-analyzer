@@ -1,6 +1,12 @@
 const std = @import("std");
 const za = @import("zig_analyzer");
 
+/// 级别由配置在运行时决定（`log.level`），编译期不过滤
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = za.util.log.logFn,
+};
+
 const usage =
     \\Usage: zig-analyzer [options]
     \\

@@ -188,7 +188,7 @@ const Burn = struct {
     pub const cost = 1000;
     pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
         if (ctx.fuel < cost) {
-            ctx.markIncomplete();
+            ctx.markIncomplete(.fuel);
             return -1;
         }
         ctx.fuel -= cost;
@@ -199,7 +199,7 @@ const Burn = struct {
 const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Cached, CachedLen, Burn });
 
 fn executions(d: *Db, comptime Q: type) u64 {
-    return d.executions[Db.queryIndex(Q)].load(.monotonic);
+    return d.executions(Q);
 }
 
 fn setNumber(d: *Db, comptime Q: type, key: u32, value: i64, durability: db.Durability) !void {
@@ -480,4 +480,43 @@ test "lru: restoring an evicted value does not depend on the remaining fuel" {
     try testing.expectEqual(3, executions(&d, Burn));
     try testing.expectEqual(42, try read(&d, Burn, 1));
     try testing.expectEqual(3, executions(&d, Burn));
+}
+
+test "stats: executions, hits, cutoffs and timing; trace records the call tree" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 42, .low);
+
+    var trace: db.Trace = .{ .gpa = testing.allocator };
+    defer trace.events.deinit(testing.allocator);
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        ctx.trace = &trace;
+        try testing.expectEqual(5, try ctx.get(Plus, 1));
+        try testing.expectEqual(5, try ctx.get(Plus, 1));
+    }
+    // 先序：Plus 在前（深度 0），Tens 在其中（深度 1）；第二次读取是命中，不再执行
+    try testing.expectEqual(2, trace.events.items.len);
+    try testing.expectEqual(Db.queryIndex(Plus), trace.events.items[0].query);
+    try testing.expectEqual(0, trace.events.items[0].depth);
+    try testing.expectEqual(Db.queryIndex(Tens), trace.events.items[1].query);
+    try testing.expectEqual(1, trace.events.items[1].depth);
+    try testing.expect(trace.events.items[0].ns >= trace.events.items[1].ns);
+    try testing.expectEqual(1, d.keyAt(Plus, trace.events.items[0].key));
+
+    // 42 → 47：Tens 重算但结果不变（cutoff），Plus 不重算
+    try setNumber(&d, Number, 1, 47, .low);
+    try testing.expectEqual(5, try read(&d, Plus, 1));
+    var stats: [Db.query_types.len]db.QueryStats = undefined;
+    _ = d.stats(&stats);
+    const plus = stats[Db.queryIndex(Plus)];
+    const tens = stats[Db.queryIndex(Tens)];
+    try testing.expectEqual(1, plus.executions);
+    try testing.expectEqual(2, plus.hits);
+    try testing.expectEqual(2, tens.executions);
+    try testing.expectEqual(1, tens.cutoffs);
+    try testing.expectEqual(1, plus.memos);
+    try testing.expect(plus.total_ns >= plus.self_ns);
+    try testing.expect(plus.max_ns <= plus.total_ns);
 }

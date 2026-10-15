@@ -4,11 +4,29 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // tracy（设计 §14）：-Dtracy=<tracy 源码目录> 时编译其客户端，query 与请求以 zone 标注
+    const tracy = b.option([]const u8, "tracy", "Enable Tracy profiling, with the path to the Tracy source checkout");
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "tracy", tracy != null);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/zig_analyzer.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod.addOptions("build_options", build_options);
+    if (tracy) |dir| {
+        mod.addCSourceFile(.{
+            .file = .{ .cwd_relative = b.pathJoin(&.{ dir, "public", "TracyClient.cpp" }) },
+            .flags = &.{ "-DTRACY_ENABLE=1", "-fno-sanitize=undefined" },
+        });
+        mod.link_libc = true;
+        mod.link_libcpp = true;
+        if (target.result.os.tag == .windows) {
+            mod.linkSystemLibrary("dbghelp", .{});
+            mod.linkSystemLibrary("ws2_32", .{});
+        }
+    }
 
     const exe = b.addExecutable(.{
         .name = "zig-analyzer",
@@ -104,15 +122,17 @@ pub fn build(b: *std.Build) void {
     patch_run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "compiler/test_runner.zig"));
     const test_runner = patch_run.addOutputFileArg("test_runner.zig");
 
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/zig_analyzer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+    });
+    test_mod.addOptions("build_options", build_options);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         // 保留帧指针：优化模式下泄漏报告的调用栈才完整
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zig_analyzer.zig"),
-            .target = target,
-            .optimize = optimize,
-            .omit_frame_pointer = false,
-        }),
+        .root_module = test_mod,
         .test_runner = .{ .path = test_runner, .mode = .server },
     })).step);
 }

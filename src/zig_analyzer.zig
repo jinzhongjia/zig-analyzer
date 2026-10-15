@@ -1,6 +1,8 @@
 pub const version = "0.0.0-dev";
 
 pub const db = @import("db/engine.zig");
+/// 查询统计的文本报告
+pub const db_report = @import("db/report.zig");
 pub const Server = @import("server/Server.zig");
 pub const base = struct {
     pub const Vfs = @import("base/Vfs.zig");
@@ -71,6 +73,8 @@ pub const ide_db = struct {
 };
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");
+    pub const log = @import("util/log.zig");
+    pub const tracy = @import("util/tracy.zig");
     /// 仅供测试：posix 写法的路径转为本机路径
     pub const test_path = @import("util/test_path.zig");
 };
@@ -85,6 +89,7 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(base);
+    std.testing.refAllDecls(db_report);
     std.testing.refAllDecls(util);
     std.testing.refAllDecls(syntax);
     std.testing.refAllDecls(hir);

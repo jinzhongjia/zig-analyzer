@@ -86,6 +86,8 @@ progress: Progress = .{},
 graph_mutex: Io.Mutex = .init,
 /// 后台索引的代数：模块图每次更新加一
 index_generation: std.atomic.Value(u64) = .init(0),
+/// 慢请求日志的阈值（毫秒，0 为关闭），来自配置 `log.slow_request_ms`
+slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// 是否有索引任务在运行（同时只运行一个）
 indexing: std.atomic.Value(bool) = .init(false),
 /// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
@@ -153,6 +155,7 @@ pub fn deinit(server: *Server) void {
     for (server.workspaces.items) |ws| ws.destroy();
     server.workspaces.deinit(server.gpa);
     server.indexed.deinit(server.gpa);
+    za.util.log.setFile(null) catch {};
     for (server.retired.items) |ws| ws.destroy();
     server.retired.deinit(server.gpa);
     for (server.roots.items) |r| server.gpa.free(r);
@@ -311,7 +314,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                             return err;
                         };
                     }
-                    server.group.async(server.io, ReadTask(func).run, .{ server, arena, pending, params });
+                    server.group.async(server.io, ReadTask(func, h[0]).run, .{ server, arena, pending, params });
                 },
                 // 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
                 // 会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
@@ -326,7 +329,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                             return err;
                         };
                     }
-                    server.group.async(server.io, SemanticTask(func).run, .{ server, arena, pending, params });
+                    server.group.async(server.io, SemanticTask(func, h[0]).run, .{ server, arena, pending, params });
                 },
                 .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
                     server.destroyArena(arena);
@@ -357,7 +360,7 @@ fn BackgroundTask(comptime func: anytype) type {
     };
 }
 
-fn ReadTask(comptime func: anytype) type {
+fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
@@ -371,6 +374,12 @@ fn ReadTask(comptime func: anytype) type {
             var ctx = server.db.beginRead(a);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            var trace: za.db.Trace = .{ .gpa = a };
+            ctx.trace = &trace;
+            const zone = za.util.tracy.zone(@src(), method);
+            defer zone.end();
+            const t0 = Io.Clock.awake.now(server.io);
+            defer server.reportIfSlow(&ctx, method, t0, &trace);
 
             const result = func(server, &ctx, a, params) catch |err| {
                 return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
@@ -381,7 +390,7 @@ fn ReadTask(comptime func: anytype) type {
 }
 
 /// 同 ReadTask，处理函数拿到的是 Resolver
-fn SemanticTask(comptime func: anytype) type {
+fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
@@ -395,6 +404,12 @@ fn SemanticTask(comptime func: anytype) type {
             var ctx = server.db.beginRead(a);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            var trace: za.db.Trace = .{ .gpa = a };
+            ctx.trace = &trace;
+            const zone = za.util.tracy.zone(@src(), method);
+            defer zone.end();
+            const t0 = Io.Clock.awake.now(server.io);
+            defer server.reportIfSlow(&ctx, method, t0, &trace);
             var r: Resolver = .{ .ctx = &ctx, .arena = a };
             const result = func(server, &r, a, params) catch |err| {
                 return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
@@ -402,6 +417,114 @@ fn SemanticTask(comptime func: anytype) type {
             server.sendResponse(pending.id, result);
         }
     };
+}
+
+// ── 慢请求日志（设计 §14）────────────────────────────────────────────
+
+/// 请求耗时超过 `log.slow_request_ms` 时记录：按 query 汇总的自身耗时与调用树中的耗时路径。
+/// 在读事务结束前调用（描述 key 时读取 ItemTree）
+fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timestamp, trace: *const za.db.Trace) void {
+    const threshold = server.slow_request_ms.load(.monotonic);
+    if (threshold == 0) return;
+    const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds));
+    if (ns < @as(u64, threshold) * std.time.ns_per_ms) return;
+    var out: std.Io.Writer.Allocating = .init(ctx.gpa);
+    defer out.deinit();
+    // 调用树只展开耗时达到总耗时 2%（至少 1 ms）的节点
+    server.writeSlowReport(&out.writer, ctx, trace, @max(std.time.ns_per_ms, ns / 50)) catch return;
+    log.warn("slow request {s}: {d:.1} ms, {d} queries executed\n{s}", .{ method, za.db_report.ms(ns), trace.events.items.len, out.written() });
+}
+
+/// 慢请求报告中调用树的最大行数
+const slow_tree_lines = 40;
+
+/// 慢请求报告：按 query 汇总的自身耗时，与调用树中耗时不少于 `min_ns` 的节点
+pub fn writeSlowReport(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, trace: *const za.db.Trace, min_ns: u64) !void {
+    const events = trace.events.items;
+    // 自身耗时：先序事件中，每个事件的子事件是其后深度更大的连续事件
+    var self_by_query: [Db.query_types.len]u64 = @splat(0);
+    var count_by_query: [Db.query_types.len]u32 = @splat(0);
+    for (events, 0..) |e, i| {
+        var children: u64 = 0;
+        var j = i + 1;
+        while (j < events.len and events[j].depth > e.depth) : (j += 1) {
+            if (events[j].depth == e.depth + 1) children += events[j].ns;
+        }
+        self_by_query[e.query] += e.ns -| children;
+        count_by_query[e.query] += 1;
+    }
+    var order: [Db.query_types.len]usize = undefined;
+    for (&order, 0..) |*o, i| o.* = i;
+    std.mem.sort(usize, &order, &self_by_query, struct {
+        fn gt(t: *const [Db.query_types.len]u64, a: usize, b: usize) bool {
+            return t[a] > t[b];
+        }
+    }.gt);
+    try w.writeAll("  by query (self time):\n");
+    for (order[0..@min(order.len, 8)]) |qi| {
+        if (count_by_query[qi] == 0) break;
+        try w.print("    {s:<26} {d:>6}x {d:>9.1} ms\n", .{ za.db_report.shortName(queryName(qi)), count_by_query[qi], za.db_report.ms(self_by_query[qi]) });
+    }
+    try w.writeAll("  slowest paths:\n");
+    var lines: usize = 0;
+    var skip_below: ?u16 = null;
+    for (events) |e| {
+        if (skip_below) |d| {
+            if (e.depth > d) continue;
+            skip_below = null;
+        }
+        if (e.ns < min_ns) {
+            skip_below = e.depth;
+            continue;
+        }
+        if (lines == slow_tree_lines) {
+            try w.writeAll("    ...\n");
+            break;
+        }
+        lines += 1;
+        try w.splatByteAll(' ', 4 + @as(usize, e.depth) * 2);
+        try w.print("{s} ", .{za.db_report.shortName(queryName(e.query))});
+        try server.describeKey(w, ctx, e.query, e.key);
+        try w.print(" {d:.1} ms{s}{s}\n", .{ za.db_report.ms(e.ns), if (e.cutoff) " (cutoff)" else "", if (e.failed) " (canceled)" else "" });
+    }
+}
+
+fn queryName(qi: usize) []const u8 {
+    inline for (Db.query_types, 0..) |Q, i| if (i == qi) return @typeName(Q);
+    unreachable;
+}
+
+/// key 的可读形式：文件取文件名，成员取「文件名:成员名」，其余字段原样输出
+fn describeKey(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, qi: usize, index: u32) !void {
+    inline for (Db.query_types, 0..) |Q, i| if (i == qi) {
+        if (Q.Key == void) return;
+        return server.writeValue(w, ctx, server.db.keyAt(Q, index));
+    };
+}
+
+fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) !void {
+    const T = @TypeOf(value);
+    if (T == Vfs.FileId) return w.writeAll(std.fs.path.basename(server.vfs.path(value)));
+    if (T == za.database.hir.OwnerKey) {
+        try w.writeAll(std.fs.path.basename(server.vfs.path(value.file)));
+        const tree = ctx.get(syntax_q.FileItemTree, value.file) catch return w.print("#{d}", .{@backingInt(value.item)});
+        for (tree.items) |it| if (it.ast_id == value.item) return w.print(":{s}", .{it.name orelse "_"});
+        return w.print("#{d}", .{@backingInt(value.item)});
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| {
+            try w.writeAll("{");
+            inline for (info.field_names, 0..) |name, i| {
+                if (i > 0) try w.writeAll(" ");
+                try w.print("{s}=", .{name});
+                try server.writeValue(w, ctx, @field(value, name));
+            }
+            try w.writeAll("}");
+        },
+        .optional => if (value) |v| try server.writeValue(w, ctx, v) else try w.writeAll("null"),
+        .@"enum" => try w.print("{any}", .{value}),
+        else => try w.print("{any}", .{value}),
+    }
 }
 
 /// 与目标相关的值运算参数（指针位宽、向量的布局规则）：各模块的 builtin 一致时取该值，不一致时为未知
@@ -824,6 +947,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
     const inactive_changed = server.config.inactive_code != new.inactive_code;
+    const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
+    server.applyLogging(&new, log_file_changed);
     server.config.deinit(server.gpa);
     server.config = new;
     server.config_mutex.unlock(server.io);
@@ -841,6 +966,22 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         if (list.len != 0) log.info("build settings changed, restarting projects", .{});
         for (list) |ws| server.restartWorkspace(ws, 0);
     }
+}
+
+/// 日志级别、慢请求阈值；`reopen_file` 时按配置重新打开日志文件
+fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void {
+    za.util.log.setLevel(config.log_level);
+    server.slow_request_ms.store(config.slow_request_ms, .monotonic);
+    if (!reopen_file) return;
+    za.util.log.setFile(config.log_file) catch |err| {
+        log.warn("cannot open log file {s}: {t}", .{ config.log_file.?, err });
+        server.showWarning("cannot open log.file, logging to stderr only");
+    };
+}
+
+fn eqlOptionalStr(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 const config_request_prefix = "zig-analyzer/configuration/";
@@ -1490,6 +1631,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
                 break :blk .{};
             },
         };
+        server.applyLogging(&server.config, server.config.log_file != null);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});
 
@@ -1549,7 +1691,23 @@ const StatusResult = struct {
     revision: u64,
     files: usize,
     deep_verifications: u64,
-    queries: []const struct { name: []const u8, executions: u64 },
+    /// 进程的常驻内存峰值（KB；不支持的平台为 0）
+    max_rss_kb: u64,
+    /// InternPool 中的类型与值的个数
+    intern_pool_items: usize,
+    queries: []const struct {
+        name: []const u8,
+        executions: u64,
+        hits: u64,
+        cutoffs: u64,
+        total_ms: f64,
+        self_ms: f64,
+        max_ms: f64,
+        memos: usize,
+        incomplete: u64,
+    },
+    /// 结果不完整的原因（环、栈深度、燃料）的累计次数
+    incomplete_causes: struct { cycle: u64, stack: u64, fuel: u64 },
 };
 
 fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
@@ -1846,19 +2004,46 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
 }
 
 fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!StatusResult {
-    var counts: [Db.query_types.len]u64 = undefined;
-    const stats = server.db.stats(&counts);
-    const queries = try arena.alloc(@typeInfo(@FieldType(StatusResult, "queries")).pointer.child, counts.len);
+    var stats: [Db.query_types.len]za.db.QueryStats = undefined;
+    const summary = server.db.stats(&stats);
+    const queries = try arena.alloc(@typeInfo(@FieldType(StatusResult, "queries")).pointer.child, stats.len);
     inline for (Db.query_types, 0..) |Q, i| {
-        queries[i] = .{ .name = @typeName(Q), .executions = counts[i] };
+        const q = stats[i];
+        queries[i] = .{
+            .name = @typeName(Q),
+            .executions = q.executions,
+            .hits = q.hits,
+            .cutoffs = q.cutoffs,
+            .total_ms = za.db_report.ms(q.total_ns),
+            .self_ms = za.db_report.ms(q.self_ns),
+            .max_ms = za.db_report.ms(q.max_ns),
+            .memos = q.memos,
+            .incomplete = q.incomplete,
+        };
     }
-    const files = server.vfs.count();
     return .{
-        .revision = stats.revision,
-        .files = files,
-        .deep_verifications = stats.deep_verifications,
+        .revision = summary.revision,
+        .files = server.vfs.count(),
+        .deep_verifications = summary.deep_verifications,
+        .max_rss_kb = maxRssKb(),
+        .intern_pool_items = server.ip.count(),
         .queries = queries,
+        .incomplete_causes = .{
+            .cycle = summary.incomplete_causes.get(.cycle),
+            .stack = summary.incomplete_causes.get(.stack),
+            .fuel = summary.incomplete_causes.get(.fuel),
+        },
     };
+}
+
+/// 进程的常驻内存峰值（KB）
+fn maxRssKb() u64 {
+    const builtin_os = @import("builtin").os.tag;
+    if (builtin_os == .windows or builtin_os == .wasi) return 0;
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    const rss: u64 = @intCast(@max(0, usage.maxrss));
+    // macOS 以字节为单位，Linux 以 KB 为单位
+    return if (builtin_os == .macos) rss / 1024 else rss;
 }
 
 // ── 发送 ─────────────────────────────────────────────────────────────

@@ -396,6 +396,13 @@ fn dupeNames(a: Allocator, names: []const []const u8) Allocator.Error![]const []
 }
 
 /// 返回的 Key 中的切片在 InternPool 生命周期内有效
+/// 已驻留的类型与值的个数
+pub fn count(ip: *InternPool) usize {
+    ip.mutex.lockUncancelable(ip.io);
+    defer ip.mutex.unlock(ip.io);
+    return ip.items.items.len;
+}
+
 pub fn key(ip: *InternPool, index: Index) Key {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);

@@ -47,6 +47,7 @@ const Client = struct {
     build_tokens: std.ArrayList([]const u8) = .empty,
     /// 最近一次构建结束时的消息（如 `1 error(s)`）
     build_message: []const u8 = "",
+    last_counts: []const QueryCount = &.{},
 
     fn send(c: *Client, value: anytype) !void {
         const body = try json.Stringify.valueAlloc(c.gpa, value, .{ .emit_null_optional_fields = false });
@@ -55,6 +56,21 @@ const Client = struct {
         try w.print("Content-Length: {d}\r\n\r\n", .{body.len});
         try w.writeAll(body);
         try w.flush();
+    }
+
+    /// 上一个阶段以来各 query 的执行次数与累计耗时的增量（BENCH_VERBOSE）
+    fn phase(c: *Client, name: []const u8) !void {
+        const now = try queryCounts(c);
+        const st, _ = try c.request("zig-analyzer/status", {});
+        std.debug.print("    phase `{s}` (revision {d}):", .{ name, st.object.get("result").?.object.get("revision").?.integer });
+        for (now) |q| {
+            const before: QueryCount = for (c.last_counts) |b| {
+                if (std.mem.eql(u8, b.name, q.name)) break b;
+            } else .{ .name = q.name, .n = 0, .ms = 0 };
+            if (q.n != before.n) std.debug.print(" {s} +{d} ({d:.0} ms)", .{ za.db_report.shortName(q.name), q.n - before.n, q.ms - before.ms });
+        }
+        std.debug.print("\n", .{});
+        c.last_counts = now;
     }
 
     fn notify(c: *Client, method: []const u8, params: anytype) !void {
@@ -109,7 +125,7 @@ const Client = struct {
         }
     }
 
-    /// 等待 `uri` 的诊断满足 `pred`，返回耗时
+    /// 等待 `uri` 的错误诊断个数满足 `pred`，返回耗时（提示等其他级别不计，如非活动代码）
     fn waitDiagnostics(c: *Client, uri: []const u8, t0: Io.Timestamp, comptime pred: fn (usize) bool) !f64 {
         while (true) {
             const msg = try c.next();
@@ -117,7 +133,12 @@ const Client = struct {
             if (!std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) continue;
             const params = msg.object.get("params").?.object;
             if (!std.mem.eql(u8, params.get("uri").?.string, uri)) continue;
-            if (pred(params.get("diagnostics").?.array.items.len)) return ms(c.io, t0);
+            var errors: usize = 0;
+            for (params.get("diagnostics").?.array.items) |d| {
+                const severity = d.object.get("severity") orelse continue;
+                if (severity == .integer and severity.integer == 1) errors += 1;
+            }
+            if (pred(errors)) return ms(c.io, t0);
         }
     }
 };
@@ -165,15 +186,57 @@ const Stats = struct {
     }
 };
 
-const QueryCount = struct { name: []const u8, n: i64 };
+const QueryCount = struct { name: []const u8, n: i64, ms: f64 = 0 };
 
 /// 各查询的累计执行次数（zig-analyzer/status）
 fn queryCounts(c: *Client) ![]QueryCount {
     const resp, _ = try c.request("zig-analyzer/status", {});
     const qs = resp.object.get("result").?.object.get("queries").?.array.items;
     const out = try c.arena.allocator().alloc(QueryCount, qs.len);
-    for (qs, out) |q, *o| o.* = .{ .name = q.object.get("name").?.string, .n = q.object.get("executions").?.integer };
+    for (qs, out) |q, *o| {
+        const t = q.object.get("total_ms").?;
+        o.* = .{ .name = q.object.get("name").?.string, .n = q.object.get("executions").?.integer, .ms = switch (t) {
+            .float => |f| f,
+            .integer => |x| @floatFromInt(x),
+            else => 0,
+        } };
+    }
     return out;
+}
+
+/// 服务器整个运行期间各 query 的耗时（zig-analyzer/status），按自身耗时排序
+fn printQueryTable(c: *Client) !void {
+    const resp, _ = try c.request("zig-analyzer/status", {});
+    const qs = resp.object.get("result").?.object.get("queries").?.array.items;
+    const a = c.arena.allocator();
+    const names = try a.alloc([]const u8, qs.len);
+    const stats = try a.alloc(za.db.QueryStats, qs.len);
+    const ns = struct {
+        fn of(v: json.Value) u64 {
+            const f: f64 = switch (v) {
+                .float => |x| x,
+                .integer => |x| @floatFromInt(x),
+                else => 0,
+            };
+            return @intFromFloat(f * std.time.ns_per_ms);
+        }
+    }.of;
+    for (qs, names, stats) |q, *n, *st| {
+        const o = q.object;
+        n.* = o.get("name").?.string;
+        st.* = .{
+            .executions = @intCast(o.get("executions").?.integer),
+            .hits = @intCast(o.get("hits").?.integer),
+            .cutoffs = @intCast(o.get("cutoffs").?.integer),
+            .total_ns = ns(o.get("total_ms").?),
+            .self_ns = ns(o.get("self_ms").?),
+            .max_ns = ns(o.get("max_ms").?),
+            .memos = @intCast(o.get("memos").?.integer),
+        };
+    }
+    var out: std.Io.Writer.Allocating = .init(a);
+    try za.db_report.writeTable(&out.writer, names, stats, 12);
+    std.debug.print("queries (whole run):\n{s}", .{out.written()});
 }
 
 fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
@@ -240,6 +303,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("  first hover            {d:.1}ms (open → {d:.1}ms)\n", .{ first_hover, ms(io, t_open) });
         _ = try c.request("zig-analyzer/waitIdle", {});
         std.debug.print("  open → project idle    {d:.1}ms\n", .{ms(io, t_open)});
+        if (verbose) try c.phase("open + project load");
         if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  memory after idle {d:.0} MB\n", .{mb});
         _, const first_after = try c.request("textDocument/hover", .{ .textDocument = doc, .position = first[0] });
         std.debug.print("  first hover after idle {d:.1}ms\n", .{first_after});
@@ -280,6 +344,7 @@ pub fn main(init: std.process.Init) !u8 {
                 };
             }
             Stats.print(method["textDocument/".len..], times);
+            if (verbose) try c.phase(method);
             if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  {s:<12} memory {d:.0} MB\n", .{ "", mb });
             std.debug.print("  {s:<12} non-null {d}/{d}\n", .{ "", hits, positions.len });
             std.debug.print("  {s:<12} first pass max {d:.1}ms\n", .{ "", cold_max });
@@ -304,6 +369,10 @@ pub fn main(init: std.process.Init) !u8 {
             }
             Stats.print("edit→diag", &edit_times);
             Stats.print("undo→clear", &clear_times);
+            if (verbose) {
+                _ = try c.request("zig-analyzer/waitIdle", {});
+                try c.phase("edits (incl. background work until idle)");
+            }
 
             // 保存 → 编译器诊断（BENCH_SAVE=1）：在磁盘文件末尾写入一个语义错误（AstGen 不报，只有编译器报），
             // 保存后等诊断出现，再恢复原文件并等诊断清除。会改写项目中的文件，结束时恢复
@@ -333,6 +402,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("resident memory {d:.0} MB\n", .{mb});
+    try printQueryTable(&c);
     _ = try c.request("shutdown", {});
     try c.send(.{ .jsonrpc = "2.0", .method = "exit" });
     _ = try c.child.wait(io);

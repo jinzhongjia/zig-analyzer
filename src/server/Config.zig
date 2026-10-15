@@ -5,7 +5,8 @@
 //!
 //!     { "zig": { "path": "/usr/local/bin/zig" },
 //!       "build": { "args": ["-Dtarget=aarch64-linux"] },
-//!       "diagnostics": { "step": "check", "inactive_code": true } }
+//!       "diagnostics": { "step": "check", "inactive_code": true },
+//!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 
 const std = @import("std");
 const json = std.json;
@@ -14,6 +15,12 @@ const Allocator = std.mem.Allocator;
 const Config = @This();
 
 arena: std.heap.ArenaAllocator.State = .{},
+/// 日志级别（err / warn / info / debug）
+log_level: std.log.Level = .info,
+/// 日志同时追加到这个文件；null 为只写 stderr
+log_file: ?[]const u8 = null,
+/// 请求超过这么多毫秒时记录查询耗时（慢请求日志）；0 为关闭
+slow_request_ms: u32 = 100,
 /// zig 可执行文件；null 时从 PATH 查找
 zig_path: ?[]const u8 = null,
 /// 传给 `zig build` 的额外参数（如 `-Dtarget=...`）
@@ -27,6 +34,7 @@ const Json = struct {
     zig: ?struct { path: ?[]const u8 = null } = null,
     build: ?struct { args: ?[]const []const u8 = null } = null,
     diagnostics: ?struct { step: ?[]const u8 = null, inactive_code: ?bool = null } = null,
+    log: ?struct { level: ?std.log.Level = null, file: ?[]const u8 = null, slow_request_ms: ?u32 = null } = null,
 };
 
 pub fn deinit(c: *Config, gpa: Allocator) void {
@@ -49,6 +57,9 @@ pub fn parse(gpa: Allocator, value: json.Value) error{ OutOfMemory, InvalidConfi
         .build_args = if (j.build) |b| b.args orelse &.{} else &.{},
         .diagnostics_step = if (j.diagnostics) |d| d.step else null,
         .inactive_code = if (j.diagnostics) |d| d.inactive_code orelse true else true,
+        .log_level = if (j.log) |l| l.level orelse .info else .info,
+        .log_file = if (j.log) |l| l.file else null,
+        .slow_request_ms = if (j.log) |l| l.slow_request_ms orelse 100 else 100,
     };
 }
 
@@ -63,6 +74,9 @@ pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
         .build_args = args,
         .diagnostics_step = if (c.diagnostics_step) |s| try a.dupe(u8, s) else null,
         .inactive_code = c.inactive_code,
+        .log_level = c.log_level,
+        .log_file = if (c.log_file) |f| try a.dupe(u8, f) else null,
+        .slow_request_ms = c.slow_request_ms,
         .arena = arena.state,
     };
 }

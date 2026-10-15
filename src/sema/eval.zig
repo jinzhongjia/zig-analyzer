@@ -434,7 +434,7 @@ const Evaluator = struct {
         }
         // 本次请求的燃料耗尽或嵌套过深：结果取决于请求，不写入 memo
         if (ctx.fuel == 0) {
-            ctx.markIncomplete();
+            ctx.markIncomplete(.fuel);
             return error.Abort;
         }
         if (ctx.stackExhausted()) {
