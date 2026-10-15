@@ -300,12 +300,13 @@ const Inferrer = struct {
         };
         const ty: Index = (try inf.inferComptime(ty_e, null)).asType() orelse .unknown;
         if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, a, ty)) orelse a };
-        if (ty == .type_type and (arg == null or arg.? == .unknown)) return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = inf.body_owner(), .binding = @backingInt(p), .name = binding.name } }));
+        if (ty == .type_type and (arg == null or arg.? == .unknown)) return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(p), .name = binding.name } }));
         return .{ .ty = ty };
     }
 
-    fn body_owner(inf: *Inferrer) ItemTree.AstId {
-        return (inf.r.itemTree(inf.file) catch unreachable).items[inf.item].ast_id;
+    /// 读取 ItemTree 是 query：即使已缓存，读事务被写事务或客户端取消时也会返回 `error.Canceled`
+    fn body_owner(inf: *Inferrer) Error!ItemTree.AstId {
+        return (try inf.r.itemTree(inf.file)).items[inf.item].ast_id;
     }
 
     /// 实际执行到的 return 的值：都相同时带值，否则为类型的 peer
@@ -1453,7 +1454,7 @@ const Inferrer = struct {
                         // 元素为类型（`inline for (.{ f32, f64 }) |T|`）：每次迭代的类型不同，与泛型函数的
                         // `comptime T: type` 一样按抽象参数推导
                         inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
-                            TypedValue.ofType(try ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }))
+                            TypedValue.ofType(try ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }))
                         else
                             .{ .ty = if (ptr) try ip.ptrTo(elem, .one, false) else elem };
                     }
