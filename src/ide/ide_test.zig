@@ -554,6 +554,50 @@ test "goto declaration of labels and field names in initializers" {
     }
 }
 
+test "goto declaration of enum literals compared with enums and tagged unions" {
+    const text =
+        \\const E = enum { a, b };
+        \\const U = union(enum) { int: u32, none };
+        \\fn tag(x: u32) E {
+        \\    return if (x == 0) .a else .b;
+        \\}
+        \\fn f(e: E, u: U) bool {
+        \\    const x: E = .a;
+        \\    if (u == .none) return false;
+        \\    if (u != .int) return false;
+        \\    if (.b == e) return true;
+        \\    return e == .b and tag(1) != .a and x == .a;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "a;\n    if", "a, b }" },
+        .{ "none) return", "none };" },
+        .{ "int) return", "int: u32" },
+        .{ "b and", "b }" },
+        .{ "a and", "a, b }" },
+        .{ "b == e", "b }" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 20)] });
+            return err;
+        };
+    }
+}
+
 test "inlay hint options" {
     const text =
         \\fn add(a: u32, b: u32) u32 {

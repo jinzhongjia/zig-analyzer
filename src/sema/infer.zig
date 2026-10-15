@@ -421,6 +421,15 @@ const Inferrer = struct {
             .optional_type => |c| c,
             else => t,
         };
+        // `union(enum)` 生成的标签枚举：成员是 union 的字段
+        const want_union = switch (inf.ip.key(want)) {
+            .union_tag_type => |u| u,
+            else => want,
+        };
+        return inf.recordTagMemberOf(e, want_union);
+    }
+
+    fn recordTagMemberOf(inf: *Inferrer, e: ExprId, want: Index) Error!void {
         const c = switch (inf.ip.key(want)) {
             .container_type => |c| c,
             else => return,
@@ -1566,6 +1575,18 @@ const Inferrer = struct {
 
     // ── 运算 ─────────────────────────────────────────────────────────
 
+    /// 比较中另一侧的结果类型：带标签的 union 与标签比较，另一侧按标签类型（`u == .none`）
+    fn comparedType(inf: *Inferrer, t: Index) Error!?Index {
+        if (t == .unknown or t == .comptime_int_type) return null;
+        const is_union = switch (inf.ip.key(t)) {
+            .container_type => |c| c.kind == .@"union",
+            .reified_type => |rt| rt.kind == .@"union",
+            else => false,
+        };
+        if (is_union) return try eval.unionTag(inf.r, t);
+        return t;
+    }
+
     fn binary(inf: *Inferrer, e: ExprId, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId, expected: ?Index) Error!TypedValue {
         const ip = inf.ip;
         switch (op) {
@@ -1592,14 +1613,15 @@ const Inferrer = struct {
                 return .{ .ty = .bool_type };
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                const lhs = try inf.infer(lhs_e, null);
-                // 带标签的 union 与标签比较：另一侧不按 union 类型转换
-                const is_union = switch (ip.key(lhs.ty)) {
-                    .container_type => |c| c.kind == .@"union",
-                    .reified_type => |rt| rt.kind == .@"union",
-                    else => false,
+                // 枚举字面量在左侧（`.a == e`）：先推导右侧，字面量按右侧的类型（peer）
+                const literal_lhs = inf.body.expr(lhs_e) == .enum_literal and inf.body.expr(rhs_e) != .enum_literal;
+                const lhs, const rhs = if (literal_lhs) blk: {
+                    const r = try inf.infer(rhs_e, null);
+                    break :blk .{ try inf.infer(lhs_e, try inf.comparedType(r.ty)), r };
+                } else blk: {
+                    const l = try inf.infer(lhs_e, null);
+                    break :blk .{ l, try inf.infer(rhs_e, try inf.comparedType(l.ty)) };
                 };
-                const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type and !is_union) lhs.ty else null);
                 // 向量逐元素比较，结果为 bool 的向量
                 const vec_len: ?u32 = switch (ip.key(lhs.ty)) {
                     .vector_type => |v| v.len,
