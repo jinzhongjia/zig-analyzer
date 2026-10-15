@@ -717,6 +717,7 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 | `inlay_hints.types` / `.parameters` | `true` | 类型提示 / 参数名提示（变化后请客户端刷新） |
 | `inlay_hints.hide_redundant_param_names` | `true` | 实参是同名变量（或以形参名结尾的字段访问）时不显示形参名 |
 | `sema.callsite_seeding` | `true` | 泛型函数体内没有具体类型时是否以调用点的实例推导（hover、补全、inlay hints 等） |
+| `sema.max_intern_pool_mb` | `64` | InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导，见 §19.26）；`0` 不回收 |
 | `log.level` / `log.file` | `info` / 无 | 日志级别与文件 |
 | `log.slow_request_ms` | `100` | 请求超过此耗时时记录慢请求日志；`0` 关闭 |
 
@@ -932,7 +933,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | InternPool 的锁 | 读写共用一把互斥锁，`key()` 读取也要加锁 | 类型推导并发请求多、InternPool 很大时的锁竞争 | 分片，或读路径改为无锁（只追加的分段数组） | M4 |
 | 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
 | ~~读请求用 `async` 提交~~ | 已处理，见 §19.24 | — | — | §19.24 |
-| 泛型实例的内存 | 推导结果已按 LRU 回收（M7，`Infer` 上限 16384 个）；InternPool 中的实例与类型仍只增不减。实测：标准库全量推导的最大 RSS 1.24 GB；InternPool 17 万项 | 长时间运行、大量不同的实例化 | InternPool 代际回收（§9.1） | M5 |
+| ~~泛型实例的内存~~ | 已处理，见 §19.26 | — | — | §19.26 |
 | 实例化与 comptime 求值的推导耗时 | 同一台机器上标准库全量推导：M4 1.44 秒 → M5（实例化）1.92 秒 → M5（解释器）2.91 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
 | workspace symbol 的匹配 | 每次请求遍历全部项目文件的 ItemTree 做子序列匹配，没有 trigram 索引（§10.2） | 文件很多的项目中逐字输入查询 | `file_index` 增加声明名的 trigram，先粗筛文件 | M6 |
 | 引用查找的反向 import 图 | 每次查找引用都现场构建反向图；各文件的 `FileIndex` 由后台索引预先算好（M7），构建只需读取缓存。实测冷缓存下在标准库（563 个文件）上查找 `mem.Allocator` 的引用 0.36～0.43 秒（含全部文件的解析），热缓存下几十毫秒 | 更大的项目，或频繁的 document highlight | 反向 import 图做成 query | M6 |
@@ -1259,6 +1260,24 @@ Zig 0.17.0 编译器源码、`src/Sema.zig`（3.56 万行），4 核云主机，
 - 按键 → hover 的下限约 100 ms：每次按键后 hover 要重新解析 Sema.zig（增量解析约 65 ms）并重建 ItemTree、FileIndex 等。
 - 测试：`zig build test` 共 248 个（连续编辑只发布一次且按最后的文本；`live.Prepared` 的匹配、取用与淘汰；发布时 `AstCheck` 取用预先算好的结果）。
 
+### 19.26 长时间会话的内存（2026-10-15）
+
+基准新增「长时间会话」（`BENCH_SESSION=<轮数>`）：每轮在项目的 25 个文件中打开、hover、补全、编辑并关闭，逐轮向后轮换；每轮结束后从 `zig-analyzer/status` 读取内存的分布。`status` 新增存活的堆内存（可执行文件以计数分配器包装 gpa）、InternPool 的字节数，以及每个 query 的 key 数、依赖边数与保留值的字节数（query 声明 `bytes`）。
+
+Zig 0.17.0 编译器源码（含标准库，2940 个 .zig 文件），4 核云主机，ReleaseSafe，关闭编译器诊断。最初的测量（40 轮）：常驻内存 182 → 998 MB，堆在 400 MB 左右波动；InternPool 只有 54 MB（不是方案中预想的大头），ItemBody 最高 335 MB；sema 的 key 与依赖边（26.7 万 / 143 万）只增不减。
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 分配器 | `src/main.zig` | ReleaseSafe 下 `init.gpa` 是查错用的 `SafeAllocator`：每次分配附带元数据与调用栈，小分配所在的桶要等其中全部释放才归还。非 Debug 构建改用 `smp_allocator`，Debug 下保留 `init.gpa`（退出时报告泄漏）。常驻内存 998 → 562 MB；分配也更快：hover p50 3.2 → 0.7 ms，连续输入时按键后 hover p50 141 → 31 ms，Sema.zig 上编辑 → 诊断 472 → 95 ms |
+| 按字节数的 LRU | `src/db/engine.zig` | query 可声明 `lru_bytes`：保留值的字节数超过上限时按最近使用淘汰（个数与字节数都降到上限的 3/4）。`ItemBody` 与 `Infer` 各 48 MB：只按个数（16384）时，长函数的 HIR 可使 ItemBody 达到 300 MB 以上。值的字节数须在存入后不变（`ParseFile` 的增量解析共享旧结果，不声明） |
+| 整代回收 | `src/db/engine.zig`、`src/sema/InternPool.zig`、`src/server/Server.zig` | 引擎 `resetQueries`：清空指定 query 的 key 与 memo，其他 query 中依赖它们的 memo 一并丢弃（依赖边按 key 的下标记录，清空后失效），推进 revision 并标记所有 durability 层已变化。`InternPool.reset` 回收全部非预置的项。InternPool 超过 `sema.max_intern_pool_mb` 时，在读请求与诊断发布之后的空闲处，在一个写事务中回收 InternPool 与 key 或值引用它的 query（`Infer`、`LocalValue`、`DeclType`、`CallEval`、`ErrorSetOf`、调用点种子） |
+| 诊断的文案 | `src/diagnostics/compiler.zig` | 发布的诊断复制文案：live 诊断的文案属于 `AstCheck` 的 memo，编译器诊断的文案属于工作区的构建结果，发布在读事务结束、工作区的锁释放之后才序列化，期间两者都可能被释放 |
+
+62 轮的结果（默认配置）：常驻内存 642 MB（此前 807～998 MB），堆稳定在 340～400 MB（此前 616 MB），ItemBody ≤ 48 MB，InternPool 达到 64 MB 时回收一次。最后一轮的堆：FileText 74 MB、FileItemTree 56 MB、Infer 41 MB、ItemBody 34 MB、InternPool 55 MB、未归属 85 MB（引擎的表与依赖边、Vfs 等）。前两者随访问过的文件数增长，上限是项目本身的大小。常驻内存比堆多出的部分来自 `smp_allocator` 不把小块内存还给操作系统。
+
+- 未解决：开启整代回收（阈值 24 MB）的一次 62 轮会话在第 60 轮崩溃一次：诊断发布中推导某个成员时 `Inferrer.exprs` 的长度（按 Body 分配）与 Body 不一致（`isConstPlace` 下标越界），即 Body 在推导中途被改写。此后同样配置的 7 次会话（共 40 余次回收，其中 2 次用释放即毒化的分配器）都未复现；引擎中释放值的路径（LRU 淘汰、垃圾回收、`resetQueries`）都只在独占锁下进行，读写锁的 `tryLock` 实现也已核对。`SafeAllocator` 不复用内存，释放后读取只会读到旧数据，因此这类问题此前可能被掩盖。继续在长时间会话中观察。
+- 测试：`zig build test` 共 253 个（`resetQueries` 清空 key 并使依赖它的 memo 重算；`lru_bytes` 按字节数淘汰最旧的值；`InternPool.reset` 保留预置项；回收前后 hover 结果相同；计数分配器）。
+
 ## 20. 风险与对策
 
 | 风险 | 影响 | 对策 |
@@ -1267,7 +1286,7 @@ Zig 0.17.0 编译器源码、`src/Sema.zig`（3.56 万行），4 核云主机，
 | 构建系统协议 / `Configuration` 格式随版本变化 | 无法获取项目模型 | 握手校验 `build_system_version`，不匹配时提示并降级为单文件模式；发布版本与 Zig 版本一一对应 |
 | comptime 解释器复杂度 | 工期、性能 | 燃料上限 + `unknown` 兜底；先覆盖 std 中高频模式，以测试集驱动 |
 | 自研 CST 与 `std.zig.Ast` 行为不一致 | 结构差异导致错误定位偏差 | corpus 对拍；格式化与 AstGen 始终用标准库 |
-| InternPool 只增不减 | 长时间运行内存增长 | 监控 + 设上限；v2 引入代际回收或重启引擎状态 |
+| InternPool 只增不减 | 长时间运行内存增长 | 超过 `sema.max_intern_pool_mb` 时整代回收（§19.26） |
 | 查询引擎开销 | 小请求反而变慢 | 小 query 合并；热点 query 跳过依赖记录（标记为「易变」直接重算） |
 | 内置标准库与用户 zig 版本不同 | 进程内 AstGen 结果可能与编译器不同 | 版本不等时强制走 `zig ast-check` 慢路径；版本判断精确到 nightly 提交哈希 |
 | `-fincremental` 不成熟 | 增量编译崩溃或结果错误 | 检测编译器异常退出后自动回退非增量模式；配置可关闭 |
