@@ -701,29 +701,24 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 
 ## 15. 配置
 
-配置来源按优先级从低到高合并：内置默认值 → 全局配置文件 → 项目 `zig-analyzer.json` → 客户端 `workspace/configuration`。合并结果作为 `config` input 进入引擎，变更只让依赖相关配置项的 query 失效。
+配置来自客户端：`initialize` 的 `initializationOptions`，与 `workspace/didChangeConfiguration` 推送（或经 `workspace/configuration` 拉取）的 settings。项目级 `zig-analyzer.json`（团队共享 `build.args`、`diagnostics.steps`）留待以后；全局配置文件不做（编辑器已能管理用户级设置）。
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `zig.path` | 自动探测 `PATH` | zig 可执行文件路径 |
-| `build.enable` | `true` | 是否通过构建系统协议获取项目模型 |
-| `build.args` | `[]` | 传给 `zig build` 的额外参数（如 `-Dtarget=...`） |
-| `diagnostics.compiler` | `true` | 是否运行编译器 watch 进程 |
-| `diagnostics.steps` | `[]`（自动：`check` 否则 `install`） | 用于诊断的构建 step 列表 |
-| `diagnostics.incremental` | `true` | 是否传 `-fincremental` |
-| `diagnostics.stale_in_edited` | `"hide"` | 被修改区域内的旧编译错误：`hide` / `keep` |
+| `zig.path` | 自动探测 `PATH` | zig 可执行文件路径（重启后生效） |
+| `build.enable` | `true` | 是否通过构建系统协议获取项目模型；关闭时所有文件按单文件处理，运行中切换即时生效 |
+| `build.args` | `[]` | 传给 `zig build` 的额外参数（如 `-Dtarget=...`、`-fincremental`） |
+| `diagnostics.steps` | `[]`（自动：`check` 否则默认 step） | 用于诊断的构建 step 列表，结果合并；找不到的 step 提示后忽略。`diagnostics.step` 为单个 step 的写法，与之合并 |
+| `diagnostics.compiler` | `true` | 是否运行编译器得到诊断；关闭时构建只产出生成文件（使以生成文件为根的模块可解析），只有 live 诊断 |
 | `diagnostics.inactive_code` | `true` | 当前构建配置下不编译的代码（comptime 已知不执行的分支）是否显示为非活动代码 |
-| `inlay_hints.types` / `.parameters` | `true` | 类型提示 / 参数名提示 |
-| `inlay_hints.hide_redundant_param_names` | `true` | 实参名与形参名相同时不显示 |
-| `completion.snippets` | `true` | 函数调用补全是否带参数占位 |
-| `sema.callsite_seeding` | `true` | 泛型函数体是否用调用点实例推导 |
-| `sema.comptime_fuel` | `100000` | 单次 comptime 调用的步数上限 |
-| `cache.max_memory_mb` | `1024` | LRU 回收触发阈值 |
+| `inlay_hints.types` / `.parameters` | `true` | 类型提示 / 参数名提示（变化后请客户端刷新） |
+| `inlay_hints.hide_redundant_param_names` | `true` | 实参是同名变量（或以形参名结尾的字段访问）时不显示形参名 |
+| `sema.callsite_seeding` | `true` | 泛型函数体内没有具体类型时是否以调用点的实例推导（hover、补全、inlay hints 等） |
 | `log.level` / `log.file` | `info` / 无 | 日志级别与文件 |
 | `log.slow_request_ms` | `100` | 请求超过此耗时时记录慢请求日志；`0` 关闭 |
 
-- 配置 schema 由 `tools/gen_config.zig` 从 `config.zon` 单一来源生成：Zig 结构体、JSON Schema、文档表格，三者不会不一致。
-- 未知配置项记录警告但不报错；类型错误的配置项回落到默认值并通过 `window/showMessage` 提示一次。
+- 逐项解析：未知的项与类型错误的项合并为一条 `window/showMessage` 提示，类型错误的项取默认值，其余项照常生效；只有整个配置不是对象时才保留原来的配置。
+- 有意不提供的配置：`diagnostics.incremental`（0.17 的 `-fincremental` 会漏报错误、macOS 上输出二进制时崩溃，需要时经 `build.args` 传入）；`completion.snippets`（补全还不生成带参数占位的调用）；`sema.comptime_fuel`（燃料按读事务计，与「单次调用的步数」的语义不同，且实测不完整的结果来自环而非燃料）；`cache.max_memory_mb`（淘汰按条目数，不按字节）；`diagnostics.stale_in_edited`（没有需求）。配置的 schema 生成（`tools/gen_config.zig`）等有编辑器扩展时再做。
 
 ---
 
@@ -1205,6 +1200,17 @@ pub fn make() std.ArrayList(u8) { ... }
 - 「非活动代码区间做成 query」：不做。每次发布中求区间约 12～15 ms（编辑到诊断共 15～20 ms），但时间花在逐个成员验证依赖上——每次编辑后全部 766 个成员的 Body 都重新降级（`ItemBody` 依赖 `FileAstIdMap`，后者按指针比较），包一层 query 验证时同样要检查这些依赖。要降低的是 §19.6 中「Body 随每次解析重新降级」。
 - 「不完整的结果在同一 revision 内复用」：不做。修复环之后每次发布只剩几个不完整的推导，不值得为它设计复用的语义（不完整的结果取决于请求的燃料与栈深度）。
 - 测试：`zig build test` 共 237 个（统计与调用跟踪、日志文件的追加与级别过滤、status 与慢请求报告的端到端测试、体内容器引用外层局部绑定不形成环）。
+
+### 19.22 配置（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 解析 | `src/server/Config.zig` | 配置项登记在一张表中（分组、名字、字段），逐项解析；未知的项与类型错误的项记入 `warnings`，由服务器合并提示 |
+| 构建与诊断 | `src/server/Server.zig`、`Workspace.zig`、`src/base/ProjectModel.zig` | `build.enable`：关闭时不启动项目、所有文件按单文件处理，运行中关闭时停止项目并清除其诊断、重新打开时启动；`diagnostics.compiler`：关闭时构建只请求生成文件的产出 step（没有时不构建，并以空结果清除重启前的诊断），单文件不编译；`diagnostics.steps`：ProjectModel 的诊断 step 改为列表，编译集合、构建请求与错误的收集都取全部诊断 step |
+| inlay hints | `src/ide/inlay_hints.zig` | `Options`：类型、形参名、与实参同名时隐藏；变化后发 `workspace/inlayHint/refresh` |
+| 调用点种子 | `src/database.zig`、`src/ide/seed.zig` | `Env.callsite_seeding`（服务器持有的原子开关）；`seed.find` 在 IDE 层读取，不影响 query 结果 |
+
+- 测试：`zig build test` 共 242 个（逐项解析与警告、多个诊断 step 的合并与找不到的 step、关闭编译器诊断、运行中开关构建系统集成、inlay hints 的选项、关闭调用点种子）。
 
 ## 20. 风险与对策
 
