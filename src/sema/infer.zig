@@ -47,6 +47,8 @@ pub const Result = struct {
     field_refs: []const FieldRef = &.{},
     /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）及其期望类型：补全按它列出成员
     literal_expected: []const LiteralExpected = &.{},
+    /// comptime 已知不会执行的 `if` / `switch` 分支（最外层的）：在当前构建配置下不编译的代码
+    inactive: []const ExprId = &.{},
 
     pub const LiteralExpected = struct { expr: ExprId, ty: Index };
 
@@ -59,7 +61,7 @@ pub const Result = struct {
     };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -109,7 +111,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Re
     const ret = try inf.returnValue();
     const field_refs = try a.dupe(Result.FieldRef, inf.field_refs.items);
     const literal_expected = try a.dupe(Result.LiteralExpected, inf.literal_expected.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected };
+    const inactive = try a.dupe(ExprId, inf.inactive.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive };
 }
 
 fn empty(gpa: Allocator) Result {
@@ -140,6 +143,8 @@ const Inferrer = struct {
     current_init: ?ExprId = null,
     /// 见 `Result.literal_expected`
     literal_expected: std.ArrayList(Result.LiteralExpected) = .empty,
+    /// 见 `Result.inactive`
+    inactive: std.ArrayList(ExprId) = .empty,
     /// 实例上下文（owner 自身或外层泛型函数的实例）
     inst: ?Index,
     /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
@@ -286,6 +291,12 @@ const Inferrer = struct {
         return if (inf.ip.key(cond.ty) == .optional_type) true else null;
     }
 
+    /// `if` / `switch` 的分支：不会执行的记录为非活动代码（见 `Result.inactive`）
+    fn inferArm(inf: *Inferrer, e: ExprId, expected: ?Index, dead_branch: bool) Error!TypedValue {
+        if (dead_branch and inf.dead == 0) try inf.inactive.append(inf.scratch, e);
+        return inf.inferBranch(e, expected, dead_branch);
+    }
+
     /// 在 `dead_branch` 为真时以「不会执行」的状态推导
     fn inferBranch(inf: *Inferrer, e: ExprId, expected: ?Index, dead_branch: bool) Error!TypedValue {
         if (dead_branch) inf.dead += 1;
@@ -408,8 +419,8 @@ const Inferrer = struct {
                 try inf.bindCaptures(x.capture, cond, .if_then);
                 try inf.bindCaptures(x.else_capture, cond, .if_else);
                 const taken = inf.condValue(cond);
-                const then = try inf.inferBranch(x.then, expected, taken == false);
-                const other: TypedValue = if (x.@"else") |el| try inf.inferBranch(el, expected, taken == true) else .{ .ty = .void_type };
+                const then = try inf.inferArm(x.then, expected, taken == false);
+                const other: TypedValue = if (x.@"else") |el| try inf.inferArm(el, expected, taken == true) else .{ .ty = .void_type };
                 if (taken) |t| return if (t) then else other;
                 const ty = try inf.peer(&.{ then.ty, other.ty });
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) sameLiveValue(&.{ then, other }, ty) else null };
@@ -427,7 +438,7 @@ const Inferrer = struct {
                 var chosen_tv: TypedValue = .unknown;
                 for (s.prongs, 0..) |prong, i| {
                     try inf.bindSwitchCapture(prong, operand.ty);
-                    const tv = try inf.inferBranch(prong.body, expected, chosen != null and chosen.? != i);
+                    const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);

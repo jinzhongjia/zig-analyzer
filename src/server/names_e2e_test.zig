@@ -299,6 +299,48 @@ test "a module that is also the root of a test step is analyzed as a test" {
     try h.notify("exit", {});
 }
 
+const inactive_main =
+    \\const debug = false;
+    \\pub fn main() void {
+    \\    if (debug) {
+    \\        @panic("never");
+    \\    }
+    \\}
+    \\
+;
+
+test "code excluded by a comptime condition is published as an unnecessary hint" {
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = inactive_main }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "one.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = inactive_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const published = try h.notifications("textDocument/publishDiagnostics");
+    try testing.expect(published.len > 0);
+    const diags = published[published.len - 1].object.get("params").?.object.get("diagnostics").?.array.items;
+    var found = false;
+    for (diags) |d| {
+        if (!std.mem.eql(u8, d.object.get("source").?.string, "zig-analyzer")) continue;
+        found = true;
+        const range = d.object.get("range").?.object;
+        try testing.expectEqual(2, range.get("start").?.object.get("line").?.integer);
+        try testing.expectEqual(15, range.get("start").?.object.get("character").?.integer);
+        try testing.expectEqual(4, range.get("end").?.object.get("line").?.integer);
+        try testing.expectEqual(4, d.object.get("severity").?.integer);
+        try testing.expectEqual(1, d.object.get("tags").?.array.items[0].integer);
+    }
+    try testing.expect(found);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "@import(\"builtin\") in single-file mode is the host target" {
     var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = builtin_main }});
     defer project.deinit();

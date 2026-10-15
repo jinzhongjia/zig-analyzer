@@ -10,6 +10,7 @@ const completion = @import("completion.zig");
 const definition = @import("definition.zig");
 const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
+const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 const src =
@@ -319,4 +320,38 @@ test "completion after `.` lists members of the expected type" {
             return err;
         };
     }
+}
+
+test "branches excluded by comptime conditions are inactive" {
+    const text =
+        \\const debug = false;
+        \\fn f(x: u32) u32 {
+        \\    if (debug) {
+        \\        return x + 1;
+        \\    }
+        \\    const y = switch (@sizeOf(u16)) {
+        \\        2 => x,
+        \\        else => x * 2,
+        \\    };
+        \\    if (x > 3) return y;
+        \\    return y;
+        \\}
+        \\fn g(comptime T: type, x: T) T {
+        \\    if (T == u8) return x;
+        \\    return x;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    // 运行时的条件与取决于抽象参数的条件不是非活动代码
+    try testing.expectEqual(2, ranges.len);
+    try testing.expectEqualStrings("{\n        return x + 1;\n    }", text[ranges[0].start..ranges[0].end]);
+    try testing.expectEqualStrings("x * 2", text[ranges[1].start..ranges[1].end]);
 }

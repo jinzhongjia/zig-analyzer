@@ -5,7 +5,7 @@
 //!
 //!     { "zig": { "path": "/usr/local/bin/zig" },
 //!       "build": { "args": ["-Dtarget=aarch64-linux"] },
-//!       "diagnostics": { "step": "check" } }
+//!       "diagnostics": { "step": "check", "inactive_code": true } }
 
 const std = @import("std");
 const json = std.json;
@@ -20,11 +20,13 @@ zig_path: ?[]const u8 = null,
 build_args: []const []const u8 = &.{},
 /// 用于诊断的 step；null 时用 `check`，没有则用默认 step
 diagnostics_step: ?[]const u8 = null,
+/// 是否把当前构建配置下不编译的代码（comptime 已知不执行的分支）显示为非活动代码
+inactive_code: bool = true,
 
 const Json = struct {
     zig: ?struct { path: ?[]const u8 = null } = null,
     build: ?struct { args: ?[]const []const u8 = null } = null,
-    diagnostics: ?struct { step: ?[]const u8 = null } = null,
+    diagnostics: ?struct { step: ?[]const u8 = null, inactive_code: ?bool = null } = null,
 };
 
 pub fn deinit(c: *Config, gpa: Allocator) void {
@@ -46,6 +48,7 @@ pub fn parse(gpa: Allocator, value: json.Value) error{ OutOfMemory, InvalidConfi
         .zig_path = if (j.zig) |z| z.path else null,
         .build_args = if (j.build) |b| b.args orelse &.{} else &.{},
         .diagnostics_step = if (j.diagnostics) |d| d.step else null,
+        .inactive_code = if (j.diagnostics) |d| d.inactive_code orelse true else true,
     };
 }
 
@@ -59,6 +62,7 @@ pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
         .zig_path = if (c.zig_path) |p| try a.dupe(u8, p) else null,
         .build_args = args,
         .diagnostics_step = if (c.diagnostics_step) |s| try a.dupe(u8, s) else null,
+        .inactive_code = c.inactive_code,
         .arena = arena.state,
     };
 }
@@ -104,7 +108,12 @@ test "parse: nested fields, optional wrapper, unknown fields ignored" {
 
     var empty = try parseText("{}");
     defer empty.deinit(testing.allocator);
-    try testing.expect(empty.zig_path == null and empty.build_args.len == 0 and empty.diagnostics_step == null);
+    try testing.expect(empty.zig_path == null and empty.build_args.len == 0 and empty.diagnostics_step == null and empty.inactive_code);
+    var no_inactive = try parseText(
+        \\{"diagnostics": {"inactive_code": false}}
+    );
+    defer no_inactive.deinit(testing.allocator);
+    try testing.expect(!no_inactive.inactive_code);
     try testing.expect(!c.sameBuild(&empty) and !c.sameZig(&empty));
 }
 

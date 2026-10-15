@@ -714,9 +714,11 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config_mutex.lockUncancelable(server.io);
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
+    const inactive_changed = server.config.inactive_code != new.inactive_code;
     server.config.deinit(server.gpa);
     server.config = new;
     server.config_mutex.unlock(server.io);
+    if (inactive_changed) server.publishOpenFiles();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
     if (build_changed) {
@@ -1161,7 +1163,40 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
             .other_ctx = &other,
         });
     }
+    if (text) |current| if (server.wantsInactiveCode(file)) {
+        diags = try server.appendInactiveCode(ctx, arena, file, current, diags);
+    };
     return .{ .uri = document_uri, .diagnostics = diags };
+}
+
+/// 只为打开的文件显示非活动代码：需要推导文件中的全部成员
+fn wantsInactiveCode(server: *Server, file: Vfs.FileId) bool {
+    {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        if (!server.config.inactive_code) return false;
+    }
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    return server.open_docs.contains(file);
+}
+
+/// 当前构建配置下不编译的代码（comptime 已知不执行的分支）：带 `Unnecessary` 标记的提示，编辑器以淡色显示
+fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    var r: Resolver = .{ .ctx = ctx, .arena = arena };
+    const ranges = try za.ide.inactive.ranges(&r, file);
+    if (ranges.len == 0) return diags;
+    const lines = try offsets.LineIndex.init(arena, text);
+    const out = try arena.alloc(types.Diagnostic, diags.len + ranges.len);
+    @memcpy(out[0..diags.len], diags);
+    for (ranges, out[diags.len..]) |x, *d| d.* = .{
+        .range = lines.range(x.start, x.end, server.encoding),
+        .severity = .Hint,
+        .source = "zig-analyzer",
+        .message = .{ .string = "code is inactive: a comptime condition excludes it under the current build configuration" },
+        .tags = &.{.Unnecessary},
+    };
+    return out;
 }
 
 // ── 请求处理函数 ──────────────────────────────────────────────────────
