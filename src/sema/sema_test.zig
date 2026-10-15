@@ -1413,6 +1413,40 @@ test "peer types of pointers and optionals" {
     });
 }
 
+test "generic bodies without an instance use values that do not depend on the parameters" {
+    try expectTypes(
+        \\fn List(comptime T: type, comptime alignment: ?u29) type {
+        \\    if (alignment) |a| {
+        \\        if (a == @alignOf(T)) return List(T, null);
+        \\    }
+        \\    return struct {
+        \\        items: Slice,
+        \\        const Self = @This();
+        \\        pub const Slice = if (alignment) |a| []align(a) T else []T;
+        \\        fn first(self: *Self) T {
+        \\            const head = self.items;
+        \\            return head[0];
+        \\        }
+        \\        fn other() void {
+        \\            const S = List(T, alignment).Slice;
+        \\            _ = S;
+        \\        }
+        \\    };
+        \\}
+        \\fn g(c: bool) void {
+        \\    const x = if (c) @as(u32, 5) else @as(u32, 5);
+        \\    _ = x;
+        \\}
+    , &.{
+        // 条件取决于抽象参数，但两个分支的值相同（不区分指针的对齐）
+        .{ "head", "[]T" },
+        // 自递归的类型函数：取本实例中的容器
+        .{ "S", "type = []T" },
+        // 运行时的条件：值不是 comptime 已知的
+        .{ "x", "u32" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);

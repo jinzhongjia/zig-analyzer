@@ -241,11 +241,39 @@ const Inferrer = struct {
         if (rs.len == 0) return .unknown;
         const first = rs[0];
         for (rs[1..]) |x| if (!deepEql(x, first)) {
+            if (inf.selfInstance(rs)) |own| return own;
             var types: std.ArrayList(Index) = .empty;
             for (rs) |y| try types.append(inf.scratch, y.ty);
             return .{ .ty = try inf.peer(types.items) };
         };
         return first;
+    }
+
+    /// 条件求不出时的多个 return 都是同一个容器定义的不同实例（自递归的类型函数，如 `Aligned` 中的
+    /// `return Aligned(T, null)` 与 `return struct {...}`）：取本实例中的那个
+    fn selfInstance(inf: *Inferrer, rs: []const TypedValue) ?TypedValue {
+        var own: ?TypedValue = null;
+        var def: ?InternPool.Container = null;
+        for (rs) |x| {
+            const c = switch (inf.ip.key(x.val orelse return null)) {
+                .container_type => |c| c,
+                else => return null,
+            };
+            if (def) |d| {
+                if (d.file != c.file or d.ast_id != c.ast_id) return null;
+            } else def = c;
+            if (std.meta.eql(c.inst, inf.inst)) own = x;
+        }
+        return own;
+    }
+
+    /// 求不出值的条件是否 comptime 已知（如取决于抽象参数）：comptime 上下文、结果为 comptime-only 类型、
+    /// 容器级的常量与变量的初始化和字段（在 comptime 求值），或条件本身 comptime 已知
+    fn comptimeCond(inf: *Inferrer, cond: ExprId, result: Index) Error!bool {
+        if (inf.comptime_depth > 0 or value.isComptimeOnly(inf.ip, result)) return true;
+        const kind = (try inf.r.itemTree(inf.file)).items[inf.item].kind;
+        if (kind != .@"fn" and kind != .@"test") return true;
+        return try inf.knownness(cond, 0) == .comptime_known;
     }
 
     /// comptime 已知的条件：bool 值，或 optional 是否为 null（非 null 的 optional 值即其载荷值）
@@ -383,7 +411,8 @@ const Inferrer = struct {
                 const then = try inf.inferBranch(x.then, expected, taken == false);
                 const other: TypedValue = if (x.@"else") |el| try inf.inferBranch(el, expected, taken == true) else .{ .ty = .void_type };
                 if (taken) |t| return if (t) then else other;
-                return .{ .ty = try inf.peer(&.{ then.ty, other.ty }) };
+                const ty = try inf.peer(&.{ then.ty, other.ty });
+                return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) sameLiveValue(&.{ then, other }, ty) else null };
             },
             .loop => |l| return inf.loop(l, expected),
             .@"switch" => |s| {
@@ -394,15 +423,18 @@ const Inferrer = struct {
                 // comptime 已知的操作数：只有匹配的分支会执行
                 const chosen = try inf.chooseProng(s.prongs, operand);
                 var types: std.ArrayList(Index) = .empty;
+                var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 for (s.prongs, 0..) |prong, i| {
                     try inf.bindSwitchCapture(prong, operand.ty);
                     const tv = try inf.inferBranch(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
+                    try values.append(inf.scratch, tv);
                 }
                 if (chosen != null) return chosen_tv;
-                return .{ .ty = try inf.peer(types.items) };
+                const ty = try inf.peer(types.items);
+                return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
             },
             .@"catch" => |c| {
                 const lhs = try inf.infer(c.lhs, null);
@@ -1675,8 +1707,8 @@ const Inferrer = struct {
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .uncertain;
                 switch (def) {
                     .local => |l| {
-                        // 外层函数的局部变量（体内容器的成员中引用）
-                        if (l.file != inf.file or l.item != inf.item) return .uncertain;
+                        // 外层函数的局部变量（体内容器的成员中引用）：与编译器一致，只能引用 comptime 已知的
+                        if (l.file != inf.file or l.item != inf.item) return .comptime_known;
                         const binding = b.binding(l.binding);
                         return switch (binding.kind) {
                             .local_var => .runtime,
@@ -2231,6 +2263,20 @@ fn order(op: SyntaxKind, x: anytype, y: @TypeOf(x)) ?bool {
         .angle_bracket_right_equal => x >= y,
         else => null,
     };
+}
+
+/// 不计 noreturn 的分支：各分支的值都相同时为该值
+fn sameLiveValue(values: []const TypedValue, ty: Index) ?Index {
+    var v: ?Index = null;
+    for (values) |x| {
+        if (x.ty == .noreturn_type) continue;
+        if (x.ty != ty) return null;
+        const xv = x.val orelse return null;
+        if (v) |y| {
+            if (y != xv) return null;
+        } else v = xv;
+    }
+    return v;
 }
 
 /// 各个 break 的值都相同（且类型就是汇合后的类型）时的值
