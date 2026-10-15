@@ -145,6 +145,29 @@ pub fn backingIntType(r: *Resolver, t: Index) Error!?Index {
     };
 }
 
+/// 枚举显式给出的标签类型（`enum(u8)` 的 `u8`）；没有时为 null。不读取成员的值
+pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    if (!value.isEnumType(ev.ip, t)) return null;
+    const decl = ev.containerSyntax(t) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => return null,
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return decl.arg;
+}
+
+/// union 的标签类型（`union(E)` 为 E，`union(enum)` 为生成的标签枚举）；不是带标签的 union 时为 null
+pub fn unionTag(r: *Resolver, t: Index) Error!?Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    if (!ev.isUnion(t)) return null;
+    return ev.unionTagType(t) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 /// comptime 已知的字符串的内容；不是时为 null
 pub fn stringValue(r: *Resolver, tv: TypedValue) Error!?[]const u8 {
     const v = tv.val orelse return null;

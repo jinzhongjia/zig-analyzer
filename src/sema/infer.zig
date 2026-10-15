@@ -170,7 +170,7 @@ const Inferrer = struct {
                 };
             },
             .@"const", .@"var", .field => {
-                const annotation: ?Index = if (b.type_expr) |t| (try inf.inferComptime(t, null)).asType() else null;
+                const annotation: ?Index = if (b.type_expr) |t| (try inf.inferComptime(t, null)).asType() else if (kind == .field) try inf.enumValueType() else null;
                 // 对齐属于签名：字段的布局读取它
                 if (b.align_expr) |e| _ = try inf.inferComptime(e, try inf.clauseType(.@"align"));
                 if (mode == .full) if (b.value) |v| {
@@ -185,6 +185,15 @@ const Inferrer = struct {
         if (mode == .full) for (b.clauses) |c| {
             _ = try inf.infer(c.expr, try inf.clauseType(c.kind));
         };
+    }
+
+    /// 枚举成员的值（`a = 1`）的结果类型：显式给出的标签类型
+    fn enumValueType(inf: *Inferrer) Error!?Index {
+        const tree = try inf.r.itemTree(inf.file);
+        const container = tree.items[inf.item].container;
+        if (tree.containers[container].kind != .@"enum") return null;
+        const t = try queries.containerType(inf.r, .{ .file = inf.file, .container = container }, inf.inst);
+        return eval.explicitTagType(inf.r, t);
     }
 
     /// 子句中表达式的结果类型（与编译器一致）
@@ -406,7 +415,7 @@ const Inferrer = struct {
             .prefix => |p| return inf.prefix(p.op, p.operand, expected),
             .assign => |a| {
                 const lhs = try inf.infer(a.lhs, null);
-                _ = try inf.infer(a.rhs, if (lhs.ty != .unknown) lhs.ty else null);
+                _ = try inf.infer(a.rhs, try inf.assignRhsType(a.op, lhs.ty));
                 return .{ .ty = .void_type };
             },
             .index => |x| {
@@ -478,7 +487,8 @@ const Inferrer = struct {
                 return .{ .ty = .noreturn_type };
             },
             .@"continue" => |c| {
-                if (c.value) |v| _ = try inf.infer(v, null);
+                // labeled switch 的 `continue :l value`：值按 switch 操作数的类型推导
+                if (c.value) |v| _ = try inf.infer(v, if (c.label) |l| inf.switchOperandType(e, l) else null);
                 return .{ .ty = .noreturn_type };
             },
             .@"comptime" => |x| return inf.infer(x, expected),
@@ -628,13 +638,24 @@ const Inferrer = struct {
         return .unknown;
     }
 
-    /// decl literal：结果类型为容器时，`.name` 是该类型的声明 `T.name`（枚举优先取同名成员）
+    /// decl literal：结果类型（去掉 error union、optional 与单项指针，与编译器一致）为容器时，`.name` 是该
+    /// 类型的声明 `T.name`（枚举优先取同名成员）
     fn declLiteral(inf: *Inferrer, e: ExprId, want: Index, name: []const u8) Error!?TypedValue {
-        const c = switch (inf.ip.key(want)) {
+        const ip = inf.ip;
+        var t = want;
+        while (true) switch (ip.key(t)) {
+            .error_union_type => |eu| t = eu.payload,
+            .optional_type => |child| t = child,
+            .ptr_type => |p| if (p.size == .one) {
+                t = p.child;
+            } else break,
+            else => break,
+        };
+        const c = switch (ip.key(t)) {
             .container_type => |c| c,
             else => return null,
         };
-        const ns = try queries.namespaceOfType(inf.r, want) orelse return null;
+        const ns = try queries.namespaceOfType(inf.r, t) orelse return null;
         if (c.kind == .@"enum") {
             const tree = try inf.r.itemTree(ns.file);
             if (fieldItem(tree, ns.container, name) != null) return null;
@@ -1246,7 +1267,6 @@ const Inferrer = struct {
     }
 
     fn loop(inf: *Inferrer, l: Body.Loop, expected: ?Index) Error!TypedValue {
-        _ = expected;
         const ip = inf.ip;
         switch (l.kind) {
             .@"while" => {
@@ -1273,12 +1293,30 @@ const Inferrer = struct {
             },
         }
         if (l.cont) |c| _ = try inf.infer(c, null);
-        try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true });
+        // break 的值与 else 分支取循环的结果类型
+        try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true, .expected = expected });
         _ = try inf.infer(l.body, null);
         var frame = inf.labels.pop().?;
-        const other: Index = if (l.@"else") |el| (try inf.infer(el, null)).ty else .void_type;
+        const other: Index = if (l.@"else") |el| (try inf.infer(el, expected)).ty else .void_type;
         try frame.types.append(inf.scratch, other);
         return .{ .ty = try inf.peer(frame.types.items) };
+    }
+
+    /// `continue :label` 的目标为 labeled switch 时其操作数的类型
+    fn switchOperandType(inf: *Inferrer, e: ExprId, label: []const u8) ?Index {
+        const b = inf.body;
+        var s: ?Body.ScopeId = b.expr_scopes[@backingInt(e)];
+        while (s) |id| : (s = b.scope(id).parent) {
+            const l = b.scope(id).label orelse continue;
+            if (!std.mem.eql(u8, l.name, label)) continue;
+            const sw = switch (b.expr(l.expr)) {
+                .@"switch" => |sw| sw,
+                else => return null,
+            };
+            const t = inf.get(sw.operand).ty;
+            return if (t != .unknown) t else null;
+        }
+        return null;
     }
 
     /// break 的目标（`labels` 中的下标）
@@ -1313,25 +1351,39 @@ const Inferrer = struct {
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, false) else t, .val = val };
     }
 
+    /// switch 的捕获。带标签的 union：捕获为各分支项对应字段类型的 peer（与编译器一致），`else` 分支与
+    /// 求不出的分支项为 unknown；第二个捕获为标签
     fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, operand: Index) Error!void {
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
-        var t: Index = operand;
-        // 带标签的 union：单个分支项时捕获对应字段的类型
-        if (ip.key(operand) == .container_type and ip.key(operand).container_type.kind == .@"union" and prong.items.len == 1) {
-            if (inf.body.expr(prong.items[0]) == .enum_literal) {
-                const name = inf.body.expr(prong.items[0]).enum_literal;
-                const ns = try queries.namespaceOfType(inf.r, operand);
-                t = .unknown;
-                if (ns) |n| {
-                    const tree = try inf.r.itemTree(n.file);
-                    if (fieldItem(tree, n.container, name)) |f| t = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = f } }, null, queries.instOfType(ip, operand))).ty;
-                }
-            } else t = .unknown;
-        } else if (ip.key(operand) == .container_type and ip.key(operand).container_type.kind == .@"union") t = .unknown;
+        const is_union = switch (ip.key(operand)) {
+            .container_type => |c| c.kind == .@"union",
+            .reified_type => |rt| rt.kind == .@"union",
+            else => false,
+        };
+        const t: Index = if (is_union) try inf.prongPayloadType(prong, operand) else operand;
         const cap = prong.capture[0];
         inf.bindings[@backingInt(cap)] = .{ .ty = if (inf.body.binding(cap).is_ptr) try ip.ptrTo(t, .one, false) else t };
-        if (prong.capture.len > 1) inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = .unknown };
+        if (prong.capture.len > 1) {
+            const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
+            inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag };
+        }
+    }
+
+    fn prongPayloadType(inf: *Inferrer, prong: Body.Prong, operand: Index) Error!Index {
+        if (prong.is_else or prong.items.len == 0) return .unknown;
+        const types = try inf.scratch.alloc(Index, prong.items.len);
+        for (prong.items, types) |item, *t| {
+            const name = switch (inf.body.expr(item)) {
+                .enum_literal => |n| n,
+                else => switch (inf.ip.key(inf.get(item).val orelse return .unknown)) {
+                    .enum_tag => |tag| tag.name,
+                    else => return .unknown,
+                },
+            };
+            t.* = try inf.unionFieldType(operand, name) orelse return .unknown;
+        }
+        return inf.peer(types);
     }
 
     /// union 字段的类型
@@ -1391,9 +1443,10 @@ const Inferrer = struct {
                 if (try inf.compare(op, lhs, rhs)) |result| return boolValue(result);
                 return .{ .ty = .bool_type };
             },
+            // `<<` / `>>` 的右侧按 `Log2Int(T)` 推导，`<<|` 的右侧没有结果类型（与编译器一致）
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .angle_bracket_angle_bracket_left_pipe => {
                 const lhs = try inf.infer(lhs_e, expected);
-                const rhs = try inf.infer(rhs_e, null);
+                const rhs = try inf.infer(rhs_e, if (op == .angle_bracket_angle_bracket_left_pipe) null else try inf.log2IntType(lhs.ty));
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
@@ -1478,7 +1531,12 @@ const Inferrer = struct {
         const ip = inf.ip;
         switch (op) {
             .keyword_try => {
-                const v = try inf.infer(operand_e, null);
+                // 与编译器一致：结果类型只用于 `try .foo(...)` 中 decl literal 的查找
+                const decl_call = switch (inf.body.expr(operand_e)) {
+                    .call => |c| inf.body.expr(c.callee) == .enum_literal,
+                    else => false,
+                };
+                const v = try inf.infer(operand_e, if (decl_call) expected else null);
                 const payload, _ = inf.unwrapErrorUnion(v.ty);
                 return .{ .ty = payload };
             },
@@ -1488,8 +1546,19 @@ const Inferrer = struct {
                 return .{ .ty = .bool_type };
             },
             .ampersand => {
-                const child_expected: ?Index = if (expected) |x| switch (ip.key(x)) {
-                    .ptr_type => |p| if (p.size == .one) p.child else null,
+                const want: ?Index = if (expected) |x| switch (ip.key(x)) {
+                    .optional_type => |c| c,
+                    else => x,
+                } else null;
+                const child_expected: ?Index = if (want) |x| switch (ip.key(x)) {
+                    .ptr_type => |p| switch (p.size) {
+                        .one => p.child,
+                        // `&.{ a, b }` 转换为切片或多项指针：按 `[2]T` 推导
+                        .slice, .many, .c => switch (inf.body.expr(operand_e)) {
+                            .init => |init| if (init.ty == null) try ip.get(.{ .array_type = .{ .len = init.fields.len, .child = p.child, .sentinel = p.sentinel } }) else null,
+                            else => null,
+                        },
+                    },
                     else => null,
                 } else null;
                 const v = try inf.infer(operand_e, child_expected);
@@ -1515,24 +1584,31 @@ const Inferrer = struct {
 
     fn initExpr(inf: *Inferrer, ty_e: ?ExprId, fields: []const Body.FieldInit, expected: ?Index) Error!TypedValue {
         const ip = inf.ip;
-        if (ty_e == null and (expected == null or expected.? == .unknown)) return inf.anonInit(fields);
+        // `.{ ... }` 的类型为结果类型去掉 error union 与 optional（与编译器一致）
+        const want = inf.destType(expected, .eu_opt);
+        if (ty_e == null and want == null) return inf.anonInit(fields);
         const t: Index = if (ty_e) |te|
             try inf.inferredLenArray(te, fields.len) orelse (try inf.infer(te, null)).asType() orelse .unknown
         else
-            expected orelse .unknown;
+            want.?;
         const ns: ?Namespace = if (t != .unknown and ip.key(t) == .container_type) try queries.namespaceOfType(inf.r, t) else null;
-        const elem: ?Index = switch (ip.key(t)) {
-            .array_type => |a| a.child,
-            else => null,
-        };
         for (fields, 0..) |f, fi_index| {
-            var field_ty: ?Index = elem;
+            var field_ty: ?Index = switch (ip.key(t)) {
+                .array_type => |a| a.child,
+                .vector_type => |v| v.child,
+                .tuple_type => |tt| if (f.name == null and fi_index < tt.types.len) tt.types[fi_index] else null,
+                else => null,
+            };
             if (f.name) |name| if (ns) |n| {
                 const tree = try inf.r.itemTree(n.file);
                 if (fieldItem(tree, n.container, name)) |fi| {
                     field_ty = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = fi } }, null, queries.instOfType(ip, t))).ty;
                     if (inf.current_init) |init_e| try inf.field_refs.append(inf.scratch, .{ .init = init_e, .index = @intCast(fi_index), .member = .{ .file = n.file, .item = tree.items[fi].ast_id } });
                 }
+            } else switch (ip.key(t)) {
+                // 构造的类型、元组与匿名结构体的字段
+                .reified_type, .tuple_type, .anon_struct_type => field_ty = try eval.fieldType(inf.r, t, name),
+                else => {},
             };
             _ = try inf.infer(f.value, if (field_ty) |x| (if (x != .unknown) x else null) else null);
         }
@@ -1786,6 +1862,18 @@ const Inferrer = struct {
         }
         const info = value.intInfo(ip, t) orelse return null;
         return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits));
+    }
+
+    /// 赋值右侧的结果类型（与编译器一致）：`<<=` / `>>=` 为 `Log2Int(T)`，`<<|=` 没有结果类型，多项指针的
+    /// `+=` / `-=` 为 usize
+    fn assignRhsType(inf: *Inferrer, op: SyntaxKind, lhs: Index) Error!?Index {
+        if (lhs == .unknown) return null;
+        return switch (op) {
+            .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_right_equal => inf.log2IntType(lhs),
+            .angle_bracket_angle_bracket_left_pipe_equal => null,
+            .plus_equal, .minus_equal => if (isManyPtr(inf.ip, lhs)) .usize_type else lhs,
+            else => lhs,
+        };
     }
 
     fn isConstPtr(inf: *Inferrer, t: Index) bool {

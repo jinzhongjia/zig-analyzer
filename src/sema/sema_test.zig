@@ -1328,6 +1328,60 @@ test "builtin arguments get their result types" {
     });
 }
 
+test "result types reach operands like the compiler" {
+    try expectTypes(
+        \\const Tag = enum { a, b, c };
+        \\const U = union(Tag) { a: u8, b: u16, c: bool };
+        \\const Buf = struct {
+        \\    len: usize,
+        \\    var global: Buf = .{ .len = 9 };
+        \\    pub fn current() *Buf { return &global; }
+        \\    pub fn init(n: usize) !Buf { return .{ .len = n }; }
+        \\};
+        \\const Pair = struct { a: u8, b: u16 };
+        \\const Code = enum(u8) { ok = 1, bad = 71 };
+        \\fn f(u: U, x: u32, c: bool) !void {
+        \\    const d: Buf = try .init(2);
+        \\    const cur: *Buf = .current();
+        \\    const sh = x << 31;
+        \\    const g = switch (u) { .a, .b => |pay| pay, .c => 0 };
+        \\    const h = switch (u) { inline .a, .b => |_, tag| tag, .c => Tag.c };
+        \\    const vec: @Vector(2, f32) = .{ 41, 42 };
+        \\    const tup: struct { u8, bool } = .{ 43, true };
+        \\    const op: ?Pair = .{ .a = 44, .b = 45 };
+        \\    const sl: []const u16 = &.{ 46, 47 };
+        \\    var w: u32 = 0;
+        \\    const st: u8 = sw: switch (@as(u8, 1)) {
+        \\        1 => continue :sw 49,
+        \\        else => |k| break :sw k,
+        \\    };
+        \\    w <<= 29;
+        \\    const lp: u8 = while (c) { break 72; } else 73;
+        \\    _ = .{ d, cur, sh, g, h, vec, tup, op, sl, st, lp };
+        \\}
+    , &.{
+        .{ "d", "Buf" },
+        .{ "cur", "*Buf" },
+        // 移位的右侧为 `Log2Int(T)`
+        .{ "31", "u5 = 31" },
+        .{ "29", "u5 = 29" },
+        // 多个分支项的捕获为各字段类型的 peer，第二个捕获为标签
+        .{ "pay", "u16" },
+        .{ "tag", "Tag" },
+        .{ "41", "f32 = 41" },
+        .{ "43", "u8 = 43" },
+        .{ "45", "u16 = 45" },
+        .{ ".{ 46, 47 }", "[2]u16" },
+        // labeled switch 的 `continue` 的值按操作数的类型推导
+        .{ "49", "u8 = 49" },
+        // 循环的 break 与 else 取循环的结果类型
+        .{ "72", "u8 = 72" },
+        .{ "73", "u8 = 73" },
+        // 枚举成员的值按标签类型推导
+        .{ "71", "u8 = 71" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
