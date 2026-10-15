@@ -1964,21 +1964,16 @@ const Inferrer = struct {
                 if (y > x) result = t;
                 continue;
             }
-            // T 与 ?T
-            if (ip.key(cur) == .optional_type and ip.key(cur).optional_type == t) continue;
-            if (ip.key(t) == .optional_type and ip.key(t).optional_type == cur) {
-                result = t;
+            // 一侧为 optional：载荷与另一侧的 peer 再包为 optional
+            if (ip.key(cur) == .optional_type or ip.key(t) == .optional_type) {
+                const p = try inf.peer(&.{ optionalChild(ip, cur), optionalChild(ip, t) });
+                if (p == .unknown) return .unknown;
+                result = try ip.optionalOf(p);
                 continue;
             }
-            // 指针 const 合并
-            if (ip.key(cur) == .ptr_type and ip.key(t) == .ptr_type) {
-                var a = ip.key(cur).ptr_type;
-                const b = ip.key(t).ptr_type;
-                if (a.child == b.child and a.size == b.size) {
-                    a.is_const = a.is_const or b.is_const;
-                    result = try ip.get(.{ .ptr_type = a });
-                    continue;
-                }
+            if (try peerPtr(ip, cur, t)) |p| {
+                result = p;
+                continue;
             }
             return .unknown;
         }
@@ -2014,6 +2009,55 @@ fn isPtrCast(name: []const u8) bool {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+fn optionalChild(ip: *InternPool, t: Index) Index {
+    return switch (ip.key(t)) {
+        .optional_type => |c| c,
+        else => t,
+    };
+}
+
+/// 两个指针的 peer（与编译器一致）：元素类型须相同；指向数组的单项指针与切片、多项指针统一为后者，长度不同的
+/// 数组指针统一为切片；const 取并集，哨兵只在两侧相同时保留。不能统一时为 null
+fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
+    const x = switch (ip.key(a)) {
+        .ptr_type => |p| p,
+        else => return null,
+    };
+    const y = switch (ip.key(b)) {
+        .ptr_type => |p| p,
+        else => return null,
+    };
+    const xa: ?@FieldType(InternPool.Key, "array_type") = if (x.size == .one) switch (ip.key(x.child)) {
+        .array_type => |arr| arr,
+        else => null,
+    } else null;
+    const ya: ?@FieldType(InternPool.Key, "array_type") = if (y.size == .one) switch (ip.key(y.child)) {
+        .array_type => |arr| arr,
+        else => null,
+    } else null;
+    const is_const = x.is_const or y.is_const;
+    // 指向非数组的单项指针只与同类型的单项指针统一
+    if ((x.size == .one and xa == null) or (y.size == .one and ya == null)) {
+        if (x.size != y.size or x.child != y.child) return null;
+        return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .one, .is_const = is_const } });
+    }
+    const x_elem = if (xa) |arr| arr.child else x.child;
+    const y_elem = if (ya) |arr| arr.child else y.child;
+    if (x_elem != y_elem) return null;
+    const x_sentinel = if (xa) |arr| arr.sentinel else x.sentinel;
+    const y_sentinel = if (ya) |arr| arr.sentinel else y.sentinel;
+    const sentinel: ?Index = if (x_sentinel != null and y_sentinel != null and x_sentinel.? == y_sentinel.?) x_sentinel else null;
+    if (xa != null and ya != null) {
+        if (xa.?.len == ya.?.len) {
+            const arr = try ip.get(.{ .array_type = .{ .len = xa.?.len, .child = x_elem, .sentinel = sentinel } });
+            return try ip.ptrTo(arr, .one, is_const);
+        }
+        return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = .slice, .is_const = is_const, .sentinel = sentinel } });
+    }
+    const size: InternPool.PtrSize = if (xa != null) y.size else if (ya != null) x.size else if (x.size == y.size) x.size else return null;
+    return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel } });
 }
 
 /// 可做指针运算的指针（多项指针与 C 指针）

@@ -1382,6 +1382,37 @@ test "result types reach operands like the compiler" {
     });
 }
 
+test "peer types of pointers and optionals" {
+    try expectTypes(
+        \\fn f(c: bool, sl: []const u8, opt: ?[]const u8, ms: [*:0]const u8, mut: []u8) void {
+        \\    var arr: [3]u8 = .{ 1, 2, 3 };
+        \\    var arr4: [4]u8 = .{ 1, 2, 3, 4 };
+        \\    const s1 = if (c) "abc" else "hello";
+        \\    const s2 = if (c) sl else "hello";
+        \\    const s3 = opt orelse "";
+        \\    const s4 = if (c) &arr else &arr4;
+        \\    const s5 = if (c) "abc" else ms;
+        \\    const s6 = if (c) mut else "lit";
+        \\    const s7 = if (c) &arr else "abc";
+        \\    const s8 = switch (arr[0]) { 1 => "one", 2 => "three", else => "x" };
+        \\    const s9 = if (c) opt else "x";
+        \\    _ = .{ &arr, &arr4, s1, s2, s3, s4, s5, s6, s7, s8, s9 };
+        \\}
+    , &.{
+        // 长度不同的数组指针统一为切片，哨兵只在两侧相同时保留
+        .{ "s1", "[:0]const u8" },
+        .{ "s2", "[]const u8" },
+        .{ "s3", "[]const u8" },
+        .{ "s4", "[]u8" },
+        .{ "s5", "[*:0]const u8" },
+        .{ "s6", "[]const u8" },
+        .{ "s7", "*const [3]u8" },
+        .{ "s8", "[:0]const u8" },
+        // optional 与另一侧按载荷的 peer 包为 optional
+        .{ "s9", "?[]const u8" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
