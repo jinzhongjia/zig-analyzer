@@ -12,6 +12,7 @@
 //! - `BENCH_VERBOSE=1`：打印首轮中较慢的请求、其内存变化与各 query 的执行次数
 //! - `BENCH_CHECK=<n>`：校验跳转的正确性：对文件中的标识符请求 declaration，目标处的标识符应与请求处相同；
 //!   同时打印前 n 个未解析的标识符
+//! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致）
 //! - `BENCH_SESSION=<轮数>`：长时间会话，观察内存的增长
 
 const std = @import("std");
@@ -335,6 +336,157 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched });
 }
 
+const Loc = struct { uri: []const u8, line: u32, character: u32 };
+
+fn locOf(v: json.Value) Loc {
+    const start = v.object.get("range").?.object.get("start").?.object;
+    return .{ .uri = v.object.get("uri").?.string, .line = @intCast(start.get("line").?.integer), .character = @intCast(start.get("character").?.integer) };
+}
+
+fn locEql(a: Loc, b: Loc) bool {
+    return a.line == b.line and a.character == b.character and std.mem.eql(u8, a.uri, b.uri);
+}
+
+fn containsLoc(list: []const Loc, l: Loc) bool {
+    for (list) |x| if (locEql(x, l)) return true;
+    return false;
+}
+
+/// 查找引用与重命名的正确性（BENCH_REFS=<n>）：文件中均匀选 n 个声明（`const` / `var` / `fn` 之后的名字），
+/// 1. 引用处的标识符与声明同名；2. 从每个引用处 declaration 回到该声明（无误报）；3. 本文件中 declaration
+/// 指向该声明的同名标识符都在引用中（无漏报）；4. rename 的编辑与引用的位置相同
+fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const u8, count: usize) !void {
+    const a = c.arena.allocator();
+    var decls: std.ArrayList(usize) = .empty;
+    var tokenizer: std.zig.Tokenizer = .init(text);
+    var prev: std.zig.Token.Tag = .invalid;
+    while (true) {
+        const t = tokenizer.next();
+        if (t.tag == .eof) break;
+        if (t.tag == .identifier and (prev == .keyword_const or prev == .keyword_var or prev == .keyword_fn)) try decls.append(a, t.loc.start);
+        prev = t.tag;
+    }
+    const n = @min(count, decls.items.len);
+    var texts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try texts.put(a, uri, text);
+    var times: std.ArrayList(f64) = .empty;
+    var total_refs: usize = 0;
+    var bad_name: usize = 0;
+    var false_pos: usize = 0;
+    var missing: usize = 0;
+    var rename_mismatch: usize = 0;
+    var shown: usize = 0;
+    var checked: usize = 0;
+    for (0..n) |i| {
+        const off = decls.items[i * decls.items.len / n];
+        const name = identAt(text, off);
+        const decl_pos = positionOf(text, off);
+        const decl_loc: Loc = .{ .uri = uri, .line = decl_pos.line, .character = decl_pos.character };
+        // 只取声明处（`[]const T` 中的 T 等不是声明）：declaration 指向自身
+        {
+            const self, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = uri }, .position = decl_pos });
+            const target = if (self.object.get("result")) |r| switch (r) {
+                .object => locOf(r),
+                .array => |arr| if (arr.items.len > 0) locOf(arr.items[0]) else null,
+                else => null,
+            } else null;
+            if (target == null or !locEql(target.?, decl_loc)) continue;
+        }
+        checked += 1;
+        const resp, const ms_refs = try c.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = decl_pos, .context = .{ .includeDeclaration = true } });
+        try times.append(a, ms_refs);
+        const result = resp.object.get("result") orelse continue;
+        if (result != .array) continue;
+        var refs: std.ArrayList(Loc) = .empty;
+        for (result.array.items) |v| try refs.append(a, locOf(v));
+        total_refs += refs.items.len;
+        for (refs.items) |l| {
+            const t = texts.get(l.uri) orelse blk: {
+                const path = za.base.uri.toPath(a, l.uri) catch break :blk "";
+                const x = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(16 * 1024 * 1024)) catch "";
+                try texts.put(a, l.uri, x);
+                break :blk x;
+            };
+            const o2 = offsetOf(t, .{ .line = l.line, .character = l.character }) orelse continue;
+            if (!std.mem.eql(u8, identAt(t, o2), name)) {
+                bad_name += 1;
+                continue;
+            }
+            // 引用所在的文件须先打开才能请求（其他文件按需打开再关闭）
+            const other = !std.mem.eql(u8, l.uri, uri);
+            if (other) try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = l.uri, .languageId = "zig", .version = 1, .text = t } });
+            const back, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = l.uri }, .position = .{ .line = l.line, .character = l.character } });
+            if (other) try c.notify("textDocument/didClose", .{ .textDocument = .{ .uri = l.uri } });
+            const target = if (back.object.get("result")) |r| switch (r) {
+                .object => locOf(r),
+                .array => |arr| if (arr.items.len > 0) locOf(arr.items[0]) else null,
+                else => null,
+            } else null;
+            if (target == null or !locEql(target.?, decl_loc)) {
+                false_pos += 1;
+                if (shown < 10) {
+                    shown += 1;
+                    std.debug.print("    false positive `{s}` ({s}:{d}): {s}:{d}:{d}\n", .{ name, rel, decl_pos.line + 1, std.fs.path.basename(l.uri), l.line + 1, l.character + 1 });
+                }
+            }
+        }
+        // 本文件中同名、declaration 指向该声明的标识符
+        var tk: std.zig.Tokenizer = .init(text);
+        while (true) {
+            const t = tk.next();
+            if (t.tag == .eof) break;
+            if (t.tag != .identifier or !std.mem.eql(u8, text[t.loc.start..t.loc.end], name)) continue;
+            const p = positionOf(text, t.loc.start);
+            const here: Loc = .{ .uri = uri, .line = p.line, .character = p.character };
+            if (containsLoc(refs.items, here)) continue;
+            const back, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = uri }, .position = p });
+            const target = if (back.object.get("result")) |r| switch (r) {
+                .object => locOf(r),
+                .array => |arr| if (arr.items.len > 0) locOf(arr.items[0]) else null,
+                else => null,
+            } else null;
+            if (target != null and locEql(target.?, decl_loc) and !locEql(here, decl_loc)) {
+                missing += 1;
+                if (shown < 10) {
+                    shown += 1;
+                    std.debug.print("    missing `{s}` ({s}:{d}): {s}:{d}:{d}\n", .{ name, rel, decl_pos.line + 1, rel, p.line + 1, p.character + 1 });
+                }
+            }
+        }
+        // rename 的编辑与引用的位置相同
+        const ren, _ = try c.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = decl_pos, .newName = "zz_renamed" });
+        if (ren.object.get("result")) |r| if (r == .object) {
+            var edits: std.ArrayList(Loc) = .empty;
+            if (r.object.get("changes")) |changes| {
+                var it = changes.object.iterator();
+                while (it.next()) |kv| for (kv.value_ptr.array.items) |e| {
+                    const st = e.object.get("range").?.object.get("start").?.object;
+                    try edits.append(a, .{ .uri = kv.key_ptr.*, .line = @intCast(st.get("line").?.integer), .character = @intCast(st.get("character").?.integer) });
+                };
+            } else if (r.object.get("documentChanges")) |dcs| for (dcs.array.items) |dc| {
+                const du = dc.object.get("textDocument").?.object.get("uri").?.string;
+                for (dc.object.get("edits").?.array.items) |e| {
+                    const st = e.object.get("range").?.object.get("start").?.object;
+                    try edits.append(a, .{ .uri = du, .line = @intCast(st.get("line").?.integer), .character = @intCast(st.get("character").?.integer) });
+                }
+            };
+            var same = edits.items.len == refs.items.len;
+            if (same) for (edits.items) |e| if (!containsLoc(refs.items, e)) {
+                same = false;
+            };
+            if (!same) {
+                rename_mismatch += 1;
+                if (shown < 10) {
+                    shown += 1;
+                    std.debug.print("    rename mismatch `{s}` ({s}:{d}): {d} edits, {d} references\n", .{ name, rel, decl_pos.line + 1, edits.items.len, refs.items.len });
+                }
+            }
+        };
+    }
+    Stats.print("references", times.items);
+    std.debug.print("  references   checked {d} declarations, {d} references: wrong name {d}, false positives {d}, missing in this file {d}, rename mismatches {d}\n", .{ checked, total_refs, bad_name, false_pos, missing, rename_mismatch });
+}
+
 /// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、补全、
 /// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
@@ -548,6 +700,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("  {s:<12} first pass max {d:.1}ms\n", .{ "", cold_max });
         }
 
+        if (init.environ_map.get("BENCH_REFS")) |v| try checkReferences(&c, uri, text, rel, std.fmt.parseInt(usize, v, 10) catch 20);
         if (init.environ_map.get("BENCH_CHECK")) |v| {
             c.unresolved_samples = std.fmt.parseInt(usize, v, 10) catch 0;
             try checkDeclarations(&c, uri, text, rel);
