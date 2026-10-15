@@ -1864,3 +1864,45 @@ test "slicing an outer function's local from a container in the body" {
         .{ "part", "*const [3]u8" },
     });
 }
+
+test "union(enum) without a tag expression: field names are not lowered as expressions" {
+    // `union(enum) { unneeded, ... }` 的括号内没有表达式，此前取到了第一个成员，`unneeded` 被当作名字
+    // 引用解析到外层的同名声明，与该声明的初始化形成环（Zig 编译器源码中 `LazySrcLoc.Offset`）
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src =
+        \\pub const L = struct {
+        \\    offset: Offset,
+        \\    pub const unneeded: L = .{ .offset = .unneeded };
+        \\    pub const Offset = union(enum) {
+        \\        unneeded,
+        \\        byte: u32,
+        \\    };
+        \\    pub const Tagged = union(enum(u8)) { a, b: u32 };
+        \\};
+    ;
+    const f = try w.add("/p/main.zig", src);
+    var ctx = w.db.beginRead(testing.allocator);
+    defer ctx.end();
+    const tree = try ctx.get(database.syntax.FileItemTree, f.file);
+    for (tree.items) |it| {
+        const name = it.name orelse continue;
+        if (std.mem.eql(u8, name, "Offset")) {
+            const body = try ctx.get(database.hir.ItemBody, .{ .file = f.file, .item = it.ast_id });
+            for (body.exprs) |e| try testing.expect(e != .name_ref);
+            _ = try ctx.get(queries.DeclType, .{ .owner = .{ .file = f.file, .item = it.ast_id } });
+        }
+        // `union(enum(u8))` 的参数仍然取到
+        if (std.mem.eql(u8, name, "Tagged")) {
+            const body = try ctx.get(database.hir.ItemBody, .{ .file = f.file, .item = it.ast_id });
+            var has_arg = false;
+            for (body.exprs) |e| if (e == .container) {
+                has_arg = e.container.arg != null;
+            };
+            try testing.expect(has_arg);
+        }
+    }
+    var buf: [database.Db.query_types.len]@import("../db/engine.zig").QueryStats = undefined;
+    try testing.expectEqual(0, w.db.stats(&buf).incomplete_causes.get(.cycle));
+}

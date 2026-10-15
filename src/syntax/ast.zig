@@ -144,8 +144,23 @@ pub const ContainerDecl = struct {
     }
 
     /// `enum(u8)` 的整数类型、`union(E)` 的标签类型
+    /// `enum(u8)` / `union(E)` / `packed struct(u32)` 中括号内的表达式。`union(enum)` 的括号内没有表达式，
+    /// 不能越过 `)` 取到第一个成员
     pub fn argExpr(n: ContainerDecl) ?SyntaxNode {
-        return nodeAfter(n.syntax, .l_paren);
+        var it = n.syntax.children();
+        var depth: u32 = 0;
+        while (it.next()) |e| switch (e) {
+            .token => |t| switch (t.kind) {
+                .l_paren => depth += 1,
+                .r_paren => if (depth <= 1) return null else {
+                    depth -= 1;
+                },
+                .l_brace => return null,
+                else => {},
+            },
+            .node => |c| if (depth > 0) return c,
+        };
+        return null;
     }
 };
 
