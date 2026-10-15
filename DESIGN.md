@@ -930,7 +930,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | live 诊断的 AstGen 不可取消 | 标准库 AstGen 计算中不检查取消，写事务需要等它结束 | 大文件上的编辑延迟 | 防抖，或把 AstGen 放到单独的计算队列 | M1 |
 | InternPool 的锁 | 读写共用一把互斥锁，`key()` 读取也要加锁 | 类型推导并发请求多、InternPool 很大时的锁竞争 | 分片，或读路径改为无锁（只追加的分段数组） | M4 |
 | 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
-| 读请求用 `async` 提交 | hover、补全等读请求与诊断发布用 `group.async`；线程池满时（核数少或常驻任务多）会在主循环中同步执行，期间收不到 `$/cancelRequest`，后续请求排队。不会死锁：这些任务不等待主循环 | 用户感到请求卡顿或取消不及时 | 读请求改为 `concurrent`（与 `waitIdle` 相同） | M4 |
+| ~~读请求用 `async` 提交~~ | 已处理，见 §19.24 | — | — | §19.24 |
 | 泛型实例的内存 | 推导结果已按 LRU 回收（M7，`Infer` 上限 16384 个）；InternPool 中的实例与类型仍只增不减。实测：标准库全量推导的最大 RSS 1.24 GB；InternPool 17 万项 | 长时间运行、大量不同的实例化 | InternPool 代际回收（§9.1） | M5 |
 | 实例化与 comptime 求值的推导耗时 | 同一台机器上标准库全量推导：M4 1.44 秒 → M5（实例化）1.92 秒 → M5（解释器）2.91 秒 | 大项目首次 hover / 补全 | 按需推导（只算光标所需的表达式），或延迟实例化 | M5 |
 | workspace symbol 的匹配 | 每次请求遍历全部项目文件的 ItemTree 做子序列匹配，没有 trigram 索引（§10.2） | 文件很多的项目中逐字输入查询 | `file_index` 增加声明名的 trigram，先粗筛文件 | M6 |
@@ -1226,6 +1226,15 @@ pub fn make() std.ArrayList(u8) { ... }
 | 请求与诊断发布 | `src/server/Server.zig` | IDE 层（如 hover 中的类型渲染）同样会吞掉错误，结果不写入 memo，但会作为响应发出。读请求与语义请求的处理函数返回后检查一次取消，已取消则回复 `ContentModified` / `RequestCancelled`（客户端重试）；诊断发布已取消时重新计算 |
 
 - 测试：`zig build test` 共 245 个（吞掉 `Canceled` 的 compute 不写入 memo）。
+
+### 19.24 读请求与诊断发布的线程（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 提交方式 | `src/server/Server.zig` | 读请求、语义请求、诊断发布、索引与单文件编译统一经由 `spawn`：`group.concurrent`，只在无法创建线程时退回 `async`。此前前三者用 `async`，线程池满（CPU 核数 - 1，长期阻塞的项目任务也占名额）时在主循环中同步执行：执行期间收不到 `$/cancelRequest`，后续请求排队，诊断发布中大文件的 AstGen 也在主循环中进行。`concurrent` 默认没有数量上限；线程栈大小不变，不影响 `max_stack_bytes` |
+| 测试工具 | `src/server/test_harness.zig` | `startIo` 以指定的 Io 启动服务器；`send` / `response` 分开发送请求与等待响应 |
+
+- 测试：`zig build test` 共 246 个（线程池没有空位时，测试持有写锁使读请求阻塞，主循环仍响应其他消息，阻塞期间送达的 `$/cancelRequest` 生效；修复前主循环被阻塞，测试超时）。
 
 ## 20. 风险与对策
 
