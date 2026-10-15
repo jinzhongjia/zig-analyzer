@@ -32,6 +32,7 @@ pub const Seed = struct {
 /// 成员 `item`（位于某个泛型函数内）以第一个调用点的实例推导的结果：先找同一文件，再按文件顺序找
 /// 项目中其他能引用到该函数的文件
 pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
+    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
     const owner = try r.ownerKey(file, item);
     const found = try r.ctx.get(Query, owner) orelse return null;
     return .{

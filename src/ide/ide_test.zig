@@ -123,7 +123,7 @@ test "signature help and inlay hints" {
     try testing.expectEqual(1, m.active);
     try testing.expectEqualStrings("到原点的距离", m.doc.?);
 
-    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(src.len));
+    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(src.len), .{});
     var out: std.ArrayList(u8) = .empty;
     for (hints) |h| {
         try out.appendSlice(w.arena.allocator(), h.label);
@@ -399,7 +399,7 @@ test "completion, goto, signature help and inlay hints in generic bodies use a c
     try testing.expectEqual(1, s.active);
 
     // 抽象的结果中未知的局部变量：类型取自调用点的实例，并说明所依据的调用
-    const hints = try inlay_hints.inlayHints(&r, file, at("const v"), at("_ = v"));
+    const hints = try inlay_hints.inlayHints(&r, file, at("const v"), at("_ = v"), .{});
     var found = false;
     for (hints) |h| if (h.kind == .type) {
         try testing.expectEqualStrings(": i32", h.label);
@@ -507,4 +507,66 @@ test "goto declaration, definition through aliases and type definition" {
             return err;
         };
     }
+}
+
+test "inlay hint options" {
+    const text =
+        \\fn add(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+        \\fn f() void {
+        \\    const a: u32 = 1;
+        \\    const v = add(a, 2);
+        \\    _ = v;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { inlay_hints.Options, []const u8 }{
+        // 默认：类型；形参名，与实参同名的 `a` 不提示
+        .{ .{}, ": u32 b:" },
+        .{ .{ .types = false }, "b:" },
+        .{ .{ .parameters = false }, ": u32" },
+        .{ .{ .hide_redundant_param_names = false }, ": u32 a: b:" },
+    };
+    for (cases, 0..) |c, i| {
+        const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), c[0]);
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (hints) |h| try labels.append(w.arena.allocator(), h.label);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("case {d}\n", .{i});
+            return err;
+        };
+    }
+}
+
+test "callsite seeding can be switched off" {
+    const text =
+        \\fn max(comptime T: type, a: T, b: T) T {
+        \\    const bigger = if (a > b) a else b;
+        \\    return bigger;
+        \\}
+        \\fn run() void {
+        \\    _ = max(u32, 1, 2);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    var seeding: std.atomic.Value(bool) = .init(false);
+    w.env.callsite_seeding = &seeding;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "bigger =").?)) orelse return error.NoHover;
+    // 不以调用点的实例推导：显示抽象的类型，没有「inferred from」
+    try testing.expectEqualStrings("```zig\nconst bigger: T\n```", info.text);
 }

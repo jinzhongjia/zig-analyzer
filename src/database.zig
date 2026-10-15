@@ -1,5 +1,7 @@
 //! 注册全部 query 的数据库类型。
 
+const std = @import("std");
+
 const engine = @import("db/engine.zig");
 pub const Durability = engine.Durability;
 pub const inputs = @import("base/inputs.zig");
@@ -22,7 +24,11 @@ const InternPool = @import("sema/InternPool.zig");
 pub const Env = struct {
     vfs: *Vfs,
     ip: *InternPool,
+    /// 配置 `sema.callsite_seeding`：泛型函数体内是否以调用点的实例推导（只在 IDE 层读取，不影响 query 结果）
+    callsite_seeding: *const std.atomic.Value(bool) = &always_on,
 };
+
+var always_on: std.atomic.Value(bool) = .init(true);
 
 pub const Db = engine.Engine(*const Env, &.{
     inputs.FileText,
