@@ -12,3 +12,7 @@
 
 - 只有注释使用中文。
 - 日志、错误消息、panic / compileError、发给客户端的文案（进度、showMessage、错误响应）、工具输出、build step 描述、测试名一律使用英文。
+
+## 目标
+
+- 在 zig 源代码库可以流畅使用 zig-analyzer 进行代码分析。
