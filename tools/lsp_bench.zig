@@ -12,6 +12,7 @@
 //! - `BENCH_VERBOSE=1`：打印首轮中较慢的请求、其内存变化与各 query 的执行次数
 //! - `BENCH_CHECK=<n>`：校验跳转的正确性：对文件中的标识符请求 declaration，目标处的标识符应与请求处相同；
 //!   同时打印前 n 个未解析的标识符
+//! - `BENCH_COMPLETE=<n>`：补全的召回：源码中的成员访问 `a.b` 在 `.` 之后补全，列表中应有 `b`
 //! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致）
 //! - `BENCH_SESSION=<轮数>`：长时间会话，观察内存的增长
 
@@ -487,6 +488,58 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
     std.debug.print("  references   checked {d} declarations, {d} references: wrong name {d}, false positives {d}, missing in this file {d}, rename mismatches {d}\n", .{ checked, total_refs, bad_name, false_pos, missing, rename_mismatch });
 }
 
+/// 补全的召回（BENCH_COMPLETE=<n>）：源码中的成员访问 `a.b`（`.` 之前是标识符、`)` 或 `]`），在 `.` 之后
+/// 请求补全，列表中应有 `b`。均匀取样 n 处，输出召回率与未补全的样例
+fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const u8, count: usize) !void {
+    const a = c.arena.allocator();
+    var sites: std.ArrayList(usize) = .empty;
+    var tokenizer: std.zig.Tokenizer = .init(text);
+    var prev2: std.zig.Token.Tag = .invalid;
+    var prev: std.zig.Token.Tag = .invalid;
+    while (true) {
+        const t = tokenizer.next();
+        if (t.tag == .eof) break;
+        if (t.tag == .identifier and prev == .period and (prev2 == .identifier or prev2 == .r_paren or prev2 == .r_bracket)) try sites.append(a, t.loc.start);
+        prev2 = prev;
+        prev = t.tag;
+    }
+    const n = @min(count, sites.items.len);
+    var found: usize = 0;
+    var empty: usize = 0;
+    var shown: usize = 0;
+    var times: std.ArrayList(f64) = .empty;
+    for (0..n) |i| {
+        const off = sites.items[i * sites.items.len / n];
+        const name = identAt(text, off);
+        const resp, const ms_c = try c.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = positionOf(text, off) });
+        try times.append(a, ms_c);
+        const result = resp.object.get("result") orelse continue;
+        const items = switch (result) {
+            .array => |arr| arr.items,
+            .object => |o| o.get("items").?.array.items,
+            else => &.{},
+        };
+        if (items.len == 0) empty += 1;
+        const hit = for (items) |it| {
+            const label = it.object.get("label").?.string;
+            // `@"struct"` 形式的标签按其中的名字比较
+            const bare = if (std.mem.startsWith(u8, label, "@\"") and label.len > 3) label[2 .. label.len - 1] else label;
+            if (std.mem.eql(u8, bare, name)) break true;
+        } else false;
+        if (hit) {
+            found += 1;
+        } else if (shown < 15) {
+            shown += 1;
+            const p = positionOf(text, off);
+            const line_start = off - p.character;
+            const line_end = std.mem.indexOfScalarPos(u8, text, off, '\n') orelse text.len;
+            std.debug.print("    not offered {s}:{d}:{d} `{s}` ({d} items) | {s}\n", .{ rel, p.line + 1, p.character + 1, name, items.len, std.mem.trim(u8, text[line_start..line_end], " ") });
+        }
+    }
+    Stats.print("member compl.", times.items);
+    std.debug.print("  completion   checked {d} member accesses: offered {d} ({d:.1}%), empty lists {d}\n", .{ n, found, @as(f64, @floatFromInt(found)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), empty });
+}
+
 /// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、补全、
 /// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
@@ -700,6 +753,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("  {s:<12} first pass max {d:.1}ms\n", .{ "", cold_max });
         }
 
+        if (init.environ_map.get("BENCH_COMPLETE")) |v| try checkCompletion(&c, uri, text, rel, std.fmt.parseInt(usize, v, 10) catch 300);
         if (init.environ_map.get("BENCH_REFS")) |v| try checkReferences(&c, uri, text, rel, std.fmt.parseInt(usize, v, 10) catch 20);
         if (init.environ_map.get("BENCH_CHECK")) |v| {
             c.unresolved_samples = std.fmt.parseInt(usize, v, 10) catch 0;
