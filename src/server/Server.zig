@@ -816,8 +816,9 @@ fn startup(server: *Server) Io.Cancelable!void {
         server.zig_env = env;
     }
     log.info("zig {s} ({s})", .{ env.version, env.zig_exe });
-    // 默认的 builtin.zig：与单文件编译（`zig build-obj -fno-emit-bin`）的设置一致
-    const default_builtin = za.project.builtin.generate(server.gpa, server.io, &env, &.{"build-obj"}) catch |err| switch (err) {
+    // 默认的 builtin.zig（单文件模式）：按 `zig test` 的设置，test 块中依赖 `builtin.is_test` 的
+    // `std.testing.allocator` 等可以推导（与有 test step 的模块一致，见 configuration.zig）
+    const default_builtin = za.project.builtin.generate(server.gpa, server.io, &env, &.{"test"}) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.OutOfMemory => null,
     };

@@ -251,6 +251,54 @@ test "@import(\"builtin\") follows the module's target and optimize mode" {
     try h.notify("exit", {});
 }
 
+const test_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\    const mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = mod });
+    \\    b.installArtifact(exe);
+    \\    const tests = b.addTest(.{ .root_module = mod });
+    \\    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    \\}
+    \\
+;
+
+const test_main =
+    \\const std = @import("std");
+    \\const builtin = @import("builtin");
+    \\pub fn main() void {}
+    \\test "uses the testing allocator" {
+    \\    const gpa = std.testing.allocator;
+    \\    const t = if (builtin.is_test) @as(u8, 1) else @as(u16, 2);
+    \\    _ = .{ gpa, t };
+    \\}
+    \\
+;
+
+test "a module that is also the root of a test step is analyzed as a test" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = test_build },
+        .{ .path = "src/main.zig", .text = test_main },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = test_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    try testing.expectEqualStrings("```zig\nconst t: u8 = 1\n```", try hoverText(&h, uri, test_main, "t ="));
+    try testing.expectEqualStrings("```zig\nconst gpa: Allocator\n```", try hoverText(&h, uri, test_main, "gpa ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "@import(\"builtin\") in single-file mode is the host target" {
     var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = builtin_main }});
     defer project.deinit();

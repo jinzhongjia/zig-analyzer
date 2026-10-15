@@ -73,26 +73,34 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     }
 
     // builtin 的子命令与编译后端取以该模块为根的 compile step（决定 output_mode / is_test / zig_backend），
-    // 其他模块按 build-obj
-    for (c.steps) |*src| switch (src.extended.get(c.extra)) {
+    // 其他模块按 build-obj。同一模块常常既是可执行文件也是 test 的根，这时取 test：test 块中的
+    // `std.testing.allocator` 等依赖 `builtin.is_test`
+    const chosen = try a.alloc(?usize, modules.items.len);
+    @memset(chosen, null);
+    for (c.steps, 0..) |*src, si| switch (src.extended.get(c.extra)) {
         .compile => |comp| {
             const index = module_ids.getIndex(comp.root_module) orelse continue;
-            const mod = &modules.items[index];
-            if (!std.mem.eql(u8, mod.builtin_args[0], "build-obj")) continue;
-            var args: std.ArrayList([]const u8) = .empty;
-            try args.appendSlice(a, mod.builtin_args);
-            args.items[0] = switch (comp.flags3.kind) {
-                .exe => "build-exe",
-                .lib => "build-lib",
-                .obj, .test_obj => "build-obj",
-                .@"test" => "test",
-            };
-            // 编译后端决定 builtin 中的 `zig_backend`（向量的布局取决于它）
-            if (comp.flags2.use_llvm.toBool()) |on| try args.append(a, if (on) "-fllvm" else "-fno-llvm");
-            mod.builtin_args = args.items;
+            if (chosen[index]) |prev| if (c.steps[prev].extended.get(c.extra).compile.flags3.kind.isTest() or !comp.flags3.kind.isTest()) continue;
+            chosen[index] = si;
         },
         else => {},
     };
+    for (chosen, modules.items) |step, *mod| {
+        const comp = c.steps[step orelse continue].extended.get(c.extra).compile;
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(a, mod.builtin_args);
+        args.items[0] = switch (comp.flags3.kind) {
+            .exe => "build-exe",
+            .lib => "build-lib",
+            .obj => "build-obj",
+            .@"test" => "test",
+            .test_obj => "test-obj",
+        };
+        if (comp.flags3.kind == .test_obj) try args.append(a, "--test-no-exec");
+        // 编译后端决定 builtin 中的 `zig_backend`（向量的布局取决于它）
+        if (comp.flags2.use_llvm.toBool()) |on| try args.append(a, if (on) "-fllvm" else "-fno-llvm");
+        mod.builtin_args = args.items;
+    }
 
     const producers = try a.alloc(?u32, c.generated_files_len);
     @memset(producers, null);
