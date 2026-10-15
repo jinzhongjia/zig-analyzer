@@ -540,3 +540,31 @@ test "settings: build.enable can be switched off and on at runtime" {
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{});
     try shutdown(&h);
 }
+
+test "project zig-analyzer.json: build settings apply, a change on disk restarts the project" {
+    var project = try fixture.Project.create(settings_project ++ [_]fixture.File{
+        .{ .path = "zig-analyzer.json", .text =
+        \\{"build": {"args": ["-Dbad=true"]}, "log": {"level": "err"}}
+        },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    try waitIdle(&h);
+    var diags = try h.diagnostics();
+    try expectDiagnostics(diags, "main.zig", &.{"3:23 zig: expected type 'u32'"});
+    try testing.expect(anyContains(try shownMessages(&h), "`log.level` cannot be set in zig-analyzer.json"));
+
+    // 编辑器之外改为用 unit step 诊断、去掉 -D 参数：项目重启
+    const a = h.arena.allocator();
+    const path = try project.path(a, "zig-analyzer.json");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "{\"diagnostics\": {\"steps\": [\"unit\"]}}" });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, path), .type = 2 }} });
+    try waitIdle(&h);
+    diags = try h.diagnostics();
+    try expectDiagnostics(diags, "main.zig", &.{});
+    try expectDiagnostics(diags, "t.zig", &.{"1:18 zig: expected type 'u8'"});
+    try shutdown(&h);
+}

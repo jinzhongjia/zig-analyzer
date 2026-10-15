@@ -838,7 +838,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
     const path = server.vfs.path(id);
     const base = std.fs.path.basename(path);
-    const is_build_file = std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon");
+    const is_build_file = isProjectFile(base);
 
     if (server.isSingleFile(id)) return server.compileSingle(id);
 
@@ -856,8 +856,13 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     }
 }
 
+/// 项目根目录中变化时需要重启项目的文件
+fn isProjectFile(base: []const u8) bool {
+    return std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon") or std.mem.eql(u8, base, Config.project_file);
+}
+
 /// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
-/// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon 变化时重启该项目，
+/// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon / zig-analyzer.json 变化时重启该项目，
 /// 其他文件变化时项目重新构建、单文件重新编译
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
     const Change = struct { file: Vfs.FileId, text: ?[]u8 };
@@ -871,7 +876,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         };
         if (!std.fs.path.isAbsolute(path)) continue;
         const base = std.fs.path.basename(path);
-        if (std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon")) try build_files.append(arena, std.fs.path.dirname(path) orelse "");
+        if (isProjectFile(base)) try build_files.append(arena, std.fs.path.dirname(path) orelse "");
         // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）
         const file = try server.vfs.lookup(path) orelse continue;
         {
@@ -947,7 +952,7 @@ fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChange
 /// 替换当前配置；构建相关配置变化时重启各项目
 fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     var new = fresh;
-    server.reportConfigWarnings(&new);
+    server.reportConfigWarnings("zig-analyzer settings", &new);
     server.config_mutex.lockUncancelable(server.io);
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
@@ -1129,9 +1134,9 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
     var registrations: std.ArrayList(types.Registration) = .empty;
     if (server.register_config) try registrations.append(arena, .{ .id = "zig-analyzer/didChangeConfiguration", .method = "workspace/didChangeConfiguration" });
     if (server.register_watch) {
-        // 编辑器之外的改动（git checkout、代码生成等）：源文件与 build.zig.zon
+        // 编辑器之外的改动（git checkout、代码生成等）：源文件、build.zig.zon 与项目配置文件
         const options = try std.json.parseFromSliceLeaky(std.json.Value, arena,
-            \\{"watchers": [{"globPattern": "**/*.zig"}, {"globPattern": "**/*.zon"}]}
+            \\{"watchers": [{"globPattern": "**/*.zig"}, {"globPattern": "**/*.zon"}, {"globPattern": "**/zig-analyzer.json"}]}
         , .{});
         try registrations.append(arena, .{ .id = "zig-analyzer/didChangeWatchedFiles", .method = "workspace/didChangeWatchedFiles", .registerOptions = options });
     }
@@ -1432,11 +1437,12 @@ pub fn zigEnv(server: *Server) ?*const ZigEnv {
 }
 
 /// 配置中未知的项与类型错误的项：合并为一条提示
-fn reportConfigWarnings(server: *Server, config: *const Config) void {
+/// 合并提示配置中的问题；`source` 为配置的来源（客户端的配置或项目配置文件的路径）
+pub fn reportConfigWarnings(server: *Server, source: []const u8, config: *const Config) void {
     if (config.warnings.len == 0) return;
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    w.writeAll("zig-analyzer settings: ") catch {};
+    w.print("{s}: ", .{source}) catch {};
     for (config.warnings, 0..) |msg, i| w.print("{s}{s}", .{ if (i > 0) "; " else "", msg }) catch break;
     server.showWarning(w.buffered());
 }
@@ -1727,7 +1733,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
                 break :blk .{};
             },
         };
-        server.reportConfigWarnings(&server.config);
+        server.reportConfigWarnings("zig-analyzer settings", &server.config);
         server.applyLogging(&server.config, server.config.log_file != null);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});

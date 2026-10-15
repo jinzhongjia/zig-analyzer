@@ -11,6 +11,9 @@
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
 //! 逐项解析：未知的项与类型错误的项只产生警告（`warnings`），类型错误的项取默认值，其余项照常生效。
+//!
+//! 项目根目录的 `zig-analyzer.json`（同样的结构）可以设置与项目相关的项（`project_settings`），
+//! 供团队共享；其中出现的项优先于客户端的配置（`overlayProject`）。
 
 const std = @import("std");
 const json = std.json;
@@ -49,6 +52,11 @@ log_file: ?[]const u8 = null,
 slow_request_ms: u32 = 100,
 /// 解析时发现的问题（未知的项、类型错误的项），用于提示用户
 warnings: []const []const u8 = &.{},
+/// 配置中出现（且类型正确）的项，下标对应 `settings`
+present: std.StaticBitSet(settings.len) = .empty,
+
+/// 项目配置文件的文件名（位于项目根目录）
+pub const project_file = "zig-analyzer.json";
 
 /// 配置项：JSON 中的「分组.名字」与对应的字段
 const Setting = struct { section: []const u8, key: []const u8, field: []const u8 };
@@ -69,6 +77,14 @@ const settings = [_]Setting{
     .{ .section = "log", .key = "file", .field = "log_file" },
     .{ .section = "log", .key = "slow_request_ms", .field = "slow_request_ms" },
 };
+
+/// 可以在项目配置文件中设置的项
+const project_settings = [_][]const u8{ "build_args", "diagnostics_step", "diagnostics_steps", "compiler_diagnostics" };
+
+fn isProjectSetting(comptime field: []const u8) bool {
+    for (project_settings) |f| if (std.mem.eql(u8, f, field)) return true;
+    return false;
+}
 
 pub fn deinit(c: *Config, gpa: Allocator) void {
     var arena = c.arena.promote(gpa);
@@ -100,10 +116,11 @@ pub fn parse(gpa: Allocator, value: json.Value) error{ OutOfMemory, InvalidConfi
         var keys = section.value_ptr.object.iterator();
         keys: while (keys.next()) |entry| {
             const key = entry.key_ptr.*;
-            inline for (settings) |s| if (std.mem.eql(u8, s.section, name) and std.mem.eql(u8, s.key, key)) {
+            inline for (settings, 0..) |s, si| if (std.mem.eql(u8, s.section, name) and std.mem.eql(u8, s.key, key)) {
                 const T = @FieldType(Config, s.field);
                 if (json.parseFromValueLeaky(T, a, entry.value_ptr.*, .{ .allocate = .alloc_always })) |v| {
                     @field(c, s.field) = v;
+                    c.present.set(si);
                 } else |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => try warnings.append(a, try std.fmt.allocPrint(a, "invalid value for `{s}.{s}`, using the default", .{ name, key })),
@@ -123,24 +140,60 @@ fn isSection(name: []const u8) bool {
     return false;
 }
 
+/// 解析项目配置文件的内容。JSON 有误时返回 `error.InvalidConfig`；不能在项目中设置的项记入 `warnings` 并忽略
+pub fn parseProject(gpa: Allocator, text: []const u8) error{ OutOfMemory, InvalidConfig }!Config {
+    const value = json.parseFromSlice(json.Value, gpa, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidConfig,
+    };
+    defer value.deinit();
+    var c = try parse(gpa, value.value);
+    errdefer c.deinit(gpa);
+    var arena = c.arena.promote(gpa);
+    defer c.arena = arena.state;
+    const a = arena.allocator();
+    var warnings: std.ArrayList([]const u8) = .fromOwnedSlice(@constCast(c.warnings));
+    inline for (settings, 0..) |s, si| if (comptime !isProjectSetting(s.field)) if (c.present.isSet(si)) {
+        try warnings.append(a, try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }));
+        c.present.unset(si);
+    };
+    c.warnings = warnings.items;
+    return c;
+}
+
+/// 以项目配置中出现的项覆盖（`project` 由 `parseProject` 得到）
+pub fn overlayProject(c: *Config, gpa: Allocator, project: *const Config) Allocator.Error!void {
+    var arena = c.arena.promote(gpa);
+    defer c.arena = arena.state;
+    const a = arena.allocator();
+    inline for (settings, 0..) |s, si| if (comptime isProjectSetting(s.field)) {
+        if (project.present.isSet(si)) {
+            @field(c, s.field) = try dupeValue(a, @field(project, s.field));
+            c.present.set(si);
+        }
+    };
+}
+
+fn dupeValue(a: Allocator, v: anytype) Allocator.Error!@TypeOf(v) {
+    return switch (@TypeOf(v)) {
+        ?[]const u8 => if (v) |x| try a.dupe(u8, x) else null,
+        []const []const u8 => blk: {
+            const list = try a.alloc([]const u8, v.len);
+            for (v, list) |src, *dst| dst.* = try a.dupe(u8, src);
+            break :blk list;
+        },
+        else => v,
+    };
+}
+
 /// 深拷贝（不含 `warnings`）
 pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     var out: Config = .{};
-    inline for (settings) |s| {
-        const v = @field(c, s.field);
-        @field(out, s.field) = switch (@TypeOf(v)) {
-            ?[]const u8 => if (v) |x| try a.dupe(u8, x) else null,
-            []const []const u8 => blk: {
-                const list = try a.alloc([]const u8, v.len);
-                for (v, list) |src, *dst| dst.* = try a.dupe(u8, src);
-                break :blk list;
-            },
-            else => v,
-        };
-    }
+    inline for (settings) |s| @field(out, s.field) = try dupeValue(a, @field(c, s.field));
+    out.present = c.present;
     out.arena = arena.state;
     return out;
 }
@@ -235,4 +288,26 @@ test "parse: unknown and invalid settings are reported, the rest still applies" 
     try testing.expect(std.mem.indexOf(u8, joined.items, "`log` must be an object") != null);
 
     try testing.expectError(error.InvalidConfig, parseText("[]"));
+}
+
+test "project file: only project settings apply and override the client" {
+    var client = try parseText(
+        \\{"build": {"args": ["-Dclient"]}, "diagnostics": {"steps": ["check"]}, "log": {"level": "debug"}}
+    );
+    defer client.deinit(testing.allocator);
+    var project = try parseProject(testing.allocator,
+        \\{"build": {"args": ["-Dtarget=wasm32-freestanding"], "enable": false}, "diagnostics": {"compiler": false}, "log": {"level": "err"}}
+    );
+    defer project.deinit(testing.allocator);
+    try testing.expectEqual(2, project.warnings.len);
+    try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.json", project.warnings[0]);
+
+    try client.overlayProject(testing.allocator, &project);
+    try testing.expectEqualStrings("-Dtarget=wasm32-freestanding", client.build_args[0]);
+    try testing.expect(!client.compiler_diagnostics and client.build_enable);
+    // 项目中没有的项保留客户端的值
+    try testing.expectEqualStrings("check", client.diagnostics_steps[0]);
+    try testing.expectEqual(.debug, client.log_level);
+
+    try testing.expectError(error.InvalidConfig, parseProject(testing.allocator, "{\"build\": "));
 }

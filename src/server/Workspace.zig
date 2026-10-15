@@ -90,6 +90,7 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
+    try loadProjectConfig(server, root, &ws.config);
     var title_buf: [256]u8 = undefined;
     ws.loading = server.progress.begin(server, std.fmt.bufPrint(&title_buf, "Loading project {s}", .{std.fs.path.basename(root)}) catch "Loading project", false);
     errdefer server.progress.end(server, ws.loading, null);
@@ -98,6 +99,29 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     server.busyBegin();
     try server.bg_group.concurrent(server.io, run, .{ws});
     return ws;
+}
+
+/// 以项目根目录的 `zig-analyzer.json` 覆盖配置；文件不存在时不变，有误时提示并忽略
+fn loadProjectConfig(server: *Server, root: []const u8, config: *Server.Config) Allocator.Error!void {
+    const gpa = server.gpa;
+    const path = try std.fs.path.join(gpa, &.{ root, Server.Config.project_file });
+    defer gpa.free(path);
+    const text = Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(1 << 20)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound => return,
+        else => return log.warn("{s}: cannot read: {t}", .{ path, err }),
+    };
+    defer gpa.free(text);
+    var project = Server.Config.parseProject(gpa, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidConfig => {
+            var buf: [512]u8 = undefined;
+            return server.showWarning(std.fmt.bufPrint(&buf, "{s} is not a valid JSON object, it is ignored", .{path}) catch path);
+        },
+    };
+    defer project.deinit(gpa);
+    server.reportConfigWarnings(path, &project);
+    try config.overlayProject(gpa, &project);
 }
 
 /// 请求停止：maker 退出后后台任务结束并回收进程
