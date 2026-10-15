@@ -325,6 +325,26 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             @as(u64, @intCast(deps)),
             @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s,
         });
+        if (round + 1 == rounds) {
+            // 最后一轮：按字节数列出各 query，其余为未归属（引擎的表、依赖、Vfs 等）
+            const Row = struct { name: []const u8, bytes: i64, memos: i64, keys: i64 };
+            var rows: std.ArrayList(Row) = .empty;
+            var attributed: i64 = o.get("intern_pool_bytes").?.integer;
+            for (o.get("queries").?.array.items) |q| {
+                const b = q.object.get("bytes").?.integer;
+                attributed += b;
+                try rows.append(a, .{ .name = q.object.get("name").?.string, .bytes = b, .memos = q.object.get("memos").?.integer, .keys = q.object.get("keys").?.integer });
+            }
+            std.mem.sort(Row, rows.items, {}, struct {
+                fn gt(_: void, x: Row, y: Row) bool {
+                    return x.bytes > y.bytes;
+                }
+            }.gt);
+            std.debug.print("  memory by query (last round):\n", .{});
+            for (rows.items[0..@min(12, rows.items.len)]) |r| std.debug.print("    {s:<28} {d:>8.1} MB  memos {d:>7}  keys {d:>7}\n", .{ r.name, mb(r.bytes), r.memos, r.keys });
+            std.debug.print("    {s:<28} {d:>8.1} MB\n", .{ "InternPool", mb(o.get("intern_pool_bytes").?.integer) });
+            std.debug.print("    {s:<28} {d:>8.1} MB\n", .{ "unattributed", mb(o.get("heap_bytes").?.integer - attributed) });
+        }
     }
 }
 

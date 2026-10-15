@@ -143,6 +143,10 @@ pub const ItemSummaries = struct {
     pub const Key = Vfs.FileId;
     pub const Value = *const Summaries;
 
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(Summaries) + v.items.len * @sizeOf(ItemSummary) + v.container_offsets.len * @sizeOf(?u32);
+    }
+
     pub const Summaries = struct {
         items: []ItemSummary,
         /// 容器节点在文件中的起始位置；找不到节点时为 null
@@ -197,6 +201,10 @@ pub const FileAstIdMap = struct {
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree.AstIdMap;
     pub const lru = parse_lru;
+
+    pub fn bytes(v: Value) usize {
+        return v.bytes();
+    }
 
     const Owned = struct {
         map: ItemTree.AstIdMap,

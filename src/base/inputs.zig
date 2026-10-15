@@ -20,4 +20,8 @@ pub const FileText = struct {
     pub fn deinit(v: *Value, gpa: Allocator) void {
         if (v.*) |text| gpa.free(text);
     }
+
+    pub fn bytes(v: Value) usize {
+        return if (v) |text| text.len else 0;
+    }
 };

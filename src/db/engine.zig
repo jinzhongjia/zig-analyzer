@@ -287,7 +287,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 var bytes: usize = 0;
                 var deps: usize = 0;
                 for (db.tables[qi].slots.items) |slot| switch (Q.kind) {
-                    .input => memos += @intFromBool(slot.is_set),
+                    .input => if (slot.is_set) {
+                        memos += 1;
+                        if (@hasDecl(Q, "bytes")) bytes += Q.bytes(slot.value);
+                    },
                     .derived => if (slot.memo) |m| {
                         deps += m.deps.len;
                         if (!m.evicted) {

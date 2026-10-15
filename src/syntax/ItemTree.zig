@@ -336,6 +336,11 @@ pub const AstIdMap = struct {
         m.map.deinit(gpa);
     }
 
+    /// 哈希表占用的字节数（节点本身属于语法树，不计入）
+    pub fn bytes(m: *const AstIdMap) usize {
+        return m.map.capacity() * (@sizeOf(AstId) + @sizeOf(SyntaxNode) + @sizeOf(u32));
+    }
+
     pub fn get(m: *const AstIdMap, id: AstId) ?SyntaxNode {
         return m.map.get(id);
     }
