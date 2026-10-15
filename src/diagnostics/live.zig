@@ -192,7 +192,7 @@ pub const Prepared = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
     entries: std.ArrayList(Entry) = .empty,
-    /// 每个文件最近一次准备的文本哈希：文本未变时不重复准备
+    /// 每个文件最近一次准备好（已放入）的文本哈希：文本未变时不重复准备
     last: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
     /// `take` 命中的次数（统计与测试用）
     hits: usize = 0,
@@ -210,30 +210,27 @@ pub const Prepared = struct {
         return std.hash.Wyhash.hash(@backingInt(mode), text);
     }
 
-    /// 文件的这个文本是否还需要准备（并记为已准备）
-    pub fn claim(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) Allocator.Error!bool {
-        p.mutex.lockUncancelable(io);
-        defer p.mutex.unlock(io);
-        const gop = try p.last.getOrPut(p.gpa, file);
-        if (gop.found_existing and gop.value_ptr.* == h) return false;
-        gop.value_ptr.* = h;
-        return true;
+    /// 文件的这个文本是否还需要准备。放入之后才算准备好：并发的两次发布可能都准备同一个文本（在读事务
+    /// 之外重复一次 AstGen），但不会有发布在准备完成之前进入读事务、在其中做 AstGen
+    pub fn claim(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) bool {
+        return !p.prepared(io, file, h);
     }
 
-    /// 放入 `check(text, mode)` 的结果，取得 `result` 的所有权
-    /// 文件的这个文本是否已经准备过
+    /// 文件的这个文本是否已经准备好
     pub fn prepared(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) bool {
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
         return if (p.last.get(file)) |last| last == h else false;
     }
 
-    pub fn put(p: *Prepared, io: Io, text: []const u8, mode: Mode, result: *Result) Allocator.Error!void {
+    /// 放入文件 `file` 的 `check(text, mode)` 的结果，取得 `result` 的所有权，并记这个文本已准备好
+    pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, result: *Result) Allocator.Error!void {
         errdefer result.destroy(p.gpa);
         const owned = try p.gpa.dupe(u8, text);
         errdefer p.gpa.free(owned);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
+        try p.last.put(p.gpa, file, hash(text, mode));
         if (p.find(text, mode) != null) {
             p.gpa.free(owned);
             result.destroy(p.gpa);
@@ -511,7 +508,7 @@ test "prepared results: matched by text and mode, taken once, oldest evicted" {
     const io = std.testing.io;
     var p: Prepared = .{ .gpa = gpa };
     defer p.deinit();
-    try p.put(io, "const a = ;", .zig, try check(gpa, "const a = ;", .zig));
+    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, try check(gpa, "const a = ;", .zig));
     // 同样的文本不同的模式不命中
     try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon));
     const r = p.take(io, "const a = ;", .zig).?;
@@ -522,14 +519,13 @@ test "prepared results: matched by text and mode, taken once, oldest evicted" {
     for (0..Prepared.capacity + 1) |i| {
         var buf: [32]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "const a = {d};", .{i});
-        try p.put(io, text, .zig, try check(gpa, text, .zig));
+        try p.put(io, @fromBackingInt(@as(u32, 1)), text, .zig, try check(gpa, text, .zig));
     }
     try std.testing.expectEqual(Prepared.capacity, p.entries.items.len);
     try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig));
 
-    // 同一文件的同一文本只准备一次
-    const h = Prepared.hash("x", .zig);
-    try std.testing.expect(try p.claim(io, @fromBackingInt(@intCast(0)), h));
-    try std.testing.expect(!try p.claim(io, @fromBackingInt(@intCast(0)), h));
-    try std.testing.expect(try p.claim(io, @fromBackingInt(@intCast(0)), Prepared.hash("y", .zig)));
+    // 放入之后同一文件的同一文本不再准备，其他文本仍需准备
+    try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig)));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig)));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig)));
 }

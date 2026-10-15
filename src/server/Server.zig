@@ -1659,9 +1659,9 @@ fn prepareLive(server: *Server, file: Vfs.FileId) void {
         break :blk a.dupe(u8, t) catch return;
     };
     const mode = live.modeOf(server.vfs.path(file));
-    if (!(server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode)) catch return)) return;
+    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode))) return;
     const result = live.check(server.gpa, text, mode) catch return;
-    server.live_prepared.put(server.io, text, mode, result) catch {};
+    server.live_prepared.put(server.io, file, text, mode, result) catch {};
 }
 
 /// 当前文本的 live 诊断已在读事务之外准备过（或不需要准备）
