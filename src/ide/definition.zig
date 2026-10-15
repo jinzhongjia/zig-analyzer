@@ -20,13 +20,60 @@ pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
+    if (try errorMemberTarget(r, file, offset)) |t| return t;
     const def = try defAt(r, file, offset) orelse return null;
     return target(r, try r.aliasTarget(def));
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
+    if (try errorMemberTarget(r, file, offset)) |t| return t;
     return target(r, try defAt(r, file, offset) orelse return null);
+}
+
+/// 具名错误集的成员：`Error.Foo` 跳到声明 `const Error = error{ Foo, ... }` 中的 `Foo`（声明是别名时沿别名查找）
+fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const e = b.exprAt(rel) orelse return null;
+    const fa = switch (b.expr(e)) {
+        .field_access => |x| x,
+        else => return null,
+    };
+    if (rel < b.range(fa.lhs).end) return null;
+    const name = fa.field orelse return null;
+    const lhs_def: Def = switch (b.expr(fa.lhs)) {
+        .name_ref => |n| try r.resolveName(file, item, b, b.expr_scopes[@backingInt(fa.lhs)], n) orelse return null,
+        .field_access => blk: {
+            const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+            break :blk try context.defOfKey(r, a.member(fa.lhs) orelse return null) orelse return null;
+        },
+        else => return null,
+    };
+    for ([_]Def{ lhs_def, try r.aliasTarget(lhs_def) }) |def| {
+        const it = switch (def) {
+            .item => |x| x,
+            else => continue,
+        };
+        const decl = try r.itemNode(it.file, it.item) orelse continue;
+        if (findErrorName(decl, name, 0)) |at| return .{ .file = it.file, .start = at, .end = at + @as(u32, @intCast(name.len)) };
+    }
+    return null;
+}
+
+/// 节点中 `error{ ... }` 里名为 `name` 的错误的位置
+fn findErrorName(node: ast.SyntaxNode, name: []const u8, depth: u32) ?u32 {
+    if (depth > 16) return null;
+    var it = node.children();
+    while (it.next()) |child| switch (child) {
+        .token => |t| if (node.kind() == .error_set_decl and t.kind == .identifier and std.mem.eql(u8, t.text, name)) return t.offset,
+        .node => |n| if (findErrorName(n, name, depth + 1)) |at| return at,
+    };
+    return null;
 }
 
 /// 标签：`break :l` / `continue :l` 中的 `l` 跳到带标签的块或循环的标签处，标签自身返回自身

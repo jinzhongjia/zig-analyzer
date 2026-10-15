@@ -598,6 +598,45 @@ test "goto declaration of enum literals compared with enums and tagged unions" {
     }
 }
 
+test "named error sets: goto and completion of their members" {
+    const text =
+        \\pub const Error = error{ MissingValue, InvalidArgument };
+        \\const Alias = Error;
+        \\fn f(e: Error) bool {
+        \\    return e == Error.MissingValue or e == Alias.InvalidArgument;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "MissingValue or", "MissingValue, Invalid" },
+        .{ "InvalidArgument;", "InvalidArgument }" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 20)] });
+            return err;
+        };
+    }
+    const items = try @import("completion.zig").complete(&r, file, @intCast(std.mem.indexOf(u8, text, "MissingValue or").?));
+    var found = false;
+    for (items) |it| if (std.mem.eql(u8, it.label, "InvalidArgument")) {
+        found = true;
+    };
+    try testing.expect(found);
+}
+
 test "inlay hint options" {
     const text =
         \\fn add(a: u32, b: u32) u32 {

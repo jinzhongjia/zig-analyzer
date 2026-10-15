@@ -173,6 +173,11 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
                 for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
                 return;
             },
+            // 错误集（`Error.` 之后）：其中的错误名
+            .error_set_type => |names| {
+                for (names) |name| try out.add(.{ .label = name, .kind = .enum_member });
+                return;
+            },
             else => {},
         }
         const ns = try queries.namespaceOfType(r, t) orelse return;
