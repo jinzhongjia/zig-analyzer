@@ -1215,6 +1215,17 @@ pub fn make() std.ArrayList(u8) { ... }
 
 - 测试：`zig build test` 共 244 个（逐项解析与警告、多个诊断 step 的合并与找不到的 step、关闭编译器诊断、运行中开关构建系统集成、inlay hints 的选项、关闭调用点种子、项目配置文件的覆盖与变化后重启）。
 
+### 19.23 取消与被吞掉的错误（2026-10-15）
+
+`ctx.get` 进入时先检查取消（写事务的 `pending_write` 与请求的取消标志），即使值已在 memo 中也会返回 `error.Canceled`。逐字输入时写事务随时到来，因此 compute 中任何读取 query 的位置都可能得到 `Canceled`。
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 崩溃 | `src/sema/infer.zig` | `body_owner` 以 `catch unreachable` 读取 ItemTree：推导 `comptime T: type` 参数或类型捕获时恰好有写事务到来，ReleaseSafe 下服务器崩溃（ReleaseFast 下为未定义行为）。改为传出错误 |
+| 缓存污染 | `src/db/engine.zig` | compute 中以回退值吞掉内层读取的错误（`catch null`、`catch return ...`，如 `ownInstance`、类型渲染）时，被取消的计算得到不完整的结果并写入 memo，之后依赖不变就一直沿用。compute 成功返回后再检查一次取消：已取消则丢弃结果并返回 `Canceled`。取消标志在读事务结束前不会复位，这一次检查即可覆盖所有吞掉错误的位置 |
+
+- 测试：`zig build test` 共 245 个（吞掉 `Canceled` 的 compute 不写入 memo）。
+
 ## 20. 风险与对策
 
 | 风险 | 影响 | 对策 |
