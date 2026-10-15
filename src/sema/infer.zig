@@ -864,18 +864,78 @@ const Inferrer = struct {
         }
         if (eq(u8, name, "@field")) {
             if (args.len != 2) return .unknown;
-            _ = try inf.infer(args[1], null);
-            const field = switch (inf.body.expr(args[1])) {
-                .literal => |text| std.zig.string_literal.parseAlloc(inf.scratch, text) catch null,
+            // 字段名为字符串字面量或 comptime 已知的字符串
+            const field_name = try inf.infer(args[1], null);
+            return inf.fieldAccess(e, args[0], try inf.stringArg(args[1]) orelse try eval.stringValue(inf.r, field_name));
+        }
+        if (try inf.typedArgsBuiltin(name, args, expected)) |tv| return tv;
+        // 嵌套的指针转换在编译器中合并为一次转换（`@ptrCast(@alignCast(p))`、`@alignCast(@fieldParentPtr(...))`）：
+        // 内层取外层的结果类型
+        if (isPtrCast(name) and args.len == 1) switch (inf.body.expr(args[0])) {
+            .builtin_call => |inner| if (isPtrCast(inner.name) or eq(u8, inner.name, "@fieldParentPtr")) {
+                _ = try inf.infer(args[0], inf.destType(expected, .eu));
+            },
+            else => {},
+        };
+        for (args) |a| _ = try inf.infer(a, null);
+        // 转换：结果类型由期望类型决定（按编译器的 `resolveDestType` 去掉 error union / optional）
+        const casts = [_]struct { []const u8, DestStrip }{
+            .{ "@intCast", .eu_opt },      .{ "@truncate", .eu_opt },    .{ "@floatCast", .eu_opt }, .{ "@floatFromInt", .eu_opt },
+            .{ "@intFromFloat", .eu_opt }, .{ "@enumFromInt", .eu_opt }, .{ "@bitCast", .eu_opt },   .{ "@ptrCast", .eu },
+            .{ "@alignCast", .eu },        .{ "@addrSpaceCast", .eu },   .{ "@ptrFromInt", .eu },    .{ "@fieldParentPtr", .eu },
+            .{ "@errorCast", .opt },
+        };
+        for (casts) |c| if (eq(u8, name, c[0])) {
+            if (inf.destType(expected, c[1])) |t| return .{ .ty = t };
+            // `@alignCast` / `@addrSpaceCast` 没有结果类型（在编译器中是错误）时取参数的类型
+            if ((eq(u8, name, "@alignCast") or eq(u8, name, "@addrSpaceCast")) and args.len == 1) return .{ .ty = inf.get(args[0]).ty };
+            return .unknown;
+        };
+        // 去掉 const / volatile：结果只取决于参数的类型（与编译器一致）
+        if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
+            const t = if (args.len == 1) inf.get(args[0]).ty else .unknown;
+            return .{ .ty = if (eq(u8, name, "@constCast")) try inf.mutablePtr(t) else t };
+        }
+        if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
+            if (try inf.pureValue(name, args)) |tv| return tv;
+            const t = if (args.len == 1) inf.get(args[0]).ty else .unknown;
+            if (t == .unknown) return .unknown;
+            return .{ .ty = try eval.backingIntType(inf.r, t) orelse .unknown };
+        }
+        if (eq(u8, name, "@clz") or eq(u8, name, "@ctz") or eq(u8, name, "@popCount")) {
+            if (try inf.pureValue(name, args)) |tv| return tv;
+            return .{ .ty = (if (args.len == 1) try inf.bitCountType(inf.get(args[0]).ty) else null) orelse .unknown };
+        }
+        // `struct { T, u1 }`：T 为两侧的 peer（`@shlWithOverflow` 为左侧的类型），向量时溢出位也是向量
+        if (eq(u8, name, "@addWithOverflow") or eq(u8, name, "@subWithOverflow") or eq(u8, name, "@mulWithOverflow") or eq(u8, name, "@shlWithOverflow")) {
+            if (args.len != 2) return .unknown;
+            const lhs = inf.get(args[0]).ty;
+            const t = if (eq(u8, name, "@shlWithOverflow")) lhs else try inf.peer(&.{ lhs, inf.get(args[1]).ty });
+            if (t == .unknown) return .unknown;
+            const bit: Index = switch (ip.key(t)) {
+                .vector_type => |v| try ip.get(.{ .vector_type = .{ .len = v.len, .child = .u1_type } }),
+                else => .u1_type,
+            };
+            return .{ .ty = try ip.get(.{ .tuple_type = .{ .types = &.{ t, bit } } }) };
+        }
+        // `@Vector(n, T)`：n 为 `pred` / `mask` 的长度
+        if (eq(u8, name, "@select") or eq(u8, name, "@shuffle")) {
+            if (args.len != 4) return .unknown;
+            const t = inf.get(args[0]).asType() orelse return .unknown;
+            const n: ?u64 = switch (ip.key(inf.get(if (eq(u8, name, "@select")) args[1] else args[3]).ty)) {
+                .vector_type => |v| v.len,
+                .array_type => |a| a.len,
                 else => null,
             };
-            const tv = try inf.fieldAccess(e, args[0], field);
-            return tv;
+            const len = std.math.cast(u32, n orelse return .unknown) orelse return .unknown;
+            return .{ .ty = try ip.get(.{ .vector_type = .{ .len = len, .child = t } }) };
         }
-        for (args) |a| _ = try inf.infer(a, null);
-        // 结果类型由期望类型决定的转换
-        const result_typed = [_][]const u8{ "@intCast", "@truncate", "@floatCast", "@floatFromInt", "@intFromFloat", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@enumFromInt", "@errorCast", "@bitCast", "@fieldParentPtr", "@ptrFromInt", "@splat", "@errSetCast", "@addrSpaceCast" };
-        for (result_typed) |n| if (eq(u8, name, n)) return .{ .ty = expected orelse .unknown };
+        // 错误的整数值：位宽取决于错误数量的上限（编译器默认为 u16）
+        if (eq(u8, name, "@intFromError")) return .{ .ty = try ip.intType(.unsigned, 16) };
+        if (eq(u8, name, "@errorReturnTrace")) {
+            const trace = try inf.stdType(&.{ "builtin", "StackTrace" }) orelse return .unknown;
+            return .{ .ty = try ip.optionalOf(try ip.ptrTo(trace, .one, false)) };
+        }
         if (eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf")) {
             const t = if (args.len == 2) inf.get(args[0]).asType() else null;
             const field = if (args.len == 2) try inf.stringArg(args[1]) else null;
@@ -884,10 +944,6 @@ const Inferrer = struct {
             const n = if (eq(u8, name, "@offsetOf")) bits / 8 else bits;
             return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = n } }) };
         }
-        if (eq(u8, name, "@mulAdd")) {
-            const t = if (args.len == 4) inf.get(args[0]).asType() orelse .unknown else .unknown;
-            return try inf.pureValue(name, args) orelse .{ .ty = t };
-        }
         const simple = [_]struct { []const u8, Index }{
             .{ "@intFromPtr", .usize_type },
             .{ "@inComptime", .bool_type },
@@ -895,23 +951,23 @@ const Inferrer = struct {
             .{ "@compileError", .noreturn_type },
             .{ "@trap", .noreturn_type },
             .{ "@memcpy", .void_type },
-            .{ "@memset", .void_type },
             .{ "@memmove", .void_type },
-            .{ "@setEvalBranchQuota", .void_type },
             .{ "@setRuntimeSafety", .void_type },
             .{ "@breakpoint", .void_type },
             .{ "@compileLog", .void_type },
-            .{ "@export", .void_type },
-            .{ "@prefetch", .void_type },
-            .{ "@setFloatMode", .void_type },
+            .{ "@disableInstrumentation", .void_type },
+            .{ "@disableIntrinsics", .void_type },
+            .{ "@returnAddress", .usize_type },
+            .{ "@frameAddress", .usize_type },
+            .{ "@errorFromInt", .anyerror_type },
         };
         for (simple) |s| if (eq(u8, name, s[0])) return .{ .ty = s[1] };
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName") or eq(u8, name, "@typeName")) {
             const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
-        // 结果与第一个参数同类型
-        const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil", "@shlExact", "@shrExact" };
+        // 结果与第一个参数同类型（除法与取余为两侧的 peer）
+        const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil" };
         for (same) |n| if (eq(u8, name, n)) {
             if (args.len == 0) return .unknown;
             if (try inf.pureValue(name, args)) |tv| return tv;
@@ -926,9 +982,161 @@ const Inferrer = struct {
             }
             // 有符号整数的绝对值为同位宽的无符号整数
             if (eq(u8, name, "@abs")) if (value.intInfo(ip, types.items[0])) |info| if (info.signed) return .{ .ty = try ip.intType(.unsigned, info.bits) };
+            // 除法与取余：两侧的 peer
+            if (args.len == 2) return .{ .ty = try inf.peer(types.items) };
             return .{ .ty = types.items[0] };
         };
         return .unknown;
+    }
+
+    /// 参数有结果类型的内置函数（与编译器一致）：参数按各自的结果类型推导；不是这些内置函数时为 null
+    fn typedArgsBuiltin(inf: *Inferrer, name: []const u8, args: []const ExprId, expected: ?Index) Error!?TypedValue {
+        const ip = inf.ip;
+        const eq = std.mem.eql;
+        if (eq(u8, name, "@splat")) {
+            const dest = inf.destType(expected, .eu_opt);
+            const elem: ?Index = if (dest) |d| switch (ip.key(d)) {
+                .vector_type => |v| v.child,
+                .array_type => |a| a.child,
+                else => null,
+            } else null;
+            for (args) |a| _ = try inf.infer(a, elem);
+            return .{ .ty = dest orelse .unknown };
+        }
+        // 参数的结果类型为目标类型的 backing 整数
+        if (eq(u8, name, "@fromBackingInt")) {
+            const dest = inf.destType(expected, .eu_opt);
+            const int_ty: ?Index = if (dest) |d| try eval.backingIntType(inf.r, d) else null;
+            for (args) |a| _ = try inf.infer(a, int_ty);
+            return .{ .ty = dest orelse .unknown };
+        }
+        // 右侧为 `Log2Int(T)`
+        if (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact")) {
+            const lhs: TypedValue = if (args.len > 0) try inf.infer(args[0], null) else .unknown;
+            for (args[@min(args.len, 1)..]) |a| _ = try inf.infer(a, try inf.log2IntType(lhs.ty));
+            return try inf.pureValue(name, args) orelse .{ .ty = lhs.ty };
+        }
+        // 初始化值的结果类型为字段的类型
+        if (eq(u8, name, "@unionInit")) {
+            if (args.len != 3) return null;
+            const t = (try inf.infer(args[0], null)).asType();
+            const field_name = try inf.infer(args[1], null);
+            const field = try inf.stringArg(args[1]) orelse try eval.stringValue(inf.r, field_name);
+            const field_ty: ?Index = if (t != null and field != null) try inf.unionFieldType(t.?, field.?) else null;
+            _ = try inf.infer(args[2], field_ty);
+            return .{ .ty = t orelse .unknown };
+        }
+        // 填充值的结果类型为元素类型
+        if (eq(u8, name, "@memset")) {
+            const dest: TypedValue = if (args.len > 0) try inf.infer(args[0], null) else .unknown;
+            const elem = inf.elementType(dest.ty);
+            for (args[@min(args.len, 1)..]) |a| _ = try inf.infer(a, if (elem != .unknown) elem else null);
+            return .{ .ty = .void_type };
+        }
+        // 各参数的结果类型；`elem` 为第一个参数给出的类型
+        const ArgType = enum { none, elem, u32, atomic_order, atomic_rmw_op, reduce_op, call_modifier, branch_hint, float_mode, prefetch_options, export_options, extern_options };
+        const signatures = [_]struct { []const u8, []const ArgType }{
+            .{ "@atomicLoad", &.{ .none, .none, .atomic_order } },
+            .{ "@atomicStore", &.{ .none, .none, .elem, .atomic_order } },
+            .{ "@atomicRmw", &.{ .none, .none, .atomic_rmw_op, .elem, .atomic_order } },
+            .{ "@cmpxchgStrong", &.{ .none, .none, .elem, .elem, .atomic_order, .atomic_order } },
+            .{ "@cmpxchgWeak", &.{ .none, .none, .elem, .elem, .atomic_order, .atomic_order } },
+            .{ "@mulAdd", &.{ .none, .elem, .elem, .elem } },
+            .{ "@reduce", &.{ .reduce_op, .none } },
+            .{ "@call", &.{ .call_modifier, .none, .none } },
+            .{ "@branchHint", &.{.branch_hint} },
+            .{ "@setFloatMode", &.{.float_mode} },
+            .{ "@setEvalBranchQuota", &.{.u32} },
+            .{ "@prefetch", &.{ .none, .prefetch_options } },
+            .{ "@export", &.{ .none, .export_options } },
+            .{ "@extern", &.{ .none, .extern_options } },
+        };
+        const sig = for (signatures) |x| {
+            if (eq(u8, name, x[0])) break x[1];
+        } else return null;
+        var elem: Index = .unknown;
+        for (args, 0..) |a, i| {
+            const want: ?Index = switch (if (i < sig.len) sig[i] else .none) {
+                .none => null,
+                .elem => if (elem != .unknown) elem else null,
+                .u32 => try ip.intType(.unsigned, 32),
+                .atomic_order => try inf.stdType(&.{ "builtin", "AtomicOrder" }),
+                .atomic_rmw_op => try inf.stdType(&.{ "builtin", "AtomicRmwOp" }),
+                .reduce_op => try inf.stdType(&.{ "builtin", "ReduceOp" }),
+                .call_modifier => try inf.stdType(&.{ "builtin", "CallModifier" }),
+                .branch_hint => try inf.stdType(&.{ "builtin", "BranchHint" }),
+                .float_mode => try inf.stdType(&.{ "builtin", "FloatMode" }),
+                .prefetch_options => try inf.stdType(&.{ "builtin", "PrefetchOptions" }),
+                .export_options => try inf.stdType(&.{ "builtin", "ExportOptions" }),
+                .extern_options => try inf.stdType(&.{ "builtin", "ExternOptions" }),
+            };
+            const tv = try inf.infer(a, want);
+            if (i == 0) elem = tv.asType() orelse .unknown;
+        }
+        if (eq(u8, name, "@atomicLoad") or eq(u8, name, "@atomicRmw") or eq(u8, name, "@extern")) return .{ .ty = elem };
+        if (eq(u8, name, "@cmpxchgStrong") or eq(u8, name, "@cmpxchgWeak")) return .{ .ty = try ip.optionalOf(elem) };
+        if (eq(u8, name, "@mulAdd")) return try inf.pureValue(name, args) orelse .{ .ty = elem };
+        if (eq(u8, name, "@reduce")) return .{ .ty = if (args.len == 2) inf.elementType(inf.get(args[1]).ty) else .unknown };
+        if (eq(u8, name, "@call")) return .{ .ty = if (args.len == 3) inf.fnReturnType(inf.get(args[1]).ty) else .unknown };
+        return .{ .ty = .void_type };
+    }
+
+    const DestStrip = enum { eu_opt, eu, opt };
+
+    /// 转换类内置函数的目标类型：期望类型按编译器的 `resolveDestType` 去掉 error union / optional
+    fn destType(inf: *Inferrer, expected: ?Index, strip: DestStrip) ?Index {
+        const ip = inf.ip;
+        var t = expected orelse return null;
+        if (t == .unknown) return null;
+        if (strip != .opt) switch (ip.key(t)) {
+            .error_union_type => |eu| t = eu.payload,
+            else => {},
+        };
+        if (strip != .eu) switch (ip.key(t)) {
+            .optional_type => |c| t = c,
+            else => {},
+        };
+        return t;
+    }
+
+    /// 去掉指针（含 optional 指针）的 const
+    fn mutablePtr(inf: *Inferrer, t: Index) Error!Index {
+        const ip = inf.ip;
+        switch (ip.key(t)) {
+            .ptr_type => |p| {
+                var q = p;
+                q.is_const = false;
+                return ip.get(.{ .ptr_type = q });
+            },
+            .optional_type => |c| if (ip.key(c) == .ptr_type) return ip.optionalOf(try inf.mutablePtr(c)),
+            else => {},
+        }
+        return t;
+    }
+
+    /// `@clz` / `@ctz` / `@popCount` 的结果类型：能容纳 0 到位宽的最小无符号整数，向量逐元素
+    fn bitCountType(inf: *Inferrer, t: Index) Error!?Index {
+        const ip = inf.ip;
+        switch (ip.key(t)) {
+            .vector_type => |v| {
+                const child = try inf.bitCountType(v.child) orelse return null;
+                return try ip.get(.{ .vector_type = .{ .len = v.len, .child = child } });
+            },
+            else => {},
+        }
+        const info = value.intInfo(ip, t) orelse return null;
+        return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int(u16, info.bits) + 1);
+    }
+
+    /// 函数（或函数指针）的返回类型；依赖参数时为 unknown
+    fn fnReturnType(inf: *Inferrer, t: Index) Index {
+        const ip = inf.ip;
+        const f = switch (ip.key(t)) {
+            .fn_type => |f| f,
+            .ptr_type => |p| if (p.size == .one and ip.key(p.child) == .fn_type) ip.key(p.child).fn_type else return .unknown,
+            else => return .unknown,
+        };
+        return inf.concrete(f.ret) orelse .unknown;
     }
 
     /// 参数都已知时只做计算的内置函数（数学函数、布局）的值，由解释器计算
@@ -1124,6 +1332,15 @@ const Inferrer = struct {
         const cap = prong.capture[0];
         inf.bindings[@backingInt(cap)] = .{ .ty = if (inf.body.binding(cap).is_ptr) try ip.ptrTo(t, .one, false) else t };
         if (prong.capture.len > 1) inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = .unknown };
+    }
+
+    /// union 字段的类型
+    fn unionFieldType(inf: *Inferrer, t: Index, name: []const u8) Error!?Index {
+        if (inf.ip.key(t) != .container_type) return eval.fieldType(inf.r, t, name);
+        const ns = try queries.namespaceOfType(inf.r, t) orelse return null;
+        const tree = try inf.r.itemTree(ns.file);
+        const f = fieldItem(tree, ns.container, name) orelse return null;
+        return (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(inf.ip, t))).ty;
     }
 
     // ── 运算 ─────────────────────────────────────────────────────────
@@ -1556,6 +1773,21 @@ const Inferrer = struct {
         return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel } }) };
     }
 
+    /// 移位右侧的结果类型 `Log2Int(T)`（与编译器一致）；不是整数及其向量时为 null
+    fn log2IntType(inf: *Inferrer, t: Index) Error!?Index {
+        const ip = inf.ip;
+        if (t == .comptime_int_type) return .comptime_int_type;
+        switch (ip.key(t)) {
+            .vector_type => |v| {
+                const child = try inf.log2IntType(v.child) orelse return null;
+                return try ip.get(.{ .vector_type = .{ .len = v.len, .child = child } });
+            },
+            else => {},
+        }
+        const info = value.intInfo(ip, t) orelse return null;
+        return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits));
+    }
+
     fn isConstPtr(inf: *Inferrer, t: Index) bool {
         return switch (inf.ip.key(t)) {
             .ptr_type => |p| p.is_const,
@@ -1686,6 +1918,14 @@ fn declKnownness(it: ItemTree.Item) Inferrer.Knownness {
 
 fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
     return std.mem.indexOfScalar(Body.BindingId, list, b) != null;
+}
+
+/// 指针转换类内置函数（嵌套时在编译器中合并为一次转换）
+fn isPtrCast(name: []const u8) bool {
+    for ([_][]const u8{ "@ptrCast", "@alignCast", "@addrSpaceCast", "@constCast", "@volatileCast" }) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
 }
 
 /// 可做指针运算的指针（多项指针与 C 指针）

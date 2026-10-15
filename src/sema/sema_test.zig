@@ -1241,6 +1241,93 @@ test "calls through function pointers" {
     });
 }
 
+test "builtin result types follow the compiler" {
+    try expectTypes(
+        \\const Tag = enum { a, b, c };
+        \\const U = union(Tag) { a: u8, b: u16, c: bool };
+        \\const E = enum(u4) { x, y, z };
+        \\const P = packed struct(u12) { lo: u4, hi: u8 };
+        \\fn ret7() u32 { return 7; }
+        \\fn f(e: E, u: U, pk: P, x: u32, y: u32, v: @Vector(4, u32), cp: *const u8, op: ?*const u8) void {
+        \\    var w: u32 = 0;
+        \\    const q1 = @intFromEnum(e);
+        \\    const q2 = @backingInt(pk);
+        \\    const q3 = @intFromEnum(u);
+        \\    const q4 = @backingInt(u);
+        \\    const q5 = @intFromEnum(E.z);
+        \\    const b1 = @clz(x);
+        \\    const b2 = @addWithOverflow(x, y);
+        \\    const b3 = @shlWithOverflow(x, 3);
+        \\    const b4 = @call(.auto, ret7, .{});
+        \\    const b5 = @divTrunc(100, x);
+        \\    const b6 = @returnAddress();
+        \\    const b7 = @atomicLoad(u32, &w, .seq_cst);
+        \\    const b8 = @cmpxchgWeak(u32, &w, 1, 2, .seq_cst, .seq_cst);
+        \\    const b9 = @atomicRmw(u32, &w, .Add, 1, .seq_cst);
+        \\    const v1 = @reduce(.Add, v);
+        \\    const v2 = @select(u32, @as(@Vector(4, bool), @splat(true)), v, v);
+        \\    const v3 = @shuffle(u32, v, v, [_]i32{ 0, 1 });
+        \\    const v4 = @clz(v);
+        \\    const k1 = @constCast(cp);
+        \\    const k2 = @constCast(op);
+        \\    const ui = @unionInit(U, "b", 4);
+        \\    _ = .{ q1, q2, q3, q4, q5, b1, b2, b3, b4, b5, b6, b7, b8, b9, v1, v2, v3, v4, k1, k2, ui };
+        \\}
+    , &.{
+        .{ "q1", "u4" },
+        .{ "q2", "u12" },
+        // 带标签的 union：标签的整数
+        .{ "q3", "u2" },
+        .{ "q4", "u2" },
+        .{ "q5", "u4 = 2" },
+        .{ "b1", "u6" },
+        .{ "b2", "struct { u32, u1 }" },
+        .{ "b3", "struct { u32, u1 }" },
+        .{ "b4", "u32" },
+        .{ "b5", "u32" },
+        .{ "b6", "usize" },
+        .{ "b7", "u32" },
+        .{ "b8", "?u32" },
+        .{ "b9", "u32" },
+        .{ "v1", "u32" },
+        .{ "v2", "@Vector(4, u32)" },
+        .{ "v3", "@Vector(2, u32)" },
+        .{ "v4", "@Vector(4, u6)" },
+        .{ "k1", "*u8" },
+        .{ "k2", "?*u8" },
+        .{ "ui", "U" },
+    });
+}
+
+test "builtin arguments get their result types" {
+    try expectTypes(
+        \\const E = enum(u4) { x, y, z };
+        \\const P = packed struct(u12) { lo: u4, hi: u8 };
+        \\const Outer = struct { x: u32, inner: u16 };
+        \\fn f(n: u4, buf: []u16, p: *u16) void {
+        \\    var w: u32 = 0;
+        \\    const ee: anyerror!E = @enumFromInt(n);
+        \\    const pk: P = @fromBackingInt(61);
+        \\    const sp: @Vector(4, u8) = @splat(62);
+        \\    @memset(buf, 63);
+        \\    _ = @atomicRmw(u32, &w, .Add, 48, .seq_cst);
+        \\    const outer: *Outer = @alignCast(@fieldParentPtr("inner", p));
+        \\    _ = .{ ee, pk, sp, outer };
+        \\}
+    , &.{
+        // 转换的目标类型去掉 error union 与 optional
+        .{ "@enumFromInt(n)", "E" },
+        .{ "pk", "P" },
+        // 参数的结果类型：backing 整数、向量与切片的元素类型、原子操作的类型参数
+        .{ "61", "u12 = 61" },
+        .{ "62", "u8 = 62" },
+        .{ "63", "u16 = 63" },
+        .{ "48", "u32 = 48" },
+        // `@alignCast(@fieldParentPtr(...))` 合并为一次转换：内层取外层的结果类型
+        .{ "@fieldParentPtr(\"inner\", p)", "*Outer" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
@@ -1436,6 +1523,18 @@ test "clauses get the compiler's result types" {
         .{ "\"std\"", "*const [3:0]u8" },
         .{ ".naked", "CallingConvention" },
         .{ "16", "u29 = 16" },
+    });
+}
+
+test "builtin arguments of std types get their result types" {
+    try expectStdTypes(
+        \\fn f(p: *u32) void {
+        \\    @branchHint(.cold);
+        \\    _ = @atomicLoad(u32, p, .seq_cst);
+        \\}
+    , &.{
+        .{ ".cold", "BranchHint = .cold" },
+        .{ ".seq_cst", "AtomicOrder = .seq_cst" },
     });
 }
 

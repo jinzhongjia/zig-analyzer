@@ -134,6 +134,28 @@ pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
     };
 }
 
+/// `@backingInt` 的结果类型（与编译器一致）：枚举为标签整数，带标签的 union 为标签枚举的整数，
+/// packed 容器为显式给出的 backing 整数；其他类型或求不出时为 null
+pub fn backingIntType(r: *Resolver, t: Index) Error!?Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return ev.backingIntType(t) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// comptime 已知的字符串的内容；不是时为 null
+pub fn stringValue(r: *Resolver, tv: TypedValue) Error!?[]const u8 {
+    const v = tv.val orelse return null;
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return ev.stringOf(Val.of(tv.ty, v)) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 /// 结构体字段的位偏移（`@bitOffsetOf`）；求不出时为 null
 pub fn bitOffsetOf(r: *Resolver, t: Index, field: []const u8) Error!?u64 {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
@@ -1988,10 +2010,6 @@ const Evaluator = struct {
             if (want == null and pointer_cast) return vals[0];
             return ev.cast(name, vals[0], want orelse return error.Abort);
         }
-        if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
-            if (vals.len != 1) return error.Abort;
-            return ev.enumInt(vals[0]);
-        }
         if (eq(u8, name, "@intFromBool")) {
             if (vals.len != 1) return error.Abort;
             return ev.int(.u1_type, @intFromBool((try ev.condition(vals[0])).yes));
@@ -2034,6 +2052,10 @@ const Evaluator = struct {
             const l = try ev.typeLayout(try asType(vals[0]), 0) orelse return error.Abort;
             const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits orelse return error.Abort;
             return try ev.int(.comptime_int_type, n);
+        }
+        if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
+            if (vals.len != 1) return error.Abort;
+            return try ev.enumInt(vals[0]);
         }
         if (eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf")) {
             if (vals.len != 2) return error.Abort;
@@ -2205,14 +2227,16 @@ const Evaluator = struct {
     fn enumInt(ev: *Evaluator, v: Val) EvalError!Val {
         const ip = ev.ip;
         const x = try ev.freeze(v) orelse return error.Abort;
-        const tag = switch (ip.key(x)) {
-            .enum_tag => |t| t,
+        const enum_ty: Index, const tag_name: []const u8 = switch (ip.key(x)) {
+            .enum_tag => |t| .{ t.ty, t.name },
+            // 带标签的 union：标签的整数
+            .union_value => |u| .{ try ev.unionTagType(u.ty) orelse return error.Abort, u.tag },
             else => return error.Abort,
         };
-        const names = try ev.enumNames(tag.ty) orelse return error.Abort;
-        const values = try ev.enumValues(tag.ty);
-        const int_ty = try ev.enumTagType(tag.ty) orelse .comptime_int_type;
-        for (names, values) |n, val| if (std.mem.eql(u8, n, tag.name)) return ev.int(int_ty, val);
+        const names = try ev.enumNames(enum_ty) orelse return error.Abort;
+        const values = try ev.enumValues(enum_ty);
+        const int_ty = try ev.enumTagType(enum_ty) orelse .comptime_int_type;
+        for (names, values) |n, val| if (std.mem.eql(u8, n, tag_name)) return ev.int(int_ty, val);
         return error.Abort;
     }
 
@@ -2943,6 +2967,20 @@ const Evaluator = struct {
         const s = try ev.containerSyntax(t);
         if (s.auto_enum) return try ev.ip.get(.{ .union_tag_type = t });
         return s.arg;
+    }
+
+    fn backingIntType(ev: *Evaluator, t: Index) EvalError!?Index {
+        const ip = ev.ip;
+        if (value.isEnumType(ip, t)) return ev.enumTagType(t);
+        switch (ip.key(t)) {
+            .container_type, .reified_type => {},
+            else => return null,
+        }
+        const decl = try ev.containerSyntax(t);
+        // 未显式给出 backing 整数的 packed 容器：编译器对 `@backingInt` 报错
+        if (decl.layout == .@"packed") return decl.arg;
+        if (ev.isUnion(t)) if (try ev.unionTagType(t)) |tag| return ev.enumTagType(tag);
+        return null;
     }
 
     /// packed 结构体的 backing 整数（`?type` 的值）
