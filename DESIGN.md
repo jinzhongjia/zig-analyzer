@@ -701,7 +701,9 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 
 ## 15. 配置
 
-配置来自客户端：`initialize` 的 `initializationOptions`，与 `workspace/didChangeConfiguration` 推送（或经 `workspace/configuration` 拉取）的 settings。项目级 `zig-analyzer.json`（团队共享 `build.args`、`diagnostics.steps`）留待以后；全局配置文件不做（编辑器已能管理用户级设置）。
+配置来自客户端：`initialize` 的 `initializationOptions`，与 `workspace/didChangeConfiguration` 推送（或经 `workspace/configuration` 拉取）的 settings。全局配置文件不做（编辑器已能管理用户级设置）。
+
+项目根目录（有 build.zig 的工作区根目录）的 `zig-analyzer.json` 用同样的结构，供团队共享与项目相关的项：`build.args`、`diagnostics.step` / `steps`、`diagnostics.compiler`。其中出现的项优先于客户端的配置，没有出现的项沿用客户端的配置；其余的项提示后忽略，JSON 有误时提示后忽略整个文件。项目启动时读取；文件变化（`didChangeWatchedFiles`，监听 `**/zig-analyzer.json`）时重启该项目。
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
@@ -1209,8 +1211,9 @@ pub fn make() std.ArrayList(u8) { ... }
 | 构建与诊断 | `src/server/Server.zig`、`Workspace.zig`、`src/base/ProjectModel.zig` | `build.enable`：关闭时不启动项目、所有文件按单文件处理，运行中关闭时停止项目并清除其诊断、重新打开时启动；`diagnostics.compiler`：关闭时构建只请求生成文件的产出 step（没有时不构建，并以空结果清除重启前的诊断），单文件不编译；`diagnostics.steps`：ProjectModel 的诊断 step 改为列表，编译集合、构建请求与错误的收集都取全部诊断 step |
 | inlay hints | `src/ide/inlay_hints.zig` | `Options`：类型、形参名、与实参同名时隐藏；变化后发 `workspace/inlayHint/refresh` |
 | 调用点种子 | `src/database.zig`、`src/ide/seed.zig` | `Env.callsite_seeding`（服务器持有的原子开关）；`seed.find` 在 IDE 层读取，不影响 query 结果 |
+| 项目配置文件 | `src/server/Config.zig`、`Workspace.zig` | `parseProject` 只保留项目相关的项（`present` 记录出现的项），`overlayProject` 覆盖客户端的配置；`Workspace.start` 读取根目录的 `zig-analyzer.json`，它与 build.zig 一样变化时重启项目 |
 
-- 测试：`zig build test` 共 242 个（逐项解析与警告、多个诊断 step 的合并与找不到的 step、关闭编译器诊断、运行中开关构建系统集成、inlay hints 的选项、关闭调用点种子）。
+- 测试：`zig build test` 共 244 个（逐项解析与警告、多个诊断 step 的合并与找不到的 step、关闭编译器诊断、运行中开关构建系统集成、inlay hints 的选项、关闭调用点种子、项目配置文件的覆盖与变化后重启）。
 
 ## 20. 风险与对策
 
