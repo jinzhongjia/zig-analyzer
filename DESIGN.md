@@ -1223,6 +1223,7 @@ pub fn make() std.ArrayList(u8) { ... }
 |---|---|---|
 | 崩溃 | `src/sema/infer.zig` | `body_owner` 以 `catch unreachable` 读取 ItemTree：推导 `comptime T: type` 参数或类型捕获时恰好有写事务到来，ReleaseSafe 下服务器崩溃（ReleaseFast 下为未定义行为）。改为传出错误 |
 | 缓存污染 | `src/db/engine.zig` | compute 中以回退值吞掉内层读取的错误（`catch null`、`catch return ...`，如 `ownInstance`、类型渲染）时，被取消的计算得到不完整的结果并写入 memo，之后依赖不变就一直沿用。compute 成功返回后再检查一次取消：已取消则丢弃结果并返回 `Canceled`。取消标志在读事务结束前不会复位，这一次检查即可覆盖所有吞掉错误的位置 |
+| 请求与诊断发布 | `src/server/Server.zig` | IDE 层（如 hover 中的类型渲染）同样会吞掉错误，结果不写入 memo，但会作为响应发出。读请求与语义请求的处理函数返回后检查一次取消，已取消则回复 `ContentModified` / `RequestCancelled`（客户端重试）；诊断发布已取消时重新计算 |
 
 - 测试：`zig build test` 共 245 个（吞掉 `Canceled` 的 compute 不写入 memo）。
 
