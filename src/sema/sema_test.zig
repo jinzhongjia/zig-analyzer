@@ -1134,6 +1134,102 @@ test "destructuring infers each element" {
     });
 }
 
+test "slices with comptime-known bounds are pointers to arrays" {
+    try expectTypes(
+        \\fn f(n: usize, sl: []u8, mp: [*]u8, s0: [:0]const u8, p0: [*:0]const u8) void {
+        \\    var arr: [8]u8 = @splat(1);
+        \\    const carr: [8]u8 = @splat(2);
+        \\    var sarr: [8:0]u8 = @splat(3);
+        \\    const t1 = arr[0..4];
+        \\    const t2 = carr[1..4];
+        \\    const t3 = sl[0..4];
+        \\    const t4 = mp[0..4];
+        \\    const t5 = arr[2..];
+        \\    const t6 = sl[2..];
+        \\    const t7 = arr[0..n];
+        \\    const t8 = "hello"[1..3];
+        \\    const t9 = arr[0..4 :1];
+        \\    const t10 = sarr[2..];
+        \\    const t11 = sarr[0..8];
+        \\    const t12 = mp[2..];
+        \\    const t13 = s0[1..];
+        \\    const t14 = p0[1..];
+        \\    const t15 = sarr[n..];
+        \\    const t16 = (&arr)[1..3];
+        \\    const t17 = sl[1..3 :1];
+        \\    const t18 = (&arr[0])[0..1];
+        \\    _ = .{ &arr, &sarr, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18 };
+        \\}
+    , &.{
+        .{ "t1", "*[4]u8" },
+        .{ "t2", "*const [3]u8" },
+        .{ "t3", "*[4]u8" },
+        .{ "t4", "*[4]u8" },
+        .{ "t5", "*[6]u8" },
+        .{ "t6", "[]u8" },
+        .{ "t7", "[]u8" },
+        .{ "t8", "*const [2]u8" },
+        .{ "t9", "*[4:1]u8" },
+        // 切到末尾（含结束位置等于长度）时保留数组的哨兵
+        .{ "t10", "*[6:0]u8" },
+        .{ "t11", "*[8:0]u8" },
+        .{ "t12", "[*]u8" },
+        .{ "t13", "[:0]const u8" },
+        .{ "t14", "[*:0]const u8" },
+        .{ "t15", "[:0]u8" },
+        .{ "t16", "*[2]u8" },
+        .{ "t17", "*[2:1]u8" },
+        // 指向单个元素的指针按长度为 1 的数组切片
+        .{ "t18", "*[1]u8" },
+    });
+}
+
+test "concatenation follows the compiler" {
+    try expectTypes(
+        \\fn f() void {
+        \\    const c1 = "ab" ++ "cd";
+        \\    const c2 = [2]u8{ 1, 2 } ++ "cd";
+        \\    const c3 = "ab" ++ [2]u8{ 3, 4 };
+        \\    const c4 = [2]u8{ 1, 2 } ++ [_]u8{3};
+        \\    const c5 = .{ 1, true } ++ .{"x"};
+        \\    const c6 = [_:0]u8{1} ++ [_:1]u8{2};
+        \\    const c7 = "ab" ++ [_:1]u8{2};
+        \\    const c8 = .{ 1, 2 } ++ [_]u8{3};
+        \\    const c9 = [_]u16{1} ++ [_]u8{2};
+        \\    _ = .{ c1, c2, c3, c4, c5, c6, c7, c8, c9 };
+        \\}
+    , &.{
+        .{ "c1", "*const [4:0]u8" },
+        // 只有一侧有哨兵时保留它，两侧的哨兵不同时没有哨兵
+        .{ "c2", "*const [4:0]u8" },
+        .{ "c3", "*const [4:0]u8" },
+        .{ "c4", "[3]u8" },
+        .{ "c5", "struct { comptime comptime_int = 1, comptime bool = true, comptime *const [1:0]u8 = \"x\" }" },
+        .{ "c6", "[2]u8" },
+        .{ "c7", "*const [3]u8" },
+        .{ "c8", "[3]u8" },
+        .{ "c9", "[2]u16" },
+    });
+}
+
+test "pointer arithmetic and vector operations" {
+    try expectTypes(
+        \\fn f(p: [*]const u8, q: [*]const u8, v: @Vector(4, u32)) void {
+        \\    const p1 = p + 1;
+        \\    const d = p - q;
+        \\    const h = v[1];
+        \\    const vc = v == v;
+        \\    _ = .{ p1, d, h, vc };
+        \\}
+    , &.{
+        .{ "p1", "[*]const u8" },
+        .{ "d", "usize" },
+        .{ "h", "u32" },
+        // 向量逐元素比较
+        .{ "vc", "@Vector(4, bool)" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);

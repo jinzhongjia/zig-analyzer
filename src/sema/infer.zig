@@ -402,7 +402,7 @@ const Inferrer = struct {
                 const rhs = try inf.infer(c.rhs, if (payload != .unknown) payload else null);
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
             },
-            .binary => |bin| return inf.binary(bin.op, bin.lhs, bin.rhs, expected),
+            .binary => |bin| return inf.binary(e, bin.op, bin.lhs, bin.rhs, expected),
             .prefix => |p| return inf.prefix(p.op, p.operand, expected),
             .assign => |a| {
                 const lhs = try inf.infer(a.lhs, null);
@@ -425,14 +425,7 @@ const Inferrer = struct {
                 };
                 return .{ .ty = elem };
             },
-            .slice => |s| {
-                const lhs = try inf.infer(s.lhs, null);
-                _ = try inf.infer(s.start, .usize_type);
-                if (s.end) |end| _ = try inf.infer(end, .usize_type);
-                if (s.sentinel) |sen| _ = try inf.infer(sen, null);
-                const elem = inf.elementType(lhs.ty);
-                return .{ .ty = try ip.ptrTo(elem, .slice, inf.isConstPtr(lhs.ty)) };
-            },
+            .slice => |s| return inf.slice(s.lhs, s.start, s.end, s.sentinel),
             .deref => |x| {
                 const p = try inf.infer(x, null);
                 return .{ .ty = switch (ip.key(p.ty)) {
@@ -1130,7 +1123,7 @@ const Inferrer = struct {
 
     // ── 运算 ─────────────────────────────────────────────────────────
 
-    fn binary(inf: *Inferrer, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId, expected: ?Index) Error!TypedValue {
+    fn binary(inf: *Inferrer, e: ExprId, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId, expected: ?Index) Error!TypedValue {
         const ip = inf.ip;
         switch (op) {
             .keyword_orelse => {
@@ -1164,6 +1157,15 @@ const Inferrer = struct {
                     else => false,
                 };
                 const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type and !is_union) lhs.ty else null);
+                // 向量逐元素比较，结果为 bool 的向量
+                const vec_len: ?u32 = switch (ip.key(lhs.ty)) {
+                    .vector_type => |v| v.len,
+                    else => switch (ip.key(rhs.ty)) {
+                        .vector_type => |v| v.len,
+                        else => null,
+                    },
+                };
+                if (vec_len) |n| return .{ .ty = try ip.get(.{ .vector_type = .{ .len = n, .child = .bool_type } }) };
                 if (try inf.compare(op, lhs, rhs)) |result| return boolValue(result);
                 return .{ .ty = .bool_type };
             },
@@ -1172,10 +1174,14 @@ const Inferrer = struct {
                 const rhs = try inf.infer(rhs_e, null);
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
-            .plus_plus => {
-                _ = try inf.infer(lhs_e, null);
-                _ = try inf.infer(rhs_e, null);
-                return .unknown;
+            .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
+            // 指针运算（与编译器一致）：`[*]T ± usize` 仍为原指针类型，两个指针相减为 usize
+            .plus, .minus => {
+                const lhs = try inf.infer(lhs_e, expected);
+                if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e, expected);
+                const rhs = try inf.infer(rhs_e, .usize_type);
+                if (isNonSlicePtr(ip, rhs.ty)) return .{ .ty = if (op == .minus) .usize_type else .unknown };
+                return .{ .ty = if (isManyPtr(ip, lhs.ty)) lhs.ty else .unknown };
             },
             // 错误集合并
             .pipe_pipe => {
@@ -1186,13 +1192,49 @@ const Inferrer = struct {
                 const names = try std.mem.concat(inf.scratch, []const u8, &.{ x, y });
                 return TypedValue.ofType(try ip.errorSet(inf.scratch, names));
             },
-            else => {
-                // 算术与位运算：两侧 peer；两侧都是已知整数时按结果类型的位宽折叠
-                const lhs = try inf.infer(lhs_e, expected);
-                const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else expected);
-                return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
-            },
+            else => return inf.arith(op, try inf.infer(lhs_e, expected), rhs_e, expected),
         }
+    }
+
+    /// 算术与位运算：两侧 peer；两侧都是已知整数时按结果类型的位宽折叠
+    fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId, expected: ?Index) Error!TypedValue {
+        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else expected);
+        return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
+    }
+
+    /// `++`（与编译器的 `zirArrayCat` 一致）：元组相接为元组；数组与指向数组的指针相接为数组，元素类型为两侧
+    /// 元素类型的 peer，任一侧是指针时为 `*const [N]T`。两侧的值都已知时由解释器求值
+    fn concat(inf: *Inferrer, e: ExprId, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
+        const ty = try inf.concatType(lhs.ty, rhs.ty);
+        if (ty == .unknown) return .unknown;
+        if (lhs.val != null and rhs.val != null and inf.dead == 0 and !inf.r.ctx.incomplete()) {
+            const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null);
+            if (tv.val != null and tv.ty == ty) return tv;
+        }
+        return .{ .ty = ty };
+    }
+
+    fn concatType(inf: *Inferrer, a: Index, b: Index) Error!Index {
+        const ip = inf.ip;
+        if (ip.key(a) == .tuple_type and ip.key(b) == .tuple_type) {
+            // comptime 字段保持为 comptime 字段
+            const x = ip.key(a).tuple_type;
+            const y = ip.key(b).tuple_type;
+            const types = try std.mem.concat(inf.scratch, Index, &.{ x.types, y.types });
+            const values = try inf.scratch.alloc(Index, types.len);
+            for (values, 0..) |*v, i| v.* = if (i < x.types.len) InternPool.fieldValue(x.values, i) else InternPool.fieldValue(y.values, i - x.types.len);
+            return ip.get(.{ .tuple_type = .{ .types = types, .values = InternPool.fieldValues(values) } });
+        }
+        // 元组与数组相接时元组按另一侧的元素类型看作数组
+        const x = concatOperand(ip, a, b) orelse return .unknown;
+        const y = concatOperand(ip, b, a) orelse return .unknown;
+        const elem = try inf.peer(&.{ x.elem, y.elem });
+        if (elem == .unknown) return .unknown;
+        // 哨兵先转换为结果的元素类型再比较
+        const xs: ?Index = if (x.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return .unknown else null;
+        const ys: ?Index = if (y.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return .unknown else null;
+        const array = try ip.get(.{ .array_type = .{ .len = x.len + y.len, .child = elem, .sentinel = eval.concatSentinel(xs, ys) } });
+        return if (x.is_ptr or y.is_ptr) ip.ptrTo(array, .one, true) else array;
     }
 
     /// 整数运算：结果类型为 `ty`，两侧值已知且结果有定义时带值
@@ -1458,11 +1500,12 @@ const Inferrer = struct {
 
     // ── 类型工具 ─────────────────────────────────────────────────────
 
-    /// 数组、切片、多项指针、指向数组的指针的元素类型
+    /// 数组、向量、切片、多项指针、指向数组的指针的元素类型
     fn elementType(inf: *Inferrer, t: Index) Index {
         const ip = inf.ip;
         return switch (ip.key(t)) {
             .array_type => |a| a.child,
+            .vector_type => |v| v.child,
             .ptr_type => |p| switch (p.size) {
                 .slice, .many, .c => p.child,
                 .one => switch (ip.key(p.child)) {
@@ -1472,6 +1515,40 @@ const Inferrer = struct {
             },
             else => .unknown,
         };
+    }
+
+    /// 切片（与编译器的 `analyzeSlice` 一致）：长度 comptime 已知时为指向数组的指针，否则为切片；多项指针
+    /// 不给结束位置时为指针运算，仍是原指针类型。切到数组或切片的末尾时保留原有的哨兵
+    fn slice(inf: *Inferrer, lhs_e: ExprId, start_e: ExprId, end_e: ?ExprId, sentinel_e: ?ExprId) Error!TypedValue {
+        const ip = inf.ip;
+        const lhs = try inf.infer(lhs_e, null);
+        const start = try inf.infer(start_e, .usize_type);
+        const end: ?TypedValue = if (end_e) |x| try inf.infer(x, .usize_type) else null;
+        const Source = struct { elem: Index, sentinel: ?Index = null, len: ?u64 = null, is_const: bool = false };
+        const src: Source = switch (ip.key(lhs.ty)) {
+            .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = try inf.isConstPlace(lhs_e) },
+            .ptr_type => |p| switch (p.size) {
+                .one => switch (ip.key(p.child)) {
+                    .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const },
+                    // 指向单个元素的指针按长度为 1 的数组切片
+                    else => .{ .elem = p.child, .len = 1, .is_const = p.is_const },
+                },
+                .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const },
+            },
+            else => .{ .elem = .unknown },
+        };
+        const explicit: ?TypedValue = if (sentinel_e) |x| try inf.infer(x, if (src.elem != .unknown) src.elem else null) else null;
+        if (src.elem == .unknown) return .unknown;
+        if (end == null and isManyPtr(ip, lhs.ty)) return .{ .ty = lhs.ty };
+        const start_n = std.math.cast(u64, value.intOf(ip, start.val) orelse -1);
+        const end_n: ?u64 = if (end) |x| std.math.cast(u64, value.intOf(ip, x.val) orelse -1) else src.len;
+        const end_is_len = end == null or (src.len != null and end_n != null and end_n.? == src.len.?);
+        const sentinel: ?Index = if (explicit) |x| (x.val orelse return .unknown) else if (end_is_len) src.sentinel else null;
+        if (start_n != null and end_n != null and end_n.? >= start_n.?) {
+            const array = try ip.get(.{ .array_type = .{ .len = end_n.? - start_n.?, .child = src.elem, .sentinel = sentinel } });
+            return .{ .ty = try ip.ptrTo(array, .one, src.is_const) };
+        }
+        return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel } }) };
     }
 
     fn isConstPtr(inf: *Inferrer, t: Index) bool {
@@ -1604,6 +1681,52 @@ fn declKnownness(it: ItemTree.Item) Inferrer.Knownness {
 
 fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
     return std.mem.indexOfScalar(Body.BindingId, list, b) != null;
+}
+
+/// 可做指针运算的指针（多项指针与 C 指针）
+fn isManyPtr(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size == .many or p.size == .c,
+        else => false,
+    };
+}
+
+fn isNonSlicePtr(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .slice,
+        else => false,
+    };
+}
+
+const ConcatOperand = struct { elem: Index, len: u64, sentinel: ?Index, is_ptr: bool };
+
+/// `++` 的一侧：数组、指向数组的指针，或另一侧可下标时的元组（元素类型取另一侧的）
+fn concatOperand(ip: *InternPool, t: Index, other: Index) ?ConcatOperand {
+    switch (ip.key(t)) {
+        .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = false },
+        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
+            .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = true },
+            else => {},
+        },
+        .tuple_type => |tt| {
+            const elem: Index = switch (ip.key(other)) {
+                .array_type => |a| a.child,
+                .vector_type => |v| v.child,
+                .ptr_type => |p| switch (p.size) {
+                    .one => switch (ip.key(p.child)) {
+                        .array_type => |a| a.child,
+                        .vector_type => |v| v.child,
+                        else => return null,
+                    },
+                    .many, .c, .slice => p.child,
+                },
+                else => return null,
+            };
+            return .{ .elem = elem, .len = tt.types.len, .sentinel = null, .is_ptr = false };
+        },
+        else => {},
+    }
+    return null;
 }
 
 /// 元组类型（含指向元组的单项指针）
