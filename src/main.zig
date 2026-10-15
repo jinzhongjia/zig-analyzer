@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const za = @import("zig_analyzer");
 
 /// 级别由配置在运行时决定（`log.level`），编译期不过滤
@@ -40,8 +41,11 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
     var writer: za.lsp.transport.Writer = .{ .io = io, .inner = &stdout.interface };
 
+    // ReleaseSafe 下 `init.gpa` 是查错用的 `SafeAllocator`：每次分配附带元数据与调用栈，小分配所在的桶
+    // 要等其中全部释放才归还，长时间运行时常驻内存远超实际使用。只在 Debug 下保留它（退出时报告泄漏）
+    const backing = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
     // 统计存活的堆内存（`zig-analyzer/status`）
-    var counting: za.util.mem.Counting = .{ .child = init.gpa };
+    var counting: za.util.mem.Counting = .{ .child = backing };
     var server: za.Server = undefined;
     try server.init(io, counting.allocator(), &writer);
     server.heap = &counting;
