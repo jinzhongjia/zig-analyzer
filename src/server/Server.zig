@@ -86,6 +86,8 @@ progress: Progress = .{},
 graph_mutex: Io.Mutex = .init,
 /// 后台索引的代数：模块图每次更新加一
 index_generation: std.atomic.Value(u64) = .init(0),
+/// 配置 `sema.callsite_seeding`（经 `Env` 供 IDE 层读取）
+callsite_seeding: std.atomic.Value(bool) = .init(true),
 /// 慢请求日志的阈值（毫秒，0 为关闭），来自配置 `log.slow_request_ms`
 slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// 是否有索引任务在运行（同时只运行一个）
@@ -102,6 +104,8 @@ pull_config: bool = false,
 register_config: bool = false,
 /// 客户端支持动态注册 `workspace/didChangeWatchedFiles`（监听磁盘上的外部改动）
 register_watch: bool = false,
+/// 客户端支持 `workspace/inlayHint/refresh`（inlay hints 的配置变化后请客户端重新请求）
+inlay_refresh: bool = false,
 /// 已发出的拉取请求数；只采纳最近一次请求的响应
 config_requests: u32 = 0,
 /// 尚未收到响应的拉取请求数：等待期间计为忙碌（waitIdle 会等待配置生效）
@@ -143,7 +147,7 @@ pub const HandlerError = error{
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
 pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) Allocator.Error!void {
     server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .ip = try .init(gpa, io), .env = undefined, .out = out };
-    server.env = .{ .vfs = &server.vfs, .ip = &server.ip };
+    server.env = .{ .vfs = &server.vfs, .ip = &server.ip, .callsite_seeding = &server.callsite_seeding };
     server.db = .init(io, gpa, &server.env);
 }
 
@@ -943,10 +947,15 @@ fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChange
 /// 替换当前配置；构建相关配置变化时重启各项目
 fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     var new = fresh;
+    server.reportConfigWarnings(&new);
     server.config_mutex.lockUncancelable(server.io);
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
     const inactive_changed = server.config.inactive_code != new.inactive_code;
+    const build_was_enabled = server.config.build_enable;
+    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_parameters != new.inlay_parameters or
+        server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.callsite_seeding != new.callsite_seeding;
+    const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
     const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
     server.applyLogging(&new, log_file_changed);
     server.config.deinit(server.gpa);
@@ -955,23 +964,112 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (inactive_changed) server.publishOpenFiles();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
+    if (compiler_disabled) server.clearSingleFileResults();
+    if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
     if (build_changed) {
-        server.workspaces_mutex.lockUncancelable(server.io);
-        const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch {
+        if (!new.build_enable) {
+            // 关闭构建系统集成：停止各项目，其文件改按单文件处理
+            server.stopProjects();
+        } else if (!build_was_enabled) {
+            if (server.zigEnv() != null) server.startProjectsForRoots();
+        } else {
+            server.workspaces_mutex.lockUncancelable(server.io);
+            const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch {
+                server.workspaces_mutex.unlock(server.io);
+                return error.OutOfMemory;
+            };
             server.workspaces_mutex.unlock(server.io);
-            return error.OutOfMemory;
-        };
-        server.workspaces_mutex.unlock(server.io);
-        defer server.gpa.free(list);
-        if (list.len != 0) log.info("build settings changed, restarting projects", .{});
-        for (list) |ws| server.restartWorkspace(ws, 0);
+            defer server.gpa.free(list);
+            if (list.len != 0) log.info("build settings changed, restarting projects", .{});
+            for (list) |ws| server.restartWorkspace(ws, 0);
+        }
     }
+}
+
+/// 构建系统集成与编译器诊断是否开启
+fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
+    server.config_mutex.lockUncancelable(server.io);
+    defer server.config_mutex.unlock(server.io);
+    return .{ .build = server.config.build_enable, .compiler = server.config.compiler_diagnostics };
+}
+
+/// 停止全部项目（保留到退出时释放），清除其发布过的编译器诊断，模块图随之更新
+fn stopProjects(server: *Server) void {
+    // 先在锁内取出列表（不在持有 workspaces_mutex 时锁各项目的 mutex）
+    const list = blk: {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        server.retired.appendSlice(server.gpa, server.workspaces.items) catch return;
+        const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch return;
+        server.workspaces.clearRetainingCapacity();
+        break :blk list;
+    };
+    defer server.gpa.free(list);
+    var stale: std.ArrayList(Vfs.FileId) = .empty;
+    defer stale.deinit(server.gpa);
+    for (list) |ws| {
+        ws.stop();
+        ws.mutex.lockUncancelable(server.io);
+        stale.appendSlice(server.gpa, ws.result_files.keys()) catch {};
+        ws.mutex.unlock(server.io);
+    }
+    server.updateModuleGraph();
+    server.publishFiles(stale.items, true);
+    server.publishOpenFiles();
+    // 打开的文件改按单文件编译
+    server.docs_mutex.lockUncancelable(server.io);
+    const open = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
+        server.docs_mutex.unlock(server.io);
+        return;
+    };
+    server.docs_mutex.unlock(server.io);
+    defer server.gpa.free(open);
+    for (open) |file| server.compileSingle(file);
+}
+
+/// 为有 build.zig 的根目录启动项目
+fn startProjectsForRoots(server: *Server) void {
+    var roots: std.ArrayList([]u8) = .empty;
+    defer {
+        for (roots.items) |r| server.gpa.free(r);
+        roots.deinit(server.gpa);
+    }
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        for (server.roots.items, server.root_has_build.items) |root, has_build| {
+            if (!has_build) continue;
+            const copy = server.gpa.dupe(u8, root) catch return;
+            roots.append(server.gpa, copy) catch {
+                server.gpa.free(copy);
+                return;
+            };
+        }
+    }
+    for (roots.items) |root| server.startWorkspace(root);
+}
+
+/// 清除单文件模式的编译器诊断（关闭编译器诊断时）
+fn clearSingleFileResults(server: *Server) void {
+    var files: std.ArrayList(Vfs.FileId) = .empty;
+    defer files.deinit(server.gpa);
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        for (server.single.keys(), server.single.values()) |f, *sf| if (sf.result) |*r| {
+            r.deinit(server.gpa);
+            sf.result = null;
+            files.append(server.gpa, f) catch {};
+        };
+    }
+    server.publishFiles(files.items, true);
 }
 
 /// 日志级别、慢请求阈值；`reopen_file` 时按配置重新打开日志文件
 fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void {
     za.util.log.setLevel(config.log_level);
     server.slow_request_ms.store(config.slow_request_ms, .monotonic);
+    server.callsite_seeding.store(config.callsite_seeding, .monotonic);
     if (!reopen_file) return;
     za.util.log.setFile(config.log_file) catch |err| {
         log.warn("cannot open log file {s}: {t}", .{ config.log_file.?, err });
@@ -1095,24 +1193,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
     }
     server.updateModuleGraph();
-    var roots: std.ArrayList([]u8) = .empty;
-    defer {
-        for (roots.items) |r| server.gpa.free(r);
-        roots.deinit(server.gpa);
-    }
-    {
-        server.roots_mutex.lockUncancelable(server.io);
-        defer server.roots_mutex.unlock(server.io);
-        for (server.roots.items, server.root_has_build.items) |root, has_build| {
-            if (!has_build) continue;
-            const copy = server.gpa.dupe(u8, root) catch return;
-            roots.append(server.gpa, copy) catch {
-                server.gpa.free(copy);
-                return;
-            };
-        }
-    }
-    for (roots.items) |root| server.startWorkspace(root);
+    if (server.buildFlags().build) server.startProjectsForRoots();
     // 启动前已打开的单文件：zig 环境就绪后补一次编译
     server.docs_mutex.lockUncancelable(server.io);
     const open = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
@@ -1130,6 +1211,8 @@ fn startup(server: *Server) Io.Cancelable!void {
 fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
     const path = server.vfs.path(file);
     if (!std.mem.endsWith(u8, path, ".zig")) return false;
+    // 关闭构建系统集成时所有文件都按单文件处理
+    if (!server.buildFlags().build) return true;
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
     for (server.roots.items, server.root_has_build.items) |root, has_build| {
@@ -1141,6 +1224,7 @@ fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
 /// 在后台用 `zig build-obj -fno-emit-bin` 编译单个文件；编译期间再次请求时，结束后重新编译
 fn compileSingle(server: *Server, file: Vfs.FileId) void {
     if (server.zigEnv() == null) return; // 启动完成后会补编译
+    if (!server.buildFlags().compiler) return;
     // 编译器读取磁盘：尚未保存到磁盘的新文件不编译
     Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch return;
     {
@@ -1203,7 +1287,7 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 
 /// 为根目录启动项目；同一根目录已有项目时不重复启动（启动阶段与工作区文件夹的变化可能同时进行）
 fn startWorkspace(server: *Server, root: []const u8) void {
-    if (server.isShuttingDown()) return;
+    if (server.isShuttingDown() or !server.buildFlags().build) return;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -1347,8 +1431,19 @@ pub fn zigEnv(server: *Server) ?*const ZigEnv {
     return if (server.zig_env) |*e| e else null;
 }
 
+/// 配置中未知的项与类型错误的项：合并为一条提示
+fn reportConfigWarnings(server: *Server, config: *const Config) void {
+    if (config.warnings.len == 0) return;
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("zig-analyzer settings: ") catch {};
+    for (config.warnings, 0..) |msg, i| w.print("{s}{s}", .{ if (i > 0) "; " else "", msg }) catch break;
+    server.showWarning(w.buffered());
+}
+
 pub fn showWarning(server: *Server, message: []const u8) void {
-    log.warn("{s}", .{message});
+    // 已经提示给用户：日志只作记录
+    log.info("shown to the user: {s}", .{message});
     server.sendNotification("window/showMessage", types.ShowMessageParams{ .type = .Warning, .message = message });
 }
 
@@ -1622,6 +1717,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         server.pull_config = ws.configuration orelse false;
         if (ws.didChangeConfiguration) |d| server.register_config = d.dynamicRegistration orelse false;
         if (ws.didChangeWatchedFiles) |d| server.register_watch = d.dynamicRegistration orelse false;
+        if (ws.inlayHint) |ih| server.inlay_refresh = ih.refreshSupport orelse false;
     }
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
@@ -1631,6 +1727,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
                 break :blk .{};
             },
         };
+        server.reportConfigWarnings(&server.config);
         server.applyLogging(&server.config, server.config.log_file != null);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});
@@ -1803,7 +1900,12 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const start: u32 = @intCast(offsets.positionToOffset(text, params.range.start, server.encoding));
     const end: u32 = @intCast(offsets.positionToOffset(text, params.range.end, server.encoding));
-    const hints = try ide.inlay_hints.inlayHints(r, file, start, end);
+    const opts: ide.inlay_hints.Options = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk .{ .types = server.config.inlay_types, .parameters = server.config.inlay_parameters, .hide_redundant_param_names = server.config.hide_redundant_param_names };
+    };
+    const hints = try ide.inlay_hints.inlayHints(r, file, start, end, opts);
     const lines = try offsets.LineIndex.init(arena, text);
     const out = try arena.alloc(types.InlayHint, hints.len);
     for (hints, out) |h, *o| o.* = .{

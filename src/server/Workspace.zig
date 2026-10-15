@@ -131,32 +131,50 @@ pub fn destroy(ws: *Workspace) void {
 /// 保存文件后请求构建；构建进行中时标记为结束后重建
 pub fn requestBuild(ws: *Workspace) void {
     const io = ws.server.io;
-    ws.mutex.lockUncancelable(io);
-    defer ws.mutex.unlock(io);
-    const client = ws.client orelse return;
-    const model = &(ws.model orelse return);
-    if (ws.stopping) return;
-    if (ws.building) {
-        ws.rebuild = true;
-        return;
+    {
+        ws.mutex.lockUncancelable(io);
+        defer ws.mutex.unlock(io);
+        const client = ws.client orelse return;
+        const model = &(ws.model orelse return);
+        if (ws.stopping) return;
+        if (ws.building) {
+            ws.rebuild = true;
+            return;
+        }
+        const steps = model.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
+        defer ws.gpa.free(steps);
+        if (steps.len != 0) {
+            ws.building = true;
+            ws.server.busyBegin();
+            ws.build_progress = ws.server.progress.begin(ws.server, buildTitle(model, ws.config.compiler_diagnostics), true);
+            sendBuild(ws, client, model, steps) catch |err| {
+                log.err("failed to send build request: {t}", .{err});
+                ws.building = false;
+                ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
+                ws.build_progress = null;
+                ws.server.busyEnd();
+            };
+            return;
+        }
     }
-    ws.building = true;
-    ws.server.busyBegin();
-    var title_buf: [256]u8 = undefined;
-    ws.build_progress = ws.server.progress.begin(ws.server, std.fmt.bufPrint(&title_buf, "zig build {s}", .{model.steps[model.diagnosticsStep()].name}) catch "zig build", true);
-    sendBuild(ws, client, model) catch |err| {
-        log.err("failed to send build request: {t}", .{err});
-        ws.building = false;
-        ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
-        ws.build_progress = null;
-        ws.server.busyEnd();
+    // 不运行编译器且没有要产出的生成文件：不构建，按空结果完成一次（清除重启前发布的编译器诊断）
+    ws.finishBuild() catch {};
+}
+
+/// 构建进度的标题：诊断 step 的名字；不运行编译器诊断时只构建生成文件
+fn buildTitle(model: *const ProjectModel, with_diagnostics: bool) []const u8 {
+    if (!with_diagnostics) return "zig build (generated files)";
+    const S = struct {
+        threadlocal var buf: [256]u8 = undefined;
     };
+    var w: std.Io.Writer = .fixed(&S.buf);
+    w.writeAll("zig build") catch {};
+    for (model.diagnostics_steps) |s| w.print(" {s}", .{model.steps[s].name}) catch break;
+    return w.buffered();
 }
 
 /// 发送构建请求并重置进度计数；调用方持有 mutex
-fn sendBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel) !void {
-    const steps = try model.buildSteps(ws.gpa);
-    defer ws.gpa.free(steps);
+fn sendBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) !void {
     var closure = try model.dependencyClosure(ws.gpa, steps);
     defer closure.deinit(ws.gpa);
     ws.build_total = @intCast(closure.count());
@@ -269,11 +287,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 },
             };
             try ws.generateBuiltins(&model);
-            if (ws.config.diagnostics_step) |name| {
-                model.preferred_step = model.topLevelStep(name);
-                if (model.preferred_step == null) {
+            {
+                const names = try ws.config.diagnosticsSteps(ws.gpa);
+                defer if (names.ptr != ws.config.diagnostics_steps.ptr) ws.gpa.free(names);
+                if (try model.setDiagnosticsSteps(ws.gpa, names) != 0) {
                     var buf: [256]u8 = undefined;
-                    ws.server.showWarning(std.fmt.bufPrint(&buf, "diagnostics.step \"{s}\" is not a step of {s}, using the default", .{ name, ws.root }) catch "diagnostics.step not found, using the default");
+                    ws.server.showWarning(std.fmt.bufPrint(&buf, "some diagnostics.steps are not steps of {s}, they are ignored", .{ws.root}) catch "some diagnostics.steps are not steps of the project, they are ignored");
                 }
             }
             {
@@ -283,7 +302,11 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 ws.model = model;
                 ws.diag_steps.deinit(ws.gpa);
                 ws.diag_steps = .{};
-                ws.diag_steps = try ws.model.?.dependencyClosure(ws.gpa, &.{ws.model.?.diagnosticsStep()});
+                // 不运行编译器诊断时没有诊断 step：构建中的错误不发布
+                ws.diag_steps = if (ws.config.compiler_diagnostics)
+                    try ws.model.?.dependencyClosure(ws.gpa, ws.model.?.diagnostics_steps)
+                else
+                    try .initEmpty(ws.gpa, ws.model.?.steps.len);
             }
             try ws.recomputeCompileSet();
             ws.mutex.lockUncancelable(io);
@@ -347,7 +370,11 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
                 ws.server.progress.report(ws.server, ws.build_progress, "Files changed, rebuilding", 0);
-                if (ws.client) |c| if (ws.model) |*m| sendBuild(ws, c, m) catch {};
+                if (ws.client) |c| if (ws.model) |*m| {
+                    const steps = m.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
+                    defer ws.gpa.free(steps);
+                    sendBuild(ws, c, m, steps) catch {};
+                };
                 return;
             }
             var errors: u32 = 0;
@@ -498,7 +525,7 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
         ws.mutex.lockUncancelable(io);
         defer ws.mutex.unlock(io);
         const model = &(ws.model orelse return);
-        steps = try model.compileStepsOf(ws.gpa, model.diagnosticsStep());
+        steps = try model.compileStepsOf(ws.gpa, model.diagnostics_steps);
     }
 
     var rounds: usize = 0;

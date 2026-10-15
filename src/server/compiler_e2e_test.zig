@@ -459,3 +459,84 @@ test "few CPU cores: async tasks run inline, waitIdle, progress and pulled setti
     }
     try testing.expect(builds >= 2);
 }
+
+/// 收到的 window/showMessage 文案
+fn shownMessages(h: *Harness) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try h.notifications("window/showMessage")) |m| try out.append(h.arena.allocator(), m.object.get("params").?.object.get("message").?.string);
+    return out.items;
+}
+
+fn anyContains(list: []const []const u8, needle: []const u8) bool {
+    for (list) |s| if (std.mem.indexOf(u8, s, needle) != null) return true;
+    return false;
+}
+
+test "settings: several diagnostics steps are merged, unknown steps and settings are reported" {
+    var project = try fixture.Project.create(settings_project);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"build": {"args": ["-Dbad=true"]}, "diagnostics": {"steps": ["check", "unit", "nope"]}, "colors": {}, "inlay_hints": {"types": "yes"}}
+    ));
+    try waitIdle(&h);
+    const diags = try h.diagnostics();
+    try expectDiagnostics(diags, "main.zig", &.{"3:23 zig: expected type 'u32'"});
+    try expectDiagnostics(diags, "t.zig", &.{"1:18 zig: expected type 'u8'"});
+    const messages = try shownMessages(&h);
+    try testing.expect(anyContains(messages, "some diagnostics.steps are not steps of"));
+    try testing.expect(anyContains(messages, "unknown setting `colors`"));
+    try testing.expect(anyContains(messages, "invalid value for `inlay_hints.types`, using the default"));
+    try shutdown(&h);
+}
+
+test "settings: diagnostics.compiler off publishes no compiler diagnostics" {
+    var project = try fixture.Project.create(settings_project);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"build": {"args": ["-Dbad=true"]}, "diagnostics": {"compiler": false}}
+    ));
+    _ = try open(&h, try project.path(h.arena.allocator(), "main.zig"), settings_project[1].text);
+    try waitIdle(&h);
+    const diags = try h.diagnostics();
+    for (diags.get("main.zig") orelse &.{}) |d| try testing.expect(std.mem.indexOf(u8, d, "zig:") == null);
+    try testing.expect(diags.get("t.zig") == null);
+    try shutdown(&h);
+}
+
+test "settings: build.enable can be switched off and on at runtime" {
+    var project = try fixture.Project.create(settings_project);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"build": {"enable": false, "args": ["-Dbad=true"]}}
+    ));
+    try waitIdle(&h);
+    // 不启动构建系统
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+    try testing.expect((try h.diagnostics()).get("main.zig") == null);
+
+    // 打开：启动项目并发布编译器诊断
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"build": {"enable": true, "args": ["-Dbad=true"]}}
+    ) });
+    try waitIdle(&h);
+    try testing.expectEqual(1, h.server.workspaces.items.len);
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"3:23 zig: expected type 'u32'"});
+
+    // 再关闭：项目停止，其诊断被清除
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"build": {"enable": false}}
+    ) });
+    try waitIdle(&h);
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{});
+    try shutdown(&h);
+}
