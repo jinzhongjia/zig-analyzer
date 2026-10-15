@@ -10,6 +10,7 @@ const inputs = @import("../base/inputs.zig");
 const Parse = @import("Parse.zig");
 const ItemTree = @import("ItemTree.zig");
 const ast = @import("ast.zig");
+const mem = @import("../util/mem.zig");
 
 /// 文件内容：有 `FileText`（打开的文档、项目加载的文件）时用它，否则从磁盘读取。
 ///
@@ -54,6 +55,11 @@ pub const ParseFile = struct {
     pub const Value = *Parse;
     pub const lru = parse_lru;
 
+    /// 增量解析的结果共享未变的节点，同一文件的新旧结果会重复计入
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(Parse) + v.arena.queryCapacity() + v.source.len;
+    }
+
     /// 有上一次的结果时尝试局部重解析（结果与全量解析相同，见 `Parse.reparse`）
     pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const text = (try ctx.get(SourceText, file)).text;
@@ -75,6 +81,10 @@ pub const FileItemTree = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree;
+
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(ItemTree) + mem.arenaBytes(v.arena);
+    }
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const parse = try ctx.get(ParseFile, file);

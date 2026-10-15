@@ -88,6 +88,8 @@ graph_mutex: Io.Mutex = .init,
 index_generation: std.atomic.Value(u64) = .init(0),
 /// 配置 `sema.callsite_seeding`（经 `Env` 供 IDE 层读取）
 callsite_seeding: std.atomic.Value(bool) = .init(true),
+/// 统计分配器（可执行文件设置，用于 `zig-analyzer/status` 的 `heap_bytes`）
+heap: ?*const za.util.mem.Counting = null,
 /// 慢请求日志的阈值（毫秒，0 为关闭），来自配置 `log.slow_request_ms`
 slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// 编辑触发的诊断发布的防抖（毫秒），来自配置 `diagnostics.debounce_ms`
@@ -1909,6 +1911,10 @@ const StatusResult = struct {
     max_rss_kb: u64,
     /// InternPool 中的类型与值的个数
     intern_pool_items: usize,
+    /// InternPool 占用的字节数
+    intern_pool_bytes: usize,
+    /// 经由服务器分配器分配、尚未释放的字节数（可执行文件以 `mem.Counting` 包装分配器时；否则为 0）
+    heap_bytes: usize,
     queries: []const struct {
         name: []const u8,
         executions: u64,
@@ -1918,6 +1924,10 @@ const StatusResult = struct {
         self_ms: f64,
         max_ms: f64,
         memos: usize,
+        keys: usize,
+        /// 保留着的值占用的字节数（声明了 `bytes` 的 query；否则为 0）
+        bytes: usize,
+        deps: usize,
         incomplete: u64,
     },
     /// 结果不完整的原因（环、栈深度、燃料）的累计次数
@@ -2237,6 +2247,9 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
             .self_ms = za.db_report.ms(q.self_ns),
             .max_ms = za.db_report.ms(q.max_ns),
             .memos = q.memos,
+            .keys = q.keys,
+            .bytes = q.bytes,
+            .deps = q.deps,
             .incomplete = q.incomplete,
         };
     }
@@ -2246,6 +2259,8 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         .deep_verifications = summary.deep_verifications,
         .max_rss_kb = maxRssKb(),
         .intern_pool_items = server.ip.count(),
+        .intern_pool_bytes = server.ip.bytes(),
+        .heap_bytes = if (server.heap) |h| h.liveBytes() else 0,
         .queries = queries,
         .incomplete_causes = .{
             .cycle = summary.incomplete_causes.get(.cycle),

@@ -75,6 +75,7 @@ pub const util = struct {
     pub const offsets = @import("util/offsets.zig");
     pub const log = @import("util/log.zig");
     pub const tracy = @import("util/tracy.zig");
+    pub const mem = @import("util/mem.zig");
     /// 仅供测试：posix 写法的路径转为本机路径
     pub const test_path = @import("util/test_path.zig");
 };

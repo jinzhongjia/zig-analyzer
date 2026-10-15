@@ -289,6 +289,13 @@ pub fn deinit(ip: *InternPool) void {
     ip.* = undefined;
 }
 
+/// 占用的字节数（Key 表、哈希表与存放 Key 中切片的 arena），用于统计
+pub fn bytes(ip: *InternPool) usize {
+    ip.mutex.lockUncancelable(ip.io);
+    defer ip.mutex.unlock(ip.io);
+    return ip.items.capacity * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
+}
+
 pub fn pointerBits(ip: *const InternPool) ?u16 {
     const bits = ip.pointer_bits.load(.monotonic);
     return if (bits == 0) null else bits;

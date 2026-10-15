@@ -18,6 +18,7 @@ const ast = @import("../syntax/ast.zig");
 const ItemTree = @import("../syntax/ItemTree.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
+const mem = @import("../util/mem.zig");
 
 /// 与目标相关的值运算参数：指针位宽、向量的布局规则（各模块一致时）。值同时存于 InternPool 供值的运算
 /// 读取，用到值运算的 query 先读本 input 以记录依赖
@@ -48,6 +49,11 @@ pub const Infer = struct {
     pub const Value = *const infer.Result;
     /// 约束长时间会话的内存（泛型实例的结果会不断累积）：被淘汰的结果按需重新推导
     pub const lru = 16 * 1024;
+
+    pub fn bytes(v: Value) usize {
+        if (v == &empty_result) return 0;
+        return @sizeOf(infer.Result) + mem.arenaBytes(v.arena);
+    }
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
         _ = try ctx.get(TargetAbi, {});

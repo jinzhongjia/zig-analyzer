@@ -11,6 +11,7 @@ const syntax = @import("../syntax/queries.zig");
 const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const mem = @import("../util/mem.zig");
 
 const FileIndex = @This();
 
@@ -71,6 +72,10 @@ pub const Query = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *const FileIndex;
+
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(FileIndex) + mem.arenaBytes(v.arena);
+    }
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const parse = try ctx.get(syntax.ParseFile, file);

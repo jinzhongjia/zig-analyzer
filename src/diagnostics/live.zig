@@ -11,6 +11,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 const engine = @import("../db/engine.zig");
 const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
+const mem = @import("../util/mem.zig");
 
 pub const Diagnostic = struct {
     /// 字节偏移区间（ErrorBundle 的 span_start / span_end）
@@ -173,6 +174,10 @@ pub const AstCheck = struct {
 
     pub fn eql(a: Value, b: Value) bool {
         return a == b;
+    }
+
+    pub fn bytes(v: Value) usize {
+        return mem.arenaBytes(v.arena);
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {

@@ -29,6 +29,8 @@
 //! derived query 可改为声明 `computeIncremental(ctx, key, prev: ?Value)`，重算时引擎传入上一次的值
 //! （首次计算为 null）。结果必须与从零计算完全相同，prev 只用于加速；读取 prev 不记录依赖。
 //!
+//! derived query 可声明 `pub fn bytes(v: Value) usize`：值占用的字节数，只用于统计（`Db.stats`）。
+//!
 //! derived query 可声明 `pub const lru: usize = N`：保留值的 memo 超过 N 个时，最久未使用的 memo
 //! 被淘汰，只删除值，保留依赖与 changed_at。被淘汰的 memo 验证通过时重算并沿用原 changed_at
 //! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `trySweep` 中进行
@@ -112,6 +114,12 @@ pub const QueryStats = struct {
     max_ns: u64,
     /// 当前保留着值的 memo 数
     memos: usize,
+    /// 驻留的 key 数（含值已被淘汰或未计算过的）
+    keys: usize = 0,
+    /// 保留着的值占用的字节数：query 声明了 `bytes(value)` 时统计，否则为 0
+    bytes: usize = 0,
+    /// memo 记录的依赖边总数（值被淘汰的 memo 仍保留依赖）
+    deps: usize = 0,
     /// 结果不完整（环、栈深度或燃料用尽）而未写入 memo 的次数：这些结果每次读取都要重算
     incomplete: u64 = 0,
 };
@@ -276,10 +284,16 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             inline for (queries, 0..) |Q, qi| {
                 const c = &db.counters[qi];
                 var memos: usize = 0;
+                var bytes: usize = 0;
+                var deps: usize = 0;
                 for (db.tables[qi].slots.items) |slot| switch (Q.kind) {
                     .input => memos += @intFromBool(slot.is_set),
                     .derived => if (slot.memo) |m| {
-                        memos += @intFromBool(!m.evicted);
+                        deps += m.deps.len;
+                        if (!m.evicted) {
+                            memos += 1;
+                            if (@hasDecl(Q, "bytes")) bytes += Q.bytes(m.value);
+                        }
                     },
                 };
                 buf[qi] = .{
@@ -290,6 +304,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     .self_ns = c.self_ns.load(.monotonic),
                     .max_ns = c.max_ns.load(.monotonic),
                     .memos = memos,
+                    .keys = db.tables[qi].keys.count(),
+                    .bytes = bytes,
+                    .deps = deps,
                     .incomplete = c.incomplete.load(.monotonic),
                 };
             }

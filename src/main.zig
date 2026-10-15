@@ -40,8 +40,11 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
     var writer: za.lsp.transport.Writer = .{ .io = io, .inner = &stdout.interface };
 
+    // 统计存活的堆内存（`zig-analyzer/status`）
+    var counting: za.util.mem.Counting = .{ .child = init.gpa };
     var server: za.Server = undefined;
-    try server.init(io, init.gpa, &writer);
+    try server.init(io, counting.allocator(), &writer);
+    server.heap = &counting;
     defer server.deinit();
     return server.run(&stdin.interface);
 }

@@ -9,6 +9,7 @@ const syntax = @import("../syntax/queries.zig");
 const ast = @import("../syntax/ast.zig");
 const Body = @import("Body.zig");
 const lower = @import("lower.zig").lower;
+const mem = @import("../util/mem.zig");
 
 /// enum 成员与 union 中只写名字的字段（没有 `:`）：类型表达式的位置是名字。元组式结构体的字段同样
 /// 没有 `:`，那里是类型，因此须由 ItemTree 得到所在容器的种类
@@ -35,6 +36,10 @@ pub const ItemBody = struct {
     pub const Value = *const Body;
     /// 约束长时间会话的内存：被淘汰的 Body 按需重新降级
     pub const lru = 16 * 1024;
+
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(Body) + mem.arenaBytes(v.arena);
+    }
 
     pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
         const map = try ctx.get(syntax.FileAstIdMap, key.file);
