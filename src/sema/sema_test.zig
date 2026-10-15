@@ -1844,3 +1844,23 @@ test "container arguments that refer to locals of an outer function" {
     const file = (try w.add("/p/main.zig", text)).file;
     try testing.expectEqualStrings("u16 = 1", try typeAt(&w, file, text, "x", 0));
 }
+
+test "slicing an outer function's local from a container in the body" {
+    // 外层函数的局部变量按其所在成员的 Body 判断常量性（此前用内层成员的 Body 查绑定，越界）
+    try expectTypes(
+        \\fn f() void {
+        \\    const a = 1;
+        \\    const b = 2;
+        \\    const table = [_]u8{ 1, 2, 3 };
+        \\    const S = struct {
+        \\        fn g() []const u8 {
+        \\            const part = table[0..];
+        \\            return part;
+        \\        }
+        \\    };
+        \\    _ = .{ a, b, S };
+        \\}
+    , &.{
+        .{ "part", "*const [3]u8" },
+    });
+}

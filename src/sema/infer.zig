@@ -2142,7 +2142,8 @@ const Inferrer = struct {
             .name_ref => |name| {
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
                 return switch (def) {
-                    .local => |l| b.binding(l.binding).kind != .local_var,
+                    // 外层函数的局部变量（体内容器的成员中引用）在其所在成员的 Body 中
+                    .local => |l| (if (l.file == inf.file and l.item == inf.item) b else try inf.r.body(l.file, l.item)).binding(l.binding).kind != .local_var,
                     .item => |it| (try inf.r.itemTree(it.file)).items[it.item].kind == .@"const",
                     .file => true,
                 };
