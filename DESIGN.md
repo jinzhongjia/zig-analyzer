@@ -1122,6 +1122,21 @@ pub fn make() std.ArrayList(u8) { ... }
 - 新口径下的标准库统计：声明类型已知 37012/37265（99.3%），局部变量 37251/40626（91.7%），表达式 937790/983121（95.4%）。§19.8～§19.15 中的表达式统计含上述约 3.7 万个不是表达式的项，同一时刻按旧口径为 92.4%。
 - 测试：`zig build test` 共 203 个。
 
+### 19.17 结果类型的传递与常见缺口（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 结果类型 | `src/sema/infer.zig` | 与编译器一致地把结果类型传给子表达式：decl literal 去掉 error union、optional 与单项指针后查找（`const t: *T = .current()`、`const x: ?S = .empty`）；`try .init()` 把结果类型交给 decl literal（编译器中 `try` 只对这种形式传递结果类型，`catch` / `orelse` 的左侧不传）；`.{ ... }` 的类型为结果类型去掉 error union 与 optional，字段按向量、元组、构造的类型与匿名结构体的字段类型推导；`&.{ a, b }` 转换为切片或多项指针时按 `[2]T` 推导；循环的 `break` 值与 `else` 分支取循环的结果类型；labeled switch 的 `continue :l v` 按操作数的类型推导；移位的右侧为 `Log2Int(T)`（`<<|` 没有结果类型），多项指针 `+=` / `-=` 的右侧为 usize；带显式标签类型的枚举成员的值按标签类型推导 |
+| 内置函数 | `src/sema/infer.zig`、`eval.zig` | 转换类的目标类型按编译器的 `resolveDestType` 去掉 error union / optional；`@constCast` / `@volatileCast` 为参数类型去掉 const / volatile；嵌套的指针转换在编译器中合并为一次，内层取外层的结果类型（`@alignCast(@fieldParentPtr(...))` 由此有类型）；`@intFromEnum` / `@backingInt` 的类型与值（含带标签的 union 与 packed 容器），`@fromBackingInt` 的参数取目标的 backing 整数；原子操作、`@mulAdd`、`@splat`、`@memset`、`@unionInit`、`@reduce`、`@call`、`@branchHint` 等的参数按各自的结果类型推导；补上 `@clz` / `@ctz` / `@popCount`、溢出算术（`struct { T, u1 }`）、`@select` / `@shuffle`、`@returnAddress` 等的结果类型；`@field` 的字段名可以是 comptime 已知的字符串；除法与取余为两侧的 peer |
+| 切片与 `++` | `src/sema/infer.zig`、`eval.zig` | 切片与编译器的 `analyzeSlice` 一致：长度 comptime 已知时为指向数组的指针（`arr[0..4]` 为 `*[4]u8`），切到末尾（含结束位置等于长度）时保留哨兵，多项指针不给结束位置时仍为多项指针，单项指针按长度 1 切片。`++` 与 `zirArrayCat` 一致：元组相接为元组（comptime 字段保持），数组与指向数组的指针相接为数组，任一侧是指针时为 `*const [N]T`；只有一侧有哨兵时保留它（解释器此前要求两侧都有） |
+| peer 类型 | `src/sema/infer.zig` | 长度不同的数组指针统一为切片（`if (c) "abc" else "hello"` 为 `[:0]const u8`），数组指针与切片、多项指针统一为后者，哨兵只在两侧相同时保留（此前保留前者的哨兵）；optional 与另一侧按载荷的 peer 包为 optional；向量的比较为 `@Vector(n, bool)` |
+| 其他 | `src/hir/`、`src/sema/queries.zig`、`infer.zig` | HIR 记录 `align` / `addrspace` / `linksection` / `callconv` 子句中的表达式（此前不在表达式树中，从未推导），分别按 `u29`、`AddressSpace`、`[]const u8`、`CallingConvention` 推导，`callconv(.naked)` 等可以跳转；元组声明 `struct { A, B }` 与编译器一致是结构化的元组类型（此前为具名容器，下标、解构与初始化取不到字段类型）；解构 `const a, const b = x;` 按元组、数组、向量的元素推导；extern 函数的无名参数以空名绑定，类型得到推导；经由函数指针的调用；多个分支项的 union 捕获为各字段类型的 peer，第二个捕获为标签类型；`@import` 的参数 |
+
+- 验证：各项与 zig 0.17.0 编译运行的结果核对（x86_64-linux）。
+- 标准库全量统计：声明类型已知 37012 → 37045（99.4%），局部变量 37251 → 38425（91.7% → 94.6%），表达式 937790 → 955423（95.4% → 97.2%），未知的表达式 45331 → 27698。与 73c8565 对比耗时不变（ReleaseSafe 约 4.2 秒）。
+- 剩余的未知中约 1.2 万个位于泛型函数中；其余主要是其他目标的代码（如 `posix.system` 中当前目标没有的声明）、依赖 `builtin.is_test` 的 `std.testing.allocator`，以及由它们传播出的部分。另有 `"..." ++ @typeName(T)`（编译器中 `@typeName` 为 `*const [N:0]u8`，长度取决于类型名，这里仍按切片处理）与 `@embedFile`。
+- 测试：`zig build test` 共 217 个（Debug 与 ReleaseSafe 均通过）。
+
 ## 20. 风险与对策
 
 | 风险 | 影响 | 对策 |
