@@ -45,7 +45,8 @@ pub const Result = struct {
     ret: TypedValue,
     /// 初始化表达式中字段名解析到的字段（`.{ .x = 1 }` 的 `x`）
     field_refs: []const FieldRef = &.{},
-    /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）及其期望类型：补全按它列出成员
+    /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）与匿名初始化（`.{ ... }`）及其期望类型：
+    /// 补全按它列出成员与字段
     literal_expected: []const LiteralExpected = &.{},
     /// comptime 已知不会执行的 `if` / `switch` 分支（最外层的）：在当前构建配置下不编译的代码
     inactive: []const ExprId = &.{},
@@ -495,6 +496,7 @@ const Inferrer = struct {
                 return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) o.val else null };
             },
             .init => |x| {
+                if (x.ty == null) if (expected) |want| if (want != .unknown) try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = want });
                 const saved = inf.current_init;
                 inf.current_init = e;
                 defer inf.current_init = saved;

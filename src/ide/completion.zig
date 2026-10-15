@@ -1,4 +1,6 @@
-//! 名字补全：`a.` 之后列出命名空间的成员，否则列出光标处可见的名字（局部名字与外层容器的声明）。
+//! 补全：`a.` 之后列出命名空间的成员；`.` 之后按期望类型列出成员，初始化中列出未赋值的字段；
+//! `@` 之后列出内置函数；`@import("` 中列出模块与文件；`break :` / `continue :` 之后列出标签；
+//! 否则列出光标处可见的名字（局部名字与外层容器的声明）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -15,6 +17,8 @@ const eval = @import("../sema/eval.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
+const database = @import("../database.zig");
+const ModuleGraph = @import("../names/ModuleGraph.zig");
 
 pub const Item = struct {
     label: []const u8,
@@ -23,16 +27,40 @@ pub const Item = struct {
     doc: ?[]const u8 = null,
     /// 类型
     detail: ?[]const u8 = null,
+    /// 替换的范围（文件中的字节偏移，插入的文本为 `label`）；null 时由客户端按单词确定。
+    /// `@`、路径中的 `/` 等不属于单词的字符需要它
+    replace: ?Range = null,
 
-    pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member };
+    pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, builtin, module, file, folder, label };
+    pub const Range = struct { start: u32, end: u32 };
 };
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Item {
     var out: Collector = .{ .arena = r.arena };
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    if (offset > text.len) return &.{};
+
+    // 以下几种上下文在语法树中多为错误节点（如单独的 `@`、未闭合的字符串），直接按源码文本识别
+    if (builtinStart(text, offset)) |start| {
+        const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
+        for (std.zig.BuiltinFn.list.keys()) |name| try out.add(.{ .label = name, .kind = .builtin, .replace = range });
+        return out.items.items;
+    }
+    if (importString(text, offset)) |start| {
+        try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = offset });
+        return out.items.items;
+    }
+
     const item = try r.ownerAt(file, offset, true) orelse return &.{};
     const node = try r.itemNode(file, item) orelse return &.{};
     const b = try r.body(file, item);
     const rel = offset - node.offset;
+
+    if (labelStart(text, offset) != null) {
+        var s: ?Body.ScopeId = b.scopeAt(rel);
+        while (s) |id| : (s = b.scope(id).parent) if (b.scope(id).label) |l| try out.add(.{ .label = l.name, .kind = .label });
+        return out.items.items;
+    }
 
     // `lhs.` / `lhs.na`：光标前一个字符在字段访问内、且不在左侧表达式内
     if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
@@ -49,9 +77,15 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
         else => {},
     };
 
-    // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员
+    // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员；初始化中（`.{ .x = 1, .| }`）列出未赋值的字段
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
         const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
+        if (initOf(b, e)) |init| {
+            const x = b.expr(init).init;
+            const ty = if (x.ty == null) a.literalExpected(init) orelse return &.{} else a.exprType(init).ty;
+            try initFields(r, &out, ty, x.fields);
+            return out.items.items;
+        }
         try expectedMembers(r, &out, a.literalExpected(e) orelse return &.{}, file);
         return out.items.items;
     };
@@ -88,7 +122,11 @@ const Collector = struct {
         if (item.label.len == 0) return;
         if ((try c.seen.getOrPut(c.arena, item.label)).found_existing) return;
         var out = item;
-        if (!std.zig.isValidId(item.label)) out.label = try std.fmt.allocPrint(c.arena, "{f}", .{std.zig.fmtId(item.label)});
+        const is_name = switch (item.kind) {
+            .builtin, .module, .file, .folder => false,
+            else => true,
+        };
+        if (is_name and !std.zig.isValidId(item.label)) out.label = try std.fmt.allocPrint(c.arena, "{f}", .{std.zig.fmtId(item.label)});
         try c.items.append(c.arena, out);
     }
 };
@@ -230,6 +268,113 @@ fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
         .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
         else => false,
     };
+}
+
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn identEnd(text: []const u8, offset: u32) u32 {
+    var i = offset;
+    while (i < text.len and isIdentChar(text[i])) i += 1;
+    return i;
+}
+
+/// 光标在 `@` 或 `@name` 中时 `@` 的位置（不含 `@"..."` 形式的标识符）
+fn builtinStart(text: []const u8, offset: u32) ?u32 {
+    var i = offset;
+    while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
+    if (i == 0 or text[i - 1] != '@') return null;
+    return i - 1;
+}
+
+/// 光标在 `@import("` 的字符串中时字符串内容的起始位置（字符串可以尚未闭合）
+fn importString(text: []const u8, offset: u32) ?u32 {
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    const quote = std.mem.lastIndexOfScalar(u8, text[line_start..offset], '"') orelse return null;
+    const start: u32 = @intCast(line_start + quote + 1);
+    var head = std.mem.trimEnd(u8, text[line_start .. start - 1], " \t");
+    if (!std.mem.endsWith(u8, head, "(")) return null;
+    head = std.mem.trimEnd(u8, head[0 .. head.len - 1], " \t");
+    if (!std.mem.endsWith(u8, head, "@import")) return null;
+    return start;
+}
+
+/// 光标在 `break :` / `continue :` 之后的标签位置时标签的起始位置
+fn labelStart(text: []const u8, offset: u32) ?u32 {
+    var i = offset;
+    while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
+    const start = i;
+    while (i > 0 and (text[i - 1] == ' ' or text[i - 1] == '\t')) i -= 1;
+    if (i == 0 or text[i - 1] != ':') return null;
+    i -= 1;
+    while (i > 0 and (text[i - 1] == ' ' or text[i - 1] == '\t')) i -= 1;
+    const end = i;
+    while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
+    const word = text[i..end];
+    if (!std.mem.eql(u8, word, "break") and !std.mem.eql(u8, word, "continue")) return null;
+    return start;
+}
+
+/// `@import("...` 中的模块名（std、builtin、root、所在模块 import 的模块）与相对路径下的
+/// `.zig` / `.zon` 文件、子目录。补全项为从字符串开头起的完整路径
+fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range) resolve.Error!void {
+    const slash = std.mem.lastIndexOfScalar(u8, typed, '/');
+    if (slash == null) {
+        for ([_][]const u8{ "std", "builtin", "root" }) |m| try out.add(.{ .label = m, .kind = .module, .replace = range });
+        if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.entry(file)) |entry| if (entry.module != ModuleGraph.std_module) {
+            for (graph.modules[entry.module].imports) |imp| try out.add(.{ .label = imp.name, .kind = .module, .replace = range });
+        };
+    }
+    const vfs = r.ctx.db.env.vfs;
+    const prefix = if (slash) |s| typed[0 .. s + 1] else "";
+    const base = std.fs.path.dirname(vfs.path(file)) orelse return;
+    const dir_path = try std.fs.path.join(r.arena, &.{ base, prefix });
+    var dir = std.Io.Dir.cwd().openDir(vfs.io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(vfs.io);
+    var it = dir.iterate();
+    while (it.next(vfs.io) catch null) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.eql(u8, entry.name, "zig-out")) continue;
+        switch (entry.kind) {
+            .directory => try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}/", .{ prefix, entry.name }), .kind = .folder, .replace = range }),
+            .file => if (std.mem.endsWith(u8, entry.name, ".zig") or std.mem.endsWith(u8, entry.name, ".zon")) {
+                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}", .{ prefix, entry.name }), .kind = .file, .replace = range });
+            },
+            else => {},
+        }
+    }
+}
+
+/// 以枚举字面量 `e` 为元素（没有字段名）的初始化表达式
+fn initOf(b: *const Body, e: Body.ExprId) ?Body.ExprId {
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .init => |init| for (init.fields) |f| if (f.name == null and f.value == e) return @fromBackingInt(@as(u32, @intCast(i))),
+        else => {},
+    };
+    return null;
+}
+
+/// 初始化类型（`?T` 取 `T`）中尚未赋值的字段
+fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.FieldInit) resolve.Error!void {
+    const ip = r.ctx.db.env.ip;
+    const t = switch (ip.key(ty)) {
+        .optional_type => |c| c,
+        else => ty,
+    };
+    switch (ip.key(t)) {
+        .container_type => |c| if (c.kind != .@"struct" and c.kind != .@"union") return,
+        else => return,
+    }
+    const ns = try queries.namespaceOfType(r, t) orelse return;
+    const tree = try r.itemTree(ns.file);
+    outer: for (tree.containerMembers(ns.container)) |m| {
+        const it = tree.items[m];
+        if (it.kind != .field) continue;
+        const name = it.name orelse continue;
+        for (given) |g| if (g.name) |n| if (std.mem.eql(u8, n, name)) continue :outer;
+        const fty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) })).ty;
+        try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
+    }
 }
 
 /// `ns.` 之后的成员；同一文件中可以访问非 pub 声明

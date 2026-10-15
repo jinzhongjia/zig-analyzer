@@ -408,3 +408,54 @@ test "completion, goto, signature help and inlay hints in generic bodies use a c
     };
     try testing.expect(found);
 }
+
+test "completion: builtins, labels, init fields and import names" {
+    const decls =
+        \\const S = struct { x: u8, y: u16, z: bool = false };
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 标签：内层在前
+        .{ "fn f() void { outer: while (true) { inner: { break :<|> } } }", "inner outer" },
+        .{ "fn f() void { outer: while (true) { continue :ou<|>; } }", "outer" },
+        // 初始化中未赋值的字段
+        .{ "const s: S = .{ .x = 1, .<|> };", "y z" },
+        .{ "const s = S{ .<|> };", "x y z" },
+        .{ "const s: ?S = .{ .y = 2, .<|> };", "x z" },
+        // import：模块名（没有项目时只有固定的三个）
+        .{ "const a = @import(\"<|>\");", "std builtin root" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ decls, c[0], "\n" });
+        const added = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = try completion.complete(&r, added.file, added.cursor);
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+
+    // 内置函数：替换范围从 `@` 开始，到名字末尾
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn f() void {\n    _ = @imp<|>ort;\n}\n");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    try testing.expectEqual(std.zig.BuiltinFn.list.keys().len, items.len);
+    const import = for (items) |it| {
+        if (std.mem.eql(u8, it.label, "@import")) break it;
+    } else return error.NoImport;
+    try testing.expectEqual(added.cursor - 4, import.replace.?.start);
+    try testing.expectEqual(added.cursor + 3, import.replace.?.end);
+}

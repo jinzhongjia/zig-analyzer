@@ -1502,7 +1502,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .foldingRangeProvider = .{ .boolean = true },
             .selectionRangeProvider = .{ .boolean = true },
             .definitionProvider = .{ .boolean = true },
-            .completionProvider = .{ .triggerCharacters = &.{"."} },
+            .completionProvider = .{ .triggerCharacters = &.{ ".", "@", "\"", "/" } },
             .hoverProvider = .{ .boolean = true },
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
             .inlayHintProvider = .{ .boolean = true },
@@ -1558,18 +1558,29 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
     const items = try ide.completion.complete(r, file, offset);
     const out = try arena.alloc(types.CompletionItem, items.len);
-    for (items, out) |it, *o| o.* = .{
-        .label = it.label,
-        .kind = switch (it.kind) {
-            .param, .local, .capture, .variable => .Variable,
-            .function => .Function,
-            .constant => .Constant,
-            .field => .Field,
-            .enum_member => .EnumMember,
-        },
-        .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
-        .detail = it.detail,
-    };
+    var lines: ?offsets.LineIndex = null;
+    for (items, out) |it, *o| {
+        o.* = .{
+            .label = it.label,
+            .kind = switch (it.kind) {
+                .param, .local, .capture, .variable => .Variable,
+                .function, .builtin => .Function,
+                .constant => .Constant,
+                .field => .Field,
+                .enum_member => .EnumMember,
+                .module => .Module,
+                .file => .File,
+                .folder => .Folder,
+                .label => .Reference,
+            },
+            .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+            .detail = it.detail,
+        };
+        if (it.replace) |range| {
+            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
+            o.textEdit = .{ .TextEdit = .{ .range = lines.?.range(range.start, range.end, server.encoding), .newText = it.label } };
+        }
+    }
     return .{ .array_of_CompletionItem = out };
 }
 
