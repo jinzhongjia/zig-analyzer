@@ -712,6 +712,7 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 | `build.args` | `[]` | 传给 `zig build` 的额外参数（如 `-Dtarget=...`、`-fincremental`） |
 | `diagnostics.steps` | `[]`（自动：`check` 否则默认 step） | 用于诊断的构建 step 列表，结果合并；找不到的 step 提示后忽略。`diagnostics.step` 为单个 step 的写法，与之合并 |
 | `diagnostics.compiler` | `true` | 是否运行编译器得到诊断；关闭时构建只产出生成文件（使以生成文件为根的模块可解析），只有 live 诊断 |
+| `diagnostics.debounce_ms` | `50` | 编辑后等待这么多毫秒没有新的编辑才计算 live 诊断（打开、保存、构建结果触发的发布不等待）；`0` 不等待 |
 | `diagnostics.inactive_code` | `true` | 当前构建配置下不编译的代码（comptime 已知不执行的分支）是否显示为非活动代码 |
 | `inlay_hints.types` / `.parameters` | `true` | 类型提示 / 参数名提示（变化后请客户端刷新） |
 | `inlay_hints.hide_redundant_param_names` | `true` | 实参是同名变量（或以形参名结尾的字段访问）时不显示形参名 |
@@ -924,10 +925,10 @@ pub fn make() std.ArrayList(u8) { ... }
 |---|---|---|---|---|
 | 容器成员按名字查找 | `lookupDecl` 线性扫描 ItemTree 中该容器的成员，没有按容器缓存的哈希表（§7.2 的 `namespace` query） | 类型推导时大文件中大量名字查找，或成员特别多的容器 | 加一个以容器为键、值为「名字 → 成员」表的 query；只改 `lookupDecl` / `memberDef` 内部 | M3 |
 | 行索引 | 每个请求现场计算 `LineIndex`，未做成 `line_index(file)` query（§12.2） | 大文件上高频请求（逐字输入时的补全、semantic tokens） | 做成 query 缓存 | M1 |
-| live 诊断防抖 | 每次编辑都重新计算 live 诊断，没有防抖（§11.2）。M7 实测：Zig 编译器源码中最大的 Sema.zig（3.5 万行）上编辑到诊断 9～45 ms，其余文件 ≤ 9 ms，暂不需要 | 大文件上快速输入 | 发布前等待 ~50ms 内无新编辑 | M1 |
+| ~~live 诊断防抖~~ | 已处理，见 §19.25 | — | — | §19.25 |
 | 超大文件的 AstGen | 合法代码的 live 诊断需要完整 AstGen：Sema.zig 上约 45 ms，超出 30 ms 预算（有语法错误时只解析，约 9 ms）。AstGen 是官方实现，无法局部重做 | 编辑数万行的单个文件 | 只能等上游；或对超大文件放宽预算 | M7 |
 | 保存后的编译器诊断 | 由编译器决定：Zig 编译器项目以 `-Dno-bin` 检查约 5 秒；`-fincremental` 约 2.6 秒，但 0.17 中漏报部分错误（文件级 `comptime` 块中的错误），macOS 上输出二进制时直接崩溃（`TODO(MachO2): load archive`），因此不自动启用，用户可经 `build.args` 自行传入。小项目约 120 ms | 大项目保存后等待诊断 | 上游增量编译成熟后默认启用 | M7 |
-| live 诊断的 AstGen 不可取消 | 标准库 AstGen 计算中不检查取消，写事务需要等它结束 | 大文件上的编辑延迟 | 防抖，或把 AstGen 放到单独的计算队列 | M1 |
+| ~~live 诊断的 AstGen 不可取消~~ | 已处理，见 §19.25 | — | — | §19.25 |
 | InternPool 的锁 | 读写共用一把互斥锁，`key()` 读取也要加锁 | 类型推导并发请求多、InternPool 很大时的锁竞争 | 分片，或读路径改为无锁（只追加的分段数组） | M4 |
 | 函数体的推导粒度 | hover、补全、inlay hint 每次对整个成员做完整推导（`Infer` 按成员缓存，编辑该成员后整体重算） | 很长的函数中逐字输入 | 按语句块增量推导，或只推导光标所需的表达式 | M4 |
 | ~~读请求用 `async` 提交~~ | 已处理，见 §19.24 | — | — | §19.24 |
@@ -1235,6 +1236,28 @@ pub fn make() std.ArrayList(u8) { ... }
 | 测试工具 | `src/server/test_harness.zig` | `startIo` 以指定的 Io 启动服务器；`send` / `response` 分开发送请求与等待响应 |
 
 - 测试：`zig build test` 共 246 个（线程池没有空位时，测试持有写锁使读请求阻塞，主循环仍响应其他消息，阻塞期间送达的 `$/cancelRequest` 生效；修复前主循环被阻塞，测试超时）。
+
+### 19.25 逐字输入时的诊断发布（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 防抖 | `src/server/Server.zig`、`Config.zig` | 编辑触发的发布按文件防抖：每个文件记录编辑代数，同一文件最多一个等待中的任务，`diagnostics.debounce_ms`（默认 50）内没有新的编辑才计算。打开、保存、构建结果等触发的发布不防抖 |
+| 被取代的发布 | `src/server/Server.zig` | 编辑触发的发布被写事务打断时，若已有更新的编辑就放弃，由那次编辑触发的发布接替。此前每次打断都立即重试（最多 100 次），逐字输入时与编辑反复争抢 |
+| AstGen 移出读事务 | `src/diagnostics/live.zig`、`src/database.zig`、`Server.zig` | AstGen 不检查取消，在读事务中进行时写事务要等它结束。发布先在锁外对当前文本做 AstGen，结果放入按文本与模式索引的小缓存 `live.Prepared`（容量 8，按完整文本匹配），`AstCheck` 计算时取走命中的结果（`Env.live_prepared`）。发布进入读事务后确认缓存是为当前文本准备的，否则退出读事务重新准备：逐字输入时 AstGen 可能慢于按键，准备好时文本已经变了，此前这时 `AstCheck` 未命中，仍在读事务中做 AstGen |
+| 基准 | `tools/lsp_bench.zig` | 新增「连续输入」：在文件末尾的注释中每 30ms 输入一个字符，每次按键后立即 hover，延迟包含编辑的写事务等待读事务退出的时间 |
+
+Zig 0.17.0 编译器源码、`src/Sema.zig`（3.56 万行），4 核云主机，ReleaseSafe，关闭编译器诊断（`diagnostics.compiler = false`，只测 live 诊断）：
+
+| 指标 | 修复前 | 防抖 + AstGen 移出 | + 放弃被取代的发布、确认已准备 | 输入期间不发布（下限） |
+|---|---|---|---|---|
+| 按键 → hover p50 | 2690 ms | 2428 ms | 141 ms | 102 ms |
+| 按键 → hover p95 | 11043 ms | 10312 ms | 220 ms | 190 ms |
+| 按键 → hover max | 13903 ms | 13848 ms | 224 ms | 193 ms |
+| 编辑 → 诊断 p50 | 420 ms | 517 ms | 472 ms | — |
+
+- 关闭非活动代码（`diagnostics.inactive_code = false`）时编辑 → 诊断为 85 ms：发布的大部分时间是推导整个文件以求非活动代码区间（Sema.zig 有上千个成员）。推导可取消，不再阻塞编辑，但大文件上诊断出现得晚，待处理。
+- 按键 → hover 的下限约 100 ms：每次按键后 hover 要重新解析 Sema.zig（增量解析约 65 ms）并重建 ItemTree、FileIndex 等。
+- 测试：`zig build test` 共 248 个（连续编辑只发布一次且按最后的文本；`live.Prepared` 的匹配、取用与淘汰；发布时 `AstCheck` 取用预先算好的结果）。
 
 ## 20. 风险与对策
 
