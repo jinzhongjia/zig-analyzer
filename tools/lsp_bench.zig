@@ -10,6 +10,9 @@
 //! - `BENCH_SAVE=1`：测量保存 → 构建完成（会改写项目中的文件，结束时恢复）
 //! - `BENCH_HOVER=行:列`：打印该处的 hover 结果
 //! - `BENCH_VERBOSE=1`：打印首轮中较慢的请求、其内存变化与各 query 的执行次数
+//! - `BENCH_CHECK=<n>`：校验跳转的正确性：对文件中的标识符请求 declaration，目标处的标识符应与请求处相同；
+//!   同时打印前 n 个未解析的标识符
+//! - `BENCH_SESSION=<轮数>`：长时间会话，观察内存的增长
 
 const std = @import("std");
 const Io = std.Io;
@@ -48,6 +51,8 @@ const Client = struct {
     /// 最近一次构建结束时的消息（如 `1 error(s)`）
     build_message: []const u8 = "",
     last_counts: []const QueryCount = &.{},
+    /// 跳转校验中打印的未解析样例数（BENCH_CHECK 的值）
+    unresolved_samples: usize = 0,
 
     fn send(c: *Client, value: anytype) !void {
         const body = try json.Stringify.valueAlloc(c.gpa, value, .{ .emit_null_optional_fields = false });
@@ -249,6 +254,87 @@ fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     return @as(f64, @floatFromInt(kb)) / 1024;
 }
 
+/// 位置（行、UTF-16 列；样例文件都是 ASCII 时等于字节列）对应的字节偏移
+fn offsetOf(text: []const u8, p: Position) ?usize {
+    var line: u32 = 0;
+    var start: usize = 0;
+    while (line < p.line) : (line += 1) start = (std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return null) + 1;
+    return if (start + p.character <= text.len) start + p.character else null;
+}
+
+/// 偏移处的标识符（含 `@"..."` 形式）
+fn identAt(text: []const u8, offset: usize) []const u8 {
+    if (std.mem.startsWith(u8, text[offset..], "@\"")) {
+        const end = std.mem.indexOfScalarPos(u8, text, offset + 2, '"') orelse return "";
+        return text[offset + 2 .. end];
+    }
+    var end = offset;
+    while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) end += 1;
+    return text[offset..end];
+}
+
+/// 跳转的正确性（BENCH_CHECK=1）：对文件中的每个标识符（最多 `limit` 个，均匀取样）请求
+/// `textDocument/declaration`，目标位置的标识符应与请求处的相同（declaration 不追别名链）
+fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const u8) !void {
+    const a = c.arena.allocator();
+    const limit = 3000;
+    var offsets: std.ArrayList(usize) = .empty;
+    var tokenizer: std.zig.Tokenizer = .init(text);
+    while (true) {
+        const t = tokenizer.next();
+        if (t.tag == .eof) break;
+        if (t.tag == .identifier and !std.mem.eql(u8, text[t.loc.start..t.loc.end], "_")) try offsets.append(a, t.loc.start);
+    }
+    const n = @min(offsets.items.len, limit);
+    var texts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var resolved: usize = 0;
+    var mismatched: usize = 0;
+    var samples_shown: usize = 0;
+    var unresolved_shown: usize = 0;
+    // BENCH_CHECK=<n>：打印前 n 个未解析的标识符
+    const unresolved_limit = c.unresolved_samples;
+    for (0..n) |i| {
+        const off = offsets.items[i * offsets.items.len / n];
+        const name = identAt(text, off);
+        const resp, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = uri }, .position = positionOf(text, off) });
+        const result = resp.object.get("result") orelse continue;
+        const loc = switch (result) {
+            .object => result,
+            .array => |arr| if (arr.items.len > 0) arr.items[0] else null,
+            else => null,
+        } orelse {
+            if (unresolved_shown < unresolved_limit) {
+                unresolved_shown += 1;
+                const p = positionOf(text, off);
+                const line_start = off - p.character;
+                const line_end = std.mem.indexOfScalarPos(u8, text, off, '\n') orelse text.len;
+                std.debug.print("    unresolved {s}:{d}:{d} `{s}`  | {s}\n", .{ rel, p.line + 1, p.character + 1, name, std.mem.trim(u8, text[line_start..line_end], " ") });
+            }
+            continue;
+        };
+        resolved += 1;
+        const target_uri = loc.object.get("uri").?.string;
+        const start = loc.object.get("range").?.object.get("start").?.object;
+        const target_text = texts.get(target_uri) orelse blk: {
+            const path = za.base.uri.toPath(a, target_uri) catch break :blk "";
+            const t = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(16 * 1024 * 1024)) catch "";
+            try texts.put(a, target_uri, t);
+            break :blk t;
+        };
+        const target_off = offsetOf(target_text, .{ .line = @intCast(start.get("line").?.integer), .character = @intCast(start.get("character").?.integer) }) orelse continue;
+        const target_name = identAt(target_text, target_off);
+        if (std.mem.eql(u8, name, target_name)) continue;
+        mismatched += 1;
+        if (samples_shown < 12) {
+            samples_shown += 1;
+            const p = positionOf(text, off);
+            const tp = positionOf(target_text, target_off);
+            std.debug.print("    mismatch {s}:{d}:{d} `{s}` -> {s}:{d}:{d} `{s}`\n", .{ rel, p.line + 1, p.character + 1, name, std.fs.path.basename(target_uri), tp.line + 1, tp.character + 1, target_name });
+        }
+    }
+    std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched });
+}
+
 /// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、补全、
 /// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
@@ -447,6 +533,11 @@ pub fn main(init: std.process.Init) !u8 {
             if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  {s:<12} memory {d:.0} MB\n", .{ "", mb });
             std.debug.print("  {s:<12} non-null {d}/{d}\n", .{ "", hits, positions.len });
             std.debug.print("  {s:<12} first pass max {d:.1}ms\n", .{ "", cold_max });
+        }
+
+        if (init.environ_map.get("BENCH_CHECK")) |v| {
+            c.unresolved_samples = std.fmt.parseInt(usize, v, 10) catch 0;
+            try checkDeclarations(&c, uri, text, rel);
         }
 
         // 编辑 → live 诊断：在文件末尾加入语法错误，再撤销
