@@ -1349,7 +1349,7 @@ Sema.zig 上的编辑响应（同一台机器）：
 | 预备 AstGen 的竞态 | `src/diagnostics/live.zig` | `claim` 在结果写入前就将文本标记为已预备，并发的发布可能取不到结果；改为在 `put` 时标记 |
 | 基准在带错误的文件上挂起 | `tools/lsp_bench.zig` | 编辑 → 诊断等待「出现 / 清空错误」，标准库等文件本身带有错误时撤销后永不清空；改为以编辑前的错误个数为基准 |
 
-- 余下的补全缺口：zig-clap 的 `@field` / 反射生成的类型，z2d 中经 comptime 函数指针表分派的泛型函数。
+- 余下的未补全（zig-clap 23 处、z2d 27 处）均为空列表，尚未逐一归类。
 - 查找引用的冷启动最坏 1.9 s（`src/Compilation.zig` 中被大量文件引用的声明，`ParseFile` 的 LRU 容量 64 不足以容纳候选文件而反复解析）；热状态 p95 124 ms。
 - 测试：`zig build test` 共 260 个。
 
