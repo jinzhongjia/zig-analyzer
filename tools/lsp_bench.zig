@@ -434,6 +434,19 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     }
 }
 
+/// 文件后半段第一个函数体中的语句（缩进至少 8 个空格、以 `;` 结尾）的行尾偏移
+fn bodyLine(text: []const u8) ?usize {
+    var start = std.mem.indexOfScalarPos(u8, text, text.len / 2, '\n') orelse return null;
+    while (start < text.len) {
+        const line_start = start + 1;
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse return null;
+        const line = text[line_start..line_end];
+        if (std.mem.startsWith(u8, line, "        ") and std.mem.endsWith(u8, line, ";") and std.mem.indexOf(u8, line, "//") == null) return line_end;
+        start = line_end;
+    }
+    return null;
+}
+
 fn notEmpty(n: usize) bool {
     return n > 0;
 }
@@ -579,9 +592,47 @@ pub fn main(init: std.process.Init) !u8 {
                 try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = typed_end }, .text = "" }} });
                 version += 1;
             }
+
+            // 函数体中的编辑（实际编辑的常见位置，走块级增量重解析）：文件后半段第一个缩进至少 8 个空格、
+            // 以 `;` 结尾的语句，在行尾加入语法错误再撤销；再在行尾的注释中连续输入并 hover
+            if (bodyLine(text)) |line_end| {
+                _ = try c.request("zig-analyzer/waitIdle", {});
+                if (verbose) try c.phase("end-of-file edits");
+                const at = positionOf(text, line_end);
+                const after: Position = .{ .line = at.line, .character = at.character + 2 };
+                var body_edit_times: [10]f64 = undefined;
+                var body_clear_times: [10]f64 = undefined;
+                for (&body_edit_times, &body_clear_times) |*te, *tc| {
+                    var t0 = Io.Clock.awake.now(io);
+                    try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = "@@" }} });
+                    version += 1;
+                    te.* = try c.waitDiagnostics(uri, t0, notEmpty);
+                    t0 = Io.Clock.awake.now(io);
+                    try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = after }, .text = "" }} });
+                    version += 1;
+                    tc.* = try c.waitDiagnostics(uri, t0, isEmpty);
+                }
+                Stats.print("body edit→diag", &body_edit_times);
+                Stats.print("body undo→clear", &body_clear_times);
+                try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = " //" }} });
+                version += 1;
+                _ = try c.request("zig-analyzer/waitIdle", {});
+                var body_typing_times: [40]f64 = undefined;
+                for (&body_typing_times, 0..) |*t, i| {
+                    const p: Position = .{ .line = at.line, .character = at.character + 3 + @as(u32, @intCast(i)) };
+                    try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = p, .end = p }, .text = "x" }} });
+                    version += 1;
+                    _, t.* = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i % idents.len] });
+                    try (Io.Clock.Duration{ .raw = .fromMilliseconds(30), .clock = .awake }).sleep(io);
+                }
+                Stats.print("body type→hover", &body_typing_times);
+                const body_typed_end: Position = .{ .line = at.line, .character = at.character + 3 + @as(u32, body_typing_times.len) };
+                try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = body_typed_end }, .text = "" }} });
+                version += 1;
+            }
             if (verbose) {
                 _ = try c.request("zig-analyzer/waitIdle", {});
-                try c.phase("edits (incl. background work until idle)");
+                try c.phase("in-body edits (incl. background work until idle)");
             }
 
             // 保存 → 编译器诊断（BENCH_SAVE=1）：在磁盘文件末尾写入一个语义错误（AstGen 不报，只有编译器报），
