@@ -3,6 +3,7 @@
 //! 自研 CST 的错误不参与诊断（见设计 §11）。
 
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Ast = std.zig.Ast;
 const ErrorBundle = std.zig.ErrorBundle;
@@ -39,6 +40,11 @@ pub const Result = struct {
 };
 
 pub const Mode = enum { zig, zon };
+
+/// `.zon` 文件按 ZON 处理
+pub fn modeOf(path: []const u8) Mode {
+    return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
+}
 
 /// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
@@ -150,9 +156,12 @@ pub const AstCheck = struct {
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const text = try ctx.get(inputs.FileText, file) orelse "";
         const vfs: *Vfs = ctx.db.env.vfs;
-        const mode: Mode = if (std.mem.endsWith(u8, vfs.path(file), ".zon")) .zon else .zig;
+        const mode = modeOf(vfs.path(file));
         return switch (try ctx.get(LiveBackend, {})) {
-            .in_process => check(ctx.db.gpa, text, mode),
+            .in_process => blk: {
+                if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode)) |r| break :blk r;
+                break :blk check(ctx.db.gpa, text, mode);
+            },
             .subprocess => |zig_exe| checkSubprocess(ctx.db.gpa, ctx.db.io, zig_exe, text, mode) catch |err| switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Canceled => error.Canceled,
@@ -168,6 +177,79 @@ pub const AstCheck = struct {
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
         v.*.destroy(gpa);
+    }
+};
+
+/// 在读事务之外预先算好的 `check` 结果，按文本与模式索引。AstGen 不检查取消，在读事务中执行时
+/// 写事务（逐字输入）要等它结束；诊断发布先在锁外算好放入这里，`AstCheck` 计算时取走命中的结果。
+/// 结果只取决于文本，因此不影响 query 的纯函数语义。容量很小：未被取走的结果（memo 已有效）按先进先出淘汰
+pub const Prepared = struct {
+    gpa: Allocator,
+    mutex: Io.Mutex = .init,
+    entries: std.ArrayList(Entry) = .empty,
+    /// 每个文件最近一次准备的文本哈希：文本未变时不重复准备
+    last: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
+    /// `take` 命中的次数（统计与测试用）
+    hits: usize = 0,
+
+    const Entry = struct { mode: Mode, text: []const u8, result: *Result };
+    pub const capacity = 8;
+
+    pub fn deinit(p: *Prepared) void {
+        for (p.entries.items) |e| p.destroyEntry(e);
+        p.entries.deinit(p.gpa);
+        p.last.deinit(p.gpa);
+    }
+
+    pub fn hash(text: []const u8, mode: Mode) u64 {
+        return std.hash.Wyhash.hash(@backingInt(mode), text);
+    }
+
+    /// 文件的这个文本是否还需要准备（并记为已准备）
+    pub fn claim(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) Allocator.Error!bool {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        const gop = try p.last.getOrPut(p.gpa, file);
+        if (gop.found_existing and gop.value_ptr.* == h) return false;
+        gop.value_ptr.* = h;
+        return true;
+    }
+
+    /// 放入 `check(text, mode)` 的结果，取得 `result` 的所有权
+    pub fn put(p: *Prepared, io: Io, text: []const u8, mode: Mode, result: *Result) Allocator.Error!void {
+        errdefer result.destroy(p.gpa);
+        const owned = try p.gpa.dupe(u8, text);
+        errdefer p.gpa.free(owned);
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        if (p.find(text, mode) != null) {
+            p.gpa.free(owned);
+            result.destroy(p.gpa);
+            return;
+        }
+        if (p.entries.items.len == capacity) p.destroyEntry(p.entries.orderedRemove(0));
+        try p.entries.append(p.gpa, .{ .mode = mode, .text = owned, .result = result });
+    }
+
+    /// 取走 `check(text, mode)` 的结果（调用方取得所有权）
+    pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode) ?*Result {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        const i = p.find(text, mode) orelse return null;
+        const e = p.entries.orderedRemove(i);
+        p.gpa.free(e.text);
+        p.hits += 1;
+        return e.result;
+    }
+
+    fn find(p: *Prepared, text: []const u8, mode: Mode) ?usize {
+        for (p.entries.items, 0..) |e, i| if (e.mode == mode and std.mem.eql(u8, e.text, text)) return i;
+        return null;
+    }
+
+    fn destroyEntry(p: *Prepared, e: Entry) void {
+        p.gpa.free(e.text);
+        e.result.destroy(p.gpa);
     }
 };
 
@@ -410,4 +492,32 @@ test "error locations and notes" {
     try testing.expectEqual(2, d.notes.len);
     try testing.expectEqualStrings("duplicate name here", d.notes[0].message);
     try testing.expectEqualStrings("struct declared here", d.notes[1].message);
+}
+
+test "prepared results: matched by text and mode, taken once, oldest evicted" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var p: Prepared = .{ .gpa = gpa };
+    defer p.deinit();
+    try p.put(io, "const a = ;", .zig, try check(gpa, "const a = ;", .zig));
+    // 同样的文本不同的模式不命中
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon));
+    const r = p.take(io, "const a = ;", .zig).?;
+    defer r.destroy(gpa);
+    try std.testing.expectEqual(1, r.items.len);
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig));
+
+    for (0..Prepared.capacity + 1) |i| {
+        var buf: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "const a = {d};", .{i});
+        try p.put(io, text, .zig, try check(gpa, text, .zig));
+    }
+    try std.testing.expectEqual(Prepared.capacity, p.entries.items.len);
+    try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig));
+
+    // 同一文件的同一文本只准备一次
+    const h = Prepared.hash("x", .zig);
+    try std.testing.expect(try p.claim(io, @fromBackingInt(@intCast(0)), h));
+    try std.testing.expect(!try p.claim(io, @fromBackingInt(@intCast(0)), h));
+    try std.testing.expect(try p.claim(io, @fromBackingInt(@intCast(0)), Prepared.hash("y", .zig)));
 }

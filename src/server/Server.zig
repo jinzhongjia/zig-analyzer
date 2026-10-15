@@ -95,6 +95,8 @@ debounce_ms: std.atomic.Value(u32) = .init(50),
 /// 编辑触发的待发布文件（见 `publishDebounced`）
 edits_mutex: Io.Mutex = .init,
 edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
+/// 诊断发布在读事务之外预先算好的 live 诊断（经 `Env` 供 `AstCheck` 取用）
+live_prepared: live.Prepared = undefined,
 /// 是否有索引任务在运行（同时只运行一个）
 indexing: std.atomic.Value(bool) = .init(false),
 /// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
@@ -152,7 +154,8 @@ pub const HandlerError = error{
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
 pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) Allocator.Error!void {
     server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .ip = try .init(gpa, io), .env = undefined, .out = out };
-    server.env = .{ .vfs = &server.vfs, .ip = &server.ip, .callsite_seeding = &server.callsite_seeding };
+    server.live_prepared = .{ .gpa = gpa };
+    server.env = .{ .vfs = &server.vfs, .ip = &server.ip, .callsite_seeding = &server.callsite_seeding, .live_prepared = &server.live_prepared };
     server.db = .init(io, gpa, &server.env);
 }
 
@@ -165,6 +168,7 @@ pub fn deinit(server: *Server) void {
     server.workspaces.deinit(server.gpa);
     server.indexed.deinit(server.gpa);
     server.edits.deinit(server.gpa);
+    server.live_prepared.deinit();
     za.util.log.setFile(null) catch {};
     for (server.retired.items) |ws| ws.destroy();
     server.retired.deinit(server.gpa);
@@ -1568,6 +1572,7 @@ fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!voi
 }
 
 fn publishNow(server: *Server, file: Vfs.FileId, clear: bool) void {
+    server.prepareLive(file);
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     // 被写事务取消时重试：构建结果触发的发布不能因无关的编辑而丢失
@@ -1590,6 +1595,27 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool) void {
         server.sendDiagnostics(file, params, clear);
         return;
     }
+}
+
+/// 在读事务之外对文件的当前文本做 AstGen（见 `live.Prepared`）：AstGen 不检查取消，在读事务中进行时
+/// 写事务要等它结束。只读取文本时短暂持有读事务。任何失败都只是退回在 query 中计算
+fn prepareLive(server: *Server, file: Vfs.FileId) void {
+    const eligible = if (server.workspaceFor(file)) |w| w.liveEligible(file) else true;
+    if (!eligible) return;
+    var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const text = blk: {
+        var ctx = server.db.beginRead(a);
+        defer ctx.end();
+        if ((ctx.get(live.LiveBackend, {}) catch return) != .in_process) return;
+        const t = (ctx.get(FileText, file) catch return) orelse return;
+        break :blk a.dupe(u8, t) catch return;
+    };
+    const mode = live.modeOf(server.vfs.path(file));
+    if (!(server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode)) catch return)) return;
+    const result = live.check(server.gpa, text, mode) catch return;
+    server.live_prepared.put(server.io, text, mode, result) catch {};
 }
 
 fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool) void {

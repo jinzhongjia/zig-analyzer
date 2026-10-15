@@ -26,6 +26,8 @@ pub const Env = struct {
     ip: *InternPool,
     /// 配置 `sema.callsite_seeding`：泛型函数体内是否以调用点的实例推导（只在 IDE 层读取，不影响 query 结果）
     callsite_seeding: *const std.atomic.Value(bool) = &always_on,
+    /// 在读事务之外预先算好的 live 诊断（见 `live.Prepared`）；null 时总在 query 中计算
+    live_prepared: ?*live.Prepared = null,
 };
 
 var always_on: std.atomic.Value(bool) = .init(true);

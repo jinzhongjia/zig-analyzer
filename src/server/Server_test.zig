@@ -270,7 +270,7 @@ test "read requests run on their own threads: a blocked read does not stall the 
     try h.notify("exit", {});
 }
 
-test "live diagnostics are debounced per file" {
+test "live diagnostics are debounced per file and AstGen runs outside the read transaction" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};
     var h: Harness = undefined;
@@ -298,6 +298,9 @@ test "live diagnostics are debounced per file" {
     const diags = published[published.len - 1].object.get("params").?.object.get("diagnostics").?.array.items;
     try testing.expectEqual(1, diags.len);
     try testing.expectEqualStrings("expected expression, found ';'", diags[0].object.get("message").?.string);
+    // AstCheck 取用了在读事务之外算好的结果
+    try testing.expect(h.server.live_prepared.hits >= 2);
+    try testing.expectEqual(0, h.server.live_prepared.entries.items.len);
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
