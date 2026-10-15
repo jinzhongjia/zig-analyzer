@@ -184,6 +184,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// 保护所有表的元数据（key 驻留、slot、memo、垃圾列表）
         mutex: Io.Mutex = .init,
         pending_write: std.atomic.Value(bool) = .init(false),
+        /// 进行中的读事务数。释放 memo 的值（淘汰、垃圾回收、`resetQueries`）时必须为 0，以断言检查
+        active_readers: std.atomic.Value(u32) = .init(0),
         writing: bool = false,
         bumped_in_write: bool = false,
 
@@ -373,6 +375,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// 调用方须独占数据库（没有读事务持有值）
         fn evictLocked(db: *Db) void {
             if (!db.sweep_wanted.swap(false, .monotonic)) return;
+            db.assertNoReaders();
             inline for (queries, 0..) |Q, qi| {
                 if (comptime Q.kind == .derived and @hasDecl(Q, "lru")) {
                     const table = &db.tables[qi];
@@ -514,7 +517,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return table.slots.items[index].value;
         }
 
+        fn assertNoReaders(db: *Db) void {
+            const n = db.active_readers.load(.acquire);
+            if (n != 0) std.debug.panic("freeing memo values with {d} read transactions in progress", .{n});
+        }
+
         fn collectGarbage(db: *Db) void {
+            db.assertNoReaders();
             for (db.garbage.items) |g| switch (g) {
                 .deps => |deps| db.gpa.free(deps),
                 .value => |v| v.free(v.ptr, db.gpa),
@@ -526,6 +535,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         pub fn beginRead(db: *Db, gpa: Allocator) Ctx {
             db.rw.lockSharedUncancelable(db.io);
+            _ = db.active_readers.fetchAdd(1, .acq_rel);
             return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress() };
         }
 
@@ -560,6 +570,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             pub fn end(ctx: *Ctx) void {
                 assert(ctx.stack.items.len == 0);
                 ctx.stack.deinit(ctx.gpa);
+                _ = ctx.db.active_readers.fetchSub(1, .acq_rel);
                 ctx.db.rw.unlockShared(ctx.db.io);
                 ctx.* = undefined;
             }
