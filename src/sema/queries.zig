@@ -326,6 +326,7 @@ pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!In
     const tree = try r.itemTree(ns.file);
     const c = tree.containers[ns.container];
     const container_inst = if (c.parent_item) |p| try normalizeInst(r, ns.file, p, inst) else null;
+    if (c.kind == .@"struct") if (try tupleDecl(r, tree, ns, container_inst)) |t| return t;
     return r.ctx.db.env.ip.get(.{ .container_type = .{ .file = ns.file, .ast_id = c.ast_id, .kind = switch (c.kind) {
         .file => .file,
         .@"struct" => .@"struct",
@@ -333,6 +334,22 @@ pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!In
         .@"union" => .@"union",
         .@"opaque" => .@"opaque",
     }, .inst = container_inst } });
+}
+
+/// 元组声明 `struct { A, B }`：与编译器一致是结构化的元组类型（字段类型相同的声明是同一个类型）。
+/// 有字段名或声明时不是元组声明，为 null
+fn tupleDecl(r: *Resolver, tree: *const ItemTree, ns: Namespace, inst: ?Index) resolve.Error!?Index {
+    const members = tree.containerMembers(ns.container);
+    if (members.len == 0) return null;
+    for (members) |m| if (tree.items[m].kind != .field or tree.items[m].name != null) return null;
+    const types = try r.arena.alloc(Index, members.len);
+    const values = try r.arena.alloc(Index, members.len);
+    for (members, types, values) |m, *t, *v| {
+        t.* = (try defType(r, .{ .item = .{ .file = ns.file, .item = m } }, null, inst)).ty;
+        // comptime 字段的值属于类型，这里不求值
+        v.* = if (tree.items[m].flags.is_comptime) .unknown else .runtime;
+    }
+    return try r.ctx.db.env.ip.get(.{ .tuple_type = .{ .types = types, .values = InternPool.fieldValues(values) } });
 }
 
 pub fn namespaceOfType(r: *Resolver, t: Index) resolve.Error!?Namespace {

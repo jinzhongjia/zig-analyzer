@@ -1091,6 +1091,26 @@ test "unnamed parameters of extern functions are inferred" {
     });
 }
 
+test "tuple declarations are structural" {
+    try expectTypes(
+        \\const A = struct { u8, bool };
+        \\const B = struct { u8, bool };
+        \\fn pair() struct { u32, bool } { return .{ 1, true }; }
+        \\fn f() void {
+        \\    const same = if (A == B) @as(u8, 1) else @as(u16, 2);
+        \\    const p = pair();
+        \\    const first = p[0];
+        \\    _ = .{ same, first };
+        \\}
+    , &.{
+        .{ "A", "type = struct { u8, bool }" },
+        // 两个声明是同一个类型：比较 comptime 已知，只取 then 分支
+        .{ "same", "u8 = 1" },
+        .{ "p", "struct { u32, bool }" },
+        .{ "first", "u32" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
