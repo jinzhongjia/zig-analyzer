@@ -939,7 +939,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | 引用查找的反向 import 图 | 每次查找引用都现场构建反向图；各文件的 `FileIndex` 由后台索引预先算好（M7），构建只需读取缓存。实测冷缓存下在标准库（563 个文件）上查找 `mem.Allocator` 的引用 0.36～0.43 秒（含全部文件的解析），热缓存下几十毫秒 | 更大的项目，或频繁的 document highlight | 反向 import 图做成 query | M6 |
 | ProjectModel 磁盘缓存 | 未实现（§13.1）。M7 实测：Zig 编译器项目上 `zig build` 配置有 Zig 自身的缓存，项目加载约 1 秒（builtin.zig 生成按参数缓存后），冷启动预算已满足 | 配置特别慢的 build.zig | 按 §13.1 实现 | M7 |
 | ~~项目加载期间大量重算 `Infer`~~ | 已处理，见 §19.21 的「第一个发现」 | — | — | §19.21 |
-| Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
+| ~~Body 随每次解析重新降级~~ | 已处理，见 §19.27：成员源码未变时沿用上一次的 Body | — | — | §19.27 |
 
 ### 19.7 M4 完成情况（2026-10-13）
 
@@ -1275,8 +1275,50 @@ Zig 0.17.0 编译器源码（含标准库，2940 个 .zig 文件），4 核云�
 
 62 轮的结果（默认配置）：常驻内存 642 MB（此前 807～998 MB），堆稳定在 340～400 MB（此前 616 MB），ItemBody ≤ 48 MB，InternPool 达到 64 MB 时回收一次。最后一轮的堆：FileText 74 MB、FileItemTree 56 MB、Infer 41 MB、ItemBody 34 MB、InternPool 55 MB、未归属 85 MB（引擎的表与依赖边、Vfs 等）。前两者随访问过的文件数增长，上限是项目本身的大小。常驻内存比堆多出的部分来自 `smp_allocator` 不把小块内存还给操作系统。
 
-- 未解决：开启整代回收（阈值 24 MB）的一次 62 轮会话在第 60 轮崩溃一次：诊断发布中推导某个成员时 `Inferrer.exprs` 的长度（按 Body 分配）与 Body 不一致（`isConstPlace` 下标越界），即 Body 在推导中途被改写。此后同样配置的 7 次会话（共 40 余次回收，其中 2 次用释放即毒化的分配器）都未复现；引擎中释放值的路径（LRU 淘汰、垃圾回收、`resetQueries`）都只在独占锁下进行，读写锁的 `tryLock` 实现也已核对。`SafeAllocator` 不复用内存，释放后读取只会读到旧数据，因此这类问题此前可能被掩盖。继续在长时间会话中观察。
+- 已解决：开启整代回收的一次 62 轮会话曾在第 60 轮崩溃（推导中下标越界），当时疑为释放后使用，此后多次未能复现。在 libvaxis 的长时间会话中稳定复现后查明是逻辑错误，与回收和分配器无关：`isConstPlace` 用当前成员的 Body 查外层函数的局部绑定（体内容器的成员中对外层函数的局部变量取切片或地址），绑定编号越界。ReleaseSafe 下内联使报告的行号指向了相邻的 `inf.exprs` 访问。已修复（见 §19.27）；引擎同时在释放值之前断言没有进行中的读事务
 - 测试：`zig build test` 共 253 个（`resetQueries` 清空 key 并使依赖它的 memo 重算；`lru_bytes` 按字节数淘汰最旧的值；`InternPool.reset` 保留预置项；回收前后 hover 结果相同；计数分配器）。
+
+### 19.27 在真实项目上的验证（2026-10-15）
+
+选取支持 Zig 0.17.0 的热门项目与 Zig 编译器源码，测量性能、校验功能并跑长时间会话。依赖由 `git` 取得后经 `zig fetch <目录>` 放入缓存（内容哈希与 `build.zig.zon` 一致）。
+
+基准新增「跳转的正确性」（`BENCH_CHECK=<n>`）：对文件中的标识符（最多 3000 个，均匀取样）请求 `textDocument/declaration`，目标处的标识符应与请求处相同（declaration 不追别名链）；输出解析率、不一致的个数与样例，以及前 n 个未解析的标识符。
+
+| 项目（文件） | 规模 | 加载 | hover p50 | 补全 p50 | declaration 解析 / 不一致 | 编辑 → 诊断 p50 | 按键 → hover p50 | 30 轮后常驻内存 |
+|---|---|---|---|---|---|---|---|---|
+| ZLS master（`src/analysis.zig`） | 5.7 万行 | 1.1 s | 0.7 ms | 0.5 ms | 92.2% / 0 | 90 ms | 16 ms | 218 MB |
+| zigimg（`src/color.zig`） | 3.8 万行 | 1.0 s | 0.3 ms | 0.4 ms | 93.4% / 0 | 80 ms | 9 ms | 163 MB |
+| zig-clap（`clap.zig`） | 0.3 万行 | 1.0 s | 0.2 ms | 0.3 ms | 89.9% / 0 | 62 ms | 5 ms | 84 MB |
+| libvaxis `zig-0.17`（`src/Vaxis.zig`） | 2.5 万行 | 1.4 s | 0.2 ms | 0.3 ms | 91.7% / 0 | 59 ms | 5 ms | 232 MB |
+| z2d `zig-0.17`（`src/compositor.zig`） | 3.6 万行 | 1.1 s | 0.4 ms | 0.3 ms | 85.3% / 0 | 72 ms | 9 ms | 142 MB |
+| Zig 0.17.0 编译器（`src/Sema.zig`，关闭编译器诊断） | 54 万行 + 标准库 | 4.4 s | 2.8 ms | 1.5 ms | 96.6% / 0 | 177 ms | 97 ms | 547 MB（40 轮） |
+
+- 编辑 → 诊断含 50 ms 防抖。Zig 编译器源码另测 `src/Compilation.zig` 与 `lib/std/mem.zig`，declaration 解析 86.7% / 80.3%，均无不一致。
+- 解析器语料对拍（上述项目与 Zig 编译器源码、标准库，1835 个文件 73 MB）：无损、无误报、结构一致、截断不崩溃、HIR 无失败、增量与全量解析一致。
+- 编译器诊断（`BENCH_SAVE`，写入只有编译器能报的语义错误并保存）：zig-clap 保存 → 构建 2.4 s，libvaxis 4.4 s，恢复后诊断清除。
+
+发现并修复的问题：
+
+| 问题 | 文件 | 内容 |
+|---|---|---|
+| 崩溃 | `src/sema/infer.zig` | `isConstPlace` 用当前成员的 Body 查外层函数的局部绑定（体内容器的成员中对外层函数的局部变量取切片或地址），越界崩溃。libvaxis 的长时间会话中稳定复现（§19.26 中曾疑为释放后使用的崩溃即此） |
+| 环与大量重算 | `src/syntax/ast.zig` | `ContainerDecl.argExpr` 越过 `)` 取到第一个成员：`union(enum) { a, ... }` 的 `a` 被降级为名字引用、解析到外层的同名声明。Zig 编译器源码中 `LazySrcLoc.Offset` 由此与 `LazySrcLoc.unneeded` 形成环（§19.21 中记录的环），环中的结果不写入 memo，Sema.zig 每次发布重算近千次 `DeclType` 与 `Infer` |
+| 每次编辑的重算 | `src/hir/queries.zig`、`src/syntax/ItemTree.zig`、`src/sema/queries.zig`、`eval.zig` | 成员源码未变时沿用上一次的 Body（§19.6 的「Body 随每次解析重新降级」）；函数的推导错误集与 `...`、容器的 `packed` / `extern` / `union(enum)` 记录在 ItemTree 中，签名推导与布局不再读取每次编辑都变化的 `FileAstIdMap`；非活动代码的区间单独缓存（`InactiveRanges`），`Infer` 的值被淘汰时不必重算 |
+| 跳转的缺口 | `src/ide/definition.zig`、`context.zig` | 标签（`break :l`、`continue :l` 与标签自身）；初始化中的字段名（`.{ .x = 1 }`、`S{ .x = 1 }`）。z2d 的 declaration 解析 67.8% → 85.3% |
+| 与 union 比较的字面量 | `src/sema/infer.zig` | 与带标签的 union 比较时枚举字面量按标签类型推导（`u == .none`），`union(enum)` 生成的标签枚举的字面量记录为 union 的字段；字面量在左侧（`.a == e`）时按右侧的类型 |
+
+Sema.zig 上的编辑响应（同一台机器）：
+
+| 指标 | 本节修复前 | 修复后 |
+|---|---|---|
+| 编辑 → 诊断 p50 | 351 ms | 177 ms |
+| 编辑阶段（60 次编辑）的 `Infer` 执行 | 77364 次 | 0 次 |
+
+剩余的时间主要是 Sema.zig 的重新解析（约 54 ms）与官方 AstGen（约 48 ms，已在读事务之外）。
+
+- 未解析的标识符主要是：内置类型与值（`u8`、`true`）、切片的 `len`、`error.Foo`、`@field` 的动态字段、`anytype` 参数的泛型函数中的字段（z2d 的合成运算经 comptime 分派调用，同一文件中找不到调用点）。具名错误集的成员（`Error.Foo` 跳到 `error{ Foo }`）尚不支持。
+- `ItemSummaries` 记录的是容器在文件中的绝对位置：在文件前部编辑使其后的位置平移时，`containerRel` 的依赖随之变化。
+- 测试：`zig build test` 共 258 个。
 
 ## 20. 风险与对策
 
