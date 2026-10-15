@@ -1258,6 +1258,21 @@ test "bare unions have a safety tag in safe build modes" {
     });
 }
 
+test "clauses get the compiler's result types" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\fn ext() callconv(.naked) void {}
+        \\fn f() void {
+        \\    const buf: []align(16) u8 = &.{};
+        \\    _ = buf;
+        \\}
+    , &.{
+        .{ "\"std\"", "*const [3:0]u8" },
+        .{ ".naked", "CallingConvention" },
+        .{ "16", "u29 = 16" },
+    });
+}
+
 test "std generic containers" {
     try expectStdTypes(
         \\const std = @import("std");

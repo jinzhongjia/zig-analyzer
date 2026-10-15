@@ -172,7 +172,7 @@ const Inferrer = struct {
             .@"const", .@"var", .field => {
                 const annotation: ?Index = if (b.type_expr) |t| (try inf.inferComptime(t, null)).asType() else null;
                 // 对齐属于签名：字段的布局读取它
-                if (b.align_expr) |e| _ = try inf.inferComptime(e, null);
+                if (b.align_expr) |e| _ = try inf.inferComptime(e, try inf.clauseType(.@"align"));
                 if (mode == .full) if (b.value) |v| {
                     _ = try inf.infer(v, annotation);
                 };
@@ -181,6 +181,22 @@ const Inferrer = struct {
                 _ = try inf.infer(v, null);
             },
         }
+        // 子句不属于表达式树：按子句的结果类型推导
+        if (mode == .full) for (b.clauses) |c| {
+            _ = try inf.infer(c.expr, try inf.clauseType(c.kind));
+        };
+    }
+
+    /// 子句中表达式的结果类型（与编译器一致）
+    fn clauseType(inf: *Inferrer, kind: Body.Clause.Kind) Error!?Index {
+        const ip = inf.ip;
+        return switch (kind) {
+            .@"align" => try ip.intType(.unsigned, 29),
+            .bit_range => try ip.intType(.unsigned, 16),
+            .@"linksection" => try ip.ptrTo(.u8_type, .slice, true),
+            .@"callconv" => try inf.stdType(&.{ "builtin", "CallingConvention" }),
+            .@"addrspace" => try inf.stdType(&.{ "builtin", "AddressSpace" }),
+        };
     }
 
     /// owner 自身（函数）的实例
@@ -762,6 +778,7 @@ const Inferrer = struct {
         const ip = inf.ip;
         const eq = std.mem.eql;
         if (eq(u8, name, "@import")) {
+            for (args) |a| _ = try inf.infer(a, null);
             const target = try inf.r.importTarget(inf.file, inf.body, args) orelse return .unknown;
             return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = target, .container = 0 }, null));
         }

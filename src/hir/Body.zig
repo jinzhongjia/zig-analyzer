@@ -29,6 +29,9 @@ value: ?ExprId,
 type_expr: ?ExprId,
 /// 变量与字段的 `align(...)` 中的表达式
 align_expr: ?ExprId,
+/// 函数原型、变量与字段、局部变量、指针类型的 `align` / `addrspace` / `linksection` / `callconv` 子句中的
+/// 表达式（子句不属于表达式树，推导时按子句的结果类型单独推导）
+clauses: []const Clause,
 
 pub const ExprId = enum(u32) { _ };
 pub const BindingId = enum(u32) { _ };
@@ -95,6 +98,14 @@ pub const Expr = union(enum) {
 };
 
 pub const PtrSize = enum { one, many, slice, c };
+
+pub const Clause = struct {
+    kind: Kind,
+    expr: ExprId,
+
+    /// `bit_range` 为位指针 `align(a:b:c)` 中对齐之后的两项
+    pub const Kind = enum { @"align", bit_range, @"addrspace", @"linksection", @"callconv" };
+};
 
 pub const Block = struct {
     label: ?[]const u8,

@@ -45,7 +45,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
                     _ = try l.pushScope(&.{b});
                 }
                 for (proto.clauses()) |c| if (c) |n| {
-                    _ = try l.expr(n);
+                    _ = try l.clause(n);
                 };
                 type_expr = try l.optExpr(proto.returnType());
             }
@@ -83,6 +83,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
         .value = value,
         .type_expr = type_expr,
         .align_expr = align_expr,
+        .clauses = l.clause_list.items,
     };
     body.arena = arena.state;
     return body;
@@ -99,6 +100,8 @@ const Lowerer = struct {
     expr_scopes: std.ArrayList(ScopeId) = .empty,
     bindings: std.ArrayList(Body.Binding) = .empty,
     scopes: std.ArrayList(Body.Scope) = .empty,
+    /// Body 的 arena 中分配
+    clause_list: std.ArrayList(Body.Clause) = .empty,
     scope: ScopeId = .root,
 
     fn deinit(l: *Lowerer) void {
@@ -192,15 +195,30 @@ const Lowerer = struct {
         var it = n.children();
         while (it.nextNode()) |c| switch (c.kind()) {
             .align_clause, .addrspace_clause, .linksection_clause, .callconv_clause => {
-                const id = try l.expr(c);
-                if (c.kind() == .align_clause) align_expr = switch (l.exprs.items[@backingInt(id)]) {
-                    .other => |children| if (children.len == 1) children[0] else null,
-                    else => null,
-                };
+                const e = try l.clause(c);
+                if (c.kind() == .align_clause) align_expr = e;
             },
             else => {},
         };
         return align_expr;
+    }
+
+    /// 一个子句：本身降级为 `.other`，其中的表达式记录到 `clauses`；返回其中的第一个表达式
+    fn clause(l: *Lowerer, c: SyntaxNode) Error!?ExprId {
+        const id = try l.expr(c);
+        const children = switch (l.exprs.items[@backingInt(id)]) {
+            .other => |children| children,
+            else => return null,
+        };
+        const kind: Body.Clause.Kind = switch (c.kind()) {
+            .align_clause => .@"align",
+            .addrspace_clause => .@"addrspace",
+            .linksection_clause => .@"linksection",
+            .callconv_clause => .@"callconv",
+            else => unreachable,
+        };
+        for (children, 0..) |x, i| try l.clause_list.append(l.a, .{ .kind = if (i == 0) kind else .bit_range, .expr = x });
+        return if (children.len == 1) children[0] else null;
     }
 
     fn expr(l: *Lowerer, n: SyntaxNode) Error!ExprId {
@@ -288,7 +306,7 @@ const Lowerer = struct {
                 var it = proto.params();
                 while (it.next()) |p| if ((ast.Param{ .syntax = p }).typeExpr()) |t| try params.append(l.a, try l.expr(t));
                 for (proto.clauses()) |c| if (c) |cn| {
-                    _ = try l.expr(cn);
+                    _ = try l.clause(cn);
                 };
                 break :blk .{ .fn_type = .{ .params = params.items, .ret = try l.optExpr(proto.returnType()) } };
             },
@@ -510,7 +528,7 @@ const Lowerer = struct {
         var it = ast.childNodes(n);
         while (it.next()) |c| switch (c.kind()) {
             .sentinel => sentinel = try l.exprOrMissing(firstChild(c)),
-            .align_clause, .addrspace_clause => _ = try l.expr(c),
+            .align_clause, .addrspace_clause => _ = try l.clause(c),
             else => child = try l.expr(c),
         };
         return l.add(.{ .ptr_type = .{
