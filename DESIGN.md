@@ -50,7 +50,7 @@ Zig 的语言特性给 IDE 分析带来几个独特挑战，本设计围绕它�
 | 打开文件 → hover / goto / completion 可用 | < 3 s |
 | 工作区符号索引完成（后台，不阻塞交互） | < 30 s |
 
-符号索引未完成时，workspace symbol 返回已索引部分并标记 `isIncomplete`；references / rename 退化为对未索引文件的实时扫描，结果仍然完整，只是更慢。
+符号索引未完成时，workspace symbol 返回已索引部分（LSP 的 workspace/symbol 没有 `isIncomplete`，客户端随输入重新请求，见 §19.20）；references / rename 退化为对未索引文件的实时扫描，结果仍然完整，只是更慢。
 
 ---
 
@@ -1163,6 +1163,18 @@ pub fn make() std.ArrayList(u8) { ... }
 | 未保存的文档 | `src/server/Server.zig` | `untitled:` 等非 file URI 的文档映射到虚拟目录下按 URI 哈希命名的路径（不与真实文件冲突），语法、名字、类型与 live 诊断按单文件处理；磁盘上不存在，因此不交给编译器；其中的定义可以重命名。对客户端仍使用原始 URI |
 
 - 测试：`src/server/workspace_e2e_test.zig`（外部改写、删除与打开文件的优先级；文件夹的加入与移除；`untitled:` 文档的诊断与 hover）。`zig build test` 共 228 个。
+
+### 19.20 §10.3 功能清单的补全（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 补全 | `src/ide/completion.zig` | `@` 之后列出内置函数；`@import("` 中列出模块名（std、builtin、root、所在模块 import 的模块）与相对路径下的 `.zig` / `.zon` 文件、子目录；`break :` / `continue :` 之后列出可见的标签（内层在前）；初始化（`.{ .x = 1, .| }`、`S{ .| }`、期望类型为 `?S`）中列出未赋值的字段。前三种在语法树中多为错误节点（单独的 `@`、未闭合的字符串），按源码文本识别；补全项带替换范围（服务器转为 `textEdit`），`@`、`/` 不影响客户端的过滤。触发字符增加 `@`、`"`、`/` |
+| 推导 | `src/sema/infer.zig` | `Result.literal_expected` 同时记录匿名初始化（`.{ ... }`）的期望类型 |
+| 跳转 | `src/ide/definition.zig` | `textDocument/declaration` 跳到名字直接解析到的声明；`textDocument/definition` 再沿容器级的别名链追到最终的定义（`const A = std.mem.Allocator;`）；`textDocument/typeDefinition` 跳到光标处符号的类型（剥去指针、optional、数组、向量、错误联合）：`const S = struct {...}` 跳到声明，泛型函数返回的容器跳到容器本身，文件即容器时跳到文件开头 |
+| 提取变量 | `src/ide/code_actions.zig` | `refactor.extract`：选中的表达式提取为所在语句之前的局部常量，名字取 `value`、`value1`……中此处不可见且本成员中没有绑定的（Zig 不允许遮蔽）。赋值的左侧、取地址的操作数、控制流表达式与 `while` 的条件 / `: (cont)` 不提取 |
+| workspace symbol | `src/server/Server.zig` | 索引进行中时只在已建立索引的文件与打开的文档中查找，不在请求中解析其余文件。LSP 的 `workspace/symbol` 没有 `isIncomplete`（§1 的说法有误）：客户端随输入重新请求，结果随索引的进展补全 |
+
+- 测试：`zig build test` 共 232 个。
 
 ## 20. 风险与对策
 
