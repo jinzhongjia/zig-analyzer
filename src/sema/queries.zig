@@ -100,15 +100,15 @@ pub const DeclType = struct {
                 if (res.exprs.len == 0) return .unknown;
                 const node = try r.itemNode(key.file, item) orelse return .unknown;
                 const proto = (ast.cast(ast.FnDecl, node) orelse return .unknown).proto() orelse return .unknown;
-                // 按语法中的参数个数（含 anytype 与无名参数）
+                // 按语法中的参数个数（含 anytype 与无名参数）；`...` 没有绑定
                 var params: std.ArrayList(Index) = .empty;
                 var it = proto.params();
-                var named: usize = 0;
+                var bound: usize = 0;
                 while (it.next()) |p| {
                     const param = ast.cast(ast.Param, p).?;
-                    if (param.name() != null and named < b.params.len) {
-                        try params.append(r.arena, res.bindings[@backingInt(b.params[named])].ty);
-                        named += 1;
+                    if ((param.name() != null or param.typeExpr() != null) and bound < b.params.len) {
+                        try params.append(r.arena, res.bindings[@backingInt(b.params[bound])].ty);
+                        bound += 1;
                     } else try params.append(r.arena, .unknown);
                 }
                 const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = try returnType(&r, key, b, res, dk.inst) } });

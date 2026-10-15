@@ -39,7 +39,8 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
                 while (it.next()) |p| {
                     const param = ast.cast(ast.Param, p).?;
                     const ty = try l.optExpr(param.typeExpr());
-                    const name = param.name() orelse continue;
+                    // 无名参数（extern 函数的 `fn f(*const u32) void`）以空名绑定，保证参数按位置对应；`...` 不绑定
+                    const name = param.name() orelse if (ty != null) SyntaxToken{ .kind = .identifier, .text = "", .offset = p.offset } else continue;
                     const b = try l.bind(name, .param, .{ .ty = ty, .is_comptime = param.isComptime() });
                     try params.append(l.a, b);
                     _ = try l.pushScope(&.{b});

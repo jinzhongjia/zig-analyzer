@@ -1075,6 +1075,22 @@ test "concatenation in comptime keeps a sentinel that only one side has" {
     });
 }
 
+test "unnamed parameters of extern functions are inferred" {
+    try expectTypes(
+        \\extern fn ext(*const u32, n: u32) bool;
+        \\fn f() void {
+        \\    var w: u32 = 0;
+        \\    const r = ext(&w, 74);
+        \\    _ = r;
+        \\}
+    , &.{
+        .{ "ext", "fn (*const u32, u32) bool" },
+        .{ "*const u32", "type = *const u32" },
+        .{ "74", "u32 = 74" },
+        .{ "r", "bool" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
