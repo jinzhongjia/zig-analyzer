@@ -88,6 +88,9 @@ graph_mutex: Io.Mutex = .init,
 index_generation: std.atomic.Value(u64) = .init(0),
 /// 是否有索引任务在运行（同时只运行一个）
 indexing: std.atomic.Value(bool) = .init(false),
+/// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
+indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
+indexed_mutex: Io.Mutex = .init,
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── 拉取配置（只在主循环中访问）──
@@ -149,6 +152,7 @@ pub fn deinit(server: *Server) void {
     server.bg_group.cancel(server.io);
     for (server.workspaces.items) |ws| ws.destroy();
     server.workspaces.deinit(server.gpa);
+    server.indexed.deinit(server.gpa);
     for (server.retired.items) |ws| ws.destroy();
     server.retired.deinit(server.gpa);
     for (server.roots.items) |r| server.gpa.free(r);
@@ -540,6 +544,11 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
                 error.Canceled => continue,
                 error.OutOfMemory => return log.err("out of memory while indexing", .{}),
             };
+        }
+        {
+            server.indexed_mutex.lockUncancelable(server.io);
+            defer server.indexed_mutex.unlock(server.io);
+            for (files[done..end]) |f| server.indexed.put(server.gpa, f, {}) catch {};
         }
         done = end;
         if (server.db.wantsSweep()) _ = server.db.trySweep();
@@ -1662,6 +1671,20 @@ fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return set.keys();
 }
 
+/// workspace symbol 的范围：索引进行中时只取已建立索引的文件与打开的文档，不在请求中解析其余文件
+/// （LSP 的 workspace/symbol 没有 isIncomplete：客户端随输入重新请求，结果随索引的进展补全）
+fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
+    const all = try server.searchScope(r);
+    if (!server.indexing.load(.acquire)) return all;
+    var out: std.ArrayList(Vfs.FileId) = .empty;
+    server.indexed_mutex.lockUncancelable(server.io);
+    defer server.indexed_mutex.unlock(server.io);
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    for (all) |f| if (server.indexed.contains(f) or server.open_docs.contains(f)) try out.append(r.arena, f);
+    return out.items;
+}
+
 /// 光标处的定义及其全部引用
 fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
@@ -1772,7 +1795,7 @@ fn identifierText(arena: Allocator, name: []const u8) HandlerError![]const u8 {
 }
 
 fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
-    const scope = try server.searchScope(r);
+    const scope = try server.symbolScope(r);
     const syms = try ide.workspace_symbol.search(r, scope, params.query);
     const out = try arena.alloc(types.WorkspaceSymbol, syms.len);
     var m: RangeMapper = .{ .server = server, .r = r };

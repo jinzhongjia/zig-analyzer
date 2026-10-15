@@ -116,6 +116,17 @@ test "references, highlight, rename and workspace symbol" {
         const syms = resp.object.get("result").?.array.items;
         try testing.expect(syms.len >= 1);
         try testing.expectEqualStrings("hello", syms[0].object.get("name").?.string);
+
+        // 索引进行中：只在已建立索引的文件与打开的文档中查找（lib.zig 尚未索引、也未打开）
+        h.server.indexing.store(true, .release);
+        h.server.indexed_mutex.lockUncancelable(testing.io);
+        h.server.indexed.clearRetainingCapacity();
+        h.server.indexed_mutex.unlock(testing.io);
+        defer h.server.indexing.store(false, .release);
+        const partial = try h.request("workspace/symbol", .{ .query = "hel" });
+        try testing.expectEqual(0, partial.object.get("result").?.array.items.len);
+        const open_doc = try h.request("workspace/symbol", .{ .query = "main" });
+        try testing.expectEqualStrings("main", open_doc.object.get("result").?.array.items[0].object.get("name").?.string);
     }
 
     // code action：未使用的局部常量
