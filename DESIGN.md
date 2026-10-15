@@ -712,6 +712,7 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 | `diagnostics.steps` | `[]`（自动：`check` 否则 `install`） | 用于诊断的构建 step 列表 |
 | `diagnostics.incremental` | `true` | 是否传 `-fincremental` |
 | `diagnostics.stale_in_edited` | `"hide"` | 被修改区域内的旧编译错误：`hide` / `keep` |
+| `diagnostics.inactive_code` | `true` | 当前构建配置下不编译的代码（comptime 已知不执行的分支）是否显示为非活动代码 |
 | `inlay_hints.types` / `.parameters` | `true` | 类型提示 / 参数名提示 |
 | `inlay_hints.hide_redundant_param_names` | `true` | 实参名与形参名相同时不显示 |
 | `completion.snippets` | `true` | 函数调用补全是否带参数占位 |
@@ -1136,6 +1137,22 @@ pub fn make() std.ArrayList(u8) { ... }
 - 标准库全量统计：声明类型已知 37012 → 37045（99.4%），局部变量 37251 → 38425（91.7% → 94.6%），表达式 937790 → 955423（95.4% → 97.2%），未知的表达式 45331 → 27698。与 73c8565 对比耗时不变（ReleaseSafe 约 4.2 秒）。
 - 剩余的未知中约 1.2 万个位于泛型函数中；其余主要是其他目标的代码（如 `posix.system` 中当前目标没有的声明）、依赖 `builtin.is_test` 的 `std.testing.allocator`，以及由它们传播出的部分。另有 `"..." ++ @typeName(T)`（编译器中 `@typeName` 为 `*const [N:0]u8`，长度取决于类型名，这里仍按切片处理）与 `@embedFile`。
 - 测试：`zig build test` 共 217 个（Debug 与 ReleaseSafe 均通过）。
+
+### 19.18 泛型代码与其他目标的代码（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 构建配置 | `src/project/configuration.zig`、`src/server/Server.zig`、`tools/sema_corpus.zig` | 模块同时是 test 的根时取 test 的配置：常见的 build.zig 中同一模块既是可执行文件也是 test 的根，此前取第一个 compile step（可执行文件），`builtin.is_test` 为 false，test 块中的 `std.testing.allocator` 推不出。`test_obj` 的子命令改为 `test-obj --test-no-exec`（此前按 build-obj）。默认 builtin（单文件模式、sema-corpus）改为 `zig test` 的设置 |
+| 无实例的推导 | `src/sema/infer.zig`、`InternPool.zig`、`value.zig` | 条件 comptime 已知但求不出（取决于抽象参数）时，各分支的值相同即为结果的值：`ArrayList` 的 `Slice = if (alignment) \|a\| []align(a) T else []T` 此前没有值，各方法中的 `self.items` 都是未知；运行时的条件不合并（编译器中结果不是 comptime 已知的）。体内容器的成员引用的外层函数局部变量按 comptime 已知处理（与编译器一致，只能引用 comptime 已知的）。自递归的类型函数（`return Aligned(T, null)` 与 `return struct {...}`）条件求不出时取本实例中的容器。长度求不出的数组（`[block_length]u8`）为新的类型 `abstract_array_type`：元素类型已知，长度按源码显示，下标、切片（起止已知时为 `*[n]T`）、`len`、`for` 可以推导，布局未知，与其他类型是否相同为未知 |
+| 遍历类型 | `src/sema/infer.zig` | `for` 的元素为类型时（`inline for (.{ f32, f64 }) \|T\|`），捕获与泛型函数的 `comptime T: type` 一样按抽象参数推导；各字段类型相同的元组可以遍历 |
+| 调用点实例 | `src/ide/seed.zig`、`context.zig`、补全、跳转、signature help、inlay hints | 调用点的查找改为按成员缓存的 query。补全、跳转、signature help 与 inlay hints 在泛型函数体内，抽象的结果含抽象参数或未知时取调用点实例的结果（`context.atSeeded`，此前只有 hover）。inlay hints 的类型只在抽象的结果未知时取调用点实例，tooltip 说明所依据的调用；抽象的类型（如 `T`）照常显示 |
+| 非活动代码 | `src/ide/inactive.zig`、`src/server/Server.zig`、`Config.zig` | 推导结果记录 comptime 已知不执行的 `if` / `switch` 分支（最外层）。打开的文件发布带 `Unnecessary` 标记的提示，编辑器以淡色显示（rust-analyzer 对不满足 `#[cfg]` 的代码也是如此），由 `diagnostics.inactive_code` 控制。按位置标记，定义在这些分支中的容器的成员也在其中 |
+| 其他目标的命名空间 | `src/sema/infer.zig` | 成员在命名空间中不存在、而命名空间由声明中的 `if` / `switch` 选择（如 `posix.system` 在 linux 上为 `linux`）时，到其他分支选择的容器中查找，给出那里的定义：这样的代码只在其他目标上编译 |
+| 统计 | `tools/sema_corpus.zig` | 未知表达式按非活动代码、泛型函数、泛型函数返回的容器的成员、其他分别计数；另计泛型代码中以同一文件的调用点实例推导后有类型的个数 |
+
+- 标准库全量统计：声明类型已知 37045 → 37187（99.4% → 99.8%），局部变量 38425 → 39115（94.6% → 96.3%），表达式 955423 → 962836（97.2% → 97.9%），未知的表达式 27698 → 20285。其中 test 配置 +934、分支合并等 +791、长度未知的数组 +4671、遍历类型 +586、其他目标的命名空间 +431（另有声明 +137，如 `posix.zig` 中 `pub const X = system.X` 形式的别名）。
+- 剩余的未知：非活动代码 515、泛型函数 10657、泛型函数返回的容器的成员 4654、其他 4459。泛型代码中的 15311 个里 6453 个以同一文件的调用点实例推导后有类型（编辑器中的 hover、补全等即使用它；跨文件的调用点不在统计范围内）。
+- 测试：`zig build test` 共 225 个（Debug 与 ReleaseSafe 均通过）。
 
 ## 20. 风险与对策
 
