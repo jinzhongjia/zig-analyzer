@@ -369,6 +369,26 @@ pub fn main(init: std.process.Init) !u8 {
             }
             Stats.print("edit→diag", &edit_times);
             Stats.print("undo→clear", &clear_times);
+
+            // 连续输入：在文件末尾的注释中每 30ms 输入一个字符，每次按键后立即 hover。编辑的写事务要等
+            // 进行中的读事务（诊断计算）退出，这里的延迟包含这段等待
+            {
+                try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "//" }} });
+                version += 1;
+                _ = try c.request("zig-analyzer/waitIdle", {});
+                var typing_times: [40]f64 = undefined;
+                for (&typing_times, 0..) |*t, i| {
+                    const at: Position = .{ .line = end.line, .character = end.character + 2 + @as(u32, @intCast(i)) };
+                    try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = "x" }} });
+                    version += 1;
+                    _, t.* = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i % idents.len] });
+                    try (Io.Clock.Duration{ .raw = .fromMilliseconds(30), .clock = .awake }).sleep(io);
+                }
+                Stats.print("type→hover", &typing_times);
+                const typed_end: Position = .{ .line = end.line, .character = end.character + 2 + @as(u32, typing_times.len) };
+                try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = typed_end }, .text = "" }} });
+                version += 1;
+            }
             if (verbose) {
                 _ = try c.request("zig-analyzer/waitIdle", {});
                 try c.phase("edits (incl. background work until idle)");
