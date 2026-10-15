@@ -119,6 +119,10 @@ pub fn main(init: std.process.Init) !u8 {
     var locals: Counts = .{};
     var decls: Counts = .{};
     var exprs: Counts = .{};
+    // 未知表达式的分布：非活动代码、泛型函数、泛型函数返回的容器的成员（如 `ArrayList(T)` 的方法）、其他
+    var unknown: struct { inactive: usize = 0, generic: usize = 0, generic_member: usize = 0, other: usize = 0 } = .{};
+    // 泛型代码中的未知表达式以同一文件中的调用点实例推导后得到类型的个数（编辑器中的 hover、补全等使用它）
+    var seeded: usize = 0;
     var members: usize = 0;
     var sweeps: usize = 0;
     const t0 = std.Io.Clock.awake.now(io);
@@ -129,7 +133,10 @@ pub fn main(init: std.process.Init) !u8 {
             var ctx = db.beginRead(scratch.allocator());
             defer ctx.end();
             const tree = try ctx.get(database.syntax.FileItemTree, file);
-            for (tree.items) |item| {
+            var r: za.names.resolve.Resolver = .{ .ctx = &ctx, .arena = scratch.allocator() };
+            // 文件中的非活动代码（含定义在不执行的分支中的容器的成员）
+            const inactive_ranges = try za.ide.inactive.ranges(&r, file);
+            for (tree.items, 0..) |item, item_index| {
                 const owner: database.hir.OwnerKey = .{ .file = file, .item = item.ast_id };
                 members += 1;
                 const decl = try ctx.get(queries.DeclType, .{ .owner = owner });
@@ -140,12 +147,35 @@ pub fn main(init: std.process.Init) !u8 {
                 const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
                 const body = try ctx.get(database.hir.ItemBody, owner);
                 for (body.bindings, res.bindings) |b, tv| if (b.kind == .local_const or b.kind == .local_var) locals.add(tv.ty);
-                for (body.exprs, res.exprs) |e, tv| switch (e) {
-                    // 只统计有值的表达式（不含语句级的控制流与类型表达式）；`_ = x;` 的 `_` 是丢弃，不是值
-                    .name_ref => |n| if (!std.mem.eql(u8, n, "_")) exprs.add(tv.ty),
-                    .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => exprs.add(tv.ty),
-                    else => {},
-                };
+                const generic = isGenericFn(item, body);
+                const generic_member = try inGenericFn(&ctx, file, tree, item);
+                const base = (try r.itemNode(file, @intCast(item_index))).?.offset;
+                var seed: ?za.ide.seed.Seed = null;
+                var seed_looked = false;
+                for (body.exprs, res.exprs, 0..) |e, tv, ei| {
+                    switch (e) {
+                        // 只统计有值的表达式（不含语句级的控制流与类型表达式）；`_ = x;` 的 `_` 是丢弃，不是值
+                        .name_ref => |n| if (std.mem.eql(u8, n, "_")) continue,
+                        .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => {},
+                        else => continue,
+                    }
+                    exprs.add(tv.ty);
+                    if (tv.ty != .unknown) continue;
+                    const range = body.expr_ranges[ei];
+                    const inactive = for (inactive_ranges) |rr| {
+                        if (rr.start <= base + range.start and base + range.end <= rr.end) break true;
+                    } else false;
+                    if (inactive) unknown.inactive += 1 else if (generic) unknown.generic += 1 else if (generic_member) unknown.generic_member += 1 else unknown.other += 1;
+                    if (!inactive and (generic or generic_member)) {
+                        if (!seed_looked) {
+                            seed = try za.ide.seed.find(&r, file, @intCast(item_index));
+                            seed_looked = true;
+                        }
+                        if (seed) |sd| if (ei < sd.res.exprs.len and sd.res.exprs[ei].ty != .unknown) {
+                            seeded += 1;
+                        };
+                    }
+                }
             }
         }
         // 与服务器相同：读事务结束后按需淘汰（同时检验淘汰后恢复的结果与从未淘汰时一致）
@@ -168,9 +198,39 @@ pub fn main(init: std.process.Init) !u8 {
         \\declarations with known type: {d}/{d} ({d:.1}%)
         \\local variables with known type: {d}/{d} ({d:.1}%)
         \\expressions with known type: {d}/{d} ({d:.1}%)
+        \\unknown expressions: {d} in inactive code, {d} in generic functions, {d} in members of types returned by generic functions, {d} elsewhere
+        \\  of those in generic code, known when inferred from a call site in the same file: {d}
         \\
-    , .{ files.items.len, members, secs, sweeps, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct() });
+    , .{ files.items.len, members, secs, sweeps, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct(), unknown.inactive, unknown.generic, unknown.generic_member, unknown.other, seeded });
     return 0;
+}
+
+/// 泛型函数：有 comptime（含隐式的 `T: type`）或 anytype 参数，或返回 `type`
+fn isGenericFn(item: za.syntax.ItemTree.Item, body: *const za.hir.Body) bool {
+    if (item.kind != .@"fn") return false;
+    for (body.params) |p| {
+        const b = body.binding(p);
+        if (b.is_comptime or b.ty == null or isTypeName(body, b.ty.?)) return true;
+    }
+    return if (body.type_expr) |t| isTypeName(body, t) else false;
+}
+
+fn isTypeName(body: *const za.hir.Body, e: za.hir.Body.ExprId) bool {
+    return switch (body.expr(e)) {
+        .name_ref => |n| std.mem.eql(u8, n, "type"),
+        else => false,
+    };
+}
+
+/// 成员位于某个泛型函数返回（或定义）的容器中
+fn inGenericFn(ctx: *database.Db.Ctx, file: FileId, tree: *const za.syntax.ItemTree, item: za.syntax.ItemTree.Item) !bool {
+    var parent = tree.containers[item.container].parent_item;
+    while (parent) |pi| {
+        const p = tree.items[pi];
+        if (p.kind == .@"fn" and isGenericFn(p, try ctx.get(database.hir.ItemBody, .{ .file = file, .item = p.ast_id }))) return true;
+        parent = tree.containers[p.container].parent_item;
+    }
+    return false;
 }
 
 /// 统计 `file` 顶层声明 `name` 的引用数与耗时

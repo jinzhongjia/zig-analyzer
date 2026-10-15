@@ -61,6 +61,7 @@ pub const ide = struct {
     pub const signature_help = @import("ide/signature_help.zig");
     pub const inlay_hints = @import("ide/inlay_hints.zig");
     pub const inactive = @import("ide/inactive.zig");
+    pub const seed = @import("ide/seed.zig");
     pub const workspace_symbol = @import("ide/workspace_symbol.zig");
     pub const code_actions = @import("ide/code_actions.zig");
 };
