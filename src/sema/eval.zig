@@ -1431,7 +1431,7 @@ const Evaluator = struct {
         if (ip.key(lt) == .array_type and ip.key(rt) == .array_type) {
             const la = ip.key(lt).array_type;
             const ra = ip.key(rt).array_type;
-            const sentinel = if (la.sentinel != null and ra.sentinel != null and la.sentinel.? == ra.sentinel.?) la.sentinel else null;
+            const sentinel = concatSentinel(la.sentinel, ra.sentinel);
             const array = try ip.get(.{ .array_type = .{ .len = n + m, .child = la.child, .sentinel = sentinel } });
             // 两侧有一个是指针时结果为指向数组的指针（字符串字面量）
             ty = if (ip.key(lhs.ty) == .ptr_type or ip.key(rhs.ty) == .ptr_type) try ip.ptrTo(array, .one, true) else array;
@@ -2986,6 +2986,13 @@ fn alignValue(ip: *InternPool, v: ?Index) EvalError!u64 {
     const x = value.intOf(ip, v) orelse return error.Abort;
     if (x <= 0 or x & (x - 1) != 0) return error.Abort;
     return @intCast(x);
+}
+
+/// `++` 结果的哨兵（与编译器一致）：两侧都有时须相同，只有一侧有时取该侧
+pub fn concatSentinel(a: ?Index, b: ?Index) ?Index {
+    const x = a orelse return b;
+    const y = b orelse return x;
+    return if (x == y) x else null;
 }
 
 /// 浮点运算的结果；求不出（不是浮点类型、除数为零等）时放弃

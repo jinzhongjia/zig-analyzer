@@ -1067,6 +1067,14 @@ test "anytype arguments do not expand large arrays" {
     , &.{.{ "w", "Wrapper([]u8)" }});
 }
 
+test "concatenation in comptime keeps a sentinel that only one side has" {
+    try expectTypes(
+        \\const cat = [2]u8{ 1, 2 } ++ "cd";
+    , &.{
+        .{ "cat", "*const [4:0]u8 = \"\\x01\\x02cd\"" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
