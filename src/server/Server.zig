@@ -57,10 +57,12 @@ busy_mutex: Io.Mutex = .init,
 busy_cond: Io.Condition = .init,
 busy: usize = 0,
 
-/// 客户端在 initialize 中给出的工作区根目录（绝对路径）
+/// 工作区根目录（绝对路径）：initialize 时给出，之后随 `workspace/didChangeWorkspaceFolders` 增减
 roots: std.ArrayList([]u8) = .empty,
-/// 与 `roots` 一一对应：根目录下是否有 build.zig（在 initialize 时同步检查，避免项目加载完成前误判）
+/// 与 `roots` 一一对应：根目录下是否有 build.zig（加入时同步检查，避免项目加载完成前误判）
 root_has_build: std.ArrayList(bool) = .empty,
+/// 保护 `roots` 与 `root_has_build`
+roots_mutex: Io.Mutex = .init,
 
 single_mutex: Io.Mutex = .init,
 /// 单文件模式（不属于任何带 build.zig 的工作区）的编译结果
@@ -93,6 +95,8 @@ config: Config = .{},
 pull_config: bool = false,
 /// 客户端支持动态注册 `workspace/didChangeConfiguration`（注册后客户端在配置变化时通知，内容由服务器拉取）
 register_config: bool = false,
+/// 客户端支持动态注册 `workspace/didChangeWatchedFiles`（监听磁盘上的外部改动）
+register_watch: bool = false,
 /// 已发出的拉取请求数；只采纳最近一次请求的响应
 config_requests: u32 = 0,
 /// 尚未收到响应的拉取请求数：等待期间计为忙碌（waitIdle 会等待配置生效）
@@ -586,6 +590,8 @@ fn processNotification(server: *Server, arena: Allocator, method: []const u8, pa
         .{ "textDocument/didClose", didClose },
         .{ "textDocument/didSave", didSave },
         .{ "workspace/didChangeConfiguration", didChangeConfiguration },
+        .{ "workspace/didChangeWatchedFiles", didChangeWatchedFiles },
+        .{ "workspace/didChangeWorkspaceFolders", didChangeWorkspaceFolders },
         .{ "initialized", initialized },
     };
     inline for (handlers) |h| {
@@ -610,13 +616,30 @@ fn cancelRequest(server: *Server, _: Allocator, params: types.CancelParams) !voi
 }
 
 fn fileIdFromUri(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
+    const path = try documentPath(arena, document_uri) orelse return null;
+    return try server.vfs.intern(path);
+}
+
+/// 文档的路径：file URI 为其路径；`untitled:` 等非 file URI 的文档映射到虚拟目录下按 URI 命名的
+/// 路径（不与真实文件冲突，磁盘上不存在，因此不交给编译器；其余功能按单文件处理）
+fn documentPath(arena: Allocator, document_uri: []const u8) Allocator.Error!?[]const u8 {
     const path = uri.toPath(arena, document_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // untitled: 等非文件文档暂不处理
-        error.UnsupportedScheme, error.InvalidUri => return null,
+        error.UnsupportedScheme => {
+            const ext = if (std.mem.endsWith(u8, document_uri, ".zon")) ".zon" else ".zig";
+            return try std.fmt.allocPrint(arena, "{s}{c}{x:0>16}{s}", .{ virtual_root, std.fs.path.sep, std.hash.Wyhash.hash(0, document_uri), ext });
+        },
+        error.InvalidUri => return null,
     };
     if (!std.fs.path.isAbsolute(path)) return null;
-    return try server.vfs.intern(path);
+    return path;
+}
+
+/// 非 file URI 文档的虚拟目录
+const virtual_root = if (@import("builtin").os.tag == .windows) "C:\\.zig-analyzer-virtual" else "/.zig-analyzer-virtual";
+
+fn isVirtual(path: []const u8) bool {
+    return Workspace.isUnder(path, virtual_root);
 }
 
 fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
@@ -693,6 +716,81 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
             ws.requestBuild();
         }
     }
+}
+
+/// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
+/// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon 变化时重启该项目，
+/// 其他文件变化时项目重新构建、单文件重新编译
+fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
+    const Change = struct { file: Vfs.FileId, text: ?[]u8 };
+    var changes: std.ArrayList(Change) = .empty;
+    defer for (changes.items) |c| if (c.text) |t| server.gpa.free(t);
+    var build_files: std.ArrayList([]const u8) = .empty;
+    for (params.changes) |event| {
+        const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedScheme, error.InvalidUri => continue,
+        };
+        if (!std.fs.path.isAbsolute(path)) continue;
+        const base = std.fs.path.basename(path);
+        if (std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon")) try build_files.append(arena, std.fs.path.dirname(path) orelse "");
+        // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）
+        const file = try server.vfs.lookup(path) orelse continue;
+        {
+            server.docs_mutex.lockUncancelable(server.io);
+            defer server.docs_mutex.unlock(server.io);
+            if (server.open_docs.contains(file)) continue;
+        }
+        const text = if (event.type == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            error.FileTooBig => null,
+        };
+        try changes.append(arena, .{ .file = file, .text = text });
+    }
+    if (changes.items.len != 0) {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        for (changes.items) |*c| {
+            try server.db.set(FileText, c.file, c.text, server.fileDurability(server.vfs.path(c.file)));
+            c.text = null;
+        }
+    }
+
+    server.workspaces_mutex.lockUncancelable(server.io);
+    const list = try arena.dupe(*Workspace, server.workspaces.items);
+    server.workspaces_mutex.unlock(server.io);
+    for (list) |ws| {
+        // 非 watch 模式下 maker 不会自动重新配置：重启
+        const reconfigure = for (build_files.items) |dir| {
+            if (std.mem.eql(u8, dir, ws.root)) break true;
+        } else false;
+        if (reconfigure) {
+            server.restartWorkspace(ws, 0);
+            continue;
+        }
+        for (changes.items) |c| if (ws.owns(c.file)) {
+            ws.requestBuild();
+            break;
+        };
+    }
+    if (changes.items.len == 0) return;
+    const files = try arena.alloc(Vfs.FileId, changes.items.len);
+    for (changes.items, files) |c, *f| f.* = c.file;
+    server.publishFiles(files, true);
+    // 单文件模式：被它 import 的文件可能变了
+    server.docs_mutex.lockUncancelable(server.io);
+    const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
+    server.docs_mutex.unlock(server.io);
+    for (open) |file| if (server.isSingleFile(file)) server.compileSingle(file);
+}
+
+/// 文件内容的变化频率：标准库几乎不变，依赖包很少变化，项目文件经常变化
+pub fn fileDurability(server: *Server, path: []const u8) database.Durability {
+    const env = server.zigEnv() orelse return .low;
+    if (Workspace.isUnder(path, env.lib_dir)) return .high;
+    if (Workspace.isUnder(path, env.global_cache_dir)) return .medium;
+    return .low;
 }
 
 fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChangeConfigurationParams) !void {
@@ -777,11 +875,18 @@ pub fn configSnapshot(server: *Server) Allocator.Error!Config {
     return server.config.clone(server.gpa);
 }
 
-fn initialized(server: *Server, _: Allocator, _: types.InitializedParams) !void {
-    if (server.register_config) {
-        server.sendRequest(.{ .string = "zig-analyzer/register" }, "client/registerCapability", types.RegistrationParams{ .registrations = &.{
-            .{ .id = "zig-analyzer/didChangeConfiguration", .method = "workspace/didChangeConfiguration" },
-        } });
+fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !void {
+    var registrations: std.ArrayList(types.Registration) = .empty;
+    if (server.register_config) try registrations.append(arena, .{ .id = "zig-analyzer/didChangeConfiguration", .method = "workspace/didChangeConfiguration" });
+    if (server.register_watch) {
+        // 编辑器之外的改动（git checkout、代码生成等）：源文件与 build.zig.zon
+        const options = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+            \\{"watchers": [{"globPattern": "**/*.zig"}, {"globPattern": "**/*.zon"}]}
+        , .{});
+        try registrations.append(arena, .{ .id = "zig-analyzer/didChangeWatchedFiles", .method = "workspace/didChangeWatchedFiles", .registerOptions = options });
+    }
+    if (registrations.items.len != 0) {
+        server.sendRequest(.{ .string = "zig-analyzer/register" }, "client/registerCapability", types.RegistrationParams{ .registrations = registrations.items });
     }
     if (server.pull_config) {
         // 拉取到配置后再启动项目
@@ -838,18 +943,24 @@ fn startup(server: *Server) Io.Cancelable!void {
         server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
     }
     server.updateModuleGraph();
-    for (server.roots.items) |root| {
-        const build_zig = std.fs.path.join(server.gpa, &.{ root, "build.zig" }) catch return;
-        defer server.gpa.free(build_zig);
-        Io.Dir.cwd().access(server.io, build_zig, .{}) catch continue;
-        const ws = Workspace.start(server, root, 0) catch |err| {
-            log.err("{s}: failed to start build system protocol: {t}", .{ root, err });
-            continue;
-        };
-        server.workspaces_mutex.lockUncancelable(server.io);
-        defer server.workspaces_mutex.unlock(server.io);
-        server.workspaces.append(server.gpa, ws) catch ws.stop();
+    var roots: std.ArrayList([]u8) = .empty;
+    defer {
+        for (roots.items) |r| server.gpa.free(r);
+        roots.deinit(server.gpa);
     }
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        for (server.roots.items, server.root_has_build.items) |root, has_build| {
+            if (!has_build) continue;
+            const copy = server.gpa.dupe(u8, root) catch return;
+            roots.append(server.gpa, copy) catch {
+                server.gpa.free(copy);
+                return;
+            };
+        }
+    }
+    for (roots.items) |root| server.startWorkspace(root);
     // 启动前已打开的单文件：zig 环境就绪后补一次编译
     server.docs_mutex.lockUncancelable(server.io);
     const open = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
@@ -867,6 +978,8 @@ fn startup(server: *Server) Io.Cancelable!void {
 fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
     const path = server.vfs.path(file);
     if (!std.mem.endsWith(u8, path, ".zig")) return false;
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
     for (server.roots.items, server.root_has_build.items) |root, has_build| {
         if (has_build and Workspace.isUnder(path, root)) return false;
     }
@@ -934,6 +1047,99 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
 fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
     const server: *Server = @ptrCast(@alignCast(ctx));
     return Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
+}
+
+/// 为根目录启动项目；同一根目录已有项目时不重复启动（启动阶段与工作区文件夹的变化可能同时进行）
+fn startWorkspace(server: *Server, root: []const u8) void {
+    if (server.isShuttingDown()) return;
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return;
+    }
+    const ws = Workspace.start(server, root, 0) catch |err| {
+        log.err("{s}: failed to start build system protocol: {t}", .{ root, err });
+        return;
+    };
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) {
+        ws.stop();
+        server.retired.append(server.gpa, ws) catch {};
+        return;
+    };
+    server.workspaces.append(server.gpa, ws) catch {
+        ws.stop();
+        server.retired.append(server.gpa, ws) catch {};
+    };
+}
+
+/// 加入工作区根目录（`uri` 为目录的 URI）。zig 环境已就绪时立即启动项目，否则由启动阶段启动
+fn addRoot(server: *Server, root_uri: []const u8) !void {
+    const path = uri.toPath(server.gpa, root_uri) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    defer server.gpa.free(path);
+    const normalized = try Vfs.normalize(.native, server.gpa, path) orelse return;
+    var owned = true;
+    defer if (owned) server.gpa.free(normalized);
+    const build_zig = try std.fs.path.join(server.gpa, &.{ normalized, "build.zig" });
+    defer server.gpa.free(build_zig);
+    const has_build = if (Io.Dir.cwd().access(server.io, build_zig, .{})) |_| true else |_| false;
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        for (server.roots.items) |r| if (std.mem.eql(u8, r, normalized)) return;
+        try server.root_has_build.ensureUnusedCapacity(server.gpa, 1);
+        try server.roots.append(server.gpa, normalized);
+        server.root_has_build.appendAssumeCapacity(has_build);
+        owned = false;
+    }
+    if (has_build and server.zigEnv() != null) server.startWorkspace(normalized);
+}
+
+/// 移除工作区根目录：停止其项目，清除其发布过的编译器诊断
+fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
+    const path = uri.toPath(arena, root_uri) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    const normalized = try Vfs.normalize(.native, arena, path) orelse return;
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        for (server.roots.items, 0..) |r, i| if (std.mem.eql(u8, r, normalized)) {
+            server.gpa.free(server.roots.orderedRemove(i));
+            _ = server.root_has_build.orderedRemove(i);
+            break;
+        };
+    }
+    var removed: ?*Workspace = null;
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, normalized)) {
+            // 后台任务可能仍在运行：保留到退出时统一释放
+            try server.retired.ensureUnusedCapacity(server.gpa, 1);
+            server.retired.appendAssumeCapacity(server.workspaces.orderedRemove(i));
+            removed = w;
+            break;
+        };
+    }
+    const ws = removed orelse return;
+    ws.stop();
+    ws.mutex.lockUncancelable(server.io);
+    const stale = try arena.dupe(Vfs.FileId, ws.result_files.keys());
+    ws.mutex.unlock(server.io);
+    server.publishFiles(stale, true);
+}
+
+/// 工作区文件夹的增减
+fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.DidChangeWorkspaceFoldersParams) !void {
+    for (params.event.removed) |f| try server.removeRoot(arena, f.uri);
+    for (params.event.added) |f| try server.addRoot(f.uri);
+    server.updateModuleGraph();
 }
 
 /// 停止 `ws` 并以新实例替换。`crash_restarts` 为 maker 连续崩溃后自动重启的次数（正常重启为 0）
@@ -1203,11 +1409,7 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
 
 /// 读请求中把 URI 换成已知文件；未打开或不存在的文件返回 null
 fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
-    const path = uri.toPath(arena, document_uri) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedScheme, error.InvalidUri => return null,
-    };
-    if (!std.fs.path.isAbsolute(path)) return null;
+    const path = try documentPath(arena, document_uri) orelse return null;
     return try server.vfs.lookup(path);
 }
 
@@ -1267,6 +1469,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
     if (params.capabilities.workspace) |ws| {
         server.pull_config = ws.configuration orelse false;
         if (ws.didChangeConfiguration) |d| server.register_config = d.dynamicRegistration orelse false;
+        if (ws.didChangeWatchedFiles) |d| server.register_watch = d.dynamicRegistration orelse false;
     }
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
@@ -1284,23 +1487,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
     defer root_uris.deinit(server.gpa);
     if (params.workspaceFolders) |folders| for (folders) |f| try root_uris.append(server.gpa, f.uri);
     if (root_uris.items.len == 0) if (params.rootUri) |r| try root_uris.append(server.gpa, r);
-    for (root_uris.items) |root_uri| {
-        const path = uri.toPath(server.gpa, root_uri) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => continue,
-        };
-        errdefer server.gpa.free(path);
-        const normalized = try Vfs.normalize(.native, server.gpa, path) orelse {
-            server.gpa.free(path);
-            continue;
-        };
-        server.gpa.free(path);
-        try server.roots.append(server.gpa, normalized);
-        const build_zig = try std.fs.path.join(server.gpa, &.{ normalized, "build.zig" });
-        defer server.gpa.free(build_zig);
-        const has_build = if (Io.Dir.cwd().access(server.io, build_zig, .{})) |_| true else |_| false;
-        try server.root_has_build.append(server.gpa, has_build);
-    }
+    for (root_uris.items) |root_uri| try server.addRoot(root_uri);
 
     return .{
         .capabilities = .{
@@ -1323,6 +1510,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .documentHighlightProvider = .{ .boolean = true },
             .renameProvider = .{ .RenameOptions = .{ .prepareProvider = true } },
             .workspaceSymbolProvider = .{ .boolean = true },
+            .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
             .codeActionProvider = .{ .CodeActionOptions = .{ .codeActionKinds = &.{types.CodeActionKind.QuickFix} } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
@@ -1501,6 +1689,10 @@ fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
         .file => unreachable,
     };
     const path = server.vfs.path(file);
+    // 未保存的文档（`untitled:` 等）只存在于编辑器中
+    if (isVirtual(path)) return true;
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
     for (server.roots.items) |root| {
         if (!std.mem.startsWith(u8, path, root) or path.len <= root.len or !std.fs.path.isSep(path[root.len])) continue;
         const rest = path[root.len + 1 ..];
@@ -1667,4 +1859,5 @@ test {
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
+    _ = @import("workspace_e2e_test.zig");
 }

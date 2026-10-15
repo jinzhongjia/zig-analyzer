@@ -518,7 +518,6 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
 }
 
 fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
-    const env = ws.server.zigEnv().?;
     const Loaded = struct { file: FileId, text: ?[]u8, durability: database.Durability };
     var batch: std.ArrayList(Loaded) = .empty;
     defer batch.deinit(ws.gpa);
@@ -529,9 +528,7 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        // 标准库几乎不变，依赖包很少变化，项目文件经常变化
-        const durability: database.Durability = if (isUnder(path, env.lib_dir)) .high else if (isUnder(path, env.global_cache_dir)) .medium else .low;
-        try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = durability });
+        try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = ws.server.fileDurability(path) });
     }
     const db = &ws.server.db;
     db.beginWrite();
