@@ -110,6 +110,10 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     }
 
     const std_root = try std.fs.path.join(a, &.{ env.std_dir, "std.zig" });
+    const default_diag = for (steps, 0..) |s, si| {
+        if (s.kind == .top_level and std.mem.eql(u8, s.name, "check")) break @as(u32, @intCast(si));
+    } else @backingInt(c.default_step);
+    const diagnostics_steps = try a.dupe(u32, &.{default_diag});
     // arena 的状态复制进结果之后不能再分配：新增的缓冲区不在复制的状态中，释放时会泄漏
     return .{
         .arena = arena_state.state,
@@ -119,6 +123,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         .modules = modules.items,
         .default_step = @backingInt(c.default_step),
         .producers = producers,
+        .diagnostics_steps = diagnostics_steps,
     };
 }
 

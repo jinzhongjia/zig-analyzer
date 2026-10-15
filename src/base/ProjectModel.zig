@@ -17,8 +17,9 @@ modules: []Module,
 default_step: u32,
 /// 生成文件编号 → 产出它的 step（构建图中的 `GeneratedFileIndex`）
 producers: []const ?u32 = &.{},
-/// 用户配置的诊断 step（`diagnostics.step`）；null 时按默认规则选择
-preferred_step: ?u32 = null,
+/// 用于诊断的 step：构建图转换时为默认值（项目定义了 `check` 就用它，否则用默认 step），
+/// 用户配置了 `diagnostics.steps` 时由 `setDiagnosticsSteps` 替换
+diagnostics_steps: []const u32 = &.{},
 
 pub const Step = struct {
     name: []const u8,
@@ -71,9 +72,26 @@ pub fn topLevelStep(m: *const ProjectModel, name: []const u8) ?u32 {
     return null;
 }
 
-/// 用于诊断的 step：用户配置的 step；未配置时，项目定义了 `check` 就用它，否则用默认 step（通常是 install）
-pub fn diagnosticsStep(m: *const ProjectModel) u32 {
-    return m.preferred_step orelse m.topLevelStep("check") orelse m.default_step;
+/// 默认的诊断 step：项目定义了 `check` 就用它，否则用默认 step（通常是 install）
+pub fn defaultDiagnosticsStep(m: *const ProjectModel) u32 {
+    return m.topLevelStep("check") orelse m.default_step;
+}
+
+/// 按名字设置诊断 step（顶层 step）；返回找不到的名字的个数。一个都找不到时保留默认值
+pub fn setDiagnosticsSteps(m: *ProjectModel, gpa: Allocator, names: []const []const u8) Allocator.Error!usize {
+    var arena = m.arena.promote(gpa);
+    defer m.arena = arena.state;
+    var steps: std.ArrayList(u32) = .empty;
+    var missing: usize = 0;
+    for (names) |name| {
+        const s = m.topLevelStep(name) orelse {
+            missing += 1;
+            continue;
+        };
+        if (std.mem.indexOfScalar(u32, steps.items, s) == null) try steps.append(arena.allocator(), s);
+    }
+    if (steps.items.len != 0) m.diagnostics_steps = steps.items;
+    return missing;
 }
 
 /// `roots` 及其传递依赖的 step 集合
@@ -91,12 +109,12 @@ pub fn dependencyClosure(m: *const ProjectModel, gpa: Allocator, roots: []const 
     return seen;
 }
 
-/// 每次构建请求的 step：诊断 step，加上所有生成模块根文件的产出 step。
+/// 每次构建请求的 step：诊断 step（`diagnostics` 为 false 时不含），加上所有生成模块根文件的产出 step。
 /// 后者让诊断 step 不依赖的模块（如只在 test step 中使用的）也能得知根文件路径。
-pub fn buildSteps(m: *const ProjectModel, gpa: Allocator) Allocator.Error![]u32 {
+pub fn buildSteps(m: *const ProjectModel, gpa: Allocator, diagnostics: bool) Allocator.Error![]u32 {
     var steps: std.ArrayList(u32) = .empty;
     errdefer steps.deinit(gpa);
-    try steps.append(gpa, m.diagnosticsStep());
+    if (diagnostics) try steps.appendSlice(gpa, m.diagnostics_steps);
     for (m.modules) |mod| {
         const g = mod.generated_root orelse continue;
         const producer = (if (g.file < m.producers.len) m.producers[g.file] else null) orelse continue;
@@ -131,14 +149,14 @@ pub fn setGeneratedPath(m: *ProjectModel, gpa: Allocator, file: u32, path: []con
 }
 
 /// `step` 传递依赖的所有 compile step（下标），按发现顺序
-pub fn compileStepsOf(m: *const ProjectModel, gpa: Allocator, step: u32) Allocator.Error![]u32 {
+pub fn compileStepsOf(m: *const ProjectModel, gpa: Allocator, roots: []const u32) Allocator.Error![]u32 {
     var seen: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, m.steps.len);
     defer seen.deinit(gpa);
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(gpa);
     var result: std.ArrayList(u32) = .empty;
     errdefer result.deinit(gpa);
-    try stack.append(gpa, step);
+    try stack.appendSlice(gpa, roots);
     while (stack.pop()) |s| {
         if (seen.isSet(s)) continue;
         seen.set(s);

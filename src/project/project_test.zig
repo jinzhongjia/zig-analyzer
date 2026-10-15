@@ -36,7 +36,7 @@ test "build system protocol: read build graph and get compile errors" {
                 long_env.std_dir = long_dir;
                 var long_model = try configuration.load(gpa, testing.io, project.root, path, &long_env);
                 long_model.deinit(gpa);
-                try client.buildSteps(&.{model.?.diagnosticsStep()});
+                try client.buildSteps(model.?.diagnostics_steps);
             },
             .step_completed => |sc| if (sc.errors.errorMessageCount() != 0) {
                 const eb = sc.errors;
@@ -55,8 +55,9 @@ test "build system protocol: read build graph and get compile errors" {
 
     // 构建图：check step → compile step → 根模块 main.zig，import "lib" → lib.zig
     const m = &model.?;
-    try testing.expectEqualStrings("check", m.steps[m.diagnosticsStep()].name);
-    const compiles = try m.compileStepsOf(gpa, m.diagnosticsStep());
+    try testing.expectEqual(1, m.diagnostics_steps.len);
+    try testing.expectEqualStrings("check", m.steps[m.diagnostics_steps[0]].name);
+    const compiles = try m.compileStepsOf(gpa, m.diagnostics_steps);
     defer gpa.free(compiles);
     try testing.expectEqual(1, compiles.len);
     const root = m.modules[m.steps[compiles[0]].kind.compile.root_module];
