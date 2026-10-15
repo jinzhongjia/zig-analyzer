@@ -3,6 +3,7 @@
 //! 能求出具体实例的调用，结果确定、可复现。
 
 const std = @import("std");
+const engine = @import("../db/engine.zig");
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const database = @import("../database.zig");
@@ -31,16 +32,47 @@ pub const Seed = struct {
 /// 成员 `item`（位于某个泛型函数内）以第一个调用点的实例推导的结果：先找同一文件，再按文件顺序找
 /// 项目中其他能引用到该函数的文件
 pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
-    const root = try genericRoot(r, file, item) orelse return null;
-    const files = try search.importers(r, file, try search.projectFiles(r));
-    const names = try callNames(r, file, root, files);
-    if (try findIn(r, file, file, item, root, names)) |s| return s;
-    for (files) |f| {
-        if (f == file or !try containsAny(r, f, names)) continue;
-        if (try findIn(r, f, file, item, root, names)) |s| return s;
-    }
-    return null;
+    const owner = try r.ownerKey(file, item);
+    const found = try r.ctx.get(Query, owner) orelse return null;
+    return .{
+        .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
+        .file = found.file,
+        .offset = found.offset,
+    };
 }
+
+/// 成员所用的调用点：实例与调用表达式的位置
+pub const Found = struct { inst: ?Index, file: FileId, offset: u32 };
+
+/// 调用点的查找按成员缓存：补全、inlay hints 等频繁的请求不必每次重新查找
+pub const Query = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = hir.OwnerKey;
+    pub const Value = ?Found;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const tree = try r.itemTree(key.file);
+        const item: u32 = for (tree.items, 0..) |it, i| {
+            if (it.ast_id == key.item) break @intCast(i);
+        } else return null;
+        const root = try genericRoot(&r, key.file, item) orelse return null;
+        const files = try search.importers(&r, key.file, try search.projectFiles(&r));
+        const names = try callNames(&r, key.file, root, files);
+        if (try findIn(&r, key.file, key.file, item, root, names)) |s| return s;
+        for (files) |f| {
+            if (f == key.file or !try containsAny(&r, f, names)) continue;
+            if (try findIn(&r, f, key.file, item, root, names)) |s| return s;
+        }
+        return null;
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return null;
+    }
+};
 
 /// 调用泛型函数 `root` 可能使用的名字：函数名，以及 `files` 中指向它的容器级别名
 /// （`const biggest = lib.max;`，含别名的别名）。只检查文件索引中出现这些名字的文件
@@ -94,7 +126,7 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8) resolve.Error!?Seed {
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8) resolve.Error!?Found {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
@@ -134,8 +166,7 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
             const inst = try infer.instanceOf(r, r.arena, g, f, args);
             if (!value.isConcrete(ip, inst)) continue;
             const node = try r.itemNode(in, @intCast(i)) orelse continue;
-            const seeded = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, item), .mode = .full, .inst = try queries.normalizeInst(r, file, item, inst) });
-            return .{ .res = seeded, .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
+            return .{ .inst = try queries.normalizeInst(r, file, item, inst), .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
         }
     }
     return null;

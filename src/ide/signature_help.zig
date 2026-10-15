@@ -16,7 +16,8 @@ pub const Signature = struct {
 };
 
 pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Signature {
-    const a = try context.at(r, file, offset, true) orelse return null;
+    // 泛型函数体内取调用点的实例
+    const a = try context.atSeeded(r, file, offset, true) orelse return null;
     const b = a.body;
     // 光标在参数括号内的最内层调用
     var best: ?Body.ExprId = null;

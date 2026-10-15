@@ -4,6 +4,7 @@ const std = @import("std");
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const context = @import("context.zig");
+const seed = @import("seed.zig");
 const render = @import("../sema/render.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
@@ -12,6 +13,8 @@ pub const Hint = struct {
     offset: u32,
     label: []const u8,
     kind: enum { type, parameter },
+    /// 类型取自调用点的实例时说明所依据的调用
+    tooltip: ?[]const u8 = null,
 };
 
 /// `[start, end)` 范围内的提示
@@ -22,7 +25,7 @@ pub fn inlayHints(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Erro
         const node = try r.itemNode(file, @intCast(i)) orelse continue;
         const range = node.range();
         if (range.end < start or range.start > end) continue;
-        const a = try context.at(r, file, range.start, false) orelse continue;
+        const a = try context.atSeeded(r, file, range.start, false) orelse continue;
         // 嵌套的成员各自处理：只处理以本成员为最内层 owner 的提示
         if (a.item != i) continue;
         try bodyHints(r, a, start, end, &out);
@@ -43,10 +46,13 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, out: *std.ArrayL
         if (binding.ty != null or binding.name.len == 0) continue;
         const at = base + binding.range.end;
         if (at < start or at > end) continue;
-        const tv = a.bindingType(@fromBackingInt(@as(u32, @intCast(i))));
+        // 泛型函数体内抽象的类型（如 `T`）照常显示，只有未知时才取调用点的实例
+        const abstract = a.res.bindings[i];
+        const tv = if (abstract.ty == .unknown) a.bindingType(@fromBackingInt(@as(u32, @intCast(i)))) else abstract;
         // 未知的类型与值为类型的常量（`const T = u8`）不提示
         if (tv.ty == .unknown or tv.ty == .type_type) continue;
-        try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, tv.ty)}), .kind = .type });
+        const tooltip: ?[]const u8 = if (abstract.ty == .unknown) if (a.seeded) |s| try seedNote(r, s) else null else null;
+        try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, tv.ty)}), .kind = .type, .tooltip = tooltip });
     }
     for (b.exprs, 0..) |e, i| {
         if (e != .call) continue;
@@ -68,4 +74,11 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, out: *std.ArrayL
             try out.append(r.arena, .{ .offset = base + b.range(arg).start, .label = try std.fmt.allocPrint(r.arena, "{s}:", .{name}), .kind = .parameter });
         }
     }
+}
+
+/// 「inferred from the call at file.zig:123」
+fn seedNote(r: *Resolver, s: seed.Seed) resolve.Error![]const u8 {
+    const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
+    const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
+    return std.fmt.allocPrint(r.arena, "inferred from the call at {s}:{d}", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(s.file)), line });
 }

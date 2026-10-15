@@ -355,3 +355,56 @@ test "branches excluded by comptime conditions are inactive" {
     try testing.expectEqualStrings("{\n        return x + 1;\n    }", text[ranges[0].start..ranges[0].end]);
     try testing.expectEqualStrings("x * 2", text[ranges[1].start..ranges[1].end]);
 }
+
+test "completion, goto, signature help and inlay hints in generic bodies use a call site" {
+    const text =
+        \\const Point = struct {
+        \\    x: i32,
+        \\    pub fn scale(self: Point, k: i32) i32 { return self.x * k; }
+        \\};
+        \\fn twice(p: anytype) void {
+        \\    const v = p.scale(2);
+        \\    _ = v;
+        \\    _ = p.x;
+        \\}
+        \\fn run() void {
+        \\    twice(Point{ .x = 1 });
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn f(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.f;
+
+    // `p.` 之后：调用点实例中 `p` 为 Point
+    const items = try completion.complete(&r, file, at("p.x") + 2);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    try testing.expectEqualStrings("x scale", try std.mem.join(w.arena.allocator(), " ", labels.items));
+
+    const t = try definition.definition(&r, file, at("scale(2)")) orelse return error.NoDefinition;
+    try testing.expect(std.mem.startsWith(u8, text[t.start..], "scale(self: Point"));
+
+    const s = try signature_help.signatureHelp(&r, file, at("2);")) orelse return error.NoSignature;
+    try testing.expectEqualStrings("fn scale(self: Point, k: i32) i32", s.label);
+    try testing.expectEqual(1, s.active);
+
+    // 抽象的结果中未知的局部变量：类型取自调用点的实例，并说明所依据的调用
+    const hints = try inlay_hints.inlayHints(&r, file, at("const v"), at("_ = v"));
+    var found = false;
+    for (hints) |h| if (h.kind == .type) {
+        try testing.expectEqualStrings(": i32", h.label);
+        try testing.expectEqualStrings("inferred from the call at main.zig:11", h.tooltip.?);
+        found = true;
+    };
+    try testing.expect(found);
+}

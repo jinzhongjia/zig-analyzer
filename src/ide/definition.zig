@@ -72,7 +72,8 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
 }
 
 fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Def {
-    const a = try context.at(r, file, offset, false) orelse return null;
+    // 泛型函数体内取调用点的实例
+    const a = try context.atSeeded(r, file, offset, false) orelse return null;
     const key = a.member(e) orelse return null;
     return context.defOfKey(r, key);
 }

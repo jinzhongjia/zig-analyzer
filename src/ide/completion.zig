@@ -41,8 +41,8 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
                 try members(r, &out, ns, ns.file == file);
                 return out.items.items;
             }
-            // 经由类型：实例的字段与方法
-            const a = try context.at(r, file, offset, true) orelse return &.{};
+            // 经由类型：实例的字段与方法（泛型函数体内取调用点的实例）
+            const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
             try typedMembers(r, &out, a.exprType(fa.lhs), file);
             return out.items.items;
         },
@@ -51,7 +51,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
 
     // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
-        const a = try context.at(r, file, offset, true) orelse return &.{};
+        const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
         try expectedMembers(r, &out, a.literalExpected(e) orelse return &.{}, file);
         return out.items.items;
     };

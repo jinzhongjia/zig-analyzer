@@ -1433,6 +1433,7 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
             .parameter => .Parameter,
         },
         .paddingRight = if (h.kind == .parameter) true else null,
+        .tooltip = if (h.tooltip) |t| .{ .string = t } else null,
     };
     return out;
 }

@@ -11,6 +11,9 @@ pub const sema = @import("sema/queries.zig");
 pub const ide_db = struct {
     pub const FileIndex = @import("ide_db/FileIndex.zig");
 };
+pub const ide = struct {
+    pub const seed = @import("ide/seed.zig");
+};
 
 const Vfs = @import("base/Vfs.zig");
 const InternPool = @import("sema/InternPool.zig");
@@ -38,4 +41,5 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.CallEval,
     sema.ErrorSetOf,
     ide_db.FileIndex.Query,
+    ide.seed.Query,
 });

@@ -12,8 +12,10 @@ const SyntaxNode = ast.SyntaxNode;
 const Body = @import("../hir/Body.zig");
 const infer = @import("../sema/infer.zig");
 const render = @import("../sema/render.zig");
-const TypedValue = @import("../sema/InternPool.zig").TypedValue;
-const Index = @import("../sema/InternPool.zig").Index;
+const InternPool = @import("../sema/InternPool.zig");
+const TypedValue = InternPool.TypedValue;
+const Index = InternPool.Index;
+const seed = @import("seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 pub const At = struct {
@@ -25,26 +27,37 @@ pub const At = struct {
     res: *const infer.Result,
     /// 相对成员起点的位置
     rel: u32,
+    ip: *InternPool,
+    /// 成员位于泛型函数内时以调用点的实例推导的结果（设计 §9.4，见 `atSeeded`）：`res` 中含抽象参数或
+    /// 未知的部分取自这里
+    seeded: ?seed.Seed = null,
 
     pub fn exprType(a: At, e: Body.ExprId) TypedValue {
-        const i = @backingInt(e);
-        return if (i < a.res.exprs.len) a.res.exprs[i] else .unknown;
+        return a.better(a.res.exprs, if (a.seeded) |s| s.res.exprs else &.{}, @backingInt(e));
     }
 
     pub fn bindingType(a: At, b: Body.BindingId) TypedValue {
-        const i = @backingInt(b);
-        return if (i < a.res.bindings.len) a.res.bindings[i] else .unknown;
+        return a.better(a.res.bindings, if (a.seeded) |s| s.res.bindings else &.{}, @backingInt(b));
+    }
+
+    fn better(a: At, abstract: []const TypedValue, seeded: []const TypedValue, i: u32) TypedValue {
+        const tv: TypedValue = if (i < abstract.len) abstract[i] else .unknown;
+        if (i < seeded.len and seed.wanted(a.ip, tv) and !seed.wanted(a.ip, seeded[i])) return seeded[i];
+        return tv;
     }
 
     /// 枚举字面量的期望类型（没有期望类型时为 null）
     pub fn literalExpected(a: At, e: Body.ExprId) ?Index {
         for (a.res.literal_expected) |x| if (x.expr == e) return x.ty;
+        if (a.seeded) |s| for (s.res.literal_expected) |x| if (x.expr == e) return x.ty;
         return null;
     }
 
     pub fn member(a: At, e: Body.ExprId) ?hir.OwnerKey {
         const i = @backingInt(e);
-        return if (i < a.res.members.len) a.res.members[i] else null;
+        if (i < a.res.members.len) if (a.res.members[i]) |m| return m;
+        if (a.seeded) |s| if (i < s.res.members.len) return s.res.members[i];
+        return null;
     }
 };
 
@@ -60,7 +73,15 @@ pub fn at(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.
         .body = try r.ctx.get(hir.ItemBody, owner),
         .res = try r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full }),
         .rel = offset - node.offset,
+        .ip = r.ctx.db.env.ip,
     };
+}
+
+/// 同 `at`；成员位于泛型函数内时附带调用点实例的推导结果（`At.seeded`）
+pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.Error!?At {
+    var a = try at(r, file, offset, inclusive_end) orelse return null;
+    a.seeded = try seed.find(r, a.file, a.item);
+    return a;
 }
 
 /// 推导结果中记录的成员（按 AstId）对应的定义
