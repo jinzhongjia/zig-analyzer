@@ -1447,6 +1447,41 @@ test "generic bodies without an instance use values that do not depend on the pa
     });
 }
 
+test "arrays whose length depends on abstract parameters keep their element type" {
+    try expectTypes(
+        \\fn Hasher(comptime block_length: usize) type {
+        \\    return struct {
+        \\        buf: [block_length]u8,
+        \\        const Self = @This();
+        \\        fn f(self: *Self, i: usize) void {
+        \\            const whole = self.buf;
+        \\            const b = self.buf[i];
+        \\            const head = self.buf[0..4];
+        \\            const rest = self.buf[1..];
+        \\            const n = self.buf.len;
+        \\            for (self.buf) |byte| _ = byte;
+        \\            _ = .{ whole, b, head, rest, n };
+        \\        }
+        \\    };
+        \\}
+        \\fn g(comptime N: usize) void {
+        \\    var tmp: [N * 2]u16 = undefined;
+        \\    const zeros: [N:0]u8 = @splat(0);
+        \\    _ = .{ &tmp, zeros };
+        \\}
+    , &.{
+        // 长度按源码显示
+        .{ "whole", "[block_length]u8" },
+        .{ "b", "u8" },
+        .{ "head", "*[4]u8" },
+        .{ "rest", "[]u8" },
+        .{ "n", "usize" },
+        .{ "byte", "u8" },
+        .{ "tmp", "[N * 2]u16" },
+        .{ "zeros", "[N:0]u8" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);

@@ -544,11 +544,17 @@ const Inferrer = struct {
             .array_type => |arr| {
                 const len = try inf.inferComptime(arr.len, .usize_type);
                 const child = (try inf.infer(arr.child, null)).asType() orelse return typeUnknown();
+                const sentinel: ?Index = if (arr.sentinel) |x| (try inf.infer(x, child)).val else null;
                 const n: u64 = if (len.val) |v| switch (ip.key(v)) {
                     .int_value => |iv| std.math.cast(u64, iv.value) orelse return typeUnknown(),
                     else => return typeUnknown(),
-                } else return typeUnknown();
-                const sentinel: ?Index = if (arr.sentinel) |x| (try inf.infer(x, child)).val else null;
+                } else {
+                    // 长度求不出（如取决于抽象参数）：元素类型已知，长度按源码显示
+                    if (child == .unknown or (arr.sentinel != null and sentinel == null)) return typeUnknown();
+                    var text: std.ArrayList(u8) = .empty;
+                    if (!try inf.exprText(arr.len, &text, 0)) return typeUnknown();
+                    return TypedValue.ofType(try ip.get(.{ .abstract_array_type = .{ .len = text.items, .child = child, .sentinel = sentinel } }));
+                };
                 return TypedValue.ofType(try ip.get(.{ .array_type = .{ .len = n, .child = child, .sentinel = sentinel } }));
             },
             .error_set => |names| return TypedValue.ofType(try ip.errorSet(inf.scratch, names)),
@@ -653,6 +659,9 @@ const Inferrer = struct {
             },
             .array_type => |arr| if (std.mem.eql(u8, name, "len")) {
                 return .{ .ty = .usize_type, .val = try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = arr.len } }) };
+            },
+            .abstract_array_type => if (std.mem.eql(u8, name, "len")) {
+                return .{ .ty = .usize_type };
             },
             .ptr_type => |p| if (p.size == .slice) {
                 if (std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type };
@@ -1051,6 +1060,7 @@ const Inferrer = struct {
             const elem: ?Index = if (dest) |d| switch (ip.key(d)) {
                 .vector_type => |v| v.child,
                 .array_type => |a| a.child,
+                .abstract_array_type => |a| a.child,
                 else => null,
             } else null;
             for (args) |a| _ = try inf.infer(a, elem);
@@ -1627,6 +1637,7 @@ const Inferrer = struct {
         for (fields, 0..) |f, fi_index| {
             var field_ty: ?Index = switch (ip.key(t)) {
                 .array_type => |a| a.child,
+                .abstract_array_type => |a| a.child,
                 .vector_type => |v| v.child,
                 .tuple_type => |tt| if (f.name == null and fi_index < tt.types.len) tt.types[fi_index] else null,
                 else => null,
@@ -1803,6 +1814,54 @@ const Inferrer = struct {
         }
     }
 
+    /// 表达式的源码形式（显示长度未知的数组用）：名字、字段访问、字面量、调用与二元运算；其他形式为 false
+    fn exprText(inf: *Inferrer, e: ExprId, out: *std.ArrayList(u8), depth: u32) Error!bool {
+        if (depth > 8) return false;
+        const a = inf.scratch;
+        switch (inf.body.expr(e)) {
+            .name_ref => |n| try out.appendSlice(a, n),
+            .literal => |t| try out.appendSlice(a, t),
+            .field_access => |fa| {
+                if (!try inf.exprText(fa.lhs, out, depth + 1)) return false;
+                try out.append(a, '.');
+                try out.appendSlice(a, fa.field orelse return false);
+            },
+            .builtin_call, .call => {
+                const args = switch (inf.body.expr(e)) {
+                    .builtin_call => |c| blk: {
+                        try out.appendSlice(a, c.name);
+                        break :blk c.args;
+                    },
+                    .call => |c| blk: {
+                        if (!try inf.exprText(c.callee, out, depth + 1)) return false;
+                        break :blk c.args;
+                    },
+                    else => unreachable,
+                };
+                try out.append(a, '(');
+                for (args, 0..) |x, i| {
+                    if (i > 0) try out.appendSlice(a, ", ");
+                    if (!try inf.exprText(x, out, depth + 1)) return false;
+                }
+                try out.append(a, ')');
+            },
+            .binary => |x| {
+                const tag: std.zig.Token.Tag = @fromBackingInt(@as(@typeInfo(std.zig.Token.Tag).@"enum".tag_type, @intCast(@backingInt(x.op))));
+                const op = tag.lexeme() orelse return false;
+                // 嵌套的运算加上括号（HIR 中不保留括号）
+                for ([_]ExprId{ x.lhs, x.rhs }, 0..) |side, i| {
+                    if (i == 1) try out.print(a, " {s} ", .{op});
+                    const nested = inf.body.expr(side) == .binary;
+                    if (nested) try out.append(a, '(');
+                    if (!try inf.exprText(side, out, depth + 1)) return false;
+                    if (nested) try out.append(a, ')');
+                }
+            },
+            else => return false,
+        }
+        return true;
+    }
+
     /// `[_]T{ ... }`：数组长度由元素个数决定。不是这种形式时返回 null
     fn inferredLenArray(inf: *Inferrer, te: ExprId, n: usize) Error!?Index {
         const arr = switch (inf.body.expr(te)) {
@@ -1835,11 +1894,13 @@ const Inferrer = struct {
         const ip = inf.ip;
         return switch (ip.key(t)) {
             .array_type => |a| a.child,
+            .abstract_array_type => |a| a.child,
             .vector_type => |v| v.child,
             .ptr_type => |p| switch (p.size) {
                 .slice, .many, .c => p.child,
                 .one => switch (ip.key(p.child)) {
                     .array_type => |a| a.child,
+                    .abstract_array_type => |a| a.child,
                     else => .unknown,
                 },
             },
@@ -1857,9 +1918,11 @@ const Inferrer = struct {
         const Source = struct { elem: Index, sentinel: ?Index = null, len: ?u64 = null, is_const: bool = false };
         const src: Source = switch (ip.key(lhs.ty)) {
             .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = try inf.isConstPlace(lhs_e) },
+            .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = try inf.isConstPlace(lhs_e) },
             .ptr_type => |p| switch (p.size) {
                 .one => switch (ip.key(p.child)) {
                     .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const },
+                    .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = p.is_const },
                     // 指向单个元素的指针按长度为 1 的数组切片
                     else => .{ .elem = p.child, .len = 1, .is_const = p.is_const },
                 },

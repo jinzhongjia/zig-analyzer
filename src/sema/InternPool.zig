@@ -97,6 +97,9 @@ pub const Key = union(enum) {
     int_type: struct { signedness: std.builtin.Signedness, bits: u16 },
     ptr_type: struct { child: Index, size: PtrSize, is_const: bool = false, sentinel: ?Index = null },
     array_type: struct { len: u64, child: Index, sentinel: ?Index = null },
+    /// 长度取决于抽象参数的数组（泛型函数体没有具体实例时，如 `[block_length]u8`）：元素类型已知，
+    /// 长度未知；`len` 为长度表达式的源码形式，只用于显示
+    abstract_array_type: struct { len: []const u8, child: Index, sentinel: ?Index = null },
     optional_type: Index,
     error_union_type: struct { err: Index, payload: Index },
     /// 名字按字典序排列、去重
@@ -363,6 +366,7 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         },
         .fn_type => |f| .{ .fn_type = .{ .params = try a.dupe(Index, f.params), .ret = f.ret, .varargs = f.varargs } },
         .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
+        .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = try a.dupe(u8, t.len), .child = t.child, .sentinel = t.sentinel } },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
         .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent } },
@@ -489,6 +493,15 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         .array_type => |a| {
             try w.print("[{d}", .{a.len});
+            if (a.sentinel) |s| {
+                try w.writeAll(":");
+                try ip.print(s, w, container_name);
+            }
+            try w.writeAll("]");
+            try ip.print(a.child, w, container_name);
+        },
+        .abstract_array_type => |a| {
+            try w.print("[{s}", .{a.len});
             if (a.sentinel) |s| {
                 try w.writeAll(":");
                 try ip.print(s, w, container_name);

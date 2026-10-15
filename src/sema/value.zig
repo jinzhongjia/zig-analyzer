@@ -515,7 +515,7 @@ fn hasBitRepr(ip: *InternPool, t: Index) bool {
 pub fn isTypeKey(k: InternPool.Key) bool {
     return switch (k) {
         .simple_type, .int_type, .ptr_type, .array_type, .optional_type, .error_union_type, .error_set_type, .fn_type, .container_type, .opaque_param => true,
-        .tuple_type, .vector_type, .anon_struct_type, .reified_type, .union_tag_type, .inferred_error_set => true,
+        .tuple_type, .vector_type, .anon_struct_type, .reified_type, .union_tag_type, .inferred_error_set, .abstract_array_type => true,
         else => false,
     };
 }
@@ -540,6 +540,7 @@ pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
         .fn_type => true,
         .ptr_type => |p| isComptimeOnly(ip, p.child),
         .array_type => |a| isComptimeOnly(ip, a.child),
+        .abstract_array_type => |a| isComptimeOnly(ip, a.child),
         .optional_type => |c| isComptimeOnly(ip, c),
         .error_union_type => |e| isComptimeOnly(ip, e.payload),
         .tuple_type => |tt| anyRuntimeComptimeOnly(ip, tt.types, tt.values),
@@ -573,7 +574,7 @@ fn anyRuntimeComptimeOnly(ip: *InternPool, types: []const Index, values: []const
 pub fn isPrecise(ip: *InternPool, v: Index) bool {
     if (v == .unknown) return false;
     return switch (ip.key(v)) {
-        .unknown => false,
+        .unknown, .abstract_array_type => false,
         .ptr_type => |p| isPrecise(ip, p.child) and (p.sentinel == null or isPrecise(ip, p.sentinel.?)),
         .array_type => |a| isPrecise(ip, a.child) and (a.sentinel == null or isPrecise(ip, a.sentinel.?)),
         .optional_type => |c| isPrecise(ip, c),
@@ -610,7 +611,7 @@ fn allPrecise(ip: *InternPool, items: []const Index) bool {
 pub fn isConcrete(ip: *InternPool, t: Index) bool {
     if (t == .unknown) return false;
     return switch (ip.key(t)) {
-        .unknown, .opaque_param => false,
+        .unknown, .opaque_param, .abstract_array_type => false,
         .ptr_type => |p| isConcrete(ip, p.child),
         .array_type => |a| isConcrete(ip, a.child),
         .optional_type => |c| isConcrete(ip, c),
@@ -657,7 +658,9 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
     if (a == .unknown or b == .unknown) return null;
     const ka = ip.key(a);
     const kb = ip.key(b);
+    // 抽象的类型（参数、长度未知的数组）与其他类型是否相同取决于实例
     if (ka == .opaque_param or kb == .opaque_param or ka == .unknown or kb == .unknown) return null;
+    if (ka == .abstract_array_type or kb == .abstract_array_type) return null;
     if (std.meta.activeTag(ka) != std.meta.activeTag(kb)) return false;
     return switch (ka) {
         .ptr_type => |p| blk: {
