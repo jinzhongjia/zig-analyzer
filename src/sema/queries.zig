@@ -106,19 +106,10 @@ pub const DeclType = struct {
             .@"fn" => {
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
-                const node = try r.itemNode(key.file, item) orelse return .unknown;
-                const proto = (ast.cast(ast.FnDecl, node) orelse return .unknown).proto() orelse return .unknown;
-                // 按语法中的参数个数（含 anytype 与无名参数）；`...` 没有绑定
+                // 绑定的参数（含 anytype 与无名参数）按顺序，`...` 没有绑定、只能在末尾（见 ItemTree 的 `varargs`）
                 var params: std.ArrayList(Index) = .empty;
-                var it = proto.params();
-                var bound: usize = 0;
-                while (it.next()) |p| {
-                    const param = ast.cast(ast.Param, p).?;
-                    if ((param.name() != null or param.typeExpr() != null) and bound < b.params.len) {
-                        try params.append(r.arena, res.bindings[@backingInt(b.params[bound])].ty);
-                        bound += 1;
-                    } else try params.append(r.arena, .unknown);
-                }
+                for (b.params) |p| try params.append(r.arena, res.bindings[@backingInt(p)].ty);
+                if (tree.items[item].flags.varargs) try params.append(r.arena, .unknown);
                 const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = try returnType(&r, key, b, res, dk.inst) } });
                 return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item, .inst = dk.inst } }) };
             },
@@ -249,11 +240,7 @@ pub fn errorSetMembers(r: *Resolver, t: Index) resolve.Error!?[]const []const u8
 /// 函数的返回类型是否为 `!T`（推导的错误集）
 fn inferredErrorSet(r: *Resolver, owner: hir.OwnerKey) resolve.Error!bool {
     const tree = try r.itemTree(owner.file);
-    for (tree.items, 0..) |it, i| if (it.ast_id == owner.item) {
-        const node = try r.itemNode(owner.file, @intCast(i)) orelse return false;
-        const proto = (ast.cast(ast.FnDecl, node) orelse return false).proto() orelse return false;
-        return proto.inferredErrorSet();
-    };
+    for (tree.items) |it| if (it.ast_id == owner.item) return it.flags.inferred_error_set;
     return false;
 }
 

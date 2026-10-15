@@ -2920,13 +2920,16 @@ const Evaluator = struct {
             .reified_type => |rt| return .{ .layout = rt.layout, .arg = rt.tag },
             .container_type => |c| {
                 const ns = try queries.namespaceOfType(ev.r, t) orelse return .{};
-                const node = try ev.r.containerNode(ns) orelse return .{};
-                var out: ContainerSyntax = .{};
-                if (node.kind() == .container_decl) {
-                    if (node.childToken(.keyword_packed) != null) out.layout = .@"packed";
-                    if (node.childToken(.keyword_extern) != null) out.layout = .@"extern";
-                    out.auto_enum = c.kind == .@"union" and node.childToken(.keyword_enum) != null;
-                }
+                // 布局修饰记录在 ItemTree 中（结构不变时不随编辑变化），不读语法树
+                const container = (try ev.r.itemTree(ns.file)).containers[ns.container];
+                var out: ContainerSyntax = .{
+                    .layout = switch (container.layout) {
+                        .auto => .auto,
+                        .@"packed" => .@"packed",
+                        .@"extern" => .@"extern",
+                    },
+                    .auto_enum = container.auto_enum,
+                };
                 out.arg = try ev.containerArg(ns, c.inst);
                 return out;
             },

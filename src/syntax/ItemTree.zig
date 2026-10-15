@@ -34,8 +34,13 @@ pub const Container = struct {
     /// 词法上包含本容器的成员（文件根为 null）
     parent_item: ?u32,
     members: struct { start: u32, len: u32 },
+    /// `packed` / `extern`（布局与 ABI 大小的计算读取它，不必再读语法树）
+    layout: Layout = .auto,
+    /// `union(enum)`：标签类型由编译器生成
+    auto_enum: bool = false,
 
     pub const Kind = enum { file, @"struct", @"enum", @"union", @"opaque" };
+    pub const Layout = enum { auto, @"packed", @"extern" };
 };
 
 pub const Item = struct {
@@ -59,7 +64,10 @@ pub const Item = struct {
         is_inline: bool = false,
         is_comptime: bool = false,
         is_threadlocal: bool = false,
-        _: u2 = 0,
+        /// 函数的返回类型为 `!T`（推导的错误集）
+        inferred_error_set: bool = false,
+        /// 函数的参数列表中有不绑定的参数（`...`）：只能在末尾
+        varargs: bool = false,
     };
 };
 
@@ -84,6 +92,7 @@ pub fn eql(a: *const ItemTree, b: *const ItemTree) bool {
     if (!std.mem.eql(u32, a.member_list, b.member_list)) return false;
     for (a.containers, b.containers) |x, y| {
         if (x.ast_id != y.ast_id or x.kind != y.kind or x.parent_item != y.parent_item) return false;
+        if (x.layout != y.layout or x.auto_enum != y.auto_enum) return false;
         if (x.members.start != y.members.start or x.members.len != y.members.len) return false;
     }
     for (a.items, b.items) |x, y| {
@@ -160,7 +169,7 @@ const Builder = struct {
                 .kind = kind,
                 .name = if (name) |n| try b.arena.dupe(u8, n) else null,
                 .container = index,
-                .flags = memberFlags(member),
+                .flags = fnFlags(member, memberFlags(member)),
                 .sig_hash = signatureHash(member, kind),
                 .doc = try b.docText(member),
             });
@@ -178,11 +187,14 @@ const Builder = struct {
                 continue;
             }
             const index: u32 = @intCast(b.containers.items.len);
+            const kind = containerKind(c);
             try b.containers.append(b.gpa, .{
                 .ast_id = try b.uniqueId(b.items.items[parent_item].ast_id, "container", ""),
-                .kind = containerKind(c),
+                .kind = kind,
                 .parent_item = parent_item,
                 .members = undefined,
+                .layout = if (c.childToken(.keyword_packed) != null) .@"packed" else if (c.childToken(.keyword_extern) != null) .@"extern" else .auto,
+                .auto_enum = kind == .@"union" and c.childToken(.keyword_enum) != null,
             });
             try b.visitContainer(c, index);
         }
@@ -222,6 +234,19 @@ fn mixId(parent: u32, kind: []const u8, name: []const u8, ordinal: u32) AstId {
     h.update(name);
     h.update(std.mem.asBytes(&ordinal));
     return @fromBackingInt(@as(u32, @truncate(h.final())));
+}
+
+/// 函数原型中下游需要的语法信息（避免签名推导为此读取每次编辑都会变化的语法树）
+fn fnFlags(member: SyntaxNode, base: Item.Flags) Item.Flags {
+    var flags = base;
+    const proto = (ast.cast(ast.FnDecl, member) orelse return flags).proto() orelse return flags;
+    flags.inferred_error_set = proto.inferredErrorSet();
+    var it = proto.params();
+    while (it.next()) |p| {
+        const param = ast.cast(ast.Param, p).?;
+        if (param.name() == null and param.typeExpr() == null) flags.varargs = true;
+    }
+    return flags;
 }
 
 fn memberFlags(member: SyntaxNode) Item.Flags {
