@@ -1906,3 +1906,32 @@ test "union(enum) without a tag expression: field names are not lowered as expre
     var buf: [database.Db.query_types.len]@import("../db/engine.zig").QueryStats = undefined;
     try testing.expectEqual(0, w.db.stats(&buf).incomplete_causes.get(.cycle));
 }
+
+test "member bodies are reused when their source is unchanged" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const v1 = "fn a() u32 {\n    return 1;\n}\nfn b() u32 {\n    return 2;\n}\n";
+    const v2 = "// edited\nfn a() u32 {\n    return 1;\n}\nfn b() u32 {\n    return 3;\n}\n";
+    const Bodies = struct { a: *const @import("../hir/Body.zig"), b: *const @import("../hir/Body.zig") };
+    const read = struct {
+        fn bodies(w2: *World, file: FileId) !Bodies {
+            var ctx = w2.db.beginRead(testing.allocator);
+            defer ctx.end();
+            const tree = try ctx.get(database.syntax.FileItemTree, file);
+            var out: [2]*const @import("../hir/Body.zig") = undefined;
+            for (tree.items) |it| {
+                const i: usize = if (std.mem.eql(u8, it.name.?, "a")) 0 else 1;
+                out[i] = try ctx.get(database.hir.ItemBody, .{ .file = file, .item = it.ast_id });
+            }
+            return .{ .a = out[0], .b = out[1] };
+        }
+    }.bodies;
+    const f = try w.add("/p/main.zig", v1);
+    const before = try read(&w, f.file);
+    _ = try w.add("/p/main.zig", v2);
+    const after = try read(&w, f.file);
+    // a 的源码未变：沿用同一个 Body；b 改了：重新降级
+    try testing.expectEqual(before.a, after.a);
+    try testing.expect(before.b != after.b);
+}

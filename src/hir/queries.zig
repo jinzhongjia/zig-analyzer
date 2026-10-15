@@ -40,27 +40,53 @@ pub const ItemBody = struct {
     pub const lru_bytes = 48 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
-        return @sizeOf(Body) + mem.arenaBytes(v.arena);
+        return @sizeOf(Owned) + mem.arenaBytes(v.arena);
     }
 
-    pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
+    /// Body 与降级它的成员源码：文本不变时下一次计算直接沿用（引用计数，与 `ParseFile` 沿用旧结果相同）
+    const Owned = struct {
+        body: Body,
+        refs: std.atomic.Value(u32) = .init(1),
+        source_hash: u64,
+        field_is_name: bool,
+
+        fn of(v: Value) *Owned {
+            return @alignCast(@fieldParentPtr("body", @constCast(v)));
+        }
+    };
+
+    /// 文件中任何编辑都使 `FileAstIdMap` 变化（按指针比较），各成员的 Body 随之重算：成员的源码文本与降级
+    /// 参数未变时沿用上一次的 Body（降级只读取成员自身的语法树，位置相对成员起点），不再重新降级。
+    /// 非活动代码等需要文件中全部成员的功能，在大文件上每次编辑都要重新降级上千个成员
+    pub fn computeIncremental(ctx: anytype, key: Key, prev: ?Value) engine.Error!Value {
         const map = try ctx.get(syntax.FileAstIdMap, key.file);
-        const gpa = ctx.db.gpa;
-        const result = try gpa.create(Body);
-        errdefer gpa.destroy(result);
+        const parse = try ctx.get(syntax.ParseFile, key.file);
         // 找不到时（成员已被删除）降级根节点：不是成员，得到空 Body
-        const node = map.get(key.item) orelse (try ctx.get(syntax.ParseFile, key.file)).rootNode();
-        result.* = try lower(gpa, node, try fieldIsName(ctx, key, node));
-        return result;
+        const node = map.get(key.item) orelse parse.rootNode();
+        const field_is_name = try fieldIsName(ctx, key, node);
+        const source_hash = std.hash.Wyhash.hash(0, node.text(parse.source));
+        if (prev) |p| {
+            const o = Owned.of(p);
+            if (o.source_hash == source_hash and o.field_is_name == field_is_name) {
+                _ = o.refs.fetchAdd(1, .monotonic);
+                return p;
+            }
+        }
+        const gpa = ctx.db.gpa;
+        const result = try gpa.create(Owned);
+        errdefer gpa.destroy(result);
+        result.* = .{ .body = try lower(gpa, node, field_is_name), .source_hash = source_hash, .field_is_name = field_is_name };
+        return &result.body;
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        return a.eql(b);
+        return a == b or a.eql(b);
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
-        const b: *Body = @constCast(v.*);
-        b.deinit(gpa);
-        gpa.destroy(b);
+        const o = Owned.of(v.*);
+        if (o.refs.fetchSub(1, .acq_rel) != 1) return;
+        o.body.deinit(gpa);
+        gpa.destroy(o);
     }
 };
