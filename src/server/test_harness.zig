@@ -109,11 +109,16 @@ pub const Harness = struct {
 
     /// `h` 必须位于稳定的地址（Server 持有指向其内部的指针）
     pub fn start(h: *Harness) !void {
+        return h.startIo(testing.io);
+    }
+
+    /// 同 `start`，服务器使用指定的 Io（如限制线程数的 `Io.Threaded`）
+    pub fn startIo(h: *Harness, io: Io) !void {
         h.* = .{};
         h.arena = .init(testing.allocator);
         h.input.reader.buffer = &h.input.read_buf;
         h.writer = .{ .io = testing.io, .inner = &h.output.writer };
-        try h.server.init(testing.io, testing.allocator, &h.writer);
+        try h.server.init(io, testing.allocator, &h.writer);
         h.thread = try std.Thread.spawn(.{}, runServer, .{h});
     }
 
@@ -151,12 +156,25 @@ pub const Harness = struct {
 
     /// 发送请求并等待其响应（期间到达的其他消息记入 `received`）
     pub fn request(h: *Harness, method: []const u8, params: anytype) !std.json.Value {
+        return h.response(try h.send(method, params));
+    }
+
+    /// 只发送请求，返回其 id（之后用 `response` 等待）
+    pub fn send(h: *Harness, method: []const u8, params: anytype) !i64 {
         const id = h.next_id;
         h.next_id += 1;
         if (@TypeOf(params) == void) {
             try h.write(.{ .jsonrpc = "2.0", .id = id, .method = method });
         } else {
             try h.write(.{ .jsonrpc = "2.0", .id = id, .method = method, .params = params });
+        }
+        return id;
+    }
+
+    /// 等待指定 id 的响应；已经收到的在 `received` 中查找
+    pub fn response(h: *Harness, id: i64) !std.json.Value {
+        for (h.received.items) |msg| {
+            if (msg.object.get("method") == null) if (msg.object.get("id")) |i| if (i == .integer and i.integer == id) return msg;
         }
         while (true) {
             const msg = try h.next();

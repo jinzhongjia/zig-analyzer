@@ -239,3 +239,33 @@ test "malformed params return InvalidParams" {
     const msgs = try s.messages();
     try testing.expectEqual(-32602, errorCode(msgs[0]));
 }
+
+test "read requests run on their own threads: a blocked read does not stall the main loop" {
+    const Harness = @import("test_harness.zig").Harness;
+    // 线程池没有空位：`async` 会在调用方同步执行
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    var h: Harness = undefined;
+    try h.startIo(threaded.io());
+    defer h.finish();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    // 持有写锁：读请求等在读事务的开始处
+    h.server.db.beginWrite();
+    var writing = true;
+    defer if (writing) h.server.db.endWrite();
+    const blocked = try h.send("zig-analyzer/status", {});
+    try h.notify("$/cancelRequest", .{ .id = blocked });
+    // 主循环仍在处理消息
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+
+    h.server.db.endWrite();
+    writing = false;
+    // 取消在读请求阻塞期间送达
+    try testing.expectEqual(-32800, errorCode(try h.response(blocked)));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

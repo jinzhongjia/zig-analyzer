@@ -246,7 +246,7 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
 const Mode = enum {
     /// 在主循环中同步执行（改变服务器状态的请求）
     sync,
-    /// 在独立任务中持有读事务并发执行（线程数达到上限时在主循环中同步执行）
+    /// 在独立线程中持有读事务并发执行
     read,
     /// 在独立任务中执行，不持有读事务（会长时间等待的请求，不能阻塞主循环）
     background,
@@ -318,7 +318,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                             return err;
                         };
                     }
-                    server.group.async(server.io, ReadTask(func, h[0]).run, .{ server, arena, pending, params });
+                    spawn(server.io, &server.group, ReadTask(func, h[0]).run, .{ server, arena, pending, params });
                 },
                 // 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
                 // 会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
@@ -333,7 +333,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                             return err;
                         };
                     }
-                    server.group.async(server.io, SemanticTask(func, h[0]).run, .{ server, arena, pending, params });
+                    spawn(server.io, &server.group, SemanticTask(func, h[0]).run, .{ server, arena, pending, params });
                 },
                 .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
                     server.destroyArena(arena);
@@ -345,6 +345,13 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
     }
     server.destroyArena(arena);
     server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
+}
+
+/// 在独立线程中执行任务。不用 `async`：线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
+/// 它在调用方同步执行，主循环中执行期间收不到 `$/cancelRequest`，后续请求排队。`concurrent` 默认
+/// 没有数量上限，只在无法创建线程时失败，这时退回 `async`
+fn spawn(io: Io, group: *Io.Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+    group.concurrent(io, function, args) catch group.async(io, function, args);
 }
 
 /// 处理函数最后一个参数即请求参数类型
@@ -626,8 +633,7 @@ fn scheduleIndexing(server: *Server) void {
     _ = server.index_generation.fetchAdd(1, .monotonic);
     if (server.indexing.swap(true, .acq_rel)) return;
     server.busyBegin();
-    server.bg_group.concurrent(server.io, indexTask, .{server}) catch
-        server.bg_group.async(server.io, indexTask, .{server});
+    spawn(server.io, &server.bg_group, indexTask, .{server});
 }
 
 fn indexTask(server: *Server) Io.Cancelable!void {
@@ -1249,8 +1255,7 @@ fn compileSingle(server: *Server, file: Vfs.FileId) void {
     }
     server.busyBegin();
     // 编译耗时数秒，尽量不在主循环中同步执行（否则期间无法处理进度 token 的响应等消息）
-    server.bg_group.concurrent(server.io, singleFileTask, .{ server, file }) catch
-        server.bg_group.async(server.io, singleFileTask, .{ server, file });
+    spawn(server.io, &server.bg_group, singleFileTask, .{ server, file });
 }
 
 fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
@@ -1495,7 +1500,7 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
     for (files) |file| {
         server.busyBegin();
-        server.bg_group.async(server.io, publishTask, .{ server, file, clear });
+        spawn(server.io, &server.bg_group, publishTask, .{ server, file, clear });
     }
 }
 
