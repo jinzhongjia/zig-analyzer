@@ -162,6 +162,47 @@ pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *co
 
 /// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误，含未知部分时为 anyerror。
 /// 递归的函数取最小不动点（与编译器一致；编译器不允许相互递归，这里同样取各函数错误的并集）
+/// 成员中 comptime 已知不会执行的分支的范围（相对成员起点，按位置排序）。非活动代码需要文件中全部成员的
+/// 推导结果，大文件的 `Infer` 结果超出 LRU 的上限，每次发布都要重算被淘汰的部分；这里只保留区间，
+/// 依赖未变时即使 `Infer` 的值已被淘汰也不必重算
+pub const InactiveRanges = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = hir.OwnerKey;
+    pub const Value = []const Range;
+
+    pub const Range = struct { start: u32, end: u32 };
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        const res = try ctx.get(Infer, .{ .owner = key, .mode = .full });
+        if (res.inactive.len == 0) return &.{};
+        const body = try ctx.get(hir.ItemBody, key);
+        var out: std.ArrayList(Range) = .empty;
+        errdefer out.deinit(ctx.db.gpa);
+        for (res.inactive) |e| {
+            const rg = body.range(e);
+            if (rg.end > rg.start) try out.append(ctx.db.gpa, .{ .start = rg.start, .end = rg.end });
+        }
+        std.mem.sort(Range, out.items, {}, struct {
+            fn lt(_: void, a: Range, b: Range) bool {
+                return a.start < b.start;
+            }
+        }.lt);
+        return out.toOwnedSlice(ctx.db.gpa);
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b));
+    }
+
+    pub fn bytes(v: Value) usize {
+        return v.len * @sizeOf(Range);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
 pub const ErrorSetOf = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = DeclKey;

@@ -51,6 +51,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.DeclType,
     sema.CallEval,
     sema.ErrorSetOf,
+    sema.InactiveRanges,
     ide_db.FileIndex.Query,
     ide.seed.Query,
 });
