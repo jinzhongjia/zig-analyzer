@@ -388,6 +388,8 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             const result = func(server, &ctx, a, params) catch |err| {
                 return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             };
+            // 处理函数可能以回退值吞掉了 `Canceled`（如类型渲染中的 `catch null`），结果不完整
+            ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             server.sendResponse(pending.id, result);
         }
     };
@@ -418,6 +420,8 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             const result = func(server, &r, a, params) catch |err| {
                 return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             };
+            // 同 ReadTask：吞掉 `Canceled` 的处理函数结果不完整
+            ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             server.sendResponse(pending.id, result);
         }
     };
@@ -1523,7 +1527,10 @@ fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!voi
                 error.OutOfMemory => return log.err("out of memory while computing diagnostics", .{}),
             }
         };
+        // 计算中吞掉了 `Canceled` 时结果不完整：同样重试
+        const canceled = if (ctx.checkCanceled()) |_| false else |_| true;
         ctx.end();
+        if (canceled) continue;
         server.sendDiagnostics(file, params, clear);
         return;
     }
