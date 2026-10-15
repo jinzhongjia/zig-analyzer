@@ -1499,6 +1499,24 @@ test "loops over types bind an abstract type" {
     });
 }
 
+test "members missing for the current target are looked up in other targets' namespaces" {
+    try expectTypes(
+        \\const native = .linux;
+        \\const linux = struct { pub const read: u8 = 1; };
+        \\const darwin = struct { pub const kqueue: u16 = 2; };
+        \\const system = switch (native) { .linux => linux, .macos => darwin, else => struct {} };
+        \\fn f() void {
+        \\    const here = system.read;
+        \\    const elsewhere = system.kqueue;
+        \\    _ = .{ here, elsewhere };
+        \\}
+    , &.{
+        .{ "here", "u8 = 1" },
+        // 当前目标的命名空间中没有：取其他分支选择的容器中的定义
+        .{ "elsewhere", "u16 = 2" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);

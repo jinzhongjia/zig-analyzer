@@ -625,7 +625,7 @@ const Inferrer = struct {
             switch (ip.key(t)) {
                 .container_type => {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .unknown;
-                    const def = try inf.r.memberDef(ns, name) orelse return .unknown;
+                    const def = try inf.r.memberDef(ns, name) orelse return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown;
                     inf.members[@backingInt(e)] = try defKey(inf.r, def);
                     return queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 },
@@ -641,6 +641,39 @@ const Inferrer = struct {
             return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
         };
         return tv;
+    }
+
+    /// 当前构建配置下不存在的成员，所在的命名空间由声明中的 `if` / `switch` 按目标选择（如 `posix.system`
+    /// 在 linux 上为 `linux`，其他目标为 `std.c` 等）：到其他分支选择的容器中查找。这样的代码只在其他目标上
+    /// 编译，给出那里的定义，而不是未知
+    fn otherBranchMember(inf: *Inferrer, e: ExprId, lhs_e: ExprId, current: Index, name: []const u8) Error!?TypedValue {
+        const ip = inf.ip;
+        const owner: hir.OwnerKey = if (inf.members[@backingInt(lhs_e)]) |m| m else switch (inf.body.expr(lhs_e)) {
+            .name_ref => |n| blk: {
+                const def = try inf.r.resolveName(inf.file, inf.item, inf.body, inf.body.expr_scopes[@backingInt(lhs_e)], n) orelse return null;
+                break :blk try defKey(inf.r, def) orelse return null;
+            },
+            else => return null,
+        };
+        const body = try inf.r.ctx.get(hir.ItemBody, owner);
+        const init = body.value orelse return null;
+        switch (body.expr(init)) {
+            .@"if", .@"switch" => {},
+            else => return null,
+        }
+        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        if (res.exprs.len != body.exprs.len) return null;
+        var leaves: std.ArrayList(ExprId) = .empty;
+        try branchLeaves(inf.scratch, body, init, &leaves, 0);
+        for (leaves.items) |leaf| {
+            const t = res.exprs[@backingInt(leaf)].asType() orelse continue;
+            if (t == current or ip.key(t) != .container_type) continue;
+            const ns = try queries.namespaceOfType(inf.r, t) orelse continue;
+            const def = try inf.r.memberDef(ns, name) orelse continue;
+            inf.members[@backingInt(e)] = try defKey(inf.r, def);
+            return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
+        }
+        return null;
     }
 
     /// 实例（值）上的成员：字段与方法，自动解引用单指针
@@ -2120,6 +2153,19 @@ fn declKnownness(it: ItemTree.Item) Inferrer.Knownness {
 
 fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
     return std.mem.indexOfScalar(Body.BindingId, list, b) != null;
+}
+
+/// `if` / `switch` 各分支（含嵌套的）的结果表达式
+fn branchLeaves(a: Allocator, body: *const Body, e: ExprId, out: *std.ArrayList(ExprId), depth: u32) Allocator.Error!void {
+    if (depth > 8) return;
+    switch (body.expr(e)) {
+        .@"if" => |x| {
+            try branchLeaves(a, body, x.then, out, depth + 1);
+            if (x.@"else") |el| try branchLeaves(a, body, el, out, depth + 1);
+        },
+        .@"switch" => |sw| for (sw.prongs) |p| try branchLeaves(a, body, p.body, out, depth + 1),
+        else => try out.append(a, e),
+    }
 }
 
 /// 指针转换类内置函数（嵌套时在编译器中合并为一次转换）
