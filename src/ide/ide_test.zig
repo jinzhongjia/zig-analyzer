@@ -209,6 +209,36 @@ test "hover in generic bodies is inferred from a call site" {
     }
 }
 
+test "hover in generic bodies called only from other generic functions" {
+    const text =
+        \\const Px = struct { r: u8 };
+        \\fn over(dst: anytype, src: anytype) @TypeOf(dst, src) {
+        \\    const v = src;
+        \\    return v;
+        \\}
+        \\fn run(op: u8, dst: anytype, src: anytype) @TypeOf(dst, src) {
+        \\    return switch (op) {
+        \\        else => over(dst, src),
+        \\    };
+        \\}
+        \\fn paint() void {
+        \\    const p: Px = .{ .r = 0 };
+        \\    _ = run(0, p, p);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    // `over` 只在泛型的 `run` 中调用：经由 `run` 的调用点实例得到具体类型
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:8", info.text);
+}
+
 test "hover in generic bodies is inferred from a call site in another file" {
     const lib_text =
         \\pub fn max(comptime T: type, a: T, b: T) T {

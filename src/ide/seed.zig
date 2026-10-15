@@ -128,7 +128,6 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
 fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8) resolve.Error!?Found {
-    const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
@@ -139,36 +138,49 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        if (res.exprs.len != body.exprs.len) continue;
-        for (body.exprs, 0..) |e, ei| {
-            const c = switch (e) {
-                .call => |c| c,
-                else => continue,
-            };
-            const callee = res.exprs[@backingInt(c.callee)];
-            const fv = switch (ip.key(callee.val orelse continue)) {
-                .fn_value => |v| v,
-                else => continue,
-            };
-            if (fv.file != root_key.file or fv.decl != root_key.item) continue;
-            const f = switch (ip.key(callee.ty)) {
-                .fn_type => |f| f,
-                else => continue,
-            };
-            const g = try infer.genericCallee(r, r.arena, callee, f) orelse continue;
-            // 方法调用：接收者是第一个实参
-            const receiver: ?TypedValue = switch (body.expr(c.callee)) {
-                .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
-                else => null,
-            };
-            const skip: usize = @intFromBool(receiver != null);
-            const args = try r.arena.alloc(TypedValue, g.body.params.len);
-            for (args, 0..) |*a, ai| a.* = if (ai < skip) receiver.? else if (ai - skip < c.args.len) res.exprs[@backingInt(c.args[ai - skip])] else .unknown;
-            const inst = try infer.instanceOf(r, r.arena, g, f, args);
-            if (!value.isConcrete(ip, inst)) continue;
-            const node = try r.itemNode(in, @intCast(i)) orelse continue;
-            return .{ .inst = try queries.normalizeInst(r, file, item, inst), .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
-        }
+        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key)) |s| return s;
+        // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
+        // 实参是抽象的，改用调用者的调用点实例推导后再找。经由 Query 递归，环由 cycleFallback 截断
+        if (try genericRoot(r, in, @intCast(i)) == null) continue;
+        const outer = try r.ctx.get(Query, owner) orelse continue;
+        const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
+        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key)) |s| return s;
+    }
+    return null;
+}
+
+/// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用
+fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey) resolve.Error!?Found {
+    const ip = r.ctx.db.env.ip;
+    if (res.exprs.len != body.exprs.len) return null;
+    for (body.exprs, 0..) |e, ei| {
+        const c = switch (e) {
+            .call => |c| c,
+            else => continue,
+        };
+        const callee = res.exprs[@backingInt(c.callee)];
+        const fv = switch (ip.key(callee.val orelse continue)) {
+            .fn_value => |v| v,
+            else => continue,
+        };
+        if (fv.file != root_key.file or fv.decl != root_key.item) continue;
+        const f = switch (ip.key(callee.ty)) {
+            .fn_type => |f| f,
+            else => continue,
+        };
+        const g = try infer.genericCallee(r, r.arena, callee, f) orelse continue;
+        // 方法调用：接收者是第一个实参
+        const receiver: ?TypedValue = switch (body.expr(c.callee)) {
+            .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
+            else => null,
+        };
+        const skip: usize = @intFromBool(receiver != null);
+        const args = try r.arena.alloc(TypedValue, g.body.params.len);
+        for (args, 0..) |*a, ai| a.* = if (ai < skip) receiver.? else if (ai - skip < c.args.len) res.exprs[@backingInt(c.args[ai - skip])] else .unknown;
+        const inst = try infer.instanceOf(r, r.arena, g, f, args);
+        if (!value.isConcrete(ip, inst)) continue;
+        const node = try r.itemNode(in, i) orelse continue;
+        return .{ .inst = try queries.normalizeInst(r, file, item, inst), .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
     }
     return null;
 }
