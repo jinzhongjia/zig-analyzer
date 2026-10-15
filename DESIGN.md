@@ -1320,6 +1320,39 @@ Sema.zig 上的编辑响应（同一台机器）：
 - `ItemSummaries` 记录的是容器在文件中的绝对位置：在文件前部编辑使其后的位置平移时，`containerRel` 的依赖随之变化。
 - 测试：`zig build test` 共 258 个。
 
+### 19.28 功能的对拍与补全的召回（2026-10-15）
+
+在 §19.27 的项目上，以外部工具或源码本身为准校验各项功能：
+
+| 校验 | 方法 | 结果 |
+|---|---|---|
+| 查找引用与重命名（`BENCH_REFS=<n>`） | 对文件中的声明请求 references，每处引用的名字应与声明相同、文件内同名且解析到该声明的标识符都应在列表中；rename 的编辑应与引用一致 | 325 个声明、1879 处引用：名字不符、误报、遗漏、重命名不一致均为 0 |
+| 编译器诊断 | 写入错误后与 `zig build` 的输出逐条比较 | 15 / 15 一致 |
+| 格式化 | `textDocument/formatting` 与 `zig fmt` 的输出比较 | 372 / 372 个文件一致 |
+| 补全（`BENCH_COMPLETE=<n>`） | 源码中的成员访问 `a.b` 在 `.` 之后补全，列表中应有 `b` | 见下表 |
+
+| 项目（文件） | 召回 |
+|---|---|
+| zig-clap（`clap.zig`） | 96.0% → 96.2% |
+| ZLS（`src/analysis.zig`） | 99.7% → 99.8% |
+| zigimg（`src/color.zig`） | 97.2% → 99.0% |
+| libvaxis（`src/Vaxis.zig`） | 100% |
+| z2d（`src/compositor.zig`） | 53.0% → 95.3% |
+| Zig 编译器（`src/Compilation.zig` / `lib/std/mem.zig`） | 99.5% / 98.2% → 98.5% |
+
+发现并修复的问题：
+
+| 问题 | 文件 | 内容 |
+|---|---|---|
+| 具名错误集的成员 | `src/ide/definition.zig`、`completion.zig` | `Error.Foo` 跳到 `error{ Foo }`（含经由别名的错误集），`Error.` 之后补全错误名 |
+| 只被泛型函数调用的泛型函数 | `src/ide/seed.zig` | 调用点种子（§9.4）只看具体的调用：z2d 的合成运算 `srcOver(dst: anytype, src: anytype)` 只在 `run(op, dst: anytype, src: anytype)` 的 `switch (op)` 分派中调用，实参是抽象的。调用者自身位于泛型函数内时，改用调用者的调用点实例推导后再找；经由 `seed.Query` 递归，环由 `cycleFallback` 截断 |
+| 预备 AstGen 的竞态 | `src/diagnostics/live.zig` | `claim` 在结果写入前就将文本标记为已预备，并发的发布可能取不到结果；改为在 `put` 时标记 |
+| 基准在带错误的文件上挂起 | `tools/lsp_bench.zig` | 编辑 → 诊断等待「出现 / 清空错误」，标准库等文件本身带有错误时撤销后永不清空；改为以编辑前的错误个数为基准 |
+
+- 余下的补全缺口：zig-clap 的 `@field` / 反射生成的类型，z2d 中经 comptime 函数指针表分派的泛型函数。
+- 查找引用的冷启动最坏 1.9 s（`src/Compilation.zig` 中被大量文件引用的声明，`ParseFile` 的 LRU 容量 64 不足以容纳候选文件而反复解析）；热状态 p95 124 ms。
+- 测试：`zig build test` 共 260 个。
+
 ## 20. 风险与对策
 
 | 风险 | 影响 | 对策 |
