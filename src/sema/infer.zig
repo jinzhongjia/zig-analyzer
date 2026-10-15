@@ -666,6 +666,11 @@ const Inferrer = struct {
         const callee = try inf.infer(callee_e, if (inf.body.expr(callee_e) == .enum_literal) expected else null);
         const f = switch (inf.ip.key(callee.ty)) {
             .fn_type => |f| f,
+            // 函数指针
+            .ptr_type => |p| if (p.size == .one and inf.ip.key(p.child) == .fn_type) inf.ip.key(p.child).fn_type else {
+                for (args) |a| _ = try inf.infer(a, null);
+                return .unknown;
+            },
             else => {
                 for (args) |a| _ = try inf.infer(a, null);
                 return .unknown;

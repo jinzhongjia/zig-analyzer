@@ -1230,6 +1230,17 @@ test "pointer arithmetic and vector operations" {
     });
 }
 
+test "calls through function pointers" {
+    try expectTypes(
+        \\fn f(fp: *const fn (u32) u64) void {
+        \\    const k = fp(4);
+        \\    _ = k;
+        \\}
+    , &.{
+        .{ "k", "u64" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
