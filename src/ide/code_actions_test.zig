@@ -4,17 +4,27 @@ const resolve = @import("../names/resolve.zig");
 const World = @import("../names/resolve_test.zig").World;
 const code_actions = @import("code_actions.zig");
 
-/// 在 `<|>` 处取标题为 `title` 的修复，返回应用后的文本
+/// 在 `<|>` 处（或 `«...»` 选区上）取标题为 `title` 的修复，返回应用后的文本
 fn apply(text: []const u8, title_prefix: []const u8) ![]const u8 {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
-    const added = try w.add("/p/main.zig", text);
+    // 选区：去掉 `«` `»` 标记
+    var start: ?u32 = null;
+    var end: u32 = 0;
+    const plain = blk: {
+        const open = std.mem.indexOf(u8, text, "«") orelse break :blk text;
+        const close = std.mem.indexOf(u8, text, "»").?;
+        start = @intCast(open);
+        end = @intCast(close - "«".len);
+        break :blk try std.mem.concat(w.arena.allocator(), u8, &.{ text[0..open], text[open + "«".len .. close], text[close + "»".len ..] });
+    };
+    const added = try w.add("/p/main.zig", plain);
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
     const clean = (try ctx.get(@import("../database.zig").syntax.SourceText, added.file)).text;
-    const actions = try code_actions.codeActions(&r, added.file, added.cursor, added.cursor);
+    const actions = try code_actions.codeActions(&r, added.file, start orelse added.cursor, if (start != null) end else added.cursor);
     for (actions) |a| {
         if (!std.mem.startsWith(u8, a.title, title_prefix)) continue;
         var out: std.ArrayList(u8) = .empty;
@@ -149,4 +159,54 @@ test "add missing struct fields" {
         \\    .y = undefined,
         \\};
     );
+}
+
+test "extract to local constant" {
+    try expectAction(
+        \\fn f(a: u32, b: u32) u32 {
+        \\    const c = «a * b» + 1;
+        \\    return c;
+        \\}
+    , "extract",
+        \\fn f(a: u32, b: u32) u32 {
+        \\    const value = a * b;
+        \\    const c = value + 1;
+        \\    return c;
+        \\}
+    );
+    // 表达式位于语句开头；名字已被占用时换一个
+    try expectAction(
+        \\fn g(x: u32) u32 {
+        \\    return x;
+        \\}
+        \\fn f(value: u32) void {
+        \\    if (value > 0) {
+        \\        _ = «g(value)»;
+        \\    }
+        \\}
+    , "extract",
+        \\fn g(x: u32) u32 {
+        \\    return x;
+        \\}
+        \\fn f(value: u32) void {
+        \\    if (value > 0) {
+        \\        const value1 = g(value);
+        \\        _ = value1;
+        \\    }
+        \\}
+    );
+    // 不提取：赋值的左侧、取地址的操作数、while 的条件、不是完整表达式的选区
+    for ([_][]const u8{
+        "fn f() void {\n    var x: u32 = 0;\n    «x» = 1;\n}",
+        "fn f() void {\n    var x: u32 = 0;\n    const p = &«x»;\n    _ = p;\n}",
+        "fn f(n: u32) void {\n    var i: u32 = 0;\n    while («i < n») : (i += 1) {}\n}",
+        "fn f(a: u32) u32 {\n    return «a +» 1;\n}",
+    }) |text| {
+        const got = try apply(text, "extract");
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings("no action", got) catch |err| {
+            std.debug.print("{s}\n", .{text});
+            return err;
+        };
+    }
 }

@@ -3,6 +3,8 @@
 //! - 多余的丢弃（`pointless discard of ...`）：删除 `_ = name;`
 //! - switch 缺少的枚举 / 联合分支：补上 `.name => {},`
 //! - 结构体初始化缺少的字段（没有默认值的）：补上 `.name = undefined`
+//!
+//! 以及重构：选中的表达式提取为局部常量。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -22,9 +24,12 @@ pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
 pub const Action = struct {
     title: []const u8,
+    kind: Kind = .quickfix,
     edits: []const Edit,
     /// 所修复的诊断（`live.AstCheck` 的位置）；没有对应诊断时为 null
     diagnostic: ?struct { start: u32, end: u32 } = null,
+
+    pub const Kind = enum { quickfix, refactor_extract };
 };
 
 /// `[start, end]` 区间内可用的快速修复
@@ -50,7 +55,77 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
     }
     if (try missingProngs(r, file, text, start)) |a| try out.append(r.arena, a);
     if (try missingFields(r, file, text, start)) |a| try out.append(r.arena, a);
+    if (try extractVariable(r, file, text, start, end)) |a| try out.append(r.arena, a);
     return out.items;
+}
+
+/// 选中的表达式（两端空白不计）提取为所在语句之前的局部常量，原处替换为它的名字。
+/// 赋值的左侧、取地址的操作数与控制流表达式不提取（提取后语义改变或不合法）
+fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
+    var start = sel_start;
+    var end = @min(sel_end, @as(u32, @intCast(text.len)));
+    while (start < end and std.ascii.isWhitespace(text[start])) start += 1;
+    while (end > start and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    if (start == end) return null;
+
+    const item = try r.ownerAt(file, start, false) orelse return null;
+    const base = try r.itemOffset(file, item) orelse return null;
+    const b = try r.body(file, item);
+    if (start < base) return null;
+    const rel_start = start - base;
+    const rel_end = end - base;
+    var expr: ?Body.ExprId = null;
+    for (b.expr_ranges, 0..) |range, i| if (range.start == rel_start and range.end == rel_end) {
+        expr = @fromBackingInt(@as(u32, @intCast(i)));
+    };
+    const e = expr orelse return null;
+    switch (b.expr(e)) {
+        .missing, .@"return", .@"break", .@"continue", .@"unreachable", .assign, .block, .loop, .container => return null,
+        else => {},
+    }
+    const within = struct {
+        fn f(body: *const Body, outer: Body.ExprId, rs: u32, re: u32) bool {
+            const range = body.range(outer);
+            return range.start <= rs and re <= range.end;
+        }
+    }.f;
+    for (b.exprs) |x| switch (x) {
+        .assign => |a| if (a.lhs == e) return null,
+        .prefix => |p| if (p.op == .ampersand and p.operand == e) return null,
+        // 循环的条件与 `: (cont)` 每轮都会求值，提取到循环之前只求值一次
+        .loop => |l| if (l.kind == .@"while") {
+            for (l.inputs) |in| if (within(b, in, rel_start, rel_end)) return null;
+            if (l.cont) |c| if (within(b, c, rel_start, rel_end)) return null;
+        },
+        else => {},
+    };
+
+    // 所在语句：块的直接子节点
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const path = try root.coveringPath(r.arena, start);
+    var stmt: ?ast.SyntaxNode = null;
+    for (path[1..], 1..) |n, i| {
+        if (path[i - 1].kind() == .block and n.range().end >= end) stmt = n;
+    }
+    const s = stmt orelse return null;
+
+    // 名字：Zig 不允许遮蔽，选一个在此处不可见、本成员中也没有绑定的名字
+    var buf: [16]u8 = undefined;
+    const name = for (0..100) |n| {
+        const candidate = if (n == 0) "value" else std.fmt.bufPrint(&buf, "value{d}", .{n}) catch unreachable;
+        if (try r.resolveName(file, item, b, b.expr_scopes[@backingInt(e)], candidate) != null) continue;
+        for (b.bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, candidate)) break;
+        } else break try r.arena.dupe(u8, candidate);
+    } else return null;
+
+    const indent = lineIndent(text, s.offset);
+    const new_text = try std.fmt.allocPrint(r.arena, "const {s} = {s};\n{s}{s}{s}", .{ name, text[start..end], indent, text[s.offset..start], name });
+    return .{
+        .title = "extract to local constant",
+        .kind = .refactor_extract,
+        .edits = try r.arena.dupe(Edit, &.{.{ .start = s.offset, .end = end, .text = new_text }}),
+    };
 }
 
 /// 在名字 `offset` 处的局部绑定之后（局部变量的语句之后、参数或捕获所在块的开头）插入 `_ = name;`

@@ -1515,7 +1515,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .renameProvider = .{ .RenameOptions = .{ .prepareProvider = true } },
             .workspaceSymbolProvider = .{ .boolean = true },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
-            .codeActionProvider = .{ .CodeActionOptions = .{ .codeActionKinds = &.{types.CodeActionKind.QuickFix} } },
+            .codeActionProvider = .{ .CodeActionOptions = .{ .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract } } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .boolean = true },
@@ -1810,7 +1810,10 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         } else null;
         o.* = .{ .CodeAction = .{
             .title = a.title,
-            .kind = types.CodeActionKind.QuickFix,
+            .kind = switch (a.kind) {
+                .quickfix => types.CodeActionKind.QuickFix,
+                .refactor_extract => types.CodeActionKind.RefactorExtract,
+            },
             .diagnostics = diagnostics,
             .isPreferred = if (a.diagnostic != null) true else null,
             .edit = .{ .changes = changes },
