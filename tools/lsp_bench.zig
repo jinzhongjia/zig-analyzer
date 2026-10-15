@@ -52,6 +52,8 @@ const Client = struct {
     build_tokens: std.ArrayList([]const u8) = .empty,
     /// 最近一次构建结束时的消息（如 `1 error(s)`）
     build_message: []const u8 = "",
+    /// 各文件最近一次发布的错误诊断个数（按 uri）
+    errors: std.StringHashMapUnmanaged(usize) = .empty,
     last_counts: []const QueryCount = &.{},
     /// 跳转校验中打印的未解析样例数（BENCH_CHECK 的值）
     unresolved_samples: usize = 0,
@@ -90,6 +92,18 @@ const Client = struct {
             const body = try transport.readMessage(&c.reader.interface, c.arena.allocator());
             const msg = try json.parseFromSliceLeaky(json.Value, c.arena.allocator(), body, .{});
             const method = msg.object.get("method") orelse return msg;
+            if (std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) {
+                const params = msg.object.get("params").?.object;
+                var errors: usize = 0;
+                for (params.get("diagnostics").?.array.items) |d| {
+                    const severity = d.object.get("severity") orelse continue;
+                    if (severity == .integer and severity.integer == 1) errors += 1;
+                }
+                const uri = params.get("uri").?.string;
+                const entry = try c.errors.getOrPut(c.arena.allocator(), uri);
+                if (!entry.found_existing) entry.key_ptr.* = try c.arena.allocator().dupe(u8, uri);
+                entry.value_ptr.* = errors;
+            }
             // 进度事件：打印时间线
             if (std.mem.eql(u8, method.string, "$/progress")) {
                 const v = msg.object.get("params").?.object.get("value").?.object;
@@ -133,20 +147,22 @@ const Client = struct {
     }
 
     /// 等待 `uri` 的错误诊断个数满足 `pred`，返回耗时（提示等其他级别不计，如非活动代码）
-    fn waitDiagnostics(c: *Client, uri: []const u8, t0: Io.Timestamp, comptime pred: fn (usize) bool) !f64 {
+    fn waitDiagnostics(c: *Client, uri: []const u8, t0: Io.Timestamp, comptime pred: fn (usize, usize) bool, base: usize) !f64 {
         while (true) {
             const msg = try c.next();
             const method = msg.object.get("method") orelse continue;
             if (!std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) continue;
             const params = msg.object.get("params").?.object;
             if (!std.mem.eql(u8, params.get("uri").?.string, uri)) continue;
-            var errors: usize = 0;
-            for (params.get("diagnostics").?.array.items) |d| {
-                const severity = d.object.get("severity") orelse continue;
-                if (severity == .integer and severity.integer == 1) errors += 1;
-            }
-            if (pred(errors)) return ms(c.io, t0);
+            if (pred(c.errors.get(uri).?, base)) return ms(c.io, t0);
         }
+    }
+
+    /// `uri` 当前的错误诊断个数：先等后台工作结束，使之是当前文本的结果。
+    /// 标准库等文件本身可能带有错误，编辑的计时以此为基准
+    fn baseErrors(c: *Client, uri: []const u8) !usize {
+        _ = try c.request("zig-analyzer/waitIdle", {});
+        return c.errors.get(uri) orelse 0;
     }
 };
 
@@ -652,12 +668,12 @@ fn bodyLine(text: []const u8) ?usize {
     return null;
 }
 
-fn notEmpty(n: usize) bool {
-    return n > 0;
+fn above(n: usize, base: usize) bool {
+    return n > base;
 }
 
-fn isEmpty(n: usize) bool {
-    return n == 0;
+fn atBase(n: usize, base: usize) bool {
+    return n <= base;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -766,16 +782,17 @@ pub fn main(init: std.process.Init) !u8 {
             var edit_times: [10]f64 = undefined;
             var clear_times: [10]f64 = undefined;
             var version: i64 = 2;
+            const base = try c.baseErrors(uri);
             for (&edit_times, &clear_times) |*te, *tc| {
                 var t0 = Io.Clock.awake.now(io);
                 try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "@@" }} });
                 version += 1;
-                te.* = try c.waitDiagnostics(uri, t0, notEmpty);
+                te.* = try c.waitDiagnostics(uri, t0, above, base);
                 t0 = Io.Clock.awake.now(io);
                 const after: Position = .{ .line = end.line, .character = end.character + 2 };
                 try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = after }, .text = "" }} });
                 version += 1;
-                tc.* = try c.waitDiagnostics(uri, t0, isEmpty);
+                tc.* = try c.waitDiagnostics(uri, t0, atBase, base);
             }
             Stats.print("edit→diag", &edit_times);
             Stats.print("undo→clear", &clear_times);
@@ -803,7 +820,7 @@ pub fn main(init: std.process.Init) !u8 {
             // 函数体中的编辑（实际编辑的常见位置，走块级增量重解析）：文件后半段第一个缩进至少 8 个空格、
             // 以 `;` 结尾的语句，在行尾加入语法错误再撤销；再在行尾的注释中连续输入并 hover
             if (bodyLine(text)) |line_end| {
-                _ = try c.request("zig-analyzer/waitIdle", {});
+                const body_base = try c.baseErrors(uri);
                 if (verbose) try c.phase("end-of-file edits");
                 const at = positionOf(text, line_end);
                 const after: Position = .{ .line = at.line, .character = at.character + 2 };
@@ -813,11 +830,11 @@ pub fn main(init: std.process.Init) !u8 {
                     var t0 = Io.Clock.awake.now(io);
                     try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = "@@" }} });
                     version += 1;
-                    te.* = try c.waitDiagnostics(uri, t0, notEmpty);
+                    te.* = try c.waitDiagnostics(uri, t0, above, body_base);
                     t0 = Io.Clock.awake.now(io);
                     try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = after }, .text = "" }} });
                     version += 1;
-                    tc.* = try c.waitDiagnostics(uri, t0, isEmpty);
+                    tc.* = try c.waitDiagnostics(uri, t0, atBase, body_base);
                 }
                 Stats.print("body edit→diag", &body_edit_times);
                 Stats.print("body undo→clear", &body_clear_times);
