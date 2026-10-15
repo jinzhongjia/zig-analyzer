@@ -188,17 +188,19 @@ fn remap(e: Edit, start: u32, end: u32) ?[2]u32 {
     return null;
 }
 
+// 文案复制到 `arena`：live 结果属于 `AstCheck` 的 memo，编译结果属于工作区（新的构建结果到达时释放），
+// 发布在读事务结束、工作区的锁释放之后才序列化，期间两者都可能被释放
 fn liveDiagnostic(arena: Allocator, in: MergeInput, d: live.Diagnostic) Allocator.Error!types.Diagnostic {
     const related = try arena.alloc(types.DiagnosticRelatedInformation, d.notes.len);
     for (d.notes, related) |n, *r| r.* = .{
         .location = .{ .uri = in.uri, .range = in.lines.range(n.start, n.end, in.encoding) },
-        .message = n.message,
+        .message = try arena.dupe(u8, n.message),
     };
     return .{
         .range = in.lines.range(d.start, d.end, in.encoding),
         .severity = .Error,
         .source = "zig ast-check",
-        .message = .{ .string = d.message },
+        .message = .{ .string = try arena.dupe(u8, d.message) },
         .relatedInformation = if (related.len == 0) null else related,
     };
 }
@@ -210,14 +212,14 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
         const lines = try offsets.LineIndex.init(arena, other.text);
         try related.append(arena, .{
             .location = .{ .uri = other.uri, .range = lines.range(n.start, n.end, in.encoding) },
-            .message = n.message,
+            .message = try arena.dupe(u8, n.message),
         });
     }
     return .{
         .range = in.lines.range(start, end, in.encoding),
         .severity = .Error,
         .source = "zig",
-        .message = .{ .string = item.message },
+        .message = .{ .string = try arena.dupe(u8, item.message) },
         .relatedInformation = if (related.items.len == 0) null else related.items,
     };
 }
