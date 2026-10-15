@@ -55,6 +55,10 @@ building: bool = false,
 built: bool = false,
 /// 构建期间又收到构建请求：本轮结果作废，结束后立即重建
 rebuild: bool = false,
+/// 构建过程中得知了新的生成文件路径、但编译集合尚未重算（节流，见 `generated_recompute_interval_ms`）
+generated_dirty: bool = false,
+/// 上一次因生成文件重算编译集合的时间
+generated_recomputed_at: ?Io.Timestamp = null,
 stopping: bool = false,
 /// 项目加载进度（启动到首次编译集合算出）
 loading: ?*Progress = null,
@@ -72,6 +76,9 @@ diag_steps: std.DynamicBitSetUnmanaged = .{},
 bundles: std.ArrayList(ErrorBundle) = .empty,
 /// 已尝试从磁盘加载的文件（不存在的文件也记录，避免反复尝试）
 loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+
+/// 构建过程中因生成文件的路径而重算编译集合的最短间隔
+const generated_recompute_interval_ms = 1000;
 
 /// 启动 maker 并在后台读取事件
 pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
@@ -314,8 +321,19 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     if (try m.setGeneratedPath(ws.gpa, g.file, path)) roots_changed = true;
                 };
             }
-            // 生成的模块根文件路径刚刚得知（或变化）：立即更新编译集合，不必等整个构建结束
-            if (roots_changed) try ws.recomputeCompileSet();
+            // 生成的模块根文件路径刚刚得知（或变化）：不必等整个构建结束就更新编译集合，但要节流。
+            // 大项目的构建图有上千个以生成文件为根的模块（如各测试变体的 build_options），逐个重算会使
+            // 模块图更新上千次，每次都触发打开文件的诊断重新发布与其中的推导重算
+            if (roots_changed) ws.generated_dirty = true;
+            if (ws.generated_dirty) {
+                const now = Io.Clock.awake.now(io);
+                const due = if (ws.generated_recomputed_at) |t| t.durationTo(now).nanoseconds >= generated_recompute_interval_ms * std.time.ns_per_ms else true;
+                if (due) {
+                    ws.generated_dirty = false;
+                    ws.generated_recomputed_at = now;
+                    try ws.recomputeCompileSet();
+                }
+            }
         },
         .build_completed => {
             ws.mutex.lockUncancelable(io);
@@ -342,6 +360,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 ws.build_progress = null;
             }
             try ws.finishBuild();
+            ws.generated_dirty = false;
             try ws.recomputeCompileSet();
             ws.mutex.lockUncancelable(io);
             ws.building = false;
