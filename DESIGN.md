@@ -692,10 +692,10 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 
 ## 14. 可观测性
 
-- **tracy**：编译期开关，query 粒度 zone，自动以 query 名标注。
-- **query 统计**：每个 query 的执行次数、命中率、累计耗时、cutoff 次数，经 `zig-analyzer/status` 暴露。
-- **慢请求日志**：超过阈值的请求记录完整 query 调用树。
-- **日志**：`window/logMessage` + 可选文件日志，按模块分级。
+- **tracy**：编译期开关 `-Dtracy=<tracy 源码目录>`，query 粒度 zone，以 query 名标注；请求以方法名标注。关闭时为空操作。
+- **query 统计**：每个 query 的执行次数、命中率、cutoff 次数、累计耗时（含其中执行的其他 query）、自身耗时、单次最长耗时与当前 memo 数，经 `zig-analyzer/status` 暴露（另有进程常驻内存峰值与 InternPool 大小）。`zig build bench` 结束时与 `zig build sema-corpus` 都按自身耗时打印这张表。
+- **慢请求日志**：超过阈值（`log.slow_request_ms`）的请求记录按 query 汇总的自身耗时，与调用树中的耗时路径（key 显示为「文件名:成员名」）。
+- **日志**：stderr（客户端的输出面板）+ 可选文件日志（`log.file`），级别可在运行时调整（`log.level`）。
 
 ---
 
@@ -720,6 +720,7 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 | `sema.comptime_fuel` | `100000` | 单次 comptime 调用的步数上限 |
 | `cache.max_memory_mb` | `1024` | LRU 回收触发阈值 |
 | `log.level` / `log.file` | `info` / 无 | 日志级别与文件 |
+| `log.slow_request_ms` | `100` | 请求超过此耗时时记录慢请求日志；`0` 关闭 |
 
 - 配置 schema 由 `tools/gen_config.zig` 从 `config.zon` 单一来源生成：Zig 结构体、JSON Schema、文档表格，三者不会不一致。
 - 未知配置项记录警告但不报错；类型错误的配置项回落到默认值并通过 `window/showMessage` 提示一次。
@@ -938,6 +939,7 @@ pub fn make() std.ArrayList(u8) { ... }
 | workspace symbol 的匹配 | 每次请求遍历全部项目文件的 ItemTree 做子序列匹配，没有 trigram 索引（§10.2） | 文件很多的项目中逐字输入查询 | `file_index` 增加声明名的 trigram，先粗筛文件 | M6 |
 | 引用查找的反向 import 图 | 每次查找引用都现场构建反向图；各文件的 `FileIndex` 由后台索引预先算好（M7），构建只需读取缓存。实测冷缓存下在标准库（563 个文件）上查找 `mem.Allocator` 的引用 0.36～0.43 秒（含全部文件的解析），热缓存下几十毫秒 | 更大的项目，或频繁的 document highlight | 反向 import 图做成 query | M6 |
 | ProjectModel 磁盘缓存 | 未实现（§13.1）。M7 实测：Zig 编译器项目上 `zig build` 配置有 Zig 自身的缓存，项目加载约 1 秒（builtin.zig 生成按参数缓存后），冷启动预算已满足 | 配置特别慢的 build.zig | 按 §13.1 实现 | M7 |
+| ~~项目加载期间大量重算 `Infer`~~ | 已处理，见 §19.21 的「第一个发现」 | — | — | §19.21 |
 | Body 随每次解析重新降级 | `ItemBody` 依赖 `FileAstIdMap`，任何编辑后被请求的 Body 都会重新降级（结果按结构比较，内容不变时下游不重算） | 类型推导请求大量 Body 时 | 按成员文本哈希跳过降级，或让 AstIdMap 也做 cutoff | M3 |
 
 ### 19.7 M4 完成情况（2026-10-13）
@@ -1175,6 +1177,34 @@ pub fn make() std.ArrayList(u8) { ... }
 | workspace symbol | `src/server/Server.zig` | 索引进行中时只在已建立索引的文件与打开的文档中查找，不在请求中解析其余文件。LSP 的 `workspace/symbol` 没有 `isIncomplete`（§1 的说法有误）：客户端随输入重新请求，结果随索引的进展补全 |
 
 - 测试：`zig build test` 共 232 个。
+
+### 19.21 可观测性（2026-10-15）
+
+| 部分 | 文件 | 内容 |
+|---|---|---|
+| 查询统计 | `src/db/engine.zig` | 每个 query 的原子计数：执行、命中、cutoff、累计 / 自身 / 最长耗时；执行帧记录其中执行的其他 query 的耗时以得到自身耗时。`Db.stats` 同时统计当前 memo 数 |
+| 调用跟踪 | `src/db/engine.zig` | 读事务可挂 `Trace`：执行开始时按先序追加事件（query、key、深度），结束时补上耗时与是否 cutoff / 取消，可还原调用树 |
+| 报告 | `src/db/report.zig` | 按自身耗时排序的查询统计表；基准工具（从 status 读取）与语料工具共用 |
+| status | `src/server/Server.zig` | `zig-analyzer/status` 返回各 query 的统计、进程常驻内存峰值与 InternPool 大小 |
+| 慢请求日志 | `src/server/Server.zig` | 每个读请求挂 `Trace`；超过 `log.slow_request_ms` 时在读事务结束前生成报告（读取 ItemTree 把成员 key 显示为名字）：按 query 汇总的自身耗时 Top 8，与调用树中耗时达到总耗时 2%（至少 1 ms）的节点（最多 40 行） |
+| 日志 | `src/util/log.zig`、`src/main.zig` | `std_options.logFn`：运行时按 `log.level` 过滤，写 stderr，配置了 `log.file` 时同时追加到文件（时间、级别、作用域、消息） |
+| tracy | `src/util/tracy.zig`、`build.zig` | `-Dtracy=<tracy 源码目录>` 编译 `TracyClient.cpp` 并链接 C++ 标准库；query 计算与请求各为一个 zone。关闭时为编译期确定的空操作，不引用 tracy 的符号 |
+
+- 第一个发现（用这套工具定位并修复）：基准的查询统计显示，在 Compilation.zig 上一次运行中 `Infer` 执行 66.9 万次、累计 50 秒（其中 50.7 万次结果不变），请求延迟却不受影响。基准增加按阶段的统计（`BENCH_VERBOSE` 时每个阶段之后打印各 query 执行次数与 revision 的增量）后看出：
+  - 开销几乎全在项目加载阶段（`Infer` 66.4 万次、48 秒），编辑阶段只有 3480 次；
+  - 加载期间 revision 推进到 3492：Zig 编译器的构建图有 4352 个模块，大量模块的根是生成文件（各测试变体的 `build_options` 等），每个 step 完成、得知一个生成文件的路径时都立即重算编译集合并更新模块图，共更新了 3483 次；
+  - 名字解析直接读取整个模块图（`resolveImport`、`stdType`），模块图每变一次，所有解析过 import 的推导都要重算；每次更新还会重新发布打开文件的诊断（非活动代码要推导整个文件），其中结果不完整而不写入 memo 的推导每次都重算。
+- 修复：
+  - 名字解析经由新的 `ModuleGraph.FileImports(file)`（该文件中出现的模块名各自的目标）与 `StdRoot` 读取模块图，模块图的其他变化在这两个 query 处 cutoff；
+  - 构建过程中因生成文件的路径而重算编译集合改为节流（至少间隔 1 秒，构建结束时总会重算）。
+- 效果（同一基准）：模块图更新 3483 → 4 次，revision 3492 → 14；加载阶段 `Infer` 66.4 万次 / 48.3 秒 → 1 万次 / 1.1 秒；整次运行 `Infer` 的自身耗时 37.5 秒 → 0.2 秒；常驻内存 295 → 269 MB；请求延迟不变。
+- 继续追查重算的来源（统计新增「结果不完整」的次数与原因：环、栈深度、燃料；Trace 事件也标记不完整）：
+  - 不完整的结果全部来自环，没有一次是燃料或栈深度用尽。主要的环：体内容器的方法用到外层函数的局部类型（`fromUnresolved` 中 `struct { fn lessThan(_: void, lhs: PathAndRoot, ...) }`），外层函数体又引用这个方法；体内的 `enum(u32)`（`parse` 中的 `BlockId`）取参数的值。两者都去取外层函数**整体**的推导结果，而外层函数正在推导中。
+  - 修复：新增 `LocalValue(owner, 绑定或 comptime 表达式, inst)`，只推导这一个绑定（类型标注与初始化表达式）或表达式，其中引用的本成员的其他局部绑定同样按需查询；`defType` 取其他成员的局部绑定、`containerArg` 取体内容器的参数都经由它。
+  - 效果：Compilation.zig 每次发布诊断中不完整的推导 47 → 6～18 个，环 70～150 → 2～3 次；剩下的是 Zcu.zig 中 `LazySrcLoc` 的字段 `offset: Offset`、`Offset` 与 `pub const unneeded: LazySrcLoc = .{ .offset = .unneeded }` 之间的环，每次发布不到 1 ms，暂不处理。标准库统计的表达式已知 962770 → 962860。
+- 「非活动代码区间做成 query」：不做。每次发布中求区间约 12～15 ms（编辑到诊断共 15～20 ms），但时间花在逐个成员验证依赖上——每次编辑后全部 766 个成员的 Body 都重新降级（`ItemBody` 依赖 `FileAstIdMap`，后者按指针比较），包一层 query 验证时同样要检查这些依赖。要降低的是 §19.6 中「Body 随每次解析重新降级」。
+- 「不完整的结果在同一 revision 内复用」：不做。修复环之后每次发布只剩几个不完整的推导，不值得为它设计复用的语义（不完整的结果取决于请求的燃料与栈深度）。
+- 测试：`zig build test` 共 237 个（统计与调用跟踪、日志文件的追加与级别过滤、status 与慢请求报告的端到端测试、体内容器引用外层局部绑定不形成环）。
 
 ## 20. 风险与对策
 
