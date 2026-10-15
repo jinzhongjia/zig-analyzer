@@ -249,6 +249,85 @@ fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     return @as(f64, @floatFromInt(kb)) / 1024;
 }
 
+/// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、补全、
+/// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
+fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
+    const a = c.arena.allocator();
+    const io = c.io;
+    const found = try std.process.run(c.gpa, io, .{ .argv = &.{ "find", root, "-name", "*.zig", "-not", "-path", "*/.zig-cache/*", "-not", "-path", "*/zig-out/*" } });
+    defer c.gpa.free(found.stdout);
+    defer c.gpa.free(found.stderr);
+    var files: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, found.stdout, '\n');
+    while (lines.next()) |l| try files.append(a, try a.dupe(u8, l));
+    std.mem.sort([]const u8, files.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    if (files.items.len == 0) return;
+    const per_round = 25;
+    std.debug.print("long session: {d} rounds × {d} files (of {d})\n", .{ rounds, per_round, files.items.len });
+    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "keys", "deps", "s" });
+    const t0 = Io.Clock.awake.now(io);
+    var version: i64 = 1;
+    for (0..rounds) |round| {
+        for (0..per_round) |k| {
+            const path = files.items[(round * per_round + k) % files.items.len];
+            const text = Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(8 * 1024 * 1024), .of(u8), 0) catch continue;
+            const uri = try za.base.uri.fromPath(a, path);
+            const doc = .{ .uri = uri };
+            try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = version, .text = text } });
+            version += 1;
+            const idents = try samplePositions(a, text, false);
+            const step = @max(1, idents.len / 10);
+            var i: usize = 0;
+            while (i < idents.len) : (i += step) _ = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i] });
+            const dots = try samplePositions(a, text, true);
+            if (dots.len > 0) _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
+            const end = positionOf(text, text.len);
+            try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "// x" }} });
+            version += 1;
+            try c.notify("textDocument/didClose", .{ .textDocument = doc });
+        }
+        _ = try c.request("zig-analyzer/waitIdle", {});
+        const st, _ = try c.request("zig-analyzer/status", {});
+        const o = st.object.get("result").?.object;
+        var infer_b: i64 = 0;
+        var body_b: i64 = 0;
+        var parse_b: i64 = 0;
+        var keys: i64 = 0;
+        var deps: i64 = 0;
+        for (o.get("queries").?.array.items) |q| {
+            keys += q.object.get("keys").?.integer;
+            deps += q.object.get("deps").?.integer;
+            const name = q.object.get("name").?.string;
+            const b = q.object.get("bytes").?.integer;
+            if (std.mem.endsWith(u8, name, ".Infer")) infer_b = b;
+            if (std.mem.endsWith(u8, name, ".ItemBody")) body_b = b;
+            if (std.mem.endsWith(u8, name, ".ParseFile")) parse_b = b;
+        }
+        const mb = struct {
+            fn f(x: i64) f64 {
+                return @as(f64, @floatFromInt(x)) / (1024 * 1024);
+            }
+        }.f;
+        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0}\n", .{
+            round + 1,
+            (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
+            mb(o.get("heap_bytes").?.integer),
+            @as(u64, @intCast(o.get("intern_pool_items").?.integer)),
+            mb(o.get("intern_pool_bytes").?.integer),
+            mb(infer_b),
+            mb(body_b),
+            mb(parse_b),
+            @as(u64, @intCast(keys)),
+            @as(u64, @intCast(deps)),
+            @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s,
+        });
+    }
+}
+
 fn notEmpty(n: usize) bool {
     return n > 0;
 }
@@ -421,6 +500,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
+    if (init.environ_map.get("BENCH_SESSION")) |v| try longSession(&c, root, try std.fmt.parseInt(usize, v, 10));
     if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("resident memory {d:.0} MB\n", .{mb});
     try printQueryTable(&c);
     _ = try c.request("shutdown", {});
