@@ -27,6 +27,15 @@ test "build system protocol: read build graph and get compile errors" {
             .handshake => |h| try testing.expectEqual(bsp.protocol_version, h.version),
             .configuration => |path| {
                 model = try configuration.load(gpa, testing.io, project.root, path, &project.env);
+                // 回归：模型中最后分配的字段曾在复制 arena 状态之后分配，新开的 arena 块随模型释放时被漏掉
+                // （是否新开块取决于路径长度，CI 上偶发）。超长的标准库路径保证新开块
+                var long_env = project.env;
+                const long_dir = try gpa.alloc(u8, 64 * 1024);
+                defer gpa.free(long_dir);
+                @memset(long_dir, 'a');
+                long_env.std_dir = long_dir;
+                var long_model = try configuration.load(gpa, testing.io, project.root, path, &long_env);
+                long_model.deinit(gpa);
                 try client.buildSteps(&.{model.?.diagnosticsStep()});
             },
             .step_completed => |sc| if (sc.errors.errorMessageCount() != 0) {
