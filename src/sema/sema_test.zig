@@ -1482,6 +1482,23 @@ test "arrays whose length depends on abstract parameters keep their element type
     });
 }
 
+test "loops over types bind an abstract type" {
+    try expectTypes(
+        \\fn gamma(comptime T: type, x: T) T { return x; }
+        \\fn f() void {
+        \\    inline for (.{ f32, f64 }) |T| {
+        \\        const x: T = 1.0;
+        \\        const g = gamma(T, x);
+        \\        _ = g;
+        \\    }
+        \\}
+    , &.{
+        // 每次迭代的类型不同：与泛型函数的类型参数一样是抽象的
+        .{ "x", "T" },
+        .{ "g", "T" },
+    });
+}
+
 /// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);

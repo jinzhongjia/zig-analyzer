@@ -1335,12 +1335,17 @@ const Inferrer = struct {
                             for (range) |x| _ = try inf.infer(x, .usize_type);
                             break :blk .usize_type;
                         },
-                        else => inf.elementType((try inf.infer(input, null)).ty),
+                        else => inf.forElement((try inf.infer(input, null)).ty),
                     };
                     if (i < l.capture.len) {
                         const cap = l.capture[i];
                         const ptr = inf.body.binding(cap).is_ptr;
-                        inf.bindings[@backingInt(cap)] = .{ .ty = if (ptr) try ip.ptrTo(elem, .one, false) else elem };
+                        // 元素为类型（`inline for (.{ f32, f64 }) |T|`）：每次迭代的类型不同，与泛型函数的
+                        // `comptime T: type` 一样按抽象参数推导
+                        inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
+                            TypedValue.ofType(try ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }))
+                        else
+                            .{ .ty = if (ptr) try ip.ptrTo(elem, .one, false) else elem };
                     }
                 }
             },
@@ -1899,6 +1904,14 @@ const Inferrer = struct {
     }
 
     // ── 类型工具 ─────────────────────────────────────────────────────
+
+    /// `for` 遍历的元素类型：`elementType`，以及各字段类型相同的元组（`.{ f32, f64 }` 的元素为 `type`）
+    fn forElement(inf: *Inferrer, t: Index) Index {
+        const tt = tupleOf(inf.ip, t) orelse return inf.elementType(t);
+        if (tt.types.len == 0) return .unknown;
+        for (tt.types[1..]) |x| if (x != tt.types[0]) return .unknown;
+        return tt.types[0];
+    }
 
     /// 数组、向量、切片、多项指针、指向数组的指针的元素类型
     fn elementType(inf: *Inferrer, t: Index) Index {
