@@ -46,6 +46,8 @@ inlay_parameters: bool = true,
 hide_redundant_param_names: bool = true,
 /// 泛型函数体内没有具体类型时以调用点的实例推导（hover、补全、inlay hints 等）
 callsite_seeding: bool = true,
+/// InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导）；0 为不回收
+max_intern_pool_mb: u32 = 64,
 /// 日志级别（err / warn / info / debug）
 log_level: std.log.Level = .info,
 /// 日志同时追加到这个文件；null 为只写 stderr
@@ -76,6 +78,7 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
+    .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },
     .{ .section = "log", .key = "slow_request_ms", .field = "slow_request_ms" },

@@ -92,6 +92,10 @@ callsite_seeding: std.atomic.Value(bool) = .init(true),
 heap: ?*const za.util.mem.Counting = null,
 /// 慢请求日志的阈值（毫秒，0 为关闭），来自配置 `log.slow_request_ms`
 slow_request_ms: std.atomic.Value(u32) = .init(100),
+/// InternPool 超过这么多 MB 时整代回收类型信息（0 为不回收），来自配置 `sema.max_intern_pool_mb`
+max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
+/// 是否有线程正在整代回收（同时只进行一次）
+sema_resetting: std.atomic.Value(bool) = .init(false),
 /// 编辑触发的诊断发布的防抖（毫秒），来自配置 `diagnostics.debounce_ms`
 debounce_ms: std.atomic.Value(u32) = .init(50),
 /// 编辑触发的待发布文件（见 `publishDebounced`）
@@ -392,6 +396,7 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
                 server.destroyArena(arena);
                 // 读事务已结束：有 query 超出缓存容量且没有其他读事务时淘汰
                 if (server.db.wantsSweep()) _ = server.db.trySweep();
+                server.maybeResetSema();
             }
             const a = arena.allocator();
             var ctx = server.db.beginRead(a);
@@ -424,6 +429,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 server.destroyArena(arena);
                 // 读事务已结束：有 query 超出缓存容量且没有其他读事务时淘汰
                 if (server.db.wantsSweep()) _ = server.db.trySweep();
+                server.maybeResetSema();
             }
             const a = arena.allocator();
             var ctx = server.db.beginRead(a);
@@ -1097,6 +1103,7 @@ fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void 
     za.util.log.setLevel(config.log_level);
     server.slow_request_ms.store(config.slow_request_ms, .monotonic);
     server.debounce_ms.store(config.debounce_ms, .monotonic);
+    server.max_intern_pool_mb.store(config.max_intern_pool_mb, .monotonic);
     server.callsite_seeding.store(config.callsite_seeding, .monotonic);
     if (!reopen_file) return;
     za.util.log.setFile(config.log_file) catch |err| {
@@ -1566,6 +1573,7 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
     server.publishNow(file, false, seen);
+    server.maybeResetSema();
 }
 
 fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
@@ -1577,6 +1585,28 @@ fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
 fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!void {
     defer server.busyEnd();
     server.publishNow(file, clear, null);
+    server.maybeResetSema();
+}
+
+/// InternPool 超过 `sema.max_intern_pool_mb` 时整代回收（见 `resetSema`）。在读事务之外的空闲处调用
+fn maybeResetSema(server: *Server) void {
+    const limit = server.max_intern_pool_mb.load(.monotonic);
+    if (limit == 0 or server.ip.bytes() < @as(usize, limit) * 1024 * 1024) return;
+    if (server.sema_resetting.swap(true, .acq_rel)) return;
+    defer server.sema_resetting.store(false, .release);
+    server.resetSema();
+}
+
+/// 整代回收类型信息：清空 InternPool 中非预置的项，以及 key 或值引用它们的 query（其余 query 中依赖
+/// 它们的 memo 一并丢弃）。InternPool 与这些 query 的 key、依赖边只增不减，长时间会话中随访问过的
+/// 泛型实例持续增长；回收后再请求时按需重新推导
+pub fn resetSema(server: *Server) void {
+    const before = server.ip.bytes();
+    server.db.beginWrite();
+    defer server.db.endWrite();
+    server.db.resetQueries(&.{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.ide.seed.Query });
+    server.ip.reset() catch return log.err("out of memory while resetting the intern pool", .{});
+    log.info("reclaimed type information ({d} MB in the intern pool)", .{before / (1024 * 1024)});
 }
 
 /// `generation`：编辑触发的发布所针对的编辑代数。被打断时若已有更新的编辑就放弃，由那次编辑触发的发布接替

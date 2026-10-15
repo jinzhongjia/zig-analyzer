@@ -49,6 +49,8 @@ pub const Infer = struct {
     pub const Value = *const infer.Result;
     /// 约束长时间会话的内存（泛型实例的结果会不断累积）：被淘汰的结果按需重新推导
     pub const lru = 16 * 1024;
+    /// 值的大小差别很大（长函数的 HIR / 推导结果可达数百 KB），同时按字节数限制
+    pub const lru_bytes = 48 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         if (v == &empty_result) return 0;

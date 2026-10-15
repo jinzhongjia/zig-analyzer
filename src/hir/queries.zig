@@ -36,6 +36,8 @@ pub const ItemBody = struct {
     pub const Value = *const Body;
     /// 约束长时间会话的内存：被淘汰的 Body 按需重新降级
     pub const lru = 16 * 1024;
+    /// 值的大小差别很大（长函数的 HIR / 推导结果可达数百 KB），同时按字节数限制
+    pub const lru_bytes = 48 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         return @sizeOf(Body) + mem.arenaBytes(v.arena);

@@ -289,6 +289,19 @@ pub fn deinit(ip: *InternPool) void {
     ip.* = undefined;
 }
 
+/// 回收全部非预置的项（整代回收，设计 §9.1）。调用方须保证此后没有任何地方使用非预置的 Index：
+/// 引用它们的 query 同时清空（`Db.resetQueries`），且没有读事务在进行
+pub fn reset(ip: *InternPool) Allocator.Error!void {
+    {
+        ip.mutex.lockUncancelable(ip.io);
+        defer ip.mutex.unlock(ip.io);
+        ip.items.clearAndFree(ip.gpa);
+        ip.map.clearAndFree(ip.gpa);
+        _ = ip.arena.reset(.free_all);
+    }
+    for (preset, 0..) |k, i| std.debug.assert(@backingInt(try ip.get(k)) == i);
+}
+
 /// 占用的字节数（Key 表、哈希表与存放 Key 中切片的 arena），用于统计
 pub fn bytes(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
@@ -690,4 +703,18 @@ test "interning is idempotent and presets are stable" {
     const eu = try ip.get(.{ .error_union_type = .{ .err = .anyerror_type, .payload = try ip.optionalOf(a) } });
     try ip.print(eu, &w, Names{});
     try testing.expectEqualStrings("anyerror!?[]const u8", w.buffered());
+}
+
+test "reset keeps the presets and frees everything else" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    const n = ip.count();
+    const slice = try ip.ptrTo(.u8_type, .slice, true);
+    _ = try ip.errorSet(testing.allocator, &.{ "A", "B" });
+    try testing.expect(ip.count() > n);
+    try ip.reset();
+    try testing.expectEqual(n, ip.count());
+    try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
+    // 重新驻留得到同样的位置（下标只取决于驻留顺序）
+    try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
 }

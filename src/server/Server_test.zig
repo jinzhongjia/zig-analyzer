@@ -305,3 +305,40 @@ test "live diagnostics are debounced per file and AstGen runs outside the read t
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "resetting type information gives the same hover results" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-2";
+    const text =
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\const L = List(u8);
+        \\pub fn main() void {
+        \\    const l: L = undefined;
+        \\    _ = l.items;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 6, .character = 11 } };
+    const before = try h.request("textDocument/hover", at);
+    const contents = before.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, contents, "[]u8") != null);
+
+    const items = h.server.ip.count();
+    h.server.resetSema();
+    try testing.expect(h.server.ip.count() < items);
+    const after = try h.request("textDocument/hover", at);
+    try testing.expectEqualStrings(contents, after.object.get("result").?.object.get("contents").?.object.get("value").?.string);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

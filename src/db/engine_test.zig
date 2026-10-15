@@ -182,6 +182,27 @@ const Cached = struct {
     }
 };
 
+/// 按字节数淘汰的 query：个数上限很大，字节数上限只容得下一个值
+const Sized = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub const lru: usize = 100;
+    pub const lru_bytes: usize = 10;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return ctx.db.gpa.dupe(u8, try ctx.get(Text, key));
+    }
+    pub fn bytes(v: Value) usize {
+        return v.len;
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
 const CachedLen = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -208,7 +229,7 @@ const Burn = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Swallow, Cached, CachedLen, Burn });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Swallow, Cached, Sized, CachedLen, Burn });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -437,6 +458,55 @@ test "cancellation: result of a compute that swallowed Canceled is not memoized"
     const before = executions(&d, Swallow);
     try testing.expectEqual(7, try read(&d, Swallow, 1));
     try testing.expectEqual(before + 1, executions(&d, Swallow));
+}
+
+test "resetQueries: cleared keys and dependent memos are recomputed" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 25, .high);
+    try testing.expectEqual(3, try read(&d, Plus, 1));
+    try testing.expectEqual(0, try read(&d, OnlyStable, 1));
+
+    d.beginWrite();
+    d.resetQueries(&.{Tens});
+    d.endWrite();
+    var buf: [Db.query_types.len]db.QueryStats = undefined;
+    const stats = d.stats(&buf);
+    try testing.expectEqual(0, stats.queries[comptime Db.queryIndex(Tens)].keys);
+    // Plus 依赖 Tens：memo 被丢弃，重新读取时两者都重算
+    try testing.expectEqual(0, stats.queries[comptime Db.queryIndex(Plus)].memos);
+    const tens = executions(&d, Tens);
+    const plus = executions(&d, Plus);
+    try testing.expectEqual(3, try read(&d, Plus, 1));
+    try testing.expectEqual(tens + 1, executions(&d, Tens));
+    try testing.expectEqual(plus + 1, executions(&d, Plus));
+    // 与它们无关的 memo 保留（high durability 的依赖也重新验证，但不重算）
+    const only = executions(&d, OnlyStable);
+    _ = try read(&d, OnlyStable, 1);
+    try testing.expectEqual(only, executions(&d, OnlyStable));
+}
+
+test "lru_bytes: values are evicted by size, oldest first" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    {
+        d.beginWrite();
+        defer d.endWrite();
+        for (1..4) |k| try d.set(Text, @intCast(k), try testing.allocator.dupe(u8, "abcdef"), .low);
+    }
+    for (1..4) |k| _ = try read(&d, Sized, @intCast(k));
+    try testing.expect(d.wantsSweep());
+    try testing.expect(d.trySweep());
+    var buf: [Db.query_types.len]db.QueryStats = undefined;
+    const q = d.stats(&buf).queries[comptime Db.queryIndex(Sized)];
+    // 3 × 6 字节超过 10：淘汰到不超过 7.5 字节，只留下最近使用的一个
+    try testing.expectEqual(1, q.memos);
+    const before = executions(&d, Sized);
+    try testing.expectEqualStrings("abcdef", try read(&d, Sized, 3));
+    try testing.expectEqual(before, executions(&d, Sized));
+    // 被淘汰的值按需恢复
+    try testing.expectEqualStrings("abcdef", try read(&d, Sized, 1));
+    try testing.expectEqual(before + 1, executions(&d, Sized));
 }
 
 test "concurrent reads: readers of the same query agree" {

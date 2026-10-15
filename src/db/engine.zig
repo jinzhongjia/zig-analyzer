@@ -29,7 +29,10 @@
 //! derived query 可改为声明 `computeIncremental(ctx, key, prev: ?Value)`，重算时引擎传入上一次的值
 //! （首次计算为 null）。结果必须与从零计算完全相同，prev 只用于加速；读取 prev 不记录依赖。
 //!
-//! derived query 可声明 `pub fn bytes(v: Value) usize`：值占用的字节数，只用于统计（`Db.stats`）。
+//! query 可声明 `pub fn bytes(v: Value) usize`：值占用的字节数，只用于统计（`Db.stats`）。
+//!
+//! 同时声明了 `lru` 与 `bytes` 的 query 可再声明 `pub const lru_bytes: usize = N`：保留值的字节数超过 N 时
+//! 同样按最近使用淘汰（值的大小差别很大时，只按个数限制不住内存）。
 //!
 //! derived query 可声明 `pub const lru: usize = N`：保留值的 memo 超过 N 个时，最久未使用的 memo
 //! 被淘汰，只删除值，保留依赖与 changed_at。被淘汰的 memo 验证通过时重算并沿用原 changed_at
@@ -217,6 +220,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 slots: std.ArrayList(Slot) = .empty,
                 /// 保留着值的 memo 数（只对声明了 `lru` 的 query 统计）
                 live: usize = 0,
+                /// 保留着的值的字节数（只对声明了 `lru_bytes` 的 query 统计）
+                live_bytes: usize = 0,
 
                 const Slot = switch (Q.kind) {
                     .input => struct {
@@ -371,37 +376,97 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             inline for (queries, 0..) |Q, qi| {
                 if (comptime Q.kind == .derived and @hasDecl(Q, "lru")) {
                     const table = &db.tables[qi];
-                    if (table.live > Q.lru) evictTable(Q, table, db.gpa, table.live - Q.lru * 3 / 4);
+                    const over_bytes = if (@hasDecl(Q, "lru_bytes")) table.live_bytes > Q.lru_bytes else false;
+                    if (table.live > Q.lru or over_bytes) evictTable(Q, table, db.gpa);
                 }
             }
         }
 
-        fn evictTable(comptime Q: type, table: *Table(Q), gpa: Allocator, count: usize) void {
-            // 第 count 小的最近使用时间之前（含）的都淘汰；内存不足时退而淘汰全部
-            const ticks = gpa.alloc(u64, table.live) catch {
+        /// 按最近使用时间从旧到新淘汰，直到个数与字节数都降到上限的 3/4（留出余量，避免频繁清扫）
+        fn evictTable(comptime Q: type, table: *Table(Q), gpa: Allocator) void {
+            const target_count = Q.lru * 3 / 4;
+            const target_bytes: usize = if (@hasDecl(Q, "lru_bytes")) Q.lru_bytes * 3 / 4 else std.math.maxInt(usize);
+            const Entry = struct { tick: u64, slot: u32 };
+            // 内存不足时退而淘汰全部
+            const entries = gpa.alloc(Entry, table.live) catch {
                 for (table.slots.items) |*slot| if (slot.memo) |*m| if (!m.evicted) evictMemo(Q, table, m, gpa);
                 return;
             };
-            defer gpa.free(ticks);
+            defer gpa.free(entries);
             var n: usize = 0;
-            for (table.slots.items) |slot| if (slot.memo) |m| if (!m.evicted) {
-                ticks[n] = m.last_used;
+            for (table.slots.items, 0..) |slot, i| if (slot.memo) |m| if (!m.evicted) {
+                entries[n] = .{ .tick = m.last_used, .slot = @intCast(i) };
                 n += 1;
             };
-            std.mem.sort(u64, ticks[0..n], {}, std.sort.asc(u64));
-            const limit = ticks[@min(count, n) - 1];
-            var evicted: usize = 0;
-            for (table.slots.items) |*slot| if (slot.memo) |*m| if (!m.evicted and m.last_used <= limit and evicted < count) {
-                evictMemo(Q, table, m, gpa);
-                evicted += 1;
-            };
+            std.mem.sort(Entry, entries[0..n], {}, struct {
+                fn lt(_: void, a: Entry, b: Entry) bool {
+                    return a.tick < b.tick;
+                }
+            }.lt);
+            for (entries[0..n]) |e| {
+                if (table.live <= target_count and table.live_bytes <= target_bytes) break;
+                evictMemo(Q, table, &table.slots.items[e.slot].memo.?, gpa);
+            }
         }
 
         fn evictMemo(comptime Q: type, table: *Table(Q), m: *Table(Q).Memo, gpa: Allocator) void {
+            if (@hasDecl(Q, "lru_bytes")) table.live_bytes -= Q.bytes(m.value);
             deinitValue(Q, &m.value, gpa);
             m.value = undefined;
             m.evicted = true;
             table.live -= 1;
+        }
+
+        /// 清空这些 derived query 的全部 key 与 memo，供回收它们的 key 或值所引用的外部状态（如 InternPool）。
+        /// 依赖边以 key 的下标记录，清空后下标失效：其他 query 中依赖它们的 memo 一并丢弃（重新读取时重算）。
+        /// 推进 revision 并标记所有 durability 层已变化，剩下的 memo 都重新验证。只能在写事务中调用
+        pub fn resetQueries(db: *Db, comptime reset: []const type) void {
+            assert(db.writing);
+            db.collectGarbage();
+            const cleared = comptime blk: {
+                var c: [queries.len]bool = @splat(false);
+                for (reset) |Q| {
+                    assert(Q.kind == .derived);
+                    c[queryIndex(Q)] = true;
+                }
+                break :blk c;
+            };
+            inline for (queries, 0..) |Q, qi| {
+                if (comptime Q.kind == .derived and !cleared[qi]) {
+                    const table = &db.tables[qi];
+                    for (table.slots.items) |*slot| if (slot.memo) |*memo| {
+                        const stale = for (memo.deps) |d| {
+                            if (cleared[d.query]) break true;
+                        } else false;
+                        if (!stale) continue;
+                        if (!memo.evicted) {
+                            if (@hasDecl(Q, "lru_bytes")) table.live_bytes -= Q.bytes(memo.value);
+                            deinitValue(Q, &memo.value, db.gpa);
+                            if (@hasDecl(Q, "lru")) table.live -= 1;
+                        }
+                        db.gpa.free(memo.deps);
+                        slot.memo = null;
+                    };
+                }
+            }
+            inline for (queries, 0..) |Q, qi| {
+                if (comptime cleared[qi]) {
+                    const table = &db.tables[qi];
+                    for (table.slots.items) |*slot| if (slot.memo) |*memo| {
+                        if (!memo.evicted) deinitValue(Q, &memo.value, db.gpa);
+                        db.gpa.free(memo.deps);
+                    };
+                    table.slots.clearAndFree(db.gpa);
+                    table.keys.clearAndFree(db.gpa);
+                    table.live = 0;
+                    table.live_bytes = 0;
+                }
+            }
+            if (!db.bumped_in_write) {
+                db.revision += 1;
+                db.bumped_in_write = true;
+            }
+            db.last_changed = @splat(db.revision);
         }
 
         pub fn endWrite(db: *Db) void {
@@ -783,6 +848,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (old.evicted) {
                         if (restore) changed_at = old.changed_at;
                         if (@hasDecl(Q, "lru")) table.live += 1;
+                        if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                     } else if (valueEql(Q, old.value, value)) {
                         // early cutoff：保留旧值与旧 changed_at
                         changed_at = old.changed_at;
@@ -793,10 +859,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                         deinitValue(Q, &value, db.gpa);
                         value = old.value;
                     } else {
+                        if (@hasDecl(Q, "lru_bytes")) table.live_bytes = table.live_bytes - Q.bytes(old.value) + Q.bytes(value);
                         try db.discardLocked(Q, &old.value);
                     }
-                } else if (@hasDecl(Q, "lru")) table.live += 1;
+                } else {
+                    if (@hasDecl(Q, "lru")) table.live += 1;
+                    if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
+                }
                 if (@hasDecl(Q, "lru") and table.live > Q.lru) db.sweep_wanted.store(true, .monotonic);
+                if (@hasDecl(Q, "lru_bytes") and table.live_bytes > Q.lru_bytes) db.sweep_wanted.store(true, .monotonic);
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,
