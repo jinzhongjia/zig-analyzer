@@ -62,7 +62,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | libvaxis（`src/Vaxis.zig`） | 2.5 万行 | 0.2 ms | 0.3 ms | 59 ms | 5 ms | 232 MB |
 | http.zig（`src/httpz.zig`） | 1.5 万行 | 0.5 ms | 0.4 ms | 64 ms | 9 ms | 105 MB |
 | zig-clap（`clap.zig`） | 0.3 万行 | 0.2 ms | 0.3 ms | 62 ms | 5 ms | 84 MB |
-| 97 个库批量校验 | — | 中位数 0.3 ms，最大 6.0 ms | — | — | — | 中位数 64 MB，最大 181 MB |
+| 97 个库批量校验 | — | 中位数 0.3 ms，最大 7.0 ms | — | — | — | 中位数 66 MB，最大 201 MB |
 
 编辑 → 诊断均含 50 ms 防抖。
 
@@ -165,6 +165,7 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 ### 4.7 构建集成（`project/`）
 
 - 直接作为官方构建系统协议 `zig build --listen=-` 的客户端：握手校验 `build_system_version`，读取 `bsp_configuration` 中的构建图（`std.Build.Configuration`）转换为 ProjectModel，按 step 请求构建并从 `bsp_step_completed` 取 `ErrorBundle` 与生成文件路径；`bsp_configuration_failed` 作为 `build.zig` 的诊断发布。
+- 构建图只包含 step 可达的模块。没有任何 compile step 的项目（只导出模块、由使用方编译的库）在 `.zig-cache/zig-analyzer/exports` 中生成探针包：以项目为 path 依赖，为每个导出的模块添加 object step，复用项目的 `zig-pkg`；读出的模块与 compile step 并入 ProjectModel，只用于模块归属，不出现在构建请求中。
 - 同一进程同时承担项目模型与编译器诊断；崩溃后退避重启，`build.zig` 变化时由 maker 重新配置，完成前沿用旧模型。
 - 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库，用户 zig 版本不同时降级（单文件模式 / `zig ast-check`）。发布版本跟随 Zig 版本。
 
@@ -202,9 +203,9 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 
 | 变量 | 校验 | 通过标准 |
 |---|---|---|
-| `BENCH_CHECK=<n>` | 对标识符请求 declaration，目标处名字应与请求处相同 | 不一致 = 0 |
+| `BENCH_CHECK=<n>` | 对标识符请求 declaration，目标处名字应与请求处相同；未解析的按种类（原始类型、`len` / `ptr`、错误名、`.` 字面量、成员访问、标签、名字）统计 | 不一致 = 0 |
 | `BENCH_COMPLETE=<n>` | 源码中的 `a.b` 在 `.` 后补全，列表中应有 `b` | 召回 ≥ 95% |
-| `BENCH_REFS=<n>` | 查找引用与重命名 | 名字不符、误报、遗漏、重命名不一致均为 0 |
+| `BENCH_REFS=<n>` | 查找引用与重命名；泛型函数体中在其他调用点实例下指向同名声明的引用另计 | 名字不符、误报、遗漏、重命名不一致均为 0 |
 | `BENCH_SAVE=1` | 保存 → 编译器诊断，与 `zig build` 逐条比较 | 完全一致 |
 | `BENCH_SESSION=<轮数>` | 长时间会话的内存 | 稳定，不超过预算 |
 | `BENCH_QUICK=1` | 跳过编辑相关阶段，用于批量校验 | — |
@@ -215,9 +216,9 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 
 | 范围 | 结果 |
 |---|---|
-| 97 个 Zig 0.17.0 库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib 等）批量校验 | 崩溃 / 超时 0；declaration 不一致 0（解析率中位数 88.5%）；引用与重命名错误 0；补全召回中位数 99.7%，81 / 97 ≥ 95%；hover p50 中位数 0.3 ms；常驻内存中位数 64 MB、最大 181 MB |
-| 语料对拍（8438 个文件、182.5 MB） | 全部通过；10 万次随机编辑下增量与全量解析无不一致 |
+| 97 个 Zig 0.17.0 库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib 等）批量校验 | 崩溃 / 超时 0；declaration 不一致 0（解析率中位数 89.4%；构建图正常的 80 个项目排除没有声明位置的标识符后 99.7%）；引用与重命名错误 0；补全召回中位数 100%，88 / 97 ≥ 95%；hover p50 中位数 0.3 ms；常驻内存中位数 66 MB、最大 201 MB |
+| 语料对拍（10305 个文件、264.6 MB） | 全部通过；12 万次随机编辑下增量与全量解析无不一致 |
 | 编译器诊断对拍 | 15 / 15 一致 |
 | 格式化对拍 | 372 / 372 个文件一致 |
 
-召回低于 95% 的库主要因依赖未能取得而没有构建图；其余为 `@cImport` 与经多层泛型的 comptime 反射类型。
+召回低于 95% 的 9 个库中，2 个没有成员访问样本，4 个因依赖未能取得而没有构建图，其余为 `@cImport` 与泛型中的 comptime 反射类型。
