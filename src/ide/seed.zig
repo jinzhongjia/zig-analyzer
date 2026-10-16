@@ -42,6 +42,30 @@ pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     };
 }
 
+/// 同 `find`，但要求成员中相对位置 `rel` 处的代码在该实例下是活动的（如 `if (has_alpha)` 分支中，
+/// 第一个调用点的实例没有 alpha 时取下一个有的）。第一个调用点满足时与 `find` 相同；否则重新查找，不缓存
+pub fn findActive(r: *Resolver, file: FileId, item: u32, rel: u32) resolve.Error!?Seed {
+    const first = try find(r, file, item) orelse return null;
+    const owner = try r.ownerKey(file, item);
+    const body = try r.ctx.get(hir.ItemBody, owner);
+    if (!inactiveAt(body, first.res, rel)) return first;
+    const found = try search_(r, owner, rel) orelse return first;
+    return .{
+        .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
+        .file = found.file,
+        .offset = found.offset,
+    };
+}
+
+/// 相对位置 `rel` 落在推导结果的非活动分支中
+fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
+    for (res.inactive) |e| {
+        const rg = body.range(e);
+        if (rg.start <= rel and rel < rg.end) return true;
+    }
+    return false;
+}
+
 /// 成员所用的调用点：实例与调用表达式的位置
 pub const Found = struct { inst: ?Index, file: FileId, offset: u32 };
 
@@ -55,25 +79,30 @@ pub const Query = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        const tree = try r.itemTree(key.file);
-        const item: u32 = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.item) break @intCast(i);
-        } else return null;
-        const root = try genericRoot(&r, key.file, item) orelse return null;
-        const files = try search.importers(&r, key.file, try search.projectFiles(&r));
-        const names = try callNames(&r, key.file, root, files);
-        if (try findIn(&r, key.file, key.file, item, root, names)) |s| return s;
-        for (files) |f| {
-            if (f == key.file or !try containsAny(&r, f, names)) continue;
-            if (try findIn(&r, f, key.file, item, root, names)) |s| return s;
-        }
-        return null;
+        return search_(&r, key, null);
     }
 
     pub fn cycleFallback(_: Key) Value {
         return null;
     }
 };
+
+/// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的
+fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32) resolve.Error!?Found {
+    const tree = try r.itemTree(key.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == key.item) break @intCast(i);
+    } else return null;
+    const root = try genericRoot(r, key.file, item) orelse return null;
+    const files = try search.importers(r, key.file, try search.projectFiles(r));
+    const names = try callNames(r, key.file, root, files);
+    if (try findIn(r, key.file, key.file, item, root, names, active)) |s| return s;
+    for (files) |f| {
+        if (f == key.file or !try containsAny(r, f, names)) continue;
+        if (try findIn(r, f, key.file, item, root, names, active)) |s| return s;
+    }
+    return null;
+}
 
 /// 调用泛型函数 `root` 可能使用的名字：函数名，以及 `files` 中指向它的容器级别名
 /// （`const biggest = lib.max;`，含别名的别名）。只检查文件索引中出现这些名字的文件
@@ -127,7 +156,7 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8) resolve.Error!?Found {
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32) resolve.Error!?Found {
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
@@ -138,19 +167,19 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
         // 实参是抽象的，改用调用者的调用点实例推导后再找。经由 Query 递归，环由 cycleFallback 截断
         if (try genericRoot(r, in, @intCast(i)) == null) continue;
         const outer = try r.ctx.get(Query, owner) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
-        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active)) |s| return s;
     }
     return null;
 }
 
 /// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用
-fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey) resolve.Error!?Found {
+fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32) resolve.Error!?Found {
     const ip = r.ctx.db.env.ip;
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
@@ -180,7 +209,13 @@ fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer
         const inst = try infer.instanceOf(r, r.arena, g, f, args);
         if (!value.isConcrete(ip, inst)) continue;
         const node = try r.itemNode(in, i) orelse continue;
-        return .{ .inst = try queries.normalizeInst(r, file, item, inst), .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
+        const norm = try queries.normalizeInst(r, file, item, inst);
+        if (active) |rel| {
+            const owner = try r.ownerKey(file, item);
+            const target = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
+            if (inactiveAt(try r.ctx.get(hir.ItemBody, owner), target, rel)) continue;
+        }
+        return .{ .inst = norm, .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
     }
     return null;
 }

@@ -754,3 +754,34 @@ test "member completion on values lists function aliases as methods" {
     // 函数的别名 `isARM` 可作为方法调用；值常量 `count` 不列出
     try testing.expectEqualStrings("x86 arm isArm isARM", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
+
+test "completion in a branch inactive for the first call site uses a call site where it is active" {
+    const text =
+        \\const Rgb = struct { r: u8 };
+        \\const Rgba = struct { r: u8, a: u8 };
+        \\fn opaqueOf(comptime T: type, v: T) T {
+        \\    var res = v;
+        \\    if (@hasField(T, "a")) {
+        \\        res.<|> = 255;
+        \\    }
+        \\    return res;
+        \\}
+        \\fn run() void {
+        \\    _ = opaqueOf(Rgb, .{ .r = 0 });
+        \\    _ = opaqueOf(Rgba, .{ .r = 0, .a = 0 });
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    // 第一个调用点（Rgb）下该分支不生效：取第二个调用点（Rgba）
+    try testing.expectEqualStrings("r a", try std.mem.join(w.arena.allocator(), " ", labels.items));
+}

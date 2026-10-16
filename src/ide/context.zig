@@ -87,7 +87,7 @@ pub fn at(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.
 /// 同 `at`；成员位于泛型函数内时附带调用点实例的推导结果（`At.seeded`）
 pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.Error!?At {
     var a = try at(r, file, offset, inclusive_end) orelse return null;
-    a.seeded = try seed.find(r, a.file, a.item);
+    a.seeded = try seed.findActive(r, a.file, a.item, a.rel);
     return a;
 }
 
