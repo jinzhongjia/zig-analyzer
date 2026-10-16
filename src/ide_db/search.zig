@@ -226,19 +226,38 @@ pub fn mentions(body: *const Body, name: []const u8) bool {
 fn lastNameStart(text: []const u8, end: u32) ?u32 {
     if (end == 0 or end > text.len) return null;
     if (text[end - 1] == '"') {
-        const q = std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '"') orelse return null;
-        if (q == 0 or text[q - 1] != '@') return null;
-        return @intCast(q - 1);
+        // 内部可能有转义的引号：从同一行中每个 `@"` 起按字符串字面量的规则向后扫描，取恰好结束于 `end` 的
+        const line_start = if (std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '\n')) |i| i + 1 else 0;
+        var q = end - 1;
+        while (q > line_start + 1) {
+            q -= 1;
+            if (text[q] == '"' and text[q - 1] == '@' and quotedEnd(text, q) == end) return @intCast(q - 1);
+        }
+        return null;
     }
     var i = end;
     while (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) i -= 1;
     return if (i == end) null else i;
 }
 
+/// 起始于 `q`（开引号）的字符串字面量的结束位置（闭引号之后）
+fn quotedEnd(text: []const u8, q: usize) ?usize {
+    var i = q + 1;
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        '\\' => i += 1,
+        '"' => return i + 1,
+        '\n' => return null,
+        else => {},
+    };
+    return null;
+}
+
 test lastNameStart {
     try std.testing.expectEqual(4, lastNameStart("a.b.cde", 7));
     try std.testing.expectEqual(2, lastNameStart("x.@\"a b\"", 8));
     try std.testing.expectEqual(null, lastNameStart("a.", 2));
+    try std.testing.expectEqual(2, lastNameStart("s.@\"a\\\"b\"", 9));
+    try std.testing.expectEqual(2, lastNameStart("s.@\"a\\\\\"", 8));
 }
 
 fn keyDef(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {

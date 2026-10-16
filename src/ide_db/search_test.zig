@@ -124,3 +124,22 @@ test "enum member names are not references to declarations of the same name" {
     // 在成员名处查找：是该成员自身，不是同名的函数
     try testing.expectEqualStrings("x:2:read*", try refs(&w, fs, f, at(src, "read", 1), null));
 }
+
+test "references to quoted names with escaped quotes" {
+    const src =
+        \\const S = struct { @"a\"b": u32 };
+        \\pub fn f(s: S) u32 {
+        \\    return s.@"a\"b";
+        \\}
+        \\const @"\x66oo": u8 = 7;
+        \\const bar = foo + @"foo";
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:@\"a\\\"b\"* x:3:@\"a\\\"b\"", try refs(&w, fs, f, at(src, "@\"a", 0), null));
+    // 转义的名字与普通写法是同一个名字
+    try testing.expectEqualStrings("x:5:@\"\\x66oo\"* x:6:foo x:6:@\"foo\"", try refs(&w, fs, f, at(src, "@\"\\x66", 0), null));
+}
