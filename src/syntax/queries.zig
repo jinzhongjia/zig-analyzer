@@ -81,6 +81,10 @@ pub const FileItemTree = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree;
+    /// 约束长时间会话的内存：每个访问过的文件都有一份，大项目（Zig 编译器源码与标准库）中可达 50 MB。
+    /// 被淘汰的按需重建；依赖未变时沿用原 changed_at，下游不重算
+    pub const lru = 16 * 1024;
+    pub const lru_bytes = 32 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         return @sizeOf(ItemTree) + mem.arenaBytes(v.arena);
