@@ -124,3 +124,27 @@ test "enum member names are not references to declarations of the same name" {
     // 在成员名处查找：是该成员自身，不是同名的函数
     try testing.expectEqualStrings("x:2:read*", try refs(&w, fs, f, at(src, "read", 1), null));
 }
+
+test "references in generic bodies use a call site instance" {
+    const src =
+        \\const Real = struct {
+        \\    pub fn getenv(_: *Real) ?[]const u8 {
+        \\        return null;
+        \\    }
+        \\};
+        \\fn lookup(comptime System: type, system: *System) ?[]const u8 {
+        \\    return system.getenv();
+        \\}
+        \\pub fn main() void {
+        \\    var s: Real = .{};
+        \\    _ = lookup(Real, &s);
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    // `system` 在抽象的推导中未知：与跳转一样取调用点（`lookup(Real, ..)`）的实例
+    try testing.expectEqualStrings("x:2:getenv* x:7:getenv", try refs(&w, fs, f, at(src, "getenv", 0), null));
+}

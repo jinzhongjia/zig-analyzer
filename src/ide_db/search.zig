@@ -15,6 +15,7 @@ const Def = resolve.Def;
 const Body = @import("../hir/Body.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("FileIndex.zig");
+const seed = @import("../ide/seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 
@@ -148,6 +149,7 @@ const Finder = struct {
         if (!mentions(body, f.name)) return;
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
+        var sd: Seeded = .unknown;
         for (body.exprs, 0..) |e, i| {
             const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
             const range = body.expr_ranges[i];
@@ -160,22 +162,20 @@ const Finder = struct {
                     const d = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns|
                         try r.memberDef(ns, f.name)
                     else
-                        try f.viaTypes(&res, file, item_index, id);
+                        try f.viaTypes(&res, &sd, file, item_index, id);
                     if (d != null and deepEql(d.?, f.def)) try f.addLastToken(file, base + range.end);
                 },
                 .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
-                    const d = try f.viaTypes(&res, file, item_index, id);
+                    const d = try f.viaTypes(&res, &sd, file, item_index, id);
                     if (d != null and deepEql(d.?, f.def)) try f.addLastToken(file, base + range.end);
                 },
                 .init => |x| for (x.fields, 0..) |fi, k| {
                     const n = fi.name orelse continue;
                     if (!std.mem.eql(u8, n, f.name)) continue;
                     const result = try f.inferred(&res, file, item_index);
-                    for (result.field_refs) |ref| {
-                        if (ref.init != id or ref.index != k) continue;
-                        const d = try keyDef(r, ref.member) orelse continue;
-                        if (deepEql(d, f.def)) try f.add(file, base + fi.name_range.start, base + fi.name_range.end);
-                    }
+                    const member = fieldRef(result, id, k) orelse if (try f.seeded(&sd, file, item_index)) |s| fieldRef(s.res, id, k) else null;
+                    const d = try keyDef(r, member orelse continue) orelse continue;
+                    if (deepEql(d, f.def)) try f.add(file, base + fi.name_range.start, base + fi.name_range.end);
                 },
                 else => {},
             }
@@ -189,12 +189,29 @@ const Finder = struct {
         return x;
     }
 
-    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员）
-    fn viaTypes(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, e: Body.ExprId) resolve.Error!?Def {
+    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员）。泛型函数体内抽象的结果中求不出时，
+    /// 与跳转一样取调用点实例的结果（设计 §9.4，如 `fn get(comptime S: type, s: *S)` 中的 `s.getenv`）
+    fn viaTypes(f: *Finder, res: *?*const infer.Result, sd: *Seeded, file: FileId, item_index: u32, e: Body.ExprId) resolve.Error!?Def {
         const result = try f.inferred(res, file, item_index);
         const i = @backingInt(e);
         if (i >= result.members.len) return null;
-        return keyDef(f.r, result.members[i] orelse return null);
+        const member = result.members[i] orelse blk: {
+            const s = try f.seeded(sd, file, item_index) orelse return null;
+            break :blk if (i < s.res.members.len) s.res.members[i] orelse return null else return null;
+        };
+        return keyDef(f.r, member);
+    }
+
+    /// 成员的调用点实例的推导结果（每个成员只查找一次）
+    fn seeded(f: *Finder, sd: *Seeded, file: FileId, item_index: u32) resolve.Error!?seed.Seed {
+        switch (sd.*) {
+            .unknown => {
+                sd.* = if (try seed.find(f.r, file, item_index)) |s| .{ .found = s } else .none;
+                return f.seeded(sd, file, item_index);
+            },
+            .none => return null,
+            .found => |s| return s,
+        }
     }
 
     fn add(f: *Finder, file: FileId, start: u32, end: u32) resolve.Error!void {
@@ -239,6 +256,14 @@ test lastNameStart {
     try std.testing.expectEqual(4, lastNameStart("a.b.cde", 7));
     try std.testing.expectEqual(2, lastNameStart("x.@\"a b\"", 8));
     try std.testing.expectEqual(null, lastNameStart("a.", 2));
+}
+
+const Seeded = union(enum) { unknown, none, found: seed.Seed };
+
+/// 初始化表达式 `init` 中第 `index` 个字段名解析到的字段
+fn fieldRef(result: *const infer.Result, init: Body.ExprId, index: usize) ?hir.OwnerKey {
+    for (result.field_refs) |ref| if (ref.init == init and ref.index == index) return ref.member;
+    return null;
 }
 
 fn keyDef(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {
