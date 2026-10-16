@@ -124,6 +124,7 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *std.ArrayList(Index
         if (f == key.file or !try containsAny(r, f, names)) continue;
         try collectIn(r, f, key.file, item, root, names, depth, out);
     }
+    if (out.items.len == 0) if (try dispatched(r, key.file, item, root, null)) |found| if (found.inst) |inst| try out.append(r.arena, inst);
 }
 
 /// 同 `findIn`，收集全部实例
@@ -162,6 +163,85 @@ fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Err
     for (files) |f| {
         if (f == key.file or !try containsAny(r, f, names)) continue;
         if (try findIn(r, f, key.file, item, root, names, active, depth)) |s| return s;
+    }
+    return dispatched(r, key.file, item, root, active);
+}
+
+/// 标准库中按方法名分派到实参的方法的函数：`printValue` 对 `{f}` 等调用 `value.format(w)`、
+/// `value.formatNumber(w, ...)`。泛型方法（如 `format(self, writer: anytype)`）在项目中没有调用点时，
+/// 以这些分派处的调用求实例
+const dispatchers = [_]struct { path: []const []const u8, func: []const u8 }{
+    .{ .path = &.{ "Io", "Writer" }, .func = "printValue" },
+};
+
+/// 泛型方法 `root`（成员 `item` 位于其中）在标准库分派处的实例：分派函数中对 anytype 参数调用同名方法，
+/// 接收者为方法所在的容器（不在泛型函数内），其余实参取分派处推导的类型
+fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32, active: ?u32) resolve.Error!?Found {
+    const ip = r.ctx.db.env.ip;
+    const tree = try r.itemTree(file);
+    const name = tree.items[root].name orelse return null;
+    const container = tree.items[root].container;
+    if (tree.containers[container].parent_item) |p| if (try genericRoot(r, file, p) != null) return null;
+    const method: resolve.Def = .{ .item = .{ .file = file, .item = root } };
+    const callee = try queries.defType(r, method, null, null);
+    const f = switch (ip.key(callee.ty)) {
+        .fn_type => |x| x,
+        else => return null,
+    };
+    const g = try infer.genericCallee(r, r.arena, callee, f) orelse return null;
+    if (g.body.params.len == 0) return null;
+    const receiver: TypedValue = .{ .ty = try queries.containerType(r, .{ .file = file, .container = container }, null) };
+    const std_root = try r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return null;
+    for (dispatchers) |d| {
+        var t = try queries.containerType(r, .{ .file = std_root, .container = 0 }, null);
+        for (d.path) |part| {
+            const ns = try queries.namespaceOfType(r, t) orelse return null;
+            const def = try r.memberDef(ns, part) orelse return null;
+            t = (try queries.defType(r, def, null, null)).asType() orelse return null;
+        }
+        const ns = try queries.namespaceOfType(r, t) orelse continue;
+        const it = switch (try r.memberDef(ns, d.func) orelse continue) {
+            .item => |x| x,
+            else => continue,
+        };
+        const owner = try r.ownerKey(it.file, it.item);
+        const body = try r.ctx.get(hir.ItemBody, owner);
+        const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        if (res.exprs.len != body.exprs.len) continue;
+        for (body.exprs, 0..) |e, ei| {
+            const c = switch (e) {
+                .call => |c| c,
+                else => continue,
+            };
+            const fa = switch (body.expr(c.callee)) {
+                .field_access => |x| x,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, fa.field orelse continue, name)) continue;
+            // 接收者是分派函数的 anytype 参数
+            const n = switch (body.expr(fa.lhs)) {
+                .name_ref => |x| x,
+                else => continue,
+            };
+            const l = switch (try r.resolveName(it.file, it.item, body, body.expr_scopes[@backingInt(fa.lhs)], n) orelse continue) {
+                .local => |x| x,
+                else => continue,
+            };
+            const binding = body.binding(l.binding);
+            if (binding.kind != .param or binding.ty != null) continue;
+            const args = try r.arena.alloc(TypedValue, g.body.params.len);
+            for (args, 0..) |*a, ai| a.* = if (ai == 0) receiver else if (ai - 1 < c.args.len) res.exprs[@backingInt(c.args[ai - 1])] else .unknown;
+            const inst = try infer.instanceOf(r, r.arena, g, f, args);
+            if (!value.isConcrete(ip, inst)) continue;
+            const norm = try queries.normalizeInst(r, file, item, inst);
+            if (active) |rel| {
+                const target_owner = try r.ownerKey(file, item);
+                const target = try r.ctx.get(queries.Infer, .{ .owner = target_owner, .mode = .full, .inst = norm });
+                if (inactiveAt(try r.ctx.get(hir.ItemBody, target_owner), target, rel)) continue;
+            }
+            const node = try r.itemNode(it.file, it.item) orelse continue;
+            return .{ .inst = norm, .file = it.file, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
+        }
     }
     return null;
 }

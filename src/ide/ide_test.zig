@@ -335,6 +335,34 @@ test "goto declaration through comptime anytype parameters" {
     }
 }
 
+test "goto declaration in format methods called only by std.Io.Writer.printValue" {
+    // `format(self, writer: anytype)` 只由 `{f}` 经 printValue 的 `value.format(w)` 调用：writer 为 `*std.Io.Writer`
+    const text =
+        \\const Fig = struct {
+        \\    rows: u8,
+        \\    pub fn format(self: Fig, writer: anytype) !void {
+        \\        _ = self;
+        \\        try writer.writeAll("x");
+        \\    }
+        \\};
+        \\
+    ;
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root_path = try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" });
+    const std_root = try w.vfs.intern(std_root_path);
+    const file = (try w.add("/p/main.zig", text)).file;
+    try w.setGraph(std_root, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const t = try definition.declaration(&r, file, @intCast(std.mem.indexOf(u8, text, "writeAll").?)) orelse return error.NoTarget;
+    try testing.expect(std.mem.endsWith(u8, w.vfs.path(t.file), "Writer.zig"));
+}
+
 test "hover in generic functions passed as a value with an argument tuple" {
     // `Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`：以元组元素调用
     const text =
