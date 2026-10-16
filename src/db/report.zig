@@ -1,4 +1,4 @@
-//! 查询统计的文本报告（设计 §14）：基准工具、语料工具与慢请求日志共用。
+//! 查询统计的文本报告：基准工具、语料工具与慢请求日志共用。
 
 const std = @import("std");
 const engine = @import("engine.zig");

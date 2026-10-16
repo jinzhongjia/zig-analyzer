@@ -1,6 +1,6 @@
-//! 名字解析（设计 §7.3）：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、
+//! 名字解析：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、
 //! `@This()` 与别名链求出命名空间后查找成员。不做类型推导：经由函数调用、变量类型得到的
-//! 命名空间（如 `std.ArrayList(u8)`、`var x: S` 的 `x.`）留给 sema（M4 / M5）。
+//! 命名空间（如 `std.ArrayList(u8)`、`var x: S` 的 `x.`）由 sema 处理。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

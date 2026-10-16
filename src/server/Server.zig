@@ -448,7 +448,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     };
 }
 
-// ── 慢请求日志（设计 §14）────────────────────────────────────────────
+// ── 慢请求日志 ─────────────────────────────────────────────────────
 
 /// 请求耗时超过 `log.slow_request_ms` 时记录：按 query 汇总的自身耗时与调用树中的耗时路径。
 /// 在读事务结束前调用（描述 key 时读取 ItemTree）
@@ -1217,7 +1217,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         server.default_builtin = path;
     }
     if (!env.matchesBuiltin()) {
-        // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check（§11.2）
+        // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check
         server.showWarningOnce("zig version differs from the one zig-analyzer was built with: live diagnostics fall back to zig ast-check, compiler diagnostics are unavailable");
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
         server.db.beginWrite();
@@ -1512,7 +1512,7 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
     server.waitIdle();
 }
 
-// ── 诊断发布（设计 §11.5） ───────────────────────────────────────────
+// ── 诊断发布 ───────────────────────────────────────────────────
 
 /// 在后台重新计算并发布这些文件的诊断。`clear` 为 true 时即使没有诊断也发布（用于清除旧诊断）。
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {

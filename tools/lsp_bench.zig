@@ -1,4 +1,4 @@
-//! LSP 基准（设计 §1 的性能预算）：以子进程启动 zig-analyzer，经标准输入输出按真实编辑器的方式交互，
+//! LSP 基准（docs/design.md 的性能目标）：以子进程启动 zig-analyzer，经标准输入输出按真实编辑器的方式交互，
 //! 测量冷启动各阶段、热状态下 hover / goto / completion 的延迟分布、编辑到诊断的延迟与常驻内存。
 //!
 //! 用法：zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项目根）>...

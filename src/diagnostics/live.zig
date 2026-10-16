@@ -1,6 +1,6 @@
 //! `live` 诊断来源：官方解析器 + AstGen（等价于 `zig ast-check`），保证与编译器一致。
 //!
-//! 自研 CST 的错误不参与诊断（见设计 §11）。
+//! 自研 CST 的错误不参与诊断。
 
 const std = @import("std");
 const Io = std.Io;
@@ -121,7 +121,7 @@ fn spanOf(bundle: ErrorBundle, loc: ErrorBundle.SourceLocationIndex) [2]u32 {
     return .{ sl.span_start, sl.span_end };
 }
 
-/// live 诊断的执行方式（设计 §11.2）。进程内 AstGen 只有在用户 zig 与 zig-analyzer 编译时的版本完全相同时
+/// live 诊断的执行方式。进程内 AstGen 只有在用户 zig 与 zig-analyzer 编译时的版本完全相同时
 /// 才与编译器一致；否则调用用户的 `zig ast-check`。
 pub const Backend = union(enum) {
     in_process,

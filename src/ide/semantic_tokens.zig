@@ -1,7 +1,7 @@
-//! textDocument/semanticTokens：纯语法分类（M1）。
+//! textDocument/semanticTokens：纯语法分类。
 //!
 //! 只为能从语法确定的 token 着色：关键字、注释、字面量、builtin、各类声明处的名字、
-//! 字段访问与枚举字面量、标签、原始类型。引用处的普通名字需要语义信息，留给后续阶段。
+//! 字段访问与枚举字面量、标签、原始类型。引用处的普通名字需要语义信息，不着色。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

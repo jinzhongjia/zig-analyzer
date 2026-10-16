@@ -1,4 +1,4 @@
-//! 模块图（设计 §7.1）：各模块的根文件与 import 表，以及每个文件所属的模块。
+//! 模块图：各模块的根文件与 import 表，以及每个文件所属的模块。
 //!
 //! 由 Server 汇总各项目的构建图与编译集合生成，作为查询引擎的 input（`ModuleGraphInput`）。
 //! 文件的模块归属来自编译集合（与编译器一致：从 compile step 的根模块沿 import 到达）；
@@ -167,7 +167,7 @@ pub const Input = struct {
 /// 文件中各模块名 import 的目标（文件中出现的 `@import` 字符串，另加 std、builtin、root）。
 ///
 /// 名字解析经由它读取模块图：模块图的其他变化（如加入新文件、其他模块的 import 表）在这里截断，
-/// 不使依赖它的推导重算。项目加载期间模块图会多次更新，此前每次都使已推导的结果全部重算
+/// 不使依赖它的推导重算（项目加载期间模块图会多次更新）
 pub const FileImports = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;

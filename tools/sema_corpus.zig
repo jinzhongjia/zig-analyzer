@@ -4,8 +4,7 @@
 //!
 //! 标准库的全部文件都归入 std 模块：`@import("std")` 可解析，`builtin` 为本机目标、Debug、`zig test`
 //! 的 builtin.zig（需要 PATH 中的 zig），`root` 不可解析。
-//! 依赖 comptime 求值的部分（泛型类型构造、依赖 comptime 参数的返回类型）属于 M5，计入未知。
-//! 每个文件之后与服务器一样按需淘汰缓存（§6.6），结果须与不淘汰时相同。
+//! 每个文件之后与服务器一样按需淘汰缓存，结果须与不淘汰时相同。
 
 const std = @import("std");
 const za = @import("zig_analyzer");
@@ -197,7 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
         \\  of those in generic code, known when inferred from a call site in the same file: {d}
         \\
     , .{ files.items.len, members, secs, sweeps, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct(), unknown.inactive, unknown.generic, unknown.generic_member, unknown.other, seeded });
-    // 各 query 的耗时（设计 §14）：按自身耗时排序，定位推导中最耗时的部分
+    // 各 query 的耗时：按自身耗时排序，定位推导中最耗时的部分
     {
         var stats: [database.Db.query_types.len]za.db.QueryStats = undefined;
         _ = db.stats(&stats);

@@ -1,4 +1,4 @@
-//! sema query（设计 §9.2）：声明类型与 Body 的类型推导。
+//! sema query：声明类型与 Body 的类型推导。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -285,7 +285,7 @@ fn inferredErrorSet(r: *Resolver, owner: hir.OwnerKey) resolve.Error!bool {
     return false;
 }
 
-/// comptime 调用的结果（设计 §9.2 的 call_eval）：由解释器执行函数体，结果按实例与实参缓存
+/// comptime 调用的结果：由解释器执行函数体，结果按实例与实参缓存
 pub const CallEval = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = eval.CallKey;
@@ -316,8 +316,8 @@ pub const LocalKey = struct {
 /// 局部常量 / 变量推导其类型标注与初始化表达式，其中引用的其他局部绑定同样按需查询）。
 ///
 /// 体内定义的容器引用外层函数的局部名字（如 `const T = struct {...}; ... struct { fn f(x: T) }`）时
-/// 经由它，不依赖外层函数的整个函数体。此前取外层函数整体的推导结果：外层函数体又引用内层成员时
-/// 形成环，环中的结果不写入 memo，每次读取都要重算
+/// 经由它，不依赖外层函数的整个函数体：否则外层函数体又引用内层成员时形成环，
+/// 环中的结果不写入 memo，每次读取都要重算
 pub const LocalValue = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = LocalKey;

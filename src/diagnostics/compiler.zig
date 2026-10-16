@@ -1,4 +1,4 @@
-//! `compiler` 诊断来源：把构建结果中的 ErrorBundle 转换为按文件组织的诊断，并与 live 诊断合并（设计 §11.3、§11.5）。
+//! `compiler` 诊断来源：把构建结果中的 ErrorBundle 转换为按文件组织的诊断，并与 live 诊断合并。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -121,7 +121,7 @@ fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error![]
     return std.fs.path.resolveAlloc(a, &.{ base, path });
 }
 
-// ── 合并（§11.5） ────────────────────────────────────────────────────
+// ── 合并 ──────────────────────────────────────────────────────────
 
 pub const MergeInput = struct {
     /// 当前缓冲区文本

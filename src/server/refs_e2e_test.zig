@@ -147,7 +147,7 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("\n    _ = x;", edits[0].object.get("newText").?.string);
     }
 
-    // 可观测性（设计 §14）：status 的查询统计与慢请求报告
+    // 可观测性：status 的查询统计与慢请求报告
     {
         const st = try h.request("zig-analyzer/status", {});
         var found = false;

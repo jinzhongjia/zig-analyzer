@@ -101,7 +101,7 @@ pub const Stats = struct {
     incomplete_causes: std.EnumArray(IncompleteCause, u64),
 };
 
-/// 一个 query 的累计统计（设计 §14）
+/// 一个 query 的累计统计
 pub const QueryStats = struct {
     /// 执行 compute 的次数
     executions: u64,
