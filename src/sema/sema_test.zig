@@ -537,6 +537,39 @@ test "inferred error sets from function bodies" {
     });
 }
 
+test "comptime slices alias the sliced storage" {
+    try expectTypes(
+        \\fn f() u8 {
+        \\    var a = [_]u8{ 1, 2 };
+        \\    const s = a[0..];
+        \\    s[0] = 9;
+        \\    return a[0];
+        \\}
+        \\fn g() u8 {
+        \\    var a = [_]u8{ 1, 2, 3, 4 };
+        \\    const p = &a;
+        \\    const s = p[1..];
+        \\    const t = s[1..3];
+        \\    t[1] = 7;
+        \\    for (s) |*x| x.* += 1;
+        \\    return a[3] + a[1];
+        \\}
+        \\fn h() u8 {
+        \\    var a = [_]u8{ 1, 2 };
+        \\    const s = a[0..];
+        \\    a[1] = 5;
+        \\    return s[1];
+        \\}
+        \\const result = f();
+        \\const nested = g();
+        \\const reads = h();
+    , &.{
+        .{ "result", "u8 = 9" },
+        .{ "nested", "u8 = 11" },
+        .{ "reads", "u8 = 5" },
+    });
+}
+
 test "escaped identifiers name the same declaration as plain ones" {
     try expectTypes(
         \\const @"\x66oo": u8 = 7;

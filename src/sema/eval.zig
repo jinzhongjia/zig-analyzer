@@ -390,6 +390,10 @@ const Ref = struct {
     cell: *Val,
     /// 从存储单元的值逐层取元素的下标
     path: []const u32,
+    /// 切片：指向 `path` 处聚合的 `[start, start + len)` 区间（与原数组共享存储）
+    window: ?Window = null,
+
+    const Window = struct { start: u32, len: u32 };
 };
 
 const Frame = struct {
@@ -601,10 +605,19 @@ const Evaluator = struct {
     fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
         var cur = ref.cell.*;
         for (ref.path) |i| cur = try ev.elemAt(cur, i);
-        return cur;
+        const w = ref.window orelse return cur;
+        // 区间：取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）
+        const elems = try ev.a.alloc(Val, w.len);
+        for (elems, w.start..) |*o, i| o.* = try ev.elemAt(cur, i);
+        const array = try ev.ip.get(.{ .array_type = .{ .len = w.len, .child = ev.elemTypeOf(cur.ty, w.start) } });
+        return ev.makeAgg(array, elems);
     }
 
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
+        if (ref.window) |w| {
+            for (0..w.len) |i| try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
+            return;
+        }
         var cell = ref.cell;
         for (ref.path) |i| {
             const agg = try ev.mutableAgg(cell);
@@ -1302,16 +1315,13 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return error.Abort,
         };
-        const path = try ev.a.alloc(u32, ref.path.len + 1);
-        @memcpy(path[0..ref.path.len], ref.path);
-        path[ref.path.len] = @intCast(i);
         const target = try ev.load(ref);
         const child = ev.elemTypeOf(target.ty, i);
         const is_const = switch (ev.ip.key(seq.ty)) {
             .ptr_type => |p| p.is_const,
             else => false,
         };
-        return .{ .ty = try ev.ip.ptrTo(child, .one, is_const), .v = .{ .ref = .{ .cell = ref.cell, .path = path } } };
+        return .{ .ty = try ev.ip.ptrTo(child, .one, is_const), .v = .{ .ref = try ev.extend(ref, std.math.cast(u32, i) orelse return error.Abort) } };
     }
 
     fn switchExpr(ev: *Evaluator, f: *Frame, e: ExprId, s: @FieldType(Body.Expr, "switch"), want: ?Index) EvalError!Val {
@@ -1615,10 +1625,15 @@ const Evaluator = struct {
         };
     }
 
-    fn extend(ev: *Evaluator, base: Ref, i: u32) Error!Ref {
+    /// 第 `i` 个元素的位置；区间的下标相对于区间的起点
+    fn extend(ev: *Evaluator, base: Ref, i: u32) EvalError!Ref {
+        const index = if (base.window) |w| blk: {
+            if (i >= w.len) return error.Abort;
+            break :blk w.start + i;
+        } else i;
         const path = try ev.a.alloc(u32, base.path.len + 1);
         @memcpy(path[0..base.path.len], base.path);
-        path[base.path.len] = i;
+        path[base.path.len] = index;
         return .{ .cell = base.cell, .path = path };
     }
 
@@ -1701,9 +1716,31 @@ const Evaluator = struct {
             .ptr_type => |p| p.is_const,
             else => true,
         };
-        // comptime 已知的区间：指向数组的指针（元素为复制，不驻留）
+        // comptime 已知的区间：指向数组的指针
         const array = try ip.get(.{ .array_type = .{ .len = elems.len, .child = child } });
-        return ev.pointerToNew(try ip.ptrTo(array, .one, is_const), try ev.makeAgg(array, elems));
+        const ptr_ty = try ip.ptrTo(array, .one, is_const);
+        // 切片的是局部变量（或经由指针）的存储：引用原存储的区间，写入反映到原数组
+        if (try ev.sliceTarget(f, s.lhs, base)) |target| {
+            const offset = if (target.window) |tw| tw.start else 0;
+            var ref = target;
+            ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = @intCast(end - start) };
+            return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
+        }
+        // 其他（驻留的常量等）：元素为复制，不驻留
+        return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
+    }
+
+    /// 被切片的存储：指针所指向的存储，或数组局部变量自身；没有可引用的存储时为 null
+    fn sliceTarget(ev: *Evaluator, f: *Frame, lhs: ExprId, base: Val) EvalError!?Ref {
+        switch (base.v) {
+            .ref => |r| return r,
+            else => {},
+        }
+        if (ev.ip.key(base.ty) != .array_type) return null;
+        return ev.place(f, lhs) catch |err| switch (err) {
+            error.Abort => null,
+            else => |x| x,
+        };
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
