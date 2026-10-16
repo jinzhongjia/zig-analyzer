@@ -132,6 +132,13 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     }
     // maker 崩溃自动重启时会多一次构建
     try testing.expect(builds >= 2);
+    if (titles.len != ends) {
+        for (try h.notifications("$/progress")) |m| {
+            const params = m.object.get("params").?.object;
+            const value = params.get("value").?.object;
+            std.debug.print("  {s} {s} {s}\n", .{ params.get("token").?.string, value.get("kind").?.string, if (value.get("title")) |t| t.string else if (value.get("message")) |x| (if (x == .string) x.string else "") else "" });
+        }
+    }
     try testing.expectEqual(titles.len, ends);
     try testing.expect(percentages >= 2);
 }
