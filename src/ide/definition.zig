@@ -21,14 +21,45 @@ pub const Target = struct { file: FileId, start: u32, end: u32 };
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
-    const def = try defAt(r, file, offset) orelse return null;
-    return target(r, try r.aliasTarget(def));
+    if (try defAt(r, file, offset)) |def| return target(r, try r.aliasTarget(def));
+    return selfTarget(r, file, offset);
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
-    return target(r, try defAt(r, file, offset) orelse return null);
+    if (try defAt(r, file, offset)) |def| return target(r, def);
+    return selfTarget(r, file, offset);
+}
+
+/// 本身就是声明处、但不是成员或局部绑定的名字：错误集 `error{ Foo }` 中的 `Foo`，没有结果类型的
+/// 匿名初始化 `.{ .x = 1 }` 中的字段名（定义了匿名结构体的字段）。与在声明的名字上跳转一样返回自身
+fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const span: Target = .{ .file = file, .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const path = try root.coveringPath(r.arena, tok.offset);
+    if (path.len > 0 and path[path.len - 1].kind() == .error_set_decl) return span;
+
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const e = b.exprAt(rel) orelse return null;
+    const x = switch (b.expr(e)) {
+        .init => |x| x,
+        else => return null,
+    };
+    if (x.ty != null) return null;
+    for (x.fields) |fi| {
+        if (fi.name == null or rel < fi.name_range.start or rel >= fi.name_range.end) continue;
+        // 有结果类型（字段解析不出时）不是声明处
+        const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+        if (a.literalExpected(e) != null) return null;
+        return span;
+    }
+    return null;
 }
 
 /// 具名错误集的成员：`Error.Foo` 跳到声明 `const Error = error{ Foo, ... }` 中的 `Foo`（声明是别名时沿别名查找）

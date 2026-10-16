@@ -818,3 +818,47 @@ test "completion in a branch inactive for the first call site uses a call site w
     // 第一个调用点（Rgb）下该分支不生效：取第二个调用点（Rgba）
     try testing.expectEqualStrings("r a", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
+
+test "goto declaration on names that declare themselves: error set members and anonymous fields" {
+    const text =
+        \\const Error = error{ Timeout, Closed };
+        \\const Point = struct { x: i32 };
+        \\fn f(opts: anytype) void {
+        \\    _ = opts;
+        \\}
+        \\fn g() void {
+        \\    f(.{ .verbose = true });
+        \\    const table = .{ .first = 1, .second = 2 };
+        \\    const p: Point = .{ .x = 0 };
+        \\    _ = .{ table, p };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, usize, []const u8 }{
+        // 错误集的成员与匿名初始化的字段名：本身就是声明处
+        .{ "Timeout", 0, "Timeout" },
+        .{ "Closed", 0, "Closed" },
+        .{ ".verbose", 1, "verbose" },
+        .{ ".second", 1, "second" },
+        // 有结果类型：跳到字段的声明
+        .{ ".x = 0", 1, "x: i32" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).? + c[1];
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[2])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 20)] });
+            return err;
+        };
+    }
+}
