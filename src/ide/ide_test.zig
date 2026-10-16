@@ -903,3 +903,95 @@ test "goto declaration of tagged union fields accessed through the type or an er
         try testing.expect(std.mem.startsWith(u8, text[t.start..], "null_val: void"));
     }
 }
+
+test "goto declaration of members that exist only in other target branches" {
+    const text =
+        \\const os: enum { linux, macos } = .linux;
+        \\const linux_ns = struct {
+        \\    pub const SO = struct {
+        \\        pub const REUSEADDR = 2;
+        \\    };
+        \\};
+        \\const c_ns = struct {
+        \\    pub const SO = switch (os) {
+        \\        .linux => struct {
+        \\            pub const REUSEADDR = 2;
+        \\        },
+        \\        .macos => struct {
+        \\            pub const REUSEPORT_LB = 0x10000;
+        \\        },
+        \\    };
+        \\    pub const EVFILT = switch (os) {
+        \\        .macos => struct {
+        \\            pub const READ = -1;
+        \\        },
+        \\        else => void,
+        \\    };
+        \\};
+        \\const system = switch (os) {
+        \\    .linux => linux_ns,
+        \\    .macos => c_ns,
+        \\};
+        \\const SO = system.SO;
+        \\const posix_impl = struct {
+        \\    pub const State = struct {
+        \\        fd: u32 = 0,
+        \\        pub fn init() State {
+        \\            return .{};
+        \\        }
+        \\    };
+        \\};
+        \\const windows_impl = struct {
+        \\    pub const State = struct {
+        \\        handle: u32 = 0,
+        \\        pub fn init() State {
+        \\            return .{};
+        \\        }
+        \\    };
+        \\};
+        \\const platform = if (os == .macos) windows_impl else posix_impl;
+        \\const Terminal = struct {
+        \\    state: platform.State,
+        \\};
+        \\fn f(t: *Terminal) void {
+        \\    _ = SO.REUSEPORT_LB;
+        \\    _ = system.EVFILT.READ;
+        \\    _ = t.state.handle;
+        \\    var s = platform.State.init();
+        \\    _ = s.handle;
+        \\    _ = platform.State.init().handle;
+        \\    _ = t.state.fd;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 别名 `system.SO` 与嵌套的 switch
+        .{ "REUSEPORT_LB;", "REUSEPORT_LB = 0x10000" },
+        // 当前配置下 EVFILT 为 void
+        .{ "READ;", "READ = -1" },
+        // 字段的类型、局部变量的 `init()`、调用结果
+        .{ "handle;\n    var", "handle: u32" },
+        .{ "handle;\n    _ = platform", "handle: u32" },
+        .{ "handle;\n    _ = t", "handle: u32" },
+        // 当前配置下存在的成员
+        .{ "fd;\n}", "fd: u32" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 24)] });
+            return err;
+        };
+    }
+}

@@ -752,10 +752,14 @@ const Inferrer = struct {
                 .error_set_type => return .{ .ty = t, .val = try ip.get(.{ .error_value = name }) },
                 // 构造的枚举（`@Enum`、union(enum) 的标签枚举）的成员
                 .reified_type, .union_tag_type => return try eval.typeMember(inf.r, t, name) orelse .unknown,
-                else => return .unknown,
+                // 当前配置下的值不是容器（`std.c.EVFILT` 在 linux 上为 void）
+                else => return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown,
             }
         }
-        const tv = try inf.instanceMember(e, lhs, name);
+        var tv = try inf.instanceMember(e, lhs, name);
+        if (tv.ty == .unknown and inf.members[@backingInt(e)] == null and lhs.ty != .unknown) {
+            if (try inf.otherBranchField(e, lhs_e, lhs.ty, name)) |x| tv = x;
+        }
         // comptime 已知的值（结构体、union、元组、`len`）：取出字段的值
         if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, lhs, name)) |fv| {
             return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
@@ -812,32 +816,92 @@ const Inferrer = struct {
     /// 编译，给出那里的定义，而不是未知
     fn otherBranchMember(inf: *Inferrer, e: ExprId, lhs_e: ExprId, current: Index, name: []const u8) Error!?TypedValue {
         const ip = inf.ip;
-        const owner: hir.OwnerKey = if (inf.members[@backingInt(lhs_e)]) |m| m else switch (inf.body.expr(lhs_e)) {
-            .name_ref => |n| blk: {
-                const def = try inf.r.resolveName(inf.file, inf.item, inf.body, inf.body.expr_scopes[@backingInt(lhs_e)], n) orelse return null;
-                break :blk try defKey(inf.r, def) orelse return null;
-            },
-            else => return null,
-        };
-        const body = try inf.r.ctx.get(hir.ItemBody, owner);
-        const init = body.value orelse return null;
-        switch (body.expr(init)) {
-            .@"if", .@"switch" => {},
-            else => return null,
-        }
-        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        if (res.exprs.len != body.exprs.len) return null;
-        var leaves: std.ArrayList(ExprId) = .empty;
-        try branchLeaves(inf.scratch, body, init, &leaves, 0);
-        for (leaves.items) |leaf| {
-            const t = res.exprs[@backingInt(leaf)].asType() orelse continue;
-            if (t == current or ip.key(t) != .container_type) continue;
+        var cands: std.ArrayList(Index) = .empty;
+        if (inf.members[@backingInt(lhs_e)]) |owner| {
+            try alternativeContainers(inf.r, inf.scratch, owner, &cands, 0);
+        } else try leafAlternatives(inf.r, inf.scratch, inf.file, inf.item, inf.body, inf.exprs, lhs_e, &cands, 0);
+        for (cands.items) |t| {
+            if (t == current) continue;
             const ns = try queries.namespaceOfType(inf.r, t) orelse continue;
             const def = try inf.r.memberDef(ns, name) orelse continue;
             inf.members[@backingInt(e)] = try defKey(inf.r, def);
             return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
         }
         return null;
+    }
+
+    /// 实例上当前构建配置下不存在的成员，实例的类型由按目标选择的命名空间给出（`state: platform.State`、
+    /// `var state = platform.State.init()`，platform 按目标选择文件）：到其他配置下的同名类型中查找字段与方法
+    fn otherBranchField(inf: *Inferrer, e: ExprId, lhs_e: ExprId, lhs_ty: Index, name: []const u8) Error!?TypedValue {
+        const ip = inf.ip;
+        const current = switch (ip.key(lhs_ty)) {
+            .ptr_type => |p| if (p.size == .one) p.child else lhs_ty,
+            else => lhs_ty,
+        };
+        var cands: std.ArrayList(Index) = .empty;
+        if (try inf.typeExprOf(lhs_e)) |te| {
+            try leafAlternatives(inf.r, inf.scratch, te.file, te.item, te.body, te.exprs, te.expr, &cands, 0);
+        }
+        for (cands.items) |t| {
+            if (t == current) continue;
+            const ns = try queries.namespaceOfType(inf.r, t) orelse continue;
+            const tree = try inf.r.itemTree(ns.file);
+            const def: resolve.Def = if (fieldItem(tree, ns.container, name)) |fi|
+                .{ .item = .{ .file = ns.file, .item = fi } }
+            else
+                try inf.r.memberDef(ns, name) orelse continue;
+            inf.members[@backingInt(e)] = try defKey(inf.r, def);
+            return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
+        }
+        return null;
+    }
+
+    const TypeExpr = struct { file: FileId, item: u32, body: *const Body, exprs: []const TypedValue, expr: ExprId };
+
+    /// 给出表达式类型的类型表达式：字段的类型、局部变量与参数的类型标注，或 `X.Y.init()` 这类调用中的 `X.Y`
+    fn typeExprOf(inf: *Inferrer, e: ExprId) Error!?TypeExpr {
+        const here: TypeExpr = .{ .file = inf.file, .item = inf.item, .body = inf.body, .exprs = inf.exprs, .expr = e };
+        switch (inf.body.expr(e)) {
+            .field_access => {
+                const key = inf.members[@backingInt(e)] orelse return null;
+                const item = try itemOfKey(inf.r, key) orelse return null;
+                if ((try inf.r.itemTree(key.file)).items[item].kind != .field) return null;
+                const body = try inf.r.ctx.get(hir.ItemBody, key);
+                const ty = body.type_expr orelse return null;
+                const res = try inf.r.ctx.get(queries.Infer, .{ .owner = key, .mode = .signature });
+                if (res.exprs.len != body.exprs.len) return null;
+                return .{ .file = key.file, .item = item, .body = body, .exprs = res.exprs, .expr = ty };
+            },
+            .name_ref => |n| {
+                const def = try inf.r.resolveName(inf.file, inf.item, inf.body, inf.body.expr_scopes[@backingInt(e)], n) orelse return null;
+                const l = switch (def) {
+                    .local => |l| l,
+                    else => return null,
+                };
+                if (l.file != inf.file or l.item != inf.item) return null;
+                const binding = inf.body.binding(l.binding);
+                if (binding.ty) |t| return .{ .file = here.file, .item = here.item, .body = here.body, .exprs = here.exprs, .expr = t };
+                const init = binding.init orelse return null;
+                return calleeTypeExpr(here, init);
+            },
+            .call => return calleeTypeExpr(here, e),
+            else => return null,
+        }
+    }
+
+    fn calleeTypeExpr(here: TypeExpr, e: ExprId) ?TypeExpr {
+        const c = switch (here.body.expr(e)) {
+            .call => |c| c,
+            .prefix => |x| return if (x.op == .keyword_try) calleeTypeExpr(here, x.operand) else null,
+            else => return null,
+        };
+        const fa = switch (here.body.expr(c.callee)) {
+            .field_access => |fa| fa,
+            else => return null,
+        };
+        var te = here;
+        te.expr = fa.lhs;
+        return te;
     }
 
     /// 实例（值）上的成员：字段与方法，自动解引用单指针
@@ -2338,6 +2402,62 @@ fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
 }
 
 /// `if` / `switch` 各分支（含嵌套的）的结果表达式
+/// 声明 `owner` 在各种构建配置下可能的值（容器类型）：初始化为按 comptime 条件选择的 `if` / `switch` 时取
+/// 各分支，分支或初始化本身是别名（`linux`、`std.c`、`system.SO`）时沿别名查找。用于当前配置下不存在的成员
+fn alternativeContainers(r: *Resolver, a: Allocator, owner: hir.OwnerKey, out: *std.ArrayList(Index), depth: u32) Error!void {
+    if (depth > 4 or out.items.len >= max_alternatives) return;
+    const item = try itemOfKey(r, owner) orelse return;
+    const body = try r.ctx.get(hir.ItemBody, owner);
+    const init = body.value orelse return;
+    const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+    if (res.exprs.len != body.exprs.len) return;
+    var leaves: std.ArrayList(ExprId) = .empty;
+    try branchLeaves(a, body, init, &leaves, 0);
+    for (leaves.items) |leaf| try leafAlternatives(r, a, owner.file, item, body, res.exprs, leaf, out, depth);
+}
+
+const max_alternatives = 64;
+
+/// 表达式 `e` 在各种构建配置下可能的值（容器类型）：当前的值，以及它引用的声明在其他配置下的值
+fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *const Body, exprs: []const TypedValue, e: ExprId, out: *std.ArrayList(Index), depth: u32) Error!void {
+    if (depth > 4 or out.items.len >= max_alternatives) return;
+    const ip = r.ctx.db.env.ip;
+    if (@backingInt(e) < exprs.len) if (exprs[@backingInt(e)].asType()) |t| if (ip.key(t) == .container_type) try appendUnique(a, out, t);
+    switch (body.expr(e)) {
+        .name_ref => |n| {
+            const def = try r.resolveName(file, item, body, body.expr_scopes[@backingInt(e)], n) orelse return;
+            const key = try defKey(r, def) orelse return;
+            try alternativeContainers(r, a, key, out, depth + 1);
+        },
+        // `X.Name`：X 的各个可能的容器中的 `Name`
+        .field_access => |fa| {
+            const name = fa.field orelse return;
+            var bases: std.ArrayList(Index) = .empty;
+            try leafAlternatives(r, a, file, item, body, exprs, fa.lhs, &bases, depth + 1);
+            for (bases.items) |base| {
+                const ns = try queries.namespaceOfType(r, base) orelse continue;
+                const def = try r.memberDef(ns, name) orelse continue;
+                const tv = try queries.defType(r, def, null, queries.instOfType(ip, base));
+                if (tv.asType()) |t| if (ip.key(t) == .container_type) try appendUnique(a, out, t);
+                const key = try defKey(r, def) orelse continue;
+                try alternativeContainers(r, a, key, out, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendUnique(a: Allocator, out: *std.ArrayList(Index), t: Index) Allocator.Error!void {
+    if (std.mem.indexOfScalar(Index, out.items, t) == null and out.items.len < max_alternatives) try out.append(a, t);
+}
+
+/// `ItemTree.items` 中 AST id 为 `key.item` 的项的下标
+fn itemOfKey(r: *Resolver, key: hir.OwnerKey) Error!?u32 {
+    const tree = try r.itemTree(key.file);
+    for (tree.items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
+    return null;
+}
+
 fn branchLeaves(a: Allocator, body: *const Body, e: ExprId, out: *std.ArrayList(ExprId), depth: u32) Allocator.Error!void {
     if (depth > 8) return;
     switch (body.expr(e)) {
