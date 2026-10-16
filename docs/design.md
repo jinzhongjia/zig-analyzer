@@ -62,7 +62,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | libvaxis（`src/Vaxis.zig`） | 2.5 万行 | 0.2 ms | 0.3 ms | 59 ms | 5 ms | 232 MB |
 | http.zig（`src/httpz.zig`） | 1.5 万行 | 0.5 ms | 0.4 ms | 64 ms | 9 ms | 105 MB |
 | zig-clap（`clap.zig`） | 0.3 万行 | 0.2 ms | 0.3 ms | 62 ms | 5 ms | 84 MB |
-| 97 个库批量校验 | — | 中位数 0.3 ms，最大 7.0 ms | — | — | — | 中位数 66 MB，最大 201 MB |
+| 97 个库批量校验 | — | 中位数 0.2 ms，最大 3.1 ms | — | — | — | 中位数 70 MB，最大 215 MB |
 
 编辑 → 诊断均含 50 ms 防抖。
 
@@ -221,7 +221,7 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 
 | 范围 | 结果 |
 |---|---|
-| 97 个 Zig 0.17.0 库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib 等）批量校验 | 崩溃 / 超时 0；declaration 不一致 0（解析率中位数 89.4%；构建图正常的 80 个项目排除没有声明位置的标识符后 99.7%）；引用与重命名错误 0；补全召回中位数 100%，88 / 97 ≥ 95%；hover p50 中位数 0.3 ms；常驻内存中位数 66 MB、最大 201 MB |
+| 97 个 Zig 0.17.0 库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib 等）批量校验 | 崩溃 / 超时 0；declaration 不一致 0（解析率中位数 89.4%；构建图正常的 80 个项目排除没有声明位置的标识符后 99.8%）；引用与重命名错误 0；补全召回中位数 100%，88 / 97 ≥ 95%；hover p50 中位数 0.2 ms；常驻内存中位数 70 MB、最大 215 MB |
 | 语料对拍（10305 个文件、264.6 MB） | 全部通过；12 万次随机编辑下增量与全量解析无不一致 |
 | 编译器诊断对拍 | 15 / 15 一致 |
 | 格式化对拍 | 372 / 372 个文件一致 |
