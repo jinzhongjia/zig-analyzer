@@ -1353,6 +1353,31 @@ Sema.zig 上的编辑响应（同一台机器）：
 - 查找引用的冷启动最坏 1.9 s（`src/Compilation.zig` 中被大量文件引用的声明，`ParseFile` 的 LRU 容量 64 不足以容纳候选文件而反复解析）；热状态 p95 124 ms。
 - 测试：`zig build test` 共 260 个。
 
+### 19.29 第二批真实项目（2026-10-16）
+
+在另一批支持 Zig 0.17.0 的项目上重复 §19.27、§19.28 的测量与对拍（ghostty 的 C 依赖在本环境中哈希不一致、构建图加载失败，关闭编译器诊断）：
+
+| 项目（文件） | 规模 | hover p50 | 补全 p50 | 补全召回 | declaration 解析 / 不一致 | 引用与重命名 | 编辑 → 诊断 p50 | 按键 → hover p50 | 常驻内存 |
+|---|---|---|---|---|---|---|---|---|---|
+| ghostty `zig-0.17`（`src/terminal/Terminal.zig`，1.7 万行） | 37 万行 | 1.6 ms | 1.2 ms | 99.3% | 95.3% / 0 | 40 个声明、269 处，无误 | 118 ms | 48 ms | 112 MB |
+| http.zig（`src/httpz.zig`） | 1.5 万行 | 0.5 ms | 0.4 ms | 99.2% | 91.0% / 0 | 40 个声明、222 处，无误 | 64 ms | 9 ms | 105 MB |
+| superhtml（`src/html/Tokenizer.zig`） | 4.3 万行 | 0.5 ms | 0.7 ms | 100% | 97.4% / 0 | 38 个声明、240 处，无误 | 65 ms | 11 ms | 97 MB |
+| ziggy（`src/schema/Ast.zig`） | 1.5 万行 | 0.5 ms | 0.4 ms | 99.3% | 95.7% / 0 | 32 个声明、226 处，无误 | 64 ms | 10 ms | 90 MB |
+| zeit（`src/zeit.zig`） | 0.5 万行 | 0.4 ms | 0.5 ms | 100% | 92.8% / 0 | 38 个声明、563 处，无误 | 67 ms | 9 ms | 82 MB |
+
+发现并修复的问题：
+
+| 问题 | 文件 | 内容 |
+|---|---|---|
+| 调用点种子的环 | `src/ide/seed.zig` | §19.28 中经由泛型调用者的传递不限层数：互相调用的泛型函数（http.zig 的 `execute` 与 `init`）使 `seed.Query` 形成环，环中的结果不写入 memo，每次请求都重新计算且层层放大（17 万次执行，declaration 请求 200~300 ms，补全 p95 231 ms）。改为只传递一层：调用者的实例取自只看直接调用点的 `DirectQuery`。执行降为 142 次，补全 p95 0.8 ms；z2d 的召回 95.3% → 95.0% |
+| 库得不到 live 诊断 | `src/server/Workspace.zig` | zeit 只有 `addModule` 与 `addTest`，默认的 install step 为空，编译集合为空，而集合算出后只对其中的文件发布 live 诊断。诊断 step 不涉及编译时改用构建图中所有的编译 step；集合仍为空时按尚未算出处理 |
+| maker 崩溃重启的竞态 | `src/server/Workspace.zig`、`Server.zig` | 空闲时崩溃，重启期间不计为忙碌，shutdown 可能早于新实例的进度结束；新实例在首次构建前又被重启时，旧实例的编译器诊断（`stale_files`）不再转交而一直残留；后台任务在结束进度之前就计为空闲。均在高负载下（并发运行多份测试）复现后修复 |
+| 函数别名的补全 | `src/ide/completion.zig` | 实例的成员补全列出函数的别名（`pub const isPowerPC = isPowerpc;`） |
+| 不活动分支中的种子 | `src/ide/seed.zig`、`context.zig` | 光标处的代码在第一个调用点的实例下不活动时（zigimg 的 `if (has_alpha) { res.a = ... }`），改取使之活动的调用点 |
+
+- `zig build test` 在测试向 stderr 写日志时也会打印 `failed command: ...`，但退出码为 0，并非失败；真正的失败带有「N pass, M fail」与测试名。
+- 测试：`zig build test` 共 264 个。
+
 ## 20. 风险与对策
 
 | 风险 | 影响 | 对策 |
