@@ -229,9 +229,12 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
 /// （类型为 `T` 的常量、返回 `T` 或 `!T` 的函数；类型推导不出时也列出）
 fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
-    const t = switch (ip.key(ty)) {
+    // 与编译器一致，结果类型去掉 error union 与 optional（`fn f() !Color { return .red; }`）
+    var t = ty;
+    while (true) t = switch (ip.key(t)) {
+        .error_union_type => |eu| eu.payload,
         .optional_type => |c| c,
-        else => ty,
+        else => break,
     };
     switch (ip.key(t)) {
         .reified_type, .union_tag_type => {
@@ -392,10 +395,14 @@ fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolv
     const tree = try r.itemTree(ns.file);
     if (ns.container >= tree.containers.len) return;
     try decls(out, tree, ns.container, same_file);
-    if (same_file and tree.containers[ns.container].kind == .@"enum") {
-        for (tree.containerMembers(ns.container)) |m| {
-            const it = tree.items[m];
-            if (it.kind == .field) if (it.name) |name| try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc });
-        }
+    const kind = tree.containers[ns.container].kind;
+    // 同一文件中的枚举成员（其他文件的由 `decls` 给出）；带标签的 union 在类型上访问字段得到字段的标签
+    // （`Value.null_val`），可以转换为 union
+    const fields = (same_file and kind == .@"enum") or
+        (kind == .@"union" and try eval.unionTag(r, try queries.containerType(r, ns, null)) != null);
+    if (!fields) return;
+    for (tree.containerMembers(ns.container)) |m| {
+        const it = tree.items[m];
+        if (it.kind == .field) if (it.name) |name| try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc });
     }
 }

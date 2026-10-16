@@ -424,10 +424,8 @@ const Inferrer = struct {
     }
 
     fn recordTagMember(inf: *Inferrer, e: ExprId, t: Index) Error!void {
-        const want = switch (inf.ip.key(t)) {
-            .optional_type => |c| c,
-            else => t,
-        };
+        // 结果类型为 `E!U`、`?U`、`E!?U` 时转换到 U（`fn parse() Error!Value { return .null_val; }`）
+        const want = inf.destType(t, .eu_opt) orelse return;
         // `union(enum)` 生成的标签枚举：成员是 union 的字段
         const want_union = switch (inf.ip.key(want)) {
             .union_tag_type => |u| u,
@@ -464,6 +462,11 @@ const Inferrer = struct {
                 return .{ .ty = want, .val = val };
             },
             .enum_literal_type => if (tv.val) |v| {
+                // `E!T`：字面量转换为载荷类型 T（再由编译器包装成 error union）
+                switch (ip.key(want)) {
+                    .error_union_type => |eu| return inf.coerce(tv, eu.payload),
+                    else => {},
+                }
                 const name = ip.key(v).enum_literal;
                 if (value.isEnumType(ip, target)) return .{ .ty = want, .val = try ip.get(.{ .enum_tag = .{ .ty = target, .name = name } }) };
                 switch (ip.key(target)) {
@@ -729,7 +732,10 @@ const Inferrer = struct {
             switch (ip.key(t)) {
                 .container_type => {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .unknown;
-                    const def = try inf.r.memberDef(ns, name) orelse return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown;
+                    const def = try inf.r.memberDef(ns, name) orelse {
+                        if (try inf.unionTagMember(e, t, ns, name)) |tv| return tv;
+                        return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown;
+                    };
                     inf.members[@backingInt(e)] = try defKey(inf.r, def);
                     return queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 },
@@ -778,6 +784,17 @@ const Inferrer = struct {
         if (res.exprs.len != body.exprs.len) return null;
         const fv = res.exprs[@backingInt(field.value)];
         return if (fv.val != null) fv else null;
+    }
+
+    /// 带标签的 union 在类型上访问字段（`Value.null_val`）：值为该字段的标签，类型为 union 的标签类型，
+    /// 可以转换为 union（与编译器一致）；引用的成员是 union 的字段
+    fn unionTagMember(inf: *Inferrer, e: ExprId, t: Index, ns: Namespace, name: []const u8) Error!?TypedValue {
+        const tree = try inf.r.itemTree(ns.file);
+        if (tree.containers[ns.container].kind != .@"union") return null;
+        const fi = fieldItem(tree, ns.container, name) orelse return null;
+        const tag = try eval.unionTag(inf.r, t) orelse return null;
+        inf.members[@backingInt(e)] = .{ .file = ns.file, .item = tree.items[fi].ast_id };
+        return .{ .ty = tag, .val = try inf.ip.get(.{ .enum_tag = .{ .ty = tag, .name = name } }) };
     }
 
     /// 当前构建配置下不存在的成员，所在的命名空间由声明中的 `if` / `switch` 按目标选择（如 `posix.system`

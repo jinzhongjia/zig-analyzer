@@ -166,10 +166,9 @@ const Finder = struct {
                 },
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
-                    const hit = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns|
-                        if (try r.memberDef(ns, f.name)) |d| deepEql(d, f.def) else false
-                    else
-                        try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    // 命名空间的声明直接比较；其他成员（带标签 union 的字段标签、其他目标分支中的声明）由推导给出
+                    const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
+                    const hit = if (ns_def) |d| deepEql(d, f.def) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     if (hit) try f.addLastToken(file, base + range.end);
                 },
                 .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {

@@ -232,3 +232,22 @@ test "references in generic bodies use a call site instance" {
     // `system` 在抽象的推导中未知：与跳转一样取调用点（`lookup(Real, ..)`）的实例
     try testing.expectEqualStrings("x:2:getenv* x:7:getenv", try refs(&w, fs, f, at(src, "getenv", 0), null));
 }
+
+test "references to tagged union fields through the type and error union results" {
+    const src =
+        \\const Value = union(enum) { null_val: void, int: i64 };
+        \\fn parse(n: u8) error{Bad}!Value {
+        \\    if (n == 0) return .null_val;
+        \\    return .{ .int = n };
+        \\}
+        \\test {
+        \\    _ = Value.null_val;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:null_val* x:3:null_val x:7:null_val", try refs(&w, fs, f, at(src, "null_val", 0), null));
+}

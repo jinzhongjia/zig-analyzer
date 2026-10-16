@@ -341,6 +341,10 @@ test "completion after `.` lists members of the expected type" {
         \\    }
         \\};
         \\const U = union(enum) { num: u8, none };
+        \\const V = union {
+        \\    a: u8,
+        \\    pub const k = 1;
+        \\};
         \\const S = struct {
         \\    x: u8,
         \\    pub const empty: S = .{ .x = 0 };
@@ -363,6 +367,12 @@ test "completion after `.` lists members of the expected type" {
         .{ "const c: ?E = .<|>;", "red green default parse" },
         .{ "const s: S = .<|>;", "empty init" },
         .{ "const u: U = .<|>;", "num none" },
+        // 结果类型去掉 error union 与 optional
+        .{ "fn f() !E { return .<|>; }", "red green default parse" },
+        .{ "fn f() error{X}!?U { return .<|>; }", "num none" },
+        // 带标签的 union 在类型上访问字段得到标签；不带标签的没有
+        .{ "const t = U.<|>;", "num none" },
+        .{ "const t = V.<|>;", "k" },
         // 没有期望类型
         .{ "const c = .<|>;", "" },
     };
@@ -860,5 +870,36 @@ test "goto declaration on names that declare themselves: error set members and a
             std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 20)] });
             return err;
         };
+    }
+}
+
+test "goto declaration of tagged union fields accessed through the type or an error union result" {
+    const text =
+        \\const Value = union(enum) { null_val: void, int: i64 };
+        \\const Error = error{Bad};
+        \\fn parse(n: u8) Error!Value {
+        \\    if (n == 0) return .null_val;
+        \\    return .{ .int = n };
+        \\}
+        \\test {
+        \\    const v = Value.null_val;
+        \\    _ = v;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_][]const u8{ "null_val;\n    return", "null_val;\n    _" }, 0..) |needle, i| {
+        const at = std.mem.indexOf(u8, text, needle).? + 1;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        try testing.expect(std.mem.startsWith(u8, text[t.start..], "null_val: void"));
     }
 }
