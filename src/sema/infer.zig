@@ -290,13 +290,17 @@ const Inferrer = struct {
         return if (key.decl == tree.items[inf.item].ast_id) key else null;
     }
 
-    /// 参数的值：实例中 comptime 参数取实参值（按参数类型转换），anytype 参数取实参的类型；
+    /// 参数的值：实例中 comptime 参数取实参值（按参数类型转换），comptime anytype 参数取实参值，
+    /// anytype 参数取实参的类型；
     /// 没有具体实参时类型参数（`comptime T: type`，或不写 comptime 的 `T: type`）为抽象参数
     fn paramValue(inf: *Inferrer, p: Body.BindingId, arg: ?Index) Error!TypedValue {
         const binding = inf.body.binding(p);
         const ty_e = binding.ty orelse {
-            // anytype：实例记录的是实参类型
-            return .{ .ty = if (arg) |a| (if (a == .runtime) .unknown else a) else .unknown };
+            const a = arg orelse return .unknown;
+            if (a == .runtime or a == .unknown) return .unknown;
+            // comptime anytype：实例记录的是实参值；anytype：实参类型
+            if (binding.is_comptime) return .{ .ty = value.typeOfValue(inf.ip, a), .val = a };
+            return .{ .ty = a };
         };
         const ty: Index = (try inf.inferComptime(ty_e, null)).asType() orelse .unknown;
         if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, a, ty)) orelse a };
@@ -971,6 +975,7 @@ const Inferrer = struct {
         // anytype 实参只需要类型，不是 comptime 上下文
         for (args, 0..) |a, i| switch (g.kind(i + skip)) {
             .comptime_value => _ = try inf.inferComptime(a, inf.concrete(paramType(f, i + skip))),
+            .comptime_anytype => _ = try inf.inferComptime(a, null),
             .anytype_type => _ = try inf.infer(a, null),
             .runtime => {},
         };
@@ -2653,7 +2658,8 @@ fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
     return if (v == .runtime or v == .unknown) null else v;
 }
 
-pub const ParamKind = enum { runtime, comptime_value, anytype_type };
+/// `comptime_anytype`（`comptime x: anytype`）在实例中记录实参值，参数类型由值给出；`anytype_type` 记录实参类型
+pub const ParamKind = enum { runtime, comptime_value, comptime_anytype, anytype_type };
 
 /// 需要实例化的被调函数：参数中有 comptime（含隐式的 comptime-only 类型参数）或 anytype，
 /// 或返回 comptime-only 类型（如 `type`，此时调用在 comptime 执行，所有实参都参与实例）
@@ -2682,7 +2688,7 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
     for (body.params, kinds, 0..) |p, *k, i| {
         const b = body.binding(p);
         k.* = if (b.ty == null)
-            .anytype_type
+            (if (b.is_comptime) .comptime_anytype else .anytype_type)
         else if (all_comptime or b.is_comptime or (i < f.params.len and value.isComptimeOnly(ip, f.params[i])))
             .comptime_value
         else
@@ -2705,6 +2711,7 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
         switch (g.kinds[i]) {
             .runtime => out.* = .runtime,
             .anytype_type => out.* = tv.ty,
+            .comptime_anytype => out.* = tv.val orelse .unknown,
             .comptime_value => {
                 out.* = tv.val orelse .unknown;
                 if (out.* == .unknown) continue;

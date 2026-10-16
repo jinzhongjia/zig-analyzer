@@ -1251,9 +1251,11 @@ const Evaluator = struct {
         var frame = try ev.newFrame(owner.file, item, body, inst);
         for (body.params, 0..) |p, i| {
             const arg: Val = if (i < args.len) args[i] else .unknown;
-            // anytype 参数的类型为实参类型（实例中记录的也是它）
-            const ty: Index = if (body.binding(p).ty == null)
-                (if (i < inst_args.len and inst_args[i] != .unknown and inst_args[i] != .runtime) inst_args[i] else arg.ty)
+            // anytype 参数的类型为实参类型（实例中记录的也是它；comptime anytype 记录的是实参值）
+            const binding = body.binding(p);
+            const recorded = i < inst_args.len and inst_args[i] != .unknown and inst_args[i] != .runtime;
+            const ty: Index = if (binding.ty == null)
+                (if (!recorded) arg.ty else if (binding.is_comptime) value.typeOfValue(ip, inst_args[i]) else inst_args[i])
             else if (@backingInt(p) < sig.bindings.len) sig.bindings[@backingInt(p)].ty else .unknown;
             frame.slots[@backingInt(p)] = try ev.copy(try ev.coerce(.{ .ty = if (arg.ty == .unknown) ty else arg.ty, .v = arg.v }, if (ty != .unknown) ty else null));
         }

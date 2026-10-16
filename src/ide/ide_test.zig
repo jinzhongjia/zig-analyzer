@@ -293,6 +293,48 @@ test "hover in generic bodies is inferred from a call site" {
     }
 }
 
+test "goto declaration through comptime anytype parameters" {
+    // `comptime H: anytype` 的实例记录实参值：类型实参的成员可以解析，原先只记录了实参的类型 `type`
+    const text =
+        \\const Md = struct {
+        \\    pub const digest_length = 16;
+        \\    pub fn hash(out: *[digest_length]u8) void {
+        \\        _ = out;
+        \\    }
+        \\};
+        \\fn check(comptime H: anytype, comptime hex: *const [H.digest_length * 2]u8) void {
+        \\    var h: [H.digest_length]u8 = undefined;
+        \\    H.hash(&h);
+        \\    _ = hex;
+        \\}
+        \\test {
+        \\    check(Md, "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 签名中的参数类型
+        .{ "digest_length * 2", "digest_length = 16" },
+        .{ "digest_length]u8 = undefined", "digest_length = 16" },
+        .{ "hash(&h)", "hash(out" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        try testing.expect(std.mem.startsWith(u8, text[t.start..], c[1]));
+    }
+}
+
 test "hover in generic bodies called only from other generic functions" {
     const text =
         \\const Px = struct { r: u8 };
