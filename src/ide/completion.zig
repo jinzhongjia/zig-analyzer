@@ -215,6 +215,11 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
                 try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
             },
             .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = .function, .doc = it.doc }),
+            // 函数的别名（`pub const isPowerPC = isPowerpc;`）同样可以作为方法调用
+            .@"const" => if (same_file or it.flags.is_pub) {
+                const cty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) })).ty;
+                if (ip.key(cty) == .fn_type) try out.add(.{ .label = name, .kind = .function, .doc = it.doc });
+            },
             else => {},
         }
     }

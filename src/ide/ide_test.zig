@@ -728,3 +728,29 @@ test "callsite seeding can be switched off" {
     // 不以调用点的实例推导：显示抽象的类型，没有「inferred from」
     try testing.expectEqualStrings("```zig\nconst bigger: T\n```", info.text);
 }
+
+test "member completion on values lists function aliases as methods" {
+    const text =
+        \\const Arch = enum {
+        \\    x86,
+        \\    arm,
+        \\    pub fn isArm(a: Arch) bool { return a == .arm; }
+        \\    pub const isARM = isArm;
+        \\    pub const count = 2;
+        \\};
+        \\fn f(a: Arch) bool { return a.<|>; }
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    // 函数的别名 `isARM` 可作为方法调用；值常量 `count` 不列出
+    try testing.expectEqualStrings("x86 arm isArm isARM", try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
