@@ -19,6 +19,7 @@ const InternPool = @import("../sema/InternPool.zig");
 const Index = InternPool.Index;
 const FileId = @import("../base/Vfs.zig").FileId;
 const definition = @import("definition.zig");
+const render = @import("../sema/render.zig");
 
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
@@ -83,20 +84,9 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         .missing, .@"return", .@"break", .@"continue", .@"unreachable", .assign, .block, .loop, .container => return null,
         else => {},
     }
-    const within = struct {
-        fn f(body: *const Body, outer: Body.ExprId, rs: u32, re: u32) bool {
-            const range = body.range(outer);
-            return range.start <= rs and re <= range.end;
-        }
-    }.f;
     for (b.exprs) |x| switch (x) {
         .assign => |a| if (a.lhs == e) return null,
         .prefix => |p| if (p.op == .ampersand and p.operand == e) return null,
-        // 循环的条件与 `: (cont)` 每轮都会求值，提取到循环之前只求值一次
-        .loop => |l| if (l.kind == .@"while") {
-            for (l.inputs) |in| if (within(b, in, rel_start, rel_end)) return null;
-            if (l.cont) |c| if (within(b, c, rel_start, rel_end)) return null;
-        },
         else => {},
     };
 
@@ -108,6 +98,21 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         if (path[i - 1].kind() == .block and n.range().end >= end) stmt = n;
     }
     const s = stmt orelse return null;
+    // defer 等语句中的表达式不在语句处求值（或在 comptime 求值）
+    switch (s.kind()) {
+        .defer_stmt, .errdefer_stmt, .comptime_stmt, .suspend_stmt, .nosuspend_stmt => return null,
+        else => {},
+    }
+    const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, item), .mode = .full });
+    if (res.exprs.len != b.exprs.len) return null;
+    const purity: Purity = .{ .r = r, .file = file, .item = item, .body = b, .res = res };
+    if (s.offset < base or !try hoistable(purity, e, s.offset - base, s.range().end - base)) return null;
+    // 类型取决于结果位置的表达式（`@intCast(x)` 等）：提取后显式标注原处的类型，标注不出时不提取
+    const annotation: []const u8 = if (needsResultType(b, e)) blk: {
+        const ty = res.exprs[@backingInt(e)].ty;
+        if (!isPlainType(r.ctx.db.env.ip, ty)) return null;
+        break :blk try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, ty)});
+    } else "";
 
     // 名字：Zig 不允许遮蔽，选一个在此处不可见、本成员中也没有绑定的名字
     var buf: [16]u8 = undefined;
@@ -120,11 +125,170 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
     } else return null;
 
     const indent = lineIndent(text, s.offset);
-    const new_text = try std.fmt.allocPrint(r.arena, "const {s} = {s};\n{s}{s}{s}", .{ name, text[start..end], indent, text[s.offset..start], name });
+    const new_text = try std.fmt.allocPrint(r.arena, "const {s}{s} = {s};\n{s}{s}{s}", .{ name, annotation, text[start..end], indent, text[s.offset..start], name });
     return .{
         .title = "extract to local constant",
         .kind = .refactor_extract,
         .edits = try r.arena.dupe(Edit, &.{.{ .start = s.offset, .end = end, .text = new_text }}),
+    };
+}
+
+/// `e` 提取到所在语句（相对 owner 的 `[stmt_start, stmt_end)`）之前后，求值的条件、次数与顺序不变：
+/// - `e` 不在有条件或重复求值的位置（`and` / `or` / `orelse` / `catch` 的右侧、`if` / `switch` 的分支、
+///   循环的条件与循环体等）
+/// - 语句中先于 `e` 求值的部分与 `e` 交换顺序不改变结果：两者之一是纯的（见 `Purity`）
+fn hoistable(p: Purity, e: Body.ExprId, stmt_start: u32, stmt_end: u32) resolve.Error!bool {
+    const b = p.body;
+    const target = b.range(e);
+    const in = struct {
+        fn f(body: *const Body, child: ?Body.ExprId, t: Body.Range) bool {
+            const range = body.range(child orelse return false);
+            return range.start <= t.start and t.end <= range.end;
+        }
+    }.f;
+    const e_pure = try p.pure(target);
+    for (b.exprs, b.expr_ranges, 0..) |x, range, i| {
+        if (i == @backingInt(e) or range.start < stmt_start or range.end > stmt_end) continue;
+        if (!(range.start <= target.start and target.end <= range.end)) {
+            // 先于 `e` 求值的部分有副作用（或读取可变的状态、可能提前退出），而 `e` 也不是纯的
+            if (!e_pure and range.end <= target.start and try p.impure(@intCast(i))) return false;
+            continue;
+        }
+        switch (x) {
+            .binary => |bin| switch (bin.op) {
+                .keyword_and, .keyword_or, .keyword_orelse => if (in(b, bin.rhs, target)) return false,
+                else => {},
+            },
+            .@"catch" => |c| if (in(b, c.rhs, target)) return false,
+            .@"if" => |f| if (in(b, f.then, target) or in(b, f.@"else", target)) return false,
+            .@"switch" => |sw| for (sw.prongs) |pr| {
+                if (in(b, pr.body, target)) return false;
+                for (pr.items) |it| if (in(b, it, target)) return false;
+            },
+            .loop => |l| {
+                if (in(b, l.body, target) or in(b, l.@"else", target) or in(b, l.cont, target)) return false;
+                // while 的条件每轮都会求值
+                if (l.kind == .@"while") for (l.inputs) |it| if (in(b, it, target)) return false;
+            },
+            .block, .@"comptime", .container, .other => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// 表达式的纯度：纯的表达式没有副作用、不会提前退出，读取的也只有不可变的值（字面量、常量、参数、
+/// 值捕获），与其他表达式交换求值顺序不改变结果（溢出等运行时检查失败的先后除外）
+const Purity = struct {
+    r: *Resolver,
+    file: FileId,
+    item: u32,
+    body: *const Body,
+    res: queries.Infer.Value,
+
+    /// 区间 `range` 内的表达式都不是 `impure` 的
+    fn pure(p: Purity, range: Body.Range) resolve.Error!bool {
+        for (p.body.expr_ranges, 0..) |x, i| {
+            if (x.start >= range.start and x.end <= range.end and try p.impure(@intCast(i))) return false;
+        }
+        return true;
+    }
+
+    /// 表达式自身（不含子表达式）有副作用、可能提前退出或读取可变的状态
+    fn impure(p: Purity, i: u32) resolve.Error!bool {
+        const b = p.body;
+        const id: Body.ExprId = @fromBackingInt(i);
+        return switch (b.expr(id)) {
+            .call, .assign, .deref, .@"return", .@"break", .@"continue", .@"unreachable", .other => true,
+            .prefix => |x| x.op == .keyword_try,
+            .builtin_call => |c| for (pure_builtins) |n| {
+                if (std.mem.eql(u8, c.name, n)) break false;
+            } else true,
+            .name_ref => |name| try p.mutableName(id, name),
+            // 经由指针（含自动解引用）读取：所指向的内容可能被修改
+            .field_access => |fa| p.viaPointer(fa.lhs) or try p.isVar(p.res.members[i]),
+            .index => |x| p.viaPointer(x.lhs),
+            else => false,
+        };
+    }
+
+    fn mutableName(p: Purity, e: Body.ExprId, name: []const u8) resolve.Error!bool {
+        const def = try p.r.resolveName(p.file, p.item, p.body, p.body.expr_scopes[@backingInt(e)], name) orelse
+            return !(std.zig.primitives.isPrimitive(name) or for ([_][]const u8{ "_", "true", "false", "null", "undefined" }) |n| {
+                if (std.mem.eql(u8, name, n)) break true;
+            } else false);
+        return switch (def) {
+            .local => |l| (try p.r.body(l.file, l.item)).binding(l.binding).kind == .local_var,
+            .item => |it| (try p.r.itemTree(it.file)).items[it.item].kind == .@"var",
+            .file => false,
+        };
+    }
+
+    fn viaPointer(p: Purity, lhs: Body.ExprId) bool {
+        return switch (p.r.ctx.db.env.ip.key(p.res.exprs[@backingInt(lhs)].ty)) {
+            .ptr_type, .unknown => true,
+            else => false,
+        };
+    }
+
+    fn isVar(p: Purity, member: ?database.hir.OwnerKey) resolve.Error!bool {
+        const key = member orelse return false;
+        const tree = try p.r.itemTree(key.file);
+        for (tree.items) |it| if (it.ast_id == key.item) return it.kind == .@"var";
+        return false;
+    }
+};
+
+/// 没有副作用的内建函数
+const pure_builtins = [_][]const u8{
+    "@as",              "@sizeOf",          "@alignOf",   "@bitSizeOf",  "@TypeOf",       "@typeInfo",        "@typeName",
+    "@This",            "@min",             "@max",       "@abs",        "@intFromEnum",  "@intFromBool",     "@tagName",
+    "@errorName",       "@truncate",        "@intCast",   "@floatCast",  "@floatFromInt", "@intFromFloat",    "@enumFromInt",
+    "@bitCast",         "@ptrCast",         "@alignCast", "@constCast",  "@splat",        "@import",          "@hasDecl",
+    "@hasField",        "@offsetOf",        "@divTrunc",  "@divFloor",   "@divExact",     "@mod",             "@rem",
+    "@shlExact",        "@shrExact",        "@sqrt",      "@floor",      "@ceil",         "@round",           "@clz",
+    "@ctz",             "@popCount",        "@byteSwap",  "@bitReverse", "@mulAdd",       "@addWithOverflow", "@subWithOverflow",
+    "@mulWithOverflow", "@shlWithOverflow", "@Vector",    "@Type",       "@embedFile",    "@src",
+};
+
+/// 类型由结果位置决定的转换（与 `Infer` 的 `casts` 一致）
+const result_typed_builtins = [_][]const u8{
+    "@intCast", "@truncate",  "@floatCast",     "@floatFromInt", "@intFromFloat",   "@enumFromInt", "@bitCast",
+    "@ptrCast", "@alignCast", "@addrSpaceCast", "@ptrFromInt",   "@fieldParentPtr", "@errorCast",   "@splat",
+};
+
+/// 表达式的类型（或合法性）取决于结果位置：单独作为 `const` 的初始值时须标注类型
+fn needsResultType(b: *const Body, e: Body.ExprId) bool {
+    return switch (b.expr(e)) {
+        .builtin_call => |c| for (result_typed_builtins) |n| {
+            if (std.mem.eql(u8, c.name, n)) break true;
+        } else false,
+        .init => |i| i.ty == null,
+        .enum_literal => true,
+        .name_ref => |n| std.mem.eql(u8, n, "undefined") or std.mem.eql(u8, n, "null"),
+        .@"if" => |f| needsResultType(b, f.then) or (if (f.@"else") |x| needsResultType(b, x) else false),
+        .@"switch" => |sw| for (sw.prongs) |p| {
+            if (needsResultType(b, p.body)) break true;
+        } else false,
+        .@"catch" => |c| needsResultType(b, c.lhs) or needsResultType(b, c.rhs),
+        .binary => |bin| bin.op == .keyword_orelse and (needsResultType(b, bin.lhs) or needsResultType(b, bin.rhs)),
+        .prefix => |p| p.op == .keyword_try and needsResultType(b, p.operand),
+        else => false,
+    };
+}
+
+/// 只由内建类型组成、在任何作用域都能原样写出的类型
+fn isPlainType(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .int_type => true,
+        .simple_type => |st| switch (st) {
+            .type, .noreturn, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => false,
+            else => true,
+        },
+        .ptr_type => |p| p.sentinel == null and isPlainType(ip, p.child),
+        .array_type => |a| a.sentinel == null and isPlainType(ip, a.child),
+        .optional_type => |c| isPlainType(ip, c),
+        else => false,
     };
 }
 
