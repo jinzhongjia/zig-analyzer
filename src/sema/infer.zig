@@ -744,7 +744,40 @@ const Inferrer = struct {
         if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, lhs, name)) |fv| {
             return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
         };
+        if (tv.val == null and lhs.val == null) if (try inf.declInitFieldValue(lhs_e, name)) |fv| {
+            return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
+        };
         return tv;
+    }
+
+    /// 左侧是初始化为结构体字面量的容器级常量、但整体的值求不出时（其他字段求不出）：取该字段的初始化
+    /// 表达式的值。如 wasm 目标的 `builtin.cpu = .{ .arch = .wasm32, .features = featureSet(..) }` 中
+    /// `featureSet` 求不出，`builtin.cpu.arch` 仍为 `.wasm32`
+    fn declInitFieldValue(inf: *Inferrer, lhs_e: ExprId, name: []const u8) Error!?TypedValue {
+        const owner: hir.OwnerKey = if (inf.members[@backingInt(lhs_e)]) |m| m else switch (inf.body.expr(lhs_e)) {
+            .name_ref => |n| blk: {
+                const def = try inf.r.resolveName(inf.file, inf.item, inf.body, inf.body.expr_scopes[@backingInt(lhs_e)], n) orelse return null;
+                break :blk try defKey(inf.r, def) orelse return null;
+            },
+            else => return null,
+        };
+        const tree = try inf.r.itemTree(owner.file);
+        const item = for (tree.items) |it| {
+            if (it.ast_id == owner.item) break it;
+        } else return null;
+        if (item.kind != .@"const") return null;
+        const body = try inf.r.ctx.get(hir.ItemBody, owner);
+        const init = switch (body.expr(body.value orelse return null)) {
+            .init => |x| x,
+            else => return null,
+        };
+        const field = for (init.fields) |f| {
+            if (f.name != null and std.mem.eql(u8, f.name.?, name)) break f;
+        } else return null;
+        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        if (res.exprs.len != body.exprs.len) return null;
+        const fv = res.exprs[@backingInt(field.value)];
+        return if (fv.val != null) fv else null;
     }
 
     /// 当前构建配置下不存在的成员，所在的命名空间由声明中的 `if` / `switch` 按目标选择（如 `posix.system`
