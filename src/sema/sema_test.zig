@@ -1935,3 +1935,20 @@ test "member bodies are reused when their source is unchanged" {
     try testing.expectEqual(before.a, after.a);
     try testing.expect(before.b != after.b);
 }
+
+test "std.mem pointer reinterpretation" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const F = packed struct { a: u8 };
+        \\fn g(s: []const u16, b: *const [2]u8, z: [:0]const u8) void {
+        \\    const bytes = std.mem.sliceAsBytes(s);
+        \\    const fs = std.mem.bytesAsSlice(F, b);
+        \\    const zb = std.mem.sliceAsBytes(z);
+        \\    _ = .{ bytes, fs, zb };
+        \\}
+    , &.{
+        .{ "bytes", "[]const u8" },
+        .{ "fs", "[]const F" },
+        .{ "zb", "[]const u8" },
+    });
+}
