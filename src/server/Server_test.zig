@@ -62,8 +62,9 @@ fn errorCode(msg: std.json.Value) i64 {
 
 test "full lifecycle: initialize, document sync, read requests, shutdown" {
     var s: Session = undefined;
+    // zig 指向不存在的路径：后台启动（zig env、加载 std）确定地失败，不与 status 的文件数与 revision 竞争
     try s.run(frame(
-        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-16","utf-8"]}}}}
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-16","utf-8"]}},"initializationOptions":{"zig":{"path":"/nonexistent/zig"}}}}
     ) ++ frame(
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
     ) ++ frame(
