@@ -298,12 +298,20 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     const a = c.arena.allocator();
     const limit = 3000;
     var offsets: std.ArrayList(usize) = .empty;
+    // 每个标识符之前的两个 token，用于给未解析的标识符分类
+    var befores: std.ArrayList([2]std.zig.Token.Tag) = .empty;
     var tokenizer: std.zig.Tokenizer = .init(text);
+    var prev: [2]std.zig.Token.Tag = .{ .invalid, .invalid };
     while (true) {
         const t = tokenizer.next();
         if (t.tag == .eof) break;
-        if (t.tag == .identifier and !std.mem.eql(u8, text[t.loc.start..t.loc.end], "_")) try offsets.append(a, t.loc.start);
+        if (t.tag == .identifier and !std.mem.eql(u8, text[t.loc.start..t.loc.end], "_")) {
+            try offsets.append(a, t.loc.start);
+            try befores.append(a, prev);
+        }
+        prev = .{ prev[1], t.tag };
     }
+    var kinds: [@typeInfo(UnresolvedKind).@"enum".field_names.len]usize = @splat(0);
     const n = @min(offsets.items.len, limit);
     var texts: std.StringHashMapUnmanaged([]const u8) = .empty;
     var resolved: usize = 0;
@@ -314,6 +322,7 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     const unresolved_limit = c.unresolved_samples;
     for (0..n) |i| {
         const off = offsets.items[i * offsets.items.len / n];
+        const before = befores.items[i * offsets.items.len / n];
         const name = identAt(text, off);
         const resp, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = uri }, .position = positionOf(text, off) });
         const result = resp.object.get("result") orelse continue;
@@ -322,6 +331,7 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
             .array => |arr| if (arr.items.len > 0) arr.items[0] else null,
             else => null,
         } orelse {
+            kinds[@intFromEnum(classifyUnresolved(name, before))] += 1;
             if (unresolved_shown < unresolved_limit) {
                 unresolved_shown += 1;
                 const p = positionOf(text, off);
@@ -352,6 +362,40 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
         }
     }
     std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched });
+    std.debug.print("  declaration  unresolved by kind:", .{});
+    for (kinds, 0..) |k, i| std.debug.print(" {t} {d}", .{ @as(UnresolvedKind, @enumFromInt(i)), k });
+    // 内置类型与值、len / ptr、error.X 本来就没有声明位置，不计入分母
+    const no_decl = kinds[@intFromEnum(UnresolvedKind.primitive)] + kinds[@intFromEnum(UnresolvedKind.len_ptr)] + kinds[@intFromEnum(UnresolvedKind.error_name)];
+    std.debug.print("; resolved excluding identifiers without a declaration {d:.1}%\n", .{@as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n - no_decl, 1)))});
+}
+
+/// 未解析的标识符的种类（由其之前的 token 判断）
+const UnresolvedKind = enum {
+    /// 内置类型与值（`u8`、`bool`、`true`、`null`、`undefined`）：没有声明位置
+    primitive,
+    /// 切片、数组的 `len` 与 `ptr`：没有声明位置
+    len_ptr,
+    /// `error.Foo`：没有声明位置
+    error_name,
+    /// 没有左侧的 `.name`：枚举字面量、decl literal、初始化中的字段名
+    dot_literal,
+    /// `a.name`
+    member,
+    /// 标签（`break :blk`）
+    label,
+    /// 名字引用（局部、容器级、模块名）
+    name,
+};
+
+fn classifyUnresolved(name: []const u8, before: [2]std.zig.Token.Tag) UnresolvedKind {
+    if (std.zig.primitives.isPrimitive(name)) return .primitive;
+    if (before[1] == .colon and (before[0] == .keyword_break or before[0] == .keyword_continue)) return .label;
+    if (before[1] != .period) return .name;
+    return switch (before[0]) {
+        .keyword_error => .error_name,
+        .identifier, .r_paren, .r_bracket, .r_brace, .question_mark, .period_asterisk, .string_literal => if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "ptr")) .len_ptr else .member,
+        else => .dot_literal,
+    };
 }
 
 const Loc = struct { uri: []const u8, line: u32, character: u32 };
