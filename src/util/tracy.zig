@@ -1,4 +1,4 @@
-//! tracy 性能分析器的接入（设计 §14）：`zig build -Dtracy=<tracy 源码目录>` 时生效，否则全部为空操作。
+//! tracy 性能分析器的接入：`zig build -Dtracy=<tracy 源码目录>` 时生效，否则全部为空操作。
 //!
 //! zone 的粒度：每次 query 计算（以 query 名标注，附带 key）与每个请求（以方法名标注）。
 

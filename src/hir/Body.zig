@@ -1,9 +1,9 @@
-//! HIR：BodyOwner（函数、const/var、字段、test、comptime 块）中表达式的容错中间表示（设计 §8）。
+//! HIR：BodyOwner（函数、const/var、字段、test、comptime 块）中表达式的容错中间表示。
 //!
 //! 由 CST 降级而来（`lower.zig`），语法缺失处为 `.missing`。位置都相对于 owner 节点的起点，
 //! owner 之前的编辑不改变 Body 的内容。体内定义的容器只记录为 `.container`，其成员属于 ItemTree。
 //!
-//! 作用域（§8.3）在降级时一并算出：每个表达式记录其求值时所在的作用域，作用域链上是可见的
+//! 作用域在降级时一并算出：每个表达式记录其求值时所在的作用域，作用域链上是可见的
 //! 参数、局部变量、捕获与标签。
 
 const std = @import("std");

@@ -1,8 +1,8 @@
-//! InternPool：类型与 comptime 值的唯一表示（设计 §9.1）。
+//! InternPool：类型与 comptime 值的唯一表示。
 //!
 //! 类型本身也是值（其类型为 `type`）。相同的 Key 总是得到相同的 Index，与驻留顺序无关，
 //! 因此 query 结果中的 Index 可以直接比较。只追加不删除：类型身份在整个进程内稳定。
-//! 多个 query 并发驻留，以互斥锁保护（见 §19.6）。
+//! 多个 query 并发驻留，以互斥锁保护。
 
 const std = @import("std");
 const Io = std.Io;
@@ -104,7 +104,7 @@ pub const Key = union(enum) {
     error_union_type: struct { err: Index, payload: Index },
     /// 名字按字典序排列、去重
     error_set_type: []const []const u8,
-    /// 函数 `!T` 中由函数体推导的错误集（设计 §9.4）。签名只记录这个标记，成员由 `ErrorSetOf` 按需求出
+    /// 函数 `!T` 中由函数体推导的错误集。签名只记录这个标记，成员由 `ErrorSetOf` 按需求出
     inferred_error_set: struct { file: FileId, decl: AstId, inst: ?Index = null },
     fn_type: struct { params: []const Index, ret: Index, varargs: bool = false },
     /// 身份 = 定义位置（文件 + 容器的 AstId）
@@ -144,7 +144,7 @@ pub const Key = union(enum) {
     /// anytype 参数为实参类型；非 comptime 参数为 `runtime`）。
     /// `parent` 为函数自身所在的实例（定义在另一个实例化容器中的函数）
     instance: Instance,
-    /// 没有具体实例时的 comptime 类型参数（抽象实例，设计 §9.4），显示为参数名
+    /// 没有具体实例时的 comptime 类型参数（抽象实例），显示为参数名
     opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
     /// 实例实参中非 comptime 参数的占位
     runtime,
@@ -289,7 +289,7 @@ pub fn deinit(ip: *InternPool) void {
     ip.* = undefined;
 }
 
-/// 回收全部非预置的项（整代回收，设计 §9.1）。调用方须保证此后没有任何地方使用非预置的 Index：
+/// 回收全部非预置的项（整代回收）。调用方须保证此后没有任何地方使用非预置的 Index：
 /// 引用它们的 query 同时清空（`Db.resetQueries`），且没有读事务在进行
 ///
 /// 先在新的表中建好预置项再整体替换：分配失败时原来的池保持完整（预置的 Index 仍然有效），只是没有回收

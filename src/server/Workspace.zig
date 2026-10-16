@@ -1,4 +1,4 @@
-//! 一个带 build.zig 的项目：管理构建系统协议进程、项目模型、编译集合与编译器诊断（设计 §11、§13）。
+//! 一个带 build.zig 的项目：管理构建系统协议进程、项目模型、编译集合与编译器诊断。
 //!
 //! 线程模型：每个 Workspace 有一个专用的后台任务阻塞读取 BSP 事件并处理；LSP 主循环只通过
 //! `requestBuild` / `stop` 与之交互。
@@ -217,7 +217,7 @@ pub fn owns(ws: *Workspace, file: FileId) bool {
     return isUnder(ws.server.vfs.path(file), ws.root);
 }
 
-/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件发布（与编译器一致，§11.4）
+/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件发布（与编译器一致）
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);

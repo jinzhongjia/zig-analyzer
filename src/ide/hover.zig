@@ -66,7 +66,7 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
         };
     }
 
-    // 泛型函数体内没有具体实例：以调用点的实例推导（设计 §9.4 的调用点种子）
+    // 泛型函数体内没有具体实例：以调用点的实例推导
     var seeded_from: ?seed.Seed = null;
     if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) if (try seed.find(r, file, a.item)) |s| {
         const res = s.res;

@@ -1,4 +1,4 @@
-//! CST → HIR 降级（设计 §8.2），同时计算局部作用域（§8.3）。
+//! CST → HIR 降级，同时计算局部作用域。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

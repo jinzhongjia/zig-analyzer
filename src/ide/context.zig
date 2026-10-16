@@ -28,7 +28,7 @@ pub const At = struct {
     /// 相对成员起点的位置
     rel: u32,
     ip: *InternPool,
-    /// 成员位于泛型函数内时以调用点的实例推导的结果（设计 §9.4，见 `atSeeded`）：`res` 中含抽象参数或
+    /// 成员位于泛型函数内时以调用点的实例推导的结果（见 `atSeeded`）：`res` 中含抽象参数或
     /// 未知的部分取自这里
     seeded: ?seed.Seed = null,
 

@@ -1,4 +1,4 @@
-//! 编译集合（设计 §11.4）：编译器会做 AstGen 的全部文件，即从各 compile step 的根模块与标准库根文件出发，
+//! 编译集合：编译器会做 AstGen 的全部文件，即从各 compile step 的根模块与标准库根文件出发，
 //! 沿 ZIR 记录的 `@import`（含未被分析的函数中的 import）可达的文件。live 诊断只对其中的文件发布。
 
 const std = @import("std");

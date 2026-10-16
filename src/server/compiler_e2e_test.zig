@@ -1,4 +1,4 @@
-//! 端到端：Server + 真实的构建系统协议，校验发布的诊断与编译器一致（设计 §11），以及构建进度通知。
+//! 端到端：Server + 真实的构建系统协议，校验发布的诊断与编译器一致，以及构建进度通知。
 
 const std = @import("std");
 const testing = std.testing;

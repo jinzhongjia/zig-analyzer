@@ -1,4 +1,4 @@
-//! 用户配置（设计 §15）：来自客户端，即 `initialize` 的 `initializationOptions` 与
+//! 用户配置：来自客户端，即 `initialize` 的 `initializationOptions` 与
 //! `workspace/didChangeConfiguration` 推送（或经 `workspace/configuration` 拉取）的 settings。
 //!
 //! JSON 结构如下；也接受外面再包一层 `"zig-analyzer"`：

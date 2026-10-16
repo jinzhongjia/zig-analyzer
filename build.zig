@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // tracy（设计 §14）：-Dtracy=<tracy 源码目录> 时编译其客户端，query 与请求以 zone 标注
+    // tracy：-Dtracy=<tracy 源码目录> 时编译其客户端，query 与请求以 zone 标注
     const tracy = b.option([]const u8, "tracy", "Enable Tracy profiling, with the path to the Tracy source checkout");
     const build_options = b.addOptions();
     build_options.addOption(bool, "tracy", tracy != null);
