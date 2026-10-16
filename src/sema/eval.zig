@@ -157,6 +157,12 @@ pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
     return decl.arg;
 }
 
+/// 指向 comptime 常量值 `pointee` 的指针值（与解释器的表示一致：指向数组的指针以元素表示）
+pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    return ev.pointerTo(ptr_ty, pointee);
+}
+
 /// union 的标签类型（`union(E)` 为 E，`union(enum)` 为生成的标签枚举）；不是带标签的 union 时为 null
 pub fn unionTag(r: *Resolver, t: Index) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };

@@ -2087,6 +2087,63 @@ test "a field of a literal-initialized constant is known when other fields are n
     });
 }
 
+test "comptime evaluation: multiline strings, string arguments and comptime expressions in bodies" {
+    try expectTypes(
+        \\const text =
+        \\    \\-a, --aa
+        \\    \\  -b
+        \\;
+        \\const Split = struct {
+        \\    buffer: []const u8,
+        \\    index: ?usize = 0,
+        \\    fn find(s: []const u8, start: usize) ?usize {
+        \\        var i = start;
+        \\        while (i < s.len) : (i += 1) if (s[i] == '\n') return i;
+        \\        return null;
+        \\    }
+        \\    fn next(self: *Split) ?[]const u8 {
+        \\        const start = self.index orelse return null;
+        \\        const end = if (find(self.buffer, start)) |d| blk: {
+        \\            self.index = d + 1;
+        \\            break :blk d;
+        \\        } else blk: {
+        \\            self.index = null;
+        \\            break :blk self.buffer.len;
+        \\        };
+        \\        return self.buffer[start..end];
+        \\    }
+        \\};
+        \\fn count(s: []const u8) usize {
+        \\    var n: usize = 0;
+        \\    var it: Split = .{ .buffer = s };
+        \\    while (it.next()) |_| n += 1;
+        \\    return n;
+        \\}
+        \\fn Buf(comptime s: []const u8) type {
+        \\    return [s.len]u8;
+        \\}
+        \\const lines = count(text);
+        \\const FromLiteral = Buf("abc");
+        \\const FromMultiline = Buf(
+        \\    \\ab
+        \\    \\c
+        \\);
+        \\fn f() void {
+        \\    const local = comptime count("x\ny\nz");
+        \\    _ = local;
+        \\}
+    , &.{
+        // 各行去掉 `\\` 后以换行符连接
+        .{ "text", "*const [13:0]u8 = \"-a, --aa\\n  -b\"" },
+        .{ "lines", "usize = 2" },
+        // 字符串字面量作为 comptime 实参有值
+        .{ "FromLiteral", "type = [3]u8" },
+        .{ "FromMultiline", "type = [4]u8" },
+        // 函数体中的 `comptime` 表达式在 comptime 求值
+        .{ "local", "usize = 3" },
+    });
+}
+
 test "comptime evaluation: slices, pointers and error unions in interpreter storage" {
     try expectTypes(
         \\fn at(b: *[4]u8) error{X}!*u8 {

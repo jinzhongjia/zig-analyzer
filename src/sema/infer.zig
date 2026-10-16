@@ -412,7 +412,18 @@ const Inferrer = struct {
             defer inf.comptime_depth -= 1;
             break :blk try inf.infer(e, expected);
         };
-        if (!outermost or tv.val != null or inf.dead > 0 or inf.r.ctx.incomplete()) return tv;
+        if (tv.val != null or inf.dead > 0) return tv;
+        // comptime 实参中的字符串字面量（推导器平时不为字符串生成值）：与解释器一致，值的类型为 `*const [N:0]u8`
+        switch (inf.body.expr(e)) {
+            .literal => |text| if (try Body.stringLiteralValue(inf.scratch, text)) |str| {
+                const ty = try inf.ip.stringLiteralType(str.len);
+                const v: TypedValue = .{ .ty = ty, .val = try inf.ip.get(.{ .bytes = .{ .ty = ty, .bytes = str } }) };
+                inf.exprs[@backingInt(e)] = v;
+                return v;
+            },
+            else => {},
+        }
+        if (!outermost or inf.r.ctx.incomplete()) return tv;
         switch (inf.body.expr(e)) {
             .missing, .other, .literal, .name_ref => return tv,
             else => {},
@@ -632,7 +643,7 @@ const Inferrer = struct {
                 if (c.value) |v| _ = try inf.infer(v, if (c.label) |l| inf.switchOperandType(e, l) else null);
                 return .{ .ty = .noreturn_type };
             },
-            .@"comptime" => |x| return inf.infer(x, expected),
+            .@"comptime" => |x| return inf.inferComptime(x, expected),
             .@"unreachable" => return .{ .ty = .noreturn_type },
             .optional_type => |x| {
                 const child = (try inf.infer(x, null)).asType() orelse return typeUnknown();
@@ -1818,7 +1829,13 @@ const Inferrer = struct {
                     else => null,
                 } else null;
                 const v = try inf.infer(operand_e, child_expected);
-                return .{ .ty = try ip.ptrTo(v.ty, .one, try inf.isConstPlace(operand_e)) };
+                const is_const = try inf.isConstPlace(operand_e);
+                const ty = try ip.ptrTo(v.ty, .one, is_const);
+                // comptime 实参中指向常量的指针（`parseEx(Id, &params, ...)`）：值为指向该常量值的指针
+                if (inf.comptime_depth > 0 and is_const) if (v.val) |pointee| {
+                    return .{ .ty = ty, .val = try eval.constPointer(inf.r, ty, pointee) };
+                };
+                return .{ .ty = ty };
             },
             .minus, .minus_percent, .tilde => {
                 // 数字字面量先按 comptime_int 运算，结果再转换为期望类型（`const x: i8 = -128`）
