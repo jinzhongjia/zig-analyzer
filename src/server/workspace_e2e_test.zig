@@ -205,3 +205,37 @@ test "completion of @import paths lists modules, files and directories" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "live diagnostics in a library whose default step compiles nothing" {
+    // 只有 addModule 与 addTest：默认的 install step 为空，编译集合改用构建图中所有的编译 step
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const mod = b.addModule("lib", .{ .root_source_file = b.path("lib.zig"), .target = b.graph.host });
+        \\    const tests = b.addTest(.{ .root_module = mod });
+        \\    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+        \\}
+        \\
+        },
+        .{ .path = "lib.zig", .text = "pub const a = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "lib.zig"));
+    try open(&h, uri, "pub const a = 1;\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text = "pub const a = 1;\n@@\n" }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const diags = (try lastDiagnostics(&h, uri)) orelse return error.NoDiagnostics;
+    try testing.expectEqual(1, diags.len);
+    try testing.expect(std.mem.indexOf(u8, diags[0], "invalid token") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

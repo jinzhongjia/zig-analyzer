@@ -219,6 +219,8 @@ pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     const set = &(ws.compile_set orelse return true);
+    // 构建图中没有任何编译：集合为空时按尚未算出处理，不让所有文件都失去 live 诊断
+    if (set.files.count() == 0) return true;
     return set.contains(file);
 }
 
@@ -553,6 +555,15 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
         defer ws.mutex.unlock(io);
         const model = &(ws.model orelse return);
         steps = try model.compileStepsOf(ws.gpa, model.diagnostics_steps);
+        // 诊断 step 不编译任何东西（如只有 addModule 与 addTest、默认的 install 为空的库）：改用构建图中
+        // 所有的编译 step，否则编译集合为空，项目中的文件都得不到 live 诊断
+        if (steps.len == 0) {
+            var all: std.ArrayList(u32) = .empty;
+            errdefer all.deinit(ws.gpa);
+            for (model.steps, 0..) |st, i| if (st.kind == .compile) try all.append(ws.gpa, @intCast(i));
+            ws.gpa.free(steps);
+            steps = try all.toOwnedSlice(ws.gpa);
+        }
     }
 
     var rounds: usize = 0;
