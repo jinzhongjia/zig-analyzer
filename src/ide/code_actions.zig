@@ -431,7 +431,7 @@ fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
         if (it.kind != .field) continue;
         const name = it.name orelse continue;
         if (covered.contains(ast.identName(name))) continue;
-        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{s} => {{}}", .{name}));
+        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} => {{}}", .{std.zig.fmtIdP(ast.identName(name))}));
     }
     if (items.items.len == 0) return null;
     const edit = try appendBeforeClose(r.arena, text, at.base + at.body.range(at.expr).start, at.base + at.body.range(at.expr).end, items.items, true) orelse return null;
@@ -460,7 +460,7 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
         for (init.fields) |f| if (std.mem.eql(u8, ast.identName(f.name.?), ast.identName(name))) continue :outer;
         const node = map.get(it.ast_id) orelse continue;
         if (ast.cast(ast.ContainerField, node)) |cf| if (cf.defaultValue() != null) continue;
-        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{s} = undefined", .{name}));
+        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} = undefined", .{std.zig.fmtIdP(ast.identName(name))}));
     }
     if (items.items.len == 0) return null;
     const start = at.base + at.body.range(at.expr).start;

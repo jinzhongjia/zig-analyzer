@@ -161,6 +161,32 @@ test "add missing struct fields" {
     );
 }
 
+test "add missing fields and prongs with names that need quoting" {
+    try expectAction(
+        \\const S = struct { @"x y": u32, @"type": u8 };
+        \\const s: S = .{<|>};
+    , "add missing struct fields",
+        \\const S = struct { @"x y": u32, @"type": u8 };
+        \\const s: S = .{ .@"x y" = undefined, .type = undefined };
+    );
+    try expectAction(
+        \\const E = enum { @"a b", c };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .c => {},<|>
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { @"a b", c };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .c => {},
+        \\        .@"a b" => {},
+        \\    }
+        \\}
+    );
+}
+
 test "extract to local constant" {
     try expectAction(
         \\fn f(a: u32, b: u32) u32 {
