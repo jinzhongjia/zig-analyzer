@@ -71,7 +71,8 @@ pub const Builder = struct {
         b.arena.deinit();
     }
 
-    pub fn add(b: *Builder, model: *const ProjectModel, compile_set: *const CompileSet.Result) Allocator.Error!void {
+    /// `extra`：其余编译 step 可达的文件，不在编译集合中的按它归属（测试、示例中的文件也能解析模块 import）
+    pub fn add(b: *Builder, model: *const ProjectModel, compile_set: *const CompileSet.Result, extra: ?*const CompileSet.Result) Allocator.Error!void {
         const a = b.arena.allocator();
         const offset: u32 = @intCast(b.modules.items.len);
         for (model.modules) |m| {
@@ -83,15 +84,18 @@ pub const Builder = struct {
                 .builtin = if (m.builtin_file) |p| try b.vfs.intern(p) else null,
             });
         }
-        for (compile_set.files.keys(), compile_set.files.values()) |file, mem| {
-            // 同一文件属于多个项目时取第一个
-            const gop = try b.files.getOrPut(b.gpa, file);
-            if (gop.found_existing) continue;
-            gop.value_ptr.* = .{
-                .file = file,
-                .module = if (mem.module == std_module) std_module else offset + mem.module,
-                .root_module = offset + mem.root_module,
-            };
+        for ([_]?*const CompileSet.Result{ compile_set, extra }) |set| {
+            const cs = set orelse continue;
+            for (cs.files.keys(), cs.files.values()) |file, mem| {
+                // 同一文件属于多个项目（或同时在编译集合与 `extra` 中）时取第一个
+                const gop = try b.files.getOrPut(b.gpa, file);
+                if (gop.found_existing) continue;
+                gop.value_ptr.* = .{
+                    .file = file,
+                    .module = if (mem.module == std_module) std_module else offset + mem.module,
+                    .root_module = offset + mem.root_module,
+                };
+            }
         }
     }
 

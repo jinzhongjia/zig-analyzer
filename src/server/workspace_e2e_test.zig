@@ -239,3 +239,41 @@ test "live diagnostics in a library whose default step compiles nothing" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "files reachable only from non-default steps resolve module imports" {
+    // 默认的 install 只编译 app；t.zig 只在 test step 的模块中，经由它 import 了模块 lib
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const lib = b.addModule("lib", .{ .root_source_file = b.path("lib.zig"), .target = b.graph.host });
+        \\    const app = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("app.zig"), .target = b.graph.host }) });
+        \\    b.installArtifact(app);
+        \\    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("t.zig"),
+        \\        .target = b.graph.host,
+        \\        .imports = &.{.{ .name = "lib", .module = lib }},
+        \\    }) });
+        \\    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+        \\}
+        \\
+        },
+        .{ .path = "app.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "lib.zig", .text = "pub fn answer() u32 {\n    return 42;\n}\n" },
+        .{ .path = "t.zig", .text = "const lib = @import(\"lib\");\ntest {\n    _ = lib.answer();\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const text = "const lib = @import(\"lib\");\ntest {\n    _ = lib.answer();\n}\n";
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "t.zig"));
+    try open(&h, uri, text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("answer", try completionLabels(&h, uri, text, "lib."));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

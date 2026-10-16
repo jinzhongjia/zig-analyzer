@@ -46,6 +46,8 @@ mutex: Io.Mutex = .init,
 client: ?*bsp.Client = null,
 model: ?ProjectModel = null,
 compile_set: ?CompileSet.Result = null,
+/// 诊断 step 之外的编译 step 可达的文件（只用于模块归属，见 `recomputeCompileSet`）；与编译集合相同时为 null
+resolve_set: ?CompileSet.Result = null,
 /// 最近一次构建的编译器诊断
 result: ?compiler.BuildResult = null,
 /// FileId → `result` 中的条目
@@ -140,6 +142,7 @@ pub fn destroy(ws: *Workspace) void {
     const gpa = ws.gpa;
     if (ws.model) |*m| m.deinit(gpa);
     if (ws.compile_set) |*s| s.deinit(gpa);
+    if (ws.resolve_set) |*s| s.deinit(gpa);
     if (ws.result) |*r| r.deinit(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
@@ -550,22 +553,40 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     const io = ws.server.io;
     var steps: []u32 = &.{};
     defer ws.gpa.free(steps);
+    var all: std.ArrayList(u32) = .empty;
+    defer all.deinit(ws.gpa);
     {
         ws.mutex.lockUncancelable(io);
         defer ws.mutex.unlock(io);
         const model = &(ws.model orelse return);
         steps = try model.compileStepsOf(ws.gpa, model.diagnostics_steps);
+        for (model.steps, 0..) |st, i| if (st.kind == .compile) try all.append(ws.gpa, @intCast(i));
         // 诊断 step 不编译任何东西（如只有 addModule 与 addTest、默认的 install 为空的库）：改用构建图中
         // 所有的编译 step，否则编译集合为空，项目中的文件都得不到 live 诊断
         if (steps.len == 0) {
-            var all: std.ArrayList(u32) = .empty;
-            errdefer all.deinit(ws.gpa);
-            for (model.steps, 0..) |st, i| if (st.kind == .compile) try all.append(ws.gpa, @intCast(i));
             ws.gpa.free(steps);
-            steps = try all.toOwnedSlice(ws.gpa);
+            steps = try ws.gpa.dupe(u32, all.items);
         }
     }
 
+    var result = try ws.computeSet(steps) orelse return;
+    errdefer result.deinit(ws.gpa);
+    // 其余编译 step（测试、示例等）可达的文件：只用于模块归属与 import 的解析，不发布 live 诊断
+    const extra: ?CompileSet.Result = if (all.items.len > steps.len) try ws.computeSet(all.items) else null;
+    ws.mutex.lockUncancelable(io);
+    if (ws.compile_set) |*old| old.deinit(ws.gpa);
+    ws.compile_set = result;
+    if (ws.resolve_set) |*old| old.deinit(ws.gpa);
+    ws.resolve_set = extra;
+    ws.mutex.unlock(io);
+    // 编译集合变化会影响模块归属与已打开文件的 live 诊断
+    ws.server.updateModuleGraph();
+    ws.server.publishOpenFiles();
+}
+
+/// 从这些编译 step 的根模块沿 import 可达的文件；缺少的文件读入后重算。不收敛时返回 null
+fn computeSet(ws: *Workspace, steps: []const u32) Allocator.Error!?CompileSet.Result {
+    const io = ws.server.io;
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
         var arena: std.heap.ArenaAllocator = .init(ws.gpa);
@@ -583,22 +604,14 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
                 error.Canceled => continue,
             };
         };
-        if (result.missing.count() == 0) {
-            ws.mutex.lockUncancelable(io);
-            if (ws.compile_set) |*old| old.deinit(ws.gpa);
-            ws.compile_set = result;
-            ws.mutex.unlock(io);
-            // 编译集合变化会影响模块归属与已打开文件的 live 诊断
-            ws.server.updateModuleGraph();
-            ws.server.publishOpenFiles();
-            return;
-        }
+        if (result.missing.count() == 0) return result;
         defer result.deinit(ws.gpa);
         var buf: [64]u8 = undefined;
         ws.reportLoading(std.fmt.bufPrint(&buf, "Analyzing compile set ({d} files)", .{result.files.count()}) catch null);
         try ws.loadFiles(result.missing.keys());
     }
     log.warn("{s}: compile set computation did not converge", .{ws.root});
+    return null;
 }
 
 fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
