@@ -351,6 +351,13 @@ const Inferrer = struct {
     }
 
     /// comptime 已知的条件：bool 值，或 optional 是否为 null（非 null 的 optional 值即其载荷值）
+    fn isCompileError(inf: *Inferrer, e: ExprId) bool {
+        return switch (inf.body.expr(e)) {
+            .builtin_call => |c| std.mem.eql(u8, c.name, "@compileError"),
+            else => false,
+        };
+    }
+
     fn condValue(inf: *Inferrer, cond: TypedValue) ?bool {
         const v = cond.val orelse return null;
         if (v == .true_value) return true;
@@ -499,7 +506,16 @@ const Inferrer = struct {
                 const taken = inf.condValue(cond);
                 const then = try inf.inferArm(x.then, expected, taken == false);
                 const other: TypedValue = if (x.@"else") |el| try inf.inferArm(el, expected, taken == true) else .{ .ty = .void_type };
-                if (taken) |t| return if (t) then else other;
+                if (taken) |t| {
+                    // 选中的分支是 `@compileError`：被使用的声明不可能是编译错误（否则无法编译），使用它的代码
+                    // 只在另一个分支生效的配置中编译。如 `std.testing.allocator = if (builtin.is_test) .. else
+                    // @compileError(..)` 在非测试模块的 test 块中使用：取另一个分支
+                    if (x.@"else") |el| {
+                        const chosen, const rest = if (t) .{ x.then, el } else .{ el, x.then };
+                        if (inf.isCompileError(chosen) and !inf.isCompileError(rest)) return if (t) other else then;
+                    }
+                    return if (t) then else other;
+                }
                 const ty = try inf.peer(&.{ then.ty, other.ty });
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) sameLiveValue(&.{ then, other }, ty) else null };
             },

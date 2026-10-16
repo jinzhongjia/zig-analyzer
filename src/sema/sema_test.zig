@@ -1975,3 +1975,26 @@ test "switch on a type: unevaluable prong items do not hide a matching prong" {
         .{ "miss", "unknown" },
     });
 }
+
+test "a comptime branch that is @compileError gives way to the other branch" {
+    try expectTypes(
+        \\const is_test = false;
+        \\const only_in_tests = if (is_test) @as(u32, 1) else @compileError("not testing");
+        \\const only_outside = if (!is_test) @compileError("testing") else @as(u8, 2);
+        \\const both = if (is_test) @compileError("x") else @compileError("y");
+        \\const plain = if (is_test) @as(u16, 3) else @as(i16, 4);
+        \\test {
+        \\    const v_in = only_in_tests;
+        \\    const v_out = only_outside;
+        \\    const v_both = both;
+        \\    const v_plain = plain;
+        \\    _ = .{ v_in, v_out, v_both, v_plain };
+        \\}
+    , &.{
+        // 被使用的声明不可能是编译错误：取另一个分支
+        .{ "v_in", "u32 = 1" },
+        .{ "v_out", "u8 = 2" },
+        .{ "v_both", "noreturn" },
+        .{ "v_plain", "i16 = 4" },
+    });
+}
