@@ -239,6 +239,39 @@ test "hover in generic bodies called only from other generic functions" {
     try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:8", info.text);
 }
 
+test "hover in generic bodies through two levels of generic callers" {
+    const text =
+        \\const Px = struct { r: u8 };
+        \\fn leaf(src: anytype) @TypeOf(src) {
+        \\    const v = src;
+        \\    return v;
+        \\}
+        \\fn mid(src: anytype) @TypeOf(src) {
+        \\    return leaf(src);
+        \\}
+        \\fn run(op: u8, src: anytype) @TypeOf(src) {
+        \\    return switch (op) {
+        \\        else => mid(src),
+        \\    };
+        \\}
+        \\fn paint() void {
+        \\    const p: Px = .{ .r = 0 };
+        \\    _ = run(0, p);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    // `leaf` ← 泛型的 `mid` ← 泛型的 `run` ← 具体的调用
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:7", info.text);
+}
+
 test "hover in generic bodies is inferred from a call site in another file" {
     const lib_text =
         \\pub fn max(comptime T: type, a: T, b: T) T {

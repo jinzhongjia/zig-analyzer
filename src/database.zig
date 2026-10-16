@@ -54,5 +54,4 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.InactiveRanges,
     ide_db.FileIndex.Query,
     ide.seed.Query,
-    ide.seed.DirectQuery,
 });

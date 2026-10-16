@@ -34,7 +34,7 @@ pub const Seed = struct {
 pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
     const owner = try r.ownerKey(file, item);
-    const found = try r.ctx.get(Query, owner) orelse return null;
+    const found = try r.ctx.get(Query, .{ .owner = owner, .depth = max_depth }) orelse return null;
     return .{
         .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
         .file = found.file,
@@ -49,7 +49,7 @@ pub fn findActive(r: *Resolver, file: FileId, item: u32, rel: u32) resolve.Error
     const owner = try r.ownerKey(file, item);
     const body = try r.ctx.get(hir.ItemBody, owner);
     if (!inactiveAt(body, first.res, rel)) return first;
-    const found = try search_(r, owner, rel, true) orelse return first;
+    const found = try search_(r, owner, rel, max_depth) orelse return first;
     return .{
         .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
         .file = found.file,
@@ -69,37 +69,23 @@ fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
 /// 成员所用的调用点：实例与调用表达式的位置
 pub const Found = struct { inst: ?Index, file: FileId, offset: u32 };
 
-/// 调用点的查找按成员缓存：补全、inlay hints 等频繁的请求不必每次重新查找
+/// 经由泛型调用者传递的最大层数：z2d 的 `toRGBA` 由泛型的 `hue` 调用，`hue` 又由泛型的 `run` 分派
+pub const max_depth = 3;
+
+/// 调用点的查找按成员与层数缓存：补全、inlay hints 等频繁的请求不必每次重新查找。
+/// 层数为 d 的查找为位于泛型函数内的调用者取实例时使用层数 d - 1 的查找（0 层只看实参本身具体的调用点）。
+/// 层数严格递减，不会成环：互相调用的泛型函数（http.zig 的 `execute` 与 `init`）若以同一个 key 递归，
+/// 环中的结果不写入 memo，每次请求都重新计算且层层放大
 pub const Query = struct {
     pub const kind: engine.Kind = .derived;
-    pub const Key = hir.OwnerKey;
+    pub const Key = struct { owner: hir.OwnerKey, depth: u8 };
     pub const Value = ?Found;
 
     pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return search_(&r, key, null, true);
-    }
-
-    pub fn cycleFallback(_: Key) Value {
-        return null;
-    }
-};
-
-/// 只看实参本身具体的调用点（不经由泛型调用者传递）。`Query` 为位于泛型函数内的调用者取实例时
-/// 使用它：互相调用的泛型函数（`execute` 调用 `init`、`init` 又调用 `execute`）若都经由 `Query`
-/// 递归会形成环，环中的结果不写入 memo，每次请求都重新计算且层层放大
-pub const DirectQuery = struct {
-    pub const kind: engine.Kind = .derived;
-    pub const Key = hir.OwnerKey;
-    pub const Value = ?Found;
-
-    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
-        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
-        defer scratch.deinit();
-        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return search_(&r, key, null, false);
+        return search_(&r, key.owner, null, key.depth);
     }
 
     pub fn cycleFallback(_: Key) Value {
@@ -108,7 +94,7 @@ pub const DirectQuery = struct {
 };
 
 /// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的
-fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, transitive: bool) resolve.Error!?Found {
+fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == key.item) break @intCast(i);
@@ -116,10 +102,10 @@ fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, transitive: bool) reso
     const root = try genericRoot(r, key.file, item) orelse return null;
     const files = try search.importers(r, key.file, try search.projectFiles(r));
     const names = try callNames(r, key.file, root, files);
-    if (try findIn(r, key.file, key.file, item, root, names, active, transitive)) |s| return s;
+    if (try findIn(r, key.file, key.file, item, root, names, active, depth)) |s| return s;
     for (files) |f| {
         if (f == key.file or !try containsAny(r, f, names)) continue;
-        if (try findIn(r, f, key.file, item, root, names, active, transitive)) |s| return s;
+        if (try findIn(r, f, key.file, item, root, names, active, depth)) |s| return s;
     }
     return null;
 }
@@ -176,7 +162,7 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32, transitive: bool) resolve.Error!?Found {
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32, depth: u8) resolve.Error!?Found {
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
@@ -189,9 +175,9 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
-        // 实参是抽象的，改用调用者的调用点实例推导后再找。只传递一层：调用者的实例取自 `DirectQuery`
-        if (!transitive or try genericRoot(r, in, @intCast(i)) == null) continue;
-        const outer = try r.ctx.get(DirectQuery, owner) orelse continue;
+        // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
+        if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
+        const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active)) |s| return s;
     }
