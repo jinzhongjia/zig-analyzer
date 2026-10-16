@@ -49,7 +49,7 @@ pub fn findActive(r: *Resolver, file: FileId, item: u32, rel: u32) resolve.Error
     const owner = try r.ownerKey(file, item);
     const body = try r.ctx.get(hir.ItemBody, owner);
     if (!inactiveAt(body, first.res, rel)) return first;
-    const found = try search_(r, owner, rel) orelse return first;
+    const found = try search_(r, owner, rel, true) orelse return first;
     return .{
         .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
         .file = found.file,
@@ -79,7 +79,27 @@ pub const Query = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return search_(&r, key, null);
+        return search_(&r, key, null, true);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return null;
+    }
+};
+
+/// 只看实参本身具体的调用点（不经由泛型调用者传递）。`Query` 为位于泛型函数内的调用者取实例时
+/// 使用它：互相调用的泛型函数（`execute` 调用 `init`、`init` 又调用 `execute`）若都经由 `Query`
+/// 递归会形成环，环中的结果不写入 memo，每次请求都重新计算且层层放大
+pub const DirectQuery = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = hir.OwnerKey;
+    pub const Value = ?Found;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        return search_(&r, key, null, false);
     }
 
     pub fn cycleFallback(_: Key) Value {
@@ -88,7 +108,7 @@ pub const Query = struct {
 };
 
 /// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的
-fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32) resolve.Error!?Found {
+fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, transitive: bool) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == key.item) break @intCast(i);
@@ -96,10 +116,10 @@ fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32) resolve.Error!?Found {
     const root = try genericRoot(r, key.file, item) orelse return null;
     const files = try search.importers(r, key.file, try search.projectFiles(r));
     const names = try callNames(r, key.file, root, files);
-    if (try findIn(r, key.file, key.file, item, root, names, active)) |s| return s;
+    if (try findIn(r, key.file, key.file, item, root, names, active, transitive)) |s| return s;
     for (files) |f| {
         if (f == key.file or !try containsAny(r, f, names)) continue;
-        if (try findIn(r, f, key.file, item, root, names, active)) |s| return s;
+        if (try findIn(r, f, key.file, item, root, names, active, transitive)) |s| return s;
     }
     return null;
 }
@@ -156,7 +176,7 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32) resolve.Error!?Found {
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32, transitive: bool) resolve.Error!?Found {
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
@@ -169,9 +189,9 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
-        // 实参是抽象的，改用调用者的调用点实例推导后再找。经由 Query 递归，环由 cycleFallback 截断
-        if (try genericRoot(r, in, @intCast(i)) == null) continue;
-        const outer = try r.ctx.get(Query, owner) orelse continue;
+        // 实参是抽象的，改用调用者的调用点实例推导后再找。只传递一层：调用者的实例取自 `DirectQuery`
+        if (!transitive or try genericRoot(r, in, @intCast(i)) == null) continue;
+        const outer = try r.ctx.get(DirectQuery, owner) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active)) |s| return s;
     }

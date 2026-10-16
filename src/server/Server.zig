@@ -1606,7 +1606,7 @@ pub fn resetSema(server: *Server) void {
     const before = server.ip.bytes();
     server.db.beginWrite();
     defer server.db.endWrite();
-    server.db.resetQueries(&.{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.ide.seed.Query });
+    server.db.resetQueries(&.{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.ide.seed.Query, database.ide.seed.DirectQuery });
     server.ip.reset() catch return log.err("out of memory while resetting the intern pool", .{});
     log.info("reclaimed type information ({d} MB in the intern pool)", .{before / (1024 * 1024)});
 }
