@@ -736,7 +736,12 @@ const Evaluator = struct {
                 const cond = try ev.eval(f, x.cond, null);
                 const taken = try ev.condition(cond);
                 if (taken.yes) {
-                    if (x.capture.len != 0) try ev.bindCapture(f, x.capture[0], taken.payload);
+                    if (x.capture.len != 0) {
+                        const cap = x.capture[0];
+                        if (b.binding(cap).is_ptr and ip.key(cond.ty) == .optional_type) {
+                            try ev.bindPayloadPtr(f, cap, x.cond, taken.payload);
+                        } else try ev.bindCapture(f, cap, taken.payload);
+                    }
                     return ev.eval(f, x.then, want);
                 }
                 if (x.else_capture.len != 0) try ev.bindCapture(f, x.else_capture[0], taken.payload);
@@ -750,9 +755,10 @@ const Evaluator = struct {
                     .error_union_type => |eu| eu,
                     else => return error.Abort,
                 };
-                const x = lhs.ip() orelse return error.Abort;
-                if (ip.key(x) != .error_value) return .{ .ty = eu.payload, .v = lhs.v };
-                if (c.capture) |cap| f.slots[@backingInt(cap)] = Val.of(eu.err, x);
+                // 载荷可以是解释器内的存储（指向局部数组元素的指针等），与 `try` 一样由 `condition` 区分
+                const taken = try ev.condition(lhs);
+                if (taken.yes) return taken.payload;
+                if (c.capture) |cap| f.slots[@backingInt(cap)] = taken.payload;
                 return ev.eval(f, c.rhs, eu.payload);
             },
             .binary => |bin| return ev.binary(f, bin.op, bin.lhs, bin.rhs, want),
@@ -879,6 +885,15 @@ const Evaluator = struct {
         if (std.mem.eql(u8, name, "len")) if (ev.isSequence(v.ty)) {
             const n = try ev.elemCount(v) orelse return .{ .ty = .usize_type };
             return Val.of(.usize_type, try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = n } }));
+        };
+        // 切片的 `ptr`：多项指针，与切片共用表示（用于指针比较，见 `pointerEql`）
+        if (std.mem.eql(u8, name, "ptr")) switch (ip.key(v.ty)) {
+            .ptr_type => |p| if (p.size == .slice) {
+                var q = p;
+                q.size = .many;
+                return .{ .ty = try ip.get(.{ .ptr_type = q }), .v = v.v };
+            },
+            else => {},
         };
         switch (ip.key(v.ty)) {
             .container_type => |c| if (c.kind == .@"union") {
@@ -1129,7 +1144,8 @@ const Evaluator = struct {
             error.Return => return ev.coerce(ev.jump_value, frame.ret_type),
             else => |e| return e,
         };
-        return Val.void_val;
+        // 执行到函数体末尾：返回 void（返回类型为 `E!void` 时转换为 error union）
+        return ev.coerce(Val.void_val, frame.ret_type);
     }
 
     // ── 块与控制流 ───────────────────────────────────────────────────
@@ -1234,6 +1250,22 @@ const Evaluator = struct {
     fn bindCapture(ev: *Evaluator, f: *Frame, b: Body.BindingId, v: Val) EvalError!void {
         if (f.body.binding(b).is_ptr) return error.Abort;
         f.slots[@backingInt(b)] = try ev.copy(v);
+    }
+
+    /// `if (opt) |*x|`：x 指向 optional 的载荷。optional 以载荷表示，指针指向 optional 所在的位置
+    /// （读取见 `deref`，写入按存储单元的类型转换回 optional）；条件不是位置时指向载荷的副本
+    fn bindPayloadPtr(ev: *Evaluator, f: *Frame, b: Body.BindingId, cond_e: ExprId, payload: Val) EvalError!void {
+        var is_const = false;
+        const ref = ev.place(f, cond_e) catch |err| switch (err) {
+            error.Abort => blk: {
+                is_const = true;
+                const cell = try ev.a.create(Val);
+                cell.* = try ev.copy(payload);
+                break :blk Ref{ .cell = cell, .path = &.{} };
+            },
+            else => |x| return x,
+        };
+        f.slots[@backingInt(b)] = .{ .ty = try ev.ip.ptrTo(payload.ty, .one, is_const), .v = .{ .ref = ref } };
     }
 
     fn loop(ev: *Evaluator, f: *Frame, l: Body.Loop, want: ?Index) EvalError!Val {
@@ -1439,6 +1471,10 @@ const Evaluator = struct {
                 // 带标签的 union 与标签比较：另一侧不按 union 类型转换
                 const rhs_want: ?Index = if (lhs.ty == .unknown or lhs.ty == .comptime_int_type or lhs.ty == .enum_literal_type or ev.isUnion(lhs.ty)) null else lhs.ty;
                 const rhs = try ev.eval(f, rhs_e, rhs_want);
+                if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
+                    const eq = pointerEql(lhs, rhs) orelse return error.Abort;
+                    return boolVal(eq == (op == .equal_equal));
+                }
                 const a = try ev.freeze(lhs) orelse return error.Abort;
                 const b = try ev.freeze(rhs) orelse return error.Abort;
                 if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
@@ -1457,9 +1493,20 @@ const Evaluator = struct {
                 return Val.ofType(try ip.errorSet(ev.a, names));
             },
             else => {
-                const lhs = try ev.eval(f, lhs_e, want);
+                // 操作数的期望类型：结果类型去掉 error union 与 optional，且只取数值类型
+                // （`self.index = start + 1` 中 index 为 `?usize`，`+` 的操作数是 usize）
+                var operand_want = want;
+                while (operand_want) |t| switch (ip.key(t)) {
+                    .error_union_type => |eu| operand_want = eu.payload,
+                    .optional_type => |c| operand_want = c,
+                    else => break,
+                };
+                if (operand_want) |t| if (!ip.isInt(t) and !ip.isFloat(t) and ip.key(t) != .vector_type) {
+                    operand_want = null;
+                };
+                const lhs = try ev.eval(f, lhs_e, operand_want);
                 const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
-                const rhs = try ev.eval(f, rhs_e, if (is_shift) null else if (lhs.ty != .comptime_int_type) lhs.ty else want);
+                const rhs = try ev.eval(f, rhs_e, if (is_shift) null else if (lhs.ty != .comptime_int_type) lhs.ty else operand_want);
                 // bool 的位运算
                 if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
                     const x = (try ev.condition(lhs)).yes;
@@ -1483,6 +1530,30 @@ const Evaluator = struct {
                 const r = value.binaryInt(ip, op, ty, a, b) orelse return error.Abort;
                 return Val.of(ty, try ip.get(.{ .int_value = .{ .ty = ty, .value = r } }));
             },
+        }
+    }
+
+    /// comptime 指针是否相等；判断不了时为 null。解释器内的存储单元各自独立；驻留的常量数据以值区分
+    /// （相同的值视为同一块数据，与编译器对相同字面量的去重一致）
+    fn pointerEql(a: Val, b: Val) ?bool {
+        switch (a.v) {
+            .ref => |x| switch (b.v) {
+                .ref => |y| {
+                    if (x.cell != y.cell) return false;
+                    if (!std.mem.eql(u32, x.path, y.path)) return null;
+                    const xs = if (x.window) |w| w.start else 0;
+                    const ys = if (y.window) |w| w.start else 0;
+                    return xs == ys;
+                },
+                .ip => return false,
+                else => return null,
+            },
+            .ip => |x| switch (b.v) {
+                .ip => |y| return x == y,
+                .ref => return false,
+                else => return null,
+            },
+            else => return null,
         }
     }
 
@@ -1643,8 +1714,29 @@ const Evaluator = struct {
             _ = try ev.eval(f, rhs_e, null);
             return;
         }
-        const ref = try ev.place(f, lhs_e);
-        const old = try ev.load(ref);
+        switch (f.body.expr(lhs_e)) {
+            .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, "len")) {
+                if (try ev.assignSliceLen(f, op, fa.lhs, rhs_e)) return;
+            },
+            else => {},
+        }
+        var ref: Ref = undefined;
+        var old: Val = undefined;
+        switch (f.body.expr(lhs_e)) {
+            // `p.* = x`：经由指针读取旧值，指向 optional 载荷的指针（`if (opt) |*x|`）按载荷类型
+            .deref => |x| {
+                const p = try ev.eval(f, x, null);
+                ref = switch (p.v) {
+                    .ref => |r| r,
+                    else => return error.Abort,
+                };
+                old = try ev.deref(p);
+            },
+            else => {
+                ref = try ev.place(f, lhs_e);
+                old = try ev.load(ref);
+            },
+        }
         const rhs_want: ?Index = if (old.ty != .unknown) old.ty else null;
         if (op == .equal) return ev.store(ref, try ev.eval(f, rhs_e, rhs_want));
         // 复合赋值 `a += b`
@@ -1684,11 +1776,51 @@ const Evaluator = struct {
         try ev.store(ref, Val.of(old.ty, try ev.ip.get(.{ .int_value = .{ .ty = old.ty, .value = r } })));
     }
 
+    /// 修改切片的 `len`（`list.items.len += 1`）：切片指向解释器内的存储时调整区间的长度，不能超出
+    /// 所在的数组。切片不在解释器内的存储中时返回 false
+    fn assignSliceLen(ev: *Evaluator, f: *Frame, op: SyntaxKind, slice_e: ExprId, rhs_e: ExprId) EvalError!bool {
+        const ip = ev.ip;
+        const ref = ev.place(f, slice_e) catch |err| switch (err) {
+            error.Abort => return false,
+            else => return err,
+        };
+        const s = try ev.load(ref);
+        switch (ip.key(s.ty)) {
+            .ptr_type => |p| if (p.size != .slice) return false,
+            else => return false,
+        }
+        const r = switch (s.v) {
+            .ref => |r| r,
+            else => return false,
+        };
+        const w = r.window orelse return false;
+        const rhs = try ev.evalInt(f, rhs_e, .usize_type);
+        const len: i128 = switch (op) {
+            .equal => rhs,
+            .plus_equal => @as(i128, w.len) + rhs,
+            .minus_equal => @as(i128, w.len) - rhs,
+            else => return error.Abort,
+        };
+        const whole = try ev.load(.{ .cell = r.cell, .path = r.path });
+        const n = try ev.elemCount(whole) orelse return error.Abort;
+        if (len < 0 or w.start + len > n) return error.Abort;
+        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) } } } });
+        return true;
+    }
+
     fn deref(ev: *Evaluator, p: Val) EvalError!Val {
         const ip = ev.ip;
         const child = ev.pointeeType(p.ty);
         switch (p.v) {
-            .ref => |r| return ev.load(r),
+            .ref => |r| {
+                const v = try ev.load(r);
+                // 指向 optional 载荷的指针（`if (opt) |*x|`）：optional 以载荷表示，按载荷类型读取
+                if (child != .unknown and v.ty != child) switch (ip.key(v.ty)) {
+                    .optional_type => |c| if (c == child) return .{ .ty = child, .v = v.v },
+                    else => {},
+                };
+                return v;
+            },
             .ip => |x| switch (ip.key(x)) {
                 .ptr_value => |pv| return Val.of(child, pv.pointee),
                 // 指向数组的指针以元素表示：解引用得到数组
@@ -1878,7 +2010,15 @@ const Evaluator = struct {
         }
         // 指向元组的指针 → 切片：元素逐个转换；元组 / 匿名结构体字面量 → 数组、结构体
         switch (ip.key(t)) {
-            .ptr_type => |p| if (p.size == .slice or p.size == .many) {
+            // `*const T` → `*const [1]T`：取出元素，指向只含该元素的常量数组
+            .ptr_type => |p| if (p.size == .one and p.is_const and ip.key(p.child) == .array_type and
+                ip.key(p.child).array_type.len == 1 and ip.key(v.ty) == .ptr_type and
+                ip.key(v.ty).ptr_type.size == .one and ip.key(v.ty).ptr_type.child == ip.key(p.child).array_type.child)
+            {
+                const elem = try ev.freeze(try ev.deref(v)) orelse return error.Abort;
+                const array = try ip.get(.{ .aggregate = .{ .ty = p.child, .elems = &.{elem} } });
+                return Val.of(t, try ev.pointerTo(t, array));
+            } else if (p.size == .slice or p.size == .many) {
                 const target_ty = ev.pointeeType(v.ty);
                 if (target_ty != .unknown and (ip.key(target_ty) == .tuple_type or ip.key(target_ty) == .anon_struct_type)) {
                     const n = try ev.elemCount(v) orelse return error.Abort;

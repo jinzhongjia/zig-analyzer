@@ -2086,3 +2086,83 @@ test "a field of a literal-initialized constant is known when other fields are n
         .{ "Platform", "type = u8" },
     });
 }
+
+test "comptime evaluation: slices, pointers and error unions in interpreter storage" {
+    try expectTypes(
+        \\fn at(b: *[4]u8) error{X}!*u8 {
+        \\    return &b[1];
+        \\}
+        \\fn put(b: *[4]u8, x: u8) error{X}!void {
+        \\    const p = try at(b);
+        \\    p.* = x;
+        \\}
+        \\fn viaErrorUnion() usize {
+        \\    var buf: [4]u8 = .{ 0, 0, 0, 0 };
+        \\    put(&buf, 7) catch return 99;
+        \\    return buf[1];
+        \\}
+        \\const List = struct {
+        \\    items: []u8,
+        \\    capacity: usize,
+        \\    fn addOne(self: *List) error{OutOfMemory}!*u8 {
+        \\        if (self.items.len >= self.capacity) return error.OutOfMemory;
+        \\        self.items.len += 1;
+        \\        return &self.items[self.items.len - 1];
+        \\    }
+        \\    fn append(self: *List, x: u8) error{OutOfMemory}!void {
+        \\        const p = try self.addOne();
+        \\        p.* = x;
+        \\    }
+        \\};
+        \\fn growSlice() usize {
+        \\    var buf: [4]u8 = undefined;
+        \\    var list: List = .{ .items = buf[0..0], .capacity = buf.len };
+        \\    list.append(5) catch return 99;
+        \\    list.append(6) catch return 99;
+        \\    return list.items.len * 100 + list.items[1];
+        \\}
+        \\fn intoOptional(start: usize) usize {
+        \\    var index: ?usize = null;
+        \\    index = start + 1;
+        \\    return index.?;
+        \\}
+        \\fn eql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    if (a.ptr == b.ptr) return true;
+        \\    for (a, b) |x, y| if (x != y) return false;
+        \\    return true;
+        \\}
+        \\fn samePtr(a: []const u8) usize {
+        \\    const lit: []const u8 = "ab";
+        \\    return if (eql(a, "ab") and eql(a[0..1], "a") and lit.ptr == lit.ptr) 1 else 0;
+        \\}
+        \\const Names = struct { short: ?u8 };
+        \\fn shortName(n: *const Names) usize {
+        \\    if (n.short) |*s| return @as(*const [1]u8, s)[0];
+        \\    return 0;
+        \\}
+        \\fn bump() usize {
+        \\    var n: Names = .{ .short = 1 };
+        \\    if (n.short) |*s| s.* += 2;
+        \\    return n.short.?;
+        \\}
+        \\const r_eu = viaErrorUnion();
+        \\const r_grow = growSlice();
+        \\const r_opt = intoOptional(4);
+        \\const r_ptr = samePtr("ab");
+        \\const r_short = shortName(&.{ .short = 'h' });
+        \\const r_bump = bump();
+    , &.{
+        // 函数执行到末尾时的 `E!void` 与 `catch` 中指向局部存储的载荷
+        .{ "r_eu", "usize = 7" },
+        // 修改切片的 `len`
+        .{ "r_grow", "usize = 206" },
+        // 算术的操作数不按 optional 结果类型转换
+        .{ "r_opt", "usize = 5" },
+        // 切片的 `ptr` 比较（`std.mem.eql` 中的快速路径）
+        .{ "r_ptr", "usize = 1" },
+        // optional 的指针捕获与 `*const T` 到 `*const [1]T`
+        .{ "r_short", "usize = 104" },
+        .{ "r_bump", "usize = 3" },
+    });
+}
