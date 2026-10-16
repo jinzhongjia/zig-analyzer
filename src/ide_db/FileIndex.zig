@@ -57,7 +57,7 @@ fn walk(gpa: Allocator, a: Allocator, node: SyntaxNode, names: *std.StringArrayH
     };
     var it = node.children();
     while (it.next()) |e| switch (e) {
-        .token => |t| if (t.kind == .identifier) try names.put(gpa, ast.identName(t.text), {}),
+        .token => |t| if (t.kind == .identifier) try names.put(gpa, try ast.identNameAlloc(a, t.text), {}),
         .node => |c| try walk(gpa, a, c, names, imports),
     };
 }

@@ -537,6 +537,21 @@ test "inferred error sets from function bodies" {
     });
 }
 
+test "escaped identifiers name the same declaration as plain ones" {
+    try expectTypes(
+        \\const @"\x66oo": u8 = 7;
+        \\const S = struct { @"a\"b": u16 };
+        \\const result = foo;
+        \\fn f(s: S) void {
+        \\    const field = s.@"a\x22b";
+        \\    _ = field;
+        \\}
+    , &.{
+        .{ "result", "u8 = 7" },
+        .{ "field", "u16" },
+    });
+}
+
 test "oversized layouts degrade to unknown instead of overflowing" {
     // 大小无法用 u64 表示的类型：布局求不出，不能使宿主溢出崩溃
     try expectTypes(
