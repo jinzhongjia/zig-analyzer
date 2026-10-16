@@ -17,6 +17,7 @@ const bsp = za.project.bsp;
 const builtin = za.project.builtin;
 const ZigEnv = za.project.ZigEnv;
 const configuration = za.project.configuration;
+const exports = za.project.exports;
 const ProjectModel = za.base.ProjectModel;
 const Vfs = za.base.Vfs;
 const FileId = Vfs.FileId;
@@ -318,6 +319,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     return;
                 },
             };
+            if (!model.hasCompileSteps()) try ws.loadExports(&model);
             try ws.generateBuiltins(&model);
             {
                 const names = try ws.config.diagnosticsSteps(ws.gpa);
@@ -428,6 +430,14 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         },
         else => {},
     }
+}
+
+/// 构建图中没有 compile step（只导出模块的库）：并入项目导出的模块，项目中的文件按它们得到模块归属
+fn loadExports(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
+    ws.reportLoading("Reading exported modules");
+    var exported = try exports.load(ws.gpa, ws.server.io, ws.server.zigEnv().?, ws.root, ws.config.build_args) orelse return;
+    defer exported.deinit(ws.gpa);
+    try model.appendExports(ws.gpa, &exported);
 }
 
 /// 为每个模块生成 builtin.zig（相同参数只生成一次）

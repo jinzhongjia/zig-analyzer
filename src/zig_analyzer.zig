@@ -42,6 +42,7 @@ pub const project = struct {
     pub const bsp = @import("project/bsp.zig");
     pub const builtin = @import("project/builtin.zig");
     pub const configuration = @import("project/configuration.zig");
+    pub const exports = @import("project/exports.zig");
     /// 仅供测试：在临时目录中创建示例项目
     pub const fixture = @import("project/fixture.zig");
 };

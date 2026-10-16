@@ -157,6 +157,47 @@ pub fn setGeneratedPath(m: *ProjectModel, gpa: Allocator, file: u32, path: []con
     return changed;
 }
 
+pub fn hasCompileSteps(m: *const ProjectModel) bool {
+    for (m.steps) |s| if (s.kind == .compile) return true;
+    return false;
+}
+
+/// 并入另一个构建图（项目导出的模块，见 `project/exports.zig`）的模块与 compile step。
+/// 并入的 step 没有依赖、也不被任何 step 依赖，不会出现在构建请求中，只参与模块归属；
+/// 生成文件的编号属于另一个构建图，以生成文件为根的模块没有根文件
+pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectModel) Allocator.Error!void {
+    var arena = m.arena.promote(gpa);
+    defer m.arena = arena.state;
+    const a = arena.allocator();
+    const base: u32 = @intCast(m.modules.len);
+    const modules = try a.alloc(Module, m.modules.len + exports.modules.len);
+    @memcpy(modules[0..m.modules.len], m.modules);
+    for (exports.modules, modules[m.modules.len..]) |src, *dst| {
+        const imports = try a.alloc(Import, src.imports.len);
+        for (src.imports, imports) |imp, *out| out.* = .{ .name = try a.dupe(u8, imp.name), .module = base + imp.module };
+        const builtin_args = try a.alloc([]const u8, src.builtin_args.len);
+        for (src.builtin_args, builtin_args) |arg, *out| out.* = try a.dupe(u8, arg);
+        dst.* = .{
+            .root_file = if (src.generated_root != null) null else if (src.root_file) |p| try a.dupe(u8, p) else null,
+            .imports = imports,
+            .builtin_args = builtin_args,
+            .builtin_file = if (src.builtin_file) |p| try a.dupe(u8, p) else null,
+        };
+    }
+    var steps: std.ArrayList(Step) = .empty;
+    try steps.appendSlice(a, m.steps);
+    for (exports.steps) |s| switch (s.kind) {
+        .compile => |c| try steps.append(a, .{
+            .name = try a.dupe(u8, s.name),
+            .kind = .{ .compile = .{ .root_module = base + c.root_module } },
+            .deps = &.{},
+        }),
+        else => {},
+    };
+    m.modules = modules;
+    m.steps = steps.items;
+}
+
 /// `step` 传递依赖的所有 compile step（下标），按发现顺序
 pub fn compileStepsOf(m: *const ProjectModel, gpa: Allocator, roots: []const u32) Allocator.Error![]u32 {
     var seen: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, m.steps.len);
@@ -182,4 +223,50 @@ test "Module.isNativeTarget" {
     try std.testing.expect(native.isNativeTarget());
     try std.testing.expect(explicit_native.isNativeTarget());
     try std.testing.expect(!wasm.isNativeTarget());
+}
+
+test appendExports {
+    const gpa = std.testing.allocator;
+    var main_arena: std.heap.ArenaAllocator = .init(gpa);
+    const ma = main_arena.allocator();
+    const main_modules = try ma.dupe(Module, &.{.{ .root_file = "/p/a.zig", .imports = &.{} }});
+    var m: ProjectModel = .{
+        .arena = main_arena.state,
+        .build_root = "/p",
+        .std_root = "/std/std.zig",
+        .steps = try ma.dupe(Step, &.{.{ .name = "install", .kind = .{ .top_level = .{ .description = "" } }, .deps = &.{} }}),
+        .modules = main_modules,
+        .default_step = 0,
+    };
+    defer m.deinit(gpa);
+
+    var exports_modules = [_]Module{
+        .{ .root_file = "/p/lib.zig", .imports = &.{.{ .name = "dep", .module = 1 }}, .builtin_args = &.{"build-obj"} },
+        .{ .root_file = "/p/.zig-cache/o/x/options.zig", .generated_root = .{ .file = 3 }, .imports = &.{} },
+    };
+    const exports: ProjectModel = .{
+        .arena = undefined,
+        .build_root = "/p/.zig-cache/zig-analyzer/exports",
+        .std_root = "/std/std.zig",
+        .steps = &.{
+            .{ .name = "exports", .kind = .{ .top_level = .{ .description = "" } }, .deps = &.{1} },
+            .{ .name = "compile obj lib", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
+        },
+        .modules = &exports_modules,
+        .default_step = 0,
+    };
+    try m.appendExports(gpa, &exports);
+
+    try std.testing.expect(m.hasCompileSteps());
+    try std.testing.expectEqual(2, m.steps.len);
+    try std.testing.expectEqual(1, m.steps[1].kind.compile.root_module);
+    try std.testing.expectEqual(0, m.steps[1].deps.len);
+    try std.testing.expectEqual(3, m.modules.len);
+    try std.testing.expectEqualStrings("/p/a.zig", m.modules[0].root_file.?);
+    try std.testing.expectEqualStrings("/p/lib.zig", m.modules[1].root_file.?);
+    try std.testing.expectEqual(2, m.modules[1].imports[0].module);
+    try std.testing.expectEqualStrings("build-obj", m.modules[1].builtin_args[0]);
+    // 生成文件的编号属于探针的构建图，不能当作本项目的生成文件
+    try std.testing.expectEqual(null, m.modules[2].root_file);
+    try std.testing.expectEqual(null, m.modules[2].generated_root);
 }

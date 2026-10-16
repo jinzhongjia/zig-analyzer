@@ -277,3 +277,33 @@ test "files reachable only from non-default steps resolve module imports" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "files of a package that only exports modules resolve module imports" {
+    // 构建图中没有 compile step：lib 只由使用方编译，模块归属来自导出的模块
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const dep = b.createModule(.{ .root_source_file = b.path("dep.zig") });
+        \\    _ = b.addModule("lib", .{ .root_source_file = b.path("lib.zig"), .imports = &.{.{ .name = "dep", .module = dep }} });
+        \\}
+        \\
+        },
+        .{ .path = "dep.zig", .text = "pub fn answer() u32 {\n    return 42;\n}\n" },
+        .{ .path = "lib.zig", .text = "const dep = @import(\"dep\");\npub fn f() void {\n    _ = dep.answer();\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const text = "const dep = @import(\"dep\");\npub fn f() void {\n    _ = dep.answer();\n}\n";
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "lib.zig"));
+    try open(&h, uri, text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("answer", try completionLabels(&h, uri, text, "dep."));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
