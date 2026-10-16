@@ -290,6 +290,65 @@ pub fn stringLiteralValue(gpa: Allocator, text: []const u8) Allocator.Error!?[]u
     }
 }
 
+/// 字符串字面量的源码（含引号；多行字符串含各行的 `\\` 与行间缩进）中，解码后的内容第 `decoded` 个字节
+/// 所在的位置；`decoded` 为内容长度时为内容结束处
+pub fn literalSourceOffset(src: []const u8, decoded: usize) ?usize {
+    if (src.len == 0) return null;
+    var d: usize = 0;
+    switch (src[0]) {
+        '"' => {
+            var i: usize = 1;
+            while (i < src.len and src[i] != '"') {
+                if (d == decoded) return i;
+                if (src[i] != '\\') {
+                    i += 1;
+                    d += 1;
+                    continue;
+                }
+                const start = i;
+                const len: usize = switch (std.zig.string_literal.parseEscapeSequence(src, &i)) {
+                    .success => |c| std.unicode.utf8CodepointSequenceLength(c) catch return null,
+                    .failure => return null,
+                };
+                if (decoded < d + len) return start;
+                d += len;
+            }
+            return if (d == decoded) i else null;
+        },
+        '\\' => {
+            var i: usize = 0;
+            while (true) {
+                if (!std.mem.startsWith(u8, src[i..], "\\\\")) return null;
+                i += 2;
+                const end = std.mem.indexOfScalarPos(u8, src, i, '\n') orelse src.len;
+                const content_end = if (end > i and src[end - 1] == '\r') end - 1 else end;
+                if (decoded <= d + (content_end - i)) return i + (decoded - d);
+                d += content_end - i + 1;
+                if (end == src.len) return null;
+                i = end + 1;
+                while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
+            }
+        },
+        else => return null,
+    }
+}
+
+test literalSourceOffset {
+    const cases = [_]struct { []const u8, usize, ?usize }{
+        .{ "\"abc\"", 1, 2 },
+        .{ "\"abc\"", 3, 4 },
+        .{ "\"a\\tb\"", 2, 4 },
+        .{ "\"\\u{e9}x\"", 2, 7 },
+        .{ "\\\\-a, --aa\n    \\\\-b", 6, 8 },
+        .{ "\\\\-a, --aa\n    \\\\-b", 8, 10 },
+        .{ "\\\\-a, --aa\n    \\\\-b", 9, 17 },
+        .{ "\\\\-a, --aa\n    \\\\-b", 11, 19 },
+        .{ "\\\\-a, --aa\n    \\\\-b", 12, null },
+        .{ "12", 0, null },
+    };
+    for (cases) |c| try std.testing.expectEqual(c[2], literalSourceOffset(c[0], c[1]));
+}
+
 test stringLiteralValue {
     const gpa = std.testing.allocator;
     const cases = [_]struct { []const u8, ?[]const u8 }{

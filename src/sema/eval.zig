@@ -104,6 +104,57 @@ pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Ex
     return ev.toTyped(v) catch |err| giveUp(err);
 }
 
+pub const StringOrigin = struct {
+    file: FileId,
+    /// 字面量所在成员（`ItemTree.items` 下标）
+    item: u32,
+    /// 字符串字面量
+    expr: ExprId,
+    /// 字面量解码后的内容中的偏移
+    offset: u32,
+};
+
+/// 表达式 `e` 的 comptime 值中沿 `path`（逐层的元素下标，指针透明）到达的字符串来自哪个字符串字面量。
+/// 跟踪来源重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，调用在本次求值中展开；
+/// 字符串经过复制（如 `++`、逐字节构造）时来源丢失，返回 null
+pub fn stringOrigin(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, path: []const u32) Error!?StringOrigin {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var tracking: Tracking = .{};
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena, .track = &tracking };
+    var frame = try ev.newFrame(file, item, body, null);
+    const origin = ev.followOrigin(&frame, e, path) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => return null,
+        else => |x| return x,
+    };
+    return origin;
+}
+
+/// 在驻留的值中查找内容为 `needle` 的字符串，`path` 为逐层的元素下标（指针透明，与 `stringOrigin` 一致）；
+/// `chain` 为路径上依次经过的值（不含根与字符串本身）
+pub fn findString(ip: *InternPool, a: Allocator, root: Index, needle: []const u8, path: *std.ArrayList(u32), chain: *std.ArrayList(Index)) Allocator.Error!bool {
+    var budget: u32 = 4096;
+    return findStringIn(ip, a, root, needle, path, chain, &budget, 0);
+}
+
+fn findStringIn(ip: *InternPool, a: Allocator, v: Index, needle: []const u8, path: *std.ArrayList(u32), chain: *std.ArrayList(Index), budget: *u32, depth: u32) Allocator.Error!bool {
+    if (budget.* == 0 or depth > 12) return false;
+    budget.* -= 1;
+    switch (ip.key(v)) {
+        .bytes => |b| return std.mem.eql(u8, b.bytes, needle),
+        .ptr_value => |p| return findStringIn(ip, a, p.pointee, needle, path, chain, budget, depth + 1),
+        .aggregate => |agg| for (agg.elems, 0..) |x, i| {
+            try path.append(a, @intCast(i));
+            if (depth > 0) try chain.append(a, v);
+            if (try findStringIn(ip, a, x, needle, path, chain, budget, depth + 1)) return true;
+            _ = path.pop();
+            if (depth > 0) _ = chain.pop();
+        },
+        else => {},
+    }
+    return false;
+}
+
 /// 值的字段（聚合、union、切片与数组的 `len`）；求不出时为 null
 pub fn fieldValue(r: *Resolver, base: TypedValue, name: []const u8) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
@@ -402,6 +453,13 @@ const Ref = struct {
     const Window = struct { start: u32, len: u32 };
 };
 
+/// 求值中创建的字符串字面量的存储单元及其位置
+const Tracking = struct {
+    literals: std.ArrayList(Literal) = .empty,
+
+    const Literal = struct { cell: *Val, file: FileId, item: u32, expr: ExprId };
+};
+
 const Frame = struct {
     file: FileId,
     item: u32,
@@ -430,6 +488,8 @@ const Evaluator = struct {
     arena: ?*std.heap.ArenaAllocator = null,
     steps: u32 = 0,
     inline_calls: u32 = 0,
+    /// 跟踪字符串字面量的来源（见 `stringOrigin`）
+    track: ?*Tracking = null,
     /// break / continue 的目标（`Frame.labels` 下标）与值；return 的值
     jump_target: usize = 0,
     jump_value: Val = .unknown,
@@ -728,7 +788,7 @@ const Evaluator = struct {
         switch (b.expr(e)) {
             .missing, .other, .@"unreachable" => return error.Abort,
             .name_ref => |name| return ev.nameRef(f, e, name),
-            .literal => |text| return ev.literal(text),
+            .literal => |text| return if (ev.track != null) ev.trackedLiteral(f, e, text) else ev.literal(text),
             .field_access => |fa| return ev.fieldAccess(try ev.eval(f, fa.lhs, null), fa.field orelse return error.Abort),
             .enum_literal => |name| {
                 if (want) |t| if (try ev.declLiteral(t, name)) |v| return v;
@@ -846,7 +906,62 @@ const Evaluator = struct {
             .local => |l| if (l.file == f.file and l.item == f.item) return f.slots[@backingInt(l.binding)],
             else => {},
         }
-        return thaw(try queries.defType(ev.r, def, null, f.inst));
+        const tv = try queries.defType(ev.r, def, null, f.inst);
+        if (ev.track != null) if (try ev.trackedDecl(def, tv)) |v| return v;
+        return thaw(tv);
+    }
+
+    /// 跟踪来源时，值为字符串的全局常量在本次求值中重新求出（字面量的来源才能保留）
+    fn trackedDecl(ev: *Evaluator, def: resolve.Def, tv: TypedValue) EvalError!?Val {
+        const v = tv.val orelse return null;
+        if (ev.ip.key(v) != .bytes) return null;
+        const it = switch (def) {
+            .item => |x| x,
+            else => return null,
+        };
+        const tree = try ev.r.itemTree(it.file);
+        const owner: hir.OwnerKey = .{ .file = it.file, .item = tree.items[it.item].ast_id };
+        const body = try ev.r.ctx.get(hir.ItemBody, owner);
+        const main = body.value orelse return null;
+        if (ev.inline_calls >= max_inline_calls) return null;
+        ev.inline_calls += 1;
+        defer ev.inline_calls -= 1;
+        var frame = try ev.newFrame(it.file, it.item, body, null);
+        return try ev.eval(&frame, main, tv.ty);
+    }
+
+    fn followOrigin(ev: *Evaluator, f: *Frame, e: ExprId, path: []const u32) EvalError!?StringOrigin {
+        var v = try ev.eval(f, e, null);
+        for (path) |i| v = try ev.elemAt(v, i);
+        const ref = switch (v.v) {
+            .ref => |x| x,
+            else => return null,
+        };
+        if (ref.path.len != 0) return null;
+        for (ev.track.?.literals.items) |lit| if (lit.cell == ref.cell) return .{
+            .file = lit.file,
+            .item = lit.item,
+            .expr = lit.expr,
+            .offset = if (ref.window) |w| w.start else 0,
+        };
+        return null;
+    }
+
+    /// 跟踪来源时的字符串字面量：指向独立存储单元的指针，切片保持对它的引用
+    fn trackedLiteral(ev: *Evaluator, f: *Frame, e: ExprId, text: []const u8) EvalError!Val {
+        const v = try ev.literal(text);
+        const ptr = switch (ev.ip.key(v.ty)) {
+            .ptr_type => |p| p,
+            else => return v,
+        };
+        const bytes = switch (ev.ip.key(v.ip() orelse return v)) {
+            .bytes => |b| b.bytes,
+            else => return v,
+        };
+        const array = Val.of(ptr.child, try ev.ip.get(.{ .bytes = .{ .ty = ptr.child, .bytes = bytes } }));
+        const out = try ev.pointerToNew(v.ty, array);
+        try ev.track.?.literals.append(ev.a, .{ .cell = out.v.ref.cell, .file = f.file, .item = f.item, .expr = e });
+        return out;
     }
 
     fn literal(ev: *Evaluator, text: []const u8) EvalError!Val {
@@ -1114,7 +1229,8 @@ const Evaluator = struct {
             try infer.instanceOf(ev.r, ev.a, gg, fty, tvs)
         else
             try infer.runtimeInstance(ip, ev.a, fv, args.len);
-        if (!local) {
+        // 跟踪来源时在本次求值中展开：经 query 调用的结果是驻留的值，字面量的来源会丢失
+        if (!local and ev.track == null) {
             const tv = try call(ev.r, inst, tvs);
             if (tv.val == null) return error.Abort;
             return thaw(tv);

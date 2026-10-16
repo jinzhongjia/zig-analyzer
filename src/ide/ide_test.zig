@@ -133,6 +133,90 @@ test "signature help and inlay hints" {
     try testing.expectEqualStrings("x: y: : u32 scale: : u32 a: b: ", out.items);
 }
 
+test "goto declaration of reified fields named by comptime parsed strings" {
+    // 字段名从帮助文本中解析出来（zig-clap 的用法）：跳到帮助文本中的参数名
+    const text =
+        \\const Param = struct { long: ?[]const u8 = null };
+        \\fn count(str: []const u8) usize {
+        \\    var n: usize = 1;
+        \\    for (str) |ch| n += @intFromBool(ch == '\n');
+        \\    return n;
+        \\}
+        \\fn parse(comptime str: []const u8) [count(str)]Param {
+        \\    var out: [count(str)]Param = undefined;
+        \\    var n: usize = 0;
+        \\    var start: usize = 0;
+        \\    var i: usize = 0;
+        \\    while (i <= str.len) : (i += 1) {
+        \\        if (i < str.len and str[i] != '\n') continue;
+        \\        var name_end = start + 2;
+        \\        while (name_end < i and str[name_end] != ' ') name_end += 1;
+        \\        out[n] = .{ .long = str[start + 2 .. name_end] };
+        \\        n += 1;
+        \\        start = i + 1;
+        \\    }
+        \\    return out;
+        \\}
+        \\fn Args(comptime params: []const Param) type {
+        \\    var names: [params.len][]const u8 = undefined;
+        \\    var types: [params.len]type = undefined;
+        \\    for (params, 0..) |p, k| {
+        \\        names[k] = p.long.?[0..p.long.?.len] ++ "";
+        \\        types[k] = bool;
+        \\    }
+        \\    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+        \\}
+        \\const help = "--count Number of items";
+        \\const params = parse(
+        \\    \\--alpha First option
+        \\    \\--beta Second option
+        \\);
+        \\const other = parse(help);
+        \\fn run(a: Args(&params), b: Args(&other)) void {
+        \\    const local = comptime parse(
+        \\        \\--gamma Local option
+        \\    );
+        \\    const c: Args(&local) = undefined;
+        \\    _ = .{ a.beta, b.count, c.gamma };
+        \\}
+        \\
+    ;
+    // `@Struct` 的字段属性类型来自 std.builtin
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root_path = try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" });
+    const std_root = try w.vfs.intern(std_root_path);
+    const file = (try w.add("/p/main.zig", text)).file;
+    try w.setGraph(std_root, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 多行字符串的第二行
+        .{ "beta, b.", "beta Second" },
+        // 经由另一个常量的普通字符串
+        .{ "count, c.", "count Number" },
+        // 局部常量
+        .{ "gamma };", "gamma Local" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        const name_len = std.mem.indexOfAny(u8, c[0], ",; ").?;
+        testing.expectEqualStrings(c[0][0..name_len], text[t.start..t.end]) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..t.end] });
+            return err;
+        };
+        try testing.expect(std.mem.startsWith(u8, text[t.start..], c[1]));
+    }
+}
+
 test "member completion of reified, tuple and anonymous struct types" {
     const text =
         \\fn Fields() type { return @Enum(u8, .exhaustive, &.{ "alpha", "beta" }, &.{ 0, 1 }); }

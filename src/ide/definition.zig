@@ -14,7 +14,10 @@ const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const context = @import("context.zig");
 const queries = @import("../sema/queries.zig");
-const TypedValue = @import("../sema/InternPool.zig").TypedValue;
+const InternPool = @import("../sema/InternPool.zig");
+const TypedValue = InternPool.TypedValue;
+const Index = InternPool.Index;
+const eval = @import("../sema/eval.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
@@ -22,6 +25,7 @@ pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
     if (try defAt(r, file, offset)) |def| return target(r, try r.aliasTarget(def));
+    if (try reifiedFieldTarget(r, file, offset)) |t| return t;
     return selfTarget(r, file, offset);
 }
 
@@ -29,6 +33,7 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
     if (try defAt(r, file, offset)) |def| return target(r, def);
+    if (try reifiedFieldTarget(r, file, offset)) |t| return t;
     return selfTarget(r, file, offset);
 }
 
@@ -60,6 +65,153 @@ fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
         return span;
     }
     return null;
+}
+
+/// `@Struct` / `@Union` 构造的类型的字段没有声明。字段名来自 comptime 求值的字符串（如 zig-clap 从帮助文本
+/// 解析出的参数名）时跳到字符串字面量中的位置：候选为本文件中初始化表达式含有包含该名字的字符串字面量
+/// （直接或经由同文件的常量）的常量与当前成员的局部常量，取值中含有该字符串、且与构造类型时的实例实参共有
+/// 这部分值的候选，跟踪字面量的来源重新求值
+fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const e = b.exprAt(rel) orelse return null;
+    const fa = switch (b.expr(e)) {
+        .field_access => |x| x,
+        else => return null,
+    };
+    if (rel < b.range(fa.lhs).end) return null;
+    const name = fa.field orelse return null;
+    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+    if (a.member(e) != null) return null;
+    const ip = r.ctx.db.env.ip;
+    var t = a.exprType(fa.lhs).ty;
+    switch (ip.key(t)) {
+        .ptr_type => |p| if (p.size == .one) {
+            t = p.child;
+        },
+        else => {},
+    }
+    const rt = switch (ip.key(t)) {
+        .reified_type => |x| x,
+        else => return null,
+    };
+    if (rt.kind == .@"enum") return null;
+    for (rt.names) |n| {
+        if (std.mem.eql(u8, n, name)) break;
+    } else return null;
+
+    const Candidate = struct { item: u32, body: *const Body, expr: Body.ExprId, value: Index };
+    var cands: std.ArrayList(Candidate) = .empty;
+    const tree = try r.itemTree(file);
+    // 初始化表达式中直接含有该名字的字符串字面量的常量（名字），以及经由它们的常量
+    var holders: std.ArrayList([]const u8) = .empty;
+    for (tree.items, 0..) |it, i| {
+        if (it.kind != .@"const" and it.kind != .@"var") continue;
+        const ib = try r.body(file, @intCast(i));
+        const v = ib.value orelse continue;
+        if (literalWithin(ib, v, name)) try holders.append(r.arena, it.name orelse continue);
+    }
+    for (tree.items, 0..) |it, i| {
+        if (it.kind != .@"const" and it.kind != .@"var") continue;
+        const ib = try r.body(file, @intCast(i));
+        const v = ib.value orelse continue;
+        if (!literalWithin(ib, v, name) and !nameRefWithin(ib, v, holders.items)) continue;
+        const tv = try queries.defType(r, .{ .item = .{ .file = file, .item = @intCast(i) } }, null, null);
+        try cands.append(r.arena, .{ .item = @intCast(i), .body = ib, .expr = v, .value = tv.val orelse continue });
+    }
+    for (b.bindings, 0..) |binding, bi| {
+        const init = binding.init orelse continue;
+        if (!literalWithin(b, init, name) and !nameRefWithin(b, init, holders.items)) continue;
+        const v = a.bindingType(@fromBackingInt(@intCast(bi))).val orelse continue;
+        try cands.append(r.arena, .{ .item = item, .body = b, .expr = init, .value = v });
+    }
+
+    var chosen: ?struct { cand: Candidate, path: []const u32 } = null;
+    var found: u32 = 0;
+    var shared: u32 = 0;
+    for (cands.items) |c| {
+        var path: std.ArrayList(u32) = .empty;
+        var chain: std.ArrayList(Index) = .empty;
+        if (!try eval.findString(ip, r.arena, c.value, name, &path, &chain)) continue;
+        found += 1;
+        const share = if (rt.inst) |inst| sharesValue(ip, inst, chain.items) else false;
+        if (share) shared += 1;
+        // 与实例实参共有值的候选优先；都没有时只有唯一的候选才取
+        if (share or (shared == 0 and chosen == null)) chosen = .{ .cand = c, .path = path.items };
+    }
+    const pick = chosen orelse return null;
+    if (shared > 1 or (shared == 0 and found > 1)) return null;
+
+    const origin = try eval.stringOrigin(r, file, pick.cand.item, pick.cand.body, pick.cand.expr, pick.path) orelse return null;
+    const lit_node = try r.itemNode(origin.file, origin.item) orelse return null;
+    const lit_body = try r.body(origin.file, origin.item);
+    const range = lit_body.range(origin.expr);
+    const source = (try r.ctx.get(database.syntax.ParseFile, origin.file)).source;
+    const lit_start = lit_node.offset + range.start;
+    const src = source[lit_start .. lit_node.offset + range.end];
+    const start = Body.literalSourceOffset(src, origin.offset) orelse return null;
+    const end = Body.literalSourceOffset(src, origin.offset + name.len) orelse return null;
+    return .{ .file = origin.file, .start = lit_start + @as(u32, @intCast(start)), .end = lit_start + @as(u32, @intCast(end)) };
+}
+
+/// `e` 的范围内有内容含有 `name` 的字符串字面量
+fn literalWithin(b: *const Body, e: Body.ExprId, name: []const u8) bool {
+    const range = b.range(e);
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .literal => |text| {
+            if (text.len == 0 or (text[0] != '"' and text[0] != '\\')) continue;
+            const ri = b.expr_ranges[i];
+            if (ri.start >= range.start and ri.end <= range.end and std.mem.indexOf(u8, text, name) != null) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// `e` 的范围内引用了 `names` 中的名字
+fn nameRefWithin(b: *const Body, e: Body.ExprId, names: []const []const u8) bool {
+    const range = b.range(e);
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .name_ref => |n| {
+            const ri = b.expr_ranges[i];
+            if (ri.start < range.start or ri.end > range.end) continue;
+            for (names) |want| if (std.mem.eql(u8, n, want)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// 实例 `inst`（及其所在的实例）的实参中含有 `values` 中的某个值
+fn sharesValue(ip: *InternPool, inst: Index, values: []const Index) bool {
+    if (values.len == 0) return false;
+    var budget: u32 = 4096;
+    var cur: ?Index = inst;
+    while (cur) |x| {
+        const ins = switch (ip.key(x)) {
+            .instance => |v| v,
+            else => return false,
+        };
+        for (ins.args) |arg| if (containsValue(ip, arg, values, &budget, 0)) return true;
+        cur = ins.parent;
+    }
+    return false;
+}
+
+fn containsValue(ip: *InternPool, v: Index, values: []const Index, budget: *u32, depth: u32) bool {
+    if (budget.* == 0 or depth > 12) return false;
+    budget.* -= 1;
+    if (std.mem.indexOfScalar(Index, values, v) != null) return true;
+    switch (ip.key(v)) {
+        .ptr_value => |p| return containsValue(ip, p.pointee, values, budget, depth + 1),
+        .aggregate => |agg| for (agg.elems) |x| if (containsValue(ip, x, values, budget, depth + 1)) return true,
+        else => {},
+    }
+    return false;
 }
 
 /// 具名错误集的成员：`Error.Foo` 跳到声明 `const Error = error{ Foo, ... }` 中的 `Foo`（声明是别名时沿别名查找）
