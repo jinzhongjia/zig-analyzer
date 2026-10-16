@@ -15,9 +15,10 @@ const Def = resolve.Def;
 const Body = @import("../hir/Body.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("FileIndex.zig");
-const seed = @import("../ide/seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const seed = @import("../ide/seed.zig");
+const InternPool = @import("../sema/InternPool.zig");
 
 pub const Reference = struct {
     file: FileId,
@@ -47,6 +48,9 @@ pub const Options = struct {
     scope: []const FileId,
     /// 只在这个文件中查找（document highlight）
     only_file: ?FileId = null,
+    /// 不为 null 时记录第一处有歧义的引用：泛型函数体内的成员访问，在一些调用点实例下指向 `def`，
+    /// 另一些指向其他定义（重命名会破坏其他实例，应拒绝）
+    ambiguous: ?*?Reference = null,
 };
 
 /// `def` 的全部引用（含定义处），按文件与位置排序
@@ -62,7 +66,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .file => unreachable,
     };
 
-    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out };
+    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
@@ -140,6 +144,9 @@ const Finder = struct {
     def: Def,
     name: []const u8,
     out: *std.ArrayList(Reference),
+    ambiguous: ?*?Reference,
+    /// 最近一个成员的调用点实例（`instances`）
+    cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index } = null,
 
     /// 检查文件 `file` 中的成员 `item`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
@@ -149,7 +156,6 @@ const Finder = struct {
         if (!mentions(body, f.name)) return;
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
-        var sd: Seeded = .unknown;
         for (body.exprs, 0..) |e, i| {
             const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
             const range = body.expr_ranges[i];
@@ -159,23 +165,22 @@ const Finder = struct {
                     if (deepEql(d, f.def)) try f.add(file, base + range.start, base + range.end);
                 },
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
-                    const d = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns|
-                        try r.memberDef(ns, f.name)
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    const hit = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns|
+                        if (try r.memberDef(ns, f.name)) |d| deepEql(d, f.def) else false
                     else
-                        try f.viaTypes(&res, &sd, file, item_index, id);
-                    if (d != null and deepEql(d.?, f.def)) try f.addLastToken(file, base + range.end);
+                        try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    if (hit) try f.addLastToken(file, base + range.end);
                 },
                 .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
-                    const d = try f.viaTypes(&res, &sd, file, item_index, id);
-                    if (d != null and deepEql(d.?, f.def)) try f.addLastToken(file, base + range.end);
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    if (try f.refersTo(&res, file, item_index, .{ .e = id }, at)) try f.addLastToken(file, base + range.end);
                 },
                 .init => |x| for (x.fields, 0..) |fi, k| {
                     const n = fi.name orelse continue;
                     if (!std.mem.eql(u8, n, f.name)) continue;
-                    const result = try f.inferred(&res, file, item_index);
-                    const member = fieldRef(result, id, k) orelse if (try f.seeded(&sd, file, item_index)) |s| fieldRef(s.res, id, k) else null;
-                    const d = try keyDef(r, member orelse continue) orelse continue;
-                    if (deepEql(d, f.def)) try f.add(file, base + fi.name_range.start, base + fi.name_range.end);
+                    const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
+                    if (try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at)) try f.add(file, at.start, at.end);
                 },
                 else => {},
             }
@@ -189,29 +194,33 @@ const Finder = struct {
         return x;
     }
 
-    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员）。泛型函数体内抽象的结果中求不出时，
-    /// 与跳转一样取调用点实例的结果（设计 §9.4，如 `fn get(comptime S: type, s: *S)` 中的 `s.getenv`）
-    fn viaTypes(f: *Finder, res: *?*const infer.Result, sd: *Seeded, file: FileId, item_index: u32, e: Body.ExprId) resolve.Error!?Def {
-        const result = try f.inferred(res, file, item_index);
-        const i = @backingInt(e);
-        if (i >= result.members.len) return null;
-        const member = result.members[i] orelse blk: {
-            const s = try f.seeded(sd, file, item_index) orelse return null;
-            break :blk if (i < s.res.members.len) s.res.members[i] orelse return null else return null;
+    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员、初始化的字段）是否为 `def`。
+    /// 泛型函数体内抽象推导求不出时检查全部调用点实例：任一实例指向 `def` 即为引用；同时有实例指向
+    /// 其他定义时记为有歧义（`at`）
+    fn refersTo(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, l: Lookup, at: Reference) resolve.Error!bool {
+        if (l.member(try f.inferred(res, file, item_index))) |m| {
+            const d = try keyDef(f.r, m) orelse return false;
+            return deepEql(d, f.def);
+        }
+        const owner = try f.r.ownerKey(file, item_index);
+        var hit = false;
+        var miss = false;
+        for (try f.instances(file, item_index)) |inst| {
+            const m = l.member(try f.r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .inst = inst })) orelse continue;
+            const d = try keyDef(f.r, m) orelse continue;
+            if (deepEql(d, f.def)) hit = true else miss = true;
+        }
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
         };
-        return keyDef(f.r, member);
+        return hit;
     }
 
-    /// 成员的调用点实例的推导结果（每个成员只查找一次）
-    fn seeded(f: *Finder, sd: *Seeded, file: FileId, item_index: u32) resolve.Error!?seed.Seed {
-        switch (sd.*) {
-            .unknown => {
-                sd.* = if (try seed.find(f.r, file, item_index)) |s| .{ .found = s } else .none;
-                return f.seeded(sd, file, item_index);
-            },
-            .none => return null,
-            .found => |s| return s,
-        }
+    fn instances(f: *Finder, file: FileId, item_index: u32) resolve.Error![]const InternPool.Index {
+        if (f.cached) |c| if (c.file == file and c.item == item_index) return c.list;
+        const list = try seed.allInstances(f.r, file, item_index);
+        f.cached = .{ .file = file, .item = item_index, .list = list };
+        return list;
     }
 
     fn add(f: *Finder, file: FileId, start: u32, end: u32) resolve.Error!void {
@@ -224,6 +233,21 @@ const Finder = struct {
         const text = (try f.r.ctx.get(database.syntax.SourceText, file)).text;
         const start = lastNameStart(text, end) orelse return;
         try f.add(file, start, end);
+    }
+};
+
+/// 推导结果中的成员：表达式 `e` 访问的成员，或初始化表达式 `e` 的第 `field` 个字段
+const Lookup = struct {
+    e: Body.ExprId,
+    field: ?usize = null,
+
+    fn member(l: Lookup, res: *const infer.Result) ?hir.OwnerKey {
+        if (l.field) |k| {
+            for (res.field_refs) |ref| if (ref.init == l.e and ref.index == k) return ref.member;
+            return null;
+        }
+        const i = @backingInt(l.e);
+        return if (i < res.members.len) res.members[i] else null;
     }
 };
 
@@ -243,27 +267,38 @@ pub fn mentions(body: *const Body, name: []const u8) bool {
 fn lastNameStart(text: []const u8, end: u32) ?u32 {
     if (end == 0 or end > text.len) return null;
     if (text[end - 1] == '"') {
-        const q = std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '"') orelse return null;
-        if (q == 0 or text[q - 1] != '@') return null;
-        return @intCast(q - 1);
+        // 内部可能有转义的引号：从同一行中每个 `@"` 起按字符串字面量的规则向后扫描，取恰好结束于 `end` 的
+        const line_start = if (std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '\n')) |i| i + 1 else 0;
+        var q = end - 1;
+        while (q > line_start + 1) {
+            q -= 1;
+            if (text[q] == '"' and text[q - 1] == '@' and quotedEnd(text, q) == end) return @intCast(q - 1);
+        }
+        return null;
     }
     var i = end;
     while (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) i -= 1;
     return if (i == end) null else i;
 }
 
+/// 起始于 `q`（开引号）的字符串字面量的结束位置（闭引号之后）
+fn quotedEnd(text: []const u8, q: usize) ?usize {
+    var i = q + 1;
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        '\\' => i += 1,
+        '"' => return i + 1,
+        '\n' => return null,
+        else => {},
+    };
+    return null;
+}
+
 test lastNameStart {
     try std.testing.expectEqual(4, lastNameStart("a.b.cde", 7));
     try std.testing.expectEqual(2, lastNameStart("x.@\"a b\"", 8));
     try std.testing.expectEqual(null, lastNameStart("a.", 2));
-}
-
-const Seeded = union(enum) { unknown, none, found: seed.Seed };
-
-/// 初始化表达式 `init` 中第 `index` 个字段名解析到的字段
-fn fieldRef(result: *const infer.Result, init: Body.ExprId, index: usize) ?hir.OwnerKey {
-    for (result.field_refs) |ref| if (ref.init == init and ref.index == index) return ref.member;
-    return null;
+    try std.testing.expectEqual(2, lastNameStart("s.@\"a\\\"b\"", 9));
+    try std.testing.expectEqual(2, lastNameStart("s.@\"a\\\\\"", 8));
 }
 
 fn keyDef(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {

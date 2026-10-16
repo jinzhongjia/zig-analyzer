@@ -104,6 +104,8 @@ pub const Harness = struct {
     received: std.ArrayList(std.json.Value) = .empty,
     /// 为 true 时以错误回复服务器发来的请求
     reject_requests: bool = false,
+    /// 为 true 时不回复服务器发来的请求（模拟迟迟不回复的客户端）
+    hold_requests: bool = false,
     /// 回复 `workspace/configuration` 的 `zig-analyzer` 配置节（null 表示未设置）
     configuration: std.json.Value = .null,
 
@@ -137,7 +139,7 @@ pub const Harness = struct {
         h.arena.deinit();
     }
 
-    fn write(h: *Harness, value: anytype) !void {
+    pub fn write(h: *Harness, value: anytype) !void {
         const body = try std.json.Stringify.valueAlloc(testing.allocator, value, .{ .emit_null_optional_fields = false });
         defer testing.allocator.free(body);
         var header: [64]u8 = undefined;
@@ -187,7 +189,9 @@ pub const Harness = struct {
         const msg = try h.output.readMessage(h.arena.allocator(), 120_000);
         try h.received.append(h.arena.allocator(), msg);
         if (msg.object.get("method") != null) if (msg.object.get("id")) |id| {
-            if (h.reject_requests) {
+            if (h.hold_requests) {
+                // 不回复
+            } else if (h.reject_requests) {
                 try h.write(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = -32603, .message = "rejected" } });
             } else if (std.mem.eql(u8, msg.object.get("method").?.string, "workspace/configuration")) {
                 try h.write(.{ .jsonrpc = "2.0", .id = id, .result = &[_]std.json.Value{h.configuration} });

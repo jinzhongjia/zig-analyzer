@@ -291,15 +291,20 @@ pub fn deinit(ip: *InternPool) void {
 
 /// 回收全部非预置的项（整代回收，设计 §9.1）。调用方须保证此后没有任何地方使用非预置的 Index：
 /// 引用它们的 query 同时清空（`Db.resetQueries`），且没有读事务在进行
+///
+/// 先在新的表中建好预置项再整体替换：分配失败时原来的池保持完整（预置的 Index 仍然有效），只是没有回收
 pub fn reset(ip: *InternPool) Allocator.Error!void {
-    {
-        ip.mutex.lockUncancelable(ip.io);
-        defer ip.mutex.unlock(ip.io);
-        ip.items.clearAndFree(ip.gpa);
-        ip.map.clearAndFree(ip.gpa);
-        _ = ip.arena.reset(.free_all);
-    }
-    for (preset, 0..) |k, i| std.debug.assert(@backingInt(try ip.get(k)) == i);
+    var fresh: InternPool = .{ .gpa = ip.gpa, .io = ip.io, .arena = .init(ip.gpa) };
+    errdefer fresh.deinit();
+    for (preset, 0..) |k, i| std.debug.assert(@backingInt(try fresh.get(k)) == i);
+
+    ip.mutex.lockUncancelable(ip.io);
+    std.mem.swap(std.ArrayList(Key), &ip.items, &fresh.items);
+    std.mem.swap(@TypeOf(ip.map), &ip.map, &fresh.map);
+    std.mem.swap(std.heap.ArenaAllocator, &ip.arena, &fresh.arena);
+    ip.mutex.unlock(ip.io);
+    // 换出的旧表
+    fresh.deinit();
 }
 
 /// 占用的字节数（Key 表、哈希表与存放 Key 中切片的 arena），用于统计
@@ -716,5 +721,20 @@ test "reset keeps the presets and frees everything else" {
     try testing.expectEqual(n, ip.count());
     try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
     // 重新驻留得到同样的位置（下标只取决于驻留顺序）
+    try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
+}
+
+test "reset that runs out of memory leaves the pool intact" {
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var ip: InternPool = try .init(failing.allocator(), testing.io);
+    defer ip.deinit();
+    const slice = try ip.ptrTo(.u8_type, .slice, true);
+    const n = ip.count();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, ip.reset());
+    failing.fail_index = std.math.maxInt(usize);
+    // 没有回收，原来的项（含预置项）仍然有效
+    try testing.expectEqual(n, ip.count());
+    try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
     try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
 }

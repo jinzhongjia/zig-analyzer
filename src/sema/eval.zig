@@ -390,6 +390,10 @@ const Ref = struct {
     cell: *Val,
     /// 从存储单元的值逐层取元素的下标
     path: []const u32,
+    /// 切片：指向 `path` 处聚合的 `[start, start + len)` 区间（与原数组共享存储）
+    window: ?Window = null,
+
+    const Window = struct { start: u32, len: u32 };
 };
 
 const Frame = struct {
@@ -601,10 +605,19 @@ const Evaluator = struct {
     fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
         var cur = ref.cell.*;
         for (ref.path) |i| cur = try ev.elemAt(cur, i);
-        return cur;
+        const w = ref.window orelse return cur;
+        // 区间：取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）
+        const elems = try ev.a.alloc(Val, w.len);
+        for (elems, w.start..) |*o, i| o.* = try ev.elemAt(cur, i);
+        const array = try ev.ip.get(.{ .array_type = .{ .len = w.len, .child = ev.elemTypeOf(cur.ty, w.start) } });
+        return ev.makeAgg(array, elems);
     }
 
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
+        if (ref.window) |w| {
+            for (0..w.len) |i| try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
+            return;
+        }
         var cell = ref.cell;
         for (ref.path) |i| {
             const agg = try ev.mutableAgg(cell);
@@ -1302,16 +1315,13 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return error.Abort,
         };
-        const path = try ev.a.alloc(u32, ref.path.len + 1);
-        @memcpy(path[0..ref.path.len], ref.path);
-        path[ref.path.len] = @intCast(i);
         const target = try ev.load(ref);
         const child = ev.elemTypeOf(target.ty, i);
         const is_const = switch (ev.ip.key(seq.ty)) {
             .ptr_type => |p| p.is_const,
             else => false,
         };
-        return .{ .ty = try ev.ip.ptrTo(child, .one, is_const), .v = .{ .ref = .{ .cell = ref.cell, .path = path } } };
+        return .{ .ty = try ev.ip.ptrTo(child, .one, is_const), .v = .{ .ref = try ev.extend(ref, std.math.cast(u32, i) orelse return error.Abort) } };
     }
 
     fn switchExpr(ev: *Evaluator, f: *Frame, e: ExprId, s: @FieldType(Body.Expr, "switch"), want: ?Index) EvalError!Val {
@@ -1615,10 +1625,15 @@ const Evaluator = struct {
         };
     }
 
-    fn extend(ev: *Evaluator, base: Ref, i: u32) Error!Ref {
+    /// 第 `i` 个元素的位置；区间的下标相对于区间的起点
+    fn extend(ev: *Evaluator, base: Ref, i: u32) EvalError!Ref {
+        const index = if (base.window) |w| blk: {
+            if (i >= w.len) return error.Abort;
+            break :blk w.start + i;
+        } else i;
         const path = try ev.a.alloc(u32, base.path.len + 1);
         @memcpy(path[0..base.path.len], base.path);
-        path[base.path.len] = i;
+        path[base.path.len] = index;
         return .{ .cell = base.cell, .path = path };
     }
 
@@ -1701,9 +1716,31 @@ const Evaluator = struct {
             .ptr_type => |p| p.is_const,
             else => true,
         };
-        // comptime 已知的区间：指向数组的指针（元素为复制，不驻留）
+        // comptime 已知的区间：指向数组的指针
         const array = try ip.get(.{ .array_type = .{ .len = elems.len, .child = child } });
-        return ev.pointerToNew(try ip.ptrTo(array, .one, is_const), try ev.makeAgg(array, elems));
+        const ptr_ty = try ip.ptrTo(array, .one, is_const);
+        // 切片的是局部变量（或经由指针）的存储：引用原存储的区间，写入反映到原数组
+        if (try ev.sliceTarget(f, s.lhs, base)) |target| {
+            const offset = if (target.window) |tw| tw.start else 0;
+            var ref = target;
+            ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = @intCast(end - start) };
+            return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
+        }
+        // 其他（驻留的常量等）：元素为复制，不驻留
+        return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
+    }
+
+    /// 被切片的存储：指针所指向的存储，或数组局部变量自身；没有可引用的存储时为 null
+    fn sliceTarget(ev: *Evaluator, f: *Frame, lhs: ExprId, base: Val) EvalError!?Ref {
+        switch (base.v) {
+            .ref => |r| return r,
+            else => {},
+        }
+        if (ev.ip.key(base.ty) != .array_type) return null;
+        return ev.place(f, lhs) catch |err| switch (err) {
+            error.Abort => null,
+            else => |x| x,
+        };
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
@@ -2518,7 +2555,7 @@ const Evaluator = struct {
     /// 元组的布局（`Type.structFieldOffset` 与 `abiAlignment` 的元组分支）：按声明顺序，不重排；comptime 字段
     /// 与零大小的字段不占位置。对齐计入零大小的字段，大小只按有大小的字段的对齐补齐（与编译器一致，
     /// `struct { u8, [0]u64 }` 的大小为 1、对齐为 8）
-    fn tupleLayout(ev: *Evaluator, fields: []const LayoutField) Error!StructLayout {
+    fn tupleLayout(ev: *Evaluator, fields: []const LayoutField) Error!?StructLayout {
         const offsets = try ev.a.alloc(?u64, fields.len);
         var end: u64 = 0;
         var size_align: u64 = 1;
@@ -2534,11 +2571,11 @@ const Evaluator = struct {
                 continue;
             }
             size_align = @max(size_align, fl.alignment);
-            const offset = std.mem.alignForward(u64, end, fl.alignment);
-            o.* = offset * 8;
-            end = offset + fl.layout.?.size;
+            const offset = value.alignForward(end, fl.alignment) orelse return null;
+            o.* = value.bitsOf(offset) orelse return null;
+            end = std.math.add(u64, offset, fl.layout.?.size) catch return null;
         }
-        return .{ .layout = .{ .size = std.mem.alignForward(u64, end, size_align), .alignment = alignment, .bits = null }, .bit_offsets = offsets };
+        return .{ .layout = .{ .size = value.alignForward(end, size_align) orelse return null, .alignment = alignment, .bits = null }, .bit_offsets = offsets };
     }
 
     /// 结构体的布局与各字段的位偏移（comptime 字段为 null）。auto 布局按对齐降序重排字段，
@@ -2553,7 +2590,7 @@ const Evaluator = struct {
                 // packed 的字段不能有显式对齐（编译器报错）
                 if (fl.explicit_align or !try ev.packable(fl.ty)) return null;
                 o.* = bits;
-                bits += l.bits orelse return null;
+                bits = std.math.add(u64, bits, l.bits orelse return null) catch return null;
             }
             // 显式的 backing 整数须与各字段的位宽之和相等
             if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
@@ -2573,11 +2610,11 @@ const Evaluator = struct {
         var end: u64 = 0;
         for (order) |i| {
             if (i == RuntimeOrder.omitted) continue;
-            const offset = std.mem.alignForward(u64, end, fields[i].alignment);
-            offsets[i] = offset * 8;
-            end = offset + fields[i].layout.?.size;
+            const offset = value.alignForward(end, fields[i].alignment) orelse return null;
+            offsets[i] = value.bitsOf(offset) orelse return null;
+            end = std.math.add(u64, offset, fields[i].layout.?.size) catch return null;
         }
-        return .{ .layout = .{ .size = std.mem.alignForward(u64, end, struct_align), .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
+        return .{ .layout = .{ .size = value.alignForward(end, struct_align) orelse return null, .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
     }
 
     /// 字段在内存中的顺序：与编译器的比较函数相同，comptime 字段排在最后
@@ -2600,7 +2637,7 @@ const Evaluator = struct {
             payload_size = @max(payload_size, l.size);
             payload_align = @max(payload_align, fl.alignment);
         }
-        const payload: value.Layout = .{ .size = std.mem.alignForward(u64, payload_size, payload_align), .alignment = payload_align, .bits = null };
+        const payload: value.Layout = .{ .size = value.alignForward(payload_size, payload_align) orelse return null, .alignment = payload_align, .bits = null };
         switch (decl.layout) {
             .@"packed" => {
                 if (fields.len == 0) return null;
@@ -2623,7 +2660,8 @@ const Evaluator = struct {
         else
             return payload;
         const alignment = @max(tag.alignment, payload_align);
-        return .{ .size = std.mem.alignForward(u64, tag.size + payload_size, alignment), .alignment = alignment, .bits = null };
+        const size = std.math.add(u64, tag.size, payload_size) catch return null;
+        return .{ .size = value.alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
     }
 
     const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
@@ -3030,7 +3068,10 @@ const Evaluator = struct {
         if (layout != .@"packed") return .null_value;
         if ((try ev.containerSyntax(t)).arg) |arg| return arg;
         var bits: u64 = 0;
-        for (types) |ty| bits += (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
+        for (types) |ty| {
+            const field_bits = (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
+            bits = std.math.add(u64, bits, field_bits) catch return error.Abort;
+        }
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }
 };
@@ -3065,7 +3106,7 @@ fn literalFieldAttrs(values: []const Index, i: usize) EvalError!Evaluator.FieldA
 fn alignValue(ip: *InternPool, v: ?Index) EvalError!u64 {
     const x = value.intOf(ip, v) orelse return error.Abort;
     if (x <= 0 or x & (x - 1) != 0) return error.Abort;
-    return @intCast(x);
+    return std.math.cast(u64, x) orelse error.Abort;
 }
 
 /// `++` 结果的哨兵（与编译器一致）：两侧都有时须相同，只有一侧有时取该侧

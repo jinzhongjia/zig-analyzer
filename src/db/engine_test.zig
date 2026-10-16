@@ -362,6 +362,37 @@ test "Value with pointers: keep old value when equal, deferred free when changed
     ctx.end();
 }
 
+test "out of memory while committing a memo keeps the old memo intact and leaks nothing" {
+    // 依次让重算 Upper 过程中的第 i 次分配失败：旧 memo 的依赖与值不能被提前移交，新值不能泄漏
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var d: Db = .init(testing.io, gpa, {});
+        defer d.deinit();
+        d.beginWrite();
+        try d.set(Text, 1, try gpa.dupe(u8, "abc"), .low);
+        d.endWrite();
+        try testing.expectEqualStrings("ABC", try read(&d, Upper, 1));
+        d.beginWrite();
+        try d.set(Text, 1, try gpa.dupe(u8, "xyz"), .low);
+        d.endWrite();
+
+        failing.fail_index = failing.alloc_index + i;
+        _ = read(&d, Upper, 1) catch |err| try testing.expectEqual(error.OutOfMemory, err);
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+
+        try testing.expectEqualStrings("XYZ", try read(&d, Upper, 1));
+        // 写事务释放垃圾列表：旧的依赖与值各只释放一次
+        d.beginWrite();
+        try d.set(Text, 1, try gpa.dupe(u8, "q"), .low);
+        d.endWrite();
+        try testing.expectEqualStrings("Q", try read(&d, Upper, 1));
+        if (!induced) break;
+    }
+}
+
 test "cycle: uses cycleFallback without writing memo" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

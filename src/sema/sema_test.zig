@@ -537,6 +537,79 @@ test "inferred error sets from function bodies" {
     });
 }
 
+test "comptime slices alias the sliced storage" {
+    try expectTypes(
+        \\fn f() u8 {
+        \\    var a = [_]u8{ 1, 2 };
+        \\    const s = a[0..];
+        \\    s[0] = 9;
+        \\    return a[0];
+        \\}
+        \\fn g() u8 {
+        \\    var a = [_]u8{ 1, 2, 3, 4 };
+        \\    const p = &a;
+        \\    const s = p[1..];
+        \\    const t = s[1..3];
+        \\    t[1] = 7;
+        \\    for (s) |*x| x.* += 1;
+        \\    return a[3] + a[1];
+        \\}
+        \\fn h() u8 {
+        \\    var a = [_]u8{ 1, 2 };
+        \\    const s = a[0..];
+        \\    a[1] = 5;
+        \\    return s[1];
+        \\}
+        \\const result = f();
+        \\const nested = g();
+        \\const reads = h();
+    , &.{
+        .{ "result", "u8 = 9" },
+        .{ "nested", "u8 = 11" },
+        .{ "reads", "u8 = 5" },
+    });
+}
+
+test "escaped identifiers name the same declaration as plain ones" {
+    try expectTypes(
+        \\const @"\x66oo": u8 = 7;
+        \\const S = struct { @"a\"b": u16 };
+        \\const result = foo;
+        \\fn f(s: S) void {
+        \\    const field = s.@"a\x22b";
+        \\    _ = field;
+        \\}
+    , &.{
+        .{ "result", "u8 = 7" },
+        .{ "field", "u16" },
+    });
+}
+
+test "oversized layouts degrade to unknown instead of overflowing" {
+    // 大小无法用 u64 表示的类型：布局求不出，不能使宿主溢出崩溃
+    try expectTypes(
+        \\const S = extern struct {
+        \\    a: [2305843009213693952]u8,
+        \\    b: u8,
+        \\};
+        \\const T = struct { u8, [18446744073709551615]u8 };
+        \\const U = union(enum) { a: [18446744073709551615]u8, b: u8 };
+        \\const s_size = @sizeOf(S);
+        \\const sentinel_size = @sizeOf([18446744073709551615:0]u8);
+        \\const opt_size = @sizeOf(?[18446744073709551615]u8);
+        \\const eu_size = @sizeOf(anyerror![18446744073709551615]u8);
+        \\const t_size = @sizeOf(T);
+        \\const u_size = @sizeOf(U);
+    , &.{
+        .{ "s_size", "comptime_int" },
+        .{ "sentinel_size", "comptime_int" },
+        .{ "opt_size", "comptime_int" },
+        .{ "eu_size", "comptime_int" },
+        .{ "t_size", "comptime_int" },
+        .{ "u_size", "comptime_int" },
+    });
+}
+
 test "container layouts match the compiler" {
     // 期望值为 zig 0.17.0 在 x86_64-linux 上的结果
     try expectTypes(

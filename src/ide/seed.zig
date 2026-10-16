@@ -93,6 +93,56 @@ pub const Query = struct {
     }
 };
 
+/// 成员 `item`（位于某个泛型函数内）在各调用点的全部具体实例（去重，按查找顺序）。调用者自身位于泛型函数内时
+/// 取调用者的全部实例（最多 `max_depth` 层）。用于需要覆盖所有实例的场合（引用查找与重命名）
+pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error![]const Index {
+    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
+    var out: std.ArrayList(Index) = .empty;
+    try collect(r, try r.ownerKey(file, item), max_depth, &out);
+    return out.items;
+}
+
+/// 实例个数的上限：超过时截断（调用点极多的泛型函数）
+const max_instances = 64;
+
+fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *std.ArrayList(Index)) resolve.Error!void {
+    const tree = try r.itemTree(key.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == key.item) break @intCast(i);
+    } else return;
+    const root = try genericRoot(r, key.file, item) orelse return;
+    const files = try search.importers(r, key.file, try search.projectFiles(r));
+    const names = try callNames(r, key.file, root, files);
+    try collectIn(r, key.file, key.file, item, root, names, depth, out);
+    for (files) |f| {
+        if (f == key.file or !try containsAny(r, f, names)) continue;
+        try collectIn(r, f, key.file, item, root, names, depth, out);
+    }
+}
+
+/// 同 `findIn`，收集全部实例
+fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, depth: u8, out: *std.ArrayList(Index)) resolve.Error!void {
+    const tree = try r.itemTree(in);
+    const root_key = try r.ownerKey(file, root);
+    for (tree.items, 0..) |_, i| {
+        if (out.items.len >= max_instances) return;
+        if (in == file and try enclosedBy(r, file, @intCast(i), root)) continue;
+        if (!try mayMentionAny(r, in, @intCast(i), names)) continue;
+        const owner = try r.ownerKey(in, @intCast(i));
+        const body = try r.ctx.get(hir.ItemBody, owner);
+        if (!mentionsAny(body, names)) continue;
+        const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, out);
+        if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
+        var outer: std.ArrayList(Index) = .empty;
+        try collect(r, owner, depth - 1, &outer);
+        for (outer.items) |inst| {
+            const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+            _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, out);
+        }
+    }
+}
+
 /// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的
 fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
@@ -173,19 +223,20 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active, null)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
         // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
-        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null)) |s| return s;
     }
     return null;
 }
 
-/// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用
-fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32) resolve.Error!?Found {
+/// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。
+/// `all` 不为 null 时把全部调用的实例（去重）加入其中，返回 null
+fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*std.ArrayList(Index)) resolve.Error!?Found {
     const ip = r.ctx.db.env.ip;
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
@@ -216,6 +267,10 @@ fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer
         if (!value.isConcrete(ip, inst)) continue;
         const node = try r.itemNode(in, i) orelse continue;
         const norm = try queries.normalizeInst(r, file, item, inst);
+        if (all) |list| {
+            if (norm) |n| if (list.items.len < max_instances and std.mem.indexOfScalar(Index, list.items, n) == null) try list.append(r.arena, n);
+            continue;
+        }
         if (active) |rel| {
             const owner = try r.ownerKey(file, item);
             const target = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });

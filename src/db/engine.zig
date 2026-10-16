@@ -827,9 +827,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     var frame = ctx.stack.pop().?;
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(db.gpa);
-                    db.mutex.lockUncancelable(db.io);
-                    defer db.mutex.unlock(db.io);
-                    try db.discardLocked(Q, &value);
+                    // 新值没有发布过，没有其他引用：直接释放
+                    deinitValue(Q, &value, db.gpa);
                     return err;
                 }
                 var frame = ctx.stack.pop().?;
@@ -839,19 +838,24 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer db.mutex.unlock(db.io);
 
                 const slot = &db.tables[qi].slots.items[index];
-                const published = if (slot.memo) |old| old.verified_at == db.revision and !old.evicted else false;
-                if (frame.in_cycle or published) {
+                // 并发读者已在本 revision 发布结果，以它为准；新值没有发布过，直接释放
+                if (slot.memo) |old| if (old.verified_at == db.revision and !old.evicted) {
                     frame.deps.deinit(db.gpa);
-                    try db.discardLocked(Q, &value);
-                    // 并发读者已在本 revision 发布结果，以它为准
-                    if (published) {
-                        const old = slot.memo.?;
-                        return .{ .value = old.value, .changed_at = old.changed_at, .durability = old.durability, .executed = true };
-                    }
-                    // 环中的结果依赖于入口，不写入 memo
+                    deinitValue(Q, &value, db.gpa);
+                    return .{ .value = old.value, .changed_at = old.changed_at, .durability = old.durability, .executed = true };
+                };
+                // 环中的结果依赖于入口，不写入 memo。值返回给调用方使用，放入垃圾列表待读事务结束后释放
+                if (frame.in_cycle) {
+                    frame.deps.deinit(db.gpa);
+                    db.discardLocked(Q, &value) catch |err| {
+                        deinitValue(Q, &value, db.gpa);
+                        return err;
+                    };
                     return .{ .value = value, .changed_at = db.revision, .durability = .low, .executed = true };
                 }
 
+                // 提交 memo 之前失败：新值没有发布过，直接释放
+                errdefer deinitValue(Q, &value, db.gpa);
                 const deps = frame.deps.toOwnedSlice(db.gpa) catch |err| {
                     frame.deps.deinit(db.gpa);
                     return err;
@@ -861,13 +865,17 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 var changed_at = db.revision;
                 const table = &db.tables[qi];
                 if (slot.memo) |*old| {
+                    const same = !old.evicted and valueEql(Q, old.value, value);
+                    // 先完成全部可能失败的分配，再转移旧 memo 的资源：失败时旧 memo 保持完整（deps 仍归它所有）
                     try db.garbage.ensureUnusedCapacity(db.gpa, 2);
+                    const box = if (old.evicted or same) null else try db.allocBox(Q);
+                    // 此后不再失败
                     db.garbage.appendAssumeCapacity(.{ .deps = old.deps });
                     if (old.evicted) {
                         if (restore) changed_at = old.changed_at;
                         if (@hasDecl(Q, "lru")) table.live += 1;
                         if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
-                    } else if (valueEql(Q, old.value, value)) {
+                    } else if (same) {
                         // early cutoff：保留旧值与旧 changed_at
                         changed_at = old.changed_at;
                         _ = db.counters[qi].cutoffs.fetchAdd(1, .monotonic);
@@ -878,7 +886,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                         value = old.value;
                     } else {
                         if (@hasDecl(Q, "lru_bytes")) table.live_bytes = table.live_bytes - Q.bytes(old.value) + Q.bytes(value);
-                        try db.discardLocked(Q, &old.value);
+                        db.discardBoxed(Q, box, &old.value);
                     }
                 } else {
                     if (@hasDecl(Q, "lru")) table.live += 1;
@@ -933,21 +941,28 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return .{ .value = slot.value, .changed_at = slot.changed_at, .durability = slot.durability };
         }
 
-        /// 把值放入垃圾列表，下一次写事务时释放。调用方须持有 mutex。
+        /// 把值放入垃圾列表，下一次写事务时释放。调用方须持有 mutex。失败时值的所有权仍归调用方
         fn discardLocked(db: *Db, comptime Q: type, value: *Q.Value) Allocator.Error!void {
+            try db.garbage.ensureUnusedCapacity(db.gpa, 1);
+            db.discardBoxed(Q, try db.allocBox(Q), value);
+        }
+
+        /// 放入垃圾列表的值的存储；值不需要释放时为 null
+        fn allocBox(db: *Db, comptime Q: type) Allocator.Error!?*Q.Value {
+            return if (@hasDecl(Q, "deinit")) try db.gpa.create(Q.Value) else null;
+        }
+
+        /// 同 `discardLocked`，不会失败：调用方已预留垃圾列表的容量并分配好 `box`（`allocBox`）
+        fn discardBoxed(db: *Db, comptime Q: type, box: ?*Q.Value, value: *Q.Value) void {
             if (!@hasDecl(Q, "deinit")) return;
-            const box = try db.gpa.create(Q.Value);
-            box.* = value.*;
-            db.garbage.append(db.gpa, .{ .value = .{ .ptr = @ptrCast(box), .free = struct {
+            box.?.* = value.*;
+            db.garbage.appendAssumeCapacity(.{ .value = .{ .ptr = @ptrCast(box.?), .free = struct {
                 fn free(ptr: *anyopaque, gpa: Allocator) void {
                     const v: *Q.Value = @ptrCast(@alignCast(ptr));
                     Q.deinit(v, gpa);
                     gpa.destroy(v);
                 }
-            }.free } }) catch |err| {
-                db.gpa.destroy(box);
-                return err;
-            };
+            }.free } });
         }
     };
 }

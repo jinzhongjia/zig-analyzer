@@ -181,7 +181,10 @@ pub const ItemSummaries = struct {
     fn collectNames(node: ast.SyntaxNode, s: *ItemSummary) void {
         var it = node.children();
         while (it.next()) |e| switch (e) {
-            .token => |t| if (t.kind == .identifier) s.add(ast.identName(t.text)),
+            .token => |t| if (t.kind == .identifier) {
+                var buf: [256]u8 = undefined;
+                s.add(ast.identNameBuf(t.text, &buf));
+            },
             .node => |c| collectNames(c, s),
         };
     }

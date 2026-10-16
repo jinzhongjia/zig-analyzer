@@ -155,6 +155,8 @@ pub const HandlerError = error{
     RenameOutsideWorkspace,
     /// 新名字不是合法的标识符
     InvalidIdentifier,
+    /// 泛型函数体内的引用在一些实例下指向其他定义：重命名会破坏这些实例
+    RenameAmbiguous,
 };
 
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
@@ -297,22 +299,23 @@ const request_handlers = .{
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
     const a = arena.allocator();
+    // 字符串 ID 引用 arena 中的内存：错误响应须在释放 arena 之前序列化，因此错误出口都用 defer 释放
     inline for (request_handlers) |h| {
         if (std.mem.eql(u8, method, h[0])) {
             const is_initialize = comptime std.mem.eql(u8, h[0], "initialize");
             if (server.state == .uninitialized and !is_initialize) {
-                server.destroyArena(arena);
+                defer server.destroyArena(arena);
                 return server.sendError(id, jsonrpc.error_codes.server_not_initialized, "server not initialized");
             }
             if (server.state != .uninitialized and is_initialize or server.state == .shutdown) {
-                server.destroyArena(arena);
+                defer server.destroyArena(arena);
                 return server.sendError(id, jsonrpc.error_codes.invalid_request, "request not allowed in current state");
             }
 
             const func = h[2];
             const Params = LastParam(@TypeOf(func));
             const params = jsonrpc.parseParams(Params, a, params_value) catch |err| {
-                server.destroyArena(arena);
+                defer server.destroyArena(arena);
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 return server.sendError(id, jsonrpc.error_codes.invalid_params, "malformed params");
             };
@@ -323,44 +326,37 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     const result = func(server, a, params) catch |err| return server.sendHandlerError(id, err, false);
                     server.sendResponse(id, result);
                 },
-                .read => {
-                    const pending = try a.create(Pending);
-                    pending.* = .{ .id = id };
-                    {
-                        server.pending_mutex.lockUncancelable(server.io);
-                        defer server.pending_mutex.unlock(server.io);
-                        server.pending.append(server.gpa, pending) catch |err| {
-                            server.destroyArena(arena);
-                            return err;
-                        };
-                    }
-                    spawn(server.io, &server.group, ReadTask(func, h[0]).run, .{ server, arena, pending, params });
-                },
-                // 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
-                // 会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
-                .semantic => {
-                    const pending = try a.create(Pending);
-                    pending.* = .{ .id = id };
-                    {
-                        server.pending_mutex.lockUncancelable(server.io);
-                        defer server.pending_mutex.unlock(server.io);
-                        server.pending.append(server.gpa, pending) catch |err| {
-                            server.destroyArena(arena);
-                            return err;
-                        };
-                    }
-                    spawn(server.io, &server.group, SemanticTask(func, h[0]).run, .{ server, arena, pending, params });
+                .read, .semantic => {
+                    const pending = server.addPending(a, id) catch |err| {
+                        defer server.destroyArena(arena);
+                        server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
+                        return err;
+                    };
+                    const Task = if (h[1] == .read) ReadTask(func, h[0]) else SemanticTask(func, h[0]);
+                    // semantic 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务
+                    // 也占名额）时会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
+                    spawn(server.io, &server.group, Task.run, .{ server, arena, pending, params });
                 },
                 .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
-                    server.destroyArena(arena);
+                    defer server.destroyArena(arena);
                     server.sendError(id, jsonrpc.error_codes.internal_error, "failed to start background task");
                 },
             }
             return;
         }
     }
-    server.destroyArena(arena);
+    defer server.destroyArena(arena);
     server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
+}
+
+/// 登记进行中的请求（可被 `$/cancelRequest` 取消）；Pending 分配在请求的 arena 中
+fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
+    const pending = try a.create(Pending);
+    pending.* = .{ .id = id };
+    server.pending_mutex.lockUncancelable(server.io);
+    defer server.pending_mutex.unlock(server.io);
+    try server.pending.append(server.gpa, pending);
+    return pending;
 }
 
 /// 在独立线程中执行任务。不用 `async`：线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
@@ -1940,12 +1936,13 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
 }
 
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
-    // 等待进行中的读请求完成；停止各项目的构建系统进程，并等后台任务（诊断发布等）收尾
-    server.group.await(server.io) catch {};
-    // 客户端一直没有回复配置请求：不再等待
+    // 先解除依赖主循环的等待：客户端一直没有回复配置请求时不再等待。之后主循环阻塞在 await 上，
+    // 处理不了补发的响应，进行中的 `waitIdle` 请求只能靠这里结束
     server.startup_pending = false;
     while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
+    // 停止各项目的构建系统进程；等待进行中的请求完成，再等后台任务（诊断发布等）收尾
     server.stopWorkspaces();
+    server.group.await(server.io) catch {};
     server.waitIdle();
     server.state = .shutdown;
 }
@@ -2120,11 +2117,12 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 }
 
 /// 光标处的定义及其全部引用
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// `ambiguous` 不为 null 时记录第一处有歧义的引用（见 `search.Options.ambiguous`）
+fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
     const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null });
+    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous });
     return .{ .def = def, .refs = refs };
 }
 
@@ -2145,7 +2143,7 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null) orelse return null;
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs) |ref| {
@@ -2156,7 +2154,7 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null) orelse return null;
     const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
@@ -2200,8 +2198,11 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
 
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
     const new_name = try identifierText(arena, params.newName);
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+    var ambiguous: ?za.ide_db.search.Reference = null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous) orelse return null;
     if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
+    // 不返回只改了一部分的结果
+    if (ambiguous != null) return error.RenameAmbiguous;
     var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
     var m: RangeMapper = .{ .server = server, .r = r };
     var i: usize = 0;
@@ -2362,6 +2363,7 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
+        error.RenameAmbiguous => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function also refers to other declarations in some instantiations"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }

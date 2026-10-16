@@ -94,14 +94,37 @@ pub fn isMember(k: SyntaxKind) bool {
     };
 }
 
-/// 标识符的名字：`@"name"` 形式去掉引号（含转义的保留原文）。语义层（名字解析、字段、枚举成员）
-/// 一律使用去掉引号的名字，显示时再按需加回（`std.zig.fmtId`）
+/// 标识符的名字：`@"name"` 形式去掉引号（含转义的保留原文，解码见 `identNameAlloc` / `identNameBuf`）。
+/// 语义层（名字解析、字段、枚举成员）一律使用去掉引号并解码的名字，显示时再按需加回（`std.zig.fmtId`）
 pub fn identName(text: []const u8) []const u8 {
-    if (text.len >= 3 and text[0] == '@' and text[1] == '"' and text[text.len - 1] == '"') {
+    if (isQuotedIdent(text)) {
         const inner = text[2 .. text.len - 1];
         if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
     }
     return text;
+}
+
+fn isQuotedIdent(text: []const u8) bool {
+    return text.len >= 3 and text[0] == '@' and text[1] == '"' and text[text.len - 1] == '"';
+}
+
+/// 同 `identName`，含转义时解码（`@"\x66oo"` 即 `foo`）。不含转义时引用原文；转义不合法时保留原文
+pub fn identNameAlloc(a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
+    const name = identName(text);
+    if (name.ptr != text.ptr or !isQuotedIdent(text)) return name;
+    return std.zig.string_literal.parseAlloc(a, text[1..]) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidLiteral => text,
+    };
+}
+
+/// 同 `identNameAlloc`，解码到 `buf`；`buf` 不够时保留原文
+pub fn identNameBuf(text: []const u8, buf: []u8) []const u8 {
+    const name = identName(text);
+    if (name.ptr != text.ptr or !isQuotedIdent(text)) return name;
+    var w: std.Io.Writer = .fixed(buf);
+    const result = std.zig.string_literal.parseWrite(&w, text[1..]) catch return text;
+    return if (result == .success) w.buffered() else text;
 }
 
 /// 容器成员的名字 token：函数名、变量名、字段名、test 名（字符串或标识符）；没有名字时为 null。

@@ -161,6 +161,32 @@ test "add missing struct fields" {
     );
 }
 
+test "add missing fields and prongs with names that need quoting" {
+    try expectAction(
+        \\const S = struct { @"x y": u32, @"type": u8 };
+        \\const s: S = .{<|>};
+    , "add missing struct fields",
+        \\const S = struct { @"x y": u32, @"type": u8 };
+        \\const s: S = .{ .@"x y" = undefined, .type = undefined };
+    );
+    try expectAction(
+        \\const E = enum { @"a b", c };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .c => {},<|>
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { @"a b", c };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .c => {},
+        \\        .@"a b" => {},
+        \\    }
+        \\}
+    );
+}
+
 test "extract to local constant" {
     try expectAction(
         \\fn f(a: u32, b: u32) u32 {
@@ -195,12 +221,100 @@ test "extract to local constant" {
         \\    }
         \\}
     );
+    // 类型取决于结果位置：标注原处的类型
+    try expectAction(
+        \\pub fn f(x: u64) u8 {
+        \\    return «@intCast(x)»;
+        \\}
+    , "extract",
+        \\pub fn f(x: u64) u8 {
+        \\    const value: u8 = @intCast(x);
+        \\    return value;
+        \\}
+    );
+    // 短路的左侧总会求值
+    try expectAction(
+        \\fn g() bool {
+        \\    return true;
+        \\}
+        \\fn f(flag: bool) bool {
+        \\    return «g()» and flag;
+        \\}
+    , "extract",
+        \\fn g() bool {
+        \\    return true;
+        \\}
+        \\fn f(flag: bool) bool {
+        \\    const value = g();
+        \\    return value and flag;
+        \\}
+    );
+    // 选区是纯的：可以越过之前的调用
+    try expectAction(
+        \\fn g(x: u32) u32 {
+        \\    return x;
+        \\}
+        \\fn f(a: u32, b: u32) u32 {
+        \\    return g(1) + «a * b»;
+        \\}
+    , "extract",
+        \\fn g(x: u32) u32 {
+        \\    return x;
+        \\}
+        \\fn f(a: u32, b: u32) u32 {
+        \\    const value = a * b;
+        \\    return g(1) + value;
+        \\}
+    );
+    // 之前的部分是纯的（参数、常量）：有副作用的选区可以提前
+    try expectAction(
+        \\const k: u32 = 2;
+        \\fn g() u32 {
+        \\    return 1;
+        \\}
+        \\fn h(a: u32, b: u32, c: u32) u32 {
+        \\    return a + b + c;
+        \\}
+        \\fn f(n: u32) u32 {
+        \\    return h(n, k * 2, «g()»);
+        \\}
+    , "extract",
+        \\const k: u32 = 2;
+        \\fn g() u32 {
+        \\    return 1;
+        \\}
+        \\fn h(a: u32, b: u32, c: u32) u32 {
+        \\    return a + b + c;
+        \\}
+        \\fn f(n: u32) u32 {
+        \\    const value = g();
+        \\    return h(n, k * 2, value);
+        \\}
+    );
     // 不提取：赋值的左侧、取地址的操作数、while 的条件、不是完整表达式的选区
     for ([_][]const u8{
         "fn f() void {\n    var x: u32 = 0;\n    «x» = 1;\n}",
         "fn f() void {\n    var x: u32 = 0;\n    const p = &«x»;\n    _ = p;\n}",
         "fn f(n: u32) void {\n    var i: u32 = 0;\n    while («i < n») : (i += 1) {}\n}",
         "fn f(a: u32) u32 {\n    return «a +» 1;\n}",
+        // 有条件求值：短路的右侧、if 的分支、catch / orelse 的右侧、循环体
+        "var hits: u32 = 0;\nfn hit() bool {\n    hits += 1;\n    return true;\n}\npub fn f(flag: bool) bool {\n    return flag and «hit()»;\n}",
+        "fn g() u32 {\n    return 1;\n}\nfn f(c: bool) u32 {\n    return if (c) «g()» else 0;\n}",
+        "fn g() u32 {\n    return 1;\n}\nfn f(x: ?u32) u32 {\n    return x orelse «g()»;\n}",
+        "fn g() u32 {\n    return 1;\n}\nfn f(x: anyerror!u32) u32 {\n    return x catch «g()»;\n}",
+        "fn g(x: u32) void {\n    _ = x;\n}\nfn f(xs: []const u32) void {\n    for (xs) |x| g(«x + 1»);\n}",
+        // 顺序：选区与之前的部分都有副作用
+        "fn g(x: u32) u32 {\n    return x;\n}\nfn f() u32 {\n    return g(1) + «g(2)»;\n}",
+        // 顺序：之前读取的 var 可能被选区中的调用修改
+        "fn g() u32 {\n    return 1;\n}\nfn f() u32 {\n    var i: u32 = 0;\n    i += 1;\n    return i + «g()»;\n}",
+        // 顺序：之前的 try 可能提前返回
+        "fn h() !u32 {\n    return 1;\n}\nfn g() u32 {\n    return 1;\n}\nfn f(x: anyerror!u32) !u32 {\n    return (try x) + «g()»;\n}",
+        // 纯的表达式也不提出短路的保护（除零）
+        "fn f(x: u32, y: u32) bool {\n    return x != 0 and «y / x» > 1;\n}",
+        // defer 中的表达式在离开作用域时求值
+        "fn g(x: u32) void {\n    _ = x;\n}\nfn f(a: u32) void {\n    defer g(«a + 1»);\n}",
+        // 结果类型标注不出
+        "const E = enum { a, b };\nfn f() E {\n    return «.a»;\n}",
     }) |text| {
         const got = try apply(text, "extract");
         defer testing.allocator.free(got);

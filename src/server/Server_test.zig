@@ -229,6 +229,29 @@ test "requests before initialize return ServerNotInitialized, unknown methods re
     try testing.expectEqual(-32700, errorCode(msgs[4]));
 }
 
+test "error responses keep string request ids" {
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":"before-init","method":"zig-analyzer/status"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"unknown-method","method":"not-a-real-method"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"reinit","method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"bad-params","method":"textDocument/hover","params":{"textDocument":42}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+    const msgs = try s.messages();
+    const expected = [_][]const u8{ "before-init", "init", "unknown-method", "reinit", "bad-params" };
+    try testing.expectEqual(expected.len, msgs.len);
+    for (expected, msgs) |id, msg| try testing.expectEqualStrings(id, msg.object.get("id").?.string);
+    try testing.expectEqual(-32602, errorCode(msgs[4]));
+}
+
 test "malformed params return InvalidParams" {
     var s: Session = undefined;
     try s.run(frame(
@@ -268,6 +291,31 @@ test "read requests run on their own threads: a blocked read does not stall the 
     // 取消在读请求阻塞期间送达
     try testing.expectEqual(-32800, errorCode(try h.response(blocked)));
     _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "shutdown does not deadlock with waitIdle while a configuration request is unanswered" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{ .configuration = true } } });
+    h.hold_requests = true;
+    try h.notify("initialized", Empty{});
+    // 等到配置请求发出，暂不回复
+    var config_id: ?std.json.Value = null;
+    while (config_id == null) {
+        const msg = try h.next();
+        const method = msg.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "workspace/configuration")) config_id = msg.object.get("id").?;
+    }
+    const wait = try h.send("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    _ = try h.response(wait);
+    h.hold_requests = false;
+    // 关闭后补发的配置响应被忽略
+    try h.write(.{ .jsonrpc = "2.0", .id = config_id.?, .result = &[_]std.json.Value{.null} });
     try h.notify("exit", {});
 }
 
