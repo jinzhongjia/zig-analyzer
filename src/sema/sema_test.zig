@@ -1952,3 +1952,26 @@ test "std.mem pointer reinterpretation" {
         .{ "zb", "[]const u8" },
     });
 }
+
+test "switch on a type: unevaluable prong items do not hide a matching prong" {
+    try expectTypes(
+        \\const Vec = @import("missing.zig").Vec;
+        \\fn Pick(comptime T: type) type {
+        \\    return switch (T) {
+        \\        Vec => u8,
+        \\        u16 => u32,
+        \\        else => @compileError("unsupported"),
+        \\    };
+        \\}
+        \\fn g() void {
+        \\    const hit: Pick(u16) = 0;
+        \\    const miss: Pick(i8) = 0;
+        \\    _ = .{ hit, miss };
+        \\}
+    , &.{
+        // 分支项的值互不相同：`u16` 匹配时，求不出的 `Vec` 不可能也匹配
+        .{ "hit", "u32 = 0" },
+        // 都不匹配且有求不出的分支项：不能落到 else
+        .{ "miss", "unknown" },
+    });
+}

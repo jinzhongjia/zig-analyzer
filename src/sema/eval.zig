@@ -1341,32 +1341,48 @@ const Evaluator = struct {
     }
 
     fn chooseProng(ev: *Evaluator, f: *Frame, prongs: []const Body.Prong, operand: Val) EvalError!?usize {
-        const ip = ev.ip;
         const v = try ev.freeze(operand) orelse return error.Abort;
         var else_prong: ?usize = null;
+        // 求不出的分支项：分支项的值互不相同（重复是编译错误），其他分支项与操作数相等时它不可能也相等，
+        // 因此继续查找；都不相等时才无法确定（不能落到 else）。如 `switch (T) { vector.T => .., Scalar => .. }`
+        var unknown = false;
         for (prongs, 0..) |prong, i| {
             if (prong.is_else) {
                 else_prong = i;
                 continue;
             }
-            for (prong.items) |item| switch (f.body.expr(item)) {
-                // `a...b`
-                .other => |range| {
-                    if (range.len != 2) return error.Abort;
-                    const x = value.intOf(ip, v) orelse return error.Abort;
-                    const lo = try ev.evalInt(f, range[0], operand.ty);
-                    const hi = try ev.evalInt(f, range[1], operand.ty);
-                    if (lo <= x and x <= hi) return i;
-                },
-                else => {
-                    // union 的分支项是标签
-                    const item_want: ?Index = if (ev.isUnion(operand.ty)) null else operand.ty;
-                    const iv = try ev.freeze(try ev.eval(f, item, item_want)) orelse return error.Abort;
-                    if (try eqlValues(ev.r, iv, v) orelse return error.Abort) return i;
-                },
-            };
+            for (prong.items) |item| {
+                const hit = ev.prongItemMatches(f, item, operand, v) catch |err| switch (err) {
+                    error.Abort => {
+                        unknown = true;
+                        continue;
+                    },
+                    else => |x| return x,
+                };
+                if (hit) return i;
+            }
         }
+        if (unknown) return error.Abort;
         return else_prong;
+    }
+
+    fn prongItemMatches(ev: *Evaluator, f: *Frame, item: ExprId, operand: Val, v: Index) EvalError!bool {
+        switch (f.body.expr(item)) {
+            // `a...b`
+            .other => |range| {
+                if (range.len != 2) return error.Abort;
+                const x = value.intOf(ev.ip, v) orelse return error.Abort;
+                const lo = try ev.evalInt(f, range[0], operand.ty);
+                const hi = try ev.evalInt(f, range[1], operand.ty);
+                return lo <= x and x <= hi;
+            },
+            else => {
+                // union 的分支项是标签
+                const item_want: ?Index = if (ev.isUnion(operand.ty)) null else operand.ty;
+                const iv = try ev.freeze(try ev.eval(f, item, item_want)) orelse return error.Abort;
+                return try eqlValues(ev.r, iv, v) orelse return error.Abort;
+            },
+        }
     }
 
     fn switchPayload(ev: *Evaluator, operand: Val) EvalError!Val {
