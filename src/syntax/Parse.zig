@@ -81,6 +81,7 @@ pub fn rootNode(self: *const Parse) tree.SyntaxNode {
 /// 结果与 `create(gpa, text)` 完全相同。
 pub fn reparse(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!*Parse {
     if (try reparseBlock(gpa, old, text)) |p| return p;
+    if (try reparseTopLevel(gpa, old, text)) |p| return p;
     return create(gpa, text);
 }
 
@@ -233,6 +234,83 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
         .gpa = gpa,
         .source = try a.dupeSentinel(u8, text, 0),
         .root = new_node,
+        .errors = errors.items,
+        .base = old,
+        .chain_bytes = 0,
+        .full_bytes = old.full_bytes,
+    };
+    result.arena = arena;
+    result.chain_bytes = old.chain_bytes + result.arena.queryCapacity();
+    _ = old.retain();
+    return result;
+}
+
+/// 顶层的编辑（声明之间、文件末尾的注释等，不在任何 `{}` 之内）：从编辑位置之前第二个顶层成员起
+/// 重解析到文件末尾，之前的顶层子节点原样复用。顶层成员逐个独立解析，向前看至多一两个 token；
+/// 多退一个成员使被向前看到的 token 都在编辑之前。不满足条件时返回 null（结果与全量解析相同）
+pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
+    const old_text = old.source;
+    const edit_start: u32 = @intCast(std.mem.indexOfDiff(u8, old_text, text) orelse return null);
+    if (old.chain_bytes > 2 * old.full_bytes) return null;
+
+    // 顶层的成员节点：第一个结束于编辑之后的成员之前再退两个
+    const root = old.rootNode();
+    var nodes: std.ArrayList(struct { child: usize, start: u32 }) = .empty;
+    defer nodes.deinit(gpa);
+    var first_after: ?usize = null;
+    {
+        var it = root.children();
+        var index: usize = 0;
+        while (it.next()) |e| : (index += 1) {
+            if (e != .node) continue;
+            const r = e.node.range();
+            if (first_after == null and r.end > edit_start) first_after = nodes.items.len;
+            try nodes.append(gpa, .{ .child = index, .start = r.start });
+        }
+    }
+    const k = first_after orelse nodes.items.len;
+    if (k < 2) return null;
+    const from = nodes.items[k - 2];
+    // 更早的成员的错误可能报在切点上（如缺少 `;` 报在下一个 token）：重解析不会再产生它
+    for (old.errors) |e| if (e.offset == from.start) return null;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const sub_source = try a.dupeSentinel(u8, text[from.start..], 0);
+    const tokens = try lexer.tokenize(gpa, sub_source);
+    defer gpa.free(tokens);
+    // `//!` 只在文件开头作为容器文档注释：片段的开头不是文件开头
+    for (tokens) |t| if (t.kind == .container_doc_comment) {
+        arena.deinit();
+        return null;
+    };
+    const events = try runParser(gpa, sub_source, tokens, grammar.sourceFile);
+    defer gpa.free(events.events);
+    defer gpa.free(events.errors);
+
+    var builder: green.Builder = .{ .arena = a, .gpa = gpa };
+    defer builder.deinit();
+    try parser.buildTree(&builder, sub_source, tokens, events.events);
+    const tail = builder.finish();
+
+    const children = try a.alloc(green.GreenElement, from.child + tail.children.len);
+    @memcpy(children[0..from.child], old.root.children[0..from.child]);
+    @memcpy(children[from.child..], tail.children);
+    const new_root = try a.create(green.GreenNode);
+    new_root.* = .{ .kind = old.root.kind, .text_len = from.start + tail.text_len, .children = children };
+
+    var errors: std.ArrayList(parser.Error) = .empty;
+    for (old.errors) |e| if (e.offset < from.start) try errors.append(a, e);
+    for (events.errors) |e| try errors.append(a, .{ .offset = e.offset + from.start, .message = e.message });
+    sortErrors(errors.items);
+
+    const result = try a.create(Parse);
+    result.* = .{
+        .arena = undefined,
+        .gpa = gpa,
+        .source = try a.dupeSentinel(u8, text, 0),
+        .root = new_root,
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,

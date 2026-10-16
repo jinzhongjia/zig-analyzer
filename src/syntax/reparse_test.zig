@@ -73,3 +73,40 @@ test "ref counting: old result stays valid until the incremental result is freed
     try testing.expectEqualStrings("fn", inc.root.children[0].node().?.children[0].node().?.children[0].unpack().token.text);
     inc.destroy();
 }
+
+/// 同 `expectReparse`，校验顶层的局部重解析
+fn expectTopLevel(old_text: []const u8, new_text: []const u8, expect_incremental: bool) !void {
+    const old = try Parse.create(testing.allocator, old_text);
+    defer old.destroy();
+    const full = try Parse.create(testing.allocator, new_text);
+    defer full.destroy();
+    const inc = try Parse.reparseTopLevel(testing.allocator, old, new_text);
+    try testing.expectEqual(expect_incremental, inc != null);
+    if (inc) |p| {
+        defer p.destroy();
+        try testing.expect(p.sameAs(full));
+        try testing.expectEqualStrings(new_text, p.source);
+    }
+}
+
+test "top-level edits reparse from shortly before the edit" {
+    const base = "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n";
+    // 文件末尾的注释中输入
+    try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// endx\n", true);
+    // 声明之间插入新的声明、制造语法错误
+    try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst x = ;\nconst c = 3;\n// end\n", true);
+    try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3\n// end\n", true);
+    // 编辑之前不足两个成员：全量解析
+    try expectTopLevel(base, "const a = 10;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n", false);
+    // 片段中有 `//!`：全量解析
+    try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n//! doc\n", false);
+}
+
+test "top-level reparse falls back when an earlier error sits at the cut" {
+    // `const b = 2` 缺少 `;`，错误报在下一个成员 `const c` 的开头
+    const old_text = "const a = 1;\nconst b = 2\nconst c = 3;\nconst d = 4;\nconst e = 5;\n";
+    // 切点在 `const d`：照常局部重解析
+    try expectTopLevel(old_text, "const a = 1;\nconst b = 2\nconst c = 3;\nconst d = 4;\nconst e = 5;\nconst f = 6;\n", true);
+    // 切点在 `const c`，正是该错误的位置：全量解析
+    try expectTopLevel(old_text, "const a = 1;\nconst b = 2\nconst c = 3;\nconst d = 4;\nconst e = 50;\n", false);
+}
