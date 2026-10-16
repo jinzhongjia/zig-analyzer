@@ -696,11 +696,10 @@ const Inferrer = struct {
         const ip = inf.ip;
         if (text.len == 0) return .unknown;
         switch (text[0]) {
-            '"' => {
-                const s = std.zig.string_literal.parseAlloc(inf.scratch, text) catch return .unknown;
+            '"', '\\' => {
+                const s = try Body.stringLiteralValue(inf.scratch, text) orelse return .unknown;
                 return .{ .ty = try ip.stringLiteralType(s.len) };
             },
-            '\\' => return .{ .ty = try ip.ptrTo(.u8_type, .slice, true) },
             '\'' => {
                 const c = std.zig.parseCharLiteral(text);
                 const code: ?i128 = switch (c) {
@@ -1904,10 +1903,9 @@ const Inferrer = struct {
     fn literalField(inf: *Inferrer, e: ExprId, ty: Index, val: Index) Error!Index {
         if (val != .unknown) return val;
         if (ty == .void_type) return .void_value;
-        // 字符串字面量（推导器不为字符串生成值；多行字符串在 HIR 中只保留第一行）
+        // 字符串字面量（推导器不为字符串生成值）
         switch (inf.body.expr(e)) {
-            .literal => |text| if (text.len > 0 and text[0] == '"') {
-                const str = std.zig.string_literal.parseAlloc(inf.scratch, text) catch return .unknown;
+            .literal => |text| if (try Body.stringLiteralValue(inf.scratch, text)) |str| {
                 return inf.ip.get(.{ .bytes = .{ .ty = ty, .bytes = str } });
             },
             else => {},

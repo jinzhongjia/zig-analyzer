@@ -57,7 +57,7 @@ pub const Expr = union(enum) {
     field_access: struct { lhs: ExprId, field: ?[]const u8 },
     enum_literal: []const u8,
     error_value: []const u8,
-    /// 数字、字符串、字符字面量：原文（多行字符串只取第一行）
+    /// 数字、字符串、字符字面量：原文。多行字符串为各行的 token（`\\` 开头，不含换行符）以 `\n` 连接
     literal: []const u8,
     /// `name` 含 `@`
     builtin_call: struct { name: []const u8, args: []const ExprId },
@@ -263,4 +263,44 @@ pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
 
 test {
     _ = @import("lower.zig");
+}
+
+/// 字符串字面量（`literal` 的原文，含多行字符串）的值；不是字符串或转义无效时为 null
+pub fn stringLiteralValue(gpa: Allocator, text: []const u8) Allocator.Error!?[]u8 {
+    if (text.len == 0) return null;
+    switch (text[0]) {
+        '"' => return std.zig.string_literal.parseAlloc(gpa, text) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => null,
+        },
+        // 与编译器一致：各行去掉 `\\` 后以换行符连接，最后一行之后没有换行符
+        '\\' => {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa);
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            var first = true;
+            while (lines.next()) |line| {
+                if (!first) try out.append(gpa, '\n');
+                first = false;
+                try out.appendSlice(gpa, line[@min(line.len, 2)..]);
+            }
+            return try out.toOwnedSlice(gpa);
+        },
+        else => return null,
+    }
+}
+
+test stringLiteralValue {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "\"a\\tb\"", "a\tb" },
+        .{ "\\\\one", "one" },
+        .{ "\\\\-a, --aa\n\\\\-b\n\\\\", "-a, --aa\n-b\n" },
+        .{ "12", null },
+    };
+    for (cases) |c| {
+        const v = try stringLiteralValue(gpa, c[0]);
+        defer if (v) |x| gpa.free(x);
+        if (c[1]) |want| try std.testing.expectEqualStrings(want, v.?) else try std.testing.expectEqual(null, v);
+    }
 }

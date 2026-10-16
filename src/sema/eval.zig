@@ -847,13 +847,11 @@ const Evaluator = struct {
         const ip = ev.ip;
         if (text.len == 0) return error.Abort;
         switch (text[0]) {
-            '"' => {
-                const s = std.zig.string_literal.parseAlloc(ev.a, text) catch return error.Abort;
+            '"', '\\' => {
+                const s = try Body.stringLiteralValue(ev.a, text) orelse return error.Abort;
                 const ty = try ip.stringLiteralType(s.len);
                 return Val.of(ty, try ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
             },
-            // 多行字符串在 HIR 中只保留第一行
-            '\\' => return .{ .ty = try ip.ptrTo(.u8_type, .slice, true) },
             '\'' => switch (std.zig.parseCharLiteral(text)) {
                 .success => |c| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = c } })),
                 .failure => return error.Abort,

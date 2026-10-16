@@ -134,6 +134,22 @@ const Lowerer = struct {
         return l.a.dupe(u8, s);
     }
 
+    /// 字面量的原文；多行字符串由各行的 token 以换行符连接（见 `Body.Expr.literal`）
+    fn literal(l: *Lowerer, n: SyntaxNode) Error![]const u8 {
+        const first = n.firstToken() orelse return "";
+        if (first.kind != .multiline_string_literal_line) return l.str(first.text);
+        var text: std.ArrayList(u8) = .empty;
+        var it = n.children();
+        while (it.next()) |c| switch (c) {
+            .token => |t| if (t.kind == .multiline_string_literal_line) {
+                if (text.items.len > 0) try text.append(l.a, '\n');
+                try text.appendSlice(l.a, t.text);
+            },
+            .node => {},
+        };
+        return text.items;
+    }
+
     /// token 的文本；`@"name"` 形式的标识符取去掉引号并解码的名字
     fn tokenText(l: *Lowerer, t: ?SyntaxToken) Error!?[]const u8 {
         return if (t) |tok| try l.ident(tok.text) else null;
@@ -232,7 +248,7 @@ const Lowerer = struct {
             // 括号与语句形式的分支不单独成节点
             .paren_expr, .expr_stmt => return l.exprOrMissing(firstChild(n)),
             .name_ref => .{ .name_ref = try l.ident((ast.NameRef{ .syntax = n }).name().?.text) },
-            .literal => .{ .literal = try l.tokenText(n.firstToken()) orelse "" },
+            .literal => .{ .literal = try l.literal(n) },
             .field_access => blk: {
                 const fa = ast.FieldAccess{ .syntax = n };
                 break :blk .{ .field_access = .{ .lhs = try l.exprOrMissing(fa.lhs()), .field = try l.tokenText(fa.name()) } };
