@@ -146,8 +146,12 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。容器类型的身份不依赖字段类型，递归类型不会成环。
 - **核心 query**：`DeclType`（声明的类型与 comptime 值，只读签名）、`Infer`（BodyOwner + 实例 → 每个表达式的类型与解析目标）、`CallEval`（comptime 调用按实例与实参记忆化）、`ErrorSetOf`（推导错误集）、`LocalValue`（单个局部绑定）。
 - **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution；`unknown` 吸收一切。
-- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；单次求值 20 万步、64 MB 上限；遇到运行时值、外部函数、`@cImport` 为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。
-- **泛型函数体**：没有具体实例时以抽象实例推导（`comptime T: type` 为抽象参数，显示为 `T`）；**调用点种子**取一个能求出具体实例的调用点推导（经文件索引跨文件查找，最多传递 3 层），hover 标注来源。
+- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；单次求值 20 万步、64 MB 上限；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。跳转到 `@Struct` 生成的字段（字段名来自 comptime 解析的字符串，如 zig-clap 的帮助文本）时，以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到字段名在字面量中的位置。
+- **泛型函数体**：没有具体实例时以抽象实例推导（`comptime T: type` 为抽象参数，显示为 `T`；`comptime x: anytype` 的实例记录实参值）；**调用点种子**取一个能求出具体实例的调用点推导，hover 标注来源：
+  - 经文件索引跨文件查找；调用者自身在泛型函数内时取调用者的实例，hover / 跳转 / 补全最多上溯 6 层，收集全部实例（查找引用、重命名）最多 3 层（每层取调用者的全部实例，实例数随层数成倍增长）
+  - 函数值与实参元组一起传入的调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`）以元组元素作为实参
+  - 项目中没有调用点的泛型方法以标准库的分派处求实例：`std.Io.Writer.printValue` 中的 `value.format(w)`、`value.formatNumber(w, ...)` 等
+- **其他构建配置**：当前配置下不存在的成员（只在其他目标上编译的代码，如 `posix.system.EVFILT.READ`、macOS 的 `settings.cflag.CCTS_OFLOW`）到其他配置的容器中查找：沿别名与 comptime 条件的 `if` / `switch` 分支收集各配置下的容器；实例的类型沿局部变量、全局变量、调用的返回类型与字段类型收集。
 - **目标相关**：指针位宽等从各模块的 builtin.zig 求出（`TargetAbi`），目标变化时依赖它的结果失效。
 
 ### 4.6 IDE 层（`ide/`、`ide_db/`）
@@ -166,6 +170,7 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 - 直接作为官方构建系统协议 `zig build --listen=-` 的客户端：握手校验 `build_system_version`，读取 `bsp_configuration` 中的构建图（`std.Build.Configuration`）转换为 ProjectModel，按 step 请求构建并从 `bsp_step_completed` 取 `ErrorBundle` 与生成文件路径；`bsp_configuration_failed` 作为 `build.zig` 的诊断发布。
 - 构建图只包含 step 可达的模块。没有任何 compile step 的项目（只导出模块、由使用方编译的库）在 `.zig-cache/zig-analyzer/exports` 中生成探针包：以项目为 path 依赖，为每个导出的模块添加 object step，复用项目的 `zig-pkg`；读出的模块与 compile step 并入 ProjectModel，只用于模块归属，不出现在构建请求中。
+- C 绑定由构建系统的 translate-c 生成（Zig 0.17 已移除 `@cImport`），作为以生成文件为根的模块，构建后得知路径。
 - 同一进程同时承担项目模型与编译器诊断；崩溃后退避重启，`build.zig` 变化时由 maker 重新配置，完成前沿用旧模型。
 - 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库，用户 zig 版本不同时降级（单文件模式 / `zig ast-check`）。发布版本跟随 Zig 版本。
 
@@ -221,4 +226,4 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 | 编译器诊断对拍 | 15 / 15 一致 |
 | 格式化对拍 | 372 / 372 个文件一致 |
 
-召回低于 95% 的 9 个库中，2 个没有成员访问样本，4 个因依赖未能取得而没有构建图，其余为 `@cImport` 与泛型中的 comptime 反射类型。
+召回低于 95% 的库中，2 个没有成员访问样本，4 个因依赖未能取得而没有构建图；其余为泛型中的 comptime 反射类型（`@typeInfo` 的字段经 `inline for` 访问），以及位于嵌套子项目中的文件（raylib 的 Zig 示例有自己的 build.zig，工作区根目录的构建图中没有它）。
