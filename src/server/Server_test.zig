@@ -229,6 +229,29 @@ test "requests before initialize return ServerNotInitialized, unknown methods re
     try testing.expectEqual(-32700, errorCode(msgs[4]));
 }
 
+test "error responses keep string request ids" {
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":"before-init","method":"zig-analyzer/status"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"unknown-method","method":"not-a-real-method"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"reinit","method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":"bad-params","method":"textDocument/hover","params":{"textDocument":42}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+    const msgs = try s.messages();
+    const expected = [_][]const u8{ "before-init", "init", "unknown-method", "reinit", "bad-params" };
+    try testing.expectEqual(expected.len, msgs.len);
+    for (expected, msgs) |id, msg| try testing.expectEqualStrings(id, msg.object.get("id").?.string);
+    try testing.expectEqual(-32602, errorCode(msgs[4]));
+}
+
 test "malformed params return InvalidParams" {
     var s: Session = undefined;
     try s.run(frame(

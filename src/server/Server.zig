@@ -297,22 +297,23 @@ const request_handlers = .{
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
     const a = arena.allocator();
+    // 字符串 ID 引用 arena 中的内存：错误响应须在释放 arena 之前序列化，因此错误出口都用 defer 释放
     inline for (request_handlers) |h| {
         if (std.mem.eql(u8, method, h[0])) {
             const is_initialize = comptime std.mem.eql(u8, h[0], "initialize");
             if (server.state == .uninitialized and !is_initialize) {
-                server.destroyArena(arena);
+                defer server.destroyArena(arena);
                 return server.sendError(id, jsonrpc.error_codes.server_not_initialized, "server not initialized");
             }
             if (server.state != .uninitialized and is_initialize or server.state == .shutdown) {
-                server.destroyArena(arena);
+                defer server.destroyArena(arena);
                 return server.sendError(id, jsonrpc.error_codes.invalid_request, "request not allowed in current state");
             }
 
             const func = h[2];
             const Params = LastParam(@TypeOf(func));
             const params = jsonrpc.parseParams(Params, a, params_value) catch |err| {
-                server.destroyArena(arena);
+                defer server.destroyArena(arena);
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 return server.sendError(id, jsonrpc.error_codes.invalid_params, "malformed params");
             };
@@ -323,44 +324,37 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     const result = func(server, a, params) catch |err| return server.sendHandlerError(id, err, false);
                     server.sendResponse(id, result);
                 },
-                .read => {
-                    const pending = try a.create(Pending);
-                    pending.* = .{ .id = id };
-                    {
-                        server.pending_mutex.lockUncancelable(server.io);
-                        defer server.pending_mutex.unlock(server.io);
-                        server.pending.append(server.gpa, pending) catch |err| {
-                            server.destroyArena(arena);
-                            return err;
-                        };
-                    }
-                    spawn(server.io, &server.group, ReadTask(func, h[0]).run, .{ server, arena, pending, params });
-                },
-                // 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
-                // 会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
-                .semantic => {
-                    const pending = try a.create(Pending);
-                    pending.* = .{ .id = id };
-                    {
-                        server.pending_mutex.lockUncancelable(server.io);
-                        defer server.pending_mutex.unlock(server.io);
-                        server.pending.append(server.gpa, pending) catch |err| {
-                            server.destroyArena(arena);
-                            return err;
-                        };
-                    }
-                    spawn(server.io, &server.group, SemanticTask(func, h[0]).run, .{ server, arena, pending, params });
+                .read, .semantic => {
+                    const pending = server.addPending(a, id) catch |err| {
+                        defer server.destroyArena(arena);
+                        server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
+                        return err;
+                    };
+                    const Task = if (h[1] == .read) ReadTask(func, h[0]) else SemanticTask(func, h[0]);
+                    // semantic 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务
+                    // 也占名额）时会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
+                    spawn(server.io, &server.group, Task.run, .{ server, arena, pending, params });
                 },
                 .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
-                    server.destroyArena(arena);
+                    defer server.destroyArena(arena);
                     server.sendError(id, jsonrpc.error_codes.internal_error, "failed to start background task");
                 },
             }
             return;
         }
     }
-    server.destroyArena(arena);
+    defer server.destroyArena(arena);
     server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
+}
+
+/// 登记进行中的请求（可被 `$/cancelRequest` 取消）；Pending 分配在请求的 arena 中
+fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
+    const pending = try a.create(Pending);
+    pending.* = .{ .id = id };
+    server.pending_mutex.lockUncancelable(server.io);
+    defer server.pending_mutex.unlock(server.io);
+    try server.pending.append(server.gpa, pending);
+    return pending;
 }
 
 /// 在独立线程中执行任务。不用 `async`：线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
