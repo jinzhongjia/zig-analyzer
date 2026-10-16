@@ -12,6 +12,7 @@
 //! - `BENCH_VERBOSE=1`：打印首轮中较慢的请求、其内存变化与各 query 的执行次数
 //! - `BENCH_CHECK=<n>`：校验跳转的正确性：对文件中的标识符请求 declaration，目标处的标识符应与请求处相同；
 //!   同时打印前 n 个未解析的标识符
+//! - `BENCH_QUICK=1`：跳过编辑、连续输入与保存的各阶段（批量校验大量项目时使用）
 //! - `BENCH_COMPLETE=<n>`：补全的召回：源码中的成员访问 `a.b` 在 `.` 之后补全，列表中应有 `b`
 //! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致）
 //! - `BENCH_SESSION=<轮数>`：长时间会话，观察内存的增长
@@ -776,8 +777,8 @@ pub fn main(init: std.process.Init) !u8 {
             try checkDeclarations(&c, uri, text, rel);
         }
 
-        // 编辑 → live 诊断：在文件末尾加入语法错误，再撤销
-        {
+        // 编辑 → live 诊断：在文件末尾加入语法错误，再撤销（BENCH_QUICK 时跳过编辑相关的各阶段）
+        if (init.environ_map.get("BENCH_QUICK") == null) {
             const end = positionOf(text, text.len);
             var edit_times: [10]f64 = undefined;
             var clear_times: [10]f64 = undefined;
