@@ -69,8 +69,14 @@ fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
 /// 成员所用的调用点：实例与调用表达式的位置
 pub const Found = struct { inst: ?Index, file: FileId, offset: u32 };
 
-/// 经由泛型调用者传递的最大层数：z2d 的 `toRGBA` 由泛型的 `hue` 调用，`hue` 又由泛型的 `run` 分派
-pub const max_depth = 3;
+/// 经由泛型调用者传递的最大层数：z2d 的 `toRGBA` 由泛型的 `hue` 调用，`hue` 又由泛型的 `run` 分派；
+/// websocket.zig 的 `_handleClientData` 经 `handleClientData`、`NonBlockingBase` 的方法、`NonBlocking` 的字段、
+/// `listen`、`listenInNewThread`（`Thread.spawn` 传入）才到具体的 `Server(TestHandler)`
+pub const max_depth = 6;
+
+/// 收集全部实例时的最大层数：每层取调用者的全部实例，实例数随层数成倍增长（http.zig 的查找引用在 6 层时
+/// 要数秒）
+const max_collect_depth = 3;
 
 /// 调用点的查找按成员与层数缓存：补全、inlay hints 等频繁的请求不必每次重新查找。
 /// 层数为 d 的查找为位于泛型函数内的调用者取实例时使用层数 d - 1 的查找（0 层只看实参本身具体的调用点）。
@@ -94,11 +100,11 @@ pub const Query = struct {
 };
 
 /// 成员 `item`（位于某个泛型函数内）在各调用点的全部具体实例（去重，按查找顺序）。调用者自身位于泛型函数内时
-/// 取调用者的全部实例（最多 `max_depth` 层）。用于需要覆盖所有实例的场合（引用查找与重命名）
+/// 取调用者的全部实例（最多 `max_collect_depth` 层）。用于需要覆盖所有实例的场合（引用查找与重命名）
 pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error![]const Index {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
     var out: std.ArrayList(Index) = .empty;
-    try collect(r, try r.ownerKey(file, item), max_depth, &out);
+    try collect(r, try r.ownerKey(file, item), max_collect_depth, &out);
     return out.items;
 }
 
@@ -234,52 +240,95 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
     return null;
 }
 
-/// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。
+/// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。函数作为值与实参元组
+/// 一起传入另一个调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a, b })`）也算作以元组元素调用。
 /// `all` 不为 null 时把全部调用的实例（去重）加入其中，返回 null
 fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*std.ArrayList(Index)) resolve.Error!?Found {
-    const ip = r.ctx.db.env.ip;
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
-        const c = switch (e) {
-            .call => |c| c,
-            else => continue,
-        };
-        const callee = res.exprs[@backingInt(c.callee)];
-        const fv = switch (ip.key(callee.val orelse continue)) {
-            .fn_value => |v| v,
-            else => continue,
-        };
-        if (fv.file != root_key.file or fv.decl != root_key.item) continue;
-        const f = switch (ip.key(callee.ty)) {
-            .fn_type => |f| f,
-            else => continue,
-        };
-        const g = try infer.genericCallee(r, r.arena, callee, f) orelse continue;
-        // 方法调用：接收者是第一个实参
-        const receiver: ?TypedValue = switch (body.expr(c.callee)) {
-            .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
-            else => null,
-        };
-        const skip: usize = @intFromBool(receiver != null);
-        const args = try r.arena.alloc(TypedValue, g.body.params.len);
-        for (args, 0..) |*a, ai| a.* = if (ai < skip) receiver.? else if (ai - skip < c.args.len) res.exprs[@backingInt(c.args[ai - skip])] else .unknown;
-        const inst = try infer.instanceOf(r, r.arena, g, f, args);
-        if (!value.isConcrete(ip, inst)) continue;
-        const node = try r.itemNode(in, i) orelse continue;
-        const norm = try queries.normalizeInst(r, file, item, inst);
-        if (all) |list| {
-            if (norm) |n| if (list.items.len < max_instances and std.mem.indexOfScalar(Index, list.items, n) == null) try list.append(r.arena, n);
-            continue;
+        const site: Site = .{ .r = r, .in = in, .i = i, .body = body, .res = res, .expr = @intCast(ei), .file = file, .item = item, .root_key = root_key, .active = active, .all = all };
+        switch (e) {
+            .call => |c| {
+                // 方法调用：接收者是第一个实参
+                const receiver: ?TypedValue = switch (body.expr(c.callee)) {
+                    .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
+                    else => null,
+                };
+                if (try site.instance(res.exprs[@backingInt(c.callee)], receiver, c.args)) |x| return x;
+                if (try site.passed(c.args)) |x| return x;
+            },
+            .builtin_call => |b| if (try site.passed(b.args)) |x| return x,
+            else => {},
         }
-        if (active) |rel| {
-            const owner = try r.ownerKey(file, item);
-            const target = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
-            if (inactiveAt(try r.ctx.get(hir.ItemBody, owner), target, rel)) continue;
-        }
-        return .{ .inst = norm, .file = in, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
     }
     return null;
 }
+
+/// `callIn` 中的一个调用表达式
+const Site = struct {
+    r: *Resolver,
+    in: FileId,
+    i: u32,
+    body: *const Body,
+    res: *const infer.Result,
+    expr: u32,
+    file: FileId,
+    item: u32,
+    root_key: hir.OwnerKey,
+    active: ?u32,
+    all: ?*std.ArrayList(Index),
+
+    /// 实参中的函数值后面紧跟着匿名元组字面量：以元组元素调用该函数
+    fn passed(s: Site, args: []const Body.ExprId) resolve.Error!?Found {
+        if (args.len < 2) return null;
+        for (args[0 .. args.len - 1], args[1..]) |f_e, tuple_e| {
+            const init = switch (s.body.expr(tuple_e)) {
+                .init => |x| x,
+                else => continue,
+            };
+            if (init.ty != null) continue;
+            const elems = try s.r.arena.alloc(Body.ExprId, init.fields.len);
+            for (init.fields, elems) |fi, *out| {
+                if (fi.name != null) break;
+                out.* = fi.value;
+            } else if (try s.instance(s.res.exprs[@backingInt(f_e)], null, elems)) |x| return x;
+        }
+        return null;
+    }
+
+    /// 以 `callee`（及接收者）和实参 `args` 调用：callee 为 `root_key` 且实例具体时返回调用点
+    fn instance(s: Site, callee: TypedValue, receiver: ?TypedValue, args: []const Body.ExprId) resolve.Error!?Found {
+        const r = s.r;
+        const ip = r.ctx.db.env.ip;
+        const fv = switch (ip.key(callee.val orelse return null)) {
+            .fn_value => |v| v,
+            else => return null,
+        };
+        if (fv.file != s.root_key.file or fv.decl != s.root_key.item) return null;
+        const f = switch (ip.key(callee.ty)) {
+            .fn_type => |f| f,
+            else => return null,
+        };
+        const g = try infer.genericCallee(r, r.arena, callee, f) orelse return null;
+        const skip: usize = @intFromBool(receiver != null);
+        const tvs = try r.arena.alloc(TypedValue, g.body.params.len);
+        for (tvs, 0..) |*a, ai| a.* = if (ai < skip) receiver.? else if (ai - skip < args.len) s.res.exprs[@backingInt(args[ai - skip])] else .unknown;
+        const inst = try infer.instanceOf(r, r.arena, g, f, tvs);
+        if (!value.isConcrete(ip, inst)) return null;
+        const node = try r.itemNode(s.in, s.i) orelse return null;
+        const norm = try queries.normalizeInst(r, s.file, s.item, inst);
+        if (s.all) |list| {
+            if (norm) |n| if (list.items.len < max_instances and std.mem.indexOfScalar(Index, list.items, n) == null) try list.append(r.arena, n);
+            return null;
+        }
+        if (s.active) |rel| {
+            const owner = try r.ownerKey(s.file, s.item);
+            const target = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
+            if (inactiveAt(try r.ctx.get(hir.ItemBody, owner), target, rel)) return null;
+        }
+        return .{ .inst = norm, .file = s.in, .offset = node.offset + s.body.range(@fromBackingInt(s.expr)).start };
+    }
+};
 
 /// 包含成员 `item` 的最内层泛型函数（成员自身，或经由体内定义的容器的外层函数）
 fn genericRoot(r: *Resolver, file: FileId, item: u32) resolve.Error!?u32 {

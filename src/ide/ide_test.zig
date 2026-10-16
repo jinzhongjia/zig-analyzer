@@ -335,6 +335,47 @@ test "goto declaration through comptime anytype parameters" {
     }
 }
 
+test "hover in generic functions passed as a value with an argument tuple" {
+    // `Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`：以元组元素调用
+    const text =
+        \\fn spawn(f: anytype, args: anytype) void {
+        \\    _ = .{ f, args };
+        \\}
+        \\const Ctx = struct { id: u8 };
+        \\fn run() void {
+        \\    spawn(worker, .{ Ctx{ .id = 1 }, 2 });
+        \\    @call(.auto, other, .{@as(u16, 3)});
+        \\}
+        \\fn worker(ctx: anytype, n: u32) void {
+        \\    const got = ctx;
+        \\    _ = .{ got, n };
+        \\}
+        \\fn other(x: anytype) void {
+        \\    const y = x;
+        \\    _ = y;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "got =", "```zig\nconst got: Ctx\n```\n\ninferred from the call at main.zig:6" },
+        .{ "y =", "```zig\nconst y: u16\n```\n\ninferred from the call at main.zig:7" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "hover in generic bodies called only from other generic functions" {
     const text =
         \\const Px = struct { r: u8 };
