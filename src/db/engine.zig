@@ -278,6 +278,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.* = undefined;
         }
 
+        /// query `Q` 的 key 个数（含值已被淘汰的）
+        pub fn keyCount(db: *Db, comptime Q: type) usize {
+            db.mutex.lockUncancelable(db.io);
+            defer db.mutex.unlock(db.io);
+            return db.tables[comptime queryIndex(Q)].keys.count();
+        }
+
         pub fn queryIndex(comptime Q: type) u16 {
             inline for (queries, 0..) |Candidate, i| {
                 if (Candidate == Q) return i;

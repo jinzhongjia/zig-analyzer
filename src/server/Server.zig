@@ -1593,10 +1593,24 @@ fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!voi
 /// InternPool 超过 `sema.max_intern_pool_mb` 时整代回收（见 `resetSema`）。在读事务之外的空闲处调用
 fn maybeResetSema(server: *Server) void {
     const limit = server.max_intern_pool_mb.load(.monotonic);
-    if (limit == 0 or server.ip.bytes() < @as(usize, limit) * 1024 * 1024) return;
+    if (limit == 0) return;
+    if (server.ip.bytes() < @as(usize, limit) * 1024 * 1024 and server.semaKeys() < sema_reset_keys) return;
     if (server.sema_resetting.swap(true, .acq_rel)) return;
     defer server.sema_resetting.store(false, .release);
     server.resetSema();
+}
+
+/// 类型信息相关 query 的 key 总数超过此值时同样整代回收：key 与依赖边不随淘汰释放，长时间会话中
+/// 随访问过的成员与实例持续增长（Zig 编译器源码 40 轮约 25 万个，连同依赖边数十 MB）
+const sema_reset_keys = 200_000;
+
+/// 整代回收所清空的 query
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.ide.seed.Query };
+
+fn semaKeys(server: *Server) usize {
+    var n: usize = 0;
+    inline for (sema_queries) |Q| n += server.db.keyCount(Q);
+    return n;
 }
 
 /// 整代回收类型信息：清空 InternPool 中非预置的项，以及 key 或值引用它们的 query（其余 query 中依赖
@@ -1606,9 +1620,10 @@ pub fn resetSema(server: *Server) void {
     const before = server.ip.bytes();
     server.db.beginWrite();
     defer server.db.endWrite();
-    server.db.resetQueries(&.{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.ide.seed.Query });
+    const keys = server.semaKeys();
+    server.db.resetQueries(&sema_queries);
     server.ip.reset() catch return log.err("out of memory while resetting the intern pool", .{});
-    log.info("reclaimed type information ({d} MB in the intern pool)", .{before / (1024 * 1024)});
+    log.info("reclaimed type information ({d} MB in the intern pool, {d} keys)", .{ before / (1024 * 1024), keys });
 }
 
 /// `generation`：编辑触发的发布所针对的编辑代数。被打断时若已有更新的编辑就放弃，由那次编辑触发的发布接替
