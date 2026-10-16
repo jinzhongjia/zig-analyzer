@@ -1044,6 +1044,7 @@ fn stopProjects(server: *Server) void {
         ws.stop();
         ws.mutex.lockUncancelable(server.io);
         stale.appendSlice(server.gpa, ws.result_files.keys()) catch {};
+        stale.appendSlice(server.gpa, ws.stale_files.items) catch {};
         ws.mutex.unlock(server.io);
     }
     server.updateModuleGraph();
@@ -1400,7 +1401,7 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     const ws = removed orelse return;
     ws.stop();
     ws.mutex.lockUncancelable(server.io);
-    const stale = try arena.dupe(Vfs.FileId, ws.result_files.keys());
+    const stale = try std.mem.concat(arena, Vfs.FileId, &.{ ws.result_files.keys(), ws.stale_files.items });
     ws.mutex.unlock(server.io);
     server.publishFiles(stale, true);
 }
@@ -1422,10 +1423,11 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
         log.err("{s}: failed to restart build system protocol: {t}", .{ root, err });
         return;
     };
-    // 旧实例发布过的编译器诊断由新实例在首次构建后清除（新结果中没有的文件）。
+    // 旧实例发布过的编译器诊断由新实例在首次构建后清除（新结果中没有的文件）。旧实例自身尚未清除的
+    // （首次构建前又被重启，如 maker 接连崩溃）一并转交。
     // 新实例的后台任务已在运行，两边都要加锁（先后各持一把，不同时持有）
     ws.mutex.lockUncancelable(server.io);
-    const stale = server.gpa.dupe(Vfs.FileId, ws.result_files.keys()) catch &.{};
+    const stale = std.mem.concat(server.gpa, Vfs.FileId, &.{ ws.result_files.keys(), ws.stale_files.items }) catch &.{};
     ws.mutex.unlock(server.io);
     defer server.gpa.free(stale);
     fresh.mutex.lockUncancelable(server.io);

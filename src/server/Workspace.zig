@@ -250,8 +250,11 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
                 } else {
                     log.info("{s}: build system exited unexpectedly ({t}, {?t}), restarting", .{ ws.root, err, client.readError() });
-                    // 新实例计为忙碌后本实例才结束，waitIdle 不会在两者之间返回
+                    // 重启期间计为忙碌：崩溃时本实例可能并不忙碌，新实例计为忙碌之前 waitIdle（如 shutdown）
+                    // 不应返回，否则新实例的进度可能在 shutdown 之后才结束
+                    ws.server.busyBegin();
                     ws.server.restartWorkspace(ws, next);
+                    ws.server.busyEnd();
                 }
             }
             break;
