@@ -305,7 +305,9 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     while (true) {
         const t = tokenizer.next();
         if (t.tag == .eof) break;
-        if (t.tag == .identifier and !std.mem.eql(u8, text[t.loc.start..t.loc.end], "_")) {
+        // `[*c]` 中的 `c` 是指针语法的一部分，不是名字
+        const c_ptr = prev[0] == .l_bracket and prev[1] == .asterisk and std.mem.eql(u8, text[t.loc.start..t.loc.end], "c");
+        if (t.tag == .identifier and !c_ptr and !std.mem.eql(u8, text[t.loc.start..t.loc.end], "_")) {
             try offsets.append(a, t.loc.start);
             try befores.append(a, prev);
         }

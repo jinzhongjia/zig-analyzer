@@ -2071,3 +2071,18 @@ test "a comptime branch that is @compileError gives way to the other branch" {
         .{ "v_plain", "i16 = 4" },
     });
 }
+
+test "a field of a literal-initialized constant is known when other fields are not" {
+    try expectTypes(
+        \\const Arch = enum { x86, wasm32 };
+        \\const Cpu = struct { arch: Arch, features: u32 };
+        \\extern fn featureSet() u32;
+        \\const cpu: Cpu = .{ .arch = .wasm32, .features = featureSet() };
+        \\const the_arch = cpu.arch;
+        \\const Platform = if (cpu.arch == .wasm32) u8 else u16;
+    , &.{
+        // `features` 求不出，整个 `cpu` 没有值；`arch` 仍取初始化中的值，按它选择分支
+        .{ "the_arch", "Arch = .wasm32" },
+        .{ "Platform", "type = u8" },
+    });
+}
