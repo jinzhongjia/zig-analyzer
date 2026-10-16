@@ -334,7 +334,7 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
             .array => |arr| if (arr.items.len > 0) arr.items[0] else null,
             else => null,
         } orelse {
-            kinds[@intFromEnum(classifyUnresolved(name, before))] += 1;
+            kinds[@backingInt(classifyUnresolved(name, before))] += 1;
             if (unresolved_shown < unresolved_limit) {
                 unresolved_shown += 1;
                 const p = positionOf(text, off);
@@ -366,9 +366,9 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     }
     std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched });
     std.debug.print("  declaration  unresolved by kind:", .{});
-    for (kinds, 0..) |k, i| std.debug.print(" {t} {d}", .{ @as(UnresolvedKind, @enumFromInt(i)), k });
+    for (kinds, 0..) |k, i| std.debug.print(" {t} {d}", .{ @as(UnresolvedKind, @fromBackingInt(@intCast(i))), k });
     // 内置类型与值、len / ptr、error.X 本来就没有声明位置，不计入分母
-    const no_decl = kinds[@intFromEnum(UnresolvedKind.primitive)] + kinds[@intFromEnum(UnresolvedKind.len_ptr)] + kinds[@intFromEnum(UnresolvedKind.error_name)];
+    const no_decl = kinds[@backingInt(UnresolvedKind.primitive)] + kinds[@backingInt(UnresolvedKind.len_ptr)] + kinds[@backingInt(UnresolvedKind.error_name)];
     std.debug.print("; resolved excluding identifiers without a declaration {d:.1}%\n", .{@as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n - no_decl, 1)))});
 }
 
