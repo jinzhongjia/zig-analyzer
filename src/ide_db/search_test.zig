@@ -125,6 +125,32 @@ test "enum member names are not references to declarations of the same name" {
     try testing.expectEqualStrings("x:2:read*", try refs(&w, fs, f, at(src, "read", 1), null));
 }
 
+test "member references inside generic functions use the call-site instance" {
+    const src =
+        \\const S = struct { x: u32 };
+        \\fn read(p: anytype) u32 {
+        \\    return p.x;
+        \\}
+        \\pub fn main() void {
+        \\    const s: S = .{ .x = 1 };
+        \\    _ = read(s);
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:x* x:3:x x:6:x", try refs(&w, fs, f, at(src, "x", 0), null));
+    // 只有一种实例：没有歧义
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var ambiguous: ?search.Reference = null;
+    _ = try search.findReferences(&r, (try definition.defAt(&r, f, at(src, "x", 0))).?, .{ .scope = &.{f}, .ambiguous = &ambiguous });
+    try testing.expectEqual(null, ambiguous);
+}
+
 test "references to quoted names with escaped quotes" {
     const src =
         \\const S = struct { @"a\"b": u32 };
@@ -142,4 +168,43 @@ test "references to quoted names with escaped quotes" {
     try testing.expectEqualStrings("x:1:@\"a\\\"b\"* x:3:@\"a\\\"b\"", try refs(&w, fs, f, at(src, "@\"a", 0), null));
     // 转义的名字与普通写法是同一个名字
     try testing.expectEqualStrings("x:5:@\"\\x66oo\"* x:6:foo x:6:@\"foo\"", try refs(&w, fs, f, at(src, "@\"\\x66", 0), null));
+}
+
+test "member references inside generic functions cover every call-site instance" {
+    const src =
+        \\const S = struct { x: u32 };
+        \\const T = struct { x: u32 };
+        \\fn both(p: anytype) u32 {
+        \\    return p.x;
+        \\}
+        \\fn onlyS(p: anytype) u32 {
+        \\    return p.x;
+        \\}
+        \\pub fn main() void {
+        \\    _ = both(T{ .x = 2 });
+        \\    _ = both(S{ .x = 1 });
+        \\    _ = onlyS(S{ .x = 3 });
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    // 第一个调用点的实例是 T：仍能找到 S 实例中的引用
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:x* x:4:x x:7:x x:11:x x:12:x", try refs(&w, fs, f, at(src, "x", 0), null));
+
+    // `both` 中的 `p.x` 在 T 的实例下指向 T.x：有歧义（重命名会破坏 T 的实例）
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var ambiguous: ?search.Reference = null;
+    const def = (try definition.defAt(&r, f, at(src, "x", 0))).?;
+    _ = try search.findReferences(&r, def, .{ .scope = &.{f}, .ambiguous = &ambiguous });
+    try testing.expectEqual(at(src, "p.x", 0), ambiguous.?.start);
+    // T.x 同样在 `both` 中有歧义
+    ambiguous = null;
+    const t_def = (try definition.defAt(&r, f, at(src, "x", 1))).?;
+    _ = try search.findReferences(&r, t_def, .{ .scope = &.{f}, .ambiguous = &ambiguous });
+    try testing.expectEqual(at(src, "p.x", 0), ambiguous.?.start);
 }

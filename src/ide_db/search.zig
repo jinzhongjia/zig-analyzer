@@ -17,6 +17,8 @@ const infer = @import("../sema/infer.zig");
 const FileIndex = @import("FileIndex.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const seed = @import("../ide/seed.zig");
+const InternPool = @import("../sema/InternPool.zig");
 
 pub const Reference = struct {
     file: FileId,
@@ -46,6 +48,9 @@ pub const Options = struct {
     scope: []const FileId,
     /// 只在这个文件中查找（document highlight）
     only_file: ?FileId = null,
+    /// 不为 null 时记录第一处有歧义的引用：泛型函数体内的成员访问，在一些调用点实例下指向 `def`，
+    /// 另一些指向其他定义（重命名会破坏其他实例，应拒绝）
+    ambiguous: ?*?Reference = null,
 };
 
 /// `def` 的全部引用（含定义处），按文件与位置排序
@@ -61,7 +66,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .file => unreachable,
     };
 
-    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out };
+    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
@@ -139,6 +144,9 @@ const Finder = struct {
     def: Def,
     name: []const u8,
     out: *std.ArrayList(Reference),
+    ambiguous: ?*?Reference,
+    /// 最近一个成员的调用点实例（`instances`）
+    cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index } = null,
 
     /// 检查文件 `file` 中的成员 `item`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
@@ -157,25 +165,22 @@ const Finder = struct {
                     if (deepEql(d, f.def)) try f.add(file, base + range.start, base + range.end);
                 },
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
-                    const d = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns|
-                        try r.memberDef(ns, f.name)
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    const hit = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns|
+                        if (try r.memberDef(ns, f.name)) |d| deepEql(d, f.def) else false
                     else
-                        try f.viaTypes(&res, file, item_index, id);
-                    if (d != null and deepEql(d.?, f.def)) try f.addLastToken(file, base + range.end);
+                        try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    if (hit) try f.addLastToken(file, base + range.end);
                 },
                 .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
-                    const d = try f.viaTypes(&res, file, item_index, id);
-                    if (d != null and deepEql(d.?, f.def)) try f.addLastToken(file, base + range.end);
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    if (try f.refersTo(&res, file, item_index, .{ .e = id }, at)) try f.addLastToken(file, base + range.end);
                 },
                 .init => |x| for (x.fields, 0..) |fi, k| {
                     const n = fi.name orelse continue;
                     if (!std.mem.eql(u8, n, f.name)) continue;
-                    const result = try f.inferred(&res, file, item_index);
-                    for (result.field_refs) |ref| {
-                        if (ref.init != id or ref.index != k) continue;
-                        const d = try keyDef(r, ref.member) orelse continue;
-                        if (deepEql(d, f.def)) try f.add(file, base + fi.name_range.start, base + fi.name_range.end);
-                    }
+                    const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
+                    if (try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at)) try f.add(file, at.start, at.end);
                 },
                 else => {},
             }
@@ -189,12 +194,33 @@ const Finder = struct {
         return x;
     }
 
-    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员）
-    fn viaTypes(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, e: Body.ExprId) resolve.Error!?Def {
-        const result = try f.inferred(res, file, item_index);
-        const i = @backingInt(e);
-        if (i >= result.members.len) return null;
-        return keyDef(f.r, result.members[i] orelse return null);
+    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员、初始化的字段）是否为 `def`。
+    /// 泛型函数体内抽象推导求不出时检查全部调用点实例：任一实例指向 `def` 即为引用；同时有实例指向
+    /// 其他定义时记为有歧义（`at`）
+    fn refersTo(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, l: Lookup, at: Reference) resolve.Error!bool {
+        if (l.member(try f.inferred(res, file, item_index))) |m| {
+            const d = try keyDef(f.r, m) orelse return false;
+            return deepEql(d, f.def);
+        }
+        const owner = try f.r.ownerKey(file, item_index);
+        var hit = false;
+        var miss = false;
+        for (try f.instances(file, item_index)) |inst| {
+            const m = l.member(try f.r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .inst = inst })) orelse continue;
+            const d = try keyDef(f.r, m) orelse continue;
+            if (deepEql(d, f.def)) hit = true else miss = true;
+        }
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
+        };
+        return hit;
+    }
+
+    fn instances(f: *Finder, file: FileId, item_index: u32) resolve.Error![]const InternPool.Index {
+        if (f.cached) |c| if (c.file == file and c.item == item_index) return c.list;
+        const list = try seed.allInstances(f.r, file, item_index);
+        f.cached = .{ .file = file, .item = item_index, .list = list };
+        return list;
     }
 
     fn add(f: *Finder, file: FileId, start: u32, end: u32) resolve.Error!void {
@@ -207,6 +233,21 @@ const Finder = struct {
         const text = (try f.r.ctx.get(database.syntax.SourceText, file)).text;
         const start = lastNameStart(text, end) orelse return;
         try f.add(file, start, end);
+    }
+};
+
+/// 推导结果中的成员：表达式 `e` 访问的成员，或初始化表达式 `e` 的第 `field` 个字段
+const Lookup = struct {
+    e: Body.ExprId,
+    field: ?usize = null,
+
+    fn member(l: Lookup, res: *const infer.Result) ?hir.OwnerKey {
+        if (l.field) |k| {
+            for (res.field_refs) |ref| if (ref.init == l.e and ref.index == k) return ref.member;
+            return null;
+        }
+        const i = @backingInt(l.e);
+        return if (i < res.members.len) res.members[i] else null;
     }
 };
 

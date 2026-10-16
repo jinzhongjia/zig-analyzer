@@ -179,3 +179,41 @@ test "references, highlight, rename and workspace symbol" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "rename refuses when a generic reference also refers to other declarations" {
+    const text =
+        \\const S = struct { x: u32 };
+        \\const T = struct { x: u32 };
+        \\fn read(p: anytype) u32 {
+        \\    return p.x;
+        \\}
+        \\pub fn main() void {
+        \\    _ = read(S{ .x = 1 });
+        \\    _ = read(T{ .x = 2 });
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = text },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `read` 中的 `p.x` 在 T 的实例下是 T.x：不返回只改了一部分的结果
+    const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x"), .newName = "y" });
+    try testing.expect(resp.object.get("error") != null);
+    // 查找引用仍然包含它
+    const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x"), .context = .{ .includeDeclaration = true } });
+    try testing.expectEqual(3, refs.object.get("result").?.array.items.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

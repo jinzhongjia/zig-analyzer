@@ -155,6 +155,8 @@ pub const HandlerError = error{
     RenameOutsideWorkspace,
     /// 新名字不是合法的标识符
     InvalidIdentifier,
+    /// 泛型函数体内的引用在一些实例下指向其他定义：重命名会破坏这些实例
+    RenameAmbiguous,
 };
 
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
@@ -2115,11 +2117,12 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 }
 
 /// 光标处的定义及其全部引用
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// `ambiguous` 不为 null 时记录第一处有歧义的引用（见 `search.Options.ambiguous`）
+fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
     const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null });
+    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous });
     return .{ .def = def, .refs = refs };
 }
 
@@ -2140,7 +2143,7 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null) orelse return null;
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs) |ref| {
@@ -2151,7 +2154,7 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null) orelse return null;
     const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
@@ -2195,8 +2198,11 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
 
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
     const new_name = try identifierText(arena, params.newName);
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+    var ambiguous: ?za.ide_db.search.Reference = null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous) orelse return null;
     if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
+    // 不返回只改了一部分的结果
+    if (ambiguous != null) return error.RenameAmbiguous;
     var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
     var m: RangeMapper = .{ .server = server, .r = r };
     var i: usize = 0;
@@ -2357,6 +2363,7 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
+        error.RenameAmbiguous => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function also refers to other declarations in some instantiations"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
