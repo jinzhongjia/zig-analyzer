@@ -722,7 +722,7 @@ Zig 0.17 的 `zig build` 拆分为 configurer（执行 `build.zig` 得到构建�
 | `log.slow_request_ms` | `100` | 请求超过此耗时时记录慢请求日志；`0` 关闭 |
 
 - 逐项解析：未知的项与类型错误的项合并为一条 `window/showMessage` 提示，类型错误的项取默认值，其余项照常生效；只有整个配置不是对象时才保留原来的配置。
-- 有意不提供的配置：`diagnostics.incremental`（0.17 的 `-fincremental` 会漏报错误、macOS 上输出二进制时崩溃，需要时经 `build.args` 传入）；`completion.snippets`（补全还不生成带参数占位的调用）；`sema.comptime_fuel`（燃料按读事务计，与「单次调用的步数」的语义不同，且实测不完整的结果来自环而非燃料）；`cache.max_memory_mb`（淘汰按条目数，不按字节）；`diagnostics.stale_in_edited`（没有需求）。配置的 schema 生成（`tools/gen_config.zig`）等有编辑器扩展时再做。
+- 有意不提供的配置：`diagnostics.incremental`（0.17 的 `-fincremental` 会漏报错误、macOS 上输出二进制时崩溃，需要时经 `build.args` 传入）；`completion.snippets`（补全还不生成带参数占位的调用）；`sema.comptime_fuel`（燃料按读事务计，与「单次调用的步数」的语义不同，且实测不完整的结果来自环而非燃料）；`cache.max_memory_mb`（按字节的淘汰只用于 `ItemBody` 与 `Infer`，各有固定的上限，类型信息由 `sema.max_intern_pool_mb` 控制，其余部分不按字节计，给不出可靠的总量上限，见 §19.26）；`diagnostics.stale_in_edited`（没有需求）。配置的 schema 生成（`tools/gen_config.zig`）等有编辑器扩展时再做。
 
 ---
 
