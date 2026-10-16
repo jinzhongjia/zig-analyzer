@@ -267,8 +267,6 @@ fn run(ws: *Workspace) Io.Cancelable!void {
             ws.server.busyEnd();
         }
     }
-    if (started) ws.server.busyEnd();
-
     ws.mutex.lockUncancelable(ws.server.io);
     const was_building = ws.building;
     ws.building = false;
@@ -279,6 +277,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else null);
     ws.loading = null;
     ws.mutex.unlock(ws.server.io);
+    // 进度结束后才计为空闲：waitIdle（如 shutdown）返回前客户端已收到 end
+    if (started) ws.server.busyEnd();
     if (was_building) ws.server.busyEnd();
     if (c) |cl| cl.deinit();
 }
