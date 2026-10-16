@@ -911,8 +911,28 @@ test "goto declaration of members that exist only in other target branches" {
         \\    pub const SO = struct {
         \\        pub const REUSEADDR = 2;
         \\    };
+        \\    pub const termios = extern struct {
+        \\        cflag: tc_cflag_t,
+        \\    };
+        \\    pub const tc_cflag_t = packed struct(u32) {
+        \\        CREAD: bool = false,
+        \\        _: u31 = 0,
+        \\    };
         \\};
         \\const c_ns = struct {
+        \\    pub const termios = switch (os) {
+        \\        .linux => linux_ns.termios,
+        \\        .macos => extern struct {
+        \\            cflag: tc_cflag_t,
+        \\        },
+        \\    };
+        \\    pub const tc_cflag_t = switch (os) {
+        \\        .linux => linux_ns.tc_cflag_t,
+        \\        .macos => packed struct(u64) {
+        \\            CCTS_OFLOW: bool = false,
+        \\            _: u63 = 0,
+        \\        },
+        \\    };
         \\    pub const SO = switch (os) {
         \\        .linux => struct {
         \\            pub const REUSEADDR = 2;
@@ -933,6 +953,13 @@ test "goto declaration of members that exist only in other target branches" {
         \\    .macos => c_ns,
         \\};
         \\const SO = system.SO;
+        \\const posix_ns = struct {
+        \\    pub const termios = system.termios;
+        \\    pub fn tcgetattr(fd: u32) error{NotATerminal}!termios {
+        \\        _ = fd;
+        \\        return undefined;
+        \\    }
+        \\};
         \\const posix_impl = struct {
         \\    pub const State = struct {
         \\        fd: u32 = 0,
@@ -962,6 +989,10 @@ test "goto declaration of members that exist only in other target branches" {
         \\    _ = platform.State.init().handle;
         \\    _ = t.state.fd;
         \\}
+        \\fn g() !void {
+        \\    var settings = try posix_ns.tcgetattr(0);
+        \\    settings.cflag.CCTS_OFLOW = true;
+        \\}
         \\
     ;
     var w: World = undefined;
@@ -982,6 +1013,8 @@ test "goto declaration of members that exist only in other target branches" {
         .{ "handle;\n    _ = t", "handle: u32" },
         // 当前配置下存在的成员
         .{ "fd;\n}", "fd: u32" },
+        // 函数返回类型按目标选择，字段的类型再按目标选择
+        .{ "CCTS_OFLOW = true", "CCTS_OFLOW: bool = false" },
     };
     for (cases, 0..) |c, i| {
         const at = std.mem.indexOf(u8, text, c[0]).?;
