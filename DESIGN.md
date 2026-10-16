@@ -1378,6 +1378,42 @@ Sema.zig 上的编辑响应（同一台机器）：
 - `zig build test` 在测试向 stderr 写日志时也会打印 `failed command: ...`，但退出码为 0，并非失败；真正的失败带有「N pass, M fail」与测试名。
 - 测试：`zig build test` 共 264 个。
 
+### 19.30 97 个 Zig 0.17.0 库的批量校验（2026-10-16）
+
+对一份 97 个面向 Zig 0.17.0 的库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib、ffmpeg 等）做批量校验：浅克隆后 `zig build --fetch` 取依赖，每个库取最大的源文件，以 `BENCH_QUICK=1`（跳过编辑相关的阶段）跑 declaration、补全召回与引用 / 重命名三项对拍，关闭编译器诊断。另对全部仓库跑语料对拍。
+
+| 校验 | 结果 |
+|---|---|
+| 崩溃、超时 | 0 / 97 |
+| declaration 不一致 | 0（解析率中位数 88.5%） |
+| 引用与重命名（名字不符、误报、遗漏、重命名不一致） | 0（修复后） |
+| 补全召回 | 中位数 99.7%，81 / 97 个 ≥ 95% |
+| hover p50 | 中位数 0.3 ms，最大 6.0 ms |
+| 常驻内存 | 中位数 64 MB，最大 181 MB |
+| 语料对拍（8438 个文件、182.5 MB） | 无损、无误报、结构一致、截断不崩溃、HIR 无失败；10 万次随机编辑的增量解析与全量解析无不一致 |
+
+召回低于 95% 的 16 个库中，11 个因依赖未能取得（GitHub 的压缩包下载受限）而 `build.zig` 无法编译、没有构建图，模块 import 都解析不出；其余为 C 头文件的转换（raylib 的 `@cImport`）、comptime 反射生成的类型（zig-clap 的 `parse` 结果、logex 的 `std.meta.fields` 经多层泛型）。
+
+发现并修复的问题：
+
+| 问题 | 文件 | 内容 |
+|---|---|---|
+| 泛型函数体内的引用遗漏 | `src/ide_db/search.zig` | 跳转在泛型函数体内取调用点实例，查找引用只看抽象的结果：known-folders 的 `getPathInner(comptime System: type, system: *System)` 中 `system.getenv` 遗漏 6 处，zalgebra 遗漏 1 处。抽象的结果中求不出成员时与跳转一样取调用点实例的结果 |
+| 非默认 step 中的文件 | `src/server/Workspace.zig`、`src/names/ModuleGraph.zig` | 文件的模块归属只取自诊断 step 的编译集合：只在测试、示例等 step 的模块中的文件解析不出模块 import。另以所有编译 step 计算一个集合，只用于模块归属（live 诊断不变）。zig-flatbuffers 的补全召回 70.3% → 96.3%，zig-protobuf 74.7% → 100%，libvaxis 的 `c_api.zig` 77.7% → 100% |
+| `@compileError` 分支 | `src/sema/infer.zig` | comptime 条件选中的分支是 `@compileError` 时取另一个分支（被使用的声明不可能是编译错误）：`std.testing.allocator` 在非测试模块的 test 块中原为 `noreturn` |
+| switch 中求不出的分支项 | `src/sema/eval.zig` | 分支项的值互不相同，其他分支项匹配时不必求出所有分支项（z2d 的 `fromRGBT`） |
+| 调用点种子的层数 | `src/ide/seed.zig` | 按层数缓存（key 带层数，严格递减不成环），最多传递 3 层 |
+
+本轮同时完成的性能与内存改进：
+
+| 指标 | 之前 | 之后 |
+|---|---|---|
+| ghostty（`Terminal.zig`，1.7 万行）按键 → hover p50 | 49 ms | 21 ms（顶层的编辑也局部重解析） |
+| Zig 编译器源码 40 轮常驻内存 | 534 MB | 459 MB，峰值 476 MB（`FileItemTree` 按字节淘汰；key 超过 20 万时整代回收类型信息） |
+| z2d 补全召回 | 95.3% | 97.5% |
+
+- 测试：`zig build test` 共 271 个。
+
 ## 20. 风险与对策
 
 | 风险 | 影响 | 对策 |
