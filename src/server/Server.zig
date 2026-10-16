@@ -1934,12 +1934,13 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
 }
 
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
-    // 等待进行中的读请求完成；停止各项目的构建系统进程，并等后台任务（诊断发布等）收尾
-    server.group.await(server.io) catch {};
-    // 客户端一直没有回复配置请求：不再等待
+    // 先解除依赖主循环的等待：客户端一直没有回复配置请求时不再等待。之后主循环阻塞在 await 上，
+    // 处理不了补发的响应，进行中的 `waitIdle` 请求只能靠这里结束
     server.startup_pending = false;
     while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
+    // 停止各项目的构建系统进程；等待进行中的请求完成，再等后台任务（诊断发布等）收尾
     server.stopWorkspaces();
+    server.group.await(server.io) catch {};
     server.waitIdle();
     server.state = .shutdown;
 }

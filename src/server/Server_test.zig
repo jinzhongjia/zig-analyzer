@@ -294,6 +294,31 @@ test "read requests run on their own threads: a blocked read does not stall the 
     try h.notify("exit", {});
 }
 
+test "shutdown does not deadlock with waitIdle while a configuration request is unanswered" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{ .configuration = true } } });
+    h.hold_requests = true;
+    try h.notify("initialized", Empty{});
+    // 等到配置请求发出，暂不回复
+    var config_id: ?std.json.Value = null;
+    while (config_id == null) {
+        const msg = try h.next();
+        const method = msg.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "workspace/configuration")) config_id = msg.object.get("id").?;
+    }
+    const wait = try h.send("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    _ = try h.response(wait);
+    h.hold_requests = false;
+    // 关闭后补发的配置响应被忽略
+    try h.write(.{ .jsonrpc = "2.0", .id = config_id.?, .result = &[_]std.json.Value{.null} });
+    try h.notify("exit", {});
+}
+
 test "live diagnostics are debounced per file and AstGen runs outside the read transaction" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};
