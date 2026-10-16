@@ -567,6 +567,18 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
             ws.gpa.free(steps);
             steps = try ws.gpa.dupe(u32, all.items);
         }
+        // 文件归属先到达它的 compile step：本机目标的排在前面，同时编译到多个目标的文件（如一份代码
+        // 既编译为 wasm 库也编译为本机示例）按本机目标分析
+        const Native = struct {
+            fn lt(m: *const ProjectModel, a: u32, b: u32) bool {
+                return isNativeStep(m, a) and !isNativeStep(m, b);
+            }
+            fn isNativeStep(m: *const ProjectModel, step: u32) bool {
+                return m.modules[m.steps[step].kind.compile.root_module].isNativeTarget();
+            }
+        };
+        std.mem.sort(u32, steps, model, Native.lt);
+        std.mem.sort(u32, all.items, model, Native.lt);
     }
 
     var result = try ws.computeSet(steps) orelse return;

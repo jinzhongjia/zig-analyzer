@@ -45,6 +45,15 @@ pub const Module = struct {
     builtin_args: []const []const u8 = &.{},
     /// 生成的 `builtin.zig` 的路径（由 Workspace 在加载构建图后填入）
     builtin_file: ?[]const u8 = null,
+
+    /// 目标为本机（没有指定 `-target`，或指定的是 `native` 开头的三元组）
+    pub fn isNativeTarget(m: *const Module) bool {
+        for (m.builtin_args, 0..) |arg, i| {
+            if (!std.mem.eql(u8, arg, "-target") or i + 1 >= m.builtin_args.len) continue;
+            return std.mem.startsWith(u8, m.builtin_args[i + 1], "native");
+        }
+        return true;
+    }
 };
 
 /// 相对于生成文件的路径：从生成文件向上 `up` 级目录，再拼上 `sub_path`
@@ -164,4 +173,13 @@ pub fn compileStepsOf(m: *const ProjectModel, gpa: Allocator, roots: []const u32
         try stack.appendSlice(gpa, m.steps[s].deps);
     }
     return result.toOwnedSlice(gpa);
+}
+
+test "Module.isNativeTarget" {
+    const native: Module = .{ .root_file = null, .imports = &.{}, .builtin_args = &.{ "build-exe", "-Odebug" } };
+    const explicit_native: Module = .{ .root_file = null, .imports = &.{}, .builtin_args = &.{ "build-exe", "-target", "native-linux" } };
+    const wasm: Module = .{ .root_file = null, .imports = &.{}, .builtin_args = &.{ "build-lib", "-target", "wasm32-freestanding", "-mcpu", "generic" } };
+    try std.testing.expect(native.isNativeTarget());
+    try std.testing.expect(explicit_native.isNativeTarget());
+    try std.testing.expect(!wasm.isNativeTarget());
 }
