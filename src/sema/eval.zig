@@ -2518,7 +2518,7 @@ const Evaluator = struct {
     /// 元组的布局（`Type.structFieldOffset` 与 `abiAlignment` 的元组分支）：按声明顺序，不重排；comptime 字段
     /// 与零大小的字段不占位置。对齐计入零大小的字段，大小只按有大小的字段的对齐补齐（与编译器一致，
     /// `struct { u8, [0]u64 }` 的大小为 1、对齐为 8）
-    fn tupleLayout(ev: *Evaluator, fields: []const LayoutField) Error!StructLayout {
+    fn tupleLayout(ev: *Evaluator, fields: []const LayoutField) Error!?StructLayout {
         const offsets = try ev.a.alloc(?u64, fields.len);
         var end: u64 = 0;
         var size_align: u64 = 1;
@@ -2534,11 +2534,11 @@ const Evaluator = struct {
                 continue;
             }
             size_align = @max(size_align, fl.alignment);
-            const offset = std.mem.alignForward(u64, end, fl.alignment);
-            o.* = offset * 8;
-            end = offset + fl.layout.?.size;
+            const offset = value.alignForward(end, fl.alignment) orelse return null;
+            o.* = value.bitsOf(offset) orelse return null;
+            end = std.math.add(u64, offset, fl.layout.?.size) catch return null;
         }
-        return .{ .layout = .{ .size = std.mem.alignForward(u64, end, size_align), .alignment = alignment, .bits = null }, .bit_offsets = offsets };
+        return .{ .layout = .{ .size = value.alignForward(end, size_align) orelse return null, .alignment = alignment, .bits = null }, .bit_offsets = offsets };
     }
 
     /// 结构体的布局与各字段的位偏移（comptime 字段为 null）。auto 布局按对齐降序重排字段，
@@ -2553,7 +2553,7 @@ const Evaluator = struct {
                 // packed 的字段不能有显式对齐（编译器报错）
                 if (fl.explicit_align or !try ev.packable(fl.ty)) return null;
                 o.* = bits;
-                bits += l.bits orelse return null;
+                bits = std.math.add(u64, bits, l.bits orelse return null) catch return null;
             }
             // 显式的 backing 整数须与各字段的位宽之和相等
             if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
@@ -2573,11 +2573,11 @@ const Evaluator = struct {
         var end: u64 = 0;
         for (order) |i| {
             if (i == RuntimeOrder.omitted) continue;
-            const offset = std.mem.alignForward(u64, end, fields[i].alignment);
-            offsets[i] = offset * 8;
-            end = offset + fields[i].layout.?.size;
+            const offset = value.alignForward(end, fields[i].alignment) orelse return null;
+            offsets[i] = value.bitsOf(offset) orelse return null;
+            end = std.math.add(u64, offset, fields[i].layout.?.size) catch return null;
         }
-        return .{ .layout = .{ .size = std.mem.alignForward(u64, end, struct_align), .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
+        return .{ .layout = .{ .size = value.alignForward(end, struct_align) orelse return null, .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
     }
 
     /// 字段在内存中的顺序：与编译器的比较函数相同，comptime 字段排在最后
@@ -2600,7 +2600,7 @@ const Evaluator = struct {
             payload_size = @max(payload_size, l.size);
             payload_align = @max(payload_align, fl.alignment);
         }
-        const payload: value.Layout = .{ .size = std.mem.alignForward(u64, payload_size, payload_align), .alignment = payload_align, .bits = null };
+        const payload: value.Layout = .{ .size = value.alignForward(payload_size, payload_align) orelse return null, .alignment = payload_align, .bits = null };
         switch (decl.layout) {
             .@"packed" => {
                 if (fields.len == 0) return null;
@@ -2623,7 +2623,8 @@ const Evaluator = struct {
         else
             return payload;
         const alignment = @max(tag.alignment, payload_align);
-        return .{ .size = std.mem.alignForward(u64, tag.size + payload_size, alignment), .alignment = alignment, .bits = null };
+        const size = std.math.add(u64, tag.size, payload_size) catch return null;
+        return .{ .size = value.alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
     }
 
     const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
@@ -3030,7 +3031,10 @@ const Evaluator = struct {
         if (layout != .@"packed") return .null_value;
         if ((try ev.containerSyntax(t)).arg) |arg| return arg;
         var bits: u64 = 0;
-        for (types) |ty| bits += (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
+        for (types) |ty| {
+            const field_bits = (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
+            bits = std.math.add(u64, bits, field_bits) catch return error.Abort;
+        }
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }
 };
@@ -3065,7 +3069,7 @@ fn literalFieldAttrs(values: []const Index, i: usize) EvalError!Evaluator.FieldA
 fn alignValue(ip: *InternPool, v: ?Index) EvalError!u64 {
     const x = value.intOf(ip, v) orelse return error.Abort;
     if (x <= 0 or x & (x - 1) != 0) return error.Abort;
-    return @intCast(x);
+    return std.math.cast(u64, x) orelse error.Abort;
 }
 
 /// `++` 结果的哨兵（与编译器一致）：两侧都有时须相同，只有一侧有时取该侧

@@ -460,7 +460,18 @@ fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
         },
         .elem => .{ elem.alignment, std.math.mul(u64, elem.size, len) catch return null },
     };
-    return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = if (hasBitRepr(ip, child)) bits else null };
+    return .{ .size = alignForward(bytes, alignment) orelse return null, .alignment = alignment, .bits = if (hasBitRepr(ip, child)) bits else null };
+}
+
+/// 向上对齐到 `alignment`（2 的幂）；溢出时为 null，源码中的超大类型不应使宿主崩溃
+pub fn alignForward(x: u64, alignment: u64) ?u64 {
+    const sum = std.math.add(u64, x, alignment - 1) catch return null;
+    return sum & ~(alignment - 1);
+}
+
+/// 字节偏移换算为位偏移；溢出时为 null
+pub fn bitsOf(bytes: u64) ?u64 {
+    return std.math.mul(u64, bytes, 8) catch null;
 }
 
 /// 无符号整数类型（packed 容器的 backing 整数、枚举的标签）的布局
@@ -475,29 +486,30 @@ pub fn intLayout(bits: u16) ?Layout {
 
 /// `?T`：非 C 指针（含切片）与错误集以零值表示 null，与载荷同大小；其余在载荷之后加一个标记，
 /// 按载荷的对齐补齐。只有单项与多项指针的 optional 有位表示
-pub fn optionalLayout(ip: *InternPool, child: Index, payload: Layout) Layout {
+pub fn optionalLayout(ip: *InternPool, child: Index, payload: Layout) ?Layout {
     switch (ip.key(child)) {
         .ptr_type => |p| if (p.size != .c) return .{ .size = payload.size, .alignment = payload.alignment, .bits = if (p.size == .slice) null else payload.bits },
         .error_set_type, .inferred_error_set => return .{ .size = payload.size, .alignment = payload.alignment, .bits = null },
         .simple_type => |s| if (s == .anyerror) return .{ .size = payload.size, .alignment = payload.alignment, .bits = null },
         else => {},
     }
-    return .{ .size = payload.size + payload.alignment, .alignment = payload.alignment, .bits = null };
+    return .{ .size = std.math.add(u64, payload.size, payload.alignment) catch return null, .alignment = payload.alignment, .bits = null };
 }
 
 /// 数组（长度含哨兵）。`elem_bit_repr`：元素有位表示时数组才有位宽（错误集与未指定标签类型的枚举
 /// 虽可求 `@bitSizeOf`，却没有位表示）
 pub fn arrayLayout(elem: Layout, a: @FieldType(InternPool.Key, "array_type"), elem_bit_repr: bool) ?Layout {
-    const n = a.len + @intFromBool(a.sentinel != null);
+    const n = std.math.add(u64, a.len, @intFromBool(a.sentinel != null)) catch return null;
     const size = std.math.mul(u64, elem.size, n) catch return null;
     const bits: ?u64 = if (elem_bit_repr) (if (elem.bits) |b| std.math.mul(u64, b, n) catch null else null) else null;
     return .{ .size = size, .alignment = elem.alignment, .bits = bits };
 }
 
 /// `E!T`：错误码与载荷，按两者中较大的对齐补齐
-pub fn errorUnionLayout(payload: Layout) Layout {
+pub fn errorUnionLayout(payload: Layout) ?Layout {
     const alignment = @max(error_layout.alignment, payload.alignment);
-    return .{ .size = std.mem.alignForward(u64, error_layout.size + payload.size, alignment), .alignment = alignment, .bits = null };
+    const size = std.math.add(u64, error_layout.size, payload.size) catch return null;
+    return .{ .size = alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
 }
 
 /// 不含容器的类型是否有位表示（错误集没有）

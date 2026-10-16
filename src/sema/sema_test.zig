@@ -537,6 +537,31 @@ test "inferred error sets from function bodies" {
     });
 }
 
+test "oversized layouts degrade to unknown instead of overflowing" {
+    // 大小无法用 u64 表示的类型：布局求不出，不能使宿主溢出崩溃
+    try expectTypes(
+        \\const S = extern struct {
+        \\    a: [2305843009213693952]u8,
+        \\    b: u8,
+        \\};
+        \\const T = struct { u8, [18446744073709551615]u8 };
+        \\const U = union(enum) { a: [18446744073709551615]u8, b: u8 };
+        \\const s_size = @sizeOf(S);
+        \\const sentinel_size = @sizeOf([18446744073709551615:0]u8);
+        \\const opt_size = @sizeOf(?[18446744073709551615]u8);
+        \\const eu_size = @sizeOf(anyerror![18446744073709551615]u8);
+        \\const t_size = @sizeOf(T);
+        \\const u_size = @sizeOf(U);
+    , &.{
+        .{ "s_size", "comptime_int" },
+        .{ "sentinel_size", "comptime_int" },
+        .{ "opt_size", "comptime_int" },
+        .{ "eu_size", "comptime_int" },
+        .{ "t_size", "comptime_int" },
+        .{ "u_size", "comptime_int" },
+    });
+}
+
 test "container layouts match the compiler" {
     // 期望值为 zig 0.17.0 在 x86_64-linux 上的结果
     try expectTypes(
