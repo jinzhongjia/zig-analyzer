@@ -14,7 +14,8 @@
 //!   同时打印前 n 个未解析的标识符
 //! - `BENCH_QUICK=1`：跳过编辑、连续输入与保存的各阶段（批量校验大量项目时使用）
 //! - `BENCH_COMPLETE=<n>`：补全的召回：源码中的成员访问 `a.b` 在 `.` 之后补全，列表中应有 `b`
-//! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致）
+//! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致；
+//!   泛型函数体中在其他实例下指向同名声明的引用单独计数）
 //! - `BENCH_SESSION=<轮数>`：长时间会话，观察内存的增长
 
 const std = @import("std");
@@ -439,6 +440,7 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
     var false_pos: usize = 0;
     var missing: usize = 0;
     var rename_mismatch: usize = 0;
+    var other_instance: usize = 0;
     var shown: usize = 0;
     var checked: usize = 0;
     for (0..n) |i| {
@@ -464,6 +466,10 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         var refs: std.ArrayList(Loc) = .empty;
         for (result.array.items) |v| try refs.append(a, locOf(v));
         total_refs += refs.items.len;
+        // 泛型函数体中的引用在不同实例下指向不同的声明时，rename 返回错误；这样的引用处 declaration 只取
+        // 一个实例，可能指向另一个同名声明（计为 other instance，不是误报）
+        const ren, _ = try c.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = decl_pos, .newName = "zz_renamed" });
+        const ambiguous = ren.object.get("error") != null;
         for (refs.items) |l| {
             const t = texts.get(l.uri) orelse blk: {
                 const path = za.base.uri.toPath(a, l.uri) catch break :blk "";
@@ -486,6 +492,19 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
                 .array => |arr| if (arr.items.len > 0) locOf(arr.items[0]) else null,
                 else => null,
             } else null;
+            if (ambiguous) if (target) |tl| if (!locEql(tl, decl_loc)) {
+                const tt = texts.get(tl.uri) orelse blk: {
+                    const path = za.base.uri.toPath(a, tl.uri) catch break :blk "";
+                    const x = Io.Dir.cwd().readFileAlloc(c.io, path, a, .limited(16 * 1024 * 1024)) catch "";
+                    try texts.put(a, tl.uri, x);
+                    break :blk x;
+                };
+                const to = offsetOf(tt, .{ .line = tl.line, .character = tl.character });
+                if (to != null and std.mem.eql(u8, identAt(tt, to.?), name)) {
+                    other_instance += 1;
+                    continue;
+                }
+            };
             if (target == null or !locEql(target.?, decl_loc)) {
                 false_pos += 1;
                 if (shown < 10) {
@@ -518,7 +537,6 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
             }
         }
         // rename 的编辑与引用的位置相同
-        const ren, _ = try c.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = decl_pos, .newName = "zz_renamed" });
         if (ren.object.get("result")) |r| if (r == .object) {
             var edits: std.ArrayList(Loc) = .empty;
             if (r.object.get("changes")) |changes| {
@@ -548,7 +566,7 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         };
     }
     Stats.print("references", times.items);
-    std.debug.print("  references   checked {d} declarations, {d} references: wrong name {d}, false positives {d}, missing in this file {d}, rename mismatches {d}\n", .{ checked, total_refs, bad_name, false_pos, missing, rename_mismatch });
+    std.debug.print("  references   checked {d} declarations, {d} references: wrong name {d}, false positives {d}, missing in this file {d}, rename mismatches {d}, other instances {d}\n", .{ checked, total_refs, bad_name, false_pos, missing, rename_mismatch, other_instance });
 }
 
 /// 补全的召回（BENCH_COMPLETE=<n>）：源码中的成员访问 `a.b`（`.` 之前是标识符、`)` 或 `]`），在 `.` 之后
