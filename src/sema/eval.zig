@@ -2292,6 +2292,8 @@ const Evaluator = struct {
         if (eq(u8, name, "@hasDecl") or eq(u8, name, "@hasField")) {
             if (vals.len != 2) return error.Abort;
             const t = try asType(vals[0]);
+            // 没有实例的泛型体中的类型参数：有哪些成员取决于实例（同 `infer.hasMember`）
+            if (ip.key(t) == .opaque_param) return error.Abort;
             const field = try ev.stringOf(vals[1]);
             if (eq(u8, name, "@hasField")) return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
             const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);

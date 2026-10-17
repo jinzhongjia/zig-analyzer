@@ -660,6 +660,50 @@ test "branches excluded by comptime conditions are inactive" {
     try testing.expectEqualStrings("x * 2", text[ranges[1].start..ranges[1].end]);
 }
 
+test "conditions on members of abstract parameters are not inactive" {
+    // 防止没有实例时把 `@hasDecl` / `@hasField` 求值为 false：有调用点的泛型代码中实际执行的分支显示为非活动
+    const text =
+        \\fn hasInner(comptime T: type) bool {
+        \\    return @hasDecl(T, "Inner");
+        \\}
+        \\fn k(comptime T: type) u32 {
+        \\    if (comptime @hasDecl(T, "Inner")) return 1;
+        \\    if (comptime hasInner(T)) return 2;
+        \\    if (comptime @hasField(T, "x")) return 3;
+        \\    return 0;
+        \\}
+        \\fn Foo(comptime T: type) type {
+        \\    return struct {
+        \\        const has_inner = @hasDecl(T, "Inner");
+        \\        fn m() u32 {
+        \\            if (has_inner) return 1;
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\const Arg = struct {
+        \\    pub const Inner = u8;
+        \\    x: u8,
+        \\};
+        \\fn caller() u32 {
+        \\    return k(Arg) + Foo(Arg).m();
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    testing.expectEqual(0, ranges.len) catch |err| {
+        for (ranges) |rg| std.debug.print("inactive: `{s}`\n", .{text[rg.start..rg.end]});
+        return err;
+    };
+}
+
 test "completion, goto, signature help and inlay hints in generic bodies use a call site" {
     const text =
         \\const Point = struct {

@@ -1544,6 +1544,44 @@ test "generic bodies without an instance use values that do not depend on the pa
     });
 }
 
+test "@hasDecl and @hasField on abstract parameters are unknown" {
+    // 防止解释器把抽象参数当作没有该成员：类型标注与 comptime 调用中按 false 选择分支
+    try expectTypes(
+        \\const HasInner = struct { pub const Inner = u32; x: u8 };
+        \\fn Sel(comptime T: type) type {
+        \\    return if (@hasDecl(T, "Inner")) T.Inner else T;
+        \\}
+        \\fn f(comptime T: type) void {
+        \\    var va: if (@hasDecl(T, "Inner")) T.Inner else T = undefined;
+        \\    var vb: if (@hasField(T, "x")) u8 else u16 = undefined;
+        \\    const S = Sel(T);
+        \\    _ = .{ &va, &vb, S };
+        \\}
+        \\fn Pick(comptime U: type) type {
+        \\    return if (@hasDecl(U, "get")) u8 else u16;
+        \\}
+        \\fn Wrap(comptime T: type) type {
+        \\    return struct {
+        \\        x: T,
+        \\        const Self = @This();
+        \\        pub fn get() void {}
+        \\        fn g() void {
+        \\            const P = Pick(Self);
+        \\            _ = P;
+        \\        }
+        \\    };
+        \\}
+        \\const real = Sel(HasInner);
+    , &.{
+        .{ "va", "unknown" },
+        .{ "vb", "unknown" },
+        .{ "S", "type" },
+        // 抽象实例中的容器：成员只取决于源码
+        .{ "P", "type = u8" },
+        .{ "real", "type = u32" },
+    });
+}
+
 test "arrays whose length depends on abstract parameters keep their element type" {
     try expectTypes(
         \\fn Hasher(comptime block_length: usize) type {
