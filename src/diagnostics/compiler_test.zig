@@ -127,3 +127,151 @@ test "merge: live only without build result; no live outside the compile set" {
     try testing.expectEqual(1, (try mergeMessages(arena.allocator(), main_text, true, null)).len);
     try testing.expectEqual(0, (try mergeMessages(arena.allocator(), main_text, false, null)).len);
 }
+
+const caller_text =
+    \\const m = @import("main.zig");
+    \\pub fn f() void {
+    \\    m.main();
+    \\}
+    \\
+;
+
+const Files = struct {
+    fn get(_: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
+        const text = if (std.mem.endsWith(u8, path, "caller.zig")) caller_text else if (std.mem.endsWith(u8, path, "main.zig")) main_text else return null;
+        return .{ .uri = std.fmt.allocPrint(arena, "file://{s}", .{path}) catch return null, .text = text };
+    }
+};
+
+/// 源位置：`needle` 在 `text` 中的区间
+fn location(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: []const u8, reference_trace_len: u32) !ErrorBundle.SourceLocationIndex {
+    const start: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
+    return wip.addSourceLocation(.{
+        .src_path = try wip.addString(path),
+        .line = 0,
+        .column = 0,
+        .span_start = start,
+        .span_main = start,
+        .span_end = start + @as(u32, @intCast(needle.len)),
+        .reference_trace_len = reference_trace_len,
+    });
+}
+
+test "collect: reference trace and compile log output are kept" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    // 带附注与引用链（一个有位置的引用、一个隐藏计数）的错误；引用链紧跟在错误的源位置之后
+    const ref_loc = try location(&wip, "src/caller.zig", caller_text, "m.main()", 0);
+    const note_loc = try location(&wip, "src/main.zig", main_text, "x", 0);
+    const err_loc = try location(&wip, "src/main.zig", main_text, "\"s\"", 2);
+    try wip.addReferenceTrace(.{ .decl_name = try wip.addString("f"), .src_loc = ref_loc });
+    try wip.addReferenceTrace(.{ .decl_name = 3, .src_loc = .none });
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("a note"), .src_loc = note_loc }},
+    );
+    // 只剩隐藏标记的引用链
+    const err2_loc = try location(&wip, "src/main.zig", main_text, "unused", 1);
+    try wip.addReferenceTrace(.{ .decl_name = 0, .src_loc = .none });
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString("unused local variable"), .src_loc = err2_loc });
+    try addError(&wip, "src/main.zig", main_text, "_ = x", "found compile log statement");
+    var eb = try wip.toOwnedBundle("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")\n");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.deinit(gpa);
+
+    const items = r.files.get(native("/proj/src/main.zig")).?.items;
+    try testing.expectEqual(3, items.len);
+    const err_start: u32 = @intCast(std.mem.indexOf(u8, main_text, "\"s\"").?);
+    const notes = items[0].notes;
+    try testing.expectEqual(3, notes.len);
+    try testing.expectEqualStrings("a note", notes[0].message);
+    try testing.expectEqualStrings(native("/proj/src/caller.zig"), notes[1].path);
+    try testing.expectEqual(std.mem.indexOf(u8, caller_text, "m.main()").?, notes[1].start);
+    try testing.expectEqualStrings("referenced by: f", notes[1].message);
+    // 隐藏计数没有位置：放在错误的起点，文案与 zig build 的输出相同
+    try testing.expectEqualStrings(native("/proj/src/main.zig"), notes[2].path);
+    try testing.expectEqual(err_start, notes[2].start);
+    try testing.expectEqual(err_start, notes[2].end);
+    try testing.expectEqualStrings("3 reference(s) hidden; use '-freference-trace=4' to see all references", notes[2].message);
+    try testing.expectEqual(1, items[1].notes.len);
+    try testing.expectEqualStrings("remaining reference traces hidden; use '-freference-trace' to see all reference traces", items[1].notes[0].message);
+    try testing.expectEqualStrings("found compile log statement", items[2].message);
+    try testing.expectEqualStrings("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")", items[2].compile_log);
+
+    // 发布时附注与引用链都成为 relatedInformation
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var ctx: u8 = 0;
+    const diags = try compiler.merge(arena.allocator(), .{
+        .text = main_text,
+        .lines = try offsets.LineIndex.init(arena.allocator(), main_text),
+        .encoding = .utf16,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = r.files.getPtr(native("/proj/src/main.zig")).?,
+        .other_file = Files.get,
+        .other_ctx = &ctx,
+    });
+    const related = diags[0].relatedInformation.?;
+    try testing.expectEqual(3, related.len);
+    try testing.expect(std.mem.endsWith(u8, related[1].location.uri, "caller.zig"));
+    try testing.expectEqual(2, related[1].location.range.start.line);
+    try testing.expectEqual(4, related[1].location.range.start.character);
+    try testing.expectEqualStrings("referenced by: f", related[1].message);
+    try testing.expectEqual(2, related[2].location.range.start.line);
+    try testing.expectEqual(19, related[2].location.range.start.character);
+    // compile log 的输出接在文案之后
+    try testing.expectEqualStrings(
+        \\found compile log statement
+        \\
+        \\Compile Log Output:
+        \\@as(comptime_int, 3)
+        \\@as(*const [2:0]u8, "hi")
+    , diags[2].message.string);
+}
+
+/// 只有一条错误（"unused local variable"）的错误包，compile log 的输出为 `log_text`
+fn unusedWithLog(log_text: []const u8) !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(testing.allocator);
+    defer wip.deinit();
+    try addError(&wip, "src/main.zig", main_text, "unused", "unused local variable");
+    return wip.toOwnedBundle(log_text);
+}
+
+test "compile log: kept apart from the message for dedup and the AstGen flag" {
+    const gpa = testing.allocator;
+    // 几个 compile step 报告同一个 AstGen 错误，其中一些带有 compile log 的输出（没有
+    // "found compile log statement" 时附在第一条错误上）
+    var plain = try unusedWithLog("");
+    defer plain.deinit(gpa);
+    var log1 = try unusedWithLog("@as(comptime_int, 1)\n");
+    defer log1.deinit(gpa);
+    var log2 = try unusedWithLog("@as(comptime_int, 2)\n");
+    defer log2.deinit(gpa);
+    var dummy: u8 = 0;
+    var r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.deinit(gpa);
+    const result = r.files.getPtr(native("/proj/src/main.zig")).?;
+    // 防止同一错误因带有 compile log 而显示多次、不再被识别为 AstGen 错误：只保留一条，各个 step 的输出并到这一条上
+    try testing.expectEqual(1, result.items.len);
+    const item = result.items[0];
+    try testing.expect(item.is_astgen);
+    try testing.expectEqualStrings("unused local variable", item.message);
+    try testing.expectEqualStrings("@as(comptime_int, 1)\n@as(comptime_int, 2)", item.compile_log);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 文本与构建时一致：输出接在文案之后
+    const msgs = try mergeMessages(a, main_text, true, result);
+    try testing.expectEqual(1, msgs.len);
+    try testing.expectEqualStrings("zig@1:8: unused local variable\n\nCompile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs[0]);
+    // 有未保存修改：AstGen 错误只由 live 提供，不与编译器的那条重复
+    const edited = try std.mem.concat(a, u8, &.{ "// 新注释\n", main_text });
+    const msgs2 = try mergeMessages(a, edited, true, result);
+    try testing.expectEqual(1, msgs2.len);
+    try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs2[0]);
+}
