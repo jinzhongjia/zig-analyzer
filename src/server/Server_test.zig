@@ -62,7 +62,11 @@ fn errorCode(msg: std.json.Value) i64 {
 
 test "full lifecycle: initialize, document sync, read requests, shutdown" {
     var s: Session = undefined;
-    // zig 指向不存在的路径：后台启动（zig env、加载 std）确定地失败，不与 status 的文件数与 revision 竞争
+    // zig 指向不存在的路径：后台启动（zig env、加载 std）确定地失败，不与 status 的文件数与 revision 竞争。
+    // 失败时的警告是预期的，不写到 stderr
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-16","utf-8"]}},"initializationOptions":{"zig":{"path":"/nonexistent/zig"}}}}
     ) ++ frame(
@@ -266,7 +270,10 @@ test "malformed params return InvalidParams" {
 
 test "read requests run on their own threads: a blocked read does not stall the main loop" {
     const Harness = @import("test_harness.zig").Harness;
-    // 线程池没有空位：`async` 会在调用方同步执行
+    // 线程池没有空位：`async` 会在调用方同步执行，zig env 因此可能失败，失败时的警告不写到 stderr
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
     var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
     defer threaded.deinit();
     var h: Harness = undefined;
