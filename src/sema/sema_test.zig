@@ -378,6 +378,30 @@ test "comptime integer arithmetic follows the result type" {
     });
 }
 
+test "arithmetic operands have no result type" {
+    // 预期值与编译器一致（comptime 块中以 @compileError 核对过）
+    try expectTypes(
+        \\const m: u8 = (0xFF << 4) >> 4;
+        \\const w: u8 = (200 +% 100) / 2;
+        \\const r: f32 = 1 / 3;
+        \\const n: i8 = (100 * 100) / 100;
+        \\const big: u64 = @as(u32, 0xFFFFFFFF) * 2;
+        \\fn g(x: u8) void {
+        \\    const y: u32 = x + 1;
+        \\    _ = y;
+        \\}
+    , &.{
+        // 按结果类型 u8 计算时左移丢掉了高位，得 15
+        .{ "m", "u8 = 255" },
+        .{ "w", "u8 = 150" },
+        .{ "r", "f32 = 0" },
+        .{ "n", "i8 = 100" },
+        // u32 的乘法溢出（编译错误）：没有值，不能按 u64 计算
+        .{ "big", "u64" },
+        .{ "x + 1", "u8" },
+    });
+}
+
 test "comptime arguments are coerced to their instantiated parameter types" {
     try expectTypes(
         \\const E = enum { a, b };

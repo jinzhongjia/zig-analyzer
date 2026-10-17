@@ -1627,20 +1627,11 @@ const Evaluator = struct {
                 return Val.ofType(try ip.errorSet(ev.a, names));
             },
             else => {
-                // 操作数的期望类型：结果类型去掉 error union 与 optional，且只取数值类型
-                // （`self.index = start + 1` 中 index 为 `?usize`，`+` 的操作数是 usize）
-                var operand_want = want;
-                while (operand_want) |t| switch (ip.key(t)) {
-                    .error_union_type => |eu| operand_want = eu.payload,
-                    .optional_type => |c| operand_want = c,
-                    else => break,
-                };
-                if (operand_want) |t| if (!ip.isInt(t) and !ip.isFloat(t) and ip.key(t) != .vector_type) {
-                    operand_want = null;
-                };
-                const lhs = try ev.eval(f, lhs_e, operand_want);
+                // 与编译器一致，操作数没有结果类型：`const m: u8 = (0xFF << 4) >> 4` 按 comptime_int 计算，
+                // 结果转换为 u8 时为 255。右侧以左侧的类型作为字面量的期望，与 peer 的结果相同
+                const lhs = try ev.eval(f, lhs_e, null);
                 const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
-                const rhs = try ev.eval(f, rhs_e, if (is_shift) null else if (lhs.ty != .comptime_int_type) lhs.ty else operand_want);
+                const rhs = try ev.eval(f, rhs_e, if (is_shift or lhs.ty == .comptime_int_type) null else lhs.ty);
                 // bool 的位运算
                 if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
                     const x = (try ev.condition(lhs)).yes;

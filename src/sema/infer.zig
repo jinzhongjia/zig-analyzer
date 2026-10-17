@@ -1786,17 +1786,17 @@ const Inferrer = struct {
                 if (try inf.compare(op, lhs, rhs)) |result| return boolValue(result);
                 return .{ .ty = .bool_type };
             },
-            // `<<` / `>>` 的右侧按 `Log2Int(T)` 推导，`<<|` 的右侧没有结果类型（与编译器一致）
+            // 与编译器一致：左侧没有结果类型；`<<` / `>>` 的右侧按 `Log2Int(T)` 推导，`<<|` 的右侧没有结果类型
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .angle_bracket_angle_bracket_left_pipe => {
-                const lhs = try inf.infer(lhs_e, expected);
+                const lhs = try inf.infer(lhs_e, null);
                 const rhs = try inf.infer(rhs_e, if (op == .angle_bracket_angle_bracket_left_pipe) null else try inf.log2IntType(lhs.ty));
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
             // 指针运算（与编译器一致）：`[*]T ± usize` 仍为原指针类型，两个指针相减为 usize
             .plus, .minus => {
-                const lhs = try inf.infer(lhs_e, expected);
-                if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e, expected);
+                const lhs = try inf.infer(lhs_e, null);
+                if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e);
                 const rhs = try inf.infer(rhs_e, .usize_type);
                 if (isNonSlicePtr(ip, rhs.ty)) return .{ .ty = if (op == .minus) .usize_type else .unknown };
                 return .{ .ty = if (isManyPtr(ip, lhs.ty)) lhs.ty else .unknown };
@@ -1810,13 +1810,15 @@ const Inferrer = struct {
                 const names = try std.mem.concat(inf.scratch, []const u8, &.{ x, y });
                 return TypedValue.ofType(try ip.errorSet(inf.scratch, names));
             },
-            else => return inf.arith(op, try inf.infer(lhs_e, expected), rhs_e, expected),
+            else => return inf.arith(op, try inf.infer(lhs_e, null), rhs_e),
         }
     }
 
-    /// 算术与位运算：两侧 peer；两侧都是已知整数时按结果类型的位宽折叠
-    fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId, expected: ?Index) Error!TypedValue {
-        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else expected);
+    /// 算术与位运算：两侧 peer；两侧都是已知整数时按 peer 类型的位宽折叠。与编译器一致，操作数没有
+    /// 结果类型（`const m: u8 = (0xFF << 4) >> 4` 按 comptime_int 计算得 255，之后才转换为 u8）；
+    /// 右侧以左侧的类型作为字面量的期望，与 peer 的结果相同
+    fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
+        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
         return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
     }
 
