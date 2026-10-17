@@ -13,6 +13,8 @@ const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
 const mem = @import("../util/mem.zig");
 
+const log = std.log.scoped(.live);
+
 pub const Diagnostic = struct {
     /// 字节偏移区间（ErrorBundle 的 span_start / span_end）
     start: u32,
@@ -47,14 +49,124 @@ pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
-/// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。
+/// 估计的嵌套深度（`nestingEstimate`）不超过它时在当前线程解析与 AstGen。官方实现逐层递归，
+/// Debug 构建中每层约用 16 KB 栈，而当前线程可能已处在较深的 query 嵌套中
+const inline_depth = 256;
+/// 不超过它时在专用的大栈线程上解析与 AstGen；更深的文本不做（官方 `zig ast-check` 同样会耗尽栈），
+/// 没有诊断，import 按 token 收集
+const thread_depth = 8192;
+const thread_stack_size = 512 * 1024 * 1024;
+
+/// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。按嵌套深度选择执行的线程，深层嵌套的文本
+/// 不会耗尽原生栈
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
+    const source = try gpa.dupeSentinel(u8, text, 0);
+    defer gpa.free(source);
+    const depth = try nestingEstimate(gpa, source);
+    if (depth <= inline_depth) return checkSource(gpa, source, mode);
+    if (depth <= thread_depth) {
+        var result: Allocator.Error!*Result = undefined;
+        if (std.Thread.spawn(.{ .stack_size = thread_stack_size }, checkInto, .{ gpa, source, mode, &result })) |thread| {
+            thread.join();
+            return result;
+        } else |err| log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});
+    }
+    return importsOnly(gpa, source, mode);
+}
+
+fn checkInto(gpa: Allocator, source: [:0]const u8, mode: Mode, result: *Allocator.Error!*Result) void {
+    result.* = checkSource(gpa, source, mode);
+}
+
+/// 官方解析器与 AstGen 递归深度的上界估计。每层括号算一层；同一层括号内，以 `;` 或 `,` 分隔的一段中
+/// 每个 token 与括号对都可能使嵌套再深一层（运算符链、前缀与后缀、else-if 链）。`}` 之后接着的是新的
+/// 语句或声明（标识符、字面量、else 等之外的关键字）时，这一段重新计数。超过 `thread_depth` 时提前返回
+fn nestingEstimate(gpa: Allocator, source: [:0]const u8) Allocator.Error!u32 {
+    var segments: std.ArrayList(u32) = .empty;
+    defer segments.deinit(gpa);
+    try segments.append(gpa, 0);
+    var tokenizer: std.zig.Tokenizer = .init(source);
+    var total: u32 = 0;
+    var max: u32 = 0;
+    var after_brace = false;
+    while (true) {
+        const tag = tokenizer.next().tag;
+        if (tag == .eof) return max;
+        const top = &segments.items[segments.items.len - 1];
+        if (after_brace and startsStatement(tag)) {
+            total -= top.*;
+            top.* = 0;
+        }
+        after_brace = false;
+        switch (tag) {
+            .l_paren, .l_bracket, .l_brace => {
+                top.* += 1;
+                total += 2;
+                try segments.append(gpa, 0);
+            },
+            .r_paren, .r_bracket, .r_brace => {
+                if (segments.items.len > 1) total -= 1 + segments.pop().?;
+                after_brace = tag == .r_brace;
+            },
+            .semicolon, .comma => {
+                total -= top.*;
+                top.* = 0;
+            },
+            else => {
+                top.* += 1;
+                total += 1;
+            },
+        }
+        max = @max(max, total);
+        if (max > thread_depth) return max;
+    }
+}
+
+/// `}` 之后的这个 token 不能接续表达式，只能开始新的语句或声明
+fn startsStatement(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .keyword_else, .keyword_orelse, .keyword_catch, .keyword_and, .keyword_or => false,
+        .identifier, .builtin, .number_literal, .string_literal, .multiline_string_literal_line, .char_literal, .doc_comment, .container_doc_comment => true,
+        else => std.zig.Token.keywords.has(tag.lexeme() orelse return false),
+    };
+}
+
+/// 不做 AstGen 时的结果：没有诊断，import 按 token 收集（AstGen 记录的正是 `@import` 的字符串字面量）
+fn importsOnly(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var imports: std.ArrayList([]const u8) = .empty;
+    if (mode == .zig) {
+        var tokenizer: std.zig.Tokenizer = .init(source);
+        // 前两个 token：`@import` 与 `(`
+        var prev: [2]std.zig.Token = @splat(.{ .tag = .invalid, .loc = .{ .start = 0, .end = 0 } });
+        while (true) {
+            const t = tokenizer.next();
+            if (t.tag == .eof) break;
+            if (t.tag == .string_literal and prev[1].tag == .l_paren and prev[0].tag == .builtin and
+                std.mem.eql(u8, source[prev[0].loc.start..prev[0].loc.end], "@import"))
+            {
+                const name = std.zig.string_literal.parseAlloc(arena, source[t.loc.start..t.loc.end]) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidLiteral => null,
+                };
+                if (name) |n| try imports.append(arena, n);
+            }
+            prev = .{ prev[1], t };
+        }
+    }
+    const result = try arena.create(Result);
+    result.* = .{ .arena = undefined, .items = &.{}, .imports = imports.items };
+    result.arena = arena_state.state;
+    return result;
+}
+
+fn checkSource(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const source = try gpa.dupeSentinel(u8, text, 0);
-    defer gpa.free(source);
     var tree = try Ast.parse(gpa, source, .{ .mode = switch (mode) {
         .zig => .zig,
         .zon => .zon,
@@ -469,6 +581,38 @@ test "errors match zig ast-check" {
 test "ZON" {
     try expectMessages(".{ .a = 1 }", .zon, &.{});
     try expectMessages(".{ .a = 1, .a = 2 }", .zon, &.{"duplicate struct field name"});
+}
+
+test "deeply nested text: AstGen on a large stack, imports only beyond the limit" {
+    const gpa = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    // 3000 项的加法链：官方 AstGen 在普通线程上耗尽栈（进程崩溃），在大栈线程上照常得到诊断
+    try src.appendSlice(gpa, "const std = @import(\"std\");\nfn f() void {\n    var unused = 1;\n}\nconst x = ");
+    for (0..3000) |_| try src.appendSlice(gpa, "1 + ");
+    try src.appendSlice(gpa, "1;\n");
+    {
+        const r = try check(gpa, src.items, .zig);
+        defer r.destroy(gpa);
+        try testing.expectEqual(1, r.items.len);
+        try testing.expectEqualStrings("unused local variable", r.items[0].message);
+        try testing.expectEqual(1, r.imports.len);
+    }
+    // 超过上限：不做 AstGen，没有诊断，import 按 token 收集
+    src.clearRetainingCapacity();
+    try src.appendSlice(gpa, "const std = @import(\"std\");\nconst x = ");
+    for (0..20000) |_| try src.append(gpa, '(');
+    try src.append(gpa, '1');
+    for (0..20000) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa, ";\nfn g() void {\n    _ = @import(\"a\\x2ezig\");\n}\n");
+    {
+        const r = try check(gpa, src.items, .zig);
+        defer r.destroy(gpa);
+        try testing.expectEqual(0, r.items.len);
+        try testing.expectEqual(2, r.imports.len);
+        try testing.expectEqualStrings("std", r.imports[0]);
+        try testing.expectEqualStrings("a.zig", r.imports[1]);
+    }
 }
 
 test "ZIR import list matches the compiler" {
