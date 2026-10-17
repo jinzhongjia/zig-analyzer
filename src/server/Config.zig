@@ -155,15 +155,18 @@ pub fn parseProject(gpa: Allocator, text: []const u8) error{ OutOfMemory, Invali
     defer value.deinit();
     var c = try parse(gpa, value.value);
     errdefer c.deinit(gpa);
-    var arena = c.arena.promote(gpa);
-    defer c.arena = arena.state;
-    const a = arena.allocator();
-    var warnings: std.ArrayList([]const u8) = .fromOwnedSlice(@constCast(c.warnings));
-    inline for (settings, 0..) |s, si| if (comptime !isProjectSetting(s.field)) if (c.present.isSet(si)) {
-        try warnings.append(a, try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }));
-        c.present.unset(si);
-    };
-    c.warnings = warnings.items;
+    // arena 的状态须在 `return c` 复制返回值之前写回：defer 在复制之后才执行
+    {
+        var arena = c.arena.promote(gpa);
+        defer c.arena = arena.state;
+        const a = arena.allocator();
+        var warnings: std.ArrayList([]const u8) = .fromOwnedSlice(@constCast(c.warnings));
+        inline for (settings, 0..) |s, si| if (comptime !isProjectSetting(s.field)) if (c.present.isSet(si)) {
+            try warnings.append(a, try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }));
+            c.present.unset(si);
+        };
+        c.warnings = warnings.items;
+    }
     return c;
 }
 
@@ -316,4 +319,16 @@ test "project file: only project settings apply and override the client" {
     try testing.expectEqual(.debug, client.log_level);
 
     try testing.expectError(error.InvalidConfig, parseProject(testing.allocator, "{\"build\": "));
+}
+
+test "project file: the parsed config owns the memory of its warnings" {
+    // 防止返回的配置带着加入警告之前的 arena 状态：分配器不能原地扩大时，警告所在的内存块在释放时泄漏
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+    const gpa = failing.allocator();
+    var project = try parseProject(gpa,
+        \\{"build": {"enable": false}, "diagnostics": {"compiler": false}, "log": {"level": "err"}}
+    );
+    defer project.deinit(gpa);
+    try testing.expectEqual(2, project.warnings.len);
+    try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.json", project.warnings[0]);
 }

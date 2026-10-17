@@ -50,17 +50,26 @@ pub fn query(gpa: Allocator, io: Io, zig_exe: ?[]const u8) QueryError!ZigEnv {
         .exited => |code| if (code != 0) return error.ZigEnvFailed,
         else => return error.ZigEnvFailed,
     }
-    var env = parse(gpa, result.stdout) catch |err| switch (err) {
+    const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", gpa) catch return error.ZigEnvFailed;
+    defer gpa.free(cwd);
+    return fromOutput(gpa, result.stdout, cwd) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => return error.ZigEnvFailed,
     };
+}
+
+/// 解析 `zig env` 的输出。`zig env` 原样输出 ZIG_GLOBAL_CACHE_DIR 等环境变量，可能是相对路径：
+/// 按当前目录 `cwd` 转为绝对路径
+fn fromOutput(gpa: Allocator, text: []const u8, cwd: []const u8) error{ OutOfMemory, ParseZon }!ZigEnv {
+    var env = try parse(gpa, text);
     errdefer env.deinit(gpa);
-    // `zig env` 原样输出 ZIG_GLOBAL_CACHE_DIR 等环境变量，可能是相对路径：按当前目录转为绝对路径
-    var arena = env.arena.promote(gpa);
-    defer env.arena = arena.state;
-    const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", arena.allocator()) catch return error.ZigEnvFailed;
-    inline for (.{ "lib_dir", "std_dir", "global_cache_dir" }) |field| {
-        @field(env, field) = try absolute(arena.allocator(), cwd, @field(env, field));
+    // arena 的状态须在 `return env` 复制返回值之前写回：defer 在复制之后才执行
+    {
+        var arena = env.arena.promote(gpa);
+        defer env.arena = arena.state;
+        inline for (.{ "lib_dir", "std_dir", "global_cache_dir" }) |field| {
+            @field(env, field) = try absolute(arena.allocator(), cwd, @field(env, field));
+        }
     }
     return env;
 }
@@ -128,6 +137,24 @@ test parse {
     try std.testing.expectEqualStrings("/opt/zig/lib/std", env.std_dir);
     try std.testing.expectEqualStrings("C:\\Users\\u\\AppData\\Local\\zig", env.global_cache_dir);
     try std.testing.expectEqualStrings("0.17.0", env.version);
+}
+
+test fromOutput {
+    // 防止返回的环境带着转换路径之前的 arena 状态：分配器不能原地扩大时，绝对路径所在的内存块在释放时泄漏
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const gpa = failing.allocator();
+    // 足够长的当前目录使绝对路径放不进 arena 已有的内存块
+    const root = if (builtin.os.tag == .windows) "C:\\" else "/";
+    const cwd = try std.testing.allocator.alloc(u8, root.len + 8192);
+    defer std.testing.allocator.free(cwd);
+    @memcpy(cwd[0..root.len], root);
+    @memset(cwd[root.len..], 'w');
+    var env = try fromOutput(gpa,
+        \\.{ .zig_exe = "zig", .lib_dir = "lib", .std_dir = "lib/std", .global_cache_dir = ".cache", .version = "0.17.0" }
+    , cwd);
+    defer env.deinit(gpa);
+    try std.testing.expect(std.fs.path.isAbsolute(env.std_dir));
+    try std.testing.expect(std.mem.startsWith(u8, env.global_cache_dir, cwd));
 }
 
 test "query local zig (skipped when zig is not in PATH)" {
