@@ -9,6 +9,7 @@ const ModuleGraph = @import("../names/ModuleGraph.zig");
 const queries = @import("queries.zig");
 const render = @import("render.zig");
 const InternPool = @import("InternPool.zig");
+const value = @import("value.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 /// `needle` 第 `nth` 次出现处：名字与绑定重合时取绑定的类型，否则取区间恰好为 `needle` 的表达式的类型
@@ -636,7 +637,7 @@ test "oversized layouts degrade to unknown instead of overflowing" {
 
 test "container layouts match the compiler" {
     // 期望值为 zig 0.17.0 在 x86_64-linux 上的结果
-    try expectTypes(
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
         \\const A = struct { a: u8, b: u32, c: u16 };
         \\const B = extern struct { a: u8, b: u32, c: u16 };
         \\const C = packed struct { a: u3, b: u5, c: u16 };
@@ -957,6 +958,126 @@ test "vector layouts follow the backend and CPU features" {
         .{ "v2u8", "comptime_int" },
         .{ "bits", "comptime_int" },
     });
+}
+
+/// 目标 `arch_os_abi` 与 CPU（同编译器的 `-target` / `-mcpu`）的目标参数：指针位宽与标量类型的布局规则
+fn targetOf(arch_os_abi: []const u8, cpu: ?[]const u8) !InternPool.Target {
+    const query = try std.Target.Query.parse(.{ .arch_os_abi = arch_os_abi, .cpu_features = cpu });
+    const t = try std.zig.system.resolveTargetQuery(testing.io, query);
+    return .{ .pointer_bits = t.ptrBitWidth(), .scalar_abi = .of(&t) };
+}
+
+/// 布局随目标变化的类型：`s_T` / `a_T` 为 `@sizeOf(T)` / `@alignOf(T)`
+const target_layout_src =
+    \\const S = struct { a: u8, b: u64, c: u16, d: f80 };
+    \\fn g(c: bool) void {
+    \\    const s_u8 = @sizeOf(u8);
+    \\    const s_u32 = @sizeOf(u32);
+    \\    const a_u32 = @alignOf(u32);
+    \\    const s_u24 = @sizeOf(u24);
+    \\    const a_u24 = @alignOf(u24);
+    \\    const s_u64 = @sizeOf(u64);
+    \\    const a_u64 = @alignOf(u64);
+    \\    const s_u128 = @sizeOf(u128);
+    \\    const a_u128 = @alignOf(u128);
+    \\    const s_f80 = @sizeOf(f80);
+    \\    const a_f80 = @alignOf(f80);
+    \\    const s_f128 = @sizeOf(f128);
+    \\    const a_f128 = @alignOf(f128);
+    \\    const s_c_int = @sizeOf(c_int);
+    \\    const a_c_int = @alignOf(c_int);
+    \\    const s_c_longdouble = @sizeOf(c_longdouble);
+    \\    const a_c_longdouble = @alignOf(c_longdouble);
+    \\    const s_S = @sizeOf(S);
+    \\    const a_S = @alignOf(S);
+    \\    const max_c_uint = @as(c_uint, 0) -% 1;
+    \\    const peer = if (c) @as(f32, 1) else @as(f64, 2);
+    \\    _ = .{ s_u8, s_u32, a_u32, s_u24, a_u24, s_u64, a_u64, s_u128, a_u128, s_f80, a_f80, s_f128, a_f128, s_c_int, a_c_int, s_c_longdouble, a_c_longdouble, s_S, a_S, max_c_uint, peer };
+    \\}
+;
+
+const target_layout_types = [_][]const u8{ "u24", "u64", "u128", "f80", "f128", "c_int", "c_longdouble", "S" };
+
+/// `target_layout_src` 在目标上的结果：`expected[i]` 为 `target_layout_types[i]` 的大小与对齐（null 为未知）
+fn expectTargetLayouts(target: InternPool.Target, expected: [target_layout_types.len]?[2]u64, max_c_uint: u64) !void {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try w.setTarget(target);
+    const src = target_layout_src;
+    const f = try w.add("/p/main.zig", src);
+    const a = w.arena.allocator();
+    for (target_layout_types, expected) |name, e| {
+        for ([_][]const u8{ "s_", "a_" }, 0..) |prefix, i| {
+            const binding = try std.mem.concat(a, u8, &.{ prefix, name });
+            const want = if (e) |v| try std.fmt.allocPrint(a, "comptime_int = {d}", .{v[i]}) else "comptime_int";
+            testing.expectEqualStrings(want, try typeAt(&w, f.file, src, binding, 0)) catch |err| {
+                std.debug.print("type of `{s}`\n", .{binding});
+                return err;
+            };
+        }
+    }
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "c_uint = {d}", .{max_c_uint}), try typeAt(&w, f.file, src, "max_c_uint", 0));
+}
+
+test "integer, float and C type layouts follow the target" {
+    // 期望值为 zig 0.17.0 的结果（`zig build-obj -target <目标>` 中以 @compileError 输出）。类型顺序：
+    // u24, u64, u128, f80, f128, c_int, c_longdouble, S
+    try expectTargetLayouts(try targetOf("x86_64-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 16, 16 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 16 } }, 4294967295);
+    // 整数的最大对齐为 4；long double 为 80 位、按 4 字节对齐
+    try expectTargetLayouts(try targetOf("x86-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 4 }, .{ 16, 4 }, .{ 12, 4 }, .{ 16, 16 }, .{ 4, 4 }, .{ 12, 4 }, .{ 24, 4 } }, 4294967295);
+    // 布局也取决于操作系统：Windows 上整数的最大对齐为 8
+    try expectTargetLayouts(try targetOf("x86-windows-gnu", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 12, 4 }, .{ 16, 16 }, .{ 4, 4 }, .{ 12, 4 }, .{ 24, 8 } }, 4294967295);
+    // long double 为 128 位：f80 按软浮点（u64 与 u16）布局
+    try expectTargetLayouts(try targetOf("aarch64-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 16, 8 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 8 } }, 4294967295);
+    try expectTargetLayouts(try targetOf("arm-linux-musleabihf", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 4, 4 }, .{ 8, 8 }, .{ 32, 8 } }, 4294967295);
+    try expectTargetLayouts(try targetOf("riscv32-freestanding-none", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 8 } }, 4294967295);
+    // AVR：整数与浮点按 1 字节对齐，c_int 为 16 位；std 没有定义 32 位 long double 的大小，为未知
+    try expectTargetLayouts(try targetOf("avr-freestanding-none", "atmega328p"), .{ .{ 3, 1 }, .{ 8, 1 }, .{ 16, 1 }, .{ 10, 1 }, .{ 16, 1 }, .{ 2, 1 }, null, .{ 21, 1 } }, 65535);
+    try expectTargetLayouts(try targetOf("msp430-freestanding-none", null), .{ .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 10, 2 }, .{ 16, 2 }, .{ 2, 2 }, .{ 8, 2 }, .{ 22, 2 } }, 65535);
+}
+
+test "type layouts with several targets keep only what the targets agree on" {
+    const x86_64 = try targetOf("x86_64-linux-musl", null);
+    const x86 = try targetOf("x86-linux-musl", null);
+    const src = target_layout_src;
+    // 整数的最大对齐为 16 与 4：不超过 4 字节的整数仍有确定的布局；f128 在两者上相同
+    try expectTypesTargeted(.{ .pointer_bits = null, .scalar_abi = x86_64.scalar_abi.merge(x86.scalar_abi) }, src, &.{
+        .{ "s_u32", "comptime_int = 4" },
+        .{ "a_u32", "comptime_int = 4" },
+        .{ "s_u24", "comptime_int = 4" },
+        .{ "a_u64", "comptime_int" },
+        .{ "s_S", "comptime_int" },
+        .{ "a_f80", "comptime_int" },
+        .{ "a_f128", "comptime_int = 16" },
+        .{ "s_c_int", "comptime_int = 4" },
+        .{ "max_c_uint", "c_uint = 4294967295" },
+    });
+    // 目标未知：只有不超过 1 字节的整数有确定的布局；浮点的位宽与目标无关
+    try expectTypesTargeted(.{ .pointer_bits = null, .scalar_abi = .unknown }, src, &.{
+        .{ "s_u8", "comptime_int = 1" },
+        .{ "s_u32", "comptime_int" },
+        .{ "s_f80", "comptime_int" },
+        .{ "s_c_int", "comptime_int" },
+        .{ "max_c_uint", "c_uint" },
+        .{ "peer", "f64" },
+    });
+}
+
+test "integer layouts match std.zig.target for every width" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    for ([_][]const u8{ "x86_64-linux-musl", "x86-linux-musl", "x86-windows-gnu", "arm-linux-musleabihf", "avr-freestanding-none", "msp430-freestanding-none", "xtensa-freestanding-none" }) |triple| {
+        const t = try std.zig.system.resolveTargetQuery(testing.io, try .parse(.{ .arch_os_abi = triple }));
+        try w.setTarget(.{ .scalar_abi = .of(&t) });
+        for (1..129) |i| {
+            const bits: u16 = @intCast(i);
+            const l = value.intLayout(&w.ip, bits).?;
+            try testing.expectEqual(std.zig.target.intAlignment(&t, bits), l.alignment);
+            try testing.expectEqual(std.zig.target.intByteSize(&t, bits), l.size);
+        }
+    }
 }
 
 test "tuple and anonymous struct literals have comptime fields like the compiler" {

@@ -2738,7 +2738,7 @@ const Evaluator = struct {
         switch (ip.key(t)) {
             .optional_type => |c| return value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
             .array_type => |a| return value.arrayLayout(try ev.typeLayout(a.child, depth + 1) orelse return null, a, try ev.hasBitRepr(a.child)),
-            .error_union_type => |eu| return value.errorUnionLayout(try ev.typeLayout(eu.payload, depth + 1) orelse return null),
+            .error_union_type => |eu| return value.errorUnionLayout(ip, try ev.typeLayout(eu.payload, depth + 1) orelse return null),
             .container_type, .reified_type, .union_tag_type, .tuple_type, .anon_struct_type => {},
             else => return value.typeLayout(ip, t),
         }
@@ -2891,7 +2891,7 @@ const Evaluator = struct {
             }
             // 显式的 backing 整数须与各字段的位宽之和相等
             if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
-            return .{ .layout = value.intLayout(std.math.cast(u16, bits) orelse return null) orelse return null, .bit_offsets = offsets };
+            return .{ .layout = value.intLayout(ev.ip, std.math.cast(u16, bits) orelse return null) orelse return null, .bit_offsets = offsets };
         }
         const order = try ev.a.alloc(u32, fields.len);
         var struct_align: u64 = 1;
@@ -2942,7 +2942,7 @@ const Evaluator = struct {
                 const bits = fields[0].layout.?.bits orelse return null;
                 for (fields[1..]) |fl| if ((fl.layout.?.bits orelse return null) != bits) return null;
                 if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
-                return value.intLayout(std.math.cast(u16, bits) orelse return null);
+                return value.intLayout(ev.ip, std.math.cast(u16, bits) orelse return null);
             },
             .@"extern" => return payload,
             .auto => {},
@@ -2953,7 +2953,7 @@ const Evaluator = struct {
             try ev.typeLayout(tag_ty, depth + 1) orelse return null
         else if (try ev.safetyTagged(t) orelse return null)
             // 隐藏标签与 `union(enum)` 的标签相同：容纳字段序号的最小无符号整数
-            value.intLayout(@intCast(64 - @clz(@as(u64, fields.len - 1)))) orelse return null
+            value.intLayout(ev.ip, @intCast(64 - @clz(@as(u64, fields.len - 1)))) orelse return null
         else
             return payload;
         const alignment = @max(tag.alignment, payload_align);
@@ -3076,7 +3076,7 @@ const Evaluator = struct {
                 .type, .void, .bool, .noreturn, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .{ @tagName(s), .void_value },
                 .anyerror => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", .null_value }}) },
                 .anyopaque => .{ "opaque", try ev.structValue(try ev.member(type_ty, "Opaque"), &.{.{ "decl_names", try ev.namesValue(&.{}) }}) },
-                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), (value.typeLayout(ip, t) orelse return error.Abort).bits orelse return error.Abort) }}) },
+                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), value.floatBits(ip, t).?) }}) },
                 else => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t) orelse return error.Abort) },
             },
             .int_type => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t).?) },

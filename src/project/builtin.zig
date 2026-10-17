@@ -120,10 +120,7 @@ pub const VectorFacts = struct {
 pub fn vectorFacts(text: []const u8) ?VectorFacts {
     const backend = tagAfter(text, "pub const zig_backend = std.lang.CompilerBackend.") orelse return null;
     const arch = tagAfter(text, "    .arch = .") orelse return null;
-    // `cpu.features` 的成员：`featureSet(&.{` 与 `})` 之间，每行一个
-    const start = (std.mem.indexOf(u8, text, "featureSet(&.{") orelse return null) + "featureSet(&.{".len;
-    const end = std.mem.indexOfPos(u8, text, start, "})") orelse return null;
-    const features = text[start..end];
+    const features = featureList(text) orelse return null;
     return .{
         .backend = std.meta.stringToEnum(std.lang.CompilerBackend, backend) orelse return null,
         .arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null,
@@ -133,12 +130,116 @@ pub fn vectorFacts(text: []const u8) ?VectorFacts {
     };
 }
 
+/// `cpu.features` 的成员：`featureSet(&.{` 与 `})` 之间，每行一个
+fn featureList(text: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, text, "featureSet(&.{") orelse return null) + "featureSet(&.{".len;
+    const end = std.mem.indexOfPos(u8, text, start, "})") orelse return null;
+    return text[start..end];
+}
+
 fn hasFeature(features: []const u8, name: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, features, " \n,");
     while (it.next()) |tok| {
-        if (tok.len == name.len + 1 and tok[0] == '.' and std.mem.eql(u8, tok[1..], name)) return true;
+        if (std.mem.eql(u8, featureName(tok) orelse continue, name)) return true;
     }
     return false;
+}
+
+/// 特性列表中一项的名字：`.avx`；不是合法标识符的名字写作 `.@"64bit"`。其他写法为 null
+fn featureName(tok: []const u8) ?[]const u8 {
+    if (tok.len >= 4 and std.mem.startsWith(u8, tok, ".@\"") and tok[tok.len - 1] == '"') return tok[3 .. tok.len - 1];
+    if (tok.len >= 2 and tok[0] == '.' and tok[1] != '@') return tok[1..];
+    return null;
+}
+
+/// builtin.zig 中的目标：架构、操作系统、ABI 与 CPU 特性取自文件；CPU 型号、系统版本范围与对象格式
+/// 取该架构与系统的默认值（类型布局等规则不依赖它们）
+pub fn target(text: []const u8) ?std.Target {
+    const arch = std.meta.stringToEnum(std.Target.Cpu.Arch, tagAfter(text, "    .arch = .") orelse return null) orelse return null;
+    const abi = std.meta.stringToEnum(std.Target.Abi, tagAfter(text, "pub const abi: std.Target.Abi = .") orelse return null) orelse return null;
+    const os_start = std.mem.indexOf(u8, text, "pub const os: std.Target.Os = .{") orelse return null;
+    const os_tag = std.meta.stringToEnum(std.Target.Os.Tag, tagAfter(text[os_start..], "    .tag = .") orelse return null) orelse return null;
+    const list = featureList(text) orelse return null;
+    // 只遍历一次列表：架构的特性有上百个，逐个在列表中查找要把列表扫描上百遍
+    var features: std.Target.Cpu.Feature.Set = .empty;
+    const all = arch.allFeaturesList();
+    var it = std.mem.tokenizeAny(u8, list, " \n,");
+    while (it.next()) |tok| {
+        const name = featureName(tok) orelse continue;
+        for (all) |f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                features.addFeature(f.index);
+                break;
+            }
+        }
+    }
+    return .{
+        .cpu = .{ .arch = arch, .model = .generic(arch), .features = features },
+        .os = os_tag.defaultVersionRange(arch, abi),
+        .abi = abi,
+        .ofmt = .default(os_tag, arch),
+    };
+}
+
+test target {
+    const text =
+        \\pub const abi: std.Target.Abi = .musl;
+        \\pub const cpu: std.Target.Cpu = .{
+        \\    .arch = .x86,
+        \\    .model = &std.Target.x86.cpu.i686,
+        \\    .features = std.Target.x86.featureSet(&.{
+        \\        .@"32bit_mode",
+        \\        .cmov,
+        \\        .soft_float,
+        \\        .x87,
+        \\    }),
+        \\};
+        \\pub const os: std.Target.Os = .{
+        \\    .tag = .linux,
+        \\    .version_range = .{ .linux = .{
+        \\        .range = .{
+        \\            .min = .{
+        \\                .major = 5,
+        \\                .minor = 10,
+        \\                .patch = 0,
+        \\            },
+        \\        },
+        \\    }},
+        \\};
+    ;
+    const t = target(text).?;
+    try std.testing.expectEqual(std.Target.Cpu.Arch.x86, t.cpu.arch);
+    try std.testing.expectEqual(std.Target.Os.Tag.linux, t.os.tag);
+    try std.testing.expectEqual(std.Target.Abi.musl, t.abi);
+    try std.testing.expect(t.cpu.has(.x86, .soft_float) and t.cpu.has(.x86, .@"32bit_mode") and !t.cpu.has(.x86, .sse));
+    try std.testing.expectEqual(32, t.ptrBitWidth());
+}
+
+test "malformed feature names are skipped" {
+    // 回归：手工改坏的 `.@"` 不能使切片越界
+    const text =
+        \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
+        \\pub const abi: std.Target.Abi = .gnu;
+        \\pub const cpu: std.Target.Cpu = .{
+        \\    .arch = .x86_64,
+        \\    .model = &std.Target.x86.cpu.x86_64,
+        \\    .features = std.Target.x86.featureSet(&.{
+        \\        .@",
+        \\        .@"",
+        \\        .@"64bit,
+        \\        .,
+        \\        avx2,
+        \\        .avx,
+        \\    }),
+        \\};
+        \\pub const os: std.Target.Os = .{
+        \\    .tag = .linux,
+        \\};
+    ;
+    const f = vectorFacts(text).?;
+    try std.testing.expect(f.avx and !f.avx512f);
+    const t = target(text).?;
+    try std.testing.expect(t.cpu.has(.x86, .avx) and !t.cpu.has(.x86, .avx2) and !t.cpu.has(.x86, .@"64bit"));
 }
 
 test vectorFacts {

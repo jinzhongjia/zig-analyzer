@@ -2372,8 +2372,8 @@ const Inferrer = struct {
             }
             // 浮点之间取位宽较大者（c_longdouble 的位宽取决于目标）
             if (ip.isFloat(cur) and ip.isFloat(t)) {
-                const x = (value.typeLayout(ip, cur) orelse return .unknown).bits orelse return .unknown;
-                const y = (value.typeLayout(ip, t) orelse return .unknown).bits orelse return .unknown;
+                const x = value.floatBits(ip, cur) orelse return .unknown;
+                const y = value.floatBits(ip, t) orelse return .unknown;
                 if (y > x) result = t;
                 continue;
             }

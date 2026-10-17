@@ -4,8 +4,8 @@
 //! 相等判断返回 `?bool`：抽象参数、未知值，或身份取决于捕获值的泛型实例无法判断时为 null，
 //! 调用方据此不选择任何分支，而不是给出可能错误的结果。
 //!
-//! 与目标相关的大小（usize、指针）按目标的指针位宽（`InternPool.pointerBits`）计算；
-//! 位宽未知时（各模块的目标宽度不一致）这些值为未知。
+//! 与目标相关的大小与位宽（usize、指针、整数的对齐、浮点与 C 类型）按目标的参数（`InternPool.Target`）
+//! 计算；参数未知时（各模块的目标不一致）这些值为未知。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,19 +17,16 @@ const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 
 pub const IntInfo = struct { signed: bool, bits: u16 };
 
-/// 定宽整数类型的符号与位宽；comptime_int 与位宽取决于目标的 C 类型（c_char、c_long）为 null
+/// 定宽整数类型的符号与位宽（usize 与 C 整数类型按目标）；comptime_int 与位宽或符号未知的为 null
 pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
     return switch (ip.key(t)) {
         .int_type => |i| .{ .signed = i.signedness == .signed, .bits = i.bits },
         .simple_type => |s| switch (s) {
             .usize => .{ .signed = false, .bits = ip.pointerBits() orelse return null },
             .isize => .{ .signed = true, .bits = ip.pointerBits() orelse return null },
-            .c_short => .{ .signed = true, .bits = 16 },
-            .c_ushort => .{ .signed = false, .bits = 16 },
-            .c_int => .{ .signed = true, .bits = 32 },
-            .c_uint => .{ .signed = false, .bits = 32 },
-            .c_longlong => .{ .signed = true, .bits = 64 },
-            .c_ulonglong => .{ .signed = false, .bits = 64 },
+            .c_char => .{ .signed = (ip.scalarAbi().c_char_signedness orelse return null) == .signed, .bits = (scalarAbiOf(ip, s) orelse return null).bits },
+            .c_short, .c_int, .c_long, .c_longlong => .{ .signed = true, .bits = (scalarAbiOf(ip, s) orelse return null).bits },
+            .c_ushort, .c_uint, .c_ulong, .c_ulonglong => .{ .signed = false, .bits = (scalarAbiOf(ip, s) orelse return null).bits },
             else => null,
         },
         else => null,
@@ -219,8 +216,7 @@ pub fn minMaxFloatType(ip: *InternPool, types: []const Index) ?Index {
     for (types) |t| {
         if (t == .comptime_float_type or ip.isInt(t)) continue;
         if (!ip.isFloat(t)) return null;
-        // c_longdouble 的位宽取决于目标
-        const bits = (typeLayout(ip, t) orelse return null).bits orelse return null;
+        const bits = floatBits(ip, t) orelse return null;
         if (bits > best_bits) {
             best = t;
             best_bits = @intCast(bits);
@@ -280,6 +276,22 @@ fn FloatOf(comptime k: InternPool.Simple) type {
         .f64 => f64,
         .f80 => f80,
         else => f128,
+    };
+}
+
+/// 浮点类型的位宽（与布局无关）；c_longdouble 按目标，目标未知时为 null
+pub fn floatBits(ip: *InternPool, t: Index) ?u16 {
+    return switch (ip.key(t)) {
+        .simple_type => |s| switch (s) {
+            .f16 => 16,
+            .f32 => 32,
+            .f64 => 64,
+            .f80 => 80,
+            .f128 => 128,
+            .c_longdouble => (scalarAbiOf(ip, s) orelse return null).bits,
+            else => null,
+        },
+        else => null,
     };
 }
 
@@ -382,31 +394,28 @@ pub const Layout = struct {
     bits: ?u64,
 };
 
-const error_layout: Layout = .{ .size = 2, .alignment = 2, .bits = 16 };
+/// 错误码：按 u16 的整数布局
+fn errorLayout(ip: *InternPool) ?Layout {
+    return intLayout(ip, 16);
+}
 
-/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），按 x86_64 / aarch64 的 ABI。
+/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），按目标的规则（`InternPool.Target`）。
 /// 只处理不含容器的类型（容器由 `eval.typeLayout` 处理），其余为 null
 pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
     const pointer_bits: u64 = ip.pointerBits() orelse 0;
     const ptr_bytes: u64 = pointer_bits / 8;
     return switch (ip.key(t)) {
-        .int_type => |i| intLayout(i.bits),
+        .int_type => |i| intLayout(ip, i.bits),
         .simple_type => |s| switch (s) {
             .bool => .{ .size = 1, .alignment = 1, .bits = 1 },
             .void => .{ .size = 0, .alignment = 1, .bits = 0 },
-            .usize, .isize => if (pointer_bits == 0) null else intLayout(@intCast(pointer_bits)),
-            .c_short, .c_ushort => intLayout(16),
-            .c_int, .c_uint => intLayout(32),
-            .c_longlong, .c_ulonglong => intLayout(64),
-            .f16 => .{ .size = 2, .alignment = 2, .bits = 16 },
-            .f32 => .{ .size = 4, .alignment = 4, .bits = 32 },
-            .f64 => .{ .size = 8, .alignment = 8, .bits = 64 },
-            .f80 => .{ .size = 16, .alignment = 16, .bits = 80 },
-            .f128 => .{ .size = 16, .alignment = 16, .bits = 128 },
-            .anyerror => error_layout,
-            else => null,
+            .usize, .isize => if (pointer_bits == 0) null else intLayout(ip, @intCast(pointer_bits)),
+            // 表示为 u16
+            .f16 => intLayout(ip, 16),
+            .anyerror => errorLayout(ip),
+            else => if (scalarAbiOf(ip, s)) |l| .{ .size = l.size, .alignment = l.alignment, .bits = l.bits } else null,
         },
-        .error_set_type, .inferred_error_set => error_layout,
+        .error_set_type, .inferred_error_set => errorLayout(ip),
         .ptr_type => |p| if (pointer_bits == 0)
             null
         else if (p.size == .slice)
@@ -415,10 +424,28 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             .{ .size = ptr_bytes, .alignment = ptr_bytes, .bits = pointer_bits },
         .optional_type => |c| optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
         .array_type => |a| arrayLayout(typeLayout(ip, a.child) orelse return null, a, hasBitRepr(ip, a.child)),
-        .error_union_type => |eu| errorUnionLayout(typeLayout(ip, eu.payload) orelse return null),
+        .error_union_type => |eu| errorUnionLayout(ip, typeLayout(ip, eu.payload) orelse return null),
         .vector_type => |v| vectorLayout(ip, v.len, v.child),
         else => null,
     };
+}
+
+/// C 类型与 f32、f64、f80、f128 的布局（`InternPool.ScalarAbi`）；其余类型与目标未定义时为 null
+fn scalarAbiOf(ip: *InternPool, s: InternPool.Simple) ?InternPool.ScalarAbi.Scalar {
+    const k: InternPool.ScalarAbi.Type = switch (s) {
+        .c_char => .c_char,
+        .c_short, .c_ushort => .c_short,
+        .c_int, .c_uint => .c_int,
+        .c_long, .c_ulong => .c_long,
+        .c_longlong, .c_ulonglong => .c_longlong,
+        .c_longdouble => .c_longdouble,
+        .f32 => .f32,
+        .f64 => .f64,
+        .f80 => .f80,
+        .f128 => .f128,
+        else => return null,
+    };
+    return ip.scalarAbi().types.get(k);
 }
 
 /// `@Vector(len, T)`（`Type.abiAlignment` / `abiSize` 的 vector 分支）：规则取决于编译后端与 CPU 特性
@@ -474,13 +501,17 @@ pub fn bitsOf(bytes: u64) ?u64 {
     return std.math.mul(u64, bytes, 8) catch null;
 }
 
-/// 无符号整数类型（packed 容器的 backing 整数、枚举的标签）的布局
-pub fn intLayout(bits: u16) ?Layout {
+/// 定宽整数类型（含 packed 容器的 backing 整数、枚举的标签）的布局（`std.zig.target.intAlignment` /
+/// `intByteSize`）：对齐为不小于字节数的 2 的幂，且不超过目标的最大整数对齐。最大对齐在各模块中不一致、
+/// 且影响该位宽的对齐时为 null
+pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     if (bits == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
     if (bits > 128) return null;
     const bytes: u64 = (bits + 7) / 8;
-    // 不超过 8 字节时对齐为不小于字节数的 2 的幂，更宽的为 16
-    const alignment: u64 = if (bytes <= 1) 1 else if (bytes <= 2) 2 else if (bytes <= 4) 4 else if (bytes <= 8) 8 else 16;
+    const natural = std.math.ceilPowerOfTwoAssert(u64, bytes);
+    const max_align = ip.scalarAbi().max_int_align;
+    const alignment = @min(natural, max_align.min);
+    if (@min(natural, max_align.max) != alignment) return null;
     return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = bits };
 }
 
@@ -506,9 +537,10 @@ pub fn arrayLayout(elem: Layout, a: @FieldType(InternPool.Key, "array_type"), el
 }
 
 /// `E!T`：错误码与载荷，按两者中较大的对齐补齐
-pub fn errorUnionLayout(payload: Layout) ?Layout {
-    const alignment = @max(error_layout.alignment, payload.alignment);
-    const size = std.math.add(u64, error_layout.size, payload.size) catch return null;
+pub fn errorUnionLayout(ip: *InternPool, payload: Layout) ?Layout {
+    const err = errorLayout(ip) orelse return null;
+    const alignment = @max(err.alignment, payload.alignment);
+    const size = std.math.add(u64, err.size, payload.size) catch return null;
     return .{ .size = alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
 }
 

@@ -559,3 +559,45 @@ test "results depending on pointer width are recomputed when the target changes"
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "type layouts follow the project's target and are recomputed when it changes" {
+    // 期望值为 zig 0.17.0 的结果。两个目标的指针位宽与向量的规则相同，整数的最大对齐不同（4 与 16）
+    const text =
+        \\pub fn main() void {
+        \\    const align_u64 = @alignOf(u64);
+        \\    const size_s = @sizeOf(struct { a: u8, b: u64 });
+        \\    _ = .{ align_u64, size_s };
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = text },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    const x86 = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=x86-linux"]}}
+    , .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = x86 });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("```zig\nconst align_u64: comptime_int = 4\n```", try hoverText(&h, uri, text, "align_u64 ="));
+    try testing.expectEqualStrings("```zig\nconst size_s: comptime_int = 12\n```", try hoverText(&h, uri, text, "size_s ="));
+
+    const wasm = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=wasm32-freestanding"]}}
+    , .{});
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = wasm });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("```zig\nconst align_u64: comptime_int = 8\n```", try hoverText(&h, uri, text, "align_u64 ="));
+    try testing.expectEqualStrings("```zig\nconst size_s: comptime_int = 16\n```", try hoverText(&h, uri, text, "size_s ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

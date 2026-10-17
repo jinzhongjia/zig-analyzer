@@ -646,34 +646,39 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
     }
 }
 
-/// 与目标相关的值运算参数（指针位宽、向量的布局规则）：各模块的 builtin 一致时取该值，不一致时为未知
-/// （与大小相关的值为未知）；没有项目模块时取默认 builtin（本机）
-fn targetAbi(server: *Server, graph: *const ModuleGraph) za.sema.InternPool.Target {
+/// 与目标相关的值运算参数（指针位宽、向量与标量类型的布局规则）：取各模块的 builtin 中一致的部分，
+/// 不一致的为未知（与之相关的值为未知）；没有项目模块时取默认 builtin（本机）
+fn targetAbi(server: *Server, modules: []const ModuleGraph.Module, default_builtin: ?Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
     var result: za.sema.InternPool.Target = .{};
-    var any = false;
-    for (graph.modules) |m| {
+    // 参数相同的模块共用同一份 builtin，重复合并同一目标不改变结果：每份只读取、解析一次
+    var seen: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    defer seen.deinit(server.gpa);
+    for (modules) |m| {
         const file = m.builtin orelse continue;
+        if ((try seen.getOrPut(server.gpa, file)).found_existing) continue;
         const t = server.builtinTarget(file);
-        if (!any) {
+        if (seen.count() == 1) {
             result = t;
-            any = true;
             continue;
         }
         if (result.pointer_bits != t.pointer_bits) result.pointer_bits = null;
         if (result.vector_abi != t.vector_abi) result.vector_abi = .unknown;
+        result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
-    if (any) return result;
-    if (graph.default_builtin) |f| return server.builtinTarget(f);
+    if (seen.count() != 0) return result;
+    if (default_builtin) |f| return server.builtinTarget(f);
     return .{};
 }
 
 fn builtinTarget(server: *Server, file: Vfs.FileId) za.sema.InternPool.Target {
-    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return .{ .pointer_bits = null };
+    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return .{ .pointer_bits = null, .scalar_abi = .unknown };
     defer server.gpa.free(text);
     const facts = za.project.builtin.vectorFacts(text);
+    const target = za.project.builtin.target(text);
     return .{
         .pointer_bits = za.project.builtin.pointerBits(text),
         .vector_abi = if (facts) |f| .of(f.backend, f.arch, f.avx, f.avx512f, f.soft_float) else .unknown,
+        .scalar_abi = if (target) |*t| .of(t) else .unknown,
     };
 }
 
@@ -706,10 +711,10 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         defer server.env_mutex.unlock(server.io);
         break :blk if (server.default_builtin) |p| try server.vfs.intern(p) else null;
     };
+    const t = try server.targetAbi(b.modules.items, default_builtin);
     const graph = try server.gpa.create(ModuleGraph);
     errdefer server.gpa.destroy(graph);
     graph.* = try b.finish(std_root, default_builtin);
-    const t = server.targetAbi(graph);
     // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
     server.db.beginWrite();
     defer server.db.endWrite();
