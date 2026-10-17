@@ -203,6 +203,27 @@ test "recovery: garbage tokens in a statement do not affect later statements" {
     );
 }
 
+test "recovery: unwinding deep unclosed nesting and long else-if chains" {
+    const a = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    // 出错处逐层退出未闭合的嵌套，每层都查看 token 而不消费（查看次数上限过小时 panic）
+    for ([_][]const u8{ "f(", ".{", "a[", "(" }) |open| {
+        src.clearRetainingCapacity();
+        try src.appendSlice(a, "const x = ");
+        for (0..1000) |_| try src.appendSlice(a, open);
+        try src.appendSlice(a, "\nconst y = 1;\n");
+        try expectLossless(src.items);
+    }
+    // 合法代码：表达式形式的 else-if 链在末尾逐层退出
+    src.clearRetainingCapacity();
+    try src.appendSlice(a, "fn f(x: u32) u32 {\n    return ");
+    for (0..1000) |i| try src.print(a, "if (x == {d}) {d} else ", .{ i, i });
+    try src.appendSlice(a, "0;\n}\n");
+    try expectNoErrors(src.items);
+    try expectLossless(src.items);
+}
+
 test "lossless: malformed inputs" {
     const inputs = [_][]const u8{
         "",

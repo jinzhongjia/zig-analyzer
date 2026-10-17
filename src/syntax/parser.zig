@@ -40,10 +40,11 @@ pub const Parser = struct {
     pos: u32 = 0,
     events: std.ArrayList(Event) = .empty,
     errors: std.ArrayList(Error) = .empty,
-    /// 防止语法函数在不消费 token 的情况下无限循环
+    /// 两次消费 token 之间查看 token 的次数上限：防止语法函数在不消费 token 的情况下无限循环
     fuel: u32 = max_fuel,
 
-    const max_fuel = 256;
+    /// 在出错处逐层退出嵌套结构时，每层都会查看 token 而不消费，上限须远高于嵌套层数与每层查看次数之积
+    const max_fuel = 1 << 24;
 
     pub fn deinit(p: *Parser) void {
         p.events.deinit(p.gpa);
