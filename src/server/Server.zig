@@ -125,6 +125,8 @@ config_requests: u32 = 0,
 config_outstanding: u32 = 0,
 /// 首次拉取的响应到达前推迟项目启动（启动要用 zig.path 与构建参数）
 startup_pending: bool = false,
+/// 监视客户端进程（`initialize` 的 `processId`）的后台任务
+parent_watch: ?Io.Future(void) = null,
 /// 项目已启动：此后修改 zig.path 需要重启服务器
 started: bool = false,
 
@@ -168,6 +170,7 @@ pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) All
 }
 
 pub fn deinit(server: *Server) void {
+    if (server.parent_watch) |*w| w.cancel(server.io);
     server.group.cancel(server.io);
     server.stopWorkspaces();
     server.waitIdle();
@@ -199,9 +202,8 @@ pub fn deinit(server: *Server) void {
     server.* = undefined;
 }
 
-/// 运行主循环直到收到 `exit` 或输入结束，返回进程退出码。
-/// 返回前等待已调度的后台任务（诊断发布等）收尾；收到 `exit` 时还会停止各项目的构建系统进程。
-/// 输入结束而未收到 `exit` 时项目继续运行，可以用新的输入再次调用（测试中用于在两段输入之间修改磁盘文件）。
+/// 运行主循环直到收到 `exit` 或输入结束，返回进程退出码。返回前停止各项目的构建系统进程，等待已调度的
+/// 后台任务（诊断发布等）收尾。输入结束而未收到 `exit` 时客户端已经退出：不再等待它对服务器请求的回复。
 pub fn run(server: *Server, reader: *Io.Reader) !u8 {
     var exited = false;
     while (true) {
@@ -224,10 +226,73 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
         }
     }
     server.group.await(server.io) catch {};
-    if (exited) server.stopWorkspaces();
+    if (!exited) server.abandonConfigRequests();
+    server.stopWorkspaces();
     server.waitIdle();
     return if (server.state == .shutdown) 0 else 1;
 }
+
+/// 不再等待客户端对配置请求的回复（关闭时，或客户端已经退出）
+fn abandonConfigRequests(server: *Server) void {
+    server.startup_pending = false;
+    while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
+}
+
+/// 每隔这么久检查一次客户端进程是否还在
+const parent_check_interval_ms = 2000;
+
+/// 监视客户端进程：它退出后服务器随之退出。客户端退出时 stdin 通常随之关闭（见 `run`），但管道的写端
+/// 可能被客户端的其他子进程继承而一直不关闭
+fn watchParent(server: *Server, pid: i32) void {
+    if (pid <= 0 or server.parent_watch != null) return;
+    server.parent_watch = server.io.concurrent(parentWatcher, .{ server, pid }) catch |err| {
+        return log.warn("cannot watch the client process {d}: {t}", .{ pid, err });
+    };
+}
+
+fn parentWatcher(server: *Server, pid: i32) void {
+    while (true) {
+        server.io.sleep(.fromMilliseconds(parent_check_interval_ms), .awake) catch return;
+        if (processAlive(pid)) continue;
+        log.warn("client process {d} has exited, exiting", .{pid});
+        server.stopWorkspaces();
+        std.process.exit(1);
+    }
+}
+
+/// 进程是否仍在运行；无法确定时（如没有权限）按仍在运行处理
+fn processAlive(pid: i32) bool {
+    if (@import("builtin").os.tag == .windows) {
+        const windows = std.os.windows;
+        const handle = win32.OpenProcess(win32.SYNCHRONIZE, 0, @bitCast(pid)) orelse
+            return windows.GetLastError() != .INVALID_PARAMETER;
+        defer windows.CloseHandle(handle);
+        // 已退出的进程处于有信号状态
+        return win32.WaitForSingleObject(handle, 0) != win32.WAIT_OBJECT_0;
+    }
+    // 信号 0 只检查进程是否存在
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err != error.ProcessNotFound;
+    return true;
+}
+
+test "processAlive: a running child process, then its pid after it has been reaped" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", "read line" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    const pid = child.id.?;
+    try std.testing.expect(processAlive(pid));
+    child.stdin.?.close(io);
+    child.stdin = null;
+    _ = try child.wait(io);
+    try std.testing.expect(!processAlive(pid));
+}
+
+const win32 = struct {
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const WAIT_OBJECT_0: u32 = 0;
+    extern "kernel32" fn OpenProcess(access: u32, inherit: c_int, pid: u32) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, ms: u32) callconv(.winapi) u32;
+};
 
 const Flow = enum { @"continue", exit };
 
@@ -1900,6 +1965,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         server.applyLogging(&server.config, server.config.log_file != null);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});
+    if (params.processId) |pid| server.watchParent(pid);
 
     // 工作区根目录：优先 workspaceFolders，其次 rootUri / rootPath
     var root_uris: std.ArrayList([]const u8) = .empty;
@@ -1945,8 +2011,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
     // 先解除依赖主循环的等待：客户端一直没有回复配置请求时不再等待。之后主循环阻塞在 await 上，
     // 处理不了补发的响应，进行中的 `waitIdle` 请求只能靠这里结束
-    server.startup_pending = false;
-    while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
+    server.abandonConfigRequests();
     // 停止各项目的构建系统进程；等待进行中的请求完成，再等后台任务（诊断发布等）收尾
     server.stopWorkspaces();
     server.group.await(server.io) catch {};

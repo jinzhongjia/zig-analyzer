@@ -326,6 +326,30 @@ test "shutdown does not deadlock with waitIdle while a configuration request is 
     try h.notify("exit", {});
 }
 
+test "input closing while a configuration request is unanswered ends the main loop" {
+    // 客户端没有回复配置请求就退出时，主循环一直等待这个回复，进程不退出
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{ .configuration = true } } });
+    h.hold_requests = true;
+    try h.notify("initialized", Empty{});
+    while (true) {
+        const msg = try h.next();
+        const method = msg.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+    }
+    h.input.close();
+    // 主循环返回后输出随之关闭；仍在等待时这里超时出错（不调用 finish，免得等待卡住的线程）
+    while (true) _ = h.next() catch |err| switch (err) {
+        error.EndOfStream => break,
+        else => return err,
+    };
+    h.finish();
+    try testing.expectEqual(1, h.exit_code);
+}
+
 test "live diagnostics are debounced per file and AstGen runs outside the read transaction" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};
