@@ -3,6 +3,11 @@
 //! 线程模型：每个 Workspace 有一个专用的后台任务阻塞读取 BSP 事件并处理；LSP 主循环只通过
 //! `requestBuild` / `stop` 与之交互。
 //!
+//! 生命周期：maker 崩溃、build.zig 或构建配置变化时以新实例重启项目。新实例在首次构建完成（或配置失败）前
+//! 不可见，其间旧实例的模型、编译集合与编译器诊断继续生效；旧实例没有模型时，新实例配置完成即替换它
+//! （见 `Server.restartWorkspace`、`Server.promote`）。
+//! 实例按引用计数回收：服务器的项目列表、后台任务与临时使用实例的调用方各持有一个引用。
+//!
 //! 锁顺序：持有 `mutex` 时绝不开启查询引擎的写事务。诊断发布任务会在读事务中获取 `mutex`，
 //! 而写事务要等所有读事务结束，交叉持有会死锁。
 
@@ -41,6 +46,13 @@ root: []const u8,
 config: Server.Config,
 /// 本实例是 maker 连续崩溃后自动重启的第几次（0 表示正常启动）
 crash_restarts: u8 = 0,
+/// 引用计数，归零时释放（见 `acquire` / `release`）
+refs: std.atomic.Value(u32) = .init(0),
+/// 重启产生、尚未替换本实例的新实例（持有一个引用）；受 `Server.workspaces_mutex` 保护
+successor: ?*Workspace = null,
+/// 调用方已确定本实例的位置：加入项目列表、挂到旧实例上或作废（见 `Server.startWorkspace`、`Server.restartWorkspace`）。
+/// 后台任务在此之后才处理事件，`Server.isVisible` 与 `Server.promote` 才能据位置判断
+placed: Io.Event = .unset,
 
 mutex: Io.Mutex = .init,
 // ── 以下字段受 mutex 保护 ──
@@ -69,8 +81,6 @@ loading: ?*Progress = null,
 build_progress: ?*Progress = null,
 build_total: u32 = 0,
 build_done: u32 = 0,
-/// 被重启替换的旧实例发布过编译器诊断的文件：首次构建完成时一并重新发布，清除过时的诊断
-stale_files: std.ArrayList(FileId) = .empty,
 /// 诊断 step 及其传递依赖：只有这些 step 的错误作为编译器诊断发布
 /// （构建请求中额外的生成文件产出 step 不影响诊断，与直接运行 `zig build <step>` 一致）
 diag_steps: std.DynamicBitSetUnmanaged = .{},
@@ -83,13 +93,14 @@ loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
 /// 构建过程中因生成文件的路径而重算编译集合的最短间隔
 const generated_recompute_interval_ms = 1000;
 
-/// 启动 maker 并在后台读取事件
+/// 启动 maker 并在后台读取事件。返回的实例带有一个属于调用方的引用；调用方确定实例的位置后设置 `placed`
 pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
     const gpa = server.gpa;
     const env = server.zigEnv() orelse return error.ZigNotFound;
     const ws = try gpa.create(Workspace);
     errdefer gpa.destroy(ws);
-    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined, .crash_restarts = crash_restarts };
+    // 一个引用属于后台任务，一个属于调用方
+    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined, .crash_restarts = crash_restarts, .refs = .init(2) };
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
@@ -103,7 +114,17 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     server.busyBegin();
     errdefer server.busyEnd();
     try server.bg_group.concurrent(server.io, run, .{ws});
+    _ = server.live_workspaces.fetchAdd(1, .monotonic);
     return ws;
+}
+
+pub fn acquire(ws: *Workspace) void {
+    _ = ws.refs.fetchAdd(1, .monotonic);
+}
+
+/// 放弃一个引用；最后一个引用放弃时释放实例（此时后台任务已经结束）
+pub fn release(ws: *Workspace) void {
+    if (ws.refs.fetchSub(1, .acq_rel) == 1) ws.destroy();
 }
 
 /// 以项目根目录的 `zig-analyzer.json` 覆盖配置；文件不存在时不变，有误时提示并忽略
@@ -140,16 +161,16 @@ pub fn stop(ws: *Workspace) void {
 /// maker 连续崩溃时自动重启的次数上限
 const max_crash_restarts = 3;
 
-/// 后台任务全部结束后调用
-pub fn destroy(ws: *Workspace) void {
+fn destroy(ws: *Workspace) void {
     const gpa = ws.gpa;
+    _ = ws.server.live_workspaces.fetchSub(1, .monotonic);
+    if (ws.successor) |s| s.release();
     if (ws.model) |*m| m.deinit(gpa);
     if (ws.compile_set) |*s| s.deinit(gpa);
     if (ws.resolve_set) |*s| s.deinit(gpa);
     if (ws.result) |*r| r.deinit(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
-    ws.stale_files.deinit(gpa);
     ws.config.deinit(gpa);
     for (ws.bundles.items) |*eb| eb.deinit(gpa);
     ws.bundles.deinit(gpa);
@@ -230,6 +251,13 @@ pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     return set.contains(file);
 }
 
+/// 是否参与模块图：已有模型与编译集合（见 `Server.updateModuleGraph`）
+pub fn inModuleGraph(ws: *Workspace) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    return ws.model != null and ws.compile_set != null;
+}
+
 pub fn isUnder(path: []const u8, dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, dir)) return false;
     return path.len == dir.len or std.fs.path.isSep(path[dir.len]) or (dir.len > 0 and std.fs.path.isSep(dir[dir.len - 1]));
@@ -242,6 +270,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     // build.zig 编译失败后 maker 会退出，属于预期情况（保存 build.zig 时会重启）
     var config_failed = false;
     const client = ws.client.?;
+    ws.placed.waitUncancelable(ws.server.io);
     while (true) {
         var event = client.next() catch |err| {
             if (err == error.Canceled or ws.server.isShuttingDown()) {
@@ -256,6 +285,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 if (next > max_crash_restarts) {
                     log.err("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
+                    ws.server.abandon(ws);
                 } else {
                     log.info("{s}: build system exited unexpectedly ({t}, {?t}), restarting", .{ ws.root, err, client.readError() });
                     // 重启期间计为忙碌：崩溃时本实例可能并不忙碌，新实例计为忙碌之前 waitIdle（如 shutdown）
@@ -292,6 +322,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     if (started) ws.server.busyEnd();
     if (was_building) ws.server.busyEnd();
     if (c) |cl| cl.deinit();
+    ws.release();
 }
 
 fn isStopping(ws: *Workspace) bool {
@@ -302,10 +333,14 @@ fn isStopping(ws: *Workspace) bool {
 
 fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     const io = ws.server.io;
+    // 已停止的实例（被重启替换、项目被移除、服务器关闭）不再处理 maker 结束前发出的事件：其结果不会被采用。
+    // 进度与忙碌计数在后台任务结束时收尾
+    if (ws.isStopping()) return;
     switch (event.*) {
         .handshake => |h| if (h.version != bsp.protocol_version) {
             log.err("{s}: build system protocol version {d} does not match supported version {d}", .{ ws.root, h.version, bsp.protocol_version });
             ws.stop();
+            ws.server.abandon(ws);
         },
         .configuration => |path| {
             const env = ws.server.zigEnv().?;
@@ -345,6 +380,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     try .initEmpty(ws.gpa, ws.model.?.steps.len);
             }
             try ws.recomputeCompileSet();
+            // 旧实例没有可沿用的模型时不必等整次构建结束
+            ws.promote(.configured);
             ws.mutex.lockUncancelable(io);
             ws.server.progress.end(ws.server, ws.loading, "Done");
             ws.loading = null;
@@ -528,15 +565,41 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         defer ws.mutex.unlock(io);
         try affected.appendSlice(ws.gpa, ws.result_files.keys());
         try affected.appendSlice(ws.gpa, files.keys());
-        try affected.appendSlice(ws.gpa, ws.stale_files.items);
-        ws.stale_files.clearAndFree(ws.gpa);
         if (ws.result) |*old| old.deinit(ws.gpa);
         ws.result_files.deinit(ws.gpa);
         // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
         ws.result = result;
         ws.result_files = files;
     }
+    // 重启产生的新实例：首个结果连同模型与编译集合一起替换旧实例
+    ws.promote(.built);
     ws.server.publishFiles(affected.items, true);
+}
+
+/// 重启产生的新实例到了 `stage`：替换旧实例（见 `Server.promote`），更新模块图，重新发布打开的文件与旧实例
+/// 发布过编译器诊断的文件
+fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
+    const old = ws.server.promote(ws, stage) orelse return;
+    defer old.release();
+    ws.server.updateModuleGraph();
+    ws.server.publishOpenFiles();
+    old.mutex.lockUncancelable(ws.server.io);
+    const stale = ws.gpa.dupe(FileId, old.result_files.keys()) catch &.{};
+    old.mutex.unlock(ws.server.io);
+    defer ws.gpa.free(stale);
+    ws.server.publishFiles(stale, true);
+}
+
+/// 清除编译器诊断，重新发布发布过诊断的文件
+pub fn clearResult(ws: *Workspace) void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    const stale = ws.gpa.dupe(FileId, ws.result_files.keys()) catch &.{};
+    if (ws.result) |*r| r.deinit(ws.gpa);
+    ws.result = null;
+    ws.result_files.clearRetainingCapacity();
+    ws.mutex.unlock(ws.server.io);
+    defer ws.gpa.free(stale);
+    ws.server.publishFiles(stale, true);
 }
 
 fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
@@ -608,7 +671,8 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     if (ws.resolve_set) |*old| old.deinit(ws.gpa);
     ws.resolve_set = extra;
     ws.mutex.unlock(io);
-    // 编译集合变化会影响模块归属与已打开文件的 live 诊断
+    // 编译集合变化会影响模块归属与已打开文件的 live 诊断。尚未替换旧实例的新实例不影响（替换时一并更新）
+    if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
 }

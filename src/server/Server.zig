@@ -74,11 +74,12 @@ zig_env: ?ZigEnv = null,
 default_builtin: ?[]u8 = null,
 warned: bool = false,
 workspaces_mutex: Io.Mutex = .init,
+/// 各项目当前可见的实例（各持有一个引用）。在锁外使用其中的实例前先 `acquire`
 workspaces: std.ArrayList(*Workspace) = .empty,
 /// 已开始停止所有项目（shutdown / exit / deinit）：此后不再重启项目
 shutting_down: bool = false,
-/// 已被重启替换的实例：其后台任务可能仍在收尾，退出时统一释放
-retired: std.ArrayList(*Workspace) = .empty,
+/// 尚未释放的 Workspace 实例数（统计与测试用）
+live_workspaces: std.atomic.Value(usize) = .init(0),
 
 progress: Progress = .{},
 
@@ -175,14 +176,13 @@ pub fn deinit(server: *Server) void {
     server.stopWorkspaces();
     server.waitIdle();
     server.bg_group.cancel(server.io);
-    for (server.workspaces.items) |ws| ws.destroy();
+    // 后台任务都已结束，只剩列表持有的引用
+    for (server.workspaces.items) |ws| ws.release();
     server.workspaces.deinit(server.gpa);
     server.indexed.deinit(server.gpa);
     server.edits.deinit(server.gpa);
     server.live_prepared.deinit();
     za.util.log.setFile(null) catch {};
-    for (server.retired.items) |ws| ws.destroy();
-    server.retired.deinit(server.gpa);
     for (server.roots.items) |r| server.gpa.free(r);
     server.roots.deinit(server.gpa);
     server.root_has_build.deinit(server.gpa);
@@ -664,13 +664,8 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     defer server.graph_mutex.unlock(server.io);
     var b: ModuleGraph.Builder = .init(server.gpa, &server.vfs);
     errdefer b.deinit();
-    server.workspaces_mutex.lockUncancelable(server.io);
-    const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch |err| {
-        server.workspaces_mutex.unlock(server.io);
-        return err;
-    };
-    server.workspaces_mutex.unlock(server.io);
-    defer server.gpa.free(list);
+    const list = try server.workspaceList(server.gpa);
+    defer server.releaseList(server.gpa, list);
     for (list) |ws| {
         ws.mutex.lockUncancelable(server.io);
         defer ws.mutex.unlock(server.io);
@@ -931,16 +926,15 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
 
     if (server.isSingleFile(id)) return server.compileSingle(id);
 
-    server.workspaces_mutex.lockUncancelable(server.io);
-    const list = try arena.dupe(*Workspace, server.workspaces.items);
-    server.workspaces_mutex.unlock(server.io);
+    const list = try server.workspaceList(arena);
+    defer server.releaseList(arena, list);
     for (list) |ws| {
         if (!ws.owns(id)) continue;
         if (is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) {
             // 非 watch 模式下 maker 不会自动重新配置：重启
             server.restartWorkspace(ws, 0);
         } else {
-            ws.requestBuild();
+            server.requestBuild(ws);
         }
     }
 }
@@ -989,9 +983,8 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         }
     }
 
-    server.workspaces_mutex.lockUncancelable(server.io);
-    const list = try arena.dupe(*Workspace, server.workspaces.items);
-    server.workspaces_mutex.unlock(server.io);
+    const list = try server.workspaceList(arena);
+    defer server.releaseList(arena, list);
     for (list) |ws| {
         // 非 watch 模式下 maker 不会自动重新配置：重启
         const reconfigure = for (build_files.items) |dir| {
@@ -1002,7 +995,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             continue;
         }
         for (changes.items) |c| if (ws.owns(c.file)) {
-            ws.requestBuild();
+            server.requestBuild(ws);
             break;
         };
     }
@@ -1067,13 +1060,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         } else if (!build_was_enabled) {
             if (server.zigEnv() != null) server.startProjectsForRoots();
         } else {
-            server.workspaces_mutex.lockUncancelable(server.io);
-            const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch {
-                server.workspaces_mutex.unlock(server.io);
-                return error.OutOfMemory;
-            };
-            server.workspaces_mutex.unlock(server.io);
-            defer server.gpa.free(list);
+            const list = try server.workspaceList(server.gpa);
+            defer server.releaseList(server.gpa, list);
             if (list.len != 0) log.info("build settings changed, restarting projects", .{});
             for (list) |ws| server.restartWorkspace(ws, 0);
         }
@@ -1087,25 +1075,23 @@ fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
     return .{ .build = server.config.build_enable, .compiler = server.config.compiler_diagnostics };
 }
 
-/// 停止全部项目（保留到退出时释放），清除其发布过的编译器诊断，模块图随之更新
+/// 停止全部项目，清除其发布过的编译器诊断，模块图随之更新
 fn stopProjects(server: *Server) void {
-    // 先在锁内取出列表（不在持有 workspaces_mutex 时锁各项目的 mutex）
+    // 从列表中取出（连同列表持有的引用）
     const list = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        server.retired.appendSlice(server.gpa, server.workspaces.items) catch return;
         const list = server.gpa.dupe(*Workspace, server.workspaces.items) catch return;
         server.workspaces.clearRetainingCapacity();
         break :blk list;
     };
-    defer server.gpa.free(list);
+    defer server.releaseList(server.gpa, list);
     var stale: std.ArrayList(Vfs.FileId) = .empty;
     defer stale.deinit(server.gpa);
     for (list) |ws| {
-        ws.stop();
+        server.stopProject(ws);
         ws.mutex.lockUncancelable(server.io);
         stale.appendSlice(server.gpa, ws.result_files.keys()) catch {};
-        stale.appendSlice(server.gpa, ws.stale_files.items) catch {};
         ws.mutex.unlock(server.io);
     }
     server.updateModuleGraph();
@@ -1395,15 +1381,12 @@ fn startWorkspace(server: *Server, root: []const u8) void {
     };
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) {
-        ws.stop();
-        server.retired.append(server.gpa, ws) catch {};
-        return;
-    };
-    server.workspaces.append(server.gpa, ws) catch {
-        ws.stop();
-        server.retired.append(server.gpa, ws) catch {};
-    };
+    // 列表接管 `start` 返回的引用。期间同一根目录已启动了项目，或列表无法增长：新实例作废
+    const added = server.visibleFor(root) == null and
+        (if (server.workspaces.append(server.gpa, ws)) |_| true else |_| false);
+    if (!added) ws.stop();
+    ws.placed.set(server.io);
+    if (!added) ws.release();
 }
 
 /// 加入工作区根目录（`uri` 为目录的 URI）。zig 环境已就绪时立即启动项目，否则由启动阶段启动
@@ -1451,18 +1434,17 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
+        // 连同列表持有的引用一起取出
         for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, normalized)) {
-            // 后台任务可能仍在运行：保留到退出时统一释放
-            try server.retired.ensureUnusedCapacity(server.gpa, 1);
-            server.retired.appendAssumeCapacity(server.workspaces.orderedRemove(i));
-            removed = w;
+            removed = server.workspaces.orderedRemove(i);
             break;
         };
     }
     const ws = removed orelse return;
-    ws.stop();
+    defer ws.release();
+    server.stopProject(ws);
     ws.mutex.lockUncancelable(server.io);
-    const stale = try std.mem.concat(arena, Vfs.FileId, &.{ ws.result_files.keys(), ws.stale_files.items });
+    const stale = try arena.dupe(Vfs.FileId, ws.result_files.keys());
     ws.mutex.unlock(server.io);
     server.publishFiles(stale, true);
 }
@@ -1474,46 +1456,145 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     server.updateModuleGraph();
 }
 
-/// 停止 `ws` 并以新实例替换。`crash_restarts` 为 maker 连续崩溃后自动重启的次数（正常重启为 0）
+/// 重启 `ws` 所在的项目（按根目录找到项目当前的实例：调用方持有的列表快照可能已过时）。`crash_restarts` 为
+/// maker 连续崩溃后自动重启的次数（正常重启为 0）。
+///
+/// 先结束旧的 maker（不与新实例同时构建），再启动新实例。新实例在首次构建完成（或配置失败；旧实例没有模型时
+/// 为配置完成）前不可见（见 `promote`）：其间列表中仍是旧实例，其模型、编译集合与编译器诊断继续生效，构建请求
+/// 转给新实例（见 `requestBuild`）
 pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
     ws.stop();
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        // 所在项目已被移除
+        const visible = server.visibleFor(ws.root) orelse return;
+        visible.stop();
+        if (visible.successor) |pending| pending.stop();
+    }
     if (server.isShuttingDown()) return;
-    const root = server.gpa.dupe(u8, ws.root) catch return;
-    defer server.gpa.free(root);
-    const fresh = Workspace.start(server, root, crash_restarts) catch |err| {
-        log.err("{s}: failed to restart build system protocol: {t}", .{ root, err });
+    const fresh = Workspace.start(server, ws.root, crash_restarts) catch |err| {
+        log.err("{s}: failed to restart build system protocol: {t}", .{ ws.root, err });
         return;
     };
-    // 旧实例发布过的编译器诊断由新实例在首次构建后清除（新结果中没有的文件）。旧实例自身尚未清除的
-    // （首次构建前又被重启，如 maker 接连崩溃）一并转交。
-    // 新实例的后台任务已在运行，两边都要加锁（先后各持一把，不同时持有）
-    ws.mutex.lockUncancelable(server.io);
-    const stale = std.mem.concat(server.gpa, Vfs.FileId, &.{ ws.result_files.keys(), ws.stale_files.items }) catch &.{};
-    ws.mutex.unlock(server.io);
-    defer server.gpa.free(stale);
-    fresh.mutex.lockUncancelable(server.io);
-    fresh.stale_files.appendSlice(server.gpa, stale) catch {};
-    fresh.mutex.unlock(server.io);
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    // 旧实例保留在列表中直到退出时统一释放（其后台任务可能仍在运行），但不再参与调度
-    // 启动新实例期间服务器开始关闭：新实例同样停止
-    if (server.shutting_down) fresh.stop();
-    for (server.workspaces.items) |*w| if (w.* == ws) {
-        w.* = fresh;
-        server.retired.append(server.gpa, ws) catch {};
+    // 启动新实例期间服务器开始关闭，或所在项目已被移除：新实例作废
+    const visible = (if (server.shutting_down) null else server.visibleFor(ws.root)) orelse {
+        fresh.stop();
+        fresh.placed.set(server.io);
+        fresh.release();
         return;
     };
-    // `ws` 已被其他重启替换（并发的崩溃重启与配置变化）：新实例作废
-    fresh.stop();
-    server.retired.append(server.gpa, fresh) catch {};
+    // 此前（或并发的重启）产生、尚未替换旧实例的新实例同样作废
+    if (visible.successor) |pending| {
+        pending.stop();
+        pending.release();
+    }
+    visible.successor = fresh;
+    fresh.placed.set(server.io);
+}
+
+/// 新实例替换旧实例的时机。`built`：首次构建完成（或配置失败、读不了构建图、不需要构建），总是替换。
+/// `configured`：读入构建图并算出编译集合，只在旧实例不参与模块图（配置失败、读不了构建图、配置前 maker 崩溃）
+/// 时替换：旧实例没有可沿用的模块，不必等整次构建结束才能解析命名模块
+pub const PromoteStage = enum { configured, built };
+
+/// 重启产生的新实例 `ws` 到了 `stage`：替换列表中的旧实例。返回被替换的实例（连同列表持有的引用，
+/// 调用方释放）；`ws` 不是等待替换的新实例或时机未到时返回 null
+pub fn promote(server: *Server, ws: *Workspace, stage: PromoteStage) ?*Workspace {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    if (server.shutting_down) return null;
+    for (server.workspaces.items) |*w| if (w.*.successor == ws) {
+        const old = w.*;
+        if (stage == .configured and old.inModuleGraph()) return null;
+        // 列表接管 `successor` 持有的引用
+        old.successor = null;
+        w.* = ws;
+        return old;
+    };
+    return null;
+}
+
+/// 重启产生的新实例 `ws` 不再继续（maker 反复崩溃、协议版本不符）：不再等它替换旧实例。旧实例的模型与
+/// 编译集合继续用于模块归属；其编译器诊断不再更新，予以清除
+pub fn abandon(server: *Server, ws: *Workspace) void {
+    const old = blk: {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        for (server.workspaces.items) |w| if (w.successor == ws) {
+            w.successor = null;
+            w.acquire();
+            break :blk w;
+        };
+        return;
+    };
+    defer old.release();
+    // `successor` 持有的引用（调用方另持有一个）
+    ws.release();
+    old.clearResult();
+}
+
+/// `ws` 是否是列表中（可见）的实例
+pub fn isVisible(server: *Server, ws: *Workspace) bool {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    return std.mem.indexOfScalar(*Workspace, server.workspaces.items, ws) != null;
+}
+
+/// 停止列表中的实例 `ws` 以及尚未替换它的新实例
+fn stopProject(server: *Server, ws: *Workspace) void {
+    ws.stop();
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    if (ws.successor) |s| s.stop();
+}
+
+/// 请求构建 `ws` 所在的项目（按根目录找到项目当前的实例：调用方持有的列表快照可能已过时）：重启期间转给新实例
+pub fn requestBuild(server: *Server, ws: *Workspace) void {
+    const target = blk: {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        // 所在项目已被移除
+        const visible = server.visibleFor(ws.root) orelse return;
+        const t = visible.successor orelse visible;
+        t.acquire();
+        break :blk t;
+    };
+    defer target.release();
+    target.requestBuild();
+}
+
+/// 根目录 `root` 的项目在列表中的实例；调用方持有 `workspaces_mutex`
+fn visibleFor(server: *Server, root: []const u8) ?*Workspace {
+    for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return w;
+    return null;
+}
+
+/// 列表中各实例的快照（各持有一个引用，用 `releaseList` 释放）
+fn workspaceList(server: *Server, a: Allocator) Allocator.Error![]*Workspace {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    const list = try a.dupe(*Workspace, server.workspaces.items);
+    for (list) |ws| ws.acquire();
+    return list;
+}
+
+fn releaseList(server: *Server, a: Allocator, list: []*Workspace) void {
+    _ = server;
+    for (list) |ws| ws.release();
+    a.free(list);
 }
 
 fn stopWorkspaces(server: *Server) void {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     server.shutting_down = true;
-    for (server.workspaces.items) |ws| ws.stop();
+    for (server.workspaces.items) |ws| {
+        ws.stop();
+        if (ws.successor) |s| s.stop();
+    }
 }
 
 pub fn isShuttingDown(server: *Server) bool {
@@ -1724,8 +1805,7 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
 /// 在读事务之外对文件的当前文本做 AstGen（见 `live.Prepared`）：AstGen 不检查取消，在读事务中进行时
 /// 写事务要等它结束。只读取文本时短暂持有读事务。任何失败都只是退回在 query 中计算
 fn prepareLive(server: *Server, file: Vfs.FileId) void {
-    const eligible = if (server.workspaceFor(file)) |w| w.liveEligible(file) else true;
-    if (!eligible) return;
+    if (!server.liveEligible(file)) return;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1744,8 +1824,7 @@ fn prepareLive(server: *Server, file: Vfs.FileId) void {
 
 /// 当前文本的 live 诊断已在读事务之外准备过（或不需要准备）
 fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
-    const eligible = if (server.workspaceFor(file)) |w| w.liveEligible(file) else true;
-    if (!eligible or try ctx.get(live.LiveBackend, {}) != .in_process) return true;
+    if (!server.liveEligible(file) or try ctx.get(live.LiveBackend, {}) != .in_process) return true;
     const text = try ctx.get(FileText, file) orelse return true;
     return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file))));
 }
@@ -1766,12 +1845,22 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
     server.sendNotification("textDocument/publishDiagnostics", params);
 }
 
-/// 文件所属的项目（第一个包含它的工作区）
+/// 文件所属的项目（第一个包含它的工作区），带有一个属于调用方的引用
 fn workspaceFor(server: *Server, file: Vfs.FileId) ?*Workspace {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    for (server.workspaces.items) |ws| if (ws.owns(file)) return ws;
+    for (server.workspaces.items) |ws| if (ws.owns(file)) {
+        ws.acquire();
+        return ws;
+    };
     return null;
+}
+
+/// 是否发布文件的 live 诊断：不属于任何项目，或所属项目认为需要（见 `Workspace.liveEligible`）
+fn liveEligible(server: *Server, file: Vfs.FileId) bool {
+    const ws = server.workspaceFor(file) orelse return true;
+    defer ws.release();
+    return ws.liveEligible(file);
 }
 
 fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
@@ -1799,6 +1888,7 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     const document_uri = try server.uriFor(arena, file);
     const text = try ctx.get(FileText, file);
     const ws = server.workspaceFor(file);
+    defer if (ws) |w| w.release();
 
     // live 诊断：文件已加载，且（不属于任何项目，或编译集合尚未算出，或在编译集合中）
     var live_result: ?*live.Result = null;
