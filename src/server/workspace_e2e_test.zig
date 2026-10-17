@@ -1,4 +1,4 @@
-//! 端到端：磁盘上的外部改动、工作区文件夹的增减、未保存的文档（`untitled:`）、项目的启动与停止。
+//! 端到端：磁盘上的外部改动、工作区文件夹的增减、未保存的文档（`untitled:`）、项目的启动、重启与停止。
 
 const std = @import("std");
 const testing = std.testing;
@@ -703,6 +703,77 @@ test "a new instance handles build events only after the server has placed it" {
     // 加入列表后读入的构建图进入模块图
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("lib.zig", try gotoFile(&h, main_uri, fixture.basic[1].text, "lib.hel"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// 只用命名模块 geo 的源文件；没有 build.zig 时按单文件编译，找不到这个模块
+const named_module_main = "const geo = @import(\"geo\");\npub fn main() void {\n    const x: u32 = geo.name;\n    _ = x;\n}\n";
+const named_module_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const geo = b.createModule(.{ .root_source_file = b.path("geo.zig") });
+    \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "geo", .module = geo }},
+    \\    }) });
+    \\    b.installArtifact(exe);
+    \\}
+    \\
+;
+
+test "creating or deleting build.zig in a workspace folder starts or stops its project" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = named_module_main },
+        .{ .path = "geo.zig", .text = "pub const name = \"geo\";\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, named_module_main);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+    try testing.expect(try lastHas(&h, main_uri, "no module named 'geo'"));
+
+    // 编辑器之外新建 build.zig（如 zig init）：启动项目，命名模块得以解析
+    const build_path = try project.path(a, "build.zig");
+    const build_uri = try za.base.uri.fromPath(a, build_path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = build_uri, .type = 1 }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, h.server.workspaces.items.len);
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+    try testing.expect(!try lastHas(&h, main_uri, "no module named"));
+
+    // 删除：项目停止，打开的文件改按单文件编译
+    try std.Io.Dir.cwd().deleteFile(testing.io, build_path);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = build_uri, .type = 3 }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+    try testing.expect(try lastHas(&h, main_uri, "no module named 'geo'"));
+
+    // 在编辑器中新建并保存 build.zig（没有文件监听）：同样启动项目
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
+    try open(&h, build_uri, named_module_build);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, h.server.workspaces.items.len);
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
+    // 关闭构建系统集成期间删除 build.zig（没有事件），再打开：按磁盘重新检查，不启动项目
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .build = .{ .enable = false } } } });
+    try std.Io.Dir.cwd().deleteFile(testing.io, build_path);
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .build = .{ .enable = true } } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

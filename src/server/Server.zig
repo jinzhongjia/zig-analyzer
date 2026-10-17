@@ -59,7 +59,8 @@ busy: usize = 0,
 
 /// 工作区根目录（绝对路径）：initialize 时给出，之后随 `workspace/didChangeWorkspaceFolders` 增减
 roots: std.ArrayList([]u8) = .empty,
-/// 与 `roots` 一一对应：根目录下是否有 build.zig（加入时同步检查，避免项目加载完成前误判）
+/// 与 `roots` 一一对应：根目录下是否有 build.zig（加入时同步检查，避免项目加载完成前误判；build.zig 新建或删除时
+/// 更新，见 `refreshRoot`）
 root_has_build: std.ArrayList(bool) = .empty,
 /// 保护 `roots` 与 `root_has_build`
 roots_mutex: Io.Mutex = .init,
@@ -924,6 +925,10 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const base = std.fs.path.basename(path);
     const is_build_file = isProjectFile(base);
 
+    // 根目录下新建的 build.zig：启动项目
+    if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
+        if (try server.refreshRoot(dir)) return;
+    };
     if (server.isSingleFile(id)) return server.compileSingle(id);
 
     const list = try server.workspaceList(arena);
@@ -946,12 +951,13 @@ fn isProjectFile(base: []const u8) bool {
 
 /// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
 /// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon / zig-analyzer.json 变化时重启该项目，
-/// 其他文件变化时项目重新构建、单文件重新编译
+/// 根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时项目重新构建、单文件重新编译
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
     const Change = struct { file: Vfs.FileId, text: ?[]u8 };
     var changes: std.ArrayList(Change) = .empty;
     defer for (changes.items) |c| if (c.text) |t| server.gpa.free(t);
     var build_files: std.ArrayList([]const u8) = .empty;
+    var build_zig_dirs: std.ArrayList([]const u8) = .empty;
     for (params.changes) |event| {
         const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -960,6 +966,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         if (!std.fs.path.isAbsolute(path)) continue;
         const base = std.fs.path.basename(path);
         if (isProjectFile(base)) try build_files.append(arena, std.fs.path.dirname(path) orelse "");
+        if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, std.fs.path.dirname(path) orelse "");
         // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）
         const file = try server.vfs.lookup(path) orelse continue;
         {
@@ -983,6 +990,10 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         }
     }
 
+    // 根目录下新建或删除了 build.zig：启动或停止项目，刚启动的项目不必重启
+    var refreshed: std.ArrayList([]const u8) = .empty;
+    for (build_zig_dirs.items) |dir| if (try server.refreshRoot(dir)) try refreshed.append(arena, dir);
+
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
@@ -991,7 +1002,10 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             if (std.mem.eql(u8, dir, ws.root)) break true;
         } else false;
         if (reconfigure) {
-            server.restartWorkspace(ws, 0);
+            const started = for (refreshed.items) |dir| {
+                if (std.mem.eql(u8, dir, ws.root)) break true;
+            } else false;
+            if (!started) server.restartWorkspace(ws, 0);
             continue;
         }
         for (changes.items) |c| if (ws.owns(c.file)) {
@@ -1108,7 +1122,7 @@ fn stopProjects(server: *Server) void {
     for (open) |file| server.compileSingle(file);
 }
 
-/// 为有 build.zig 的根目录启动项目
+/// 为有 build.zig 的根目录启动项目（按磁盘重新检查：加入根目录之后 build.zig 可能被新建或删除）
 fn startProjectsForRoots(server: *Server) void {
     var roots: std.ArrayList([]u8) = .empty;
     defer {
@@ -1118,8 +1132,7 @@ fn startProjectsForRoots(server: *Server) void {
     {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
-        for (server.roots.items, server.root_has_build.items) |root, has_build| {
-            if (!has_build) continue;
+        for (server.roots.items) |root| {
             const copy = server.gpa.dupe(u8, root) catch return;
             roots.append(server.gpa, copy) catch {
                 server.gpa.free(copy);
@@ -1127,7 +1140,54 @@ fn startProjectsForRoots(server: *Server) void {
             };
         }
     }
-    for (roots.items) |root| server.startWorkspace(root);
+    for (roots.items) |root| {
+        const has_build = server.hasBuildZig(root) catch return;
+        _ = server.setRootHasBuild(root, has_build);
+        if (has_build) server.startWorkspace(root);
+    }
+}
+
+/// 目录下是否有 build.zig
+fn hasBuildZig(server: *Server, dir: []const u8) Allocator.Error!bool {
+    const path = try std.fs.path.join(server.gpa, &.{ dir, "build.zig" });
+    defer server.gpa.free(path);
+    Io.Dir.cwd().access(server.io, path, .{}) catch return false;
+    return true;
+}
+
+/// 记录根目录 `root` 下是否有 build.zig；返回记录是否因此改变（`root` 不是根目录时为 false）
+fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    for (server.roots.items, server.root_has_build.items) |r, *flag| if (std.mem.eql(u8, r, root)) {
+        if (flag.* == has_build) return false;
+        flag.* = has_build;
+        return true;
+    };
+    return false;
+}
+
+/// 目录 `dir` 下的 build.zig 可能被新建或删除：按磁盘重新检查。`dir` 是根目录且有变化时，新出现则启动项目；
+/// 消失则停止项目，其中的文件改按单文件处理。返回是否有变化
+fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
+    const has_build = try server.hasBuildZig(dir);
+    if (!server.setRootHasBuild(dir, has_build)) return false;
+    if (has_build) {
+        log.info("{s}: build.zig was created", .{dir});
+        if (server.zigEnv() != null) server.startWorkspace(dir);
+    } else {
+        log.info("{s}: build.zig was deleted", .{dir});
+        server.removeProject(dir);
+        server.updateModuleGraph();
+    }
+    // 打开的文件：单文件模式的结果不再适用，或改按单文件编译
+    server.publishOpenFiles();
+    server.docs_mutex.lockUncancelable(server.io);
+    const open = try server.gpa.dupe(Vfs.FileId, server.open_docs.keys());
+    server.docs_mutex.unlock(server.io);
+    defer server.gpa.free(open);
+    for (open) |file| if (server.isSingleFile(file)) server.compileSingle(file);
+    return true;
 }
 
 /// 清除单文件模式的编译器诊断（关闭编译器诊断时）
@@ -1399,9 +1459,7 @@ fn addRoot(server: *Server, root_uri: []const u8) !void {
     const normalized = try Vfs.normalize(.native, server.gpa, path) orelse return;
     var owned = true;
     defer if (owned) server.gpa.free(normalized);
-    const build_zig = try std.fs.path.join(server.gpa, &.{ normalized, "build.zig" });
-    defer server.gpa.free(build_zig);
-    const has_build = if (Io.Dir.cwd().access(server.io, build_zig, .{})) |_| true else |_| false;
+    const has_build = try server.hasBuildZig(normalized);
     {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
@@ -1430,12 +1488,17 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
             break;
         };
     }
+    server.removeProject(normalized);
+}
+
+/// 停止根目录 `root` 的项目，清除其发布过的编译器诊断（模块图由调用方更新）
+fn removeProject(server: *Server, root: []const u8) void {
     var removed: ?*Workspace = null;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
         // 连同列表持有的引用一起取出
-        for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, normalized)) {
+        for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, root)) {
             removed = server.workspaces.orderedRemove(i);
             break;
         };
@@ -1444,8 +1507,9 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     defer ws.release();
     server.stopProject(ws);
     ws.mutex.lockUncancelable(server.io);
-    const stale = try arena.dupe(Vfs.FileId, ws.result_files.keys());
+    const stale = server.gpa.dupe(Vfs.FileId, ws.result_files.keys()) catch &.{};
     ws.mutex.unlock(server.io);
+    defer server.gpa.free(stale);
     server.publishFiles(stale, true);
 }
 
