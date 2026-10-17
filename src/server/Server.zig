@@ -2025,6 +2025,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
                 .constant => .Constant,
                 .field => .Field,
                 .enum_member => .EnumMember,
+                .error_name => .Constant,
                 .module => .Module,
                 .file => .File,
                 .folder => .Folder,

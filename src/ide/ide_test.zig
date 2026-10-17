@@ -728,6 +728,16 @@ test "completion: builtins, labels, init fields and import names" {
         .{ "const s: ?S = .{ .y = 2, .<|> };", "x z" },
         // import：模块名（没有项目时只有固定的三个）
         .{ "const a = @import(\"<|>\");", "std builtin root" },
+        // 注释与字符串中不补全（曾列出作用域中的全部名字）
+        .{ "fn f() void {\n    const p: S = .{ .x = 1 };\n    // p.<|>\n    _ = p;\n}", "" },
+        .{ "fn f() void {\n    _ = \"p.<|>\";\n}", "" },
+        .{ "fn f() void {\n    _ = \"p.<|>\n}", "" },
+        .{ "/// a @<|>\nconst T = 1;", "" },
+        // 错误名：期望类型的错误集成员，没有期望类型时为本文件中出现的错误名
+        .{ "const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.<|>;\n}", "Bad Worse" },
+        .{ "const E = error{ Worse, Bad };\nfn g() void {\n    const e = error.<|>;\n    _ = e;\n}\nfn h() !void {\n    return error.Other;\n}", "Worse Bad Other" },
+        // 未写完的 `error.` 接上了下一行的名字（`error._`），这个名字不列出
+        .{ "const E = error{ Worse, Bad };\nfn g() void {\n    const e = error.<|>\n    _ = e;\n}", "Worse Bad" },
     };
     for (cases, 0..) |c, i| {
         var w: World = undefined;
