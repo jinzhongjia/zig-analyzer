@@ -89,6 +89,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | `compiler` | 保存 | 构建系统协议回传的 `ErrorBundle`；无 `build.zig` 时为 `zig build-obj -fno-emit-bin --listen=-` |
 
 - 只对编译集合（从各 compile step 根模块沿 `@import` 可达的文件）发布 live 诊断。
+- 官方解析器与 AstGen 逐层递归（Debug 构建每层约 16 KB 栈）。先按 token 估计嵌套深度的上界：不超过 256 在当前线程做，不超过 8192 在 512 MiB 栈的专用线程上做；更深的文件不做 AstGen（`zig ast-check` 同样耗尽栈），没有 live 诊断，import 按 token 收集。
 - 有未保存修改时：live 诊断基于缓冲区，编译器诊断基于已保存内容并按编辑增量平移位置。
 
 ---
@@ -117,7 +118,7 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 ### 4.2 查询引擎（`db/`）
 
 - **红绿验证 + early cutoff**：memo 记录 `verified_at` / `changed_at` 与依赖；输入变化后逐个验证依赖，重算得到相等的值时保留旧 `changed_at`，下游不重算。
-- **Durability**：std 与依赖包为 high，验证时整体跳过不变的层。
+- **Durability**：std 与依赖包为 high，验证时整体跳过不变的层；验证通过的 memo 取依赖当前的最低 durability（输入降低 durability 而值经 early cutoff 不变时，下游不能仍按高 durability 跳过验证）。
 - **增量计算**：query 可声明 `computeIncremental(ctx, key, prev)`，重算时拿到上一次的值（用于局部重解析）。
 - **环与深度**：每线程维护活动查询栈，遇到环调用 query 的 `cycleFallback`，环中的结果不写 memo；嵌套计算占用原生栈超过 4 MB 时同样回退，并以迭代加深分段计算深链。每个读事务有 comptime 求值的总步数预算（2000 万步）。
 - **取消**：写事务到来时置位，读查询在 `get` 入口返回 `error.Canceled`，被取消的计算不写 memo；读请求回复 `ContentModified`。
@@ -130,6 +131,7 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 - **红绿树 CST**：手写递归下降，以官方 PEG 语法为准，永不失败，错误处产出 `ERROR` 节点；无损（树文本拼接等于原文）。
 - **局部重解析**：编辑落在花括号平衡的 `block` / `container_decl` 内时只重解析该节点，其余绿节点复用；结果必须与全量解析完全相同（语料与随机编辑测试保证）。
+- **深度上限**：语法树最深 1024 层，更深的节点在构造绿树时展平（token 直接挂在这一层，仍然无损），沿树递归的各层（HIR 降级、推导、语义 token 等）因此有上限；解析器在未结束的节点达到 2048 个时不再递归，括号配平地把所在结构包进错误节点。触及上限的文件之后的编辑都全量解析。标准库与 `lib/compiler` 中最深的文件为 319 层。
 - **ItemTree**：文件声明骨架（名字、种类、标志、签名哈希），不含函数体；只改函数体时值不变，名字层与签名推导都不失效。
 - **AstId**：由父 AstId + 种类 + 名字 + 同名序号得到，跨编辑稳定；函数体内节点用 HIR 的 `ExprId` 定位。
 - **类型化访问层**（`ast.zig`）：手写，集中「某信息位于哪个子节点」的知识，访问器返回可选值。
@@ -146,7 +148,7 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。容器类型的身份不依赖字段类型，递归类型不会成环。
 - **核心 query**：`DeclType`（声明的类型与 comptime 值，只读签名）、`Infer`（BodyOwner + 实例 → 每个表达式的类型与解析目标）、`CallEval`（comptime 调用按实例与实参记忆化）、`ErrorSetOf`（推导错误集）、`LocalValue`（单个局部绑定）。
 - **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution；`unknown` 吸收一切。
-- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；单次求值 20 万步、64 MB 上限；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。跳转到 `@Struct` 生成的字段（字段名来自 comptime 解析的字符串，如 zig-clap 的帮助文本）时，以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到字段名在字面量中的位置。
+- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；单次求值 20 万步、64 MB 上限，驻留的值至多嵌套 256 层（自引用的值按 `unknown`）；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。跳转到 `@Struct` 生成的字段（字段名来自 comptime 解析的字符串，如 zig-clap 的帮助文本）时，以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到字段名在字面量中的位置。
 - **泛型函数体**：没有具体实例时以抽象实例推导（`comptime T: type` 为抽象参数，显示为 `T`；`comptime x: anytype` 的实例记录实参值）；**调用点种子**取一个能求出具体实例的调用点推导，hover 标注来源：
   - 经文件索引跨文件查找；调用者自身在泛型函数内时取调用者的实例，hover / 跳转 / 补全最多上溯 6 层，收集全部实例（查找引用、重命名）最多 3 层（每层取调用者的全部实例，实例数随层数成倍增长）
   - 函数值与实参元组一起传入的调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`）以元组元素作为实参
@@ -161,7 +163,7 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | semantic tokens / folding / selection range / document symbol | 纯语法 |
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致 |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
-| references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemSummaries` 的布隆过滤器粗筛成员 → 逐处精确解析确认 |
+| references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemSummaries` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
 | workspace symbol | 后台为全部项目文件建索引，未完成时返回已索引部分 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
 | 非活动代码 | comptime 已知不执行的分支 |
