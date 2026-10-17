@@ -147,6 +147,8 @@ const SingleFile = struct {
     result: ?compiler.BuildResult = null,
     /// FileId → `result` 中的条目（根文件自身与被它 import 的文件）
     files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty,
+    /// 得到 `result` 的那次编译读取的、根文件所在目录下的文件（含被它 import 的）：其中任何一个变化都需要重新编译
+    inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
     /// `result` 存入时的 `single_generation`：越大越新
     generation: u64 = 0,
     running: bool = false,
@@ -157,6 +159,8 @@ const SingleFile = struct {
         sf.result = null;
         sf.files.deinit(gpa);
         sf.files = .empty;
+        sf.inputs.deinit(gpa);
+        sf.inputs = .empty;
     }
 };
 
@@ -1415,14 +1419,19 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     var errors: usize = 0;
     defer server.progress.end(server, progress, if (errors == 0) "Done" else "Has errors");
     while (true) {
+        var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
         var result: ?compiler.BuildResult = blk: {
-            var eb = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
+            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
                 log.warn("{s}: single-file compile failed: {t}", .{ path, err });
                 break :blk null;
             };
-            defer eb.deinit(server.gpa);
-            errors = eb.errorMessageCount();
-            break :blk compiler.collect(server.gpa, &.{eb}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
+            defer compiled.deinit(server.gpa);
+            errors = compiled.errors.errorMessageCount();
+            for (compiled.inputs) |p| {
+                const id = server.vfs.intern(p) catch continue;
+                inputs.put(server.gpa, id, {}) catch continue;
+            }
+            break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
         };
         // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
         var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
@@ -1436,6 +1445,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             sf.rerun = false;
             server.single_mutex.unlock(server.io);
             files.deinit(server.gpa);
+            inputs.deinit(server.gpa);
             if (result) |*r| r.deinit(server.gpa);
             continue;
         }
@@ -1449,6 +1459,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         server.single_generation += 1;
         sf.result = result;
         sf.files = files;
+        sf.inputs = inputs;
         sf.generation = server.single_generation;
         sf.running = false;
         server.single_mutex.unlock(server.io);
@@ -1457,8 +1468,8 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     }
 }
 
-/// 重新编译单文件模式的根文件：`roots`，以及上一次编译在 `changed` 中的文件里报告过错误的根文件（这些错误
-/// 基于文件旧的内容）。每个根文件只编译一次
+/// 重新编译单文件模式的根文件：`roots`，以及上一次编译读取过 `changed` 中的文件或在其中报告过错误的根文件
+/// （例如 import 了被保存的文件）。每个根文件只编译一次
 fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const Vfs.FileId) void {
     var list: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     defer list.deinit(server.gpa);
@@ -1467,7 +1478,7 @@ fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const 
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
         for (server.single.keys(), server.single.values()) |root, *sf| {
-            for (changed) |f| if (sf.files.contains(f)) {
+            for (changed) |f| if (sf.inputs.contains(f) or sf.files.contains(f)) {
                 list.put(server.gpa, root, {}) catch return;
                 break;
             };

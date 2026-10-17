@@ -433,6 +433,13 @@ test "single-file mode: errors in imported files are published on them and clear
     diags = try h.diagnostics();
     try expectDiagnostics(diags, "a.zig", &.{});
     try expectDiagnostics(diags, "b.zig", &.{});
+
+    // 再把错误改回去并保存：a.zig 上一次编译读取过 b.zig（虽然没有在其中报告错误），同样重新编译
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = b_path, .data = b_text });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = b_uri, .version = 3 }, .contentChanges = &.{.{ .text = b_text }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = b_uri } });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
     try shutdown(&h);
 }
 

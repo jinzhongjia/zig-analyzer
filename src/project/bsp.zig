@@ -375,9 +375,23 @@ const win32 = struct {
     extern "kernel32" fn TerminateJobObject(job: HANDLE, exit_code: u32) callconv(.winapi) c_int;
 };
 
-/// 单文件模式（没有 build.zig）：运行 `zig build-obj -fno-emit-bin --listen=- <file>`，
-/// 请求一次编译并返回错误包（没有错误时为空）。错误中的相对路径相对于文件所在目录。
-pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path: []const u8) !ErrorBundle {
+pub const SingleFileResult = struct {
+    /// 错误包（没有错误时为空）。错误中的相对路径相对于文件所在目录
+    errors: ErrorBundle,
+    /// 编译读取的、位于文件所在目录之下的文件（绝对路径，含 import 了但不存在的文件）：其中任何一个变化
+    /// 都可能改变编译结果。标准库等其他位置的文件不在其中
+    inputs: []const []const u8,
+
+    pub fn deinit(r: *SingleFileResult, gpa: Allocator) void {
+        r.errors.deinit(gpa);
+        for (r.inputs) |p| gpa.free(p);
+        gpa.free(r.inputs);
+        r.* = undefined;
+    }
+};
+
+/// 单文件模式（没有 build.zig）：运行 `zig build-obj -fno-emit-bin --listen=- <file>`，请求一次编译
+pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path: []const u8) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
     var child = try std.process.spawn(io, .{
         .argv = &.{ zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path) },
@@ -396,24 +410,42 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path:
     try w.writeStruct(ClientMessage.Header{ .tag = .update, .bytes_len = 0 }, .little);
     try w.flush();
 
+    var inputs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (inputs.items) |p| gpa.free(p);
+        inputs.deinit(gpa);
+    }
     const r = &reader.interface;
     while (true) {
         const header = try r.takeStruct(ServerMessage.Header, .little);
         const body = try r.readAlloc(gpa, header.bytes_len);
         defer gpa.free(body);
-        const result: ?ErrorBundle = switch (header.tag) {
+        var errors: ErrorBundle = switch (header.tag) {
             .error_bundle => std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.EndOfStream => return error.InvalidMessage,
             },
             .emit_digest => .empty,
-            else => null,
+            .file_system_inputs => {
+                // 以 0 分隔的路径，第一个字节是路径前缀（`PathPrefix` 加一）。单独编译时 cwd 与构建根目录都是
+                // 文件所在目录（命中缓存时用后者）；只保留这两种前缀的，不保留标准库与缓存中的
+                var it = std.mem.splitScalar(u8, body, 0);
+                while (it.next()) |prefixed| {
+                    if (prefixed.len < 2) continue;
+                    const prefix = std.enums.fromInt(ServerMessage.PathPrefix, prefixed[0] -% 1) orelse continue;
+                    if (prefix != .cwd and prefix != .build_root) continue;
+                    const p = try std.fs.path.resolveAlloc(gpa, &.{ dir, prefixed[1..] });
+                    errdefer gpa.free(p);
+                    try inputs.append(gpa, p);
+                }
+                continue;
+            },
+            else => continue,
         };
-        if (result) |eb| {
-            w.writeStruct(ClientMessage.Header{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
-            w.flush() catch {};
-            return eb;
-        }
+        errdefer errors.deinit(gpa);
+        w.writeStruct(ClientMessage.Header{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
+        w.flush() catch {};
+        return .{ .errors = errors, .inputs = try inputs.toOwnedSlice(gpa) };
     }
 }
 
@@ -492,21 +524,42 @@ test encodeBuildSteps {
     try testing.expectEqual(5, try r.takeInt(u32, .little));
 }
 
-test "single-file mode: compile one file and get errors" {
-    var project = try @import("fixture.zig").Project.create(&.{.{ .path = "one.zig", .text =
+test "single-file mode: compile one file, get its errors and the files it read" {
+    var project = try @import("fixture.zig").Project.create(&.{
+        .{ .path = "one.zig", .text =
         \\fn g() void {
         \\    var u = 1;
         \\}
         \\
-    }});
+        },
+        .{ .path = "ok.zig", .text = "const dep = @import(\"dep.zig\");\ncomptime {\n    _ = dep;\n}\n" },
+        .{ .path = "dep.zig", .text = "pub const x = 1;\n" },
+    });
     defer project.deinit();
     const gpa = testing.allocator;
     const path = try project.path(gpa, "one.zig");
     defer gpa.free(path);
-    var eb = try compileSingleFile(gpa, testing.io, project.env.zig_exe, path);
-    defer eb.deinit(gpa);
+    var result = try compileSingleFile(gpa, testing.io, project.env.zig_exe, path);
+    defer result.deinit(gpa);
+    const eb = result.errors;
     try testing.expectEqual(1, eb.errorMessageCount());
     const msg = eb.getErrorMessage(eb.getMessages()[0]);
     try testing.expectEqualStrings("unused local variable", eb.nullTerminatedString(msg.msg));
     try testing.expectEqualStrings("one.zig", eb.nullTerminatedString(eb.getSourceLocation(msg.src_loc).src_path));
+    // 编译读取的文件：根文件自身在其中，标准库与缓存中的文件不在其中
+    try testing.expectEqual(1, result.inputs.len);
+    try testing.expectEqualStrings(path, result.inputs[0]);
+
+    // 没有错误的编译：第二次命中缓存，读取的文件（包括被 import 的）仍然完整
+    const ok = try project.path(gpa, "ok.zig");
+    defer gpa.free(ok);
+    const dep = try project.path(gpa, "dep.zig");
+    defer gpa.free(dep);
+    for (0..2) |_| {
+        var r = try compileSingleFile(gpa, testing.io, project.env.zig_exe, ok);
+        defer r.deinit(gpa);
+        try testing.expectEqual(0, r.errors.errorMessageCount());
+        try testing.expectEqual(2, r.inputs.len);
+        for (r.inputs) |input| try testing.expect(std.mem.eql(u8, input, ok) or std.mem.eql(u8, input, dep));
+    }
 }
