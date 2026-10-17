@@ -67,6 +67,14 @@ test "references, highlight, rename and workspace symbol" {
     _ = try h.request("zig-analyzer/waitIdle", {});
     const doc = .{ .uri = uri };
 
+    // 后台索引已为未打开的 lib.zig 算出成员摘要：workspace symbol 不在请求中计算（计算要用到语法树）
+    {
+        const before = h.server.db.executions(za.syntax.queries.ItemSummaries);
+        const resp = try h.request("workspace/symbol", .{ .query = "hello" });
+        try testing.expectEqualStrings("hello", resp.object.get("result").?.array.items[0].object.get("name").?.string);
+        try testing.expectEqual(before, h.server.db.executions(za.syntax.queries.ItemSummaries));
+    }
+
     // 查找引用：lib.zig 未打开，经由模块图纳入
     {
         const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(main_text, "hello"), .context = .{ .includeDeclaration = true } });

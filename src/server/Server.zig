@@ -728,7 +728,7 @@ const index_progress_delay_ms = 200;
 /// 每批索引的文件数：每批一个读事务，编辑（写事务）最多等一批
 const index_batch = 8;
 
-/// 后台为项目文件建立索引（文件索引与 ItemTree）：引用查找、workspace symbol 与调用点种子
+/// 后台为项目文件建立索引（文件索引、ItemTree 与成员摘要）：引用查找、workspace symbol 与调用点种子
 /// 只需读取索引，不必在请求中解析全部文件。解析结果随后按 LRU 淘汰，索引保留。
 ///
 /// 同时只运行一个任务：模块图在项目加载与构建期间会多次更新，运行中的任务不中断，做完一遍后
@@ -806,6 +806,7 @@ fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId) za.db.Error!void {
     for (files) |f| {
         _ = try ctx.get(za.ide_db.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
+        _ = try ctx.get(syntax_q.ItemSummaries, f);
     }
 }
 

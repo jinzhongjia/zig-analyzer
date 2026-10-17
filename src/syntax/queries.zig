@@ -115,6 +115,9 @@ pub const FileItemTree = struct {
 pub const ItemSummary = struct {
     /// 成员节点在文件中的起始位置；找不到节点时为 null
     offset: ?u32,
+    /// 名字 token 在文件中的起始位置与长度；没有名字（或找不到节点）时长度为 0
+    name_offset: u32 = 0,
+    name_len: u32 = 0,
     /// 成员节点内出现的标识符（含嵌套成员）的布隆过滤器：判断「可能提到某个名字」，
     /// 有假阳性、无假阴性
     names: [4]u64 = @splat(0),
@@ -139,7 +142,7 @@ pub const ItemSummary = struct {
 };
 
 /// 文件中各成员与容器的摘要（与 `ItemTree.items` / `containers` 一一对应）。值很小且不淘汰：
-/// 只需要位置或只需判断成员是否提到某个名字的场景（引用查找、调用点种子、定位体内的容器），
+/// 只需要位置或只需判断成员是否提到某个名字的场景（引用查找、调用点种子、定位体内的容器、workspace symbol），
 /// 不必为已被淘汰的解析结果重新解析，也不必为不相关的成员生成 Body。
 /// 单独作为一个 query，不放进 ItemTree：函数体内的编辑会改变它，而 ItemTree 必须保持不变
 pub const ItemSummaries = struct {
@@ -172,6 +175,10 @@ pub const ItemSummaries = struct {
                 continue;
             };
             o.* = .{ .offset = node.offset };
+            if (ast.memberName(node, ItemTree.bareFieldNames(items.containers[it.container].kind))) |t| {
+                o.name_offset = t.offset;
+                o.name_len = @intCast(t.text.len);
+            }
             collectNames(node, o);
         }
         for (items.containers, out.container_offsets) |c, *o| o.* = if (map.get(c.ast_id)) |n| n.offset else null;
