@@ -2739,22 +2739,24 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
         else => return null,
     };
     const owner: hir.OwnerKey = .{ .file = fv.file, .item = fv.decl };
-    const body = try r.ctx.get(hir.ItemBody, owner);
+    // 先只看参数的形式：不是泛型的调用（绝大多数）不依赖被调函数的函数体
+    const forms = try r.ctx.get(hir.ParamForms, owner);
     const all_comptime = try eval.isComptimeOnly(r, f.ret);
-    const kinds = try scratch.alloc(ParamKind, body.params.len);
+    const kinds = try scratch.alloc(ParamKind, forms.len);
     var generic = all_comptime;
-    for (body.params, kinds, 0..) |p, *k, i| {
-        const b = body.binding(p);
-        k.* = if (b.ty == null)
-            (if (b.is_comptime) .comptime_anytype else .anytype_type)
-        else if (all_comptime or b.is_comptime or (i < f.params.len and value.isComptimeOnly(ip, f.params[i])))
-            .comptime_value
-        else
-            .runtime;
+    for (forms, kinds, 0..) |form, *k, i| {
+        k.* = switch (form) {
+            .any => .anytype_type,
+            .comptime_any => .comptime_anytype,
+            .typed, .comptime_typed => if (all_comptime or form == .comptime_typed or (i < f.params.len and value.isComptimeOnly(ip, f.params[i])))
+                .comptime_value
+            else
+                .runtime,
+        };
         if (k.* != .runtime) generic = true;
     }
     if (!generic) return null;
-    return .{ .owner = owner, .body = body, .parent = fv.inst, .kinds = kinds };
+    return .{ .owner = owner, .body = try r.ctx.get(hir.ItemBody, owner), .parent = fv.inst, .kinds = kinds };
 }
 
 /// 调用的实例（`args` 与形参一一对应）。comptime 实参按参数类型转换：参数类型依赖其他参数

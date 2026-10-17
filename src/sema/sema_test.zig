@@ -2033,6 +2033,35 @@ test "member bodies are reused when their source is unchanged" {
     try testing.expect(before.b != after.b);
 }
 
+test "editing a callee body does not invalidate the inference of its callers" {
+    // 判断是否为泛型调用时依赖被调函数的整个 Body：改它的函数体会使全部调用者重新推导
+    const v1 = "fn callee(a: u32) u32 {\n    return a + 1;\n}\nfn generic(x: anytype) @TypeOf(x) {\n    return x;\n}\nfn caller(v: u32) u32 {\n    const r = callee(v);\n    return generic(r);\n}\n";
+    const v2 = "fn callee(a: u32) u32 {\n    var b = a;\n    b += 2;\n    return b;\n}\nfn generic(x: anytype) @TypeOf(x) {\n    return x;\n}\nfn caller(v: u32) u32 {\n    const r = callee(v);\n    return generic(r);\n}\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", v1);
+    for ([_][]const u8{ v1, v2 }, 0..) |text, round| {
+        if (round == 1) _ = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var trace: @import("../db/engine.zig").Trace = .{ .gpa = w.arena.allocator() };
+        ctx.trace = &trace;
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const owner = try r.ownerKey(f.file, resolve.Resolver.lookupDecl(try r.itemTree(f.file), 0, "caller").?);
+        _ = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        if (round == 0) continue;
+        // 被调函数自身（签名部分）重新推导，值不变；调用者不重算
+        const infer_index = comptime for (database.Db.query_types, 0..) |Q, qi| {
+            if (Q == queries.Infer) break qi;
+        } else unreachable;
+        for (trace.events.items) |ev| if (ev.query == infer_index) {
+            try testing.expect(w.db.keyAt(queries.Infer, ev.key).owner.item != owner.item);
+        };
+    }
+    try testing.expectEqualStrings("u32", try typeAt(&w, f.file, v2, "r", 1));
+}
+
 test "std.mem pointer reinterpretation" {
     try expectStdTypes(
         \\const std = @import("std");
