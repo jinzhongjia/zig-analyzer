@@ -9,11 +9,15 @@ const FileId = @import("../base/Vfs.zig").FileId;
 pub const Result = struct {
     /// 文件 → 第一次到达它时所在的模块
     files: std.AutoArrayHashMapUnmanaged(FileId, Membership) = .empty,
+    /// 文件之后又在其他模块中到达时的 (文件, 模块)，按到达顺序：不同 compile step 中同一文件可以属于
+    /// import 表不同的模块（如 exe 与 test 各自创建模块、共用根文件）
+    others: std.AutoArrayHashMapUnmanaged(FileModule, void) = .empty,
     /// 可达但尚未加载内容的文件；调用方加载后应重新计算
     missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
         r.files.deinit(gpa);
+        r.others.deinit(gpa);
         r.missing.deinit(gpa);
     }
 
@@ -24,6 +28,12 @@ pub const Result = struct {
 
 /// 标准库在遍历中使用的模块编号
 pub const std_module = std.math.maxInt(u32);
+
+pub const FileModule = struct {
+    file: FileId,
+    /// `ProjectModel.modules` 下标；标准库为 `std_module`
+    module: u32,
+};
 
 pub const Membership = struct {
     /// `ProjectModel.modules` 下标；标准库为 `std_module`
@@ -40,7 +50,7 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
     var result: Result = .{};
     errdefer result.deinit(gpa);
 
-    const Node = struct { file: FileId, module: u32 };
+    const Node = FileModule;
     var visited: std.AutoHashMapUnmanaged(Node, void) = .empty;
     defer visited.deinit(gpa);
     var stack: std.ArrayList(Node) = .empty;
@@ -60,7 +70,11 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
         while (stack.pop()) |node| {
             if ((try visited.getOrPut(gpa, node)).found_existing) continue;
             const gop = try result.files.getOrPut(gpa, node.file);
-            if (!gop.found_existing) gop.value_ptr.* = .{ .module = node.module, .root_module = root_module };
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .module = node.module, .root_module = root_module };
+            } else if (gop.value_ptr.module != node.module) {
+                try result.others.put(gpa, node, {});
+            }
             const imports = try resolver.imports(node.file) orelse {
                 try result.missing.put(gpa, node.file, {});
                 continue;
@@ -239,4 +253,48 @@ test buildScripts {
     try testing.expectEqualStrings(native("/p/shared.zig"), names.items[3]);
     try testing.expectEqual(1, r.missing.count());
     try testing.expectEqualStrings(native("/p/shared.zig"), fs.path(r.missing.keys()[0]));
+}
+
+test "a file shared by modules of different compile steps records every module" {
+    const gpa = testing.allocator;
+    // exe（模块 0）与 test（模块 1）共用根文件 main.zig；test 的模块多 import 一个 helper（模块 2），
+    // 两者都 import dep（模块 3）
+    var modules = [_]ProjectModel.Module{
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{.{ .name = "dep", .module = 3 }} },
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{ .{ .name = "dep", .module = 3 }, .{ .name = "helper", .module = 2 } } },
+        .{ .root_file = native("/p/helper.zig"), .imports = &.{} },
+        .{ .root_file = native("/p/dep.zig"), .imports = &.{} },
+    };
+    const steps = [_]ProjectModel.Step{
+        .{ .name = "exe", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
+        .{ .name = "test", .kind = .{ .compile = .{ .root_module = 1 } }, .deps = &.{} },
+    };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
+
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    try fs.files.put(gpa, native("/p/src/main.zig"), &.{ "dep", "helper", "util.zig", "std" });
+    try fs.files.put(gpa, native("/p/src/util.zig"), &.{});
+    try fs.files.put(gpa, native("/p/helper.zig"), &.{});
+    try fs.files.put(gpa, native("/p/dep.zig"), &.{});
+    try fs.files.put(gpa, native("/zig/std/std.zig"), &.{});
+
+    var r = try compute(gpa, &model, &.{ 0, 1 }, &fs);
+    defer r.deinit(gpa);
+    const id = struct {
+        fn of(f: *FakeFs, path: []const u8) FileId {
+            for (f.paths.items, 0..) |p, i| if (std.mem.eql(u8, p, path)) return @fromBackingInt(@as(u32, @intCast(i)));
+            unreachable;
+        }
+    }.of;
+    const main = id(&fs, native("/p/src/main.zig"));
+    const util = id(&fs, native("/p/src/util.zig"));
+    // 先到达的 compile step 决定 `files` 中的归属
+    try testing.expectEqual(0, r.files.get(main).?.module);
+    try testing.expectEqual(0, r.files.get(util).?.module);
+    try testing.expectEqual(2, r.files.get(id(&fs, native("/p/helper.zig"))).?.module);
+    // test 的模块中再次到达的文件记为其他归属；两个 step 中模块相同的文件（dep、std）不重复记录
+    try testing.expectEqual(2, r.others.count());
+    try testing.expect(r.others.contains(.{ .file = main, .module = 1 }));
+    try testing.expect(r.others.contains(.{ .file = util, .module = 1 }));
 }

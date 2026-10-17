@@ -379,15 +379,15 @@ fn labelStart(text: []const u8, offset: u32) ?u32 {
     return start;
 }
 
-/// `@import("...` 中的模块名（std、builtin、root、所在模块 import 的模块）与相对路径下的
+/// `@import("...` 中的模块名（std、builtin、root、所属各模块 import 的模块）与相对路径下的
 /// `.zig` / `.zon` 文件、子目录。补全项为从字符串开头起的完整路径
 fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range) resolve.Error!void {
     const slash = std.mem.lastIndexOfScalar(u8, typed, '/');
     if (slash == null) {
         for ([_][]const u8{ "std", "builtin", "root" }) |m| try out.add(.{ .label = m, .kind = .module, .replace = range });
-        if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.entry(file)) |entry| if (entry.module != ModuleGraph.std_module) {
-            for (graph.modules[entry.module].imports) |imp| try out.add(.{ .label = imp.name, .kind = .module, .replace = range });
-        };
+        if (try r.ctx.get(ModuleGraph.Input, {})) |graph| {
+            for (try graph.importNames(r.arena, file)) |name| try out.add(.{ .label = name, .kind = .module, .replace = range });
+        }
     }
     const vfs = r.ctx.db.env.vfs;
     const prefix = if (slash) |s| typed[0 .. s + 1] else "";

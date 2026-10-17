@@ -187,6 +187,49 @@ test "imports: relative files, modules, std and root" {
     try testing.expectEqualStrings("Allocator eql", try w.complete(main.file, main.cursor));
 }
 
+test "imports of a file in several modules" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = try w.add("/p/a.zig", "pub fn fromA() u32 {}\n");
+    const b = try w.add("/p/b.zig", "pub fn fromB() u32 {}\n");
+    const src =
+        \\const dep = @import("dep");
+        \\pub fn main() void {
+        \\    _ = dep.fromA();
+        \\}
+        \\test {
+        \\    const h = @import("helper");
+        \\    _ = h.fromB();
+        \\    _ = @import("<|>");
+        \\}
+    ;
+    const main = try w.add("/p/src/main.zig", src);
+    // exe 的模块（0）与 test 的模块（1）共用根文件：exe 中 dep → a；test 中 dep → b，另有 helper → b
+    try w.setGraph(null, &.{
+        .{ .root = main.file, .imports = &.{.{ .name = "dep", .module = 2 }} },
+        .{ .root = main.file, .imports = &.{ .{ .name = "dep", .module = 3 }, .{ .name = "helper", .module = 3 } } },
+        .{ .root = a.file, .imports = &.{} },
+        .{ .root = b.file, .imports = &.{} },
+    }, &.{
+        .{ .file = main.file, .module = 0, .root_module = 0, .others = &.{1} },
+        .{ .file = a.file, .module = 2, .root_module = 0 },
+        .{ .file = b.file, .module = 3, .root_module = 1 },
+    });
+    const text = try std.mem.replaceOwned(u8, w.arena.allocator(), src, "<|>", "");
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    // 只有 test 的模块 import 的名字
+    try testing.expectEqualStrings("b.zig:", try w.goto(main.file, at(text, "\"helper\"")));
+    try testing.expectEqualStrings("b.zig:fromB", try w.goto(main.file, at(text, "fromB")));
+    // 两个模块都 import 的名字取优先的模块中的
+    try testing.expectEqualStrings("a.zig:fromA", try w.goto(main.file, at(text, "fromA")));
+    try testing.expectEqualStrings("builtin dep helper root std", try w.complete(main.file, main.cursor));
+}
+
 test "@This, enums, nested containers and generic functions" {
     var w: World = undefined;
     try w.init();

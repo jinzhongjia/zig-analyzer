@@ -309,6 +309,73 @@ const inactive_main =
     \\
 ;
 
+/// exe 与 test 各自创建模块、共用根文件：两者的 dep 指向不同的包，test 的模块另有 helper
+const shared_root_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\    const pkg_a = b.createModule(.{ .root_source_file = b.path("pkg_a/a.zig") });
+    \\    const pkg_b = b.createModule(.{ .root_source_file = b.path("pkg_b/b.zig") });
+    \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\        .imports = &.{.{ .name = "dep", .module = pkg_a }},
+    \\    }) });
+    \\    b.installArtifact(exe);
+    \\    const tests = b.addTest(.{ .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\        .imports = &.{ .{ .name = "dep", .module = pkg_b }, .{ .name = "helper", .module = pkg_b } },
+    \\    }) });
+    \\    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    \\}
+    \\
+;
+
+const shared_root_main =
+    \\const dep = @import("dep");
+    \\pub fn main() void {
+    \\    _ = dep.fromA();
+    \\}
+    \\test "uses the helper" {
+    \\    const h = @import("helper");
+    \\    const w = h.fromB();
+    \\    _ = w;
+    \\}
+    \\
+;
+
+test "a root file shared by modules with different imports resolves the imports of each module" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = shared_root_build },
+        .{ .path = "src/main.zig", .text = shared_root_main },
+        .{ .path = "pkg_a/a.zig", .text = "pub fn fromA() u32 {\n    return 1;\n}\n" },
+        .{ .path = "pkg_b/b.zig", .text = "pub const Widget = struct { size: u64 };\npub fn fromB() Widget {\n    return .{ .size = 2 };\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = shared_root_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    // 只有 test 的模块 import 的名字
+    try testing.expectEqualStrings("b.zig:0", try gotoAt(&h, uri, shared_root_main, "\"helper\""));
+    try testing.expectEqualStrings("b.zig:1", try gotoAt(&h, uri, shared_root_main, "fromB"));
+    try testing.expectEqualStrings("```zig\nconst w: Widget\n```", try hoverText(&h, uri, shared_root_main, "w ="));
+    // 两个模块都 import 的名字取诊断 step（默认的 install，即 exe）的模块中的
+    try testing.expectEqualStrings("a.zig:0", try gotoAt(&h, uri, shared_root_main, "fromA"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "code excluded by a comptime condition is published as an unnecessary hint" {
     var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = inactive_main }});
     defer project.deinit();

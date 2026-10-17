@@ -1,8 +1,10 @@
 //! 模块图：各模块的根文件与 import 表，以及每个文件所属的模块。
 //!
 //! 由 Server 汇总各项目的构建图与编译集合生成，作为查询引擎的 input（`ModuleGraphInput`）。
-//! 文件的模块归属来自编译集合（与编译器一致：从 compile step 的根模块沿 import 到达）；
-//! 不在任何编译集合中的文件没有归属，只能 import 标准库与相对路径。
+//! 文件的模块归属来自编译集合（与编译器一致：从 compile step 的根模块沿 import 到达）。一个文件可以
+//! 属于多个模块（不同 compile step 各自创建的模块共用一个文件，如 exe 与 test 共用根文件），按名字的
+//! import 依次在这些模块的 import 表中查找。不在任何编译集合中的文件没有归属，只能 import 标准库与
+//! 相对路径。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,10 +43,13 @@ pub const Import = struct {
 
 pub const FileEntry = struct {
     file: FileId,
-    /// `modules` 下标；标准库文件为 `std_module`
+    /// `modules` 下标；标准库文件为 `std_module`。属于多个模块时为最优先的一个（诊断 step 的、本机
+    /// 目标的 compile step 中的模块在前）
     module: u32,
-    /// `@import("root")` 的目标模块
+    /// `@import("root")` 的目标模块（`module` 所在 compile step 的根模块）
     root_module: u32,
+    /// 文件同时属于的其他模块，按优先级排列（不含 `module`）
+    others: []const u32 = &.{},
 };
 
 pub fn deinit(g: *ModuleGraph, gpa: Allocator) void {
@@ -60,6 +65,14 @@ pub const Builder = struct {
     arena: std.heap.ArenaAllocator,
     modules: std.ArrayList(Module) = .empty,
     files: std.AutoArrayHashMapUnmanaged(FileId, FileEntry) = .empty,
+    /// 文件的其他归属，按加入的顺序（即优先级）；`finish` 时按文件分组写入 `FileEntry.others`
+    others: std.AutoArrayHashMapUnmanaged(Other, void) = .empty,
+
+    const Other = struct {
+        /// 文件在 `files` 中的下标
+        index: u32,
+        module: u32,
+    };
 
     pub fn init(gpa: Allocator, vfs: *Vfs) Builder {
         return .{ .gpa = gpa, .vfs = vfs, .arena = .init(gpa) };
@@ -68,10 +81,12 @@ pub const Builder = struct {
     /// `finish` 之后不必调用
     pub fn deinit(b: *Builder) void {
         b.files.deinit(b.gpa);
+        b.others.deinit(b.gpa);
         b.arena.deinit();
     }
 
-    /// `extra`：其余编译 step 可达的文件，不在编译集合中的按它归属（测试、示例中的文件也能解析模块 import）
+    /// `extra`：其余编译 step 可达的文件（测试、示例中的文件也能解析模块 import），归属排在编译集合之后。
+    /// 同一文件属于多个项目时，先加入的项目中的归属优先
     pub fn add(b: *Builder, model: *const ProjectModel, compile_set: *const CompileSet.Result, extra: ?*const CompileSet.Result) Allocator.Error!void {
         const a = b.arena.allocator();
         const offset: u32 = @intCast(b.modules.items.len);
@@ -87,26 +102,51 @@ pub const Builder = struct {
         for ([_]?*const CompileSet.Result{ compile_set, extra }) |set| {
             const cs = set orelse continue;
             for (cs.files.keys(), cs.files.values()) |file, mem| {
-                // 同一文件属于多个项目（或同时在编译集合与 `extra` 中）时取第一个
+                const module = if (mem.module == std_module) std_module else offset + mem.module;
                 const gop = try b.files.getOrPut(b.gpa, file);
-                if (gop.found_existing) continue;
-                gop.value_ptr.* = .{
-                    .file = file,
-                    .module = if (mem.module == std_module) std_module else offset + mem.module,
-                    .root_module = offset + mem.root_module,
-                };
+                if (gop.found_existing) {
+                    try b.addOther(gop.index, module);
+                } else {
+                    gop.value_ptr.* = .{ .file = file, .module = module, .root_module = offset + mem.root_module };
+                }
             }
+            // 这些文件第一次到达时的归属已在上面加入
+            for (cs.others.keys()) |o| try b.addOther(b.files.getIndex(o.file).?, if (o.module == std_module) std_module else offset + o.module);
         }
     }
 
+    fn addOther(b: *Builder, index: usize, module: u32) Allocator.Error!void {
+        if (b.files.values()[index].module == module) return;
+        try b.others.put(b.gpa, .{ .index = @intCast(index), .module = module }, {});
+    }
+
     pub fn finish(b: *Builder, std_root: ?FileId, default_builtin: ?FileId) Allocator.Error!ModuleGraph {
-        const entries = try b.arena.allocator().dupe(FileEntry, b.files.values());
+        const a = b.arena.allocator();
+        const values = b.files.values();
+        // 其他归属按文件分组放在同一个数组中，同一文件内保持加入的顺序（计数排序）
+        const all = try a.alloc(u32, b.others.count());
+        const next = try b.gpa.alloc(u32, values.len);
+        defer b.gpa.free(next);
+        @memset(next, 0);
+        for (b.others.keys()) |o| next[o.index] += 1;
+        var start: u32 = 0;
+        for (values, next) |*e, *n| {
+            e.others = all[start..][0..n.*];
+            n.* = start;
+            start += @intCast(e.others.len);
+        }
+        for (b.others.keys()) |o| {
+            all[next[o.index]] = o.module;
+            next[o.index] += 1;
+        }
+        const entries = try a.dupe(FileEntry, values);
         std.mem.sort(FileEntry, entries, {}, struct {
             fn lt(_: void, x: FileEntry, y: FileEntry) bool {
                 return @backingInt(x.file) < @backingInt(y.file);
             }
         }.lt);
         b.files.deinit(b.gpa);
+        b.others.deinit(b.gpa);
         return .{ .arena = b.arena.state, .std_root = std_root, .default_builtin = default_builtin, .modules = b.modules.items, .files = entries };
     }
 };
@@ -120,7 +160,7 @@ pub fn entry(g: *const ModuleGraph, file: FileId) ?FileEntry {
     return g.files[i];
 }
 
-/// 文件 `file` 中 `@import(name)` 的目标（模块名：std、builtin、root 与所在模块 import 的模块；
+/// 文件 `file` 中 `@import(name)` 的目标（模块名：std、builtin、root 与所属各模块 import 的模块；
 /// 相对路径不经过模块图，不在此处理）
 pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?FileId {
     if (std.mem.eql(u8, name, "std")) return g.std_root;
@@ -132,11 +172,35 @@ pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?File
     }
     const e = g.entry(file) orelse return null;
     if (std.mem.eql(u8, name, "root")) return g.modules[e.root_module].root;
-    if (e.module == std_module) return null;
-    for (g.modules[e.module].imports) |imp| {
-        if (std.mem.eql(u8, imp.name, name)) return g.modules[imp.module].root;
+    // 属于多个模块时依次查找；多个模块都 import 同一名字（可能指向不同的模块）时取最优先的模块中的
+    if (g.moduleImport(e.module, name)) |m| return g.modules[m].root;
+    for (e.others) |other| if (g.moduleImport(other, name)) |m| return g.modules[m].root;
+    return null;
+}
+
+/// 模块 `module` 以 `name` import 的模块
+fn moduleImport(g: *const ModuleGraph, module: u32, name: []const u8) ?u32 {
+    if (module == std_module) return null;
+    for (g.modules[module].imports) |imp| {
+        if (std.mem.eql(u8, imp.name, name)) return imp.module;
     }
     return null;
+}
+
+/// 文件所属的各模块的 import 名字（不重复，按模块的优先级）
+pub fn importNames(g: *const ModuleGraph, arena: Allocator, file: FileId) Allocator.Error![]const []const u8 {
+    const e = g.entry(file) orelse return &.{};
+    var names: std.ArrayList([]const u8) = .empty;
+    const first = [_]u32{e.module};
+    for ([_][]const u32{ &first, e.others }) |modules| for (modules) |m| {
+        if (m == std_module) continue;
+        for (g.modules[m].imports) |imp| {
+            for (names.items) |n| {
+                if (std.mem.eql(u8, n, imp.name)) break;
+            } else try names.append(arena, imp.name);
+        }
+    };
+    return names.items;
 }
 
 pub fn eql(a: *const ModuleGraph, b: *const ModuleGraph) bool {
@@ -228,3 +292,80 @@ pub const StdRoot = struct {
         return graph.std_root;
     }
 };
+
+const testing = std.testing;
+const native = @import("../util/test_path.zig").native;
+
+test "a file in several modules resolves imports from each of them" {
+    const gpa = testing.allocator;
+    var vfs: Vfs = .init(testing.io, gpa);
+    defer vfs.deinit();
+    // exe 的模块（0）与 test 的模块（1）共用根文件 main.zig：exe 中 dep → a；test 中 dep → b，另有 helper → b
+    var modules = [_]ProjectModel.Module{
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{.{ .name = "dep", .module = 2 }} },
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{ .{ .name = "dep", .module = 3 }, .{ .name = "helper", .module = 3 } } },
+        .{ .root_file = native("/p/a.zig"), .imports = &.{} },
+        .{ .root_file = native("/p/b.zig"), .imports = &.{} },
+    };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &.{}, .modules = &modules, .default_step = 0 };
+    const main = try vfs.intern(native("/p/src/main.zig"));
+    const a = try vfs.intern(native("/p/a.zig"));
+    const b = try vfs.intern(native("/p/b.zig"));
+    // 编译集合（诊断 step 为 exe）与全部 compile step 的集合（exe 在前）
+    var cs: CompileSet.Result = .{};
+    defer cs.deinit(gpa);
+    try cs.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
+    try cs.files.put(gpa, a, .{ .module = 2, .root_module = 0 });
+    var extra: CompileSet.Result = .{};
+    defer extra.deinit(gpa);
+    try extra.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
+    try extra.files.put(gpa, a, .{ .module = 2, .root_module = 0 });
+    try extra.files.put(gpa, b, .{ .module = 3, .root_module = 1 });
+    try extra.others.put(gpa, .{ .file = main, .module = 1 }, {});
+
+    var builder: Builder = .init(gpa, &vfs);
+    try builder.add(&model, &cs, &extra);
+    var g = try builder.finish(null, null);
+    defer g.deinit(gpa);
+    try testing.expectEqualSlices(u32, &.{1}, g.entry(main).?.others);
+    // 只有 test 的模块 import 的名字也能解析
+    try testing.expectEqual(@as(?FileId, b), g.importTarget(main, "helper"));
+    // 两个模块都 import 的名字取优先的模块（编译集合中的 exe）中的
+    try testing.expectEqual(@as(?FileId, a), g.importTarget(main, "dep"));
+    try testing.expectEqual(null, g.importTarget(main, "other"));
+    // `@import("root")` 取优先的归属所在 compile step 的根模块
+    try testing.expectEqual(@as(?FileId, main), g.importTarget(main, "root"));
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const names = try g.importNames(arena.allocator(), main);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("dep", names[0]);
+    try testing.expectEqualStrings("helper", names[1]);
+}
+
+test "a file in many modules keeps its other modules in linear space" {
+    // 防止每加入一个归属就复制一遍已有的归属：属于 k 个模块的文件会在模块图的 arena 中留下 O(k²) 的垃圾
+    const gpa = testing.allocator;
+    var vfs: Vfs = .init(testing.io, gpa);
+    defer vfs.deinit();
+    const k = 1000;
+    var modules: [k]ProjectModel.Module = undefined;
+    for (&modules) |*m| m.* = .{ .root_file = native("/p/src/main.zig"), .imports = &.{} };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &.{}, .modules = &modules, .default_step = 0 };
+    const main = try vfs.intern(native("/p/src/main.zig"));
+    var cs: CompileSet.Result = .{};
+    defer cs.deinit(gpa);
+    try cs.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
+    for (1..k) |m| try cs.others.put(gpa, .{ .file = main, .module = @intCast(m) }, {});
+
+    var builder: Builder = .init(gpa, &vfs);
+    try builder.add(&model, &cs, null);
+    var g = try builder.finish(null, null);
+    defer g.deinit(gpa);
+    const others = g.entry(main).?.others;
+    try testing.expectEqual(k - 1, others.len);
+    for (others, 1..) |m, i| try testing.expectEqual(i, m);
+    // 这些归属只占 4 KB；逐个复制时的垃圾约为 2 MB
+    try testing.expect(g.arena.promote(gpa).queryCapacity() < 512 * 1024);
+}
