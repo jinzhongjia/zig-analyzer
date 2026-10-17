@@ -38,6 +38,9 @@ const max_eval_bytes = 64 * 1024 * 1024;
 const max_agg_elems = 1 << 16;
 /// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
 const max_layout_depth = 64;
+/// 驻留时值的嵌套深度上限（聚合与指针的层数）。驻留的值按内容唯一表示、没有环，
+/// 自引用的值（如 `n.next = &n`）沿指针展开不会结束
+const max_freeze_depth = 256;
 
 const Error = resolve.Error;
 /// 放弃求值与控制流
@@ -488,6 +491,8 @@ const Evaluator = struct {
     arena: ?*std.heap.ArenaAllocator = null,
     steps: u32 = 0,
     inline_calls: u32 = 0,
+    /// `freeze` 当前的嵌套深度
+    freeze_depth: u32 = 0,
     /// 跟踪字符串字面量的来源（见 `stringOrigin`）
     track: ?*Tracking = null,
     /// break / continue 的目标（`Frame.labels` 下标）与值；return 的值
@@ -536,12 +541,18 @@ const Evaluator = struct {
         return if (tv.val) |x| Val.of(tv.ty, x) else .{ .ty = tv.ty };
     }
 
-    /// 驻留后的值；值未知时为 null
+    /// 驻留后的值；值未知时为 null。自引用与嵌套超过 `max_freeze_depth` 的值按未知处理
     fn freeze(ev: *Evaluator, v: Val) EvalError!?Index {
         switch (v.v) {
             .unknown => return null,
             .undef => return .undefined_value,
             .ip => |x| return x,
+            .agg, .ref => {},
+        }
+        if (ev.freeze_depth >= max_freeze_depth) return null;
+        ev.freeze_depth += 1;
+        defer ev.freeze_depth -= 1;
+        switch (v.v) {
             .agg => |agg| {
                 const elems = try ev.a.alloc(Index, agg.elems.len);
                 for (agg.elems, elems) |e, *out| out.* = try ev.freeze(e) orelse return null;
@@ -552,6 +563,7 @@ const Evaluator = struct {
                 const pointee = try ev.freeze(target) orelse return null;
                 return try ev.pointerTo(v.ty, pointee);
             },
+            .unknown, .undef, .ip => unreachable,
         }
     }
 

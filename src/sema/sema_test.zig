@@ -2223,3 +2223,39 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
         .{ "r_bump", "usize = 3" },
     });
 }
+
+test "comptime evaluation: self-referential and deeply nested values are unknown" {
+    try expectTypes(
+        \\const Node = struct { next: ?*const Node = null, v: u32 = 0 };
+        \\fn selfLoop() Node {
+        \\    var n: Node = .{ .v = 1 };
+        \\    n.next = &n;
+        \\    return n;
+        \\}
+        \\fn pair() [2]Node {
+        \\    var ns: [2]Node = .{ .{ .v = 1 }, .{ .v = 2 } };
+        \\    ns[0].next = &ns[1];
+        \\    ns[1].next = &ns[0];
+        \\    return ns;
+        \\}
+        \\fn chain(comptime n: usize) Node {
+        \\    var nodes: [n]Node = undefined;
+        \\    nodes[0] = .{ .v = 0 };
+        \\    for (1..n) |i| nodes[i] = .{ .next = &nodes[i - 1], .v = i };
+        \\    return nodes[n - 1];
+        \\}
+        \\const loop = selfLoop();
+        \\const both = pair();
+        \\const v = selfLoop().v;
+        \\const short = chain(3).next.?.v;
+        \\const long = chain(1000);
+    , &.{
+        // 自引用的值沿指针展开不会结束（原生栈耗尽，进程崩溃）
+        .{ "loop", "Node" },
+        .{ "both", "[2]Node" },
+        // 调用的结果整体驻留，含环时其中的字段也未知
+        .{ "v", "u32" },
+        .{ "short", "u32 = 1" },
+        .{ "long", "Node" },
+    });
+}
