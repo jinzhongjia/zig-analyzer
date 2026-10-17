@@ -171,6 +171,35 @@ fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error![]
     return std.fs.path.resolveAlloc(a, &.{ base, path });
 }
 
+/// 合并同一文件在多次编译中的结果（单文件模式下 import 它的各个根文件分别编译）。`results` 按编译完成的
+/// 先后从新到旧排列，以最新一次读取的文本为准：文本相同的结果直接并入；文本不同的（两次编译之间文件被修改）
+/// 只并入非 AstGen 错误，按文本差异平移，落在修改区域内的丢弃，与 `merge` 处理未保存修改的方式相同。
+/// 区间与文案相同的错误只保留一条（compile log 并到保留的那条上）
+pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.Error!FileResult {
+    const base = results[0].base_text;
+    var items: std.ArrayList(Item) = .empty;
+    for (results) |r| {
+        const edit: ?Edit = if (std.mem.eql(u8, r.base_text, base)) null else diffRegion(r.base_text, base);
+        next: for (r.items) |item| {
+            var moved = item;
+            if (edit) |e| {
+                if (item.is_astgen) continue;
+                const span = remap(e, item.start, item.end) orelse continue;
+                moved.start = span[0];
+                moved.end = span[1];
+            }
+            for (items.items) |*x| {
+                if (x.start == moved.start and x.end == moved.end and std.mem.eql(u8, x.message, moved.message)) {
+                    try addCompileLog(arena, x, moved.compile_log);
+                    continue :next;
+                }
+            }
+            try items.append(arena, moved);
+        }
+    }
+    return .{ .base_text = base, .items = items.items };
+}
+
 // ── 合并 ──────────────────────────────────────────────────────────
 
 pub const MergeInput = struct {

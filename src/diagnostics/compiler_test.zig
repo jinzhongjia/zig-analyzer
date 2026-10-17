@@ -233,6 +233,38 @@ test "collect: reference trace and compile log output are kept" {
     , diags[2].message.string);
 }
 
+test "combine: results of several compilations of the same file" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r = try buildResult();
+    defer r.deinit(testing.allocator);
+    const newest = r.files.getPtr(native("/proj/src/main.zig")).?;
+    const unused = newest.items[0];
+    const sema = newest.items[1];
+
+    // 同一文本：重复的错误只保留一条
+    const extra: compiler.Item = .{ .start = 0, .end = 3, .message = "another error", .is_astgen = false, .notes = &.{} };
+    const same: compiler.FileResult = .{ .base_text = main_text, .items = &.{ sema, extra } };
+    // 较旧的文本（`= 1` 当时是 `= 100`）：非 AstGen 错误平移到最新的文本上，AstGen 错误与落在修改区域内的丢弃
+    const old_text = try std.mem.replaceOwned(u8, a, main_text, "= 1;", "= 100;");
+    const edited: u32 = @intCast(std.mem.indexOf(u8, old_text, "100").?);
+    const old: compiler.FileResult = .{ .base_text = old_text, .items = &.{
+        .{ .start = sema.start + 2, .end = sema.end + 2, .message = "old error", .is_astgen = false, .notes = &.{} },
+        .{ .start = unused.start, .end = unused.end, .message = "old AstGen error", .is_astgen = true, .notes = &.{} },
+        .{ .start = edited, .end = edited + 3, .message = "in the edit", .is_astgen = false, .notes = &.{} },
+    } };
+    const c = try compiler.combine(a, &.{ newest, &same, &old });
+    try testing.expectEqualStrings(main_text, c.base_text);
+    try testing.expectEqual(4, c.items.len);
+    try testing.expectEqualStrings(unused.message, c.items[0].message);
+    try testing.expectEqualStrings(sema.message, c.items[1].message);
+    try testing.expectEqualStrings("another error", c.items[2].message);
+    try testing.expectEqualStrings("old error", c.items[3].message);
+    try testing.expectEqual(sema.start, c.items[3].start);
+    try testing.expectEqual(sema.end, c.items[3].end);
+}
+
 /// 只有一条错误（"unused local variable"）的错误包，compile log 的输出为 `log_text`
 fn unusedWithLog(log_text: []const u8) !ErrorBundle {
     var wip: ErrorBundle.Wip = try .init(testing.allocator);
@@ -265,6 +297,14 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
+    // 多次编译的结果合并时同样只保留一条，输出并到保留的那条上
+    var without_log = item;
+    without_log.compile_log = "";
+    const other: compiler.FileResult = .{ .base_text = main_text, .items = &.{without_log} };
+    const c = try compiler.combine(a, &.{ &other, result });
+    try testing.expectEqual(1, c.items.len);
+    try testing.expectEqualStrings(item.compile_log, c.items[0].compile_log);
+
     // 文本与构建时一致：输出接在文案之后
     const msgs = try mergeMessages(a, main_text, true, result);
     try testing.expectEqual(1, msgs.len);

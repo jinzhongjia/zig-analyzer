@@ -382,6 +382,60 @@ test "single-file mode: compile one file without build.zig, with progress" {
     try testing.expectEqualStrings("Compiling one.zig", titles[0]);
 }
 
+test "single-file mode: errors in imported files are published on them and cleared after a fix" {
+    const a_text =
+        \\const b = @import("b.zig");
+        \\export fn entry() u32 {
+        \\    return b.foo(1);
+        \\}
+        \\
+    ;
+    const b_text =
+        \\const T = u32;
+        \\comptime {
+        \\    _ = @as(T, "x");
+        \\}
+        \\pub fn foo(x: u32) u32 {
+        \\    const y: T = "s";
+        \\    _ = y;
+        \\    return x;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{ .{ .path = "a.zig", .text = a_text }, .{ .path = "b.zig", .text = b_text } });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    try waitIdle(&h);
+    const arena = h.arena.allocator();
+
+    // 编译 a.zig 时报告在 b.zig 中的错误发布在 b.zig 上（b.zig 尚未打开）
+    _ = try open(&h, try project.path(arena, "a.zig"), a_text);
+    try waitIdle(&h);
+    var diags = try h.diagnostics();
+    try expectDiagnostics(diags, "a.zig", &.{});
+    try expectDiagnostics(diags, "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
+
+    // 打开 b.zig：单独编译 b.zig 只报告 comptime 块中的错误，与 a.zig 的编译结果合并（相同的错误只保留一条）
+    const b_path = try project.path(arena, "b.zig");
+    const b_uri = try open(&h, b_path, b_text);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
+
+    // 在错误位置之外修复并保存 b.zig：在 b.zig 中报告过错误的 a.zig 随之重新编译，错误全部被清除
+    const fixed = try std.mem.replaceOwned(u8, arena, b_text, "T = u32", "T = []const u8");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = b_path, .data = fixed });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = b_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = b_uri } });
+    try waitIdle(&h);
+    diags = try h.diagnostics();
+    try expectDiagnostics(diags, "a.zig", &.{});
+    try expectDiagnostics(diags, "b.zig", &.{});
+    try shutdown(&h);
+}
+
 test "generated module roots: resolved from build results, including modules check does not depend on" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text =

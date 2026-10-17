@@ -66,8 +66,11 @@ root_has_build: std.ArrayList(bool) = .empty,
 roots_mutex: Io.Mutex = .init,
 
 single_mutex: Io.Mutex = .init,
-/// 单文件模式（不属于任何带 build.zig 的工作区）的编译结果
+/// 单文件模式（不属于任何带 build.zig 的工作区）的编译结果，按编译的根文件组织。结果中也有被根文件
+/// import 的文件中的错误
 single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
+/// 已存入的单文件编译结果数（受 single_mutex 保护），用于确定结果的先后
+single_generation: u64 = 0,
 env_mutex: Io.Mutex = .init,
 /// 启动后在后台查询；查询完成前为 null
 zig_env: ?ZigEnv = null,
@@ -142,8 +145,19 @@ pub const State = enum { uninitialized, running, shutdown };
 
 const SingleFile = struct {
     result: ?compiler.BuildResult = null,
+    /// FileId → `result` 中的条目（根文件自身与被它 import 的文件）
+    files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty,
+    /// `result` 存入时的 `single_generation`：越大越新
+    generation: u64 = 0,
     running: bool = false,
     rerun: bool = false,
+
+    fn clearResult(sf: *SingleFile, gpa: Allocator) void {
+        if (sf.result) |*r| r.deinit(gpa);
+        sf.result = null;
+        sf.files.deinit(gpa);
+        sf.files = .empty;
+    }
 };
 
 const Pending = struct {
@@ -187,7 +201,7 @@ pub fn deinit(server: *Server) void {
     for (server.roots.items) |r| server.gpa.free(r);
     server.roots.deinit(server.gpa);
     server.root_has_build.deinit(server.gpa);
-    for (server.single.values()) |*sf| if (sf.result) |*r| r.deinit(server.gpa);
+    for (server.single.values()) |*sf| sf.clearResult(server.gpa);
     server.single.deinit(server.gpa);
     if (server.zig_env) |*env| env.deinit(server.gpa);
     if (server.default_builtin) |p| server.gpa.free(p);
@@ -929,7 +943,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
         if (try server.refreshRoot(dir)) return;
     };
-    if (server.isSingleFile(id)) return server.compileSingle(id);
+    if (server.isSingleFile(id)) return server.recompileSingle(&.{id}, &.{id});
 
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
@@ -1022,11 +1036,11 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     const files = try arena.alloc(Vfs.FileId, changes.items.len);
     for (changes.items, files) |c, *f| f.* = c.file;
     server.publishFiles(files, true);
-    // 单文件模式：被它 import 的文件可能变了
+    // 单文件模式：打开的文件 import 的文件可能变了
     server.docs_mutex.lockUncancelable(server.io);
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
     server.docs_mutex.unlock(server.io);
-    for (open) |file| if (server.isSingleFile(file)) server.compileSingle(file);
+    server.recompileSingle(open, files);
 }
 
 /// 文件内容的变化频率：标准库几乎不变，依赖包很少变化，项目文件经常变化
@@ -1202,10 +1216,10 @@ fn clearSingleFileResults(server: *Server) void {
     {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
-        for (server.single.keys(), server.single.values()) |f, *sf| if (sf.result) |*r| {
-            r.deinit(server.gpa);
-            sf.result = null;
+        for (server.single.keys(), server.single.values()) |f, *sf| if (sf.result != null) {
             files.append(server.gpa, f) catch {};
+            files.appendSlice(server.gpa, sf.files.keys()) catch {};
+            sf.clearResult(server.gpa);
         };
     }
     server.publishFiles(files.items, true);
@@ -1410,21 +1424,83 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             errors = eb.errorMessageCount();
             break :blk compiler.collect(server.gpa, &.{eb}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
         };
+        // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
+        var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
+        if (result) |*r| for (r.files.keys(), r.files.values()) |p, *fr| {
+            const id = server.vfs.intern(p) catch continue;
+            files.put(server.gpa, id, fr) catch continue;
+        };
         server.single_mutex.lockUncancelable(server.io);
         const sf = server.single.getPtr(file).?;
         if (sf.rerun) {
             sf.rerun = false;
             server.single_mutex.unlock(server.io);
+            files.deinit(server.gpa);
             if (result) |*r| r.deinit(server.gpa);
             continue;
         }
-        if (sf.result) |*old| old.deinit(server.gpa);
+        // 受影响的文件：根文件自身，以及上一次与本次结果中有错误的文件（被 import 的文件也在其中）
+        var affected: std.ArrayList(Vfs.FileId) = .empty;
+        defer affected.deinit(server.gpa);
+        affected.append(server.gpa, file) catch {};
+        affected.appendSlice(server.gpa, sf.files.keys()) catch {};
+        affected.appendSlice(server.gpa, files.keys()) catch {};
+        sf.clearResult(server.gpa);
+        server.single_generation += 1;
         sf.result = result;
+        sf.files = files;
+        sf.generation = server.single_generation;
         sf.running = false;
         server.single_mutex.unlock(server.io);
-        server.publishFiles(&.{file}, true);
+        server.publishFiles(affected.items, true);
         return;
     }
+}
+
+/// 重新编译单文件模式的根文件：`roots`，以及上一次编译在 `changed` 中的文件里报告过错误的根文件（这些错误
+/// 基于文件旧的内容）。每个根文件只编译一次
+fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const Vfs.FileId) void {
+    var list: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    defer list.deinit(server.gpa);
+    for (roots) |root| list.put(server.gpa, root, {}) catch return;
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        for (server.single.keys(), server.single.values()) |root, *sf| {
+            for (changed) |f| if (sf.files.contains(f)) {
+                list.put(server.gpa, root, {}) catch return;
+                break;
+            };
+        }
+    }
+    for (list.keys()) |root| if (server.isSingleFile(root)) server.compileSingle(root);
+}
+
+/// 各个根文件最近一次编译中 `file` 的诊断，有多个时按 `compiler.combine` 合并。调用者持有 single_mutex
+fn singleFileResult(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error!?*const compiler.FileResult {
+    const Found = struct {
+        generation: u64,
+        result: *const compiler.FileResult,
+
+        fn newer(_: void, a: @This(), b: @This()) bool {
+            return a.generation > b.generation;
+        }
+    };
+    var found: std.ArrayList(Found) = .empty;
+    for (server.single.values()) |*sf| if (sf.files.get(file)) |fr| {
+        try found.append(arena, .{ .generation = sf.generation, .result = fr });
+    };
+    switch (found.items.len) {
+        0 => return null,
+        1 => return found.items[0].result,
+        else => {},
+    }
+    std.mem.sort(Found, found.items, {}, Found.newer);
+    const results = try arena.alloc(*const compiler.FileResult, found.items.len);
+    for (found.items, results) |f, *r| r.* = f.result;
+    const combined = try arena.create(compiler.FileResult);
+    combined.* = try compiler.combine(arena, results);
+    return combined;
 }
 
 fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
@@ -1990,17 +2066,14 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
             .other_file = OtherFiles.get,
             .other_ctx = &other,
         });
-    } else if (text) |current| {
-        // 单文件模式：只使用编译结果中本文件的诊断。不再按单文件处理的文件（所在根目录新建了 build.zig，
-        // 而项目没有启动）不使用此前的结果
+    } else {
+        // 单文件模式：各个根文件的编译中本文件的诊断（被 import 的文件中的错误由 import 它的根文件报告）。
+        // 不再按单文件处理的文件（所在根目录新建了 build.zig，而项目没有启动）不使用此前的结果
         const single = server.isSingleFile(file);
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
-        const sf = if (single) server.single.getPtr(file) else null;
-        const fr: ?*const compiler.FileResult = if (sf) |f|
-            if (f.result) |*r| r.files.getPtr(server.vfs.path(file)) else null
-        else
-            null;
+        const fr = if (single) try server.singleFileResult(arena, file) else null;
+        const current = text orelse if (fr) |r| r.base_text else "";
         diags = try compiler.merge(arena, .{
             .text = current,
             .lines = try offsets.LineIndex.init(arena, current),
