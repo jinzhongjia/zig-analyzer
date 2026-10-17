@@ -115,17 +115,27 @@ pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
     return out.items;
 }
 
-/// 在 `scope` 中能经由 `@import` 链到达 `target` 的文件（含 `target` 自身）
+/// 在 `scope` 中能经由 `@import` 链到达 `target` 的文件（含 `target` 自身）。`target` 不在 `scope` 中
+/// （标准库、依赖包）时，导入链会经过范围外的文件（项目 → `std.zig` → `mem.zig`）：沿 import 求出从
+/// 范围内的文件可达的全部文件，在其上建立反向边；范围外的其他文件不在结果中
 pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
+    // 范围内的文件在前（下标小于 `scope_len`），之后追加范围外可达的文件
+    var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    for (scope) |f| try nodes.put(r.arena, f, {});
+    const scope_len = nodes.count();
+    const in_scope = nodes.contains(target);
     // 反向边：被导入的文件 → 导入它的文件
     var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
-    for (scope) |f| {
+    var n: usize = 0;
+    while (n < nodes.count()) : (n += 1) {
+        const f = nodes.keys()[n];
         const index = try r.ctx.get(FileIndex.Query, f);
         for (index.imports) |s| {
             const to = try r.resolveImport(f, s) orelse continue;
             const gop = try reverse.getOrPut(r.arena, to);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(r.arena, f);
+            if (!in_scope) try nodes.put(r.arena, to, {});
         }
     }
     var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
@@ -136,7 +146,12 @@ pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Er
         const from = reverse.get(f) orelse continue;
         for (from.items) |x| try seen.put(r.arena, x, {});
     }
-    return seen.keys();
+    if (in_scope) return seen.keys();
+    var out: std.ArrayList(FileId) = .empty;
+    for (seen.keys()) |f| {
+        if (f == target or nodes.getIndex(f).? < scope_len) try out.append(r.arena, f);
+    }
+    return out.items;
 }
 
 const Finder = struct {
