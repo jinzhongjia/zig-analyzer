@@ -5,6 +5,8 @@ const testing = std.testing;
 const za = @import("../zig_analyzer.zig");
 const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
+const Server = @import("Server.zig");
+const Workspace = @import("Workspace.zig");
 
 const Empty = struct {};
 
@@ -306,4 +308,25 @@ test "files of a package that only exports modules resolve module imports" {
     try testing.expectEqualStrings("answer", try completionLabels(&h, uri, text, "dep."));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
+}
+
+test "a project whose background task cannot be started does not leave the server busy" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    // 不允许并发任务：项目的后台任务启动失败
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var writer: za.lsp.transport.Writer = .{ .io = testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(threaded.io(), testing.allocator, &writer);
+    defer server.deinit();
+    server.zig_env = try za.project.ZigEnv.query(testing.allocator, testing.io, project.env.zig_exe);
+
+    try testing.expectError(error.ConcurrencyUnavailable, Workspace.start(&server, project.root, 0));
+    const busy = server.busy;
+    // 计数泄漏时 deinit 中的 waitIdle 永远等待：先归零，让失败的测试正常结束
+    server.busy = 0;
+    try testing.expectEqual(0, busy);
 }
