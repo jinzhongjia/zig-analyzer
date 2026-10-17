@@ -2277,6 +2277,88 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
     });
 }
 
+test "comptime evaluation: slices of interpreter storage read elements in place" {
+    // 防止取切片的元素或长度时复制整个区间：逐次切片的循环（comptime 分词器的常见写法）分配量与
+    // 长度的平方成正比，超过内存上限后结果未知
+    const text = comptime blk: {
+        @setEvalBranchQuota(2000);
+        var buf: [1024]u8 = undefined;
+        for (&buf, 0..) |*c, i| c.* = if (i % 2 == 0) 'a' else 'b';
+        const final = buf;
+        break :blk &final;
+    };
+    try expectTypes(
+        \\fn count(comptime s: []const u8) usize {
+        \\    @setEvalBranchQuota(100000);
+        \\    var rest: []const u8 = s;
+        \\    var k: usize = 0;
+        \\    while (rest.len > 0) : (rest = rest[1..]) {
+        \\        if (rest[0] == 'a') k += 1;
+        \\    }
+        \\    return k;
+        \\}
+        \\fn copies(comptime s: []const u8) usize {
+        \\    var buf: [s.len]u8 = undefined;
+        \\    @memcpy(&buf, s);
+        \\    const view = buf[1..];
+        \\    var out: [s.len - 1]u8 = undefined;
+        \\    @memcpy(&out, view);
+        \\    const joined = view[view.len - 3 ..] ++ "c";
+        \\    for (view[0..2]) |*x| x.* = 'd';
+        \\    const p = view[2..4];
+        \\    p.*[0] = 'e';
+        \\    const digits = [_]u8{ out[0], joined[3], buf[2], buf[3], 'a' + joined.len };
+        \\    var n: usize = 0;
+        \\    for (digits) |d| n = n * 10 + (d - 'a');
+        \\    return n;
+        \\}
+        \\const big = "
+    ++ text ++
+        \\";
+        \\const counted = count(big);
+        \\const copied = copies(big);
+    , &.{
+        .{ "counted", "usize = 512" },
+        // 经由区间读取、复制、拼接与写入
+        .{ "copied", "usize = 12344" },
+    });
+}
+
+test "comptime evaluation: element-wise work counts toward the step and memory limits" {
+    // 防止逐元素的操作绕过上限：表达式不多的求值中逐个写入数十万个元素，或在两次内存检查之间
+    // 复制出超过内存上限的大数组
+    try expectTypes(
+        \\fn copyMany() u8 {
+        \\    const buf: [60000]u8 = @splat(1);
+        \\    var out: [60000]u8 = undefined;
+        \\    for (0..4) |_| @memcpy(&out, &buf);
+        \\    return out[0];
+        \\}
+        \\fn copyFew() u8 {
+        \\    const buf: [60000]u8 = @splat(1);
+        \\    var out: [60000]u8 = undefined;
+        \\    @memcpy(&out, &buf);
+        \\    return out[0];
+        \\}
+        \\fn copyLarge() u8 {
+        \\    const buf: [65536]u8 = @splat(1);
+        \\    var sum: u8 = 0;
+        \\    for (0..24) |_| {
+        \\        const c = buf;
+        \\        sum +%= c[0];
+        \\    }
+        \\    return sum;
+        \\}
+        \\const many = copyMany();
+        \\const few = copyFew();
+        \\const large = copyLarge();
+    , &.{
+        .{ "many", "u8" },
+        .{ "few", "u8 = 1" },
+        .{ "large", "u8" },
+    });
+}
+
 test "catch and orelse take the result type of the whole expression, labeled switch break values" {
     try expectTypes(
         \\fn parse(s: []const u8) error{Bad}!u8 {

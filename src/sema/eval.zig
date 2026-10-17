@@ -594,13 +594,13 @@ const Evaluator = struct {
     }
 
     /// 深复制可修改的聚合（值语义）
-    fn copy(ev: *Evaluator, v: Val) Error!Val {
+    fn copy(ev: *Evaluator, v: Val) EvalError!Val {
         const agg = switch (v.v) {
             .agg => |x| x,
             else => return v,
         };
         const out = try ev.a.create(Agg);
-        out.* = .{ .elems = try ev.a.alloc(Val, agg.elems.len) };
+        out.* = .{ .elems = try ev.allocElems(agg.elems.len) };
         for (agg.elems, out.elems) |e, *o| o.* = try ev.copy(e);
         return .{ .ty = v.ty, .v = .{ .agg = out } };
     }
@@ -643,7 +643,8 @@ const Evaluator = struct {
     fn elemCount(ev: *Evaluator, v: Val) EvalError!?usize {
         switch (v.v) {
             .agg => |agg| return agg.elems.len,
-            .ref => |ref| return ev.elemCount(try ev.load(ref)),
+            // 区间的长度不必取出元素
+            .ref => |ref| return if (ref.window) |w| w.len else ev.elemCount(try ev.load(ref)),
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return agg.elems.len,
                 .bytes => |b| return b.bytes.len,
@@ -669,7 +670,13 @@ const Evaluator = struct {
             .unknown => return .{ .ty = ty },
             .undef => return .{ .ty = ty, .v = .undef },
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
-            .ref => |ref| return ev.elemAt(try ev.load(ref), i),
+            .ref => |ref| {
+                // 区间：下标相对于区间的起点，在所在的聚合中直接取元素
+                const base = try ev.loadPath(ref);
+                const w = ref.window orelse return ev.elemAt(base, i);
+                if (i >= w.len) return error.Abort;
+                return ev.elemAt(base, w.start + i);
+            },
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
                 .bytes => |b| return if (i < b.bytes.len) Val.of(.u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
@@ -680,20 +687,39 @@ const Evaluator = struct {
         }
     }
 
+    /// 指针所指向的值。区间取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）；
+    /// 只取元素或长度时用 `elemAt` / `elemCount`，不复制区间
     fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
-        var cur = ref.cell.*;
-        for (ref.path) |i| cur = try ev.elemAt(cur, i);
+        const cur = try ev.loadPath(ref);
         const w = ref.window orelse return cur;
-        // 区间：取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）
-        const elems = try ev.a.alloc(Val, w.len);
+        const elems = try ev.allocElems(w.len);
         for (elems, w.start..) |*o, i| o.* = try ev.elemAt(cur, i);
         const array = try ev.ip.get(.{ .array_type = .{ .len = w.len, .child = ev.elemTypeOf(cur.ty, w.start) } });
         return ev.makeAgg(array, elems);
     }
 
+    /// 沿 `path` 逐层取元素得到的值；区间所在的聚合（不取出区间）
+    fn loadPath(ev: *Evaluator, ref: Ref) EvalError!Val {
+        var cur = ref.cell.*;
+        for (ref.path) |i| cur = try ev.elemAt(cur, i);
+        return cur;
+    }
+
+    /// 展开 `n` 个元素的聚合：分配之前检查元素个数与本次求值的内存上限（`tick` 每隔一段才检查内存，
+    /// 单步展开的大聚合会越过它）
+    fn allocElems(ev: *Evaluator, n: usize) EvalError![]Val {
+        if (n > max_agg_elems) return error.Abort;
+        if (ev.arena) |arena| if (arena.queryCapacity() + n * @sizeOf(Val) > max_eval_bytes) return error.Abort;
+        return ev.a.alloc(Val, n);
+    }
+
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
         if (ref.window) |w| {
-            for (0..w.len) |i| try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
+            // 逐元素写入：每个元素计一步
+            for (0..w.len) |i| {
+                try ev.tick();
+                try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
+            }
             return;
         }
         var cell = ref.cell;
@@ -710,9 +736,8 @@ const Evaluator = struct {
         if (cell.v == .agg) return cell.v.agg;
         if (cell.v == .ref) return error.Abort;
         const n = try ev.elemCount(cell.*) orelse return error.Abort;
-        if (n > max_agg_elems) return error.Abort;
         const agg = try ev.a.create(Agg);
-        agg.* = .{ .elems = try ev.a.alloc(Val, n) };
+        agg.* = .{ .elems = try ev.allocElems(n) };
         for (agg.elems, 0..) |*e, i| e.* = try ev.elemAt(cell.*, i);
         cell.v = .{ .agg = agg };
         return agg;
@@ -1481,8 +1506,9 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return error.Abort,
         };
-        const target = try ev.load(ref);
-        const child = ev.elemTypeOf(target.ty, i);
+        // 元素的类型取自所在的聚合，不取出区间
+        const target = try ev.loadPath(ref);
+        const child = ev.elemTypeOf(target.ty, if (ref.window) |w| w.start + i else i);
         const is_const = switch (ev.ip.key(seq.ty)) {
             .ptr_type => |p| p.is_const,
             else => false,
@@ -1688,8 +1714,7 @@ const Evaluator = struct {
         if (lhs.v == .unknown or rhs.v == .unknown) return error.Abort;
         const n = try ev.elemCount(lhs) orelse return error.Abort;
         const m = try ev.elemCount(rhs) orelse return error.Abort;
-        if (n + m > max_agg_elems) return error.Abort;
-        const elems = try ev.a.alloc(Val, n + m);
+        const elems = try ev.allocElems(n + m);
         for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
         for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
         const lt = ev.arrayOf(lhs.ty);
@@ -1814,6 +1839,8 @@ const Evaluator = struct {
     /// 位置；值为指向局部存储的指针时取它所指向的位置（自动解引用）
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
         const ref = try ev.place(f, e);
+        // 区间的值是数组，不是指针
+        if (ref.window != null) return ref;
         const v = try ev.load(ref);
         return switch (v.v) {
             .ref => |r| r,
@@ -1966,15 +1993,13 @@ const Evaluator = struct {
         const count = try ev.elemCount(base) orelse return error.Abort;
         const end = if (s.end) |e| std.math.cast(usize, try ev.evalInt(f, e, .usize_type)) orelse return error.Abort else count;
         if (start > end or end > count or end - start > max_agg_elems) return error.Abort;
-        const elems = try ev.a.alloc(Val, end - start);
-        for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
         const child = ev.elemTypeOf(base.ty, 0);
         const is_const = switch (ip.key(base.ty)) {
             .ptr_type => |p| p.is_const,
             else => true,
         };
         // comptime 已知的区间：指向数组的指针
-        const array = try ip.get(.{ .array_type = .{ .len = elems.len, .child = child } });
+        const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child } });
         const ptr_ty = try ip.ptrTo(array, .one, is_const);
         // 切片的是局部变量（或经由指针）的存储：引用原存储的区间，写入反映到原数组
         if (try ev.sliceTarget(f, s.lhs, base)) |target| {
@@ -1984,6 +2009,8 @@ const Evaluator = struct {
             return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
         }
         // 其他（驻留的常量等）：元素为复制，不驻留
+        const elems = try ev.allocElems(end - start);
+        for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
         return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
     }
 
@@ -2147,7 +2174,7 @@ const Evaluator = struct {
                 const target_ty = ev.pointeeType(v.ty);
                 if (target_ty != .unknown and (ip.key(target_ty) == .tuple_type or ip.key(target_ty) == .anon_struct_type)) {
                     const n = try ev.elemCount(v) orelse return error.Abort;
-                    const elems = try ev.a.alloc(Val, n);
+                    const elems = try ev.allocElems(n);
                     for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), p.child);
                     const array = try ip.get(.{ .array_type = .{ .len = n, .child = p.child, .sentinel = p.sentinel } });
                     const frozen = try ev.freeze(try ev.makeAgg(array, elems)) orelse return error.Abort;
@@ -2156,7 +2183,7 @@ const Evaluator = struct {
             },
             .array_type, .vector_type => if (ev.isAnon(v.ty)) {
                 const n = try ev.elemCount(v) orelse return error.Abort;
-                const elems = try ev.a.alloc(Val, n);
+                const elems = try ev.allocElems(n);
                 for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), ev.elemTypeOf(t, i));
                 return ev.makeAgg(t, elems);
             },
@@ -2359,8 +2386,7 @@ const Evaluator = struct {
             const t = want orelse return error.Abort;
             if (vals.len != 1) return error.Abort;
             const n = try ev.typeElemCount(t) orelse return error.Abort;
-            if (n > max_agg_elems) return error.Abort;
-            const elems = try ev.a.alloc(Val, n);
+            const elems = try ev.allocElems(n);
             for (elems) |*o| o.* = try ev.coerce(vals[0], ev.elemTypeOf(t, 0));
             return ev.makeAgg(t, elems);
         }
@@ -2378,7 +2404,11 @@ const Evaluator = struct {
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[1]) orelse return error.Abort;
-            for (0..n) |i| try ev.store(try ev.extend(dest, @intCast(i)), try ev.elemAt(vals[1], i));
+            // 逐元素写入：每个元素计一步
+            for (0..n) |i| {
+                try ev.tick();
+                try ev.store(try ev.extend(dest, @intCast(i)), try ev.elemAt(vals[1], i));
+            }
             return Val.void_val;
         }
         return error.Abort;
