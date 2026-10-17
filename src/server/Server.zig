@@ -1822,6 +1822,13 @@ fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs
     return try server.vfs.lookup(path);
 }
 
+/// 请求中的区间换算为字节偏移；起止颠倒的区间按交换后处理
+fn rangeOffsets(server: *const Server, text: []const u8, range: types.Range) struct { u32, u32 } {
+    const a: u32 = @intCast(offsets.positionToOffset(text, range.start, server.encoding));
+    const b: u32 = @intCast(offsets.positionToOffset(text, range.end, server.encoding));
+    return .{ @min(a, b), @max(a, b) };
+}
+
 /// 文件文本与行索引
 fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineIndex {
     const text = try ctx.get(FileText, file) orelse "";
@@ -2069,8 +2076,7 @@ fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.
 fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.InlayHintParams) HandlerError!types.ResultType("textDocument/inlayHint") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
-    const start: u32 = @intCast(offsets.positionToOffset(text, params.range.start, server.encoding));
-    const end: u32 = @intCast(offsets.positionToOffset(text, params.range.end, server.encoding));
+    const start, const end = server.rangeOffsets(text, params.range);
     const opts: ide.inlay_hints.Options = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
@@ -2246,8 +2252,7 @@ fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: type
 fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
-    const start: u32 = @intCast(offsets.positionToOffset(text, params.range.start, server.encoding));
-    const end: u32 = @intCast(offsets.positionToOffset(text, params.range.end, server.encoding));
+    const start, const end = server.rangeOffsets(text, params.range);
     const actions = try ide.code_actions.codeActions(r, file, start, end);
     const lines = try offsets.LineIndex.init(arena, text);
     const doc_uri = try server.uriFor(arena, file);

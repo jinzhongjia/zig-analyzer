@@ -131,7 +131,7 @@ test "references, highlight, rename and workspace symbol" {
 
     // code action：未使用的局部常量
     {
-        const extra = "fn f() void {\n    const x = 1;\n}\n";
+        const extra = "const y = 2;\nfn f() void {\n    const x = 1;\n}\n";
         const extra_uri = try za.base.uri.fromPath(a, try project.path(a, "src/extra.zig"));
         try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = extra_uri, .languageId = "zig", .version = 1, .text = extra } });
         const p = position(extra, "x =");
@@ -145,6 +145,14 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("discard `x`", actions[0].object.get("title").?.string);
         const edits = actions[0].object.get("edit").?.object.get("changes").?.object.get(extra_uri).?.array.items;
         try testing.expectEqualStrings("\n    _ = x;", edits[0].object.get("newText").?.string);
+
+        // 起止颠倒的区间按交换后处理（未交换时偏移相减下溢，服务器崩溃）
+        const reversed = try h.request("textDocument/codeAction", .{
+            .textDocument = .{ .uri = extra_uri },
+            .range = .{ .start = p, .end = .{ .line = 0, .character = 0 } },
+            .context = .{ .diagnostics = &[_]Empty{} },
+        });
+        try testing.expect(reversed.object.get("result") != null);
     }
 
     // 可观测性：status 的查询统计与慢请求报告
