@@ -31,6 +31,13 @@ pub const Error = struct {
     message: []const u8,
 };
 
+/// 语法树的最大深度。更深的节点在构造绿树时展平：其 token 直接挂在这一层的节点下（见 `buildTree`）。
+/// 沿树递归的各处（HIR 降级、ItemTree、推导等）的递归深度因此有上限
+pub const max_depth = 1024;
+/// 解析器的递归上限，以未结束的节点个数计。未结束而之后被放弃的节点每层至多一个，到这里时所在位置
+/// 在树中至少 `max_depth` 层深，不再递归解析的结构反正会被展平（见 `Parser.skipNested`）
+pub const nesting_limit = 2 * max_depth;
+
 pub const Parser = struct {
     gpa: Allocator,
     source: []const u8,
@@ -42,6 +49,12 @@ pub const Parser = struct {
     errors: std.ArrayList(Error) = .empty,
     /// 两次消费 token 之间查看 token 的次数上限：防止语法函数在不消费 token 的情况下无限循环
     fuel: u32 = max_fuel,
+    /// 未结束的节点（已开始、尚未 complete 或 abandon 的 Marker）个数，语法函数的递归深度与之相当
+    open: u32 = 0,
+    /// 解析过程中 `open` 的最大值
+    peak_open: u32 = 0,
+    /// 有结构因嵌套超过 `nesting_limit` 而没有递归解析（见 `skipNested`）
+    limited: bool = false,
 
     /// 在出错处逐层退出嵌套结构时，每层都会查看 token 而不消费，上限须远高于嵌套层数与每层查看次数之积
     const max_fuel = 1 << 24;
@@ -126,14 +139,48 @@ pub const Parser = struct {
         _ = try m.complete(p, .error_node);
     }
 
+    /// 嵌套已达 `nesting_limit`：语法函数不再递归，改用 `skipNested`
+    pub fn tooDeep(p: *const Parser) bool {
+        return p.open >= nesting_limit;
+    }
+
+    /// 不递归地消费所在的结构：括号配平地前进到同一层的 `;`、`,` 或未配对的右括号之前（当前 token 是
+    /// 左括号时到与它配对的右括号为止），包进一个错误节点。没有可消费的 token 时返回 null
+    pub fn skipNested(p: *Parser) Allocator.Error!?CompletedMarker {
+        p.limited = true;
+        try p.err("nesting too deep");
+        const group = isOpenBracket(p.peek());
+        var m: ?Marker = null;
+        var depth: u32 = 0;
+        while (!p.atEof()) {
+            const k = p.peek();
+            if (isOpenBracket(k)) {
+                depth += 1;
+            } else if (k == .r_paren or k == .r_bracket or k == .r_brace) {
+                if (depth == 0) break;
+                depth -= 1;
+            } else if (depth == 0 and (k == .semicolon or k == .comma)) break;
+            if (m == null) m = try p.start();
+            try p.bump();
+            if (group and depth == 0) break;
+        }
+        return if (m) |marker| try marker.complete(p, .error_node) else null;
+    }
+
     // ── Marker ──────────────────────────────────────────────────────────
 
     pub fn start(p: *Parser) Allocator.Error!Marker {
         const index: u32 = @intCast(p.events.items.len);
         try p.events.append(p.gpa, .{ .start = .{ .kind = null } });
+        p.open += 1;
+        p.peak_open = @max(p.peak_open, p.open);
         return .{ .index = index };
     }
 };
+
+fn isOpenBracket(kind: SyntaxKind) bool {
+    return kind == .l_paren or kind == .l_bracket or kind == .l_brace;
+}
 
 pub const Marker = struct {
     index: u32,
@@ -141,11 +188,13 @@ pub const Marker = struct {
     pub fn complete(m: Marker, p: *Parser, kind: SyntaxKind) Allocator.Error!CompletedMarker {
         p.events.items[m.index].start.kind = kind;
         try p.events.append(p.gpa, .finish);
+        p.open -= 1;
         return .{ .index = m.index, .kind = kind };
     }
 
     /// 放弃本节点：已产生的子事件保留，直接成为外层节点的子元素。
     pub fn abandon(m: Marker, p: *Parser) void {
+        p.open -= 1;
         if (m.index == p.events.items.len - 1) {
             _ = p.events.pop();
         } else {
@@ -168,15 +217,22 @@ pub const CompletedMarker = struct {
 
 /// 把事件转换为绿树。trivia 规则：节点开始前的 trivia 挂在父节点上，
 /// 因此节点总是以有效 token 开始；文件末尾的 trivia 挂在根节点上。
+///
+/// `base_depth` 为所构造的树的根在整棵树中的深度（局部重解析时不为 0）。深度达到 `max_depth` 的节点
+/// 不开始，其内容直接挂在外层节点下；返回是否有这样展平的节点。
 pub fn buildTree(
     builder: *green.Builder,
     source: []const u8,
     tokens: []const lexer.Token,
     events: []Event,
-) Allocator.Error!void {
+    base_depth: usize,
+) Allocator.Error!bool {
     var cursor: usize = 0;
     var parents: std.ArrayList(SyntaxKind) = .empty;
     defer parents.deinit(builder.gpa);
+    // 已展平（未开始）而尚未结束的节点个数：它们总是最内层的几个
+    var flattened: usize = 0;
+    var any_flattened = false;
 
     for (events, 0..) |*event, i| switch (event.*) {
         .start => |s| {
@@ -197,10 +253,17 @@ pub fn buildTree(
             var j = parents.items.len;
             while (j > 0) {
                 j -= 1;
-                try builder.startNode(parents.items[j]);
+                if (flattened > 0 or base_depth + builder.depth() >= max_depth) {
+                    flattened += 1;
+                    any_flattened = true;
+                } else try builder.startNode(parents.items[j]);
             }
         },
         .finish => {
+            if (flattened > 0) {
+                flattened -= 1;
+                continue;
+            }
             if (builder.depth() == 1) {
                 // 关闭根节点前挂上剩余的全部 token（只可能是 trivia）
                 while (cursor < tokens.len) : (cursor += 1) {
@@ -218,6 +281,7 @@ pub fn buildTree(
             cursor += 1;
         },
     };
+    return any_flattened;
 }
 
 fn emitTrivia(builder: *green.Builder, source: []const u8, tokens: []const lexer.Token, start: usize) Allocator.Error!usize {

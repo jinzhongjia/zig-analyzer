@@ -110,3 +110,50 @@ test "top-level reparse falls back when an earlier error sits at the cut" {
     // 切点在 `const c`，正是该错误的位置：全量解析
     try expectTopLevel(old_text, "const a = 1;\nconst b = 2\nconst c = 3;\nconst d = 4;\nconst e = 50;\n", false);
 }
+
+/// 增量结果（`Parse.reparse`）与全量解析一致
+fn expectConsistent(old: *Parse, new_text: []const u8) !void {
+    const inc = try Parse.reparse(testing.allocator, old, new_text);
+    defer inc.destroy();
+    const full = try Parse.create(testing.allocator, new_text);
+    defer full.destroy();
+    try testing.expect(inc.sameAs(full));
+}
+
+test "depth limits: deep files reparse in full, edits that reach the limit fall back" {
+    const a = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    // 文件中有超过上限的嵌套：其他函数体内的编辑也全量解析
+    try src.appendSlice(a, "fn g() void {\n    a();\n}\nconst x = ");
+    for (0..5000) |_| try src.append(a, '(');
+    try src.append(a, '1');
+    for (0..5000) |_| try src.append(a, ')');
+    try src.appendSlice(a, ";\n");
+    {
+        const old = try Parse.create(a, src.items);
+        defer old.destroy();
+        try testing.expect(old.deep);
+        const edited = try std.mem.replaceOwned(u8, a, src.items, "a();", "b();");
+        defer a.free(edited);
+        try testing.expectEqual(null, try Parse.reparseBlock(a, old, edited));
+        try expectConsistent(old, edited);
+    }
+
+    // 嵌套的代码块逐层加深，直到刚好触及上限：每一步在最内层的块中插入一层，增量结果都与全量一致
+    var depth: usize = 200;
+    while (depth < 3000) : (depth += 100) {
+        src.clearRetainingCapacity();
+        try src.appendSlice(a, "fn f() void ");
+        for (0..depth) |_| try src.append(a, '{');
+        try src.appendSlice(a, "a();");
+        for (0..depth) |_| try src.append(a, '}');
+        try src.append(a, '\n');
+        const old = try Parse.create(a, src.items);
+        defer old.destroy();
+        const edited = try std.mem.replaceOwned(u8, a, src.items, "a();", "{{{{{{{{{{a();}}}}}}}}}}");
+        defer a.free(edited);
+        try expectConsistent(old, edited);
+        if (old.deep) break;
+    } else return error.TestUnexpectedResult;
+}

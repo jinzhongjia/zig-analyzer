@@ -1,7 +1,8 @@
 //! 解析器的性质测试（固定种子随机输入 + 覆盖率引导模糊测试）：
 //!
 //! 1. 任意字节输入都能解析出无损的语法树，不崩溃、不卡死；
-//! 2. 对任意文本做任意编辑，局部重解析的结果与全量解析完全相同（含连续编辑形成的复用链）。
+//! 2. 对任意文本做任意编辑，局部重解析的结果与全量解析完全相同（含连续编辑形成的复用链），
+//!    包括嵌套超过解析器递归上限与语法树深度上限的文本。
 
 const std = @import("std");
 const testing = std.testing;
@@ -18,9 +19,32 @@ const pieces = [_][]const u8{
     ".{",     "a.b", "x()",    "u32",    "\t",    "\r\n",  "\xff",     "\x00",  "extern", "packed",
 };
 
-fn genSource(e: *Entropy, out: *std.ArrayList(u8)) !void {
+fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(100 * s.len * n);
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        return &final;
+    }
+}
+
+/// 长片段：几个拼在一起就超过解析器的递归上限与语法树的深度上限
+const deep_pieces = [_][]const u8{
+    repeat("(", 700),  repeat(")", 700),  repeat("{", 700),              repeat("}", 700),
+    repeat("!", 700),  repeat("f(", 700), repeat("if (a) b else ", 400), repeat("1 + ", 600),
+    repeat(".b", 700), repeat("?", 700),  repeat("[]", 700),
+};
+
+/// 片段：`deep` 时每 8 个中约有 1 个取长片段
+fn pickPiece(e: *Entropy, deep: bool) []const u8 {
+    if (deep and e.below(8) == 0) return e.pick([]const u8, &deep_pieces);
+    return e.pick([]const u8, &pieces);
+}
+
+fn genSource(e: *Entropy, out: *std.ArrayList(u8), deep: bool) !void {
     const n = e.below(64);
-    for (0..n) |_| try out.appendSlice(testing.allocator, e.pick([]const u8, &pieces));
+    for (0..n) |_| try out.appendSlice(testing.allocator, pickPiece(e, deep));
 }
 
 fn expectLossless(p: *const Parse, text: []const u8) !void {
@@ -46,12 +70,16 @@ fn checkAll(input: []const u8) !void {
         defer p.destroy();
         try expectLossless(p, input);
     }
+    try checkEdits(input, false);
+}
 
-    // 由结构性片段拼出源码，再连续做随机编辑
+/// 由片段拼出源码，再连续做随机编辑
+fn checkEdits(input: []const u8, deep: bool) !void {
+    const a = testing.allocator;
     var e: Entropy = .{ .bytes = input };
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
-    try genSource(&e, &text);
+    try genSource(&e, &text, deep);
     var chain = try Parse.create(a, text.items);
     defer chain.destroy();
     try expectLossless(chain, text.items);
@@ -60,7 +88,7 @@ fn checkAll(input: []const u8) !void {
     for (0..edits) |_| {
         const at = e.below(text.items.len + 1);
         const del = @min(e.below(5), text.items.len - at);
-        const ins = if (e.below(2) == 0) e.pick([]const u8, &pieces) else "";
+        const ins = if (e.below(2) == 0) pickPiece(&e, deep) else "";
         try text.replaceRange(a, at, del, ins);
 
         const inc = try Parse.reparse(a, chain, text.items);
@@ -83,6 +111,15 @@ test "parser properties: fixed-seed random input" {
         const len = prng.random().uintLessThan(usize, buf.len + 1);
         prng.random().bytes(buf[0..len]);
         try checkAll(buf[0..len]);
+    }
+}
+
+test "parser properties: random edits around the depth limits" {
+    var prng: std.Random.DefaultPrng = .init(0xdee9_11e5);
+    var buf: [192]u8 = undefined;
+    for (0..Entropy.iterations(300)) |_| {
+        prng.random().bytes(&buf);
+        try checkEdits(&buf, true);
     }
 }
 
