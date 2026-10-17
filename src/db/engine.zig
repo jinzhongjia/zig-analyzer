@@ -728,23 +728,26 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 db.mutex.unlock(db.io);
 
                 if (existing) |memo| {
-                    const valid = memo.verified_at == db.revision or try ctx.deepVerify(memo.verified_at, memo.durability, memo.deps);
+                    const durability: ?Durability = if (memo.verified_at == db.revision)
+                        memo.durability
+                    else
+                        try ctx.deepVerify(memo.verified_at, memo.durability, memo.deps);
                     // 值已被淘汰：依赖未变，重算出的值必然相同，沿用原 changed_at
-                    if (valid and memo.evicted) {
+                    if (durability != null and memo.evicted) {
                         if (need_value) return ctx.execute(Q, index, key, true);
                         db.mutex.lockUncancelable(db.io);
                         defer db.mutex.unlock(db.io);
                         const m = &table.slots.items[index].memo.?;
-                        m.verified_at = @max(m.verified_at, db.revision);
+                        markVerified(m, db.revision, durability.?);
                         return .{ .value = undefined, .changed_at = m.changed_at, .durability = m.durability };
                     }
-                    if (valid) {
+                    if (durability) |d| {
                         db.mutex.lockUncancelable(db.io);
                         defer db.mutex.unlock(db.io);
                         // 可能已被并发读者重算替换，以表中当前值为准
                         const m = &table.slots.items[index].memo.?;
                         if (!m.evicted) {
-                            m.verified_at = @max(m.verified_at, db.revision);
+                            markVerified(m, db.revision, d);
                             return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
                         }
                     }
@@ -752,34 +755,49 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 return ctx.execute(Q, index, key, false);
             }
 
-            /// 所有依赖的 changed_at 都不晚于 `verified_at` 时返回 true。
-            fn deepVerify(ctx: *Ctx, verified_at: Revision, durability: Durability, deps: []const DepKey) Error!bool {
-                const db = ctx.db;
-                if (db.last_changed[@backingInt(durability)] <= verified_at) return true;
-                _ = db.deep_verifications.fetchAdd(1, .monotonic);
-                for (deps) |dep| {
-                    if (try ctx.changedAt(dep) > verified_at) return false;
-                }
-                return true;
+            /// 验证通过的 memo 取依赖当前的最低 durability：依赖的输入降低 durability 而值经 early cutoff
+            /// 未变时，memo 不能仍按旧的高 durability 在之后的验证中跳过依赖检查
+            fn markVerified(m: anytype, revision: Revision, durability: Durability) void {
+                if (m.verified_at < revision) m.durability = durability;
+                m.verified_at = @max(m.verified_at, revision);
             }
 
-            /// 把依赖带到最新状态并返回它的 changed_at（不记录依赖）。
-            fn changedAt(ctx: *Ctx, dep: DepKey) Error!Revision {
+            /// 所有依赖的 changed_at 都不晚于 `verified_at` 时返回依赖当前的最低 durability，否则返回 null。
+            fn deepVerify(ctx: *Ctx, verified_at: Revision, durability: Durability, deps: []const DepKey) Error!?Durability {
+                const db = ctx.db;
+                // 不低于 `durability` 的输入都未变化：依赖的 durability 也不会降低
+                if (db.last_changed[@backingInt(durability)] <= verified_at) return durability;
+                _ = db.deep_verifications.fetchAdd(1, .monotonic);
+                var lowest: Durability = .high;
+                for (deps) |dep| {
+                    const state = try ctx.depState(dep);
+                    if (state.changed_at > verified_at) return null;
+                    lowest = lowest.min(state.durability);
+                }
+                return lowest;
+            }
+
+            /// 把依赖带到最新状态并返回它的 changed_at 与 durability（不记录依赖）。
+            fn depState(ctx: *Ctx, dep: DepKey) Error!struct { changed_at: Revision, durability: Durability } {
                 const db = ctx.db;
                 inline for (queries, 0..) |Q, qi| {
                     if (dep.query == qi) switch (Q.kind) {
-                        .input => return db.readInput(Q, dep.index).changed_at,
+                        .input => {
+                            const input = db.readInput(Q, dep.index);
+                            return .{ .changed_at = input.changed_at, .durability = input.durability };
+                        },
                         .derived => {
                             db.mutex.lockUncancelable(db.io);
                             const key = db.tables[qi].keys.keys()[dep.index];
                             db.mutex.unlock(db.io);
                             for (ctx.stack.items) |frame| {
                                 // 验证路径上遇到环：视为已变化，强制上层重算
-                                if (frame.key.eql(dep)) return db.revision;
+                                if (frame.key.eql(dep)) return .{ .changed_at = db.revision, .durability = .low };
                             }
                             // 栈深度超过上限：同样视为已变化，由重算处理（重算时以回退值代替）
-                            if (ctx.stackExhausted()) return db.revision;
-                            return (try ctx.ensureFresh(Q, dep.index, key, false)).changed_at;
+                            if (ctx.stackExhausted()) return .{ .changed_at = db.revision, .durability = .low };
+                            const fresh = try ctx.ensureFresh(Q, dep.index, key, false);
+                            return .{ .changed_at = fresh.changed_at, .durability = fresh.durability };
                         },
                     };
                 }

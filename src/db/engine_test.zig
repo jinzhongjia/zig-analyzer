@@ -80,6 +80,24 @@ const OnlyStable = struct {
     }
 };
 
+const StableTens = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return @divFloor(try ctx.get(Stable, key), 10);
+    }
+};
+
+const StablePlus = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return try ctx.get(StableTens, key) + 1;
+    }
+};
+
 // 环：CycleA(k) = CycleB(k) + 1，CycleB(k) = CycleA(k)
 const CycleA = struct {
     pub const kind: db.Kind = .derived;
@@ -229,7 +247,7 @@ const Burn = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, CycleA, CycleB, Depth, Reach, Spin, Swallow, Cached, Sized, CachedLen, Burn });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Spin, Swallow, Cached, Sized, CachedLen, Burn });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -329,6 +347,20 @@ test "durability: still invalidated after input drops from high to low" {
     try testing.expectEqual(4, try read(&d, OnlyStable, 1));
     try setNumber(&d, Stable, 1, 3, .low);
     try testing.expectEqual(6, try read(&d, OnlyStable, 1));
+}
+
+test "durability: memo verified through an early cutoff takes the lowered durability" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Stable, 1, 21, .high);
+    try testing.expectEqual(3, try read(&d, StablePlus, 1));
+    // 降为 low：StableTens 重算出相同的值，StablePlus 只被验证
+    try setNumber(&d, Stable, 1, 29, .low);
+    try testing.expectEqual(3, try read(&d, StablePlus, 1));
+    try testing.expectEqual(1, executions(&d, StablePlus));
+    // StablePlus 仍按 high 跳过依赖检查时，这里得到的是旧值 3
+    try setNumber(&d, Stable, 1, 35, .low);
+    try testing.expectEqual(4, try read(&d, StablePlus, 1));
 }
 
 test "Value with pointers: keep old value when equal, deferred free when changed" {
