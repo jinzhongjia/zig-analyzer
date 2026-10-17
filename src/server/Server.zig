@@ -2321,7 +2321,13 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
 /// 进程的常驻内存峰值（KB）
 fn maxRssKb() u64 {
     const builtin_os = @import("builtin").os.tag;
-    if (builtin_os == .windows or builtin_os == .wasi) return 0;
+    if (builtin_os == .windows) {
+        const w = std.os.windows;
+        var c: w.PROCESS.VM_COUNTERS = undefined;
+        if (w.ntdll.NtQueryInformationProcess(w.GetCurrentProcess(), .VmCounters, &c, @sizeOf(w.PROCESS.VM_COUNTERS), null) != .SUCCESS) return 0;
+        return c.PeakWorkingSetSize / 1024;
+    }
+    if (builtin_os == .wasi) return 0;
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const rss: u64 = @intCast(@max(0, usage.maxrss));
     // macOS 以字节为单位，Linux 以 KB 为单位
