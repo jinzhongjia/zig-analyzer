@@ -143,6 +143,46 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     try testing.expect(percentages >= 2);
 }
 
+test "compiler diagnostics: a save while the finished build is being published starts another build" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    const a = testing.allocator;
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, true);
+    const main_path = try project.path(h.arena.allocator(), "src/main.zig");
+    const main_text = fixture.basic[1].text;
+    const main_uri = try open(&h, main_path, main_text);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"2:19 zig: expected type 'u32'"});
+
+    // 构建进度一结束就保存修复后的文件：服务器此时还在发布这一轮的结果与重算编译集合
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    var build_token: ?[]const u8 = null;
+    while (true) {
+        const msg = try h.next();
+        const method = msg.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "$/progress")) continue;
+        const params = msg.object.get("params").?.object;
+        const token = params.get("token").?.string;
+        const value = params.get("value").?.object;
+        const kind = value.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "begin") and std.mem.startsWith(u8, value.get("title").?.string, "zig build")) build_token = token;
+        if (std.mem.eql(u8, kind, "end") and build_token != null and std.mem.eql(u8, token, build_token.?)) break;
+    }
+    const fixed = try std.mem.replaceOwned(u8, a, main_text, "const x: u32 = \"不是数字\";", "const x: u32 = 1;");
+    defer a.free(fixed);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/main.zig", .data = fixed });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    try waitIdle(&h);
+    // 这次保存的构建请求丢失时，main.zig 仍挂着已修复的错误
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{});
+    try shutdown(&h);
+}
+
 fn countRequests(h: *Harness, method: []const u8) usize {
     var n: usize = 0;
     for (h.received.items) |m| {

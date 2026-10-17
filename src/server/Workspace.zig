@@ -425,7 +425,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             try ws.recomputeCompileSet();
             ws.mutex.lockUncancelable(io);
             ws.building = false;
+            const again = ws.rebuild;
+            ws.rebuild = false;
             ws.mutex.unlock(io);
+            // 发布结果期间又有文件被保存：`requestBuild` 当时只记下了 `rebuild`，在这里开始下一轮。
+            // 先发起新构建再结束本轮的 busy，等待空闲的一方不会在两轮之间返回
+            if (again) ws.requestBuild();
             ws.server.busyEnd();
         },
         else => {},
