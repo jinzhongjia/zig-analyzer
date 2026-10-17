@@ -2224,6 +2224,62 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
     });
 }
 
+test "catch and orelse take the result type of the whole expression, labeled switch break values" {
+    try expectTypes(
+        \\fn parse(s: []const u8) error{Bad}!u8 {
+        \\    return if (s.len == 0) error.Bad else 1;
+        \\}
+        \\fn find(x: u32) ?u8 {
+        \\    return if (x == 0) null else 1;
+        \\}
+        \\const Color = enum { red, green };
+        \\fn pick(x: u32) error{Bad}!Color {
+        \\    return if (x == 0) error.Bad else .red;
+        \\}
+        \\fn g(s: []const u8, x: u32) void {
+        \\    const a = parse(s) catch null;
+        \\    const b = parse(s) catch 0;
+        \\    const c: ?u16 = parse(s) catch null;
+        \\    const d = pick(x) catch .green;
+        \\    const e = find(x) orelse null;
+        \\    const f = find(x) orelse 0;
+        \\    const k = sw: switch (x) {
+        \\        0 => break :sw @as(u8, 1),
+        \\        else => break :sw 2,
+        \\    };
+        \\    const k2 = sw2: switch (x) {
+        \\        0 => continue :sw2 1,
+        \\        1 => break :sw2 @as(u16, 3),
+        \\        else => @as(u16, 4),
+        \\    };
+        \\    const k3 = sw3: switch (1) {
+        \\        1 => break :sw3 @as(u8, 1),
+        \\        else => break :sw3 @as(u16, 2),
+        \\    };
+        \\    const k4 = sw4: switch (@as(u8, 0)) {
+        \\        0 => continue :sw4 1,
+        \\        1 => break :sw4 @as(u16, 7),
+        \\        else => break :sw4 @as(u16, 8),
+        \\    };
+        \\    _ = .{ a, b, c, d, e, f, k, k2, k3, k4 };
+        \\}
+    , &.{
+        // 右侧按载荷类型转换时 `null` 被当作 `u8`
+        .{ "a", "?u8" },
+        .{ "b", "u8" },
+        .{ "c", "?u16" },
+        .{ "d", "Color" },
+        .{ "e", "?u8" },
+        .{ "f", "u8" },
+        // 不收集 `break :sw` 的值时各分支都是 noreturn
+        .{ "k", "u8" },
+        .{ "k2", "u16" },
+        // comptime 已知的操作数只执行匹配的分支；有 `continue :sw4` 时可能转到其他分支
+        .{ "k3", "u8 = 1" },
+        .{ "k4", "u16" },
+    });
+}
+
 test "comptime evaluation: self-referential and deeply nested values are unknown" {
     try expectTypes(
         \\const Node = struct { next: ?*const Node = null, v: u32 = 0 };

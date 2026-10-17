@@ -543,8 +543,11 @@ const Inferrer = struct {
                 for (s.prongs) |prong| for (prong.items) |item| {
                     _ = try inf.infer(item, operand.ty);
                 };
-                // comptime 已知的操作数：只有匹配的分支会执行
-                const chosen = try inf.chooseProng(s.prongs, operand);
+                // 带标签的 switch：`break :label value` 的值也是结果
+                const label = inf.switchLabel(e, s.operand);
+                // comptime 已知的操作数：只有匹配的分支会执行。`continue :label` 会转到其他分支，有它时不选
+                const chosen = if (label != null and inf.continuesTo(label.?)) null else try inf.chooseProng(s.prongs, operand);
+                if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected });
                 var types: std.ArrayList(Index) = .empty;
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
@@ -555,6 +558,25 @@ const Inferrer = struct {
                     try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);
                 }
+                if (label != null) {
+                    const frame = inf.labels.pop().?;
+                    // 选中分支时只记录了它的 break（其他分支按不执行推导）
+                    if (chosen != null) {
+                        if (frame.types.items.len == 0) return chosen_tv;
+                        var live_types: std.ArrayList(Index) = .empty;
+                        var live_values: std.ArrayList(TypedValue) = .empty;
+                        if (chosen_tv.ty != .noreturn_type) {
+                            try live_types.append(inf.scratch, chosen_tv.ty);
+                            try live_values.append(inf.scratch, chosen_tv);
+                        }
+                        try live_types.appendSlice(inf.scratch, frame.types.items);
+                        try live_values.appendSlice(inf.scratch, frame.values.items);
+                        const t = try inf.peer(live_types.items);
+                        return .{ .ty = t, .val = sameValue(live_values.items, t) };
+                    }
+                    try types.appendSlice(inf.scratch, frame.types.items);
+                    try values.appendSlice(inf.scratch, frame.values.items);
+                }
                 if (chosen != null) return chosen_tv;
                 const ty = try inf.peer(types.items);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
@@ -563,7 +585,7 @@ const Inferrer = struct {
                 const lhs = try inf.infer(c.lhs, null);
                 const payload, const err = inf.unwrapErrorUnion(lhs.ty);
                 if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err };
-                const rhs = try inf.infer(c.rhs, if (payload != .unknown) payload else null);
+                const rhs = try inf.infer(c.rhs, inf.fallbackType(expected, payload, c.rhs));
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
             },
             .binary => |bin| return inf.binary(e, bin.op, bin.lhs, bin.rhs, expected),
@@ -1594,6 +1616,39 @@ const Inferrer = struct {
         return null;
     }
 
+    /// `catch` / `orelse` 右侧的期望类型。编译器取整个表达式的结果类型；没有结果类型时两侧做 peer type
+    /// resolution，这里以载荷类型作为右侧字面量（`0`、`.red`）的期望，得到与 peer 相同的结果。`null` 例外：
+    /// 与载荷 peer 得到 optional（`parseInt(u8, s, 10) catch null` 为 `?u8`），不能转换为载荷类型
+    fn fallbackType(inf: *Inferrer, expected: ?Index, payload: Index, rhs: ExprId) ?Index {
+        if (expected) |want| if (want != .unknown) return want;
+        if (payload == .unknown) return null;
+        switch (inf.body.expr(rhs)) {
+            .name_ref => |name| if (std.mem.eql(u8, name, "null")) return null,
+            else => {},
+        }
+        return payload;
+    }
+
+    /// 函数体中有 `continue :label`（带标签的 switch 由它转到其他分支）
+    fn continuesTo(inf: *Inferrer, label: []const u8) bool {
+        for (inf.body.exprs) |x| switch (x) {
+            .@"continue" => |c| if (c.label) |l| if (std.mem.eql(u8, l, label)) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// switch 的标签：lowering 在推导操作数之前推入了以这个 switch 为目标的带标签作用域
+    fn switchLabel(inf: *Inferrer, e: ExprId, operand: ExprId) ?[]const u8 {
+        const b = inf.body;
+        var s: ?Body.ScopeId = b.expr_scopes[@backingInt(operand)];
+        while (s) |id| : (s = b.scope(id).parent) {
+            const l = b.scope(id).label orelse continue;
+            if (l.expr == e) return l.name;
+        }
+        return null;
+    }
+
     /// break 的目标（`labels` 中的下标）
     fn labelFrame(inf: *Inferrer, label: ?[]const u8) ?usize {
         var i = inf.labels.items.len;
@@ -1695,7 +1750,7 @@ const Inferrer = struct {
                 };
                 // comptime 已知时只有一侧会被求值
                 const non_null = inf.condValue(lhs);
-                const rhs = try inf.inferBranch(rhs_e, if (child != .unknown) child else null, non_null == true);
+                const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, child, rhs_e), non_null == true);
                 if (non_null) |n| return if (n) .{ .ty = child, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
