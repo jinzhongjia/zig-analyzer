@@ -5,11 +5,14 @@
 //! （0.17 的 maker 在 watch 期间收到新请求会 panic，且 watch 模式下无法改变要构建的 step。）
 
 const std = @import("std");
+const native_os = @import("builtin").os.tag;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ErrorBundle = std.zig.ErrorBundle;
 const ServerMessage = std.zig.Server.Message;
 const ClientMessage = std.zig.Client.Message;
+
+const log = std.log.scoped(.bsp);
 
 pub const protocol_version = std.zig.Server.build_system_version;
 
@@ -132,11 +135,14 @@ pub fn encodeBuildSteps(w: *Io.Writer, steps: []const u32) Io.Writer.Error!void 
     try w.writeSliceEndian(u32, steps, .little);
 }
 
-/// 一个 `zig build --listen=-` 子进程
+/// 一个 `zig build --listen=-` 子进程。maker 及其启动的编译器等子进程放在一起：POSIX 上是同一个进程组，
+/// Windows 上是同一个 Job Object。停止时结束整组，不等 maker 跑完当前的构建（非 watch 模式的 maker 构建
+/// 期间不读取输入，收到的 exit 要等构建结束才处理）。
 pub const Client = struct {
     gpa: Allocator,
     io: Io,
     child: std.process.Child,
+    group: Group,
     read_buffer: [64 * 1024]u8 = undefined,
     reader: Io.File.Reader = undefined,
     write_buffer: [256]u8 = undefined,
@@ -154,17 +160,19 @@ pub const Client = struct {
 
         const c = try gpa.create(Client);
         errdefer gpa.destroy(c);
-        c.* = .{
-            .gpa = gpa,
-            .io = io,
-            .child = try std.process.spawn(io, .{
-                .argv = argv.items,
-                .cwd = .{ .path = build_root },
-                .stdin = .pipe,
-                .stdout = .pipe,
-                .stderr = .ignore,
-            }),
-        };
+        var group: Group = .create(io);
+        errdefer group.destroy(io);
+        var child = try std.process.spawn(io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = build_root },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+            .pgid = group.spawnPgid(),
+            .start_suspended = group.spawnSuspended(),
+        });
+        group.adopt(&child);
+        c.* = .{ .gpa = gpa, .io = io, .child = child, .group = group };
         c.reader = c.child.stdout.?.readerStreaming(io, &c.read_buffer);
         c.writer = c.child.stdin.?.writerStreaming(io, &c.write_buffer);
         return c;
@@ -206,28 +214,165 @@ pub const Client = struct {
         try c.writer.interface.flush();
     }
 
-    /// 请求 maker 退出（不关闭管道，避免与阻塞在 `next` 中的读取竞争）。maker 处理完当前构建后退出，
-    /// 读取方随后得到 `error.EndOfStream`，再调用 `deinit` 回收进程与资源。
-    pub fn requestStop(c: *Client) void {
-        c.write_mutex.lockUncancelable(c.io);
-        defer c.write_mutex.unlock(c.io);
-        const w = &c.writer.interface;
-        if (w.writeStruct(ClientMessage.Header{ .tag = .exit, .bytes_len = 0 }, .little)) |_| {
-            w.flush() catch {};
-        } else |_| {}
+    /// 立即结束 maker 及其全部子进程，不等待、不回收（不关闭管道，不与阻塞在 `next` 中的读取竞争）。
+    /// 读取方随后得到 `error.EndOfStream`，再调用 `deinit` 回收进程与资源
+    pub fn terminate(c: *Client) void {
+        c.group.terminate(&c.child);
     }
 
-    /// 结束进程（若仍在运行）并释放。调用时不能有其他任务在 `next` 中读取。
+    /// 结束 maker 及其全部子进程（若仍在运行）并释放。调用时不能有其他任务在 `next` 中读取。
     pub fn deinit(c: *Client) void {
+        c.terminate();
         c.child.kill(c.io);
+        c.group.destroy(c.io);
         c.gpa.destroy(c);
     }
+};
 
-    /// 请求停止并立即回收（仅当没有其他任务在读取时使用，如测试）
-    pub fn stop(c: *Client) void {
-        c.requestStop();
-        c.deinit();
-    }
+/// maker 及其子进程的整体。
+///
+/// POSIX：maker 加入看门狗进程（`sh`）为组长的进程组。看门狗阻塞读取一个只有服务器持有写端的管道，
+/// 读到输入结束时向整个进程组发 SIGKILL：服务器以任何方式退出（包括被 SIGKILL、崩溃）时，操作系统
+/// 关闭写端，maker 与编译器随之结束。看门狗无法启动时 maker 自成一组，只有服务器主动停止时才结束整组。
+///
+/// Windows：maker 以挂起状态启动，放入设置了 KILL_ON_JOB_CLOSE 的 Job Object 后再恢复运行，之后启动的
+/// 子进程都在其中；服务器退出时句柄随之关闭，Job 中的进程全部结束。
+const Group = switch (native_os) {
+    .windows => struct {
+        job: ?std.os.windows.HANDLE,
+
+        fn create(io: Io) @This() {
+            _ = io;
+            const job = win32.CreateJobObjectW(null, null) orelse {
+                log.warn("cannot create a job object for zig build: child processes may outlive zig-analyzer", .{});
+                return .{ .job = null };
+            };
+            var info = std.mem.zeroes(win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+            info.BasicLimitInformation.LimitFlags = win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (win32.SetInformationJobObject(job, win32.JobObjectExtendedLimitInformation, &info, @sizeOf(win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION)) == 0) {
+                std.os.windows.CloseHandle(job);
+                log.warn("cannot configure the job object for zig build: child processes may outlive zig-analyzer", .{});
+                return .{ .job = null };
+            }
+            return .{ .job = job };
+        }
+
+        fn spawnPgid(_: *const @This()) ?std.posix.pid_t {
+            return null;
+        }
+
+        fn spawnSuspended(g: *const @This()) bool {
+            return g.job != null;
+        }
+
+        /// 放入 Job 后恢复运行；放不进去时只能单独结束 maker
+        fn adopt(g: *@This(), child: *std.process.Child) void {
+            const job = g.job orelse return;
+            if (win32.AssignProcessToJobObject(job, child.id.?) == 0) {
+                log.warn("cannot assign zig build to a job object: child processes may outlive zig-analyzer", .{});
+                std.os.windows.CloseHandle(job);
+                g.job = null;
+            }
+            _ = std.os.windows.ntdll.NtResumeThread(child.thread_handle, null);
+        }
+
+        fn terminate(g: *@This(), child: *std.process.Child) void {
+            if (g.job) |job| {
+                _ = win32.TerminateJobObject(job, 1);
+            } else if (child.id) |handle| {
+                _ = std.os.windows.ntdll.NtTerminateProcess(handle, @fromBackingInt(1));
+            }
+        }
+
+        fn destroy(g: *@This(), io: Io) void {
+            _ = io;
+            if (g.job) |job| std.os.windows.CloseHandle(job);
+            g.job = null;
+        }
+    },
+    else => struct {
+        watchdog: ?std.process.Child,
+        /// 进程组号：看门狗的 pid；没有看门狗时为 maker 的 pid（启动后得知）
+        pgid: std.posix.pid_t = 0,
+
+        fn create(io: Io) @This() {
+            const watchdog = std.process.spawn(io, .{
+                .argv = &.{ "/bin/sh", "-c", "read _; kill -9 0" },
+                .stdin = .pipe,
+                .stdout = .ignore,
+                .stderr = .ignore,
+                .pgid = 0,
+            }) catch |err| {
+                log.warn("cannot start the watchdog of zig build ({t}): child processes may outlive zig-analyzer", .{err});
+                return .{ .watchdog = null };
+            };
+            return .{ .watchdog = watchdog, .pgid = watchdog.id.? };
+        }
+
+        /// 加入看门狗的进程组，没有看门狗时自成一组
+        fn spawnPgid(g: *const @This()) ?std.posix.pid_t {
+            return g.pgid;
+        }
+
+        fn spawnSuspended(_: *const @This()) bool {
+            return false;
+        }
+
+        fn adopt(g: *@This(), child: *std.process.Child) void {
+            if (g.watchdog == null) g.pgid = child.id.?;
+        }
+
+        fn terminate(g: *@This(), _: *std.process.Child) void {
+            // 组长（看门狗或 maker）在 `deinit` 中才回收，组号在此之前不会被复用。0 表示调用者自己的进程组
+            if (g.pgid > 0) std.posix.kill(-g.pgid, .KILL) catch {};
+        }
+
+        /// 回收看门狗。maker 已结束时组中可能还有它的子进程：先结束整组
+        fn destroy(g: *@This(), io: Io) void {
+            if (g.watchdog) |*w| {
+                std.posix.kill(-g.pgid, .KILL) catch {};
+                w.kill(io);
+            }
+            g.watchdog = null;
+        }
+    },
+};
+
+const win32 = struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: u32,
+        MinimumWorkingSetSize: usize,
+        MaximumWorkingSetSize: usize,
+        ActiveProcessLimit: u32,
+        Affinity: usize,
+        PriorityClass: u32,
+        SchedulingClass: u32,
+    };
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: usize,
+        JobMemoryLimit: usize,
+        PeakProcessMemoryUsed: usize,
+        PeakJobMemoryUsed: usize,
+    };
+    const JobObjectExtendedLimitInformation: c_int = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    extern "kernel32" fn CreateJobObjectW(attributes: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(job: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) callconv(.winapi) c_int;
+    extern "kernel32" fn TerminateJobObject(job: HANDLE, exit_code: u32) callconv(.winapi) c_int;
 };
 
 /// 单文件模式（没有 build.zig）：运行 `zig build-obj -fno-emit-bin --listen=- <file>`，

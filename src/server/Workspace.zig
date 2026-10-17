@@ -98,7 +98,7 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     ws.loading = server.progress.begin(server, std.fmt.bufPrint(&title_buf, "Loading project {s}", .{std.fs.path.basename(root)}) catch "Loading project", false);
     errdefer server.progress.end(server, ws.loading, null);
     ws.client = try bsp.Client.start(gpa, server.io, env.zig_exe, root, ws.config.build_args);
-    errdefer ws.client.?.stop();
+    errdefer ws.client.?.deinit();
     // 在启动后台任务之前计为忙碌：任务可能先于这里运行到结束时的 busyEnd
     server.busyBegin();
     errdefer server.busyEnd();
@@ -129,12 +129,12 @@ fn loadProjectConfig(server: *Server, root: []const u8, config: *Server.Config) 
     try config.overlayProject(gpa, &project);
 }
 
-/// 请求停止：maker 退出后后台任务结束并回收进程
+/// 停止：立即结束 maker 及其子进程（进行中的构建不再继续），后台任务随即读到输入结束，收尾并回收进程
 pub fn stop(ws: *Workspace) void {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     ws.stopping = true;
-    if (ws.client) |c| c.requestStop();
+    if (ws.client) |c| c.terminate();
 }
 
 /// maker 连续崩溃时自动重启的次数上限

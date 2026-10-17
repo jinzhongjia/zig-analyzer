@@ -94,3 +94,36 @@ pub const basic = [_]File{
     \\
     },
 };
+
+/// 构建中运行 60 秒外部命令（POSIX 的 `sleep`，由 maker 启动）的示例项目：诊断 step 为 check。
+/// sleep 在 exe 编译完成后才开始，是 check 之前最后开始的 step：客户端晚于它激活进度 token 时，补发的 begin
+/// 带有的也是 "run sleep"（激活前只保留最近一次报告）
+pub const slow = [_]File{
+    .{ .path = "build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\    }) });
+    \\    const sleep = b.addSystemCommand(&.{ "sleep", "60" });
+    \\    sleep.step.dependOn(&exe.step);
+    \\    const check = b.step("check", "Check");
+    \\    check.dependOn(&sleep.step);
+    \\}
+    \\
+    },
+    .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+};
+
+/// 进程组 `pgid` 中的进程（被结束后由 init 回收）在几秒内全部消失
+pub fn expectGroupGone(pgid: std.posix.pid_t) !void {
+    for (0..100) |_| {
+        std.posix.kill(-pgid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.ProcessGroupStillAlive;
+}

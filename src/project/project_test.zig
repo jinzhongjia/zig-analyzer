@@ -10,7 +10,7 @@ test "build system protocol: read build graph and get compile errors" {
     const gpa = testing.allocator;
 
     const client = try bsp.Client.start(gpa, testing.io, project.env.zig_exe, project.root, &.{});
-    defer client.stop();
+    defer client.deinit();
 
     var model: ?@import("../base/ProjectModel.zig") = null;
     defer if (model) |*m| m.deinit(gpa);
@@ -76,4 +76,59 @@ test "build system protocol: read build graph and get compile errors" {
     try testing.expect(std.mem.indexOf(u8, errors.items[0], "lib.zig:2: unused local variable") != null);
     try testing.expect(std.mem.indexOf(u8, errors.items[1], "main.zig:3: expected type 'u32'") != null);
     try testing.expect(std.mem.indexOf(u8, errors.items[2], "orphan.zig:2: unused local variable") != null);
+}
+
+fn stopAfter(io: std.Io, client: *bsp.Client, fired: *bool) std.Io.Cancelable!void {
+    try io.sleep(.fromSeconds(20), .awake);
+    fired.* = true;
+    client.terminate();
+}
+
+test "build system protocol: zig build and the processes it started end when the server goes away" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&fixture.slow);
+    defer project.deinit();
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const client = try bsp.Client.start(gpa, io, project.env.zig_exe, project.root, &.{});
+    var deinited = false;
+    defer if (!deinited) client.deinit();
+    const pgid = client.group.pgid;
+    var model: ?@import("../base/ProjectModel.zig") = null;
+    defer if (model) |*m| m.deinit(gpa);
+    // 等到运行 sleep 的 step 开始
+    while (true) {
+        var event = try client.next();
+        defer event.deinit(gpa);
+        switch (event) {
+            .configuration => |path| {
+                model = try configuration.load(gpa, io, project.root, path, &project.env);
+                try client.buildSteps(model.?.diagnostics_steps);
+            },
+            .step_started => |step| if (std.mem.indexOf(u8, model.?.steps[step].name, "sleep") != null) break,
+            else => {},
+        }
+    }
+
+    // 服务器进程退出时（不论如何退出）操作系统关闭看门狗输入的写端
+    const watchdog = &client.group.watchdog.?;
+    watchdog.stdin.?.close(io);
+    watchdog.stdin = null;
+    // 看门狗没有结束进程组时由这里结束：测试失败而不是等构建跑完
+    var fired = false;
+    var fallback = try io.concurrent(stopAfter, .{ io, client, &fired });
+    while (true) {
+        var event = client.next() catch |err| {
+            try testing.expectEqual(error.EndOfStream, err);
+            break;
+        };
+        event.deinit(gpa);
+    }
+    fallback.cancel(io) catch {};
+    try testing.expect(!fired);
+    client.deinit();
+    deinited = true;
+    // maker 启动的 sleep 也已结束
+    try fixture.expectGroupGone(pgid);
 }

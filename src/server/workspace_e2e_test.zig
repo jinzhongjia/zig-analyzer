@@ -1,4 +1,4 @@
-//! 端到端：磁盘上的外部改动、工作区文件夹的增减、未保存的文档（`untitled:`）。
+//! 端到端：磁盘上的外部改动、工作区文件夹的增减、未保存的文档（`untitled:`）、项目的启动与停止。
 
 const std = @import("std");
 const testing = std.testing;
@@ -329,4 +329,48 @@ test "a project whose background task cannot be started does not leave the serve
     // 计数泄漏时 deinit 中的 waitIdle 永远等待：先归零，让失败的测试正常结束
     server.busy = 0;
     try testing.expectEqual(0, busy);
+}
+
+/// 等到某个进度报告的文案包含 `needle`
+fn waitProgress(h: *Harness, needle: []const u8) !void {
+    while (true) {
+        const msg = try h.next();
+        const method = msg.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "$/progress")) continue;
+        const value = msg.object.get("params").?.object.get("value").?.object;
+        const text = value.get("message") orelse value.get("title") orelse continue;
+        if (text == .string and std.mem.indexOf(u8, text.string, needle) != null) return;
+    }
+}
+
+/// 项目当前的 maker 所在的进程组
+fn makerGroup(h: *Harness) std.posix.pid_t {
+    h.server.workspaces_mutex.lockUncancelable(testing.io);
+    defer h.server.workspaces_mutex.unlock(testing.io);
+    const ws = h.server.workspaces.items[0];
+    ws.mutex.lockUncancelable(testing.io);
+    defer ws.mutex.unlock(testing.io);
+    return ws.client.?.group.pgid;
+}
+
+test "shutdown during a build ends zig build and its child processes without waiting for the build" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&fixture.slow);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .window = .{ .workDoneProgress = true } } });
+    try h.notify("initialized", Empty{});
+    // 构建进行到 60 秒的 sleep：maker 要等构建结束才读取下一条消息
+    try waitProgress(&h, "run sleep");
+    const pgid = makerGroup(&h);
+
+    const t0 = std.Io.Clock.awake.now(testing.io);
+    _ = try h.request("shutdown", {});
+    const elapsed = t0.durationTo(std.Io.Clock.awake.now(testing.io));
+    try testing.expect(elapsed.toSeconds() < 10);
+    try fixture.expectGroupGone(pgid);
+    try h.notify("exit", {});
 }
