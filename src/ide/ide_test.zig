@@ -133,6 +133,42 @@ test "signature help and inlay hints" {
     try testing.expectEqualStrings("x: y: : u32 scale: : u32 a: b: ", out.items);
 }
 
+test "signature help and parameter hints through aliases" {
+    // 经由别名调用（`const assert = std.debug.assert;`）时不跟随别名：没有签名帮助与参数名提示
+    const text =
+        \\fn add(a: u32, b: u32) u32 { return a + b; }
+        \\const plus = add;
+        \\const ns = struct { const sum = plus; };
+        \\fn run(x: u32) void {
+        \\    const local = add;
+        \\    _ = plus(x, 1);
+        \\    _ = ns.sum(x, 2);
+        \\    _ = local(x, 3);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_][]const u8{ "1);", "2);", "3);" }) |needle| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
+        const s = try signature_help.signatureHelp(&r, file, offset) orelse return error.NoSignature;
+        try testing.expectEqualStrings("fn add(a: u32, b: u32) u32", s.label);
+        try testing.expectEqual(1, s.active);
+    }
+    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{});
+    var out: std.ArrayList(u8) = .empty;
+    for (hints) |h| if (h.kind == .parameter) {
+        try out.appendSlice(w.arena.allocator(), h.label);
+        try out.append(w.arena.allocator(), ' ');
+    };
+    try testing.expectEqualStrings("a: b: a: b: a: b: ", out.items);
+}
+
 test "goto declaration of reified fields named by comptime parsed strings" {
     // 字段名从帮助文本中解析出来（zig-clap 的用法）：跳到帮助文本中的参数名
     const text =
