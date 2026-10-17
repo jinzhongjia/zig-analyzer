@@ -431,7 +431,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     sc.errors = .empty;
                 }
                 if (ws.model) |*m| for (sc.generated) |g| {
-                    const path = try configuration.generatedPath(ws.gpa, ws.root, ws.server.zigEnv().?, g.prefix, g.sub_path);
+                    const path = try configuration.generatedPath(ws.gpa, m, ws.server.zigEnv().?, g.prefix, g.sub_path);
                     defer ws.gpa.free(path);
                     if (try m.setGeneratedPath(ws.gpa, g.file, path)) roots_changed = true;
                 };

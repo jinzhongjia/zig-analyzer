@@ -564,6 +564,67 @@ test "generated module roots: resolved from build results, including modules che
     try testing.expectEqual(1, in_set);
 }
 
+// 防止本地缓存目录固定按 `<构建根>/.zig-cache` 计算：`--cache-dir`（或 `ZIG_LOCAL_CACHE_DIR`）把生成文件放到
+// 别处时，生成的模块根文件的路径不存在，模块中的名字全部无法解析
+test "generated module roots: local cache directory moved with --cache-dir" {
+    const main_text =
+        \\const opts = @import("build_options");
+        \\pub fn main() void {
+        \\    _ = opts.answer;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const opts = b.addOptions();
+        \\    opts.addOption(u32, "answer", 42);
+        \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.graph.host,
+        \\        .imports = &.{.{ .name = "build_options", .module = opts.createModule() }},
+        \\    }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "main.zig", .text = main_text },
+        // 相对路径相对于构建根目录
+        .{ .path = "zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--cache-dir\", \"altcache\"]}}" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    try waitIdle(&h);
+    const a = h.arena.allocator();
+    {
+        const ws = h.server.workspaces.items[0];
+        ws.mutex.lockUncancelable(testing.io);
+        defer ws.mutex.unlock(testing.io);
+        const cache = try project.path(a, "altcache");
+        try testing.expectEqualStrings(cache, ws.model.?.local_cache_root);
+        var generated: usize = 0;
+        for (ws.model.?.modules) |m| {
+            if (m.generated_root == null) continue;
+            generated += 1;
+            try testing.expect(std.mem.startsWith(u8, m.root_file.?, cache));
+            try std.Io.Dir.cwd().access(testing.io, m.root_file.?, .{});
+        }
+        try testing.expectEqual(1, generated);
+    }
+    const uri = try open(&h, try project.path(a, "main.zig"), main_text);
+    try waitIdle(&h);
+    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 2, .character = 14 } });
+    const result = resp.object.get("result").?;
+    try testing.expect(result == .object);
+    const value = result.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, value, "answer: u32 = 42") != null);
+    try shutdown(&h);
+}
+
 /// 配置测试的项目：`-Dbad=true` 时 main.zig 中被屏蔽的错误出现；`unit` step 编译 t.zig（有错误）
 const settings_project: []const fixture.File = &.{
     .{ .path = "build.zig", .text =
