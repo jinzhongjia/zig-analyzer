@@ -108,6 +108,7 @@ pub fn build(b: *std.Build) void {
     bench_run.addArtifactArg(exe);
     bench_run.addPassthruArgs();
     b.step("bench", "Measure LSP latencies against a project (see tools/lsp_bench.zig)").dependOn(&bench_run.step);
+    check.dependOn(&bench.step);
 
     // 测试运行器：在 Zig 自带的运行器上开启测试分配器的调用栈记录（ReleaseSafe 下泄漏也能定位）
     const patch_runner = b.addExecutable(.{

@@ -265,6 +265,13 @@ fn printQueryTable(c: *Client) !void {
 }
 
 fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
+    // Windows 上 Child.Id 是进程 HANDLE，且没有 ps：直接读进程的工作集
+    if (@import("builtin").os.tag == .windows) {
+        const w = std.os.windows;
+        var c: w.PROCESS.VM_COUNTERS = undefined;
+        if (w.ntdll.NtQueryInformationProcess(pid, .VmCounters, &c, @sizeOf(w.PROCESS.VM_COUNTERS), null) != .SUCCESS) return null;
+        return @as(f64, @floatFromInt(c.WorkingSetSize)) / (1024 * 1024);
+    }
     const pid_str = try std.fmt.allocPrint(gpa, "{d}", .{pid});
     defer gpa.free(pid_str);
     const r = std.process.run(gpa, io, .{ .argv = &.{ "ps", "-o", "rss=", "-p", pid_str } }) catch return null;
