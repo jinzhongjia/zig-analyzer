@@ -105,6 +105,10 @@ test "references, highlight, rename and workspace symbol" {
         const kw = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "hello"), .newName = "fn" });
         var kw_it = kw.object.get("result").?.object.get("changes").?.object.iterator();
         try testing.expectEqualStrings("@\"fn\"", kw_it.next().?.value_ptr.array.items[0].object.get("newText").?.string);
+        // 原生类型的名字：同样用 @"..." 包裹（原样写入时与原生类型同名，编译错误）
+        const prim = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "hello"), .newName = "u8" });
+        var prim_it = prim.object.get("result").?.object.get("changes").?.object.iterator();
+        try testing.expectEqualStrings("@\"u8\"", prim_it.next().?.value_ptr.array.items[0].object.get("newText").?.string);
         // 标准库中的声明不能重命名
         const std_rename = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(main_text, "Allocator") });
         try testing.expect(std_rename.object.get("error") != null);

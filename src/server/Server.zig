@@ -2203,12 +2203,17 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
 }
 
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
-    const new_name = try identifierText(arena, params.newName);
+    _ = try identifierText(arena, params.newName, false);
     var ambiguous: ?za.ide_db.search.Reference = null;
     const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous) orelse return null;
     if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
     // 不返回只改了一部分的结果
     if (ambiguous != null) return error.RenameAmbiguous;
+    const is_field = switch (found.def) {
+        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
+        .local, .file => false,
+    };
+    const new_name = try identifierText(arena, params.newName, is_field);
     var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
     var m: RangeMapper = .{ .server = server, .r = r };
     var i: usize = 0;
@@ -2224,15 +2229,44 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
     return .{ .changes = changes };
 }
 
-/// 新名字的源码写法：合法标识符原样使用，`@"..."` 原样使用，其余（关键字、含特殊字符）用 `@"..."` 包裹
-fn identifierText(arena: Allocator, name: []const u8) HandlerError![]const u8 {
-    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n\r\\") != null and !std.mem.startsWith(u8, name, "@\"")) return error.InvalidIdentifier;
+/// 新名字的源码写法：`@"..."` 校验后原样使用；其余按需用 `@"..."` 包裹：关键字、含特殊字符的名字、`_`，
+/// 以及原生类型与值的名字（`u8`、`true`；声明与局部变量不能与它们同名）。`is_field` 时原生名字原样使用：
+/// 字段的声明与 `.` 之后的访问都可以用它们（如 `std.json.Value` 的 `null`、`bool`）
+fn identifierText(arena: Allocator, name: []const u8, is_field: bool) HandlerError![]const u8 {
     if (std.mem.startsWith(u8, name, "@\"")) {
-        if (name.len < 3 or name[name.len - 1] != '"') return error.InvalidIdentifier;
+        // 整个名字须是一个标识符 token，引号中的转义合法且不为空
+        var tokenizer: std.zig.Tokenizer = .init(try arena.dupeSentinel(u8, name, 0));
+        const token = tokenizer.next();
+        if (token.tag != .identifier or token.loc.end != name.len) return error.InvalidIdentifier;
+        const decoded = std.zig.string_literal.parseAlloc(arena, name[1..]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidLiteral => return error.InvalidIdentifier,
+        };
+        if (decoded.len == 0) return error.InvalidIdentifier;
         return name;
     }
-    if (std.zig.isValidId(name)) return name;
-    return std.fmt.allocPrint(arena, "@\"{s}\"", .{name});
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n\r\\") != null) return error.InvalidIdentifier;
+    return std.fmt.allocPrint(arena, "{f}", .{std.zig.fmtIdFlags(name, .{ .allow_primitive = is_field })});
+}
+
+test "rename: source text of the new name" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("greet", try identifierText(a, "greet", false));
+    try std.testing.expectEqualStrings("@\"fn\"", try identifierText(a, "fn", false));
+    try std.testing.expectEqualStrings("@\"a b\"", try identifierText(a, "a b", false));
+    // 原生类型与值的名字、`_`：原样写入时声明与原生名字同名，编译错误
+    try std.testing.expectEqualStrings("@\"u8\"", try identifierText(a, "u8", false));
+    try std.testing.expectEqualStrings("@\"true\"", try identifierText(a, "true", false));
+    try std.testing.expectEqualStrings("@\"_\"", try identifierText(a, "_", false));
+    // 字段可以与原生名字同名；`_` 在枚举中表示非穷尽，仍要加引号
+    try std.testing.expectEqualStrings("bool", try identifierText(a, "bool", true));
+    try std.testing.expectEqualStrings("@\"_\"", try identifierText(a, "_", true));
+    try std.testing.expectEqualStrings("@\"x\\\"y\"", try identifierText(a, "@\"x\\\"y\"", false));
+    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\"b\"", false));
+    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\"", false));
+    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "", false));
 }
 
 fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
