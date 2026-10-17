@@ -56,6 +56,7 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
                 def = try definition.defAt(r, file, offset);
             },
             .builtin_call => {},
+            .error_value => |name| return errorValue(r, file, tok, e, name),
             else => return null,
         }
         // 直接引用的声明以其声明类型显示（表达式可能经过了结果类型转换）；
@@ -90,5 +91,19 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
         w.print("\n\ninferred from the call at {s}:{d}", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(s.file)), line }) catch return error.OutOfMemory;
     }
     if (def) |d| if (try context.doc(r, d)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
+    return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
+}
+
+/// `error.Foo`：错误名与期望的错误集；当前文件中有它的声明时附上文档
+fn errorValue(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId, name: []const u8) resolve.Error!?Info {
+    if (name.len == 0) return null;
+    var out: std.Io.Writer.Allocating = .init(r.arena);
+    const w = &out.writer;
+    if (try definition.expectedErrorSet(r, file, tok.offset, e)) |set| {
+        w.print("```zig\nerror.{s}: {s}\n```", .{ name, try render.typeAlloc(r, set) }) catch return error.OutOfMemory;
+    } else {
+        w.print("```zig\nerror.{s}\n```", .{name}) catch return error.OutOfMemory;
+    }
+    if (try definition.errorValueDecl(r, file, tok.offset, false)) |d| if (d.doc) |doc| w.print("\n\n{s}", .{doc}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
 }

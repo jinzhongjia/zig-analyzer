@@ -774,6 +774,70 @@ test "completion: builtins, labels, init fields and import names" {
     try testing.expectEqual(added.cursor + 3, import.replace.?.end);
 }
 
+test "goto and hover on error values: the expected error set picks the declaration" {
+    // `error.Foo` 曾既不能跳转也没有 hover
+    const lib_text =
+        \\pub const LibError = error{ Missing, Busy };
+        \\
+    ;
+    const text =
+        \\const lib = @import("lib.zig");
+        \\const Other = error{ Foo, Baz };
+        \\const E = error{
+        \\    /// the foo error
+        \\    Foo,
+        \\    Bar,
+        \\};
+        \\const M = Other || E;
+        \\fn f() E!void {
+        \\    return error.Foo;
+        \\}
+        \\fn g() void {
+        \\    const x = error.Baz;
+        \\    _ = x;
+        \\}
+        \\fn h() M!void {
+        \\    return error.Bar;
+        \\}
+        \\fn k() lib.LibError!void {
+        \\    return error.Missing;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = (try w.add("/p/lib.zig", lib_text)).file;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.of;
+    // 期望的错误集 E 中的 Foo，而不是 Other 中的
+    const foo = (try definition.definition(&r, file, at("Foo;") + 1)).?;
+    try testing.expectEqual(file, foo.file);
+    try testing.expectEqual(at("Foo,\n    Bar"), foo.start);
+    // 没有期望类型：含这个名字的错误集
+    const baz = (try definition.definition(&r, file, at("Baz;") + 1)).?;
+    try testing.expectEqual(at("Baz }"), baz.start);
+    // 合并的错误集：其中含这个名字的部分
+    const bar = (try definition.definition(&r, file, at("Bar;") + 1)).?;
+    try testing.expectEqual(at("Bar,\n};"), bar.start);
+    // 其他文件中声明的错误集
+    const missing = (try definition.definition(&r, file, at("Missing;") + 1)).?;
+    try testing.expectEqual(lib, missing.file);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, lib_text, "Missing").?)), missing.start);
+
+    const info = (try hover.hover(&r, file, at("Foo;") + 1)).?;
+    try testing.expectEqualStrings("```zig\nerror.Foo: error{Bar,Foo}\n```\n\nthe foo error", info.text);
+    const plain = (try hover.hover(&r, file, at("Baz;") + 1)).?;
+    try testing.expectEqualStrings("```zig\nerror.Baz\n```", plain.text);
+}
+
 test "goto declaration, definition through aliases and type definition" {
     const text =
         \\const Point = struct { x: i32 };

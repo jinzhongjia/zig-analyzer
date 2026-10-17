@@ -18,12 +18,14 @@ const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
+const FileIndex = @import("../ide_db/FileIndex.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
+    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
     if (try defAt(r, file, offset)) |def| return target(r, try r.aliasTarget(def));
     if (try reifiedFieldTarget(r, file, offset)) |t| return t;
     return selfTarget(r, file, offset);
@@ -32,6 +34,7 @@ pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
+    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
     if (try defAt(r, file, offset)) |def| return target(r, def);
     if (try reifiedFieldTarget(r, file, offset)) |t| return t;
     return selfTarget(r, file, offset);
@@ -246,6 +249,124 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
         if (findErrorName(decl, name, 0)) |at| return .{ .file = it.file, .start = at, .end = at + @as(u32, @intCast(name.len)) };
     }
     return null;
+}
+
+/// `error.Foo` 中的 `Foo` 在错误集声明中的位置与文档
+pub const ErrorDecl = struct { target: Target, doc: ?[]const u8 };
+
+/// `error.Foo`：错误名不必先声明，同名的错误也可以出现在多个错误集中。在 `error{ ... }` 声明中查找：成员与
+/// 期望的错误集完全相同的优先，其次是期望错误集的一部分（`A || B` 中的 `A`），再次是任何含这个名字的。
+/// 先查当前文件；`imports` 时再查沿 import 可达的文件（以文件索引按名字筛选），直到找到完全相同的
+pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) resolve.Error!?ErrorDecl {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const e = b.exprAt(tok.offset - node.offset) orelse return null;
+    const name = switch (b.expr(e)) {
+        .error_value => |n| ast.identName(n),
+        else => return null,
+    };
+    if (name.len == 0) return null;
+    const expected = try expectedErrorNames(r, file, tok.offset, e);
+    var best: ?ErrorCandidate = null;
+    try findErrorDecl(r, file, name, expected, &best);
+    if (!imports) return if (best) |c| c.decl else null;
+    var files: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    try files.put(r.arena, file, {});
+    var i: usize = 0;
+    while (i < files.count() and (best == null or best.?.rank != .exact)) : (i += 1) {
+        const f = files.keys()[i];
+        const index = try r.ctx.get(FileIndex.Query, f);
+        if (i > 0 and index.contains(name)) try findErrorDecl(r, f, name, expected, &best);
+        for (index.imports) |s| if (try r.resolveImport(f, s)) |to| try files.put(r.arena, to, {});
+    }
+    return if (best) |c| c.decl else null;
+}
+
+/// `error.X` 的期望错误集（错误联合取其错误集）的成员
+pub fn expectedErrorNames(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?[]const []const u8 {
+    const set = try expectedErrorSet(r, file, offset, e) orelse return null;
+    return queries.errorSetMembers(r, set);
+}
+
+pub fn expectedErrorSet(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Index {
+    const a = try context.atSeeded(r, file, offset, false) orelse return null;
+    const want = a.literalExpected(e) orelse return null;
+    return switch (r.ctx.db.env.ip.key(want)) {
+        .error_union_type => |eu| eu.err,
+        .error_set_type, .inferred_error_set => want,
+        else => null,
+    };
+}
+
+const ErrorCandidate = struct {
+    rank: enum(u2) { any, subset, exact },
+    decl: ErrorDecl,
+};
+
+/// 文件中含名为 `name` 的错误的 `error{ ... }` 声明，比 `best` 更符合期望的错误集时替换它
+fn findErrorDecl(r: *Resolver, file: FileId, name: []const u8, expected: ?[]const []const u8, best: *?ErrorCandidate) resolve.Error!void {
+    var stack: std.ArrayList(ast.SyntaxNode) = .empty;
+    try stack.append(r.arena, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode());
+    var children: std.ArrayList(ast.SyntaxNode) = .empty;
+    while (stack.pop()) |n| {
+        if (n.kind() == .error_set_decl) {
+            try considerErrorSet(r, file, n, name, expected, best);
+            continue;
+        }
+        // 按源码顺序访问：同样符合时取先出现的
+        children.clearRetainingCapacity();
+        var it = n.children();
+        while (it.nextNode()) |c| try children.append(r.arena, c);
+        var k = children.items.len;
+        while (k > 0) {
+            k -= 1;
+            try stack.append(r.arena, children.items[k]);
+        }
+    }
+}
+
+fn considerErrorSet(r: *Resolver, file: FileId, set: ast.SyntaxNode, name: []const u8, expected: ?[]const []const u8, best: *?ErrorCandidate) resolve.Error!void {
+    var names: std.ArrayList([]const u8) = .empty;
+    var doc: std.ArrayList(u8) = .empty;
+    var found: ?ErrorDecl = null;
+    var it = set.children();
+    while (it.next()) |el| {
+        const t = switch (el) {
+            .token => |t| t,
+            .node => continue,
+        };
+        switch (t.kind) {
+            .doc_comment => {
+                var line = t.text["///".len..];
+                if (std.mem.startsWith(u8, line, " ")) line = line[1..];
+                if (doc.items.len != 0) try doc.append(r.arena, '\n');
+                try doc.appendSlice(r.arena, std.mem.trimEnd(u8, line, "\r"));
+            },
+            .identifier => {
+                const member = ast.identName(t.text);
+                try names.append(r.arena, member);
+                if (found == null and std.mem.eql(u8, member, name)) found = .{
+                    .target = .{ .file = file, .start = t.offset, .end = t.offset + @as(u32, @intCast(t.text.len)) },
+                    .doc = if (doc.items.len != 0) try r.arena.dupe(u8, doc.items) else null,
+                };
+                doc.clearRetainingCapacity();
+            },
+            else => {},
+        }
+    }
+    const decl = found orelse return;
+    const rank: @FieldType(ErrorCandidate, "rank") = if (expected) |want| blk: {
+        for (names.items) |x| {
+            for (want) |y| {
+                if (std.mem.eql(u8, x, y)) break;
+            } else break :blk .any;
+        }
+        break :blk if (names.items.len == want.len) .exact else .subset;
+    } else .any;
+    if (best.* == null or @backingInt(rank) > @backingInt(best.*.?.rank)) best.* = .{ .rank = rank, .decl = decl };
 }
 
 /// 节点中 `error{ ... }` 里名为 `name` 的错误的位置
