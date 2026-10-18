@@ -939,6 +939,9 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         defer server.docs_mutex.unlock(server.io);
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
+    // 单文件模式的根文件在打开期间从磁盘删除时（外部改动的通知不处理打开的文件），关闭时丢弃它的编译结果，
+    // 被它 import 的文件一并重新发布
+    if (disk == null and server.dropSingle(id)) return;
     // 关闭后按磁盘内容重新发布（编译集合中的文件仍可能有编译器诊断）
     server.publishFiles(&.{id}, true);
 }
@@ -1397,8 +1400,11 @@ fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
 fn compileSingle(server: *Server, file: Vfs.FileId) void {
     if (server.zigEnv() == null) return; // 启动完成后会补编译
     if (!server.buildFlags().compiler) return;
-    // 编译器读取磁盘：尚未保存到磁盘的新文件不编译
-    Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch return;
+    // 编译器读取磁盘：不在磁盘上的文件（尚未保存的新文件、已被删除的文件）不编译，丢弃它上一次的编译结果
+    Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch {
+        _ = server.dropSingle(file);
+        return;
+    };
     {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
@@ -1415,6 +1421,26 @@ fn compileSingle(server: *Server, file: Vfs.FileId) void {
     spawn(server.io, &server.bg_group, singleFileTask, .{ server, file });
 }
 
+/// 丢弃已不在磁盘上的根文件 `file` 的编译结果，并重新发布其中有错误的文件（被它 import 的文件上的错误也随之
+/// 清除）。返回是否丢弃了结果（`file` 已随之重新发布）
+fn dropSingle(server: *Server, file: Vfs.FileId) bool {
+    var affected: std.ArrayList(Vfs.FileId) = .empty;
+    defer affected.deinit(server.gpa);
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        const sf = server.single.getPtr(file) orelse return false;
+        // 正在进行的编译可能在删除之前就读取了文件：结束后重新编译（文件已不在磁盘上，得到空结果）
+        if (sf.running) sf.rerun = true;
+        if (sf.result == null) return false;
+        affected.append(server.gpa, file) catch {};
+        affected.appendSlice(server.gpa, sf.files.keys()) catch {};
+        sf.clearResult(server.gpa);
+    }
+    server.publishFiles(affected.items, true);
+    return true;
+}
+
 fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     defer server.busyEnd();
     const env = server.zigEnv().?;
@@ -1427,6 +1453,8 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     while (true) {
         var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
         var result: ?compiler.BuildResult = blk: {
+            // 文件已从磁盘删除（编译期间被删除时由 `dropSingle` 要求重新编译）：没有结果
+            Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
             var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
                 log.warn("{s}: single-file compile failed: {t}", .{ path, err });
                 break :blk null;

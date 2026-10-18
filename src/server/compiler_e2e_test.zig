@@ -412,7 +412,8 @@ test "single-file mode: errors in imported files are published on them and clear
     const arena = h.arena.allocator();
 
     // 编译 a.zig 时报告在 b.zig 中的错误发布在 b.zig 上（b.zig 尚未打开）
-    _ = try open(&h, try project.path(arena, "a.zig"), a_text);
+    const a_path = try project.path(arena, "a.zig");
+    const a_uri = try open(&h, a_path, a_text);
     try waitIdle(&h);
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "a.zig", &.{});
@@ -440,7 +441,60 @@ test "single-file mode: errors in imported files are published on them and clear
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = b_uri } });
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
+
+    // 关闭 a.zig 并在编辑器之外删除它：丢弃它的编译结果，b.zig 上只剩单独编译 b.zig 报告的错误
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = a_uri } });
+    try std.Io.Dir.cwd().deleteFile(testing.io, a_path);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = a_uri, .type = 3 }} });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "b.zig", &.{"2:15 zig: expected type 'u32'"});
+
+    // 重新创建并打开 a.zig（自身也有错误），先在编辑器之外删除再关闭：删除时 a.zig 仍打开着，
+    // 关闭时同样丢弃它的编译结果
+    const a_bad = a_text ++ "comptime {\n    _ = @as(u8, 300);\n}\n";
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = a_path, .data = a_bad });
+    _ = try open(&h, a_path, a_bad);
+    try waitIdle(&h);
+    diags = try h.diagnostics();
+    try expectDiagnostics(diags, "a.zig", &.{"5:16 zig: type 'u8' cannot represent integer value '300'"});
+    try expectDiagnostics(diags, "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
+    try std.Io.Dir.cwd().deleteFile(testing.io, a_path);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = a_uri, .type = 3 }} });
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = a_uri } });
+    try waitIdle(&h);
+    diags = try h.diagnostics();
+    try expectDiagnostics(diags, "a.zig", &.{});
+    try expectDiagnostics(diags, "b.zig", &.{"2:15 zig: expected type 'u32'"});
     try shutdown(&h);
+}
+
+test "single-file mode: a root deleted while it compiles leaves no diagnostics" {
+    const text =
+        \\comptime {
+        \\    _ = @as(u8, 300);
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "a.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, true);
+    try waitIdle(&h);
+    const path = try project.path(h.arena.allocator(), "a.zig");
+    const a_uri = try open(&h, path, text);
+    // 编译开始（请求创建进度）后在编辑器之外删除 a.zig 再关闭：这次编译的结果不再发布
+    while (true) {
+        const msg = try h.next();
+        const method = msg.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "window/workDoneProgress/create")) break;
+    }
+    try std.Io.Dir.cwd().deleteFile(testing.io, path);
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = a_uri } });
+    try waitIdle(&h);
+    try shutdown(&h);
+    try expectDiagnostics(try h.diagnostics(), "a.zig", &.{});
 }
 
 test "generated module roots: resolved from build results, including modules check does not depend on" {
