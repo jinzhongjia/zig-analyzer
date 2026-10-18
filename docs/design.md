@@ -259,7 +259,7 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 
 另以 `zig fmt` 对拍 `textDocument/formatting`（逐字一致）。
 
-批量校验：每个库先 `zig build --fetch` 取得依赖，取根项目（不含自带 `build.zig` 的子目录、测试与示例）中成员访问最多的一个文件，以 `BENCH_QUICK=1 BENCH_CHECK=40 BENCH_COMPLETE=40 BENCH_REFS=20` 运行。
+批量校验：每个库先 `zig build --fetch` 取得依赖，取根项目（不含自带 `build.zig` 的子目录、测试与示例）中成员访问最多的一个文件，以 `BENCH_QUICK=1 BENCH_CHECK=40 BENCH_COMPLETE=40 BENCH_REFS=20` 运行。项目、提交与测量文件见 `docs/test-list.md`。
 
 ### 5.3 当前验收结果
 
