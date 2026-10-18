@@ -563,13 +563,19 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// 已经从栈底计算过的中断处个数
             deepening: u32 = 0,
 
+            /// 帧中记下的依赖，按记录顺序去重。依赖少时线性查找，多时建立散列索引：接过环中结果的依赖后，
+            /// 一帧可能有很多依赖
+            const DepSet = std.array_hash_map.Custom(DepKey, void, std.array_hash_map.AutoContext(DepKey), false);
+
             /// `deps` 使用 `db.gpa` 分配，因为它最终归 memo 所有
             const Frame = struct {
                 key: DepKey,
-                deps: std.ArrayList(DepKey) = .empty,
+                deps: DepSet = .empty,
                 durability: Durability = .high,
                 /// 本帧参与了环，结果不写入 memo
                 in_cycle: bool = false,
+                /// 本帧被 `markIncomplete` 标记：它与它下面的各帧都不写入 memo
+                incomplete: bool = false,
                 /// 本帧中执行的其他 query 的耗时（用于自身耗时）
                 child_ns: u64 = 0,
             };
@@ -592,7 +598,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// 当前结果不完整（燃料耗尽等）：栈上的 query 都不写入 memo
             pub fn markIncomplete(ctx: *Ctx, cause: IncompleteCause) void {
                 _ = ctx.db.incomplete_causes[@backingInt(cause)].fetchAdd(1, .monotonic);
-                for (ctx.stack.items) |*frame| frame.in_cycle = true;
+                for (ctx.stack.items) |*frame| {
+                    frame.in_cycle = true;
+                    frame.incomplete = true;
+                }
             }
 
             /// compute 内部因栈深度上限中断：除 `markIncomplete` 外，记下正在计算的 query，
@@ -679,6 +688,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     },
                 };
                 if (Q.kind == .derived and !fresh.executed) _ = db.counters[qi].hits.fetchAdd(1, .monotonic);
+                if (Q.kind == .derived and fresh.in_cycle) return fresh.value;
                 try ctx.recordDep(dep, fresh.durability);
                 return fresh.value;
             }
@@ -687,8 +697,31 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (ctx.stack.items.len == 0) return;
                 const top = &ctx.stack.items[ctx.stack.items.len - 1];
                 top.durability = top.durability.min(durability);
-                for (top.deps.items) |d| if (d.eql(dep)) return;
-                try top.deps.append(ctx.db.gpa, dep);
+                _ = try top.deps.getOrPut(ctx.db.gpa, dep);
+            }
+
+            /// 环中的结果不写入 memo，读取它的 query 不把它记为依赖，改为接过它读到的依赖（环中对栈上
+            /// query 的读取不记为依赖，读到的是回退值）。环中的 query 可能另有单独计算出的 memo，值与环中算出的
+            /// 不同：若记为依赖，它之后重算出与旧 memo 相同的值（early cutoff）时，依赖它的 memo 会被误判为未变；
+            /// 环的入口也会与环内成员的 memo 互相依赖，验证时沿 memo 环反复递归
+            fn inheritDeps(ctx: *Ctx, frame: *const Frame) Allocator.Error!void {
+                const target = ctx.inheritTarget() orelse return;
+                target.durability = target.durability.min(frame.durability);
+                for (frame.deps.keys()) |dep| _ = try target.deps.getOrPut(ctx.db.gpa, dep);
+            }
+
+            /// 接过环中结果的依赖的帧：栈上最近的不在环中的帧。跳过的帧都在环中、不写入 memo，依赖不必
+            /// 经过它们逐层传递（否则环中每一层都要合并上面各层的依赖）。`markIncomplete` 标记的帧及其下方
+            /// 都不写入 memo，没有这样的帧
+            fn inheritTarget(ctx: *Ctx) ?*Frame {
+                var i = ctx.stack.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const frame = &ctx.stack.items[i];
+                    if (frame.incomplete) return null;
+                    if (!frame.in_cycle) return frame;
+                }
+                return null;
             }
 
             fn onCycle(ctx: *Ctx, comptime Q: type, head: usize, key: Q.Key) Q.Value {
@@ -703,7 +736,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             fn Fresh(comptime Q: type) type {
-                return struct { value: Q.Value, changed_at: Revision, durability: Durability, executed: bool = false };
+                return struct {
+                    value: Q.Value,
+                    changed_at: Revision,
+                    durability: Durability,
+                    executed: bool = false,
+                    /// 环中的结果：它读到的依赖已交给栈上的帧（见 `inheritDeps`），读取方不再把它记为依赖
+                    in_cycle: bool = false,
+                };
             }
 
             fn verifiedMemo(ctx: *Ctx, comptime Q: type, index: u32) ?Fresh(Q) {
@@ -864,20 +904,19 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 };
                 // 环中的结果依赖于入口，不写入 memo。值返回给调用方使用，放入垃圾列表待读事务结束后释放
                 if (frame.in_cycle) {
-                    frame.deps.deinit(db.gpa);
+                    defer frame.deps.deinit(db.gpa);
                     db.discardLocked(Q, &value) catch |err| {
                         deinitValue(Q, &value, db.gpa);
                         return err;
                     };
-                    return .{ .value = value, .changed_at = db.revision, .durability = .low, .executed = true };
+                    try ctx.inheritDeps(&frame);
+                    return .{ .value = value, .changed_at = db.revision, .durability = .low, .executed = true, .in_cycle = true };
                 }
 
                 // 提交 memo 之前失败：新值没有发布过，直接释放
                 errdefer deinitValue(Q, &value, db.gpa);
-                const deps = frame.deps.toOwnedSlice(db.gpa) catch |err| {
-                    frame.deps.deinit(db.gpa);
-                    return err;
-                };
+                defer frame.deps.deinit(db.gpa);
+                const deps = try db.gpa.dupe(DepKey, frame.deps.keys());
                 errdefer db.gpa.free(deps);
 
                 var changed_at = db.revision;
