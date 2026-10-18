@@ -342,6 +342,24 @@ test "goto declaration of enum literals in branches whose result is the peer typ
     }
 }
 
+test "completion through a switch whose other prong is an empty tuple literal" {
+    // `else => &.{}` 与切片做 peer type resolution 得到切片：曾求不出，补全为空
+    const labels = try completionLabels(
+        \\const Item = struct { label: []const u8, kind: u8 };
+        \\fn f(list: []const Item, n: u8) usize {
+        \\    const items = switch (n) {
+        \\        0 => list,
+        \\        else => &.{},
+        \\    };
+        \\    for (items) |it| _ = it.<|>;
+        \\    return items.len;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("label kind", labels);
+}
+
 test "goto declaration of reified enum members named by string literals or @typeInfo" {
     // `@Enum` 构造的枚举（如 SyntaxKind）的成员曾没有跳转目标
     const kind_text =

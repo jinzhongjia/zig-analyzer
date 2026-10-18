@@ -2749,6 +2749,8 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
         .ptr_type => |p| p,
         else => return null,
     };
+    if (try tupleAsArray(ip, x, y)) |p| return peerPtr(ip, p, b);
+    if (try tupleAsArray(ip, y, x)) |p| return peerPtr(ip, a, p);
     const xa: ?@FieldType(InternPool.Key, "array_type") = if (x.size == .one) switch (ip.key(x.child)) {
         .array_type => |arr| arr,
         else => null,
@@ -2778,6 +2780,23 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
     }
     const size: InternPool.PtrSize = if (xa != null) y.size else if (ya != null) x.size else if (x.size == y.size) x.size else return null;
     return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel } });
+}
+
+/// 指向元组的单项指针 `p`（`&.{}`、`&.{ a, b }`）的各项都是指针 `other` 的元素类型（或没有项）时，对应的指向
+/// 数组的指针：与切片、指向数组的指针做 peer type resolution 时按数组处理（`else => &.{}`）
+fn tupleAsArray(ip: *InternPool, p: @FieldType(InternPool.Key, "ptr_type"), other: @FieldType(InternPool.Key, "ptr_type")) Allocator.Error!?Index {
+    if (p.size != .one) return null;
+    const tt = switch (ip.key(p.child)) {
+        .tuple_type => |t| t,
+        else => return null,
+    };
+    const elem = if (other.size == .one) switch (ip.key(other.child)) {
+        .array_type => |arr| arr.child,
+        else => return null,
+    } else other.child;
+    for (tt.types) |t| if (t != elem) return null;
+    const arr = try ip.get(.{ .array_type = .{ .len = @intCast(tt.types.len), .child = elem, .sentinel = null } });
+    return try ip.ptrTo(arr, .one, p.is_const);
 }
 
 /// 可做指针运算的指针（多项指针与 C 指针）
