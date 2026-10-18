@@ -303,6 +303,45 @@ test "goto declaration of enum literals passed to anytype parameters that the ca
     }
 }
 
+test "goto declaration of enum literals in branches whose result is the peer type" {
+    // 没有结果类型的 `if` / `switch`：分支按 peer type 转换，`.invalid` 是 Kind 的成员；曾没有跳转目标
+    const text =
+        \\const Kind = enum { invalid, name, none };
+        \\const Tok = struct { kind: Kind };
+        \\fn f(t: ?Tok, n: u8) bool {
+        \\    const a = if (t) |x| x.kind else .invalid;
+        \\    const b = switch (n) {
+        \\        0 => a,
+        \\        else => .none,
+        \\    };
+        \\    return a == b;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "invalid;", "invalid, name" },
+        .{ "none,\n", "none }" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.definition(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..t.end] });
+            return err;
+        };
+    }
+}
+
 test "goto declaration of reified enum members named by string literals or @typeInfo" {
     // `@Enum` 构造的枚举（如 SyntaxKind）的成员曾没有跳转目标
     const kind_text =

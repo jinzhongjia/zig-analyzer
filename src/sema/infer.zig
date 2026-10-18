@@ -430,6 +430,16 @@ const Inferrer = struct {
         return tv;
     }
 
+    /// 没有结果类型的分支结果按 peer type 转换（`if (b.op()) |t| t.kind else .invalid`）：分支中的枚举字面量引用
+    /// peer 类型中的成员，并以它为期望类型
+    fn peerLiteral(inf: *Inferrer, e: ExprId, ty: Index) Error!void {
+        if (ty == .unknown or ty == .enum_literal_type) return;
+        if (inf.body.expr(e) != .enum_literal or inf.members[@backingInt(e)] != null) return;
+        if (inf.get(e).ty != .enum_literal_type) return;
+        try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = ty });
+        try inf.recordTagMember(e, ty);
+    }
+
     /// 见 `Result.param_coercions`：`e` 是对本成员参数的引用，以期望类型 `want` 使用
     fn noteParamCoercion(inf: *Inferrer, e: ExprId, want: Index) Error!void {
         if (want == .unknown or want == .enum_literal_type) return;
@@ -578,6 +588,8 @@ const Inferrer = struct {
                     return if (t) then else other;
                 }
                 const ty = try inf.peer(&.{ then.ty, other.ty });
+                try inf.peerLiteral(x.then, ty);
+                if (x.@"else") |el| try inf.peerLiteral(el, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) sameLiveValue(&.{ then, other }, ty) else null };
             },
             .loop => |l| return inf.loop(l, expected),
@@ -624,6 +636,7 @@ const Inferrer = struct {
                 }
                 if (chosen != null) return chosen_tv;
                 const ty = try inf.peer(types.items);
+                for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
             },
             .@"catch" => |c| {
