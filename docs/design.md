@@ -163,7 +163,8 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。容器类型的身份不依赖字段类型，递归类型不会成环。
 - **核心 query**：`DeclType`（声明的类型与 comptime 值，只读签名）、`Infer`（BodyOwner + 实例 → 每个表达式的类型与解析目标）、`CallEval`（comptime 调用按实例与实参记忆化）、`ErrorSetOf`（推导错误集）、`LocalValue`（单个局部绑定）。
 - **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution；`unknown` 吸收一切。调用处判断是否为泛型调用只读被调函数的参数形式（`ParamForms`），只改被调函数的函数体时调用者不重新推导。
-- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。跳转到 `@Struct` 生成的字段（字段名来自 comptime 解析的字符串，如 zig-clap 的帮助文本）时，以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到字段名在字面量中的位置。
+- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。构造类型（`@Struct` / `@Enum` / `@Union`）以构造它的函数实例命名（`FieldEnum(S)`）；不在函数中构造、正是某个常量的值时以常量命名。
+  - 跳转到构造类型的成员（字段访问 `x.name`、`E.name`、枚举字面量 `.name`）：名字是 comptime 求出的字符串。来自字符串字面量时（如 zig-clap 解析帮助文本得到的字段名），以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到名字在字面量中的位置；候选为初始化表达式含有这个字面量的常量，以及使用处与构造处所在成员的局部绑定。来自 `@typeInfo(X)` 时（`@typeInfo(Tag).@"enum".field_names`）跳到 X 的同名成员。
   - 单次求值 20 万步，`@memcpy` 与经由切片的整体写入每个元素计一步。内存上限 64 MB，单个聚合至多 65536 个元素：展开聚合（复制、拼接、切片、`@splat` 等）之前按已占用容量加本次分配检查，其余每 256 步检查一次。
   - 指向局部存储的切片以「存储单元 + 路径 + 区间」表示，取元素与长度时在原聚合中直接读取，不复制区间。
   - 驻留的值至多嵌套 256 层（自引用的值按 `unknown`）。
@@ -172,6 +173,10 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 函数值与实参元组一起传入的调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`）以元组元素作为实参
   - 项目中没有调用点的泛型方法以标准库的分派处求实例：`std.Io.Writer.printValue` 中的 `value.format(w)`、`value.formatNumber(w, ...)` 等
   - 抽象参数的 `@hasDecl` / `@hasField` 结果未知（推导与解释器一致），依赖它们的 comptime 分支不判为非活动；抽象实例中的容器（如 `@This()`）有哪些成员只取决于源码，仍给出确定结果
+  - 选择实例：hover / 跳转 / 补全取第一个使光标处的代码会执行、光标处的表达式（或局部绑定）能求出具体类型的实例（如 `switch (Q.kind)` 中只有部分实例有的成员）。先看第一个调用点，再依次尝试其他调用点（每个成员缓存前 8 个不同的实例，`Instances`）；都求不出类型时退而只要求代码会执行。调用者实例中不执行的代码里的调用不计；调用者位于泛型函数内时，它的一个实例中没有可用的调用就尝试它的其他实例
+  - 调用者以自己的 comptime 类型参数调用（`P.name(...)`）、而它的实例中 `P` 是其他容器时，把实例中 `P` 的实参换成目标所在的容器
+  - 目标所在的容器作为 comptime 类型实参传入泛型函数、再经类型参数调用目标（查询引擎中 `ctx.get(Q, key)` → … → `Q.compute(ctx, key)`）：分派处所在的文件不必 import 目标所在的文件，按导入链找不到。从实参中传入这个容器类型的调用出发，逐层进入实参中仍含有它的泛型调用，直到调用目标处；收集全部实例时同样沿这条路径查找
+  - 遍历 comptime 已知的类型列表的循环（`inline for`，comptime 中的 `for`）中循环变量是抽象的类型。光标或调用位于这样的循环中时按单次迭代推导（至多 64 次迭代），同一循环的其他循环变量（`for (types, 0..) |T, i|`）取这次迭代的值；hover 标注 `inferred from iteration <n> of the loop at <位置>`
 - **其他构建配置**：当前配置下不存在的成员（只在其他目标上编译的代码，如 `posix.system.EVFILT.READ`、macOS 的 `settings.cflag.CCTS_OFLOW`）到其他配置的容器中查找：沿别名与 comptime 条件的 `if` / `switch` 分支收集各配置下的容器；实例的类型沿局部变量、全局变量、调用的返回类型与字段类型收集。
 - **目标相关**：与目标相关的参数从各模块的 builtin.zig 解析出的目标（架构、操作系统、ABI、CPU 特性）求出（`TargetAbi`），目标变化时依赖它的结果失效；参数相同的模块共用同一份 builtin.zig，每份只读取、解析一次。
   - 参数包括指针位宽、向量的布局规则、整数的最大对齐、`c_char` 的符号，以及 C 类型与 `f32` / `f64` / `f80` / `f128` 的大小、对齐与位宽，按编译器 `Type.abiAlignment` / `abiSize` 的规则计算：C 类型用 `std.Target.cType*`，整数用 `std.zig.target.intAlignment` / `intByteSize`，浮点按 C 类型、表示它的整数或 compiler-rt 的软浮点表示。
@@ -189,7 +194,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemSummaries` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
-| 非活动代码 | comptime 已知不执行的分支 |
+| 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
 
 ### 4.7 构建集成（`project/`）
 
