@@ -4,7 +4,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ProjectModel = @import("../base/ProjectModel.zig");
-const FileId = @import("../base/Vfs.zig").FileId;
+const Vfs = @import("../base/Vfs.zig");
+const FileId = Vfs.FileId;
 
 pub const Result = struct {
     /// 文件 → 第一次到达它时所在的模块
@@ -83,8 +84,8 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
             const a = scratch.allocator();
             for (imports) |name| {
                 const target: Node = if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) blk: {
-                    const dir = std.fs.path.dirname(resolver.path(node.file)) orelse continue;
-                    break :blk .{ .file = try resolver.intern(try std.fs.path.resolveAlloc(a, &.{ dir, name })), .module = node.module };
+                    const file = try relativeImport(a, resolver, node.file, name) orelse continue;
+                    break :blk .{ .file = file, .module = node.module };
                 } else if (std.mem.eql(u8, name, "std"))
                     .{ .file = try resolver.intern(model.std_root), .module = std_module }
                 else if (std.mem.eql(u8, name, "root"))
@@ -137,13 +138,19 @@ pub fn buildScripts(gpa: Allocator, build_root: []const u8, resolver: anytype) !
             try result.missing.put(gpa, file, {});
             continue;
         };
-        const dir = std.fs.path.dirname(resolver.path(file)) orelse continue;
         for (imports) |name| {
             if (!std.mem.endsWith(u8, name, ".zig") and !std.mem.endsWith(u8, name, ".zon")) continue;
-            try stack.append(gpa, try resolver.intern(try std.fs.path.resolveAlloc(scratch.allocator(), &.{ dir, name })));
+            try stack.append(gpa, try relativeImport(scratch.allocator(), resolver, file, name) orelse continue);
         }
     }
     return result;
+}
+
+/// 文件 `file` 中按相对路径 `@import(name)` 的目标。解析结果不是绝对路径时（Windows 上另一驱动器的相对路径，
+/// 如 `D:a.zig`）不能驻留，返回 null
+fn relativeImport(a: Allocator, resolver: anytype, file: FileId, name: []const u8) !?FileId {
+    const dir = std.fs.path.dirname(resolver.path(file)) orelse return null;
+    return try resolver.intern(try Vfs.resolve(.native, a, dir, name) orelse return null);
 }
 
 const testing = std.testing;
@@ -156,6 +163,8 @@ const FakeFs = struct {
     files: std.StringHashMapUnmanaged([]const []const u8) = .empty,
 
     fn intern(fs: *FakeFs, file_path: []const u8) !FileId {
+        // 与 `Vfs.intern` 的约定相同：只接受绝对路径
+        if (!std.fs.path.isAbsolute(file_path)) return error.NotAbsolute;
         for (fs.paths.items, 0..) |p, i| if (std.mem.eql(u8, p, file_path)) return @fromBackingInt(@as(u32, @intCast(i)));
         try fs.paths.append(testing.allocator, try testing.allocator.dupe(u8, file_path));
         return @fromBackingInt(@as(u32, @intCast(fs.paths.items.len - 1)));
@@ -253,6 +262,19 @@ test buildScripts {
     try testing.expectEqualStrings(native("/p/shared.zig"), names.items[3]);
     try testing.expectEqual(1, r.missing.count());
     try testing.expectEqualStrings(native("/p/shared.zig"), fs.path(r.missing.keys()[0]));
+}
+
+test "relative imports that do not resolve to absolute paths are skipped" {
+    // 曾把 Windows 上另一驱动器的相对路径（`D:other.zig` 解析后仍是相对路径）交给 `intern`，在其中 panic
+    const gpa = testing.allocator;
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    try fs.files.put(gpa, native("/p/build.zig"), &.{ "D:other.zig", "helper.zig" });
+    try fs.files.put(gpa, native("/p/build.zig.zon"), &.{});
+    try fs.files.put(gpa, native("/p/helper.zig"), &.{});
+    var r = try buildScripts(gpa, native("/p"), &fs);
+    defer r.deinit(gpa);
+    try testing.expect(r.files.contains(try fs.intern(native("/p/helper.zig"))));
 }
 
 test "a file shared by modules of different compile steps records every module" {
