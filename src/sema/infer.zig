@@ -541,8 +541,10 @@ const Inferrer = struct {
             .loop => |l| return inf.loop(l, expected),
             .@"switch" => |s| {
                 const operand = try inf.infer(s.operand, null);
+                // 带标签的 union 按标签匹配：分支项按标签类型推导，转换为 union 本身会失去值，选不出执行的分支
+                const item_ty = try inf.comparedType(operand.ty);
                 for (s.prongs) |prong| for (prong.items) |item| {
-                    _ = try inf.infer(item, operand.ty);
+                    _ = try inf.infer(item, item_ty);
                 };
                 // 带标签的 switch：`break :label value` 的值也是结果
                 const label = inf.switchLabel(e, s.operand);

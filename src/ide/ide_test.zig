@@ -660,6 +660,63 @@ test "branches excluded by comptime conditions are inactive" {
     try testing.expectEqualStrings("x * 2", text[ranges[1].start..ranges[1].end]);
 }
 
+test "switch prongs on a comptime-known tagged union are inactive unless they match" {
+    // 操作数是带标签的 union 时曾选不出执行的分支，其余分支都不判为非活动
+    const text =
+        \\const U = union(enum) { x: u32, y: void };
+        \\const u: U = .{ .x = 1 };
+        \\fn f() u32 {
+        \\    switch (u) {
+        \\        .x => |v| return v,
+        \\        .y => return 0,
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    try testing.expectEqual(1, ranges.len);
+    try testing.expectEqualStrings("return 0", text[ranges[0].start..ranges[0].end]);
+}
+
+/// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）：`@typeInfo` 需要 `std.builtin.Type`
+fn useRealStd(w: *World) !void {
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
+    defer testing.allocator.free(std_root_path);
+    try w.setGraph(try w.vfs.intern(std_root_path), &.{}, &.{});
+}
+
+test "switch prongs on @typeInfo of a concrete type are inactive unless they match" {
+    const text =
+        \\fn g() u16 {
+        \\    return switch (@typeInfo(u16)) {
+        \\        .int => |i| i.bits,
+        \\        else => 7,
+        \\    };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    try testing.expectEqual(1, ranges.len);
+    try testing.expectEqualStrings("7", text[ranges[0].start..ranges[0].end]);
+}
+
 test "conditions on members of abstract parameters are not inactive" {
     // 防止没有实例时把 `@hasDecl` / `@hasField` 求值为 false：有调用点的泛型代码中实际执行的分支显示为非活动
     const text =
