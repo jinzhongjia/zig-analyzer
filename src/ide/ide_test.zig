@@ -704,6 +704,29 @@ test "conditions on members of abstract parameters are not inactive" {
     };
 }
 
+test "conditions on the root of a file outside every module are not inactive" {
+    // 防止为不属于任何模块的文件猜测根文件（如取文件自身）：它可能由另一个文件以相对路径 import，
+    // 也可能由 `zig test` 编译（根文件是测试运行器）
+    const text =
+        \\const root = @import("root");
+        \\pub fn check() void {
+        \\    if (@hasDecl(root, "main")) {
+        \\        @panic("root has main");
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/helper.zig", text)).file;
+    try w.setGraph(null, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    try testing.expectEqual(0, (try inactive.ranges(&r, file)).len);
+}
+
 test "completion, goto, signature help and inlay hints in generic bodies use a call site" {
     const text =
         \\const Point = struct {
