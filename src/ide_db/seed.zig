@@ -70,7 +70,7 @@ pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject
         if (fits(ip, body, res, rel, subject)) return .{ .res = res, .inst = found.inst, .file = found.file, .offset = found.offset };
     };
     if (!inactiveAt(body, first.res, rel)) return first;
-    const found = try search_(r, owner, rel, max_depth) orelse return first;
+    const found = try search_(r, owner, rel, max_depth, true) orelse return first;
     return .{
         .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
         .inst = found.inst,
@@ -145,7 +145,7 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
 
 /// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）内提到 `names` 的调用：实参求不出
 /// 具体的实例；按各次迭代推导（实例 `inst` 下的结果为 `res`）再找。`all` 不为 null 时收集
-fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector) resolve.Error!?Found {
+fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs) |e| {
         const l = switch (e) {
@@ -157,7 +157,7 @@ fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const 
             const n = try iterations(r, res, l, k) orelse continue;
             for (0..n) |idx| {
                 const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = @intCast(idx) } });
-                if (try callIn(r, in, i, body, res_i, file, item, root_key, active, all)) |found| return found;
+                if (try callIn(r, in, i, body, res_i, file, item, root_key, active, all, strict)) |found| return found;
                 if (all) |c| if (c.full()) return null;
             }
         }
@@ -225,7 +225,8 @@ pub const max_depth = 6;
 /// 要数秒）
 const max_collect_depth = 3;
 
-/// 调用点的查找按成员与层数缓存：补全、inlay hints 等频繁的请求不必每次重新查找。
+/// 调用点的查找按成员与层数缓存：补全、inlay hints 等频繁的请求不必每次重新查找。先严格查找，没有结果时放宽
+/// （见 `callIn`）。
 /// 层数为 d 的查找为位于泛型函数内的调用者取实例时使用层数 d - 1 的查找（0 层只看实参本身具体的调用点）。
 /// 层数严格递减，不会成环：互相调用的泛型函数（http.zig 的 `execute` 与 `init`）若以同一个 key 递归，
 /// 环中的结果不写入 memo，每次请求都重新计算且层层放大
@@ -238,7 +239,7 @@ pub const Query = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return search_(&r, key.owner, null, key.depth);
+        return try search_(&r, key.owner, null, key.depth, true) orelse search_(&r, key.owner, null, key.depth, false);
     }
 
     pub fn cycleFallback(_: Key) Value {
@@ -252,7 +253,7 @@ pub const max_seeds = 8;
 /// 成员在各调用点的不同实例（按查找顺序，去重）。调用者自身位于泛型函数内时取调用者的实例（同样的 `all`，
 /// 层数少一层）。`all` 为 false 时只取前 `max_seeds` 个：第一个实例不适用时（光标处的代码不执行、表达式求不出
 /// 类型、调用位于该实例不执行的分支中）依次尝试；为 true 时至多 `max_instances` 个，用于需要覆盖所有实例的
-/// 场合（`allInstances`）
+/// 场合（`allInstances`）。与 `Query` 一样，严格查找没有结果时放宽
 pub const Instances = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { owner: hir.OwnerKey, depth: u8, all: bool = false };
@@ -264,6 +265,10 @@ pub const Instances = struct {
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
         var out: Collector = .{ .limit = if (key.all) max_instances else max_seeds, .all = key.all };
         try collect(&r, key.owner, key.depth, &out);
+        if (out.found.items.len == 0) {
+            out.strict = false;
+            try collect(&r, key.owner, key.depth, &out);
+        }
         return ctx.db.gpa.dupe(Found, out.found.items);
     }
 
@@ -301,6 +306,8 @@ const Collector = struct {
     limit: usize,
     /// 见 `Instances.Key`
     all: bool,
+    /// 见 `callIn`
+    strict: bool = true,
 
     fn full(c: *const Collector) bool {
         return c.found.items.len >= c.limit;
@@ -328,7 +335,7 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.
         try collectIn(r, f, key.file, item, root, names, depth, out);
     }
     // 类型流的层数不受收集层数限制：它只进入实参含有目标容器的实例，不会成倍增长
-    _ = try typeFlow(r, key.file, item, root, files, null, max_depth, out);
+    _ = try typeFlow(r, key.file, item, root, files, null, max_depth, out, out.strict);
     if (out.found.items.len == 0) if (try dispatched(r, key.file, item, root, null)) |found| try out.add(r.arena, found);
 }
 
@@ -344,20 +351,21 @@ fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, out);
-        _ = try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, null, out);
+        _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, out, out.strict);
+        _ = try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, null, out, out.strict);
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1, .all = out.all })) |o| {
             if (out.full()) return;
             const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = o.inst });
-            _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, out);
-            _ = try loopCall(r, in, @intCast(i), owner, body, seeded, o.inst, names, file, item, root_key, null, out);
+            _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, out, out.strict);
+            _ = try loopCall(r, in, @intCast(i), owner, body, seeded, o.inst, names, file, item, root_key, null, out, out.strict);
         }
     }
 }
 
-/// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的
-fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Error!?Found {
+/// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的。
+/// `strict` 见 `callIn`
+fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == key.item) break @intCast(i);
@@ -365,12 +373,12 @@ fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Err
     const root = try genericRoot(r, key.file, item) orelse return null;
     const files = try search.importers(r, key.file, try search.projectFiles(r));
     const names = try callNames(r, key.file, root, files);
-    if (try findIn(r, key.file, key.file, item, root, names, active, depth)) |s| return s;
+    if (try findIn(r, key.file, key.file, item, root, names, active, depth, strict)) |s| return s;
     for (files) |f| {
         if (f == key.file or !try containsAny(r, f, names)) continue;
-        if (try findIn(r, f, key.file, item, root, names, active, depth)) |s| return s;
+        if (try findIn(r, f, key.file, item, root, names, active, depth, strict)) |s| return s;
     }
-    if (try typeFlow(r, key.file, item, root, files, active, depth, null)) |s| return s;
+    if (try typeFlow(r, key.file, item, root, files, active, depth, null, strict)) |s| return s;
     return dispatched(r, key.file, item, root, active);
 }
 
@@ -378,7 +386,7 @@ fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Err
 /// `get` → … → `execute` 中的 `Q.compute(ctx, key)`）。分派处所在的文件不必 import 目标所在的文件，按导入链
 /// 找不到：从实参中传入这个容器类型的调用出发，逐层进入实参中仍含有它的泛型调用，直到调用目标处。
 /// `all` 不为 null 时收集全部这样找到的实例，返回 null
-fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const FileId, active: ?u32, depth: u8, all: ?*Collector) resolve.Error!?Found {
+fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const FileId, active: ?u32, depth: u8, all: ?*Collector, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(file);
     const container = tree.items[root].container;
     const decl_item = tree.containers[container].parent_item orelse return null;
@@ -387,7 +395,7 @@ fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const Fil
     const target = try queries.containerType(r, .{ .file = file, .container = container }, null);
     const root_key = try r.ownerKey(file, root);
     const names = [_][]const u8{name};
-    var flow: Flow = .{ .r = r, .target = target, .file = file, .item = item, .root_key = root_key, .active = active, .all = all };
+    var flow: Flow = .{ .r = r, .target = target, .file = file, .item = item, .root_key = root_key, .active = active, .all = all, .strict = strict };
     for (files) |f| {
         if (!try containsAny(r, f, &names)) continue;
         const ft = try r.itemTree(f);
@@ -413,6 +421,7 @@ const Flow = struct {
     root_key: hir.OwnerKey,
     active: ?u32,
     all: ?*Collector,
+    strict: bool,
     visited: std.ArrayList(Index) = .empty,
 
     fn full(fl: *const Flow) bool {
@@ -431,7 +440,7 @@ const Flow = struct {
                 .call => |c| c,
                 else => continue,
             };
-            if (withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
+            if (fl.strict and withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
             const receiver: ?TypedValue = switch (body.expr(c.callee)) {
                 .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
                 else => null,
@@ -448,7 +457,7 @@ const Flow = struct {
             const callee_body = try r.ctx.get(hir.ItemBody, owner);
             const norm = try queries.normalizeInst(r, called.file, ci, called.inst);
             const callee_res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
-            if (try callIn(r, called.file, ci, callee_body, callee_res, fl.file, fl.item, fl.root_key, fl.active, fl.all)) |found| return found;
+            if (try callIn(r, called.file, ci, callee_body, callee_res, fl.file, fl.item, fl.root_key, fl.active, fl.all, fl.strict)) |found| return found;
             if (try fl.from(callee_body, callee_res, depth - 1)) |found| return found;
         }
         return null;
@@ -586,7 +595,7 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32, depth: u8) resolve.Error!?Found {
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32, depth: u8, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
@@ -597,26 +606,26 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active, null)) |s| return s;
-        if (try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, active, null)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active, null, strict)) |s| return s;
+        if (try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, active, null, strict)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
         // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
-        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null)) |s| return s;
-        if (try loopCall(r, in, @intCast(i), owner, body, seeded, outer.inst, names, file, item, root_key, active, null)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null, strict)) |s| return s;
+        if (try loopCall(r, in, @intCast(i), owner, body, seeded, outer.inst, names, file, item, root_key, active, null, strict)) |s| return s;
         // 调用者经由自己的 comptime 类型参数调用（`Q.compute(ctx, key)`）：把该参数换成目标所在的容器
         if (try substituted(r, in, @intCast(i), body, outer.inst, file, root)) |inst| {
             const res2 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
-            if (try callIn(r, in, @intCast(i), body, res2, file, item, root_key, active, null)) |s| return s;
+            if (try callIn(r, in, @intCast(i), body, res2, file, item, root_key, active, null, strict)) |s| return s;
         }
         // 第一个实例下没有有效的调用（如调用位于该实例不执行的 `switch (Q.kind)` 分支中）：依次尝试调用者的其他实例
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1 })) |other| {
             if (other.inst == outer.inst) continue;
             const res3 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = other.inst });
-            if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, active, null)) |s| return s;
-            if (try loopCall(r, in, @intCast(i), owner, body, res3, other.inst, names, file, item, root_key, active, null)) |s| return s;
+            if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, active, null, strict)) |s| return s;
+            if (try loopCall(r, in, @intCast(i), owner, body, res3, other.inst, names, file, item, root_key, active, null, strict)) |s| return s;
         }
     }
     return null;
@@ -667,15 +676,16 @@ fn substituted(r: *Resolver, in: FileId, caller: u32, body: *const Body, inst: ?
 /// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。函数作为值与实参元组
 /// 一起传入另一个调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a, b })`）也算作以元组元素调用。
 /// `all` 不为 null 时把全部调用的实例（去重）加入其中，返回 null
-fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector) resolve.Error!?Found {
+fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
         switch (e) {
             .call, .builtin_call => {},
             else => continue,
         }
-        // 调用者在该实例下不编译的代码中的调用（如 `switch (Q.kind)` 的其他分支）不产生实例
-        if (withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
+        // `strict` 时调用者在该实例下不编译的代码中的调用（如 `switch (Q.kind)` 的其他分支）不产生实例；
+        // 严格查找什么都找不到时（调用都位于项目中任何实例都不编译的分支中）才放宽，以便仍有实例可用
+        if (strict and withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
         const site: Site = .{ .r = r, .in = in, .i = i, .body = body, .res = res, .expr = @intCast(ei), .file = file, .item = item, .root_key = root_key, .active = active, .all = all };
         switch (e) {
             .call => |c| {

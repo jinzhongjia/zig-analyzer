@@ -1619,6 +1619,26 @@ test "callsite seeding skips calls in branches the caller instance does not comp
     try testing.expectEqualStrings("memo", labels);
 }
 
+test "callsite seeding falls back to calls in branches no instance of the caller compiles" {
+    // 唯一的调用位于调用者每个实例都不编译的分支中：曾因跳过这样的调用而没有实例，补全为空
+    const labels = try completionLabels(
+        \\const Point = struct { x: u32, y: u32 };
+        \\fn read(p: anytype) u32 {
+        \\    return p.<|>;
+        \\}
+        \\fn outer(comptime T: type, v: T) u32 {
+        \\    if (@hasField(T, "z")) return read(v);
+        \\    return 0;
+        \\}
+        \\test {
+        \\    _ = outer(Point, .{ .x = 1, .y = 2 });
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("x y", labels);
+}
+
 test "callsite seeding picks an instance in which the expression at the cursor has a type" {
     // 第一个调用点（Input）下 `Q.Memo` 不存在，`m` 的类型未知：曾补全为空
     const labels = try completionLabels(
