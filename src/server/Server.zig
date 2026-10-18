@@ -804,7 +804,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
 
 fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId) za.db.Error!void {
     for (files) |f| {
-        _ = try ctx.get(za.ide_db.FileIndex.Query, f);
+        _ = try ctx.get(za.syntax.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
     }
@@ -1946,7 +1946,7 @@ fn maybeResetSema(server: *Server) void {
 const sema_reset_keys = 200_000;
 
 /// 整代回收所清空的 query
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.ide.seed.Query };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.ide_db.seed.Query };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;

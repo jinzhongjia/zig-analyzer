@@ -14,10 +14,10 @@ const Resolver = resolve.Resolver;
 const Def = resolve.Def;
 const Body = @import("../hir/Body.zig");
 const infer = @import("../sema/infer.zig");
-const FileIndex = @import("FileIndex.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
-const seed = @import("../ide/seed.zig");
+const seed = @import("seed.zig");
 const InternPool = @import("../sema/InternPool.zig");
 
 pub const Reference = struct {

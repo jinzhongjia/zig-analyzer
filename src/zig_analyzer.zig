@@ -14,6 +14,7 @@ pub const syntax = struct {
     pub const ItemTree = @import("syntax/ItemTree.zig");
     pub const queries = @import("syntax/queries.zig");
     pub const ast = @import("syntax/ast.zig");
+    pub const FileIndex = @import("syntax/FileIndex.zig");
     pub const SyntaxKind = @import("syntax/kind.zig").SyntaxKind;
     pub const SyntaxNode = tree.SyntaxNode;
     pub const SyntaxToken = tree.SyntaxToken;
@@ -64,13 +65,12 @@ pub const ide = struct {
     pub const signature_help = @import("ide/signature_help.zig");
     pub const inlay_hints = @import("ide/inlay_hints.zig");
     pub const inactive = @import("ide/inactive.zig");
-    pub const seed = @import("ide/seed.zig");
     pub const workspace_symbol = @import("ide/workspace_symbol.zig");
     pub const code_actions = @import("ide/code_actions.zig");
 };
 pub const ide_db = struct {
-    pub const FileIndex = @import("ide_db/FileIndex.zig");
     pub const search = @import("ide_db/search.zig");
+    pub const seed = @import("ide_db/seed.zig");
 };
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");

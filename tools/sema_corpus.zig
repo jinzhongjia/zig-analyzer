@@ -144,7 +144,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const generic = isGenericFn(item, body);
                 const generic_member = try inGenericFn(&ctx, file, tree, item);
                 const base = (try r.itemNode(file, @intCast(item_index))).?.offset;
-                var seed: ?za.ide.seed.Seed = null;
+                var seed: ?za.ide_db.seed.Seed = null;
                 var seed_looked = false;
                 for (body.exprs, res.exprs, 0..) |e, tv, ei| {
                     switch (e) {
@@ -162,7 +162,7 @@ pub fn main(init: std.process.Init) !u8 {
                     if (inactive) unknown.inactive += 1 else if (generic) unknown.generic += 1 else if (generic_member) unknown.generic_member += 1 else unknown.other += 1;
                     if (!inactive and (generic or generic_member)) {
                         if (!seed_looked) {
-                            seed = try za.ide.seed.find(&r, file, @intCast(item_index));
+                            seed = try za.ide_db.seed.find(&r, file, @intCast(item_index));
                             seed_looked = true;
                         }
                         if (seed) |sd| if (ei < sd.res.exprs.len and sd.res.exprs[ei].ty != .unknown) {

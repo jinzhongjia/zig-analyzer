@@ -18,8 +18,8 @@ const Index = InternPool.Index;
 const TypedValue = InternPool.TypedValue;
 const FileId = @import("../base/Vfs.zig").FileId;
 const ast = @import("../syntax/ast.zig");
-const search = @import("../ide_db/search.zig");
-const FileIndex = @import("../ide_db/FileIndex.zig");
+const search = @import("search.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
 
 pub const Seed = struct {
     /// 成员 `item` 在调用点实例下的推导结果

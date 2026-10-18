@@ -12,7 +12,7 @@ const queries = @import("../sema/queries.zig");
 const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
-const seed = @import("seed.zig");
+const seed = @import("../ide_db/seed.zig");
 
 pub const Info = struct {
     /// markdown

@@ -7,8 +7,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const engine = @import("../db/engine.zig");
 const Vfs = @import("../base/Vfs.zig");
-const syntax = @import("../syntax/queries.zig");
-const ast = @import("../syntax/ast.zig");
+const syntax = @import("queries.zig");
+const ast = @import("ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const mem = @import("../util/mem.zig");
@@ -98,7 +98,7 @@ pub const Query = struct {
 };
 
 test build {
-    const Parse = @import("../syntax/Parse.zig");
+    const Parse = @import("Parse.zig");
     const p = try Parse.create(std.testing.allocator,
         \\const std = @import("std");
         \\const lib = @import("lib/a.zig");

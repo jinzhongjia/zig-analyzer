@@ -18,7 +18,7 @@ const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
-const FileIndex = @import("../ide_db/FileIndex.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 

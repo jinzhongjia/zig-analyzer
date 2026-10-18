@@ -15,7 +15,7 @@ const render = @import("../sema/render.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
-const seed = @import("seed.zig");
+const seed = @import("../ide_db/seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 pub const At = struct {

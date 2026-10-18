@@ -14,7 +14,7 @@ const FileId = Vfs.FileId;
 const ProjectModel = @import("../base/ProjectModel.zig");
 const CompileSet = @import("../diagnostics/compile_set.zig");
 const deepEql = @import("../util/deep_eql.zig").deepEql;
-const FileIndex = @import("../ide_db/FileIndex.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
 
 const ModuleGraph = @This();
 
