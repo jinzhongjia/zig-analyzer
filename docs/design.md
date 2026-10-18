@@ -88,8 +88,13 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | `live` | 编辑（防抖 50 ms） | 进程内 `std.zig.Ast` + AstGen；用户 zig 版本与内置标准库不同时改用 `zig ast-check` |
 | `compiler` | 保存 | 构建系统协议回传的 `ErrorBundle`；无 `build.zig` 时为 `zig build-obj -fno-emit-bin --listen=-` |
 
-- 只对编译集合（从各 compile step 根模块沿 `@import` 可达的文件）发布 live 诊断。
+- 只对编译集合（从各 compile step 根模块沿 `@import` 可达的文件）与构建脚本（根目录的 `build.zig`、`build.zig.zon`，以及 `build.zig` 沿相对路径 `@import` 可达的文件，项目实例启动时按文件的当前文本计算）发布 live 诊断。
 - 官方解析器与 AstGen 逐层递归（Debug 构建每层约 16 KB 栈）。先按 token 估计嵌套深度的上界：不超过 256 在当前线程做，不超过 8192 在 512 MiB 栈的专用线程上做；更深的文件不做 AstGen（`zig ast-check` 同样耗尽栈），没有 live 诊断，import 按 token 收集。
+- 附注与引用链映射为 `relatedInformation`：引用链的各项排在附注之后，有位置的项指向引用处，文案为 `referenced by: <名字>`；隐藏计数项位于错误起点，文案与 `zig build` 相同。`@compileLog` 的输出以 `Compile Log Output:` 加各行接在 `found compile log statement` 错误的文案后；同一编译中还有其他错误而没有这条错误时，接在第一条错误后。
+- 单文件模式：每个打开过的、不属于任何带 `build.zig` 的根目录的文件（关闭构建集成时为所有文件）各自作为根编译。
+  - 结果中被 import 的文件里的错误发布到那些文件上，打开与未打开的都发。同一文件被多个根报告时汇总：以最新一次编译读取的文本为准，文本不同的结果只取非 AstGen 错误并按差异平移，区间与文案相同的只保留一条。
+  - 保存或在磁盘上修改一个文件时，重新编译它自身，以及上一次编译读取过它（编译器的 `file_system_inputs`，限根文件所在目录）或在其中报告过错误的根。
+  - 根文件不在磁盘上时（重新编译或关闭时发现它已被删除）丢弃它的结果。
 - 有未保存修改时：live 诊断基于缓冲区，编译器诊断基于已保存内容并按编辑增量平移位置。
 
 ---
@@ -99,29 +104,34 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 ### 4.1 分层
 
 ```
-server/    LSP 主循环、调度、取消、工作区与项目管理、配置
-ide/       hover · completion · goto · refs · rename · inlay hints · code actions …
-ide_db/    文件索引（FileIndex）· 引用查找
-sema/      InternPool · 类型推导 · comptime 解释器 · 类型渲染
-hir/       函数体 IR 降级 · 局部作用域
-names/     模块图 · import / 名字解析
-syntax/    容错无损 CST · 局部重解析 · ItemTree · AstId · 类型化访问层
-diagnostics/ live（官方解析器 + AstGen）· compiler（ErrorBundle）· 编译集合
-db/        查询引擎
-base/      Vfs · URI · 输入 · ProjectModel
-project/   构建系统协议客户端 · zig env · builtin.zig 生成
-lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
+server/       LSP 主循环、调度、取消、工作区与项目管理、配置
+ide/          hover · completion · goto · refs · rename · inlay hints · code actions …
+ide_db/       引用查找 · 调用点种子
+sema/         InternPool · 类型推导 · comptime 解释器 · 类型渲染
+names/        模块图 · import / 名字解析
+hir/          函数体 IR 降级 · 局部作用域
+syntax/       容错无损 CST · 局部重解析 · ItemTree · AstId · 类型化访问层 · 文件索引（FileIndex）
+diagnostics/  live（官方解析器 + AstGen）· compiler（ErrorBundle）· 编译集合
+project/      构建系统协议客户端 · zig env · builtin.zig 生成
+base/         Vfs · URI · 输入 · ProjectModel
+db/           查询引擎
+util/         各层共用的工具：LSP 位置换算、结构比较、内存统计、日志
+lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 ```
 
-每层只依赖下层；全部 query 在 `database.zig` 中注册为一个 `Db` 类型。
+- 每层只依赖下层；测试可以引用上层，以驱动端到端的场景。
+- 全部 query 在 `database.zig` 中注册为一个 `Db` 类型。names 及以上的层经它取得 `Db.Ctx` 与下层的 query。
 
 ### 4.2 查询引擎（`db/`）
 
 - **红绿验证 + early cutoff**：memo 记录 `verified_at` / `changed_at` 与依赖；输入变化后逐个验证依赖，重算得到相等的值时保留旧 `changed_at`，下游不重算。
 - **Durability**：std 与依赖包为 high，验证时整体跳过不变的层；验证通过的 memo 取依赖当前的最低 durability（输入降低 durability 而值经 early cutoff 不变时，下游不能仍按高 durability 跳过验证）。
 - **增量计算**：query 可声明 `computeIncremental(ctx, key, prev)`，重算时拿到上一次的值（用于局部重解析）。
-- **环与深度**：每线程维护活动查询栈，遇到环调用 query 的 `cycleFallback`，环中的结果不写 memo；嵌套计算占用原生栈超过 4 MB 时同样回退，并以迭代加深分段计算深链。每个读事务有 comptime 求值的总步数预算（2000 万步）。
-- **取消**：写事务到来时置位，读查询在 `get` 入口返回 `error.Canceled`，被取消的计算不写 memo；读请求回复 `ContentModified`。
+- **环与深度**：每线程维护活动查询栈，遇到环调用 query 的 `cycleFallback`；嵌套计算占用原生栈超过 4 MB 时同样回退，并以迭代加深分段计算深链。每个读事务有 comptime 求值的总步数预算（2000 万步）。
+  - 环中的结果不写 memo，读取方也不把它记为依赖：它读到的依赖直接交给栈上最近的不在环中的帧。环入口的 memo 因此直接依赖环内各成员读到的 query 与 input，memo 之间不成环，成员旧 memo 的 early cutoff 也不会掩盖入口看到的变化。
+  - 燃料耗尽或栈深度回退时，栈上的 query 都不写 memo，环中的依赖也不再向它们传递，深递归的回退保持线性代价。
+  - 验证时依赖经由环回到栈上 query 的 memo，在那个 query 出栈前视为无法验证：读取时直接重算，验证其他 memo 时视为已变化。环中每个 memo 只验证一次，重算代价与首次计算相当。
+- **取消**：`pending_write` 是等待独占锁的写事务数，非零时读查询在 `get` 入口返回 `error.Canceled`，被取消的计算不写 memo；读请求回复 `ContentModified`。写事务拿到锁后才减一，重叠的写事务不会清掉彼此的登记。
 - **内存回收**：query 可声明 `lru`（个数）与 `lru_bytes`（字节数），淘汰只删值、保留依赖；`resetQueries` 整代清空类型相关的 query（与 `InternPool.reset` 配合）。
 - 引擎内只传播 `Canceled`、`OutOfMemory` 两类错误；query 结果是自包含的不可变值，只存 ID 不存指向其他 memo 的指针。
 
@@ -139,7 +149,10 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 ### 4.4 名字层与 HIR（`names/`、`hir/`）
 
-- **模块图**：来自构建图，附加 `std`、`builtin`（按模块参数运行 `zig --show-builtin` 生成）、`root`；一个文件可属于多个模块。无构建图时每个文件自成模块 + std。
+- **模块图**：来自构建图，附加 `std`、`builtin`（按模块参数运行 `zig --show-builtin` 生成）、`root`。
+  - 文件的归属来自各 compile step 的编译集合。一个文件可属于多个模块（如 exe 与 test 各自创建模块、共用根文件），按名字的 import 依次在这些模块的 import 表中查找。
+  - 多个模块以同一名字 import 不同目标时取最优先的模块：诊断 step 在前，其中本机目标在前，其余 compile step 按构建图的顺序（可用 `diagnostics.step` 改变）。不按位置区分，test 块中不会改用 test 模块的同名 import。`@import("root")` 与 `builtin` 按最优先的归属。
+  - 不属于任何模块的文件（单文件模式、不在任何编译集合中的文件、项目加载期间的文件）只能 import std 与相对路径，`builtin` 为本机目标、Debug。`@import("root")` 为 `unknown`：文件可能由另一个文件以相对路径 import，也可能由 `zig test` 编译（根文件是测试运行器），标准库又由所有这类文件共用；经 `@hasDecl(root, ...)` 读取的值（`std.options` 等）因此为 `unknown`，不产生非活动代码。
 - **名字解析**：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、`@This()` 与别名链求命名空间。
 - **HIR**：函数体、初始化表达式、comptime / test 块、字段类型与默认值都是 BodyOwner，降级为容错的表达式 IR（不用 ZIR：有语法错误时不生成），同时算出局部作用域；成员源码未变时沿用上一次的 Body。
 
@@ -147,14 +160,21 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 - **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。容器类型的身份不依赖字段类型，递归类型不会成环。
 - **核心 query**：`DeclType`（声明的类型与 comptime 值，只读签名）、`Infer`（BodyOwner + 实例 → 每个表达式的类型与解析目标）、`CallEval`（comptime 调用按实例与实参记忆化）、`ErrorSetOf`（推导错误集）、`LocalValue`（单个局部绑定）。
-- **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution；`unknown` 吸收一切。
-- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；单次求值 20 万步、64 MB 上限，驻留的值至多嵌套 256 层（自引用的值按 `unknown`）；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。跳转到 `@Struct` 生成的字段（字段名来自 comptime 解析的字符串，如 zig-clap 的帮助文本）时，以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到字段名在字面量中的位置。
+- **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution；`unknown` 吸收一切。调用处判断是否为泛型调用只读被调函数的参数形式（`ParamForms`），只改被调函数的函数体时调用者不重新推导。
+- **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。跳转到 `@Struct` 生成的字段（字段名来自 comptime 解析的字符串，如 zig-clap 的帮助文本）时，以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到字段名在字面量中的位置。
+  - 单次求值 20 万步，`@memcpy` 与经由切片的整体写入每个元素计一步。内存上限 64 MB，单个聚合至多 65536 个元素：展开聚合（复制、拼接、切片、`@splat` 等）之前按已占用容量加本次分配检查，其余每 256 步检查一次。
+  - 指向局部存储的切片以「存储单元 + 路径 + 区间」表示，取元素与长度时在原聚合中直接读取，不复制区间。
+  - 驻留的值至多嵌套 256 层（自引用的值按 `unknown`）。
 - **泛型函数体**：没有具体实例时以抽象实例推导（`comptime T: type` 为抽象参数，显示为 `T`；`comptime x: anytype` 的实例记录实参值）；**调用点种子**取一个能求出具体实例的调用点推导，hover 标注来源：
   - 经文件索引跨文件查找；调用者自身在泛型函数内时取调用者的实例，hover / 跳转 / 补全最多上溯 6 层，收集全部实例（查找引用、重命名）最多 3 层（每层取调用者的全部实例，实例数随层数成倍增长）
   - 函数值与实参元组一起传入的调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`）以元组元素作为实参
   - 项目中没有调用点的泛型方法以标准库的分派处求实例：`std.Io.Writer.printValue` 中的 `value.format(w)`、`value.formatNumber(w, ...)` 等
+  - 抽象参数的 `@hasDecl` / `@hasField` 结果未知（推导与解释器一致），依赖它们的 comptime 分支不判为非活动；抽象实例中的容器（如 `@This()`）有哪些成员只取决于源码，仍给出确定结果
 - **其他构建配置**：当前配置下不存在的成员（只在其他目标上编译的代码，如 `posix.system.EVFILT.READ`、macOS 的 `settings.cflag.CCTS_OFLOW`）到其他配置的容器中查找：沿别名与 comptime 条件的 `if` / `switch` 分支收集各配置下的容器；实例的类型沿局部变量、全局变量、调用的返回类型与字段类型收集。
-- **目标相关**：指针位宽等从各模块的 builtin.zig 求出（`TargetAbi`），目标变化时依赖它的结果失效。
+- **目标相关**：与目标相关的参数从各模块的 builtin.zig 解析出的目标（架构、操作系统、ABI、CPU 特性）求出（`TargetAbi`），目标变化时依赖它的结果失效；参数相同的模块共用同一份 builtin.zig，每份只读取、解析一次。
+  - 参数包括指针位宽、向量的布局规则、整数的最大对齐、`c_char` 的符号，以及 C 类型与 `f32` / `f64` / `f80` / `f128` 的大小、对齐与位宽，按编译器 `Type.abiAlignment` / `abiSize` 的规则计算：C 类型用 `std.Target.cType*`，整数用 `std.zig.target.intAlignment` / `intByteSize`，浮点按 C 类型、表示它的整数或 compiler-rt 的软浮点表示。
+  - 各模块的目标不一致时只保留一致的部分：最大整数对齐取区间，只有对齐不受它影响的整数有确定的布局，其余各项为 `unknown`。builtin.zig 读不到时只有不超过 1 字节的整数有确定的布局；没有任何 builtin 时按分析器自身的目标。
+  - std 没有定义的值为 `unknown`：AVR 的 32 位 `long double`，以及 ps3 / contiki / managarm 的 C 类型。
 
 ### 4.6 IDE 层（`ide/`、`ide_db/`）
 
@@ -163,8 +183,9 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | semantic tokens / folding / selection range / document symbol | 纯语法 |
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致 |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
+| `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选） |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemSummaries` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
-| workspace symbol | 后台为全部项目文件建索引，未完成时返回已索引部分 |
+| workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
 | 非活动代码 | comptime 已知不执行的分支 |
 
@@ -173,15 +194,22 @@ lsp/       由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 直接作为官方构建系统协议 `zig build --listen=-` 的客户端：握手校验 `build_system_version`，读取 `bsp_configuration` 中的构建图（`std.Build.Configuration`）转换为 ProjectModel，按 step 请求构建并从 `bsp_step_completed` 取 `ErrorBundle` 与生成文件路径；`bsp_configuration_failed` 作为 `build.zig` 的诊断发布。
 - 构建图只包含 step 可达的模块。没有任何 compile step 的项目（只导出模块、由使用方编译的库）在 `.zig-cache/zig-analyzer/exports` 中生成探针包：以项目为 path 依赖，为每个导出的模块添加 object step，复用项目的 `zig-pkg`；读出的模块与 compile step 并入 ProjectModel，只用于模块归属，不出现在构建请求中。
 - C 绑定由构建系统的 translate-c 生成（Zig 0.17 已移除 `@cImport`），作为以生成文件为根的模块，构建后得知路径。
-- 同一进程同时承担项目模型与编译器诊断；崩溃后退避重启，`build.zig` 变化时由 maker 重新配置，完成前沿用旧模型。
-- 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库，用户 zig 版本不同时降级（单文件模式 / `zig ast-check`）。发布版本跟随 Zig 版本。
+- maker 以 `local_cache` 前缀上报的生成文件路径，以及构建图中相对于本地缓存的路径，都按 maker 实际使用的本地缓存目录解析：由 `bsp_configuration` 给出的构建图路径（`<本地缓存>/c/<hash>`，不使用缓存时为 `tmp/<hex>`）反推，因此遵循 `build.args` 中的 `--cache-dir` 与 `ZIG_LOCAL_CACHE_DIR`。重命名不修改这个目录中的生成文件；本地缓存目录包含构建根时无法区分生成文件与项目文件，不按它排除。
+- 同一进程同时承担项目模型与编译器诊断。重启以新实例进行：
+  - 先结束项目当前实例与尚未替换它的新实例的 maker 及其子进程，再启动新实例。新实例在首次构建完成（或配置失败、不需要构建）时替换旧实例，其间旧实例的模型、编译集合与编译器诊断继续生效，构建请求转给新实例；旧实例没有模型与编译集合时，新实例算出编译集合后立即替换它。实例按引用计数回收。
+  - 触发重启：根目录的 `build.zig`、`build.zig.zon`、`zig-analyzer.json` 以及构建脚本（`build.zig` 沿相对路径 `@import` 可达的文件）被保存或在磁盘上变化，构建配置变化，maker 崩溃（退避重启）。根目录下新建或删除 `build.zig` 时启动或停止项目。
+  - 新实例被放弃（maker 连续崩溃超过上限、协议版本不符）时，旧实例的编译器诊断被清除、模型保留，直到再次保存 `build.zig`。读不了构建图时提示用户并停止 maker，直到保存 `build.zig`；`bsp_configuration_failed` 中没有错误（`build.zig.zon` 或依赖包的问题）时提示运行 `zig build` 查看原因。
+- 进程管理：maker 与它启动的子进程在 POSIX 上属于以看门狗 `sh` 为组长的进程组，在 Windows 上属于设置了 `KILL_ON_JOB_CLOSE` 的 Job Object。停止项目（shutdown、exit、输入结束、重启）时整组立即结束，不等待构建；服务器以任何方式退出时整组随之结束。
+- 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库。用户 zig 版本不同时，带 `build.zig` 的根目录不启动构建系统，没有编译器诊断，只有 `zig ast-check` 的 live 诊断；这些根目录下的文件也不按单文件编译（使用命名模块的文件会报出找不到模块）。其他文件仍按单文件模式编译。发布版本跟随 Zig 版本。
 
 ### 4.8 服务器与并发（`server/`）
 
-- 写消息（文档同步、配置、工作区与文件监听事件）串行执行：置取消标志 → 等读者退出 → 应用变更、推进 revision。
+- 写消息（文档同步、配置、工作区与文件监听事件）串行执行：登记等待（取消计数加一）→ 等读者退出 → 应用变更、推进 revision。
 - 读请求在快照上并发执行；`$/cancelRequest` 与写事务都可取消。
-- 诊断发布：编辑触发的按文件防抖，被更新的编辑取代时放弃；AstGen 在读事务之外预先计算，不阻塞写事务。编译进行中保留上一轮结果，完成后原子替换。
+- 诊断发布：编辑触发的按文件防抖，被更新的编辑取代时放弃；live 诊断（进程内 AstGen 与子进程 `zig ast-check`）在读事务之外计算，不阻塞写事务。编译进行中保留上一轮结果，完成后原子替换。
+  - 同一文件的发布任务并发计算，每次在读取状态之前取递增序号，只发送序号不小于已发送序号的结果。每次状态变化之后都会发起一次发布，最后发出的结果因此读到最后一次变化之后的状态。
 - 配置来自客户端（`initializationOptions`、`workspace/configuration`），项目根的 `zig-analyzer.json` 可覆盖与项目相关的项；各项说明见 `src/server/Config.zig`。
+- 退出：输入结束时不再等待客户端对配置请求的回复，停止各项目后退出。`initialize` 给出 `processId` 时每 2 秒检查一次客户端进程，它退出后服务器随之退出（stdin 的写端可能被客户端的其他子进程继承而一直不关闭）。
 - 可观测性：`zig-analyzer/status` 暴露各 query 的执行次数、命中率、耗时与内存；慢请求日志（`log.slow_request_ms`）；`-Dtracy=<目录>` 开启 tracy。
 
 ---
