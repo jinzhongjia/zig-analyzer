@@ -605,6 +605,29 @@ test "fixpoint: an unrelated change does not recompute a cycle whose members are
     try testing.expectEqual(execs, graphExecutions(&d));
 }
 
+test "fixpoint: an edit inside a cycle recomputes it at the cost of a first computation" {
+    // 防止环中反复验证、重算成员的旧 memo（重算的结果在环中，不写入 memo）：成员都单独读取过时，
+    // 改其中一个成员，读入口要重算的次数随环的规模指数增长
+    for ([_]struct { n: u32, dense: bool }{ .{ .n = 16, .dense = false }, .{ .n = 8, .dense = true } }) |c| {
+        var d: Db = .init(testing.io, testing.allocator, {});
+        defer d.deinit();
+        try setRing(&d, c.n, c.dense);
+        const all = (@as(u32, 1) << @intCast(c.n)) - 1;
+        var execs = graphExecutions(&d);
+        for (0..c.n) |k| try testing.expectEqual(all, try read(&d, Graph, @intCast(k)));
+        const first = graphExecutions(&d) - execs;
+        const mid = c.n / 2;
+        for (0..2) |i| {
+            const label: u32 = if (i == 0) 0 else @as(u32, 1) << @intCast(mid);
+            try setNumber(&d, Label, mid, label, .low);
+            const reach = all & ~(@as(u32, 1) << @intCast(mid)) | label;
+            execs = graphExecutions(&d);
+            for (0..c.n) |k| try testing.expectEqual(reach, try read(&d, Graph, @intCast(k)));
+            try testing.expect(graphExecutions(&d) - execs <= 2 * first);
+        }
+    }
+}
+
 /// Graph(start) 的期望值：从 start 可达的结点（含自身）的 Label 之并
 fn expectedGraph(succ: []const u32, label: []const u32, start: u32) u32 {
     var seen: u32 = @as(u32, 1) << @intCast(start);
