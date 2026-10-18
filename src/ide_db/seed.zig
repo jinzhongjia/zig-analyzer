@@ -64,6 +64,7 @@ fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
         const rg = body.range(e);
         if (rg.start <= rel and rel <= rg.end) return true;
     }
+    for (res.dead_spans) |rg| if (rg.start <= rel and rel <= rg.end) return true;
     return false;
 }
 

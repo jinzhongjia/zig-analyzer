@@ -160,11 +160,9 @@ pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *co
     return ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
 }
 
-/// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误，含未知部分时为 anyerror。
-/// 递归的函数取最小不动点（与编译器一致；编译器不允许相互递归，这里同样取各函数错误的并集）
-/// 成员中 comptime 已知不会执行的分支的范围（相对成员起点，按位置排序）。非活动代码需要文件中全部成员的
-/// 推导结果，大文件的 `Infer` 结果超出 LRU 的上限，每次发布都要重算被淘汰的部分；这里只保留区间，
-/// 依赖未变时即使 `Infer` 的值已被淘汰也不必重算
+/// 成员中不编译的代码的范围：`Infer` 的 `inactive` 与 `dead_spans`（相对成员起点，按位置排序）。
+/// 非活动代码需要文件中全部成员的推导结果，大文件的 `Infer` 结果超出 LRU 的上限，每次发布都要重算被淘汰的
+/// 部分；这里只保留区间，依赖未变时即使 `Infer` 的值已被淘汰也不必重算
 pub const InactiveRanges = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -174,7 +172,7 @@ pub const InactiveRanges = struct {
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
         const res = try ctx.get(Infer, .{ .owner = key, .mode = .full });
-        if (res.inactive.len == 0) return &.{};
+        if (res.inactive.len == 0 and res.dead_spans.len == 0) return &.{};
         const body = try ctx.get(hir.ItemBody, key);
         var out: std.ArrayList(Range) = .empty;
         errdefer out.deinit(ctx.db.gpa);
@@ -182,6 +180,7 @@ pub const InactiveRanges = struct {
             const rg = body.range(e);
             if (rg.end > rg.start) try out.append(ctx.db.gpa, .{ .start = rg.start, .end = rg.end });
         }
+        for (res.dead_spans) |rg| if (rg.end > rg.start) try out.append(ctx.db.gpa, .{ .start = rg.start, .end = rg.end });
         std.mem.sort(Range, out.items, {}, struct {
             fn lt(_: void, a: Range, b: Range) bool {
                 return a.start < b.start;
@@ -203,6 +202,8 @@ pub const InactiveRanges = struct {
     }
 };
 
+/// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误，含未知部分时为 anyerror。
+/// 递归的函数取最小不动点（与编译器一致；编译器不允许相互递归，这里同样取各函数错误的并集）
 pub const ErrorSetOf = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = DeclKey;

@@ -48,8 +48,12 @@ pub const Result = struct {
     /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）、错误值（`error.X`）与匿名初始化
     /// （`.{ ... }`）及其期望类型：补全按它列出成员、错误名与字段
     literal_expected: []const LiteralExpected = &.{},
-    /// comptime 已知不会执行的 `if` / `switch` 分支（最外层的）：在当前构建配置下不编译的代码
+    /// comptime 已知不会执行的 `if` / `switch` 分支，以及左侧已决定结果的 `and` / `or` 的右侧（最外层的）：
+    /// 在当前构建配置下不编译的代码
     inactive: []const ExprId = &.{},
+    /// 同一块中 noreturn 语句之后的语句（相对 owner 的范围）：同样不编译。如被选中的
+    /// `if (!@hasDecl(T, "x")) @compileError(...);`、comptime 条件下的 `return` 之后的代码
+    dead_spans: []const Body.Range = &.{},
 
     pub const LiteralExpected = struct { expr: ExprId, ty: Index };
 
@@ -62,7 +66,7 @@ pub const Result = struct {
     };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -113,7 +117,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Re
     const field_refs = try a.dupe(Result.FieldRef, inf.field_refs.items);
     const literal_expected = try a.dupe(Result.LiteralExpected, inf.literal_expected.items);
     const inactive = try a.dupe(ExprId, inf.inactive.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive };
+    const dead_spans = try a.dupe(Body.Range, inf.dead_spans.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans };
 }
 
 /// 只推导成员 `owner` 中的一个局部绑定或 comptime 表达式（见 `queries.LocalValue`）
@@ -213,6 +218,8 @@ const Inferrer = struct {
     literal_expected: std.ArrayList(Result.LiteralExpected) = .empty,
     /// 见 `Result.inactive`
     inactive: std.ArrayList(ExprId) = .empty,
+    /// 见 `Result.dead_spans`
+    dead_spans: std.ArrayList(Body.Range) = .empty,
     /// 实例上下文（owner 自身或外层泛型函数的实例）
     inst: ?Index,
     /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
@@ -1480,10 +1487,11 @@ const Inferrer = struct {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected });
         var last: Index = .void_type;
         var dead_rest = false;
-        for (blk.stmts) |s| {
+        for (blk.stmts, 0..) |s, si| {
             last = try inf.stmt(s);
             if (last == .noreturn_type and !dead_rest) {
                 dead_rest = true;
+                if (inf.dead == 0 and si + 1 < blk.stmts.len) try inf.dead_spans.append(inf.scratch, .{ .start = s.end, .end = blk.stmts[blk.stmts.len - 1].end });
                 inf.dead += 1;
             }
         }
@@ -1758,9 +1766,10 @@ const Inferrer = struct {
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
             .keyword_and, .keyword_or => {
-                const lhs = inf.condValue(try inf.infer(lhs_e, .bool_type));
-                const rhs = inf.condValue(try inf.infer(rhs_e, .bool_type));
                 const is_and = op == .keyword_and;
+                const lhs = inf.condValue(try inf.infer(lhs_e, .bool_type));
+                // 左侧 comptime 已知并决定了结果时右侧不编译（`@hasDecl(T, "x") and T.x`）
+                const rhs = inf.condValue(try inf.inferArm(rhs_e, .bool_type, if (lhs) |l| l != is_and else false));
                 // 短路：一侧已决定结果
                 if (lhs) |l| if (l != is_and) return boolValue(l);
                 if (rhs) |r| if (r != is_and) return boolValue(r);

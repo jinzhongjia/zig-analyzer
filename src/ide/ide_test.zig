@@ -1413,6 +1413,57 @@ test "completion in a switch prong on @typeInfo uses a call site where the prong
     try testing.expectEqualStrings("len ptr", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+test "code after a statement that comptime makes noreturn is inactive" {
+    const text =
+        \\const linux_only = true;
+        \\fn f(x: u32) u32 {
+        \\    if (linux_only) return 1;
+        \\    const y = x + 2;
+        \\    return y;
+        \\}
+        \\fn g(x: u32) u32 {
+        \\    if (x > 3) return 1;
+        \\    return x;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    // 运行时的条件之后的代码不是非活动代码
+    try testing.expectEqual(1, ranges.len);
+    try testing.expectEqualStrings("const y = x + 2;\n    return y;", text[ranges[0].start..ranges[0].end]);
+}
+
+test "the right side of a comptime short-circuited and / or is inactive" {
+    const text =
+        \\const debug = false;
+        \\fn f(x: bool) bool {
+        \\    return debug and x;
+        \\}
+        \\fn g(x: bool) bool {
+        \\    return x and debug;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    // 左侧是运行时的值时右侧照常编译
+    try testing.expectEqual(1, ranges.len);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "x;").?)), ranges[0].start);
+}
+
 test "completion through single pointers to arrays, tuples and slices" {
     // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
     const cases = [_]struct { []const u8, []const u8 }{
