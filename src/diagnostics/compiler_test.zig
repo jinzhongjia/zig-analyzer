@@ -6,6 +6,7 @@ const compiler = @import("compiler.zig");
 const live = @import("live.zig");
 const offsets = @import("../util/offsets.zig");
 const native = @import("../util/test_path.zig").native;
+const error_bundle = @import("../project/error_bundle.zig");
 
 const main_text =
     \\pub fn main() void {
@@ -180,11 +181,12 @@ fn location(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: [
     });
 }
 
-test "collect: reference trace and compile log output are kept" {
-    const gpa = testing.allocator;
-    var wip: ErrorBundle.Wip = try .init(gpa);
+/// 带附注与引用链的错误包：第一条错误的引用链有一个有位置的引用、一个隐藏计数，第二条只剩隐藏标记，
+/// 还有 compile log 的输出
+fn traceBundle() !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(testing.allocator);
     defer wip.deinit();
-    // 带附注与引用链（一个有位置的引用、一个隐藏计数）的错误；引用链紧跟在错误的源位置之后
+    // 引用链紧跟在错误的源位置之后
     const ref_loc = try location(&wip, "src/caller.zig", caller_text, "m.main()", 0);
     const note_loc = try location(&wip, "src/main.zig", main_text, "x", 0);
     const err_loc = try location(&wip, "src/main.zig", main_text, "\"s\"", 2);
@@ -194,12 +196,16 @@ test "collect: reference trace and compile log output are kept" {
         .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
         &.{.{ .msg = try wip.addString("a note"), .src_loc = note_loc }},
     );
-    // 只剩隐藏标记的引用链
     const err2_loc = try location(&wip, "src/main.zig", main_text, "unused", 1);
     try wip.addReferenceTrace(.{ .decl_name = 0, .src_loc = .none });
     try wip.addRootErrorMessage(.{ .msg = try wip.addString("unused local variable"), .src_loc = err2_loc });
     try addError(&wip, "src/main.zig", main_text, "_ = x", "found compile log statement");
-    var eb = try wip.toOwnedBundle("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")\n");
+    return wip.toOwnedBundle("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")\n");
+}
+
+test "collect: reference trace and compile log output are kept" {
+    const gpa = testing.allocator;
+    var eb = try traceBundle();
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
     var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
@@ -254,6 +260,64 @@ test "collect: reference trace and compile log output are kept" {
         \\@as(comptime_int, 3)
         \\@as(*const [2:0]u8, "hi")
     , diags[2].message.string);
+}
+
+/// `eb` 通过校验时转换并发布（按构建时的文本与有修改的文本各发布一次），返回是否通过校验
+fn collectIfValid(eb: ErrorBundle) !bool {
+    if (!error_bundle.isValid(eb)) return false;
+    const gpa = testing.allocator;
+    var dummy: u8 = 0;
+    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.deinit(gpa);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (r.files.values()) |*fr| {
+        for ([_][]const u8{ fr.base_text, try std.mem.concat(a, u8, &.{ "// x\n", fr.base_text }) }) |text| {
+            _ = try compiler.merge(a, .{
+                .text = text,
+                .lines = try offsets.LineIndex.init(a, text),
+                .encoding = .utf16,
+                .uri = "file:///proj/src/main.zig",
+                .live = null,
+                .compiler = fr,
+                .other_file = Files.get,
+                .other_ctx = &dummy,
+            });
+        }
+    }
+    return true;
+}
+
+test "collect: every mutation of an error bundle that passes validation can be converted" {
+    // 防止越界读取：对通过校验的错误包运行真正的 collect 与 merge，它们读取了校验没有覆盖的内容时在这里 panic
+    const gpa = testing.allocator;
+    var eb = try traceBundle();
+    defer eb.deinit(gpa);
+    const extra = try gpa.dupe(u32, eb.extra);
+    defer gpa.free(extra);
+    const strings = try gpa.dupe(u8, eb.string_bytes);
+    defer gpa.free(strings);
+    const extra_len: u32 = @intCast(extra.len);
+    const strings_len: u32 = @intCast(strings.len);
+    var accepted: usize = 0;
+    for (extra, 0..) |original, i| {
+        const values = [_]u32{ 0, 1, 2, 3, @intCast(i), extra_len - 1, extra_len, strings_len - 1, strings_len, std.math.maxInt(u32) - 1, std.math.maxInt(u32) };
+        for (values) |value| {
+            extra[i] = value;
+            if (try collectIfValid(.{ .string_bytes = strings, .extra = extra })) accepted += 1;
+        }
+        extra[i] = original;
+    }
+    for (strings, 0..) |original, i| {
+        strings[i] = if (original == 0) 'x' else 0;
+        if (try collectIfValid(.{ .string_bytes = strings, .extra = extra })) accepted += 1;
+        strings[i] = original;
+    }
+    for (0..extra.len) |n| {
+        if (try collectIfValid(.{ .string_bytes = strings, .extra = extra[0..n] })) accepted += 1;
+    }
+    try testing.expect(accepted > 0);
 }
 
 test "combine: results of several compilations of the same file" {

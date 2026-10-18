@@ -42,6 +42,7 @@ pub const sema = struct {
 pub const project = struct {
     pub const ZigEnv = @import("project/ZigEnv.zig");
     pub const bsp = @import("project/bsp.zig");
+    pub const error_bundle = @import("project/error_bundle.zig");
     pub const builtin = @import("project/builtin.zig");
     pub const configuration = @import("project/configuration.zig");
     pub const exports = @import("project/exports.zig");

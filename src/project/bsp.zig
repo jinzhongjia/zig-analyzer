@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const ErrorBundle = std.zig.ErrorBundle;
 const ServerMessage = std.zig.Server.Message;
 const ClientMessage = std.zig.Client.Message;
+const error_bundle = @import("error_bundle.zig");
 
 const log = std.log.scoped(.bsp);
 
@@ -65,10 +66,13 @@ pub fn decode(gpa: Allocator, tag: ServerMessage.Tag, body: []const u8) DecodeEr
     switch (tag) {
         .bsp_handshake => return .{ .handshake = r.takeStruct(ServerMessage.Handshake, .little) catch return error.InvalidMessage },
         .bsp_configuration => return .{ .configuration = try gpa.dupe(u8, body) },
-        .bsp_configuration_failed => return .{ .configuration_failed = std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.EndOfStream => return error.InvalidMessage,
-        } },
+        .bsp_configuration_failed => {
+            const eb = std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.EndOfStream => return error.InvalidMessage,
+            };
+            return .{ .configuration_failed = checked(gpa, eb, "zig build (configuration)", .{}) };
+        },
         .bsp_build_started => return .build_started,
         .bsp_build_completed => return .build_completed,
         .bsp_step_started => return .{ .step_started = r.takeInt(u32, .little) catch return error.InvalidMessage },
@@ -82,19 +86,30 @@ pub fn decode(gpa: Allocator, tag: ServerMessage.Tag, body: []const u8) DecodeEr
             errdefer gpa.free(strings);
             r.readSliceAll(strings) catch return error.InvalidMessage;
             const generated = try decodeGenerated(gpa, &r, hdr.generated_files_len);
+            const step = @backingInt(hdr.step_index);
             return .{ .step_completed = .{
-                .step = @backingInt(hdr.step_index),
+                .step = step,
                 .status = hdr.status,
                 .errors = if (eb_len == 0) blk: {
                     gpa.free(extra);
                     gpa.free(strings);
                     break :blk .empty;
-                } else .{ .string_bytes = strings, .extra = extra },
+                } else checked(gpa, .{ .string_bytes = strings, .extra = extra }, "zig build (step {d})", .{step}),
                 .generated = generated,
             } };
         },
         else => return null,
     }
+}
+
+/// 子进程回传的错误包：不合法时（如格式与 zig-analyzer 编译时的标准库不符）释放、记录日志并改用空的错误包，
+/// 消息的其余部分照常使用
+fn checked(gpa: Allocator, eb: ErrorBundle, comptime source: []const u8, args: anytype) ErrorBundle {
+    if (error_bundle.isValid(eb)) return eb;
+    log.warn("discarding malformed error bundle from " ++ source, args);
+    var malformed = eb;
+    malformed.deinit(gpa);
+    return .empty;
 }
 
 /// 生成文件列表：先是 `count` 个 `GeneratedFile` 头部，然后依次是每个文件的前缀字节与子路径
@@ -410,21 +425,29 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path:
     try w.writeStruct(ClientMessage.Header{ .tag = .update, .bytes_len = 0 }, .little);
     try w.flush();
 
+    const result = try receiveSingleFile(gpa, &reader.interface, file_path);
+    w.writeStruct(ClientMessage.Header{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
+    w.flush() catch {};
+    return result;
+}
+
+/// 读取编译器的消息，直到这次编译结束（`error_bundle` 或 `emit_digest`）
+fn receiveSingleFile(gpa: Allocator, r: *Io.Reader, file_path: []const u8) !SingleFileResult {
+    const dir = std.fs.path.dirname(file_path) orelse ".";
     var inputs: std.ArrayList([]const u8) = .empty;
     defer {
         for (inputs.items) |p| gpa.free(p);
         inputs.deinit(gpa);
     }
-    const r = &reader.interface;
     while (true) {
         const header = try r.takeStruct(ServerMessage.Header, .little);
         const body = try r.readAlloc(gpa, header.bytes_len);
         defer gpa.free(body);
         var errors: ErrorBundle = switch (header.tag) {
-            .error_bundle => std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
+            .error_bundle => checked(gpa, std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.EndOfStream => return error.InvalidMessage,
-            },
+            }, "zig build-obj {s}", .{file_path}),
             .emit_digest => .empty,
             .file_system_inputs => {
                 // 以 0 分隔的路径，第一个字节是路径前缀（`PathPrefix` 加一）。单独编译时 cwd 与构建根目录都是
@@ -443,13 +466,12 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path:
             else => continue,
         };
         errdefer errors.deinit(gpa);
-        w.writeStruct(ClientMessage.Header{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
-        w.flush() catch {};
         return .{ .errors = errors, .inputs = try inputs.toOwnedSlice(gpa) };
     }
 }
 
 const testing = std.testing;
+const native = @import("../util/test_path.zig").native;
 
 test "decode step completed message and error bundle" {
     const gpa = testing.allocator;
@@ -494,6 +516,64 @@ test "decode step completed message and error bundle" {
     // 数据被截断时报错且不泄漏
     w.end -= 4;
     try testing.expectError(error.InvalidMessage, decode(gpa, .bsp_step_completed, w.buffered()));
+}
+
+/// 只有一条消息的错误包，消息的字符串下标越界
+fn malformedBundle(gpa: Allocator) !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString("boom") });
+    var eb = try wip.toOwnedBundle("");
+    errdefer eb.deinit(gpa);
+    const extra = try gpa.dupe(u32, eb.extra);
+    extra[@backingInt(eb.getMessages()[0])] = std.math.maxInt(u32);
+    gpa.free(eb.extra);
+    return .{ .string_bytes = eb.string_bytes, .extra = extra };
+}
+
+fn writeBundle(w: *Io.Writer, eb: ErrorBundle) Io.Writer.Error!void {
+    try w.writeStruct(ServerMessage.ErrorBundle{ .extra_len = @intCast(eb.extra.len), .string_bytes_len = @intCast(eb.string_bytes.len) }, .little);
+    try w.writeSliceEndian(u32, eb.extra, .little);
+    try w.writeAll(eb.string_bytes);
+}
+
+test "decode: a malformed error bundle is discarded, the rest of the message is kept" {
+    const gpa = testing.allocator;
+    // 丢弃时的警告是预期的，不写到 stderr
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var eb = try malformedBundle(gpa);
+    defer eb.deinit(gpa);
+
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.writeStruct(ServerMessage.BuildStepCompleted{
+        .step_index = @fromBackingInt(7),
+        .status = .failure,
+        .error_bundle = .{ .extra_len = @intCast(eb.extra.len), .string_bytes_len = @intCast(eb.string_bytes.len) },
+        .generated_files_len = 1,
+    }, .little);
+    try w.writeSliceEndian(u32, eb.extra, .little);
+    try w.writeAll(eb.string_bytes);
+    try w.writeStruct(ServerMessage.GeneratedFile{ .index = @fromBackingInt(3), .path_len = 3 }, .little);
+    try w.writeByte(@backingInt(ServerMessage.PathPrefix.build_root));
+    try w.writeAll("gen");
+    var event = (try decode(gpa, .bsp_step_completed, w.buffered())).?;
+    defer event.deinit(gpa);
+    const sc = event.step_completed;
+    try testing.expectEqual(7, sc.step);
+    try testing.expectEqual(.failure, sc.status);
+    try testing.expectEqual(0, sc.errors.extra.len);
+    try testing.expectEqual(1, sc.generated.len);
+    try testing.expectEqual(3, sc.generated[0].file);
+    try testing.expectEqualStrings("gen", sc.generated[0].sub_path);
+
+    w = .fixed(&buf);
+    try writeBundle(&w, eb);
+    var failed = (try decode(gpa, .bsp_configuration_failed, w.buffered())).?;
+    defer failed.deinit(gpa);
+    try testing.expectEqual(0, failed.configuration_failed.extra.len);
 }
 
 test "decode other messages" {
@@ -562,4 +642,36 @@ test "single-file mode: compile one file, get its errors and the files it read" 
         try testing.expectEqual(2, r.inputs.len);
         for (r.inputs) |input| try testing.expect(std.mem.eql(u8, input, ok) or std.mem.eql(u8, input, dep));
     }
+}
+
+test "single-file mode: a malformed error bundle is discarded, the files read are kept" {
+    const gpa = testing.allocator;
+    // 丢弃时的警告是预期的，不写到 stderr
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var eb = try malformedBundle(gpa);
+    defer eb.deinit(gpa);
+    const file = native("/proj/one.zig");
+
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var inputs_buf: [64]u8 = undefined;
+    var inputs: Io.Writer = .fixed(&inputs_buf);
+    try inputs.writeByte(@backingInt(ServerMessage.PathPrefix.cwd) + 1);
+    try inputs.writeAll("one.zig\x00");
+    try inputs.writeByte(@backingInt(ServerMessage.PathPrefix.zig_lib) + 1);
+    try inputs.writeAll("std/std.zig");
+    try w.writeStruct(ServerMessage.Header{ .tag = .file_system_inputs, .bytes_len = @intCast(inputs.buffered().len) }, .little);
+    try w.writeAll(inputs.buffered());
+    const bundle_len = @sizeOf(ServerMessage.ErrorBundle) + eb.extra.len * 4 + eb.string_bytes.len;
+    try w.writeStruct(ServerMessage.Header{ .tag = .error_bundle, .bytes_len = @intCast(bundle_len) }, .little);
+    try writeBundle(&w, eb);
+
+    var r: Io.Reader = .fixed(w.buffered());
+    var result = try receiveSingleFile(gpa, &r, file);
+    defer result.deinit(gpa);
+    try testing.expectEqual(0, result.errors.extra.len);
+    try testing.expectEqual(1, result.inputs.len);
+    try testing.expectEqualStrings(file, result.inputs[0]);
 }
