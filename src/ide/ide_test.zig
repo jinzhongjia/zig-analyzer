@@ -253,6 +253,30 @@ test "goto declaration of reified fields named by comptime parsed strings" {
     }
 }
 
+test "hover names a reified type after the constant it initializes" {
+    // 不在函数中构造的类型曾按内容显示为匿名的 `enum { ... }`
+    const text =
+        \\const Kind = blk: {
+        \\    break :blk @Enum(u8, .exhaustive, &.{ "alpha", "beta" }, &.{ 0, 1 });
+        \\};
+        \\fn f(k: Kind) void {
+        \\    _ = .{ k, Kind.beta };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const param = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "k, Kind").?))).?;
+    try testing.expectEqualStrings("```zig\nk: Kind\n```", param.text);
+    const member = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "beta }").?))).?;
+    try testing.expect(std.mem.indexOf(u8, member.text, "enum {") == null);
+}
+
 test "member completion of reified, tuple and anonymous struct types" {
     const text =
         \\fn Fields() type { return @Enum(u8, .exhaustive, &.{ "alpha", "beta" }, &.{ 0, 1 }); }
