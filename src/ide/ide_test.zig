@@ -1295,6 +1295,38 @@ test "completion in a branch inactive for the first call site uses a call site w
     try testing.expectEqualStrings("r a", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+test "completion in a switch prong on @typeInfo uses a call site where the prong is taken" {
+    // 第一个调用点（结构体）下 `.pointer` 分支不执行，曾仍以它的实例补全出结构体的字段
+    const text =
+        \\const Top = struct { name: []const u8 };
+        \\fn measure(a: anytype) usize {
+        \\    switch (@typeInfo(@TypeOf(a))) {
+        \\        .@"struct" => return 1,
+        \\        .pointer => return a.<|>,
+        \\        else => return 0,
+        \\    }
+        \\}
+        \\fn run() void {
+        \\    _ = measure(Top{ .name = "x" });
+        \\    const s: []const u8 = "abc";
+        \\    _ = measure(s);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    try testing.expectEqualStrings("len ptr", try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
 test "goto declaration on names that declare themselves: error set members and anonymous fields" {
     const text =
         \\const Error = error{ Timeout, Closed };

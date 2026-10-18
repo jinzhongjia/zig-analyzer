@@ -57,11 +57,12 @@ pub fn findActive(r: *Resolver, file: FileId, item: u32, rel: u32) resolve.Error
     };
 }
 
-/// 相对位置 `rel` 落在推导结果的非活动分支中
+/// 相对位置 `rel` 落在推导结果的非活动分支中。分支的末尾也算在内：补全的位置常在刚输入的 `a.` 之后，
+/// 即分支的末尾
 fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
     for (res.inactive) |e| {
         const rg = body.range(e);
-        if (rg.start <= rel and rel < rg.end) return true;
+        if (rg.start <= rel and rel <= rg.end) return true;
     }
     return false;
 }
