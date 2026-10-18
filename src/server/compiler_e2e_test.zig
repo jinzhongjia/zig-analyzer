@@ -261,6 +261,83 @@ test "compile errors in build.zig itself are published on build.zig" {
     try expectDiagnostics(diags, "build.zig", &.{"2:19 zig: expected type 'u32'"});
 }
 
+const scripts_build =
+    \\const std = @import("std");
+    \\const helper = @import("build/helper.zig");
+    \\pub fn build(b: *std.Build) void {
+    \\    const exe = b.addExecutable(.{ .name = helper.name(), .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\    }) });
+    \\    b.installArtifact(exe);
+    \\}
+    \\
+;
+const scripts_helper = "pub fn name() []const u8 {\n    return \"demo\";\n}\n";
+const scripts_zon = ".{\n    .name = .demo,\n    .version = \"0.0.0\",\n    .fingerprint = 0xd642dfa0858809cc,\n    .paths = .{\"\"},\n}\n";
+
+fn change(h: *Harness, uri: []const u8, version: i64, text: []const u8) !void {
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = text }} });
+}
+
+test "build scripts: live diagnostics in build.zig, build.zig.zon and files build.zig imports, changes to them reconfigure" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = scripts_build },
+        .{ .path = "build/helper.zig", .text = scripts_helper },
+        .{ .path = "build.zig.zon", .text = scripts_zon },
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root, false);
+    const build_uri = try open(&h, try project.path(a, "build.zig"), scripts_build);
+    const helper_path = try project.path(a, "build/helper.zig");
+    const helper_uri = try open(&h, helper_path, scripts_helper);
+    const zon_path = try project.path(a, "build.zig.zon");
+    const zon_uri = try open(&h, zon_path, scripts_zon);
+    try waitIdle(&h);
+    try testing.expect(h.server.workspaces.items[0].compile_set != null);
+
+    // 未保存的语法错误：与编译集合中的文件一样有 live 诊断
+    try change(&h, build_uri, 2, try std.mem.replaceOwned(u8, a, scripts_build, "@import(\"std\");", "@import(\"std\")"));
+    try change(&h, helper_uri, 2, try std.mem.replaceOwned(u8, a, scripts_helper, "\"demo\";", "\"demo\""));
+    try change(&h, zon_uri, 2, try std.mem.replaceOwned(u8, a, scripts_zon, "\"0.0.0\",", "\"0.0.0\""));
+    try waitIdle(&h);
+    const diags = try h.diagnostics();
+    try expectDiagnostics(diags, "build.zig", &.{"zig ast-check: expected ';' after declaration"});
+    try expectDiagnostics(diags, "helper.zig", &.{"zig ast-check: expected ';' after statement"});
+    try expectDiagnostics(diags, "build.zig.zon", &.{"zig ast-check: expected ',' after initializer"});
+    try change(&h, build_uri, 3, scripts_build);
+    try change(&h, zon_uri, 3, scripts_zon);
+
+    // 保存 build.zig 导入的文件：重新配置，构建程序的编译错误发布在这个文件上
+    const bad_helper = try std.mem.replaceOwned(u8, a, scripts_helper, "\"demo\"", "42");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = helper_path, .data = bad_helper });
+    try change(&h, helper_uri, 3, bad_helper);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = helper_uri } });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "helper.zig", &.{"zig: expected type '[]const u8', found 'comptime_int'"});
+
+    // 编辑器之外改动它：同样重新配置
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = helper_uri } });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = helper_path, .data = try std.mem.replaceOwned(u8, a, scripts_helper, "\"demo\"", "true") });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = helper_uri, .type = 2 }} });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "helper.zig", &.{"zig: expected type '[]const u8', found 'bool'"});
+
+    // build.zig.zon 的错误不在 maker 发来的错误中：提示用户
+    const bad_zon = try std.mem.replaceOwned(u8, a, scripts_zon, "0xd642dfa0858809cc", "0x1");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = zon_path, .data = bad_zon });
+    try change(&h, zon_uri, 4, bad_zon);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = zon_uri } });
+    try waitIdle(&h);
+    try testing.expect(anyContains(try shownMessages(&h), "zig build cannot load"));
+    try shutdown(&h);
+}
+
 test "columns are UTF-16 when multi-byte characters precede the error" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = simple_build },

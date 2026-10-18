@@ -935,7 +935,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     defer server.releaseList(arena, list);
     for (list) |ws| {
         if (!ws.owns(id)) continue;
-        if (is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) {
+        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id)) {
             // 非 watch 模式下 maker 不会自动重新配置：重启
             server.restartWorkspace(ws, 0);
         } else {
@@ -950,14 +950,16 @@ fn isProjectFile(base: []const u8) bool {
 }
 
 /// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
-/// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon / zig-analyzer.json 变化时重启该项目，
-/// 根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时项目重新构建、单文件重新编译
+/// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon / zig-analyzer.json 或项目的构建脚本
+/// 变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时项目重新构建、单文件重新编译
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
     const Change = struct { file: Vfs.FileId, text: ?[]u8 };
     var changes: std.ArrayList(Change) = .empty;
     defer for (changes.items) |c| if (c.text) |t| server.gpa.free(t);
     var build_files: std.ArrayList([]const u8) = .empty;
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
+    // 变化的已知文件（含打开的文件：maker 读取磁盘）
+    var known: std.ArrayList(Vfs.FileId) = .empty;
     for (params.changes) |event| {
         const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -969,6 +971,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, std.fs.path.dirname(path) orelse "");
         // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）
         const file = try server.vfs.lookup(path) orelse continue;
+        try known.append(arena, file);
         {
             server.docs_mutex.lockUncancelable(server.io);
             defer server.docs_mutex.unlock(server.io);
@@ -1000,6 +1003,8 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         // 非 watch 模式下 maker 不会自动重新配置：重启
         const reconfigure = for (build_files.items) |dir| {
             if (std.mem.eql(u8, dir, ws.root)) break true;
+        } else for (known.items) |file| {
+            if (ws.isBuildScript(file)) break true;
         } else false;
         if (reconfigure) {
             const started = for (refreshed.items) |dir| {

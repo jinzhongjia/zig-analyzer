@@ -61,6 +61,9 @@ model: ?ProjectModel = null,
 compile_set: ?CompileSet.Result = null,
 /// 诊断 step 之外的编译 step 可达的文件（只用于模块归属，见 `recomputeCompileSet`）；与编译集合相同时为 null
 resolve_set: ?CompileSet.Result = null,
+/// 构建脚本（见 `CompileSet.buildScripts`）：后台任务开始时按文件的当前文本计算（打开的文件以缓冲区为准，
+/// 其余从磁盘读入），构建图读取失败时同样有效
+build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// 最近一次构建的编译器诊断
 result: ?compiler.BuildResult = null,
 /// FileId → `result` 中的条目
@@ -168,6 +171,7 @@ fn destroy(ws: *Workspace) void {
     if (ws.model) |*m| m.deinit(gpa);
     if (ws.compile_set) |*s| s.deinit(gpa);
     if (ws.resolve_set) |*s| s.deinit(gpa);
+    ws.build_scripts.deinit(gpa);
     if (ws.result) |*r| r.deinit(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
@@ -241,10 +245,11 @@ pub fn owns(ws: *Workspace, file: FileId) bool {
     return isUnder(ws.server.vfs.path(file), ws.root);
 }
 
-/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件发布（与编译器一致）
+/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件与构建脚本发布（与编译器一致）
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
+    if (ws.build_scripts.contains(file)) return true;
     const set = &(ws.compile_set orelse return true);
     // 构建图中没有任何编译：集合为空时按尚未算出处理，不让所有文件都失去 live 诊断
     if (set.files.count() == 0) return true;
@@ -256,6 +261,13 @@ pub fn inModuleGraph(ws: *Workspace) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return ws.model != null and ws.compile_set != null;
+}
+
+/// 文件是否是本项目的构建脚本：变化后需要重新配置
+pub fn isBuildScript(ws: *Workspace, file: FileId) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    return ws.build_scripts.contains(file);
 }
 
 pub fn isUnder(path: []const u8, dir: []const u8) bool {
@@ -271,6 +283,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     var config_failed = false;
     const client = ws.client.?;
     ws.placed.waitUncancelable(ws.server.io);
+    ws.computeBuildScripts() catch log.err("{s}: out of memory while finding build scripts", .{ws.root});
     while (true) {
         var event = client.next() catch |err| {
             if (err == error.Canceled or ws.server.isShuttingDown()) {
@@ -389,7 +402,13 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             ws.requestBuild();
         },
         .configuration_failed => |*eb| {
-            // build.zig 本身有错：作为一次构建结果发布
+            // build.zig 本身有错：作为一次构建结果发布。build.zig.zon 有误、依赖包获取失败时 maker 只把错误写到
+            // 它的 stderr，发来的错误为空：提示用户
+            if (eb.errorMessageCount() == 0) {
+                var buf: [512]u8 = undefined;
+                ws.server.showWarning(std.fmt.bufPrint(&buf, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root}) catch
+                    "zig build cannot load the project (build.zig.zon or a dependency may have errors), run zig build to see why");
+            }
             try ws.bundles.append(ws.gpa, eb.*);
             eb.* = .empty;
             try ws.finishBuild();
@@ -682,6 +701,35 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
+}
+
+/// 计算构建脚本；缺少的文件读入后重算
+fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
+    var rounds: usize = 0;
+    while (rounds < 256) : (rounds += 1) {
+        var arena: std.heap.ArenaAllocator = .init(ws.gpa);
+        defer arena.deinit();
+        var result = blk: {
+            var ctx = ws.server.db.beginRead(arena.allocator());
+            defer ctx.end();
+            break :blk CompileSet.buildScripts(ws.gpa, ws.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // 被编辑打断：重试
+                error.Canceled => continue,
+            };
+        };
+        if (result.missing.count() == 0) {
+            result.missing.deinit(ws.gpa);
+            ws.mutex.lockUncancelable(ws.server.io);
+            defer ws.mutex.unlock(ws.server.io);
+            ws.build_scripts.deinit(ws.gpa);
+            ws.build_scripts = result.files;
+            return;
+        }
+        defer result.deinit(ws.gpa);
+        try ws.loadFiles(result.missing.keys());
+    }
+    log.warn("{s}: build script computation did not converge", .{ws.root});
 }
 
 /// 从这些编译 step 的根模块沿 import 可达的文件；缺少的文件读入后重算。不收敛时返回 null

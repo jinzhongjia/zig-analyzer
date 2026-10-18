@@ -92,6 +92,46 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
     return result;
 }
 
+/// 构建脚本：构建根目录的 build.zig、build.zig.zon，以及从 build.zig 沿相对路径的 `@import` 可达的文件。
+/// build.zig 由编译器编译为构建程序，其中的错误同样会报出；按名字 import 的模块（std、依赖包）不在其中。
+/// 只用于决定 live 诊断与保存后是否重新配置，不参与模块归属
+pub const Scripts = struct {
+    files: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
+    /// 可达但尚未加载内容的文件；调用方加载后应重新计算
+    missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
+
+    pub fn deinit(s: *Scripts, gpa: Allocator) void {
+        s.files.deinit(gpa);
+        s.missing.deinit(gpa);
+    }
+};
+
+/// `resolver` 的要求同 `compute`
+pub fn buildScripts(gpa: Allocator, build_root: []const u8, resolver: anytype) !Scripts {
+    var result: Scripts = .{};
+    errdefer result.deinit(gpa);
+    var stack: std.ArrayList(FileId) = .empty;
+    defer stack.deinit(gpa);
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    for ([_][]const u8{ "build.zig.zon", "build.zig" }) |name| {
+        try stack.append(gpa, try resolver.intern(try std.fs.path.join(scratch.allocator(), &.{ build_root, name })));
+    }
+    while (stack.pop()) |file| {
+        if ((try result.files.getOrPut(gpa, file)).found_existing) continue;
+        const imports = try resolver.imports(file) orelse {
+            try result.missing.put(gpa, file, {});
+            continue;
+        };
+        const dir = std.fs.path.dirname(resolver.path(file)) orelse continue;
+        for (imports) |name| {
+            if (!std.mem.endsWith(u8, name, ".zig") and !std.mem.endsWith(u8, name, ".zon")) continue;
+            try stack.append(gpa, try resolver.intern(try std.fs.path.resolveAlloc(scratch.allocator(), &.{ dir, name })));
+        }
+    }
+    return result;
+}
+
 const testing = std.testing;
 const native = @import("../util/test_path.zig").native;
 
@@ -170,4 +210,33 @@ test compute {
     try testing.expectEqual(1, member(&r, &fs, native("/p/lib/nested/deep.zig")).module);
     try testing.expectEqual(std_module, member(&r, &fs, native("/zig/std/std.zig")).module);
     try testing.expectEqual(0, member(&r, &fs, native("/p/lib/lib.zig")).root_module);
+}
+
+test buildScripts {
+    const gpa = testing.allocator;
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    // build.zig 导入 std、依赖包与相对文件；相对文件再导入 zon 与上级目录的文件
+    try fs.files.put(gpa, native("/p/build.zig"), &.{ "std", "dep", "build/helper.zig" });
+    try fs.files.put(gpa, native("/p/build.zig.zon"), &.{});
+    try fs.files.put(gpa, native("/p/build/helper.zig"), &.{ "../build.zig.zon", "../shared.zig" });
+    // shared.zig 尚未加载
+
+    var r = try buildScripts(gpa, native("/p"), &fs);
+    defer r.deinit(gpa);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    for (r.files.keys()) |f| try names.append(gpa, fs.path(f));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    try testing.expectEqual(4, names.items.len);
+    try testing.expectEqualStrings(native("/p/build.zig"), names.items[0]);
+    try testing.expectEqualStrings(native("/p/build.zig.zon"), names.items[1]);
+    try testing.expectEqualStrings(native("/p/build/helper.zig"), names.items[2]);
+    try testing.expectEqualStrings(native("/p/shared.zig"), names.items[3]);
+    try testing.expectEqual(1, r.missing.count());
+    try testing.expectEqualStrings(native("/p/shared.zig"), fs.path(r.missing.keys()[0]));
 }
