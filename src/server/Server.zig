@@ -2402,24 +2402,39 @@ const StatusResult = struct {
 };
 
 fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
-    const loc = try server.gotoTarget(r, arena, params.textDocument.uri, params.position, ide.definition.definition) orelse return null;
-    return .{ .Definition = .{ .Location = loc } };
+    const locs = try server.gotoTargets(r, arena, params.textDocument.uri, params.position, ide.definition.definitionTargets);
+    return switch (locs.len) {
+        0 => null,
+        1 => .{ .Definition = .{ .Location = locs[0] } },
+        else => .{ .Definition = .{ .array_of_Location = locs } },
+    };
 }
 
 fn declaration(server: *Server, r: *Resolver, arena: Allocator, params: types.DeclarationParams) HandlerError!types.ResultType("textDocument/declaration") {
-    const loc = try server.gotoTarget(r, arena, params.textDocument.uri, params.position, ide.definition.declaration) orelse return null;
-    return .{ .Declaration = .{ .Location = loc } };
+    const locs = try server.gotoTargets(r, arena, params.textDocument.uri, params.position, ide.definition.declarationTargets);
+    return switch (locs.len) {
+        0 => null,
+        1 => .{ .Declaration = .{ .Location = locs[0] } },
+        else => .{ .Declaration = .{ .array_of_Location = locs } },
+    };
 }
 
 fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types.TypeDefinitionParams) HandlerError!types.ResultType("textDocument/typeDefinition") {
-    const loc = try server.gotoTarget(r, arena, params.textDocument.uri, params.position, ide.definition.typeDefinition) orelse return null;
-    return .{ .Definition = .{ .Location = loc } };
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const t = try ide.definition.typeDefinition(r, at.file, at.offset) orelse return null;
+    return .{ .Definition = .{ .Location = try server.targetLocation(r, arena, t) } };
 }
 
-/// 按 `find` 求光标处的跳转目标
-fn gotoTarget(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) !?types.Location {
-    const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
-    const t = try find(r, at.file, at.offset) orelse return null;
+/// 按 `find` 求光标处的全部跳转目标
+fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) ![]const types.Location {
+    const at = try server.textPosition(r, arena, document_uri, pos) orelse return &.{};
+    const targets = try find(r, at.file, at.offset);
+    const locs = try arena.alloc(types.Location, targets.len);
+    for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
+    return locs;
+}
+
+fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.definition.Target) !types.Location {
     const target_text = (try r.ctx.get(syntax_q.SourceText, t.file)).text;
     const lines = try offsets.LineIndex.init(arena, target_text);
     return .{ .uri = try server.uriFor(arena, t.file), .range = lines.range(t.start, t.end, server.encoding) };

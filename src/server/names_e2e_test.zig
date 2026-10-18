@@ -32,15 +32,27 @@ fn position(text: []const u8, needle: []const u8) struct { line: u32, character:
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// 跳转结果：「文件名:行」
+/// definition 的结果：「文件名:行」
 fn gotoAt(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
-    const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
+    return gotoWith(h, "textDocument/definition", uri, text, needle);
+}
+
+/// 跳转结果：「文件名:行」，多个目标以空格连接
+fn gotoWith(h: *Harness, comptime method: []const u8, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
+    const resp = try h.request(method, .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
     const result = resp.object.get("result").?;
-    if (result == .null) return "null";
-    const target = result.object;
-    const target_uri = target.get("uri").?.string;
-    const line = target.get("range").?.object.get("start").?.object.get("line").?.integer;
-    return std.fmt.allocPrint(h.arena.allocator(), "{s}:{d}", .{ target_uri[std.mem.lastIndexOfScalar(u8, target_uri, '/').? + 1 ..], line });
+    const targets = switch (result) {
+        .null => return "null",
+        .array => |arr| arr.items,
+        else => &.{result},
+    };
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (targets) |target| {
+        const target_uri = target.object.get("uri").?.string;
+        const line = target.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+        try labels.append(h.arena.allocator(), try std.fmt.allocPrint(h.arena.allocator(), "{s}:{d}", .{ target_uri[std.mem.lastIndexOfScalar(u8, target_uri, '/').? + 1 ..], line }));
+    }
+    return std.mem.join(h.arena.allocator(), " ", labels.items);
 }
 
 fn completionLabels(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const []const u8 {
@@ -370,8 +382,13 @@ test "a root file shared by modules with different imports resolves the imports 
     try testing.expectEqualStrings("b.zig:0", try gotoAt(&h, uri, shared_root_main, "\"helper\""));
     try testing.expectEqualStrings("b.zig:1", try gotoAt(&h, uri, shared_root_main, "fromB"));
     try testing.expectEqualStrings("```zig\nconst w: Widget\n```", try hoverText(&h, uri, shared_root_main, "w ="));
-    // 两个模块都 import 的名字取诊断 step（默认的 install，即 exe）的模块中的
+    // 两个模块都 import 的名字：成员取诊断 step（默认的 install，即 exe）的模块中的，import 本身列出两个模块的目标
     try testing.expectEqualStrings("a.zig:0", try gotoAt(&h, uri, shared_root_main, "fromA"));
+    try testing.expectEqualStrings("a.zig:0 b.zig:0", try gotoAt(&h, uri, shared_root_main, "\"dep\""));
+    try testing.expectEqualStrings("a.zig:0 b.zig:0", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "\"dep\""));
+    // 别名的使用处停在声明处
+    try testing.expectEqualStrings("main.zig:0", try gotoAt(&h, uri, shared_root_main, "dep.fromA"));
+    try testing.expectEqualStrings("main.zig:0", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "dep.fromA"));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

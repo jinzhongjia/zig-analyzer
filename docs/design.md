@@ -153,7 +153,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 - **模块图**：来自构建图，附加 `std`、`builtin`（按模块参数运行 `zig --show-builtin` 生成）、`root`。
   - 文件的归属来自各 compile step 的编译集合。一个文件可属于多个模块（如 exe 与 test 各自创建模块、共用根文件），按名字的 import 依次在这些模块的 import 表中查找。
-  - 多个模块以同一名字 import 不同目标时取最优先的模块：诊断 step 在前，其中本机目标在前，其余 compile step 按构建图的顺序（可用 `diagnostics.step` 改变）。不按位置区分，test 块中不会改用 test 模块的同名 import。`@import("root")` 与 `builtin` 按最优先的归属。
+  - 多个模块以同一名字 import 不同目标时，名字解析（成员、hover、补全等）取最优先的模块：诊断 step 在前，其中本机目标在前，其余 compile step 按构建图的顺序（可用 `diagnostics.step` 改变）。不按位置区分，test 块中不会改用 test 模块的同名 import。光标在 `@import` 或它的字符串上时，跳转（definition / declaration）返回全部目标，按同样的优先级排列；别名的使用处仍跳到 `const x = @import(...)` 声明。`@import("root")` 与 `builtin` 按最优先的归属。
   - 不属于任何模块的文件（单文件模式、不在任何编译集合中的文件、项目加载期间的文件）只能 import std 与相对路径，`builtin` 为本机目标、Debug。`@import("root")` 为 `unknown`：文件可能由另一个文件以相对路径 import，也可能由 `zig test` 编译（根文件是测试运行器），标准库又由所有这类文件共用；经 `@hasDecl(root, ...)` 读取的值（`std.options` 等）因此为 `unknown`，不产生非活动代码。
 - **名字解析**：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、`@This()` 与别名链求命名空间。
 - **HIR**：函数体、初始化表达式、comptime / test 块、字段类型与默认值都是 BodyOwner，降级为容错的表达式 IR（不用 ZIR：有语法错误时不生成），同时算出局部作用域；成员源码未变时沿用上一次的 Body。
