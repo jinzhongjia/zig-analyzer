@@ -39,7 +39,7 @@
 //! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `trySweep` 中进行
 //! （此时没有读事务持有值）。
 //!
-//! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先置位
+//! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先登记到
 //! `pending_write` 使进行中的读查询尽快以 `error.Canceled` 退出，再获取独占锁。
 //! 读事务内拿到的 query 值在该事务结束前一直有效：被替换的旧值延迟到下一次写事务才释放。
 
@@ -183,7 +183,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         rw: Io.RwLock = .init,
         /// 保护所有表的元数据（key 驻留、slot、memo、垃圾列表）
         mutex: Io.Mutex = .init,
-        pending_write: std.atomic.Value(bool) = .init(false),
+        /// 等待独占锁的写事务数，非零时读查询以 `error.Canceled` 退出。写事务拿到锁后才减一：
+        /// 多个写事务排队时，先拿到锁的不会清掉后面的登记，排在它们之间拿到共享锁的读事务同样被取消
+        pending_write: std.atomic.Value(u32) = .init(0),
         /// 进行中的读事务数。释放 memo 的值（淘汰、垃圾回收、`resetQueries`）时必须为 0，以断言检查
         active_readers: std.atomic.Value(u32) = .init(0),
         writing: bool = false,
@@ -353,9 +355,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         /// 开始写事务：取消进行中的读查询，等待所有读事务结束。
         pub fn beginWrite(db: *Db) void {
-            db.pending_write.store(true, .release);
+            _ = db.pending_write.fetchAdd(1, .release);
             db.rw.lockUncancelable(db.io);
-            db.pending_write.store(false, .release);
+            _ = db.pending_write.fetchSub(1, .release);
             db.writing = true;
             db.bumped_in_write = false;
             db.collectGarbage();
@@ -631,7 +633,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             /// 长时间运行的 compute 应周期性调用。
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
-                if (ctx.db.pending_write.load(.acquire)) return error.Canceled;
+                if (ctx.db.pending_write.load(.acquire) != 0) return error.Canceled;
                 if (ctx.cancel) |c| if (c.load(.acquire)) return error.Canceled;
             }
 
@@ -944,8 +946,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     return err;
                 };
                 // compute 可能吞掉了内层读取的 `Canceled`（`catch null` 之类的回退），结果不完整，
-                // 不能写入 memo。取消标志在读事务结束前不会复位（写事务要等读者退出才清除
-                // `pending_write`），所以在这里检查一次即可发现
+                // 不能写入 memo。取消标志在读事务结束前不会复位（写事务要等读者退出、拿到独占锁后
+                // 才把 `pending_write` 减一），所以在这里检查一次即可发现
                 if (ctx.checkCanceled()) |_| {} else |err| {
                     var frame = ctx.popFrame();
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);

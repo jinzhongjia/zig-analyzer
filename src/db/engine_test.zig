@@ -260,7 +260,7 @@ const Swallow = struct {
     pub const Key = u32;
     pub const Value = i64;
     pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
-        if (swallow_cancel) ctx.db.pending_write.store(true, .release);
+        if (swallow_cancel) ctx.db.pending_write.store(1, .release);
         return ctx.get(Number, key) catch -1;
     }
 };
@@ -782,8 +782,8 @@ test "cancellation: reads return Canceled when pending_write is set" {
     defer d.deinit();
     var ctx = d.beginRead(testing.allocator);
     defer ctx.end();
-    d.pending_write.store(true, .release);
-    defer d.pending_write.store(false, .release);
+    d.pending_write.store(1, .release);
+    defer d.pending_write.store(0, .release);
     try testing.expectError(error.Canceled, ctx.get(Plus, 1));
 }
 
@@ -819,6 +819,43 @@ test "cancellation: write interrupts in-flight read" {
     try testing.expectError(error.Canceled, result.?);
 }
 
+test "cancellation: a writer taking the lock keeps the request of the writer queued behind it" {
+    // 防止先拿到锁的写事务清掉排队中的写事务的登记：排在两者之间拿到共享锁的读事务不会被取消，
+    // 排队的写事务要等它完整执行
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    const Writer = struct {
+        order: *std.atomic.Value(u32),
+        seen: *[2]u32,
+        fn run(w: @This(), dd: *Db) void {
+            dd.beginWrite();
+            w.seen[w.order.fetchAdd(1, .monotonic)] = dd.pending_write.load(.acquire);
+            dd.endWrite();
+        }
+    };
+    var order: std.atomic.Value(u32) = .init(0);
+    var seen: [2]u32 = undefined;
+    const writer: Writer = .{ .order = &order, .seen = &seen };
+    // 读事务进行中，两个写事务都在等待。启动线程失败时先结束读事务，已启动的写事务才能结束
+    var ctx = d.beginRead(testing.allocator);
+    const first = std.Thread.spawn(.{}, Writer.run, .{ writer, &d }) catch |err| {
+        ctx.end();
+        return err;
+    };
+    const second = std.Thread.spawn(.{}, Writer.run, .{ writer, &d }) catch |err| {
+        ctx.end();
+        first.join();
+        return err;
+    };
+    while (d.pending_write.load(.acquire) != 2) std.Thread.yield() catch {};
+    ctx.end();
+    first.join();
+    second.join();
+    // 先拿到锁的写事务看到另一个仍在登记中
+    try testing.expectEqual([2]u32{ 1, 0 }, seen);
+    try testing.expectEqual(0, d.pending_write.load(.acquire));
+}
+
 test "cancellation: result of a compute that swallowed Canceled is not memoized" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
@@ -830,7 +867,7 @@ test "cancellation: result of a compute that swallowed Canceled is not memoized"
         defer ctx.end();
         try testing.expectError(error.Canceled, ctx.get(Swallow, 1));
     }
-    d.pending_write.store(false, .release);
+    d.pending_write.store(0, .release);
     swallow_cancel = false;
 
     // 被吞掉的取消没有留下回退值 -1：再次读取重新计算出正确结果
