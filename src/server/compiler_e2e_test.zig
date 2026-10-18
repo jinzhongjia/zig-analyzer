@@ -5,6 +5,7 @@ const testing = std.testing;
 const za = @import("../zig_analyzer.zig");
 const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
+const live = @import("../database.zig").live;
 
 /// 空对象（`.{}` 是空元组，会被序列化为 `[]`）
 const Empty = struct {};
@@ -505,6 +506,137 @@ test "few CPU cores: async tasks run inline, waitIdle, progress and pulled setti
         if (std.mem.startsWith(u8, t, "zig build")) builds += 1;
     }
     try testing.expect(builds >= 2);
+}
+
+/// 在项目目录写出包装用户 zig 的脚本 zigw：`zig env` 报告另一个版本，其余命令照常执行。返回使用它的初始化选项
+fn mismatchedZig(h: *Harness, project: *fixture.Project) !std.json.Value {
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(h.arena.allocator(),
+        \\#!/bin/sh
+        \\if [ "$1" = env ]; then "{s}" env | sed 's/\.version = "[^"]*"/.version = "0.0.0-mismatch"/'; else exec "{s}" "$@"; fi
+        \\
+    , .{ zig, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+    return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
+}
+
+test "zig version mismatch: no build system is started, live diagnostics run zig ast-check outside the read transaction" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, true, try mismatchedZig(&h, &project));
+    const lib_path = try project.path(h.arena.allocator(), "src/lib.zig");
+    const lib_uri = try open(&h, lib_path, fixture.basic[2].text);
+    try waitIdle(&h);
+
+    // 不启动构建系统：没有一直不结束的加载进度，也没有编译器诊断
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+    try expectProgressEnded(&h);
+    try testing.expect(anyContains(try shownMessages(&h), "projects with build.zig get no compiler diagnostics"));
+    // live 诊断来自子进程 zig ast-check，在读事务之外取得
+    {
+        var ctx = h.server.db.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expect(try ctx.get(live.LiveBackend, {}) == .subprocess);
+    }
+    const hits = h.server.live_prepared.hits;
+    const edited = "pub fn hello() void {\n    var unused = 1;\n    var other = 2;\n}\n";
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = lib_uri, .version = 2 }, .contentChanges = &.{.{ .text = edited }} });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "lib.zig", &.{ "2:8 zig ast-check: unused local variable", "1:8 zig ast-check: unused local variable" });
+    try testing.expect(h.server.live_prepared.hits > hits);
+    try shutdown(&h);
+}
+
+test "zig version mismatch: files under a newly created build.zig drop their single-file compile results" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const main_text = "const geo = @import(\"geo\");\npub fn main() void {\n    _ = geo.name;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "geo.zig", .text = "pub const name = \"geo\";\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initializeWith(&h, project.root, false, try mismatchedZig(&h, &project));
+    _ = try open(&h, try project.path(a, "main.zig"), main_text);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"zig: no module named 'geo'"});
+
+    // 新建 build.zig：版本不同，不启动项目，main.zig 也不再按单文件编译，此前的结果随之失效
+    const build_path = try project.path(a, "build.zig");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = simple_build });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, build_path), .type = 1 }} });
+    try waitIdle(&h);
+    try testing.expectEqual(0, h.server.workspaces.items.len);
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{});
+    try shutdown(&h);
+}
+
+test "unreadable build graph: loading ends, the build system is stopped and the user is told" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    // 假的 maker：发出指向不存在的文件的构建图，然后一直等待输入。`zig env` 报告包装脚本自身为 zig，
+    // 其余命令照常执行
+    const a = testing.allocator;
+    {
+        const missing = "missing-configuration";
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeStruct(std.zig.Server.Message.Header{ .tag = .bsp_configuration, .bytes_len = missing.len }, .little);
+        try w.writeAll(missing);
+        try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "configuration.bin", .data = w.buffered() });
+    }
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\case "$1" in
+        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}/zigw"|' ;;
+        \\build) cat "{s}/configuration.bin"; exec cat >/dev/null ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ zig, project.root, project.root, zig });
+    defer a.free(script);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const options = try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root});
+    try initializeWith(&h, project.root, true, try jsonValue(&h, options));
+    try waitIdle(&h);
+
+    try expectProgressEnded(&h);
+    try testing.expect(anyContains(try shownMessages(&h), "cannot read the build graph"));
+    // maker 被结束：后台任务读到输入结束后收尾
+    const ws = h.server.workspaces.items[0];
+    for (0..100) |_| {
+        ws.mutex.lockUncancelable(testing.io);
+        const running = ws.client != null;
+        ws.mutex.unlock(testing.io);
+        if (!running) break;
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    } else return error.TestUnexpectedResult;
+    try shutdown(&h);
+}
+
+/// 每个开始的进度都已结束
+fn expectProgressEnded(h: *Harness) !void {
+    var begins: usize = 0;
+    var ends: usize = 0;
+    for (try h.notifications("$/progress")) |m| {
+        const kind = m.object.get("params").?.object.get("value").?.object.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "begin")) begins += 1;
+        if (std.mem.eql(u8, kind, "end")) ends += 1;
+    }
+    try testing.expectEqual(begins, ends);
 }
 
 /// 收到的 window/showMessage 文案

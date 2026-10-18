@@ -270,18 +270,9 @@ pub const AstCheck = struct {
         const text = try ctx.get(inputs.FileText, file) orelse "";
         const vfs: *Vfs = ctx.db.env.vfs;
         const mode = modeOf(vfs.path(file));
-        return switch (try ctx.get(LiveBackend, {})) {
-            .in_process => blk: {
-                if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode)) |r| break :blk r;
-                break :blk check(ctx.db.gpa, text, mode);
-            },
-            .subprocess => |zig_exe| checkSubprocess(ctx.db.gpa, ctx.db.io, zig_exe, text, mode) catch |err| switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Canceled => error.Canceled,
-                // zig 无法运行：没有 live 诊断（编译器诊断仍可用）
-                else => empty(ctx.db.gpa),
-            },
-        };
+        const backend = try ctx.get(LiveBackend, {});
+        if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode, backend)) |r| return r;
+        return checkWith(ctx.db.gpa, ctx.db.io, backend, text, mode);
     }
 
     pub fn eql(a: Value, b: Value) bool {
@@ -297,9 +288,23 @@ pub const AstCheck = struct {
     }
 };
 
-/// 在读事务之外预先算好的 `check` 结果，按文本与模式索引。AstGen 不检查取消，在读事务中执行时
-/// 写事务（逐字输入）要等它结束；诊断发布先在锁外算好放入这里，`AstCheck` 计算时取走命中的结果。
-/// 结果只取决于文本，因此不影响 query 的纯函数语义。容量很小：未被取走的结果（memo 已有效）按先进先出淘汰
+/// 按执行方式对文本做 live 检查
+pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
+    return switch (backend) {
+        .in_process => check(gpa, text, mode),
+        .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, text, mode) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
+            // zig 无法运行：没有 live 诊断（编译器诊断仍可用）
+            else => empty(gpa),
+        },
+    };
+}
+
+/// 在读事务之外预先算好的 `checkWith` 结果，按文本、模式与执行方式索引。AstGen 与子进程 `zig ast-check`
+/// 都不检查取消，在读事务中执行时写事务（逐字输入）要等它结束；诊断发布先在锁外算好放入这里，`AstCheck`
+/// 计算时取走命中的结果。结果只取决于文本，因此不影响 query 的纯函数语义。容量很小：未被取走的结果
+/// （memo 已有效）按先进先出淘汰
 pub const Prepared = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
@@ -309,7 +314,8 @@ pub const Prepared = struct {
     /// `take` 命中的次数（统计与测试用）
     hits: usize = 0,
 
-    const Entry = struct { mode: Mode, text: []const u8, result: *Result };
+    const Entry = struct { mode: Mode, backend: BackendKind, text: []const u8, result: *Result };
+    const BackendKind = std.meta.Tag(Backend);
     pub const capacity = 8;
 
     pub fn deinit(p: *Prepared) void {
@@ -318,8 +324,8 @@ pub const Prepared = struct {
         p.last.deinit(p.gpa);
     }
 
-    pub fn hash(text: []const u8, mode: Mode) u64 {
-        return std.hash.Wyhash.hash(@backingInt(mode), text);
+    pub fn hash(text: []const u8, mode: Mode, backend: Backend) u64 {
+        return std.hash.Wyhash.hash(@as(u64, @backingInt(mode)) << 8 | @backingInt(std.meta.activeTag(backend)), text);
     }
 
     /// 文件的这个文本是否还需要准备。放入之后才算准备好：并发的两次发布可能都准备同一个文本（在读事务
@@ -335,36 +341,37 @@ pub const Prepared = struct {
         return if (p.last.get(file)) |last| last == h else false;
     }
 
-    /// 放入文件 `file` 的 `check(text, mode)` 的结果，取得 `result` 的所有权，并记这个文本已准备好
-    pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, result: *Result) Allocator.Error!void {
+    /// 放入文件 `file` 的 `checkWith(backend, text, mode)` 的结果，取得 `result` 的所有权，并记这个文本已准备好
+    pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, backend: Backend, result: *Result) Allocator.Error!void {
         errdefer result.destroy(p.gpa);
         const owned = try p.gpa.dupe(u8, text);
         errdefer p.gpa.free(owned);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
-        try p.last.put(p.gpa, file, hash(text, mode));
-        if (p.find(text, mode) != null) {
+        try p.last.put(p.gpa, file, hash(text, mode, backend));
+        const kind = std.meta.activeTag(backend);
+        if (p.find(text, mode, kind) != null) {
             p.gpa.free(owned);
             result.destroy(p.gpa);
             return;
         }
         if (p.entries.items.len == capacity) p.destroyEntry(p.entries.orderedRemove(0));
-        try p.entries.append(p.gpa, .{ .mode = mode, .text = owned, .result = result });
+        try p.entries.append(p.gpa, .{ .mode = mode, .backend = kind, .text = owned, .result = result });
     }
 
-    /// 取走 `check(text, mode)` 的结果（调用方取得所有权）
-    pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode) ?*Result {
+    /// 取走 `checkWith(backend, text, mode)` 的结果（调用方取得所有权）
+    pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode, backend: Backend) ?*Result {
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
-        const i = p.find(text, mode) orelse return null;
+        const i = p.find(text, mode, std.meta.activeTag(backend)) orelse return null;
         const e = p.entries.orderedRemove(i);
         p.gpa.free(e.text);
         p.hits += 1;
         return e.result;
     }
 
-    fn find(p: *Prepared, text: []const u8, mode: Mode) ?usize {
-        for (p.entries.items, 0..) |e, i| if (e.mode == mode and std.mem.eql(u8, e.text, text)) return i;
+    fn find(p: *Prepared, text: []const u8, mode: Mode, backend: BackendKind) ?usize {
+        for (p.entries.items, 0..) |e, i| if (e.mode == mode and e.backend == backend and std.mem.eql(u8, e.text, text)) return i;
         return null;
     }
 
@@ -647,29 +654,31 @@ test "error locations and notes" {
     try testing.expectEqualStrings("struct declared here", d.notes[1].message);
 }
 
-test "prepared results: matched by text and mode, taken once, oldest evicted" {
+test "prepared results: matched by text, mode and backend, taken once, oldest evicted" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var p: Prepared = .{ .gpa = gpa };
     defer p.deinit();
-    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, try check(gpa, "const a = ;", .zig));
-    // 同样的文本不同的模式不命中
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon));
-    const r = p.take(io, "const a = ;", .zig).?;
+    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, .in_process, try check(gpa, "const a = ;", .zig));
+    // 同样的文本不同的模式或执行方式不命中
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon, .in_process));
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .{ .subprocess = "zig" }));
+    const r = p.take(io, "const a = ;", .zig, .in_process).?;
     defer r.destroy(gpa);
     try std.testing.expectEqual(1, r.items.len);
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig));
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .in_process));
 
     for (0..Prepared.capacity + 1) |i| {
         var buf: [32]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "const a = {d};", .{i});
-        try p.put(io, @fromBackingInt(@as(u32, 1)), text, .zig, try check(gpa, text, .zig));
+        try p.put(io, @fromBackingInt(@as(u32, 1)), text, .zig, .in_process, try check(gpa, text, .zig));
     }
     try std.testing.expectEqual(Prepared.capacity, p.entries.items.len);
-    try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig));
+    try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig, .in_process));
 
-    // 放入之后同一文件的同一文本不再准备，其他文本仍需准备
-    try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig)));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig)));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig)));
+    // 放入之后同一文件的同一文本不再准备，其他文本、其他执行方式仍需准备
+    try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .in_process)));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig, .in_process)));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .{ .subprocess = "zig" })));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig, .in_process)));
 }

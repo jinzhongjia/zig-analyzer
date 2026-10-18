@@ -1329,7 +1329,7 @@ fn startup(server: *Server) Io.Cancelable!void {
     }
     if (!env.matchesBuiltin()) {
         // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check
-        server.showWarningOnce("zig version differs from the one zig-analyzer was built with: live diagnostics fall back to zig ast-check, compiler diagnostics are unavailable");
+        server.showWarningOnce("zig version differs from the one zig-analyzer was built with: live diagnostics fall back to zig ast-check, projects with build.zig get no compiler diagnostics");
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
         server.db.beginWrite();
         defer server.db.endWrite();
@@ -1427,9 +1427,12 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
     return Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
 }
 
-/// 为根目录启动项目；同一根目录已有项目时不重复启动（启动阶段与工作区文件夹的变化可能同时进行）
+/// 为根目录启动项目；同一根目录已有项目时不重复启动（启动阶段与工作区文件夹的变化可能同时进行）。
+/// 用户 zig 与编译时的版本不同时不启动：构建图的格式由标准库定义，读不了。这样的项目只有 live 诊断（zig ast-check），
+/// 不按单文件编译（使用命名模块的文件会报出找不到模块）
 fn startWorkspace(server: *Server, root: []const u8) void {
     if (server.isShuttingDown() or !server.buildFlags().build) return;
+    if (server.zigEnv()) |env| if (!env.matchesBuiltin()) return;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -1873,24 +1876,28 @@ fn prepareLive(server: *Server, file: Vfs.FileId) void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const text = blk: {
+    const text, const backend = blk: {
         var ctx = server.db.beginRead(a);
         defer ctx.end();
-        if ((ctx.get(live.LiveBackend, {}) catch return) != .in_process) return;
+        const backend: live.Backend = switch (ctx.get(live.LiveBackend, {}) catch return) {
+            .in_process => .in_process,
+            .subprocess => |exe| .{ .subprocess = a.dupe(u8, exe) catch return },
+        };
         const t = (ctx.get(FileText, file) catch return) orelse return;
-        break :blk a.dupe(u8, t) catch return;
+        break :blk .{ a.dupe(u8, t) catch return, backend };
     };
     const mode = live.modeOf(server.vfs.path(file));
-    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode))) return;
-    const result = live.check(server.gpa, text, mode) catch return;
-    server.live_prepared.put(server.io, file, text, mode, result) catch {};
+    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode, backend))) return;
+    const result = live.checkWith(server.gpa, server.io, backend, text, mode) catch return;
+    server.live_prepared.put(server.io, file, text, mode, backend, result) catch {};
 }
 
 /// 当前文本的 live 诊断已在读事务之外准备过（或不需要准备）
 fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
-    if (!server.liveEligible(file) or try ctx.get(live.LiveBackend, {}) != .in_process) return true;
+    if (!server.liveEligible(file)) return true;
+    const backend = try ctx.get(live.LiveBackend, {});
     const text = try ctx.get(FileText, file) orelse return true;
-    return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file))));
+    return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file)), backend));
 }
 
 fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool) void {
@@ -1979,11 +1986,14 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
             .other_ctx = &other,
         });
     } else if (text) |current| {
-        // 单文件模式：只使用编译结果中本文件的诊断
+        // 单文件模式：只使用编译结果中本文件的诊断。不再按单文件处理的文件（所在根目录新建了 build.zig，
+        // 而项目没有启动）不使用此前的结果
+        const single = server.isSingleFile(file);
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
-        const fr: ?*const compiler.FileResult = if (server.single.getPtr(file)) |sf|
-            if (sf.result) |*r| r.files.getPtr(server.vfs.path(file)) else null
+        const sf = if (single) server.single.getPtr(file) else null;
+        const fr: ?*const compiler.FileResult = if (sf) |f|
+            if (f.result) |*r| r.files.getPtr(server.vfs.path(file)) else null
         else
             null;
         diags = try compiler.merge(arena, .{

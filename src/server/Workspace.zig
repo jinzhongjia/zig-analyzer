@@ -343,16 +343,19 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             ws.server.abandon(ws);
         },
         .configuration => |path| {
+            // 用户 zig 与编译时的版本不同时不启动项目（见 `Server.startWorkspace`），构建图的格式一致
             const env = ws.server.zigEnv().?;
-            if (!env.matchesBuiltin()) {
-                ws.server.showWarningOnce("zig version differs from the one zig-analyzer was built with: cannot read the build graph, compiler diagnostics are unavailable");
-                return;
-            }
             ws.reportLoading("Reading build graph");
             var model = configuration.load(ws.gpa, io, ws.root, path, env) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    log.err("{s}: failed to read build graph: {t}", .{ ws.root, err });
+                    // 没有模型就不能构建：结束加载与 maker，按没有编译结果完成（清除此前的编译器诊断）
+                    var buf: [512]u8 = undefined;
+                    ws.server.showWarning(std.fmt.bufPrint(&buf, "cannot read the build graph of {s} ({t}): compiler diagnostics are unavailable until build.zig is saved", .{ ws.root, err }) catch
+                        "cannot read the build graph: compiler diagnostics are unavailable until build.zig is saved");
+                    ws.endLoading("Failed to read the build graph");
+                    ws.stop();
+                    try ws.finishBuild();
                     return;
                 },
             };
@@ -382,10 +385,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             try ws.recomputeCompileSet();
             // 旧实例没有可沿用的模型时不必等整次构建结束
             ws.promote(.configured);
-            ws.mutex.lockUncancelable(io);
-            ws.server.progress.end(ws.server, ws.loading, "Done");
-            ws.loading = null;
-            ws.mutex.unlock(io);
+            ws.endLoading("Done");
             ws.requestBuild();
         },
         .configuration_failed => |*eb| {
@@ -535,6 +535,13 @@ fn reportLoading(ws: *Workspace, message: ?[]const u8) void {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     ws.server.progress.report(ws.server, ws.loading, message, null);
+}
+
+fn endLoading(ws: *Workspace, message: ?[]const u8) void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    ws.server.progress.end(ws.server, ws.loading, message);
+    ws.loading = null;
 }
 
 fn clearBundles(ws: *Workspace) void {
