@@ -178,6 +178,22 @@ pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?File
     return null;
 }
 
+/// 文件 `file` 中 `@import(name)` 的全部目标：文件所属的多个模块以 `name` import 不同的模块时有多个，
+/// 按模块的优先级排列、不重复，第一个即 `importTarget` 的结果（它为 null 时为空）
+pub fn importTargets(g: *const ModuleGraph, arena: Allocator, file: FileId, name: []const u8) Allocator.Error![]const FileId {
+    const first = g.importTarget(file, name) orelse return &.{};
+    var targets: std.ArrayList(FileId) = .empty;
+    try targets.append(arena, first);
+    // std、builtin、root 只有一个目标
+    for ([_][]const u8{ "std", "builtin", "root" }) |n| if (std.mem.eql(u8, name, n)) return targets.items;
+    // `module` import 了这个名字时，其目标即 `first`
+    for (g.entry(file).?.others) |other| {
+        const target = g.modules[g.moduleImport(other, name) orelse continue].root orelse continue;
+        if (std.mem.indexOfScalar(FileId, targets.items, target) == null) try targets.append(arena, target);
+    }
+    return targets.items;
+}
+
 /// 模块 `module` 以 `name` import 的模块
 fn moduleImport(g: *const ModuleGraph, module: u32, name: []const u8) ?u32 {
     if (module == std_module) return null;
@@ -342,6 +358,55 @@ test "a file in several modules resolves imports from each of them" {
     try testing.expectEqual(2, names.len);
     try testing.expectEqualStrings("dep", names[0]);
     try testing.expectEqualStrings("helper", names[1]);
+}
+
+test "importTargets lists the targets of every module of a file in priority order" {
+    const gpa = testing.allocator;
+    var vfs: Vfs = .init(testing.io, gpa);
+    defer vfs.deinit();
+    // exe（0）、test（1）与 check（4）的模块共用根文件 main.zig，按这个顺序优先
+    var modules = [_]ProjectModel.Module{
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{ .{ .name = "dep", .module = 2 }, .{ .name = "same", .module = 2 } } },
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{ .{ .name = "dep", .module = 3 }, .{ .name = "same", .module = 2 }, .{ .name = "helper", .module = 3 }, .{ .name = "opt", .module = 2 } } },
+        .{ .root_file = native("/p/a.zig"), .imports = &.{} },
+        .{ .root_file = native("/p/b.zig"), .imports = &.{} },
+        .{ .root_file = native("/p/src/main.zig"), .imports = &.{ .{ .name = "dep", .module = 2 }, .{ .name = "opt", .module = 3 } } },
+    };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &.{}, .modules = &modules, .default_step = 0 };
+    const main = try vfs.intern(native("/p/src/main.zig"));
+    const a = try vfs.intern(native("/p/a.zig"));
+    const b = try vfs.intern(native("/p/b.zig"));
+    const std_root = try vfs.intern(native("/zig/std/std.zig"));
+    var cs: CompileSet.Result = .{};
+    defer cs.deinit(gpa);
+    try cs.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
+    try cs.files.put(gpa, a, .{ .module = 2, .root_module = 0 });
+    try cs.files.put(gpa, b, .{ .module = 3, .root_module = 1 });
+    try cs.others.put(gpa, .{ .file = main, .module = 1 }, {});
+    try cs.others.put(gpa, .{ .file = main, .module = 4 }, {});
+
+    var builder: Builder = .init(gpa, &vfs);
+    try builder.add(&model, &cs, null);
+    var g = try builder.finish(std_root, null);
+    defer g.deinit(gpa);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    // 不同的目标都列出，按模块的优先级；check 中与 exe 相同的目标不重复
+    try testing.expectEqualSlices(FileId, &.{ a, b }, try g.importTargets(ar, main, "dep"));
+    // 各模块的目标相同
+    try testing.expectEqualSlices(FileId, &.{a}, try g.importTargets(ar, main, "same"));
+    // 只有一个模块 import 的名字
+    try testing.expectEqualSlices(FileId, &.{b}, try g.importTargets(ar, main, "helper"));
+    // 最优先的模块没有 import 这个名字
+    try testing.expectEqualSlices(FileId, &.{ a, b }, try g.importTargets(ar, main, "opt"));
+    try testing.expectEqualSlices(FileId, &.{}, try g.importTargets(ar, main, "other"));
+    try testing.expectEqualSlices(FileId, &.{std_root}, try g.importTargets(ar, main, "std"));
+    try testing.expectEqualSlices(FileId, &.{main}, try g.importTargets(ar, main, "root"));
+    // 第一个目标即 `importTarget` 的结果
+    for ([_][]const u8{ "dep", "same", "helper", "opt", "std", "root" }) |name| {
+        try testing.expectEqual(g.importTarget(main, name), (try g.importTargets(ar, main, name))[0]);
+    }
 }
 
 test "a file in many modules keeps its other modules in linear space" {

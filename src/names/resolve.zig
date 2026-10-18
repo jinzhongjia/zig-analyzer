@@ -240,13 +240,22 @@ pub const Resolver = struct {
 
     /// `@import(args)` 的目标文件
     pub fn importTarget(r: *Resolver, file: FileId, b: *const Body, args: []const Body.ExprId) Error!?FileId {
+        return r.resolveImport(file, r.importName(b, args) orelse return null);
+    }
+
+    /// `@import(args)` 的全部目标（见 `resolveImportTargets`）
+    pub fn importTargets(r: *Resolver, file: FileId, b: *const Body, args: []const Body.ExprId) Error![]const FileId {
+        return r.resolveImportTargets(file, r.importName(b, args) orelse return &.{});
+    }
+
+    /// `@import(args)` 的实参字符串
+    fn importName(r: *Resolver, b: *const Body, args: []const Body.ExprId) ?[]const u8 {
         if (args.len != 1) return null;
         const raw = switch (b.expr(args[0])) {
             .literal => |text| text,
             else => return null,
         };
-        const name = stringValue(r.arena, raw) orelse return null;
-        return r.resolveImport(file, name);
+        return stringValue(r.arena, raw);
     }
 
     pub fn resolveImport(r: *Resolver, file: FileId, name: []const u8) Error!?FileId {
@@ -258,6 +267,18 @@ pub const Resolver = struct {
         if ((try r.ctx.get(ModuleGraph.FileImports, file)).get(name)) |target| return target;
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return null;
         return graph.importTarget(file, name);
+    }
+
+    /// 文件中 `@import(name)` 的全部目标：文件所属的多个模块以 `name` import 不同的模块时有多个，按模块的
+    /// 优先级排列，第一个即 `resolveImport` 的结果；相对路径至多一个。直接读取模块图、不经 `FileImports`
+    /// 截断其他变化，供跳转等请求使用，推导中不要使用
+    pub fn resolveImportTargets(r: *Resolver, file: FileId, name: []const u8) Error![]const FileId {
+        if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
+            const target = try r.resolveImport(file, name) orelse return &.{};
+            return r.arena.dupe(FileId, &.{target});
+        }
+        const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
+        return graph.importTargets(r.arena, file, name);
     }
 
     // ── 位置 ─────────────────────────────────────────────────────────
