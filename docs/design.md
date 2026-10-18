@@ -201,7 +201,9 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 触发重启：根目录的 `build.zig`、`build.zig.zon`、`zig-analyzer.json` 以及构建脚本（`build.zig` 沿相对路径 `@import` 可达的文件）被保存或在磁盘上变化，构建配置变化，maker 崩溃（退避重启）。根目录下新建或删除 `build.zig` 时启动或停止项目。
   - 新实例被放弃（maker 连续崩溃超过上限、协议版本不符）时，旧实例的编译器诊断被清除、模型保留，直到再次保存 `build.zig`。读不了构建图时提示用户并停止 maker，直到保存 `build.zig`；`bsp_configuration_failed` 中没有错误（`build.zig.zon` 或依赖包的问题）时提示运行 `zig build` 查看原因。
 - 进程管理：maker 与它启动的子进程在 POSIX 上属于以看门狗 `sh` 为组长的进程组，在 Windows 上属于设置了 `KILL_ON_JOB_CLOSE` 的 Job Object。停止项目（shutdown、exit、输入结束、重启）时整组立即结束，不等待构建；服务器以任何方式退出时整组随之结束。
-- 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库。用户 zig 版本不同时，带 `build.zig` 的根目录不启动构建系统，没有编译器诊断，只有 `zig ast-check` 的 live 诊断；这些根目录下的文件也不按单文件编译（使用命名模块的文件会报出找不到模块）。其他文件仍按单文件模式编译。发布版本跟随 Zig 版本。
+- 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库。构建图文件没有版本号，按结构体逐字节读取，格式不符时会越界（握手校验的 `build_system_version` 只覆盖协议消息），所以只在用户 zig 的版本与编译时完全一致时读取。
+  - 版本不同时，带 `build.zig` 的根目录不启动构建系统：没有编译器诊断，命名模块的 import（依赖包、构建选项）无法解析，只有 `zig ast-check` 的 live 诊断。这些根目录下的文件也不按单文件编译（使用命名模块的文件会报出找不到模块）；其他文件仍按单文件模式编译。启动时提示用户两个版本与受影响的功能。
+  - 发布版本跟随 Zig 版本。
 
 ### 4.8 服务器与并发（`server/`）
 

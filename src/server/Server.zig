@@ -1339,6 +1339,14 @@ fn startProjects(server: *Server) void {
 
 // ── 项目与后台任务 ───────────────────────────────────────────────────
 
+/// 用户 zig 与编译时的版本不同时的提示（用户的版本、编译时的版本、编译时的版本、用户的版本）。构建图文件没有版本号、
+/// 按结构体逐字节读取，格式不符时会越界，所以带 build.zig 的项目不加载（见 `startWorkspace`）：除了编译器诊断，
+/// 命名模块的 import 也无法解析，跳转、hover、补全随之受影响
+const version_mismatch_message = "zig {s} differs from zig {s} that zig-analyzer was built with. " ++
+    "Projects with build.zig are not loaded: they get no compiler diagnostics, and imports of named modules " ++
+    "(dependencies, build options) are not resolved. Live diagnostics use zig ast-check. " ++
+    "Use zig {s}, or a zig-analyzer built for zig {s}.";
+
 /// 查询 zig 环境，并为每个带 build.zig 的工作区启动构建系统协议
 fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
@@ -1367,7 +1375,10 @@ fn startup(server: *Server) Io.Cancelable!void {
     }
     if (!env.matchesBuiltin()) {
         // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check
-        server.showWarningOnce("zig version differs from the one zig-analyzer was built with: live diagnostics fall back to zig ast-check, projects with build.zig get no compiler diagnostics");
+        const built = @import("builtin").zig_version_string;
+        const message = std.fmt.allocPrint(server.gpa, version_mismatch_message, .{ env.version, built, built, env.version }) catch null;
+        defer if (message) |m| server.gpa.free(m);
+        server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
         server.db.beginWrite();
         defer server.db.endWrite();

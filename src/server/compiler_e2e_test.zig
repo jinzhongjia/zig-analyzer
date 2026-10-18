@@ -793,7 +793,11 @@ test "zig version mismatch: no build system is started, live diagnostics run zig
     // 不启动构建系统：没有一直不结束的加载进度，也没有编译器诊断
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try expectProgressEnded(&h);
-    try testing.expect(anyContains(try shownMessages(&h), "projects with build.zig get no compiler diagnostics"));
+    // 提示写出两个版本以及受影响的功能
+    const messages = try shownMessages(&h);
+    const expected_head = "zig 0.0.0-mismatch differs from zig " ++ @import("builtin").zig_version_string ++ " that zig-analyzer was built with.";
+    try testing.expect(anyContains(messages, expected_head));
+    try testing.expect(anyContains(messages, "imports of named modules (dependencies, build options) are not resolved"));
     // live 诊断来自子进程 zig ast-check，在读事务之外取得
     {
         var ctx = h.server.db.beginRead(testing.allocator);
