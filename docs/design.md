@@ -62,7 +62,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | libvaxis（`src/Vaxis.zig`） | 2.5 万行 | 0.2 ms | 0.3 ms | 59 ms | 5 ms | 232 MB |
 | http.zig（`src/httpz.zig`） | 1.5 万行 | 0.5 ms | 0.4 ms | 64 ms | 9 ms | 105 MB |
 | zig-clap（`clap.zig`） | 0.3 万行 | 0.2 ms | 0.3 ms | 62 ms | 5 ms | 84 MB |
-| 97 个库批量校验 | — | 中位数 0.2 ms，最大 3.1 ms | — | — | — | 中位数 70 MB，最大 215 MB |
+| 97 个库批量校验 | — | 中位数 0.2 ms，最大 1.0 ms | — | — | — | 中位数 93 MB，最大 308 MB |
 
 编辑 → 诊断均含 50 ms 防抖。
 
@@ -162,7 +162,9 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 - **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。容器类型的身份不依赖字段类型，递归类型不会成环。
 - **核心 query**：`DeclType`（声明的类型与 comptime 值，只读签名）、`Infer`（BodyOwner + 实例 → 每个表达式的类型与解析目标）、`CallEval`（comptime 调用按实例与实参记忆化）、`ErrorSetOf`（推导错误集）、`LocalValue`（单个局部绑定）。
-- **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution；`unknown` 吸收一切。调用处判断是否为泛型调用只读被调函数的参数形式（`ParamForms`），只改被调函数的函数体时调用者不重新推导。
+- **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution（含枚举字面量与枚举、`&.{}` 与切片），没有结果类型的分支中的枚举字面量按 peer 类型解析（`if (t) |x| x.kind else .invalid`）；`unknown` 吸收一切。调用处判断是否为泛型调用只读被调函数的参数形式（`ParamForms`），只改被调函数的函数体时调用者不重新推导。
+  - anytype 形参收到的枚举字面量在被调函数的实例中被转换成的类型（每个参数取函数体中第一处）记入推导结果，调用处的字面量引用其中的成员：`testing.expectEqual(.x, actual)` 经 `@TypeOf(expected, actual)` 转换为 actual 的类型。
+  - switch 的操作数 comptime 已知时，执行的分支的捕获取实际的载荷值；各项的载荷类型没有 peer 时（只能是 `inline .@"struct", .@"union" => |info|` 这样每项单独实例化的分支）类型也取实际的载荷类型。
 - **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。构造类型（`@Struct` / `@Enum` / `@Union`）以构造它的函数实例命名（`FieldEnum(S)`）；不在函数中构造、正是某个常量的值时以常量命名。
   - 跳转到构造类型的成员（字段访问 `x.name`、`E.name`、枚举字面量 `.name`）：名字是 comptime 求出的字符串。来自字符串字面量时（如 zig-clap 解析帮助文本得到的字段名），以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到名字在字面量中的位置；候选为初始化表达式含有这个字面量的常量，以及使用处与构造处所在成员的局部绑定。来自 `@typeInfo(X)` 时（`@typeInfo(Tag).@"enum".field_names`）跳到 X 的同名成员。
   - 单次求值 20 万步，`@memcpy` 与经由切片的整体写入每个元素计一步。内存上限 64 MB，单个聚合至多 65536 个元素：展开聚合（复制、拼接、切片、`@splat` 等）之前按已占用容量加本次分配检查，其余每 256 步检查一次。
@@ -173,10 +175,10 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 函数值与实参元组一起传入的调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`）以元组元素作为实参
   - 项目中没有调用点的泛型方法以标准库的分派处求实例：`std.Io.Writer.printValue` 中的 `value.format(w)`、`value.formatNumber(w, ...)` 等
   - 抽象参数的 `@hasDecl` / `@hasField` 结果未知（推导与解释器一致），依赖它们的 comptime 分支不判为非活动；抽象实例中的容器（如 `@This()`）有哪些成员只取决于源码，仍给出确定结果
-  - 选择实例：hover / 跳转 / 补全取第一个使光标处的代码会执行、光标处的表达式（或局部绑定）能求出具体类型的实例（如 `switch (Q.kind)` 中只有部分实例有的成员）。先看第一个调用点，再依次尝试其他调用点（每个成员缓存前 8 个不同的实例，`Instances`）；都求不出类型时退而只要求代码会执行。调用者实例中不执行的代码里的调用不计；调用者位于泛型函数内时，它的一个实例中没有可用的调用就尝试它的其他实例
+  - 选择实例：hover / 跳转 / 补全取第一个使光标处的代码会执行、光标处的表达式（或局部绑定）能求出具体类型的实例（如 `switch (Q.kind)` 中只有部分实例有的成员）。先看第一个调用点，再依次尝试其他调用点：先是每个成员缓存的前 8 个不同实例，再是全部实例（与查找引用共用；`@hasDecl(Q, "depthFallback")` 这样只有少数实例满足的分支）；都求不出类型时退而只要求代码会执行。调用者实例中不执行的代码里的调用不计，调用都位于任何实例都不编译的分支中时才使用它们；调用者位于泛型函数内时，它的一个实例中没有可用的调用就尝试它的其他实例
   - 调用者以自己的 comptime 类型参数调用（`P.name(...)`）、而它的实例中 `P` 是其他容器时，把实例中 `P` 的实参换成目标所在的容器
   - 目标所在的容器作为 comptime 类型实参传入泛型函数、再经类型参数调用目标（查询引擎中 `ctx.get(Q, key)` → … → `Q.compute(ctx, key)`）：分派处所在的文件不必 import 目标所在的文件，按导入链找不到。从实参中传入这个容器类型的调用出发，逐层进入实参中仍含有它的泛型调用，直到调用目标处；收集全部实例时同样沿这条路径查找
-  - 遍历 comptime 已知的类型列表的循环（`inline for`，comptime 中的 `for`）中循环变量是抽象的类型。光标或调用位于这样的循环中时按单次迭代推导（至多 64 次迭代），同一循环的其他循环变量（`for (types, 0..) |T, i|`）取这次迭代的值；hover 标注 `inferred from iteration <n> of the loop at <位置>`
+  - 每次迭代的循环变量类型不同的循环：遍历 comptime 已知的类型列表（`inline for`，comptime 中的 `for`；循环变量是抽象的类型），或遍历各项类型不同的元组（`inline for (.{ &posix, &windows }) |cases|`；循环变量的类型求不出）。光标处的表达式求不出类型、或调用位于这样的循环中时按单次迭代推导（至多 64 次迭代），同一循环的其他循环变量（`for (types, 0..) |T, i|`）取这次迭代的值与类型；hover 标注 `inferred from iteration <n> of the loop at <位置>`
 - **其他构建配置**：当前配置下不存在的成员（只在其他目标上编译的代码，如 `posix.system.EVFILT.READ`、macOS 的 `settings.cflag.CCTS_OFLOW`）到其他配置的容器中查找：沿别名与 comptime 条件的 `if` / `switch` 分支收集各配置下的容器；实例的类型沿局部变量、全局变量、调用的返回类型与字段类型收集。
 - **目标相关**：与目标相关的参数从各模块的 builtin.zig 解析出的目标（架构、操作系统、ABI、CPU 特性）求出（`TargetAbi`），目标变化时依赖它的结果失效；参数相同的模块共用同一份 builtin.zig，每份只读取、解析一次。
   - 参数包括指针位宽、向量的布局规则、整数的最大对齐、`c_char` 的符号，以及 C 类型与 `f32` / `f64` / `f80` / `f128` 的大小、对齐与位宽，按编译器 `Type.abiAlignment` / `abiSize` 的规则计算：C 类型用 `std.Target.cType*`，整数用 `std.zig.target.intAlignment` / `intByteSize`，浮点按 C 类型、表示它的整数或 compiler-rt 的软浮点表示。
@@ -257,13 +259,15 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 
 另以 `zig fmt` 对拍 `textDocument/formatting`（逐字一致）。
 
-### 5.3 当前验收结果（2026-10-16）
+批量校验：每个库先 `zig build --fetch` 取得依赖，取根项目（不含自带 `build.zig` 的子目录、测试与示例）中成员访问最多的一个文件，以 `BENCH_QUICK=1 BENCH_CHECK=40 BENCH_COMPLETE=40 BENCH_REFS=20` 运行。
+
+### 5.3 当前验收结果
 
 | 范围 | 结果 |
 |---|---|
-| 97 个 Zig 0.17.0 库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib 等）批量校验 | 崩溃 / 超时 0；declaration 不一致 0（解析率中位数 89.4%；构建图正常的 80 个项目排除没有声明位置的标识符后 99.8%）；引用与重命名错误 0；补全召回中位数 100%，88 / 97 ≥ 95%；hover p50 中位数 0.2 ms；常驻内存中位数 70 MB、最大 215 MB |
-| 语料对拍（10305 个文件、264.6 MB） | 全部通过；12 万次随机编辑下增量与全量解析无不一致 |
-| 编译器诊断对拍 | 15 / 15 一致 |
-| 格式化对拍 | 372 / 372 个文件一致 |
+| 97 个 Zig 0.17.0 库（zls、zigimg、libvaxis、zine、microzig、Cubyz、flow、raylib 等）批量校验（2026-10-19） | 全部有构建图；崩溃 / 超时 0；declaration 不一致 0（解析率中位数 90.8%，排除没有声明位置的标识符后中位数 100%）；引用与重命名错误 0；补全召回中位数 100%，95 / 97 ≥ 95%；hover p50 中位数 0.2 ms、最大 1.0 ms；常驻内存中位数 93 MB、最大 308 MB |
+| 语料对拍（10305 个文件、264.6 MB，2026-10-16） | 全部通过；12 万次随机编辑下增量与全量解析无不一致 |
+| 编译器诊断对拍（2026-10-16） | 15 / 15 一致 |
+| 格式化对拍（2026-10-16） | 372 / 372 个文件一致 |
 
-召回低于 95% 的库中，2 个没有成员访问样本，4 个因依赖未能取得而没有构建图；其余为泛型中的 comptime 反射类型（`@typeInfo` 的字段经 `inline for` 访问），以及位于嵌套子项目中的文件（raylib 的 Zig 示例有自己的 build.zig，工作区根目录的构建图中没有它）。
+召回低于 95% 的 2 个库：strand 中未补全的成员位于多层泛型的 comptime 反射代码中（如 `descriptor.options(T)` 的结果）；morse 的测试代码 import 的 `shakedown` 由默认配置下不存在的测试步骤添加，不在构建图中。
