@@ -1759,6 +1759,67 @@ test "callsite seeding uses an iteration of a comptime for over types" {
     try testing.expectEqualStrings("id", labels);
 }
 
+test "callsite seeding tries every instance for a branch only rare instances compile" {
+    // 只有第 10 个实例有 `extra`，调用者又在泛型函数中：曾只尝试调用者的前 8 个实例，补全为空
+    const labels = try completionLabels(
+        \\const A0 = struct {
+        \\    pub const id = 0;
+        \\};
+        \\const A1 = struct {
+        \\    pub const id = 1;
+        \\};
+        \\const A2 = struct {
+        \\    pub const id = 2;
+        \\};
+        \\const A3 = struct {
+        \\    pub const id = 3;
+        \\};
+        \\const A4 = struct {
+        \\    pub const id = 4;
+        \\};
+        \\const A5 = struct {
+        \\    pub const id = 5;
+        \\};
+        \\const A6 = struct {
+        \\    pub const id = 6;
+        \\};
+        \\const A7 = struct {
+        \\    pub const id = 7;
+        \\};
+        \\const A8 = struct {
+        \\    pub const id = 8;
+        \\};
+        \\const Z = struct {
+        \\    pub const id = 9;
+        \\    pub fn extra() u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\fn get(comptime Q: type) u32 {
+        \\    if (@hasDecl(Q, "extra")) return Q.<|>;
+        \\    return Q.id;
+        \\}
+        \\fn outer(comptime Q: type) u32 {
+        \\    return get(Q);
+        \\}
+        \\test {
+        \\    _ = outer(A0);
+        \\    _ = outer(A1);
+        \\    _ = outer(A2);
+        \\    _ = outer(A3);
+        \\    _ = outer(A4);
+        \\    _ = outer(A5);
+        \\    _ = outer(A6);
+        \\    _ = outer(A7);
+        \\    _ = outer(A8);
+        \\    _ = outer(Z);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("id extra", labels);
+}
+
 test "completion through single pointers to arrays, tuples and slices" {
     // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
     const cases = [_]struct { []const u8, []const u8 }{

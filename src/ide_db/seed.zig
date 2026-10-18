@@ -52,7 +52,8 @@ pub const Subject = union(enum) { expr: Body.ExprId, binding: Body.BindingId };
 
 /// 同 `find`，但所选实例须使成员中相对位置 `rel` 处的代码会执行（如 `if (has_alpha)` 分支中，第一个调用点的实例
 /// 没有 alpha 时取下一个有的），且 `subject` 在实例下能求出具体的类型（如 `switch (Q.kind)` 中只有部分实例有
-/// 的字段）。第一个调用点满足时与 `find` 相同；否则依次尝试其他调用点的实例（`Instances`）。都不满足 `subject`
+/// 的字段）。第一个调用点满足时与 `find` 相同；否则依次尝试其他调用点的实例：先是缓存的前几个，再是全部实例
+/// （`@hasDecl(Q, "depthFallback")` 这样只有少数实例满足的分支；层数较少，与查找引用共用）。都不满足 `subject`
 /// 时退而只要求代码会执行，按全部调用点重新查找、不缓存
 pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject) resolve.Error!?Seed {
     const first = try find(r, file, item) orelse return null;
@@ -60,10 +61,14 @@ pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject
     const body = try r.ctx.get(hir.ItemBody, owner);
     const ip = r.ctx.db.env.ip;
     if (fits(ip, body, first.res, rel, subject)) return first;
-    for (try r.ctx.get(Instances, .{ .owner = owner, .depth = max_depth })) |found| {
+    const lists = [_]Instances.Key{
+        .{ .owner = owner, .depth = max_depth },
+        .{ .owner = owner, .depth = max_collect_depth, .all = true },
+    };
+    for (lists) |key| for (try r.ctx.get(Instances, key)) |found| {
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst });
         if (fits(ip, body, res, rel, subject)) return .{ .res = res, .inst = found.inst, .file = found.file, .offset = found.offset };
-    }
+    };
     if (!inactiveAt(body, first.res, rel)) return first;
     const found = try search_(r, owner, rel, max_depth) orelse return first;
     return .{
