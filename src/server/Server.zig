@@ -140,6 +140,11 @@ docs_mutex: Io.Mutex = .init,
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
 /// 当前显示着非空诊断的文件（需要时发布空列表清除）
 published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
+/// 诊断计算的序号：每次计算在读取编译结果、文本等状态之前取一个（见 `sendDiagnostics`）
+publish_seq: std.atomic.Value(u64) = .init(0),
+publish_mutex: Io.Mutex = .init,
+/// 文件 → 已发送的诊断的序号（受 publish_mutex 保护）
+sent_seq: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
 
 pub const State = enum { uninitialized, running, shutdown };
 
@@ -212,6 +217,7 @@ pub fn deinit(server: *Server) void {
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
     server.published.deinit(server.gpa);
+    server.sent_seq.deinit(server.gpa);
     server.progress.deinit(server.gpa);
     server.config.deinit(server.gpa);
     server.pending.deinit(server.gpa);
@@ -1945,6 +1951,8 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
             ctx.end();
             continue;
         }
+        // 在读取编译结果等状态之前取序号（见 `sendDiagnostics`）
+        const seq = server.publish_seq.fetchAdd(1, .acq_rel);
         const params = server.computeDiagnostics(&ctx, arena, file) catch |err| {
             ctx.end();
             switch (err) {
@@ -1956,7 +1964,7 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
         const canceled = if (ctx.checkCanceled()) |_| false else |_| true;
         ctx.end();
         if (canceled) continue;
-        server.sendDiagnostics(file, params, clear);
+        server.sendDiagnostics(file, params, clear, seq);
         return;
     }
 }
@@ -1992,7 +2000,20 @@ fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
     return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file)), backend));
 }
 
-fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool) void {
+/// 发送 `seq` 号计算的诊断，已发送过序号更大的结果时丢弃。同一文件的多个发布任务并发计算，先开始的可能后算完。
+/// 状态每次变化之后都会发起新的发布：它在变化之后取号，序号大于变化之前取号的所有计算，读到的是变化之后的状态。
+/// 所以只发送序号不小于已发送序号的结果时，最后发出的结果读到的是最后一次变化之后的状态。比较与写出都在
+/// publish_mutex 内，写出的先后与比较的结果一致；序列化在锁外进行
+fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, seq: u64) void {
+    const bytes = jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", params) catch return log.err("out of memory while building notification", .{});
+    var sent = false;
+    defer if (!sent) server.gpa.free(bytes);
+    server.publish_mutex.lockUncancelable(server.io);
+    defer server.publish_mutex.unlock(server.io);
+    if (server.sent_seq.getOrPut(server.gpa, file)) |gop| {
+        if (gop.found_existing and gop.value_ptr.* > seq) return;
+        gop.value_ptr.* = seq;
+    } else |_| {}
     {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
@@ -2005,7 +2026,39 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
             server.published.put(server.gpa, file, {}) catch {};
         }
     }
-    server.sendNotification("textDocument/publishDiagnostics", params);
+    sent = true;
+    server.send(bytes);
+}
+
+test "sendDiagnostics: a result computed earlier is not sent after a later one" {
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    const a: Vfs.FileId = @fromBackingInt(0);
+    const b: Vfs.FileId = @fromBackingInt(1);
+    const stale: types.Diagnostic = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 1 } }, .message = .{ .string = "stale" } };
+    // 第 2 次计算先算完并发送；第 1 次计算基于更旧的状态，后算完时丢弃。其他文件不受影响
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, 2);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 1);
+    server.sendDiagnostics(b, .{ .uri = "file:///b.zig", .diagnostics = &.{stale} }, true, 0);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 3);
+
+    var reader: Io.Reader = .fixed(out.written());
+    var sent: std.ArrayList(u8) = .empty;
+    defer sent.deinit(gpa);
+    while (transport.readMessage(&reader, gpa)) |body| {
+        defer gpa.free(body);
+        const msg = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer msg.deinit();
+        const params = msg.value.object.get("params").?.object;
+        const uri_text = params.get("uri").?.string;
+        try sent.print(gpa, "{s}:{d} ", .{ uri_text[uri_text.len - 5 ..], params.get("diagnostics").?.array.items.len });
+    } else |err| if (err != error.EndOfStream) return err;
+    try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 ", sent.items);
 }
 
 /// 文件所属的项目（第一个包含它的工作区），带有一个属于调用方的引用
