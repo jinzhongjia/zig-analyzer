@@ -569,7 +569,7 @@ const Inferrer = struct {
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 for (s.prongs, 0..) |prong, i| {
-                    try inf.bindSwitchCapture(prong, operand.ty);
+                    try inf.bindSwitchCapture(prong, operand, chosen != null and chosen.? == i);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
@@ -1728,18 +1728,30 @@ const Inferrer = struct {
     }
 
     /// switch 的捕获。带标签的 union：捕获为各分支项对应字段类型的 peer（与编译器一致），`else` 分支与
-    /// 求不出的分支项为 unknown；第二个捕获为标签
-    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, operand: Index) Error!void {
+    /// 求不出的分支项为 unknown；第二个捕获为标签。`chosen`：操作数 comptime 已知，这是执行的分支，捕获取
+    /// 实际的载荷值；各项的载荷类型没有 peer 时只能是 `inline` 分支（每项单独实例化，如
+    /// `inline .@"struct", .@"union" => |info|`），类型也取实际的载荷类型
+    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, operand_tv: TypedValue, chosen: bool) Error!void {
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
+        const operand = operand_tv.ty;
         const is_union = switch (ip.key(operand)) {
             .container_type => |c| c.kind == .@"union",
             .reified_type => |rt| rt.kind == .@"union",
             else => false,
         };
-        const t: Index = if (is_union) try inf.prongPayloadType(prong, operand) else operand;
+        var t: Index = if (is_union) try inf.prongPayloadType(prong, operand) else operand;
+        var val: ?Index = null;
+        if (chosen and is_union) if (operand_tv.val) |v| switch (ip.key(v)) {
+            .union_value => |u| if (try inf.unionFieldType(operand, u.tag)) |pt| {
+                if (t == .unknown) t = pt;
+                if (t == pt) val = u.payload;
+            },
+            else => {},
+        };
         const cap = prong.capture[0];
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (inf.body.binding(cap).is_ptr) try ip.ptrTo(t, .one, false) else t };
+        const is_ptr = inf.body.binding(cap).is_ptr;
+        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, false) else t, .val = if (is_ptr) null else val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
             inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag };

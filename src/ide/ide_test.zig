@@ -1820,6 +1820,37 @@ test "callsite seeding tries every instance for a branch only rare instances com
     try testing.expectEqualStrings("id extra", labels);
 }
 
+test "an inline switch prong over several tags captures the payload of the operand's tag" {
+    // 各项的载荷类型不同（`std.lang.Type.Struct` 与 `Union`），曾按 peer 求不出捕获的类型
+    const text =
+        \\const S = struct { a: u32, b: u8 };
+        \\fn count(comptime T: type) usize {
+        \\    return switch (@typeInfo(T)) {
+        \\        inline .@"struct", .@"union" => |info| info.<|>,
+        \\        else => 0,
+        \\    };
+        \\}
+        \\test {
+        \\    _ = count(S);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var found = false;
+    for (items) |it| {
+        if (std.mem.eql(u8, it.label, "field_types")) found = true;
+    }
+    try testing.expect(found);
+}
+
 test "completion through single pointers to arrays, tuples and slices" {
     // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
     const cases = [_]struct { []const u8, []const u8 }{
