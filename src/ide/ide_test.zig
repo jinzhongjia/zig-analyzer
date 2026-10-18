@@ -1327,6 +1327,28 @@ test "completion in a switch prong on @typeInfo uses a call site where the prong
     try testing.expectEqualStrings("len ptr", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+test "completion through single pointers to arrays, tuples and slices" {
+    // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f() void {\n    const prefix = \"file://\";\n    _ = prefix.<|>;\n}\n", "len" },
+        .{ "fn f() void {\n    const t = .{ 1, 2 };\n    const p = &t;\n    _ = p.<|>;\n}\n", "@\"0\" @\"1\" len" },
+        .{ "fn f(s: *[]const u8) void {\n    _ = s.<|>;\n}\n", "len ptr" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = try completion.complete(&r, added.file, added.cursor);
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        try testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items));
+    }
+}
+
 test "goto declaration on names that declare themselves: error set members and anonymous fields" {
     const text =
         \\const Error = error{ Timeout, Closed };

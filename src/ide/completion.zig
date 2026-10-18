@@ -193,15 +193,21 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
         return members(r, out, ns, ns.file == from);
     }
     var t = tv.ty;
+    // 单指针自动解引用一次：`*[N]T` 的 len、`*S` 的字段与方法、`*[]T` 的 len 与 ptr
     switch (ip.key(t)) {
-        .ptr_type => |p| switch (p.size) {
-            .one => t = p.child,
-            .slice => {
+        .ptr_type => |p| if (p.size == .one) {
+            t = p.child;
+        },
+        else => {},
+    }
+    switch (ip.key(t)) {
+        .ptr_type => |p| {
+            // 指向指针的单指针与多元素指针没有成员
+            if (p.size == .slice) {
                 try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
                 try out.add(.{ .label = "ptr", .kind = .field });
-                return;
-            },
-            else => return,
+            }
+            return;
         },
         .array_type => return out.add(.{ .label = "len", .kind = .field, .detail = "usize" }),
         // 元组、匿名结构体、构造的结构体与 union：字段
