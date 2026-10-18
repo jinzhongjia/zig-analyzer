@@ -257,12 +257,16 @@ fn diffRegion(old: []const u8, new: []const u8) Edit {
     return .{ .start = @intCast(prefix), .old_end = @intCast(old.len - suffix), .new_end = @intCast(new.len - suffix) };
 }
 
-/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与修改区域相交返回 null
+/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与修改区域相交返回 null。
+/// 编译器给出的区间不一定合法（终点在起点之前、远超出文本）：平移后超出 u32 的同样返回 null
 fn remap(e: Edit, start: u32, end: u32) ?[2]u32 {
     if (end <= e.start) return .{ start, end };
     if (start >= e.old_end) {
         const delta = @as(i64, e.new_end) - @as(i64, e.old_end);
-        return .{ @intCast(@as(i64, start) + delta), @intCast(@as(i64, end) + delta) };
+        return .{
+            std.math.cast(u32, @as(i64, start) + delta) orelse return null,
+            std.math.cast(u32, @as(i64, end) + delta) orelse return null,
+        };
     }
     return null;
 }

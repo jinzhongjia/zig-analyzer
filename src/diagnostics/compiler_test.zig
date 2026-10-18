@@ -121,6 +121,29 @@ test "merge: live diagnostics plus remapped Sema errors with unsaved edits" {
     try testing.expectEqualStrings("zig ast-check@1:8: unused local variable", msgs2[0]);
 }
 
+test "merge: malformed compiler spans do not overflow when remapped" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sema_start: u32 = @intCast(std.mem.indexOf(u8, main_text, "\"s\"").?);
+    // 防止平移时溢出而 panic：接近 u32 上限的区间后移、终点在起点之前的区间前移后不在 u32 范围内，丢弃
+    const result: compiler.FileResult = .{ .base_text = main_text, .items = &.{
+        .{ .start = sema_start, .end = sema_start + 3, .message = "sema error", .is_astgen = false, .notes = &.{} },
+        .{ .start = std.math.maxInt(u32) - 1, .end = std.math.maxInt(u32), .message = "past the end", .is_astgen = false, .notes = &.{} },
+        .{ .start = 30, .end = 1, .message = "end before start", .is_astgen = false, .notes = &.{} },
+    } };
+    // 在开头插入：区间后移
+    const msgs = try mergeMessages(a, try std.mem.concat(a, u8, &.{ "// x\n", main_text }), false, &result);
+    try testing.expectEqual(2, msgs.len);
+    try testing.expectEqualStrings("zig@3:19: sema error", msgs[0]);
+    try testing.expect(std.mem.endsWith(u8, msgs[1], "end before start"));
+    // 删去开头：区间前移
+    const msgs2 = try mergeMessages(a, main_text[4..], false, &result);
+    try testing.expectEqual(2, msgs2.len);
+    try testing.expectEqualStrings("zig@2:19: sema error", msgs2[0]);
+    try testing.expect(std.mem.endsWith(u8, msgs2[1], "past the end"));
+}
+
 test "merge: live only without build result; no live outside the compile set" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
