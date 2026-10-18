@@ -54,8 +54,13 @@ pub const Result = struct {
     /// 同一块中 noreturn 语句之后的语句（相对 owner 的范围）：同样不编译。如被选中的
     /// `if (!@hasDecl(T, "x")) @compileError(...);`、comptime 条件下的 `return` 之后的代码
     dead_spans: []const Body.Range = &.{},
+    /// 类型为枚举字面量的参数（anytype 收到的 `.x`）在函数体中被转换成的类型，每个参数取第一处：调用处的
+    /// 字面量引用这个类型中的成员（`testing.expectEqual(.x, actual)` 经 `@TypeOf(expected, actual)` 转换为
+    /// actual 的类型）
+    param_coercions: []const ParamCoercion = &.{},
 
     pub const LiteralExpected = struct { expr: ExprId, ty: Index };
+    pub const ParamCoercion = struct { param: u32, ty: Index };
 
     pub const FieldRef = struct {
         /// `init` 表达式
@@ -66,7 +71,7 @@ pub const Result = struct {
     };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -123,7 +128,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const literal_expected = try a.dupe(Result.LiteralExpected, inf.literal_expected.items);
     const inactive = try a.dupe(ExprId, inf.inactive.items);
     const dead_spans = try a.dupe(Body.Range, inf.dead_spans.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans };
+    const param_coercions = try a.dupe(Result.ParamCoercion, inf.param_coercions.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions };
 }
 
 /// 只推导成员 `owner` 中的一个局部绑定或 comptime 表达式（见 `queries.LocalValue`）
@@ -225,6 +231,8 @@ const Inferrer = struct {
     inactive: std.ArrayList(ExprId) = .empty,
     /// 见 `Result.dead_spans`
     dead_spans: std.ArrayList(Body.Range) = .empty,
+    /// 见 `Result.param_coercions`
+    param_coercions: std.ArrayList(Result.ParamCoercion) = .empty,
     /// 实例上下文（owner 自身或外层泛型函数的实例）
     inst: ?Index,
     /// 见 `LoopSeed`
@@ -418,7 +426,27 @@ const Inferrer = struct {
         inf.exprs[i] = tv;
         // 转换为枚举 / union 的枚举字面量（`.red`、`switch` 的 `.a =>`）引用对应的成员
         if (inf.members[i] == null and inf.body.expr(e) == .enum_literal) try inf.recordTagMember(e, tv.ty);
+        if (raw.ty == .enum_literal_type) if (expected) |want| try inf.noteParamCoercion(e, want);
         return tv;
+    }
+
+    /// 见 `Result.param_coercions`：`e` 是对本成员参数的引用，以期望类型 `want` 使用
+    fn noteParamCoercion(inf: *Inferrer, e: ExprId, want: Index) Error!void {
+        if (want == .unknown or want == .enum_literal_type) return;
+        const b = inf.body;
+        const name = switch (b.expr(e)) {
+            .name_ref => |n| n,
+            else => return,
+        };
+        const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return;
+        const l = switch (def) {
+            .local => |l| l,
+            else => return,
+        };
+        if (l.file != inf.file or l.item != inf.item) return;
+        const param: u32 = @intCast(std.mem.indexOfScalar(Body.BindingId, b.params, l.binding) orelse return);
+        for (inf.param_coercions.items) |pc| if (pc.param == param) return;
+        try inf.param_coercions.append(inf.scratch, .{ .param = param, .ty = want });
     }
 
     /// comptime 上下文中的表达式（类型标注、参数与返回类型、数组长度）。推导求不出值时，在最外层
@@ -1024,7 +1052,30 @@ const Inferrer = struct {
         for (args, 0..) |a, i| if (g.kind(i + skip) == .runtime) {
             _ = try inf.infer(a, instParamType(sig, g.body, i + skip) orelse inf.concrete(paramType(f, i + skip)));
         };
-        return inf.callResult(g, inst, sig, try inf.argValues(callee_e, args, skip, g.body.params.len));
+        const result = try inf.callResult(g, inst, sig, try inf.argValues(callee_e, args, skip, g.body.params.len));
+        try inf.literalArgTargets(g, inst, args, skip);
+        return result;
+    }
+
+    /// anytype 形参收到的枚举字面量（`testing.expectEqual(.x, actual)`）：被调函数的实例把参数转换为哪个类型，
+    /// 字面量就引用其中的成员，并以它为期望类型（补全、构造类型的成员）
+    fn literalArgTargets(inf: *Inferrer, g: Generic, inst: Index, args: []const ExprId, skip: usize) Error!void {
+        var full: ?*const Result = null;
+        for (args, 0..) |a, i| {
+            switch (g.kind(i + skip)) {
+                .anytype_type, .comptime_anytype => {},
+                else => continue,
+            }
+            if (inf.body.expr(a) != .enum_literal or inf.members[@backingInt(a)] != null) continue;
+            if (inf.get(a).ty != .enum_literal_type) continue;
+            const res = full orelse try inf.r.ctx.get(queries.Infer, .{ .owner = g.owner, .mode = .full, .inst = inst });
+            full = res;
+            for (res.param_coercions) |pc| if (pc.param == i + skip) {
+                try inf.literal_expected.append(inf.scratch, .{ .expr = a, .ty = pc.ty });
+                try inf.recordTagMember(a, pc.ty);
+                break;
+            };
+        }
     }
 
     /// 与形参一一对应的实参（方法调用的接收者在最前）
@@ -2423,6 +2474,12 @@ const Inferrer = struct {
                 continue;
             }
             if (t == .comptime_float_type and ip.isFloat(cur)) continue;
+            // 枚举字面量与枚举或带标签的 union：取后者
+            if (cur == .enum_literal_type and isTagged(ip, t)) {
+                result = t;
+                continue;
+            }
+            if (t == .enum_literal_type and isTagged(ip, cur)) continue;
             // 整数之间：同符号取较宽者（位宽相同取前者），无符号且较窄时放入有符号，与编译器一致
             if (value.peerIntType(ip, cur, t)) |p| {
                 result = p;
@@ -2451,6 +2508,16 @@ const Inferrer = struct {
         const t = result orelse return if (has_null) .null_type else if (types.len != 0 and allNoreturn(types)) .noreturn_type else .void_type;
         if (has_null and ip.key(t) != .optional_type) return ip.optionalOf(t);
         return t;
+    }
+
+    /// 枚举字面量可以转换到的类型：枚举与 union
+    fn isTagged(ip: *InternPool, t: Index) bool {
+        if (value.isEnumType(ip, t)) return true;
+        return switch (ip.key(t)) {
+            .container_type => |c| c.kind == .@"union",
+            .reified_type => |rt| rt.kind == .@"union",
+            else => false,
+        };
     }
 
     fn allNoreturn(types: []const Index) bool {

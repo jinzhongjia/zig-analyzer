@@ -310,6 +310,30 @@ test "references in generic bodies use the instance a comptime type argument dis
     try testing.expectEqualStrings("queries:2:take* queries:9:take", try refs(&w, fs, queries_file, at(queries_src, "take", 0), null));
 }
 
+test "references to enum members include literals that a generic callee converts to the enum" {
+    // anytype 形参收到的 `.green` 经被调函数中的 `@TypeOf(expected, actual)` 转换：曾不算引用，重命名漏改
+    const src =
+        \\const Color = enum { red, green };
+        \\fn expectEqual(expected: anytype, actual: anytype) !void {
+        \\    const T = @TypeOf(expected, actual);
+        \\    return expectEqualInner(T, expected, actual);
+        \\}
+        \\fn expectEqualInner(comptime T: type, expected: T, actual: T) !void {
+        \\    if (expected != actual) return error.TestExpectedEqual;
+        \\}
+        \\test {
+        \\    const c: Color = .green;
+        \\    try expectEqual(.green, c);
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:green* x:10:green x:11:green", try refs(&w, fs, f, at(src, "green", 0), null));
+}
+
 test "references to tagged union fields through the type and error union results" {
     const src =
         \\const Value = union(enum) { null_val: void, int: i64 };

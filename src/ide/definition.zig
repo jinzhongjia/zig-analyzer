@@ -138,8 +138,9 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
             break :blk .{ fa.field orelse return null, ty };
         },
         .enum_literal => |n| blk: {
-            // 结果类型为 `?E`、`E!T` 时取 E
+            // 结果类型为 `?E`、`E!T` 时取 E；传给 anytype 形参的字面量取被调函数中转换成的类型
             var ty = a.exprType(e).ty;
+            if (ty == .enum_literal_type) ty = a.literalExpected(e) orelse return null;
             while (true) switch (ip.key(ty)) {
                 .optional_type => |child| ty = child,
                 .error_union_type => |eu| ty = eu.payload,

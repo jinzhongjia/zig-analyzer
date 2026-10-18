@@ -253,6 +253,56 @@ test "goto declaration of reified fields named by comptime parsed strings" {
     }
 }
 
+test "goto declaration of enum literals passed to anytype parameters that the callee converts" {
+    // `testing.expectEqual(.x, actual)` 中的字面量由被调函数经 `@TypeOf(expected, actual)` 转换：曾没有跳转目标
+    const text =
+        \\const Color = enum { red, green };
+        \\const names = [_][:0]const u8{ "fast", "slow" };
+        \\const Mode = @Enum(u8, .exhaustive, &names, &[_]u8{ 0, 1 });
+        \\fn expectEqual(expected: anytype, actual: anytype) !void {
+        \\    const T = @TypeOf(expected, actual);
+        \\    return expectEqualInner(T, expected, actual);
+        \\}
+        \\fn expectEqualInner(comptime T: type, expected: T, actual: T) !void {
+        \\    if (expected != actual) return error.TestExpectedEqual;
+        \\}
+        \\test {
+        \\    const c: Color = .green;
+        \\    try expectEqual(.green, c);
+        \\    const m: Mode = .slow;
+        \\    try expectEqual(.slow, m);
+        \\    try expectEqual(.red, @as(?Color, c));
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "green, c", "green }" },
+        // 构造的枚举：名字的字符串字面量
+        .{ "slow, m", "slow\" }" },
+        // peer type 为 optional
+        .{ "red, @as", "red, green" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.definition(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..t.end] });
+            return err;
+        };
+    }
+}
+
 test "goto declaration of reified enum members named by string literals or @typeInfo" {
     // `@Enum` 构造的枚举（如 SyntaxKind）的成员曾没有跳转目标
     const kind_text =
