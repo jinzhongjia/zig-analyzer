@@ -6,6 +6,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
 const live = @import("live.zig");
+const Vfs = @import("../base/Vfs.zig");
 
 /// 一次构建中某个文件的编译器诊断
 pub const FileResult = struct {
@@ -52,6 +53,8 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 
 /// 把一组 ErrorBundle 转换为按文件组织的结果。
 /// `src_path` 为相对路径时相对于 `build_root`；没有位置信息的错误（如链接错误）挂在 `fallback_path`（通常是 build.zig）的开头。
+/// `src_path` 解析后不是绝对路径时（格式不符的错误包，见 `absolute`）按没有位置处理：错误挂在 `fallback_path`
+/// 的开头，附注与引用链放在错误的起点。
 pub fn collect(
     gpa: Allocator,
     bundles: []const ErrorBundle,
@@ -84,9 +87,11 @@ pub fn collect(
             var end: u32 = 0;
             if (msg.src_loc != .none) {
                 const loc = eb.getSourceLocation(msg.src_loc);
-                path = try absolute(a, build_root, eb.nullTerminatedString(loc.src_path));
-                start = loc.span_start;
-                end = loc.span_end;
+                if (try absolute(a, build_root, eb.nullTerminatedString(loc.src_path))) |p| {
+                    path = p;
+                    start = loc.span_start;
+                    end = loc.span_end;
+                }
             }
             const key = try std.fmt.allocPrint(a, "{s}\x00{d}\x00{d}\x00{s}", .{ path, start, end, message });
             const seen_gop = try seen.getOrPut(a, key);
@@ -103,9 +108,11 @@ pub fn collect(
                 note.* = .{ .path = path, .start = start, .end = start, .message = try a.dupe(u8, eb.nullTerminatedString(n.msg)) };
                 if (n.src_loc != .none) {
                     const nl = eb.getSourceLocation(n.src_loc);
-                    note.path = try absolute(a, build_root, eb.nullTerminatedString(nl.src_path));
-                    note.start = nl.span_start;
-                    note.end = nl.span_end;
+                    if (try absolute(a, build_root, eb.nullTerminatedString(nl.src_path))) |p| {
+                        note.path = p;
+                        note.start = nl.span_start;
+                        note.end = nl.span_end;
+                    }
                 }
             }
             if (refs != 0) try referenceTrace(a, eb, msg.src_loc, build_root, path, start, notes[msg.notes_len..]);
@@ -147,9 +154,11 @@ fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLoca
         note.* = .{ .path = path, .start = start, .end = start, .message = "" };
         if (ref_loc != .none) {
             const rl = eb.getSourceLocation(ref_loc);
-            note.path = try absolute(a, build_root, eb.nullTerminatedString(rl.src_path));
-            note.start = rl.span_start;
-            note.end = rl.span_end;
+            if (try absolute(a, build_root, eb.nullTerminatedString(rl.src_path))) |p| {
+                note.path = p;
+                note.start = rl.span_start;
+                note.end = rl.span_end;
+            }
             note.message = try std.fmt.allocPrint(a, "referenced by: {s}", .{eb.nullTerminatedString(decl_name)});
         } else if (decl_name != 0) {
             // 隐藏标记：`decl_name` 为隐藏的引用数
@@ -166,9 +175,11 @@ fn addCompileLog(a: Allocator, item: *Item, compile_log: []const u8) Allocator.E
     item.compile_log = if (item.compile_log.len == 0) compile_log else try std.mem.join(a, "\n", &.{ item.compile_log, compile_log });
 }
 
-fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error![]const u8 {
-    if (std.fs.path.isAbsolute(path)) return std.fs.path.resolveAlloc(a, &.{path});
-    return std.fs.path.resolveAlloc(a, &.{ base, path });
+/// `path` 相对于 `base` 的绝对路径。结果作为文件驻留到 Vfs，必须是绝对路径；`path` 来自子进程回传的错误包，
+/// 内容不受校验，解析后不是绝对路径时返回 null（例如格式不符时路径下标指向源码行中间的 `x: u32 = 1;`，在
+/// Windows 上它是另一驱动器的相对路径）
+fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error!?[]const u8 {
+    return Vfs.resolve(.native, a, base, path);
 }
 
 /// 合并同一文件在多次编译中的结果（单文件模式下 import 它的各个根文件分别编译）。`results` 按编译完成的

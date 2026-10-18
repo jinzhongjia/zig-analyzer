@@ -272,7 +272,10 @@ fn collectIfValid(eb: ErrorBundle) !bool {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    for (r.files.values()) |*fr| {
+    for (r.files.keys(), r.files.values()) |path, *fr| {
+        // 结果中的路径会驻留到 Vfs，必须是绝对路径
+        try testing.expect(std.fs.path.isAbsolute(path));
+        for (fr.items) |item| for (item.notes) |n| try testing.expect(std.fs.path.isAbsolute(n.path));
         for ([_][]const u8{ fr.base_text, try std.mem.concat(a, u8, &.{ "// x\n", fr.base_text }) }) |text| {
             _ = try compiler.merge(a, .{
                 .text = text,
@@ -318,6 +321,46 @@ test "collect: every mutation of an error bundle that passes validation can be c
         if (try collectIfValid(.{ .string_bytes = strings, .extra = extra[0..n] })) accepted += 1;
     }
     try testing.expect(accepted > 0);
+}
+
+test "collect: paths that do not resolve to absolute paths count as missing locations" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    // 格式不符的错误包中路径下标可能指向任意字符串。在 Windows 上它们是另一驱动器的相对路径，解析后不是
+    // 绝对路径；防止把它们作为文件驻留（`Vfs.intern` 要求绝对路径，否则 panic）
+    const ref_loc = try location(&wip, "D:caller.zig", caller_text, "m.main()", 0);
+    const note_loc = try location(&wip, "::", main_text, "x", 0);
+    const err_loc = try location(&wip, "x: u32 = 1;", main_text, "\"s\"", 1);
+    try wip.addReferenceTrace(.{ .decl_name = try wip.addString("f"), .src_loc = ref_loc });
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("a note"), .src_loc = note_loc }},
+    );
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.deinit(gpa);
+
+    try testing.expectEqual(1, r.files.count());
+    const path = r.files.keys()[0];
+    try testing.expect(std.fs.path.isAbsolute(path));
+    const item = r.files.values()[0].items[0];
+    try testing.expectEqual(2, item.notes.len);
+    for (item.notes) |n| try testing.expect(std.fs.path.isAbsolute(n.path));
+    try testing.expectEqualStrings("referenced by: f", item.notes[1].message);
+    if (@import("builtin").os.tag == .windows) {
+        // 按没有位置处理：错误挂在 build.zig 的开头，附注与引用链放在错误的起点
+        try testing.expectEqualStrings(native("/proj/build.zig"), path);
+        try testing.expectEqual(0, item.start);
+        try testing.expectEqual(0, item.end);
+        for (item.notes) |n| {
+            try testing.expectEqualStrings(path, n.path);
+            try testing.expectEqual(0, n.start);
+            try testing.expectEqual(0, n.end);
+        }
+    }
 }
 
 test "combine: results of several compilations of the same file" {

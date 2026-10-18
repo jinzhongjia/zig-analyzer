@@ -12,6 +12,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 const ServerMessage = std.zig.Server.Message;
 const ClientMessage = std.zig.Client.Message;
 const error_bundle = @import("error_bundle.zig");
+const Vfs = @import("../base/Vfs.zig");
 
 const log = std.log.scoped(.bsp);
 
@@ -457,7 +458,8 @@ fn receiveSingleFile(gpa: Allocator, r: *Io.Reader, file_path: []const u8) !Sing
                     if (prefixed.len < 2) continue;
                     const prefix = std.enums.fromInt(ServerMessage.PathPrefix, prefixed[0] -% 1) orelse continue;
                     if (prefix != .cwd and prefix != .build_root) continue;
-                    const p = try std.fs.path.resolveAlloc(gpa, &.{ dir, prefixed[1..] });
+                    // 格式不符时路径可能是任意字符串：解析后不是绝对路径的（见 `Vfs.resolve`）不能驻留，跳过
+                    const p = try Vfs.resolve(.native, gpa, dir, prefixed[1..]) orelse continue;
                     errdefer gpa.free(p);
                     try inputs.append(gpa, p);
                 }
@@ -674,4 +676,30 @@ test "single-file mode: a malformed error bundle is discarded, the files read ar
     try testing.expectEqual(0, result.errors.extra.len);
     try testing.expectEqual(1, result.inputs.len);
     try testing.expectEqualStrings(file, result.inputs[0]);
+}
+
+test "single-file mode: files read that do not resolve to absolute paths are skipped" {
+    const gpa = testing.allocator;
+    const file = native("/proj/one.zig");
+    // 格式不符时路径可能是任意字符串。在 Windows 上 `D:x.zig` 与 `::` 是另一驱动器的相对路径，解析后不是绝对
+    // 路径；防止把它们交给 `Vfs.intern`（要求绝对路径，否则 panic）
+    var inputs_buf: [64]u8 = undefined;
+    var inputs: Io.Writer = .fixed(&inputs_buf);
+    for ([_][]const u8{ "one.zig", "D:x.zig", "::" }) |p| {
+        try inputs.writeByte(@backingInt(ServerMessage.PathPrefix.cwd) + 1);
+        try inputs.writeAll(p);
+        try inputs.writeByte(0);
+    }
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.writeStruct(ServerMessage.Header{ .tag = .file_system_inputs, .bytes_len = @intCast(inputs.buffered().len) }, .little);
+    try w.writeAll(inputs.buffered());
+    try w.writeStruct(ServerMessage.Header{ .tag = .emit_digest, .bytes_len = 0 }, .little);
+
+    var r: Io.Reader = .fixed(w.buffered());
+    var result = try receiveSingleFile(gpa, &r, file);
+    defer result.deinit(gpa);
+    try testing.expectEqualStrings(file, result.inputs[0]);
+    for (result.inputs) |input| try testing.expect(std.fs.path.isAbsolute(input));
+    try testing.expectEqual(@as(usize, if (native_os == .windows) 1 else 3), result.inputs.len);
 }
