@@ -622,6 +622,11 @@ test "generated module roots: local cache directory moved with --cache-dir" {
     try testing.expect(result == .object);
     const value = result.object.get("contents").?.object.get("value").?.string;
     try testing.expect(std.mem.indexOf(u8, value, "answer: u32 = 42") != null);
+    // 生成文件位于构建根目录下的 altcache 中，不能重命名（maker 会覆盖改动）
+    const rename_at = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 2, .character = 14 } };
+    try testing.expect((try h.request("textDocument/prepareRename", rename_at)).object.get("error") != null);
+    const rename = .{ .textDocument = rename_at.textDocument, .position = rename_at.position, .newName = "answer2" };
+    try testing.expect((try h.request("textDocument/rename", rename)).object.get("error") != null);
     try shutdown(&h);
 }
 

@@ -2584,6 +2584,13 @@ fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     const path = server.vfs.path(file);
     // 未保存的文档（`untitled:` 等）只存在于编辑器中
     if (isVirtual(path)) return true;
+    // 生成文件：`--cache-dir` / `ZIG_LOCAL_CACHE_DIR` 可以把本地缓存目录移到 `.zig-cache` 以外。
+    // 与 `workspaceFor` 相同，在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex 后 ws.mutex）
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        for (server.workspaces.items) |ws| if (ws.inLocalCache(path)) return false;
+    }
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
     for (server.roots.items) |root| {

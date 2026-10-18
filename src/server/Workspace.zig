@@ -245,6 +245,15 @@ pub fn owns(ws: *Workspace, file: FileId) bool {
     return isUnder(ws.server.vfs.path(file), ws.root);
 }
 
+/// `path` 是否位于 maker 使用的本地缓存目录（生成文件所在处，不一定是 `<构建根>/.zig-cache`）中。
+/// 本地缓存目录包含构建根目录时无法区分生成文件与项目文件，返回 false
+pub fn inLocalCache(ws: *Workspace, path: []const u8) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const cache = if (ws.model) |*m| m.local_cache_root else return false;
+    return cache.len != 0 and !isUnder(ws.root, cache) and isUnder(path, cache);
+}
+
 /// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件与构建脚本发布（与编译器一致）
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
