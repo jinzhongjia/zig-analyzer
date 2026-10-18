@@ -67,40 +67,53 @@ pub fn decode(gpa: Allocator, tag: ServerMessage.Tag, body: []const u8) DecodeEr
     switch (tag) {
         .bsp_handshake => return .{ .handshake = r.takeStruct(ServerMessage.Handshake, .little) catch return error.InvalidMessage },
         .bsp_configuration => return .{ .configuration = try gpa.dupe(u8, body) },
-        .bsp_configuration_failed => {
-            const eb = std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.EndOfStream => return error.InvalidMessage,
-            };
-            return .{ .configuration_failed = checked(gpa, eb, "zig build (configuration)", .{}) };
-        },
+        .bsp_configuration_failed => return .{ .configuration_failed = checked(gpa, try allocErrorBundle(gpa, body), "zig build (configuration)", .{}) },
         .bsp_build_started => return .build_started,
         .bsp_build_completed => return .build_completed,
         .bsp_step_started => return .{ .step_started = r.takeInt(u32, .little) catch return error.InvalidMessage },
         .bsp_step_completed => {
             const hdr = r.takeStruct(ServerMessage.BuildStepCompleted, .little) catch return error.InvalidMessage;
-            const eb_len = hdr.error_bundle.extra_len;
-            const extra = try gpa.alloc(u32, eb_len);
-            errdefer gpa.free(extra);
-            r.readSliceEndian(u32, extra, .little) catch return error.InvalidMessage;
-            const strings = try gpa.alloc(u8, hdr.error_bundle.string_bytes_len);
-            errdefer gpa.free(strings);
-            r.readSliceAll(strings) catch return error.InvalidMessage;
+            const eb = try readErrorBundle(gpa, &r, hdr.error_bundle);
+            errdefer {
+                var owned = eb;
+                owned.deinit(gpa);
+            }
             const generated = try decodeGenerated(gpa, &r, hdr.generated_files_len);
             const step = @backingInt(hdr.step_index);
             return .{ .step_completed = .{
                 .step = step,
                 .status = hdr.status,
-                .errors = if (eb_len == 0) blk: {
-                    gpa.free(extra);
-                    gpa.free(strings);
-                    break :blk .empty;
-                } else checked(gpa, .{ .string_bytes = strings, .extra = extra }, "zig build (step {d})", .{step}),
+                .errors = checked(gpa, eb, "zig build (step {d})", .{step}),
                 .generated = generated,
             } };
         },
         else => return null,
     }
+}
+
+/// 以 `ServerMessage.ErrorBundle` 头部开始的消息体中的错误包（见 `readErrorBundle`）
+fn allocErrorBundle(gpa: Allocator, body: []const u8) DecodeError!ErrorBundle {
+    var r: Io.Reader = .fixed(body);
+    const hdr = r.takeStruct(ServerMessage.ErrorBundle, .little) catch return error.InvalidMessage;
+    return readErrorBundle(gpa, &r, hdr);
+}
+
+/// 按头部给出的长度从消息体的读取器 `r` 中读取错误包；`extra` 为空时返回空的错误包。长度超出剩余的字节时
+/// （如格式与 zig-analyzer 编译时的标准库不符，长度是任意值）在分配之前返回 `error.InvalidMessage`
+fn readErrorBundle(gpa: Allocator, r: *Io.Reader, hdr: ServerMessage.ErrorBundle) DecodeError!ErrorBundle {
+    if (@as(u64, hdr.extra_len) * @sizeOf(u32) + hdr.string_bytes_len > r.bufferedLen()) return error.InvalidMessage;
+    const extra = try gpa.alloc(u32, hdr.extra_len);
+    errdefer gpa.free(extra);
+    r.readSliceEndian(u32, extra, .little) catch return error.InvalidMessage;
+    const strings = try gpa.alloc(u8, hdr.string_bytes_len);
+    errdefer gpa.free(strings);
+    r.readSliceAll(strings) catch return error.InvalidMessage;
+    if (extra.len == 0) {
+        gpa.free(extra);
+        gpa.free(strings);
+        return .empty;
+    }
+    return .{ .string_bytes = strings, .extra = extra };
 }
 
 /// 子进程回传的错误包：不合法时（如格式与 zig-analyzer 编译时的标准库不符）释放、记录日志并改用空的错误包，
@@ -445,10 +458,7 @@ fn receiveSingleFile(gpa: Allocator, r: *Io.Reader, file_path: []const u8) !Sing
         const body = try r.readAlloc(gpa, header.bytes_len);
         defer gpa.free(body);
         var errors: ErrorBundle = switch (header.tag) {
-            .error_bundle => checked(gpa, std.zig.Server.allocErrorBundle(gpa, body) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.EndOfStream => return error.InvalidMessage,
-            }, "zig build-obj {s}", .{file_path}),
+            .error_bundle => checked(gpa, try allocErrorBundle(gpa, body), "zig build-obj {s}", .{file_path}),
             .emit_digest => .empty,
             .file_system_inputs => {
                 // 以 0 分隔的路径，第一个字节是路径前缀（`PathPrefix` 加一）。单独编译时 cwd 与构建根目录都是
@@ -576,6 +586,29 @@ test "decode: a malformed error bundle is discarded, the rest of the message is 
     var failed = (try decode(gpa, .bsp_configuration_failed, w.buffered())).?;
     defer failed.deinit(gpa);
     try testing.expectEqual(0, failed.configuration_failed.extra.len);
+}
+
+test "decode: error bundle lengths beyond the message are rejected before allocating" {
+    // 曾按头部的长度先分配再读取：格式不符时长度是任意值，一次分配可达 16 GiB
+    var small: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&small);
+    const gpa = fba.allocator();
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.writeStruct(ServerMessage.BuildStepCompleted{
+        .step_index = @fromBackingInt(1),
+        .status = .failure,
+        .error_bundle = .{ .extra_len = std.math.maxInt(u32), .string_bytes_len = 8 },
+        .generated_files_len = 0,
+    }, .little);
+    try w.writeAll("garbage!");
+    try testing.expectError(error.InvalidMessage, decode(gpa, .bsp_step_completed, w.buffered()));
+
+    w = .fixed(&buf);
+    try w.writeStruct(ServerMessage.ErrorBundle{ .extra_len = 3, .string_bytes_len = std.math.maxInt(u32) }, .little);
+    try w.writeAll("garbage!");
+    try testing.expectError(error.InvalidMessage, decode(gpa, .bsp_configuration_failed, w.buffered()));
+    try testing.expectError(error.InvalidMessage, allocErrorBundle(gpa, w.buffered()));
 }
 
 test "decode other messages" {
