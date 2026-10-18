@@ -771,10 +771,20 @@ pub fn main(init: std.process.Init) !u8 {
     const a = c.arena.allocator();
     if (init.environ_map.get("BENCH_CONFIG")) |cfg| c.config = try json.parseFromSliceLeaky(json.Value, a, cfg, .{});
     const root_uri = try za.base.uri.fromPath(a, root);
-    _ = try c.request("initialize", .{
+    // 样例位置与校验中的列号都是字节偏移：位置须按 UTF-8 计数，否则含多字节字符的行上错位
+    const init_resp, _ = try c.request("initialize", .{
         .rootUri = root_uri,
-        .capabilities = .{ .workspace = .{ .configuration = true }, .window = .{ .workDoneProgress = true } },
+        .capabilities = .{
+            .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
+            .workspace = .{ .configuration = true },
+            .window = .{ .workDoneProgress = true },
+        },
     });
+    const encoding = init_resp.object.get("result").?.object.get("capabilities").?.object.get("positionEncoding");
+    if (encoding == null or encoding.? != .string or !std.mem.eql(u8, encoding.?.string, "utf-8")) {
+        std.debug.print("error: the server does not count positions in UTF-8\n", .{});
+        return 1;
+    }
     std.debug.print("cold start\n  initialize   {d:.1}ms\n", .{ms(io, t_spawn)});
     try c.notify("initialized", struct {}{});
 
