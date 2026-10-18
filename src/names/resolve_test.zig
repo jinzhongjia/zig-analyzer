@@ -78,6 +78,20 @@ pub const World = struct {
         defer ctx.end();
         var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
         const t = try definition.definition(&r, file, offset) orelse return "null";
+        return w.targetLabel(&ctx, t);
+    }
+
+    /// `definition.definitionTargets` / `declarationTargets` 的结果：各目标的「文件名:目标文本」，以空格连接
+    fn gotoAll(w: *World, file: FileId, offset: u32, comptime find: anytype) ![]const u8 {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (try find(&r, file, offset)) |t| try labels.append(w.arena.allocator(), try w.targetLabel(&ctx, t));
+        return std.mem.join(w.arena.allocator(), " ", labels.items);
+    }
+
+    fn targetLabel(w: *World, ctx: *Db.Ctx, t: definition.Target) ![]const u8 {
         const text = (try ctx.get(database.syntax.SourceText, t.file)).text;
         return std.fmt.allocPrint(w.arena.allocator(), "{s}:{s}", .{ std.fs.path.basename(w.vfs.path(t.file)), text[t.start..t.end] });
     }
@@ -228,6 +242,63 @@ test "imports of a file in several modules" {
     // 两个模块都 import 的名字取优先的模块中的
     try testing.expectEqualStrings("a.zig:fromA", try w.goto(main.file, at(text, "fromA")));
     try testing.expectEqualStrings("builtin dep helper root std", try w.complete(main.file, main.cursor));
+}
+
+test "goto on a module import that differs between the modules of a file lists every target" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const exe_cfg = try w.add("/p/exe_cfg.zig", "pub const mode = 1;\n");
+    const test_cfg = try w.add("/p/test_cfg.zig", "pub const mode = 2;\n");
+    const util = try w.add("/p/util.zig", "pub fn helper() void {}\n");
+    _ = try w.add("/p/src/local.zig", "pub fn run() void {}\n");
+    const src =
+        \\const cfg = @import("cfg");
+        \\const util = @import("util");
+        \\const local = @import("local.zig");
+        \\pub fn main() void {
+        \\    _ = cfg.mode;
+        \\    util.helper();
+        \\    local.run();
+        \\}
+    ;
+    const main = try w.add("/p/src/main.zig", src);
+    // exe 的模块（0）与 test 的模块（1）共用根文件：cfg 的目标不同，util 的相同
+    try w.setGraph(null, &.{
+        .{ .root = main.file, .imports = &.{ .{ .name = "cfg", .module = 2 }, .{ .name = "util", .module = 4 } } },
+        .{ .root = main.file, .imports = &.{ .{ .name = "cfg", .module = 3 }, .{ .name = "util", .module = 4 } } },
+        .{ .root = exe_cfg.file, .imports = &.{} },
+        .{ .root = test_cfg.file, .imports = &.{} },
+        .{ .root = util.file, .imports = &.{} },
+    }, &.{
+        .{ .file = main.file, .module = 0, .root_module = 0, .others = &.{1} },
+        .{ .file = exe_cfg.file, .module = 2, .root_module = 0 },
+        .{ .file = test_cfg.file, .module = 3, .root_module = 1 },
+        .{ .file = util.file, .module = 4, .root_module = 0 },
+    });
+    const at = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, src, needle).?);
+        }
+    }.of;
+    // `@import` 与它的字符串上：每个模块的目标，按模块的优先级
+    for ([_]u32{ at("\"cfg\"") + 1, at("@import(\"cfg") + 1 }) |offset| {
+        try testing.expectEqualStrings("exe_cfg.zig: test_cfg.zig:", try w.gotoAll(main.file, offset, definition.definitionTargets));
+        try testing.expectEqualStrings("exe_cfg.zig: test_cfg.zig:", try w.gotoAll(main.file, offset, definition.declarationTargets));
+        // 单个目标的入口取最优先的模块中的
+        try testing.expectEqualStrings("exe_cfg.zig:", try w.goto(main.file, offset));
+    }
+    // 别名的使用处：definition 不越过 `@import`，与 declaration 一样停在声明处
+    try testing.expectEqualStrings("main.zig:cfg", try w.gotoAll(main.file, at("cfg.mode"), definition.definitionTargets));
+    try testing.expectEqualStrings("main.zig:cfg", try w.gotoAll(main.file, at("cfg.mode"), definition.declarationTargets));
+    // 成员按最优先的模块解析
+    try testing.expectEqualStrings("exe_cfg.zig:mode", try w.gotoAll(main.file, at("mode;"), definition.definitionTargets));
+    // 各模块目标相同的名字与相对路径只有一个目标
+    try testing.expectEqualStrings("util.zig:", try w.gotoAll(main.file, at("\"util\""), definition.definitionTargets));
+    try testing.expectEqualStrings("local.zig:", try w.gotoAll(main.file, at("\"local.zig\""), definition.definitionTargets));
+    try testing.expectEqualStrings("util.zig:helper", try w.gotoAll(main.file, at("helper()"), definition.definitionTargets));
+    // 没有目标
+    try testing.expectEqualStrings("", try w.gotoAll(main.file, at("void"), definition.definitionTargets));
 }
 
 test "@This, enums, nested containers and generic functions" {

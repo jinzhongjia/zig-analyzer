@@ -41,6 +41,39 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
     return selfTarget(r, file, offset);
 }
 
+/// definition 的全部目标：光标在 `@import("name")` 上、文件所属的多个模块以 `name` import 不同的模块时为
+/// 这些模块的根文件（按模块的优先级）；其余情况为 `definition` 的结果。第一个即 `definition` 的结果
+pub fn definitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    if (try importTargetsAt(r, file, offset)) |targets| return targets;
+    return single(r, try definition(r, file, offset));
+}
+
+/// declaration 的全部目标：同 `definitionTargets`，其余情况为 `declaration` 的结果
+pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    if (try importTargetsAt(r, file, offset)) |targets| return targets;
+    return single(r, try declaration(r, file, offset));
+}
+
+fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
+    return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
+}
+
+/// 光标在 `@import(...)` 或其字符串上时 import 的全部目标（文件开头）。这类 token 不是名字，
+/// `definition` / `declaration` 对它们只经 `defAt` 取 import 的第一个目标
+fn importTargetsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]const Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind == .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const e = b.exprAt(tok.offset - node.offset) orelse return null;
+    const call = importCall(b, e) orelse return null;
+    const files = try r.importTargets(file, b, call.args);
+    const targets = try r.arena.alloc(Target, files.len);
+    for (files, targets) |f, *t| t.* = .{ .file = f, .start = 0, .end = 0 };
+    return targets;
+}
+
 /// 本身就是声明处、但不是成员或局部绑定的名字：错误集 `error{ Foo }` 中的 `Foo`，没有结果类型的
 /// 匿名初始化 `.{ .x = 1 }` 中的字段名（定义了匿名结构体的字段）。与在声明的名字上跳转一样返回自身
 fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
@@ -465,17 +498,26 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
             const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
             return context.defOfKey(r, a.fieldRef(e, @intCast(k)) orelse return null);
         } else return null,
-        .builtin_call => |call| return importDef(r, file, b, call),
-        .literal => {
-            // `@import("...")` 的字符串
-            for (b.exprs) |other| switch (other) {
-                .builtin_call => |call| if (std.mem.indexOfScalar(Body.ExprId, call.args, e) != null) return importDef(r, file, b, call),
-                else => {},
-            };
-            return null;
+        // `@import` 与它的字符串
+        .builtin_call, .literal => {
+            const call = importCall(b, e) orelse return null;
+            return .{ .file = try r.importTarget(file, b, call.args) orelse return null };
         },
         else => return null,
     }
+}
+
+/// `e` 为 `@import(...)` 调用或它的实参时的调用
+fn importCall(b: *const Body, e: Body.ExprId) ?@FieldType(Body.Expr, "builtin_call") {
+    const call = switch (b.expr(e)) {
+        .builtin_call => |call| call,
+        .literal => for (b.exprs) |other| switch (other) {
+            .builtin_call => |call| if (std.mem.indexOfScalar(Body.ExprId, call.args, e) != null) break call,
+            else => {},
+        } else return null,
+        else => return null,
+    };
+    return if (std.mem.eql(u8, call.name, "@import")) call else null;
 }
 
 fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Def {
@@ -483,9 +525,4 @@ fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resol
     const a = try context.atSeeded(r, file, offset, false) orelse return null;
     const key = a.member(e) orelse return null;
     return context.defOfKey(r, key);
-}
-
-fn importDef(r: *Resolver, file: FileId, b: *const Body, call: @FieldType(Body.Expr, "builtin_call")) resolve.Error!?Def {
-    if (!std.mem.eql(u8, call.name, "@import")) return null;
-    return .{ .file = try r.importTarget(file, b, call.args) orelse return null };
 }
