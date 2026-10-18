@@ -265,6 +265,75 @@ test "references in generic bodies use a call site instance" {
     try testing.expectEqualStrings("x:2:getenv* x:7:getenv", try refs(&w, fs, f, at(src, "getenv", 0), null));
 }
 
+test "references in generic bodies use the instance a comptime type argument dispatches to" {
+    // 分派处（`Q.compute(ctx)`）所在的文件不 import 被调函数所在的文件：曾只有跳转找到这个实例，引用与重命名遗漏
+    const queries_src =
+        \\pub const Cache = struct {
+        \\    pub fn take(c: *Cache) u32 {
+        \\        _ = c;
+        \\        return 1;
+        \\    }
+        \\};
+        \\pub const Item = struct {
+        \\    pub fn compute(ctx: anytype) u32 {
+        \\        return ctx.cache.take();
+        \\    }
+        \\};
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const engine_file = (try w.add("/p/engine.zig",
+        \\pub fn Engine(comptime Ctx: type) type {
+        \\    return struct {
+        \\        pub fn get(ctx: *Ctx, comptime Q: type) u32 {
+        \\            return Q.compute(ctx);
+        \\        }
+        \\    };
+        \\}
+    )).file;
+    const queries_file = (try w.add("/p/queries.zig", queries_src)).file;
+    const main_file = (try w.add("/p/main.zig",
+        \\const Engine = @import("engine.zig").Engine;
+        \\const queries = @import("queries.zig");
+        \\const Ctx = struct { cache: queries.Cache };
+        \\fn run(ctx: *Ctx) u32 {
+        \\    return Engine(Ctx).get(ctx, queries.Item);
+        \\}
+    )).file;
+    try w.setGraph(null, &.{.{ .root = main_file, .imports = &.{} }}, &.{
+        .{ .file = engine_file, .module = 0, .root_module = 0 },
+        .{ .file = queries_file, .module = 0, .root_module = 0 },
+        .{ .file = main_file, .module = 0, .root_module = 0 },
+    });
+    const fs: Files = .{ .main = main_file, .lib = queries_file, .other = engine_file };
+    try testing.expectEqualStrings("queries:2:take* queries:9:take", try refs(&w, fs, queries_file, at(queries_src, "take", 0), null));
+}
+
+test "references to enum members include literals that a generic callee converts to the enum" {
+    // anytype 形参收到的 `.green` 经被调函数中的 `@TypeOf(expected, actual)` 转换：曾不算引用，重命名漏改
+    const src =
+        \\const Color = enum { red, green };
+        \\fn expectEqual(expected: anytype, actual: anytype) !void {
+        \\    const T = @TypeOf(expected, actual);
+        \\    return expectEqualInner(T, expected, actual);
+        \\}
+        \\fn expectEqualInner(comptime T: type, expected: T, actual: T) !void {
+        \\    if (expected != actual) return error.TestExpectedEqual;
+        \\}
+        \\test {
+        \\    const c: Color = .green;
+        \\    try expectEqual(.green, c);
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:green* x:10:green x:11:green", try refs(&w, fs, f, at(src, "green", 0), null));
+}
+
 test "references to tagged union fields through the type and error union results" {
     const src =
         \\const Value = union(enum) { null_val: void, int: i64 };

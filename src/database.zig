@@ -55,4 +55,5 @@ pub const Db = engine.Engine(*const Env, &.{
     FileIndex.Query,
     ErrorSets.Query,
     ide_db.seed.Query,
+    ide_db.seed.Instances,
 });

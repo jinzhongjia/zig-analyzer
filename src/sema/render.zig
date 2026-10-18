@@ -20,10 +20,14 @@ const ContainerNames = struct {
         try n.writeArgs(c.inst orelse return, w);
     }
 
-    /// 内置函数构造的类型：以构造它的函数实例命名（`FieldEnum(S)`），否则按内容显示
+    /// 内置函数构造的类型：以构造它的函数实例命名（`FieldEnum(S)`）；不在函数中构造、正是某个常量的值时以常量命名
+    /// （`const Kind = blk: { ... break :blk @Enum(...); }` → `Kind`）；否则按内容显示
     pub fn writeReified(n: ContainerNames, t: InternPool.Reified, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
-        const inst = t.inst orelse return ip.printReified(t, w, n);
+        const inst = t.inst orelse {
+            const decl_name = n.constNaming(t) catch null orelse return ip.printReified(t, w, n);
+            return w.writeAll(decl_name);
+        };
         const i = ip.key(inst).instance;
         const tree = n.r.itemTree(i.file) catch return ip.printReified(t, w, n);
         for (tree.items) |it| if (it.ast_id == i.decl) {
@@ -31,6 +35,24 @@ const ContainerNames = struct {
             return n.writeArgs(inst, w);
         };
         return ip.printReified(t, w, n);
+    }
+
+    /// 构造所在的常量，其值就是这个类型（同一处构造）时的名字
+    fn constNaming(n: ContainerNames, t: InternPool.Reified) resolve.Error!?[]const u8 {
+        const ip = n.r.ctx.db.env.ip;
+        const tree = try n.r.itemTree(t.file);
+        for (tree.items) |it| {
+            if (it.ast_id != t.owner) continue;
+            if (it.kind != .@"const") return null;
+            const decl = try n.r.ctx.get(queries.DeclType, .{ .owner = .{ .file = t.file, .item = it.ast_id } });
+            const v = decl.val orelse return null;
+            const same = switch (ip.key(v)) {
+                .reified_type => |x| x.file == t.file and x.owner == t.owner and x.expr == t.expr and x.inst == null,
+                else => false,
+            };
+            return if (same) it.name else null;
+        }
+        return null;
     }
 
     /// 推导的错误集：显示由函数体求出的成员
