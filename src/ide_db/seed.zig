@@ -24,6 +24,8 @@ const FileIndex = @import("../syntax/FileIndex.zig");
 pub const Seed = struct {
     /// 成员 `item` 在调用点实例下的推导结果
     res: *const infer.Result,
+    /// 所用的实例
+    inst: ?Index,
     /// 调用表达式的位置
     file: FileId,
     offset: u32,
@@ -37,24 +39,47 @@ pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     const found = try r.ctx.get(Query, .{ .owner = owner, .depth = max_depth }) orelse return null;
     return .{
         .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
+        .inst = found.inst,
         .file = found.file,
         .offset = found.offset,
     };
 }
 
-/// 同 `find`，但要求成员中相对位置 `rel` 处的代码在该实例下是活动的（如 `if (has_alpha)` 分支中，
-/// 第一个调用点的实例没有 alpha 时取下一个有的）。第一个调用点满足时与 `find` 相同；否则重新查找，不缓存
-pub fn findActive(r: *Resolver, file: FileId, item: u32, rel: u32) resolve.Error!?Seed {
+/// 光标处须能求出具体类型的部分：表达式或局部绑定
+pub const Subject = union(enum) { expr: Body.ExprId, binding: Body.BindingId };
+
+/// 同 `find`，但所选实例须使成员中相对位置 `rel` 处的代码会执行（如 `if (has_alpha)` 分支中，第一个调用点的实例
+/// 没有 alpha 时取下一个有的），且 `subject` 在实例下能求出具体的类型（如 `switch (Q.kind)` 中只有部分实例有
+/// 的字段）。第一个调用点满足时与 `find` 相同；否则依次尝试其他调用点的实例（`Instances`）。都不满足 `subject`
+/// 时退而只要求代码会执行，按全部调用点重新查找、不缓存
+pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject) resolve.Error!?Seed {
     const first = try find(r, file, item) orelse return null;
     const owner = try r.ownerKey(file, item);
     const body = try r.ctx.get(hir.ItemBody, owner);
+    const ip = r.ctx.db.env.ip;
+    if (fits(ip, body, first.res, rel, subject)) return first;
+    for (try r.ctx.get(Instances, .{ .owner = owner, .depth = max_depth })) |found| {
+        const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst });
+        if (fits(ip, body, res, rel, subject)) return .{ .res = res, .inst = found.inst, .file = found.file, .offset = found.offset };
+    }
     if (!inactiveAt(body, first.res, rel)) return first;
     const found = try search_(r, owner, rel, max_depth) orelse return first;
     return .{
         .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
+        .inst = found.inst,
         .file = found.file,
         .offset = found.offset,
     };
+}
+
+/// 实例的推导结果 `res` 中，`rel` 处的代码会执行，且 `subject` 有具体的类型
+fn fits(ip: *InternPool, body: *const Body, res: *const infer.Result, rel: u32, subject: ?Subject) bool {
+    if (inactiveAt(body, res, rel)) return false;
+    const tv = switch (subject orelse return true) {
+        .expr => |e| if (@backingInt(e) < res.exprs.len) res.exprs[@backingInt(e)] else return false,
+        .binding => |b| if (@backingInt(b) < res.bindings.len) res.bindings[@backingInt(b)] else return false,
+    };
+    return !wanted(ip, tv);
 }
 
 /// 相对位置 `rel` 落在推导结果的非活动分支中。分支的末尾也算在内：补全的位置常在刚输入的 `a.` 之后，
@@ -65,6 +90,17 @@ fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
         if (rg.start <= rel and rel <= rg.end) return true;
     }
     for (res.dead_spans) |rg| if (rg.start <= rel and rel <= rg.end) return true;
+    return false;
+}
+
+/// 表达式 `e` 整个位于推导结果 `res` 的非活动代码中
+fn withinInactive(body: *const Body, res: *const infer.Result, e: Body.ExprId) bool {
+    const er = body.range(e);
+    for (res.inactive) |x| {
+        const rg = body.range(x);
+        if (rg.start <= er.start and er.end <= rg.end) return true;
+    }
+    for (res.dead_spans) |rg| if (rg.start <= er.start and er.end <= rg.end) return true;
     return false;
 }
 
@@ -101,19 +137,74 @@ pub const Query = struct {
     }
 };
 
+/// `Instances` 保留的实例个数：第一个实例不适用时依次尝试，调用点很多时只取前几个
+pub const max_seeds = 8;
+
+/// 成员在各调用点的不同实例（按查找顺序，去重）。调用者自身位于泛型函数内时取调用者的实例（同样的 `all`，
+/// 层数少一层）。`all` 为 false 时只取前 `max_seeds` 个：第一个实例不适用时（光标处的代码不执行、表达式求不出
+/// 类型、调用位于该实例不执行的分支中）依次尝试；为 true 时至多 `max_instances` 个，用于需要覆盖所有实例的
+/// 场合（`allInstances`）
+pub const Instances = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = struct { owner: hir.OwnerKey, depth: u8, all: bool = false };
+    pub const Value = []const Found;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        var out: Collector = .{ .limit = if (key.all) max_instances else max_seeds, .all = key.all };
+        try collect(&r, key.owner, key.depth, &out);
+        return ctx.db.gpa.dupe(Found, out.found.items);
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!std.meta.eql(x, y)) return false;
+        return true;
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return &.{};
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
 /// 成员 `item`（位于某个泛型函数内）在各调用点的全部具体实例（去重，按查找顺序）。调用者自身位于泛型函数内时
 /// 取调用者的全部实例（最多 `max_collect_depth` 层）。用于需要覆盖所有实例的场合（引用查找与重命名）
 pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error![]const Index {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
-    var out: std.ArrayList(Index) = .empty;
-    try collect(r, try r.ownerKey(file, item), max_collect_depth, &out);
-    return out.items;
+    const found = try r.ctx.get(Instances, .{ .owner = try r.ownerKey(file, item), .depth = max_collect_depth, .all = true });
+    const insts = try r.arena.alloc(Index, found.len);
+    for (found, insts) |f, *inst| inst.* = f.inst.?;
+    return insts;
 }
 
 /// 实例个数的上限：超过时截断（调用点极多的泛型函数）
 const max_instances = 64;
 
-fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *std.ArrayList(Index)) resolve.Error!void {
+/// 收集的实例：按实例去重，至多 `limit` 个
+const Collector = struct {
+    found: std.ArrayList(Found) = .empty,
+    limit: usize,
+    /// 见 `Instances.Key`
+    all: bool,
+
+    fn full(c: *const Collector) bool {
+        return c.found.items.len >= c.limit;
+    }
+
+    fn add(c: *Collector, a: std.mem.Allocator, f: Found) std.mem.Allocator.Error!void {
+        if (f.inst == null or c.full()) return;
+        for (c.found.items) |x| if (x.inst == f.inst) return;
+        try c.found.append(a, f);
+    }
+};
+
+fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.Error!void {
     const tree = try r.itemTree(key.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == key.item) break @intCast(i);
@@ -123,18 +214,19 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *std.ArrayList(Index
     const names = try callNames(r, key.file, root, files);
     try collectIn(r, key.file, key.file, item, root, names, depth, out);
     for (files) |f| {
+        if (out.full()) return;
         if (f == key.file or !try containsAny(r, f, names)) continue;
         try collectIn(r, f, key.file, item, root, names, depth, out);
     }
-    if (out.items.len == 0) if (try dispatched(r, key.file, item, root, null)) |found| if (found.inst) |inst| try out.append(r.arena, inst);
+    if (out.found.items.len == 0) if (try dispatched(r, key.file, item, root, null)) |found| try out.add(r.arena, found);
 }
 
 /// 同 `findIn`，收集全部实例
-fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, depth: u8, out: *std.ArrayList(Index)) resolve.Error!void {
+fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, depth: u8, out: *Collector) resolve.Error!void {
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
-        if (out.items.len >= max_instances) return;
+        if (out.full()) return;
         if (in == file and try enclosedBy(r, file, @intCast(i), root)) continue;
         if (!try mayMentionAny(r, in, @intCast(i), names)) continue;
         const owner = try r.ownerKey(in, @intCast(i));
@@ -143,10 +235,9 @@ fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, out);
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
-        var outer: std.ArrayList(Index) = .empty;
-        try collect(r, owner, depth - 1, &outer);
-        for (outer.items) |inst| {
-            const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+        for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1, .all = out.all })) |o| {
+            if (out.full()) return;
+            const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = o.inst });
             _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, out);
         }
     }
@@ -318,6 +409,12 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null)) |s| return s;
+        // 第一个实例下没有有效的调用（如调用位于该实例不执行的 `switch (Q.kind)` 分支中）：依次尝试调用者的其他实例
+        for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1 })) |other| {
+            if (other.inst == outer.inst) continue;
+            const res3 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = other.inst });
+            if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, active, null)) |s| return s;
+        }
     }
     return null;
 }
@@ -325,9 +422,15 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
 /// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。函数作为值与实参元组
 /// 一起传入另一个调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a, b })`）也算作以元组元素调用。
 /// `all` 不为 null 时把全部调用的实例（去重）加入其中，返回 null
-fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*std.ArrayList(Index)) resolve.Error!?Found {
+fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
+        switch (e) {
+            .call, .builtin_call => {},
+            else => continue,
+        }
+        // 调用者在该实例下不编译的代码中的调用（如 `switch (Q.kind)` 的其他分支）不产生实例
+        if (withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
         const site: Site = .{ .r = r, .in = in, .i = i, .body = body, .res = res, .expr = @intCast(ei), .file = file, .item = item, .root_key = root_key, .active = active, .all = all };
         switch (e) {
             .call => |c| {
@@ -358,7 +461,7 @@ const Site = struct {
     item: u32,
     root_key: hir.OwnerKey,
     active: ?u32,
-    all: ?*std.ArrayList(Index),
+    all: ?*Collector,
 
     /// 实参中的函数值后面紧跟着匿名元组字面量：以元组元素调用该函数
     fn passed(s: Site, args: []const Body.ExprId) resolve.Error!?Found {
@@ -399,8 +502,8 @@ const Site = struct {
         if (!value.isConcrete(ip, inst)) return null;
         const node = try r.itemNode(s.in, s.i) orelse return null;
         const norm = try queries.normalizeInst(r, s.file, s.item, inst);
-        if (s.all) |list| {
-            if (norm) |n| if (list.items.len < max_instances and std.mem.indexOfScalar(Index, list.items, n) == null) try list.append(r.arena, n);
+        if (s.all) |c| {
+            try c.add(r.arena, .{ .inst = norm, .file = s.in, .offset = node.offset + s.body.range(@fromBackingInt(s.expr)).start });
             return null;
         }
         if (s.active) |rel| {

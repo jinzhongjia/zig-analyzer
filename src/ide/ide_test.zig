@@ -1413,6 +1413,103 @@ test "completion in a switch prong on @typeInfo uses a call site where the prong
     try testing.expectEqualStrings("len ptr", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+/// 在 `text` 的 `<|>` 处补全，返回以空格连接的标签
+fn completionLabels(text: []const u8) ![]const u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(testing.allocator, it.label);
+    defer labels.deinit(testing.allocator);
+    return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
+test "callsite seeding skips calls in branches the caller instance does not compile" {
+    // 第一个实例（Input）下 `ensure` 的调用位于不执行的分支中：曾仍以它推导出 Input 的实例，补全出 Input 才有的字段
+    const labels = try completionLabels(
+        \\const Input = struct {
+        \\    pub const kind = .input;
+        \\};
+        \\const Derived = struct {
+        \\    pub const kind = .derived;
+        \\};
+        \\fn Slot(comptime Q: type) type {
+        \\    return switch (Q.kind) {
+        \\        .input => struct { is_set: bool },
+        \\        .derived => struct { memo: ?u32 },
+        \\        else => unreachable,
+        \\    };
+        \\}
+        \\fn get(comptime Q: type) void {
+        \\    switch (Q.kind) {
+        \\        .input => {},
+        \\        .derived => ensure(Q),
+        \\        else => unreachable,
+        \\    }
+        \\}
+        \\fn ensure(comptime Q: type) void {
+        \\    var slot: Slot(Q) = undefined;
+        \\    _ = slot.<|>;
+        \\}
+        \\fn run() void {
+        \\    get(Input);
+        \\    get(Derived);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("memo", labels);
+}
+
+test "callsite seeding picks an instance in which the expression at the cursor has a type" {
+    // 第一个调用点（Input）下 `Q.Memo` 不存在，`m` 的类型未知：曾补全为空
+    const labels = try completionLabels(
+        \\const Input = struct {};
+        \\const Derived = struct {
+        \\    pub const Memo = struct { evicted: bool };
+        \\};
+        \\fn last(comptime Q: type) void {
+        \\    const m: Q.Memo = undefined;
+        \\    _ = m.<|>;
+        \\}
+        \\fn run() void {
+        \\    last(Input);
+        \\    last(Derived);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("evicted", labels);
+}
+
+test "callsite seeding skips instances for which a guard before the cursor fires" {
+    // `if (!@hasDecl(Q, "fallback")) unreachable;` 在第一个调用点（A）下被选中，其后的代码不编译：曾仍以 A 补全
+    const labels = try completionLabels(
+        \\const A = struct {};
+        \\const B = struct {
+        \\    pub fn fallback() u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\fn onCycle(comptime Q: type) u32 {
+        \\    if (!@hasDecl(Q, "fallback")) unreachable;
+        \\    return Q.<|>();
+        \\}
+        \\fn run() void {
+        \\    _ = onCycle(A);
+        \\    _ = onCycle(B);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("fallback", labels);
+}
+
 test "code after a statement that comptime makes noreturn is inactive" {
     const text =
         \\const linux_only = true;

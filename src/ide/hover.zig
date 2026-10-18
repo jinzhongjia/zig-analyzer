@@ -69,16 +69,20 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
 
     // 泛型函数体内没有具体实例：以调用点的实例推导
     var seeded_from: ?seed.Seed = null;
-    if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) if (try seed.find(r, file, a.item)) |s| {
-        const res = s.res;
-        const better: TypedValue = if (binding_id) |id|
-            (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
-        else if (@backingInt(expr_id.?) < res.exprs.len) res.exprs[@backingInt(expr_id.?)] else .unknown;
-        if (!seed.wanted(r.ctx.db.env.ip, better)) {
-            tv = better;
-            seeded_from = s;
+    if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) {
+        const subject: seed.Subject = if (binding_id) |id| .{ .binding = id } else .{ .expr = expr_id.? };
+        const rel = tok.offset - a.node.offset;
+        if (try seed.findAt(r, file, a.item, rel, subject)) |s| {
+            const res = s.res;
+            const better: TypedValue = if (binding_id) |id|
+                (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
+            else if (@backingInt(expr_id.?) < res.exprs.len) res.exprs[@backingInt(expr_id.?)] else .unknown;
+            if (!seed.wanted(r.ctx.db.env.ip, better)) {
+                tv = better;
+                seeded_from = s;
+            }
         }
-    };
+    }
 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;

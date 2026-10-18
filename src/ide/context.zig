@@ -84,11 +84,24 @@ pub fn at(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.
     };
 }
 
-/// 同 `at`；成员位于泛型函数内时附带调用点实例的推导结果（`At.seeded`）
+/// 同 `at`；成员位于泛型函数内时附带调用点实例的推导结果（`At.seeded`），实例须使该位置的代码会执行、
+/// 该处的表达式能求出类型（见 `subjectAt`）
 pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.Error!?At {
     var a = try at(r, file, offset, inclusive_end) orelse return null;
-    a.seeded = try seed.findActive(r, a.file, a.item, a.rel);
+    const subject = subjectAt(a.body, a.rel, inclusive_end);
+    a.seeded = try seed.findAt(r, a.file, a.item, a.rel, subject);
     return a;
+}
+
+/// 位置处须能求出类型的表达式：位于成员访问的成员名处时取左侧，否则取所在的表达式。`inclusive_end` 时位置在
+/// 刚输入的内容之后（补全），取前一个字符所在的表达式（如 `a.` 的 `.`）
+fn subjectAt(b: *const Body, rel: u32, inclusive_end: bool) ?seed.Subject {
+    const at_ = if (inclusive_end and rel > 0) rel - 1 else rel;
+    const e = b.exprAt(at_) orelse return null;
+    return switch (b.expr(e)) {
+        .field_access => |fa| .{ .expr = if (at_ >= b.range(fa.lhs).end) fa.lhs else e },
+        else => .{ .expr = e },
+    };
 }
 
 /// 推导结果中记录的成员（按 AstId）对应的定义
