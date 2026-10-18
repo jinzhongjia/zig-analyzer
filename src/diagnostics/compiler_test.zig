@@ -363,6 +363,28 @@ test "collect: paths that do not resolve to absolute paths count as missing loca
     }
 }
 
+test "collect: spans that end before they start become empty" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    const reversed: ErrorBundle.SourceLocation = .{ .src_path = try wip.addString("src/main.zig"), .line = 0, .column = 0, .span_start = 30, .span_main = 30, .span_end = 1 };
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("end before start"), .src_loc = try wip.addSourceLocation(reversed), .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("a note"), .src_loc = try wip.addSourceLocation(reversed) }},
+    );
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.deinit(gpa);
+    // 防止发布终点在起点之前的 Range：改为起点处的空区间
+    const item = r.files.get(native("/proj/src/main.zig")).?.items[0];
+    try testing.expectEqual(30, item.start);
+    try testing.expectEqual(30, item.end);
+    try testing.expectEqual(30, item.notes[0].start);
+    try testing.expectEqual(30, item.notes[0].end);
+}
+
 test "combine: results of several compilations of the same file" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

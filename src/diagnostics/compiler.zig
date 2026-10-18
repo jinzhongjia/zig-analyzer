@@ -89,8 +89,7 @@ pub fn collect(
                 const loc = eb.getSourceLocation(msg.src_loc);
                 if (try absolute(a, build_root, eb.nullTerminatedString(loc.src_path))) |p| {
                     path = p;
-                    start = loc.span_start;
-                    end = loc.span_end;
+                    start, end = byteSpan(loc);
                 }
             }
             const key = try std.fmt.allocPrint(a, "{s}\x00{d}\x00{d}\x00{s}", .{ path, start, end, message });
@@ -110,8 +109,7 @@ pub fn collect(
                     const nl = eb.getSourceLocation(n.src_loc);
                     if (try absolute(a, build_root, eb.nullTerminatedString(nl.src_path))) |p| {
                         note.path = p;
-                        note.start = nl.span_start;
-                        note.end = nl.span_end;
+                        note.start, note.end = byteSpan(nl);
                     }
                 }
             }
@@ -156,8 +154,7 @@ fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLoca
             const rl = eb.getSourceLocation(ref_loc);
             if (try absolute(a, build_root, eb.nullTerminatedString(rl.src_path))) |p| {
                 note.path = p;
-                note.start = rl.span_start;
-                note.end = rl.span_end;
+                note.start, note.end = byteSpan(rl);
             }
             note.message = try std.fmt.allocPrint(a, "referenced by: {s}", .{eb.nullTerminatedString(decl_name)});
         } else if (decl_name != 0) {
@@ -173,6 +170,12 @@ fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLoca
 fn addCompileLog(a: Allocator, item: *Item, compile_log: []const u8) Allocator.Error!void {
     if (compile_log.len == 0 or std.mem.eql(u8, item.compile_log, compile_log)) return;
     item.compile_log = if (item.compile_log.len == 0) compile_log else try std.mem.join(a, "\n", &.{ item.compile_log, compile_log });
+}
+
+/// 源位置的字节区间。数值来自子进程回传的错误包，不受校验：终点在起点之前时改为起点处的空区间，
+/// 发布的 Range 不会反向
+fn byteSpan(loc: ErrorBundle.SourceLocation) [2]u32 {
+    return .{ loc.span_start, @max(loc.span_start, loc.span_end) };
 }
 
 /// `path` 相对于 `base` 的绝对路径。结果作为文件驻留到 Vfs，必须是绝对路径；`path` 来自子进程回传的错误包，
