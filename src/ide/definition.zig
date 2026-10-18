@@ -19,6 +19,7 @@ const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
+const ErrorSets = @import("../syntax/ErrorSets.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
@@ -256,7 +257,8 @@ pub const ErrorDecl = struct { target: Target, doc: ?[]const u8 };
 
 /// `error.Foo`：错误名不必先声明，同名的错误也可以出现在多个错误集中。在 `error{ ... }` 声明中查找：成员与
 /// 期望的错误集完全相同的优先，其次是期望错误集的一部分（`A || B` 中的 `A`），再次是任何含这个名字的。
-/// 先查当前文件；`imports` 时再查沿 import 可达的文件（以文件索引按名字筛选），直到找到完全相同的
+/// 先查当前文件；`imports` 时再查沿 import 可达的文件（以文件索引按名字筛选），直到找到不会被取代的：有期望的
+/// 错误集时为完全相同的；没有时各声明同样符合，取第一个
 pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) resolve.Error!?ErrorDecl {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -270,13 +272,14 @@ pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) re
     };
     if (name.len == 0) return null;
     const expected = try expectedErrorNames(r, file, tok.offset, e);
+    const enough: @FieldType(ErrorCandidate, "rank") = if (expected != null) .exact else .any;
     var best: ?ErrorCandidate = null;
     try findErrorDecl(r, file, name, expected, &best);
     if (!imports) return if (best) |c| c.decl else null;
     var files: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
     try files.put(r.arena, file, {});
     var i: usize = 0;
-    while (i < files.count() and (best == null or best.?.rank != .exact)) : (i += 1) {
+    while (i < files.count() and (best == null or best.?.rank != enough)) : (i += 1) {
         const f = files.keys()[i];
         const index = try r.ctx.get(FileIndex.Query, f);
         if (i > 0 and index.contains(name)) try findErrorDecl(r, f, name, expected, &best);
@@ -306,67 +309,27 @@ const ErrorCandidate = struct {
     decl: ErrorDecl,
 };
 
-/// 文件中含名为 `name` 的错误的 `error{ ... }` 声明，比 `best` 更符合期望的错误集时替换它
+/// 文件中含名为 `name` 的错误的 `error{ ... }` 声明，比 `best` 更符合期望的错误集时替换它（同样符合时取先出现的）
 fn findErrorDecl(r: *Resolver, file: FileId, name: []const u8, expected: ?[]const []const u8, best: *?ErrorCandidate) resolve.Error!void {
-    var stack: std.ArrayList(ast.SyntaxNode) = .empty;
-    try stack.append(r.arena, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode());
-    var children: std.ArrayList(ast.SyntaxNode) = .empty;
-    while (stack.pop()) |n| {
-        if (n.kind() == .error_set_decl) {
-            try considerErrorSet(r, file, n, name, expected, best);
-            continue;
-        }
-        // 按源码顺序访问：同样符合时取先出现的
-        children.clearRetainingCapacity();
-        var it = n.children();
-        while (it.nextNode()) |c| try children.append(r.arena, c);
-        var k = children.items.len;
-        while (k > 0) {
-            k -= 1;
-            try stack.append(r.arena, children.items[k]);
-        }
+    const sets = try r.ctx.get(ErrorSets.Query, file);
+    for (sets.sets) |set| {
+        const member = for (set.members) |m| {
+            if (std.mem.eql(u8, m.name, name)) break m;
+        } else continue;
+        const rank: @FieldType(ErrorCandidate, "rank") = if (expected) |want| blk: {
+            for (set.members) |x| {
+                for (want) |y| {
+                    if (std.mem.eql(u8, x.name, y)) break;
+                } else break :blk .any;
+            }
+            break :blk if (set.members.len == want.len) .exact else .subset;
+        } else .any;
+        if (best.*) |b| if (@backingInt(rank) <= @backingInt(b.rank)) continue;
+        best.* = .{ .rank = rank, .decl = .{
+            .target = .{ .file = file, .start = member.start, .end = member.end },
+            .doc = if (member.doc) |d| try r.arena.dupe(u8, d) else null,
+        } };
     }
-}
-
-fn considerErrorSet(r: *Resolver, file: FileId, set: ast.SyntaxNode, name: []const u8, expected: ?[]const []const u8, best: *?ErrorCandidate) resolve.Error!void {
-    var names: std.ArrayList([]const u8) = .empty;
-    var doc: std.ArrayList(u8) = .empty;
-    var found: ?ErrorDecl = null;
-    var it = set.children();
-    while (it.next()) |el| {
-        const t = switch (el) {
-            .token => |t| t,
-            .node => continue,
-        };
-        switch (t.kind) {
-            .doc_comment => {
-                var line = t.text["///".len..];
-                if (std.mem.startsWith(u8, line, " ")) line = line[1..];
-                if (doc.items.len != 0) try doc.append(r.arena, '\n');
-                try doc.appendSlice(r.arena, std.mem.trimEnd(u8, line, "\r"));
-            },
-            .identifier => {
-                const member = ast.identName(t.text);
-                try names.append(r.arena, member);
-                if (found == null and std.mem.eql(u8, member, name)) found = .{
-                    .target = .{ .file = file, .start = t.offset, .end = t.offset + @as(u32, @intCast(t.text.len)) },
-                    .doc = if (doc.items.len != 0) try r.arena.dupe(u8, doc.items) else null,
-                };
-                doc.clearRetainingCapacity();
-            },
-            else => {},
-        }
-    }
-    const decl = found orelse return;
-    const rank: @FieldType(ErrorCandidate, "rank") = if (expected) |want| blk: {
-        for (names.items) |x| {
-            for (want) |y| {
-                if (std.mem.eql(u8, x, y)) break;
-            } else break :blk .any;
-        }
-        break :blk if (names.items.len == want.len) .exact else .subset;
-    } else .any;
-    if (best.* == null or @backingInt(rank) > @backingInt(best.*.?.rank)) best.* = .{ .rank = rank, .decl = decl };
 }
 
 /// 节点中 `error{ ... }` 里名为 `name` 的错误的位置

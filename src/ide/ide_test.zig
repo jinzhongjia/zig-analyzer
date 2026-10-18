@@ -905,6 +905,43 @@ test "goto and hover on error values: the expected error set picks the declarati
     try testing.expectEqualStrings("```zig\nerror.Baz\n```", plain.text);
 }
 
+test "goto on an error value without an expected error set stops at the first declaration" {
+    // 没有期望的错误集时各声明同样符合，结果总是第一个；曾在找到后仍为 import 闭包中的全部文件建索引
+    const text =
+        \\const a = @import("a.zig");
+        \\fn g() void {
+        \\    const x = error.Baz;
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    const a_text =
+        \\const b = @import("b.zig");
+        \\pub const E = error{Baz};
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = (try w.add("/p/a.zig", a_text)).file;
+    const b = (try w.add("/p/b.zig", "pub const F = error{ Baz, Qux };\n")).file;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var trace: @import("../db/engine.zig").Trace = .{ .gpa = w.arena.allocator() };
+    ctx.trace = &trace;
+    var r = resolver(&w, &ctx);
+    const baz = (try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "Baz").? + 1))).?;
+    try testing.expectEqual(a, baz.file);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, a_text, "Baz").?)), baz.start);
+    const index_query = comptime for (database.Db.query_types, 0..) |Q, qi| {
+        if (Q == database.FileIndex.Query) break qi;
+    } else unreachable;
+    for (trace.events.items) |ev| if (ev.query == index_query) {
+        try testing.expect(w.db.keyAt(database.FileIndex.Query, ev.key) != b);
+    };
+}
+
 test "goto declaration, definition through aliases and type definition" {
     const text =
         \\const Point = struct { x: i32 };

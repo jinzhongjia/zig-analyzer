@@ -110,7 +110,7 @@ ide_db/       引用查找 · 调用点种子
 sema/         InternPool · 类型推导 · comptime 解释器 · 类型渲染
 names/        模块图 · import / 名字解析
 hir/          函数体 IR 降级 · 局部作用域
-syntax/       容错无损 CST · 局部重解析 · ItemTree · AstId · 类型化访问层 · 文件索引（FileIndex）
+syntax/       容错无损 CST · 局部重解析 · ItemTree · AstId · 类型化访问层 · 文件索引（FileIndex、ErrorSets）
 diagnostics/  live（官方解析器 + AstGen）· compiler（ErrorBundle）· 编译集合
 project/      构建系统协议客户端 · zig env · builtin.zig 生成
 base/         Vfs · URI · 输入 · ProjectModel
@@ -183,7 +183,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | semantic tokens / folding / selection range / document symbol | 纯语法 |
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致 |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
-| `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选） |
+| `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemSummaries` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
