@@ -82,12 +82,13 @@ pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject
 /// 循环按迭代推导时尝试的迭代次数上限
 const max_iterations = 64;
 
-/// 位置 `rel` 位于遍历 comptime 已知的类型列表的循环（`inline for`，或 comptime 中的 `for`）中时，按一次迭代
-/// 推导的结果：循环变量在推导中是抽象的（每次迭代不同）。`res` 是成员在实例 `inst` 下的推导结果，取第一个使
-/// `rel` 处的代码会执行、`subject` 能求出类型的迭代；都不满足 `subject` 时取第一个使代码会执行的
+/// 位置 `rel` 位于每次迭代的循环变量类型不同的循环（见 `iterations`）中、`subject` 在 `res` 中求不出类型时，按
+/// 一次迭代推导的结果。`res` 是成员在实例 `inst` 下的推导结果，取第一个使 `rel` 处的代码会执行、`subject` 能求出
+/// 类型的迭代；都不满足 `subject` 时取第一个使代码会执行的
 pub fn loopAt(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, node_offset: u32, rel: u32, subject: ?Subject) resolve.Error!?Seed {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
     const ip = r.ctx.db.env.ip;
+    if (subject != null and fits(ip, body, res, rel, subject)) return null;
     // 最内层的这类循环（其中嵌套的普通循环，如遍历运行时切片的 `for`，不算）
     var best: ?struct { loop: Body.Loop, expr: u32, len: u32 } = null;
     for (body.exprs, 0..) |e, ei| {
@@ -99,23 +100,20 @@ pub fn loopAt(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const 
         const rg = body.range(l.body);
         if (rel < rg.start or rel > rg.end) continue;
         if (best) |b| if (rg.end - rg.start >= b.len) continue;
-        const abstract = for (l.capture) |cap| {
-            if (abstractCapture(ip, res, cap)) break true;
+        const varying = for (0..l.capture.len) |k| {
+            if (try iterations(r, res, l, k) != null) break true;
         } else false;
-        if (!abstract) continue;
+        if (!varying) continue;
         best = .{ .loop = l, .expr = @intCast(ei), .len = rg.end - rg.start };
     }
     const b = best orelse return null;
     const offset = node_offset + body.range(@fromBackingInt(b.expr)).start;
     for (b.loop.capture, 0..) |cap, k| {
-        if (k >= b.loop.inputs.len or !abstractCapture(ip, res, cap)) continue;
-        const list = res.exprs[@backingInt(b.loop.inputs[k])];
+        const n = try iterations(r, res, b.loop, k) orelse continue;
         var first: ?Seed = null;
-        var idx: u32 = 0;
-        while (idx < max_iterations) : (idx += 1) {
-            if (try eval.elemValue(r, list, idx) == null) break;
-            const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = idx } });
-            const s: Seed = .{ .res = res_i, .inst = inst, .file = owner.file, .offset = offset, .iteration = idx };
+        for (0..n) |idx| {
+            const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = @intCast(idx) } });
+            const s: Seed = .{ .res = res_i, .inst = inst, .file = owner.file, .offset = offset, .iteration = @intCast(idx) };
             if (fits(ip, body, res_i, rel, subject)) return s;
             if (first == null and !inactiveAt(body, res_i, rel)) first = s;
         }
@@ -124,17 +122,31 @@ pub fn loopAt(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const 
     return null;
 }
 
-/// 循环变量在推导结果中是抽象的类型（遍历类型列表的循环，只能在 comptime 执行）
-fn abstractCapture(ip: *InternPool, res: *const infer.Result, cap: Body.BindingId) bool {
-    if (@backingInt(cap) >= res.bindings.len) return false;
-    const v = res.bindings[@backingInt(cap)].val orelse return false;
-    return ip.key(v) == .opaque_param;
+/// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数（至多 `max_iterations`）：遍历 comptime 已知的类型列表
+/// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），或遍历各项类型不同的元组（`inline for
+/// (.{ &posix, &windows }) |cases|`；循环变量的类型求不出）
+fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) resolve.Error!?u32 {
+    if (k >= l.inputs.len or k >= l.capture.len) return null;
+    const ip = r.ctx.db.env.ip;
+    const cap = l.capture[k];
+    if (@backingInt(cap) >= res.bindings.len or @backingInt(l.inputs[k]) >= res.exprs.len) return null;
+    const list = res.exprs[@backingInt(l.inputs[k])];
+    const binding = res.bindings[@backingInt(cap)];
+    if (binding.val) |v| if (ip.key(v) == .opaque_param) {
+        var n: u32 = 0;
+        while (n < max_iterations and try eval.elemValue(r, list, n) != null) n += 1;
+        return if (n > 0) n else null;
+    };
+    if (binding.ty != .unknown) return null;
+    const tt = infer.tupleOf(ip, list.ty) orelse return null;
+    if (tt.types.len == 0) return null;
+    return @intCast(@min(tt.types.len, max_iterations));
 }
 
-/// 成员 `i`（位于 `in`）中遍历 comptime 已知的类型列表的循环内提到 `names` 的调用：循环变量在推导中是
-/// 抽象的，实参求不出具体的实例；按各次迭代推导（实例 `inst` 下的结果为 `res`）再找。`all` 不为 null 时收集
+/// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）内提到 `names` 的调用：实参求不出
+/// 具体的实例；按各次迭代推导（实例 `inst` 下的结果为 `res`）再找。`all` 不为 null 时收集
 fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector) resolve.Error!?Found {
-    const ip = r.ctx.db.env.ip;
+    if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs) |e| {
         const l = switch (e) {
             .loop => |l| l,
@@ -142,12 +154,9 @@ fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const 
         };
         if (l.kind != .@"for" or !mentionsWithin(body, l.body, names)) continue;
         for (l.capture, 0..) |cap, k| {
-            if (k >= l.inputs.len or !abstractCapture(ip, res, cap)) continue;
-            const list = res.exprs[@backingInt(l.inputs[k])];
-            var idx: u32 = 0;
-            while (idx < max_iterations) : (idx += 1) {
-                if (try eval.elemValue(r, list, idx) == null) break;
-                const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = idx } });
+            const n = try iterations(r, res, l, k) orelse continue;
+            for (0..n) |idx| {
+                const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = @intCast(idx) } });
                 if (try callIn(r, in, i, body, res_i, file, item, root_key, active, all)) |found| return found;
                 if (all) |c| if (c.full()) return null;
             }
@@ -171,14 +180,15 @@ fn mentionsWithin(body: *const Body, e: Body.ExprId, names: []const []const u8) 
     return false;
 }
 
-/// 实例的推导结果 `res` 中，`rel` 处的代码会执行，且 `subject` 有具体的类型
+/// 实例的推导结果 `res` 中，`rel` 处的代码会执行，且 `subject` 有具体的类型。没有转换为枚举的枚举字面量
+/// （`switch (Q.kind)` 的 `.input =>`，类型仍为 `@Type(.enum_literal)`）还不知道指向哪个成员，不算
 fn fits(ip: *InternPool, body: *const Body, res: *const infer.Result, rel: u32, subject: ?Subject) bool {
     if (inactiveAt(body, res, rel)) return false;
     const tv = switch (subject orelse return true) {
         .expr => |e| if (@backingInt(e) < res.exprs.len) res.exprs[@backingInt(e)] else return false,
         .binding => |b| if (@backingInt(b) < res.bindings.len) res.bindings[@backingInt(b)] else return false,
     };
-    return !wanted(ip, tv);
+    return !wanted(ip, tv) and tv.ty != .enum_literal_type;
 }
 
 /// 相对位置 `rel` 落在推导结果的非活动分支中。分支的末尾也算在内：补全的位置常在刚输入的 `a.` 之后，
@@ -606,6 +616,7 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
             if (other.inst == outer.inst) continue;
             const res3 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = other.inst });
             if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, active, null)) |s| return s;
+            if (try loopCall(r, in, @intCast(i), owner, body, res3, other.inst, names, file, item, root_key, active, null)) |s| return s;
         }
     }
     return null;

@@ -1676,7 +1676,7 @@ const Inferrer = struct {
                         inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
                             try inf.typeCapture(cap, list, iteration)
                         else if (iteration) |n|
-                            .{ .ty = ty, .val = if (ptr) null else try inf.iterationValue(list, start, n) }
+                            .{ .ty = try inf.iterationType(list.ty, elem, n, ptr), .val = if (ptr) null else try inf.iterationValue(list, start, n) }
                         else
                             .{ .ty = ty };
                     }
@@ -1700,6 +1700,15 @@ const Inferrer = struct {
             if (try eval.elemValue(inf.r, list, n)) |ev| if (ev.val) |t| return TypedValue.ofType(t);
         };
         return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }));
+    }
+
+    /// 按第 `n` 次迭代推导时非类型的循环变量的类型：各项类型不同的元组（`.{ &posix, &windows }`）取第 `n` 项的类型
+    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool) Error!Index {
+        var t = elem;
+        if (t == .unknown) if (tupleOf(inf.ip, list)) |tt| if (n < tt.types.len) {
+            t = tt.types[n];
+        };
+        return if (ptr) inf.ip.ptrTo(t, .one, false) else t;
     }
 
     /// 按第 `n` 次迭代推导时非类型的循环变量的值：范围（`start..`）为 `start + n`，列表为第 `n` 个元素
@@ -2846,7 +2855,7 @@ fn concatOperand(ip: *InternPool, t: Index, other: Index) ?ConcatOperand {
 }
 
 /// 元组类型（含指向元组的单项指针）
-fn tupleOf(ip: *InternPool, t: Index) ?InternPool.Tuple {
+pub fn tupleOf(ip: *InternPool, t: Index) ?InternPool.Tuple {
     return switch (ip.key(t)) {
         .tuple_type => |tt| tt,
         .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {

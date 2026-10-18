@@ -303,6 +303,52 @@ test "goto declaration of enum literals passed to anytype parameters that the ca
     }
 }
 
+test "goto declaration of switch prong literals on a member of a loop's type" {
+    // 合并推导中光标处的字面量类型为 `@Type(.enum_literal)`：曾被当作已有类型而不按迭代推导，没有跳转目标
+    const text =
+        \\const Kind = enum { input, derived };
+        \\const A = struct {
+        \\    pub const kind: Kind = .input;
+        \\};
+        \\const B = struct {
+        \\    pub const kind: Kind = .derived;
+        \\};
+        \\fn count() u32 {
+        \\    var n: u32 = 0;
+        \\    inline for (.{ A, B }) |Q| {
+        \\        switch (Q.kind) {
+        \\            .input => n += 1,
+        \\            .derived => n += 2,
+        \\        }
+        \\    }
+        \\    return n;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "input =>", "input, derived" },
+        .{ "derived =>", "derived }" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.definition(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..t.end] });
+            return err;
+        };
+    }
+}
+
 test "goto declaration of enum literals in branches whose result is the peer type" {
     // 没有结果类型的 `if` / `switch`：分支按 peer type 转换，`.invalid` 是 Kind 的成员；曾没有跳转目标
     const text =
@@ -1864,6 +1910,46 @@ test "callsite seeding uses an iteration of a comptime for over types" {
     );
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("id", labels);
+}
+
+test "inside an inline for over a tuple whose items have different types, features use one iteration" {
+    // 各项的类型不同（长度不同的数组、字符串），合并推导时循环变量的类型求不出：曾补全为空
+    const by_array = try completionLabels(
+        \\const Case = struct { base: u32, expected: ?u32 };
+        \\const short = [_]Case{.{ .base = 1, .expected = null }};
+        \\const long = [_]Case{ .{ .base = 1, .expected = 2 }, .{ .base = 3, .expected = null } };
+        \\test {
+        \\    inline for (.{ &short, &long }) |cases| {
+        \\        for (cases) |c| {
+        \\            _ = c.<|>;
+        \\        }
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(by_array);
+    try testing.expectEqualStrings("base expected", by_array);
+    // 元组的值在运行时才知道，各项的类型 comptime 已知
+    const by_name = try completionLabels(
+        \\const Flag = enum {
+        \\    on,
+        \\    off,
+        \\    pub fn toBool(f: Flag) bool {
+        \\        return f == .on;
+        \\    }
+        \\};
+        \\fn count(strip: Flag, fuzz: Flag) u32 {
+        \\    const flags = .{ .{ "strip", strip }, .{ "single-threaded", fuzz } };
+        \\    var n: u32 = 0;
+        \\    inline for (flags) |f| {
+        \\        if (f[1].<|>) n += 1;
+        \\    }
+        \\    return n;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(by_name);
+    try testing.expectEqualStrings("on off toBool", by_name);
 }
 
 test "callsite seeding tries every instance for a branch only rare instances compile" {
