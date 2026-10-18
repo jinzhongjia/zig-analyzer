@@ -92,6 +92,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 - 只对编译集合（从各 compile step 根模块沿 `@import` 可达的文件）与构建脚本（根目录的 `build.zig`、`build.zig.zon`，以及 `build.zig` 沿相对路径 `@import` 可达的文件，项目实例启动时按文件的当前文本计算）发布 live 诊断。
 - 官方解析器与 AstGen 逐层递归（Debug 构建每层约 16 KB 栈）。先按 token 估计嵌套深度的上界：不超过 256 在当前线程做，不超过 8192 在 512 MiB 栈的专用线程上做；更深的文件不做 AstGen（`zig ast-check` 同样耗尽栈），没有 live 诊断，import 按 token 收集。
 - 附注与引用链映射为 `relatedInformation`：引用链的各项排在附注之后，有位置的项指向引用处，文案为 `referenced by: <名字>`；隐藏计数项位于错误起点，文案与 `zig build` 相同。`@compileLog` 的输出以 `Compile Log Output:` 加各行接在 `found compile log statement` 错误的文案后；同一编译中还有其他错误而没有这条错误时，接在第一条错误后。
+- 子进程回传的 `ErrorBundle`（`bsp_step_completed`、`bsp_configuration_failed` 与单文件编译的结果）使用前校验全部下标与字符串：消息列表、各条消息与逐层的附注、源位置与其后的引用链都在 `extra` 内，字符串下标指向以 0 结尾的字符串，引用链中隐藏标记的计数不当作字符串；嵌套深度与读取总量有上限，自引用与环被拒绝。不合法时丢弃并记录日志，按这次编译没有错误处理，同一消息中的生成文件与读取的文件照常使用。行列与区间等数值不校验，按编辑平移后超出范围的诊断不发布。
 - 单文件模式：每个打开过的、不属于任何带 `build.zig` 的根目录的文件（关闭构建集成时为所有文件）各自作为根编译。
   - 结果中被 import 的文件里的错误发布到那些文件上，打开与未打开的都发。同一文件被多个根报告时汇总：以最新一次编译读取的文本为准，文本不同的结果只取非 AstGen 错误并按差异平移，区间与文案相同的只保留一条。
   - 保存或在磁盘上修改一个文件时，重新编译它自身，以及上一次编译读取过它（编译器的 `file_system_inputs`，限根文件所在目录）或在其中报告过错误的根。
@@ -113,7 +114,7 @@ names/        模块图 · import / 名字解析
 hir/          函数体 IR 降级 · 局部作用域
 syntax/       容错无损 CST · 局部重解析 · ItemTree · AstId · 类型化访问层 · 文件索引（FileIndex、ErrorSets）
 diagnostics/  live（官方解析器 + AstGen）· compiler（ErrorBundle）· 编译集合
-project/      构建系统协议客户端 · zig env · builtin.zig 生成
+project/      构建系统协议客户端 · 子进程 ErrorBundle 的校验 · zig env · builtin.zig 生成
 base/         Vfs · URI · 输入 · ProjectModel
 db/           查询引擎
 util/         各层共用的工具：LSP 位置换算、结构比较、内存统计、日志
@@ -202,7 +203,8 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 新实例被放弃（maker 连续崩溃超过上限、协议版本不符）时，旧实例的编译器诊断被清除、模型保留，直到再次保存 `build.zig`。读不了构建图时提示用户并停止 maker，直到保存 `build.zig`；`bsp_configuration_failed` 中没有错误（`build.zig.zon` 或依赖包的问题）时提示运行 `zig build` 查看原因。
 - 进程管理：maker 与它启动的子进程在 POSIX 上属于以看门狗 `sh` 为组长的进程组，在 Windows 上属于设置了 `KILL_ON_JOB_CLOSE` 的 Job Object。停止项目（shutdown、exit、输入结束、重启）时整组立即结束，不等待构建；服务器以任何方式退出时整组随之结束。
 - 版本耦合：`Configuration` 格式与进程内 AstGen 都来自 zig-analyzer 编译时的标准库。构建图文件没有版本号，按结构体逐字节读取，格式不符时会越界（握手校验的 `build_system_version` 只覆盖协议消息），所以只在用户 zig 的版本与编译时完全一致时读取。
-  - 版本不同时，带 `build.zig` 的根目录不启动构建系统：没有编译器诊断，命名模块的 import（依赖包、构建选项）无法解析，只有 `zig ast-check` 的 live 诊断。这些根目录下的文件也不按单文件编译（使用命名模块的文件会报出找不到模块）；其他文件仍按单文件模式编译。启动时提示用户两个版本与受影响的功能。
+  - 版本不同时，带 `build.zig` 的根目录不启动构建系统：没有编译器诊断，命名模块的 import（依赖包、构建选项）无法解析，只有 `zig ast-check` 的 live 诊断。这些根目录下的文件也不按单文件编译（使用命名模块的文件会报出找不到模块）。启动时提示用户两个版本与受影响的功能。
+  - 其他文件仍按单文件模式编译，读取的是用户 zig 产出的 `ErrorBundle`。它的格式同样没有版本号：使用前按 §3 校验，不通过时丢弃；通过校验的包不会越界读取，但格式不符时诊断的内容可能错乱。
   - 发布版本跟随 Zig 版本。
 
 ### 4.8 服务器与并发（`server/`）
