@@ -20,8 +20,8 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const mem = @import("../util/mem.zig");
 
-/// 与目标相关的值运算参数：指针位宽、向量的布局规则（各模块一致时）。值同时存于 InternPool 供值的运算
-/// 读取，用到值运算的 query 先读本 input 以记录依赖
+/// 与目标相关的值运算参数：指针位宽，向量、整数、浮点与 C 类型的布局规则（各模块一致的部分）。值同时存于
+/// InternPool 供值的运算读取，用到值运算的 query 先读本 input 以记录依赖
 pub const TargetAbi = struct {
     pub const kind: engine.Kind = .input;
     pub const Key = void;

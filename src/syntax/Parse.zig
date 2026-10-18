@@ -30,6 +30,9 @@ base: ?*Parse = null,
 chain_bytes: usize,
 /// 链底全量解析的 arena 容量
 full_bytes: usize,
+/// 解析触及了深度上限：有结构没有递归解析（`Parser.skipNested`），或构造时展平了节点。
+/// 这样的结果与局部重解析的结果无法保证一致，之后的编辑都做全量解析
+deep: bool = false,
 
 pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -45,13 +48,22 @@ pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
 
     var builder: green.Builder = .{ .arena = a, .gpa = gpa };
     defer builder.deinit();
-    try parser.buildTree(&builder, source, tokens, events.events);
+    const flattened = try parser.buildTree(&builder, source, tokens, events.events, 0);
     const root = builder.finish();
     const errors = try a.dupe(parser.Error, events.errors);
     sortErrors(errors);
 
     const result = try a.create(Parse);
-    result.* = .{ .arena = undefined, .gpa = gpa, .source = source, .root = root, .errors = errors, .chain_bytes = 0, .full_bytes = 0 };
+    result.* = .{
+        .arena = undefined,
+        .gpa = gpa,
+        .source = source,
+        .root = root,
+        .errors = errors,
+        .chain_bytes = 0,
+        .full_bytes = 0,
+        .deep = events.limited or flattened,
+    };
     result.arena = arena;
     result.full_bytes = result.arena.queryCapacity();
     result.chain_bytes = result.full_bytes;
@@ -116,7 +128,14 @@ fn sortErrors(errors: []parser.Error) void {
 
 // ── 局部重解析 ───────────────────────────────────────────────────────
 
-const Events = struct { events: []parser.Event, errors: []parser.Error };
+const Events = struct {
+    events: []parser.Event,
+    errors: []parser.Error,
+    /// 见 `Parser.limited`
+    limited: bool,
+    /// 见 `Parser.peak_open`
+    peak_open: u32,
+};
 
 fn runParser(gpa: Allocator, source: []const u8, tokens: []const lexer.Token, comptime entry: anytype) Allocator.Error!Events {
     var significant: std.ArrayList(u32) = .empty;
@@ -133,7 +152,7 @@ fn runParser(gpa: Allocator, source: []const u8, tokens: []const lexer.Token, co
     }
     const events = try p.events.toOwnedSlice(gpa);
     errdefer gpa.free(events);
-    return .{ .events = events, .errors = try p.errors.toOwnedSlice(gpa) };
+    return .{ .events = events, .errors = try p.errors.toOwnedSlice(gpa), .limited = p.limited, .peak_open = p.peak_open };
 }
 
 const unconsumed = "block reparse: unconsumed tokens";
@@ -145,6 +164,7 @@ fn isReparsable(kind: SyntaxKind) bool {
 
 /// 只尝试局部重解析，不满足条件时返回 null（测试与语料对拍使用）。
 pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
+    if (old.deep) return null;
     const old_text = old.source;
     // 编辑区间：公共前缀与后缀之外的部分
     const prefix = std.mem.indexOfDiff(u8, old_text, text) orelse return null; // 文本相同
@@ -189,14 +209,20 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
     const ok = for (events.errors) |e| {
         if (e.message.ptr == unconsumed.ptr) break false;
     } else true;
-    if (!ok or !singleRoot(events.events, target.kind())) {
+    // 嵌套接近上限：全量解析时目标节点外层还有未结束的节点（每个祖先至多再带一个之后放弃的节点），
+    // 可能在这里触及上限而得到不同的结果
+    const near_limit = events.limited or events.peak_open + 2 * path.items.len >= parser.nesting_limit;
+    if (!ok or near_limit or !singleRoot(events.events, target.kind())) {
         arena.deinit();
         return null;
     }
 
     var builder: green.Builder = .{ .arena = a, .gpa = gpa };
     defer builder.deinit();
-    try parser.buildTree(&builder, sub_source, tokens, events.events);
+    if (try parser.buildTree(&builder, sub_source, tokens, events.events, path.items.len)) {
+        arena.deinit();
+        return null;
+    }
     var new_node = builder.finish();
 
     // 自底向上复制路径上的祖先，替换目标节点
@@ -249,6 +275,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
 /// 重解析到文件末尾，之前的顶层子节点原样复用。顶层成员逐个独立解析，向前看至多一两个 token；
 /// 多退一个成员使被向前看到的 token 都在编辑之前。不满足条件时返回 null（结果与全量解析相同）
 pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
+    if (old.deep) return null;
     const old_text = old.source;
     const edit_start: u32 = @intCast(std.mem.indexOfDiff(u8, old_text, text) orelse return null);
     if (old.chain_bytes > 2 * old.full_bytes) return null;
@@ -291,7 +318,11 @@ pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.
 
     var builder: green.Builder = .{ .arena = a, .gpa = gpa };
     defer builder.deinit();
-    try parser.buildTree(&builder, sub_source, tokens, events.events);
+    // 片段与全量解析从同一层开始，触及深度上限时结果也相同；之后的编辑仍须全量解析，这里直接放弃
+    if (events.limited or try parser.buildTree(&builder, sub_source, tokens, events.events, 0)) {
+        arena.deinit();
+        return null;
+    }
     const tail = builder.finish();
 
     const children = try a.alloc(green.GreenElement, from.child + tail.children.len);

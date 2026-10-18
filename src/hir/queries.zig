@@ -90,3 +90,34 @@ pub const ItemBody = struct {
         gpa.destroy(o);
     }
 };
+
+/// 参数的形式：有无类型标注（`anytype`）与是否 comptime
+pub const ParamForm = enum(u8) { typed, comptime_typed, any, comptime_any };
+
+/// 成员（函数）各参数的形式。调用处据此判断是否为泛型调用：只改函数体时值不变，调用者不随之重算
+/// （直接依赖 `ItemBody` 时，改被调函数的函数体会使它的全部调用者失效）
+pub const ParamForms = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = OwnerKey;
+    pub const Value = []const ParamForm;
+
+    pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
+        const body = try ctx.get(ItemBody, key);
+        const forms = try ctx.db.gpa.alloc(ParamForm, body.params.len);
+        for (body.params, forms) |p, *f| {
+            const b = body.binding(p);
+            f.* = if (b.ty == null)
+                (if (b.is_comptime) .comptime_any else .any)
+            else if (b.is_comptime) .comptime_typed else .typed;
+        }
+        return forms;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(ParamForm, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};

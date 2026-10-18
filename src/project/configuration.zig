@@ -19,15 +19,25 @@ pub fn load(gpa: Allocator, io: Io, build_root: []const u8, path: []const u8, en
     var file = try dir.openFile(io, path, .{});
     defer file.close(io);
     const conf = try Configuration.loadFile(scratch.allocator(), io, file);
-    return convert(gpa, &conf, build_root, env);
+    return convert(gpa, &conf, build_root, try localCacheRoot(scratch.allocator(), build_root, path), env);
 }
 
-pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, env: *const ZigEnv) Allocator.Error!ProjectModel {
+/// maker 使用的本地缓存目录（绝对路径），由构建图文件的路径 `configuration_path`（相对于构建根目录或为
+/// 绝对路径）得出：maker 把构建图写在本地缓存目录下的 `c/<hash>`（不使用缓存时为 `tmp/<hex>`）。
+/// 本地缓存目录取决于 `--cache-dir`、环境变量 `ZIG_LOCAL_CACHE_DIR` 与默认的 `<构建根>/.zig-cache`，
+/// 从 maker 给出的路径反推，不必重复 maker 解析参数与环境变量的规则
+pub fn localCacheRoot(a: Allocator, build_root: []const u8, configuration_path: []const u8) Allocator.Error![]u8 {
+    const dir = std.fs.path.dirname(configuration_path) orelse "";
+    return std.fs.path.resolveAlloc(a, &.{ build_root, std.fs.path.dirname(dir) orelse "" });
+}
+
+/// `local_cache_root` 为 maker 使用的本地缓存目录（绝对路径，见 `localCacheRoot`）
+pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, local_cache_root: []const u8, env: *const ZigEnv) Allocator.Error!ProjectModel {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const ctx: Ctx = .{ .arena = a, .c = c, .build_root = try a.dupe(u8, build_root), .env = env };
+    const ctx: Ctx = .{ .arena = a, .c = c, .build_root = try a.dupe(u8, build_root), .local_cache_root = try a.dupe(u8, local_cache_root), .env = env };
 
     // 模块按 Configuration.Module.Index 去重，下标为发现顺序
     var module_ids: std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void) = .empty;
@@ -118,6 +128,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     return .{
         .arena = arena_state.state,
         .build_root = ctx.build_root,
+        .local_cache_root = ctx.local_cache_root,
         .std_root = std_root,
         .steps = steps,
         .modules = modules.items,
@@ -170,13 +181,17 @@ fn walkGeneratedFiles(c: *const Configuration, step: *const Configuration.Step, 
 }
 
 /// maker 上报的生成文件路径（前缀 + 子路径）转为绝对路径
-pub fn generatedPath(gpa: Allocator, build_root: []const u8, env: *const ZigEnv, prefix: std.zig.Server.Message.PathPrefix, sub_path: []const u8) Allocator.Error![]u8 {
+pub fn generatedPath(gpa: Allocator, model: *const ProjectModel, env: *const ZigEnv, prefix: std.zig.Server.Message.PathPrefix, sub_path: []const u8) Allocator.Error![]u8 {
     const base: []const u8 = switch (prefix) {
         // maker 的 cwd 就是构建根目录
-        .cwd, .build_root => build_root,
+        .cwd, .build_root => model.build_root,
         .zig_lib => env.lib_dir,
         .global_cache => env.global_cache_dir,
-        .local_cache => return std.fs.path.resolveAlloc(gpa, &.{ build_root, ".zig-cache", sub_path }),
+        .local_cache => blk: {
+            // 测试中手写的模型可以不设本地缓存目录，`convert` 得到的模型总是带绝对路径
+            std.debug.assert(std.fs.path.isAbsolute(model.local_cache_root));
+            break :blk model.local_cache_root;
+        },
     };
     return std.fs.path.resolveAlloc(gpa, &.{ base, sub_path });
 }
@@ -227,6 +242,7 @@ const Ctx = struct {
     arena: Allocator,
     c: *const Configuration,
     build_root: []const u8,
+    local_cache_root: []const u8,
     env: *const ZigEnv,
 
     /// 解析为绝对路径；生成文件等构建前无法确定的路径返回 null
@@ -244,7 +260,7 @@ const Ctx = struct {
             .relative => |rel| blk: {
                 const base: []const u8 = switch (rel.flags.base) {
                     .cwd, .build_root => ctx.build_root,
-                    .local_cache => try ctx.join(ctx.build_root, ".zig-cache"),
+                    .local_cache => ctx.local_cache_root,
                     .global_cache => ctx.env.global_cache_dir,
                     .zig_lib => ctx.env.lib_dir,
                     else => break :blk null,
@@ -260,6 +276,23 @@ const Ctx = struct {
         return std.fs.path.resolveAlloc(ctx.arena, &.{ a, b });
     }
 };
+
+test localCacheRoot {
+    const native = @import("../util/test_path.zig").native;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = native("/p");
+    try std.testing.expectEqualStrings(native("/p/.zig-cache"), try localCacheRoot(a, root, ".zig-cache/c/0123"));
+    // `ZIG_LOCAL_CACHE_DIR` / `--cache-dir` 为相对路径：相对于构建根目录
+    try std.testing.expectEqualStrings(native("/p/relcache"), try localCacheRoot(a, root, "relcache/c/0123"));
+    try std.testing.expectEqualStrings(native("/altcache"), try localCacheRoot(a, root, "../altcache/c/0123"));
+    try std.testing.expectEqualStrings(native("/elsewhere/cache"), try localCacheRoot(a, root, native("/elsewhere/cache/c/0123")));
+    // 本地缓存目录就是构建根目录
+    try std.testing.expectEqualStrings(root, try localCacheRoot(a, root, "c/0123"));
+    // 不使用缓存时构建图在 `tmp` 下
+    try std.testing.expectEqualStrings(native("/p/sub/cache"), try localCacheRoot(a, root, "sub/cache/tmp/1f"));
+}
 
 test {
     _ = @import("project_test.zig");

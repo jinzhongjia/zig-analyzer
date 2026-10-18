@@ -39,7 +39,7 @@
 //! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `trySweep` 中进行
 //! （此时没有读事务持有值）。
 //!
-//! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先置位
+//! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先登记到
 //! `pending_write` 使进行中的读查询尽快以 `error.Canceled` 退出，再获取独占锁。
 //! 读事务内拿到的 query 值在该事务结束前一直有效：被替换的旧值延迟到下一次写事务才释放。
 
@@ -183,7 +183,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         rw: Io.RwLock = .init,
         /// 保护所有表的元数据（key 驻留、slot、memo、垃圾列表）
         mutex: Io.Mutex = .init,
-        pending_write: std.atomic.Value(bool) = .init(false),
+        /// 等待独占锁的写事务数，非零时读查询以 `error.Canceled` 退出。写事务拿到锁后才减一：
+        /// 多个写事务排队时，先拿到锁的不会清掉后面的登记，排在它们之间拿到共享锁的读事务同样被取消
+        pending_write: std.atomic.Value(u32) = .init(0),
         /// 进行中的读事务数。释放 memo 的值（淘汰、垃圾回收、`resetQueries`）时必须为 0，以断言检查
         active_readers: std.atomic.Value(u32) = .init(0),
         writing: bool = false,
@@ -353,9 +355,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         /// 开始写事务：取消进行中的读查询，等待所有读事务结束。
         pub fn beginWrite(db: *Db) void {
-            db.pending_write.store(true, .release);
+            _ = db.pending_write.fetchAdd(1, .release);
             db.rw.lockUncancelable(db.io);
-            db.pending_write.store(false, .release);
+            _ = db.pending_write.fetchSub(1, .release);
             db.writing = true;
             db.bumped_in_write = false;
             db.collectGarbage();
@@ -562,21 +564,38 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             frontier: ?DepKey = null,
             /// 已经从栈底计算过的中断处个数
             deepening: u32 = 0,
+            /// 在当前栈上无法验证的 memo，按 key 去重
+            unverifiable: std.ArrayList(Unverifiable) = .empty,
+
+            /// memo 的依赖经由环回到了栈上下标为 `depth` 的 query（验证时遇到它，或重算时在环中）。
+            /// 这个 query 出栈前，memo 视为无法验证：读取时直接重算（结果在环中时不写入 memo），验证其他 memo 时
+            /// 视为已变化且不重算。否则环中每读一次都要重新验证、重算它的整条依赖链，而重算的结果又不保留，
+            /// 代价随链长指数增长
+            const Unverifiable = struct { key: DepKey, depth: u32 };
+
+            /// 帧中记下的依赖，按记录顺序去重。依赖少时线性查找，多时建立散列索引：接过环中结果的依赖后，
+            /// 一帧可能有很多依赖
+            const DepSet = std.array_hash_map.Custom(DepKey, void, std.array_hash_map.AutoContext(DepKey), false);
 
             /// `deps` 使用 `db.gpa` 分配，因为它最终归 memo 所有
             const Frame = struct {
                 key: DepKey,
-                deps: std.ArrayList(DepKey) = .empty,
+                deps: DepSet = .empty,
                 durability: Durability = .high,
                 /// 本帧参与了环，结果不写入 memo
                 in_cycle: bool = false,
+                /// 本帧被 `markIncomplete` 标记：它与它下面的各帧都不写入 memo
+                incomplete: bool = false,
+                /// 本帧所在的环中位于栈最底层的 query 的下标（`markIncomplete` 不设置）
+                cycle_head: ?u32 = null,
                 /// 本帧中执行的其他 query 的耗时（用于自身耗时）
                 child_ns: u64 = 0,
             };
 
             pub fn end(ctx: *Ctx) void {
-                assert(ctx.stack.items.len == 0);
+                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0);
                 ctx.stack.deinit(ctx.gpa);
+                ctx.unverifiable.deinit(ctx.gpa);
                 _ = ctx.db.active_readers.fetchSub(1, .acq_rel);
                 ctx.db.rw.unlockShared(ctx.db.io);
                 ctx.* = undefined;
@@ -592,7 +611,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// 当前结果不完整（燃料耗尽等）：栈上的 query 都不写入 memo
             pub fn markIncomplete(ctx: *Ctx, cause: IncompleteCause) void {
                 _ = ctx.db.incomplete_causes[@backingInt(cause)].fetchAdd(1, .monotonic);
-                for (ctx.stack.items) |*frame| frame.in_cycle = true;
+                for (ctx.stack.items) |*frame| {
+                    frame.in_cycle = true;
+                    frame.incomplete = true;
+                }
             }
 
             /// compute 内部因栈深度上限中断：除 `markIncomplete` 外，记下正在计算的 query，
@@ -611,7 +633,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             /// 长时间运行的 compute 应周期性调用。
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
-                if (ctx.db.pending_write.load(.acquire)) return error.Canceled;
+                if (ctx.db.pending_write.load(.acquire) != 0) return error.Canceled;
                 if (ctx.cancel) |c| if (c.load(.acquire)) return error.Canceled;
             }
 
@@ -666,7 +688,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     .input => db.readInput(Q, index),
                     .derived => blk: {
                         for (ctx.stack.items, 0..) |frame, i| {
-                            if (frame.key.eql(dep)) return ctx.onCycle(Q, i, key);
+                            if (frame.key.eql(dep)) return ctx.onCycle(Q, @intCast(i), key);
                         }
                         if (@hasDecl(Q, "cycleFallback") and ctx.stackExhausted()) {
                             // 本 revision 已验证的结果可以直接使用，不会再深入
@@ -679,6 +701,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     },
                 };
                 if (Q.kind == .derived and !fresh.executed) _ = db.counters[qi].hits.fetchAdd(1, .monotonic);
+                if (Q.kind == .derived and fresh.in_cycle) return fresh.value;
                 try ctx.recordDep(dep, fresh.durability);
                 return fresh.value;
             }
@@ -687,23 +710,60 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (ctx.stack.items.len == 0) return;
                 const top = &ctx.stack.items[ctx.stack.items.len - 1];
                 top.durability = top.durability.min(durability);
-                for (top.deps.items) |d| if (d.eql(dep)) return;
-                try top.deps.append(ctx.db.gpa, dep);
+                _ = try top.deps.getOrPut(ctx.db.gpa, dep);
             }
 
-            fn onCycle(ctx: *Ctx, comptime Q: type, head: usize, key: Q.Key) Q.Value {
+            /// 环中的结果不写入 memo，读取它的 query 不把它记为依赖，改为接过它读到的依赖（环中对栈上
+            /// query 的读取不记为依赖，读到的是回退值）。环中的 query 可能另有单独计算出的 memo，值与环中算出的
+            /// 不同：若记为依赖，它之后重算出与旧 memo 相同的值（early cutoff）时，依赖它的 memo 会被误判为未变；
+            /// 环的入口也会与环内成员的 memo 互相依赖，验证时沿 memo 环反复递归
+            fn inheritDeps(ctx: *Ctx, frame: *const Frame) Allocator.Error!void {
+                const target = ctx.inheritTarget() orelse return;
+                target.durability = target.durability.min(frame.durability);
+                for (frame.deps.keys()) |dep| _ = try target.deps.getOrPut(ctx.db.gpa, dep);
+            }
+
+            /// 接过环中结果的依赖的帧：栈上最近的不在环中的帧。跳过的帧都在环中、不写入 memo，依赖不必
+            /// 经过它们逐层传递（否则环中每一层都要合并上面各层的依赖）。`markIncomplete` 标记的帧及其下方
+            /// 都不写入 memo，没有这样的帧
+            fn inheritTarget(ctx: *Ctx) ?*Frame {
+                var i = ctx.stack.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const frame = &ctx.stack.items[i];
+                    if (frame.incomplete) return null;
+                    if (!frame.in_cycle) return frame;
+                    // 环中位于栈最底层的 query 之上的各帧都在环中
+                    if (frame.cycle_head) |head| i = @min(i, head + 1);
+                }
+                return null;
+            }
+
+            fn onCycle(ctx: *Ctx, comptime Q: type, head: u32, key: Q.Key) Q.Value {
                 if (!@hasDecl(Q, "cycleFallback")) {
                     std.debug.panic("query cycle without cycleFallback: {s}", .{@typeName(Q)});
                 }
                 // 不动点的入口算一遍即得完整结果，只有环内的其他 query 依赖回退值
                 const first = if (@hasDecl(Q, "fixpoint") and Q.fixpoint) head + 1 else head;
                 _ = ctx.db.incomplete_causes[@backingInt(IncompleteCause.cycle)].fetchAdd(1, .monotonic);
-                for (ctx.stack.items[first..]) |*frame| frame.in_cycle = true;
+                for (ctx.stack.items[first..]) |*frame| {
+                    frame.in_cycle = true;
+                    frame.cycle_head = @min(frame.cycle_head orelse head, head);
+                }
                 return Q.cycleFallback(key);
             }
 
             fn Fresh(comptime Q: type) type {
-                return struct { value: Q.Value, changed_at: Revision, durability: Durability, executed: bool = false };
+                return struct {
+                    value: Q.Value,
+                    changed_at: Revision,
+                    durability: Durability,
+                    executed: bool = false,
+                    /// 环中的结果：它读到的依赖已交给栈上的帧（见 `inheritDeps`），读取方不再把它记为依赖
+                    in_cycle: bool = false,
+                    /// 结果在环中，或（只验证依赖时）因环无法验证而没有重算：栈上这个下标的 query 出栈前都是如此
+                    cycle: ?u32 = null,
+                };
             }
 
             fn verifiedMemo(ctx: *Ctx, comptime Q: type, index: u32) ?Fresh(Q) {
@@ -717,69 +777,134 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             /// 确保 derived memo 在当前 revision 有效，必要时验证或重算。`need_value` 为 false 时
-            /// （只验证依赖）不恢复被淘汰的值，返回的 `value` 无效
+            /// （只验证依赖）不恢复被淘汰的值、不重算因环无法验证的 memo，返回的 `value` 无效
             fn ensureFresh(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, need_value: bool) Error!Fresh(Q) {
                 const db = ctx.db;
                 const table = &db.tables[comptime queryIndex(Q)];
+                const dep: DepKey = .{ .query = comptime queryIndex(Q), .index = index };
 
                 db.mutex.lockUncancelable(db.io);
                 const existing = table.slots.items[index].memo;
                 if (existing) |_| table.slots.items[index].memo.?.last_used = db.access_tick.fetchAdd(1, .monotonic);
                 db.mutex.unlock(db.io);
 
-                if (existing) |memo| {
-                    const valid = memo.verified_at == db.revision or try ctx.deepVerify(memo.verified_at, memo.durability, memo.deps);
+                if (existing) |memo| verify: {
+                    const verdict: Verdict = if (memo.verified_at == db.revision)
+                        .{ .unchanged = memo.durability }
+                    else if (ctx.unverifiableDepth(dep)) |depth|
+                        .{ .cycle = depth }
+                    else
+                        try ctx.deepVerify(memo.verified_at, memo.durability, memo.deps);
+                    const durability = switch (verdict) {
+                        .unchanged => |d| d,
+                        .changed => break :verify,
+                        .cycle => |depth| {
+                            try ctx.markUnverifiable(dep, depth);
+                            if (need_value) break :verify;
+                            return .{ .value = undefined, .changed_at = db.revision, .durability = .low, .cycle = depth };
+                        },
+                    };
                     // 值已被淘汰：依赖未变，重算出的值必然相同，沿用原 changed_at
-                    if (valid and memo.evicted) {
+                    if (memo.evicted) {
                         if (need_value) return ctx.execute(Q, index, key, true);
                         db.mutex.lockUncancelable(db.io);
                         defer db.mutex.unlock(db.io);
                         const m = &table.slots.items[index].memo.?;
-                        m.verified_at = @max(m.verified_at, db.revision);
+                        markVerified(m, db.revision, durability);
                         return .{ .value = undefined, .changed_at = m.changed_at, .durability = m.durability };
                     }
-                    if (valid) {
-                        db.mutex.lockUncancelable(db.io);
-                        defer db.mutex.unlock(db.io);
-                        // 可能已被并发读者重算替换，以表中当前值为准
-                        const m = &table.slots.items[index].memo.?;
-                        if (!m.evicted) {
-                            m.verified_at = @max(m.verified_at, db.revision);
-                            return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
-                        }
+                    db.mutex.lockUncancelable(db.io);
+                    defer db.mutex.unlock(db.io);
+                    // 可能已被并发读者重算替换，以表中当前值为准
+                    const m = &table.slots.items[index].memo.?;
+                    if (!m.evicted) {
+                        markVerified(m, db.revision, durability);
+                        return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
                     }
                 }
                 return ctx.execute(Q, index, key, false);
             }
 
-            /// 所有依赖的 changed_at 都不晚于 `verified_at` 时返回 true。
-            fn deepVerify(ctx: *Ctx, verified_at: Revision, durability: Durability, deps: []const DepKey) Error!bool {
-                const db = ctx.db;
-                if (db.last_changed[@backingInt(durability)] <= verified_at) return true;
-                _ = db.deep_verifications.fetchAdd(1, .monotonic);
-                for (deps) |dep| {
-                    if (try ctx.changedAt(dep) > verified_at) return false;
-                }
-                return true;
+            fn unverifiableDepth(ctx: *const Ctx, dep: DepKey) ?u32 {
+                for (ctx.unverifiable.items) |u| if (u.key.eql(dep)) return u.depth;
+                return null;
             }
 
-            /// 把依赖带到最新状态并返回它的 changed_at（不记录依赖）。
-            fn changedAt(ctx: *Ctx, dep: DepKey) Error!Revision {
+            fn markUnverifiable(ctx: *Ctx, dep: DepKey, depth: u32) Allocator.Error!void {
+                for (ctx.unverifiable.items) |*u| if (u.key.eql(dep)) {
+                    // 下标越小的 query 出栈越晚
+                    u.depth = @min(u.depth, depth);
+                    return;
+                };
+                try ctx.unverifiable.append(ctx.gpa, .{ .key = dep, .depth = depth });
+            }
+
+            /// 弹出栈顶帧：依赖经由环回到这一帧的 memo 不再无法验证
+            fn popFrame(ctx: *Ctx) Frame {
+                const frame = ctx.stack.pop().?;
+                const depth = ctx.stack.items.len;
+                var i: usize = 0;
+                while (i < ctx.unverifiable.items.len) {
+                    if (ctx.unverifiable.items[i].depth >= depth) {
+                        _ = ctx.unverifiable.swapRemove(i);
+                    } else i += 1;
+                }
+                return frame;
+            }
+
+            /// 验证通过的 memo 取依赖当前的最低 durability：依赖的输入降低 durability 而值经 early cutoff
+            /// 未变时，memo 不能仍按旧的高 durability 在之后的验证中跳过依赖检查
+            fn markVerified(m: anytype, revision: Revision, durability: Durability) void {
+                if (m.verified_at < revision) m.durability = durability;
+                m.verified_at = @max(m.verified_at, revision);
+            }
+
+            /// memo 依赖的验证结果
+            const Verdict = union(enum) {
+                /// 依赖的 changed_at 都不晚于 memo 的 `verified_at`，带依赖当前的最低 durability
+                unchanged: Durability,
+                /// 有依赖在 memo 验证之后变化
+                changed,
+                /// 依赖经由环回到栈上这个下标的 query，它出栈前无法验证（见 `Unverifiable`）
+                cycle: u32,
+            };
+
+            fn deepVerify(ctx: *Ctx, verified_at: Revision, durability: Durability, deps: []const DepKey) Error!Verdict {
+                const db = ctx.db;
+                // 不低于 `durability` 的输入都未变化：依赖的 durability 也不会降低
+                if (db.last_changed[@backingInt(durability)] <= verified_at) return .{ .unchanged = durability };
+                _ = db.deep_verifications.fetchAdd(1, .monotonic);
+                var lowest: Durability = .high;
+                for (deps) |dep| {
+                    const state = try ctx.depState(dep);
+                    if (state.cycle) |depth| return .{ .cycle = depth };
+                    if (state.changed_at > verified_at) return .changed;
+                    lowest = lowest.min(state.durability);
+                }
+                return .{ .unchanged = lowest };
+            }
+
+            /// 把依赖带到最新状态并返回它的 changed_at 与 durability（不记录依赖）。`cycle` 见 `Fresh`
+            fn depState(ctx: *Ctx, dep: DepKey) Error!struct { changed_at: Revision, durability: Durability, cycle: ?u32 = null } {
                 const db = ctx.db;
                 inline for (queries, 0..) |Q, qi| {
                     if (dep.query == qi) switch (Q.kind) {
-                        .input => return db.readInput(Q, dep.index).changed_at,
+                        .input => {
+                            const input = db.readInput(Q, dep.index);
+                            return .{ .changed_at = input.changed_at, .durability = input.durability };
+                        },
                         .derived => {
                             db.mutex.lockUncancelable(db.io);
                             const key = db.tables[qi].keys.keys()[dep.index];
                             db.mutex.unlock(db.io);
-                            for (ctx.stack.items) |frame| {
-                                // 验证路径上遇到环：视为已变化，强制上层重算
-                                if (frame.key.eql(dep)) return db.revision;
+                            for (ctx.stack.items, 0..) |frame, i| {
+                                // 验证路径上回到了栈上的 query：它出栈前无法验证，强制上层重算
+                                if (frame.key.eql(dep)) return .{ .changed_at = db.revision, .durability = .low, .cycle = @intCast(i) };
                             }
                             // 栈深度超过上限：同样视为已变化，由重算处理（重算时以回退值代替）
-                            if (ctx.stackExhausted()) return db.revision;
-                            return (try ctx.ensureFresh(Q, dep.index, key, false)).changed_at;
+                            if (ctx.stackExhausted()) return .{ .changed_at = db.revision, .durability = .low };
+                            const fresh = try ctx.ensureFresh(Q, dep.index, key, false);
+                            return .{ .changed_at = fresh.changed_at, .durability = fresh.durability, .cycle = fresh.cycle };
                         },
                     };
                 }
@@ -815,23 +940,23 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     break :blk Q.computeIncremental(ctx, key, prev);
                 } else Q.compute(ctx, key);
                 var value = computed catch |err| {
-                    var frame = ctx.stack.pop().?;
+                    var frame = ctx.popFrame();
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(ctx.db.gpa);
                     return err;
                 };
                 // compute 可能吞掉了内层读取的 `Canceled`（`catch null` 之类的回退），结果不完整，
-                // 不能写入 memo。取消标志在读事务结束前不会复位（写事务要等读者退出才清除
-                // `pending_write`），所以在这里检查一次即可发现
+                // 不能写入 memo。取消标志在读事务结束前不会复位（写事务要等读者退出、拿到独占锁后
+                // 才把 `pending_write` 减一），所以在这里检查一次即可发现
                 if (ctx.checkCanceled()) |_| {} else |err| {
-                    var frame = ctx.stack.pop().?;
+                    var frame = ctx.popFrame();
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(db.gpa);
                     // 新值没有发布过，没有其他引用：直接释放
                     deinitValue(Q, &value, db.gpa);
                     return err;
                 }
-                var frame = ctx.stack.pop().?;
+                var frame = ctx.popFrame();
                 ctx.finishTiming(qi, &frame, t0, trace_index, false);
 
                 db.mutex.lockUncancelable(db.io);
@@ -846,20 +971,22 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 };
                 // 环中的结果依赖于入口，不写入 memo。值返回给调用方使用，放入垃圾列表待读事务结束后释放
                 if (frame.in_cycle) {
-                    frame.deps.deinit(db.gpa);
+                    defer frame.deps.deinit(db.gpa);
                     db.discardLocked(Q, &value) catch |err| {
                         deinitValue(Q, &value, db.gpa);
                         return err;
                     };
-                    return .{ .value = value, .changed_at = db.revision, .durability = .low, .executed = true };
+                    try ctx.inheritDeps(&frame);
+                    // 环中位于栈最底层的 query 仍在栈上：它出栈前本 query 都只能在环中计算
+                    const cycle: ?u32 = if (frame.cycle_head) |head| (if (head < ctx.stack.items.len) head else null) else null;
+                    if (cycle) |depth| try ctx.markUnverifiable(.{ .query = qi, .index = index }, depth);
+                    return .{ .value = value, .changed_at = db.revision, .durability = .low, .executed = true, .in_cycle = true, .cycle = cycle };
                 }
 
                 // 提交 memo 之前失败：新值没有发布过，直接释放
                 errdefer deinitValue(Q, &value, db.gpa);
-                const deps = frame.deps.toOwnedSlice(db.gpa) catch |err| {
-                    frame.deps.deinit(db.gpa);
-                    return err;
-                };
+                defer frame.deps.deinit(db.gpa);
+                const deps = try db.gpa.dupe(DepKey, frame.deps.keys());
                 errdefer db.gpa.free(deps);
 
                 var changed_at = db.revision;

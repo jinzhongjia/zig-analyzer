@@ -131,18 +131,39 @@ pub const LineIndex = struct {
 
     pub fn position(li: LineIndex, offset: usize, enc: Encoding) types.Position {
         const line = li.lineOf(offset);
-        const start = li.line_starts[line];
-        const target = @min(offset, li.text.len);
-        const end = lineEnd(li.text, start);
-        var i: usize = start;
-        var units: u32 = 0;
-        while (i < @min(target, end)) {
+        return .{ .line = line, .character = li.units(line, li.line_starts[line], offset, enc) };
+    }
+
+    /// 同 `position`。`prev` 为 `prev_offset`（字符边界）的位置：与 `offset` 在同一行且不晚于它时从这里
+    /// 继续计数。按偏移递增逐个换算时使用，每次从行首计数在很长的行上是二次的
+    pub fn positionAfter(li: LineIndex, prev_offset: usize, prev: types.Position, offset: usize, enc: Encoding) types.Position {
+        const line = li.lineOf(offset);
+        if (line != prev.line or offset < prev_offset or prev_offset < li.line_starts[line]) return li.position(offset, enc);
+        return .{ .line = line, .character = prev.character + li.units(line, prev_offset, offset, enc) };
+    }
+
+    /// 第 `line` 行中从 `from`（字符边界）到 `offset` 的代码单元数；偏移落在多字节字符中间时向前取整
+    fn units(li: LineIndex, line: u32, from: usize, offset: usize, enc: Encoding) u32 {
+        const end = li.contentEnd(line);
+        const target = @min(offset, end);
+        var i = from;
+        var n: u32 = 0;
+        while (i < target) {
             const w = charWidth(li.text[i..end], enc);
             if (i + w.len > target) break;
-            units += w.units;
+            n += w.units;
             i += w.len;
         }
-        return .{ .line = line, .character = units };
+        return n;
+    }
+
+    /// 第 `line` 行内容的结束偏移（不含换行符）
+    fn contentEnd(li: LineIndex, line: u32) usize {
+        if (line + 1 >= li.line_starts.len) return li.text.len;
+        var end: usize = li.line_starts[line + 1];
+        if (end > 0 and li.text[end - 1] == '\n') end -= 1;
+        if (end > li.line_starts[line] and li.text[end - 1] == '\r') end -= 1;
+        return end;
     }
 
     pub fn range(li: LineIndex, start: usize, end: usize, enc: Encoding) types.Range {
@@ -151,12 +172,21 @@ pub const LineIndex = struct {
 };
 
 test LineIndex {
-    const text = "x\r\na😀b\nlast";
+    const text = "x\r\na😀b\nlast\r\r\n😀😀";
     var li: LineIndex = try .init(testing.allocator, text);
     defer li.deinit(testing.allocator);
     for ([_]Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        var prev_offset: usize = 0;
+        var prev: types.Position = .{ .line = 0, .character = 0 };
         for (0..text.len + 1) |off| {
-            try testing.expectEqual(offsetToPosition(text, off, enc), li.position(off, enc));
+            const expected = offsetToPosition(text, off, enc);
+            try testing.expectEqual(expected, li.position(off, enc));
+            try testing.expectEqual(expected, li.positionAfter(prev_offset, prev, off, enc));
+            // 只从字符边界继续
+            if (off == text.len or (text[off] & 0xc0) != 0x80) {
+                prev_offset = off;
+                prev = expected;
+            }
         }
     }
 }

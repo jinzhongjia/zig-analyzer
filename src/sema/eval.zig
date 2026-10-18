@@ -38,6 +38,9 @@ const max_eval_bytes = 64 * 1024 * 1024;
 const max_agg_elems = 1 << 16;
 /// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
 const max_layout_depth = 64;
+/// 驻留时值的嵌套深度上限（聚合与指针的层数）。驻留的值按内容唯一表示、没有环，
+/// 自引用的值（如 `n.next = &n`）沿指针展开不会结束
+const max_freeze_depth = 256;
 
 const Error = resolve.Error;
 /// 放弃求值与控制流
@@ -488,6 +491,8 @@ const Evaluator = struct {
     arena: ?*std.heap.ArenaAllocator = null,
     steps: u32 = 0,
     inline_calls: u32 = 0,
+    /// `freeze` 当前的嵌套深度
+    freeze_depth: u32 = 0,
     /// 跟踪字符串字面量的来源（见 `stringOrigin`）
     track: ?*Tracking = null,
     /// break / continue 的目标（`Frame.labels` 下标）与值；return 的值
@@ -536,12 +541,18 @@ const Evaluator = struct {
         return if (tv.val) |x| Val.of(tv.ty, x) else .{ .ty = tv.ty };
     }
 
-    /// 驻留后的值；值未知时为 null
+    /// 驻留后的值；值未知时为 null。自引用与嵌套超过 `max_freeze_depth` 的值按未知处理
     fn freeze(ev: *Evaluator, v: Val) EvalError!?Index {
         switch (v.v) {
             .unknown => return null,
             .undef => return .undefined_value,
             .ip => |x| return x,
+            .agg, .ref => {},
+        }
+        if (ev.freeze_depth >= max_freeze_depth) return null;
+        ev.freeze_depth += 1;
+        defer ev.freeze_depth -= 1;
+        switch (v.v) {
             .agg => |agg| {
                 const elems = try ev.a.alloc(Index, agg.elems.len);
                 for (agg.elems, elems) |e, *out| out.* = try ev.freeze(e) orelse return null;
@@ -552,6 +563,7 @@ const Evaluator = struct {
                 const pointee = try ev.freeze(target) orelse return null;
                 return try ev.pointerTo(v.ty, pointee);
             },
+            .unknown, .undef, .ip => unreachable,
         }
     }
 
@@ -582,13 +594,13 @@ const Evaluator = struct {
     }
 
     /// 深复制可修改的聚合（值语义）
-    fn copy(ev: *Evaluator, v: Val) Error!Val {
+    fn copy(ev: *Evaluator, v: Val) EvalError!Val {
         const agg = switch (v.v) {
             .agg => |x| x,
             else => return v,
         };
         const out = try ev.a.create(Agg);
-        out.* = .{ .elems = try ev.a.alloc(Val, agg.elems.len) };
+        out.* = .{ .elems = try ev.allocElems(agg.elems.len) };
         for (agg.elems, out.elems) |e, *o| o.* = try ev.copy(e);
         return .{ .ty = v.ty, .v = .{ .agg = out } };
     }
@@ -631,7 +643,8 @@ const Evaluator = struct {
     fn elemCount(ev: *Evaluator, v: Val) EvalError!?usize {
         switch (v.v) {
             .agg => |agg| return agg.elems.len,
-            .ref => |ref| return ev.elemCount(try ev.load(ref)),
+            // 区间的长度不必取出元素
+            .ref => |ref| return if (ref.window) |w| w.len else ev.elemCount(try ev.load(ref)),
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return agg.elems.len,
                 .bytes => |b| return b.bytes.len,
@@ -657,7 +670,13 @@ const Evaluator = struct {
             .unknown => return .{ .ty = ty },
             .undef => return .{ .ty = ty, .v = .undef },
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
-            .ref => |ref| return ev.elemAt(try ev.load(ref), i),
+            .ref => |ref| {
+                // 区间：下标相对于区间的起点，在所在的聚合中直接取元素
+                const base = try ev.loadPath(ref);
+                const w = ref.window orelse return ev.elemAt(base, i);
+                if (i >= w.len) return error.Abort;
+                return ev.elemAt(base, w.start + i);
+            },
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
                 .bytes => |b| return if (i < b.bytes.len) Val.of(.u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
@@ -668,20 +687,39 @@ const Evaluator = struct {
         }
     }
 
+    /// 指针所指向的值。区间取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）；
+    /// 只取元素或长度时用 `elemAt` / `elemCount`，不复制区间
     fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
-        var cur = ref.cell.*;
-        for (ref.path) |i| cur = try ev.elemAt(cur, i);
+        const cur = try ev.loadPath(ref);
         const w = ref.window orelse return cur;
-        // 区间：取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）
-        const elems = try ev.a.alloc(Val, w.len);
+        const elems = try ev.allocElems(w.len);
         for (elems, w.start..) |*o, i| o.* = try ev.elemAt(cur, i);
         const array = try ev.ip.get(.{ .array_type = .{ .len = w.len, .child = ev.elemTypeOf(cur.ty, w.start) } });
         return ev.makeAgg(array, elems);
     }
 
+    /// 沿 `path` 逐层取元素得到的值；区间所在的聚合（不取出区间）
+    fn loadPath(ev: *Evaluator, ref: Ref) EvalError!Val {
+        var cur = ref.cell.*;
+        for (ref.path) |i| cur = try ev.elemAt(cur, i);
+        return cur;
+    }
+
+    /// 展开 `n` 个元素的聚合：分配之前检查元素个数与本次求值的内存上限（`tick` 每隔一段才检查内存，
+    /// 单步展开的大聚合会越过它）
+    fn allocElems(ev: *Evaluator, n: usize) EvalError![]Val {
+        if (n > max_agg_elems) return error.Abort;
+        if (ev.arena) |arena| if (arena.queryCapacity() + n * @sizeOf(Val) > max_eval_bytes) return error.Abort;
+        return ev.a.alloc(Val, n);
+    }
+
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
         if (ref.window) |w| {
-            for (0..w.len) |i| try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
+            // 逐元素写入：每个元素计一步
+            for (0..w.len) |i| {
+                try ev.tick();
+                try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
+            }
             return;
         }
         var cell = ref.cell;
@@ -698,9 +736,8 @@ const Evaluator = struct {
         if (cell.v == .agg) return cell.v.agg;
         if (cell.v == .ref) return error.Abort;
         const n = try ev.elemCount(cell.*) orelse return error.Abort;
-        if (n > max_agg_elems) return error.Abort;
         const agg = try ev.a.create(Agg);
-        agg.* = .{ .elems = try ev.a.alloc(Val, n) };
+        agg.* = .{ .elems = try ev.allocElems(n) };
         for (agg.elems, 0..) |*e, i| e.* = try ev.elemAt(cell.*, i);
         cell.v = .{ .agg = agg };
         return agg;
@@ -1469,8 +1506,9 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return error.Abort,
         };
-        const target = try ev.load(ref);
-        const child = ev.elemTypeOf(target.ty, i);
+        // 元素的类型取自所在的聚合，不取出区间
+        const target = try ev.loadPath(ref);
+        const child = ev.elemTypeOf(target.ty, if (ref.window) |w| w.start + i else i);
         const is_const = switch (ev.ip.key(seq.ty)) {
             .ptr_type => |p| p.is_const,
             else => false,
@@ -1615,20 +1653,11 @@ const Evaluator = struct {
                 return Val.ofType(try ip.errorSet(ev.a, names));
             },
             else => {
-                // 操作数的期望类型：结果类型去掉 error union 与 optional，且只取数值类型
-                // （`self.index = start + 1` 中 index 为 `?usize`，`+` 的操作数是 usize）
-                var operand_want = want;
-                while (operand_want) |t| switch (ip.key(t)) {
-                    .error_union_type => |eu| operand_want = eu.payload,
-                    .optional_type => |c| operand_want = c,
-                    else => break,
-                };
-                if (operand_want) |t| if (!ip.isInt(t) and !ip.isFloat(t) and ip.key(t) != .vector_type) {
-                    operand_want = null;
-                };
-                const lhs = try ev.eval(f, lhs_e, operand_want);
+                // 与编译器一致，操作数没有结果类型：`const m: u8 = (0xFF << 4) >> 4` 按 comptime_int 计算，
+                // 结果转换为 u8 时为 255。右侧以左侧的类型作为字面量的期望，与 peer 的结果相同
+                const lhs = try ev.eval(f, lhs_e, null);
                 const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
-                const rhs = try ev.eval(f, rhs_e, if (is_shift) null else if (lhs.ty != .comptime_int_type) lhs.ty else operand_want);
+                const rhs = try ev.eval(f, rhs_e, if (is_shift or lhs.ty == .comptime_int_type) null else lhs.ty);
                 // bool 的位运算
                 if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
                     const x = (try ev.condition(lhs)).yes;
@@ -1685,8 +1714,7 @@ const Evaluator = struct {
         if (lhs.v == .unknown or rhs.v == .unknown) return error.Abort;
         const n = try ev.elemCount(lhs) orelse return error.Abort;
         const m = try ev.elemCount(rhs) orelse return error.Abort;
-        if (n + m > max_agg_elems) return error.Abort;
-        const elems = try ev.a.alloc(Val, n + m);
+        const elems = try ev.allocElems(n + m);
         for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
         for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
         const lt = ev.arrayOf(lhs.ty);
@@ -1811,6 +1839,8 @@ const Evaluator = struct {
     /// 位置；值为指向局部存储的指针时取它所指向的位置（自动解引用）
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
         const ref = try ev.place(f, e);
+        // 区间的值是数组，不是指针
+        if (ref.window != null) return ref;
         const v = try ev.load(ref);
         return switch (v.v) {
             .ref => |r| r,
@@ -1963,15 +1993,13 @@ const Evaluator = struct {
         const count = try ev.elemCount(base) orelse return error.Abort;
         const end = if (s.end) |e| std.math.cast(usize, try ev.evalInt(f, e, .usize_type)) orelse return error.Abort else count;
         if (start > end or end > count or end - start > max_agg_elems) return error.Abort;
-        const elems = try ev.a.alloc(Val, end - start);
-        for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
         const child = ev.elemTypeOf(base.ty, 0);
         const is_const = switch (ip.key(base.ty)) {
             .ptr_type => |p| p.is_const,
             else => true,
         };
         // comptime 已知的区间：指向数组的指针
-        const array = try ip.get(.{ .array_type = .{ .len = elems.len, .child = child } });
+        const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child } });
         const ptr_ty = try ip.ptrTo(array, .one, is_const);
         // 切片的是局部变量（或经由指针）的存储：引用原存储的区间，写入反映到原数组
         if (try ev.sliceTarget(f, s.lhs, base)) |target| {
@@ -1981,6 +2009,8 @@ const Evaluator = struct {
             return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
         }
         // 其他（驻留的常量等）：元素为复制，不驻留
+        const elems = try ev.allocElems(end - start);
+        for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
         return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
     }
 
@@ -2144,7 +2174,7 @@ const Evaluator = struct {
                 const target_ty = ev.pointeeType(v.ty);
                 if (target_ty != .unknown and (ip.key(target_ty) == .tuple_type or ip.key(target_ty) == .anon_struct_type)) {
                     const n = try ev.elemCount(v) orelse return error.Abort;
-                    const elems = try ev.a.alloc(Val, n);
+                    const elems = try ev.allocElems(n);
                     for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), p.child);
                     const array = try ip.get(.{ .array_type = .{ .len = n, .child = p.child, .sentinel = p.sentinel } });
                     const frozen = try ev.freeze(try ev.makeAgg(array, elems)) orelse return error.Abort;
@@ -2153,7 +2183,7 @@ const Evaluator = struct {
             },
             .array_type, .vector_type => if (ev.isAnon(v.ty)) {
                 const n = try ev.elemCount(v) orelse return error.Abort;
-                const elems = try ev.a.alloc(Val, n);
+                const elems = try ev.allocElems(n);
                 for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), ev.elemTypeOf(t, i));
                 return ev.makeAgg(t, elems);
             },
@@ -2262,6 +2292,8 @@ const Evaluator = struct {
         if (eq(u8, name, "@hasDecl") or eq(u8, name, "@hasField")) {
             if (vals.len != 2) return error.Abort;
             const t = try asType(vals[0]);
+            // 没有实例的泛型体中的类型参数：有哪些成员取决于实例（同 `infer.hasMember`）
+            if (ip.key(t) == .opaque_param) return error.Abort;
             const field = try ev.stringOf(vals[1]);
             if (eq(u8, name, "@hasField")) return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
             const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);
@@ -2356,8 +2388,7 @@ const Evaluator = struct {
             const t = want orelse return error.Abort;
             if (vals.len != 1) return error.Abort;
             const n = try ev.typeElemCount(t) orelse return error.Abort;
-            if (n > max_agg_elems) return error.Abort;
-            const elems = try ev.a.alloc(Val, n);
+            const elems = try ev.allocElems(n);
             for (elems) |*o| o.* = try ev.coerce(vals[0], ev.elemTypeOf(t, 0));
             return ev.makeAgg(t, elems);
         }
@@ -2375,7 +2406,11 @@ const Evaluator = struct {
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[1]) orelse return error.Abort;
-            for (0..n) |i| try ev.store(try ev.extend(dest, @intCast(i)), try ev.elemAt(vals[1], i));
+            // 逐元素写入：每个元素计一步
+            for (0..n) |i| {
+                try ev.tick();
+                try ev.store(try ev.extend(dest, @intCast(i)), try ev.elemAt(vals[1], i));
+            }
             return Val.void_val;
         }
         return error.Abort;
@@ -2703,7 +2738,7 @@ const Evaluator = struct {
         switch (ip.key(t)) {
             .optional_type => |c| return value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
             .array_type => |a| return value.arrayLayout(try ev.typeLayout(a.child, depth + 1) orelse return null, a, try ev.hasBitRepr(a.child)),
-            .error_union_type => |eu| return value.errorUnionLayout(try ev.typeLayout(eu.payload, depth + 1) orelse return null),
+            .error_union_type => |eu| return value.errorUnionLayout(ip, try ev.typeLayout(eu.payload, depth + 1) orelse return null),
             .container_type, .reified_type, .union_tag_type, .tuple_type, .anon_struct_type => {},
             else => return value.typeLayout(ip, t),
         }
@@ -2856,7 +2891,7 @@ const Evaluator = struct {
             }
             // 显式的 backing 整数须与各字段的位宽之和相等
             if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
-            return .{ .layout = value.intLayout(std.math.cast(u16, bits) orelse return null) orelse return null, .bit_offsets = offsets };
+            return .{ .layout = value.intLayout(ev.ip, std.math.cast(u16, bits) orelse return null) orelse return null, .bit_offsets = offsets };
         }
         const order = try ev.a.alloc(u32, fields.len);
         var struct_align: u64 = 1;
@@ -2907,7 +2942,7 @@ const Evaluator = struct {
                 const bits = fields[0].layout.?.bits orelse return null;
                 for (fields[1..]) |fl| if ((fl.layout.?.bits orelse return null) != bits) return null;
                 if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
-                return value.intLayout(std.math.cast(u16, bits) orelse return null);
+                return value.intLayout(ev.ip, std.math.cast(u16, bits) orelse return null);
             },
             .@"extern" => return payload,
             .auto => {},
@@ -2918,7 +2953,7 @@ const Evaluator = struct {
             try ev.typeLayout(tag_ty, depth + 1) orelse return null
         else if (try ev.safetyTagged(t) orelse return null)
             // 隐藏标签与 `union(enum)` 的标签相同：容纳字段序号的最小无符号整数
-            value.intLayout(@intCast(64 - @clz(@as(u64, fields.len - 1)))) orelse return null
+            value.intLayout(ev.ip, @intCast(64 - @clz(@as(u64, fields.len - 1)))) orelse return null
         else
             return payload;
         const alignment = @max(tag.alignment, payload_align);
@@ -3041,7 +3076,7 @@ const Evaluator = struct {
                 .type, .void, .bool, .noreturn, .comptime_int, .comptime_float, .null, .undefined, .enum_literal => .{ @tagName(s), .void_value },
                 .anyerror => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", .null_value }}) },
                 .anyopaque => .{ "opaque", try ev.structValue(try ev.member(type_ty, "Opaque"), &.{.{ "decl_names", try ev.namesValue(&.{}) }}) },
-                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), (value.typeLayout(ip, t) orelse return error.Abort).bits orelse return error.Abort) }}) },
+                .f16, .f32, .f64, .f80, .f128 => .{ "float", try ev.structValue(try ev.member(type_ty, "Float"), &.{.{ "bits", try ev.intIndex(try ip.intType(.unsigned, 16), value.floatBits(ip, t).?) }}) },
                 else => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t) orelse return error.Abort) },
             },
             .int_type => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t).?) },

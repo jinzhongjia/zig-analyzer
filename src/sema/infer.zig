@@ -45,8 +45,8 @@ pub const Result = struct {
     ret: TypedValue,
     /// 初始化表达式中字段名解析到的字段（`.{ .x = 1 }` 的 `x`）
     field_refs: []const FieldRef = &.{},
-    /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）与匿名初始化（`.{ ... }`）及其期望类型：
-    /// 补全按它列出成员与字段
+    /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）、错误值（`error.X`）与匿名初始化
+    /// （`.{ ... }`）及其期望类型：补全按它列出成员、错误名与字段
     literal_expected: []const LiteralExpected = &.{},
     /// comptime 已知不会执行的 `if` / `switch` 分支（最外层的）：在当前构建配置下不编译的代码
     inactive: []const ExprId = &.{},
@@ -511,6 +511,7 @@ const Inferrer = struct {
                 return .{ .ty = .enum_literal_type, .val = try ip.get(.{ .enum_literal = name }) };
             },
             .error_value => |name| {
+                if (expected) |want| if (want != .unknown) try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = want });
                 const set = try ip.errorSet(inf.scratch, &.{name});
                 return .{ .ty = set, .val = try ip.get(.{ .error_value = name }) };
             },
@@ -543,8 +544,11 @@ const Inferrer = struct {
                 for (s.prongs) |prong| for (prong.items) |item| {
                     _ = try inf.infer(item, operand.ty);
                 };
-                // comptime 已知的操作数：只有匹配的分支会执行
-                const chosen = try inf.chooseProng(s.prongs, operand);
+                // 带标签的 switch：`break :label value` 的值也是结果
+                const label = inf.switchLabel(e, s.operand);
+                // comptime 已知的操作数：只有匹配的分支会执行。`continue :label` 会转到其他分支，有它时不选
+                const chosen = if (label != null and inf.continuesTo(label.?)) null else try inf.chooseProng(s.prongs, operand);
+                if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected });
                 var types: std.ArrayList(Index) = .empty;
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
@@ -555,6 +559,25 @@ const Inferrer = struct {
                     try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);
                 }
+                if (label != null) {
+                    const frame = inf.labels.pop().?;
+                    // 选中分支时只记录了它的 break（其他分支按不执行推导）
+                    if (chosen != null) {
+                        if (frame.types.items.len == 0) return chosen_tv;
+                        var live_types: std.ArrayList(Index) = .empty;
+                        var live_values: std.ArrayList(TypedValue) = .empty;
+                        if (chosen_tv.ty != .noreturn_type) {
+                            try live_types.append(inf.scratch, chosen_tv.ty);
+                            try live_values.append(inf.scratch, chosen_tv);
+                        }
+                        try live_types.appendSlice(inf.scratch, frame.types.items);
+                        try live_values.appendSlice(inf.scratch, frame.values.items);
+                        const t = try inf.peer(live_types.items);
+                        return .{ .ty = t, .val = sameValue(live_values.items, t) };
+                    }
+                    try types.appendSlice(inf.scratch, frame.types.items);
+                    try values.appendSlice(inf.scratch, frame.values.items);
+                }
                 if (chosen != null) return chosen_tv;
                 const ty = try inf.peer(types.items);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
@@ -563,7 +586,7 @@ const Inferrer = struct {
                 const lhs = try inf.infer(c.lhs, null);
                 const payload, const err = inf.unwrapErrorUnion(lhs.ty);
                 if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err };
-                const rhs = try inf.infer(c.rhs, if (payload != .unknown) payload else null);
+                const rhs = try inf.infer(c.rhs, inf.fallbackType(expected, payload, c.rhs));
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
             },
             .binary => |bin| return inf.binary(e, bin.op, bin.lhs, bin.rhs, expected),
@@ -1594,6 +1617,39 @@ const Inferrer = struct {
         return null;
     }
 
+    /// `catch` / `orelse` 右侧的期望类型。编译器取整个表达式的结果类型；没有结果类型时两侧做 peer type
+    /// resolution，这里以载荷类型作为右侧字面量（`0`、`.red`）的期望，得到与 peer 相同的结果。`null` 例外：
+    /// 与载荷 peer 得到 optional（`parseInt(u8, s, 10) catch null` 为 `?u8`），不能转换为载荷类型
+    fn fallbackType(inf: *Inferrer, expected: ?Index, payload: Index, rhs: ExprId) ?Index {
+        if (expected) |want| if (want != .unknown) return want;
+        if (payload == .unknown) return null;
+        switch (inf.body.expr(rhs)) {
+            .name_ref => |name| if (std.mem.eql(u8, name, "null")) return null,
+            else => {},
+        }
+        return payload;
+    }
+
+    /// 函数体中有 `continue :label`（带标签的 switch 由它转到其他分支）
+    fn continuesTo(inf: *Inferrer, label: []const u8) bool {
+        for (inf.body.exprs) |x| switch (x) {
+            .@"continue" => |c| if (c.label) |l| if (std.mem.eql(u8, l, label)) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// switch 的标签：lowering 在推导操作数之前推入了以这个 switch 为目标的带标签作用域
+    fn switchLabel(inf: *Inferrer, e: ExprId, operand: ExprId) ?[]const u8 {
+        const b = inf.body;
+        var s: ?Body.ScopeId = b.expr_scopes[@backingInt(operand)];
+        while (s) |id| : (s = b.scope(id).parent) {
+            const l = b.scope(id).label orelse continue;
+            if (l.expr == e) return l.name;
+        }
+        return null;
+    }
+
     /// break 的目标（`labels` 中的下标）
     fn labelFrame(inf: *Inferrer, label: ?[]const u8) ?usize {
         var i = inf.labels.items.len;
@@ -1695,7 +1751,7 @@ const Inferrer = struct {
                 };
                 // comptime 已知时只有一侧会被求值
                 const non_null = inf.condValue(lhs);
-                const rhs = try inf.inferBranch(rhs_e, if (child != .unknown) child else null, non_null == true);
+                const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, child, rhs_e), non_null == true);
                 if (non_null) |n| return if (n) .{ .ty = child, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
@@ -1731,17 +1787,17 @@ const Inferrer = struct {
                 if (try inf.compare(op, lhs, rhs)) |result| return boolValue(result);
                 return .{ .ty = .bool_type };
             },
-            // `<<` / `>>` 的右侧按 `Log2Int(T)` 推导，`<<|` 的右侧没有结果类型（与编译器一致）
+            // 与编译器一致：左侧没有结果类型；`<<` / `>>` 的右侧按 `Log2Int(T)` 推导，`<<|` 的右侧没有结果类型
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .angle_bracket_angle_bracket_left_pipe => {
-                const lhs = try inf.infer(lhs_e, expected);
+                const lhs = try inf.infer(lhs_e, null);
                 const rhs = try inf.infer(rhs_e, if (op == .angle_bracket_angle_bracket_left_pipe) null else try inf.log2IntType(lhs.ty));
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
             // 指针运算（与编译器一致）：`[*]T ± usize` 仍为原指针类型，两个指针相减为 usize
             .plus, .minus => {
-                const lhs = try inf.infer(lhs_e, expected);
-                if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e, expected);
+                const lhs = try inf.infer(lhs_e, null);
+                if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e);
                 const rhs = try inf.infer(rhs_e, .usize_type);
                 if (isNonSlicePtr(ip, rhs.ty)) return .{ .ty = if (op == .minus) .usize_type else .unknown };
                 return .{ .ty = if (isManyPtr(ip, lhs.ty)) lhs.ty else .unknown };
@@ -1755,13 +1811,15 @@ const Inferrer = struct {
                 const names = try std.mem.concat(inf.scratch, []const u8, &.{ x, y });
                 return TypedValue.ofType(try ip.errorSet(inf.scratch, names));
             },
-            else => return inf.arith(op, try inf.infer(lhs_e, expected), rhs_e, expected),
+            else => return inf.arith(op, try inf.infer(lhs_e, null), rhs_e),
         }
     }
 
-    /// 算术与位运算：两侧 peer；两侧都是已知整数时按结果类型的位宽折叠
-    fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId, expected: ?Index) Error!TypedValue {
-        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else expected);
+    /// 算术与位运算：两侧 peer；两侧都是已知整数时按 peer 类型的位宽折叠。与编译器一致，操作数没有
+    /// 结果类型（`const m: u8 = (0xFF << 4) >> 4` 按 comptime_int 计算得 255，之后才转换为 u8）；
+    /// 右侧以左侧的类型作为字面量的期望，与 peer 的结果相同
+    fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
+        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
         return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
     }
 
@@ -2314,8 +2372,8 @@ const Inferrer = struct {
             }
             // 浮点之间取位宽较大者（c_longdouble 的位宽取决于目标）
             if (ip.isFloat(cur) and ip.isFloat(t)) {
-                const x = (value.typeLayout(ip, cur) orelse return .unknown).bits orelse return .unknown;
-                const y = (value.typeLayout(ip, t) orelse return .unknown).bits orelse return .unknown;
+                const x = value.floatBits(ip, cur) orelse return .unknown;
+                const y = value.floatBits(ip, t) orelse return .unknown;
                 if (y > x) result = t;
                 continue;
             }
@@ -2681,22 +2739,24 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
         else => return null,
     };
     const owner: hir.OwnerKey = .{ .file = fv.file, .item = fv.decl };
-    const body = try r.ctx.get(hir.ItemBody, owner);
+    // 先只看参数的形式：不是泛型的调用（绝大多数）不依赖被调函数的函数体
+    const forms = try r.ctx.get(hir.ParamForms, owner);
     const all_comptime = try eval.isComptimeOnly(r, f.ret);
-    const kinds = try scratch.alloc(ParamKind, body.params.len);
+    const kinds = try scratch.alloc(ParamKind, forms.len);
     var generic = all_comptime;
-    for (body.params, kinds, 0..) |p, *k, i| {
-        const b = body.binding(p);
-        k.* = if (b.ty == null)
-            (if (b.is_comptime) .comptime_anytype else .anytype_type)
-        else if (all_comptime or b.is_comptime or (i < f.params.len and value.isComptimeOnly(ip, f.params[i])))
-            .comptime_value
-        else
-            .runtime;
+    for (forms, kinds, 0..) |form, *k, i| {
+        k.* = switch (form) {
+            .any => .anytype_type,
+            .comptime_any => .comptime_anytype,
+            .typed, .comptime_typed => if (all_comptime or form == .comptime_typed or (i < f.params.len and value.isComptimeOnly(ip, f.params[i])))
+                .comptime_value
+            else
+                .runtime,
+        };
         if (k.* != .runtime) generic = true;
     }
     if (!generic) return null;
-    return .{ .owner = owner, .body = body, .parent = fv.inst, .kinds = kinds };
+    return .{ .owner = owner, .body = try r.ctx.get(hir.ItemBody, owner), .parent = fv.inst, .kinds = kinds };
 }
 
 /// 调用的实例（`args` 与形参一一对应）。comptime 实参按参数类型转换：参数类型依赖其他参数

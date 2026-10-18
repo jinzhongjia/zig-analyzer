@@ -9,6 +9,9 @@ const ProjectModel = @This();
 arena: std.heap.ArenaAllocator.State,
 /// 构建根目录（绝对路径）
 build_root: []const u8,
+/// maker 使用的本地缓存目录（绝对路径）：生成文件多在其中。由 `configuration.convert` 设置，
+/// 默认的空值只供测试中手写的模型使用
+local_cache_root: []const u8 = "",
 /// 标准库根文件 `<std_dir>/std.zig`
 std_root: []const u8,
 steps: []const Step,

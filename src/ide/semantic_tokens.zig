@@ -56,6 +56,9 @@ const Builder = struct {
     enc: offsets.Encoding,
     data: std.ArrayList(u32) = .empty,
     prev: types.Position = .{ .line = 0, .character = 0 },
+    /// 上一次换算的偏移与位置：token 按偏移递增，同一行内从这里继续计数
+    cursor_offset: usize = 0,
+    cursor: types.Position = .{ .line = 0, .character = 0 },
 
     fn visit(b: *Builder, node: SyntaxNode, in_enum: bool) Allocator.Error!void {
         const child_in_enum = if (node.kind() == .container_decl) node.childToken(.keyword_enum) != null and node.childToken(.keyword_union) == null else in_enum;
@@ -68,14 +71,20 @@ const Builder = struct {
     }
 
     fn emit(b: *Builder, t: tree.SyntaxToken, token_type: TokenType, mods: u32) Allocator.Error!void {
-        const start = b.lines.position(t.offset, b.enc);
-        const end = b.lines.position(t.offset + t.text.len, b.enc);
+        const start = b.position(t.offset);
+        const end = b.position(t.offset + t.text.len);
         // 跨行 token（理论上不会出现）不输出
         if (end.line != start.line) return;
         const delta_line = start.line - b.prev.line;
         const delta_char = if (delta_line == 0) start.character - b.prev.character else start.character;
         try b.data.appendSlice(b.arena, &.{ delta_line, delta_char, end.character - start.character, @backingInt(token_type), mods });
         b.prev = start;
+    }
+
+    fn position(b: *Builder, offset: usize) types.Position {
+        b.cursor = b.lines.positionAfter(b.cursor_offset, b.cursor, offset, b.enc);
+        b.cursor_offset = offset;
+        return b.cursor;
     }
 };
 

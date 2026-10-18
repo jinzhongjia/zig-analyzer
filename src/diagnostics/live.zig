@@ -13,6 +13,8 @@ const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
 const mem = @import("../util/mem.zig");
 
+const log = std.log.scoped(.live);
+
 pub const Diagnostic = struct {
     /// 字节偏移区间（ErrorBundle 的 span_start / span_end）
     start: u32,
@@ -47,14 +49,124 @@ pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
-/// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。
+/// 估计的嵌套深度（`nestingEstimate`）不超过它时在当前线程解析与 AstGen。官方实现逐层递归，
+/// Debug 构建中每层约用 16 KB 栈，而当前线程可能已处在较深的 query 嵌套中
+const inline_depth = 256;
+/// 不超过它时在专用的大栈线程上解析与 AstGen；更深的文本不做（官方 `zig ast-check` 同样会耗尽栈），
+/// 没有诊断，import 按 token 收集
+const thread_depth = 8192;
+const thread_stack_size = 512 * 1024 * 1024;
+
+/// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。按嵌套深度选择执行的线程，深层嵌套的文本
+/// 不会耗尽原生栈
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
+    const source = try gpa.dupeSentinel(u8, text, 0);
+    defer gpa.free(source);
+    const depth = try nestingEstimate(gpa, source);
+    if (depth <= inline_depth) return checkSource(gpa, source, mode);
+    if (depth <= thread_depth) {
+        var result: Allocator.Error!*Result = undefined;
+        if (std.Thread.spawn(.{ .stack_size = thread_stack_size }, checkInto, .{ gpa, source, mode, &result })) |thread| {
+            thread.join();
+            return result;
+        } else |err| log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});
+    }
+    return importsOnly(gpa, source, mode);
+}
+
+fn checkInto(gpa: Allocator, source: [:0]const u8, mode: Mode, result: *Allocator.Error!*Result) void {
+    result.* = checkSource(gpa, source, mode);
+}
+
+/// 官方解析器与 AstGen 递归深度的上界估计。每层括号算一层；同一层括号内，以 `;` 或 `,` 分隔的一段中
+/// 每个 token 与括号对都可能使嵌套再深一层（运算符链、前缀与后缀、else-if 链）。`}` 之后接着的是新的
+/// 语句或声明（标识符、字面量、else 等之外的关键字）时，这一段重新计数。超过 `thread_depth` 时提前返回
+fn nestingEstimate(gpa: Allocator, source: [:0]const u8) Allocator.Error!u32 {
+    var segments: std.ArrayList(u32) = .empty;
+    defer segments.deinit(gpa);
+    try segments.append(gpa, 0);
+    var tokenizer: std.zig.Tokenizer = .init(source);
+    var total: u32 = 0;
+    var max: u32 = 0;
+    var after_brace = false;
+    while (true) {
+        const tag = tokenizer.next().tag;
+        if (tag == .eof) return max;
+        const top = &segments.items[segments.items.len - 1];
+        if (after_brace and startsStatement(tag)) {
+            total -= top.*;
+            top.* = 0;
+        }
+        after_brace = false;
+        switch (tag) {
+            .l_paren, .l_bracket, .l_brace => {
+                top.* += 1;
+                total += 2;
+                try segments.append(gpa, 0);
+            },
+            .r_paren, .r_bracket, .r_brace => {
+                if (segments.items.len > 1) total -= 1 + segments.pop().?;
+                after_brace = tag == .r_brace;
+            },
+            .semicolon, .comma => {
+                total -= top.*;
+                top.* = 0;
+            },
+            else => {
+                top.* += 1;
+                total += 1;
+            },
+        }
+        max = @max(max, total);
+        if (max > thread_depth) return max;
+    }
+}
+
+/// `}` 之后的这个 token 不能接续表达式，只能开始新的语句或声明
+fn startsStatement(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .keyword_else, .keyword_orelse, .keyword_catch, .keyword_and, .keyword_or => false,
+        .identifier, .builtin, .number_literal, .string_literal, .multiline_string_literal_line, .char_literal, .doc_comment, .container_doc_comment => true,
+        else => std.zig.Token.keywords.has(tag.lexeme() orelse return false),
+    };
+}
+
+/// 不做 AstGen 时的结果：没有诊断，import 按 token 收集（AstGen 记录的正是 `@import` 的字符串字面量）
+fn importsOnly(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var imports: std.ArrayList([]const u8) = .empty;
+    if (mode == .zig) {
+        var tokenizer: std.zig.Tokenizer = .init(source);
+        // 前两个 token：`@import` 与 `(`
+        var prev: [2]std.zig.Token = @splat(.{ .tag = .invalid, .loc = .{ .start = 0, .end = 0 } });
+        while (true) {
+            const t = tokenizer.next();
+            if (t.tag == .eof) break;
+            if (t.tag == .string_literal and prev[1].tag == .l_paren and prev[0].tag == .builtin and
+                std.mem.eql(u8, source[prev[0].loc.start..prev[0].loc.end], "@import"))
+            {
+                const name = std.zig.string_literal.parseAlloc(arena, source[t.loc.start..t.loc.end]) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidLiteral => null,
+                };
+                if (name) |n| try imports.append(arena, n);
+            }
+            prev = .{ prev[1], t };
+        }
+    }
+    const result = try arena.create(Result);
+    result.* = .{ .arena = undefined, .items = &.{}, .imports = imports.items };
+    result.arena = arena_state.state;
+    return result;
+}
+
+fn checkSource(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const source = try gpa.dupeSentinel(u8, text, 0);
-    defer gpa.free(source);
     var tree = try Ast.parse(gpa, source, .{ .mode = switch (mode) {
         .zig => .zig,
         .zon => .zon,
@@ -158,18 +270,9 @@ pub const AstCheck = struct {
         const text = try ctx.get(inputs.FileText, file) orelse "";
         const vfs: *Vfs = ctx.db.env.vfs;
         const mode = modeOf(vfs.path(file));
-        return switch (try ctx.get(LiveBackend, {})) {
-            .in_process => blk: {
-                if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode)) |r| break :blk r;
-                break :blk check(ctx.db.gpa, text, mode);
-            },
-            .subprocess => |zig_exe| checkSubprocess(ctx.db.gpa, ctx.db.io, zig_exe, text, mode) catch |err| switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Canceled => error.Canceled,
-                // zig 无法运行：没有 live 诊断（编译器诊断仍可用）
-                else => empty(ctx.db.gpa),
-            },
-        };
+        const backend = try ctx.get(LiveBackend, {});
+        if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode, backend)) |r| return r;
+        return checkWith(ctx.db.gpa, ctx.db.io, backend, text, mode);
     }
 
     pub fn eql(a: Value, b: Value) bool {
@@ -185,9 +288,23 @@ pub const AstCheck = struct {
     }
 };
 
-/// 在读事务之外预先算好的 `check` 结果，按文本与模式索引。AstGen 不检查取消，在读事务中执行时
-/// 写事务（逐字输入）要等它结束；诊断发布先在锁外算好放入这里，`AstCheck` 计算时取走命中的结果。
-/// 结果只取决于文本，因此不影响 query 的纯函数语义。容量很小：未被取走的结果（memo 已有效）按先进先出淘汰
+/// 按执行方式对文本做 live 检查
+pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
+    return switch (backend) {
+        .in_process => check(gpa, text, mode),
+        .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, text, mode) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
+            // zig 无法运行：没有 live 诊断（编译器诊断仍可用）
+            else => empty(gpa),
+        },
+    };
+}
+
+/// 在读事务之外预先算好的 `checkWith` 结果，按文本、模式与执行方式索引。AstGen 与子进程 `zig ast-check`
+/// 都不检查取消，在读事务中执行时写事务（逐字输入）要等它结束；诊断发布先在锁外算好放入这里，`AstCheck`
+/// 计算时取走命中的结果。结果只取决于文本，因此不影响 query 的纯函数语义。容量很小：未被取走的结果
+/// （memo 已有效）按先进先出淘汰
 pub const Prepared = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
@@ -197,7 +314,8 @@ pub const Prepared = struct {
     /// `take` 命中的次数（统计与测试用）
     hits: usize = 0,
 
-    const Entry = struct { mode: Mode, text: []const u8, result: *Result };
+    const Entry = struct { mode: Mode, backend: BackendKind, text: []const u8, result: *Result };
+    const BackendKind = std.meta.Tag(Backend);
     pub const capacity = 8;
 
     pub fn deinit(p: *Prepared) void {
@@ -206,8 +324,8 @@ pub const Prepared = struct {
         p.last.deinit(p.gpa);
     }
 
-    pub fn hash(text: []const u8, mode: Mode) u64 {
-        return std.hash.Wyhash.hash(@backingInt(mode), text);
+    pub fn hash(text: []const u8, mode: Mode, backend: Backend) u64 {
+        return std.hash.Wyhash.hash(@as(u64, @backingInt(mode)) << 8 | @backingInt(std.meta.activeTag(backend)), text);
     }
 
     /// 文件的这个文本是否还需要准备。放入之后才算准备好：并发的两次发布可能都准备同一个文本（在读事务
@@ -223,36 +341,37 @@ pub const Prepared = struct {
         return if (p.last.get(file)) |last| last == h else false;
     }
 
-    /// 放入文件 `file` 的 `check(text, mode)` 的结果，取得 `result` 的所有权，并记这个文本已准备好
-    pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, result: *Result) Allocator.Error!void {
+    /// 放入文件 `file` 的 `checkWith(backend, text, mode)` 的结果，取得 `result` 的所有权，并记这个文本已准备好
+    pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, backend: Backend, result: *Result) Allocator.Error!void {
         errdefer result.destroy(p.gpa);
         const owned = try p.gpa.dupe(u8, text);
         errdefer p.gpa.free(owned);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
-        try p.last.put(p.gpa, file, hash(text, mode));
-        if (p.find(text, mode) != null) {
+        try p.last.put(p.gpa, file, hash(text, mode, backend));
+        const kind = std.meta.activeTag(backend);
+        if (p.find(text, mode, kind) != null) {
             p.gpa.free(owned);
             result.destroy(p.gpa);
             return;
         }
         if (p.entries.items.len == capacity) p.destroyEntry(p.entries.orderedRemove(0));
-        try p.entries.append(p.gpa, .{ .mode = mode, .text = owned, .result = result });
+        try p.entries.append(p.gpa, .{ .mode = mode, .backend = kind, .text = owned, .result = result });
     }
 
-    /// 取走 `check(text, mode)` 的结果（调用方取得所有权）
-    pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode) ?*Result {
+    /// 取走 `checkWith(backend, text, mode)` 的结果（调用方取得所有权）
+    pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode, backend: Backend) ?*Result {
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
-        const i = p.find(text, mode) orelse return null;
+        const i = p.find(text, mode, std.meta.activeTag(backend)) orelse return null;
         const e = p.entries.orderedRemove(i);
         p.gpa.free(e.text);
         p.hits += 1;
         return e.result;
     }
 
-    fn find(p: *Prepared, text: []const u8, mode: Mode) ?usize {
-        for (p.entries.items, 0..) |e, i| if (e.mode == mode and std.mem.eql(u8, e.text, text)) return i;
+    fn find(p: *Prepared, text: []const u8, mode: Mode, backend: BackendKind) ?usize {
+        for (p.entries.items, 0..) |e, i| if (e.mode == mode and e.backend == backend and std.mem.eql(u8, e.text, text)) return i;
         return null;
     }
 
@@ -471,6 +590,38 @@ test "ZON" {
     try expectMessages(".{ .a = 1, .a = 2 }", .zon, &.{"duplicate struct field name"});
 }
 
+test "deeply nested text: AstGen on a large stack, imports only beyond the limit" {
+    const gpa = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    // 3000 项的加法链：官方 AstGen 在普通线程上耗尽栈（进程崩溃），在大栈线程上照常得到诊断
+    try src.appendSlice(gpa, "const std = @import(\"std\");\nfn f() void {\n    var unused = 1;\n}\nconst x = ");
+    for (0..3000) |_| try src.appendSlice(gpa, "1 + ");
+    try src.appendSlice(gpa, "1;\n");
+    {
+        const r = try check(gpa, src.items, .zig);
+        defer r.destroy(gpa);
+        try testing.expectEqual(1, r.items.len);
+        try testing.expectEqualStrings("unused local variable", r.items[0].message);
+        try testing.expectEqual(1, r.imports.len);
+    }
+    // 超过上限：不做 AstGen，没有诊断，import 按 token 收集
+    src.clearRetainingCapacity();
+    try src.appendSlice(gpa, "const std = @import(\"std\");\nconst x = ");
+    for (0..20000) |_| try src.append(gpa, '(');
+    try src.append(gpa, '1');
+    for (0..20000) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa, ";\nfn g() void {\n    _ = @import(\"a\\x2ezig\");\n}\n");
+    {
+        const r = try check(gpa, src.items, .zig);
+        defer r.destroy(gpa);
+        try testing.expectEqual(0, r.items.len);
+        try testing.expectEqual(2, r.imports.len);
+        try testing.expectEqualStrings("std", r.imports[0]);
+        try testing.expectEqualStrings("a.zig", r.imports[1]);
+    }
+}
+
 test "ZIR import list matches the compiler" {
     const a = testing.allocator;
     // 函数体内的 import 也会被收录
@@ -503,29 +654,31 @@ test "error locations and notes" {
     try testing.expectEqualStrings("struct declared here", d.notes[1].message);
 }
 
-test "prepared results: matched by text and mode, taken once, oldest evicted" {
+test "prepared results: matched by text, mode and backend, taken once, oldest evicted" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var p: Prepared = .{ .gpa = gpa };
     defer p.deinit();
-    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, try check(gpa, "const a = ;", .zig));
-    // 同样的文本不同的模式不命中
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon));
-    const r = p.take(io, "const a = ;", .zig).?;
+    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, .in_process, try check(gpa, "const a = ;", .zig));
+    // 同样的文本不同的模式或执行方式不命中
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon, .in_process));
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .{ .subprocess = "zig" }));
+    const r = p.take(io, "const a = ;", .zig, .in_process).?;
     defer r.destroy(gpa);
     try std.testing.expectEqual(1, r.items.len);
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig));
+    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .in_process));
 
     for (0..Prepared.capacity + 1) |i| {
         var buf: [32]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "const a = {d};", .{i});
-        try p.put(io, @fromBackingInt(@as(u32, 1)), text, .zig, try check(gpa, text, .zig));
+        try p.put(io, @fromBackingInt(@as(u32, 1)), text, .zig, .in_process, try check(gpa, text, .zig));
     }
     try std.testing.expectEqual(Prepared.capacity, p.entries.items.len);
-    try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig));
+    try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig, .in_process));
 
-    // 放入之后同一文件的同一文本不再准备，其他文本仍需准备
-    try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig)));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig)));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig)));
+    // 放入之后同一文件的同一文本不再准备，其他文本、其他执行方式仍需准备
+    try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .in_process)));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig, .in_process)));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .{ .subprocess = "zig" })));
+    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig, .in_process)));
 }

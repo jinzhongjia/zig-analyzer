@@ -3,6 +3,11 @@
 //! 线程模型：每个 Workspace 有一个专用的后台任务阻塞读取 BSP 事件并处理；LSP 主循环只通过
 //! `requestBuild` / `stop` 与之交互。
 //!
+//! 生命周期：maker 崩溃、build.zig 或构建配置变化时以新实例重启项目。新实例在首次构建完成（或配置失败）前
+//! 不可见，其间旧实例的模型、编译集合与编译器诊断继续生效；旧实例没有模型时，新实例配置完成即替换它
+//! （见 `Server.restartWorkspace`、`Server.promote`）。
+//! 实例按引用计数回收：服务器的项目列表、后台任务与临时使用实例的调用方各持有一个引用。
+//!
 //! 锁顺序：持有 `mutex` 时绝不开启查询引擎的写事务。诊断发布任务会在读事务中获取 `mutex`，
 //! 而写事务要等所有读事务结束，交叉持有会死锁。
 
@@ -41,6 +46,13 @@ root: []const u8,
 config: Server.Config,
 /// 本实例是 maker 连续崩溃后自动重启的第几次（0 表示正常启动）
 crash_restarts: u8 = 0,
+/// 引用计数，归零时释放（见 `acquire` / `release`）
+refs: std.atomic.Value(u32) = .init(0),
+/// 重启产生、尚未替换本实例的新实例（持有一个引用）；受 `Server.workspaces_mutex` 保护
+successor: ?*Workspace = null,
+/// 调用方已确定本实例的位置：加入项目列表、挂到旧实例上或作废（见 `Server.startWorkspace`、`Server.restartWorkspace`）。
+/// 后台任务在此之后才处理事件，`Server.isVisible` 与 `Server.promote` 才能据位置判断
+placed: Io.Event = .unset,
 
 mutex: Io.Mutex = .init,
 // ── 以下字段受 mutex 保护 ──
@@ -49,6 +61,9 @@ model: ?ProjectModel = null,
 compile_set: ?CompileSet.Result = null,
 /// 诊断 step 之外的编译 step 可达的文件（只用于模块归属，见 `recomputeCompileSet`）；与编译集合相同时为 null
 resolve_set: ?CompileSet.Result = null,
+/// 构建脚本（见 `CompileSet.buildScripts`）：后台任务开始时按文件的当前文本计算（打开的文件以缓冲区为准，
+/// 其余从磁盘读入），构建图读取失败时同样有效
+build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// 最近一次构建的编译器诊断
 result: ?compiler.BuildResult = null,
 /// FileId → `result` 中的条目
@@ -69,8 +84,6 @@ loading: ?*Progress = null,
 build_progress: ?*Progress = null,
 build_total: u32 = 0,
 build_done: u32 = 0,
-/// 被重启替换的旧实例发布过编译器诊断的文件：首次构建完成时一并重新发布，清除过时的诊断
-stale_files: std.ArrayList(FileId) = .empty,
 /// 诊断 step 及其传递依赖：只有这些 step 的错误作为编译器诊断发布
 /// （构建请求中额外的生成文件产出 step 不影响诊断，与直接运行 `zig build <step>` 一致）
 diag_steps: std.DynamicBitSetUnmanaged = .{},
@@ -83,13 +96,14 @@ loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
 /// 构建过程中因生成文件的路径而重算编译集合的最短间隔
 const generated_recompute_interval_ms = 1000;
 
-/// 启动 maker 并在后台读取事件
+/// 启动 maker 并在后台读取事件。返回的实例带有一个属于调用方的引用；调用方确定实例的位置后设置 `placed`
 pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
     const gpa = server.gpa;
     const env = server.zigEnv() orelse return error.ZigNotFound;
     const ws = try gpa.create(Workspace);
     errdefer gpa.destroy(ws);
-    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined, .crash_restarts = crash_restarts };
+    // 一个引用属于后台任务，一个属于调用方
+    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined, .crash_restarts = crash_restarts, .refs = .init(2) };
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
@@ -98,10 +112,22 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     ws.loading = server.progress.begin(server, std.fmt.bufPrint(&title_buf, "Loading project {s}", .{std.fs.path.basename(root)}) catch "Loading project", false);
     errdefer server.progress.end(server, ws.loading, null);
     ws.client = try bsp.Client.start(gpa, server.io, env.zig_exe, root, ws.config.build_args);
-    errdefer ws.client.?.stop();
+    errdefer ws.client.?.deinit();
+    // 在启动后台任务之前计为忙碌：任务可能先于这里运行到结束时的 busyEnd
     server.busyBegin();
+    errdefer server.busyEnd();
     try server.bg_group.concurrent(server.io, run, .{ws});
+    _ = server.live_workspaces.fetchAdd(1, .monotonic);
     return ws;
+}
+
+pub fn acquire(ws: *Workspace) void {
+    _ = ws.refs.fetchAdd(1, .monotonic);
+}
+
+/// 放弃一个引用；最后一个引用放弃时释放实例（此时后台任务已经结束）
+pub fn release(ws: *Workspace) void {
+    if (ws.refs.fetchSub(1, .acq_rel) == 1) ws.destroy();
 }
 
 /// 以项目根目录的 `zig-analyzer.json` 覆盖配置；文件不存在时不变，有误时提示并忽略
@@ -127,27 +153,28 @@ fn loadProjectConfig(server: *Server, root: []const u8, config: *Server.Config) 
     try config.overlayProject(gpa, &project);
 }
 
-/// 请求停止：maker 退出后后台任务结束并回收进程
+/// 停止：立即结束 maker 及其子进程（进行中的构建不再继续），后台任务随即读到输入结束，收尾并回收进程
 pub fn stop(ws: *Workspace) void {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     ws.stopping = true;
-    if (ws.client) |c| c.requestStop();
+    if (ws.client) |c| c.terminate();
 }
 
 /// maker 连续崩溃时自动重启的次数上限
 const max_crash_restarts = 3;
 
-/// 后台任务全部结束后调用
-pub fn destroy(ws: *Workspace) void {
+fn destroy(ws: *Workspace) void {
     const gpa = ws.gpa;
+    _ = ws.server.live_workspaces.fetchSub(1, .monotonic);
+    if (ws.successor) |s| s.release();
     if (ws.model) |*m| m.deinit(gpa);
     if (ws.compile_set) |*s| s.deinit(gpa);
     if (ws.resolve_set) |*s| s.deinit(gpa);
+    ws.build_scripts.deinit(gpa);
     if (ws.result) |*r| r.deinit(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
-    ws.stale_files.deinit(gpa);
     ws.config.deinit(gpa);
     for (ws.bundles.items) |*eb| eb.deinit(gpa);
     ws.bundles.deinit(gpa);
@@ -218,14 +245,38 @@ pub fn owns(ws: *Workspace, file: FileId) bool {
     return isUnder(ws.server.vfs.path(file), ws.root);
 }
 
-/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件发布（与编译器一致）
+/// `path` 是否位于 maker 使用的本地缓存目录（生成文件所在处，不一定是 `<构建根>/.zig-cache`）中。
+/// 本地缓存目录包含构建根目录时无法区分生成文件与项目文件，返回 false
+pub fn inLocalCache(ws: *Workspace, path: []const u8) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const cache = if (ws.model) |*m| m.local_cache_root else return false;
+    return cache.len != 0 and !isUnder(ws.root, cache) and isUnder(path, cache);
+}
+
+/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件与构建脚本发布（与编译器一致）
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
+    if (ws.build_scripts.contains(file)) return true;
     const set = &(ws.compile_set orelse return true);
     // 构建图中没有任何编译：集合为空时按尚未算出处理，不让所有文件都失去 live 诊断
     if (set.files.count() == 0) return true;
     return set.contains(file);
+}
+
+/// 是否参与模块图：已有模型与编译集合（见 `Server.updateModuleGraph`）
+pub fn inModuleGraph(ws: *Workspace) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    return ws.model != null and ws.compile_set != null;
+}
+
+/// 文件是否是本项目的构建脚本：变化后需要重新配置
+pub fn isBuildScript(ws: *Workspace, file: FileId) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    return ws.build_scripts.contains(file);
 }
 
 pub fn isUnder(path: []const u8, dir: []const u8) bool {
@@ -240,6 +291,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     // build.zig 编译失败后 maker 会退出，属于预期情况（保存 build.zig 时会重启）
     var config_failed = false;
     const client = ws.client.?;
+    ws.placed.waitUncancelable(ws.server.io);
+    ws.computeBuildScripts() catch log.err("{s}: out of memory while finding build scripts", .{ws.root});
     while (true) {
         var event = client.next() catch |err| {
             if (err == error.Canceled or ws.server.isShuttingDown()) {
@@ -254,6 +307,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 if (next > max_crash_restarts) {
                     log.err("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
+                    ws.server.abandon(ws);
                 } else {
                     log.info("{s}: build system exited unexpectedly ({t}, {?t}), restarting", .{ ws.root, err, client.readError() });
                     // 重启期间计为忙碌：崩溃时本实例可能并不忙碌，新实例计为忙碌之前 waitIdle（如 shutdown）
@@ -290,6 +344,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     if (started) ws.server.busyEnd();
     if (was_building) ws.server.busyEnd();
     if (c) |cl| cl.deinit();
+    ws.release();
 }
 
 fn isStopping(ws: *Workspace) bool {
@@ -300,22 +355,29 @@ fn isStopping(ws: *Workspace) bool {
 
 fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     const io = ws.server.io;
+    // 已停止的实例（被重启替换、项目被移除、服务器关闭）不再处理 maker 结束前发出的事件：其结果不会被采用。
+    // 进度与忙碌计数在后台任务结束时收尾
+    if (ws.isStopping()) return;
     switch (event.*) {
         .handshake => |h| if (h.version != bsp.protocol_version) {
             log.err("{s}: build system protocol version {d} does not match supported version {d}", .{ ws.root, h.version, bsp.protocol_version });
             ws.stop();
+            ws.server.abandon(ws);
         },
         .configuration => |path| {
+            // 用户 zig 与编译时的版本不同时不启动项目（见 `Server.startWorkspace`），构建图的格式一致
             const env = ws.server.zigEnv().?;
-            if (!env.matchesBuiltin()) {
-                ws.server.showWarningOnce("zig version differs from the one zig-analyzer was built with: cannot read the build graph, compiler diagnostics are unavailable");
-                return;
-            }
             ws.reportLoading("Reading build graph");
             var model = configuration.load(ws.gpa, io, ws.root, path, env) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    log.err("{s}: failed to read build graph: {t}", .{ ws.root, err });
+                    // 没有模型就不能构建：结束加载与 maker，按没有编译结果完成（清除此前的编译器诊断）
+                    var buf: [512]u8 = undefined;
+                    ws.server.showWarning(std.fmt.bufPrint(&buf, "cannot read the build graph of {s} ({t}): compiler diagnostics are unavailable until build.zig is saved", .{ ws.root, err }) catch
+                        "cannot read the build graph: compiler diagnostics are unavailable until build.zig is saved");
+                    ws.endLoading("Failed to read the build graph");
+                    ws.stop();
+                    try ws.finishBuild();
                     return;
                 },
             };
@@ -343,14 +405,19 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     try .initEmpty(ws.gpa, ws.model.?.steps.len);
             }
             try ws.recomputeCompileSet();
-            ws.mutex.lockUncancelable(io);
-            ws.server.progress.end(ws.server, ws.loading, "Done");
-            ws.loading = null;
-            ws.mutex.unlock(io);
+            // 旧实例没有可沿用的模型时不必等整次构建结束
+            ws.promote(.configured);
+            ws.endLoading("Done");
             ws.requestBuild();
         },
         .configuration_failed => |*eb| {
-            // build.zig 本身有错：作为一次构建结果发布
+            // build.zig 本身有错：作为一次构建结果发布。build.zig.zon 有误、依赖包获取失败时 maker 只把错误写到
+            // 它的 stderr，发来的错误为空：提示用户
+            if (eb.errorMessageCount() == 0) {
+                var buf: [512]u8 = undefined;
+                ws.server.showWarning(std.fmt.bufPrint(&buf, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root}) catch
+                    "zig build cannot load the project (build.zig.zon or a dependency may have errors), run zig build to see why");
+            }
             try ws.bundles.append(ws.gpa, eb.*);
             eb.* = .empty;
             try ws.finishBuild();
@@ -373,7 +440,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     sc.errors = .empty;
                 }
                 if (ws.model) |*m| for (sc.generated) |g| {
-                    const path = try configuration.generatedPath(ws.gpa, ws.root, ws.server.zigEnv().?, g.prefix, g.sub_path);
+                    const path = try configuration.generatedPath(ws.gpa, m, ws.server.zigEnv().?, g.prefix, g.sub_path);
                     defer ws.gpa.free(path);
                     if (try m.setGeneratedPath(ws.gpa, g.file, path)) roots_changed = true;
                 };
@@ -425,7 +492,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             try ws.recomputeCompileSet();
             ws.mutex.lockUncancelable(io);
             ws.building = false;
+            const again = ws.rebuild;
+            ws.rebuild = false;
             ws.mutex.unlock(io);
+            // 发布结果期间又有文件被保存：`requestBuild` 当时只记下了 `rebuild`，在这里开始下一轮。
+            // 先发起新构建再结束本轮的 busy，等待空闲的一方不会在两轮之间返回
+            if (again) ws.requestBuild();
             ws.server.busyEnd();
         },
         else => {},
@@ -493,6 +565,13 @@ fn reportLoading(ws: *Workspace, message: ?[]const u8) void {
     ws.server.progress.report(ws.server, ws.loading, message, null);
 }
 
+fn endLoading(ws: *Workspace, message: ?[]const u8) void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    ws.server.progress.end(ws.server, ws.loading, message);
+    ws.loading = null;
+}
+
 fn clearBundles(ws: *Workspace) void {
     for (ws.bundles.items) |*eb| eb.deinit(ws.gpa);
     ws.bundles.clearRetainingCapacity();
@@ -521,15 +600,41 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         defer ws.mutex.unlock(io);
         try affected.appendSlice(ws.gpa, ws.result_files.keys());
         try affected.appendSlice(ws.gpa, files.keys());
-        try affected.appendSlice(ws.gpa, ws.stale_files.items);
-        ws.stale_files.clearAndFree(ws.gpa);
         if (ws.result) |*old| old.deinit(ws.gpa);
         ws.result_files.deinit(ws.gpa);
         // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
         ws.result = result;
         ws.result_files = files;
     }
+    // 重启产生的新实例：首个结果连同模型与编译集合一起替换旧实例
+    ws.promote(.built);
     ws.server.publishFiles(affected.items, true);
+}
+
+/// 重启产生的新实例到了 `stage`：替换旧实例（见 `Server.promote`），更新模块图，重新发布打开的文件与旧实例
+/// 发布过编译器诊断的文件
+fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
+    const old = ws.server.promote(ws, stage) orelse return;
+    defer old.release();
+    ws.server.updateModuleGraph();
+    ws.server.publishOpenFiles();
+    old.mutex.lockUncancelable(ws.server.io);
+    const stale = ws.gpa.dupe(FileId, old.result_files.keys()) catch &.{};
+    old.mutex.unlock(ws.server.io);
+    defer ws.gpa.free(stale);
+    ws.server.publishFiles(stale, true);
+}
+
+/// 清除编译器诊断，重新发布发布过诊断的文件
+pub fn clearResult(ws: *Workspace) void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    const stale = ws.gpa.dupe(FileId, ws.result_files.keys()) catch &.{};
+    if (ws.result) |*r| r.deinit(ws.gpa);
+    ws.result = null;
+    ws.result_files.clearRetainingCapacity();
+    ws.mutex.unlock(ws.server.io);
+    defer ws.gpa.free(stale);
+    ws.server.publishFiles(stale, true);
 }
 
 fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
@@ -601,9 +706,39 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     if (ws.resolve_set) |*old| old.deinit(ws.gpa);
     ws.resolve_set = extra;
     ws.mutex.unlock(io);
-    // 编译集合变化会影响模块归属与已打开文件的 live 诊断
+    // 编译集合变化会影响模块归属与已打开文件的 live 诊断。尚未替换旧实例的新实例不影响（替换时一并更新）
+    if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
+}
+
+/// 计算构建脚本；缺少的文件读入后重算
+fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
+    var rounds: usize = 0;
+    while (rounds < 256) : (rounds += 1) {
+        var arena: std.heap.ArenaAllocator = .init(ws.gpa);
+        defer arena.deinit();
+        var result = blk: {
+            var ctx = ws.server.db.beginRead(arena.allocator());
+            defer ctx.end();
+            break :blk CompileSet.buildScripts(ws.gpa, ws.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // 被编辑打断：重试
+                error.Canceled => continue,
+            };
+        };
+        if (result.missing.count() == 0) {
+            result.missing.deinit(ws.gpa);
+            ws.mutex.lockUncancelable(ws.server.io);
+            defer ws.mutex.unlock(ws.server.io);
+            ws.build_scripts.deinit(ws.gpa);
+            ws.build_scripts = result.files;
+            return;
+        }
+        defer result.deinit(ws.gpa);
+        try ws.loadFiles(result.missing.keys());
+    }
+    log.warn("{s}: build script computation did not converge", .{ws.root});
 }
 
 /// 从这些编译 step 的根模块沿 import 可达的文件；缺少的文件读入后重算。不收敛时返回 null

@@ -1,6 +1,7 @@
 //! 补全：`a.` 之后列出命名空间的成员；`.` 之后按期望类型列出成员，初始化中列出未赋值的字段；
-//! `@` 之后列出内置函数；`@import("` 中列出模块与文件；`break :` / `continue :` 之后列出标签；
-//! 否则列出光标处可见的名字（局部名字与外层容器的声明）。
+//! `error.` 之后列出错误名；`@` 之后列出内置函数；`@import("` 中列出模块与文件；
+//! `break :` / `continue :` 之后列出标签；否则列出光标处可见的名字（局部名字与外层容器的声明）。
+//! 注释与字符串中（`@import("` 之外）不补全。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,7 +32,7 @@ pub const Item = struct {
     /// `@`、路径中的 `/` 等不属于单词的字符需要它
     replace: ?Range = null,
 
-    pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, builtin, module, file, folder, label };
+    pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, error_name, builtin, module, file, folder, label };
     pub const Range = struct { start: u32, end: u32 };
 };
 
@@ -40,16 +41,19 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return &.{};
 
+    const literal = try commentOrString(r, file, offset);
+    if (literal == .comment) return &.{};
     // 以下几种上下文在语法树中多为错误节点（如单独的 `@`、未闭合的字符串），直接按源码文本识别
-    if (builtinStart(text, offset)) |start| {
+    if (literal == .none) if (builtinStart(text, offset)) |start| {
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         for (std.zig.BuiltinFn.list.keys()) |name| try out.add(.{ .label = name, .kind = .builtin, .replace = range });
         return out.items.items;
-    }
+    };
     if (importString(text, offset)) |start| {
         try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = offset });
         return out.items.items;
     }
+    if (literal == .string) return &.{};
 
     const item = try r.ownerAt(file, offset, true) orelse return &.{};
     const node = try r.itemNode(file, item) orelse return &.{};
@@ -75,6 +79,11 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
             return out.items.items;
         },
         else => {},
+    };
+
+    if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .error_value) {
+        try errorNames(r, &out, file, offset, item, e);
+        return out.items.items;
     };
 
     // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员；初始化中（`.{ .x = 1, .| }`）列出未赋值的字段
@@ -293,6 +302,47 @@ fn identEnd(text: []const u8, offset: u32) u32 {
     return i;
 }
 
+/// 光标是否在注释中，或在字符串、字符字面量之内（光标前一个字符所在的 token）
+fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum { none, comment, string } {
+    if (offset == 0) return .none;
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const t = root.tokenAtOffset(offset - 1) orelse return .none;
+    return switch (t.kind) {
+        .line_comment, .doc_comment, .container_doc_comment => .comment,
+        // 光标在闭合的引号之后时已在字面量之外
+        .string_literal, .char_literal => if (offset < t.offset + t.text.len) .string else .none,
+        .multiline_string_literal_line => .string,
+        // 未闭合的字符串
+        .invalid => if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'')) .string else .none,
+        else => .none,
+    };
+}
+
+/// `error.` 之后的错误名：期望类型为错误集（或 error union）时列出它的成员，否则列出本文件中出现的
+/// 错误名（错误集定义与 `error.X`，光标处的这个除外：未写完的 `error.` 会接上下一行的名字）
+fn errorNames(r: *Resolver, out: *Collector, file: FileId, offset: u32, item: u32, e: Body.ExprId) resolve.Error!void {
+    const ip = r.ctx.db.env.ip;
+    if (try context.atSeeded(r, file, offset, true)) |a| if (a.literalExpected(e)) |want| {
+        const set = switch (ip.key(want)) {
+            .error_union_type => |eu| eu.err,
+            else => want,
+        };
+        if (try queries.errorSetMembers(r, set)) |names| {
+            for (names) |name| try out.add(.{ .label = name, .kind = .error_name });
+            return;
+        }
+    };
+    const tree = try r.itemTree(file);
+    for (0..tree.items.len) |i| {
+        const b = try r.body(file, @intCast(i));
+        for (b.exprs, 0..) |x, xi| switch (x) {
+            .error_set => |names| for (names) |name| try out.add(.{ .label = name, .kind = .error_name }),
+            .error_value => |name| if (i != item or xi != @backingInt(e)) try out.add(.{ .label = name, .kind = .error_name }),
+            else => {},
+        };
+    }
+}
+
 /// 光标在 `@` 或 `@name` 中时 `@` 的位置（不含 `@"..."` 形式的标识符）
 fn builtinStart(text: []const u8, offset: u32) ?u32 {
     var i = offset;
@@ -329,15 +379,15 @@ fn labelStart(text: []const u8, offset: u32) ?u32 {
     return start;
 }
 
-/// `@import("...` 中的模块名（std、builtin、root、所在模块 import 的模块）与相对路径下的
+/// `@import("...` 中的模块名（std、builtin、root、所属各模块 import 的模块）与相对路径下的
 /// `.zig` / `.zon` 文件、子目录。补全项为从字符串开头起的完整路径
 fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range) resolve.Error!void {
     const slash = std.mem.lastIndexOfScalar(u8, typed, '/');
     if (slash == null) {
         for ([_][]const u8{ "std", "builtin", "root" }) |m| try out.add(.{ .label = m, .kind = .module, .replace = range });
-        if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.entry(file)) |entry| if (entry.module != ModuleGraph.std_module) {
-            for (graph.modules[entry.module].imports) |imp| try out.add(.{ .label = imp.name, .kind = .module, .replace = range });
-        };
+        if (try r.ctx.get(ModuleGraph.Input, {})) |graph| {
+            for (try graph.importNames(r.arena, file)) |name| try out.add(.{ .label = name, .kind = .module, .replace = range });
+        }
     }
     const vfs = r.ctx.db.env.vfs;
     const prefix = if (slash) |s| typed[0 .. s + 1] else "";

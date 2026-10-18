@@ -9,6 +9,7 @@ const ModuleGraph = @import("../names/ModuleGraph.zig");
 const queries = @import("queries.zig");
 const render = @import("render.zig");
 const InternPool = @import("InternPool.zig");
+const value = @import("value.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 /// `needle` 第 `nth` 次出现处：名字与绑定重合时取绑定的类型，否则取区间恰好为 `needle` 的表达式的类型
@@ -378,6 +379,30 @@ test "comptime integer arithmetic follows the result type" {
     });
 }
 
+test "arithmetic operands have no result type" {
+    // 预期值与编译器一致（comptime 块中以 @compileError 核对过）
+    try expectTypes(
+        \\const m: u8 = (0xFF << 4) >> 4;
+        \\const w: u8 = (200 +% 100) / 2;
+        \\const r: f32 = 1 / 3;
+        \\const n: i8 = (100 * 100) / 100;
+        \\const big: u64 = @as(u32, 0xFFFFFFFF) * 2;
+        \\fn g(x: u8) void {
+        \\    const y: u32 = x + 1;
+        \\    _ = y;
+        \\}
+    , &.{
+        // 按结果类型 u8 计算时左移丢掉了高位，得 15
+        .{ "m", "u8 = 255" },
+        .{ "w", "u8 = 150" },
+        .{ "r", "f32 = 0" },
+        .{ "n", "i8 = 100" },
+        // u32 的乘法溢出（编译错误）：没有值，不能按 u64 计算
+        .{ "big", "u64" },
+        .{ "x + 1", "u8" },
+    });
+}
+
 test "comptime arguments are coerced to their instantiated parameter types" {
     try expectTypes(
         \\const E = enum { a, b };
@@ -612,7 +637,7 @@ test "oversized layouts degrade to unknown instead of overflowing" {
 
 test "container layouts match the compiler" {
     // 期望值为 zig 0.17.0 在 x86_64-linux 上的结果
-    try expectTypes(
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
         \\const A = struct { a: u8, b: u32, c: u16 };
         \\const B = extern struct { a: u8, b: u32, c: u16 };
         \\const C = packed struct { a: u3, b: u5, c: u16 };
@@ -933,6 +958,126 @@ test "vector layouts follow the backend and CPU features" {
         .{ "v2u8", "comptime_int" },
         .{ "bits", "comptime_int" },
     });
+}
+
+/// 目标 `arch_os_abi` 与 CPU（同编译器的 `-target` / `-mcpu`）的目标参数：指针位宽与标量类型的布局规则
+fn targetOf(arch_os_abi: []const u8, cpu: ?[]const u8) !InternPool.Target {
+    const query = try std.Target.Query.parse(.{ .arch_os_abi = arch_os_abi, .cpu_features = cpu });
+    const t = try std.zig.system.resolveTargetQuery(testing.io, query);
+    return .{ .pointer_bits = t.ptrBitWidth(), .scalar_abi = .of(&t) };
+}
+
+/// 布局随目标变化的类型：`s_T` / `a_T` 为 `@sizeOf(T)` / `@alignOf(T)`
+const target_layout_src =
+    \\const S = struct { a: u8, b: u64, c: u16, d: f80 };
+    \\fn g(c: bool) void {
+    \\    const s_u8 = @sizeOf(u8);
+    \\    const s_u32 = @sizeOf(u32);
+    \\    const a_u32 = @alignOf(u32);
+    \\    const s_u24 = @sizeOf(u24);
+    \\    const a_u24 = @alignOf(u24);
+    \\    const s_u64 = @sizeOf(u64);
+    \\    const a_u64 = @alignOf(u64);
+    \\    const s_u128 = @sizeOf(u128);
+    \\    const a_u128 = @alignOf(u128);
+    \\    const s_f80 = @sizeOf(f80);
+    \\    const a_f80 = @alignOf(f80);
+    \\    const s_f128 = @sizeOf(f128);
+    \\    const a_f128 = @alignOf(f128);
+    \\    const s_c_int = @sizeOf(c_int);
+    \\    const a_c_int = @alignOf(c_int);
+    \\    const s_c_longdouble = @sizeOf(c_longdouble);
+    \\    const a_c_longdouble = @alignOf(c_longdouble);
+    \\    const s_S = @sizeOf(S);
+    \\    const a_S = @alignOf(S);
+    \\    const max_c_uint = @as(c_uint, 0) -% 1;
+    \\    const peer = if (c) @as(f32, 1) else @as(f64, 2);
+    \\    _ = .{ s_u8, s_u32, a_u32, s_u24, a_u24, s_u64, a_u64, s_u128, a_u128, s_f80, a_f80, s_f128, a_f128, s_c_int, a_c_int, s_c_longdouble, a_c_longdouble, s_S, a_S, max_c_uint, peer };
+    \\}
+;
+
+const target_layout_types = [_][]const u8{ "u24", "u64", "u128", "f80", "f128", "c_int", "c_longdouble", "S" };
+
+/// `target_layout_src` 在目标上的结果：`expected[i]` 为 `target_layout_types[i]` 的大小与对齐（null 为未知）
+fn expectTargetLayouts(target: InternPool.Target, expected: [target_layout_types.len]?[2]u64, max_c_uint: u64) !void {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try w.setTarget(target);
+    const src = target_layout_src;
+    const f = try w.add("/p/main.zig", src);
+    const a = w.arena.allocator();
+    for (target_layout_types, expected) |name, e| {
+        for ([_][]const u8{ "s_", "a_" }, 0..) |prefix, i| {
+            const binding = try std.mem.concat(a, u8, &.{ prefix, name });
+            const want = if (e) |v| try std.fmt.allocPrint(a, "comptime_int = {d}", .{v[i]}) else "comptime_int";
+            testing.expectEqualStrings(want, try typeAt(&w, f.file, src, binding, 0)) catch |err| {
+                std.debug.print("type of `{s}`\n", .{binding});
+                return err;
+            };
+        }
+    }
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "c_uint = {d}", .{max_c_uint}), try typeAt(&w, f.file, src, "max_c_uint", 0));
+}
+
+test "integer, float and C type layouts follow the target" {
+    // 期望值为 zig 0.17.0 的结果（`zig build-obj -target <目标>` 中以 @compileError 输出）。类型顺序：
+    // u24, u64, u128, f80, f128, c_int, c_longdouble, S
+    try expectTargetLayouts(try targetOf("x86_64-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 16, 16 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 16 } }, 4294967295);
+    // 整数的最大对齐为 4；long double 为 80 位、按 4 字节对齐
+    try expectTargetLayouts(try targetOf("x86-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 4 }, .{ 16, 4 }, .{ 12, 4 }, .{ 16, 16 }, .{ 4, 4 }, .{ 12, 4 }, .{ 24, 4 } }, 4294967295);
+    // 布局也取决于操作系统：Windows 上整数的最大对齐为 8
+    try expectTargetLayouts(try targetOf("x86-windows-gnu", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 12, 4 }, .{ 16, 16 }, .{ 4, 4 }, .{ 12, 4 }, .{ 24, 8 } }, 4294967295);
+    // long double 为 128 位：f80 按软浮点（u64 与 u16）布局
+    try expectTargetLayouts(try targetOf("aarch64-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 16, 8 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 8 } }, 4294967295);
+    try expectTargetLayouts(try targetOf("arm-linux-musleabihf", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 4, 4 }, .{ 8, 8 }, .{ 32, 8 } }, 4294967295);
+    try expectTargetLayouts(try targetOf("riscv32-freestanding-none", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 8 } }, 4294967295);
+    // AVR：整数与浮点按 1 字节对齐，c_int 为 16 位；std 没有定义 32 位 long double 的大小，为未知
+    try expectTargetLayouts(try targetOf("avr-freestanding-none", "atmega328p"), .{ .{ 3, 1 }, .{ 8, 1 }, .{ 16, 1 }, .{ 10, 1 }, .{ 16, 1 }, .{ 2, 1 }, null, .{ 21, 1 } }, 65535);
+    try expectTargetLayouts(try targetOf("msp430-freestanding-none", null), .{ .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 10, 2 }, .{ 16, 2 }, .{ 2, 2 }, .{ 8, 2 }, .{ 22, 2 } }, 65535);
+}
+
+test "type layouts with several targets keep only what the targets agree on" {
+    const x86_64 = try targetOf("x86_64-linux-musl", null);
+    const x86 = try targetOf("x86-linux-musl", null);
+    const src = target_layout_src;
+    // 整数的最大对齐为 16 与 4：不超过 4 字节的整数仍有确定的布局；f128 在两者上相同
+    try expectTypesTargeted(.{ .pointer_bits = null, .scalar_abi = x86_64.scalar_abi.merge(x86.scalar_abi) }, src, &.{
+        .{ "s_u32", "comptime_int = 4" },
+        .{ "a_u32", "comptime_int = 4" },
+        .{ "s_u24", "comptime_int = 4" },
+        .{ "a_u64", "comptime_int" },
+        .{ "s_S", "comptime_int" },
+        .{ "a_f80", "comptime_int" },
+        .{ "a_f128", "comptime_int = 16" },
+        .{ "s_c_int", "comptime_int = 4" },
+        .{ "max_c_uint", "c_uint = 4294967295" },
+    });
+    // 目标未知：只有不超过 1 字节的整数有确定的布局；浮点的位宽与目标无关
+    try expectTypesTargeted(.{ .pointer_bits = null, .scalar_abi = .unknown }, src, &.{
+        .{ "s_u8", "comptime_int = 1" },
+        .{ "s_u32", "comptime_int" },
+        .{ "s_f80", "comptime_int" },
+        .{ "s_c_int", "comptime_int" },
+        .{ "max_c_uint", "c_uint" },
+        .{ "peer", "f64" },
+    });
+}
+
+test "integer layouts match std.zig.target for every width" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    for ([_][]const u8{ "x86_64-linux-musl", "x86-linux-musl", "x86-windows-gnu", "arm-linux-musleabihf", "avr-freestanding-none", "msp430-freestanding-none", "xtensa-freestanding-none" }) |triple| {
+        const t = try std.zig.system.resolveTargetQuery(testing.io, try .parse(.{ .arch_os_abi = triple }));
+        try w.setTarget(.{ .scalar_abi = .of(&t) });
+        for (1..129) |i| {
+            const bits: u16 = @intCast(i);
+            const l = value.intLayout(&w.ip, bits).?;
+            try testing.expectEqual(std.zig.target.intAlignment(&t, bits), l.alignment);
+            try testing.expectEqual(std.zig.target.intByteSize(&t, bits), l.size);
+        }
+    }
 }
 
 test "tuple and anonymous struct literals have comptime fields like the compiler" {
@@ -1520,6 +1665,44 @@ test "generic bodies without an instance use values that do not depend on the pa
     });
 }
 
+test "@hasDecl and @hasField on abstract parameters are unknown" {
+    // 防止解释器把抽象参数当作没有该成员：类型标注与 comptime 调用中按 false 选择分支
+    try expectTypes(
+        \\const HasInner = struct { pub const Inner = u32; x: u8 };
+        \\fn Sel(comptime T: type) type {
+        \\    return if (@hasDecl(T, "Inner")) T.Inner else T;
+        \\}
+        \\fn f(comptime T: type) void {
+        \\    var va: if (@hasDecl(T, "Inner")) T.Inner else T = undefined;
+        \\    var vb: if (@hasField(T, "x")) u8 else u16 = undefined;
+        \\    const S = Sel(T);
+        \\    _ = .{ &va, &vb, S };
+        \\}
+        \\fn Pick(comptime U: type) type {
+        \\    return if (@hasDecl(U, "get")) u8 else u16;
+        \\}
+        \\fn Wrap(comptime T: type) type {
+        \\    return struct {
+        \\        x: T,
+        \\        const Self = @This();
+        \\        pub fn get() void {}
+        \\        fn g() void {
+        \\            const P = Pick(Self);
+        \\            _ = P;
+        \\        }
+        \\    };
+        \\}
+        \\const real = Sel(HasInner);
+    , &.{
+        .{ "va", "unknown" },
+        .{ "vb", "unknown" },
+        .{ "S", "type" },
+        // 抽象实例中的容器：成员只取决于源码
+        .{ "P", "type = u8" },
+        .{ "real", "type = u32" },
+    });
+}
+
 test "arrays whose length depends on abstract parameters keep their element type" {
     try expectTypes(
         \\fn Hasher(comptime block_length: usize) type {
@@ -2009,6 +2192,35 @@ test "member bodies are reused when their source is unchanged" {
     try testing.expect(before.b != after.b);
 }
 
+test "editing a callee body does not invalidate the inference of its callers" {
+    // 判断是否为泛型调用时依赖被调函数的整个 Body：改它的函数体会使全部调用者重新推导
+    const v1 = "fn callee(a: u32) u32 {\n    return a + 1;\n}\nfn generic(x: anytype) @TypeOf(x) {\n    return x;\n}\nfn caller(v: u32) u32 {\n    const r = callee(v);\n    return generic(r);\n}\n";
+    const v2 = "fn callee(a: u32) u32 {\n    var b = a;\n    b += 2;\n    return b;\n}\nfn generic(x: anytype) @TypeOf(x) {\n    return x;\n}\nfn caller(v: u32) u32 {\n    const r = callee(v);\n    return generic(r);\n}\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", v1);
+    for ([_][]const u8{ v1, v2 }, 0..) |text, round| {
+        if (round == 1) _ = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var trace: @import("../db/engine.zig").Trace = .{ .gpa = w.arena.allocator() };
+        ctx.trace = &trace;
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const owner = try r.ownerKey(f.file, resolve.Resolver.lookupDecl(try r.itemTree(f.file), 0, "caller").?);
+        _ = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        if (round == 0) continue;
+        // 被调函数自身（签名部分）重新推导，值不变；调用者不重算
+        const infer_index = comptime for (database.Db.query_types, 0..) |Q, qi| {
+            if (Q == queries.Infer) break qi;
+        } else unreachable;
+        for (trace.events.items) |ev| if (ev.query == infer_index) {
+            try testing.expect(w.db.keyAt(queries.Infer, ev.key).owner.item != owner.item);
+        };
+    }
+    try testing.expectEqualStrings("u32", try typeAt(&w, f.file, v2, "r", 1));
+}
+
 test "std.mem pointer reinterpretation" {
     try expectStdTypes(
         \\const std = @import("std");
@@ -2221,5 +2433,179 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
         // optional 的指针捕获与 `*const T` 到 `*const [1]T`
         .{ "r_short", "usize = 104" },
         .{ "r_bump", "usize = 3" },
+    });
+}
+
+test "comptime evaluation: slices of interpreter storage read elements in place" {
+    // 防止取切片的元素或长度时复制整个区间：逐次切片的循环（comptime 分词器的常见写法）分配量与
+    // 长度的平方成正比，超过内存上限后结果未知
+    const text = comptime blk: {
+        @setEvalBranchQuota(2000);
+        var buf: [1024]u8 = undefined;
+        for (&buf, 0..) |*c, i| c.* = if (i % 2 == 0) 'a' else 'b';
+        const final = buf;
+        break :blk &final;
+    };
+    try expectTypes(
+        \\fn count(comptime s: []const u8) usize {
+        \\    @setEvalBranchQuota(100000);
+        \\    var rest: []const u8 = s;
+        \\    var k: usize = 0;
+        \\    while (rest.len > 0) : (rest = rest[1..]) {
+        \\        if (rest[0] == 'a') k += 1;
+        \\    }
+        \\    return k;
+        \\}
+        \\fn copies(comptime s: []const u8) usize {
+        \\    var buf: [s.len]u8 = undefined;
+        \\    @memcpy(&buf, s);
+        \\    const view = buf[1..];
+        \\    var out: [s.len - 1]u8 = undefined;
+        \\    @memcpy(&out, view);
+        \\    const joined = view[view.len - 3 ..] ++ "c";
+        \\    for (view[0..2]) |*x| x.* = 'd';
+        \\    const p = view[2..4];
+        \\    p.*[0] = 'e';
+        \\    const digits = [_]u8{ out[0], joined[3], buf[2], buf[3], 'a' + joined.len };
+        \\    var n: usize = 0;
+        \\    for (digits) |d| n = n * 10 + (d - 'a');
+        \\    return n;
+        \\}
+        \\const big = "
+    ++ text ++
+        \\";
+        \\const counted = count(big);
+        \\const copied = copies(big);
+    , &.{
+        .{ "counted", "usize = 512" },
+        // 经由区间读取、复制、拼接与写入
+        .{ "copied", "usize = 12344" },
+    });
+}
+
+test "comptime evaluation: element-wise work counts toward the step and memory limits" {
+    // 防止逐元素的操作绕过上限：表达式不多的求值中逐个写入数十万个元素，或在两次内存检查之间
+    // 复制出超过内存上限的大数组
+    try expectTypes(
+        \\fn copyMany() u8 {
+        \\    const buf: [60000]u8 = @splat(1);
+        \\    var out: [60000]u8 = undefined;
+        \\    for (0..4) |_| @memcpy(&out, &buf);
+        \\    return out[0];
+        \\}
+        \\fn copyFew() u8 {
+        \\    const buf: [60000]u8 = @splat(1);
+        \\    var out: [60000]u8 = undefined;
+        \\    @memcpy(&out, &buf);
+        \\    return out[0];
+        \\}
+        \\fn copyLarge() u8 {
+        \\    const buf: [65536]u8 = @splat(1);
+        \\    var sum: u8 = 0;
+        \\    for (0..24) |_| {
+        \\        const c = buf;
+        \\        sum +%= c[0];
+        \\    }
+        \\    return sum;
+        \\}
+        \\const many = copyMany();
+        \\const few = copyFew();
+        \\const large = copyLarge();
+    , &.{
+        .{ "many", "u8" },
+        .{ "few", "u8 = 1" },
+        .{ "large", "u8" },
+    });
+}
+
+test "catch and orelse take the result type of the whole expression, labeled switch break values" {
+    try expectTypes(
+        \\fn parse(s: []const u8) error{Bad}!u8 {
+        \\    return if (s.len == 0) error.Bad else 1;
+        \\}
+        \\fn find(x: u32) ?u8 {
+        \\    return if (x == 0) null else 1;
+        \\}
+        \\const Color = enum { red, green };
+        \\fn pick(x: u32) error{Bad}!Color {
+        \\    return if (x == 0) error.Bad else .red;
+        \\}
+        \\fn g(s: []const u8, x: u32) void {
+        \\    const a = parse(s) catch null;
+        \\    const b = parse(s) catch 0;
+        \\    const c: ?u16 = parse(s) catch null;
+        \\    const d = pick(x) catch .green;
+        \\    const e = find(x) orelse null;
+        \\    const f = find(x) orelse 0;
+        \\    const k = sw: switch (x) {
+        \\        0 => break :sw @as(u8, 1),
+        \\        else => break :sw 2,
+        \\    };
+        \\    const k2 = sw2: switch (x) {
+        \\        0 => continue :sw2 1,
+        \\        1 => break :sw2 @as(u16, 3),
+        \\        else => @as(u16, 4),
+        \\    };
+        \\    const k3 = sw3: switch (1) {
+        \\        1 => break :sw3 @as(u8, 1),
+        \\        else => break :sw3 @as(u16, 2),
+        \\    };
+        \\    const k4 = sw4: switch (@as(u8, 0)) {
+        \\        0 => continue :sw4 1,
+        \\        1 => break :sw4 @as(u16, 7),
+        \\        else => break :sw4 @as(u16, 8),
+        \\    };
+        \\    _ = .{ a, b, c, d, e, f, k, k2, k3, k4 };
+        \\}
+    , &.{
+        // 右侧按载荷类型转换时 `null` 被当作 `u8`
+        .{ "a", "?u8" },
+        .{ "b", "u8" },
+        .{ "c", "?u16" },
+        .{ "d", "Color" },
+        .{ "e", "?u8" },
+        .{ "f", "u8" },
+        // 不收集 `break :sw` 的值时各分支都是 noreturn
+        .{ "k", "u8" },
+        .{ "k2", "u16" },
+        // comptime 已知的操作数只执行匹配的分支；有 `continue :sw4` 时可能转到其他分支
+        .{ "k3", "u8 = 1" },
+        .{ "k4", "u16" },
+    });
+}
+
+test "comptime evaluation: self-referential and deeply nested values are unknown" {
+    try expectTypes(
+        \\const Node = struct { next: ?*const Node = null, v: u32 = 0 };
+        \\fn selfLoop() Node {
+        \\    var n: Node = .{ .v = 1 };
+        \\    n.next = &n;
+        \\    return n;
+        \\}
+        \\fn pair() [2]Node {
+        \\    var ns: [2]Node = .{ .{ .v = 1 }, .{ .v = 2 } };
+        \\    ns[0].next = &ns[1];
+        \\    ns[1].next = &ns[0];
+        \\    return ns;
+        \\}
+        \\fn chain(comptime n: usize) Node {
+        \\    var nodes: [n]Node = undefined;
+        \\    nodes[0] = .{ .v = 0 };
+        \\    for (1..n) |i| nodes[i] = .{ .next = &nodes[i - 1], .v = i };
+        \\    return nodes[n - 1];
+        \\}
+        \\const loop = selfLoop();
+        \\const both = pair();
+        \\const v = selfLoop().v;
+        \\const short = chain(3).next.?.v;
+        \\const long = chain(1000);
+    , &.{
+        // 自引用的值沿指针展开不会结束（原生栈耗尽，进程崩溃）
+        .{ "loop", "Node" },
+        .{ "both", "[2]Node" },
+        // 调用的结果整体驻留，含环时其中的字段也未知
+        .{ "v", "u32" },
+        .{ "short", "u32 = 1" },
+        .{ "long", "Node" },
     });
 }

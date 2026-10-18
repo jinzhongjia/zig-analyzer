@@ -5,6 +5,7 @@
 //! 多个 query 并发驻留，以互斥锁保护。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const FileId = @import("../base/Vfs.zig").FileId;
@@ -16,11 +17,9 @@ const InternPool = @This();
 gpa: Allocator,
 io: Io,
 mutex: Io.Mutex = .init,
-/// 目标的指针位宽（usize、指针的大小）；0 表示未知（项目中各模块的宽度不一致）。
-/// 与 `queries.TargetAbi` input 在同一写事务中设置，读取它的 query 都先读该 input 以记录依赖
-pointer_bits: std.atomic.Value(u16) = .init(@bitSizeOf(usize)),
-/// 向量的布局规则；设置方式同 `pointer_bits`
-vector_abi: std.atomic.Value(VectorAbi) = .init(.unknown),
+/// 与目标相关的值运算参数。与 `queries.TargetAbi` input 在同一写事务中设置，读取它的 query 都先读该
+/// input 以记录依赖；读事务与写事务互斥，读取时不会同时被修改
+target: Target = .{},
 /// Key 中切片的存储
 arena: std.heap.ArenaAllocator,
 items: std.ArrayList(Key) = .empty,
@@ -315,25 +314,121 @@ pub fn bytes(ip: *InternPool) usize {
 }
 
 pub fn pointerBits(ip: *const InternPool) ?u16 {
-    const bits = ip.pointer_bits.load(.monotonic);
-    return if (bits == 0) null else bits;
+    return ip.target.pointer_bits;
 }
 
 pub fn vectorAbi(ip: *const InternPool) VectorAbi {
-    return ip.vector_abi.load(.monotonic);
+    return ip.target.vector_abi;
+}
+
+pub fn scalarAbi(ip: *const InternPool) *const ScalarAbi {
+    return &ip.target.scalar_abi;
 }
 
 /// 只能在写事务中调用
 pub fn setTarget(ip: *InternPool, t: Target) void {
-    ip.pointer_bits.store(t.pointer_bits orelse 0, .monotonic);
-    ip.vector_abi.store(t.vector_abi, .monotonic);
+    ip.target = t;
 }
 
-/// 与目标相关的值运算参数（各模块一致时）
+/// 与目标相关的值运算参数（各模块一致的部分）；默认为本机
 pub const Target = struct {
     /// 指针位宽；各模块不一致时为 null
     pointer_bits: ?u16 = @bitSizeOf(usize),
     vector_abi: VectorAbi = .unknown,
+    scalar_abi: ScalarAbi = .native,
+};
+
+/// 整数、浮点与 C 类型的布局，以及 C 整数类型的位宽与符号（编译器 `Type.abiAlignment` / `abiSize` /
+/// `intInfo` 的对应分支），由 `std.Target` 按编译器的规则算出
+pub const ScalarAbi = struct {
+    /// 定宽整数的最大对齐（`std.Target.cMaxIntAlignment`）在各模块中的最小值与最大值。整数的对齐为不小于
+    /// 其字节数的 2 的幂，且不超过最大对齐；两者不同时，对齐受最大对齐影响的整数的布局未知
+    max_int_align: struct { min: u16, max: u16 },
+    /// `c_char` 的符号；目标没有 C ABI 或各模块不一致时为 null
+    c_char_signedness: ?std.builtin.Signedness,
+    /// 各类型的布局；目标没有定义（没有 C ABI 等）或各模块不一致时为 null
+    types: std.EnumArray(Type, ?Scalar),
+
+    /// 布局取决于目标、且不能由整数规则得出的类型（`c_ushort` 等无符号类型与对应的有符号类型相同）
+    pub const Type = enum { c_char, c_short, c_int, c_long, c_longlong, c_longdouble, f32, f64, f80, f128 };
+
+    pub const Scalar = struct { size: u16, alignment: u16, bits: u16 };
+
+    pub const native: ScalarAbi = .of(&builtin.target);
+
+    /// 目标未知：只有对齐与目标无关的整数（不超过 1 字节）有确定的布局
+    pub const unknown: ScalarAbi = .{
+        .max_int_align = .{ .min = 1, .max = std.math.maxInt(u16) },
+        .c_char_signedness = null,
+        .types = .initFill(null),
+    };
+
+    pub fn of(t: *const std.Target) ScalarAbi {
+        const max_align = t.cMaxIntAlignment();
+        var r: ScalarAbi = .{
+            .max_int_align = .{ .min = max_align, .max = max_align },
+            .c_char_signedness = null,
+            .types = .initFill(null),
+        };
+        // std 没有为这些系统定义 C 类型的大小（`cTypeBitSize` 中为 panic），浮点的规则也依赖它
+        switch (t.os.tag) {
+            .ps3, .contiki, .managarm => return r,
+            else => {},
+        }
+        r.c_char_signedness = t.cCharSignedness();
+        inline for (.{ .c_char, .c_short, .c_int, .c_long, .c_longlong }, .{ .char, .short, .int, .long, .longlong }) |k, c| {
+            r.types.set(k, cType(t, c));
+        }
+        // long double 只有 64、80、128 位时 std 定义了大小（AVR 的 32 位 long double 在 `cTypeByteSize`
+        // 中为 unreachable）
+        if (t.cTypeBitSize(.longdouble)) |bits| switch (bits) {
+            64, 80, 128 => r.types.set(.c_longdouble, cType(t, .longdouble)),
+            else => {},
+        };
+        // 以下与编译器 `Type.abiAlignment` / `abiSize` 的浮点分支一致：与 C 类型位宽相同时按 C 类型，
+        // 否则按表示它的整数，或 compiler-rt 的软浮点表示
+        r.types.set(.f32, if (t.cTypeBitSize(.float) == 32) cType(t, .float) else intScalar(t, 32));
+        r.types.set(.f64, if (t.cTypeBitSize(.double) == 64) cType(t, .double) else intScalar(t, 64));
+        r.types.set(.f80, if (t.cTypeBitSize(.longdouble) == 80) r.types.get(.c_longdouble) else switch (std.zig.target.compilerRtFloatAbi(t, 80)) {
+            .hard => intScalar(t, 80),
+            // 尾数 u64 与指数 u16
+            .soft => blk: {
+                const alignment = @max(std.zig.target.intAlignment(t, 64), std.zig.target.intAlignment(t, 16));
+                const size = std.mem.alignForward(u16, std.zig.target.intByteSize(t, 64) + std.zig.target.intByteSize(t, 16), alignment);
+                break :blk .{ .size = size, .alignment = alignment, .bits = 80 };
+            },
+        });
+        r.types.set(.f128, if (t.cTypeBitSize(.longdouble) == 128) r.types.get(.c_longdouble) else switch (std.zig.target.compilerRtFloatAbi(t, 128)) {
+            // x86 按 C 的 `__float128`
+            .hard => if (t.cpu.arch.isX86()) .{ .size = 16, .alignment = 16, .bits = 128 } else intScalar(t, 128),
+            // 两个 u64
+            .soft => .{ .size = 2 * std.zig.target.intByteSize(t, 64), .alignment = std.zig.target.intAlignment(t, 64), .bits = 128 },
+        });
+        return r;
+    }
+
+    fn cType(t: *const std.Target, c: std.Target.CType) ?Scalar {
+        return .{
+            .size = t.cTypeByteSize(c) orelse return null,
+            .alignment = t.cTypeAlignment(c) orelse return null,
+            .bits = t.cTypeBitSize(c) orelse return null,
+        };
+    }
+
+    fn intScalar(t: *const std.Target, bits: u16) Scalar {
+        return .{ .size = std.zig.target.intByteSize(t, bits), .alignment = std.zig.target.intAlignment(t, bits), .bits = bits };
+    }
+
+    /// 两组参数中一致的部分（项目中有多个目标时）
+    pub fn merge(a: ScalarAbi, b: ScalarAbi) ScalarAbi {
+        var r = a;
+        r.max_int_align = .{ .min = @min(a.max_int_align.min, b.max_int_align.min), .max = @max(a.max_int_align.max, b.max_int_align.max) };
+        if (a.c_char_signedness != b.c_char_signedness) r.c_char_signedness = null;
+        for (&r.types.values, b.types.values) |*x, y| {
+            if (!std.meta.eql(x.*, y)) x.* = null;
+        }
+        return r;
+    }
 };
 
 /// 向量的布局规则（`Type.abiAlignment` / `abiSize` 的 vector 分支），由编译后端、架构与 CPU 特性决定

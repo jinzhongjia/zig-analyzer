@@ -93,6 +93,20 @@ pub fn normalize(comptime style: Style, gpa: Allocator, file_path: []const u8) A
     };
 }
 
+/// 按 `std.fs.path.resolve` 的规则把 `sub_path` 相对于绝对路径 `base` 解析。结果不是绝对路径时返回 null：
+/// Windows 上另一驱动器的相对路径（如 `D:a.zig`）解析后仍是相对路径。返回非 null 时可以传给 `intern`。
+/// 两种风格在任何平台上都可调用，便于测试。
+pub fn resolve(comptime style: Style, gpa: Allocator, base: []const u8, sub_path: []const u8) Allocator.Error!?[]u8 {
+    const isAbsolute, const resolveAlloc = switch (style) {
+        .posix => .{ std.fs.path.isAbsolutePosix, std.fs.path.resolveAllocPosix },
+        .windows => .{ std.fs.path.isAbsoluteWindows, std.fs.path.resolveAllocWindows },
+    };
+    const resolved = try resolveAlloc(gpa, &.{ base, sub_path });
+    if (isAbsolute(resolved)) return resolved;
+    gpa.free(resolved);
+    return null;
+}
+
 /// 驻留路径。调用方须保证 `file_path` 是绝对路径；路径会被规范化（见 `normalize`）。
 pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
     const normalized = try vfs.normalizeOwn(file_path) orelse unreachable;
@@ -185,4 +199,38 @@ test "case-sensitive: different spellings are different files" {
     defer vfs.deinit();
     try t.expect(try vfs.intern("/a/B.zig") != try vfs.intern("/a/b.zig"));
     try t.expectEqual(null, try vfs.lookup("/A/b.zig"));
+}
+
+test "resolve: results that are not absolute paths are rejected" {
+    const t = std.testing;
+    const Case = struct { base: []const u8, sub_path: []const u8, expected: ?[]const u8 };
+    const posix = [_]Case{
+        .{ .base = "/proj", .sub_path = "src/../a.zig", .expected = "/proj/a.zig" },
+        .{ .base = "/proj", .sub_path = "/other/b.zig", .expected = "/other/b.zig" },
+        .{ .base = "/proj", .sub_path = "x: u32 = 1;", .expected = "/proj/x: u32 = 1;" },
+    };
+    const windows = [_]Case{
+        .{ .base = "C:\\proj", .sub_path = "src/../a.zig", .expected = "C:\\proj\\a.zig" },
+        .{ .base = "C:\\proj", .sub_path = "D:\\other\\b.zig", .expected = "D:\\other\\b.zig" },
+        .{ .base = "C:\\proj", .sub_path = "\\\\server\\share\\c.zig", .expected = "\\\\server\\share\\c.zig" },
+        .{ .base = "C:\\proj", .sub_path = "C:a.zig", .expected = "C:\\proj\\a.zig" },
+        // 另一驱动器的相对路径：错误包格式不符时，路径下标可能指向源码行中间的 `x: u32 = 1;`
+        .{ .base = "C:\\proj", .sub_path = "x: u32 = 1;", .expected = null },
+        .{ .base = "C:\\proj", .sub_path = "D:a.zig", .expected = null },
+        .{ .base = "C:\\proj", .sub_path = "::", .expected = null },
+    };
+    inline for (.{ Style.posix, Style.windows }, .{ &posix, &windows }) |style, cases| {
+        var vfs: Vfs = .initOptions(t.io, t.allocator, .{ .style = style });
+        defer vfs.deinit();
+        for (cases) |c| {
+            const resolved = try resolve(style, t.allocator, c.base, c.sub_path);
+            defer if (resolved) |p| t.allocator.free(p);
+            if (c.expected) |expected| {
+                try t.expectEqualStrings(expected, resolved.?);
+                _ = try vfs.intern(resolved.?);
+            } else {
+                try t.expectEqual(null, resolved);
+            }
+        }
+    }
 }

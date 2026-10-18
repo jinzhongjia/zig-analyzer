@@ -18,12 +18,15 @@ const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
+const ErrorSets = @import("../syntax/ErrorSets.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
+    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
     if (try defAt(r, file, offset)) |def| return target(r, try r.aliasTarget(def));
     if (try reifiedFieldTarget(r, file, offset)) |t| return t;
     return selfTarget(r, file, offset);
@@ -32,9 +35,43 @@ pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
+    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
     if (try defAt(r, file, offset)) |def| return target(r, def);
     if (try reifiedFieldTarget(r, file, offset)) |t| return t;
     return selfTarget(r, file, offset);
+}
+
+/// definition 的全部目标：光标在 `@import("name")` 上、文件所属的多个模块以 `name` import 不同的模块时为
+/// 这些模块的根文件（按模块的优先级）；其余情况为 `definition` 的结果。第一个即 `definition` 的结果
+pub fn definitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    if (try importTargetsAt(r, file, offset)) |targets| return targets;
+    return single(r, try definition(r, file, offset));
+}
+
+/// declaration 的全部目标：同 `definitionTargets`，其余情况为 `declaration` 的结果
+pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    if (try importTargetsAt(r, file, offset)) |targets| return targets;
+    return single(r, try declaration(r, file, offset));
+}
+
+fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
+    return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
+}
+
+/// 光标在 `@import(...)` 或其字符串上时 import 的全部目标（文件开头）。这类 token 不是名字，
+/// `definition` / `declaration` 对它们只经 `defAt` 取 import 的第一个目标
+fn importTargetsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]const Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind == .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const e = b.exprAt(tok.offset - node.offset) orelse return null;
+    const call = importCall(b, e) orelse return null;
+    const files = try r.importTargets(file, b, call.args);
+    const targets = try r.arena.alloc(Target, files.len);
+    for (files, targets) |f, *t| t.* = .{ .file = f, .start = 0, .end = 0 };
+    return targets;
 }
 
 /// 本身就是声明处、但不是成员或局部绑定的名字：错误集 `error{ Foo }` 中的 `Foo`，没有结果类型的
@@ -248,6 +285,86 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
     return null;
 }
 
+/// `error.Foo` 中的 `Foo` 在错误集声明中的位置与文档
+pub const ErrorDecl = struct { target: Target, doc: ?[]const u8 };
+
+/// `error.Foo`：错误名不必先声明，同名的错误也可以出现在多个错误集中。在 `error{ ... }` 声明中查找：成员与
+/// 期望的错误集完全相同的优先，其次是期望错误集的一部分（`A || B` 中的 `A`），再次是任何含这个名字的。
+/// 先查当前文件；`imports` 时再查沿 import 可达的文件（以文件索引按名字筛选），直到找到不会被取代的：有期望的
+/// 错误集时为完全相同的；没有时各声明同样符合，取第一个
+pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) resolve.Error!?ErrorDecl {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const e = b.exprAt(tok.offset - node.offset) orelse return null;
+    const name = switch (b.expr(e)) {
+        .error_value => |n| ast.identName(n),
+        else => return null,
+    };
+    if (name.len == 0) return null;
+    const expected = try expectedErrorNames(r, file, tok.offset, e);
+    const enough: @FieldType(ErrorCandidate, "rank") = if (expected != null) .exact else .any;
+    var best: ?ErrorCandidate = null;
+    try findErrorDecl(r, file, name, expected, &best);
+    if (!imports) return if (best) |c| c.decl else null;
+    var files: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    try files.put(r.arena, file, {});
+    var i: usize = 0;
+    while (i < files.count() and (best == null or best.?.rank != enough)) : (i += 1) {
+        const f = files.keys()[i];
+        const index = try r.ctx.get(FileIndex.Query, f);
+        if (i > 0 and index.contains(name)) try findErrorDecl(r, f, name, expected, &best);
+        for (index.imports) |s| if (try r.resolveImport(f, s)) |to| try files.put(r.arena, to, {});
+    }
+    return if (best) |c| c.decl else null;
+}
+
+/// `error.X` 的期望错误集（错误联合取其错误集）的成员
+pub fn expectedErrorNames(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?[]const []const u8 {
+    const set = try expectedErrorSet(r, file, offset, e) orelse return null;
+    return queries.errorSetMembers(r, set);
+}
+
+pub fn expectedErrorSet(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Index {
+    const a = try context.atSeeded(r, file, offset, false) orelse return null;
+    const want = a.literalExpected(e) orelse return null;
+    return switch (r.ctx.db.env.ip.key(want)) {
+        .error_union_type => |eu| eu.err,
+        .error_set_type, .inferred_error_set => want,
+        else => null,
+    };
+}
+
+const ErrorCandidate = struct {
+    rank: enum(u2) { any, subset, exact },
+    decl: ErrorDecl,
+};
+
+/// 文件中含名为 `name` 的错误的 `error{ ... }` 声明，比 `best` 更符合期望的错误集时替换它（同样符合时取先出现的）
+fn findErrorDecl(r: *Resolver, file: FileId, name: []const u8, expected: ?[]const []const u8, best: *?ErrorCandidate) resolve.Error!void {
+    const sets = try r.ctx.get(ErrorSets.Query, file);
+    for (sets.sets) |set| {
+        const member = for (set.members) |m| {
+            if (std.mem.eql(u8, m.name, name)) break m;
+        } else continue;
+        const rank: @FieldType(ErrorCandidate, "rank") = if (expected) |want| blk: {
+            for (set.members) |x| {
+                for (want) |y| {
+                    if (std.mem.eql(u8, x.name, y)) break;
+                } else break :blk .any;
+            }
+            break :blk if (set.members.len == want.len) .exact else .subset;
+        } else .any;
+        if (best.*) |b| if (@backingInt(rank) <= @backingInt(b.rank)) continue;
+        best.* = .{ .rank = rank, .decl = .{
+            .target = .{ .file = file, .start = member.start, .end = member.end },
+            .doc = if (member.doc) |d| try r.arena.dupe(u8, d) else null,
+        } };
+    }
+}
+
 /// 节点中 `error{ ... }` 里名为 `name` 的错误的位置
 fn findErrorName(node: ast.SyntaxNode, name: []const u8, depth: u32) ?u32 {
     if (depth > 16) return null;
@@ -381,17 +498,26 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
             const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
             return context.defOfKey(r, a.fieldRef(e, @intCast(k)) orelse return null);
         } else return null,
-        .builtin_call => |call| return importDef(r, file, b, call),
-        .literal => {
-            // `@import("...")` 的字符串
-            for (b.exprs) |other| switch (other) {
-                .builtin_call => |call| if (std.mem.indexOfScalar(Body.ExprId, call.args, e) != null) return importDef(r, file, b, call),
-                else => {},
-            };
-            return null;
+        // `@import` 与它的字符串
+        .builtin_call, .literal => {
+            const call = importCall(b, e) orelse return null;
+            return .{ .file = try r.importTarget(file, b, call.args) orelse return null };
         },
         else => return null,
     }
+}
+
+/// `e` 为 `@import(...)` 调用或它的实参时的调用
+fn importCall(b: *const Body, e: Body.ExprId) ?@FieldType(Body.Expr, "builtin_call") {
+    const call = switch (b.expr(e)) {
+        .builtin_call => |call| call,
+        .literal => for (b.exprs) |other| switch (other) {
+            .builtin_call => |call| if (std.mem.indexOfScalar(Body.ExprId, call.args, e) != null) break call,
+            else => {},
+        } else return null,
+        else => return null,
+    };
+    return if (std.mem.eql(u8, call.name, "@import")) call else null;
 }
 
 fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Def {
@@ -399,9 +525,4 @@ fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resol
     const a = try context.atSeeded(r, file, offset, false) orelse return null;
     const key = a.member(e) orelse return null;
     return context.defOfKey(r, key);
-}
-
-fn importDef(r: *Resolver, file: FileId, b: *const Body, call: @FieldType(Body.Expr, "builtin_call")) resolve.Error!?Def {
-    if (!std.mem.eql(u8, call.name, "@import")) return null;
-    return .{ .file = try r.importTarget(file, b, call.args) orelse return null };
 }

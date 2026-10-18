@@ -71,7 +71,7 @@ pub fn load(gpa: Allocator, io: Io, env: *const ZigEnv, root: []const u8, build_
             return null;
         },
     };
-    defer client.stop();
+    defer client.deinit();
     while (true) {
         var event = client.next() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,

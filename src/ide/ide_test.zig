@@ -133,6 +133,42 @@ test "signature help and inlay hints" {
     try testing.expectEqualStrings("x: y: : u32 scale: : u32 a: b: ", out.items);
 }
 
+test "signature help and parameter hints through aliases" {
+    // 经由别名调用（`const assert = std.debug.assert;`）时不跟随别名：没有签名帮助与参数名提示
+    const text =
+        \\fn add(a: u32, b: u32) u32 { return a + b; }
+        \\const plus = add;
+        \\const ns = struct { const sum = plus; };
+        \\fn run(x: u32) void {
+        \\    const local = add;
+        \\    _ = plus(x, 1);
+        \\    _ = ns.sum(x, 2);
+        \\    _ = local(x, 3);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_][]const u8{ "1);", "2);", "3);" }) |needle| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
+        const s = try signature_help.signatureHelp(&r, file, offset) orelse return error.NoSignature;
+        try testing.expectEqualStrings("fn add(a: u32, b: u32) u32", s.label);
+        try testing.expectEqual(1, s.active);
+    }
+    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{});
+    var out: std.ArrayList(u8) = .empty;
+    for (hints) |h| if (h.kind == .parameter) {
+        try out.appendSlice(w.arena.allocator(), h.label);
+        try out.append(w.arena.allocator(), ' ');
+    };
+    try testing.expectEqualStrings("a: b: a: b: a: b: ", out.items);
+}
+
 test "goto declaration of reified fields named by comptime parsed strings" {
     // 字段名从帮助文本中解析出来（zig-clap 的用法）：跳到帮助文本中的参数名
     const text =
@@ -624,6 +660,73 @@ test "branches excluded by comptime conditions are inactive" {
     try testing.expectEqualStrings("x * 2", text[ranges[1].start..ranges[1].end]);
 }
 
+test "conditions on members of abstract parameters are not inactive" {
+    // 防止没有实例时把 `@hasDecl` / `@hasField` 求值为 false：有调用点的泛型代码中实际执行的分支显示为非活动
+    const text =
+        \\fn hasInner(comptime T: type) bool {
+        \\    return @hasDecl(T, "Inner");
+        \\}
+        \\fn k(comptime T: type) u32 {
+        \\    if (comptime @hasDecl(T, "Inner")) return 1;
+        \\    if (comptime hasInner(T)) return 2;
+        \\    if (comptime @hasField(T, "x")) return 3;
+        \\    return 0;
+        \\}
+        \\fn Foo(comptime T: type) type {
+        \\    return struct {
+        \\        const has_inner = @hasDecl(T, "Inner");
+        \\        fn m() u32 {
+        \\            if (has_inner) return 1;
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\const Arg = struct {
+        \\    pub const Inner = u8;
+        \\    x: u8,
+        \\};
+        \\fn caller() u32 {
+        \\    return k(Arg) + Foo(Arg).m();
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    testing.expectEqual(0, ranges.len) catch |err| {
+        for (ranges) |rg| std.debug.print("inactive: `{s}`\n", .{text[rg.start..rg.end]});
+        return err;
+    };
+}
+
+test "conditions on the root of a file outside every module are not inactive" {
+    // 防止为不属于任何模块的文件猜测根文件（如取文件自身）：它可能由另一个文件以相对路径 import，
+    // 也可能由 `zig test` 编译（根文件是测试运行器）
+    const text =
+        \\const root = @import("root");
+        \\pub fn check() void {
+        \\    if (@hasDecl(root, "main")) {
+        \\        @panic("root has main");
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/helper.zig", text)).file;
+    try w.setGraph(null, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    try testing.expectEqual(0, (try inactive.ranges(&r, file)).len);
+}
+
 test "completion, goto, signature help and inlay hints in generic bodies use a call site" {
     const text =
         \\const Point = struct {
@@ -692,6 +795,16 @@ test "completion: builtins, labels, init fields and import names" {
         .{ "const s: ?S = .{ .y = 2, .<|> };", "x z" },
         // import：模块名（没有项目时只有固定的三个）
         .{ "const a = @import(\"<|>\");", "std builtin root" },
+        // 注释与字符串中不补全（曾列出作用域中的全部名字）
+        .{ "fn f() void {\n    const p: S = .{ .x = 1 };\n    // p.<|>\n    _ = p;\n}", "" },
+        .{ "fn f() void {\n    _ = \"p.<|>\";\n}", "" },
+        .{ "fn f() void {\n    _ = \"p.<|>\n}", "" },
+        .{ "/// a @<|>\nconst T = 1;", "" },
+        // 错误名：期望类型的错误集成员，没有期望类型时为本文件中出现的错误名
+        .{ "const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.<|>;\n}", "Bad Worse" },
+        .{ "const E = error{ Worse, Bad };\nfn g() void {\n    const e = error.<|>;\n    _ = e;\n}\nfn h() !void {\n    return error.Other;\n}", "Worse Bad Other" },
+        // 未写完的 `error.` 接上了下一行的名字（`error._`），这个名字不列出
+        .{ "const E = error{ Worse, Bad };\nfn g() void {\n    const e = error.<|>\n    _ = e;\n}", "Worse Bad" },
     };
     for (cases, 0..) |c, i| {
         var w: World = undefined;
@@ -726,6 +839,107 @@ test "completion: builtins, labels, init fields and import names" {
     } else return error.NoImport;
     try testing.expectEqual(added.cursor - 4, import.replace.?.start);
     try testing.expectEqual(added.cursor + 3, import.replace.?.end);
+}
+
+test "goto and hover on error values: the expected error set picks the declaration" {
+    // `error.Foo` 曾既不能跳转也没有 hover
+    const lib_text =
+        \\pub const LibError = error{ Missing, Busy };
+        \\
+    ;
+    const text =
+        \\const lib = @import("lib.zig");
+        \\const Other = error{ Foo, Baz };
+        \\const E = error{
+        \\    /// the foo error
+        \\    Foo,
+        \\    Bar,
+        \\};
+        \\const M = Other || E;
+        \\fn f() E!void {
+        \\    return error.Foo;
+        \\}
+        \\fn g() void {
+        \\    const x = error.Baz;
+        \\    _ = x;
+        \\}
+        \\fn h() M!void {
+        \\    return error.Bar;
+        \\}
+        \\fn k() lib.LibError!void {
+        \\    return error.Missing;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = (try w.add("/p/lib.zig", lib_text)).file;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.of;
+    // 期望的错误集 E 中的 Foo，而不是 Other 中的
+    const foo = (try definition.definition(&r, file, at("Foo;") + 1)).?;
+    try testing.expectEqual(file, foo.file);
+    try testing.expectEqual(at("Foo,\n    Bar"), foo.start);
+    // 没有期望类型：含这个名字的错误集
+    const baz = (try definition.definition(&r, file, at("Baz;") + 1)).?;
+    try testing.expectEqual(at("Baz }"), baz.start);
+    // 合并的错误集：其中含这个名字的部分
+    const bar = (try definition.definition(&r, file, at("Bar;") + 1)).?;
+    try testing.expectEqual(at("Bar,\n};"), bar.start);
+    // 其他文件中声明的错误集
+    const missing = (try definition.definition(&r, file, at("Missing;") + 1)).?;
+    try testing.expectEqual(lib, missing.file);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, lib_text, "Missing").?)), missing.start);
+
+    const info = (try hover.hover(&r, file, at("Foo;") + 1)).?;
+    try testing.expectEqualStrings("```zig\nerror.Foo: error{Bar,Foo}\n```\n\nthe foo error", info.text);
+    const plain = (try hover.hover(&r, file, at("Baz;") + 1)).?;
+    try testing.expectEqualStrings("```zig\nerror.Baz\n```", plain.text);
+}
+
+test "goto on an error value without an expected error set stops at the first declaration" {
+    // 没有期望的错误集时各声明同样符合，结果总是第一个；曾在找到后仍为 import 闭包中的全部文件建索引
+    const text =
+        \\const a = @import("a.zig");
+        \\fn g() void {
+        \\    const x = error.Baz;
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    const a_text =
+        \\const b = @import("b.zig");
+        \\pub const E = error{Baz};
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = (try w.add("/p/a.zig", a_text)).file;
+    const b = (try w.add("/p/b.zig", "pub const F = error{ Baz, Qux };\n")).file;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var trace: @import("../db/engine.zig").Trace = .{ .gpa = w.arena.allocator() };
+    ctx.trace = &trace;
+    var r = resolver(&w, &ctx);
+    const baz = (try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "Baz").? + 1))).?;
+    try testing.expectEqual(a, baz.file);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, a_text, "Baz").?)), baz.start);
+    const index_query = comptime for (database.Db.query_types, 0..) |Q, qi| {
+        if (Q == database.FileIndex.Query) break qi;
+    } else unreachable;
+    for (trace.events.items) |ev| if (ev.query == index_query) {
+        try testing.expect(w.db.keyAt(database.FileIndex.Query, ev.key) != b);
+    };
 }
 
 test "goto declaration, definition through aliases and type definition" {

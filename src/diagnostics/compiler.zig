@@ -6,6 +6,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
 const live = @import("live.zig");
+const Vfs = @import("../base/Vfs.zig");
 
 /// 一次构建中某个文件的编译器诊断
 pub const FileResult = struct {
@@ -21,6 +22,9 @@ pub const Item = struct {
     /// 是否也是 AstGen（`zig ast-check`）错误。缓冲区有未保存修改时，这类错误改由 live 来源提供。
     is_astgen: bool,
     notes: []const Note,
+    /// 附在这条错误上的 `@compileLog` 输出（各行，不含末尾换行），发布时接在文案之后；没有时为空。
+    /// 与 `message` 分开存放：去重与 AstGen 匹配都按编译器的原始文案进行
+    compile_log: []const u8 = "",
 };
 
 pub const Note = struct {
@@ -49,6 +53,8 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 
 /// 把一组 ErrorBundle 转换为按文件组织的结果。
 /// `src_path` 为相对路径时相对于 `build_root`；没有位置信息的错误（如链接错误）挂在 `fallback_path`（通常是 build.zig）的开头。
+/// `src_path` 解析后不是绝对路径时（格式不符的错误包，见 `absolute`）按没有位置处理：错误挂在 `fallback_path`
+/// 的开头，附注与引用链放在错误的起点。
 pub fn collect(
     gpa: Allocator,
     bundles: []const ErrorBundle,
@@ -62,40 +68,56 @@ pub fn collect(
     const a = arena_state.allocator();
 
     var lists: std.StringArrayHashMapUnmanaged(std.ArrayList(Item)) = .empty;
-    // 去重：多个 compile step 可能报告同一文件的同一错误
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    // 去重：多个 compile step 可能报告同一文件的同一错误。值为保留的那条在该文件列表中的下标
+    var seen: std.StringHashMapUnmanaged(usize) = .empty;
 
     for (bundles) |eb| {
         if (eb.errorMessageCount() == 0) continue;
+        const log_text = try a.dupe(u8, std.mem.trimEnd(u8, eb.getCompileLogOutput(), "\n"));
+        // `@compileLog` 的输出附在 "found compile log statement" 错误上（没有这条错误时附在第一条错误上）
+        const log_target: ?ErrorBundle.MessageIndex = if (log_text.len == 0) null else for (eb.getMessages()) |mi| {
+            if (std.mem.eql(u8, eb.nullTerminatedString(eb.getErrorMessage(mi).msg), "found compile log statement")) break mi;
+        } else eb.getMessages()[0];
         for (eb.getMessages()) |mi| {
             const msg = eb.getErrorMessage(mi);
             const message = eb.nullTerminatedString(msg.msg);
+            const compile_log = if (log_target == mi) log_text else "";
             var path: []const u8 = fallback_path;
             var start: u32 = 0;
             var end: u32 = 0;
             if (msg.src_loc != .none) {
                 const loc = eb.getSourceLocation(msg.src_loc);
-                path = try absolute(a, build_root, eb.nullTerminatedString(loc.src_path));
-                start = loc.span_start;
-                end = loc.span_end;
+                if (try absolute(a, build_root, eb.nullTerminatedString(loc.src_path))) |p| {
+                    path = p;
+                    start, end = byteSpan(loc);
+                }
             }
             const key = try std.fmt.allocPrint(a, "{s}\x00{d}\x00{d}\x00{s}", .{ path, start, end, message });
-            if ((try seen.getOrPut(a, key)).found_existing) continue;
+            const seen_gop = try seen.getOrPut(a, key);
+            if (seen_gop.found_existing) {
+                try addCompileLog(a, &lists.getPtr(path).?.items[seen_gop.value_ptr.*], compile_log);
+                continue;
+            }
 
-            const notes = try a.alloc(Note, msg.notes_len);
-            for (notes, eb.getNotes(mi)) |*note, ni| {
+            // 附注之后是引用链（reference trace）
+            const refs: u32 = if (msg.src_loc != .none) eb.getSourceLocation(msg.src_loc).reference_trace_len else 0;
+            const notes = try a.alloc(Note, msg.notes_len + refs);
+            for (notes[0..msg.notes_len], eb.getNotes(mi)) |*note, ni| {
                 const n = eb.getErrorMessage(ni);
                 note.* = .{ .path = path, .start = start, .end = start, .message = try a.dupe(u8, eb.nullTerminatedString(n.msg)) };
                 if (n.src_loc != .none) {
                     const nl = eb.getSourceLocation(n.src_loc);
-                    note.path = try absolute(a, build_root, eb.nullTerminatedString(nl.src_path));
-                    note.start = nl.span_start;
-                    note.end = nl.span_end;
+                    if (try absolute(a, build_root, eb.nullTerminatedString(nl.src_path))) |p| {
+                        note.path = p;
+                        note.start, note.end = byteSpan(nl);
+                    }
                 }
             }
+            if (refs != 0) try referenceTrace(a, eb, msg.src_loc, build_root, path, start, notes[msg.notes_len..]);
             const gop = try lists.getOrPut(a, path);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes });
+            seen_gop.value_ptr.* = gop.value_ptr.items.len;
+            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes, .compile_log = compile_log });
         }
     }
 
@@ -116,9 +138,80 @@ pub fn collect(
     return .{ .arena = arena_state.state, .files = files };
 }
 
-fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error![]const u8 {
-    if (std.fs.path.isAbsolute(path)) return std.fs.path.resolveAlloc(a, &.{path});
-    return std.fs.path.resolveAlloc(a, &.{ base, path });
+/// 把源位置 `src_loc` 之后的引用链转换为附注，文案与 `zig build` 的输出一致。有位置的引用指向引用处；
+/// 末尾的隐藏标记没有位置，与没有位置的附注一样放在错误的起点（`path` 中的 `start`）
+fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLocationIndex, build_root: []const u8, path: []const u8, start: u32, out: []Note) Allocator.Error!void {
+    // ErrorBundle 没有公开读取引用链的接口：按其布局从 `extra` 中读取。`SourceLocation` 之后依次是各个
+    // `ReferenceTrace`，每个按字段顺序存放 `decl_name` 与 `src_loc`
+    const first = @backingInt(src_loc) + @typeInfo(ErrorBundle.SourceLocation).@"struct".field_names.len;
+    const stride = @typeInfo(ErrorBundle.ReferenceTrace).@"struct".field_names.len;
+    for (out, 0..) |*note, k| {
+        const at = first + k * stride;
+        const decl_name: ErrorBundle.String = eb.extra[at];
+        const ref_loc: ErrorBundle.SourceLocationIndex = @fromBackingInt(eb.extra[at + 1]);
+        note.* = .{ .path = path, .start = start, .end = start, .message = "" };
+        if (ref_loc != .none) {
+            const rl = eb.getSourceLocation(ref_loc);
+            if (try absolute(a, build_root, eb.nullTerminatedString(rl.src_path))) |p| {
+                note.path = p;
+                note.start, note.end = byteSpan(rl);
+            }
+            note.message = try std.fmt.allocPrint(a, "referenced by: {s}", .{eb.nullTerminatedString(decl_name)});
+        } else if (decl_name != 0) {
+            // 隐藏标记：`decl_name` 为隐藏的引用数
+            note.message = try std.fmt.allocPrint(a, "{d} reference(s) hidden; use '-freference-trace={d}' to see all references", .{ decl_name, decl_name + out.len - 1 });
+        } else {
+            note.message = "remaining reference traces hidden; use '-freference-trace' to see all reference traces";
+        }
+    }
+}
+
+/// 重复的错误只保留一条时，被丢弃的那条带有的 compile log 并到保留的那条上（相同的只保留一份）
+fn addCompileLog(a: Allocator, item: *Item, compile_log: []const u8) Allocator.Error!void {
+    if (compile_log.len == 0 or std.mem.eql(u8, item.compile_log, compile_log)) return;
+    item.compile_log = if (item.compile_log.len == 0) compile_log else try std.mem.join(a, "\n", &.{ item.compile_log, compile_log });
+}
+
+/// 源位置的字节区间。数值来自子进程回传的错误包，不受校验：终点在起点之前时改为起点处的空区间，
+/// 发布的 Range 不会反向
+fn byteSpan(loc: ErrorBundle.SourceLocation) [2]u32 {
+    return .{ loc.span_start, @max(loc.span_start, loc.span_end) };
+}
+
+/// `path` 相对于 `base` 的绝对路径。结果作为文件驻留到 Vfs，必须是绝对路径；`path` 来自子进程回传的错误包，
+/// 内容不受校验，解析后不是绝对路径时返回 null（例如格式不符时路径下标指向源码行中间的 `x: u32 = 1;`，在
+/// Windows 上它是另一驱动器的相对路径）
+fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error!?[]const u8 {
+    return Vfs.resolve(.native, a, base, path);
+}
+
+/// 合并同一文件在多次编译中的结果（单文件模式下 import 它的各个根文件分别编译）。`results` 按编译完成的
+/// 先后从新到旧排列，以最新一次读取的文本为准：文本相同的结果直接并入；文本不同的（两次编译之间文件被修改）
+/// 只并入非 AstGen 错误，按文本差异平移，落在修改区域内的丢弃，与 `merge` 处理未保存修改的方式相同。
+/// 区间与文案相同的错误只保留一条（compile log 并到保留的那条上）
+pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.Error!FileResult {
+    const base = results[0].base_text;
+    var items: std.ArrayList(Item) = .empty;
+    for (results) |r| {
+        const edit: ?Edit = if (std.mem.eql(u8, r.base_text, base)) null else diffRegion(r.base_text, base);
+        next: for (r.items) |item| {
+            var moved = item;
+            if (edit) |e| {
+                if (item.is_astgen) continue;
+                const span = remap(e, item.start, item.end) orelse continue;
+                moved.start = span[0];
+                moved.end = span[1];
+            }
+            for (items.items) |*x| {
+                if (x.start == moved.start and x.end == moved.end and std.mem.eql(u8, x.message, moved.message)) {
+                    try addCompileLog(arena, x, moved.compile_log);
+                    continue :next;
+                }
+            }
+            try items.append(arena, moved);
+        }
+    }
+    return .{ .base_text = base, .items = items.items };
 }
 
 // ── 合并 ──────────────────────────────────────────────────────────
@@ -178,12 +271,16 @@ fn diffRegion(old: []const u8, new: []const u8) Edit {
     return .{ .start = @intCast(prefix), .old_end = @intCast(old.len - suffix), .new_end = @intCast(new.len - suffix) };
 }
 
-/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与修改区域相交返回 null
+/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与修改区域相交返回 null。
+/// 编译器给出的区间不一定合法（终点在起点之前、远超出文本）：平移后超出 u32 的同样返回 null
 fn remap(e: Edit, start: u32, end: u32) ?[2]u32 {
     if (end <= e.start) return .{ start, end };
     if (start >= e.old_end) {
         const delta = @as(i64, e.new_end) - @as(i64, e.old_end);
-        return .{ @intCast(@as(i64, start) + delta), @intCast(@as(i64, end) + delta) };
+        return .{
+            std.math.cast(u32, @as(i64, start) + delta) orelse return null,
+            std.math.cast(u32, @as(i64, end) + delta) orelse return null,
+        };
     }
     return null;
 }
@@ -215,11 +312,15 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
             .message = try arena.dupe(u8, n.message),
         });
     }
+    const message = if (item.compile_log.len == 0)
+        try arena.dupe(u8, item.message)
+    else
+        try std.fmt.allocPrint(arena, "{s}\n\nCompile Log Output:\n{s}", .{ item.message, item.compile_log });
     return .{
         .range = in.lines.range(start, end, in.encoding),
         .severity = .Error,
         .source = "zig",
-        .message = .{ .string = try arena.dupe(u8, item.message) },
+        .message = .{ .string = message },
         .relatedInformation = if (related.items.len == 0) null else related.items,
     };
 }

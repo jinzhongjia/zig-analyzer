@@ -15,7 +15,7 @@ const render = @import("../sema/render.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
-const seed = @import("seed.zig");
+const seed = @import("../ide_db/seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 pub const At = struct {
@@ -167,20 +167,35 @@ pub fn callee(r: *Resolver, a: At, callee_e: Body.ExprId) resolve.Error!?struct 
     switch (b.expr(callee_e)) {
         .name_ref => |name| {
             const def = try r.resolveName(a.file, a.item, b, b.expr_scopes[@backingInt(callee_e)], name) orelse return null;
-            return .{ .def = def, .bound = false };
+            return .{ .def = try fnDecl(r, a, callee_e, def), .bound = false };
         },
         .field_access => |fa| {
             const key = a.member(callee_e) orelse return null;
             const def = try defOfKey(r, key) orelse return null;
             // 左侧是值（不是类型）时为方法调用
-            return .{ .def = def, .bound = !a.exprType(fa.lhs).isType() };
+            return .{ .def = try fnDecl(r, a, callee_e, def), .bound = !a.exprType(fa.lhs).isType() };
         },
         .enum_literal => {
             const key = a.member(callee_e) orelse return null;
-            return .{ .def = try defOfKey(r, key) orelse return null, .bound = false };
+            return .{ .def = try fnDecl(r, a, callee_e, try defOfKey(r, key) orelse return null), .bound = false };
         },
         else => return null,
     }
+}
+
+/// 被调用的名字是别名（`const assert = std.debug.assert;`，含局部常量）时取它指向的函数声明：
+/// 先沿容器成员的别名链，仍不是函数时取推导出的函数值的声明
+fn fnDecl(r: *Resolver, a: At, callee_e: Body.ExprId, def: Def) resolve.Error!Def {
+    const target = try r.aliasTarget(def);
+    switch (target) {
+        .item => |it| if ((try r.itemTree(it.file)).items[it.item].kind == .@"fn") return target,
+        .local, .file => {},
+    }
+    const v = a.exprType(callee_e).val orelse return target;
+    return switch (r.ctx.db.env.ip.key(v)) {
+        .fn_value => |f| try defOfKey(r, .{ .file = f.file, .item = f.decl }) orelse target,
+        else => target,
+    };
 }
 
 /// 函数声明的参数节点（按顺序）

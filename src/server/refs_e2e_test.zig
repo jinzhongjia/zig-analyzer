@@ -67,6 +67,14 @@ test "references, highlight, rename and workspace symbol" {
     _ = try h.request("zig-analyzer/waitIdle", {});
     const doc = .{ .uri = uri };
 
+    // 后台索引已为未打开的 lib.zig 算出成员摘要：workspace symbol 不在请求中计算（计算要用到语法树）
+    {
+        const before = h.server.db.executions(za.syntax.queries.ItemSummaries);
+        const resp = try h.request("workspace/symbol", .{ .query = "hello" });
+        try testing.expectEqualStrings("hello", resp.object.get("result").?.array.items[0].object.get("name").?.string);
+        try testing.expectEqual(before, h.server.db.executions(za.syntax.queries.ItemSummaries));
+    }
+
     // 查找引用：lib.zig 未打开，经由模块图纳入
     {
         const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(main_text, "hello"), .context = .{ .includeDeclaration = true } });
@@ -105,6 +113,10 @@ test "references, highlight, rename and workspace symbol" {
         const kw = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "hello"), .newName = "fn" });
         var kw_it = kw.object.get("result").?.object.get("changes").?.object.iterator();
         try testing.expectEqualStrings("@\"fn\"", kw_it.next().?.value_ptr.array.items[0].object.get("newText").?.string);
+        // 原生类型的名字：同样用 @"..." 包裹（原样写入时与原生类型同名，编译错误）
+        const prim = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "hello"), .newName = "u8" });
+        var prim_it = prim.object.get("result").?.object.get("changes").?.object.iterator();
+        try testing.expectEqualStrings("@\"u8\"", prim_it.next().?.value_ptr.array.items[0].object.get("newText").?.string);
         // 标准库中的声明不能重命名
         const std_rename = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(main_text, "Allocator") });
         try testing.expect(std_rename.object.get("error") != null);
@@ -131,7 +143,7 @@ test "references, highlight, rename and workspace symbol" {
 
     // code action：未使用的局部常量
     {
-        const extra = "fn f() void {\n    const x = 1;\n}\n";
+        const extra = "const y = 2;\nfn f() void {\n    const x = 1;\n}\n";
         const extra_uri = try za.base.uri.fromPath(a, try project.path(a, "src/extra.zig"));
         try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = extra_uri, .languageId = "zig", .version = 1, .text = extra } });
         const p = position(extra, "x =");
@@ -145,6 +157,14 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("discard `x`", actions[0].object.get("title").?.string);
         const edits = actions[0].object.get("edit").?.object.get("changes").?.object.get(extra_uri).?.array.items;
         try testing.expectEqualStrings("\n    _ = x;", edits[0].object.get("newText").?.string);
+
+        // 起止颠倒的区间按交换后处理（未交换时偏移相减下溢，服务器崩溃）
+        const reversed = try h.request("textDocument/codeAction", .{
+            .textDocument = .{ .uri = extra_uri },
+            .range = .{ .start = p, .end = .{ .line = 0, .character = 0 } },
+            .context = .{ .diagnostics = &[_]Empty{} },
+        });
+        try testing.expect(reversed.object.get("result") != null);
     }
 
     // 可观测性：status 的查询统计与慢请求报告

@@ -32,15 +32,29 @@ fn position(text: []const u8, needle: []const u8) struct { line: u32, character:
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// 跳转结果：「文件名:行」
+/// definition 的结果：「文件名:行」
 fn gotoAt(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
-    const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
+    return gotoWith(h, "textDocument/definition", uri, text, needle);
+}
+
+/// 跳转结果：单个 Location 为「文件名:行」；Location 数组为「[文件名:行 文件名:行 …]」，单元素的数组与单个
+/// Location 因此可以区分
+fn gotoWith(h: *Harness, comptime method: []const u8, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
+    const resp = try h.request(method, .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
     const result = resp.object.get("result").?;
-    if (result == .null) return "null";
-    const target = result.object;
-    const target_uri = target.get("uri").?.string;
-    const line = target.get("range").?.object.get("start").?.object.get("line").?.integer;
-    return std.fmt.allocPrint(h.arena.allocator(), "{s}:{d}", .{ target_uri[std.mem.lastIndexOfScalar(u8, target_uri, '/').? + 1 ..], line });
+    const targets, const is_array = switch (result) {
+        .null => return "null",
+        .array => |arr| .{ arr.items, true },
+        else => .{ &.{result}, false },
+    };
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (targets) |target| {
+        const target_uri = target.object.get("uri").?.string;
+        const line = target.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+        try labels.append(h.arena.allocator(), try std.fmt.allocPrint(h.arena.allocator(), "{s}:{d}", .{ target_uri[std.mem.lastIndexOfScalar(u8, target_uri, '/').? + 1 ..], line }));
+    }
+    const joined = try std.mem.join(h.arena.allocator(), " ", labels.items);
+    return if (is_array) std.fmt.allocPrint(h.arena.allocator(), "[{s}]", .{joined}) else joined;
 }
 
 fn completionLabels(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const []const u8 {
@@ -309,6 +323,78 @@ const inactive_main =
     \\
 ;
 
+/// exe 与 test 各自创建模块、共用根文件：两者的 dep 指向不同的包，test 的模块另有 helper
+const shared_root_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const target = b.standardTargetOptions(.{});
+    \\    const optimize = b.standardOptimizeOption(.{});
+    \\    const pkg_a = b.createModule(.{ .root_source_file = b.path("pkg_a/a.zig") });
+    \\    const pkg_b = b.createModule(.{ .root_source_file = b.path("pkg_b/b.zig") });
+    \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\        .imports = &.{.{ .name = "dep", .module = pkg_a }},
+    \\    }) });
+    \\    b.installArtifact(exe);
+    \\    const tests = b.addTest(.{ .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = target,
+    \\        .optimize = optimize,
+    \\        .imports = &.{ .{ .name = "dep", .module = pkg_b }, .{ .name = "helper", .module = pkg_b } },
+    \\    }) });
+    \\    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    \\}
+    \\
+;
+
+const shared_root_main =
+    \\const dep = @import("dep");
+    \\pub fn main() void {
+    \\    _ = dep.fromA();
+    \\}
+    \\test "uses the helper" {
+    \\    const h = @import("helper");
+    \\    const w = h.fromB();
+    \\    _ = w;
+    \\}
+    \\
+;
+
+test "a root file shared by modules with different imports resolves the imports of each module" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = shared_root_build },
+        .{ .path = "src/main.zig", .text = shared_root_main },
+        .{ .path = "pkg_a/a.zig", .text = "pub fn fromA() u32 {\n    return 1;\n}\n" },
+        .{ .path = "pkg_b/b.zig", .text = "pub const Widget = struct { size: u64 };\npub fn fromB() Widget {\n    return .{ .size = 2 };\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = shared_root_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    // 只有 test 的模块 import 的名字
+    try testing.expectEqualStrings("b.zig:0", try gotoAt(&h, uri, shared_root_main, "\"helper\""));
+    try testing.expectEqualStrings("b.zig:1", try gotoAt(&h, uri, shared_root_main, "fromB"));
+    try testing.expectEqualStrings("```zig\nconst w: Widget\n```", try hoverText(&h, uri, shared_root_main, "w ="));
+    // 两个模块都 import 的名字：成员取诊断 step（默认的 install，即 exe）的模块中的，import 本身列出两个模块的目标
+    try testing.expectEqualStrings("a.zig:0", try gotoAt(&h, uri, shared_root_main, "fromA"));
+    try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoAt(&h, uri, shared_root_main, "\"dep\""));
+    try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "\"dep\""));
+    // 别名的使用处停在声明处
+    try testing.expectEqualStrings("main.zig:0", try gotoAt(&h, uri, shared_root_main, "dep.fromA"));
+    try testing.expectEqualStrings("main.zig:0", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "dep.fromA"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "code excluded by a comptime condition is published as an unnecessary hint" {
     var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = inactive_main }});
     defer project.deinit();
@@ -489,6 +575,48 @@ test "results depending on pointer width are recomputed when the target changes"
     _ = try h.request("zig-analyzer/waitIdle", {});
     const expected = try std.fmt.allocPrint(h.arena.allocator(), "```zig\nconst size: comptime_int = {d}\n```", .{@sizeOf(usize)});
     try testing.expectEqualStrings(expected, try hoverText(&h, uri, text, "size ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "type layouts follow the project's target and are recomputed when it changes" {
+    // 期望值为 zig 0.17.0 的结果。两个目标的指针位宽与向量的规则相同，整数的最大对齐不同（4 与 16）
+    const text =
+        \\pub fn main() void {
+        \\    const align_u64 = @alignOf(u64);
+        \\    const size_s = @sizeOf(struct { a: u8, b: u64 });
+        \\    _ = .{ align_u64, size_s };
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = text },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    const x86 = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=x86-linux"]}}
+    , .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = x86 });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("```zig\nconst align_u64: comptime_int = 4\n```", try hoverText(&h, uri, text, "align_u64 ="));
+    try testing.expectEqualStrings("```zig\nconst size_s: comptime_int = 12\n```", try hoverText(&h, uri, text, "size_s ="));
+
+    const wasm = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=wasm32-freestanding"]}}
+    , .{});
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = wasm });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("```zig\nconst align_u64: comptime_int = 8\n```", try hoverText(&h, uri, text, "align_u64 ="));
+    try testing.expectEqualStrings("```zig\nconst size_s: comptime_int = 16\n```", try hoverText(&h, uri, text, "size_s ="));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
