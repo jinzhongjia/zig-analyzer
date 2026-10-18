@@ -72,7 +72,10 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
     if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) {
         const subject: seed.Subject = if (binding_id) |id| .{ .binding = id } else .{ .expr = expr_id.? };
         const rel = tok.offset - a.node.offset;
-        if (try seed.findAt(r, file, a.item, rel, subject)) |s| {
+        var chosen = try seed.findAt(r, file, a.item, rel, subject);
+        // 遍历类型列表的循环中：按一次迭代推导
+        if (try seed.loopAt(r, a.owner, b, if (chosen) |c| c.res else a.res, if (chosen) |c| c.inst else null, a.node.offset, rel, subject)) |l| chosen = l;
+        if (chosen) |s| {
             const res = s.res;
             const better: TypedValue = if (binding_id) |id|
                 (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
@@ -92,7 +95,11 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
     if (seeded_from) |s| {
         const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
         const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
-        w.print("\n\ninferred from the call at {s}:{d}", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(s.file)), line }) catch return error.OutOfMemory;
+        const where = std.fs.path.basename(r.ctx.db.env.vfs.path(s.file));
+        if (s.iteration) |n|
+            w.print("\n\ninferred from iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory
+        else
+            w.print("\n\ninferred from the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
     }
     if (def) |d| if (try context.doc(r, d)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };

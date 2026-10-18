@@ -34,6 +34,8 @@ pub const InferKey = struct {
     mode: infer.Mode,
     /// owner 自身或其外层泛型函数的实例（已规范化，见 `normalizeInst`）；null 为非泛型或抽象实例
     inst: ?Index = null,
+    /// 遍历类型列表的循环的循环变量按某次迭代取值（IDE 功能为循环体选实例时用）；null 时循环变量是抽象的
+    loop: ?infer.LoopSeed = null,
 };
 
 pub const DeclKey = struct {
@@ -62,7 +64,7 @@ pub const Infer = struct {
         const gpa = ctx.db.gpa;
         const result = try gpa.create(infer.Result);
         errdefer gpa.destroy(result);
-        result.* = try infer.run(ctx, key.owner, key.mode, key.inst);
+        result.* = try infer.run(ctx, key.owner, key.mode, key.inst, key.loop);
         return result;
     }
 

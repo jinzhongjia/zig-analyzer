@@ -1640,6 +1640,125 @@ test "callsite seeding follows a container type passed as a comptime argument to
     try testing.expectEqualStrings("n", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+test "inside an inline for over a list of types, features use one iteration" {
+    // 循环变量在推导中是抽象的（每次迭代的类型不同）：曾补全为空、hover 求不出类型
+    const text =
+        \\const A = struct {
+        \\    pub fn name() u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    pub fn name() u32 {
+        \\        return 2;
+        \\    }
+        \\};
+        \\fn f() u32 {
+        \\    var sum: u32 = 0;
+        \\    inline for (.{ A, B }) |T| {
+        \\        const v = T.name();
+        \\        sum += T.<|>();
+        \\        sum += v;
+        \\    }
+        \\    return sum;
+        \\}
+        \\
+    ;
+    const labels = try completionLabels(text);
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("name", labels);
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const plain = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "<|>", "");
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, plain, "v = ").?))) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst v: u32\n```\n\ninferred from iteration 1 of the loop at main.zig:13", info.text);
+}
+
+test "callsite seeding uses an iteration of an inline for over types that the call is in" {
+    // 调用位于遍历类型列表的 `inline for` 中，实参是抽象的循环变量：曾求不出 `get` 的实例
+    const labels = try completionLabels(
+        \\const A = struct { x: u32 };
+        \\fn get(comptime T: type) void {
+        \\    var v: T = undefined;
+        \\    _ = v.<|>;
+        \\}
+        \\fn all() void {
+        \\    inline for (.{A}) |T| get(T);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("x", labels);
+}
+
+test "an inline for over a list that is a parameter of the enclosing generic function uses the call site's list" {
+    const labels = try completionLabels(
+        \\fn Engine(comptime queries: []const type) type {
+        \\    return struct {
+        \\        pub fn reset() void {
+        \\            inline for (queries) |Q| {
+        \\                _ = Q.<|>;
+        \\            }
+        \\        }
+        \\    };
+        \\}
+        \\const A = struct {
+        \\    pub const id = 1;
+        \\};
+        \\const Db = Engine(&.{A});
+        \\fn main() void {
+        \\    Db.reset();
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("id", labels);
+}
+
+test "an iteration of a loop over types also gives the other captures of the loop their values" {
+    // 曾只给类型的循环变量取值：下标 `i` 没有值，`tables[i]` 的元素求不出；其中嵌套的普通循环不影响选取
+    const labels = try completionLabels(
+        \\const A = struct {};
+        \\const B = struct {};
+        \\const tables = .{ .{ .a_field = @as(u32, 0) }, .{ .b_field = @as(u32, 0) } };
+        \\fn f() void {
+        \\    inline for (.{ A, B }, 0..) |T, i| {
+        \\        _ = T;
+        \\        for (0..2) |_| {
+        \\            _ = tables[i].<|>;
+        \\        }
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("a_field", labels);
+}
+
+test "callsite seeding uses an iteration of a comptime for over types" {
+    // comptime 块中遍历类型列表的普通 `for`（不是 `inline for`）同样按迭代推导
+    const labels = try completionLabels(
+        \\const A = struct {
+        \\    pub const id = 1;
+        \\};
+        \\fn check(comptime Q: type) void {
+        \\    _ = Q.<|>;
+        \\}
+        \\comptime {
+        \\    for (.{A}) |Q| check(Q);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("id", labels);
+}
+
 test "completion through single pointers to arrays, tuples and slices" {
     // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
     const cases = [_]struct { []const u8, []const u8 }{

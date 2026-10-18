@@ -26,9 +26,11 @@ pub const Seed = struct {
     res: *const infer.Result,
     /// 所用的实例
     inst: ?Index,
-    /// 调用表达式的位置
+    /// 调用表达式的位置；`iteration` 不为 null 时为循环的位置
     file: FileId,
     offset: u32,
+    /// 按遍历类型列表的循环的这次迭代（从 0 开始）推导（见 `loopAt`）
+    iteration: ?u32 = null,
 };
 
 /// 成员 `item`（位于某个泛型函数内）以第一个调用点的实例推导的结果：先找同一文件，再按文件顺序找
@@ -70,6 +72,98 @@ pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject
         .file = found.file,
         .offset = found.offset,
     };
+}
+
+/// 循环按迭代推导时尝试的迭代次数上限
+const max_iterations = 64;
+
+/// 位置 `rel` 位于遍历 comptime 已知的类型列表的循环（`inline for`，或 comptime 中的 `for`）中时，按一次迭代
+/// 推导的结果：循环变量在推导中是抽象的（每次迭代不同）。`res` 是成员在实例 `inst` 下的推导结果，取第一个使
+/// `rel` 处的代码会执行、`subject` 能求出类型的迭代；都不满足 `subject` 时取第一个使代码会执行的
+pub fn loopAt(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, node_offset: u32, rel: u32, subject: ?Subject) resolve.Error!?Seed {
+    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
+    const ip = r.ctx.db.env.ip;
+    // 最内层的这类循环（其中嵌套的普通循环，如遍历运行时切片的 `for`，不算）
+    var best: ?struct { loop: Body.Loop, expr: u32, len: u32 } = null;
+    for (body.exprs, 0..) |e, ei| {
+        const l = switch (e) {
+            .loop => |l| l,
+            else => continue,
+        };
+        if (l.kind != .@"for") continue;
+        const rg = body.range(l.body);
+        if (rel < rg.start or rel > rg.end) continue;
+        if (best) |b| if (rg.end - rg.start >= b.len) continue;
+        const abstract = for (l.capture) |cap| {
+            if (abstractCapture(ip, res, cap)) break true;
+        } else false;
+        if (!abstract) continue;
+        best = .{ .loop = l, .expr = @intCast(ei), .len = rg.end - rg.start };
+    }
+    const b = best orelse return null;
+    const offset = node_offset + body.range(@fromBackingInt(b.expr)).start;
+    for (b.loop.capture, 0..) |cap, k| {
+        if (k >= b.loop.inputs.len or !abstractCapture(ip, res, cap)) continue;
+        const list = res.exprs[@backingInt(b.loop.inputs[k])];
+        var first: ?Seed = null;
+        var idx: u32 = 0;
+        while (idx < max_iterations) : (idx += 1) {
+            if (try eval.elemValue(r, list, idx) == null) break;
+            const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = idx } });
+            const s: Seed = .{ .res = res_i, .inst = inst, .file = owner.file, .offset = offset, .iteration = idx };
+            if (fits(ip, body, res_i, rel, subject)) return s;
+            if (first == null and !inactiveAt(body, res_i, rel)) first = s;
+        }
+        if (first) |s| return s;
+    }
+    return null;
+}
+
+/// 循环变量在推导结果中是抽象的类型（遍历类型列表的循环，只能在 comptime 执行）
+fn abstractCapture(ip: *InternPool, res: *const infer.Result, cap: Body.BindingId) bool {
+    if (@backingInt(cap) >= res.bindings.len) return false;
+    const v = res.bindings[@backingInt(cap)].val orelse return false;
+    return ip.key(v) == .opaque_param;
+}
+
+/// 成员 `i`（位于 `in`）中遍历 comptime 已知的类型列表的循环内提到 `names` 的调用：循环变量在推导中是
+/// 抽象的，实参求不出具体的实例；按各次迭代推导（实例 `inst` 下的结果为 `res`）再找。`all` 不为 null 时收集
+fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector) resolve.Error!?Found {
+    const ip = r.ctx.db.env.ip;
+    for (body.exprs) |e| {
+        const l = switch (e) {
+            .loop => |l| l,
+            else => continue,
+        };
+        if (l.kind != .@"for" or !mentionsWithin(body, l.body, names)) continue;
+        for (l.capture, 0..) |cap, k| {
+            if (k >= l.inputs.len or !abstractCapture(ip, res, cap)) continue;
+            const list = res.exprs[@backingInt(l.inputs[k])];
+            var idx: u32 = 0;
+            while (idx < max_iterations) : (idx += 1) {
+                if (try eval.elemValue(r, list, idx) == null) break;
+                const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = idx } });
+                if (try callIn(r, in, i, body, res_i, file, item, root_key, active, all)) |found| return found;
+                if (all) |c| if (c.full()) return null;
+            }
+        }
+    }
+    return null;
+}
+
+/// `e` 的范围内引用了 `names` 中的名字（名字或成员名）
+fn mentionsWithin(body: *const Body, e: Body.ExprId, names: []const []const u8) bool {
+    const range = body.range(e);
+    for (body.exprs, body.expr_ranges) |x, rg| {
+        if (rg.start < range.start or rg.end > range.end) continue;
+        const name = switch (x) {
+            .name_ref => |n| n,
+            .field_access => |fa| fa.field orelse continue,
+            else => continue,
+        };
+        if (contains(names, name)) return true;
+    }
+    return false;
 }
 
 /// 实例的推导结果 `res` 中，`rel` 处的代码会执行，且 `subject` 有具体的类型
@@ -236,11 +330,13 @@ fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, out);
+        _ = try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, null, out);
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1, .all = out.all })) |o| {
             if (out.full()) return;
             const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = o.inst });
             _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, out);
+            _ = try loopCall(r, in, @intCast(i), owner, body, seeded, o.inst, names, file, item, root_key, null, out);
         }
     }
 }
@@ -487,12 +583,14 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active, null)) |s| return s;
+        if (try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, active, null)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
         // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null)) |s| return s;
+        if (try loopCall(r, in, @intCast(i), owner, body, seeded, outer.inst, names, file, item, root_key, active, null)) |s| return s;
         // 调用者经由自己的 comptime 类型参数调用（`Q.compute(ctx, key)`）：把该参数换成目标所在的容器
         if (try substituted(r, in, @intCast(i), body, outer.inst, file, root)) |inst| {
             const res2 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });

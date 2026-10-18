@@ -82,7 +82,11 @@ pub const Mode = enum {
     full,
 };
 
-pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Result {
+/// 遍历类型列表的循环（`inline for`、comptime 中的 `for`）的循环变量 `binding` 取列表的第 `index` 个元素
+/// （见 `queries.InferKey.loop`）
+pub const LoopSeed = struct { binding: u32, index: u32 };
+
+pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_seed: ?LoopSeed) Error!Result {
     const gpa = ctx.db.gpa;
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
@@ -108,6 +112,7 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index) Error!Re
         .members = try a.alloc(?hir.OwnerKey, body.exprs.len),
         .scratch = scratch.allocator(),
         .inst = inst,
+        .loop_seed = loop_seed,
     };
     @memset(inf.exprs, .unknown);
     @memset(inf.bindings, .unknown);
@@ -222,6 +227,8 @@ const Inferrer = struct {
     dead_spans: std.ArrayList(Body.Range) = .empty,
     /// 实例上下文（owner 自身或外层泛型函数的实例）
     inst: ?Index,
+    /// 见 `LoopSeed`
+    loop_seed: ?LoopSeed = null,
     /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
     dead: u32 = 0,
     /// 实际执行到的 return 的值
@@ -1578,24 +1585,36 @@ const Inferrer = struct {
                 try inf.bindCaptures(l.else_capture, cond, .if_else);
             },
             .@"for" => {
+                // 按某次迭代推导这个循环（见 `LoopSeed`）：各个循环变量都取这次迭代的值
+                const iteration: ?u32 = if (inf.loop_seed) |seed|
+                    (if (std.mem.indexOfScalar(Body.BindingId, l.capture, @fromBackingInt(seed.binding)) != null) seed.index else null)
+                else
+                    null;
                 for (l.inputs, 0..) |input, i| {
+                    var list: TypedValue = .unknown;
+                    var start: TypedValue = .unknown;
                     const elem: Index = switch (inf.body.expr(input)) {
                         // `a..b` / `0..`
                         .other => |range| blk: {
                             for (range) |x| _ = try inf.infer(x, .usize_type);
+                            if (range.len > 0) start = inf.get(range[0]);
                             break :blk .usize_type;
                         },
-                        else => inf.forElement((try inf.infer(input, null)).ty),
+                        else => blk: {
+                            list = try inf.infer(input, null);
+                            break :blk inf.forElement(list.ty);
+                        },
                     };
                     if (i < l.capture.len) {
                         const cap = l.capture[i];
                         const ptr = inf.body.binding(cap).is_ptr;
-                        // 元素为类型（`inline for (.{ f32, f64 }) |T|`）：每次迭代的类型不同，与泛型函数的
-                        // `comptime T: type` 一样按抽象参数推导
+                        const ty = if (ptr) try ip.ptrTo(elem, .one, false) else elem;
                         inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
-                            TypedValue.ofType(try ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }))
+                            try inf.typeCapture(cap, list, iteration)
+                        else if (iteration) |n|
+                            .{ .ty = ty, .val = if (ptr) null else try inf.iterationValue(list, start, n) }
                         else
-                            .{ .ty = if (ptr) try ip.ptrTo(elem, .one, false) else elem };
+                            .{ .ty = ty };
                     }
                 }
             },
@@ -1608,6 +1627,22 @@ const Inferrer = struct {
         const other: Index = if (l.@"else") |el| (try inf.infer(el, expected)).ty else .void_type;
         try frame.types.append(inf.scratch, other);
         return .{ .ty = try inf.peer(frame.types.items) };
+    }
+
+    /// 元素为类型的循环变量（`inline for (.{ f32, f64 }) |T|`）：每次迭代的类型不同，与泛型函数的
+    /// `comptime T: type` 一样按抽象参数推导。按某次迭代推导时（`loop_seed`）取列表中的该元素
+    fn typeCapture(inf: *Inferrer, cap: Body.BindingId, list: TypedValue, iteration: ?u32) Error!TypedValue {
+        if (iteration) |n| if (list.val != null) {
+            if (try eval.elemValue(inf.r, list, n)) |ev| if (ev.val) |t| return TypedValue.ofType(t);
+        };
+        return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }));
+    }
+
+    /// 按第 `n` 次迭代推导时非类型的循环变量的值：范围（`start..`）为 `start + n`，列表为第 `n` 个元素
+    fn iterationValue(inf: *Inferrer, list: TypedValue, start: TypedValue, n: u32) Error!?Index {
+        if (value.intOf(inf.ip, start.val)) |s| return try inf.ip.get(.{ .int_value = .{ .ty = .usize_type, .value = s + n } });
+        if (list.val == null) return null;
+        return if (try eval.elemValue(inf.r, list, n)) |ev| ev.val else null;
     }
 
     /// `continue :label` 的目标为 labeled switch 时其操作数的类型
