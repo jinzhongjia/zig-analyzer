@@ -18,6 +18,7 @@ const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
+const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const ErrorSets = @import("../syntax/ErrorSets.zig");
 
@@ -104,10 +105,9 @@ fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return null;
 }
 
-/// `@Struct` / `@Union` 构造的类型的字段没有声明。字段名来自 comptime 求值的字符串（如 zig-clap 从帮助文本
-/// 解析出的参数名）时跳到字符串字面量中的位置：候选为本文件中初始化表达式含有包含该名字的字符串字面量
-/// （直接或经由同文件的常量）的常量与当前成员的局部常量，取值中含有该字符串、且与构造类型时的实例实参共有
-/// 这部分值的候选，跟踪字面量的来源重新求值
+/// 构造的类型（`@Struct`、`@Enum`、`@Union`）的成员：字段访问 `x.name`、经类型访问的 `E.name` 与枚举字面量 `.name`。
+/// 名字是 comptime 求出的字符串，跳到它在源码中的来源：字符串字面量（如 zig-clap 的帮助文本），或 `@typeInfo(X)`
+/// 给出的 X 的同名成员
 fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -116,31 +116,79 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     const b = try r.body(file, item);
     const rel = tok.offset - node.offset;
     const e = b.exprAt(rel) orelse return null;
-    const fa = switch (b.expr(e)) {
-        .field_access => |x| x,
-        else => return null,
-    };
-    if (rel < b.range(fa.lhs).end) return null;
-    const name = fa.field orelse return null;
     const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
     if (a.member(e) != null) return null;
     const ip = r.ctx.db.env.ip;
-    var t = a.exprType(fa.lhs).ty;
-    switch (ip.key(t)) {
-        .ptr_type => |p| if (p.size == .one) {
-            t = p.child;
+    var via_type = false;
+    const name: []const u8, const t: Index = switch (b.expr(e)) {
+        .field_access => |fa| blk: {
+            if (rel < b.range(fa.lhs).end) return null;
+            const lhs = a.exprType(fa.lhs);
+            if (lhs.asType()) |ty| {
+                via_type = true;
+                break :blk .{ fa.field orelse return null, ty };
+            }
+            var ty = lhs.ty;
+            switch (ip.key(ty)) {
+                .ptr_type => |p| if (p.size == .one) {
+                    ty = p.child;
+                },
+                else => {},
+            }
+            break :blk .{ fa.field orelse return null, ty };
         },
-        else => {},
-    }
-    const rt = switch (ip.key(t)) {
-        .reified_type => |x| x,
+        .enum_literal => |n| blk: {
+            // 结果类型为 `?E`、`E!T` 时取 E
+            var ty = a.exprType(e).ty;
+            while (true) switch (ip.key(ty)) {
+                .optional_type => |child| ty = child,
+                .error_union_type => |eu| ty = eu.payload,
+                else => break,
+            };
+            break :blk .{ n, ty };
+        },
         else => return null,
     };
-    if (rt.kind == .@"enum") return null;
+    const rt = switch (ip.key(t)) {
+        .reified_type => |x| x,
+        // `union(enum)` 的标签枚举：成员是 union 的字段
+        .union_tag_type => |u| switch (ip.key(u)) {
+            .reified_type => |x| x,
+            else => return null,
+        },
+        else => return null,
+    };
+    // 经类型访问的只有枚举成员（结构体与 union 的类型上只有声明）
+    if (via_type and rt.kind != .@"enum") return null;
     for (rt.names) |n| {
         if (std.mem.eql(u8, n, name)) break;
     } else return null;
+    // 名字的字符串字面量先在使用处找，再到构造类型的成员（含其中的局部常量，如 `blk: { const extra = .{...}; ... }`）所在的文件中找
+    if (try literalOrigin(r, file, .{ .item = item, .body = b, .at = a }, rt, name)) |found| return found;
+    const owner = try ownerLocal(r, rt);
+    if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
+    return typeInfoOrigin(r, rt, name);
+}
 
+/// 构造类型的成员（`rt.owner`）：其中的局部绑定也是名字来源的候选
+fn ownerLocal(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Local {
+    const tree = try r.itemTree(rt.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == rt.owner) break @intCast(i);
+    } else return null;
+    const node = try r.itemNode(rt.file, item) orelse return null;
+    const at = try context.at(r, rt.file, node.offset, false) orelse return null;
+    if (at.item != item) return null;
+    return .{ .item = item, .body = at.body, .at = at, .inst = rt.inst };
+}
+
+/// 局部绑定也是候选的成员：使用处所在的成员，或构造类型的成员（在其实例 `inst` 下求值）
+const Local = struct { item: u32, body: *const Body, at: context.At, inst: ?Index = null };
+
+/// 名字 `name` 在文件 `file` 中的字符串字面量来源。候选是初始化表达式含有该字面量（或经由含有它的常量）的常量，
+/// 以及 `local` 中的局部绑定：求出它们的值并在其中找到这个字符串，再以跟踪字面量来源的方式重新求值
+fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
+    const ip = r.ctx.db.env.ip;
     const Candidate = struct { item: u32, body: *const Body, expr: Body.ExprId, value: Index };
     var cands: std.ArrayList(Candidate) = .empty;
     const tree = try r.itemTree(file);
@@ -160,17 +208,23 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
         const tv = try queries.defType(r, .{ .item = .{ .file = file, .item = @intCast(i) } }, null, null);
         try cands.append(r.arena, .{ .item = @intCast(i), .body = ib, .expr = v, .value = tv.val orelse continue });
     }
-    for (b.bindings, 0..) |binding, bi| {
+    if (local) |l| for (l.body.bindings, 0..) |binding, bi| {
         const init = binding.init orelse continue;
-        if (!literalWithin(b, init, name) and !nameRefWithin(b, init, holders.items)) continue;
-        const v = a.bindingType(@fromBackingInt(@intCast(bi))).val orelse continue;
-        try cands.append(r.arena, .{ .item = item, .body = b, .expr = init, .value = v });
-    }
+        if (!literalWithin(l.body, init, name) and !nameRefWithin(l.body, init, holders.items)) continue;
+        // 推导不为字符串生成值（如块中的 `const extra = [_][]const u8{"a"};`）：求不出时按 comptime 求值
+        const v = l.at.bindingType(@fromBackingInt(@intCast(bi))).val orelse
+            (try eval.exprValue(r, file, l.item, l.body, init, l.inst, l.at.res.bindings, null)).val orelse continue;
+        try cands.append(r.arena, .{ .item = l.item, .body = l.body, .expr = init, .value = v });
+    };
 
     var chosen: ?struct { cand: Candidate, path: []const u32 } = null;
     var found: u32 = 0;
     var shared: u32 = 0;
+    // 值相同的候选（`const nodes = node_kinds;`）是同一个来源，只计一次，取先出现的
+    var seen: std.ArrayList(Index) = .empty;
     for (cands.items) |c| {
+        if (std.mem.indexOfScalar(Index, seen.items, c.value) != null) continue;
+        try seen.append(r.arena, c.value);
         var path: std.ArrayList(u32) = .empty;
         var chain: std.ArrayList(Index) = .empty;
         if (!try eval.findString(ip, r.arena, c.value, name, &path, &chain)) continue;
@@ -193,6 +247,30 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     const start = Body.literalSourceOffset(src, origin.offset) orelse return null;
     const end = Body.literalSourceOffset(src, origin.offset + name.len) orelse return null;
     return .{ .file = origin.file, .start = lit_start + @as(u32, @intCast(start)), .end = lit_start + @as(u32, @intCast(end)) };
+}
+
+/// 构造类型的成员名来自 `@typeInfo(X)`（如 `@typeInfo(Tag).@"enum".field_names`）时，X 中的同名成员：
+/// 在构造所在的成员中找 `@typeInfo` 的实参，取第一个有这个成员的类型
+fn typeInfoOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
+    const tree = try r.itemTree(rt.file);
+    const owner_item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == rt.owner) break @intCast(i);
+    } else return null;
+    const owner = try r.ownerKey(rt.file, owner_item);
+    const body = try r.ctx.get(database.hir.ItemBody, owner);
+    const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = rt.inst });
+    if (res.exprs.len != body.exprs.len) return null;
+    for (body.exprs) |x| switch (x) {
+        .builtin_call => |call| {
+            if (!std.mem.eql(u8, call.name, "@typeInfo") or call.args.len != 1) continue;
+            const t = res.exprs[@backingInt(call.args[0])].asType() orelse continue;
+            const ns = try queries.namespaceOfType(r, t) orelse continue;
+            const f = infer.fieldItem(try r.itemTree(ns.file), ns.container, name) orelse continue;
+            return target(r, .{ .item = .{ .file = ns.file, .item = f } });
+        },
+        else => {},
+    };
+    return null;
 }
 
 /// `e` 的范围内有内容含有 `name` 的字符串字面量

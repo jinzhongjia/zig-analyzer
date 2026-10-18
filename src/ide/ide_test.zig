@@ -253,6 +253,68 @@ test "goto declaration of reified fields named by comptime parsed strings" {
     }
 }
 
+test "goto declaration of reified enum members named by string literals or @typeInfo" {
+    // `@Enum` 构造的枚举（如 SyntaxKind）的成员曾没有跳转目标
+    const kind_text =
+        \\const Base = enum { alpha, beta };
+        \\const extra = [_][:0]const u8{ "gamma", "delta" };
+        \\pub const Kind = blk: {
+        \\    const tags = @typeInfo(Base).@"enum".field_names;
+        \\    const local = [_][:0]const u8{"epsilon"};
+        \\    const more = extra;
+        \\    var names: [tags.len + more.len + local.len][:0]const u8 = undefined;
+        \\    var values: [names.len]u8 = undefined;
+        \\    for (tags, 0..) |name, i| names[i] = name;
+        \\    for (more, tags.len..) |name, i| names[i] = name;
+        \\    for (local, tags.len + more.len..) |name, i| names[i] = name;
+        \\    for (&values, 0..) |*v, i| v.* = i;
+        \\    break :blk @Enum(u8, .exhaustive, &names, &values);
+        \\};
+        \\
+    ;
+    const text =
+        \\const Kind = @import("kind.zig").Kind;
+        \\const Filter = struct { only: ?Kind = null };
+        \\fn f(k: Kind) bool {
+        \\    const filter: Filter = .{ .only = .epsilon };
+        \\    _ = filter;
+        \\    return k == .gamma or k == .beta or k == Kind.delta;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const kind = (try w.add("/p/kind.zig", kind_text)).file;
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 构造类型所在文件中的字符串字面量（经由值相同的局部别名 `more`）
+        .{ "gamma or", "gamma\", \"delta" },
+        // 构造所在成员中的局部常量；结果类型为 optional
+        .{ "epsilon }", "epsilon\"}" },
+        // `@typeInfo(Base)` 给出的成员名：Base 中的成员
+        .{ "beta or", "beta };" },
+        // 经类型访问
+        .{ "delta;", "delta\" };" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.definition(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        try testing.expectEqual(kind, t.file);
+        testing.expect(std.mem.startsWith(u8, kind_text[t.start..], c[1])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, kind_text[t.start..t.end] });
+            return err;
+        };
+    }
+}
+
 test "hover names a reified type after the constant it initializes" {
     // 不在函数中构造的类型曾按内容显示为匿名的 `enum { ... }`
     const text =
