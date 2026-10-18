@@ -1561,6 +1561,85 @@ test "the right side of a comptime short-circuited and / or is inactive" {
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "x;").?)), ranges[0].start);
 }
 
+test "callsite seeding substitutes the comptime type parameter a caller dispatches through" {
+    // `A.step` 只经由 `run` 中的 `Impl.step(ctx)` 调用，而 `run` 只以 B 调用：曾没有实例，`c` 的类型未知
+    const labels = try completionLabels(
+        \\const Ctx = struct { n: u32 };
+        \\const A = struct {
+        \\    pub fn step(c: anytype) u32 {
+        \\        return c.<|>;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    pub fn step(c: anytype) u32 {
+        \\        _ = c;
+        \\        return 0;
+        \\    }
+        \\};
+        \\fn run(comptime Impl: type, ctx: *Ctx) u32 {
+        \\    return Impl.step(ctx);
+        \\}
+        \\fn main() void {
+        \\    var ctx: Ctx = .{ .n = 1 };
+        \\    _ = run(B, &ctx);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("n", labels);
+}
+
+test "callsite seeding follows a container type passed as a comptime argument to the call that dispatches to it" {
+    // 分派处（engine.zig 的 `Q.compute(ctx)`）所在的文件不 import 目标所在的文件：曾按导入链找不到调用点，`ctx` 的类型未知
+    const queries_text =
+        \\pub const Item = struct {
+        \\    pub fn compute(ctx: anytype) u32 {
+        \\        return ctx.<|>;
+        \\    }
+        \\};
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const engine_file = (try w.add("/p/engine.zig",
+        \\pub fn Engine(comptime Ctx: type) type {
+        \\    return struct {
+        \\        pub fn get(ctx: *Ctx, comptime Q: type) u32 {
+        \\            return inner(ctx, Q);
+        \\        }
+        \\        fn inner(ctx: *Ctx, comptime Q: type) u32 {
+        \\            return Q.compute(ctx);
+        \\        }
+        \\    };
+        \\}
+        \\
+    )).file;
+    const added = try w.add("/p/queries.zig", queries_text);
+    const main = (try w.add("/p/main.zig",
+        \\const Engine = @import("engine.zig").Engine;
+        \\const queries = @import("queries.zig");
+        \\const Ctx = struct { n: u32 };
+        \\const Db = Engine(Ctx);
+        \\fn run(ctx: *Ctx) u32 {
+        \\    return Db.get(ctx, queries.Item);
+        \\}
+        \\
+    )).file;
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+        .{ .file = engine_file, .module = 0, .root_module = 0 },
+        .{ .file = added.file, .module = 0, .root_module = 0 },
+        .{ .file = main, .module = 0, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    try testing.expectEqualStrings("n", try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
 test "completion through single pointers to arrays, tuples and slices" {
     // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
     const cases = [_]struct { []const u8, []const u8 }{

@@ -218,6 +218,8 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.
         if (f == key.file or !try containsAny(r, f, names)) continue;
         try collectIn(r, f, key.file, item, root, names, depth, out);
     }
+    // 类型流的层数不受收集层数限制：它只进入实参含有目标容器的实例，不会成倍增长
+    _ = try typeFlow(r, key.file, item, root, files, null, max_depth, out);
     if (out.found.items.len == 0) if (try dispatched(r, key.file, item, root, null)) |found| try out.add(r.arena, found);
 }
 
@@ -257,8 +259,90 @@ fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8) resolve.Err
         if (f == key.file or !try containsAny(r, f, names)) continue;
         if (try findIn(r, f, key.file, item, root, names, active, depth)) |s| return s;
     }
+    if (try typeFlow(r, key.file, item, root, files, active, depth, null)) |s| return s;
     return dispatched(r, key.file, item, root, active);
 }
+
+/// 目标所在的容器作为 comptime 类型实参传入泛型函数，再经类型参数调用目标（`ctx.get(hir.ItemBody, k)` →
+/// `get` → … → `execute` 中的 `Q.compute(ctx, key)`）。分派处所在的文件不必 import 目标所在的文件，按导入链
+/// 找不到：从实参中传入这个容器类型的调用出发，逐层进入实参中仍含有它的泛型调用，直到调用目标处。
+/// `all` 不为 null 时收集全部这样找到的实例，返回 null
+fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const FileId, active: ?u32, depth: u8, all: ?*Collector) resolve.Error!?Found {
+    const tree = try r.itemTree(file);
+    const container = tree.items[root].container;
+    const decl_item = tree.containers[container].parent_item orelse return null;
+    const name = tree.items[decl_item].name orelse return null;
+    if (try genericRoot(r, file, decl_item) != null) return null;
+    const target = try queries.containerType(r, .{ .file = file, .container = container }, null);
+    const root_key = try r.ownerKey(file, root);
+    const names = [_][]const u8{name};
+    var flow: Flow = .{ .r = r, .target = target, .file = file, .item = item, .root_key = root_key, .active = active, .all = all };
+    for (files) |f| {
+        if (!try containsAny(r, f, &names)) continue;
+        const ft = try r.itemTree(f);
+        for (ft.items, 0..) |_, i| {
+            if (flow.full()) return null;
+            if (!try mayMentionAny(r, f, @intCast(i), &names)) continue;
+            const owner = try r.ownerKey(f, @intCast(i));
+            const body = try r.ctx.get(hir.ItemBody, owner);
+            if (!mentionsAny(body, &names)) continue;
+            const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+            if (try flow.from(body, res, depth)) |found| return found;
+        }
+    }
+    return null;
+}
+
+/// `typeFlow` 的一次查找：已进入过的实例不再进入（互相调用的泛型函数）
+const Flow = struct {
+    r: *Resolver,
+    target: Index,
+    file: FileId,
+    item: u32,
+    root_key: hir.OwnerKey,
+    active: ?u32,
+    all: ?*Collector,
+    visited: std.ArrayList(Index) = .empty,
+
+    fn full(fl: *const Flow) bool {
+        const c = fl.all orelse return false;
+        return c.full();
+    }
+
+    /// 推导结果 `res` 中实参含有目标容器类型的泛型调用：在被调函数的该实例中找对目标的调用
+    fn from(fl: *Flow, body: *const Body, res: *const infer.Result, depth: u8) resolve.Error!?Found {
+        if (depth == 0 or res.exprs.len != body.exprs.len) return null;
+        const r = fl.r;
+        const ip = r.ctx.db.env.ip;
+        for (body.exprs, 0..) |e, ei| {
+            if (fl.full()) return null;
+            const c = switch (e) {
+                .call => |c| c,
+                else => continue,
+            };
+            if (withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
+            const receiver: ?TypedValue = switch (body.expr(c.callee)) {
+                .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
+                else => null,
+            };
+            const called = try calleeInstance(r, res, res.exprs[@backingInt(c.callee)], receiver, c.args, null) orelse continue;
+            if (std.mem.indexOfScalar(Index, ip.key(called.inst).instance.args, fl.target) == null) continue;
+            if (std.mem.indexOfScalar(Index, fl.visited.items, called.inst) != null) continue;
+            try fl.visited.append(r.arena, called.inst);
+            const ct = try r.itemTree(called.file);
+            const ci: u32 = for (ct.items, 0..) |it, k| {
+                if (it.ast_id == called.decl) break @intCast(k);
+            } else continue;
+            const owner = try r.ownerKey(called.file, ci);
+            const callee_body = try r.ctx.get(hir.ItemBody, owner);
+            const norm = try queries.normalizeInst(r, called.file, ci, called.inst);
+            const callee_res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
+            if (try callIn(r, called.file, ci, callee_body, callee_res, fl.file, fl.item, fl.root_key, fl.active, fl.all)) |found| return found;
+            if (try fl.from(callee_body, callee_res, depth - 1)) |found| return found;
+        }
+        return null;
+    }
+};
 
 /// 标准库中按方法名分派到实参的方法的函数：`printValue` 对 `{f}` 等调用 `value.format(w)`、
 /// `value.formatNumber(w, ...)`。泛型方法（如 `format(self, writer: anytype)`）在项目中没有调用点时，
@@ -409,12 +493,59 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null)) |s| return s;
+        // 调用者经由自己的 comptime 类型参数调用（`Q.compute(ctx, key)`）：把该参数换成目标所在的容器
+        if (try substituted(r, in, @intCast(i), body, outer.inst, file, root)) |inst| {
+            const res2 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+            if (try callIn(r, in, @intCast(i), body, res2, file, item, root_key, active, null)) |s| return s;
+        }
         // 第一个实例下没有有效的调用（如调用位于该实例不执行的 `switch (Q.kind)` 分支中）：依次尝试调用者的其他实例
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1 })) |other| {
             if (other.inst == outer.inst) continue;
             const res3 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = other.inst });
             if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, active, null)) |s| return s;
         }
+    }
+    return null;
+}
+
+/// 调用者 `caller`（位于 `in`）以自己的 comptime 类型参数 `P` 调用泛型函数 `root`（位于 `file`，`P.name(...)`）时，
+/// 把实例 `inst` 中 `P` 的实参换成 `root` 所在的容器得到的实例。容器位于泛型函数内（需要实例）时为 null
+fn substituted(r: *Resolver, in: FileId, caller: u32, body: *const Body, inst: ?Index, file: FileId, root: u32) resolve.Error!?Index {
+    const ip = r.ctx.db.env.ip;
+    const instance = switch (ip.key(inst orelse return null)) {
+        .instance => |x| x,
+        else => return null,
+    };
+    const tree = try r.itemTree(file);
+    const name = tree.items[root].name orelse return null;
+    const container = tree.items[root].container;
+    if (tree.containers[container].parent_item) |p| if (try genericRoot(r, file, p) != null) return null;
+    const target = try queries.containerType(r, .{ .file = file, .container = container }, null);
+    for (body.exprs) |e| {
+        const c = switch (e) {
+            .call => |c| c,
+            else => continue,
+        };
+        const fa = switch (body.expr(c.callee)) {
+            .field_access => |x| x,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, fa.field orelse continue, name)) continue;
+        const n = switch (body.expr(fa.lhs)) {
+            .name_ref => |x| x,
+            else => continue,
+        };
+        const l = switch (try r.resolveName(in, caller, body, body.expr_scopes[@backingInt(fa.lhs)], n) orelse continue) {
+            .local => |x| x,
+            else => continue,
+        };
+        const binding = body.binding(l.binding);
+        if (binding.kind != .param or !binding.is_comptime) continue;
+        const pi = std.mem.indexOfScalar(Body.BindingId, body.params, l.binding) orelse continue;
+        if (pi >= instance.args.len or instance.args[pi] == target) continue;
+        const args = try r.arena.dupe(Index, instance.args);
+        args[pi] = target;
+        return try ip.get(.{ .instance = .{ .file = instance.file, .decl = instance.decl, .args = args, .parent = instance.parent } });
     }
     return null;
 }
@@ -484,22 +615,7 @@ const Site = struct {
     /// 以 `callee`（及接收者）和实参 `args` 调用：callee 为 `root_key` 且实例具体时返回调用点
     fn instance(s: Site, callee: TypedValue, receiver: ?TypedValue, args: []const Body.ExprId) resolve.Error!?Found {
         const r = s.r;
-        const ip = r.ctx.db.env.ip;
-        const fv = switch (ip.key(callee.val orelse return null)) {
-            .fn_value => |v| v,
-            else => return null,
-        };
-        if (fv.file != s.root_key.file or fv.decl != s.root_key.item) return null;
-        const f = switch (ip.key(callee.ty)) {
-            .fn_type => |f| f,
-            else => return null,
-        };
-        const g = try infer.genericCallee(r, r.arena, callee, f) orelse return null;
-        const skip: usize = @intFromBool(receiver != null);
-        const tvs = try r.arena.alloc(TypedValue, g.body.params.len);
-        for (tvs, 0..) |*a, ai| a.* = if (ai < skip) receiver.? else if (ai - skip < args.len) s.res.exprs[@backingInt(args[ai - skip])] else .unknown;
-        const inst = try infer.instanceOf(r, r.arena, g, f, tvs);
-        if (!value.isConcrete(ip, inst)) return null;
+        const inst = (try calleeInstance(r, s.res, callee, receiver, args, s.root_key) orelse return null).inst;
         const node = try r.itemNode(s.in, s.i) orelse return null;
         const norm = try queries.normalizeInst(r, s.file, s.item, inst);
         if (s.all) |c| {
@@ -514,6 +630,30 @@ const Site = struct {
         return .{ .inst = norm, .file = s.in, .offset = node.offset + s.body.range(@fromBackingInt(s.expr)).start };
     }
 };
+
+/// 调用的被调泛型函数与具体实例：callee 是泛型函数的值、由实参（及接收者）求出的实例具体时。`only` 不为 null
+/// 时只看对它的调用（求实例之前先比较被调函数）
+const Called = struct { file: FileId, decl: @import("../syntax/ItemTree.zig").AstId, inst: Index };
+
+fn calleeInstance(r: *Resolver, res: *const infer.Result, callee: TypedValue, receiver: ?TypedValue, args: []const Body.ExprId, only: ?hir.OwnerKey) resolve.Error!?Called {
+    const ip = r.ctx.db.env.ip;
+    const fv = switch (ip.key(callee.val orelse return null)) {
+        .fn_value => |v| v,
+        else => return null,
+    };
+    if (only) |k| if (fv.file != k.file or fv.decl != k.item) return null;
+    const f = switch (ip.key(callee.ty)) {
+        .fn_type => |f| f,
+        else => return null,
+    };
+    const g = try infer.genericCallee(r, r.arena, callee, f) orelse return null;
+    const skip: usize = @intFromBool(receiver != null);
+    const tvs = try r.arena.alloc(TypedValue, g.body.params.len);
+    for (tvs, 0..) |*a, ai| a.* = if (ai < skip) receiver.? else if (ai - skip < args.len) res.exprs[@backingInt(args[ai - skip])] else .unknown;
+    const inst = try infer.instanceOf(r, r.arena, g, f, tvs);
+    if (!value.isConcrete(ip, inst)) return null;
+    return .{ .file = fv.file, .decl = fv.decl, .inst = inst };
+}
 
 /// 包含成员 `item` 的最内层泛型函数（成员自身，或经由体内定义的容器的外层函数）
 fn genericRoot(r: *Resolver, file: FileId, item: u32) resolve.Error!?u32 {
