@@ -107,6 +107,31 @@ pub fn resolve(comptime style: Style, gpa: Allocator, base: []const u8, sub_path
     return null;
 }
 
+/// `file_path` 是否就是目录 `dir` 或位于其下（两者都是规范化的绝对路径）。与文件身份的规则一致：
+/// 大小写不敏感时不区分 ASCII 字母的大小写
+pub fn isUnder(vfs: *const Vfs, file_path: []const u8, dir: []const u8) bool {
+    return switch (vfs.style) {
+        inline else => |style| isUnderStyle(style, vfs.case, file_path, dir),
+    };
+}
+
+/// 同 `isUnder`，显式指定路径风格与大小写规则，便于测试
+pub fn isUnderStyle(comptime style: Style, case: CaseMode, file_path: []const u8, dir: []const u8) bool {
+    if (file_path.len < dir.len) return false;
+    const prefix = file_path[0..dir.len];
+    const same = switch (case) {
+        .sensitive => std.mem.eql(u8, prefix, dir),
+        .insensitive => std.ascii.eqlIgnoreCase(prefix, dir),
+    };
+    if (!same) return false;
+    const path_type: std.fs.path.PathType = switch (style) {
+        .posix => .posix,
+        .windows => .windows,
+    };
+    if (file_path.len == dir.len) return true;
+    return path_type.isSep(u8, file_path[dir.len]) or (dir.len > 0 and path_type.isSep(u8, dir[dir.len - 1]));
+}
+
 /// 驻留路径。调用方须保证 `file_path` 是绝对路径；路径会被规范化（见 `normalize`）。
 pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
     const normalized = try vfs.normalizeOwn(file_path) orelse unreachable;
@@ -191,6 +216,20 @@ test "case-insensitive: spellings map to one file, first spelling is kept for di
         const expected = if (style == .posix) "/Work/Src/A.zig" else "C:\\Work\\Src\\A.zig";
         try t.expectEqualStrings(expected, vfs.path(id));
     }
+}
+
+test isUnderStyle {
+    const t = std.testing;
+    try t.expect(isUnderStyle(.posix, .sensitive, "/work/src/a.zig", "/work"));
+    try t.expect(isUnderStyle(.posix, .sensitive, "/work", "/work"));
+    try t.expect(isUnderStyle(.posix, .sensitive, "/work/a.zig", "/"));
+    // 目录名只是前缀相同
+    try t.expect(!isUnderStyle(.posix, .sensitive, "/workspace/a.zig", "/work"));
+    try t.expect(!isUnderStyle(.posix, .sensitive, "/Work/a.zig", "/work"));
+    try t.expect(isUnderStyle(.posix, .insensitive, "/Work/a.zig", "/work"));
+    try t.expect(isUnderStyle(.windows, .insensitive, "C:\\Zig\\Lib\\std\\std.zig", "C:\\zig\\lib"));
+    try t.expect(isUnderStyle(.windows, .insensitive, "C:\\a.zig", "C:\\"));
+    try t.expect(!isUnderStyle(.windows, .insensitive, "C:\\zig\\library\\a.zig", "C:\\zig\\lib"));
 }
 
 test "case-sensitive: different spellings are different files" {
