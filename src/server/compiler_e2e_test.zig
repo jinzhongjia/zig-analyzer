@@ -862,31 +862,35 @@ test "generated module roots: resolved from build results, including modules che
     try testing.expectEqual(1, in_set);
 }
 
+/// 以生成的 options 模块为 `build_options` 的项目
+const options_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const opts = b.addOptions();
+    \\    opts.addOption(u32, "answer", 42);
+    \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "build_options", .module = opts.createModule() }},
+    \\    }) });
+    \\    b.step("check", "Check").dependOn(&exe.step);
+    \\}
+    \\
+;
+const options_main =
+    \\const opts = @import("build_options");
+    \\pub fn main() void {
+    \\    _ = opts.answer;
+    \\}
+    \\
+;
+
 // 防止本地缓存目录固定按 `<构建根>/.zig-cache` 计算：`--cache-dir`（或 `ZIG_LOCAL_CACHE_DIR`）把生成文件放到
 // 别处时，生成的模块根文件的路径不存在，模块中的名字全部无法解析
 test "generated module roots: local cache directory moved with --cache-dir" {
-    const main_text =
-        \\const opts = @import("build_options");
-        \\pub fn main() void {
-        \\    _ = opts.answer;
-        \\}
-        \\
-    ;
+    const main_text = options_main;
     var project = try fixture.Project.create(&.{
-        .{ .path = "build.zig", .text =
-        \\const std = @import("std");
-        \\pub fn build(b: *std.Build) void {
-        \\    const opts = b.addOptions();
-        \\    opts.addOption(u32, "answer", 42);
-        \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
-        \\        .root_source_file = b.path("main.zig"),
-        \\        .target = b.graph.host,
-        \\        .imports = &.{.{ .name = "build_options", .module = opts.createModule() }},
-        \\    }) });
-        \\    b.step("check", "Check").dependOn(&exe.step);
-        \\}
-        \\
-        },
+        .{ .path = "build.zig", .text = options_build },
         .{ .path = "main.zig", .text = main_text },
         // 相对路径相对于构建根目录
         .{ .path = "zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--cache-dir\", \"altcache\"]}}" },
@@ -926,6 +930,46 @@ test "generated module roots: local cache directory moved with --cache-dir" {
     const rename = .{ .textDocument = rename_at.textDocument, .position = rename_at.position, .newName = "answer2" };
     try testing.expect((try h.request("textDocument/rename", rename)).object.get("error") != null);
     try shutdown(&h);
+}
+
+test "generated files in a local cache directory outside the build root: never compiled alone, not renamable" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "proj/build.zig", .text = options_build },
+        .{ .path = "proj/main.zig", .text = options_main },
+        .{ .path = "proj/zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--cache-dir\", \"../cache\"]}}" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "proj"), true);
+    try waitIdle(&h);
+    const cache = try std.fs.path.join(a, &.{ project.root, "cache" });
+    const generated = blk: {
+        const ws = h.server.workspaces.items[0];
+        ws.mutex.lockUncancelable(testing.io);
+        defer ws.mutex.unlock(testing.io);
+        try testing.expectEqualStrings(cache, ws.model.?.local_cache_root);
+        for (ws.model.?.modules) |m| if (m.generated_root != null) break :blk try a.dupe(u8, m.root_file.?);
+        return error.TestUnexpectedResult;
+    };
+    try testing.expect(std.mem.startsWith(u8, generated, cache));
+
+    // 打开、保存生成的 options.zig：它只作为项目的依赖参与编译
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, generated, a, .limited(1024 * 1024));
+    const uri = try open(&h, generated, text);
+    try waitIdle(&h);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = uri } });
+    try waitIdle(&h);
+    try expectNoErrors(&h, uri);
+    // 其中的定义由 maker 生成，不能重命名
+    const offset = std.mem.indexOf(u8, text, "answer").?;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    const position = .{ .line = std.mem.count(u8, text[0..offset], "\n"), .character = offset - line_start + 1 };
+    try testing.expect((try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = uri }, .position = position })).object.get("error") != null);
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
 }
 
 /// 配置测试的项目：`-Dbad=true` 时 main.zig 中被屏蔽的错误出现；`unit` step 编译 t.zig（有错误）
