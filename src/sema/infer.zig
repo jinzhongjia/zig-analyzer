@@ -386,11 +386,27 @@ const Inferrer = struct {
 
     fn condValue(inf: *Inferrer, cond: TypedValue) ?bool {
         const v = cond.val orelse return null;
+        switch (inf.ip.key(cond.ty)) {
+            // 非 null 的 optional 与成功的 error union 以载荷值表示，`false` 载荷仍是成功
+            .optional_type => return switch (v) {
+                .null_value => false,
+                .unknown, .undefined_value => null,
+                else => true,
+            },
+            .error_union_type => {
+                if (v == .unknown or v == .undefined_value) return null;
+                return switch (inf.ip.key(v)) {
+                    .error_value => false,
+                    else => true,
+                };
+            },
+            else => {},
+        }
         if (v == .true_value) return true;
         if (v == .false_value) return false;
         if (v == .null_value) return false;
         if (v == .unknown or v == .undefined_value) return null;
-        return if (inf.ip.key(cond.ty) == .optional_type) true else null;
+        return null;
     }
 
     /// `if` / `switch` 的分支：不会执行的记录为非活动代码（见 `Result.inactive`）

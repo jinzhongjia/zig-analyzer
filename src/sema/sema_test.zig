@@ -499,6 +499,26 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "false payloads are not null or failed" {
+    try expectTypes(
+        \\const opt: ?bool = false;
+        \\const r = @as(anyerror!bool, false);
+        \\const failed = @as(anyerror!bool, error.Bad);
+        \\fn g() void {
+        \\    const y = if (opt) |_| @as(u8, 1) else @as(u16, 2);
+        \\    const z = if (r) |_| @as(u8, 3) else @as(u16, 4);
+        \\    const q = if (failed) |_| @as(u8, 5) else @as(u16, 6);
+        \\    _ = .{ y, z, q };
+        \\}
+    , &.{
+        // `?bool` 的 false 载荷与成功的 `E!bool` 仍是非 null / 成功
+        .{ "y", "u8 = 1" },
+        .{ "z", "u8 = 3" },
+        // 失败的错误联合仍取 else 分支
+        .{ "q", "u16 = 6" },
+    });
+}
+
 test "comptime name builtins produce string literal types" {
     try expectTypes(
         \\const U = union(enum) { a: u8, b: u16 };
