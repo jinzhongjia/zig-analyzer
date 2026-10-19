@@ -30,6 +30,7 @@ const Resolver = za.names.resolve.Resolver;
 const InternPool = za.sema.InternPool;
 pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
+const SemanticCache = @import("semantic_cache.zig");
 
 const log = std.log.scoped(.server);
 
@@ -124,6 +125,12 @@ register_config: bool = false,
 register_watch: bool = false,
 /// 客户端支持 `workspace/inlayHint/refresh`（inlay hints 的配置变化后请客户端重新请求）
 inlay_refresh: bool = false,
+/// 客户端支持工作区语义令牌刷新；同一时间最多等待一个刷新响应。
+semantic_refresh: bool = false,
+semantic_refresh_mutex: Io.Mutex = .init,
+semantic_refresh_pending: bool = false,
+semantic_refresh_dirty: bool = false,
+semantic_cache: SemanticCache = .{},
 /// 已发出的拉取请求数；只采纳最近一次请求的响应
 config_requests: u32 = 0,
 /// 尚未收到响应的拉取请求数：等待期间计为忙碌（waitIdle 会等待配置生效）
@@ -223,6 +230,7 @@ pub fn deinit(server: *Server) void {
     server.last_uris.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
+    server.semantic_cache.deinit(server.gpa);
     server.progress.deinit(server.gpa);
     server.config.deinit(server.gpa);
     server.pending.deinit(server.gpa);
@@ -347,6 +355,8 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
                 .integer => |i| _ = server.progress.handleResponse(server, i, resp.@"error" == null),
                 .string => |s| if (std.mem.startsWith(u8, s, config_request_prefix)) {
                     try server.handleConfigResponse(s, resp.result, resp.@"error" != null);
+                } else if (std.mem.eql(u8, s, semantic_refresh_id)) {
+                    server.semanticRefreshFinished();
                 },
             };
         },
@@ -376,7 +386,9 @@ const request_handlers = .{
     .{ "textDocument/documentSymbol", Mode.read, documentSymbol },
     .{ "textDocument/foldingRange", Mode.read, foldingRange },
     .{ "textDocument/selectionRange", Mode.read, selectionRange },
-    .{ "textDocument/semanticTokens/full", Mode.read, semanticTokensFull },
+    .{ "textDocument/semanticTokens/full", Mode.semantic, semanticTokensFull },
+    .{ "textDocument/semanticTokens/full/delta", Mode.semantic, semanticTokensDelta },
+    .{ "textDocument/semanticTokens/range", Mode.semantic, semanticTokensRange },
     .{ "textDocument/definition", Mode.semantic, definition },
     .{ "textDocument/declaration", Mode.semantic, declaration },
     .{ "textDocument/typeDefinition", Mode.semantic, typeDefinition },
@@ -756,7 +768,11 @@ fn indexTask(server: *Server) Io.Cancelable!void {
         if (server.index_generation.load(.monotonic) != generation) continue;
         server.indexing.store(false, .release);
         // 释放标志后又有更新，且没有其他任务接手：继续
-        if (server.index_generation.load(.monotonic) == generation or server.indexing.swap(true, .acq_rel)) return;
+        if (server.index_generation.load(.monotonic) == generation) {
+            server.requestSemanticRefresh();
+            return;
+        }
+        if (server.indexing.swap(true, .acq_rel)) return;
     }
 }
 
@@ -832,6 +848,44 @@ fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     for (server.pending.items) |p| {
         if (p.id.eql(id)) p.cancel.store(true, .release);
     }
+}
+
+const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
+
+fn openDocumentCount(server: *Server) usize {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    return server.open_docs.count();
+}
+
+/// 编辑只在防抖完成后刷新其他文档；索引只在稳定的一轮结束后刷新。
+/// 等待客户端响应期间发生的变化合并为下一次刷新，不在任何读事务或状态锁内发送。
+fn requestSemanticRefresh(server: *Server) void {
+    if (!server.semantic_refresh or server.isShuttingDown() or server.openDocumentCount() == 0) return;
+    server.semantic_refresh_mutex.lockUncancelable(server.io);
+    if (server.semantic_refresh_pending) {
+        server.semantic_refresh_dirty = true;
+        server.semantic_refresh_mutex.unlock(server.io);
+        return;
+    }
+    server.semantic_refresh_pending = true;
+    server.semantic_refresh_mutex.unlock(server.io);
+    const bytes = jsonrpc.request(server.gpa, .{ .string = semantic_refresh_id }, "workspace/semanticTokens/refresh", null) catch {
+        server.semantic_refresh_mutex.lockUncancelable(server.io);
+        server.semantic_refresh_pending = false;
+        server.semantic_refresh_mutex.unlock(server.io);
+        return log.err("out of memory while building semantic tokens refresh", .{});
+    };
+    server.send(bytes);
+}
+
+fn semanticRefreshFinished(server: *Server) void {
+    server.semantic_refresh_mutex.lockUncancelable(server.io);
+    const dirty = server.semantic_refresh_dirty;
+    server.semantic_refresh_pending = false;
+    server.semantic_refresh_dirty = false;
+    server.semantic_refresh_mutex.unlock(server.io);
+    if (dirty) server.requestSemanticRefresh();
 }
 
 // ── 通知 ─────────────────────────────────────────────────────────────
@@ -928,8 +982,16 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         if (lgop.found_existing) server.gpa.free(lgop.value_ptr.*);
         lgop.value_ptr.* = last;
     }
-    try server.setFileText(id, params.textDocument.text);
+    {
+        const owned = try server.gpa.dupe(u8, params.textDocument.text);
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, id, owned, .low);
+        // 开启新会话前先等旧读请求退出，不能继承关闭期间或旧会话的增量基线。
+        server.semantic_cache.remove(server.io, server.gpa, id);
+    }
     server.publishFiles(&.{id}, false);
+    if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
     if (server.isSingleFile(id)) server.compileSingle(id);
 }
 
@@ -947,6 +1009,12 @@ fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocum
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    defer {
+        // 即使读取磁盘或替换文本失败，也先等旧读请求退出，防止关闭后重新写入快照。
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        server.semantic_cache.remove(server.io, server.gpa, id);
+    }
     // 关闭后以磁盘内容为准
     const disk = server.vfs.readFromDisk(id, arena) catch |err| switch (err) {
         error.FileTooBig => null,
@@ -958,6 +1026,7 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         defer server.docs_mutex.unlock(server.io);
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
+    server.requestSemanticRefresh();
     // 单文件模式的根文件在打开期间从磁盘删除时（外部改动的通知不处理打开的文件），关闭时丢弃它的编译结果，
     // 被它 import 的文件一并重新发布
     if (disk == null and server.dropSingle(id)) return;
@@ -1068,6 +1137,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     const files = try arena.alloc(Vfs.FileId, changes.items.len);
     for (changes.items, files) |c, *f| f.* = c.file;
     server.publishFiles(files, true);
+    server.requestSemanticRefresh();
     // 单文件模式：打开的文件 import 的文件可能变了
     server.docs_mutex.lockUncancelable(server.io);
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
@@ -1103,6 +1173,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config_mutex.lockUncancelable(server.io);
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
+    const semantic_changed = server.config.callsite_seeding != new.callsite_seeding;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const build_was_enabled = server.config.build_enable;
     const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_parameters != new.inlay_parameters or
@@ -1118,6 +1189,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
     if (compiler_disabled) server.clearSingleFileResults();
     if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
+    if (semantic_changed) server.requestSemanticRefresh();
     if (build_changed) {
         if (!new.build_enable) {
             // 关闭构建系统集成：停止各项目，其文件改按单文件处理
@@ -1940,6 +2012,7 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
     server.publishNow(file, false, seen);
+    if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
     server.maybeResetSema();
 }
 
@@ -2325,11 +2398,37 @@ fn selectionRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types
     return try ide.selection_range.selectionRanges(arena, parse.rootNode(), lines, server.encoding, params.positions);
 }
 
-fn semanticTokensFull(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.SemanticTokensParams) HandlerError!types.ResultType("textDocument/semanticTokens/full") {
+fn semanticTokensFull(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensParams) HandlerError!types.ResultType("textDocument/semanticTokens/full") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const parse = try ctx.get(syntax_q.ParseFile, file);
-    const lines = try fileLines(ctx, arena, file);
-    return .{ .data = try ide.semantic_tokens.semanticTokens(arena, parse.rootNode(), lines, server.encoding) };
+    const lines = try fileLines(r.ctx, arena, file);
+    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null);
+    const result = try server.semanticTokensResult(r.ctx, arena, file, data, null);
+    return result.SemanticTokens;
+}
+
+fn semanticTokensDelta(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensDeltaParams) HandlerError!types.ResultType("textDocument/semanticTokens/full/delta") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const lines = try fileLines(r.ctx, arena, file);
+    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null);
+    return try server.semanticTokensResult(r.ctx, arena, file, data, params.previousResultId);
+}
+
+fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, data: []const u32, previous_id: ?[]const u8) HandlerError!SemanticCache.Result {
+    const is_open = blk: {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        break :blk server.open_docs.contains(file);
+    };
+    try ctx.checkCanceled();
+    // 读事务保证关闭时会先等本请求退出；未打开的文档只返回数据，不保存可跨会话复用的快照。
+    if (!is_open) return .{ .SemanticTokens = .{ .data = data } };
+    return try server.semantic_cache.update(server.io, server.gpa, arena, file, data, previous_id);
+}
+
+fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensRangeParams) HandlerError!types.ResultType("textDocument/semanticTokens/range") {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const lines = try fileLines(r.ctx, arena, file);
+    return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range) };
 }
 
 fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
@@ -2348,6 +2447,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         if (ws.didChangeConfiguration) |d| server.register_config = d.dynamicRegistration orelse false;
         if (ws.didChangeWatchedFiles) |d| server.register_watch = d.dynamicRegistration orelse false;
         if (ws.inlayHint) |ih| server.inlay_refresh = ih.refreshSupport orelse false;
+        if (ws.semanticTokens) |st| server.semantic_refresh = st.refreshSupport orelse false;
     }
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
@@ -2397,7 +2497,8 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .codeActionProvider = .{ .CodeActionOptions = .{ .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract } } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
-                .full = .{ .boolean = true },
+                .full = .{ .SemanticTokensFullDelta = .{ .delta = true } },
+                .range = .{ .boolean = true },
             } },
         },
         .serverInfo = .{ .name = "zig-analyzer", .version = za.version },
@@ -2909,6 +3010,7 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 
 test {
     _ = @import("Server_test.zig");
+    _ = @import("semantic_tokens_test.zig");
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");

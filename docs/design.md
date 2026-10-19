@@ -189,7 +189,8 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 | 功能 | 依据 |
 |---|---|
-| semantic tokens / folding / selection range / document symbol | 纯语法 |
+| folding / selection range / document symbol | 纯语法 |
+| semantic tokens | CST 分类 + 每个成员的名字解析与类型推导；引用与声明共用类型、绑定和成员信息，无法解析的代码保留语法分类 |
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致 |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
@@ -197,6 +198,15 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
 | 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
+
+语义着色的约束：
+
+- **分类**：按实际类型与绑定区分类型、命名空间、变量、函数、方法和成员，不按名字猜测。转义标识符遵循词法作用域，裸内建名与 `_` 保留语言语义。
+- **容错**：复用每个成员的推导结果，泛型可借助一个调用点实例；依赖不同分支或循环实例的分类仍可能不完整，无法解析时保留语法着色。
+- **未使用绑定**：按绑定身份统计词法引用，只对有函数体的参数、局部变量和捕获附加 `unused`。写入、asm 输出和显式丢弃算作使用；不据局部引用判断顶层声明或容器成员。只改变着色，不产生诊断；Neovim 使用主题的 `DiagnosticUnnecessary` 暗色。
+- **编码与范围**：使用协商的位置编码，输出有序、单行、不重叠 token；范围请求返回与半开区间相交的完整 token，坐标相对于文档起点。
+- **增量与缓存**：支持 full、delta、range；delta 用公共前后缀之外的一段替换表示，无变化时返回空 edits，基线不可用时返回全量。只缓存已打开文档的最新快照，最多 128 个文档、16 MiB；关闭释放，重新打开隔离旧会话，range 不修改快照。
+- **刷新**：客户端支持 refresh 时，语义依赖变化触发合并后的刷新请求。
 
 ### 4.7 构建集成（`project/`）
 

@@ -1,16 +1,25 @@
-//! textDocument/semanticTokens：纯语法分类。
-//!
-//! 只为能从语法确定的 token 着色：关键字、注释、字面量、builtin、各类声明处的名字、
-//! 字段访问与枚举字面量、标签、原始类型。引用处的普通名字需要语义信息，不着色。
+//! 语义着色：按成员复用名字解析与类型推导，语法分类保留不完整代码的可读性。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
 const tree = @import("../syntax/tree.zig");
+const ast = @import("../syntax/ast.zig");
 const SyntaxNode = tree.SyntaxNode;
 const kind_mod = @import("../syntax/kind.zig");
-const SyntaxKind = kind_mod.SyntaxKind;
+const resolve = @import("../names/resolve.zig");
+const Resolver = resolve.Resolver;
+const database = @import("../database.zig");
+const FileId = @import("../base/Vfs.zig").FileId;
+const ItemTree = @import("../syntax/ItemTree.zig");
+const Body = @import("../hir/Body.zig");
+const InternPool = @import("../sema/InternPool.zig");
+const infer = @import("../sema/infer.zig");
+const queries = @import("../sema/queries.zig");
+const context = @import("context.zig");
+const seed = @import("../ide_db/seed.zig");
+const OwnerKey = database.hir.OwnerKey;
 
 pub const TokenType = enum(u32) {
     type,
@@ -24,6 +33,12 @@ pub const TokenType = enum(u32) {
     string,
     number,
     label,
+    namespace,
+    @"struct",
+    @"enum",
+    method,
+    operator,
+    typeParameter,
 };
 
 pub const Modifier = struct {
@@ -31,6 +46,7 @@ pub const Modifier = struct {
     pub const readonly: u32 = 1 << 1;
     pub const documentation: u32 = 1 << 2;
     pub const defaultLibrary: u32 = 1 << 3;
+    pub const unused: u32 = 1 << 4;
 };
 
 pub const legend: types.SemanticTokensLegend = .{
@@ -41,43 +57,255 @@ pub const legend: types.SemanticTokensLegend = .{
         const final = out;
         break :blk &final;
     },
-    .tokenModifiers = &.{ "declaration", "readonly", "documentation", "defaultLibrary" },
+    .tokenModifiers = &.{ "declaration", "readonly", "documentation", "defaultLibrary", "unused" },
 };
 
-pub fn semanticTokens(arena: Allocator, root: SyntaxNode, lines: offsets.LineIndex, enc: offsets.Encoding) Allocator.Error![]const u32 {
-    var b: Builder = .{ .arena = arena, .lines = lines, .enc = enc };
-    try b.visit(root, false);
+pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc: offsets.Encoding, range: ?types.Range) resolve.Error![]const u32 {
+    var b: Builder = .{ .r = r, .lines = lines, .enc = enc, .range = range };
+    try b.collect(file);
+    try b.visit((try r.ctx.get(database.syntax.ParseFile, file)).rootNode(), false);
     return b.data.items;
 }
 
+const Class = struct { type: TokenType, mods: u32 = 0 };
+const BindingKey = struct { owner: OwnerKey, binding: Body.BindingId };
+const BindingDecl = struct { key: BindingKey, end: u32, class: Class, can_be_unused: bool };
+
 const Builder = struct {
-    arena: Allocator,
+    r: *Resolver,
     lines: offsets.LineIndex,
     enc: offsets.Encoding,
+    range: ?types.Range,
+    /// 以名字 token 的末尾寻址，字段访问不需要重新遍历其左侧表达式。
+    names: std.AutoHashMapUnmanaged(u32, Class) = .empty,
+    classes: std.AutoHashMapUnmanaged(OwnerKey, Class) = .empty,
+    items: std.AutoHashMapUnmanaged(OwnerKey, u32) = .empty,
+    indexed: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+    used: std.AutoHashMapUnmanaged(BindingKey, void) = .empty,
+    declarations: std.ArrayList(BindingDecl) = .empty,
     data: std.ArrayList(u32) = .empty,
     prev: types.Position = .{ .line = 0, .character = 0 },
-    /// 上一次换算的偏移与位置：token 按偏移递增，同一行内从这里继续计数
     cursor_offset: usize = 0,
     cursor: types.Position = .{ .line = 0, .character = 0 },
 
-    fn visit(b: *Builder, node: SyntaxNode, in_enum: bool) Allocator.Error!void {
-        const child_in_enum = if (node.kind() == .container_decl) node.childToken(.keyword_enum) != null and node.childToken(.keyword_union) == null else in_enum;
-        const is_const = node.kind() == .var_decl and node.childToken(.keyword_const) != null;
-        var it = node.children();
-        while (it.next()) |e| switch (e) {
-            .node => |c| try b.visit(c, child_in_enum),
-            .token => |t| if (classify(t, node.kind(), child_in_enum, is_const)) |c| try b.emit(t, c.type, c.mods),
+    fn indexFile(b: *Builder, file: FileId) resolve.Error!void {
+        if (b.indexed.contains(file)) return;
+        const items = (try b.r.itemTree(file)).items;
+        for (items, 0..) |item, i| try b.items.put(b.r.arena, .{ .file = file, .item = item.ast_id }, @intCast(i));
+        try b.indexed.put(b.r.arena, file, {});
+    }
+
+    fn itemClass(b: *Builder, key: OwnerKey) resolve.Error!Class {
+        if (b.classes.get(key)) |c| return c;
+        try b.indexFile(key.file);
+        const index = b.items.get(key) orelse return .{ .type = .variable };
+        const itree = try b.r.itemTree(key.file);
+        const item = itree.items[index];
+        const c: Class = switch (item.kind) {
+            .@"fn" => .{ .type = try b.functionType(key, itree.containers[item.container]) },
+            .field => .{ .type = if (itree.containers[item.container].kind == .@"enum") .enumMember else .property },
+            .@"const", .@"var" => b.valueClass(try b.r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable, if (item.kind == .@"const") Modifier.readonly else 0),
+            else => .{ .type = .variable },
+        };
+        try b.classes.put(b.r.arena, key, c);
+        return c;
+    }
+
+    fn functionType(b: *Builder, key: OwnerKey, container: ItemTree.Container) resolve.Error!TokenType {
+        if (container.kind == .file) return .function;
+        const ip = b.r.ctx.db.env.ip;
+        const tv = try b.r.ctx.get(database.sema.DeclType, .{ .owner = key });
+        const signature = switch (ip.key(tv.ty)) {
+            .fn_type => |f| f,
+            else => return .function,
+        };
+        if (signature.params.len == 0) return .function;
+        const receiver = switch (ip.key(signature.params[0])) {
+            .ptr_type => |p| if (p.size == .one) p.child else return .function,
+            else => signature.params[0],
+        };
+        return switch (ip.key(receiver)) {
+            .container_type => |c| if (c.file == key.file and c.ast_id == container.ast_id) .method else .function,
+            else => .function,
         };
     }
 
-    fn emit(b: *Builder, t: tree.SyntaxToken, token_type: TokenType, mods: u32) Allocator.Error!void {
-        const start = b.position(t.offset);
-        const end = b.position(t.offset + t.text.len);
-        // 跨行 token（理论上不会出现）不输出
-        if (end.line != start.line) return;
+    fn valueClass(b: *Builder, tv: InternPool.TypedValue, fallback: TokenType, mods: u32) Class {
+        const ip = b.r.ctx.db.env.ip;
+        const token_type: TokenType = if (tv.isType()) blk: {
+            const ty = tv.asType() orelse break :blk .type;
+            break :blk switch (ip.key(ty)) {
+                .container_type => |c| switch (c.kind) {
+                    .file => .namespace,
+                    .@"struct" => .@"struct",
+                    .@"enum" => .@"enum",
+                    .@"union", .@"opaque" => .type,
+                },
+                .reified_type => |c| switch (c.kind) {
+                    .@"struct" => .@"struct",
+                    .@"enum" => .@"enum",
+                    .@"union" => .type,
+                },
+                .union_tag_type => .@"enum",
+                else => .type,
+            };
+        } else switch (ip.key(tv.ty)) {
+            .fn_type => .function,
+            .ptr_type => |p| if (ip.key(p.child) == .fn_type) .function else fallback,
+            else => fallback,
+        };
+        return .{ .type = token_type, .mods = mods };
+    }
+
+    fn bindingClass(b: *Builder, binding: Body.Binding, tv: InternPool.TypedValue) Class {
+        if (binding.kind == .param) return .{ .type = if (tv.isType()) .typeParameter else .parameter, .mods = Modifier.readonly };
+        return b.valueClass(tv, .variable, if (binding.kind == .local_var) 0 else Modifier.readonly);
+    }
+
+    fn defClass(b: *Builder, def: resolve.Def, tv: InternPool.TypedValue, owner: OwnerKey, body: *const Body, res: *const infer.Result) resolve.Error!Class {
+        return switch (def) {
+            .file => .{ .type = .namespace },
+            .item => |it| blk: {
+                const key = try b.r.ownerKey(it.file, it.item);
+                const c = try b.itemClass(key);
+                // 实例中的别名可以比抽象声明的类型更精确，但字段仍是字段。
+                break :blk if (c.type == .variable) b.valueClass(tv, c.type, c.mods) else c;
+            },
+            .local => |local| blk: {
+                const key = try b.r.ownerKey(local.file, local.item);
+                try b.used.put(b.r.arena, .{ .owner = key, .binding = local.binding }, {});
+                const lb = if (std.meta.eql(key, owner)) body else try b.r.body(local.file, local.item);
+                const binding = lb.binding(local.binding);
+                const i = @backingInt(local.binding);
+                const value = if (tv.ty == .unknown) local_value: {
+                    const local_res = if (std.meta.eql(key, owner)) res else try b.r.ctx.get(database.sema.Infer, .{ .owner = key, .mode = .full });
+                    break :local_value if (i < local_res.bindings.len) local_res.bindings[i] else tv;
+                } else tv;
+                break :blk b.bindingClass(binding, value);
+            },
+        };
+    }
+
+    fn collect(b: *Builder, file: FileId) resolve.Error!void {
+        try b.indexFile(file);
+        const itree = try b.r.itemTree(file);
+        for (itree.items, 0..) |item, index| {
+            const key: OwnerKey = .{ .file = file, .item = item.ast_id };
+            const node = try b.r.itemNode(file, @intCast(index)) orelse continue;
+            // 每个 owner 只取一次 Body 与完整推导结果；名字查找使用降级时保存的作用域。
+            const body = try b.r.ctx.get(database.hir.ItemBody, key);
+            const res = try b.r.ctx.get(database.sema.Infer, .{ .owner = key, .mode = .full });
+            const needs_seed = for (res.exprs) |tv| {
+                if (seed.wanted(b.r.ctx.db.env.ip, tv)) break true;
+            } else false;
+            const a: context.At = .{
+                .file = file,
+                .item = @intCast(index),
+                .node = node,
+                .owner = key,
+                .body = body,
+                .res = res,
+                .rel = 0,
+                .ip = b.r.ctx.db.env.ip,
+                .seeded = if (needs_seed) try seed.find(b.r, file, @intCast(index)) else null,
+            };
+            for (body.bindings, 0..) |binding, i| {
+                if (binding.range.end <= binding.range.start) continue;
+                if (binding.range.end - binding.range.start == 1 and std.mem.eql(u8, binding.name, "_")) continue;
+                var c = b.bindingClass(binding, a.bindingType(@fromBackingInt(@as(u32, @intCast(i)))));
+                c.mods |= Modifier.declaration;
+                try b.declarations.append(b.r.arena, .{
+                    .key = .{ .owner = key, .binding = @fromBackingInt(@as(u32, @intCast(i))) },
+                    .end = node.offset + binding.range.end,
+                    .class = c,
+                    .can_be_unused = binding.kind != .param or if (ast.cast(ast.FnDecl, node)) |f| f.body() != null else false,
+                });
+            }
+            for (body.exprs, 0..) |expr, i| {
+                const span = body.expr_ranges[i];
+                if (span.end <= span.start) continue;
+                const expr_id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+                const tv = a.exprType(expr_id);
+                const c: Class = switch (expr) {
+                    .name_ref => |name| blk: {
+                        if (span.end - span.start == 1 and std.mem.eql(u8, name, "_")) continue;
+                        const escaped = body.nameRefIsEscaped(expr_id);
+                        if (!escaped) {
+                            if (isPrimitiveType(name)) break :blk .{ .type = .type, .mods = Modifier.defaultLibrary };
+                            if (isPrimitiveValue(name)) break :blk .{ .type = .keyword, .mods = Modifier.defaultLibrary };
+                        }
+                        const def = try b.r.resolveName(file, @intCast(index), body, body.expr_scopes[i], name);
+                        if (def) |d| break :blk try b.defClass(d, tv, key, body, res);
+                        break :blk .{ .type = .variable };
+                    },
+                    .field_access => |fa| blk: {
+                        if (fa.field == null) continue;
+                        if (a.member(expr_id)) |member| break :blk try b.itemClass(member);
+                        const lhs = a.exprType(fa.lhs);
+                        // 构造的枚举与错误集没有 ItemTree 成员，仍可由左侧类型判定。
+                        if (lhs.asType()) |ty| switch (b.r.ctx.db.env.ip.key(ty)) {
+                            .error_set_type, .inferred_error_set => {
+                                if (try queries.errorSetMembers(b.r, ty)) |names| {
+                                    for (names) |name| if (std.mem.eql(u8, name, fa.field.?)) break :blk .{ .type = .enumMember };
+                                }
+                            },
+                            .union_tag_type, .reified_type => {
+                                if (tv.val) |value| if (b.r.ctx.db.env.ip.key(value) == .enum_tag) break :blk .{ .type = .enumMember };
+                            },
+                            .simple_type => |simple| if (simple == .anyerror) break :blk .{ .type = .enumMember },
+                            else => {},
+                        };
+                        break :blk .{ .type = .property };
+                    },
+                    .enum_literal => blk: {
+                        if (a.member(expr_id)) |member| {
+                            const c = try b.itemClass(member);
+                            break :blk if (c.type == .property) .{ .type = .enumMember } else c;
+                        }
+                        break :blk .{ .type = .enumMember };
+                    },
+                    .error_value => .{ .type = .enumMember },
+                    else => continue,
+                };
+                try b.names.put(b.r.arena, node.offset + span.end, c);
+            }
+            // 裸枚举成员在容错 HIR 中也可能是 name_ref，声明覆盖该语法表达式。
+            if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| {
+                var c = try b.itemClass(key);
+                c.mods |= Modifier.declaration;
+                try b.names.put(b.r.arena, name.offset + @as(u32, @intCast(name.text.len)), c);
+            }
+        }
+        // 嵌套容器的成员可能引用外层局部绑定；收集完所有 owner 后再决定声明是否未使用。
+        for (b.declarations.items) |declaration| {
+            var c = declaration.class;
+            if (declaration.can_be_unused and !b.used.contains(declaration.key)) c.mods |= Modifier.unused;
+            try b.names.put(b.r.arena, declaration.end, c);
+        }
+    }
+
+    fn visit(b: *Builder, node: SyntaxNode, in_enum: bool) Allocator.Error!void {
+        const child_in_enum = if (node.kind() == .container_decl) node.childToken(.keyword_enum) != null and node.childToken(.keyword_union) == null else in_enum;
+        var it = node.children();
+        while (it.next()) |element| switch (element) {
+            .node => |child| try b.visit(child, child_in_enum),
+            .token => |token| {
+                const semantic = if (token.kind == .identifier) b.names.get(token.offset + @as(u32, @intCast(token.text.len))) else null;
+                if (semantic orelse syntaxClass(token, node, child_in_enum)) |c| try b.emit(token, c);
+            },
+        };
+    }
+
+    fn emit(b: *Builder, token: tree.SyntaxToken, c: Class) Allocator.Error!void {
+        const start = b.position(token.offset);
+        const end = b.position(token.offset + token.text.len);
+        if (end.line != start.line or end.character == start.character) return;
+        if (b.range) |range| {
+            if (!before(range.start, range.end) or !before(start, range.end) or !before(range.start, end)) return;
+        }
         const delta_line = start.line - b.prev.line;
         const delta_char = if (delta_line == 0) start.character - b.prev.character else start.character;
-        try b.data.appendSlice(b.arena, &.{ delta_line, delta_char, end.character - start.character, @backingInt(token_type), mods });
+        try b.data.appendSlice(b.r.arena, &.{ delta_line, delta_char, end.character - start.character, @backingInt(c.type), c.mods });
         b.prev = start;
     }
 
@@ -88,38 +316,46 @@ const Builder = struct {
     }
 };
 
-const Class = struct { type: TokenType, mods: u32 = 0 };
+fn before(a: types.Position, b: types.Position) bool {
+    return a.line < b.line or (a.line == b.line and a.character < b.character);
+}
 
-fn classify(t: tree.SyntaxToken, parent: SyntaxKind, in_enum: bool, parent_is_const: bool) ?Class {
+fn syntaxClass(token: tree.SyntaxToken, parent: SyntaxNode, in_enum: bool) ?Class {
     const decl = Modifier.declaration;
-    switch (t.kind) {
+    switch (token.kind) {
         .line_comment => return .{ .type = .comment },
         .doc_comment, .container_doc_comment => return .{ .type = .comment, .mods = Modifier.documentation },
         .string_literal, .char_literal, .multiline_string_literal_line => return .{ .type = .string },
         .number_literal => return .{ .type = .number },
         .builtin => return .{ .type = .function, .mods = Modifier.defaultLibrary },
-        .identifier => return switch (parent) {
-            .fn_proto => .{ .type = .function, .mods = decl },
-            .var_decl => .{ .type = .variable, .mods = decl | (if (parent_is_const) Modifier.readonly else 0) },
-            .container_field => .{ .type = if (in_enum) .enumMember else .property, .mods = decl },
-            .param => .{ .type = .parameter, .mods = decl },
-            .payload => .{ .type = .variable, .mods = decl },
-            .field_access, .field_init => .{ .type = .property },
-            .enum_literal, .error_value => .{ .type = .enumMember },
-            .error_set_decl => .{ .type = .enumMember, .mods = decl },
-            .label, .break_label => .{ .type = .label },
-            .name_ref => if (isPrimitiveType(t.text))
-                .{ .type = .type, .mods = Modifier.defaultLibrary }
-            else if (isPrimitiveValue(t.text))
-                .{ .type = .keyword }
-            else
-                null,
-            else => null,
+        .identifier => {
+            if (std.mem.eql(u8, token.text, "_")) return null;
+            return switch (parent.kind()) {
+                .fn_proto => if (parent.childToken(.identifier).?.offset == token.offset) .{ .type = .function, .mods = decl } else null,
+                .var_decl => if (parent.childToken(.identifier).?.offset == token.offset) .{ .type = .variable, .mods = decl | (if (parent.childToken(.keyword_const) != null) Modifier.readonly else 0) } else .{ .type = .variable },
+                .container_field => .{ .type = if (in_enum) .enumMember else .property, .mods = decl },
+                .param => .{ .type = .parameter, .mods = decl | Modifier.readonly },
+                .payload => .{ .type = .variable, .mods = decl | Modifier.readonly },
+                .field_access, .field_init => .{ .type = .property },
+                .enum_literal, .error_value => .{ .type = .enumMember },
+                .error_set_decl => .{ .type = .enumMember, .mods = decl },
+                .label => .{ .type = .label, .mods = decl },
+                .break_label => .{ .type = .label },
+                .name_ref => if (isPrimitiveType(token.text)) .{ .type = .type, .mods = Modifier.defaultLibrary } else if (isPrimitiveValue(token.text)) .{ .type = .keyword, .mods = Modifier.defaultLibrary } else .{ .type = .variable },
+                else => null,
+            };
         },
         else => {
-            const tag = kind_mod.toTokenTag(t.kind) orelse return null;
+            const tag = kind_mod.toTokenTag(token.kind) orelse return null;
             if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) return .{ .type = .keyword };
-            return null;
+            const operators = std.StaticStringMap(void).initComptime(.{
+                .{"="},   .{"+"},   .{"-"},   .{"*"},    .{"/"},  .{"%"},  .{"!"},   .{"~"},   .{"&"},   .{"|"},   .{"^"},
+                .{"=="},  .{"!="},  .{"<"},   .{">"},    .{"<="}, .{">="}, .{"<<"},  .{">>"},  .{"+%"},  .{"-%"},  .{"*%"},
+                .{"+|"},  .{"-|"},  .{"*|"},  .{"<<|"},  .{"++"}, .{"**"}, .{"?"},   .{".*"},  .{".?"},  .{"+="},  .{"-="},
+                .{"*="},  .{"/="},  .{"%="},  .{"&="},   .{"|="}, .{"^="}, .{"<<="}, .{">>="}, .{"+%="}, .{"-%="}, .{"*%="},
+                .{"+|="}, .{"-|="}, .{"*|="}, .{"<<|="},
+            });
+            return if (operators.has(token.text)) .{ .type = .operator } else null;
         },
     }
 }
@@ -129,50 +365,10 @@ fn isPrimitiveValue(name: []const u8) bool {
     return values.has(name);
 }
 
-/// 与 `std.zig.primitives` 一致的原始类型名
 fn isPrimitiveType(name: []const u8) bool {
-    if (std.zig.primitives.isPrimitive(name)) return !isPrimitiveValue(name);
-    return false;
+    return std.zig.primitives.isPrimitive(name) and !isPrimitiveValue(name);
 }
 
-const testing = std.testing;
-const Parse = @import("../syntax/Parse.zig");
-
-test semanticTokens {
-    const text = "/// d\nconst a: u32 = @min(x.y, .z);\nfn f(p: bool) void {}";
-    const parse = try Parse.create(testing.allocator, text);
-    defer parse.destroy();
-    var lines = try offsets.LineIndex.init(testing.allocator, text);
-    defer lines.deinit(testing.allocator);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-
-    const data = try semanticTokens(arena.allocator(), parse.rootNode(), lines, .utf16);
-    // 还原为 (行, 列, 长度, 类型)
-    var line: u32 = 0;
-    var col: u32 = 0;
-    var got: std.ArrayList([4]u32) = .empty;
-    var i: usize = 0;
-    while (i < data.len) : (i += 5) {
-        if (data[i] != 0) col = 0;
-        line += data[i];
-        col += data[i + 1];
-        try got.append(arena.allocator(), .{ line, col, data[i + 2], data[i + 3] });
-    }
-    const T = TokenType;
-    const expected = [_][4]u32{
-        .{ 0, 0, 5, @backingInt(T.comment) }, // /// d
-        .{ 1, 0, 5, @backingInt(T.keyword) }, // const
-        .{ 1, 6, 1, @backingInt(T.variable) }, // a
-        .{ 1, 9, 3, @backingInt(T.type) }, // u32
-        .{ 1, 15, 4, @backingInt(T.function) }, // @min
-        .{ 1, 22, 1, @backingInt(T.property) }, // y
-        .{ 1, 26, 1, @backingInt(T.enumMember) }, // z
-        .{ 2, 0, 2, @backingInt(T.keyword) }, // fn
-        .{ 2, 3, 1, @backingInt(T.function) }, // f
-        .{ 2, 5, 1, @backingInt(T.parameter) }, // p
-        .{ 2, 8, 4, @backingInt(T.type) }, // bool
-        .{ 2, 14, 4, @backingInt(T.type) }, // void
-    };
-    try testing.expectEqualSlices([4]u32, &expected, got.items);
+test {
+    _ = @import("semantic_tokens_test.zig");
 }
