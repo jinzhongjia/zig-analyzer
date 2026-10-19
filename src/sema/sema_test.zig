@@ -403,6 +403,16 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "wide integer shift by more than 255 bits does not panic" {
+    try expectTypes(
+        \\const E = enum(u1000) { a = 5 };
+        \\const v = @intFromEnum(E.a) >> 300;
+    , &.{
+        // 位宽超过 128 的值不折叠
+        .{ "v", "u1000" },
+    });
+}
+
 test "comptime arguments are coerced to their instantiated parameter types" {
     try expectTypes(
         \\const E = enum { a, b };

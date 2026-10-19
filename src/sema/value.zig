@@ -123,6 +123,8 @@ fn shr(ip: *InternPool, ty: Index, x: Wide, y: Wide) ?i128 {
     if (y < 0) return null;
     if (ty == .comptime_int_type) return fit(ip, ty, x >> @intCast(@min(y, 255)), .check);
     const info = intInfo(ip, ty) orelse return null;
+    // 值以 i128 存储，位宽超过 128 的结果无法表示；先返回 null，避免移位量 @intCast 到 u8 溢出
+    if (info.bits > 128) return null;
     if (y >= info.bits) return null;
     return fit(ip, ty, x >> @intCast(y), .check);
 }
@@ -964,6 +966,9 @@ test "integer folding follows the type's width" {
     try testing.expectEqual(@as(?i128, 2), binaryInt(&ip, .angle_bracket_angle_bracket_left, u8_t, 0x81, 1));
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_left, u8_t, 1, 8));
     try testing.expectEqual(@as(?i128, 1 << 100), binaryInt(&ip, .angle_bracket_angle_bracket_left, .comptime_int_type, 1, 100));
+    // 位宽超过 128 的类型不折叠：移位量超过 255 时不能 @intCast 到 u8
+    const u1000_t = try ip.intType(.unsigned, 1000);
+    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_right, u1000_t, 5, 300));
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -4, 2));
     try testing.expectEqual(@as(?i128, null), negate(&ip, i8_t, -128, false));
     try testing.expectEqual(@as(?i128, -128), negate(&ip, i8_t, -128, true));
