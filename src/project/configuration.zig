@@ -62,6 +62,8 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
 
     // 沿 import 表发现全部模块（迭代过程中 module_ids 会增长）
     var modules: std.ArrayList(ProjectModel.Module) = .empty;
+    var package_roots: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer package_roots.deinit(gpa);
     var i: usize = 0;
     while (i < module_ids.count()) : (i += 1) {
         const m = module_ids.keys()[i].get(c);
@@ -71,6 +73,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
             out.* = .{ .name = try a.dupe(u8, name.slice(c)), .module = try internModule(gpa, &module_ids, target) };
         }
         const root = if (m.root_source_file.unwrap()) |lp| lp.get(c) else null;
+        if (root) |lp| if (try ctx.fetchedPackageRoot(lp)) |p| try package_roots.put(gpa, p, {});
         try modules.append(a, .{
             .builtin_args = try builtinArgs(a, c, &m),
             .root_file = if (root) |lp| try ctx.resolve(lp) else null,
@@ -124,11 +127,13 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         if (s.kind == .top_level and std.mem.eql(u8, s.name, "check")) break @as(u32, @intCast(si));
     } else @backingInt(c.default_step);
     const diagnostics_steps = try a.dupe(u32, &.{default_diag});
+    const roots = try a.dupe([]const u8, package_roots.keys());
     // arena 的状态复制进结果之后不能再分配：新增的缓冲区不在复制的状态中，释放时会泄漏
     return .{
         .arena = arena_state.state,
         .build_root = ctx.build_root,
         .local_cache_root = ctx.local_cache_root,
+        .package_roots = roots,
         .std_root = std_root,
         .steps = steps,
         .modules = modules.items,
@@ -252,10 +257,7 @@ const Ctx = struct {
             .source_path => |sp| blk: {
                 const sub = sp.sub_path.slice(c);
                 const package = sp.owner.get(c) orelse break :blk try ctx.join(ctx.build_root, sub);
-                // 依赖包的根路径相对于 maker 的 cwd（即构建根目录）或为绝对路径
-                const root = package.root_path.slice(c);
-                const abs_root = if (std.fs.path.isAbsolute(root)) root else try ctx.join(ctx.build_root, root);
-                break :blk try ctx.join(abs_root, sub);
+                break :blk try ctx.join(try ctx.packageRoot(package), sub);
             },
             .relative => |rel| blk: {
                 const base: []const u8 = switch (rel.flags.base) {
@@ -271,11 +273,42 @@ const Ctx = struct {
         };
     }
 
+    /// 依赖包的根目录（绝对路径）：maker 给出的路径相对于它的 cwd（即构建根目录）或为绝对路径
+    fn packageRoot(ctx: Ctx, package: Configuration.Package) Allocator.Error![]const u8 {
+        return std.fs.path.resolveAlloc(ctx.arena, &.{ ctx.build_root, package.root_path.slice(ctx.c) });
+    }
+
+    /// `lp` 所在的、按哈希获取的依赖包的根目录（绝对路径）；不在这样的包中时为 null
+    fn fetchedPackageRoot(ctx: Ctx, lp: Configuration.LazyPath) Allocator.Error!?[]const u8 {
+        const sp = switch (lp) {
+            .source_path => |sp| sp,
+            else => return null,
+        };
+        const package = sp.owner.get(ctx.c) orelse return null;
+        const root = try ctx.packageRoot(package);
+        return if (isFetched(root, package.hash.slice(ctx.c))) root else null;
+    }
+
     fn join(ctx: Ctx, a: []const u8, b: []const u8) Allocator.Error![]const u8 {
         if (b.len == 0) return a;
         return std.fs.path.resolveAlloc(ctx.arena, &.{ a, b });
     }
 };
+
+/// 根目录为 `root`、哈希为 `hash` 的依赖包是否是获取来的：maker 把获取的包存放在包目录（`--pkg-dir`、`--system`
+/// 或 `<构建根>/zig-pkg`）的 `<哈希>` 子目录中。`--fork` 指定的包使用用户给出的目录
+fn isFetched(root: []const u8, hash: []const u8) bool {
+    return hash.len != 0 and std.mem.eql(u8, std.fs.path.basename(root), hash);
+}
+
+test isFetched {
+    const native = @import("../util/test_path.zig").native;
+    const hash = "zlinter-0.0.1-OjQ08eFlFQAb4BLnwZNNE3R5Dx2TI67EIpAsy2h0ZyoC";
+    try std.testing.expect(isFetched(native("/p/zig-pkg/" ++ hash), hash));
+    try std.testing.expect(isFetched(native("/shared/pkgs/" ++ hash), hash));
+    try std.testing.expect(!isFetched(native("/home/me/zlinter"), hash));
+    try std.testing.expect(!isFetched(native("/p"), ""));
+}
 
 test localCacheRoot {
     const native = @import("../util/test_path.zig").native;

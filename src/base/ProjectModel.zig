@@ -12,6 +12,9 @@ build_root: []const u8,
 /// maker 使用的本地缓存目录（绝对路径）：生成文件多在其中。由 `configuration.convert` 设置，
 /// 默认的空值只供测试中手写的模型使用
 local_cache_root: []const u8 = "",
+/// 模块所在的、按哈希获取的依赖包的根目录（绝对路径，`<包目录>/<哈希>`，包目录默认为 `<构建根>/zig-pkg`）。
+/// 其中是依赖的代码而不是用户的代码；`--fork` 指定的包与按路径的依赖不在其中
+package_roots: []const []const u8 = &.{},
 /// 标准库根文件 `<std_dir>/std.zig`
 std_root: []const u8,
 steps: []const Step,
@@ -197,8 +200,12 @@ pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectMo
         }),
         else => {},
     };
+    var package_roots: std.ArrayList([]const u8) = .empty;
+    try package_roots.appendSlice(a, m.package_roots);
+    for (exports.package_roots) |p| try package_roots.append(a, try a.dupe(u8, p));
     m.modules = modules;
     m.steps = steps.items;
+    m.package_roots = package_roots.items;
 }
 
 /// `step` 传递依赖的所有 compile step（下标），按发现顺序
