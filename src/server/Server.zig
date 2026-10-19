@@ -992,7 +992,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     }
     server.publishFiles(&.{id}, false);
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
-    if (server.isSingleFile(id)) server.compileSingle(id);
+    server.compileSingle(id);
 }
 
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
@@ -1309,7 +1309,7 @@ fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     const open = try server.gpa.dupe(Vfs.FileId, server.open_docs.keys());
     server.docs_mutex.unlock(server.io);
     defer server.gpa.free(open);
-    for (open) |file| if (server.isSingleFile(file)) server.compileSingle(file);
+    for (open) |file| server.compileSingle(file);
     return true;
 }
 
@@ -1479,16 +1479,17 @@ fn startup(server: *Server) Io.Cancelable!void {
     };
     server.docs_mutex.unlock(server.io);
     defer server.gpa.free(open);
-    for (open) |file| if (server.isSingleFile(file)) server.compileSingle(file);
+    for (open) |file| server.compileSingle(file);
 }
 
 // ── 单文件模式 ───────────────────────────────────────────────────────
 
-/// 不在任何带 build.zig 的工作区根目录之下的 .zig 文件
+/// 不属于当前 Zig 标准库、也不在带 build.zig 的工作区根目录下的 .zig 文件。
 fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
     const path = server.vfs.path(file);
     if (!std.mem.endsWith(u8, path, ".zig")) return false;
-    // 关闭构建系统集成时所有文件都按单文件处理
+    if (server.zigEnv()) |env| if (Workspace.isUnder(path, env.std_dir)) return false;
+    // 关闭构建系统集成时，非标准库文件按单文件处理。
     if (!server.buildFlags().build) return true;
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
@@ -1501,6 +1502,7 @@ fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
 /// 在后台用 `zig build-obj -fno-emit-bin` 编译单个文件；编译期间再次请求时，结束后重新编译
 fn compileSingle(server: *Server, file: Vfs.FileId) void {
     if (server.zigEnv() == null) return; // 启动完成后会补编译
+    if (!server.isSingleFile(file)) return;
     if (!server.buildFlags().compiler) return;
     // 编译器读取磁盘：不在磁盘上的文件（尚未保存的新文件、已被删除的文件）不编译，丢弃它上一次的编译结果
     Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch {
@@ -1620,7 +1622,7 @@ fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const 
             };
         }
     }
-    for (list.keys()) |root| if (server.isSingleFile(root)) server.compileSingle(root);
+    for (list.keys()) |root| server.compileSingle(root);
 }
 
 /// 各个根文件最近一次编译中 `file` 的诊断，有多个时按 `compiler.combine` 合并。调用者持有 single_mutex

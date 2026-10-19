@@ -30,6 +30,17 @@ fn expectDiagnostics(map: Diagnostics, file: []const u8, expected: []const []con
     }
 }
 
+fn expectNoErrors(h: *Harness, document_uri: []const u8) !void {
+    for (try h.notifications("textDocument/publishDiagnostics")) |message| {
+        const params = message.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("uri").?.string, document_uri)) continue;
+        for (params.get("diagnostics").?.array.items) |diagnostic| {
+            const severity = diagnostic.object.get("severity") orelse continue;
+            try testing.expect(severity.integer != 1);
+        }
+    }
+}
+
 fn initialize(h: *Harness, root: []const u8, progress: bool) !void {
     return initializeWith(h, root, progress, null);
 }
@@ -380,6 +391,37 @@ test "single-file mode: compile one file without build.zig, with progress" {
     const titles = try progressTitles(&h);
     try testing.expect(titles.len >= 1);
     try testing.expectEqualStrings("Compiling one.zig", titles[0]);
+}
+
+test "standard library documents are not standalone compilation roots during startup or save" {
+    const text =
+        \\pub fn main() void {
+        \\    const x: u32 = "s";
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const std_path = try std.fs.path.join(h.arena.allocator(), &.{ project.env.std_dir, "std.zig" });
+    const std_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std_path, h.arena.allocator(), .limited(2 * 1024 * 1024));
+    try initialize(&h, project.root, true);
+    const std_uri = try open(&h, std_path, std_text);
+    try waitIdle(&h);
+    try expectNoErrors(&h, std_uri);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = std_uri } });
+    _ = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
+    try waitIdle(&h);
+    const diags = try h.diagnostics();
+    try expectNoErrors(&h, std_uri);
+    try expectDiagnostics(diags, "one.zig", &.{"1:19 zig: expected type 'u32'"});
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| {
+        try testing.expect(!std.mem.eql(u8, title, "Compiling std.zig"));
+    }
 }
 
 test "single-file mode: errors in imported files are published on them and cleared after a fix" {
@@ -963,6 +1005,11 @@ test "settings: build.enable can be switched off and on at runtime" {
     // 不启动构建系统
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try testing.expect((try h.diagnostics()).get("main.zig") == null);
+    const std_path = try std.fs.path.join(h.arena.allocator(), &.{ project.env.std_dir, "std.zig" });
+    const std_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std_path, h.arena.allocator(), .limited(2 * 1024 * 1024));
+    const std_uri = try open(&h, std_path, std_text);
+    try waitIdle(&h);
+    try expectNoErrors(&h, std_uri);
 
     // 打开：启动项目并发布编译器诊断
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
@@ -971,6 +1018,7 @@ test "settings: build.enable can be switched off and on at runtime" {
     try waitIdle(&h);
     try testing.expectEqual(1, h.server.workspaces.items.len);
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"3:23 zig: expected type 'u32'"});
+    try expectNoErrors(&h, std_uri);
 
     // 再关闭：项目停止，其诊断被清除
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
@@ -979,6 +1027,7 @@ test "settings: build.enable can be switched off and on at runtime" {
     try waitIdle(&h);
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{});
+    try expectNoErrors(&h, std_uri);
     try shutdown(&h);
 }
 
