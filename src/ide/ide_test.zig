@@ -1201,6 +1201,57 @@ test "goto and hover on error values: the expected error set picks the declarati
     try testing.expectEqualStrings("```zig\nerror.Baz\n```", plain.text);
 }
 
+test "goto and hover on quoted error names" {
+    const text =
+        \\const E = error{
+        \\    /// quoted doc
+        \\    @"Quoted",
+        \\    /// escaped doc
+        \\    @"\x45scaped",
+        \\    /// spaced doc
+        \\    @"a b",
+        \\    Plain,
+        \\};
+        \\fn f() void {
+        \\    _ = .{ error.Escaped, E.Quoted, E.Escaped, E.@"a b", error.@"\x45scaped" };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.of;
+    const cases = [_]struct { []const u8, u32, []const u8 }{
+        // `error.X` 按解码后的名字查找
+        .{ "error.Escaped", "error.".len, "@\"\\x45scaped\"" },
+        .{ "error.@\"\\x45scaped\"", "error.".len, "@\"\\x45scaped\"" },
+        // `E.X` 的 token 原文带引号，区间覆盖 token 自身
+        .{ "E.Quoted", "E.".len, "@\"Quoted\"" },
+        .{ "E.Escaped", "E.".len, "@\"\\x45scaped\"" },
+        .{ "E.@\"a b\"", "E.".len, "@\"a b\"" },
+    };
+    for (cases) |c| {
+        const t = (try definition.definition(&r, file, at(c[0]) + c[1])) orelse {
+            std.debug.print("no target for `{s}`\n", .{c[0]});
+            return error.NoTarget;
+        };
+        const decl_at = at(c[2]);
+        try testing.expectEqual(decl_at, t.start);
+        try testing.expectEqual(decl_at + @as(u32, @intCast(c[2].len)), t.end);
+    }
+    // hover 带上转义名字对应的文档
+    const info = (try hover.hover(&r, file, at("error.Escaped") + @as(u32, "error.".len))).?;
+    try testing.expect(std.mem.endsWith(u8, info.text, "escaped doc"));
+}
+
 test "goto on an error value without an expected error set stops at the first declaration" {
     // 没有期望的错误集时各声明同样符合，结果总是第一个；曾在找到后仍为 import 闭包中的全部文件建索引
     const text =

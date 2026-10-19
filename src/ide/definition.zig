@@ -359,7 +359,7 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
             else => continue,
         };
         const decl = try r.itemNode(it.file, it.item) orelse continue;
-        if (findErrorName(decl, name, 0)) |at| return .{ .file = it.file, .start = at, .end = at + @as(u32, @intCast(name.len)) };
+        if (try findErrorName(r.arena, decl, name, 0)) |at| return .{ .file = it.file, .start = at.start, .end = at.end };
     }
     return null;
 }
@@ -444,13 +444,16 @@ fn findErrorDecl(r: *Resolver, file: FileId, name: []const u8, expected: ?[]cons
     }
 }
 
-/// 节点中 `error{ ... }` 里名为 `name` 的错误的位置
-fn findErrorName(node: ast.SyntaxNode, name: []const u8, depth: u32) ?u32 {
+const ErrorNameRange = struct { start: u32, end: u32 };
+
+/// 节点中 `error{ ... }` 里名为 `name` 的错误的位置；名字按解码后的形式比较，区间为 token 自身
+fn findErrorName(a: std.mem.Allocator, node: ast.SyntaxNode, name: []const u8, depth: u32) resolve.Error!?ErrorNameRange {
     if (depth > 16) return null;
     var it = node.children();
     while (it.next()) |child| switch (child) {
-        .token => |t| if (node.kind() == .error_set_decl and t.kind == .identifier and std.mem.eql(u8, t.text, name)) return t.offset,
-        .node => |n| if (findErrorName(n, name, depth + 1)) |at| return at,
+        .token => |t| if (node.kind() == .error_set_decl and t.kind == .identifier and std.mem.eql(u8, try ast.identNameAlloc(a, t.text), name))
+            return .{ .start = t.offset, .end = t.offset + @as(u32, @intCast(t.text.len)) },
+        .node => |n| if (try findErrorName(a, n, name, depth + 1)) |at| return at,
     };
     return null;
 }

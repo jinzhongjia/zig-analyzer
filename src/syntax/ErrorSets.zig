@@ -66,8 +66,10 @@ fn collect(a: Allocator, set: SyntaxNode) Allocator.Error!Set {
                 try doc.appendSlice(a, std.mem.trimEnd(u8, line, "\r"));
             },
             .identifier => {
+                // 与 FileIndex、HIR 一致：解码 `@"..."` 中的转义
+                const name = try ast.identNameAlloc(a, t.text);
                 try members.append(a, .{
-                    .name = try a.dupe(u8, ast.identName(t.text)),
+                    .name = try a.dupe(u8, name),
                     .start = t.offset,
                     .end = t.offset + @as(u32, @intCast(t.text.len)),
                     .doc = if (doc.items.len != 0) try a.dupe(u8, doc.items) else null,
@@ -123,6 +125,7 @@ test build {
         \\    /// line two
         \\    A,
         \\    @"b c",
+        \\    @"\x45scaped",
         \\};
         \\fn f() error{C}!void {}
         \\
@@ -133,11 +136,16 @@ test build {
     defer sets.deinit(std.testing.allocator);
     try std.testing.expectEqual(2, sets.sets.len);
     const e = sets.sets[0].members;
-    try std.testing.expectEqual(2, e.len);
+    try std.testing.expectEqual(3, e.len);
     try std.testing.expectEqualStrings("A", e[0].name);
     try std.testing.expectEqualStrings("first\nline two", e[0].doc.?);
     try std.testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "A,").?)), e[0].start);
     try std.testing.expectEqualStrings("b c", e[1].name);
     try std.testing.expectEqual(null, e[1].doc);
+    // 转义按解码后的名字保存，区间覆盖 token 本身
+    try std.testing.expectEqualStrings("Escaped", e[2].name);
+    const escaped: u32 = @intCast(std.mem.indexOf(u8, text, "@\"\\x45scaped\"").?);
+    try std.testing.expectEqual(escaped, e[2].start);
+    try std.testing.expectEqual(escaped + "@\"\\x45scaped\"".len, e[2].end);
     try std.testing.expectEqualStrings("C", sets.sets[1].members[0].name);
 }
