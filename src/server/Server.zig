@@ -2673,7 +2673,7 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
 /// 字段的声明与 `.` 之后的访问都可以用它们（如 `std.json.Value` 的 `null`、`bool`）
 fn identifierText(arena: Allocator, name: []const u8, is_field: bool) HandlerError![]const u8 {
     if (std.mem.startsWith(u8, name, "@\"")) {
-        // 整个名字须是一个标识符 token，引号中的转义合法且不为空
+        // 整个名字须是一个标识符 token，引号中的转义合法、不为空且不含 NUL
         var tokenizer: std.zig.Tokenizer = .init(try arena.dupeSentinel(u8, name, 0));
         const token = tokenizer.next();
         if (token.tag != .identifier or token.loc.end != name.len) return error.InvalidIdentifier;
@@ -2681,10 +2681,10 @@ fn identifierText(arena: Allocator, name: []const u8, is_field: bool) HandlerErr
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidLiteral => return error.InvalidIdentifier,
         };
-        if (decoded.len == 0) return error.InvalidIdentifier;
+        if (decoded.len == 0 or std.mem.indexOfScalar(u8, decoded, 0) != null) return error.InvalidIdentifier;
         return name;
     }
-    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n\r\\") != null) return error.InvalidIdentifier;
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n\r\\\x00") != null) return error.InvalidIdentifier;
     return std.fmt.allocPrint(arena, "{f}", .{std.zig.fmtIdFlags(name, .{ .allow_primitive = is_field })});
 }
 
@@ -2706,6 +2706,10 @@ test "rename: source text of the new name" {
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\"b\"", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\"", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "", false));
+    // 编译器拒绝含 NUL 的标识符
+    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "a\x00b", false));
+    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\\x00b\"", false));
+    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\\u{0}\"", false));
 }
 
 fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
