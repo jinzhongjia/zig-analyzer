@@ -749,6 +749,7 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
             const y = kb.reified_type;
             if (x.file != y.file or x.owner != y.owner or x.expr != y.expr or x.kind != y.kind or x.layout != y.layout) break :blk false;
             if (x.nonexhaustive != y.nonexhaustive or !eqlNames(x.names, y.names) or !std.mem.eql(i128, x.values, y.values)) break :blk false;
+            if (x.attrs_unknown != y.attrs_unknown or !std.mem.eql(u64, x.field_aligns, y.field_aligns) or !std.mem.eql(bool, x.comptime_fields, y.comptime_fields)) break :blk false;
             const tag: ?bool = if (x.tag == null or y.tag == null) x.tag == null and y.tag == null else eqlTypes(ip, x.tag.?, y.tag.?);
             break :blk all(&.{ tag, eqlTypeLists(ip, x.types, y.types) });
         },
@@ -974,6 +975,34 @@ test "integer folding follows the type's width" {
     try testing.expectEqual(@as(?i128, -128), negate(&ip, i8_t, -128, true));
     try testing.expectEqual(@as(?i128, 0xfe), bitNot(&ip, u8_t, 1));
     try testing.expectEqual(@as(?i128, null), bitNot(&ip, .comptime_int_type, 1));
+}
+
+test "reified types compare field attributes" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    const base: InternPool.Reified = .{
+        .kind = .@"struct",
+        .file = @fromBackingInt(0),
+        .owner = @fromBackingInt(0),
+        .expr = 0,
+        .names = &.{"x"},
+        .types = &.{.u8_type},
+    };
+    const plain = try ip.get(.{ .reified_type = base });
+    var aligned = base;
+    aligned.field_aligns = &.{16};
+    const aligned_t = try ip.get(.{ .reified_type = aligned });
+    var comptime_field = base;
+    comptime_field.comptime_fields = &.{true};
+    const comptime_t = try ip.get(.{ .reified_type = comptime_field });
+    var unknown = base;
+    unknown.attrs_unknown = true;
+    const unknown_t = try ip.get(.{ .reified_type = unknown });
+
+    try testing.expectEqual(@as(?bool, true), eqlTypes(&ip, plain, plain));
+    try testing.expectEqual(@as(?bool, false), eqlTypes(&ip, plain, aligned_t));
+    try testing.expectEqual(@as(?bool, false), eqlTypes(&ip, plain, comptime_t));
+    try testing.expectEqual(@as(?bool, false), eqlTypes(&ip, plain, unknown_t));
 }
 
 test "equality is unknown when identity depends on unknown parts" {
