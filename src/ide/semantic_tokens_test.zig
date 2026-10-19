@@ -910,3 +910,59 @@ test "semantic range boundaries inside a final unicode codepoint preserve the wh
         try check(data, text, enc, &.{.{ .needle = "//😀", .ty = .comment, .len = 2 + width }});
     }
 }
+
+test "semantic generic type alias declarations and member uses retain concrete instance types" {
+    const prefix =
+        \\const EBackend = struct { pub const Format = enum { first }; };
+        \\const SBackend = struct { pub const Format = struct { value: u8 }; };
+        \\fn Wrap(comptime B: type) type {
+        \\    return struct { pub const Alias: type = B.Format; };
+        \\}
+        \\
+    ;
+    for ([_][]const u8{
+        "const E = Wrap(EBackend);\nconst S = Wrap(SBackend);\n",
+        "const S = Wrap(SBackend);\nconst E = Wrap(EBackend);\n",
+    }, [_]T{ .@"enum", .@"struct" }) |calls, declaration_type| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{
+            prefix,                                                            calls,
+            "pub fn main() void { _ = E.Alias; _ = S.Alias; _ = E.Alias; }\n",
+        });
+        const file = (try w.add("/p/main.zig", text)).file;
+        const data = try tokens(&w, file, text, .utf16, null);
+        try check(data, text, .utf16, &.{
+            .{ .needle = "Alias: type", .ty = declaration_type, .mods = M.declaration | M.readonly },
+            .{ .needle = "Alias;", .ty = .@"enum", .mods = M.readonly },
+            .{ .needle = "Alias;", .nth = 1, .ty = .@"struct", .mods = M.readonly },
+            .{ .needle = "Alias;", .nth = 2, .ty = .@"enum", .mods = M.readonly },
+        });
+        _ = try rangeMatchesFull(&w, file, text, .utf16, needleRange(text, "Alias: type", .utf16));
+        _ = try rangeMatchesFull(&w, file, text, .utf16, needleRange(text, "S.Alias;", .utf16));
+    }
+}
+
+test "semantic inferred generic aliases refine declarations without guessing unresolved types" {
+    const text =
+        \\const Backend = struct { pub const Format = enum { first }; };
+        \\fn Wrap(comptime B: type) type { return struct { pub const Alias = B.Format; }; }
+        \\fn Uncalled(comptime B: type) type { return struct { pub const Unknown = B.Missing; }; }
+        \\const X = Wrap(Backend);
+        \\pub fn main() void { _ = X.Alias; }
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const data = try tokens(&w, file, text, .utf16, null);
+    try check(data, text, .utf16, &.{
+        .{ .needle = "Alias =", .ty = .@"enum", .mods = M.declaration | M.readonly },
+        .{ .needle = "Format;", .ty = .@"enum", .mods = M.readonly },
+        .{ .needle = "Alias;", .ty = .@"enum", .mods = M.readonly },
+        .{ .needle = "Unknown =", .ty = .variable, .mods = M.declaration | M.readonly },
+        .{ .needle = "Missing;", .ty = .property },
+    });
+    _ = try rangeMatchesFull(&w, file, text, .utf16, needleRange(text, "Alias =", .utf16));
+}

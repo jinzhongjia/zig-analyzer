@@ -181,6 +181,15 @@ const Builder = struct {
         return c;
     }
 
+    fn itemClassAt(b: *Builder, key: OwnerKey, tv: InternPool.TypedValue) resolve.Error!Class {
+        const c = try b.itemClass(key);
+        // 缓存只保存抽象声明分类；当前位置的具体类型不能写回并污染其他实例。
+        if ((c.type == .variable or c.type == .type) and !seed.wanted(b.r.ctx.db.env.ip, tv)) {
+            return b.valueClass(tv, c.type, c.mods);
+        }
+        return c;
+    }
+
     fn functionType(b: *Builder, key: OwnerKey, container: ItemTree.Container) resolve.Error!TokenType {
         if (container.kind == .file) return .function;
         const ip = b.r.ctx.db.env.ip;
@@ -237,9 +246,7 @@ const Builder = struct {
             .file => .{ .type = .namespace },
             .item => |it| blk: {
                 const key = try b.r.ownerKey(it.file, it.item);
-                const c = try b.itemClass(key);
-                // 实例中的别名可以比抽象声明的类型更精确，但字段仍是字段。
-                break :blk if (c.type == .variable) b.valueClass(tv, c.type, c.mods) else c;
+                break :blk try b.itemClassAt(key, tv);
             },
             .local => |local| blk: {
                 const key = try b.r.ownerKey(local.file, local.item);
@@ -315,6 +322,7 @@ const Builder = struct {
                 });
                 if (b.visible != null) try usage_names[index].put(b.r.arena, binding.name, {});
             }
+            var initializer_value: InternPool.TypedValue = .unknown;
             for (body.exprs, 0..) |expr, i| {
                 const span = body.expr_ranges[i];
                 if (span.end <= span.start) continue;
@@ -339,6 +347,7 @@ const Builder = struct {
                     else => {},
                 }
                 const tv = a.exprType(expr_id);
+                if (body.value == expr_id) initializer_value = tv;
                 const c: Class = switch (expr) {
                     .name_ref => |name| blk: {
                         if (span.end - span.start == 1 and std.mem.eql(u8, name, "_")) continue;
@@ -352,7 +361,7 @@ const Builder = struct {
                     },
                     .field_access => |fa| blk: {
                         if (fa.field == null) continue;
-                        if (a.member(expr_id)) |member| break :blk try b.itemClass(member);
+                        if (a.member(expr_id)) |member| break :blk try b.itemClassAt(member, tv);
                         const lhs = a.exprType(fa.lhs);
                         // 构造的枚举与错误集没有 ItemTree 成员，仍可由左侧类型判定。
                         if (lhs.asType()) |ty| switch (b.r.ctx.db.env.ip.key(ty)) {
@@ -375,7 +384,7 @@ const Builder = struct {
                     },
                     .enum_literal => blk: {
                         if (a.member(expr_id)) |member| {
-                            const c = try b.itemClass(member);
+                            const c = try b.itemClassAt(member, tv);
                             break :blk if (c.type == .property) .{ .type = .enumMember } else c;
                         }
                         break :blk .{ .type = .enumMember };
@@ -387,7 +396,16 @@ const Builder = struct {
             }
             // 裸枚举成员在容错 HIR 中也可能是 name_ref，声明覆盖该语法表达式。
             if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| if (b.visible == null or b.visible_names.contains(name.range().end)) {
-                var c = try b.itemClass(key);
+                var tv = initializer_value;
+                if ((item.kind == .@"const" or item.kind == .@"var") and seed.wanted(a.ip, tv)) if (body.value) |initializer| {
+                    a.seeded = null;
+                    const span = body.range(initializer);
+                    if (span.end > span.start and seed.wanted(a.ip, a.exprType(initializer))) {
+                        a.seeded = try refiner.at(span.end - 1, .{ .expr = initializer });
+                    }
+                    tv = a.exprType(initializer);
+                };
+                var c = try b.itemClassAt(key, tv);
                 c.mods |= Modifier.declaration;
                 try b.names.put(b.r.arena, name.offset + @as(u32, @intCast(name.text.len)), c);
             };
