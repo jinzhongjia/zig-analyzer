@@ -20,6 +20,7 @@ const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const database = @import("../database.zig");
 const ModuleGraph = @import("../names/ModuleGraph.zig");
+const builtins = @import("builtins.zig");
 
 pub const Item = struct {
     label: []const u8,
@@ -46,7 +47,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
     // 以下几种上下文在语法树中多为错误节点（如单独的 `@`、未闭合的字符串），直接按源码文本识别
     if (literal == .none) if (builtinStart(text, offset)) |start| {
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
-        for (std.zig.BuiltinFn.list.keys()) |name| try out.add(.{ .label = name, .kind = .builtin, .replace = range });
+        for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
         return out.items.items;
     };
     if (importString(text, offset)) |start| {
@@ -317,9 +318,10 @@ fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum {
         .line_comment, .doc_comment, .container_doc_comment => .comment,
         // 光标在闭合的引号之后时已在字面量之外
         .string_literal, .char_literal => if (offset < t.offset + t.text.len) .string else .none,
+        .identifier => if (std.mem.startsWith(u8, t.text, "@\"") and offset < t.offset + t.text.len) .string else .none,
         .multiline_string_literal_line => .string,
         // 未闭合的字符串
-        .invalid => if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'')) .string else .none,
+        .invalid => if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'' or std.mem.startsWith(u8, t.text, "@\""))) .string else .none,
         else => .none,
     };
 }

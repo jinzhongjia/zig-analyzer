@@ -2544,3 +2544,151 @@ test "hover and definition combine alternate callsites with reflected loop itera
         }
     }
 }
+
+test "builtin hover combines official documentation and inferred values" {
+    const cases = [_]struct { text: []const u8, signature: []const u8, value: ?[]const u8 }{
+        .{ .text = "const n = @si<|>zeOf(u32);", .signature = "@sizeOf(comptime T: type) comptime_int", .value = "comptime_int = 4" },
+        .{ .text = "const n = @a<|>s(u32, 1);", .signature = "@as(comptime T: type, expression) T", .value = "u32 = 1" },
+        .{ .text = "@si<|>zeOf", .signature = "@sizeOf(comptime T: type) comptime_int", .value = null },
+        .{ .text = "const n = @si<|>zeOf(", .signature = "@sizeOf(comptime T: type) comptime_int", .value = null },
+    };
+    for (cases) |case| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", case.text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const info = try hover.hover(&r, added.file, added.cursor) orelse return error.NoHover;
+        try testing.expect(std.mem.indexOf(u8, info.text, case.signature) != null);
+        try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/0.17.0/") != null);
+        if (case.value) |value| try testing.expect(std.mem.indexOf(u8, info.text, value) != null);
+        if (std.mem.indexOf(u8, case.signature, "@sizeOf") != null)
+            try testing.expect(std.mem.indexOf(u8, info.text, "number of bytes") != null);
+    }
+}
+
+test "builtin completion exposes official details and undocumented source notes" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "const n = @si<|>zeOf;");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var size_found = false;
+    var gap_found = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.label, "@sizeOf")) {
+            size_found = true;
+            try testing.expectEqualStrings("@sizeOf(comptime T: type) comptime_int", item.detail.?);
+            try testing.expect(std.mem.indexOf(u8, item.doc.?, "number of bytes") != null);
+            try testing.expectEqual(added.cursor - 3, item.replace.?.start);
+            try testing.expectEqual(added.cursor + 4, item.replace.?.end);
+        }
+        if (std.mem.eql(u8, item.label, "@Frame")) {
+            gap_found = true;
+            try testing.expect(item.detail == null);
+            try testing.expect(std.mem.indexOf(u8, item.doc.?, "0.17.0") != null);
+        }
+    }
+    try testing.expect(size_found and gap_found);
+}
+
+test "builtin signature help selects syntax nesting and argument boundaries" {
+    const decls =
+        \\fn ordinary(a: u32, b: u32) u32 { return a + b; }
+        \\const S = struct { fn method(self: S, x: u32) u32 { _ = self; return x; } };
+        \\
+    ;
+    const cases = [_]struct { text: []const u8, label: []const u8, active: u32, count: usize }{
+        .{ .text = "const n = @as(<|>", .label = "@as(comptime T: type, expression) T", .active = 0, .count = 2 },
+        .{ .text = "const n = @as(u32, <|>", .label = "@as(comptime T: type, expression) T", .active = 1, .count = 2 },
+        .{ .text = "const n = @as(u32, // trailing, comment\n <|>", .label = "@as(comptime T: type, expression) T", .active = 1, .count = 2 },
+        .{ .text = "const n = @as(u32, 1, <|>);", .label = "@as(comptime T: type, expression) T", .active = 1, .count = 2 },
+        .{ .text = "const n = ordinary(@as(u32, <|>1), 2);", .label = "@as(comptime T: type, expression) T", .active = 1, .count = 2 },
+        .{ .text = "const n = ordinary(@as(u32, 1), <|>2);", .label = "fn ordinary(a: u32, b: u32) u32", .active = 1, .count = 2 },
+        .{ .text = "const n = @as(u32, ordinary(1, <|>2));", .label = "fn ordinary(a: u32, b: u32) u32", .active = 1, .count = 2 },
+        .{ .text = "const n = @as(u32, ordinary(1, 2)<|>);", .label = "@as(comptime T: type, expression) T", .active = 1, .count = 2 },
+        .{ .text = "const n = @TypeOf(.{ 1, 2 }, \"a,b\", <|>3);", .label = "@TypeOf(...) type", .active = 0, .count = 1 },
+        .{ .text = "const n = @as(u32, // a,b\n <|>1);", .label = "@as(comptime T: type, expression) T", .active = 1, .count = 2 },
+        .{ .text = "const n = @This(<|>);", .label = "@This() type", .active = 0, .count = 0 },
+        .{ .text = "fn run(s: S) void { _ = s.method(<|>1); }", .label = "fn method(self: S, x: u32) u32", .active = 1, .count = 2 },
+        .{ .text = "fn @\"@as\"(x: u32) u32 { return x; }\nconst n = @\"@as\"(<|>1);", .label = "fn @\"@as\"(x: u32) u32", .active = 0, .count = 1 },
+    };
+    for (cases) |case| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ decls, case.text }));
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const sig = try signature_help.signatureHelp(&r, added.file, added.cursor) orelse return error.NoSignature;
+        try testing.expectEqualStrings(case.label, sig.label);
+        try testing.expectEqual(case.active, sig.active);
+        try testing.expectEqual(case.count, sig.params.len);
+        for (sig.params) |param| try testing.expect(std.mem.indexOf(u8, sig.label, param) != null);
+    }
+}
+
+test "builtin metadata excludes strings comments unknown names and escaped identifiers" {
+    const cases = [_][]const u8{
+        "const n = @mad<|>eup(1);",
+        "const n = \"@si<|>zeOf(u32)\";",
+        "// @si<|>zeOf(u32)\nconst n = 1;",
+        "const @\"@si<|>zeOf\" = 1;",
+        "const @\"@si<|>zeOf = 1;",
+    };
+    for (cases, 0..) |text, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        if (try hover.hover(&r, added.file, added.cursor)) |info|
+            try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/") == null);
+        try testing.expect((try signature_help.signatureHelp(&r, added.file, added.cursor)) == null);
+        if (i != 0) for (try completion.complete(&r, added.file, added.cursor)) |item|
+            try testing.expect(item.kind != .builtin);
+    }
+    for ([_][]const u8{ "const n = @Frame(<|>);", "const n = @madeup(<|>);" }) |text| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        try testing.expect((try signature_help.signatureHelp(&r, added.file, added.cursor)) == null);
+    }
+}
+
+test "builtin hover source gaps and argument names remain distinct" {
+    const cases = [_]struct { text: []const u8, gap: bool }{
+        .{ .text = "const n = @Fra<|>me();", .gap = true },
+        .{ .text = "const T = u32;\nconst n = @sizeOf(T<|>);", .gap = false },
+        .{ .text = "fn @\"@as\"(x: u32) u32 { return x; }\nconst n = @\"@a<|>s\"(1);", .gap = false },
+    };
+    for (cases) |case| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", case.text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const info = try hover.hover(&r, added.file, added.cursor) orelse return error.NoHover;
+        if (case.gap) {
+            try testing.expect(std.mem.indexOf(u8, info.text, "0.17.0") != null);
+            try testing.expect(std.mem.indexOf(u8, info.text, "@Frame(") == null);
+        } else {
+            try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/") == null);
+            try testing.expect(std.mem.indexOf(u8, info.text, "Inferred result:") == null);
+        }
+    }
+}

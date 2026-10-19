@@ -13,6 +13,7 @@ const TypedValue = @import("../sema/InternPool.zig").TypedValue;
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const seed = @import("../ide_db/seed.zig");
+const builtins = @import("builtins.zig");
 
 pub const Info = struct {
     /// markdown
@@ -24,6 +25,21 @@ pub const Info = struct {
 pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
     const tok = try definition.tokenAt(r, file, offset) orelse return null;
     if (tok.kind == .string_literal) return null;
+    if (tok.kind == .builtin) {
+        const entry = builtins.get(tok.text) orelse return null;
+        var out: std.Io.Writer.Allocating = .init(r.arena);
+        const w = &out.writer;
+        if (entry.signature) |signature| w.print("```zig\n{s}\n```\n\n", .{signature}) catch return error.OutOfMemory;
+        w.writeAll(entry.documentation) catch return error.OutOfMemory;
+        if (try semanticHover(r, file, offset, tok)) |inferred| {
+            w.print("\n\nInferred result:\n\n{s}", .{inferred.text}) catch return error.OutOfMemory;
+        }
+        return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
+    }
+    return semanticHover(r, file, offset, tok);
+}
+
+fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) resolve.Error!?Info {
     const a = try context.at(r, file, tok.offset, false) orelse return null;
     const b = a.body;
 

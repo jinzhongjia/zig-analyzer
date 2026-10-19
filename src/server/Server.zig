@@ -2652,10 +2652,10 @@ fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.
     info[0] = .{
         .label = sig.label,
         .parameters = ps,
-        .activeParameter = sig.active,
+        .activeParameter = if (ps.len == 0) null else sig.active,
         .documentation = if (sig.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
     };
-    return .{ .signatures = info, .activeSignature = 0, .activeParameter = sig.active };
+    return .{ .signatures = info, .activeSignature = 0, .activeParameter = if (ps.len == 0) null else sig.active };
 }
 
 fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.InlayHintParams) HandlerError!types.ResultType("textDocument/inlayHint") {
