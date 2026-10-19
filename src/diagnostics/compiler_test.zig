@@ -36,6 +36,7 @@ fn addError(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: [
 const Disk = struct {
     fn read(_: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
         if (std.mem.endsWith(u8, path, "main.zig")) return gpa.dupe(u8, main_text) catch null;
+        if (std.mem.endsWith(u8, path, "caller.zig")) return gpa.dupe(u8, caller_text) catch null;
         return null;
     }
 };
@@ -120,6 +121,76 @@ test "merge: live diagnostics plus remapped Sema errors with unsaved edits" {
     const msgs2 = try mergeMessages(arena.allocator(), touched, true, result);
     try testing.expectEqual(1, msgs2.len);
     try testing.expectEqualStrings("zig ast-check@1:8: unused local variable", msgs2[0]);
+}
+
+test "merge: non-adjacent edits only hide their own lines" {
+    const text =
+        \\fn a() void {
+        \\    const x: u32 = "s";
+        \\    const y: u32 = 1;
+        \\    const z: u32 = "t";
+        \\}
+        \\
+    ;
+    const first: u32 = @intCast(std.mem.indexOf(u8, text, "\"s\"").?);
+    const second: u32 = @intCast(std.mem.indexOf(u8, text, "\"t\"").?);
+    const result: compiler.FileResult = .{ .base_text = text, .items = &.{
+        .{ .start = first, .end = first + 3, .message = "first", .is_astgen = false, .notes = &.{} },
+        .{ .start = second, .end = second + 3, .message = "second", .is_astgen = false, .notes = &.{} },
+    } };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 顶部与底部各插入一行：中间两处未修改的错误都应保留
+    const edited = try std.mem.concat(a, u8, &.{ "// top\n", text, "// bottom\n" });
+    const msgs = try mergeMessages(a, edited, false, &result);
+    try testing.expectEqual(2, msgs.len);
+    try testing.expectEqualStrings("zig@2:19: first", msgs[0]);
+    try testing.expectEqualStrings("zig@4:19: second", msgs[1]);
+}
+
+test "merge: notes in another file are remapped by that file's edits" {
+    const main = "fn f() void {\n    g();\n}\n";
+    const other_base = "fn g() void {\n    bad();\n}\n";
+    const other_current = "// top\n" ++ other_base;
+    const main_start: u32 = @intCast(std.mem.indexOf(u8, main, "g();").?);
+    const note_start: u32 = @intCast(std.mem.indexOf(u8, other_base, "bad").?);
+    const result: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = main_start,
+        .end = main_start + 3,
+        .message = "error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note_start, .end = note_start + 3, .message = "note" }},
+    }} };
+    const Ctx = struct {
+        base: []const u8,
+        current: []const u8,
+        fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
+            _ = arena;
+            const self: *@This() = @ptrCast(@alignCast(opaque_ctx));
+            if (!std.mem.endsWith(u8, path, "other.zig")) return null;
+            return .{ .uri = "file:///proj/src/other.zig", .text = self.current, .base_text = self.base };
+        }
+    };
+    var ctx: Ctx = .{ .base = other_base, .current = other_current };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diags = try compiler.merge(a, .{
+        .text = main,
+        .lines = try offsets.LineIndex.init(a, main),
+        .encoding = .utf16,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = Ctx.get,
+        .other_ctx = &ctx,
+    });
+    try testing.expectEqual(1, diags.len);
+    const related = diags[0].relatedInformation.?[0];
+    // 附注文件顶部插入一行：附注整体下移一行
+    try testing.expectEqual(2, related.location.range.start.line);
+    try testing.expectEqual(4, related.location.range.start.character);
 }
 
 test "merge: malformed compiler spans do not overflow when remapped" {
@@ -210,6 +281,10 @@ test "collect: reference trace and compile log output are kept" {
     var dummy: u8 = 0;
     var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
     defer r.deinit(gpa);
+
+    // 附注指向的文件没有错误也保留构建时文本
+    try testing.expectEqualStrings(caller_text, r.texts.get(native("/proj/src/caller.zig")).?);
+    try testing.expectEqualStrings(main_text, r.texts.get(native("/proj/src/main.zig")).?);
 
     const items = r.files.get(native("/proj/src/main.zig")).?.items;
     try testing.expectEqual(3, items.len);

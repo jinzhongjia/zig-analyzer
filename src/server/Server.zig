@@ -2134,6 +2134,10 @@ fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![
 const OtherFiles = struct {
     server: *Server,
     ctx: *Db.Ctx,
+    /// 构建结果所在的工作区；调用者持有其 `mutex`
+    workspace: ?*Workspace = null,
+    /// 单文件模式；调用者持有 `single_mutex`
+    single: bool = false,
 
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
         const self: *OtherFiles = @ptrCast(@alignCast(opaque_ctx));
@@ -2141,7 +2145,18 @@ const OtherFiles = struct {
         const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
         const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
         const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
-        return .{ .uri = u, .text = text };
+        const base_text: ?[]const u8 = if (file) |f| self.buildText(f) else null;
+        return .{ .uri = u, .text = text, .base_text = base_text };
+    }
+
+    /// 最近一次构建中该文件的文本（诊断区间以它为准）；没有构建结果时为 null
+    fn buildText(self: *OtherFiles, file: Vfs.FileId) ?[]const u8 {
+        const path = self.server.vfs.path(file);
+        if (self.workspace) |w| if (w.result) |*r| return r.texts.get(path);
+        if (self.single) for (self.server.single.values()) |*sf| {
+            if (sf.result) |*r| if (r.texts.get(path)) |text| return text;
+        };
+        return null;
     }
 };
 
@@ -2161,6 +2176,7 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     var other: OtherFiles = .{ .server = server, .ctx = ctx };
     var diags: []const types.Diagnostic = &.{};
     if (ws) |w| {
+        other.workspace = w;
         w.mutex.lockUncancelable(server.io);
         defer w.mutex.unlock(server.io);
         const fr = w.result_files.get(file);
@@ -2179,6 +2195,7 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
         // 单文件模式：各个根文件的编译中本文件的诊断（被 import 的文件中的错误由 import 它的根文件报告）。
         // 不再按单文件处理的文件（所在根目录新建了 build.zig，而项目没有启动）不使用此前的结果
         const single = server.isSingleFile(file);
+        other.single = single;
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
         const fr = if (single) try server.singleFileResult(arena, file) else null;

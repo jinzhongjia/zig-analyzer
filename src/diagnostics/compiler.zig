@@ -40,6 +40,8 @@ pub const BuildResult = struct {
     arena: std.heap.ArenaAllocator.State,
     /// 绝对路径 → 结果
     files: std.StringArrayHashMapUnmanaged(FileResult),
+    /// 构建时读取的文本：`files` 中各文件，以及附注指向但没有错误的文件（按路径查找）
+    texts: std.StringArrayHashMapUnmanaged([]const u8),
 
     pub fn deinit(r: *BuildResult, gpa: Allocator) void {
         var arena = r.arena.promote(gpa);
@@ -122,8 +124,19 @@ pub fn collect(
     }
 
     var files: std.StringArrayHashMapUnmanaged(FileResult) = .empty;
+    // 附注指向的文件自身没有错误时不在 `files` 中；同样保存构建时的文本，用于平移附注
+    var texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    for (lists.values()) |items| for (items.items) |item| for (item.notes) |n| {
+        if (texts.contains(n.path)) continue;
+        const text = read(read_ctx, a, n.path) orelse continue;
+        try texts.put(a, n.path, text);
+    };
     for (lists.keys(), lists.values()) |path, *items| {
-        const text = if (read(read_ctx, a, path)) |t| t else "";
+        const text = texts.get(path) orelse blk: {
+            const t = read(read_ctx, a, path) orelse "";
+            try texts.put(a, path, t);
+            break :blk t;
+        };
         // 标记 AstGen 错误：在同一份文本上运行 AstGen，按区间与文案匹配
         const mode: live.Mode = if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
         const astgen = try live.check(gpa, text, mode);
@@ -135,7 +148,7 @@ pub fn collect(
         }
         try files.put(a, path, .{ .base_text = text, .items = items.items });
     }
-    return .{ .arena = arena_state.state, .files = files };
+    return .{ .arena = arena_state.state, .files = files, .texts = texts };
 }
 
 /// 把源位置 `src_loc` 之后的引用链转换为附注，文案与 `zig build` 的输出一致。有位置的引用指向引用处；
@@ -193,12 +206,12 @@ pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.E
     const base = results[0].base_text;
     var items: std.ArrayList(Item) = .empty;
     for (results) |r| {
-        const edit: ?Edit = if (std.mem.eql(u8, r.base_text, base)) null else diffRegion(r.base_text, base);
+        const edits: []const Edit = if (std.mem.eql(u8, r.base_text, base)) &.{} else try diffEdits(arena, r.base_text, base);
         next: for (r.items) |item| {
             var moved = item;
-            if (edit) |e| {
+            if (edits.len != 0) {
                 if (item.is_astgen) continue;
-                const span = remap(e, item.start, item.end) orelse continue;
+                const span = remap(edits, item.start, item.end) orelse continue;
                 moved.start = span[0];
                 moved.end = span[1];
             }
@@ -231,7 +244,7 @@ pub const MergeInput = struct {
     other_ctx: *anyopaque,
 };
 
-pub const OtherFile = struct { uri: []const u8, text: []const u8 };
+pub const OtherFile = struct { uri: []const u8, text: []const u8, base_text: ?[]const u8 = null };
 
 /// 返回其他文件的 URI 与文本（用于附注位置）；文件不可读时返回 null
 pub const OtherFileFn = *const fn (ctx: *anyopaque, arena: Allocator, path: []const u8) ?OtherFile;
@@ -250,10 +263,10 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
     }
     if (in.compiler) |c| {
         // 有未保存修改：编译器的非 AstGen 错误按文本差异平移，落在修改区域内的隐藏
-        const edit = diffRegion(c.base_text, in.text);
+        const edits = try diffEdits(arena, c.base_text, in.text);
         for (c.items) |item| {
             if (item.is_astgen) continue;
-            const span = remap(edit, item.start, item.end) orelse continue;
+            const span = remap(edits, item.start, item.end) orelse continue;
             try out.append(arena, try compilerDiagnostic(arena, in, item, span[0], span[1]));
         }
     }
@@ -263,26 +276,127 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
 /// 新旧文本的差异区间：旧文本 [start, old_end) 被替换为新文本 [start, new_end)
 const Edit = struct { start: u32, old_end: u32, new_end: u32 };
 
-fn diffRegion(old: []const u8, new: []const u8) Edit {
-    const prefix = std.mem.indexOfDiff(u8, old, new) orelse @min(old.len, new.len);
-    var suffix: usize = 0;
-    const max = @min(old.len, new.len) - prefix;
-    while (suffix < max and old[old.len - 1 - suffix] == new[new.len - 1 - suffix]) suffix += 1;
-    return .{ .start = @intCast(prefix), .old_end = @intCast(old.len - suffix), .new_end = @intCast(new.len - suffix) };
+const Line = struct { start: u32, end: u32 };
+
+/// 行级锚点：两侧都唯一且内容相同的行
+const Anchor = struct { old: usize, new: usize };
+
+/// 按行比较新旧文本，返回按位置排序、互不相交的替换区间。两侧都唯一的相同行作为锚点，其最长递增子序列
+/// 之间的行整体视为修改区域。行粒度是保守的：修改一行会隐藏该行上的诊断，不会牵连未修改的行
+fn diffEdits(a: Allocator, old: []const u8, new: []const u8) Allocator.Error![]const Edit {
+    if (std.mem.eql(u8, old, new)) return &.{};
+    const old_lines = try splitLines(a, old);
+    const new_lines = try splitLines(a, new);
+    var old_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    for (old_lines) |l| {
+        const gop = try old_counts.getOrPut(a, old[l.start..l.end]);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    }
+    var new_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    for (new_lines) |l| {
+        const gop = try new_counts.getOrPut(a, new[l.start..l.end]);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    }
+    var old_unique: std.StringHashMapUnmanaged(usize) = .empty;
+    for (old_lines, 0..) |l, i| {
+        const line = old[l.start..l.end];
+        if (old_counts.get(line).? == 1) try old_unique.put(a, line, i);
+    }
+    var pairs: std.ArrayList(Anchor) = .empty;
+    for (new_lines, 0..) |l, i| {
+        const line = new[l.start..l.end];
+        if (new_counts.get(line).? != 1) continue;
+        const oi = old_unique.get(line) orelse continue;
+        try pairs.append(a, .{ .old = oi, .new = i });
+    }
+    const anchors = try longestIncreasing(a, pairs.items);
+    var edits: std.ArrayList(Edit) = .empty;
+    var oi: usize = 0;
+    var ni: usize = 0;
+    for (anchors) |an| {
+        try addEdit(a, &edits, old, new, old_lines, new_lines, oi, an.old, ni, an.new);
+        oi = an.old + 1;
+        ni = an.new + 1;
+    }
+    try addEdit(a, &edits, old, new, old_lines, new_lines, oi, old_lines.len, ni, new_lines.len);
+    return edits.items;
 }
 
-/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与修改区域相交返回 null。
-/// 编译器给出的区间不一定合法（终点在起点之前、远超出文本）：平移后超出 u32 的同样返回 null
-fn remap(e: Edit, start: u32, end: u32) ?[2]u32 {
-    if (end <= e.start) return .{ start, end };
-    if (start >= e.old_end) {
-        const delta = @as(i64, e.new_end) - @as(i64, e.old_end);
-        return .{
-            std.math.cast(u32, @as(i64, start) + delta) orelse return null,
-            std.math.cast(u32, @as(i64, end) + delta) orelse return null,
-        };
+fn splitLines(a: Allocator, text: []const u8) Allocator.Error![]const Line {
+    var lines: std.ArrayList(Line) = .empty;
+    var start: usize = 0;
+    while (start < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, start, '\n');
+        const end = if (nl) |i| i + 1 else text.len;
+        try lines.append(a, .{ .start = @intCast(start), .end = @intCast(end) });
+        start = end;
     }
-    return null;
+    return lines.items;
+}
+
+fn lineOffset(lines: []const Line, text: []const u8, i: usize) u32 {
+    return @intCast(if (i < lines.len) lines[i].start else text.len);
+}
+
+fn addEdit(
+    a: Allocator,
+    edits: *std.ArrayList(Edit),
+    old: []const u8,
+    new: []const u8,
+    old_lines: []const Line,
+    new_lines: []const Line,
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+) Allocator.Error!void {
+    const os = lineOffset(old_lines, old, old_start);
+    const oe = lineOffset(old_lines, old, old_end);
+    const ns = lineOffset(new_lines, new, new_start);
+    const ne = lineOffset(new_lines, new, new_end);
+    if (os == oe and ns == ne) return;
+    try edits.append(a, .{ .start = os, .old_end = oe, .new_end = ne });
+}
+
+/// `pairs` 按 `new` 递增；返回 `old` 严格递增的最长子序列
+fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]const Anchor {
+    if (pairs.len == 0) return &.{};
+    const tails = try a.alloc(usize, pairs.len);
+    const prev = try a.alloc(?usize, pairs.len);
+    var len: usize = 0;
+    for (pairs, 0..) |p, i| {
+        var lo: usize = 0;
+        var hi: usize = len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (pairs[tails[mid]].old < p.old) lo = mid + 1 else hi = mid;
+        }
+        prev[i] = if (lo > 0) tails[lo - 1] else null;
+        tails[lo] = i;
+        if (lo == len) len += 1;
+    }
+    const out = try a.alloc(Anchor, len);
+    var k: ?usize = if (len > 0) tails[len - 1] else null;
+    var i: usize = len;
+    while (k) |x| : (k = prev[x]) {
+        i -= 1;
+        out[i] = pairs[x];
+    }
+    return out;
+}
+
+/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与任一修改区域相交返回 null。
+/// 编译器给出的区间不一定合法（终点在起点之前、远超出文本）：平移后超出 u32 的同样返回 null
+fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
+    var delta: i64 = 0;
+    for (edits) |e| {
+        if (end <= e.start) break;
+        if (start < e.old_end) return null;
+        delta += @as(i64, e.new_end) - @as(i64, e.old_end);
+    }
+    const shifted_start = std.math.cast(u32, @as(i64, start) + delta) orelse return null;
+    const shifted_end = std.math.cast(u32, @as(i64, end) + delta) orelse return null;
+    return .{ shifted_start, shifted_end };
 }
 
 // 文案复制到 `arena`：live 结果属于 `AstCheck` 的 memo，编译结果属于工作区（新的构建结果到达时释放），
@@ -307,8 +421,17 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
     for (item.notes) |n| {
         const other = in.other_file(in.other_ctx, arena, n.path) orelse continue;
         const lines = try offsets.LineIndex.init(arena, other.text);
+        // 附注文件在构建后也有未保存修改：按该文件自己的差异平移
+        var note_start = n.start;
+        var note_end = n.end;
+        if (other.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {
+            const edits = try diffEdits(arena, base, other.text);
+            const span = remap(edits, n.start, n.end) orelse continue;
+            note_start = span[0];
+            note_end = span[1];
+        };
         try related.append(arena, .{
-            .location = .{ .uri = other.uri, .range = lines.range(n.start, n.end, in.encoding) },
+            .location = .{ .uri = other.uri, .range = lines.range(note_start, note_end, in.encoding) },
             .message = try arena.dupe(u8, n.message),
         });
     }
