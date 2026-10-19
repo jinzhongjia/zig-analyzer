@@ -61,6 +61,31 @@ test "ItemSummary mentions long escaped names" {
     try testing.expect(summaries.items[0].mayMention(name));
 }
 
+test "ParseFile bytes include the incremental chain" {
+    const Parse = @import("Parse.zig");
+    const base = "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n";
+    const old = try Parse.create(testing.allocator, base);
+    defer old.destroy();
+    // 末尾编辑走顶层局部重解析：新结果持有旧结果
+    const inc = try Parse.reparse(testing.allocator, old, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// endx\n");
+    defer inc.destroy();
+    try testing.expect(inc.base != null);
+    try testing.expect(inc.chain_bytes > inc.arena.queryCapacity());
+    try testing.expectEqual(@sizeOf(Parse) + inc.chain_bytes, q.ParseFile.bytes(inc));
+}
+
+test "FileAstIdMap bytes include the retained parse" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    try setText(&db, file, "const a = 1;\nfn f() void { _ = a; }\n");
+    var ctx = db.beginRead(testing.allocator);
+    defer ctx.end();
+    _ = try ctx.get(q.ParseFile, file);
+    const map = try ctx.get(q.FileAstIdMap, file);
+    try testing.expect(q.FileAstIdMap.bytes(map) > map.bytes());
+}
+
 test "body-only edit: reparse and rebuild ItemTree, downstream not recomputed" {
     var db: Db = .init(testing.io, testing.allocator, {});
     defer db.deinit();

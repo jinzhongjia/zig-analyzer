@@ -48,16 +48,19 @@ pub const SourceText = struct {
 /// 文件的语法树。文本变化后总是视为已变化（不做 cutoff），由 ItemTree 截断变化的传播。
 /// 解析结果占内存最多（约为源码的十几倍）：只保留最近使用的若干个，其余淘汰后按需重新解析
 pub const parse_lru = 64;
+/// 解析结果的字节上限：单个大文件即可超过个数上限对应的内存
+pub const parse_lru_bytes = 128 * 1024 * 1024;
 
 pub const ParseFile = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *Parse;
     pub const lru = parse_lru;
+    pub const lru_bytes = parse_lru_bytes;
 
-    /// 增量解析的结果共享未变的节点，同一文件的新旧结果会重复计入
+    /// 增量解析的结果复用上一棵树的节点并持有其引用：计入整条链的 arena
     pub fn bytes(v: Value) usize {
-        return @sizeOf(Parse) + v.arena.queryCapacity() + v.source.len;
+        return @sizeOf(Parse) + v.chain_bytes;
     }
 
     /// 有上一次的结果时尝试局部重解析（结果与全量解析相同，见 `Parse.reparse`）
@@ -269,15 +272,18 @@ pub const FileAstIdMap = struct {
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree.AstIdMap;
     pub const lru = parse_lru;
-
-    pub fn bytes(v: Value) usize {
-        return v.bytes();
-    }
+    pub const lru_bytes = parse_lru_bytes;
 
     const Owned = struct {
         map: ItemTree.AstIdMap,
         parse: *Parse,
     };
+
+    /// 哈希表与它 retain 的解析结果（`ParseFile` 被淘汰后仍可能由这里持有）
+    pub fn bytes(v: Value) usize {
+        const owned: *const Owned = @fieldParentPtr("map", v);
+        return owned.map.bytes() + owned.parse.chain_bytes;
+    }
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const parse = try ctx.get(ParseFile, file);
