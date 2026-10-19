@@ -12,6 +12,7 @@ const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const seed = database.ide_db.seed;
 
 const src =
     \\/// 平面上的点
@@ -2369,5 +2370,177 @@ test "goto declaration of members that exist only in other target branches" {
             std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..@min(text.len, t.start + 24)] });
             return err;
         };
+    }
+}
+
+fn seedFor(w: *World, file: FileId, name: []const u8) !?seed.Seed {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, name)) break @intCast(i);
+    } else return error.NoItem;
+    const chosen = try seed.find(&r, file, item);
+    _ = try ctx.get(seed.Instances, .{ .owner = try r.ownerKey(file, item), .depth = seed.max_depth });
+    _ = try seed.allInstances(&r, file, item);
+    return chosen;
+}
+
+test "recursive chosen and negative seeds survive prefix edits without executing search" {
+    const text =
+        \\fn leaf(x: anytype) @TypeOf(x) { return x; }
+        \\fn mid(x: anytype) @TypeOf(x) {
+        \\    const Wrap = struct { value: @TypeOf(x) };
+        \\    const wrapper: Wrap = .{ .value = x };
+        \\    return leaf(wrapper.value);
+        \\}
+        \\fn absent(x: anytype) void { _ = x; }
+        \\fn cold(x: anytype) void { absent(x); }
+        \\fn run() void { _ = mid(@as(u16, 1)); }
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const chosen = (try seedFor(&w, file, "leaf")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "leaf(wrapper.value)").?)), chosen.offset);
+    try testing.expectEqual(null, try seedFor(&w, file, "absent"));
+    const counters = .{
+        w.db.executions(seed.Query),
+        w.db.executions(seed.Instances),
+        w.db.executions(seed.Candidates),
+        w.db.executions(@import("../ide_db/search.zig").ProjectImporters),
+    };
+    try testing.expect(counters[0] >= 4);
+    for ([_][]const u8{ "// prefix\n" ++ text, text, "// another prefix\n" ++ text, text }) |updated| {
+        _ = try w.add("/p/main.zig", updated);
+        const current = (try seedFor(&w, file, "leaf")).?;
+        try testing.expectEqual(chosen.inst, current.inst);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, updated, "leaf(wrapper.value)").?)), current.offset);
+        try testing.expectEqual(null, try seedFor(&w, file, "absent"));
+        try testing.expectEqual(counters[0], w.db.executions(seed.Query));
+        try testing.expectEqual(counters[1], w.db.executions(seed.Instances));
+        try testing.expectEqual(counters[2], w.db.executions(seed.Candidates));
+        try testing.expectEqual(counters[3], w.db.executions(@import("../ide_db/search.zig").ProjectImporters));
+    }
+}
+
+test "seed selection invalidates for arguments caller bodies signatures aliases and new candidates" {
+    const decls =
+        \\fn leaf(x: anytype) @TypeOf(x) { return x; }
+        \\fn absent(x: anytype) void { _ = x; }
+        \\fn mid(x: anytype) @TypeOf(x) { return leaf(x); }
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", decls ++ "fn run() void { _ = mid(@as(u16, 1)); }\n")).file;
+    const initial = (try seedFor(&w, file, "leaf")).?.inst;
+    try testing.expectEqual(null, try seedFor(&w, file, "absent"));
+    const before = w.db.executions(seed.Query);
+    _ = try w.add("/p/main.zig", decls ++ "fn run() void { _ = mid(@as(u32, 1)); }\n");
+    try testing.expect(initial != (try seedFor(&w, file, "leaf")).?.inst);
+    try testing.expect(w.db.executions(seed.Query) > before);
+    _ = try w.add("/p/main.zig", decls ++
+        "const alias = absent;\nfn run() void { _ = mid(@as(u32, 1)); alias(@as(u8, 0)); }\n");
+    try testing.expect((try seedFor(&w, file, "absent")) != null);
+    _ = try w.add("/p/main.zig", decls ++
+        "const alias = leaf;\nfn run() void { _ = alias(@as(u64, 1)); }\n");
+    try testing.expectEqual(null, try seedFor(&w, file, "absent"));
+    const redirected = (try seedFor(&w, file, "leaf")).?.inst;
+    try testing.expect(redirected != initial);
+    _ = try w.add("/p/main.zig", decls);
+    try testing.expectEqual(null, try seedFor(&w, file, "leaf"));
+    const changed_body = try std.mem.replaceOwned(u8, w.arena.allocator(), decls, "return leaf(x);", "return leaf(@as(u64, 0));");
+    _ = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ changed_body, "fn run() void { _ = mid(@as(u8, 1)); }\n" }));
+    try testing.expectEqual(redirected, (try seedFor(&w, file, "leaf")).?.inst);
+    _ = try w.add("/p/main.zig", "fn leaf(x: u8) u8 { return x; }\nfn run() void { _ = leaf(1); }\n");
+    try testing.expectEqual(null, try seedFor(&w, file, "leaf"));
+}
+
+test "seed importer candidates invalidate for import and project module edits" {
+    const lib_text = "pub fn leaf(x: anytype) @TypeOf(x) { return x; }\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = (try w.add("/p/lib.zig", lib_text)).file;
+    const other = (try w.add("/p/other.zig", lib_text)).file;
+    const main = (try w.add("/p/main.zig", "const dep = @import(\"dep\");\nfn run() void { _ = dep.leaf(@as(u8, 1)); }\n")).file;
+    const files = [_]database.ModuleGraph.FileEntry{
+        .{ .file = main, .module = 0, .root_module = 0 },
+        .{ .file = lib, .module = 1, .root_module = 0 },
+        .{ .file = other, .module = 2, .root_module = 0 },
+    };
+    try w.setGraph(null, &.{
+        .{ .root = main, .imports = &.{.{ .name = "dep", .module = 1 }} },
+        .{ .root = lib, .imports = &.{} },
+        .{ .root = other, .imports = &.{} },
+    }, &files);
+    try testing.expect((try seedFor(&w, lib, "leaf")) != null);
+    try testing.expectEqual(null, try seedFor(&w, other, "leaf"));
+    try w.setGraph(null, &.{
+        .{ .root = main, .imports = &.{.{ .name = "dep", .module = 2 }} },
+        .{ .root = lib, .imports = &.{} },
+        .{ .root = other, .imports = &.{} },
+    }, &files);
+    try testing.expectEqual(null, try seedFor(&w, lib, "leaf"));
+    try testing.expect((try seedFor(&w, other, "leaf")) != null);
+    _ = try w.add("/p/main.zig", "const dep = @import(\"lib.zig\");\nfn run() void { _ = dep.leaf(@as(u16, 1)); }\n");
+    try testing.expect((try seedFor(&w, lib, "leaf")) != null);
+    try testing.expectEqual(null, try seedFor(&w, other, "leaf"));
+}
+
+test "hover and definition combine alternate callsites with reflected loop iterations" {
+    const declarations =
+        \\const List = struct { pub fn deinit(_: *@This()) void {} };
+        \\const Args = struct { count: usize = 0, items: List = .{} };
+        \\const Empty = struct { count: usize = 0, opt: ?u8 = null };
+        \\
+    ;
+    const body =
+        \\    const info = @typeInfo(@TypeOf(arguments.*)).@"struct";
+        \\    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        \\        switch (@typeInfo(field_type)) {
+        \\            .@"struct" => @field(arguments, field_name).deinit(),
+        \\            else => {},
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    const empty_call = "    var empty: Empty = .{}; cleanup(&empty);\n";
+    const args_call = "    var args: Args = .{}; cleanup(&args);\n";
+    const cases = [_][]const u8{
+        declarations ++ "fn cleanup(arguments: anytype) void {\n" ++ body ++ "pub fn main() void {\n" ++ empty_call ++ args_call ++ "}\n",
+        declarations ++ "fn cleanup(arguments: anytype) void {\n" ++ body ++ "pub fn main() void {\n" ++ args_call ++ empty_call ++ "}\n",
+        declarations ++ "fn cleanup(arguments: anytype) void {\n" ++ body ++ "pub fn main() void {\n" ++ args_call ++ "}\n",
+        declarations ++ "fn cleanup(arguments: *Args) void {\n" ++ body ++ "pub fn main() void {\n" ++ args_call ++ "}\n",
+    };
+    for (cases) |text| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const file = (try w.add("/p/main.zig", text)).file;
+        try useRealStd(&w);
+        for ([_][]const u8{ text, try std.mem.concat(w.arena.allocator(), u8, &.{ "// shifted\n", text }), text }) |updated| {
+            _ = try w.add("/p/main.zig", updated);
+            var ctx = w.db.beginRead(w.arena.allocator());
+            defer ctx.end();
+            var r = resolver(&w, &ctx);
+            const at: u32 = @intCast(std.mem.indexOf(u8, updated, ".deinit()").? + 1);
+            const info = try hover.hover(&r, file, at) orelse return error.NoHover;
+            try testing.expect(std.mem.indexOf(u8, info.text, "pub fn deinit(_: *@This()) void") != null);
+            const loop_at = std.mem.indexOf(u8, updated, "inline for").?;
+            const loop_line = std.mem.count(u8, updated[0..loop_at], "\n") + 1;
+            const origin = try std.fmt.allocPrint(w.arena.allocator(), "inferred from iteration 2 of the loop at main.zig:{d}", .{loop_line});
+            try testing.expect(std.mem.indexOf(u8, info.text, origin) != null);
+            const target = try definition.definition(&r, file, at) orelse return error.NoDefinition;
+            try testing.expectEqual(file, target.file);
+            try testing.expectEqualStrings("deinit", updated[target.start..target.end]);
+            try testing.expectEqual(std.mem.indexOf(u8, updated, "deinit(_:").?, target.start);
+        }
     }
 }

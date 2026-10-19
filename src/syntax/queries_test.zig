@@ -15,7 +15,17 @@ const ItemCount = struct {
     }
 };
 
-const Db = engine.Engine(void, &.{ FileText, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, q.ItemSummaries, ItemCount });
+const SemanticCount = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = usize;
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        return (try ctx.get(q.ItemNames, file)).len + (try ctx.get(q.ContainerRels, file)).len;
+    }
+};
+
+const Db = engine.Engine(void, &.{ FileText, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, q.ItemSummaries, q.ItemNames, q.ContainerRels, ItemCount, SemanticCount });
 
 fn setText(db: *Db, file: Vfs.FileId, text: []const u8) !void {
     db.beginWrite();
@@ -105,4 +115,33 @@ test "ParseFile uses block reparse after edits inside a function body" {
     const full = try @import("Parse.zig").create(testing.allocator, "fn f() void {\n    b(1);\n}\n");
     defer full.destroy();
     try testing.expect(parse.sameAs(full));
+}
+
+test "semantic name and container summaries ignore prefix locations but retain semantic changes" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@as(u32, 0));
+    const text = "fn f() void { const Local = struct { value: u8 }; _ = Local; }\n";
+    const get = struct {
+        fn semantic(db_: *Db, file_: Vfs.FileId) !usize {
+            var ctx = db_.beginRead(testing.allocator);
+            defer ctx.end();
+            return ctx.get(SemanticCount, file_);
+        }
+    }.semantic;
+    try setText(&db, file, text);
+    _ = try get(&db, file);
+    const before = db.executions(SemanticCount);
+    try setText(&db, file, "// prefix\n" ++ text);
+    _ = try get(&db, file);
+    try testing.expectEqual(before, db.executions(SemanticCount));
+    try setText(&db, file, text);
+    _ = try get(&db, file);
+    try testing.expectEqual(before, db.executions(SemanticCount));
+    try setText(&db, file, "fn f() void { const Local = struct { other: u8 }; _ = Local; }\n");
+    _ = try get(&db, file);
+    try testing.expectEqual(before + 1, db.executions(SemanticCount));
+    try setText(&db, file, "fn f() void { const Local =  struct { other: u8 }; _ = Local; }\n");
+    _ = try get(&db, file);
+    try testing.expectEqual(before + 2, db.executions(SemanticCount));
 }

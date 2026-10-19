@@ -89,10 +89,8 @@ pub fn at(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.
 pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.Error!?At {
     var a = try at(r, file, offset, inclusive_end) orelse return null;
     const subject = subjectAt(a.body, a.rel, inclusive_end);
-    a.seeded = try seed.findAt(r, a.file, a.item, a.rel, subject);
-    // 遍历类型列表的循环中：按一次迭代推导
-    const base = if (a.seeded) |s| s.res else a.res;
-    if (try seed.loopAt(r, a.owner, a.body, base, if (a.seeded) |s| s.inst else null, a.node.offset, a.rel, subject)) |s| a.seeded = s;
+    var refiner = try seed.Refiner.init(r, a.file, a.item, a.node.offset, a.body, a.res);
+    a.seeded = try refiner.at(a.rel, subject);
     return a;
 }
 

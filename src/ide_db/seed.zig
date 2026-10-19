@@ -17,7 +17,6 @@ const InternPool = @import("../sema/InternPool.zig");
 const Index = InternPool.Index;
 const TypedValue = InternPool.TypedValue;
 const FileId = @import("../base/Vfs.zig").FileId;
-const ast = @import("../syntax/ast.zig");
 const search = @import("search.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 
@@ -29,7 +28,7 @@ pub const Seed = struct {
     /// 调用表达式的位置；`iteration` 不为 null 时为循环的位置
     file: FileId,
     offset: u32,
-    /// 按遍历类型列表的循环的这次迭代（从 0 开始）推导（见 `loopAt`）
+    /// 按遍历类型列表的循环的这次迭代（从 0 开始）推导
     iteration: ?u32 = null,
 };
 
@@ -39,88 +38,162 @@ pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
     const owner = try r.ownerKey(file, item);
     const found = try r.ctx.get(Query, .{ .owner = owner, .depth = max_depth }) orelse return null;
-    return .{
-        .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
-        .inst = found.inst,
-        .file = found.file,
-        .offset = found.offset,
-    };
+    return present(r, owner, found);
 }
 
 /// 光标处须能求出具体类型的部分：表达式或局部绑定
 pub const Subject = union(enum) { expr: Body.ExprId, binding: Body.BindingId };
 
-/// 同 `find`，但所选实例须使成员中相对位置 `rel` 处的代码会执行（如 `if (has_alpha)` 分支中，第一个调用点的实例
-/// 没有 alpha 时取下一个有的），且 `subject` 在实例下能求出具体的类型（如 `switch (Q.kind)` 中只有部分实例有
-/// 的字段）。第一个调用点满足时与 `find` 相同；否则依次尝试其他调用点的实例：先是缓存的前几个，再是全部实例
-/// （`@hasDecl(Q, "depthFallback")` 这样只有少数实例满足的分支；层数较少，与查找引用共用）。都不满足 `subject`
-/// 时退而只要求代码会执行，按全部调用点重新查找、不缓存
-pub fn findAt(r: *Resolver, file: FileId, item: u32, rel: u32, subject: ?Subject) resolve.Error!?Seed {
-    const first = try find(r, file, item) orelse return null;
-    const owner = try r.ownerKey(file, item);
-    const body = try r.ctx.get(hir.ItemBody, owner);
-    const ip = r.ctx.db.env.ip;
-    if (fits(ip, body, first.res, rel, subject)) return first;
-    const lists = [_]Instances.Key{
-        .{ .owner = owner, .depth = max_depth },
-        .{ .owner = owner, .depth = max_collect_depth, .all = true },
+/// 一次成员分析共享调用点候选与迭代推导；每个位置在调用点和循环迭代的组合中选择。
+pub const Refiner = struct {
+    r: *Resolver,
+    owner: hir.OwnerKey,
+    node_offset: u32,
+    body: *const Body,
+    abstract: Variant,
+    candidates: std.ArrayList(Variant) = .empty,
+    loaded: u8 = 0,
+    stage_ends: [4]usize = @splat(0),
+    loop_regions: ?[]const LoopRegion = null,
+
+    const LoopRegion = struct { expr: Body.ExprId, range: Body.Range };
+
+    const Variant = struct {
+        res: ?*const infer.Result = null,
+        inst: ?Index = null,
+        origin: ?Found = null,
+        presentation: ?Seed = null,
+        loops: std.ArrayList(LoopResults) = .empty,
     };
-    for (lists) |key| for (try r.ctx.get(Instances, key)) |found| {
-        const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst });
-        if (fits(ip, body, res, rel, subject)) return .{ .res = res, .inst = found.inst, .file = found.file, .offset = found.offset };
+    const LoopResults = struct {
+        expr: Body.ExprId,
+        binding: u32,
+        results: []?*const infer.Result,
     };
-    if (!inactiveAt(body, first.res, rel)) return first;
-    const found = try search_(r, owner, rel, max_depth, true) orelse return first;
-    return .{
-        .res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = found.inst }),
-        .inst = found.inst,
-        .file = found.file,
-        .offset = found.offset,
-    };
-}
+
+    pub fn init(r: *Resolver, file: FileId, item: u32, node_offset: u32, body: *const Body, res: *const infer.Result) resolve.Error!Refiner {
+        return .{ .r = r, .owner = try r.ownerKey(file, item), .node_offset = node_offset, .body = body, .abstract = .{ .res = res } };
+    }
+
+    pub fn at(f: *Refiner, rel: u32, subject: ?Subject) resolve.Error!?Seed {
+        if (!f.r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
+        if (subject != null and fits(f.r.ctx.db.env.ip, f.body, f.abstract.res.?, rel, subject)) return null;
+        var fallback: ?Seed = null;
+        if (try f.tryVariant(&f.abstract, rel, subject, &fallback)) |s| return s;
+        var checked: usize = 0;
+        // 每个位置独立经过相同层级；之前的位置预热了更深的候选也不改变选择顺序。
+        for (0..4) |stage| {
+            if (stage == 3 and (fallback != null or f.stage_ends[2] == 0)) return fallback;
+            if (f.loaded <= stage) {
+                switch (stage) {
+                    0 => if (try f.r.ctx.get(Query, .{ .owner = f.owner, .depth = max_depth })) |found| try f.add(found),
+                    1 => for (try f.r.ctx.get(Instances, .{ .owner = f.owner, .depth = max_depth })) |found| try f.add(found),
+                    2 => for (try f.r.ctx.get(Instances, .{ .owner = f.owner, .depth = max_collect_depth, .all = true })) |found| try f.add(found),
+                    // 深层活动分支的有界回退同样在成员内共享，不按位置递归搜索项目。
+                    3 => for (try f.r.ctx.get(Instances, .{ .owner = f.owner, .depth = max_depth, .all = true })) |found| try f.add(found),
+                    else => unreachable,
+                }
+                f.stage_ends[stage] = f.candidates.items.len;
+                f.loaded += 1;
+            }
+            while (checked < f.stage_ends[stage]) : (checked += 1) {
+                if (try f.tryVariant(&f.candidates.items[checked], rel, subject, &fallback)) |s| return s;
+            }
+        }
+        return fallback;
+    }
+
+    fn add(f: *Refiner, found: Found) resolve.Error!void {
+        for (f.candidates.items) |candidate| if (candidate.inst == found.inst) return;
+        try f.candidates.append(f.r.arena, .{
+            .inst = found.inst,
+            .origin = found,
+        });
+    }
+
+    fn presented(f: *Refiner, candidate: *Variant) resolve.Error!?Seed {
+        if (candidate.presentation) |cached| return cached;
+        const origin = candidate.origin orelse return null;
+        candidate.presentation = try present(f.r, f.owner, origin);
+        return candidate.presentation;
+    }
+
+    fn regions(f: *Refiner) resolve.Error![]const LoopRegion {
+        if (f.loop_regions) |cached| return cached;
+        var out: std.ArrayList(LoopRegion) = .empty;
+        for (f.body.exprs, 0..) |expr, ei| {
+            const loop = switch (expr) {
+                .loop => |l| l,
+                else => continue,
+            };
+            if (loop.kind != .@"for") continue;
+            try out.append(f.r.arena, .{
+                .expr = @fromBackingInt(@as(u32, @intCast(ei))),
+                .range = f.body.range(loop.body),
+            });
+        }
+        f.loop_regions = out.items;
+        return out.items;
+    }
+
+    fn tryVariant(f: *Refiner, candidate: *Variant, rel: u32, subject: ?Subject, fallback: *?Seed) resolve.Error!?Seed {
+        const ip = f.r.ctx.db.env.ip;
+        const res = candidate.res orelse blk: {
+            const inferred = try f.r.ctx.get(queries.Infer, .{ .owner = f.owner, .mode = .full, .inst = candidate.inst });
+            candidate.res = inferred;
+            break :blk inferred;
+        };
+        if (fits(ip, f.body, res, rel, subject) and candidate.origin != null) return f.presented(candidate);
+        // 只选择包含此位置的最内层异构循环；同一循环的其他捕获由 Infer 一并细化。
+        var best: ?LoopResults = null;
+        var best_len: u32 = std.math.maxInt(u32);
+        for (try f.regions()) |region| {
+            const range = region.range;
+            if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
+            const id = region.expr;
+            const loop = f.body.expr(id).loop;
+            const cached = for (candidate.loops.items) |entry| {
+                if (entry.expr == id) break entry;
+            } else blk: {
+                const entry: LoopResults = for (loop.capture, 0..) |capture, k| {
+                    const n = try iterations(f.r, res, loop, k) orelse continue;
+                    const results = try f.r.arena.alloc(?*const infer.Result, n);
+                    @memset(results, null);
+                    break .{ .expr = id, .binding = @backingInt(capture), .results = results };
+                } else .{ .expr = id, .binding = 0, .results = &.{} };
+                try candidate.loops.append(f.r.arena, entry);
+                break :blk entry;
+            };
+            if (cached.results.len == 0) continue;
+            best = cached;
+            best_len = range.end - range.start;
+        }
+        if (best) |loop| for (loop.results, 0..) |*result, idx| {
+            if (result.* == null) result.* = try f.r.ctx.get(queries.Infer, .{
+                .owner = f.owner,
+                .mode = .full,
+                .inst = candidate.inst,
+                .loop = .{ .binding = loop.binding, .index = @intCast(idx) },
+            });
+            const s: Seed = .{
+                .res = result.*.?,
+                .inst = candidate.inst,
+                .file = f.owner.file,
+                .offset = f.node_offset + f.body.range(loop.expr).start,
+                .iteration = @intCast(idx),
+            };
+            if (fits(ip, f.body, s.res, rel, subject)) return s;
+            if (fallback.* == null and !inactiveAt(f.body, s.res, rel)) fallback.* = s;
+        };
+        if (fallback.* == null and !inactiveAt(f.body, res, rel)) {
+            fallback.* = try f.presented(candidate);
+        }
+        return null;
+    }
+};
 
 /// 循环按迭代推导时尝试的迭代次数上限
 const max_iterations = 64;
-
-/// 位置 `rel` 位于每次迭代的循环变量类型不同的循环（见 `iterations`）中、`subject` 在 `res` 中求不出类型时，按
-/// 一次迭代推导的结果。`res` 是成员在实例 `inst` 下的推导结果，取第一个使 `rel` 处的代码会执行、`subject` 能求出
-/// 类型的迭代；都不满足 `subject` 时取第一个使代码会执行的
-pub fn loopAt(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, node_offset: u32, rel: u32, subject: ?Subject) resolve.Error!?Seed {
-    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
-    const ip = r.ctx.db.env.ip;
-    if (subject != null and fits(ip, body, res, rel, subject)) return null;
-    // 最内层的这类循环（其中嵌套的普通循环，如遍历运行时切片的 `for`，不算）
-    var best: ?struct { loop: Body.Loop, expr: u32, len: u32 } = null;
-    for (body.exprs, 0..) |e, ei| {
-        const l = switch (e) {
-            .loop => |l| l,
-            else => continue,
-        };
-        if (l.kind != .@"for") continue;
-        const rg = body.range(l.body);
-        if (rel < rg.start or rel > rg.end) continue;
-        if (best) |b| if (rg.end - rg.start >= b.len) continue;
-        const varying = for (0..l.capture.len) |k| {
-            if (try iterations(r, res, l, k) != null) break true;
-        } else false;
-        if (!varying) continue;
-        best = .{ .loop = l, .expr = @intCast(ei), .len = rg.end - rg.start };
-    }
-    const b = best orelse return null;
-    const offset = node_offset + body.range(@fromBackingInt(b.expr)).start;
-    for (b.loop.capture, 0..) |cap, k| {
-        const n = try iterations(r, res, b.loop, k) orelse continue;
-        var first: ?Seed = null;
-        for (0..n) |idx| {
-            const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = @intCast(idx) } });
-            const s: Seed = .{ .res = res_i, .inst = inst, .file = owner.file, .offset = offset, .iteration = @intCast(idx) };
-            if (fits(ip, body, res_i, rel, subject)) return s;
-            if (first == null and !inactiveAt(body, res_i, rel)) first = s;
-        }
-        if (first) |s| return s;
-    }
-    return null;
-}
 
 /// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数（至多 `max_iterations`）：遍历 comptime 已知的类型列表
 /// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），或遍历各项类型不同的元组（`inline for
@@ -145,7 +218,7 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
 
 /// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）内提到 `names` 的调用：实参求不出
 /// 具体的实例；按各次迭代推导（实例 `inst` 下的结果为 `res`）再找。`all` 不为 null 时收集
-fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector, strict: bool) resolve.Error!?Found {
+fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs) |e| {
         const l = switch (e) {
@@ -157,7 +230,7 @@ fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const 
             const n = try iterations(r, res, l, k) orelse continue;
             for (0..n) |idx| {
                 const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(cap), .index = @intCast(idx) } });
-                if (try callIn(r, in, i, body, res_i, file, item, root_key, active, all, strict)) |found| return found;
+                if (try callIn(r, in, i, body, res_i, file, item, root_key, all, strict)) |found| return found;
                 if (all) |c| if (c.full()) return null;
             }
         }
@@ -213,8 +286,24 @@ fn withinInactive(body: *const Body, res: *const infer.Result, e: Body.ExprId) b
     return false;
 }
 
-/// 成员所用的调用点：实例与调用表达式的位置
-pub const Found = struct { inst: ?Index, file: FileId, offset: u32 };
+/// 调用点只保留稳定的成员和表达式身份；当前位置在向 IDE 返回结果时求出。
+pub const Found = struct { inst: ?Index, owner: hir.OwnerKey, expr: Body.ExprId };
+
+fn present(r: *Resolver, target: hir.OwnerKey, found: Found) resolve.Error!?Seed {
+    const tree = try r.itemTree(found.owner.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == found.owner.item) break @intCast(i);
+    } else return null;
+    const offset = try r.itemOffset(found.owner.file, item) orelse return null;
+    const body = try r.ctx.get(hir.ItemBody, found.owner);
+    if (@backingInt(found.expr) >= body.exprs.len) return null;
+    return .{
+        .res = try r.ctx.get(queries.Infer, .{ .owner = target, .mode = .full, .inst = found.inst }),
+        .inst = found.inst,
+        .file = found.owner.file,
+        .offset = offset + body.range(found.expr).start,
+    };
+}
 
 /// 经由泛型调用者传递的最大层数：z2d 的 `toRGBA` 由泛型的 `hue` 调用，`hue` 又由泛型的 `run` 分派；
 /// websocket.zig 的 `_handleClientData` 经 `handleClientData`、`NonBlockingBase` 的方法、`NonBlocking` 的字段、
@@ -239,7 +328,7 @@ pub const Query = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return try search_(&r, key.owner, null, key.depth, true) orelse search_(&r, key.owner, null, key.depth, false);
+        return try search_(&r, key.owner, key.depth, true) orelse search_(&r, key.owner, key.depth, false);
     }
 
     pub fn cycleFallback(_: Key) Value {
@@ -326,8 +415,9 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.
         if (it.ast_id == key.item) break @intCast(i);
     } else return;
     const root = try genericRoot(r, key.file, item) orelse return;
-    const files = try search.importers(r, key.file, try search.projectFiles(r));
-    const names = try callNames(r, key.file, root, files);
+    const candidates = try r.ctx.get(Candidates, try r.ownerKey(key.file, root));
+    const files = candidates.files;
+    const names = candidates.names;
     try collectIn(r, key.file, key.file, item, root, names, depth, out);
     for (files) |f| {
         if (out.full()) return;
@@ -335,8 +425,8 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.
         try collectIn(r, f, key.file, item, root, names, depth, out);
     }
     // 类型流的层数不受收集层数限制：它只进入实参含有目标容器的实例，不会成倍增长
-    _ = try typeFlow(r, key.file, item, root, files, null, max_depth, out, out.strict);
-    if (out.found.items.len == 0) if (try dispatched(r, key.file, item, root, null)) |found| try out.add(r.arena, found);
+    _ = try typeFlow(r, key.file, item, root, files, max_depth, out, out.strict);
+    if (out.found.items.len == 0) if (try dispatched(r, key.file, item, root)) |found| try out.add(r.arena, found);
 }
 
 /// 同 `findIn`，收集全部实例
@@ -351,42 +441,42 @@ fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, out, out.strict);
-        _ = try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, null, out, out.strict);
+        _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, out, out.strict);
+        _ = try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, out, out.strict);
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1, .all = out.all })) |o| {
             if (out.full()) return;
             const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = o.inst });
-            _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, out, out.strict);
-            _ = try loopCall(r, in, @intCast(i), owner, body, seeded, o.inst, names, file, item, root_key, null, out, out.strict);
+            _ = try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, out, out.strict);
+            _ = try loopCall(r, in, @intCast(i), owner, body, seeded, o.inst, names, file, item, root_key, out, out.strict);
         }
     }
 }
 
-/// 成员 `key` 的第一个能求出具体实例的调用点；`active` 不为 null 时还要求成员中该相对位置的代码在实例下是活动的。
-/// `strict` 见 `callIn`
-fn search_(r: *Resolver, key: hir.OwnerKey, active: ?u32, depth: u8, strict: bool) resolve.Error!?Found {
+/// 成员 `key` 的第一个能求出具体实例的调用点。`strict` 见 `callIn`。
+fn search_(r: *Resolver, key: hir.OwnerKey, depth: u8, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == key.item) break @intCast(i);
     } else return null;
     const root = try genericRoot(r, key.file, item) orelse return null;
-    const files = try search.importers(r, key.file, try search.projectFiles(r));
-    const names = try callNames(r, key.file, root, files);
-    if (try findIn(r, key.file, key.file, item, root, names, active, depth, strict)) |s| return s;
+    const candidates = try r.ctx.get(Candidates, try r.ownerKey(key.file, root));
+    const files = candidates.files;
+    const names = candidates.names;
+    if (try findIn(r, key.file, key.file, item, root, names, depth, strict)) |s| return s;
     for (files) |f| {
         if (f == key.file or !try containsAny(r, f, names)) continue;
-        if (try findIn(r, f, key.file, item, root, names, active, depth, strict)) |s| return s;
+        if (try findIn(r, f, key.file, item, root, names, depth, strict)) |s| return s;
     }
-    if (try typeFlow(r, key.file, item, root, files, active, depth, null, strict)) |s| return s;
-    return dispatched(r, key.file, item, root, active);
+    if (try typeFlow(r, key.file, item, root, files, depth, null, strict)) |s| return s;
+    return dispatched(r, key.file, item, root);
 }
 
 /// 目标所在的容器作为 comptime 类型实参传入泛型函数，再经类型参数调用目标（`ctx.get(hir.ItemBody, k)` →
 /// `get` → … → `execute` 中的 `Q.compute(ctx, key)`）。分派处所在的文件不必 import 目标所在的文件，按导入链
 /// 找不到：从实参中传入这个容器类型的调用出发，逐层进入实参中仍含有它的泛型调用，直到调用目标处。
 /// `all` 不为 null 时收集全部这样找到的实例，返回 null
-fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const FileId, active: ?u32, depth: u8, all: ?*Collector, strict: bool) resolve.Error!?Found {
+fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const FileId, depth: u8, all: ?*Collector, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(file);
     const container = tree.items[root].container;
     const decl_item = tree.containers[container].parent_item orelse return null;
@@ -395,7 +485,7 @@ fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const Fil
     const target = try queries.containerType(r, .{ .file = file, .container = container }, null);
     const root_key = try r.ownerKey(file, root);
     const names = [_][]const u8{name};
-    var flow: Flow = .{ .r = r, .target = target, .file = file, .item = item, .root_key = root_key, .active = active, .all = all, .strict = strict };
+    var flow: Flow = .{ .r = r, .target = target, .file = file, .item = item, .root_key = root_key, .all = all, .strict = strict };
     for (files) |f| {
         if (!try containsAny(r, f, &names)) continue;
         const ft = try r.itemTree(f);
@@ -419,7 +509,6 @@ const Flow = struct {
     file: FileId,
     item: u32,
     root_key: hir.OwnerKey,
-    active: ?u32,
     all: ?*Collector,
     strict: bool,
     visited: std.ArrayList(Index) = .empty,
@@ -457,7 +546,7 @@ const Flow = struct {
             const callee_body = try r.ctx.get(hir.ItemBody, owner);
             const norm = try queries.normalizeInst(r, called.file, ci, called.inst);
             const callee_res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
-            if (try callIn(r, called.file, ci, callee_body, callee_res, fl.file, fl.item, fl.root_key, fl.active, fl.all, fl.strict)) |found| return found;
+            if (try callIn(r, called.file, ci, callee_body, callee_res, fl.file, fl.item, fl.root_key, fl.all, fl.strict)) |found| return found;
             if (try fl.from(callee_body, callee_res, depth - 1)) |found| return found;
         }
         return null;
@@ -473,7 +562,7 @@ const dispatchers = [_]struct { path: []const []const u8, func: []const u8 }{
 
 /// 泛型方法 `root`（成员 `item` 位于其中）在标准库分派处的实例：分派函数中对 anytype 参数调用同名方法，
 /// 接收者为方法所在的容器（不在泛型函数内），其余实参取分派处推导的类型
-fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32, active: ?u32) resolve.Error!?Found {
+fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?Found {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(file);
     const name = tree.items[root].name orelse return null;
@@ -531,17 +620,61 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32, active: ?u32) re
             const inst = try infer.instanceOf(r, r.arena, g, f, args);
             if (!value.isConcrete(ip, inst)) continue;
             const norm = try queries.normalizeInst(r, file, item, inst);
-            if (active) |rel| {
-                const target_owner = try r.ownerKey(file, item);
-                const target = try r.ctx.get(queries.Infer, .{ .owner = target_owner, .mode = .full, .inst = norm });
-                if (inactiveAt(try r.ctx.get(hir.ItemBody, target_owner), target, rel)) continue;
-            }
-            const node = try r.itemNode(it.file, it.item) orelse continue;
-            return .{ .inst = norm, .file = it.file, .offset = node.offset + body.range(@fromBackingInt(@as(u32, @intCast(ei)))).start };
+            return .{ .inst = norm, .owner = owner, .expr = @fromBackingInt(@as(u32, @intCast(ei))) };
         }
     }
     return null;
 }
+
+/// 各层种子查找共享与目标函数有关的导入候选和别名闭包，不缓存任何展示位置。
+pub const Candidates = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = hir.OwnerKey;
+    pub const Value = *const Data;
+
+    pub const Data = struct {
+        arena: std.heap.ArenaAllocator,
+        files: []const FileId,
+        names: []const []const u8,
+    };
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        const data = try ctx.db.gpa.create(Data);
+        errdefer ctx.db.gpa.destroy(data);
+        data.arena = .init(ctx.db.gpa);
+        errdefer data.arena.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const tree = try r.itemTree(key.file);
+        const root: u32 = for (tree.items, 0..) |it, i| {
+            if (it.ast_id == key.item) break @intCast(i);
+        } else {
+            data.files = &.{};
+            data.names = &.{};
+            return data;
+        };
+        const allocator = data.arena.allocator();
+        data.files = try allocator.dupe(FileId, try ctx.get(search.ProjectImporters, key.file));
+        const names = try callNames(&r, key.file, root, data.files);
+        const owned = try allocator.alloc([]const u8, names.len);
+        for (names, owned) |name, *out| out.* = try allocator.dupe(u8, name);
+        data.names = owned;
+        return data;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        if (!std.mem.eql(FileId, a.files, b.files) or a.names.len != b.names.len) return false;
+        for (a.names, b.names) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+        return true;
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        const data = @constCast(v.*);
+        data.arena.deinit();
+        gpa.destroy(data);
+    }
+};
 
 /// 调用泛型函数 `root` 可能使用的名字：函数名，以及 `files` 中指向它的容器级别名
 /// （`const biggest = lib.max;`，含别名的别名）。只检查文件索引中出现这些名字的文件
@@ -595,7 +728,7 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
 
 /// 在文件 `in` 中查找泛型函数 `root`（位于 `file`）的调用点。
 /// 只推导提到 `names`（函数名与别名）的成员：推导整个成员代价较高
-fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, active: ?u32, depth: u8, strict: bool) resolve.Error!?Found {
+fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: []const []const u8, depth: u8, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(in);
     const root_key = try r.ownerKey(file, root);
     for (tree.items, 0..) |_, i| {
@@ -606,26 +739,26 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const body = try r.ctx.get(hir.ItemBody, owner);
         if (!mentionsAny(body, names)) continue;
         const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, active, null, strict)) |s| return s;
-        if (try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, active, null, strict)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, res, file, item, root_key, null, strict)) |s| return s;
+        if (try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, null, strict)) |s| return s;
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
         // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
-        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, active, null, strict)) |s| return s;
-        if (try loopCall(r, in, @intCast(i), owner, body, seeded, outer.inst, names, file, item, root_key, active, null, strict)) |s| return s;
+        if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, strict)) |s| return s;
+        if (try loopCall(r, in, @intCast(i), owner, body, seeded, outer.inst, names, file, item, root_key, null, strict)) |s| return s;
         // 调用者经由自己的 comptime 类型参数调用（`Q.compute(ctx, key)`）：把该参数换成目标所在的容器
         if (try substituted(r, in, @intCast(i), body, outer.inst, file, root)) |inst| {
             const res2 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
-            if (try callIn(r, in, @intCast(i), body, res2, file, item, root_key, active, null, strict)) |s| return s;
+            if (try callIn(r, in, @intCast(i), body, res2, file, item, root_key, null, strict)) |s| return s;
         }
         // 第一个实例下没有有效的调用（如调用位于该实例不执行的 `switch (Q.kind)` 分支中）：依次尝试调用者的其他实例
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1 })) |other| {
             if (other.inst == outer.inst) continue;
             const res3 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = other.inst });
-            if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, active, null, strict)) |s| return s;
-            if (try loopCall(r, in, @intCast(i), owner, body, res3, other.inst, names, file, item, root_key, active, null, strict)) |s| return s;
+            if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, null, strict)) |s| return s;
+            if (try loopCall(r, in, @intCast(i), owner, body, res3, other.inst, names, file, item, root_key, null, strict)) |s| return s;
         }
     }
     return null;
@@ -676,7 +809,7 @@ fn substituted(r: *Resolver, in: FileId, caller: u32, body: *const Body, inst: ?
 /// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。函数作为值与实参元组
 /// 一起传入另一个调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a, b })`）也算作以元组元素调用。
 /// `all` 不为 null 时把全部调用的实例（去重）加入其中，返回 null
-fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, active: ?u32, all: ?*Collector, strict: bool) resolve.Error!?Found {
+fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
         switch (e) {
@@ -686,7 +819,7 @@ fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer
         // `strict` 时调用者在该实例下不编译的代码中的调用（如 `switch (Q.kind)` 的其他分支）不产生实例；
         // 严格查找什么都找不到时（调用都位于项目中任何实例都不编译的分支中）才放宽，以便仍有实例可用
         if (strict and withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
-        const site: Site = .{ .r = r, .in = in, .i = i, .body = body, .res = res, .expr = @intCast(ei), .file = file, .item = item, .root_key = root_key, .active = active, .all = all };
+        const site: Site = .{ .r = r, .in = in, .i = i, .body = body, .res = res, .expr = @intCast(ei), .file = file, .item = item, .root_key = root_key, .all = all };
         switch (e) {
             .call => |c| {
                 // 方法调用：接收者是第一个实参
@@ -715,7 +848,6 @@ const Site = struct {
     file: FileId,
     item: u32,
     root_key: hir.OwnerKey,
-    active: ?u32,
     all: ?*Collector,
 
     /// 实参中的函数值后面紧跟着匿名元组字面量：以元组元素调用该函数
@@ -740,18 +872,13 @@ const Site = struct {
     fn instance(s: Site, callee: TypedValue, receiver: ?TypedValue, args: []const Body.ExprId) resolve.Error!?Found {
         const r = s.r;
         const inst = (try calleeInstance(r, s.res, callee, receiver, args, s.root_key) orelse return null).inst;
-        const node = try r.itemNode(s.in, s.i) orelse return null;
+        const site_owner = try r.ownerKey(s.in, s.i);
         const norm = try queries.normalizeInst(r, s.file, s.item, inst);
         if (s.all) |c| {
-            try c.add(r.arena, .{ .inst = norm, .file = s.in, .offset = node.offset + s.body.range(@fromBackingInt(s.expr)).start });
+            try c.add(r.arena, .{ .inst = norm, .owner = site_owner, .expr = @fromBackingInt(s.expr) });
             return null;
         }
-        if (s.active) |rel| {
-            const owner = try r.ownerKey(s.file, s.item);
-            const target = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = norm });
-            if (inactiveAt(try r.ctx.get(hir.ItemBody, owner), target, rel)) return null;
-        }
-        return .{ .inst = norm, .file = s.in, .offset = node.offset + s.body.range(@fromBackingInt(s.expr)).start };
+        return .{ .inst = norm, .owner = site_owner, .expr = @fromBackingInt(s.expr) };
     }
 };
 

@@ -154,6 +154,28 @@ pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Er
     return out.items;
 }
 
+/// 项目范围的反向导入闭包在各成员的种子查找之间共享；文件索引与模块配置仍是实际依赖。
+pub const ProjectImporters = struct {
+    pub const kind: @import("../db/engine.zig").Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = []const FileId;
+
+    pub fn compute(ctx: *database.Db.Ctx, target: Key) @import("../db/engine.zig").Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        return ctx.db.gpa.dupe(FileId, try importers(&r, target, try projectFiles(&r)));
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(FileId, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
 const Finder = struct {
     r: *Resolver,
     def: Def,

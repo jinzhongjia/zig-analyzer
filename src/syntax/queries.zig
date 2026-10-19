@@ -209,6 +209,60 @@ pub const ItemSummaries = struct {
     }
 };
 
+/// 只保留名字布隆位：文件前缀等位置变化不使语义候选筛选失效。
+pub const ItemNames = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = []const [4]u64;
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        const summaries = try ctx.get(ItemSummaries, file);
+        const names = try ctx.db.gpa.alloc([4]u64, summaries.items.len);
+        for (summaries.items, names) |item, *out| out.* = item.names;
+        return names;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b));
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+/// 容器相对于所属成员的位置：保留词法作用域与容器布局依赖，不依赖文件中的绝对位置。
+pub const ContainerRels = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = []const ?u32;
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        const tree = try ctx.get(FileItemTree, file);
+        const summaries = try ctx.get(ItemSummaries, file);
+        const rels = try ctx.db.gpa.alloc(?u32, tree.containers.len);
+        for (tree.containers, summaries.container_offsets, rels) |container, offset, *out| {
+            const parent = container.parent_item orelse {
+                out.* = null;
+                continue;
+            };
+            out.* = if (offset != null and summaries.items[parent].offset != null)
+                offset.? - summaries.items[parent].offset.?
+            else
+                null;
+        }
+        return rels;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(?u32, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
 /// 值中的节点指向解析结果：持有其一份引用，`ParseFile` 的值被淘汰后仍然有效
 pub const FileAstIdMap = struct {
     pub const kind: engine.Kind = .derived;

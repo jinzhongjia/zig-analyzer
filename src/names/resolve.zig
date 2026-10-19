@@ -78,26 +78,24 @@ pub const Resolver = struct {
     /// 成员 `item` 体内、相对其起始位置 `rel` 处定义的容器
     pub fn containerAt(r: *Resolver, file: FileId, item: u32, rel: u32) Error!?Namespace {
         const tree = try r.itemTree(file);
-        const owner = try r.itemOffset(file, item) orelse return null;
-        const s = try r.ctx.get(syntax.ItemSummaries, file);
-        for (tree.containers, s.container_offsets, 0..) |c, offset, i| {
+        const rels = try r.ctx.get(syntax.ContainerRels, file);
+        for (tree.containers, rels, 0..) |c, offset, i| {
             if (c.parent_item != item) continue;
-            if (offset == owner + rel) return .{ .file = file, .container = @intCast(i) };
+            if (offset == rel) return .{ .file = file, .container = @intCast(i) };
         }
         return null;
     }
 
     /// 体内定义的容器 `ns` 相对于其外层成员起始位置的位置
     pub fn containerRel(r: *Resolver, ns: Namespace) Error!?u32 {
-        const parent = (try r.itemTree(ns.file)).containers[ns.container].parent_item orelse return null;
-        const owner = try r.itemOffset(ns.file, parent) orelse return null;
-        const offset = try r.containerOffset(ns) orelse return null;
-        return offset - owner;
+        const rels = try r.ctx.get(syntax.ContainerRels, ns.file);
+        return if (ns.container < rels.len) rels[ns.container] else null;
     }
 
     /// 成员是否可能提到名字 `name`（有假阳性）：在生成 Body 之前粗筛
     pub fn mayMention(r: *Resolver, file: FileId, item: u32, name: []const u8) Error!bool {
-        return (try r.ctx.get(syntax.ItemSummaries, file)).items[item].mayMention(name);
+        const names = try r.ctx.get(syntax.ItemNames, file);
+        return (syntax.ItemSummary{ .offset = null, .names = names[item] }).mayMention(name);
     }
 
     pub fn containerNode(r: *Resolver, ns: Namespace) Error!?SyntaxNode {

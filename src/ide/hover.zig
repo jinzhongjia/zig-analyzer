@@ -72,10 +72,8 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
     if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) {
         const subject: seed.Subject = if (binding_id) |id| .{ .binding = id } else .{ .expr = expr_id.? };
         const rel = tok.offset - a.node.offset;
-        var chosen = try seed.findAt(r, file, a.item, rel, subject);
-        // 遍历类型列表的循环中：按一次迭代推导
-        if (try seed.loopAt(r, a.owner, b, if (chosen) |c| c.res else a.res, if (chosen) |c| c.inst else null, a.node.offset, rel, subject)) |l| chosen = l;
-        if (chosen) |s| {
+        var refiner = try seed.Refiner.init(r, file, a.item, a.node.offset, b, a.res);
+        if (try refiner.at(rel, subject)) |s| {
             const res = s.res;
             const better: TypedValue = if (binding_id) |id|
                 (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)

@@ -39,6 +39,8 @@ pub const Db = engine.Engine(*const Env, &.{
     syntax.FileItemTree,
     syntax.FileAstIdMap,
     syntax.ItemSummaries,
+    syntax.ItemNames,
+    syntax.ContainerRels,
     live.AstCheck,
     ModuleGraph.Input,
     ModuleGraph.FileImports,
@@ -56,4 +58,6 @@ pub const Db = engine.Engine(*const Env, &.{
     ErrorSets.Query,
     ide_db.seed.Query,
     ide_db.seed.Instances,
+    ide_db.seed.Candidates,
+    @import("ide_db/search.zig").ProjectImporters,
 });
