@@ -280,8 +280,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.* = undefined;
         }
 
-        /// query `Q` 的 key 个数（含值已被淘汰的）
+        /// query `Q` 的 key 个数（含值已被淘汰的）。在事务之外调用：key 的增删由写事务的独占锁保护
         pub fn keyCount(db: *Db, comptime Q: type) usize {
+            db.rw.lockSharedUncancelable(db.io);
+            defer db.rw.unlockShared(db.io);
+            return db.keyCountLocked(Q);
+        }
+
+        /// 同 `keyCount`；调用者已持有读事务或写事务（rw 共享/独占锁）
+        pub fn keyCountLocked(db: *Db, comptime Q: type) usize {
             db.mutex.lockUncancelable(db.io);
             defer db.mutex.unlock(db.io);
             return db.tables[comptime queryIndex(Q)].keys.count();

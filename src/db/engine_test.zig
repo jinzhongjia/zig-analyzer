@@ -348,6 +348,19 @@ fn read(d: *Db, comptime Q: type, key: Q.Key) !Q.Value {
     return ctx.get(Q, key);
 }
 
+test "keyCount outside and inside a transaction agree" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 5, .low);
+    try setNumber(&d, Number, 2, 6, .low);
+    // 事务之外：取共享锁
+    try testing.expectEqual(2, d.keyCount(Number));
+    // 写事务内：调用者已持有独占锁
+    d.beginWrite();
+    defer d.endWrite();
+    try testing.expectEqual(2, d.keyCountLocked(Number));
+}
+
 test "unset input returns default" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

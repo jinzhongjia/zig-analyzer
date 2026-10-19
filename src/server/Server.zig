@@ -2051,6 +2051,13 @@ fn semaKeys(server: *Server) usize {
     return n;
 }
 
+/// 同 `semaKeys`；调用者持有写事务
+fn semaKeysLocked(server: *Server) usize {
+    var n: usize = 0;
+    inline for (sema_queries) |Q| n += server.db.keyCountLocked(Q);
+    return n;
+}
+
 /// 整代回收类型信息：清空 InternPool 中非预置的项，以及 key 或值引用它们的 query（其余 query 中依赖
 /// 它们的 memo 一并丢弃）。InternPool 与这些 query 的 key、依赖边只增不减，长时间会话中随访问过的
 /// 泛型实例持续增长；回收后再请求时按需重新推导
@@ -2058,7 +2065,7 @@ pub fn resetSema(server: *Server) void {
     const before = server.ip.bytes();
     server.db.beginWrite();
     defer server.db.endWrite();
-    const keys = server.semaKeys();
+    const keys = server.semaKeysLocked();
     server.db.resetQueries(&sema_queries);
     server.ip.reset() catch return log.err("out of memory while resetting the intern pool", .{});
     log.info("reclaimed type information ({d} MB in the intern pool, {d} keys)", .{ before / (1024 * 1024), keys });
