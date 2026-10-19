@@ -62,6 +62,20 @@ pub fn build(b: *std.Build) void {
     const lsp_types = gen_lsp_run.addOutputFileArg("types.zig");
     const update_sources = b.addUpdateSourceFiles();
     update_sources.addCopyFileToSource(lsp_types, "src/lsp/types.zig");
+    const gen_builtins = b.addExecutable(.{
+        .name = "gen_builtin_data",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_builtin_data.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const gen_builtins_run = b.addRunArtifact(gen_builtins);
+    gen_builtins_run.addFileArg(b.path("tools/zig/langref.html.in"));
+    gen_builtins_run.addFileArg(b.path("tools/zig/metadata.json"));
+    gen_builtins_run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "std/zig/BuiltinFn.zig"));
+    const builtin_data = gen_builtins_run.addOutputFileArg("builtin_data.zig");
+    update_sources.addCopyFileToSource(builtin_data, "src/ide/builtin_data.zig");
     gen_step.dependOn(&update_sources.step);
 
     // 语料对拍：默认校验当前 Zig 的标准库，可追加目录：zig build corpus -- <目录>...
@@ -131,6 +145,14 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addOptions("build_options", build_options);
     const test_step = b.step("test", "Run all tests");
+    const generator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_builtin_data.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(generator_tests).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         // 保留帧指针：优化模式下泄漏报告的调用栈才完整
         .root_module = test_mod,

@@ -51,7 +51,7 @@ jobs:
       - name: 生成代码与提交一致
         run: |
           zig build gen
-          git diff --exit-code -- src/lsp/types.zig
+          git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig
 
   fuzz:
     name: 覆盖率引导模糊测试
