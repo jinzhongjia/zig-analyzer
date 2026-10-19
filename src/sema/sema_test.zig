@@ -160,6 +160,102 @@ test "optionals, error unions, captures and loops" {
     });
 }
 
+test "pointer captures follow the constness of the captured place" {
+    try expectTypes(
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\fn probe(cs: []const u8, opt: ?u8, u: U, up: *const U, cps: *const [3]u8) void {
+        \\    const arr = [_]u8{ 1, 2, 3 };
+        \\    for (&arr) |*p| {
+        \\        const v_for_const_arr_ptr = p;
+        \\        _ = v_for_const_arr_ptr;
+        \\    }
+        \\    for (cs) |*p| {
+        \\        const v_for_const_slice_ptr = p;
+        \\        _ = v_for_const_slice_ptr;
+        \\    }
+        \\    for (cps) |*p| {
+        \\        const v_for_constptr_arr = p;
+        \\        _ = v_for_constptr_arr;
+        \\    }
+        \\    if (opt) |*p| {
+        \\        const v_if_opt_ptr = p;
+        \\        _ = v_if_opt_ptr;
+        \\    }
+        \\    while (opt) |*p| {
+        \\        const v_while_opt_ptr = p;
+        \\        _ = v_while_opt_ptr;
+        \\        break;
+        \\    }
+        \\    switch (u) {
+        \\        .a => |*p| {
+        \\            const v_switch_union_ptr = p;
+        \\            _ = v_switch_union_ptr;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    switch (up.*) {
+        \\        .a => |*p| {
+        \\            const v_switch_constptr_union_ptr = p;
+        \\            _ = v_switch_constptr_union_ptr;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+        \\fn mutable(opt: ?u8, up: *U, cs: []u8) void {
+        \\    var arr = [_]u8{ 1, 2, 3 };
+        \\    for (&arr) |*p| {
+        \\        const m_for_var_arr_ptr = p;
+        \\        _ = m_for_var_arr_ptr;
+        \\    }
+        \\    for (arr) |*p| {
+        \\        const m_for_arr_value_ptr = p;
+        \\        _ = m_for_arr_value_ptr;
+        \\    }
+        \\    for (cs) |*p| {
+        \\        const m_for_slice_ptr = p;
+        \\        _ = m_for_slice_ptr;
+        \\    }
+        \\    var o = opt;
+        \\    if (o) |*p| {
+        \\        const m_if_opt_ptr = p;
+        \\        _ = m_if_opt_ptr;
+        \\    }
+        \\    var uu: U = .a;
+        \\    switch (uu) {
+        \\        .a => |*p| {
+        \\            const m_switch_union_ptr = p;
+        \\            _ = m_switch_union_ptr;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    switch (up.*) {
+        \\        .a => |*p| {
+        \\            const m_switch_mutptr_union_ptr = p;
+        \\            _ = m_switch_mutptr_union_ptr;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+        \\comptime {
+        \\    _ = .{ &probe, &mutable };
+        \\}
+    , &.{
+        .{ "v_for_const_arr_ptr", "*const u8" },
+        .{ "v_for_const_slice_ptr", "*const u8" },
+        .{ "v_for_constptr_arr", "*const u8" },
+        .{ "v_if_opt_ptr", "*const u8" },
+        .{ "v_while_opt_ptr", "*const u8" },
+        .{ "v_switch_union_ptr", "*const u8" },
+        .{ "v_switch_constptr_union_ptr", "*const u8" },
+        .{ "m_for_var_arr_ptr", "*u8" },
+        .{ "m_for_arr_value_ptr", "*u8" },
+        .{ "m_for_slice_ptr", "*u8" },
+        .{ "m_if_opt_ptr", "*u8" },
+        .{ "m_switch_union_ptr", "*u8" },
+        .{ "m_switch_mutptr_union_ptr", "*u8" },
+    });
+}
+
 test "enums, tagged unions and switch" {
     try expectTypes(
         \\const Color = enum { red, green };

@@ -572,8 +572,8 @@ const Inferrer = struct {
             .block => |blk| return inf.block(blk, expected),
             .@"if" => |x| {
                 const cond = try inf.infer(x.cond, null);
-                try inf.bindCaptures(x.capture, cond, .if_then);
-                try inf.bindCaptures(x.else_capture, cond, .if_else);
+                try inf.bindCaptures(x.capture, x.cond, cond, .if_then);
+                try inf.bindCaptures(x.else_capture, x.cond, cond, .if_else);
                 const taken = inf.condValue(cond);
                 const then = try inf.inferArm(x.then, expected, taken == false);
                 const other: TypedValue = if (x.@"else") |el| try inf.inferArm(el, expected, taken == true) else .{ .ty = .void_type };
@@ -609,7 +609,7 @@ const Inferrer = struct {
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 for (s.prongs, 0..) |prong, i| {
-                    try inf.bindSwitchCapture(prong, operand, chosen != null and chosen.? == i);
+                    try inf.bindSwitchCapture(prong, s.operand, operand, chosen != null and chosen.? == i);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
@@ -1645,8 +1645,8 @@ const Inferrer = struct {
         switch (l.kind) {
             .@"while" => {
                 const cond = try inf.infer(l.inputs[0], null);
-                try inf.bindCaptures(l.capture, cond, .if_then);
-                try inf.bindCaptures(l.else_capture, cond, .if_else);
+                try inf.bindCaptures(l.capture, l.inputs[0], cond, .if_then);
+                try inf.bindCaptures(l.else_capture, l.inputs[0], cond, .if_else);
             },
             .@"for" => {
                 // 按某次迭代推导这个循环（见 `LoopSeed`）：各个循环变量都取这次迭代的值
@@ -1672,11 +1672,12 @@ const Inferrer = struct {
                     if (i < l.capture.len) {
                         const cap = l.capture[i];
                         const ptr = inf.body.binding(cap).is_ptr;
-                        const ty = if (ptr) try ip.ptrTo(elem, .one, false) else elem;
+                        const is_const = if (ptr) try inf.forCaptureConst(input, list.ty) else false;
+                        const ty = if (ptr) try ip.ptrTo(elem, .one, is_const) else elem;
                         inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
                             try inf.typeCapture(cap, list, iteration)
                         else if (iteration) |n|
-                            .{ .ty = try inf.iterationType(list.ty, elem, n, ptr), .val = if (ptr) null else try inf.iterationValue(list, start, n) }
+                            .{ .ty = try inf.iterationType(list.ty, elem, n, ptr, is_const), .val = if (ptr) null else try inf.iterationValue(list, start, n) }
                         else
                             .{ .ty = ty };
                     }
@@ -1702,13 +1703,23 @@ const Inferrer = struct {
         return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }));
     }
 
+    /// `for` 的指针捕获是否为 const：遍历指针（切片、多项指针、指向数组的指针）时取指针本身的
+    /// `is_const`；遍历数组值时取决于被遍历的值是否为 const place
+    fn forCaptureConst(inf: *Inferrer, input: ExprId, list: Index) Error!bool {
+        return switch (inf.ip.key(list)) {
+            .ptr_type => |p| p.is_const,
+            .array_type, .vector_type, .tuple_type => inf.isConstPlace(input),
+            else => false,
+        };
+    }
+
     /// 按第 `n` 次迭代推导时非类型的循环变量的类型：各项类型不同的元组（`.{ &posix, &windows }`）取第 `n` 项的类型
-    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool) Error!Index {
+    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool, is_const: bool) Error!Index {
         var t = elem;
         if (t == .unknown) if (tupleOf(inf.ip, list)) |tt| if (n < tt.types.len) {
             t = tt.types[n];
         };
-        return if (ptr) inf.ip.ptrTo(t, .one, false) else t;
+        return if (ptr) inf.ip.ptrTo(t, .one, is_const) else t;
     }
 
     /// 按第 `n` 次迭代推导时非类型的循环变量的值：范围（`start..`）为 `start + n`，列表为第 `n` 个元素
@@ -1784,7 +1795,7 @@ const Inferrer = struct {
     const CaptureSource = enum { if_then, if_else };
 
     /// if / while 的捕获：optional 取子类型，error union 取载荷（else 分支取错误集）
-    fn bindCaptures(inf: *Inferrer, caps: []const Body.BindingId, cond_tv: TypedValue, source: CaptureSource) Error!void {
+    fn bindCaptures(inf: *Inferrer, caps: []const Body.BindingId, cond_e: ExprId, cond_tv: TypedValue, source: CaptureSource) Error!void {
         if (caps.len == 0) return;
         const ip = inf.ip;
         const cond = cond_tv.ty;
@@ -1797,14 +1808,14 @@ const Inferrer = struct {
         const is_ptr = inf.body.binding(cap).is_ptr;
         // 已知的非 null optional 值即载荷值
         const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) cond_tv.val else null;
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, false) else t, .val = val };
+        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
     }
 
     /// switch 的捕获。带标签的 union：捕获为各分支项对应字段类型的 peer（与编译器一致），`else` 分支与
     /// 求不出的分支项为 unknown；第二个捕获为标签。`chosen`：操作数 comptime 已知，这是执行的分支，捕获取
     /// 实际的载荷值；各项的载荷类型没有 peer 时只能是 `inline` 分支（每项单独实例化，如
     /// `inline .@"struct", .@"union" => |info|`），类型也取实际的载荷类型
-    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, operand_tv: TypedValue, chosen: bool) Error!void {
+    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
         const operand = operand_tv.ty;
@@ -1824,7 +1835,7 @@ const Inferrer = struct {
         };
         const cap = prong.capture[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, false) else t, .val = if (is_ptr) null else val };
+        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(operand_e)) else t, .val = if (is_ptr) null else val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
             inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag };
