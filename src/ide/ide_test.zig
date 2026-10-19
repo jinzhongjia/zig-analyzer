@@ -133,6 +133,41 @@ test "signature help and inlay hints" {
     try testing.expectEqualStrings("x: y: : u32 scale: : u32 a: b: ", out.items);
 }
 
+test "calls through function fields are not method calls" {
+    const text =
+        \\fn add(a: i32, b: i32) i32 { return a + b; }
+        \\const S = struct { g: fn (x: i32, y: i32) i32 };
+        \\const s: S = .{ .g = add };
+        \\fn caller() i32 {
+        \\    return s.g(3, 4);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.of;
+    // 字段中的函数不绑定接收者：第一个实参对应 a
+    const sig = (try signature_help.signatureHelp(&r, file, at("3, 4"))).?;
+    try testing.expectEqualStrings("fn add(a: i32, b: i32) i32", sig.label);
+    try testing.expectEqual(0, sig.active);
+    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{});
+    var out: std.ArrayList(u8) = .empty;
+    for (hints) |h| if (h.kind == .parameter) {
+        try out.appendSlice(w.arena.allocator(), h.label);
+        try out.append(w.arena.allocator(), ' ');
+    };
+    try testing.expectEqualStrings("a: b: ", out.items);
+}
+
 test "signature help and parameter hints through aliases" {
     // 经由别名调用（`const assert = std.debug.assert;`）时不跟随别名：没有签名帮助与参数名提示
     const text =

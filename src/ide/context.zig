@@ -188,8 +188,12 @@ pub fn callee(r: *Resolver, a: At, callee_e: Body.ExprId) resolve.Error!?struct 
         .field_access => |fa| {
             const key = a.member(callee_e) orelse return null;
             const def = try defOfKey(r, key) orelse return null;
-            // 左侧是值（不是类型）时为方法调用
-            return .{ .def = try fnDecl(r, a, callee_e, def), .bound = !a.exprType(fa.lhs).isType() };
+            // 只有成员是函数声明且左侧是值（不是类型）时才是方法调用：函数类型的字段不绑定接收者
+            const method = switch (def) {
+                .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"fn",
+                else => false,
+            };
+            return .{ .def = try fnDecl(r, a, callee_e, def), .bound = method and !a.exprType(fa.lhs).isType() };
         },
         .enum_literal => {
             const key = a.member(callee_e) orelse return null;
