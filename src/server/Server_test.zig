@@ -151,6 +151,37 @@ test "push live diagnostics, clear on close" {
     try testing.expectEqual(0, notes[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
 }
 
+test "close: non-file documents clear diagnostics on the client URI" {
+    const untitled = "untitled:Untitled-1";
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+    ++ untitled ++
+        \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"
+    ++ untitled ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+
+    const notes = try s.notifications();
+    try testing.expectEqual(2, notes.len);
+    for (notes) |n| {
+        const params = n.object.get("params").?.object;
+        try testing.expectEqualStrings(untitled, params.get("uri").?.string);
+    }
+    try testing.expectEqual(1, notes[0].object.get("params").?.object.get("diagnostics").?.array.items.len);
+    // 关闭后对客户端 URI 发送空列表，而不是内部的虚拟路径
+    try testing.expectEqual(0, notes[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
+}
+
 test "syntax features end to end" {
     var s: Session = undefined;
     try s.run(frame(

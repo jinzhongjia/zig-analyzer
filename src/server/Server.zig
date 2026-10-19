@@ -138,6 +138,9 @@ started: bool = false,
 docs_mutex: Io.Mutex = .init,
 /// 已打开的文档：客户端使用的 URI（发布诊断时原样使用）
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
+/// 客户端最近一次使用的 URI：文档关闭后仍用于发布诊断（清除旧诊断、编译器重新发布），
+/// 避免按内部路径重新编码 URI。虚拟文档清除后即删除
+last_uris: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
 /// 当前显示着非空诊断的文件（需要时发布空列表清除）
 published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 /// 诊断计算的序号：每次计算在读取编译结果、文本等状态之前取一个（见 `sendDiagnostics`）
@@ -216,6 +219,8 @@ pub fn deinit(server: *Server) void {
     if (server.default_builtin) |p| server.gpa.free(p);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
+    for (server.last_uris.values()) |u| server.gpa.free(u);
+    server.last_uris.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
     server.progress.deinit(server.gpa);
@@ -906,14 +911,22 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.uri);
+        const last = try server.gpa.dupe(u8, params.textDocument.uri);
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
         const gop = server.open_docs.getOrPut(server.gpa, id) catch |err| {
             server.gpa.free(owned);
+            server.gpa.free(last);
             return err;
         };
         if (gop.found_existing) server.gpa.free(gop.value_ptr.*);
         gop.value_ptr.* = owned;
+        const lgop = server.last_uris.getOrPut(server.gpa, id) catch |err| {
+            server.gpa.free(last);
+            return err;
+        };
+        if (lgop.found_existing) server.gpa.free(lgop.value_ptr.*);
+        lgop.value_ptr.* = last;
     }
     try server.setFileText(id, params.textDocument.text);
     server.publishFiles(&.{id}, false);
@@ -1982,6 +1995,13 @@ pub fn resetSema(server: *Server) void {
 fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
+    // 虚拟文档没有磁盘文件：关闭并清除诊断之后不再为内部路径发布
+    if (isVirtual(server.vfs.path(file))) {
+        server.docs_mutex.lockUncancelable(server.io);
+        const wanted = server.open_docs.contains(file) or server.last_uris.contains(file);
+        server.docs_mutex.unlock(server.io);
+        if (!wanted) return;
+    }
     // 被写事务取消时重试：构建结果触发的发布不能因无关的编辑而丢失
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
@@ -2073,6 +2093,12 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
     }
     sent = true;
     server.send(bytes);
+    // 虚拟文档的清除已发出：之后不再需要它的 URI
+    if (isVirtual(server.vfs.path(file))) {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        if (!server.open_docs.contains(file)) if (server.last_uris.fetchSwapRemove(file)) |kv| server.gpa.free(kv.value);
+    }
 }
 
 test "sendDiagnostics: a result computed earlier is not sent after a later one" {
@@ -2083,8 +2109,9 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
     var server: Server = undefined;
     try server.init(std.testing.io, gpa, &writer);
     defer server.deinit();
-    const a: Vfs.FileId = @fromBackingInt(0);
-    const b: Vfs.FileId = @fromBackingInt(1);
+    const native = @import("../util/test_path.zig").native;
+    const a = try server.vfs.intern(native("/a.zig"));
+    const b = try server.vfs.intern(native("/b.zig"));
     const stale: types.Diagnostic = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 1 } }, .message = .{ .string = "stale" } };
     // 第 2 次计算先算完并发送；第 1 次计算基于更旧的状态，后算完时丢弃。其他文件不受影响
     server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, 2);
@@ -2128,6 +2155,7 @@ fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![
     server.docs_mutex.lockUncancelable(server.io);
     defer server.docs_mutex.unlock(server.io);
     if (server.open_docs.get(file)) |u| return arena.dupe(u8, u);
+    if (server.last_uris.get(file)) |u| return arena.dupe(u8, u);
     return uri.fromPath(arena, server.vfs.path(file));
 }
 
