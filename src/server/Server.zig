@@ -2853,7 +2853,9 @@ fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return out;
 }
 
-/// 可以重命名的定义：位于某个工作区根目录内且不在其缓存目录与依赖包中
+/// 可以重命名的定义：用户自己的代码，即位于某个工作区根目录内（不在其 `.zig-cache`、`zig-pkg` 中），或在根目录外
+/// 但属于某个项目（以绝对路径加入的模块、`--fork` 指定的包）。都不能在项目的本地缓存与获取的依赖包中；根目录外的
+/// 也不能在 Zig 安装目录与全局缓存中（见 `FileContext`）
 fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
     const file = switch (def) {
@@ -2872,15 +2874,21 @@ fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
         defer server.workspaces_mutex.unlock(server.io);
         for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return false;
     }
-    server.roots_mutex.lockUncancelable(server.io);
-    defer server.roots_mutex.unlock(server.io);
-    for (server.roots.items) |root| {
-        if (!std.mem.startsWith(u8, path, root) or path.len <= root.len or !std.fs.path.isSep(path[root.len])) continue;
-        const rest = path[root.len + 1 ..];
-        if (std.mem.startsWith(u8, rest, ".zig-cache") or std.mem.startsWith(u8, rest, "zig-pkg")) continue;
-        return true;
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        var in_root = false;
+        for (server.roots.items) |root| {
+            if (path.len <= root.len or !server.vfs.isUnder(path, root)) continue;
+            in_root = true;
+            const rest = path[root.len..];
+            const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
+            if (std.mem.startsWith(u8, sub, ".zig-cache") or std.mem.startsWith(u8, sub, "zig-pkg")) continue;
+            return true;
+        }
+        if (in_root) return false;
     }
-    return false;
+    return server.fileContext(file) == .project;
 }
 
 fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!types.ResultType("textDocument/prepareRename") {

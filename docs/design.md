@@ -216,6 +216,8 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
 | 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
 
+重命名只修改用户自己的代码：定义须位于某个工作区根目录内（不在其 `.zig-cache`、`zig-pkg` 中），或在根目录外但属于某个项目（以路径加入的模块、`--fork` 指定的包）；项目的本地缓存与获取的依赖包中的定义、根目录外的 Zig 安装目录与全局缓存中的定义不能重命名。
+
 内置元数据固定为 Zig 0.17.0，来源、源码包及输入文件哈希记录在 `tools/zig/metadata.json`，许可保留在同目录。
 `zig build gen` 离线生成 `src/ide/builtin_data.zig`，校验官方输入哈希、编译器版本、名称和参数数量；运行时只查静态表。
 128 个编译器登记项中，124 个有官方文档；其余 4 个明确说明来源缺口，不编造签名，也不提供虚假的参数提示。

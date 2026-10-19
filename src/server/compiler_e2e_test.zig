@@ -521,7 +521,7 @@ fn save(h: *Harness, path: []const u8, file_uri: []const u8, version: i64, text:
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = file_uri } });
 }
 
-test "modules outside the build root: never compiled alone, saving them rebuilds the project" {
+test "modules outside the build root: never compiled alone, saving them rebuilds the project, renamable" {
     var project = try fixture.Project.create(&outside_root);
     defer project.deinit();
     var h: Harness = undefined;
@@ -544,6 +544,11 @@ test "modules outside the build root: never compiled alone, saving them rebuilds
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "dep.zig", &.{"3:11 zig: expected type 'u32'"});
     try testing.expect(countTitles(try progressTitles(&h), "zig build check") > builds);
+
+    // 根目录外、属于项目的用户代码可以重命名
+    const prepared = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = dep_uri }, .position = .{ .line = 1, .character = 8 } });
+    try testing.expect(prepared.object.get("error") == null);
+    try testing.expect(prepared.object.get("result").? != .null);
 
     // 修复后同样只保存 dep.zig：错误被清除
     try save(&h, dep_path, dep_uri, 3, dep_good);
