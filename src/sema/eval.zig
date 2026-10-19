@@ -1999,8 +1999,27 @@ const Evaluator = struct {
             .ptr_type => |p| p.is_const,
             else => true,
         };
+        // 与推导路径一致：显式哨兵优先；切到末尾时保留源数组的哨兵
+        const src_sentinel: ?Index = switch (ip.key(base.ty)) {
+            .array_type => |a| a.sentinel,
+            .abstract_array_type => |a| a.sentinel,
+            .ptr_type => |p| switch (p.size) {
+                .one => switch (ip.key(p.child)) {
+                    .array_type => |a| a.sentinel,
+                    .abstract_array_type => |a| a.sentinel,
+                    else => null,
+                },
+                .slice, .many, .c => p.sentinel,
+            },
+            else => null,
+        };
+        const explicit: ?Index = if (s.sentinel) |se| blk: {
+            const v = try ev.eval(f, se, child);
+            break :blk try ev.freeze(v) orelse return error.Abort;
+        } else null;
+        const sentinel: ?Index = if (explicit) |x| x else if (end == count) src_sentinel else null;
         // comptime 已知的区间：指向数组的指针
-        const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child } });
+        const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child, .sentinel = sentinel } });
         const ptr_ty = try ip.ptrTo(array, .one, is_const);
         // 切片的是局部变量（或经由指针）的存储：引用原存储的区间，写入反映到原数组
         if (try ev.sliceTarget(f, s.lhs, base)) |target| {

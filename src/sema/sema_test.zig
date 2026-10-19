@@ -499,6 +499,31 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "comptime slices keep their sentinel" {
+    try expectTypes(
+        \\fn Explicit() type {
+        \\    return @TypeOf("abc"[0..3 :0]);
+        \\}
+        \\fn ToEnd() type {
+        \\    return @TypeOf("abc"[0..3]);
+        \\}
+        \\fn Prefix() type {
+        \\    return @TypeOf("abc"[0..2]);
+        \\}
+        \\const T = Explicit();
+        \\const U = @TypeOf("abc"[0..3 :0]);
+        \\const V = ToEnd();
+        \\const W = Prefix();
+    , &.{
+        // 解释器与推导路径得到同一个类型
+        .{ "T", "type = *const [3:0]u8" },
+        .{ "U", "type = *const [3:0]u8" },
+        // 切到末尾时保留源数组的哨兵
+        .{ "V", "type = *const [3:0]u8" },
+        .{ "W", "type = *const [2]u8" },
+    });
+}
+
 test "wide integer shift by more than 255 bits does not panic" {
     try expectTypes(
         \\const E = enum(u1000) { a = 5 };
