@@ -223,12 +223,14 @@ pub const ErrorSetOf = struct {
         const res = try ctx.get(Infer, .{ .owner = key.owner, .mode = .full, .inst = key.inst });
         if (res.exprs.len != body.exprs.len) return .anyerror_type;
         var names: std.ArrayList([]const u8) = .empty;
-        for (body.exprs) |e| {
+        for (body.exprs, body.expr_ranges) |e, range| {
             const t: Index = switch (e) {
                 .@"return" => |v| if (v) |x| res.exprs[@backingInt(x)].ty else continue,
                 .prefix => |p| if (p.op == .keyword_try) res.exprs[@backingInt(p.operand)].ty else continue,
                 else => continue,
             };
+            // comptime 已知不会执行的分支（含 noreturn 语句之后）不并入错误集
+            if (isInactive(body, res, range)) continue;
             if (!try collectErrors(&r, t, &names, e == .prefix)) return .anyerror_type;
         }
         return ip.errorSet(r.arena, names.items);
@@ -242,6 +244,19 @@ pub const ErrorSetOf = struct {
         return .anyerror_type;
     }
 };
+
+/// `range` 是否落在 comptime 不活跃的分支或 noreturn 语句之后（见 `Infer.Result.inactive` /
+/// `dead_spans`）
+fn isInactive(body: *const Body, res: *const infer.Result, range: Body.Range) bool {
+    for (res.inactive) |e| {
+        const r = body.range(e);
+        if (range.start >= r.start and range.end <= r.end) return true;
+    }
+    for (res.dead_spans) |r| {
+        if (range.start >= r.start and range.end <= r.end) return true;
+    }
+    return false;
+}
 
 /// 类型中可能出现的错误（错误集、error union 的错误集）加入 `names`；含 anyerror 或未知时返回 false。
 /// `required` 时类型必须带有错误（`try` 的操作数）

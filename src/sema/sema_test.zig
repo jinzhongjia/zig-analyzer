@@ -761,6 +761,12 @@ test "inferred error sets from function bodies" {
         \\    if (n == 0) return error.Pong;
         \\    return ping(n - 1);
         \\}
+        \\fn inactive(x: bool) !u8 {
+        \\    if (false) return error.Fake;
+        \\    if (x) return error.Real;
+        \\    if (true) return 1;
+        \\    return error.Unreachable;
+        \\}
         \\fn g() void {
         \\    const w = wrap(@as(u8, 1));
         \\    const ra = a();
@@ -771,7 +777,8 @@ test "inferred error sets from function bodies" {
         \\    const ru = user();
         \\    const rp = ping(3);
         \\    const rq = pong(3);
-        \\    _ = .{ w, ra, rb, rc, rr, rr2, ru, rp, rq };
+        \\    const ri = inactive(false);
+        \\    _ = .{ w, ra, rb, rc, rr, rr2, ru, rp, rq, ri };
         \\}
     , &.{
         .{ "w", "error{}!u8" },
@@ -786,6 +793,8 @@ test "inferred error sets from function bodies" {
         // 相互递归（编译器报错）：取两者的并集
         .{ "rp", "error{Ping,Pong}!void" },
         .{ "rq", "error{Ping,Pong}!void" },
+        // comptime 不活跃的分支与 noreturn 之后的代码不并入
+        .{ "ri", "error{Real}!u8" },
     });
 }
 
