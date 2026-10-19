@@ -1985,7 +1985,9 @@ const Inferrer = struct {
         // 哨兵先转换为结果的元素类型再比较
         const xs: ?Index = if (x.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return .unknown else null;
         const ys: ?Index = if (y.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return .unknown else null;
-        const array = try ip.get(.{ .array_type = .{ .len = x.len + y.len, .child = elem, .sentinel = eval.concatSentinel(xs, ys) } });
+        // 长度是 u64，无法表示的拼接不产生结果
+        const len = std.math.add(u64, x.len, y.len) catch return .unknown;
+        const array = try ip.get(.{ .array_type = .{ .len = len, .child = elem, .sentinel = eval.concatSentinel(xs, ys) } });
         return if (x.is_ptr or y.is_ptr) ip.ptrTo(array, .one, true) else array;
     }
 

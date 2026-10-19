@@ -413,6 +413,28 @@ test "wide integer shift by more than 255 bits does not panic" {
     });
 }
 
+test "array concatenation length overflow does not panic" {
+    try expectTypes(
+        \\const a: [0xFFFFFFFFFFFFFFFF]u8 = undefined;
+        \\const y = a ++ [_]u8{0};
+    , &.{
+        .{ "y", "unknown" },
+    });
+}
+
+test "comptime array concatenation length overflow does not panic" {
+    try expectTypes(
+        \\fn cat(comptime a: [0xFFFFFFFFFFFFFFFF]u8) type {
+        \\    _ = a ++ [_]u8{0};
+        \\    return u8;
+        \\}
+        \\const T = cat(undefined);
+    , &.{
+        // 拼接本身不产生结果，函数返回值不受影响
+        .{ "T", "type = u8" },
+    });
+}
+
 test "comptime arguments are coerced to their instantiated parameter types" {
     try expectTypes(
         \\const E = enum { a, b };

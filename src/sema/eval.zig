@@ -1714,7 +1714,8 @@ const Evaluator = struct {
         if (lhs.v == .unknown or rhs.v == .unknown) return error.Abort;
         const n = try ev.elemCount(lhs) orelse return error.Abort;
         const m = try ev.elemCount(rhs) orelse return error.Abort;
-        const elems = try ev.allocElems(n + m);
+        const total = std.math.add(usize, n, m) catch return error.Abort;
+        const elems = try ev.allocElems(total);
         for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
         for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
         const lt = ev.arrayOf(lhs.ty);
@@ -1724,11 +1725,11 @@ const Evaluator = struct {
             const la = ip.key(lt).array_type;
             const ra = ip.key(rt).array_type;
             const sentinel = concatSentinel(la.sentinel, ra.sentinel);
-            const array = try ip.get(.{ .array_type = .{ .len = n + m, .child = la.child, .sentinel = sentinel } });
+            const array = try ip.get(.{ .array_type = .{ .len = std.math.cast(u64, total) orelse return error.Abort, .child = la.child, .sentinel = sentinel } });
             // 两侧有一个是指针时结果为指向数组的指针（字符串字面量）
             ty = if (ip.key(lhs.ty) == .ptr_type or ip.key(rhs.ty) == .ptr_type) try ip.ptrTo(array, .one, true) else array;
         } else {
-            const types = try ev.a.alloc(Index, n + m);
+            const types = try ev.a.alloc(Index, total);
             for (elems, types) |e, *t| t.* = e.ty;
             ty = try ip.get(.{ .tuple_type = .{ .types = types, .values = try ev.comptimeFieldValues(elems) } });
         }
