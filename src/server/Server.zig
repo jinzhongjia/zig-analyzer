@@ -67,14 +67,17 @@ root_has_build: std.ArrayList(bool) = .empty,
 roots_mutex: Io.Mutex = .init,
 
 single_mutex: Io.Mutex = .init,
-/// 单文件模式（不属于任何带 build.zig 的工作区）的编译结果，按编译的根文件组织。结果中也有被根文件
+/// 单文件模式（独立的 .zig 文件，见 `FileContext.detached`）的编译结果，按编译的根文件组织。结果中也有被根文件
 /// import 的文件中的错误
 single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
-/// 已存入的单文件编译结果数（受 single_mutex 保护），用于确定结果的先后
-single_generation: u64 = 0,
+/// 已取出的编译结果序号（项目的构建与单文件编译共用，见 `nextCompileGeneration`）
+compile_generation: std.atomic.Value(u64) = .init(0),
 env_mutex: Io.Mutex = .init,
 /// 启动后在后台查询；查询完成前为 null
 zig_env: ?ZigEnv = null,
+/// 启动阶段已经结束：zig 环境就绪，带 build.zig 的根目录已经启动项目。此前不按单文件编译（结束时补上），
+/// 项目开始加载之前还不能推迟属于项目的文件的编译（见 `projectsLoading`）
+startup_done: std.atomic.Value(bool) = .init(false),
 /// 不属于任何项目的文件使用的 builtin.zig（本机目标、Debug）；受 env_mutex 保护
 default_builtin: ?[]u8 = null,
 warned: bool = false,
@@ -164,10 +167,12 @@ const SingleFile = struct {
     files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty,
     /// 得到 `result` 的那次编译读取的、根文件所在目录下的文件（含被它 import 的）：其中任何一个变化都需要重新编译
     inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
-    /// `result` 存入时的 `single_generation`：越大越新
+    /// `result` 存入时取的编译结果序号：越大越新
     generation: u64 = 0,
     running: bool = false,
     rerun: bool = false,
+    /// 编译被推迟（有项目尚在首次加载）：加载结束后补上（见 `reconcileSingle`）
+    pending: bool = false,
 
     fn clearResult(sf: *SingleFile, gpa: Allocator) void {
         if (sf.result) |*r| r.deinit(gpa);
@@ -951,7 +956,7 @@ fn documentPath(arena: Allocator, document_uri: []const u8) Allocator.Error!?[]c
 const virtual_root = if (@import("builtin").os.tag == .windows) "C:\\.zig-analyzer-virtual" else "/.zig-analyzer-virtual";
 
 fn isVirtual(path: []const u8) bool {
-    return Workspace.isUnder(path, virtual_root);
+    return Vfs.isUnderStyle(.native, .sensitive, path, virtual_root);
 }
 
 fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
@@ -1044,8 +1049,8 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
         if (try server.refreshRoot(dir)) return;
     };
-    if (server.isSingleFile(id)) return server.recompileSingle(&.{id}, &.{id});
 
+    // 包含该文件的各个项目都重新构建（共用的模块、标准库）
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
@@ -1057,6 +1062,8 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
             server.requestBuild(ws);
         }
     }
+    // 单文件模式：文件自身是独立文件时编译它，上一次编译读取过它或在其中报告过错误的根文件同样重新编译
+    server.recompileSingle(&.{id}, &.{id});
 }
 
 /// 项目根目录中变化时需要重启项目的文件
@@ -1148,8 +1155,8 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
 /// 文件内容的变化频率：标准库几乎不变，依赖包很少变化，项目文件经常变化
 pub fn fileDurability(server: *Server, path: []const u8) database.Durability {
     const env = server.zigEnv() orelse return .low;
-    if (Workspace.isUnder(path, env.lib_dir)) return .high;
-    if (Workspace.isUnder(path, env.global_cache_dir)) return .medium;
+    if (server.vfs.isUnder(path, env.lib_dir)) return .high;
+    if (server.vfs.isUnder(path, env.global_cache_dir)) return .medium;
     return .low;
 }
 
@@ -1202,6 +1209,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
             if (list.len != 0) log.info("build settings changed, restarting projects", .{});
             for (list) |ws| server.restartWorkspace(ws, 0);
         }
+        // 文件的编译上下文可能变化，编译器诊断可能重新开启
+        server.reconcileSingle();
     }
 }
 
@@ -1235,14 +1244,7 @@ fn stopProjects(server: *Server) void {
     server.publishFiles(stale.items, true);
     server.publishOpenFiles();
     // 打开的文件改按单文件编译
-    server.docs_mutex.lockUncancelable(server.io);
-    const open = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
-        server.docs_mutex.unlock(server.io);
-        return;
-    };
-    server.docs_mutex.unlock(server.io);
-    defer server.gpa.free(open);
-    for (open) |file| server.compileSingle(file);
+    server.reconcileSingle();
 }
 
 /// 为有 build.zig 的根目录启动项目（按磁盘重新检查：加入根目录之后 build.zig 可能被新建或删除）
@@ -1305,26 +1307,28 @@ fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     }
     // 打开的文件：单文件模式的结果不再适用，或改按单文件编译
     server.publishOpenFiles();
-    server.docs_mutex.lockUncancelable(server.io);
-    const open = try server.gpa.dupe(Vfs.FileId, server.open_docs.keys());
-    server.docs_mutex.unlock(server.io);
-    defer server.gpa.free(open);
-    for (open) |file| server.compileSingle(file);
+    server.reconcileSingle();
     return true;
 }
 
-/// 清除单文件模式的编译器诊断（关闭编译器诊断时）
+/// 清除单文件模式的编译器诊断（关闭编译器诊断时）。没有在编译的根文件不再记录，重新开启时按打开的文件重新编译
 fn clearSingleFileResults(server: *Server) void {
     var files: std.ArrayList(Vfs.FileId) = .empty;
     defer files.deinit(server.gpa);
     {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
-        for (server.single.keys(), server.single.values()) |f, *sf| if (sf.result != null) {
-            files.append(server.gpa, f) catch {};
-            files.appendSlice(server.gpa, sf.files.keys()) catch {};
+        var i: usize = server.single.count();
+        while (i > 0) {
+            i -= 1;
+            const sf = &server.single.values()[i];
+            if (sf.result != null) {
+                files.append(server.gpa, server.single.keys()[i]) catch {};
+                files.appendSlice(server.gpa, sf.files.keys()) catch {};
+            }
             sf.clearResult(server.gpa);
-        };
+            if (!sf.running) server.single.swapRemoveAt(i);
+        }
     }
     server.publishFiles(files.items, true);
 }
@@ -1471,49 +1475,91 @@ fn startup(server: *Server) Io.Cancelable!void {
     }
     server.updateModuleGraph();
     if (server.buildFlags().build) server.startProjectsForRoots();
-    // 启动前已打开的单文件：zig 环境就绪后补一次编译
-    server.docs_mutex.lockUncancelable(server.io);
-    const open = server.gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
-        server.docs_mutex.unlock(server.io);
-        return;
-    };
-    server.docs_mutex.unlock(server.io);
-    defer server.gpa.free(open);
-    for (open) |file| server.compileSingle(file);
+    // 启动前已打开的独立文件：zig 环境就绪、项目开始加载之后补一次编译
+    server.startup_done.store(true, .release);
+    server.reconcileSingle();
 }
 
 // ── 单文件模式 ───────────────────────────────────────────────────────
 
-/// 不属于当前 Zig 标准库、也不在带 build.zig 的工作区根目录下的 .zig 文件。
-fn isSingleFile(server: *Server, file: Vfs.FileId) bool {
-    const path = server.vfs.path(file);
-    if (!std.mem.endsWith(u8, path, ".zig")) return false;
-    if (server.zigEnv()) |env| if (Workspace.isUnder(path, env.std_dir)) return false;
-    // 关闭构建系统集成时，非标准库文件按单文件处理。
-    if (!server.buildFlags().build) return true;
-    server.roots_mutex.lockUncancelable(server.io);
-    defer server.roots_mutex.unlock(server.io);
-    for (server.roots.items, server.root_has_build.items) |root, has_build| {
-        if (has_build and Workspace.isUnder(path, root)) return false;
+/// 文件的编译上下文：决定它能否作为单文件模式的根编译，以及单文件编译的结果是否用于它的诊断。
+/// 依次判断：依赖库、项目的模块图、带 build.zig 的根目录；以上都不是的 .zig 文件才是独立文件
+const FileContext = enum {
+    /// 不参与编译：虚拟文档，以及不属于任何项目的非 .zig 文件
+    none,
+    /// Zig 安装目录（标准库等）、全局缓存，以及项目的本地缓存与获取的依赖包中的文件：只作为依赖参与编译，
+    /// 不作为根。真实的编译入口在其中报告的错误照常发布
+    library,
+    /// 在某个项目的模块图中（编译集合，或者可由其余的编译 step 到达）：编译器诊断来自项目的构建
+    project,
+    /// 带 build.zig 的根目录下、不在模块图中的文件：由项目处理，不单独编译
+    project_dir,
+    /// 独立的 .zig 文件：作为根单独编译
+    detached,
+
+    /// 单文件编译的结果是否用于这类文件：项目中的文件被独立文件按相对路径 import 时处在另一个模块中，
+    /// 按名字的 import 与项目中不同，只采用项目的构建结果
+    fn usesSingle(context: FileContext) bool {
+        return switch (context) {
+            .none, .library, .detached => true,
+            .project, .project_dir => false,
+        };
     }
-    return true;
+};
+
+fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
+    const path = server.vfs.path(file);
+    if (isVirtual(path)) return .none;
+    if (server.zigEnv()) |env| {
+        if (server.vfs.isUnder(path, env.lib_dir) or server.vfs.isUnder(path, env.global_cache_dir)) return .library;
+    }
+    {
+        // 与 `liveEligible` 相同，在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex 后 ws.mutex）
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return .library;
+        for (server.workspaces.items) |ws| if (ws.contains(file)) return .project;
+    }
+    if (server.buildFlags().build) {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        for (server.roots.items, server.root_has_build.items) |root, has_build| {
+            if (has_build and server.vfs.isUnder(path, root)) return .project_dir;
+        }
+    }
+    return if (std.mem.endsWith(u8, path, ".zig")) .detached else .none;
 }
 
-/// 在后台用 `zig build-obj -fno-emit-bin` 编译单个文件；编译期间再次请求时，结束后重新编译
+/// 有项目尚在首次加载（见 `Workspace.load_done`）：还不知道哪些根目录外的文件属于项目
+fn projectsLoading(server: *Server) bool {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| if (ws.isLoading()) return true;
+    return false;
+}
+
+/// 在后台用 `zig build-obj -fno-emit-bin` 编译独立文件；编译期间再次请求时，结束后重新编译
 fn compileSingle(server: *Server, file: Vfs.FileId) void {
-    if (server.zigEnv() == null) return; // 启动完成后会补编译
-    if (!server.isSingleFile(file)) return;
+    if (!server.startup_done.load(.acquire)) return; // 启动结束时会补编译
+    if (server.fileContext(file) != .detached) return;
     if (!server.buildFlags().compiler) return;
     // 编译器读取磁盘：不在磁盘上的文件（尚未保存的新文件、已被删除的文件）不编译，丢弃它上一次的编译结果
     Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch {
         _ = server.dropSingle(file);
         return;
     };
+    // 项目首次加载期间文件可能随后归入项目：加载结束时补编译，不在错误的上下文中编译（见 `reconcileSingle`）
+    const deferred = server.projectsLoading();
     {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
         const gop = server.single.getOrPut(server.gpa, file) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (deferred) {
+            gop.value_ptr.pending = true;
+            return;
+        }
+        gop.value_ptr.pending = false;
         if (gop.value_ptr.running) {
             gop.value_ptr.rerun = true;
             return;
@@ -1523,6 +1569,67 @@ fn compileSingle(server: *Server, file: Vfs.FileId) void {
     server.busyBegin();
     // 编译耗时数秒，尽量不在主循环中同步执行（否则期间无法处理进度 token 的响应等消息）
     spawn(server.io, &server.bg_group, singleFileTask, .{ server, file });
+}
+
+/// 按文件当前的编译上下文收敛单文件模式，在上下文可能变化之后调用（zig 环境就绪，项目加载结束、编译集合变化、
+/// 新实例替换旧实例，项目与根目录的增删，构建集成与编译器诊断的开关）：不再是独立文件的根丢弃编译结果；
+/// 推迟了的编译，以及打开的、没有编译过的独立文件补上编译。单文件结果是否用于某个文件取决于该文件的上下文
+/// （见 `FileContext.usesSingle`），结果中的文件随之重新发布
+pub fn reconcileSingle(server: *Server) void {
+    if (server.isShuttingDown()) return;
+    const gpa = server.gpa;
+    var roots: std.ArrayList(Vfs.FileId) = .empty;
+    defer roots.deinit(gpa);
+    var affected: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    defer affected.deinit(gpa);
+    var compile: std.ArrayList(Vfs.FileId) = .empty;
+    defer compile.deinit(gpa);
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        roots.appendSlice(gpa, server.single.keys()) catch return;
+        for (server.single.values()) |*sf| for (sf.files.keys()) |f| affected.put(gpa, f, {}) catch return;
+    }
+    // 上下文在锁外判断：要获取项目与根目录的锁
+    for (roots.items) |root| {
+        const detached = server.fileContext(root) == .detached;
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        const sf = server.single.getPtr(root) orelse continue;
+        if (detached) {
+            if (sf.pending) compile.append(gpa, root) catch {};
+            continue;
+        }
+        affected.put(gpa, root, {}) catch {};
+        for (sf.files.keys()) |f| affected.put(gpa, f, {}) catch {};
+        if (sf.running) {
+            // 编译结束时按上下文丢弃（见 `singleFileTask`）
+            sf.rerun = true;
+        } else {
+            sf.clearResult(gpa);
+            _ = server.single.swapRemove(root);
+        }
+    }
+    server.publishFiles(affected.keys(), true);
+
+    server.docs_mutex.lockUncancelable(server.io);
+    const open = gpa.dupe(Vfs.FileId, server.open_docs.keys()) catch {
+        server.docs_mutex.unlock(server.io);
+        return;
+    };
+    server.docs_mutex.unlock(server.io);
+    defer gpa.free(open);
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        for (open) |file| if (!server.single.contains(file)) compile.append(gpa, file) catch {};
+    }
+    for (compile.items) |file| server.compileSingle(file);
+}
+
+/// 编译结果的序号：项目的构建与单文件编译存入结果时各取一个，越大越新
+pub fn nextCompileGeneration(server: *Server) u64 {
+    return server.compile_generation.fetchAdd(1, .monotonic) + 1;
 }
 
 /// 丢弃已不在磁盘上的根文件 `file` 的编译结果，并重新发布其中有错误的文件（被它 import 的文件上的错误也随之
@@ -1577,9 +1684,11 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             const id = server.vfs.intern(p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
+        // 编译期间文件可能不再是独立文件（所属项目加载完成、所在根目录新建了 build.zig 等）
+        const detached = server.fileContext(file) == .detached;
         server.single_mutex.lockUncancelable(server.io);
         const sf = server.single.getPtr(file).?;
-        if (sf.rerun) {
+        if (detached and sf.rerun) {
             sf.rerun = false;
             server.single_mutex.unlock(server.io);
             files.deinit(server.gpa);
@@ -1592,14 +1701,21 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         defer affected.deinit(server.gpa);
         affected.append(server.gpa, file) catch {};
         affected.appendSlice(server.gpa, sf.files.keys()) catch {};
-        affected.appendSlice(server.gpa, files.keys()) catch {};
         sf.clearResult(server.gpa);
-        server.single_generation += 1;
-        sf.result = result;
-        sf.files = files;
-        sf.inputs = inputs;
-        sf.generation = server.single_generation;
-        sf.running = false;
+        if (detached) {
+            affected.appendSlice(server.gpa, files.keys()) catch {};
+            sf.result = result;
+            sf.files = files;
+            sf.inputs = inputs;
+            sf.generation = server.nextCompileGeneration();
+            sf.running = false;
+        } else {
+            // 不采用这次的结果，也不再记录这个根文件
+            files.deinit(server.gpa);
+            inputs.deinit(server.gpa);
+            if (result) |*r| r.deinit(server.gpa);
+            _ = server.single.swapRemove(file);
+        }
         server.single_mutex.unlock(server.io);
         server.publishFiles(affected.items, true);
         return;
@@ -1623,33 +1739,6 @@ fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const 
         }
     }
     for (list.keys()) |root| server.compileSingle(root);
-}
-
-/// 各个根文件最近一次编译中 `file` 的诊断，有多个时按 `compiler.combine` 合并。调用者持有 single_mutex
-fn singleFileResult(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error!?*const compiler.FileResult {
-    const Found = struct {
-        generation: u64,
-        result: *const compiler.FileResult,
-
-        fn newer(_: void, a: @This(), b: @This()) bool {
-            return a.generation > b.generation;
-        }
-    };
-    var found: std.ArrayList(Found) = .empty;
-    for (server.single.values()) |*sf| if (sf.files.get(file)) |fr| {
-        try found.append(arena, .{ .generation = sf.generation, .result = fr });
-    };
-    switch (found.items.len) {
-        0 => return null,
-        1 => return found.items[0].result,
-        else => {},
-    }
-    std.mem.sort(Found, found.items, {}, Found.newer);
-    const results = try arena.alloc(*const compiler.FileResult, found.items.len);
-    for (found.items, results) |f, *r| r.* = f.result;
-    const combined = try arena.create(compiler.FileResult);
-    combined.* = try compiler.combine(arena, results);
-    return combined;
 }
 
 fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
@@ -1751,6 +1840,7 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     for (params.event.removed) |f| try server.removeRoot(arena, f.uri);
     for (params.event.added) |f| try server.addRoot(f.uri);
     server.updateModuleGraph();
+    server.reconcileSingle();
 }
 
 /// 重启 `ws` 所在的项目（按根目录找到项目当前的实例：调用方持有的列表快照可能已过时）。`crash_restarts` 为
@@ -2215,22 +2305,17 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
     try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 ", sent.items);
 }
 
-/// 文件所属的项目（第一个包含它的工作区），带有一个属于调用方的引用
-fn workspaceFor(server: *Server, file: Vfs.FileId) ?*Workspace {
+/// 是否发布文件的 live 诊断：不属于任何项目，或所属的项目中有一个认为需要（见 `Workspace.liveEligible`）
+fn liveEligible(server: *Server, file: Vfs.FileId) bool {
+    // 在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex 后 ws.mutex）
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
+    var owned = false;
     for (server.workspaces.items) |ws| if (ws.owns(file)) {
-        ws.acquire();
-        return ws;
+        if (ws.liveEligible(file)) return true;
+        owned = true;
     };
-    return null;
-}
-
-/// 是否发布文件的 live 诊断：不属于任何项目，或所属项目认为需要（见 `Workspace.liveEligible`）
-fn liveEligible(server: *Server, file: Vfs.FileId) bool {
-    const ws = server.workspaceFor(file) orelse return true;
-    defer ws.release();
-    return ws.liveEligible(file);
+    return !owned;
 }
 
 fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
@@ -2244,10 +2329,8 @@ fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![
 const OtherFiles = struct {
     server: *Server,
     ctx: *Db.Ctx,
-    /// 构建结果所在的工作区；调用者持有其 `mutex`
-    workspace: ?*Workspace = null,
-    /// 单文件模式；调用者持有 `single_mutex`
-    single: bool = false,
+    /// 编译器诊断的附注所在文件在那次编译时的文本（附注的区间以它为准），按附注中的路径
+    texts: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
         const self: *OtherFiles = @ptrCast(@alignCast(opaque_ctx));
@@ -2255,74 +2338,90 @@ const OtherFiles = struct {
         const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
         const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
         const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
-        const base_text: ?[]const u8 = if (file) |f| self.buildText(f) else null;
-        return .{ .uri = u, .text = text, .base_text = base_text };
+        return .{ .uri = u, .text = text, .base_text = self.texts.get(path) };
     }
 
-    /// 最近一次构建中该文件的文本（诊断区间以它为准）；没有构建结果时为 null
-    fn buildText(self: *OtherFiles, file: Vfs.FileId) ?[]const u8 {
-        const path = self.server.vfs.path(file);
-        if (self.workspace) |w| if (w.result) |*r| return r.texts.get(path);
-        if (self.single) for (self.server.single.values()) |*sf| {
-            if (sf.result) |*r| if (r.texts.get(path)) |text| return text;
+    /// 把编译结果 `build` 中的 `fr` 复制到 arena 中，并记下其附注所在文件在这次编译时的文本（同一路径只取最先
+    /// 记下的）。键与文本都取自 arena 中的副本：调用者释放锁之后，`build` 可能被新的结果替换而释放
+    fn copyResult(self: *OtherFiles, arena: Allocator, fr: *const compiler.FileResult, build: *const compiler.BuildResult) Allocator.Error!*const compiler.FileResult {
+        const copy = try arena.create(compiler.FileResult);
+        copy.* = try fr.dupe(arena);
+        for (copy.items) |item| for (item.notes) |n| {
+            if (self.texts.contains(n.path)) continue;
+            const text = build.texts.get(n.path) orelse continue;
+            try self.texts.put(arena, n.path, try arena.dupe(u8, text));
         };
-        return null;
+        return copy;
     }
 };
+
+/// `file` 的编译器诊断：包含它的各个项目最近一次构建的结果，单文件编译的结果按文件的上下文决定是否采用
+/// （见 `FileContext.usesSingle`）；有多个时按 `compiler.combine` 合并，以最新一次编译读取的文本为准。
+/// 各个结果在其所在的锁内复制到 arena 中（附注所在文件的文本记入 `other`），合并时不持有锁
+fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
+    const Found = struct {
+        generation: u64,
+        result: *const compiler.FileResult,
+
+        fn newer(_: void, a: @This(), b: @This()) bool {
+            return a.generation > b.generation;
+        }
+    };
+    var found: std.ArrayList(Found) = .empty;
+    {
+        const list = try server.workspaceList(arena);
+        defer server.releaseList(arena, list);
+        for (list) |ws| {
+            ws.mutex.lockUncancelable(server.io);
+            defer ws.mutex.unlock(server.io);
+            const fr = ws.result_files.get(file) orelse continue;
+            try found.append(arena, .{ .generation = ws.result_generation, .result = try other.copyResult(arena, fr, &ws.result.?) });
+        }
+    }
+    if (server.fileContext(file).usesSingle()) {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        for (server.single.values()) |*sf| if (sf.files.get(file)) |fr| {
+            try found.append(arena, .{ .generation = sf.generation, .result = try other.copyResult(arena, fr, &sf.result.?) });
+        };
+    }
+    switch (found.items.len) {
+        0 => return null,
+        1 => return found.items[0].result,
+        else => {},
+    }
+    std.mem.sort(Found, found.items, {}, Found.newer);
+    const results = try arena.alloc(*const compiler.FileResult, found.items.len);
+    for (found.items, results) |f, *r| r.* = f.result;
+    const combined = try arena.create(compiler.FileResult);
+    combined.* = try compiler.combine(arena, results);
+    return combined;
+}
 
 fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !types.PublishDiagnosticsParams {
     const document_uri = try server.uriFor(arena, file);
     const text = try ctx.get(FileText, file);
-    const ws = server.workspaceFor(file);
-    defer if (ws) |w| w.release();
 
     // live 诊断：文件已加载，且（不属于任何项目，或编译集合尚未算出，或在编译集合中）
     var live_result: ?*live.Result = null;
-    if (text != null) {
-        const eligible = if (ws) |w| w.liveEligible(file) else true;
-        if (eligible) live_result = try ctx.get(live.AstCheck, file);
-    }
+    if (text != null and server.liveEligible(file)) live_result = try ctx.get(live.AstCheck, file);
 
+    // 编译器诊断：被 import 的文件中的错误由编译它的项目或根文件报告
     var other: OtherFiles = .{ .server = server, .ctx = ctx };
-    var diags: []const types.Diagnostic = &.{};
-    if (ws) |w| {
-        other.workspace = w;
-        w.mutex.lockUncancelable(server.io);
-        defer w.mutex.unlock(server.io);
-        const fr = w.result_files.get(file);
-        const current = text orelse if (fr) |r| r.base_text else "";
-        diags = try compiler.merge(arena, .{
-            .text = current,
-            .lines = try offsets.LineIndex.init(arena, current),
-            .encoding = server.encoding,
-            .uri = document_uri,
-            .live = live_result,
-            .compiler = fr,
-            .other_file = OtherFiles.get,
-            .other_ctx = &other,
-        });
-    } else {
-        // 单文件模式：各个根文件的编译中本文件的诊断（被 import 的文件中的错误由 import 它的根文件报告）。
-        // 不再按单文件处理的文件（所在根目录新建了 build.zig，而项目没有启动）不使用此前的结果
-        const single = server.isSingleFile(file);
-        other.single = single;
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        const fr = if (single) try server.singleFileResult(arena, file) else null;
-        const current = text orelse if (fr) |r| r.base_text else "";
-        diags = try compiler.merge(arena, .{
-            .text = current,
-            .lines = try offsets.LineIndex.init(arena, current),
-            .encoding = server.encoding,
-            .uri = document_uri,
-            .live = live_result,
-            .compiler = fr,
-            .other_file = OtherFiles.get,
-            .other_ctx = &other,
-        });
-    }
-    if (text) |current| if (server.wantsInactiveCode(file)) {
-        diags = try server.appendInactiveCode(ctx, arena, file, current, diags);
+    const fr = try server.compilerResult(arena, file, &other);
+    const current = text orelse if (fr) |r| r.base_text else "";
+    var diags = try compiler.merge(arena, .{
+        .text = current,
+        .lines = try offsets.LineIndex.init(arena, current),
+        .encoding = server.encoding,
+        .uri = document_uri,
+        .live = live_result,
+        .compiler = fr,
+        .other_file = OtherFiles.get,
+        .other_ctx = &other,
+    });
+    if (text) |t| if (server.wantsInactiveCode(file)) {
+        diags = try server.appendInactiveCode(ctx, arena, file, t, diags);
     };
     return .{ .uri = document_uri, .diagnostics = diags };
 }
@@ -2754,7 +2853,7 @@ fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return out;
 }
 
-/// 可以重命名的定义：位于某个工作区根目录内且不在其缓存目录中
+/// 可以重命名的定义：位于某个工作区根目录内且不在其缓存目录与依赖包中
 fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
     const file = switch (def) {
@@ -2765,12 +2864,13 @@ fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     const path = server.vfs.path(file);
     // 未保存的文档（`untitled:` 等）只存在于编辑器中
     if (isVirtual(path)) return true;
-    // 生成文件：`--cache-dir` / `ZIG_LOCAL_CACHE_DIR` 可以把本地缓存目录移到 `.zig-cache` 以外。
-    // 与 `workspaceFor` 相同，在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex 后 ws.mutex）
+    // 生成文件与依赖包：`--cache-dir` / `ZIG_LOCAL_CACHE_DIR` 可以把本地缓存目录移到 `.zig-cache` 以外，
+    // `--pkg-dir` 可以把依赖包移到 `zig-pkg` 以外。在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex
+    // 后 ws.mutex）
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        for (server.workspaces.items) |ws| if (ws.inLocalCache(path)) return false;
+        for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return false;
     }
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);

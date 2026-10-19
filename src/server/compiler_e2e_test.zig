@@ -393,7 +393,7 @@ test "single-file mode: compile one file without build.zig, with progress" {
     try testing.expectEqualStrings("Compiling one.zig", titles[0]);
 }
 
-test "standard library documents are not standalone compilation roots during startup or save" {
+test "files of the zig installation are not standalone compilation roots during startup or save" {
     const text =
         \\pub fn main() void {
         \\    const x: u32 = "s";
@@ -406,22 +406,273 @@ test "standard library documents are not standalone compilation roots during sta
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    const std_path = try std.fs.path.join(h.arena.allocator(), &.{ project.env.std_dir, "std.zig" });
-    const std_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std_path, h.arena.allocator(), .limited(2 * 1024 * 1024));
+    const a = h.arena.allocator();
+    const std_path = try std.fs.path.join(a, &.{ project.env.std_dir, "std.zig" });
+    const std_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, std_path, a, .limited(2 * 1024 * 1024));
     try initialize(&h, project.root, true);
     const std_uri = try open(&h, std_path, std_text);
     try waitIdle(&h);
     try expectNoErrors(&h, std_uri);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = std_uri } });
-    _ = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
+    // 标准库以外的文件同样只作为依赖参与编译：单独编译它们缺少构建系统提供的模块与 builtin 成员
+    var lib_uris: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "configurer.zig", "test_runner.zig" }) |name| {
+        const path = try std.fs.path.join(a, &.{ project.env.lib_dir, "compiler", name });
+        const lib_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(2 * 1024 * 1024));
+        try lib_uris.append(a, try open(&h, path, lib_text));
+    }
+    _ = try open(&h, try project.path(a, "one.zig"), text);
     try waitIdle(&h);
     const diags = try h.diagnostics();
     try expectNoErrors(&h, std_uri);
+    for (lib_uris.items) |u| try expectNoErrors(&h, u);
     try expectDiagnostics(diags, "one.zig", &.{"1:19 zig: expected type 'u32'"});
     try shutdown(&h);
     for (try progressTitles(&h)) |title| {
-        try testing.expect(!std.mem.eql(u8, title, "Compiling std.zig"));
+        if (std.mem.startsWith(u8, title, "Compiling ")) try testing.expectEqualStrings("Compiling one.zig", title);
     }
+}
+
+test "single-file mode: errors a root reports in the standard library are published there, also once a project is added" {
+    const bad =
+        \\const std = @import("std");
+        \\pub fn main() void {
+        \\    std.debug.print("{d}\n", .{});
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "scratch/one.zig", .text = bad },
+        .{ .path = "proj/build.zig", .text = simple_build },
+        .{ .path = "proj/main.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "scratch"), false);
+    const one_path = try project.path(a, "scratch/one.zig");
+    const one_uri = try open(&h, one_path, bad);
+    try waitIdle(&h);
+    // 错误的位置在标准库中，one.zig 自身没有错误：发布在标准库的文件上
+    var diags = try h.diagnostics();
+    try expectDiagnostics(diags, "one.zig", &.{});
+    try expectDiagnostics(diags, "Writer.zig", &.{"zig: too few arguments"});
+
+    // 加入一个项目：标准库也在它的编译集合中，单文件编译的结果仍然用于标准库的文件
+    const proj_uri = try za.base.uri.fromPath(a, try project.path(a, "proj"));
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &.{.{ .uri = proj_uri, .name = "proj" }}, .removed = &[_]Empty{} } });
+    try waitIdle(&h);
+    try testing.expectEqual(1, h.server.workspaces.items.len);
+    try expectDiagnostics(try h.diagnostics(), "Writer.zig", &.{"zig: too few arguments"});
+
+    // 修复并保存 one.zig：标准库中的错误随之清除
+    const fixed = try std.mem.replaceOwned(u8, a, bad, ".{});", ".{1});");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = one_path, .data = fixed });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = one_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = one_uri } });
+    try waitIdle(&h);
+    diags = try h.diagnostics();
+    try expectDiagnostics(diags, "one.zig", &.{});
+    try expectDiagnostics(diags, "Writer.zig", &.{});
+    try shutdown(&h);
+}
+
+/// 构建根目录（project）之外的模块：dep.zig 按名字 import support，只有在项目的模块图中才能解析
+const outside_root = [_]fixture.File{
+    .{ .path = "project/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const support = b.createModule(.{ .root_source_file = .{ .cwd_relative = "../dependency/support.zig" } });
+    \\    const dep = b.createModule(.{
+    \\        .root_source_file = .{ .cwd_relative = "../dependency/dep.zig" },
+    \\        .imports = &.{.{ .name = "support", .module = support }},
+    \\    });
+    \\    const root = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "dep", .module = dep }},
+    \\    });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "probe", .root_module = root }).step);
+    \\}
+    \\
+    },
+    .{ .path = "project/main.zig", .text = "export fn entry() u32 {\n    return @import(\"dep\").value();\n}\n" },
+    .{ .path = "dependency/dep.zig", .text = dep_good },
+    .{ .path = "dependency/support.zig", .text = support_text },
+};
+const dep_good = "const support = @import(\"support\");\npub fn value() u32 {\n    return support.answer;\n}\n";
+const dep_bad = "const support = @import(\"support\");\npub fn value() u32 {\n    _ = support.answer;\n    return \"bad\";\n}\n";
+const support_text = "pub const answer: u32 = 1;\n";
+
+fn countTitles(titles: []const []const u8, title: []const u8) usize {
+    var n: usize = 0;
+    for (titles) |t| {
+        if (std.mem.eql(u8, t, title)) n += 1;
+    }
+    return n;
+}
+
+/// 保存文件：写入磁盘，同步缓冲区，再通知保存
+fn save(h: *Harness, path: []const u8, file_uri: []const u8, version: i64, text: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = text });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = file_uri, .version = version }, .contentChanges = &.{.{ .text = text }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = file_uri } });
+}
+
+test "modules outside the build root: never compiled alone, saving them rebuilds the project" {
+    var project = try fixture.Project.create(&outside_root);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "project"), true);
+    // 项目加载期间打开：此时还不知道 dep.zig 属于项目，单文件编译推迟到加载结束，届时它已归入项目
+    const dep_path = try project.path(a, "dependency/dep.zig");
+    const dep_uri = try open(&h, dep_path, dep_good);
+    try waitIdle(&h);
+    // 加载之后打开
+    _ = try open(&h, try project.path(a, "dependency/support.zig"), support_text);
+    try waitIdle(&h);
+    const builds = countTitles(try progressTitles(&h), "zig build check");
+    try testing.expect(builds >= 1);
+
+    // 只保存 dep.zig：项目重新构建，在真实的模块图中报告错误（而不是找不到 support）
+    try save(&h, dep_path, dep_uri, 2, dep_bad);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "dep.zig", &.{"3:11 zig: expected type 'u32'"});
+    try testing.expect(countTitles(try progressTitles(&h), "zig build check") > builds);
+
+    // 修复后同样只保存 dep.zig：错误被清除
+    try save(&h, dep_path, dep_uri, 3, dep_good);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "dep.zig", &.{});
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
+}
+
+/// 以绝对路径（相对于构建根目录）共用 shared/x.zig 的项目
+const shared_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const shared = b.createModule(.{ .root_source_file = .{ .cwd_relative = "../shared/x.zig" } });
+    \\    const root = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "shared", .module = shared }},
+    \\    });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "probe", .root_module = root }).step);
+    \\}
+    \\
+;
+const shared_good = "pub fn fine() u32 {\n    return 1;\n}\npub fn broken() u32 {\n    return 2;\n}\n";
+const shared_bad = "pub fn fine() u32 {\n    return 1;\n}\npub fn broken() u32 {\n    return \"x\";\n}\n";
+
+test "a module shared by two projects: saving it rebuilds both, the errors of either build are published" {
+    var project = try fixture.Project.create(&.{
+        // b 不调用 broken：它的构建不分析其中的错误
+        .{ .path = "b/build.zig", .text = shared_build },
+        .{ .path = "b/main.zig", .text = "export fn entry() u32 {\n    return @import(\"shared\").fine();\n}\n" },
+        .{ .path = "a/build.zig", .text = shared_build },
+        .{ .path = "a/main.zig", .text = "export fn entry() u32 {\n    return @import(\"shared\").broken();\n}\n" },
+        .{ .path = "shared/x.zig", .text = shared_good },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const folders = [_]struct { uri: []const u8, name: []const u8 }{
+        .{ .uri = try za.base.uri.fromPath(a, try project.path(a, "b")), .name = "b" },
+        .{ .uri = try za.base.uri.fromPath(a, try project.path(a, "a")), .name = "a" },
+    };
+    _ = try h.request("initialize", .{ .capabilities = .{ .window = .{ .workDoneProgress = true } }, .workspaceFolders = &folders });
+    try h.notify("initialized", Empty{});
+    const x_path = try project.path(a, "shared/x.zig");
+    const x_uri = try open(&h, x_path, shared_good);
+    try waitIdle(&h);
+    try testing.expectEqual(2, h.server.workspaces.items.len);
+    try testing.expect(std.mem.endsWith(u8, h.server.workspaces.items[0].root, "b"));
+    const builds = countTitles(try progressTitles(&h), "zig build check");
+
+    // 只有 a 的构建报告 x.zig 中的错误；包含 x.zig 的第一个项目是 b
+    try save(&h, x_path, x_uri, 2, shared_bad);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "x.zig", &.{"4:11 zig: expected type 'u32'"});
+    try testing.expect(countTitles(try progressTitles(&h), "zig build check") >= builds + 2);
+
+    try save(&h, x_path, x_uri, 3, shared_good);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "x.zig", &.{});
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
+}
+
+/// 按哈希获取的依赖包（伪造：包目录中已经有它时 maker 不再获取）。项目用 `--pkg-dir` 把包目录放在构建根目录之外
+const fetched_hash = "foo-0.0.1-OjQ08eFlFQAb4BLnwZNNE3R5Dx2TI67EIpAsy2h0ZyoC";
+const fetched_package = [_]fixture.File{
+    .{ .path = "proj/build.zig.zon", .text = ".{ .name = .proj, .version = \"0.0.0\", .fingerprint = 0x520c3c90be36badb, .paths = .{\"\"}, " ++
+        ".dependencies = .{ .foo = .{ .url = \"https://example.invalid/foo.tar.gz\", .hash = \"" ++ fetched_hash ++ "\" } } }\n" },
+    .{ .path = "proj/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const foo = b.dependency("foo", .{});
+    \\    const root = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "foo", .module = foo.module("foo") }},
+    \\    });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "probe", .root_module = root }).step);
+    \\}
+    \\
+    },
+    .{ .path = "proj/main.zig", .text = "export fn entry() u32 {\n    return @import(\"foo\").answer();\n}\n" },
+    .{ .path = "proj/zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--pkg-dir\", \"../pkgs\"]}}" },
+    .{ .path = "pkgs/" ++ fetched_hash ++ "/build.zig.zon", .text = ".{ .name = .foo, .version = \"0.0.1\", .fingerprint = 0x8c736521e67512df, .paths = .{\"\"} }\n" },
+    .{ .path = "pkgs/" ++ fetched_hash ++ "/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = b.addModule("foo", .{ .root_source_file = b.path("src/root.zig") });
+    \\}
+    \\
+    },
+    .{ .path = "pkgs/" ++ fetched_hash ++ "/src/root.zig", .text = fetched_root },
+    // 没有被任何模块用到的文件
+    .{ .path = "pkgs/" ++ fetched_hash ++ "/src/unused.zig", .text = "const x: u32 = \"s\";\ncomptime {\n    _ = x;\n}\n" },
+};
+const fetched_root = "pub fn answer() u32 {\n    return 42;\n}\n";
+
+test "fetched packages outside the build root are libraries: never compiled alone, not renamable" {
+    var project = try fixture.Project.create(&fetched_package);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "proj"), true);
+    try waitIdle(&h);
+    {
+        const ws = h.server.workspaces.items[0];
+        ws.mutex.lockUncancelable(testing.io);
+        defer ws.mutex.unlock(testing.io);
+        const roots = ws.model.?.package_roots;
+        try testing.expectEqual(1, roots.len);
+        try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.root, "pkgs", fetched_hash }), roots[0]);
+    }
+    const pkg = "pkgs/" ++ fetched_hash ++ "/src/";
+    const root_uri = try open(&h, try project.path(a, pkg ++ "root.zig"), fetched_root);
+    const unused_path = try project.path(a, pkg ++ "unused.zig");
+    const unused_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, unused_path, a, .limited(1024));
+    const unused_uri = try open(&h, unused_path, unused_text);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = unused_uri } });
+    try waitIdle(&h);
+    try expectNoErrors(&h, unused_uri);
+    const prepared = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = root_uri }, .position = .{ .line = 0, .character = 9 } });
+    try testing.expect(prepared.object.get("error") != null);
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
 }
 
 test "single-file mode: errors in imported files are published on them and cleared after a fix" {

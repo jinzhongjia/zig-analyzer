@@ -66,11 +66,16 @@ resolve_set: ?CompileSet.Result = null,
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// 最近一次构建的编译器诊断
 result: ?compiler.BuildResult = null,
+/// `result` 存入时取的编译结果序号（见 `Server.nextCompileGeneration`）：越大越新
+result_generation: u64 = 0,
 /// FileId → `result` 中的条目
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
 building: bool = false,
 /// 至少完成过一次构建（用于判断崩溃是否「连续」）
 built: bool = false,
+/// 首次加载已经结束：读入了构建图并算出编译集合，或者加载失败、实例已经结束。此前还不知道项目包含哪些
+/// 根目录外的文件，单文件模式推迟编译（见 `Server.projectsLoading`）
+load_done: bool = false,
 /// 构建期间又收到构建请求：本轮结果作废，结束后立即重建
 rebuild: bool = false,
 /// 构建过程中得知了新的生成文件路径、但编译集合尚未重算（节流，见 `generated_recompute_interval_ms`）
@@ -242,16 +247,47 @@ pub fn owns(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     if (ws.compile_set) |*s| if (s.contains(file)) return true;
-    return isUnder(ws.server.vfs.path(file), ws.root);
+    return ws.server.vfs.isUnder(ws.server.vfs.path(file), ws.root);
 }
 
-/// `path` 是否位于 maker 使用的本地缓存目录（生成文件所在处，不一定是 `<构建根>/.zig-cache`）中。
-/// 本地缓存目录包含构建根目录时无法区分生成文件与项目文件，返回 false
-pub fn inLocalCache(ws: *Workspace, path: []const u8) bool {
+/// 文件是否在本项目的模块图中：在编译集合中，或者可由其余的编译 step 到达
+pub fn contains(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
-    const cache = if (ws.model) |*m| m.local_cache_root else return false;
-    return cache.len != 0 and !isUnder(ws.root, cache) and isUnder(path, cache);
+    if (ws.compile_set) |*s| if (s.contains(file)) return true;
+    if (ws.resolve_set) |*s| if (s.contains(file)) return true;
+    return false;
+}
+
+/// `path` 是否位于本项目的依赖库中：maker 使用的本地缓存目录（生成文件所在处，不一定是 `<构建根>/.zig-cache`；
+/// 它包含构建根目录时无法区分生成文件与项目文件，不算在内），或获取的依赖包
+pub fn inLibrary(ws: *Workspace, path: []const u8) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const model = &(ws.model orelse return false);
+    const vfs = &ws.server.vfs;
+    const cache = model.local_cache_root;
+    if (cache.len != 0 and !vfs.isUnder(ws.root, cache) and vfs.isUnder(path, cache)) return true;
+    for (model.package_roots) |p| if (vfs.isUnder(path, p)) return true;
+    return false;
+}
+
+/// 首次加载尚未结束（见 `load_done`）
+pub fn isLoading(ws: *Workspace) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    return !ws.load_done;
+}
+
+/// 首次加载结束：此前推迟的单文件编译按文件此时的上下文进行
+fn finishLoading(ws: *Workspace) void {
+    {
+        ws.mutex.lockUncancelable(ws.server.io);
+        defer ws.mutex.unlock(ws.server.io);
+        if (ws.load_done) return;
+        ws.load_done = true;
+    }
+    ws.server.reconcileSingle();
 }
 
 /// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件与构建脚本发布（与编译器一致）
@@ -277,11 +313,6 @@ pub fn isBuildScript(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return ws.build_scripts.contains(file);
-}
-
-pub fn isUnder(path: []const u8, dir: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, dir)) return false;
-    return path.len == dir.len or std.fs.path.isSep(path[dir.len]) or (dir.len > 0 and std.fs.path.isSep(dir[dir.len - 1]));
 }
 
 // ── 后台任务 ─────────────────────────────────────────────────────────
@@ -324,9 +355,10 @@ fn run(ws: *Workspace) Io.Cancelable!void {
         ws.handle(&event) catch |err| switch (err) {
             error.OutOfMemory => log.err("{s}: out of memory while handling build event", .{ws.root}),
         };
-        // 首个构建图处理完（或构建图加载失败）后，启动阶段结束
+        // 首个构建图处理完（或构建图加载失败）后，启动阶段结束。推迟的单文件编译在计为空闲之前开始
         if (started and (event == .configuration or event == .configuration_failed)) {
             started = false;
+            ws.finishLoading();
             ws.server.busyEnd();
         }
     }
@@ -340,6 +372,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else null);
     ws.loading = null;
     ws.mutex.unlock(ws.server.io);
+    ws.finishLoading();
     // 进度结束后才计为空闲：waitIdle（如 shutdown）返回前客户端已收到 end
     if (started) ws.server.busyEnd();
     if (was_building) ws.server.busyEnd();
@@ -604,6 +637,7 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         ws.result_files.deinit(ws.gpa);
         // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
         ws.result = result;
+        ws.result_generation = ws.server.nextCompileGeneration();
         ws.result_files = files;
     }
     // 重启产生的新实例：首个结果连同模型与编译集合一起替换旧实例
@@ -612,7 +646,7 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
 }
 
 /// 重启产生的新实例到了 `stage`：替换旧实例（见 `Server.promote`），更新模块图，重新发布打开的文件与旧实例
-/// 发布过编译器诊断的文件
+/// 发布过编译器诊断的文件，单文件模式按新的模块图收敛
 fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     const old = ws.server.promote(ws, stage) orelse return;
     defer old.release();
@@ -623,6 +657,7 @@ fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     old.mutex.unlock(ws.server.io);
     defer ws.gpa.free(stale);
     ws.server.publishFiles(stale, true);
+    ws.server.reconcileSingle();
 }
 
 /// 清除编译器诊断，重新发布发布过诊断的文件
@@ -706,10 +741,12 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     if (ws.resolve_set) |*old| old.deinit(ws.gpa);
     ws.resolve_set = extra;
     ws.mutex.unlock(io);
-    // 编译集合变化会影响模块归属与已打开文件的 live 诊断。尚未替换旧实例的新实例不影响（替换时一并更新）
+    // 编译集合变化会影响模块归属、已打开文件的 live 诊断与文件是否按单文件编译。尚未替换旧实例的新实例不影响
+    // （替换时一并更新）
     if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
+    ws.server.reconcileSingle();
 }
 
 /// 计算构建脚本；缺少的文件读入后重算

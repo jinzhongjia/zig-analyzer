@@ -13,6 +13,20 @@ pub const FileResult = struct {
     /// 构建完成时读取的磁盘文本；诊断的字节区间以它为准
     base_text: []const u8,
     items: []const Item,
+
+    /// 复制到 `a` 中：所在的构建结果被新的结果替换时整体释放
+    pub fn dupe(fr: *const FileResult, a: Allocator) Allocator.Error!FileResult {
+        const items = try a.alloc(Item, fr.items.len);
+        for (fr.items, items) |item, *out| {
+            const notes = try a.alloc(Note, item.notes.len);
+            for (item.notes, notes) |n, *o| o.* = .{ .path = try a.dupe(u8, n.path), .start = n.start, .end = n.end, .message = try a.dupe(u8, n.message) };
+            out.* = item;
+            out.message = try a.dupe(u8, item.message);
+            out.notes = notes;
+            out.compile_log = try a.dupe(u8, item.compile_log);
+        }
+        return .{ .base_text = try a.dupe(u8, fr.base_text), .items = items };
+    }
 };
 
 pub const Item = struct {
@@ -198,7 +212,7 @@ fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error!?[
     return Vfs.resolve(.native, a, base, path);
 }
 
-/// 合并同一文件在多次编译中的结果（单文件模式下 import 它的各个根文件分别编译）。`results` 按编译完成的
+/// 合并同一文件在多次编译中的结果（包含它的各个项目的构建，单文件模式下 import 它的各个根文件的编译）。`results` 按编译完成的
 /// 先后从新到旧排列，以最新一次读取的文本为准：文本相同的结果直接并入；文本不同的（两次编译之间文件被修改）
 /// 只并入非 AstGen 错误，按文本差异平移，落在修改区域内的丢弃，与 `merge` 处理未保存修改的方式相同。
 /// 区间与文案相同的错误只保留一条（compile log 并到保留的那条上）
