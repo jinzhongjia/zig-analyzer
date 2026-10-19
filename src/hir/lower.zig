@@ -365,6 +365,22 @@ const Lowerer = struct {
                 while (it.next()) |c| if (c == .token and c.token.kind == .identifier) try names.append(l.a, try l.ident(c.token.text));
                 break :blk .{ .error_set = names.items };
             },
+            .asm_output => blk: {
+                // 输出目标是直接 token，不是子表达式；保留它的真实范围和当前作用域。
+                if (n.childToken(.arrow) == null) {
+                    var children = n.children();
+                    var in_operand = false;
+                    while (children.next()) |child| if (child == .token) {
+                        const token = child.token;
+                        if (token.kind == .l_paren) in_operand = true;
+                        if (in_operand and token.kind == .identifier) {
+                            const target = try l.add(.{ .name_ref = try l.ident(token.text) }, l.rel(token.offset, token.range().end));
+                            break :blk .{ .other = try l.a.dupe(ExprId, &.{target}) };
+                        }
+                    };
+                }
+                break :blk .{ .other = try l.exprList(ast.childNodes(n)) };
+            },
             else => .{ .other = try l.exprList(ast.childNodes(n)) },
         };
         return l.add(e, r);

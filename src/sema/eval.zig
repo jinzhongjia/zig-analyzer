@@ -937,7 +937,7 @@ const Evaluator = struct {
     }
 
     fn nameRef(ev: *Evaluator, f: *Frame, e: ExprId, name: []const u8) EvalError!Val {
-        if (try infer.primitive(ev.ip, name)) |tv| return thaw(tv);
+        if (!f.body.nameRefIsEscaped(e)) if (try infer.primitive(ev.ip, name)) |tv| return thaw(tv);
         const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
         switch (def) {
             .local => |l| if (l.file == f.file and l.item == f.item) return f.slots[@backingInt(l.binding)],

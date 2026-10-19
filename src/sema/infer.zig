@@ -773,7 +773,7 @@ const Inferrer = struct {
 
     fn nameRef(inf: *Inferrer, e: ExprId, name: []const u8) Error!TypedValue {
         const b = inf.body;
-        if (try primitive(inf.ip, name)) |tv| return tv;
+        if (!b.nameRefIsEscaped(e)) if (try primitive(inf.ip, name)) |tv| return tv;
         const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .unknown;
         if (inf.lazy) |range| if (def == .local) {
             const l = def.local;

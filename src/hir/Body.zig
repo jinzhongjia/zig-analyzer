@@ -208,6 +208,12 @@ pub fn range(b: *const Body, id: ExprId) Range {
     return b.expr_ranges[@backingInt(id)];
 }
 
+/// name_ref 的区间是原始 token；带引号或转义的标识符比解码后的名字更长。
+pub fn nameRefIsEscaped(b: *const Body, id: ExprId) bool {
+    const span = b.range(id);
+    return span.end - span.start > b.expr(id).name_ref.len;
+}
+
 pub fn binding(b: *const Body, id: BindingId) Binding {
     return b.bindings[@backingInt(id)];
 }
@@ -255,7 +261,10 @@ pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
         var i = bindings.len;
         while (i > 0) {
             i -= 1;
-            if (std.mem.eql(u8, b.binding(bindings[i]).name, name)) return bindings[i];
+            const candidate = b.binding(bindings[i]);
+            // 裸 `_` 不引入名字，转义后的 `@"_"` 仍是可引用的绑定。
+            if (candidate.range.end - candidate.range.start == 1 and std.mem.eql(u8, candidate.name, "_")) continue;
+            if (std.mem.eql(u8, candidate.name, name)) return bindings[i];
         }
     }
     return null;

@@ -355,10 +355,11 @@ fn statement(p: *Parser, block_level: bool) Error!void {
     _ = try m.complete(p, .expr_stmt);
 }
 
-/// `keyword BlockExprStatement`
+/// 前缀语句：只有 errdefer 允许在主体前捕获错误。
 fn prefixedStatement(p: *Parser, kind: SyntaxKind) Error!void {
     const m = try p.start();
     try p.bump();
+    if (kind == .errdefer_stmt) try optPayload(p);
     try blockExprStatement(p);
     _ = try m.complete(p, kind);
 }
