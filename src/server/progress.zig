@@ -44,9 +44,27 @@ fn free(gpa: Allocator, p: *Progress) void {
     gpa.destroy(p);
 }
 
+/// 回收已结束、但客户端从未回复 create 的条目。持有者已经调用 `end`，不会再使用指针；
+/// 未结束的条目留着，避免悬空指针。调用者持有 `mutex`
+fn pruneLocked(reg: *Registry, gpa: Allocator) void {
+    var i: usize = 0;
+    while (i < reg.active.count()) {
+        if (reg.active.count() < max_active) return;
+        const p = reg.active.values()[i];
+        if (p.state == .creating and p.ended) {
+            _ = reg.active.orderedRemove(p.id);
+            free(gpa, p);
+        } else i += 1;
+    }
+}
+
 fn tokenBuf(buf: *[32]u8, id: u32) []const u8 {
     return std.fmt.bufPrint(buf, "zig-analyzer/{d}", .{id}) catch unreachable;
 }
+
+/// 同时存在的进度上限：客户端不回复 create 时，已结束的条目会在下一次 begin 时回收；
+/// 全部未结束（调用方仍持有指针）时不再新建，避免无界增长
+const max_active = 64;
 
 /// 开始一个进度；客户端不支持时返回 null（其余函数接受 null 并忽略）
 pub fn begin(reg: *Registry, server: *Server, title: []const u8, percentage: bool) ?*Progress {
@@ -54,6 +72,10 @@ pub fn begin(reg: *Registry, server: *Server, title: []const u8, percentage: boo
     reg.mutex.lockUncancelable(server.io);
     defer reg.mutex.unlock(server.io);
     if (!reg.enabled) return null;
+    if (reg.active.count() >= max_active) {
+        reg.pruneLocked(gpa);
+        if (reg.active.count() >= max_active) return null;
+    }
     const p = gpa.create(Progress) catch return null;
     p.* = .{ .id = reg.next_id, .title = gpa.dupe(u8, title) catch {
         gpa.destroy(p);
@@ -129,4 +151,23 @@ pub fn handleResponse(reg: *Registry, server: *Server, id: i64, ok: bool) bool {
     var buf: [32]u8 = undefined;
     server.sendNotification("$/progress", .{ .token = tokenBuf(&buf, p.id), .value = Begin{ .title = p.title, .message = p.message, .percentage = p.percentage } });
     return true;
+}
+
+test "pruneLocked drops ended entries but keeps the ones still in use" {
+    const gpa = std.testing.allocator;
+    var reg: Registry = .{};
+    defer reg.deinit(gpa);
+    for (0..max_active + 10) |i| {
+        const p = try gpa.create(Progress);
+        p.* = .{ .id = @intCast(i), .title = try gpa.dupe(u8, "done"), .state = .creating, .ended = true };
+        try reg.active.put(gpa, p.id, p);
+    }
+    // 仍被调用方持有的进度
+    const live = try gpa.create(Progress);
+    live.* = .{ .id = max_active + 100, .title = try gpa.dupe(u8, "live") };
+    try reg.active.put(gpa, live.id, live);
+
+    reg.pruneLocked(gpa);
+    try std.testing.expectEqual(max_active - 1, reg.active.count());
+    try std.testing.expect(reg.active.get(live.id) != null);
 }
