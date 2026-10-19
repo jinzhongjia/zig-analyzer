@@ -169,6 +169,9 @@ pub const ItemSummaries = struct {
         out.items = try gpa.alloc(ItemSummary, items.items.len);
         errdefer gpa.free(out.items);
         out.container_offsets = try gpa.alloc(?u32, items.containers.len);
+        // 解码后的名字只用于哈希，临时分配随本次计算释放
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
         for (items.items, out.items) |it, *o| {
             const node = map.get(it.ast_id) orelse {
                 o.* = .{ .offset = null };
@@ -179,20 +182,17 @@ pub const ItemSummaries = struct {
                 o.name_offset = t.offset;
                 o.name_len = @intCast(t.text.len);
             }
-            collectNames(node, o);
+            try collectNames(scratch.allocator(), node, o);
         }
         for (items.containers, out.container_offsets) |c, *o| o.* = if (map.get(c.ast_id)) |n| n.offset else null;
         return out;
     }
 
-    fn collectNames(node: ast.SyntaxNode, s: *ItemSummary) void {
+    fn collectNames(a: Allocator, node: ast.SyntaxNode, s: *ItemSummary) Allocator.Error!void {
         var it = node.children();
         while (it.next()) |e| switch (e) {
-            .token => |t| if (t.kind == .identifier) {
-                var buf: [256]u8 = undefined;
-                s.add(ast.identNameBuf(t.text, &buf));
-            },
-            .node => |c| collectNames(c, s),
+            .token => |t| if (t.kind == .identifier) s.add(try ast.identNameAlloc(a, t.text)),
+            .node => |c| try collectNames(a, c, s),
         };
     }
 

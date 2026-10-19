@@ -15,7 +15,7 @@ const ItemCount = struct {
     }
 };
 
-const Db = engine.Engine(void, &.{ FileText, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, ItemCount });
+const Db = engine.Engine(void, &.{ FileText, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, q.ItemSummaries, ItemCount });
 
 fn setText(db: *Db, file: Vfs.FileId, text: []const u8) !void {
     db.beginWrite();
@@ -31,6 +31,24 @@ fn count(db: *Db, file: Vfs.FileId) !usize {
 
 fn executions(db: *Db, comptime Q: type) u64 {
     return db.executions(Q);
+}
+
+test "ItemSummary mentions long escaped names" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    const suffix: [300]u8 = @splat('b');
+    // 解码后 301 字节，超过旧实现的 256 字节缓冲
+    const source = try std.fmt.allocPrint(testing.allocator, "fn f() void {{\n    const x = @\"\\x41{s}\";\n}}\n", .{suffix});
+    defer testing.allocator.free(source);
+    const name = try std.fmt.allocPrint(testing.allocator, "A{s}", .{suffix});
+    defer testing.allocator.free(name);
+    try setText(&db, file, source);
+    var ctx = db.beginRead(testing.allocator);
+    defer ctx.end();
+    const summaries = try ctx.get(q.ItemSummaries, file);
+    try testing.expectEqual(1, summaries.items.len);
+    try testing.expect(summaries.items[0].mayMention(name));
 }
 
 test "body-only edit: reparse and rebuild ItemTree, downstream not recomputed" {

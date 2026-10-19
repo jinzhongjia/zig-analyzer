@@ -94,7 +94,7 @@ pub fn isMember(k: SyntaxKind) bool {
     };
 }
 
-/// 标识符的名字：`@"name"` 形式去掉引号（含转义的保留原文，解码见 `identNameAlloc` / `identNameBuf`）。
+/// 标识符的名字：`@"name"` 形式去掉引号（含转义的保留原文，解码见 `identNameAlloc`）。
 /// 语义层（名字解析、字段、枚举成员）一律使用去掉引号并解码的名字，显示时再按需加回（`std.zig.fmtId`）
 pub fn identName(text: []const u8) []const u8 {
     if (isQuotedIdent(text)) {
@@ -116,15 +116,6 @@ pub fn identNameAlloc(a: std.mem.Allocator, text: []const u8) std.mem.Allocator.
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidLiteral => text,
     };
-}
-
-/// 同 `identNameAlloc`，解码到 `buf`；`buf` 不够时保留原文
-pub fn identNameBuf(text: []const u8, buf: []u8) []const u8 {
-    const name = identName(text);
-    if (name.ptr != text.ptr or !isQuotedIdent(text)) return name;
-    var w: std.Io.Writer = .fixed(buf);
-    const result = std.zig.string_literal.parseWrite(&w, text[1..]) catch return text;
-    return if (result == .success) w.buffered() else text;
 }
 
 /// 容器成员的名字 token：函数名、变量名、字段名、test 名（字符串或标识符）；没有名字时为 null。
