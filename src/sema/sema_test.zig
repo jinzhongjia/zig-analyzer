@@ -499,6 +499,36 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "switch on an error set narrows the capture" {
+    try expectTypes(
+        \\const E = error{ A, B, C };
+        \\fn probe(e: E) void {
+        \\    switch (e) {
+        \\        error.A => |x| {
+        \\            const v_one = x;
+        \\            _ = v_one;
+        \\        },
+        \\        error.B => |x| {
+        \\            const v_two = x;
+        \\            _ = v_two;
+        \\        },
+        \\        else => |x| {
+        \\            const v_else = x;
+        \\            _ = v_else;
+        \\        },
+        \\    }
+        \\}
+        \\comptime {
+        \\    _ = &probe;
+        \\}
+    , &.{
+        .{ "v_one", "error{A}" },
+        .{ "v_two", "error{B}" },
+        // else 分支为其余的错误
+        .{ "v_else", "error{C}" },
+    });
+}
+
 test "false payloads are not null or failed" {
     try expectTypes(
         \\const opt: ?bool = false;

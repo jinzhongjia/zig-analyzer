@@ -625,7 +625,7 @@ const Inferrer = struct {
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 for (s.prongs, 0..) |prong, i| {
-                    try inf.bindSwitchCapture(prong, s.operand, operand, chosen != null and chosen.? == i);
+                    try inf.bindSwitchCapture(prong, s.prongs, s.operand, operand, chosen != null and chosen.? == i);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
@@ -1834,7 +1834,7 @@ const Inferrer = struct {
     /// 求不出的分支项为 unknown；第二个捕获为标签。`chosen`：操作数 comptime 已知，这是执行的分支，捕获取
     /// 实际的载荷值；各项的载荷类型没有 peer 时只能是 `inline` 分支（每项单独实例化，如
     /// `inline .@"struct", .@"union" => |info|`），类型也取实际的载荷类型
-    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
+    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, prongs: []const Body.Prong, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
         const operand = operand_tv.ty;
@@ -1843,13 +1843,26 @@ const Inferrer = struct {
             .reified_type => |rt| rt.kind == .@"union",
             else => false,
         };
-        var t: Index = if (is_union) try inf.prongPayloadType(prong, operand) else operand;
+        const is_error_set = switch (ip.key(operand)) {
+            .error_set_type, .inferred_error_set => true,
+            else => false,
+        };
+        var t: Index = if (is_union)
+            try inf.prongPayloadType(prong, operand)
+        else if (is_error_set)
+            try inf.errorSetProngType(prong, prongs, try queries.errorSetMembers(inf.r, operand))
+        else
+            operand;
         var val: ?Index = null;
         if (chosen and is_union) if (operand_tv.val) |v| switch (ip.key(v)) {
             .union_value => |u| if (try inf.unionFieldType(operand, u.tag)) |pt| {
                 if (t == .unknown) t = pt;
                 if (t == pt) val = u.payload;
             },
+            else => {},
+        };
+        if (chosen and is_error_set) if (operand_tv.val) |v| switch (ip.key(v)) {
+            .error_value => val = v,
             else => {},
         };
         const cap = prong.capture[0];
@@ -1859,6 +1872,43 @@ const Inferrer = struct {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
             inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag };
         }
+    }
+
+    /// 错误集 switch 分支捕获的类型：普通分支为分支项中的错误组成的集合，`else` 为操作数成员去掉
+    /// 其他分支列出的错误；成员求不出（`anyerror`）时为 unknown
+    fn errorSetProngType(inf: *Inferrer, prong: Body.Prong, prongs: []const Body.Prong, members: ?[]const []const u8) Error!Index {
+        const all = members orelse return .unknown;
+        var names: std.ArrayList([]const u8) = .empty;
+        if (prong.is_else) {
+            for (all) |m| {
+                var listed = false;
+                for (prongs) |p| {
+                    if (p.is_else) continue;
+                    for (p.items) |item| if (try inf.errorItemName(item)) |n| {
+                        if (std.mem.eql(u8, n, m)) {
+                            listed = true;
+                            break;
+                        }
+                    };
+                    if (listed) break;
+                }
+                if (!listed) try names.append(inf.scratch, m);
+            }
+        } else {
+            for (prong.items) |item| if (try inf.errorItemName(item)) |n| try names.append(inf.scratch, n);
+            if (names.items.len == 0) return .unknown;
+        }
+        return inf.ip.errorSet(inf.scratch, names.items);
+    }
+
+    fn errorItemName(inf: *Inferrer, item: ExprId) Error!?[]const u8 {
+        return switch (inf.body.expr(item)) {
+            .error_value => |n| n,
+            else => switch (inf.ip.key(inf.get(item).val orelse return null)) {
+                .error_value => |n| n,
+                else => null,
+            },
+        };
     }
 
     fn prongPayloadType(inf: *Inferrer, prong: Body.Prong, operand: Index) Error!Index {
