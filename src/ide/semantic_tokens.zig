@@ -61,9 +61,22 @@ pub const legend: types.SemanticTokensLegend = .{
 };
 
 pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc: offsets.Encoding, range: ?types.Range) resolve.Error![]const u32 {
+    if (range) |requested| if (!before(requested.start, requested.end)) return &.{};
     var b: Builder = .{ .r = r, .lines = lines, .enc = enc, .range = range };
-    try b.collect(file);
-    try b.visit((try r.ctx.get(database.syntax.ParseFile, file)).rootNode(), false);
+    if (range) |requested| {
+        const start = offsets.positionToOffset(lines.text, requested.start, enc);
+        var end = offsets.positionToOffset(lines.text, requested.end, enc);
+        // 结束位置落在多单元字符中间时，保留包含它的整个 token。
+        if (end < lines.text.len and before(lines.position(end, enc), requested.end)) {
+            const width = std.unicode.utf8ByteSequenceLength(lines.text[end]) catch 1;
+            end = @min(end + width, lines.text.len);
+        }
+        if (start >= end) return &.{};
+        b.visible = .{ .start = @intCast(start), .end = @intCast(end) };
+    }
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    try b.collect(file, root);
+    try b.visit(root, false);
     return b.data.items;
 }
 
@@ -76,8 +89,10 @@ const Builder = struct {
     lines: offsets.LineIndex,
     enc: offsets.Encoding,
     range: ?types.Range,
+    visible: ?tree.TextRange = null,
     /// 以名字 token 的末尾寻址，字段访问不需要重新遍历其左侧表达式。
     names: std.AutoHashMapUnmanaged(u32, Class) = .empty,
+    visible_names: std.AutoHashMapUnmanaged(u32, void) = .empty,
     classes: std.AutoHashMapUnmanaged(OwnerKey, Class) = .empty,
     items: std.AutoHashMapUnmanaged(OwnerKey, u32) = .empty,
     indexed: std.AutoHashMapUnmanaged(FileId, void) = .empty,
@@ -87,6 +102,61 @@ const Builder = struct {
     prev: types.Position = .{ .line = 0, .character = 0 },
     cursor_offset: usize = 0,
     cursor: types.Position = .{ .line = 0, .character = 0 },
+
+    fn intersects(b: *const Builder, span: tree.TextRange) bool {
+        const visible = b.visible orelse return true;
+        return span.start < visible.end and visible.start < span.end;
+    }
+
+    fn selectOwners(b: *Builder, node: SyntaxNode, current: ?u32, owners: *const std.AutoHashMapUnmanaged(u32, u32), selected: []bool) Allocator.Error!void {
+        if (!b.intersects(node.range())) return;
+        const owner = owners.get(node.offset) orelse current;
+        var children = node.children();
+        while (children.next()) |child| switch (child) {
+            .node => |n| try b.selectOwners(n, owner, owners, selected),
+            .token => |t| if (t.kind == .identifier and b.intersects(t.range())) {
+                if (owner) |index| selected[index] = true;
+                try b.visible_names.put(b.r.arena, t.range().end, {});
+            },
+        };
+    }
+
+    fn markUse(b: *Builder, def: resolve.Def) resolve.Error!void {
+        if (def == .local) {
+            const local = def.local;
+            // 当前文件已建立 owner 索引，名字解析返回的绑定属于该文件的词法链。
+            const key: OwnerKey = .{ .file = local.file, .item = (try b.r.itemTree(local.file)).items[local.item].ast_id };
+            try b.used.put(b.r.arena, .{ .owner = key, .binding = local.binding }, {});
+        }
+    }
+
+    fn nestedUses(b: *Builder, file: FileId, index: u32, first_child: []const ?u32, next_sibling: []const ?u32, names: *const std.StringHashMapUnmanaged(void)) resolve.Error!void {
+        var child = first_child[index];
+        while (child) |i| : (child = next_sibling[i]) {
+            var may_mention = false;
+            var wanted = names.keyIterator();
+            while (wanted.next()) |name| {
+                if (try b.r.mayMention(file, i, name.*)) {
+                    may_mention = true;
+                    break;
+                }
+            }
+            if (may_mention) {
+                const body = try b.r.body(file, i);
+                for (body.exprs, 0..) |expr, e| {
+                    const name = switch (expr) {
+                        .name_ref => |n| n,
+                        else => continue,
+                    };
+                    if (!names.contains(name)) continue;
+                    const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(e)));
+                    if (!body.nameRefIsEscaped(id) and (isPrimitiveType(name) or isPrimitiveValue(name) or std.mem.eql(u8, name, "_"))) continue;
+                    if (try b.r.resolveName(file, i, body, body.expr_scopes[e], name)) |def| try b.markUse(def);
+                }
+            }
+            try b.nestedUses(file, i, first_child, next_sibling, names);
+        }
+    }
 
     fn indexFile(b: *Builder, file: FileId) resolve.Error!void {
         if (b.indexed.contains(file)) return;
@@ -186,19 +256,39 @@ const Builder = struct {
         };
     }
 
-    fn collect(b: *Builder, file: FileId) resolve.Error!void {
+    fn collect(b: *Builder, file: FileId, root: SyntaxNode) resolve.Error!void {
         try b.indexFile(file);
         const itree = try b.r.itemTree(file);
+        const ast_ids = try b.r.ctx.get(database.syntax.FileAstIdMap, file);
+        const indexed_len = if (b.visible != null) itree.items.len else 0;
+        const selected = try b.r.arena.alloc(bool, indexed_len);
+        @memset(selected, false);
+        const first_child = try b.r.arena.alloc(?u32, indexed_len);
+        const next_sibling = try b.r.arena.alloc(?u32, indexed_len);
+        const usage_names = try b.r.arena.alloc(std.StringHashMapUnmanaged(void), indexed_len);
+        @memset(first_child, null);
+        @memset(next_sibling, null);
+        @memset(usage_names, .empty);
+        if (b.visible != null) {
+            var owners: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+            for (itree.items, 0..) |item, index| {
+                if (ast_ids.get(item.ast_id)) |node| try owners.put(b.r.arena, node.offset, @intCast(index));
+                if (itree.containers[item.container].parent_item) |parent| {
+                    next_sibling[index] = first_child[parent];
+                    first_child[parent] = @intCast(index);
+                }
+            }
+            try b.selectOwners(root, null, &owners, selected);
+        }
         for (itree.items, 0..) |item, index| {
+            if (b.visible != null and !selected[index]) continue;
             const key: OwnerKey = .{ .file = file, .item = item.ast_id };
-            const node = try b.r.itemNode(file, @intCast(index)) orelse continue;
+            const node = ast_ids.get(item.ast_id) orelse continue;
             // 每个 owner 只取一次 Body 与完整推导结果；名字查找使用降级时保存的作用域。
             const body = try b.r.ctx.get(database.hir.ItemBody, key);
             const res = try b.r.ctx.get(database.sema.Infer, .{ .owner = key, .mode = .full });
-            const needs_seed = for (res.exprs) |tv| {
-                if (seed.wanted(b.r.ctx.db.env.ip, tv)) break true;
-            } else false;
-            const a: context.At = .{
+            var refiner = try seed.Refiner.init(b.r, file, @intCast(index), node.offset, body, res);
+            var a: context.At = .{
                 .file = file,
                 .item = @intCast(index),
                 .node = node,
@@ -207,12 +297,15 @@ const Builder = struct {
                 .res = res,
                 .rel = 0,
                 .ip = b.r.ctx.db.env.ip,
-                .seeded = if (needs_seed) try seed.find(b.r, file, @intCast(index)) else null,
             };
             for (body.bindings, 0..) |binding, i| {
                 if (binding.range.end <= binding.range.start) continue;
                 if (binding.range.end - binding.range.start == 1 and std.mem.eql(u8, binding.name, "_")) continue;
-                var c = b.bindingClass(binding, a.bindingType(@fromBackingInt(@as(u32, @intCast(i)))));
+                if (b.visible != null and !b.visible_names.contains(node.offset + binding.range.end)) continue;
+                const id: Body.BindingId = @fromBackingInt(@as(u32, @intCast(i)));
+                a.seeded = null;
+                if (seed.wanted(a.ip, a.bindingType(id))) a.seeded = try refiner.at(binding.range.end - 1, .{ .binding = id });
+                var c = b.bindingClass(binding, a.bindingType(id));
                 c.mods |= Modifier.declaration;
                 try b.declarations.append(b.r.arena, .{
                     .key = .{ .owner = key, .binding = @fromBackingInt(@as(u32, @intCast(i))) },
@@ -220,11 +313,31 @@ const Builder = struct {
                     .class = c,
                     .can_be_unused = binding.kind != .param or if (ast.cast(ast.FnDecl, node)) |f| f.body() != null else false,
                 });
+                if (b.visible != null) try usage_names[index].put(b.r.arena, binding.name, {});
             }
             for (body.exprs, 0..) |expr, i| {
                 const span = body.expr_ranges[i];
                 if (span.end <= span.start) continue;
                 const expr_id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+                const builtin = expr == .name_ref and !body.nameRefIsEscaped(expr_id) and (isPrimitiveType(expr.name_ref) or isPrimitiveValue(expr.name_ref) or std.mem.eql(u8, expr.name_ref, "_"));
+                var lexical_def: ?resolve.Def = null;
+                // 视口外的词法引用仍影响当前 owner 的 unused，不需要推导该引用的类型。
+                if (expr == .name_ref and !builtin) {
+                    lexical_def = try b.r.resolveName(file, @intCast(index), body, body.expr_scopes[i], expr.name_ref);
+                    if (lexical_def) |def| try b.markUse(def);
+                }
+                if (b.visible != null and !b.visible_names.contains(node.offset + span.end)) continue;
+                a.seeded = null;
+                const abstract = a.exprType(expr_id);
+                switch (expr) {
+                    .name_ref => if (!builtin and seed.wanted(a.ip, abstract)) {
+                        a.seeded = try refiner.at(span.end - 1, .{ .expr = expr_id });
+                    },
+                    .field_access, .enum_literal => if (a.member(expr_id) == null or seed.wanted(a.ip, abstract)) {
+                        a.seeded = try refiner.at(span.end - 1, .{ .expr = expr_id });
+                    },
+                    else => {},
+                }
                 const tv = a.exprType(expr_id);
                 const c: Class = switch (expr) {
                     .name_ref => |name| blk: {
@@ -234,8 +347,7 @@ const Builder = struct {
                             if (isPrimitiveType(name)) break :blk .{ .type = .type, .mods = Modifier.defaultLibrary };
                             if (isPrimitiveValue(name)) break :blk .{ .type = .keyword, .mods = Modifier.defaultLibrary };
                         }
-                        const def = try b.r.resolveName(file, @intCast(index), body, body.expr_scopes[i], name);
-                        if (def) |d| break :blk try b.defClass(d, tv, key, body, res);
+                        if (lexical_def) |def| break :blk try b.defClass(def, tv, key, body, res);
                         break :blk .{ .type = .variable };
                     },
                     .field_access => |fa| blk: {
@@ -244,6 +356,10 @@ const Builder = struct {
                         const lhs = a.exprType(fa.lhs);
                         // 构造的枚举与错误集没有 ItemTree 成员，仍可由左侧类型判定。
                         if (lhs.asType()) |ty| switch (b.r.ctx.db.env.ip.key(ty)) {
+                            // 命名空间中的真实函数类型可以缺少成员记录，值上的可调用字段仍保持 property。
+                            .container_type => if (b.r.ctx.db.env.ip.key(tv.ty) == .fn_type) {
+                                break :blk .{ .type = .function };
+                            },
                             .error_set_type, .inferred_error_set => {
                                 if (try queries.errorSetMembers(b.r, ty)) |names| {
                                     for (names) |name| if (std.mem.eql(u8, name, fa.field.?)) break :blk .{ .type = .enumMember };
@@ -270,12 +386,15 @@ const Builder = struct {
                 try b.names.put(b.r.arena, node.offset + span.end, c);
             }
             // 裸枚举成员在容错 HIR 中也可能是 name_ref，声明覆盖该语法表达式。
-            if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| {
+            if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| if (b.visible == null or b.visible_names.contains(name.range().end)) {
                 var c = try b.itemClass(key);
                 c.mods |= Modifier.declaration;
                 try b.names.put(b.r.arena, name.offset + @as(u32, @intCast(name.text.len)), c);
-            }
+            };
         }
+        if (b.visible != null) for (usage_names, 0..) |*names, index| {
+            if (names.count() != 0) try b.nestedUses(file, @intCast(index), first_child, next_sibling, names);
+        };
         // 嵌套容器的成员可能引用外层局部绑定；收集完所有 owner 后再决定声明是否未使用。
         for (b.declarations.items) |declaration| {
             var c = declaration.class;
@@ -285,11 +404,13 @@ const Builder = struct {
     }
 
     fn visit(b: *Builder, node: SyntaxNode, in_enum: bool) Allocator.Error!void {
+        if (!b.intersects(node.range())) return;
         const child_in_enum = if (node.kind() == .container_decl) node.childToken(.keyword_enum) != null and node.childToken(.keyword_union) == null else in_enum;
         var it = node.children();
         while (it.next()) |element| switch (element) {
             .node => |child| try b.visit(child, child_in_enum),
             .token => |token| {
+                if (!b.intersects(token.range())) continue;
                 const semantic = if (token.kind == .identifier) b.names.get(token.offset + @as(u32, @intCast(token.text.len))) else null;
                 if (semantic orelse syntaxClass(token, node, child_in_enum)) |c| try b.emit(token, c);
             },

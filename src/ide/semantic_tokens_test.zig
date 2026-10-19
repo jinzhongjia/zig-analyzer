@@ -663,3 +663,250 @@ test "semantic tokens infer escaped primitive bindings through comptime calls an
         .{ .needle = "method()", .ty = .method },
     });
 }
+
+fn needleRange(text: []const u8, needle: []const u8, enc: offsets.Encoding) types.Range {
+    const start = std.mem.indexOf(u8, text, needle).?;
+    return .{
+        .start = offsets.offsetToPosition(text, start, enc),
+        .end = offsets.offsetToPosition(text, start + needle.len, enc),
+    };
+}
+
+fn rangeMatchesFull(w: *World, file: FileId, text: []const u8, enc: offsets.Encoding, range: types.Range) ![]const u32 {
+    const ranged = try tokens(w, file, text, enc, range);
+    const full = try tokens(w, file, text, enc, null);
+    var expected: std.ArrayList(u32) = .empty;
+    defer expected.deinit(testing.allocator);
+    var position: types.Position = .{ .line = 0, .character = 0 };
+    var previous: types.Position = .{ .line = 0, .character = 0 };
+    var i: usize = 0;
+    while (i < full.len) : (i += 5) {
+        if (full[i] != 0) position.character = 0;
+        position.line += full[i];
+        position.character += full[i + 1];
+        const ends_before = position.line < range.start.line or (position.line == range.start.line and position.character + full[i + 2] <= range.start.character);
+        const starts_after = position.line > range.end.line or (position.line == range.end.line and position.character >= range.end.character);
+        if (ends_before or starts_after) continue;
+        const delta_line = position.line - previous.line;
+        try expected.appendSlice(testing.allocator, &.{
+            delta_line,
+            if (delta_line == 0) position.character - previous.character else position.character,
+            full[i + 2],
+            full[i + 3],
+            full[i + 4],
+        });
+        previous = position;
+    }
+    try testing.expectEqualSlices(u32, expected.items, ranged);
+    return ranged;
+}
+
+test "empty and reversed semantic ranges execute no syntax inference or seed queries" {
+    const database = @import("../database.zig");
+    const seed = @import("../ide_db/seed.zig");
+    const text = "fn generic(value: anytype) void { value.run(); }\nfn main() void { generic(.{}); }";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    for ([_]types.Range{
+        .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+        .{ .start = .{ .line = 1, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+    }) |range| {
+        const data = try tokens(&w, file, text, .utf16, range);
+        try testing.expectEqual(@as(usize, 0), data.len);
+    }
+    try testing.expectEqual(@as(u64, 0), w.db.executions(database.syntax.ParseFile));
+    try testing.expectEqual(@as(u64, 0), w.db.executions(database.hir.ItemBody));
+    try testing.expectEqual(@as(u64, 0), w.db.executions(database.sema.Infer));
+    try testing.expectEqual(@as(u64, 0), w.db.executions(seed.Query));
+    try testing.expectEqual(@as(u64, 0), w.db.executions(seed.Instances));
+}
+
+test "semantic viewport inference does not grow with unrelated generic owners" {
+    const database = @import("../database.zig");
+    const seed = @import("../ide_db/seed.zig");
+    var counts: [2]u64 = undefined;
+    for ([_]usize{ 0, 80 }, &counts) |unrelated, *count| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        var source: std.ArrayList(u8) = .empty;
+        defer source.deinit(testing.allocator);
+        try source.appendSlice(testing.allocator, "fn visible(value: u32) u32 { return value; }\n");
+        for (0..unrelated) |i| {
+            const extra = try std.fmt.allocPrint(w.arena.allocator(), "fn unrelated{d}(value: anytype) void {{ value.missing(); }}\n", .{i});
+            try source.appendSlice(testing.allocator, extra);
+        }
+        const text = source.items;
+        const file = (try w.add("/p/main.zig", text)).file;
+        const data = try tokens(&w, file, text, .utf16, needleRange(text, "value;", .utf16));
+        try check(data, text, .utf16, &.{.{ .needle = "value;", .ty = .parameter, .mods = M.readonly }});
+        count.* = w.db.executions(database.sema.Infer);
+        try testing.expectEqual(@as(u64, 1), w.db.executions(database.hir.ItemBody));
+        try testing.expectEqual(@as(u64, 0), w.db.executions(seed.Query));
+        try testing.expectEqual(@as(u64, 0), w.db.executions(seed.Instances));
+    }
+    try testing.expect(counts[0] > 0);
+    try testing.expectEqual(counts[0], counts[1]);
+}
+
+test "semantic ranges retain uses outside the viewport and nested owner shadowing" {
+    const text =
+        \\fn outer() type {
+        \\    const captured = u32;
+        \\    const shadowed = u32;
+        \\    const @"😀used" = 1;
+        \\    const lost = 2;
+        \\    _ = @"😀used";
+        \\    return struct {
+        \\        value: captured,
+        \\        fn nested() void {
+        \\            const shadowed = 3;
+        \\            _ = shadowed;
+        \\        }
+        \\    };
+        \\}
+    ;
+    for ([_]offsets.Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const file = (try w.add("/p/main.zig", text)).file;
+        const range: types.Range = .{
+            .start = needleRange(text, "captured =", enc).start,
+            .end = needleRange(text, "lost =", enc).end,
+        };
+        const data = try rangeMatchesFull(&w, file, text, enc, range);
+        try check(data, text, enc, &.{
+            .{ .needle = "captured =", .ty = .type, .mods = M.declaration | M.readonly },
+            .{ .needle = "shadowed =", .ty = .type, .mods = M.declaration | M.readonly | M.unused },
+            .{ .needle = "@\"😀used\" =", .ty = .variable, .mods = M.declaration | M.readonly },
+            .{ .needle = "lost =", .ty = .variable, .mods = M.declaration | M.readonly | M.unused },
+        });
+    }
+}
+
+test "semantic viewport nested lexical dependencies do not infer unrelated members" {
+    const database = @import("../database.zig");
+    const text =
+        \\fn outer() type {
+        \\    const captured = u32;
+        \\    return struct {
+        \\        value: captured,
+        \\        fn unrelated(value: anytype) void { value.missing(); }
+        \\    };
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const data = try tokens(&w, file, text, .utf16, needleRange(text, "captured =", .utf16));
+    try check(data, text, .utf16, &.{.{ .needle = "captured =", .ty = .type, .mods = M.declaration | M.readonly }});
+    const inferred = w.db.executions(database.sema.Infer);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const unrelated = try r.ownerAt(file, @intCast(std.mem.indexOf(u8, text, "value.missing").?), false) orelse return error.MissingOwner;
+    const owner = try r.ownerKey(file, unrelated);
+    _ = try ctx.get(database.sema.Infer, .{ .owner = owner, .mode = .full });
+    try testing.expect(w.db.executions(database.sema.Infer) > inferred);
+}
+
+test "semantic generic members use active concrete instances independently of call order" {
+    const prefix =
+        \\const A = struct { pub fn run() void {} };
+        \\fn invoke(comptime T: type) void {
+        \\    if (@hasDecl(T, "run")) T.run();
+        \\    if (@hasDecl(T, "field")) _ = T.field;
+        \\    _ = T.missing();
+        \\}
+        \\
+    ;
+    for ([_][]const u8{
+        "pub fn main() void { invoke(struct {}); invoke(A); }",
+        "pub fn main() void { invoke(A); invoke(struct {}); }",
+    }) |calls| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ prefix, calls });
+        const file = (try w.add("/p/main.zig", text)).file;
+        const member_range = needleRange(text, "run();", .utf16);
+        const ranged = try rangeMatchesFull(&w, file, text, .utf16, member_range);
+        try check(ranged, text, .utf16, &.{.{ .needle = "run();", .ty = .function }});
+        const data = try tokens(&w, file, text, .utf16, null);
+        try check(data, text, .utf16, &.{
+            .{ .needle = "run();", .ty = .function },
+            .{ .needle = "missing();", .ty = .property },
+        });
+        var seeding: std.atomic.Value(bool) = .init(false);
+        w.env.callsite_seeding = &seeding;
+        const unseeded = try tokens(&w, file, text, .utf16, null);
+        try check(unseeded, text, .utf16, &.{
+            .{ .needle = "run();", .ty = .property },
+            .{ .needle = "missing();", .ty = .property },
+        });
+    }
+}
+
+test "semantic reflected concrete loop methods agree with range and preserve callable fields" {
+    const text =
+        \\const List = struct { pub fn deinit(_: *@This()) void {} };
+        \\const Args = struct { count: usize = 0, items: List = .{} };
+        \\fn cleanup(arguments: *Args) void {
+        \\    const info = @typeInfo(@TypeOf(arguments.*)).@"struct";
+        \\    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        \\        switch (@typeInfo(field_type)) {
+        \\            .@"struct" => @field(arguments, field_name).deinit(),
+        \\            else => {},
+        \\        }
+        \\    }
+        \\}
+        \\const Callable = struct { invoke: *const fn () void };
+        \\fn invoke(value: anytype) void { value.invoke(); }
+        \\fn direct() void {}
+        \\fn anonymous() void { const value = .{ .invoke = direct }; value.invoke(); }
+        \\pub fn main() void {
+        \\    var args: Args = .{};
+        \\    cleanup(&args);
+        \\    invoke(Callable{ .invoke = undefined });
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var env = try @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null);
+    defer env.deinit(testing.allocator);
+    const std_root = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
+    defer testing.allocator.free(std_root);
+    try w.setGraph(try w.vfs.intern(std_root), &.{}, &.{});
+    const ranged = try rangeMatchesFull(&w, file, text, .utf16, needleRange(text, "deinit(),", .utf16));
+    try check(ranged, text, .utf16, &.{.{ .needle = "deinit(),", .ty = .method }});
+    const data = try tokens(&w, file, text, .utf16, null);
+    try check(data, text, .utf16, &.{
+        .{ .needle = "deinit(),", .ty = .method },
+        .{ .needle = "invoke();", .ty = .property },
+        .{ .needle = "invoke();", .nth = 1, .ty = .property },
+        .{ .needle = "field_names,", .ty = .property },
+        .{ .needle = "field_types)", .ty = .property },
+    });
+}
+
+test "semantic range boundaries inside a final unicode codepoint preserve the whole token" {
+    const text = "//😀";
+    for ([_]offsets.Encoding{ .utf8, .utf16 }, [_]u32{ 4, 2 }) |enc, width| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const file = (try w.add("/p/main.zig", text)).file;
+        const range: types.Range = .{
+            .start = .{ .line = 0, .character = 2 },
+            .end = .{ .line = 0, .character = 2 + width - 1 },
+        };
+        const data = try rangeMatchesFull(&w, file, text, enc, range);
+        try check(data, text, enc, &.{.{ .needle = "//😀", .ty = .comment, .len = 2 + width }});
+    }
+}
