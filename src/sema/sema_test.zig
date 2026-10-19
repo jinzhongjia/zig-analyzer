@@ -1341,6 +1341,33 @@ test "unnamed parameters of extern functions are inferred" {
     });
 }
 
+test "extern varargs function type keeps the varargs flag" {
+    try expectTypes(
+        \\extern fn ext(a: u8, ...) void;
+        \\const FT = @TypeOf(ext);
+        \\fn g() void {
+        \\    const f = ext;
+        \\    _ = f;
+        \\}
+    , &.{
+        .{ "FT", "type = fn (u8, ...) void" },
+        .{ "f", "fn (u8, ...) void" },
+    });
+}
+
+test "extern varargs is reported by @typeInfo" {
+    try expectStdTypes(
+        \\extern fn ext(a: u8, ...) void;
+        \\const FT = @TypeOf(ext);
+        \\fn Flag(comptime T: type) type {
+        \\    return if (@typeInfo(T).@"fn".attrs.varargs) u8 else u16;
+        \\}
+        \\const FV = Flag(FT);
+    , &.{
+        .{ "FV", "type = u8" },
+    });
+}
+
 test "tuple declarations are structural" {
     try expectTypes(
         \\const A = struct { u8, bool };

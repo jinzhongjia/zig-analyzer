@@ -111,8 +111,8 @@ pub const DeclType = struct {
                 // 绑定的参数（含 anytype 与无名参数）按顺序，`...` 没有绑定、只能在末尾（见 ItemTree 的 `varargs`）
                 var params: std.ArrayList(Index) = .empty;
                 for (b.params) |p| try params.append(r.arena, res.bindings[@backingInt(p)].ty);
-                if (tree.items[item].flags.varargs) try params.append(r.arena, .unknown);
-                const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = try returnType(&r, key, b, res, dk.inst) } });
+                const varargs = tree.items[item].flags.varargs;
+                const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = try returnType(&r, key, b, res, dk.inst), .varargs = varargs } });
                 return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item, .inst = dk.inst } }) };
             },
             .@"const", .@"var" => {
