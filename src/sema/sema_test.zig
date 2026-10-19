@@ -499,6 +499,30 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "comptime name builtins produce string literal types" {
+    try expectTypes(
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\const En = enum { x, yy };
+        \\fn probe(u: U) void {
+        \\    const v_typename = @typeName(u8);
+        \\    const v_tagname = @tagName(En.yy);
+        \\    const v_errname = @errorName(error.Foo);
+        \\    const v_tagname_rt = @tagName(u);
+        \\    _ = .{ v_typename, v_tagname, v_errname, v_tagname_rt };
+        \\}
+        \\comptime {
+        \\    _ = &probe;
+        \\}
+    , &.{
+        // 编译期已知的名字是字符串字面量
+        .{ "v_typename", "*const [2:0]u8 = \"u8\"" },
+        .{ "v_tagname", "*const [2:0]u8 = \"yy\"" },
+        .{ "v_errname", "*const [3:0]u8 = \"Foo\"" },
+        // 运行时操作数仍是切片
+        .{ "v_tagname_rt", "[:0]const u8" },
+    });
+}
+
 test "comptime slices keep their sentinel" {
     try expectTypes(
         \\fn Explicit() type {

@@ -2292,7 +2292,7 @@ const Evaluator = struct {
             if (vals.len != 1) return error.Abort;
             var out: std.Io.Writer.Allocating = .init(ev.a);
             @import("render.zig").writeType(ev.r, try asType(vals[0]), &out.writer) catch return error.OutOfMemory;
-            return ev.string(out.written());
+            return ev.stringLiteral(out.written());
         }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
             if (vals.len != 1) return error.Abort;
@@ -2440,6 +2440,27 @@ const Evaluator = struct {
     fn pureBuiltin(ev: *Evaluator, name: []const u8, vals: []const Val) EvalError!?Val {
         const ip = ev.ip;
         const eq = std.mem.eql;
+        if (eq(u8, name, "@typeName")) {
+            if (vals.len != 1) return error.Abort;
+            const t = asType(vals[0]) catch return null;
+            if (!value.isConcrete(ip, t)) return null;
+            var out: std.Io.Writer.Allocating = .init(ev.a);
+            @import("render.zig").writeType(ev.r, t, &out.writer) catch return error.OutOfMemory;
+            return try ev.stringLiteral(out.written());
+        }
+        if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
+            if (vals.len != 1) return error.Abort;
+            // 运行时操作数没有可用的名字，由调用方按切片处理
+            const x = (try ev.freeze(vals[0])) orelse return null;
+            const s = switch (ip.key(x)) {
+                .enum_tag => |t| t.name,
+                .enum_literal => |n| n,
+                .union_value => |u| u.tag,
+                .error_value => |n| n,
+                else => return null,
+            };
+            return try ev.stringLiteral(s);
+        }
         if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
             if (vals.len != 1) return error.Abort;
             const l = try ev.typeLayout(try asType(vals[0]), 0) orelse return error.Abort;
@@ -2651,6 +2672,12 @@ const Evaluator = struct {
     /// 字符串值：`[:0]const u8`
     fn string(ev: *Evaluator, s: []const u8) Error!Val {
         const ty = try ev.stringSliceType();
+        return Val.of(ty, try ev.ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
+    }
+
+    /// 字符串字面量值：`*const [len:0]u8`
+    fn stringLiteral(ev: *Evaluator, s: []const u8) Error!Val {
+        const ty = try ev.ip.stringLiteralType(s.len);
         return Val.of(ty, try ev.ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
     }
 

@@ -1356,6 +1356,9 @@ const Inferrer = struct {
         };
         for (simple) |s| if (eq(u8, name, s[0])) return .{ .ty = s[1] };
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName") or eq(u8, name, "@typeName")) {
+            if (args.len == 1) if (try inf.pureValue(name, args)) |tv| return tv;
+            // `@typeName` 的参数总是类型：名字求不出时没有运行时切片形式
+            if (eq(u8, name, "@typeName")) return .unknown;
             const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
