@@ -121,6 +121,8 @@ pub fn expectGroupGone(pgid: std.posix.pid_t) !void {
     for (0..100) |_| {
         std.posix.kill(-pgid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
+            // macOS：组里只剩尚未回收的僵尸进程时返回 EPERM，继续等待回收
+            error.PermissionDenied => {},
             else => return err,
         };
         try testing.io.sleep(.fromMilliseconds(50), .awake);
