@@ -5,6 +5,7 @@
 //! （0.17 的 maker 在 watch 期间收到新请求会 panic，且 watch 模式下无法改变要构建的 step。）
 
 const std = @import("std");
+const Watchdog = @import("../util/watchdog.zig").Watchdog;
 const native_os = @import("builtin").os.tag;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -430,6 +431,9 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path:
         .stderr = .ignore,
     });
     defer child.kill(io);
+    var watchdog: Watchdog = .{};
+    watchdog.start(io, child.id.?, .{ .duration = .{ .raw = Io.Duration.fromSeconds(120), .clock = .awake } });
+    defer watchdog.stop();
 
     var read_buffer: [64 * 1024]u8 = undefined;
     var reader = child.stdout.?.readerStreaming(io, &read_buffer);

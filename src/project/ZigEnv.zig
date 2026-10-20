@@ -38,6 +38,8 @@ pub fn query(gpa: Allocator, io: Io, zig_exe: ?[]const u8) QueryError!ZigEnv {
         .argv = &.{ exe, "env" },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
+        // 包装脚本（asdf、mise）或网络文件系统上的 zig 可能永久挂起
+        .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } },
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,

@@ -40,6 +40,7 @@ pub fn generate(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []cons
         .argv = argv.items,
         .stdout_limit = .limited(4 * 1024 * 1024),
         .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } },
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,

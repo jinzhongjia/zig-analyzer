@@ -13,6 +13,7 @@ const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
 const mem = @import("../util/mem.zig");
 const nesting = @import("../syntax/nesting.zig");
+const Watchdog = @import("../util/watchdog.zig").Watchdog;
 
 const log = std.log.scoped(.live);
 
@@ -342,6 +343,9 @@ pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []
     if (mode == .zon) try argv.append(gpa, "--zon");
     var child = try std.process.spawn(io, .{ .argv = argv.items, .stdin = .pipe, .stdout = .ignore, .stderr = .pipe });
     defer child.kill(io);
+    var watchdog: Watchdog = .{};
+    watchdog.start(io, child.id.?, .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } });
+    defer watchdog.stop();
 
     // ast-check 先读完全部输入再输出，因此先写后读不会死锁
     {
