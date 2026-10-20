@@ -64,11 +64,11 @@ present: std.StaticBitSet(settings.len) = .empty,
 
 /// 外部改动的来源。客户端支持时总会向它注册文件监听（`workspace/didChangeWatchedFiles`）
 pub const Watcher = enum {
-    /// 客户端不支持动态注册文件监听时由服务器轮询
+    /// 客户端不支持动态注册文件监听时由服务器监听
     auto,
     /// 只用客户端的通知
     client,
-    /// 总是由服务器轮询（客户端的通知仍然处理）
+    /// 总是由服务器监听（客户端的通知仍然处理）
     server,
 };
 

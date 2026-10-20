@@ -102,8 +102,18 @@ test "external changes on disk are picked up through didChangeWatchedFiles" {
     try h.notify("exit", {});
 }
 
-test "without file watching from the client, the server polls for changes on disk" {
-    const main_text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    lib.\n}\n";
+test "without file watching from the client, the server watches files on disk" {
+    const main_text =
+        \\const lib = @import("lib.zig");
+        \\const deep = @import("sub/deep.zig");
+        \\pub fn first() void {
+        \\    lib.
+        \\}
+        \\pub fn second() void {
+        \\    deep.
+        \\}
+        \\
+    ;
     var project = try fixture.Project.create(&.{
         .{ .path = "main.zig", .text = main_text },
         .{ .path = "lib.zig", .text = "pub fn hello() void {}\n" },
@@ -113,7 +123,6 @@ test "without file watching from the client, the server polls for changes on dis
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    h.server.poll_interval_ms.store(20, .monotonic);
     const a = h.arena.allocator();
     const root_uri = try za.base.uri.fromPath(a, project.root);
     // 客户端不能动态注册文件监听
@@ -123,38 +132,75 @@ test "without file watching from the client, the server polls for changes on dis
     try open(&h, main_uri, main_text);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("hello", try completionLabels(&h, main_uri, main_text, "    lib."));
+    // sub/deep.zig 还不存在（所在的目录也不存在）
+    try testing.expectEqualStrings("", try completionLabels(&h, main_uri, main_text, "    deep."));
 
     // 编辑器之外改写未打开的 lib.zig，没有任何通知
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.zig"), .data = "pub fn goodbye() void {}\n" });
-    for (0..400) |_| {
-        _ = try h.request("zig-analyzer/waitIdle", {});
-        if (std.mem.eql(u8, try completionLabels(&h, main_uri, main_text, "    lib."), "goodbye")) break;
-        try testing.io.sleep(.fromMilliseconds(25), .awake);
-    } else return error.ChangeNotNoticed;
+    try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "goodbye" });
+
+    // 新建目录与其中被 import 的文件
+    try project.tmp.dir.createDirPath(testing.io, "sub");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "sub/deep.zig"), .data = "pub fn found() void {}\n" });
+    try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    deep.", .want = "found" });
 
     // 编辑器之外新建 build.zig：启动项目；删除：停止项目
     const build_path = try project.path(a, "build.zig");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
-    try waitProjects(&h, 1);
+    try waitWatched(&h, Projects{ .n = 1 });
     try std.Io.Dir.cwd().deleteFile(testing.io, build_path);
-    try waitProjects(&h, 0);
+    try waitWatched(&h, Projects{ .n = 0 });
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
 
-/// 等到项目列表中有 `n` 个项目
-fn waitProjects(h: *Harness, n: usize) !void {
-    for (0..400) |_| {
+/// 服务器已处理的外部改动的批数
+fn watchBatches(h: *Harness) u64 {
+    h.server.watch_mutex.lockUncancelable(testing.io);
+    defer h.server.watch_mutex.unlock(testing.io);
+    return h.server.watch_batches;
+}
+
+/// 等服务器处理外部改动，直到 `cond.done(h)`：服务器每处理完一批（并空闲）检查一次。10 秒内没有新的一批时失败
+fn waitWatched(h: *Harness, cond: anytype) !void {
+    var batches = watchBatches(h);
+    for (0..50) |_| {
         _ = try h.request("zig-analyzer/waitIdle", {});
-        h.server.workspaces_mutex.lockUncancelable(testing.io);
-        const count = h.server.workspaces.items.len;
-        h.server.workspaces_mutex.unlock(testing.io);
-        if (count == n) return;
-        try testing.io.sleep(.fromMilliseconds(25), .awake);
+        if (try cond.done(h)) return;
+        const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(10));
+        h.server.watch_mutex.lockUncancelable(testing.io);
+        defer h.server.watch_mutex.unlock(testing.io);
+        while (h.server.watch_batches == batches) {
+            h.server.watch_cond.waitTimeout(testing.io, &h.server.watch_mutex, .{ .deadline = .{ .raw = deadline, .clock = .awake } }) catch return error.ChangeNotNoticed;
+        }
+        batches = h.server.watch_batches;
     }
     return error.ChangeNotNoticed;
 }
+
+/// `waitWatched` 的条件：`after` 之后的补全列表为 `want`
+const Labels = struct {
+    uri: []const u8,
+    text: []const u8,
+    after: []const u8,
+    want: []const u8,
+
+    fn done(c: Labels, h: *Harness) !bool {
+        return std.mem.eql(u8, try completionLabels(h, c.uri, c.text, c.after), c.want);
+    }
+};
+
+/// `waitWatched` 的条件：项目列表中有 `n` 个项目
+const Projects = struct {
+    n: usize,
+
+    fn done(c: Projects, h: *Harness) !bool {
+        h.server.workspaces_mutex.lockUncancelable(testing.io);
+        defer h.server.workspaces_mutex.unlock(testing.io);
+        return h.server.workspaces.items.len == c.n;
+    }
+};
 
 test "workspace folders: added folders start a project, removed ones clear its diagnostics" {
     var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});

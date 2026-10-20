@@ -150,10 +150,16 @@ parent_watch: ?Io.Future(void) = null,
 /// 项目已启动：此后修改 zig.path 需要重启服务器
 started: bool = false,
 
-/// 串行化修改服务器状态的消息处理：主循环处理每条消息时持有，服务器轮询到外部改动时也要持有（见 `watch.zig`）
+/// 串行化修改服务器状态的消息处理：主循环处理每条消息时持有，服务器发现的外部改动也在它之下处理（见 `watch.zig`）
 write_mutex: Io.Mutex = .init,
-/// 服务器轮询外部改动的间隔（毫秒）
+/// 服务器发现外部改动的后台任务（`startProjects` 时创建）
+watcher: ?*watch.Watcher = null,
+/// 原生文件监听不可用时，轮询的最短间隔（毫秒）
 poll_interval_ms: std.atomic.Value(u32) = .init(1000),
+/// 服务器发现的外部改动已处理的批数，测试据此等待（受 `watch_mutex` 保护，变化时广播 `watch_cond`）
+watch_batches: u64 = 0,
+watch_mutex: Io.Mutex = .init,
+watch_cond: Io.Condition = .init,
 docs_mutex: Io.Mutex = .init,
 /// 已打开的文档：客户端使用的 URI（发布诊断时原样使用）
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
@@ -224,6 +230,10 @@ pub fn deinit(server: *Server) void {
     server.stopWorkspaces();
     server.waitIdle();
     server.bg_group.cancel(server.io);
+    if (server.watcher) |w| {
+        server.vfs.listener.store(null, .release);
+        w.destroy();
+    }
     // 后台任务都已结束，只剩列表持有的引用
     for (server.workspaces.items) |ws| ws.release();
     server.workspaces.deinit(server.gpa);
@@ -1223,20 +1233,51 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     server.recompileSingle(open, files);
 }
 
-/// 服务器轮询到的外部改动：与客户端的 `workspace/didChangeWatchedFiles` 通知同样处理，与主循环的消息处理串行
+/// 服务器发现的外部改动：与客户端的 `workspace/didChangeWatchedFiles` 通知同样处理，与主循环的消息处理串行
 pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent) void {
+    defer {
+        server.watch_mutex.lockUncancelable(server.io);
+        server.watch_batches += 1;
+        server.watch_mutex.unlock(server.io);
+        server.watch_cond.broadcast(server.io);
+    }
     server.write_mutex.lockUncancelable(server.io);
     defer server.write_mutex.unlock(server.io);
     if (server.state != .running or server.isShuttingDown()) return;
-    // 处理期间计为忙碌：重启项目时旧的新实例先结束、新实例随后才计为忙碌，轮询任务自身又不计为忙碌，
+    // 处理期间计为忙碌：重启项目时旧的新实例先结束、新实例随后才计为忙碌，监听任务自身又不计为忙碌，
     // 中间不能让等待空闲的一方（waitIdle、shutdown）返回
     server.busyBegin();
     defer server.busyEnd();
     server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
 }
 
-/// 是否由服务器轮询外部改动（见 `Config.Watcher`）
-pub fn pollsFiles(server: *Server) bool {
+/// 服务器发现外部改动时关注的文件（另有各根目录的项目文件）：`.zig` / `.zon`，不是虚拟文档，不在不会改变的依赖库中，
+/// 即 Zig 安装目录、全局缓存（见 `fileDurability`）与各项目的本地缓存、获取的依赖包（见 `Workspace.inLibrary`）。
+/// zig 环境未知时还分不出依赖库，都不关注
+pub fn watchable(server: *Server, path: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, ".zig") and !std.mem.endsWith(u8, path, ".zon")) return false;
+    if (isVirtual(path) or server.zigEnv() == null or server.fileDurability(path) != .low) return false;
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return false;
+    return true;
+}
+
+/// `path` 是打开的文档
+pub fn isOpen(server: *Server, path: []const u8) bool {
+    const file = (server.vfs.lookup(path) catch return false) orelse return false;
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    return server.open_docs.contains(file);
+}
+
+/// 关注的文件或监听方式可能变化：让监听任务重新计算
+fn resyncWatcher(server: *Server) void {
+    if (server.watcher) |w| w.requestResync();
+}
+
+/// 是否由服务器发现外部改动（见 `Config.Watcher`）
+pub fn watchesFiles(server: *Server) bool {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return switch (server.config.files_watcher) {
@@ -1277,6 +1318,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const semantic_changed = server.config.callsite_seeding != new.callsite_seeding;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const build_was_enabled = server.config.build_enable;
+    const watcher_changed = server.config.files_watcher != new.files_watcher;
     const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_parameters != new.inlay_parameters or
         server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.callsite_seeding != new.callsite_seeding;
     const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
@@ -1286,6 +1328,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config = new;
     server.config_mutex.unlock(server.io);
     if (inactive_changed) server.publishOpenFiles();
+    if (watcher_changed) server.resyncWatcher();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
     if (compiler_disabled) server.clearSingleFileResults();
@@ -1520,8 +1563,16 @@ fn startProjects(server: *Server) void {
         server.busyEnd();
         log.err("failed to start project loading task: {t}", .{err});
     };
-    // 一直运行到服务器关闭，不计为忙碌；不能退回在主循环中同步执行
-    server.bg_group.concurrent(server.io, watch.run, .{server}) catch |err| log.warn("failed to start watching files on disk: {t}", .{err});
+    // 在主循环中创建，之后的唤醒与停止不会丢失。一直运行到服务器关闭，不计为忙碌；不能退回在主循环中同步执行
+    const w = watch.Watcher.create(server) catch return log.err("out of memory while starting to watch files on disk", .{});
+    server.watcher = w;
+    server.vfs.listener.store(&w.listener, .release);
+    server.bg_group.concurrent(server.io, watch.Watcher.run, .{w}) catch |err| {
+        log.warn("failed to start watching files on disk: {t}", .{err});
+        server.vfs.listener.store(null, .release);
+        server.watcher = null;
+        w.destroy();
+    };
 }
 
 // ── 项目与后台任务 ───────────────────────────────────────────────────
@@ -1956,6 +2007,7 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     for (params.event.added) |f| try server.addRoot(f.uri);
     server.updateModuleGraph();
     server.reconcileSingle();
+    server.resyncWatcher();
 }
 
 /// 重启 `ws` 所在的项目（按根目录找到项目当前的实例：调用方持有的列表快照可能已过时）。`crash_restarts` 为
@@ -2090,13 +2142,16 @@ fn releaseList(server: *Server, a: Allocator, list: []*Workspace) void {
 }
 
 fn stopWorkspaces(server: *Server) void {
-    server.workspaces_mutex.lockUncancelable(server.io);
-    defer server.workspaces_mutex.unlock(server.io);
-    server.shutting_down = true;
-    for (server.workspaces.items) |ws| {
-        ws.stop();
-        if (ws.successor) |s| s.stop();
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        server.shutting_down = true;
+        for (server.workspaces.items) |ws| {
+            ws.stop();
+            if (ws.successor) |s| s.stop();
+        }
     }
+    if (server.watcher) |w| w.stop();
 }
 
 pub fn isShuttingDown(server: *Server) bool {
