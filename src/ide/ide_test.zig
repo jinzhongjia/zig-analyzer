@@ -107,6 +107,41 @@ test "member completion and goto definition through types" {
     }
 }
 
+test "completion and hover quote names that shadow primitives or are not identifiers" {
+    const text =
+        \\pub const @"bool" = c_int;
+        \\fn f(@"i32": u8) u8 {
+        \\    const @"a b" = @"i32";
+        \\    _ = @"a b";
+        \\    _ = <|>;
+        \\    return @"i32";
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    const marker = std.mem.indexOf(u8, text, "<|>").?;
+    const clean = try std.mem.concat(w.arena.allocator(), u8, &.{ text[0..marker], text[marker + 3 ..] });
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+
+    const items = try completion.complete(&r, added.file, added.cursor);
+    var saw = [4]bool{ false, false, false, false };
+    const expected = [_][]const u8{ "@\"a b\"", "@\"i32\"", "@\"bool\"", "f" };
+    for (items) |it| for (expected, 0..) |e, i| {
+        if (std.mem.eql(u8, it.label, e)) saw[i] = true;
+    };
+    for (saw) |ok| try testing.expect(ok);
+
+    const local = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, clean, "_ = @\"a b\"").? + 6))).?;
+    try testing.expectEqualStrings("```zig\nconst @\"a b\": u8\n```", local.text);
+    const param = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, clean, "return @\"i32\"").? + 8))).?;
+    try testing.expectEqualStrings("```zig\n@\"i32\": u8\n```", param.text);
+}
+
 test "signature help and inlay hints" {
     var w: World = undefined;
     const file = try setup(&w);

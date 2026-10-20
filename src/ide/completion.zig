@@ -70,6 +70,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
     // `lhs.` / `lhs.na`：光标前一个字符在字段访问内、且不在左侧表达式内
     if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .field_access => |fa| if (rel - 1 >= b.range(fa.lhs).end) {
+            out.member_mode = true;
             if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
                 try members(r, &out, ns, ns.file == file);
                 return out.items.items;
@@ -83,12 +84,14 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
     };
 
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .error_value) {
+        out.member_mode = true;
         try errorNames(r, &out, file, offset, item, e);
         return out.items.items;
     };
 
     // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员；初始化中（`.{ .x = 1, .| }`）列出未赋值的字段
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
+        out.member_mode = true;
         const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
         if (initOf(b, e)) |init| {
             const x = b.expr(init).init;
@@ -126,8 +129,11 @@ const Collector = struct {
     arena: Allocator,
     items: std.ArrayList(Item) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// `.` 之后的成员 / 字段：原始类型与原始值的名字可以不加引号（`S.u8`）
+    member_mode: bool = false,
 
-    /// 内层的名字遮蔽外层的同名名字。不是合法标识符的名字（如 `@"struct"`）以引号形式插入
+    /// 内层的名字遮蔽外层的同名名字。作用域中的名字一律按 `fmtId` 加引号（原始类型、
+    /// 含特殊字符的名字），`.` 之后的成员允许原始名字
     fn add(c: *Collector, item: Item) Allocator.Error!void {
         if (item.label.len == 0) return;
         if ((try c.seen.getOrPut(c.arena, item.label)).found_existing) return;
@@ -136,7 +142,7 @@ const Collector = struct {
             .builtin, .module, .file, .folder => false,
             else => true,
         };
-        if (is_name and !std.zig.isValidId(item.label)) out.label = try std.fmt.allocPrint(c.arena, "{f}", .{std.zig.fmtId(item.label)});
+        if (is_name) out.label = try std.fmt.allocPrint(c.arena, "{f}", .{std.zig.fmtIdFlags(item.label, .{ .allow_primitive = c.member_mode })});
         try c.items.append(c.arena, out);
     }
 };

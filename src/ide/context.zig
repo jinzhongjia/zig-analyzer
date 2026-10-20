@@ -154,7 +154,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .@"var" => "var ",
                 else => "",
             };
-            const name = if (item.name) |n| (if (std.zig.isValidId(n)) n else try std.fmt.allocPrint(r.arena, "{f}", .{std.zig.fmtId(n)})) else "_";
+            const name = if (item.name) |n| try std.fmt.allocPrint(r.arena, "{f}", .{std.zig.fmtId(n)}) else "_";
             // 容器定义：`const S = struct`
             if (tv.asType()) |t| switch (ip.key(t)) {
                 .container_type => |c| if (c.kind != .file) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),
@@ -169,7 +169,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .local_var => "var ",
                 .param, .capture => "",
             };
-            return std.fmt.allocPrint(r.arena, "{s}{s}: {s}", .{ keyword, b.name, try render.typedValueAlloc(r, tv) });
+            return std.fmt.allocPrint(r.arena, "{s}{f}: {s}", .{ keyword, std.zig.fmtId(b.name), try render.typedValueAlloc(r, tv) });
         },
         .file => |f| return std.fmt.allocPrint(r.arena, "@import(\"{s}\")", .{std.fs.path.basename(r.ctx.db.env.vfs.path(f))}),
     }
