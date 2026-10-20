@@ -442,6 +442,32 @@ test "single-file mode: disabling compiler diagnostics during a compile drops it
     try shutdown(&h);
 }
 
+test "single-file mode: closing a file without errors drops its result" {
+    const text = "pub fn main() void {}\n";
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    try waitIdle(&h);
+    const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
+    try waitIdle(&h);
+    {
+        h.server.single_mutex.lockUncancelable(testing.io);
+        defer h.server.single_mutex.unlock(testing.io);
+        try testing.expectEqual(1, h.server.single.count());
+    }
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = uri } });
+    try waitIdle(&h);
+    {
+        h.server.single_mutex.lockUncancelable(testing.io);
+        defer h.server.single_mutex.unlock(testing.io);
+        try testing.expectEqual(0, h.server.single.count());
+    }
+    try shutdown(&h);
+}
+
 test "files of the zig installation are not standalone compilation roots during startup or save" {
     const text =
         \\pub fn main() void {

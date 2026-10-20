@@ -1088,8 +1088,26 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
     // 单文件模式的根文件在打开期间从磁盘删除时（外部改动的通知不处理打开的文件），关闭时丢弃它的编译结果，
     // 被它 import 的文件一并重新发布
     if (disk == null and server.dropSingle(id)) return;
+    // 关闭后不再需要的结果立即释放，避免长会话中随打开过的文件线性增长
+    server.releaseSingleIfUnused(id);
     // 关闭后按磁盘内容重新发布（编译集合中的文件仍可能有编译器诊断）
     server.publishFiles(&.{id}, true);
+}
+
+/// 关闭文档后释放不再需要保留的单文件结果：没有在编译，且结果中没有诊断（诊断会在关闭后继续发布）。
+/// 关闭后重新打开或保存时按需重新编译
+fn releaseSingleIfUnused(server: *Server, file: Vfs.FileId) void {
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        const sf = server.single.getPtr(file) orelse return;
+        if (sf.running or sf.pending) return;
+        if (sf.result) |r| for (r.files.values()) |fr| {
+            if (fr.items.len != 0) return;
+        };
+        sf.clearResult(server.gpa);
+        _ = server.single.swapRemove(file);
+    }
 }
 
 fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentParams) !void {
