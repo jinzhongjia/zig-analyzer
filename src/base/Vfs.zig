@@ -42,6 +42,14 @@ mutex: Io.Mutex = .init,
 keys: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// 与 `keys` 一一对应：第一次见到的规范化路径（保留原始大小写）
 paths: std.ArrayList([]const u8) = .empty,
+/// 驻留了新路径时通知（如文件监听需要关注新出现的文件所在的目录）；在锁外、驻留它的线程上调用
+listener: std.atomic.Value(?*const Listener) = .init(null),
+
+pub const Listener = struct {
+    ctx: *anyopaque,
+    /// 须是线程安全的轻量操作：任何线程驻留新路径时都会调用
+    notify: *const fn (ctx: *anyopaque) void,
+};
 
 pub const Options = struct {
     style: Style = .native,
@@ -139,17 +147,21 @@ pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
     const key = try vfs.identityKey(normalized);
     errdefer vfs.gpa.free(key);
 
-    vfs.mutex.lockUncancelable(vfs.io);
-    defer vfs.mutex.unlock(vfs.io);
-    try vfs.paths.ensureUnusedCapacity(vfs.gpa, 1);
-    const gop = try vfs.keys.getOrPut(vfs.gpa, key);
-    if (gop.found_existing) {
-        vfs.gpa.free(key);
-        vfs.gpa.free(normalized);
-    } else {
-        vfs.paths.appendAssumeCapacity(normalized);
-    }
-    return @fromBackingInt(@intCast(gop.index));
+    const index, const added = blk: {
+        vfs.mutex.lockUncancelable(vfs.io);
+        defer vfs.mutex.unlock(vfs.io);
+        try vfs.paths.ensureUnusedCapacity(vfs.gpa, 1);
+        const gop = try vfs.keys.getOrPut(vfs.gpa, key);
+        if (gop.found_existing) {
+            vfs.gpa.free(key);
+            vfs.gpa.free(normalized);
+        } else {
+            vfs.paths.appendAssumeCapacity(normalized);
+        }
+        break :blk .{ gop.index, !gop.found_existing };
+    };
+    if (added) if (vfs.listener.load(.acquire)) |l| l.notify(l.ctx);
+    return @fromBackingInt(@intCast(index));
 }
 
 pub fn lookup(vfs: *Vfs, file_path: []const u8) Allocator.Error!?FileId {
@@ -230,6 +242,29 @@ test isUnderStyle {
     try t.expect(isUnderStyle(.windows, .insensitive, "C:\\Zig\\Lib\\std\\std.zig", "C:\\zig\\lib"));
     try t.expect(isUnderStyle(.windows, .insensitive, "C:\\a.zig", "C:\\"));
     try t.expect(!isUnderStyle(.windows, .insensitive, "C:\\zig\\library\\a.zig", "C:\\zig\\lib"));
+}
+
+test "listener: notified once per new path" {
+    const t = std.testing;
+    var vfs: Vfs = .init(t.io, t.allocator);
+    defer vfs.deinit();
+    var notified: usize = 0;
+    const listener: Listener = .{ .ctx = &notified, .notify = struct {
+        fn notify(ctx: *anyopaque) void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    }.notify };
+    vfs.listener.store(&listener, .release);
+    const root = if (@import("builtin").target.os.tag == .windows) "C:\\" else "/";
+    const a = try std.fs.path.join(t.allocator, &.{ root, "a.zig" });
+    defer t.allocator.free(a);
+    const b = try std.fs.path.join(t.allocator, &.{ root, "b.zig" });
+    defer t.allocator.free(b);
+    _ = try vfs.intern(a);
+    _ = try vfs.intern(a);
+    _ = try vfs.intern(b);
+    try t.expectEqual(2, notified);
 }
 
 test "case-sensitive: different spellings are different files" {
