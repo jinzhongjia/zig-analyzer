@@ -257,6 +257,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 配置来自客户端（`initializationOptions`、`workspace/configuration`），项目根的 `zig-analyzer.json` 可覆盖与项目相关的项；各项说明见 `src/server/Config.zig`。
 - 退出：输入结束时不再等待客户端对配置请求的回复，停止各项目后退出。`initialize` 给出 `processId` 时每 2 秒检查一次客户端进程，它退出后服务器随之退出（stdin 的写端可能被客户端的其他子进程继承而一直不关闭）。
 - 可观测性：`zig-analyzer/status` 暴露各 query 的执行次数、命中率、耗时与内存；慢请求日志（`log.slow_request_ms`）；`-Dtracy=<目录>` 开启 tracy。
+- 崩溃：Zig 没有栈展开，panic 结束整个进程。退出前把消息、当前线程的上下文与调用栈写入日志：上下文包括主循环处理的消息、读请求的方法、文档与位置，发布诊断的文件、单文件编译的根、项目的构建事件、索引，以及正在计算的 query 栈。分析代码对输入数据的、可以降级的假设用软断言（`util/assert.zig`）：Debug 与测试中失败即 panic，其余构建中每处只记录一次日志并走降级路径。
 
 ---
 

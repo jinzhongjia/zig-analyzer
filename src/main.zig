@@ -8,6 +8,15 @@ pub const std_options: std.Options = .{
     .logFn = za.util.log.logFn,
 };
 
+/// panic 时先把当前线程的上下文（请求、文件、执行中的 query）与调用栈写入日志，再按默认方式结束进程
+pub const panic = std.debug.FullPanic(panicFn);
+
+fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    za.util.log.writePanic(msg, first_trace_addr orelse @returnAddress());
+    std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
+}
+
 const usage =
     \\Usage: zig-analyzer [options]
     \\

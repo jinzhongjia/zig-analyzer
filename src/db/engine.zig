@@ -48,6 +48,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const tracy = @import("../util/tracy.zig");
+const panic_context = @import("../util/panic_context.zig");
 
 pub const Revision = u64;
 
@@ -652,6 +653,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// 很深的依赖链因此分段计算，总代价与链长成正比，结果也是完整的
             pub fn get(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
                 if (Q.kind == .input or ctx.stack.items.len != 0) return ctx.getInner(Q, key);
+                // panic 时写出正在计算的 query
+                var entry: panic_context.Entry = .{ .data = ctx, .write = writeStack };
+                panic_context.push(&entry);
+                defer panic_context.pop(&entry);
                 while (true) {
                     ctx.frontier = null;
                     const v = try ctx.getInner(Q, key);
@@ -662,6 +667,24 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (!try ctx.precompute(frontier)) return v;
                 }
             }
+
+            /// 正在计算的 query（`名字#key 下标`，栈底在前；很深时只写栈顶的若干个）
+            fn writeStack(data: *const anyopaque, w: *Io.Writer) Io.Writer.Error!void {
+                const ctx: *const Ctx = @ptrCast(@alignCast(data));
+                const frames = ctx.stack.items;
+                const shown = 24;
+                try w.writeAll("queries:");
+                if (frames.len > shown) try w.print(" ({d} more)", .{frames.len - shown});
+                for (frames[frames.len -| shown..], 0..) |frame, i| {
+                    try w.print("{s} {s}#{d}", .{ if (i == 0) "" else " >", query_names[frame.key.query], frame.key.index });
+                }
+            }
+
+            const query_names = blk: {
+                var names: [queries.len][]const u8 = undefined;
+                for (queries, &names) |Q, *n| n.* = @typeName(Q);
+                break :blk names;
+            };
 
             /// 从栈底计算 `dep`；返回它的结果是否已写入 memo
             fn precompute(ctx: *Ctx, dep: DepKey) Error!bool {

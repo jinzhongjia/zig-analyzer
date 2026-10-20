@@ -29,6 +29,7 @@ const FileId = Vfs.FileId;
 const compiler = za.diagnostics.compiler;
 const CompileSet = za.diagnostics.compile_set;
 const database = @import("../database.zig");
+const panic_context = za.util.panic_context;
 const FileText = database.inputs.FileText;
 const AstCheck = database.live.AstCheck;
 
@@ -388,6 +389,9 @@ fn isStopping(ws: *Workspace) bool {
 
 fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     const io = ws.server.io;
+    var pc: panic_context.Text = .{};
+    pc.enter("project {s}: build event {t}", .{ ws.root, event.* });
+    defer pc.leave();
     // 已停止的实例（被重启替换、项目被移除、服务器关闭）不再处理 maker 结束前发出的事件：其结果不会被采用。
     // 进度与忙碌计数在后台任务结束时收尾
     if (ws.isStopping()) return;

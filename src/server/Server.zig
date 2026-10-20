@@ -14,6 +14,8 @@ const types = za.lsp.types;
 const jsonrpc = za.lsp.jsonrpc;
 const transport = za.lsp.transport;
 const offsets = za.util.offsets;
+const never = za.util.assert.never;
+const panic_context = za.util.panic_context;
 const uri = za.base.uri;
 const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
@@ -348,6 +350,13 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
         server.sendError(null, jsonrpc.error_codes.parse_error, "failed to parse JSON-RPC message");
         return .@"continue";
     };
+    var pc: panic_context.Text = .{};
+    switch (message) {
+        .request => |req| messageContext(&pc, "request", req.method, req.params),
+        .notification => |n| messageContext(&pc, "notification", n.method, n.params),
+        .response => pc.enter("response", .{}),
+    }
+    defer pc.leave();
     switch (message) {
         .request => |req| try server.processRequest(arena, req.id, req.method, req.params),
         .notification => |n| {
@@ -367,6 +376,32 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
         },
     }
     return .@"continue";
+}
+
+/// panic 上下文中的消息：种类、方法，以及参数中的文档
+fn messageContext(pc: *panic_context.Text, kind: []const u8, method: []const u8, params: json.Value) void {
+    const document_uri: ?[]const u8 = blk: {
+        if (params != .object) break :blk null;
+        const doc = params.object.get("textDocument") orelse break :blk null;
+        if (doc != .object) break :blk null;
+        const u = doc.object.get("uri") orelse break :blk null;
+        break :blk if (u == .string) u.string else null;
+    };
+    if (document_uri) |u| pc.enter("{s} {s} {s}", .{ kind, method, u }) else pc.enter("{s} {s}", .{ kind, method });
+}
+
+/// panic 上下文中的读请求：方法，以及参数中的文档与位置（行列从 1 开始）
+fn requestContext(pc: *panic_context.Text, comptime method: []const u8, params: anytype) void {
+    const P = @TypeOf(params);
+    if (@typeInfo(P) != .@"struct" or !@hasField(P, "textDocument")) return pc.enter("request {s}", .{method});
+    const doc = params.textDocument.uri;
+    if (@hasField(P, "position")) {
+        return pc.enter("request {s} {s}:{d}:{d}", .{ method, doc, params.position.line + 1, params.position.character + 1 });
+    }
+    if (@hasField(P, "range")) {
+        return pc.enter("request {s} {s}:{d}:{d}", .{ method, doc, params.range.start.line + 1, params.range.start.character + 1 });
+    }
+    pc.enter("request {s} {s}", .{ method, doc });
 }
 
 // ── 请求 ─────────────────────────────────────────────────────────────
@@ -512,6 +547,9 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             defer ctx.end();
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
+            var pc: panic_context.Text = .{};
+            requestContext(&pc, method, params);
+            defer pc.leave();
             const zone = za.util.tracy.zone(@src(), method);
             defer zone.end();
             const t0 = Io.Clock.awake.now(server.io);
@@ -545,6 +583,9 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             defer ctx.end();
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
+            var pc: panic_context.Text = .{};
+            requestContext(&pc, method, params);
+            defer pc.leave();
             const zone = za.util.tracy.zone(@src(), method);
             defer zone.end();
             const t0 = Io.Clock.awake.now(server.io);
@@ -782,6 +823,9 @@ fn indexTask(server: *Server) Io.Cancelable!void {
 }
 
 fn indexOnce(server: *Server) Io.Cancelable!void {
+    var pc: panic_context.Text = .{};
+    pc.enter("workspace symbol indexing", .{});
+    defer pc.leave();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const files = blk: {
@@ -1656,6 +1700,9 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     defer server.busyEnd();
     const env = server.zigEnv().?;
     const path = server.vfs.path(file);
+    var pc: panic_context.Text = .{};
+    pc.enter("single-file compile {s}", .{path});
+    defer pc.leave();
     var title_buf: [256]u8 = undefined;
     const title = std.fmt.bufPrint(&title_buf, "Compiling {s}", .{std.fs.path.basename(path)}) catch "Compiling";
     const progress = server.progress.begin(server, title, false);
@@ -2165,6 +2212,9 @@ pub fn resetSema(server: *Server) void {
 
 /// `generation`：编辑触发的发布所针对的编辑代数。被打断时若已有更新的编辑就放弃，由那次编辑触发的发布接替
 fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) void {
+    var pc: panic_context.Text = .{};
+    pc.enter("publish diagnostics {s}", .{server.vfs.path(file)});
+    defer pc.leave();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     // 虚拟文档没有磁盘文件：关闭并清除诊断之后不再为内部路径发布
@@ -2375,14 +2425,22 @@ fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *O
             ws.mutex.lockUncancelable(server.io);
             defer ws.mutex.unlock(server.io);
             const fr = ws.result_files.get(file) orelse continue;
-            try found.append(arena, .{ .generation = ws.result_generation, .result = try other.copyResult(arena, fr, &ws.result.?) });
+            const build = if (ws.result) |*r| r else {
+                _ = never(true, @src(), "workspace has result files without a result");
+                continue;
+            };
+            try found.append(arena, .{ .generation = ws.result_generation, .result = try other.copyResult(arena, fr, build) });
         }
     }
     if (server.fileContext(file).usesSingle()) {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
         for (server.single.values()) |*sf| if (sf.files.get(file)) |fr| {
-            try found.append(arena, .{ .generation = sf.generation, .result = try other.copyResult(arena, fr, &sf.result.?) });
+            const build = if (sf.result) |*r| r else {
+                _ = never(true, @src(), "single-file root has result files without a result");
+                continue;
+            };
+            try found.append(arena, .{ .generation = sf.generation, .result = try other.copyResult(arena, fr, build) });
         };
     }
     switch (found.items.len) {
