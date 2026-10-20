@@ -102,6 +102,60 @@ test "external changes on disk are picked up through didChangeWatchedFiles" {
     try h.notify("exit", {});
 }
 
+test "without file watching from the client, the server polls for changes on disk" {
+    const main_text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    lib.\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "lib.zig", .text = "pub fn hello() void {}\n" },
+        .{ .path = "geo.zig", .text = "pub const name = \"geo\";\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    h.server.poll_interval_ms.store(20, .monotonic);
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // 客户端不能动态注册文件监听
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("hello", try completionLabels(&h, main_uri, main_text, "    lib."));
+
+    // 编辑器之外改写未打开的 lib.zig，没有任何通知
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.zig"), .data = "pub fn goodbye() void {}\n" });
+    for (0..400) |_| {
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        if (std.mem.eql(u8, try completionLabels(&h, main_uri, main_text, "    lib."), "goodbye")) break;
+        try testing.io.sleep(.fromMilliseconds(25), .awake);
+    } else return error.ChangeNotNoticed;
+
+    // 编辑器之外新建 build.zig：启动项目；删除：停止项目
+    const build_path = try project.path(a, "build.zig");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
+    try waitProjects(&h, 1);
+    try std.Io.Dir.cwd().deleteFile(testing.io, build_path);
+    try waitProjects(&h, 0);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// 等到项目列表中有 `n` 个项目
+fn waitProjects(h: *Harness, n: usize) !void {
+    for (0..400) |_| {
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        h.server.workspaces_mutex.lockUncancelable(testing.io);
+        const count = h.server.workspaces.items.len;
+        h.server.workspaces_mutex.unlock(testing.io);
+        if (count == n) return;
+        try testing.io.sleep(.fromMilliseconds(25), .awake);
+    }
+    return error.ChangeNotNoticed;
+}
+
 test "workspace folders: added folders start a project, removed ones clear its diagnostics" {
     var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
     defer first.deinit();
@@ -722,6 +776,36 @@ const named_module_build =
     \\}
     \\
 ;
+
+test "a build.zig reported created and then saved: the project restarted during loading still publishes compiler diagnostics" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = named_module_main },
+        .{ .path = "geo.zig", .text = "pub const name = \"geo\";\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = .{ .files = .{ .watcher = "client" } } });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, named_module_main);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const build_path = try project.path(a, "build.zig");
+    const build_uri = try za.base.uri.fromPath(a, build_path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = build_uri, .type = 1 }} });
+    try open(&h, build_uri, named_module_build);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, h.server.workspaces.items.len);
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
 
 test "creating or deleting build.zig in a workspace folder starts or stops its project" {
     var project = try fixture.Project.create(&.{

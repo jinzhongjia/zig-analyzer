@@ -8,6 +8,7 @@
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
 //!       "sema": { "callsite_seeding": true },
+//!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
 //! 逐项解析：未知的项与类型错误的项只产生警告（`warnings`），类型错误的项取默认值，其余项照常生效。
@@ -48,6 +49,8 @@ hide_redundant_param_names: bool = true,
 callsite_seeding: bool = true,
 /// InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导）；0 为不回收
 max_intern_pool_mb: u32 = 64,
+/// 磁盘上的外部改动由谁发现（见 `Watcher`）
+files_watcher: Watcher = .auto,
 /// 日志级别（err / warn / info / debug）
 log_level: std.log.Level = .info,
 /// 日志同时追加到这个文件；null 为只写 stderr
@@ -58,6 +61,16 @@ slow_request_ms: u32 = 100,
 warnings: []const []const u8 = &.{},
 /// 配置中出现（且类型正确）的项，下标对应 `settings`
 present: std.StaticBitSet(settings.len) = .empty,
+
+/// 外部改动的来源。客户端支持时总会向它注册文件监听（`workspace/didChangeWatchedFiles`）
+pub const Watcher = enum {
+    /// 客户端不支持动态注册文件监听时由服务器轮询
+    auto,
+    /// 只用客户端的通知
+    client,
+    /// 总是由服务器轮询（客户端的通知仍然处理）
+    server,
+};
 
 /// 项目配置文件的文件名（位于项目根目录）
 pub const project_file = "zig-analyzer.json";
@@ -79,6 +92,7 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
+    .{ .section = "files", .key = "watcher", .field = "files_watcher" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },
     .{ .section = "log", .key = "slow_request_ms", .field = "slow_request_ms" },
@@ -277,6 +291,13 @@ test "parse: nested fields, optional wrapper" {
     defer no_compiler.deinit(testing.allocator);
     try testing.expect(!no_compiler.compiler_diagnostics and !no_compiler.inlay_types and no_compiler.inlay_parameters);
     try testing.expect(!no_compiler.sameBuild(&empty));
+
+    try testing.expectEqual(Watcher.auto, empty.files_watcher);
+    var server_watcher = try parseText(
+        \\{"files": {"watcher": "server"}}
+    );
+    defer server_watcher.deinit(testing.allocator);
+    try testing.expectEqual(Watcher.server, server_watcher.files_watcher);
 }
 
 test "parse: unknown and invalid settings are reported, the rest still applies" {

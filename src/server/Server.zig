@@ -33,6 +33,7 @@ const InternPool = za.sema.InternPool;
 pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
 const SemanticCache = @import("semantic_cache.zig");
+const watch = @import("watch.zig");
 
 const log = std.log.scoped(.server);
 
@@ -147,6 +148,10 @@ parent_watch: ?Io.Future(void) = null,
 /// 项目已启动：此后修改 zig.path 需要重启服务器
 started: bool = false,
 
+/// 串行化修改服务器状态的消息处理：主循环处理每条消息时持有，服务器轮询到外部改动时也要持有（见 `watch.zig`）
+write_mutex: Io.Mutex = .init,
+/// 服务器轮询外部改动的间隔（毫秒）
+poll_interval_ms: std.atomic.Value(u32) = .init(1000),
 docs_mutex: Io.Mutex = .init,
 /// 已打开的文档：客户端使用的 URI（发布诊断时原样使用）
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
@@ -350,6 +355,8 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
         server.sendError(null, jsonrpc.error_codes.parse_error, "failed to parse JSON-RPC message");
         return .@"continue";
     };
+    server.write_mutex.lockUncancelable(server.io);
+    defer server.write_mutex.unlock(server.io);
     var pc: panic_context.Text = .{};
     switch (message) {
         .request => |req| messageContext(&pc, "request", req.method, req.params),
@@ -999,7 +1006,7 @@ fn documentPath(arena: Allocator, document_uri: []const u8) Allocator.Error!?[]c
 /// 非 file URI 文档的虚拟目录
 const virtual_root = if (@import("builtin").os.tag == .windows) "C:\\.zig-analyzer-virtual" else "/.zig-analyzer-virtual";
 
-fn isVirtual(path: []const u8) bool {
+pub fn isVirtual(path: []const u8) bool {
     return Vfs.isUnderStyle(.native, .sensitive, path, virtual_root);
 }
 
@@ -1194,6 +1201,29 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
     server.docs_mutex.unlock(server.io);
     server.recompileSingle(open, files);
+}
+
+/// 服务器轮询到的外部改动：与客户端的 `workspace/didChangeWatchedFiles` 通知同样处理，与主循环的消息处理串行
+pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent) void {
+    server.write_mutex.lockUncancelable(server.io);
+    defer server.write_mutex.unlock(server.io);
+    if (server.state != .running or server.isShuttingDown()) return;
+    // 处理期间计为忙碌：重启项目时旧的新实例先结束、新实例随后才计为忙碌，轮询任务自身又不计为忙碌，
+    // 中间不能让等待空闲的一方（waitIdle、shutdown）返回
+    server.busyBegin();
+    defer server.busyEnd();
+    server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
+}
+
+/// 是否由服务器轮询外部改动（见 `Config.Watcher`）
+pub fn pollsFiles(server: *Server) bool {
+    server.config_mutex.lockUncancelable(server.io);
+    defer server.config_mutex.unlock(server.io);
+    return switch (server.config.files_watcher) {
+        .auto => !server.register_watch,
+        .client => false,
+        .server => true,
+    };
 }
 
 /// 文件内容的变化频率：标准库几乎不变，依赖包很少变化，项目文件经常变化
@@ -1468,6 +1498,8 @@ fn startProjects(server: *Server) void {
         server.busyEnd();
         log.err("failed to start project loading task: {t}", .{err});
     };
+    // 一直运行到服务器关闭，不计为忙碌；不能退回在主循环中同步执行
+    server.bg_group.concurrent(server.io, watch.run, .{server}) catch |err| log.warn("failed to start watching files on disk: {t}", .{err});
 }
 
 // ── 项目与后台任务 ───────────────────────────────────────────────────
