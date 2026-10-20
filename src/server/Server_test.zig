@@ -118,68 +118,130 @@ test "full lifecycle: initialize, document sync, read requests, shutdown" {
     try testing.expectEqual(0, last.get("params").?.object.get("diagnostics").?.array.items.len);
 }
 
-test "push live diagnostics, clear on close" {
+test "duplicate initialized is ignored, including after shutdown" {
     var s: Session = undefined;
+    // 使用真实的 zig 查询环境：重复的 initialized 不应再次启动加载
     try s.run(frame(
-        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"initializationOptions":{"zig":{"path":"zig"}}}}
     ) ++ frame(
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
-    ++ file_uri ++
-        \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
     ) ++ frame(
         \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
     ) ++ frame(
-        \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"
-    ++ file_uri ++
-        \\"}}}
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
     ) ++ frame(
         \\{"jsonrpc":"2.0","method":"exit"}
     ));
     defer s.deinit();
+    try testing.expectEqual(0, s.exit_code);
+}
 
-    const notes = try s.notifications();
-    try testing.expectEqual(2, notes.len);
-    const diags = notes[0].object.get("params").?.object.get("diagnostics").?.array.items;
-    try testing.expectEqual(1, diags.len);
-    const d = diags[0].object;
-    try testing.expectEqualStrings("unused local variable", d.get("message").?.string);
-    try testing.expectEqualStrings("zig ast-check", d.get("source").?.string);
-    const start = d.get("range").?.object.get("start").?.object;
-    try testing.expectEqual(1, start.get("line").?.integer);
-    try testing.expectEqual(8, start.get("character").?.integer);
-    // didClose 后清空
-    try testing.expectEqual(0, notes[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
+test "push live diagnostics, clear on close" {
+    // 打开时的 live 诊断（shutdown 等待发布完成）
+    {
+        var s: Session = undefined;
+        try s.run(frame(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+        ++ file_uri ++
+            \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"exit"}
+        ));
+        defer s.deinit();
+
+        const notes = try s.notifications();
+        try testing.expectEqual(1, notes.len);
+        const diags = notes[0].object.get("params").?.object.get("diagnostics").?.array.items;
+        try testing.expectEqual(1, diags.len);
+        const d = diags[0].object;
+        try testing.expectEqualStrings("unused local variable", d.get("message").?.string);
+        try testing.expectEqualStrings("zig ast-check", d.get("source").?.string);
+        const start = d.get("range").?.object.get("start").?.object;
+        try testing.expectEqual(1, start.get("line").?.integer);
+        try testing.expectEqual(8, start.get("character").?.integer);
+    }
+    // 关闭后清空：打开时的发布可能与关闭的发布并发，只断言最后一次结果
+    {
+        var s: Session = undefined;
+        try s.run(frame(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+        ++ file_uri ++
+            \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"
+        ++ file_uri ++
+            \\"}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"exit"}
+        ));
+        defer s.deinit();
+
+        const notes = try s.notifications();
+        try testing.expect(notes.len >= 1);
+        const last = notes[notes.len - 1].object.get("params").?.object;
+        try testing.expectEqualStrings(file_uri, last.get("uri").?.string);
+        try testing.expectEqual(0, last.get("diagnostics").?.array.items.len);
+    }
 }
 
 test "close: non-file documents clear diagnostics on the client URI" {
     const untitled = "untitled:Untitled-1";
-    var s: Session = undefined;
-    try s.run(frame(
-        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
-    ) ++ frame(
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
-    ++ untitled ++
-        \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
-    ) ++ frame(
-        \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
-    ) ++ frame(
-        \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"
-    ++ untitled ++
-        \\"}}}
-    ) ++ frame(
-        \\{"jsonrpc":"2.0","method":"exit"}
-    ));
-    defer s.deinit();
-
-    const notes = try s.notifications();
-    try testing.expectEqual(2, notes.len);
-    for (notes) |n| {
-        const params = n.object.get("params").?.object;
+    // 打开时对客户端 URI 发布诊断
+    {
+        var s: Session = undefined;
+        try s.run(frame(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+        ++ untitled ++
+            \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"exit"}
+        ));
+        defer s.deinit();
+        const notes = try s.notifications();
+        try testing.expectEqual(1, notes.len);
+        const params = notes[0].object.get("params").?.object;
         try testing.expectEqualStrings(untitled, params.get("uri").?.string);
+        try testing.expectEqual(1, params.get("diagnostics").?.array.items.len);
     }
-    try testing.expectEqual(1, notes[0].object.get("params").?.object.get("diagnostics").?.array.items.len);
     // 关闭后对客户端 URI 发送空列表，而不是内部的虚拟路径
-    try testing.expectEqual(0, notes[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
+    {
+        var s: Session = undefined;
+        try s.run(frame(
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+        ++ untitled ++
+            \\","languageId":"zig","version":1,"text":"fn f() void {\n    var x = 1;\n}\n"}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"
+        ++ untitled ++
+            \\"}}}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ) ++ frame(
+            \\{"jsonrpc":"2.0","method":"exit"}
+        ));
+        defer s.deinit();
+        const notes = try s.notifications();
+        try testing.expect(notes.len >= 1);
+        const params = notes[notes.len - 1].object.get("params").?.object;
+        try testing.expectEqualStrings(untitled, params.get("uri").?.string);
+        try testing.expectEqual(0, params.get("diagnostics").?.array.items.len);
+    }
 }
 
 test "syntax features end to end" {

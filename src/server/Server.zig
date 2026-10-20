@@ -143,6 +143,8 @@ config_requests: u32 = 0,
 config_outstanding: u32 = 0,
 /// 首次拉取的响应到达前推迟项目启动（启动要用 zig.path 与构建参数）
 startup_pending: bool = false,
+/// `initialized` 已处理：LSP 规定只发送一次，重复的忽略
+initialized_received: bool = false,
 /// 监视客户端进程（`initialize` 的 `processId`）的后台任务
 parent_watch: ?Io.Future(void) = null,
 /// 项目已启动：此后修改 zig.path 需要重启服务器
@@ -948,8 +950,8 @@ fn semanticRefreshFinished(server: *Server) void {
 
 fn processNotification(server: *Server, arena: Allocator, method: []const u8, params_value: json.Value) !Flow {
     if (std.mem.eql(u8, method, "exit")) return .exit;
-    // 初始化前除 exit 外的通知一律丢弃
-    if (server.state == .uninitialized) return .@"continue";
+    // 初始化前与 shutdown 之后除 exit 外的通知一律丢弃
+    if (server.state == .uninitialized or server.state == .shutdown) return .@"continue";
 
     const handlers = .{
         .{ "$/cancelRequest", cancelRequest },
@@ -1470,6 +1472,8 @@ pub fn configSnapshot(server: *Server) Allocator.Error!Config {
 }
 
 fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !void {
+    if (server.initialized_received) return;
+    server.initialized_received = true;
     var registrations: std.ArrayList(types.Registration) = .empty;
     if (server.register_config) try registrations.append(arena, .{ .id = "zig-analyzer/didChangeConfiguration", .method = "workspace/didChangeConfiguration" });
     if (server.register_watch) {
@@ -1522,9 +1526,18 @@ fn startup(server: *Server) Io.Cancelable!void {
         return;
     };
     {
+        var fresh = true;
         server.env_mutex.lockUncancelable(server.io);
         defer server.env_mutex.unlock(server.io);
-        server.zig_env = env;
+        if (server.zig_env == null) {
+            server.zig_env = env;
+        } else fresh = false;
+        if (!fresh) {
+            // 已有环境（不应发生：`initialized` 只处理一次）：保留旧值，释放这次查询的结果
+            var stale = env;
+            stale.deinit(server.gpa);
+            return;
+        }
     }
     log.info("zig {s} ({s})", .{ env.version, env.zig_exe });
     // 默认的 builtin.zig（单文件模式）：按 `zig test` 的设置，test 块中依赖 `builtin.is_test` 的
@@ -1534,9 +1547,13 @@ fn startup(server: *Server) Io.Cancelable!void {
         error.OutOfMemory => null,
     };
     if (default_builtin) |path| {
-        server.env_mutex.lockUncancelable(server.io);
-        defer server.env_mutex.unlock(server.io);
-        server.default_builtin = path;
+        var keep = true;
+        {
+            server.env_mutex.lockUncancelable(server.io);
+            defer server.env_mutex.unlock(server.io);
+            if (server.default_builtin == null) server.default_builtin = path else keep = false;
+        }
+        if (!keep) server.gpa.free(path);
     }
     if (!env.matchesBuiltin()) {
         // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check
