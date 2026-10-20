@@ -108,6 +108,12 @@ pub const Resolver = struct {
     /// 在 BodyOwner `item` 的 `scope` 处解析名字
     pub fn resolveName(r: *Resolver, file: FileId, item: u32, b: *const Body, scope: Body.ScopeId, name: []const u8) Error!?Def {
         if (b.lookup(scope, name)) |binding| return .{ .local = .{ .file = file, .item = item, .binding = binding } };
+        return r.resolveContainerName(file, item, name);
+    }
+
+    /// 容器级的名字：成员声明，以及容器定义在成员体内时该成员在容器位置可见的局部名字。
+    /// 用于没有 Body 局部作用域的位置（如 decltest `test helper` 的名字）
+    pub fn resolveContainerName(r: *Resolver, file: FileId, item: u32, name: []const u8) Error!?Def {
         const tree = try r.itemTree(file);
         var container = tree.items[item].container;
         while (true) {

@@ -49,8 +49,14 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
     var binding_id: ?Body.BindingId = null;
     var expr_id: ?Body.ExprId = null;
     if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
-        def = .{ .item = .{ .file = file, .item = a.item } };
-        tv = try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
+        // decltest：名字指向它引用的声明，而不是 test 自身
+        if (a.node.kind() == .test_decl and name.kind == .identifier) {
+            def = try r.resolveContainerName(file, a.item, try ast.identNameAlloc(r.arena, name.text));
+            if (def) |d| tv = try queries.defType(r, d, null, null);
+        } else {
+            def = .{ .item = .{ .file = file, .item = a.item } };
+            tv = try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
+        }
     };
     if (def == null) for (b.bindings, 0..) |binding, i| {
         if (binding.range.start != tok.offset - a.node.offset) continue;

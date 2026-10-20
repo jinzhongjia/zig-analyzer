@@ -13,6 +13,7 @@ const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const seed = database.ide_db.seed;
+const search = @import("../ide_db/search.zig");
 
 const src =
     \\/// 平面上的点
@@ -105,6 +106,47 @@ test "member completion and goto definition through types" {
             return err;
         };
     }
+}
+
+test "decltest identifier is a reference to the declaration" {
+    const text =
+        \\fn helper(x: u32) u32 {
+        \\    return x + 1;
+        \\}
+        \\test helper {
+        \\    const y = helper(1);
+        \\    _ = y;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+
+    const test_name: u32 = @intCast(std.mem.indexOf(u8, text, "test helper").? + "test ".len);
+    const t = (try definition.definition(&r, file, test_name)) orelse return error.NoTarget;
+    try testing.expectEqual(file, t.file);
+    try testing.expect(std.mem.startsWith(u8, text[t.start..], "helper(x: u32)"));
+
+    const info = (try hover.hover(&r, file, test_name)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nfn helper(x: u32) u32\n```", info.text);
+
+    const fn_name: u32 = @intCast(std.mem.indexOf(u8, text, "fn helper").? + "fn ".len);
+    const def = (try definition.defAt(&r, file, fn_name)) orelse return error.NoDefinition;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{file} });
+    var saw_test = false;
+    var saw_call = false;
+    for (refs) |ref| {
+        if (ref.start == test_name) saw_test = true;
+        if (ref.start == std.mem.indexOf(u8, text, "helper(1)").?) saw_call = true;
+    }
+    try testing.expect(saw_test);
+    try testing.expect(saw_call);
+    try testing.expectEqual(3, refs.len);
 }
 
 test "definition of bare primitive names skips escaped declarations" {

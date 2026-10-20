@@ -13,6 +13,7 @@ const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const Def = resolve.Def;
 const Body = @import("../hir/Body.zig");
+const ast = @import("../syntax/ast.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
@@ -188,6 +189,15 @@ const Finder = struct {
     /// 检查文件 `file` 中的成员 `item`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
         const r = f.r;
+        // decltest 的名字不在 Body 中：`test helper` 的标识符是对 helper 的引用
+        if (try r.itemNode(file, item_index)) |node| if (node.kind() == .test_decl) if (node.childToken(.identifier)) |t| {
+            const name = try ast.identNameAlloc(r.arena, t.text);
+            if (std.mem.eql(u8, name, f.name)) {
+                if (try r.resolveContainerName(file, item_index, name)) |def| if (deepEql(def, f.def)) {
+                    try f.add(file, t.offset, t.offset + @as(u32, @intCast(t.text.len)));
+                };
+            }
+        };
         if (!try r.mayMention(file, item_index, f.name)) return;
         const body = try r.body(file, item_index);
         if (!mentions(body, f.name)) return;

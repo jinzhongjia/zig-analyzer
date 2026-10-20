@@ -579,7 +579,11 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
     const item = try r.ownerAt(file, tok.offset, false) orelse return null;
     const node = try r.itemNode(file, item) orelse return null;
     // 成员自身的名字
-    if (ast.memberName(node, try r.inEnum(file, item))) |name| if (name.offset == tok.offset) return .{ .item = .{ .file = file, .item = item } };
+    if (ast.memberName(node, try r.inEnum(file, item))) |name| if (name.offset == tok.offset) {
+        // decltest：`test helper` 的标识符是对 helper 的引用，不是 test 自身的名字
+        if (node.kind() == .test_decl and name.kind == .identifier) return r.resolveContainerName(file, item, try ast.identNameAlloc(r.arena, name.text));
+        return .{ .item = .{ .file = file, .item = item } };
+    };
 
     const b = try r.body(file, item);
     const rel = tok.offset - node.offset;
