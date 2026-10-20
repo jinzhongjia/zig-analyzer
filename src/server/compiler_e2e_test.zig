@@ -781,6 +781,8 @@ test "fetched packages outside the build root are libraries: never compiled alon
         try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.root, "pkgs", fetched_hash }), roots[0]);
     }
     const pkg = "pkgs/" ++ fetched_hash ++ "/src/";
+    try testing.expectEqual(.package, h.server.fileOrigin(try h.server.vfs.intern(try project.path(a, pkg ++ "root.zig"))));
+    try testing.expectEqual(.user, h.server.fileOrigin(try h.server.vfs.intern(try project.path(a, "proj/main.zig"))));
     const root_uri = try open(&h, try project.path(a, pkg ++ "root.zig"), fetched_root);
     const unused_path = try project.path(a, pkg ++ "unused.zig");
     const unused_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, unused_path, a, .limited(1024));
@@ -792,6 +794,32 @@ test "fetched packages outside the build root are libraries: never compiled alon
     try testing.expect(prepared.object.get("error") != null);
     try shutdown(&h);
     for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
+}
+
+test "workspace symbols list dependency packages only when enabled" {
+    var project = try fixture.Project.create(&fetched_package);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "proj"), false);
+    try waitIdle(&h);
+    // 默认不列出依赖库中的符号：依赖包中的 `answer` 不在其中
+    const user = try h.request("workspace/symbol", .{ .query = "answer" });
+    try testing.expectEqual(0, user.object.get("result").?.array.items.len);
+    const entry = try h.request("workspace/symbol", .{ .query = "entry" });
+    try testing.expectEqual(1, entry.object.get("result").?.array.items.len);
+
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"workspace_symbol": {"dependencies": true}}
+    ) });
+    try waitIdle(&h);
+    const deps = try h.request("workspace/symbol", .{ .query = "answer" });
+    const items = deps.object.get("result").?.array.items;
+    try testing.expectEqual(1, items.len);
+    try testing.expect(std.mem.endsWith(u8, items[0].object.get("location").?.object.get("uri").?.string, "/src/root.zig"));
+    try shutdown(&h);
 }
 
 test "single-file mode: errors in imported files are published on them and cleared after a fix" {
@@ -1069,6 +1097,7 @@ test "generated files in a local cache directory outside the build root: never c
         return error.TestUnexpectedResult;
     };
     try testing.expect(std.mem.startsWith(u8, generated, cache));
+    try testing.expectEqual(.generated, h.server.fileOrigin(try h.server.vfs.intern(generated)));
 
     // 打开、保存生成的 options.zig：它只作为项目的依赖参与编译
     const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, generated, a, .limited(1024 * 1024));

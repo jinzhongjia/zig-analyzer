@@ -18,6 +18,7 @@ const ErrorBundle = std.zig.ErrorBundle;
 
 const za = @import("../zig_analyzer.zig");
 const Server = @import("Server.zig");
+const origin = @import("origin.zig");
 const bsp = za.project.bsp;
 const builtin = za.project.builtin;
 const ZigEnv = za.project.ZigEnv;
@@ -260,17 +261,15 @@ pub fn contains(ws: *Workspace, file: FileId) bool {
     return false;
 }
 
-/// `path` 是否位于本项目的依赖库中：maker 使用的本地缓存目录（生成文件所在处，不一定是 `<构建根>/.zig-cache`；
-/// 它包含构建根目录时无法区分生成文件与项目文件，不算在内），或获取的依赖包
-pub fn inLibrary(ws: *Workspace, path: []const u8) bool {
+/// 本项目的依赖库目录（见 `origin.Rules`）：maker 使用的本地缓存目录（生成文件所在处，不一定是
+/// `<构建根>/.zig-cache`；它包含构建根目录时无法区分生成文件与项目文件，不算在内）与获取的依赖包，复制到 `arena` 中
+pub fn libraryDirs(ws: *Workspace, arena: Allocator, local_caches: *std.ArrayList([]const u8), packages: *std.ArrayList([]const u8)) Allocator.Error!void {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
-    const model = &(ws.model orelse return false);
-    const vfs = &ws.server.vfs;
+    const model = &(ws.model orelse return);
     const cache = model.local_cache_root;
-    if (cache.len != 0 and !vfs.isUnder(ws.root, cache) and vfs.isUnder(path, cache)) return true;
-    for (model.package_roots) |p| if (vfs.isUnder(path, p)) return true;
-    return false;
+    if (cache.len != 0 and !ws.server.vfs.isUnder(ws.root, cache)) try local_caches.append(arena, try arena.dupe(u8, cache));
+    for (model.package_roots) |p| try packages.append(arena, try arena.dupe(u8, p));
 }
 
 /// 首次加载尚未结束（见 `load_done`）
@@ -816,6 +815,9 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
     const Loaded = struct { file: FileId, text: ?[]u8, durability: database.Durability };
     var batch: std.ArrayList(Loaded) = .empty;
     defer batch.deinit(ws.gpa);
+    var arena: std.heap.ArenaAllocator = .init(ws.gpa);
+    defer arena.deinit();
+    const rules = try ws.server.originRules(arena.allocator());
     for (files) |file| {
         try ws.loaded.put(ws.gpa, file, {});
         const path = ws.server.vfs.path(file);
@@ -823,7 +825,7 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = ws.server.fileDurability(path) });
+        try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = origin.classify(&ws.server.vfs, rules, path, false).durability() });
     }
     const db = &ws.server.db;
     db.beginWrite();

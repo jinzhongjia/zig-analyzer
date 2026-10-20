@@ -8,6 +8,7 @@
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
 //!       "sema": { "callsite_seeding": true },
+//!       "workspace_symbol": { "dependencies": false },
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
@@ -49,6 +50,8 @@ hide_redundant_param_names: bool = true,
 callsite_seeding: bool = true,
 /// InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导）；0 为不回收
 max_intern_pool_mb: u32 = 64,
+/// workspace symbol 是否也列出依赖库（获取的依赖包、生成文件、打开的标准库文件）中的符号
+workspace_symbol_dependencies: bool = false,
 /// 磁盘上的外部改动由谁发现（见 `Watcher`）
 files_watcher: Watcher = .auto,
 /// 日志级别（err / warn / info / debug）
@@ -92,6 +95,7 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
+    .{ .section = "workspace_symbol", .key = "dependencies", .field = "workspace_symbol_dependencies" },
     .{ .section = "files", .key = "watcher", .field = "files_watcher" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },

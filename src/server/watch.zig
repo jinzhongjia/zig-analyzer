@@ -232,10 +232,11 @@ pub const Watcher = struct {
 
         var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         errdefer files.deinit(gpa);
+        const rules = try server.originRules(a);
         const count = server.vfs.count();
         for (0..count) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-            if (!server.watchable(path)) continue;
+            if (!server.watchable(rules, path)) continue;
             try files.put(gpa, try w.key(na, path), path);
         }
         {

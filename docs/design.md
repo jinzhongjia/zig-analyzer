@@ -98,8 +98,15 @@ Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；�
 - 官方解析器与 AstGen 逐层递归（Debug 构建每层约 16 KB 栈）。先按 token 估计嵌套深度的上界：不超过 256 在当前线程做，不超过 102400 在 2 GiB 栈的专用线程上做；更深的文件不做 AstGen，没有 live 诊断，import 按 token 收集。上限按常见的嵌套形式（else-if 链、if 表达式链、括号、调用、初始化、运算符链）标定，比它更深时 `zig ast-check`（主线程栈 46 MiB）同样耗尽栈。
 - 附注与引用链映射为 `relatedInformation`：引用链的各项排在附注之后，有位置的项指向引用处，文案为 `referenced by: <名字>`；隐藏计数项位于错误起点，文案与 `zig build` 相同。`@compileLog` 的输出以 `Compile Log Output:` 加各行接在 `found compile log statement` 错误的文案后；同一编译中还有其他错误而没有这条错误时，接在第一条错误后。
 - 子进程回传的 `ErrorBundle`（`bsp_step_completed`、`bsp_configuration_failed` 与单文件编译的结果）使用前校验全部下标与字符串：消息列表、各条消息与逐层的附注、源位置与其后的引用链都在 `extra` 内，字符串下标指向以 0 结尾的字符串，引用链中隐藏标记的计数不当作字符串；嵌套深度与读取总量有上限，自引用与环被拒绝。头部给出的长度超出消息体时整条消息按格式错误处理，不按这个长度分配内存。不合法时丢弃并记录日志，按这次编译没有错误处理，同一消息中的生成文件与读取的文件照常使用。路径解析后不是绝对路径时（Windows 上另一驱动器的相对路径，如 `D:a.zig`）不作为文件：错误包中的按没有位置处理，`file_system_inputs` 中的跳过。行列与区间等数值不校验：终点在起点之前的区间改为起点处的空区间，按编辑平移后超出范围的诊断不发布。
+- 文件的来源（`server/origin.zig`）依次判断：
+  - 获取的依赖包：模块所在的、按哈希获取的包（包目录的 `<哈希>` 子目录，包目录默认为 `<构建根>/zig-pkg`，随 `--pkg-dir`、`--system` 改变）；
+  - 生成文件：全局缓存与各项目的本地缓存；
+  - 用户代码：工作区根目录下的文件，不含其中的 `.zig-cache`、`zig-pkg`（Zig 安装目录位于根目录下时是在开发 Zig 自身，同样是用户代码）；
+  - Zig 安装目录（标准库、`lib/compiler` 等）；
+  - 用户代码：根目录外但属于某个项目的模块（以路径加入的模块、`--fork` 指定的包）。
+  - 获取的依赖包、生成文件与 Zig 安装目录合称依赖库。编译上下文、durability（§4.2）、重命名（§4.6）、服务端监听（§4.8）与 workspace symbol 的范围都由这一份分类得出。
 - 文件的编译上下文依次判断（编译入口只来自项目与独立文件，打开文件本身不产生编译入口）：
-  - 依赖库：Zig 安装目录（标准库、`lib/compiler` 等）、全局缓存，以及各项目的本地缓存与模块所在的、按哈希获取的依赖包（包目录的 `<哈希>` 子目录，包目录默认为 `<构建根>/zig-pkg`，随 `--pkg-dir`、`--system` 改变）；
+  - 依赖库；
   - 项目：在某个项目的模块图中（编译集合，或可由其余 compile step 到达），包括构建根目录外以路径加入的模块；
   - 项目目录：带 `build.zig` 的根目录下、不在模块图中的文件；
   - 其余 `.zig` 文件为独立文件，各自作为根编译（单文件模式）。关闭构建集成时没有项目与项目目录。
@@ -141,7 +148,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 ### 4.2 查询引擎（`db/`）
 
 - **红绿验证 + early cutoff**：memo 记录 `verified_at` / `changed_at` 与依赖；输入变化后逐个验证依赖，重算得到相等的值时保留旧 `changed_at`，下游不重算。
-- **Durability**：std 与依赖包为 high，验证时整体跳过不变的层；验证通过的 memo 取依赖当前的最低 durability（输入降低 durability 而值经 early cutoff 不变时，下游不能仍按高 durability 跳过验证）。
+- **Durability**：写入文件内容时按文件的来源（§3）设置：Zig 安装目录与获取的依赖包为 high，生成文件为 medium，其余为 low；验证时整体跳过不变的层。没有写入、在查询中按需从磁盘读取的文件（如单文件模式下的标准库）为 low。验证通过的 memo 取依赖当前的最低 durability（输入降低 durability 而值经 early cutoff 不变时，下游不能仍按高 durability 跳过验证）。
 - **增量计算**：query 可声明 `computeIncremental(ctx, key, prev)`，重算时拿到上一次的值（用于局部重解析）。
 - **环与深度**：每线程维护活动查询栈，遇到环调用 query 的 `cycleFallback`；嵌套计算占用原生栈超过 4 MB 时同样回退，并以迭代加深分段计算深链。每个读事务有 comptime 求值的总步数预算（2000 万步）。
   - 环中的结果不写 memo，读取方也不把它记为依赖：它读到的依赖直接交给栈上最近的不在环中的帧。环入口的 memo 因此直接依赖环内各成员读到的 query 与 input，memo 之间不成环，成员旧 memo 的 early cutoff 也不会掩盖入口看到的变化。
@@ -214,11 +221,11 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | 内置函数的补全、hover、参数提示 | 同版本 Zig 官方语言参考生成的静态签名、参数和 Markdown 说明；hover 同时保留推导结果 |
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
-| workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分 |
+| workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
 | 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
 
-重命名只修改用户自己的代码：定义须位于某个工作区根目录内（不在其 `.zig-cache`、`zig-pkg` 中），或在根目录外但属于某个项目（以路径加入的模块、`--fork` 指定的包）；项目的本地缓存与获取的依赖包中的定义、根目录外的 Zig 安装目录与全局缓存中的定义不能重命名。
+重命名只修改用户自己的代码（§3 的文件来源）：依赖库中的定义不能重命名。
 
 内置元数据固定为 Zig 0.17.0，来源、源码包及输入文件哈希记录在 `tools/zig/metadata.json`，许可保留在同目录。
 `zig build gen` 离线生成 `src/ide/builtin_data.zig`，校验官方输入哈希、编译器版本、名称和参数数量；运行时只查静态表。
@@ -259,7 +266,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 配置来自客户端（`initializationOptions`、`workspace/configuration`），项目根的 `zig-analyzer.json` 可覆盖与项目相关的项；各项说明见 `src/server/Config.zig`。
 - 退出：输入结束时不再等待客户端对配置请求的回复，停止各项目后退出。`initialize` 给出 `processId` 时等待客户端进程退出，之后服务器随之退出（stdin 的写端可能被客户端的其他子进程继承而一直不关闭）。等待使用操作系统的进程退出通知：Linux 用 pidfd（内核 5.3 起），macOS 与 FreeBSD、NetBSD、OpenBSD 用 kqueue 的 `EVFILT_PROC`，Windows 等待进程句柄；都用不了时（内核较旧、沙箱禁止、没有权限打开进程、其他平台）才每 2 秒检查一次进程是否还在。
 - 外部改动：客户端支持动态注册时注册 `workspace/didChangeWatchedFiles`。客户端不支持时（Linux 上的 Neovim 默认如此），或 `files.watcher` 为 `server` 时，由服务器监听，变化按同一条路径处理：
-  - 关注驻留过的 `.zig` / `.zon` 文件与各根目录的 `build.zig`、`build.zig.zon`、`zig-analyzer.json`，不含 Zig 安装目录、全局缓存、各项目的本地缓存与获取的依赖包中的文件；打开的文档以缓冲区为准，跳过。
+  - 关注驻留过的 `.zig` / `.zon` 文件与各根目录的 `build.zig`、`build.zig.zon`、`zig-analyzer.json`，不含依赖库（§3）中的文件；打开的文档以缓冲区为准，跳过。
   - 用操作系统的原生通知监听这些文件所在的目录：Linux 用 inotify，macOS 用 FSEvents，Windows 用目录变化通知。目录不存在时监听最近一级存在的祖先目录，它出现后改为监听它自己，其中已经存在的文件按新建处理。驻留了新文件（Vfs 通知）、根目录增减、目录新建或删除、通知丢失时重新计算要监听的目录。一阵连续的通知合为一批（静默 50 ms，至多推迟 500 ms）。
   - 轮询（检查大小与修改时间）只作为最后的退路：原生通知不可用（其他平台、初始化失败），或个别目录超出监听数量上限（如 inotify 的 `max_user_watches`）时，只对这些目录中的文件轮询，间隔至少 1 秒，且不少于一次检查耗时的 20 倍。
   - 处理期间计为忙碌：重启项目时旧实例结束与新实例开始之间，等待空闲的一方不会返回。

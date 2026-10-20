@@ -27,6 +27,7 @@ const ide = za.ide;
 const compiler = za.diagnostics.compiler;
 const ZigEnv = za.project.ZigEnv;
 const Workspace = @import("Workspace.zig");
+const origin = @import("origin.zig");
 const ModuleGraph = za.names.ModuleGraph;
 const Resolver = za.names.resolve.Resolver;
 const InternPool = za.sema.InternPool;
@@ -1143,9 +1144,10 @@ fn isProjectFile(base: []const u8) bool {
 /// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon / zig-analyzer.json 或项目的构建脚本
 /// 变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时项目重新构建、单文件重新编译
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
-    const Change = struct { file: Vfs.FileId, text: ?[]u8 };
+    const Change = struct { file: Vfs.FileId, text: ?[]u8, durability: database.Durability };
     var changes: std.ArrayList(Change) = .empty;
     defer for (changes.items) |c| if (c.text) |t| server.gpa.free(t);
+    const rules = try server.originRules(arena);
     var build_files: std.ArrayList([]const u8) = .empty;
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
     // 变化的已知文件（含打开的文件：maker 读取磁盘）
@@ -1172,13 +1174,13 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             error.Canceled => return error.Canceled,
             error.FileTooBig => null,
         };
-        try changes.append(arena, .{ .file = file, .text = text });
+        try changes.append(arena, .{ .file = file, .text = text, .durability = origin.classify(&server.vfs, rules, server.vfs.path(file), false).durability() });
     }
     if (changes.items.len != 0) {
         server.db.beginWrite();
         defer server.db.endWrite();
         for (changes.items) |*c| {
-            try server.db.set(FileText, c.file, c.text, server.fileDurability(server.vfs.path(c.file)));
+            try server.db.set(FileText, c.file, c.text, c.durability);
             c.text = null;
         }
     }
@@ -1238,16 +1240,15 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
 }
 
-/// 服务器发现外部改动时关注的文件（另有各根目录的项目文件）：`.zig` / `.zon`，不是虚拟文档，不在不会改变的依赖库中，
-/// 即 Zig 安装目录、全局缓存（见 `fileDurability`）与各项目的本地缓存、获取的依赖包（见 `Workspace.inLibrary`）。
+/// 服务器发现外部改动时关注的文件（另有各根目录的项目文件）：`.zig` / `.zon`，不是虚拟文档，不在依赖库中。
 /// zig 环境未知时还分不出依赖库，都不关注
-pub fn watchable(server: *Server, path: []const u8) bool {
+pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
     if (!std.mem.endsWith(u8, path, ".zig") and !std.mem.endsWith(u8, path, ".zon")) return false;
-    if (isVirtual(path) or server.zigEnv() == null or server.fileDurability(path) != .low) return false;
-    server.workspaces_mutex.lockUncancelable(server.io);
-    defer server.workspaces_mutex.unlock(server.io);
-    for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return false;
-    return true;
+    if (rules.zig_lib == null) return false;
+    return switch (origin.classify(&server.vfs, rules, path, false)) {
+        .user, .other => true,
+        .virtual, .zig_lib, .generated, .package => false,
+    };
 }
 
 /// `path` 是打开的文档
@@ -1274,12 +1275,53 @@ pub fn watchesFiles(server: *Server) bool {
     };
 }
 
-/// 文件内容的变化频率：标准库几乎不变，依赖包很少变化，项目文件经常变化
-pub fn fileDurability(server: *Server, path: []const u8) database.Durability {
-    const env = server.zigEnv() orelse return .low;
-    if (server.vfs.isUnder(path, env.lib_dir)) return .high;
-    if (server.vfs.isUnder(path, env.global_cache_dir)) return .medium;
-    return .low;
+/// 文件来源的分类依据（见 `origin.classify`），复制到 `arena` 中：zig 环境、工作区根目录，以及各项目的本地缓存与
+/// 依赖包（在项目读入构建图之后才知道）。依次在 roots_mutex 与 workspaces_mutex 期间读取，不能在写事务中调用
+pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rules {
+    var rules: origin.Rules = .{};
+    if (server.zigEnv()) |env| {
+        rules.zig_lib = try arena.dupe(u8, env.lib_dir);
+        rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
+    }
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        const roots = try arena.alloc([]const u8, server.roots.items.len);
+        for (server.roots.items, roots) |root, *r| r.* = try arena.dupe(u8, root);
+        rules.roots = roots;
+    }
+    var local_caches: std.ArrayList([]const u8) = .empty;
+    var packages: std.ArrayList([]const u8) = .empty;
+    {
+        // 先 workspaces_mutex 后 ws.mutex
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        for (server.workspaces.items) |ws| try ws.libraryDirs(arena, &local_caches, &packages);
+    }
+    rules.local_caches = local_caches.items;
+    rules.packages = packages.items;
+    return rules;
+}
+
+/// 文件属于某个项目的模块图（编译集合，或者可由其余的编译 step 到达）
+fn inProject(server: *Server, file: Vfs.FileId) bool {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| if (ws.contains(file)) return true;
+    return false;
+}
+
+/// 文件的来源（见 `origin.classify`）
+pub fn fileOrigin(server: *Server, file: Vfs.FileId) origin.Origin {
+    return server.originOf(file, server.inProject(file));
+}
+
+/// 内存不足、取不到分类依据时按其余文件处理
+fn originOf(server: *Server, file: Vfs.FileId, in_project: bool) origin.Origin {
+    var arena: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena.deinit();
+    const rules = server.originRules(arena.allocator()) catch return .other;
+    return origin.classify(&server.vfs, rules, server.vfs.path(file), in_project);
 }
 
 fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChangeConfigurationParams) !void {
@@ -1636,8 +1678,8 @@ fn startup(server: *Server) Io.Cancelable!void {
 const FileContext = enum {
     /// 不参与编译：虚拟文档，以及不属于任何项目的非 .zig 文件
     none,
-    /// Zig 安装目录（标准库等）、全局缓存，以及项目的本地缓存与获取的依赖包中的文件：只作为依赖参与编译，
-    /// 不作为根。真实的编译入口在其中报告的错误照常发布
+    /// 依赖库（见 `origin.Origin.isLibrary`）中的文件：只作为依赖参与编译，不作为根。真实的编译入口在其中
+    /// 报告的错误照常发布
     library,
     /// 在某个项目的模块图中（编译集合，或者可由其余的编译 step 到达）：编译器诊断来自项目的构建
     project,
@@ -1657,18 +1699,14 @@ const FileContext = enum {
 };
 
 fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
+    const in_project = server.inProject(file);
+    switch (server.originOf(file, in_project)) {
+        .virtual => return .none,
+        .zig_lib, .generated, .package => return .library,
+        .user, .other => {},
+    }
+    if (in_project) return .project;
     const path = server.vfs.path(file);
-    if (isVirtual(path)) return .none;
-    if (server.zigEnv()) |env| {
-        if (server.vfs.isUnder(path, env.lib_dir) or server.vfs.isUnder(path, env.global_cache_dir)) return .library;
-    }
-    {
-        // 与 `liveEligible` 相同，在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex 后 ws.mutex）
-        server.workspaces_mutex.lockUncancelable(server.io);
-        defer server.workspaces_mutex.unlock(server.io);
-        for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return .library;
-        for (server.workspaces.items) |ws| if (ws.contains(file)) return .project;
-    }
     if (server.buildFlags().build) {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
@@ -3136,17 +3174,29 @@ fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return set.keys();
 }
 
-/// workspace symbol 的范围：索引进行中时只取已建立索引的文件与打开的文档，不在请求中解析其余文件
-/// （LSP 的 workspace/symbol 没有 isIncomplete：客户端随输入重新请求，结果随索引的进展补全）
+/// workspace symbol 的范围：默认不含依赖库中的文件，由 `workspace_symbol.dependencies` 开启。索引进行中时
+/// 只取已建立索引的文件与打开的文档，不在请求中解析其余文件（LSP 的 workspace/symbol 没有 isIncomplete：客户端随
+/// 输入重新请求，结果随索引的进展补全）
 fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
-    const all = try server.searchScope(r);
-    if (!server.indexing.load(.acquire)) return all;
+    var scope = try server.searchScope(r);
+    const dependencies = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.workspace_symbol_dependencies;
+    };
+    if (!dependencies) {
+        const rules = try server.originRules(r.arena);
+        var user: std.ArrayList(Vfs.FileId) = .empty;
+        for (scope) |f| if (!origin.classify(&server.vfs, rules, server.vfs.path(f), false).isLibrary()) try user.append(r.arena, f);
+        scope = user.items;
+    }
+    if (!server.indexing.load(.acquire)) return scope;
     var out: std.ArrayList(Vfs.FileId) = .empty;
     server.indexed_mutex.lockUncancelable(server.io);
     defer server.indexed_mutex.unlock(server.io);
     server.docs_mutex.lockUncancelable(server.io);
     defer server.docs_mutex.unlock(server.io);
-    for (all) |f| if (server.indexed.contains(f) or server.open_docs.contains(f)) try out.append(r.arena, f);
+    for (scope) |f| if (server.indexed.contains(f) or server.open_docs.contains(f)) try out.append(r.arena, f);
     return out.items;
 }
 
@@ -3196,9 +3246,7 @@ fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return out;
 }
 
-/// 可以重命名的定义：用户自己的代码，即位于某个工作区根目录内（不在其 `.zig-cache`、`zig-pkg` 中），或在根目录外
-/// 但属于某个项目（以绝对路径加入的模块、`--fork` 指定的包）。都不能在项目的本地缓存与获取的依赖包中；根目录外的
-/// 也不能在 Zig 安装目录与全局缓存中（见 `FileContext`）
+/// 可以重命名的定义：用户自己的代码（见 `origin.Origin.user`）与未保存的文档
 fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
     const file = switch (def) {
@@ -3206,32 +3254,12 @@ fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
         .local => |l| l.file,
         .file => unreachable,
     };
-    const path = server.vfs.path(file);
-    // 未保存的文档（`untitled:` 等）只存在于编辑器中
-    if (isVirtual(path)) return true;
-    // 生成文件与依赖包：`--cache-dir` / `ZIG_LOCAL_CACHE_DIR` 可以把本地缓存目录移到 `.zig-cache` 以外，
-    // `--pkg-dir` 可以把依赖包移到 `zig-pkg` 以外。在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex
-    // 后 ws.mutex）
-    {
-        server.workspaces_mutex.lockUncancelable(server.io);
-        defer server.workspaces_mutex.unlock(server.io);
-        for (server.workspaces.items) |ws| if (ws.inLibrary(path)) return false;
-    }
-    {
-        server.roots_mutex.lockUncancelable(server.io);
-        defer server.roots_mutex.unlock(server.io);
-        var in_root = false;
-        for (server.roots.items) |root| {
-            if (path.len <= root.len or !server.vfs.isUnder(path, root)) continue;
-            in_root = true;
-            const rest = path[root.len..];
-            const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
-            if (std.mem.startsWith(u8, sub, ".zig-cache") or std.mem.startsWith(u8, sub, "zig-pkg")) continue;
-            return true;
-        }
-        if (in_root) return false;
-    }
-    return server.fileContext(file) == .project;
+    const rules = try server.originRules(r.arena);
+    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
+        // 未保存的文档（`untitled:` 等）只存在于编辑器中
+        .virtual, .user => true,
+        .zig_lib, .generated, .package, .other => false,
+    };
 }
 
 fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!types.ResultType("textDocument/prepareRename") {
@@ -3472,6 +3500,7 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 }
 
 test {
+    _ = origin;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
     _ = @import("compiler_e2e_test.zig");
