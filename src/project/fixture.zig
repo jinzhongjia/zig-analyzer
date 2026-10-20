@@ -1,5 +1,5 @@
-//! 集成测试用的示例项目：在临时目录中写出文件，真实运行 `zig build --listen=-`。
-//! PATH 中没有 zig 或版本与编译时不同时跳过（CI 与开发环境都满足）。
+//! 集成测试用的示例项目：在临时目录中写出文件，真实运行 `zig build --listen=-`。只在 `zig build test-all`
+//! 与 `test-stress` 中运行；PATH 中没有 zig 或版本与编译时不同时跳过（CI 与开发环境都满足）。
 
 const std = @import("std");
 const testing = std.testing;

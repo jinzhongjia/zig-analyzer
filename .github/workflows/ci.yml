@@ -26,10 +26,10 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: 单元测试（Debug）
-        run: zig build test --summary all
-      - name: 单元测试（ReleaseSafe）
-        run: zig build test -Doptimize=ReleaseSafe --summary all
+      - name: 全部测试（Debug）
+        run: zig build test-all --summary all
+      - name: 全部测试（ReleaseSafe）
+        run: zig build test-all -Doptimize=ReleaseSafe --summary all
       - name: 构建可执行文件
         run: zig build -Doptimize=ReleaseSafe
       - name: 编译检查（含基准工具）

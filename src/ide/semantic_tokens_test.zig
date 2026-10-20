@@ -507,7 +507,7 @@ test "semantic tokens validate closed error and generated enum members" {
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    var env = try @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null);
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
     defer testing.allocator.free(std_root_path);
@@ -878,7 +878,7 @@ test "semantic reflected concrete loop methods agree with range and preserve cal
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    var env = try @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null);
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     const std_root = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
     defer testing.allocator.free(std_root);

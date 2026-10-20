@@ -33,6 +33,8 @@ pub const QueryError = error{ ZigNotFound, ZigEnvFailed } || Allocator.Error || 
 
 /// 运行 `<zig_exe> env` 并解析结果。`zig_exe` 为 null 时从 PATH 查找 `zig`。
 pub fn query(gpa: Allocator, io: Io, zig_exe: ?[]const u8) QueryError!ZigEnv {
+    // `zig build test` 只运行不依赖外部工具的测试：找不到 zig，依赖它的测试跳过，服务器不启动项目与编译
+    if (builtin.is_test and !@import("build_options").zig_tests) return error.ZigNotFound;
     const exe = zig_exe orelse "zig";
     const result = std.process.run(gpa, io, .{
         .argv = &.{ exe, "env" },

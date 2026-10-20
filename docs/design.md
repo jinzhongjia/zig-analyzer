@@ -282,13 +282,15 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 | 命令 | 内容 |
 |---|---|
-| `zig build test`（Debug 与 ReleaseSafe） | 单元与端到端测试：引擎（增量、cutoff、环、取消、淘汰）、语法、名字、sema、IDE 功能、构建系统协议与诊断一致性 |
+| `zig build test-all`（Debug 与 ReleaseSafe） | 全部测试：引擎（增量、cutoff、环、取消、淘汰）、语法、名字、sema、IDE 功能，以及运行 PATH 中 zig 的构建系统协议、单文件编译、诊断一致性与端到端测试 |
 | `zig build test --fuzz=<次数>` | 覆盖率引导模糊测试：URI ↔ 路径、解析器无损、增量与全量解析一致、位置换算 |
 | `zig build corpus -- <目录>...` | 解析器语料对拍：无损、无误报、与 `std.zig.Ast` 结构一致、截断不崩溃、HIR 降级无失败 |
 | `zig fmt --check`、`zig build gen` 后无 diff | 格式与生成代码 |
 
+- `zig build test`：只运行不依赖外部工具的测试，供开发时快速验证。其中找不到 zig（`ZigEnv.query` 在这时返回 `ZigNotFound`），依赖它的测试（示例项目、真实的标准库）跳过，服务器不启动项目与编译。
+- `zig build test-stress -Dstress-filter=<完整测试名的片段> [-Dstress-runs=<次数>]`：以服务模式依次反复运行指定的测试（默认 50 次，每次都实际运行），用于验证并发相关的改动。
 - `zig build sema-corpus`：在标准库上做全量类型推导，检验不崩溃并统计类型已知的比例。
-- 测试向 stderr 写日志时 `zig build test` 也会打印 `failed command: ...`，退出码为 0 即通过；真正的失败带有「N pass, M fail」与测试名。
+- 测试向 stderr 写日志时 `zig build test` 与 `test-all` 也会打印 `failed command: ...`，退出码为 0 即通过；真正的失败带有「N pass, M fail」与测试名。
 
 ### 5.2 真实项目基准与对拍
 
