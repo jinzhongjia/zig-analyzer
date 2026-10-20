@@ -95,7 +95,7 @@ Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；�
 | `compiler` | 保存 | 构建系统协议回传的 `ErrorBundle`；无 `build.zig` 时为 `zig build-obj -fno-emit-bin --listen=-` |
 
 - 只对编译集合（从各 compile step 根模块沿 `@import` 可达的文件）与构建脚本（根目录的 `build.zig`、`build.zig.zon`，以及 `build.zig` 沿相对路径 `@import` 可达的文件，项目实例启动时按文件的当前文本计算）发布 live 诊断。文件属于多个项目时，其中一个项目包含它即发布。
-- 官方解析器与 AstGen 逐层递归（Debug 构建每层约 16 KB 栈）。先按 token 估计嵌套深度的上界：不超过 256 在当前线程做，不超过 8192 在 512 MiB 栈的专用线程上做；更深的文件不做 AstGen（`zig ast-check` 同样耗尽栈），没有 live 诊断，import 按 token 收集。
+- 官方解析器与 AstGen 逐层递归（Debug 构建每层约 16 KB 栈）。先按 token 估计嵌套深度的上界：不超过 256 在当前线程做，不超过 102400 在 2 GiB 栈的专用线程上做；更深的文件不做 AstGen，没有 live 诊断，import 按 token 收集。上限按常见的嵌套形式（else-if 链、if 表达式链、括号、调用、初始化、运算符链）标定，比它更深时 `zig ast-check`（主线程栈 46 MiB）同样耗尽栈。
 - 附注与引用链映射为 `relatedInformation`：引用链的各项排在附注之后，有位置的项指向引用处，文案为 `referenced by: <名字>`；隐藏计数项位于错误起点，文案与 `zig build` 相同。`@compileLog` 的输出以 `Compile Log Output:` 加各行接在 `found compile log statement` 错误的文案后；同一编译中还有其他错误而没有这条错误时，接在第一条错误后。
 - 子进程回传的 `ErrorBundle`（`bsp_step_completed`、`bsp_configuration_failed` 与单文件编译的结果）使用前校验全部下标与字符串：消息列表、各条消息与逐层的附注、源位置与其后的引用链都在 `extra` 内，字符串下标指向以 0 结尾的字符串，引用链中隐藏标记的计数不当作字符串；嵌套深度与读取总量有上限，自引用与环被拒绝。头部给出的长度超出消息体时整条消息按格式错误处理，不按这个长度分配内存。不合法时丢弃并记录日志，按这次编译没有错误处理，同一消息中的生成文件与读取的文件照常使用。路径解析后不是绝对路径时（Windows 上另一驱动器的相对路径，如 `D:a.zig`）不作为文件：错误包中的按没有位置处理，`file_system_inputs` 中的跳过。行列与区间等数值不校验：终点在起点之前的区间改为起点处的空区间，按编辑平移后超出范围的诊断不发布。
 - 文件的编译上下文依次判断（编译入口只来自项目与独立文件，打开文件本身不产生编译入口）：
@@ -209,7 +209,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 |---|---|
 | folding / selection range / document symbol | 纯语法 |
 | semantic tokens | CST 分类 + 每个成员的名字解析与类型推导；引用与声明共用类型、绑定和成员信息，无法解析的代码保留语法分类 |
-| formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致 |
+| formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致；嵌套深的文本在 2 GiB 栈的专用线程上格式化，深到 `zig fmt`（主线程栈 46 MiB）也耗尽栈时拒绝（估计深度超过 36864，按常见的嵌套形式标定；连续的前缀运算符 `zig fmt` 能格式化得更深） |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
 | 内置函数的补全、hover、参数提示 | 同版本 Zig 官方语言参考生成的静态签名、参数和 Markdown 说明；hover 同时保留推导结果 |
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |

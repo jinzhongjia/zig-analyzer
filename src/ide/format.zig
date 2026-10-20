@@ -7,20 +7,15 @@ const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
 const nesting = @import("../syntax/nesting.zig");
 
+const log = std.log.scoped(.format);
+
 pub const Mode = enum { zig, zon };
 
 /// 有语法错误时返回 null（与 `zig fmt` 一样拒绝格式化）；已格式化时返回空数组。
 pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offsets.Encoding) Allocator.Error!?[]const types.TextEdit {
     const text = lines.text;
     const source = try arena.dupeSentinel(u8, text, 0);
-    // 官方解析器逐层递归：深层嵌套会在请求线程上耗尽原生栈，直接拒绝
-    if (try nesting.estimate(arena, source) > nesting.inline_depth) return null;
-    var ast = try std.zig.Ast.parse(arena, source, .{ .mode = switch (mode) {
-        .zig => .zig,
-        .zon => .zon,
-    } });
-    if (ast.errors.len != 0) return null;
-    const formatted = try ast.renderAlloc(arena);
+    const formatted = try render(arena, source, mode) orelse return null;
     if (std.mem.eql(u8, formatted, text)) return &.{};
 
     // 公共前缀 / 后缀按整行计算，保证替换区间落在字符边界上
@@ -39,6 +34,34 @@ pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offse
     return try arena.dupe(types.TextEdit, &.{edit});
 }
 
+/// 官方解析器与渲染器（同 `zig fmt`）的结果，有语法错误时为 null。两者逐层递归：按嵌套深度选择执行的
+/// 线程，深到 `zig fmt` 也会耗尽栈的文本不格式化
+fn render(arena: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!?[]const u8 {
+    const depth = try nesting.estimate(arena, source, nesting.format_depth);
+    if (depth <= nesting.inline_depth) return renderSource(arena, source, mode);
+    if (depth > nesting.format_depth) return null;
+    var result: Allocator.Error!?[]const u8 = undefined;
+    const thread = std.Thread.spawn(.{ .stack_size = nesting.thread_stack_size }, renderInto, .{ arena, source, mode, &result }) catch |err| {
+        log.warn("cannot spawn a thread to format a deeply nested file: {t}", .{err});
+        return null;
+    };
+    thread.join();
+    return result;
+}
+
+fn renderInto(arena: Allocator, source: [:0]const u8, mode: Mode, result: *Allocator.Error!?[]const u8) void {
+    result.* = renderSource(arena, source, mode);
+}
+
+fn renderSource(arena: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!?[]const u8 {
+    var ast = try std.zig.Ast.parse(arena, source, .{ .mode = switch (mode) {
+        .zig => .zig,
+        .zon => .zon,
+    } });
+    if (ast.errors.len != 0) return null;
+    return try ast.renderAlloc(arena);
+}
+
 const testing = std.testing;
 
 fn applyEdit(gpa: Allocator, text: []const u8, edit: types.TextEdit) ![]u8 {
@@ -46,18 +69,31 @@ fn applyEdit(gpa: Allocator, text: []const u8, edit: types.TextEdit) ![]u8 {
     return offsets.applyChanges(gpa, text, &changes, .utf16);
 }
 
-test "deeply nested source is rejected instead of overflowing the stack" {
+test "deeply nested source is formatted on a large stack, beyond what zig fmt handles it is rejected" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    // 超过当前线程的上限，在专用线程上格式化
     var text: std.ArrayList(u8) = .empty;
-    try text.appendSlice(a, "const x = ");
+    try text.appendSlice(a, "const  x = ");
     for (0..3000) |_| try text.append(a, '(');
     try text.append(a, '1');
     for (0..3000) |_| try text.append(a, ')');
     try text.appendSlice(a, ";\n");
     const lines = try offsets.LineIndex.init(a, text.items);
-    try testing.expectEqual(null, try format(a, lines, .zig, .utf16));
+    const edits = (try format(a, lines, .zig, .utf16)).?;
+    try testing.expectEqual(1, edits.len);
+    try testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, text.items, "const  x", "const x"), try applyEdit(a, text.items, edits[0]));
+
+    // 更深的文本 `zig fmt` 同样耗尽栈：拒绝
+    text.clearRetainingCapacity();
+    try text.appendSlice(a, "const x = ");
+    for (0..nesting.format_depth) |_| try text.append(a, '(');
+    try text.append(a, '1');
+    for (0..nesting.format_depth) |_| try text.append(a, ')');
+    try text.appendSlice(a, ";\n");
+    const deep = try offsets.LineIndex.init(a, text.items);
+    try testing.expectEqual(null, try format(a, deep, .zig, .utf16));
 }
 
 test format {

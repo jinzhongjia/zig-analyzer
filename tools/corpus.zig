@@ -188,7 +188,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     // 2. 与 std.zig.Ast 对比（嵌套过深的文件跳过：官方解析器会耗尽栈）
     const source_z = try gpa.dupeSentinel(u8, source, 0);
     defer gpa.free(source_z);
-    if (try syntax.nesting.estimate(gpa, source_z) > syntax.nesting.inline_depth) {
+    if (try syntax.nesting.estimate(gpa, source_z, syntax.nesting.inline_depth) > syntax.nesting.inline_depth) {
         stats.std_skipped += 1;
     } else {
         var ast = try std.zig.Ast.parse(gpa, source_z, .{});

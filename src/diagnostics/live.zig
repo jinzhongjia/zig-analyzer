@@ -51,18 +51,16 @@ pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
-const thread_stack_size = 512 * 1024 * 1024;
-
 /// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。按嵌套深度选择执行的线程，深层嵌套的文本
 /// 不会耗尽原生栈
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
     const source = try gpa.dupeSentinel(u8, text, 0);
     defer gpa.free(source);
-    const depth = try nesting.estimate(gpa, source);
+    const depth = try nesting.estimate(gpa, source, nesting.thread_depth);
     if (depth <= nesting.inline_depth) return checkSource(gpa, source, mode);
     if (depth <= nesting.thread_depth) {
         var result: Allocator.Error!*Result = undefined;
-        if (std.Thread.spawn(.{ .stack_size = thread_stack_size }, checkInto, .{ gpa, source, mode, &result })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = nesting.thread_stack_size }, checkInto, .{ gpa, source, mode, &result })) |thread| {
             thread.join();
             return result;
         } else |err| log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});
@@ -540,9 +538,10 @@ test "deeply nested text: AstGen on a large stack, imports only beyond the limit
     const gpa = testing.allocator;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(gpa);
-    // 3000 项的加法链：官方 AstGen 在普通线程上耗尽栈（进程崩溃），在大栈线程上照常得到诊断
+    // 10000 项的加法链（`zig ast-check` 能检查）：官方 AstGen 在普通线程上耗尽栈（进程崩溃），在大栈线程上
+    // 照常得到诊断
     try src.appendSlice(gpa, "const std = @import(\"std\");\nfn f() void {\n    var unused = 1;\n}\nconst x = ");
-    for (0..3000) |_| try src.appendSlice(gpa, "1 + ");
+    for (0..10000) |_| try src.appendSlice(gpa, "1 + ");
     try src.appendSlice(gpa, "1;\n");
     {
         const r = try check(gpa, src.items, .zig);
@@ -554,9 +553,9 @@ test "deeply nested text: AstGen on a large stack, imports only beyond the limit
     // 超过上限：不做 AstGen，没有诊断，import 按 token 收集
     src.clearRetainingCapacity();
     try src.appendSlice(gpa, "const std = @import(\"std\");\nconst x = ");
-    for (0..20000) |_| try src.append(gpa, '(');
+    for (0..nesting.thread_depth) |_| try src.append(gpa, '(');
     try src.append(gpa, '1');
-    for (0..20000) |_| try src.append(gpa, ')');
+    for (0..nesting.thread_depth) |_| try src.append(gpa, ')');
     try src.appendSlice(gpa, ";\nfn g() void {\n    _ = @import(\"a\\x2ezig\");\n}\n");
     {
         const r = try check(gpa, src.items, .zig);
