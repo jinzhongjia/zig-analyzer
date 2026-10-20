@@ -200,6 +200,39 @@ test "references, highlight, rename and workspace symbol" {
     try h.notify("exit", {});
 }
 
+test "rename refuses when the name appears in code nested too deeply to be analyzed" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    // 左结合的运算链每项深一层：最左边的若干个 `one` 在深度上限之外，没有分析
+    try text.appendSlice(testing.allocator, "const one: u32 = 1;\nconst sum = one");
+    for (0..1100) |_| try text.appendSlice(testing.allocator, " + one");
+    try text.appendSlice(testing.allocator, ";\npub fn main() void {\n    _ = sum;\n}\n");
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = text.items },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text.items } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // 那里的 `one` 无法确认是否为引用：不返回只改了一部分的结果
+    const refused = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text.items, "one"), .newName = "two" });
+    try testing.expect(refused.object.get("error") != null);
+    // 只出现在分析了的代码中的名字照常重命名
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text.items, "sum"), .newName = "total" });
+    const changes = renamed.object.get("result").?.object.get("changes").?.object;
+    try testing.expectEqual(2, changes.get(uri).?.array.items.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "rename refuses when a generic reference also refers to other declarations" {
     const text =
         \\const S = struct { x: u32 };
