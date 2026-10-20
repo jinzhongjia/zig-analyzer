@@ -17,6 +17,8 @@ mutex: Io.Mutex = .init,
 entries: std.AutoArrayHashMapUnmanaged(FileId, Snapshot) = .empty,
 bytes: usize = 0,
 sequence: u128 = 0,
+/// 不大于它的 resultId 不再作为 delta 基线，见 `retireBaselines`
+retired: u128 = 0,
 
 const Snapshot = struct {
     id: u128,
@@ -42,6 +44,15 @@ fn removeAt(cache: *Cache, gpa: Allocator, index: usize) void {
     cache.entries.swapRemoveAt(index);
 }
 
+/// 发出 workspace/semanticTokens/refresh 之后调用：此前发出的结果都不再作为 delta 基线，各文档的下一次 delta 请求返回全量。
+/// Neovim 0.12 收到 refresh 后保留旧 resultId，同时请求 range 与 delta；先处理的 range 结果会替换它保存的 token，
+/// 基于旧结果的 delta 随后被套用到 range 的 token 上。
+pub fn retireBaselines(cache: *Cache, io: Io) void {
+    cache.mutex.lockUncancelable(io);
+    defer cache.mutex.unlock(io);
+    cache.retired = cache.sequence;
+}
+
 /// 返回值只引用本次请求的内存；比较与替换在同一把锁内完成，不向读者借出缓存切片。
 pub fn update(cache: *Cache, io: Io, gpa: Allocator, arena: Allocator, file: FileId, data: []const u32, previous_id: ?[]const u8) Allocator.Error!Result {
     cache.mutex.lockUncancelable(io);
@@ -55,7 +66,7 @@ pub fn update(cache: *Cache, io: Io, gpa: Allocator, arena: Allocator, file: Fil
     if (old) |snapshot| if (previous_id) |previous| {
         var id_buf: [40]u8 = undefined;
         const cached_id = std.fmt.bufPrint(&id_buf, "{d}", .{snapshot.id}) catch unreachable;
-        if (std.mem.eql(u8, previous, cached_id)) {
+        if (snapshot.id > cache.retired and std.mem.eql(u8, previous, cached_id)) {
             // 前后缀按整个 token 比较：客户端把 edits 套用到不一致的基线上时（Neovim 0.12 的请求竞态），
             // 结果仍由完整的 token 组成，不会出现无法解码的残缺 token。
             const shared = @min(snapshot.data.len, data.len);
@@ -139,6 +150,30 @@ test "semantic cache edits whole tokens including insertion and deletion" {
     const inserted = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 1, 0, 0 }, deleted.resultId)).SemanticTokensDelta;
     try testing.expectEqual(0, inserted.edits[0].deleteCount);
     try testing.expectEqualSlices(u32, &.{ 0, 0, 1, 0, 0 }, inserted.edits[0].data.?);
+}
+
+test "semantic cache answers deltas on baselines retired by a refresh with full results" {
+    const testing = std.testing;
+    var cache: Cache = .{};
+    defer cache.deinit(testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file: FileId = @fromBackingInt(@intCast(1));
+    const other: FileId = @fromBackingInt(@intCast(2));
+    const first = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 1, 0, 0 }, null)).SemanticTokens;
+    const other_first = (try cache.update(testing.io, testing.allocator, arena, other, &.{ 0, 0, 2, 0, 0 }, null)).SemanticTokens;
+    cache.retireBaselines(testing.io);
+    // 内容不变与内容变化时都返回全量，不再以刷新前的结果为基线
+    const unchanged = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 1, 0, 0 }, first.resultId)).SemanticTokens;
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 1, 0, 0 }, unchanged.data);
+    const changed = (try cache.update(testing.io, testing.allocator, arena, other, &.{ 0, 0, 3, 0, 0 }, other_first.resultId)).SemanticTokens;
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 3, 0, 0 }, changed.data);
+    // 刷新之后发出的结果照常作为基线
+    const current = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 1, 0, 0 }, unchanged.resultId)).SemanticTokensDelta;
+    try testing.expectEqual(0, current.edits.len);
+    const edited = (try cache.update(testing.io, testing.allocator, arena, other, &.{ 0, 0, 4, 0, 0 }, changed.resultId)).SemanticTokensDelta;
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 4, 0, 0 }, edited.edits[0].data.?);
 }
 
 test "semantic cache bounds document snapshots and drops closed baselines" {

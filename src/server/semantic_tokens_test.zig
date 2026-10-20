@@ -206,6 +206,32 @@ test "semantic refresh is capability gated and coalesces changes until the clien
     }
 }
 
+test "semantic refresh retires delta baselines issued before it" {
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try initialize(&h, "utf-16", true);
+    // 不自动回复 refresh：期间的变化合并为一次，由下面的回复触发，之后不再有刷新
+    h.hold_requests = true;
+    const source = "const value = 1;\nfn read() u32 { return value; }\n";
+    try open(&h, document, source);
+    try open(&h, other_document, "const other = 1;\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, refreshCount(&h));
+    const before = try full(&h, document);
+    try change(&h, other_document, "const other = 2;\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try h.write(.{ .jsonrpc = "2.0", .id = "zig-analyzer/semanticTokensRefresh", .result = null });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(2, refreshCount(&h));
+    // 客户端刷新后可能先处理 range 结果并替换它保存的 token，所以刷新前的结果不再作为基线
+    const retired = (try delta(&h, document, before.resultId.?)).SemanticTokens;
+    try testing.expectEqualSlices(u32, before.data, retired.data);
+    const unchanged = (try delta(&h, document, retired.resultId.?)).SemanticTokensDelta;
+    try testing.expectEqual(0, unchanged.edits.len);
+    _ = try h.request("shutdown", {});
+}
+
 test "closed semantic token requests do not retain snapshots or reopen baselines" {
     var h: Harness = undefined;
     try h.start();
@@ -368,9 +394,8 @@ test "watched dependency changes refresh a sole open consumer and change its sem
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = dep_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqual(before_refresh + 1, refreshCount(&h));
-    const changed = (try delta(&h, main_document, before.resultId.?)).SemanticTokensDelta;
-    const after = try full(&h, main_document);
-    try testing.expectEqualSlices(u32, after.data, try replay(&h, before.data, changed.edits));
+    // 刷新之前的结果不再作为基线，返回全量
+    const after = (try delta(&h, main_document, before.resultId.?)).SemanticTokens;
     try testing.expectEqual(before.data.len, after.data.len);
     var class_changes: usize = 0;
     for (before.data, after.data, 0..) |old, new, index| if (old != new) {

@@ -937,6 +937,9 @@ fn requestSemanticRefresh(server: *Server) void {
         return log.err("out of memory while building semantic tokens refresh", .{});
     };
     server.send(bytes);
+    // 写出 refresh 之后再作废：此后发出的结果都排在 refresh 之后到达客户端。先作废的话，两者之间发出的结果
+    // 可能先于 refresh 到达，成为客户端刷新后 delta 请求的基线。
+    server.semantic_cache.retireBaselines(server.io);
 }
 
 fn semanticRefreshFinished(server: *Server) void {
