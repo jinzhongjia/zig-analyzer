@@ -41,7 +41,7 @@ const Disk = struct {
     }
 };
 
-fn buildResult() !compiler.BuildResult {
+fn buildResult() !*compiler.BuildResult {
     const gpa = testing.allocator;
     var wip: ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
@@ -57,14 +57,25 @@ fn buildResult() !compiler.BuildResult {
 }
 
 test "collect: path resolution, dedup, errors without location, AstGen flag" {
-    var r = try buildResult();
-    defer r.deinit(testing.allocator);
+    const r = try buildResult();
+    defer r.release(testing.allocator);
     const main = r.files.get(native("/proj/src/main.zig")).?;
     try testing.expectEqual(2, main.items.len);
     try testing.expect(main.items[0].is_astgen); // unused local variable 也是 ast-check 错误
     try testing.expect(!main.items[1].is_astgen); // 类型错误来自 Sema
     const build_zig = r.files.get(native("/proj/build.zig")).?;
     try testing.expectEqualStrings("undefined symbol: foo", build_zig.items[0].message);
+}
+
+test "a build result stays valid while a reader holds a reference after the owner released it" {
+    const r = try buildResult();
+    const reader = r.retain();
+    // 持有者的结果被新的结果替换
+    r.release(testing.allocator);
+    const main = reader.files.get(native("/proj/src/main.zig")).?;
+    try testing.expectEqual(2, main.items.len);
+    try testing.expectEqualStrings("unused local variable", main.items[0].message);
+    reader.release(testing.allocator);
 }
 
 const NoOther = struct {
@@ -94,8 +105,8 @@ fn mergeMessages(arena: Allocator, text: []const u8, use_live: bool, result: ?*c
 test "merge: only compiler diagnostics when the buffer matches the build" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var r = try buildResult();
-    defer r.deinit(testing.allocator);
+    const r = try buildResult();
+    defer r.release(testing.allocator);
     const msgs = try mergeMessages(arena.allocator(), main_text, true, r.files.getPtr(native("/proj/src/main.zig")).?);
     try testing.expectEqual(2, msgs.len);
     try testing.expectEqualStrings("zig@1:8: unused local variable", msgs[0]);
@@ -105,8 +116,8 @@ test "merge: only compiler diagnostics when the buffer matches the build" {
 test "merge: live diagnostics plus remapped Sema errors with unsaved edits" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var r = try buildResult();
-    defer r.deinit(testing.allocator);
+    const r = try buildResult();
+    defer r.release(testing.allocator);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
 
     // 在文件开头插入一行：Sema 错误整体下移一行；AstGen 错误改由 live 提供
@@ -279,8 +290,8 @@ test "collect: reference trace and compile log output are kept" {
     var eb = try traceBundle();
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
-    defer r.deinit(gpa);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
 
     // 附注指向的文件没有错误也保留构建时文本
     try testing.expectEqualStrings(caller_text, r.texts.get(native("/proj/src/caller.zig")).?);
@@ -342,8 +353,8 @@ fn collectIfValid(eb: ErrorBundle) !bool {
     if (!error_bundle.isValid(eb)) return false;
     const gpa = testing.allocator;
     var dummy: u8 = 0;
-    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
-    defer r.deinit(gpa);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -415,8 +426,8 @@ test "collect: paths that do not resolve to absolute paths count as missing loca
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
-    defer r.deinit(gpa);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
 
     try testing.expectEqual(1, r.files.count());
     const path = r.files.keys()[0];
@@ -450,8 +461,8 @@ test "collect: spans that end before they start become empty" {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    var r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
-    defer r.deinit(gpa);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
     // 防止发布终点在起点之前的 Range：改为起点处的空区间
     const item = r.files.get(native("/proj/src/main.zig")).?.items[0];
     try testing.expectEqual(30, item.start);
@@ -464,8 +475,8 @@ test "combine: results of several compilations of the same file" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var r = try buildResult();
-    defer r.deinit(testing.allocator);
+    const r = try buildResult();
+    defer r.release(testing.allocator);
     const newest = r.files.getPtr(native("/proj/src/main.zig")).?;
     const unused = newest.items[0];
     const sema = newest.items[1];
@@ -511,8 +522,8 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     var log2 = try unusedWithLog("@as(comptime_int, 2)\n");
     defer log2.deinit(gpa);
     var dummy: u8 = 0;
-    var r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
-    defer r.deinit(gpa);
+    const r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
     // 防止同一错误因带有 compile log 而显示多次、不再被识别为 AstGen 错误：只保留一条，各个 step 的输出并到这一条上
     try testing.expectEqual(1, result.items.len);

@@ -185,7 +185,7 @@ sent_seq: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
 pub const State = enum { uninitialized, running, shutdown };
 
 const SingleFile = struct {
-    result: ?compiler.BuildResult = null,
+    result: ?*compiler.BuildResult = null,
     /// FileId → `result` 中的条目（根文件自身与被它 import 的文件）
     files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty,
     /// 得到 `result` 的那次编译读取的、根文件所在目录下的文件（含被它 import 的）：其中任何一个变化都需要重新编译
@@ -198,7 +198,7 @@ const SingleFile = struct {
     pending: bool = false,
 
     fn clearResult(sf: *SingleFile, gpa: Allocator) void {
-        if (sf.result) |*r| r.deinit(gpa);
+        if (sf.result) |r| r.release(gpa);
         sf.result = null;
         sf.files.deinit(gpa);
         sf.files = .empty;
@@ -1853,7 +1853,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     defer server.progress.end(server, progress, if (errors == 0) "Done" else "Has errors");
     while (true) {
         var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-        var result: ?compiler.BuildResult = blk: {
+        const result: ?*compiler.BuildResult = blk: {
             // 文件已从磁盘删除（编译期间被删除时由 `dropSingle` 要求重新编译）：没有结果
             Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
             var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
@@ -1868,9 +1868,8 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             }
             break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
         };
-        // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
         var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
-        if (result) |*r| for (r.files.keys(), r.files.values()) |p, *fr| {
+        if (result) |r| for (r.files.keys(), r.files.values()) |p, *fr| {
             const id = server.vfs.intern(p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
@@ -1884,7 +1883,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             server.single_mutex.unlock(server.io);
             files.deinit(server.gpa);
             inputs.deinit(server.gpa);
-            if (result) |*r| r.deinit(server.gpa);
+            if (result) |r| r.release(server.gpa);
             continue;
         }
         // 受影响的文件：根文件自身，以及上一次与本次结果中有错误的文件（被 import 的文件也在其中）
@@ -1904,7 +1903,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             // 不采用这次的结果，也不再记录这个根文件
             files.deinit(server.gpa);
             inputs.deinit(server.gpa);
-            if (result) |*r| r.deinit(server.gpa);
+            if (result) |r| r.release(server.gpa);
             _ = server.single.swapRemove(file);
         }
         server.single_mutex.unlock(server.io);
@@ -2685,6 +2684,8 @@ const OtherFiles = struct {
     ctx: *Db.Ctx,
     /// 编译器诊断的附注所在文件在那次编译时的文本（附注的区间以它为准），按附注中的路径
     texts: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// 取用的编译结果，各持有一份引用（`release` 时释放）：诊断算完之前不会因被新的结果替换而释放
+    builds: std.ArrayList(*compiler.BuildResult) = .empty,
 
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
         const self: *OtherFiles = @ptrCast(@alignCast(opaque_ctx));
@@ -2695,23 +2696,28 @@ const OtherFiles = struct {
         return .{ .uri = u, .text = text, .base_text = self.texts.get(path) };
     }
 
-    /// 把编译结果 `build` 中的 `fr` 复制到 arena 中，并记下其附注所在文件在这次编译时的文本（同一路径只取最先
-    /// 记下的）。键与文本都取自 arena 中的副本：调用者释放锁之后，`build` 可能被新的结果替换而释放
-    fn copyResult(self: *OtherFiles, arena: Allocator, fr: *const compiler.FileResult, build: *const compiler.BuildResult) Allocator.Error!*const compiler.FileResult {
-        const copy = try arena.create(compiler.FileResult);
-        copy.* = try fr.dupe(arena);
-        for (copy.items) |item| for (item.notes) |n| {
+    /// 取用编译结果 `build` 中的 `fr`（在持有 `build` 所在的锁时调用），并记下其附注所在文件在这次编译时的文本
+    /// （同一路径只取最先记下的）
+    fn use(self: *OtherFiles, arena: Allocator, fr: *const compiler.FileResult, build: *compiler.BuildResult) Allocator.Error!*const compiler.FileResult {
+        try self.builds.ensureUnusedCapacity(arena, 1);
+        self.builds.appendAssumeCapacity(build.retain());
+        for (fr.items) |item| for (item.notes) |n| {
             if (self.texts.contains(n.path)) continue;
             const text = build.texts.get(n.path) orelse continue;
-            try self.texts.put(arena, n.path, try arena.dupe(u8, text));
+            try self.texts.put(arena, n.path, text);
         };
-        return copy;
+        return fr;
+    }
+
+    fn release(self: *OtherFiles) void {
+        for (self.builds.items) |b| b.release(self.server.gpa);
+        self.builds.clearRetainingCapacity();
     }
 };
 
 /// `file` 的编译器诊断：包含它的各个项目最近一次构建的结果，单文件编译的结果按文件的上下文决定是否采用
 /// （见 `FileContext.usesSingle`）；有多个时按 `compiler.combine` 合并，以最新一次编译读取的文本为准。
-/// 各个结果在其所在的锁内复制到 arena 中（附注所在文件的文本记入 `other`），合并时不持有锁
+/// 各个结果在其所在的锁内取得引用，记入 `other`（附注所在文件的文本也记入），合并时不持有锁
 fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
     const Found = struct {
         generation: u64,
@@ -2729,22 +2735,22 @@ fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *O
             ws.mutex.lockUncancelable(server.io);
             defer ws.mutex.unlock(server.io);
             const fr = ws.result_files.get(file) orelse continue;
-            const build = if (ws.result) |*r| r else {
+            const build = ws.result orelse {
                 _ = never(true, @src(), "workspace has result files without a result");
                 continue;
             };
-            try found.append(arena, .{ .generation = ws.result_generation, .result = try other.copyResult(arena, fr, build) });
+            try found.append(arena, .{ .generation = ws.result_generation, .result = try other.use(arena, fr, build) });
         }
     }
     if (server.fileContext(file).usesSingle()) {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
         for (server.single.values()) |*sf| if (sf.files.get(file)) |fr| {
-            const build = if (sf.result) |*r| r else {
+            const build = sf.result orelse {
                 _ = never(true, @src(), "single-file root has result files without a result");
                 continue;
             };
-            try found.append(arena, .{ .generation = sf.generation, .result = try other.copyResult(arena, fr, build) });
+            try found.append(arena, .{ .generation = sf.generation, .result = try other.use(arena, fr, build) });
         };
     }
     switch (found.items.len) {
@@ -2770,6 +2776,7 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
 
     // 编译器诊断：被 import 的文件中的错误由编译它的项目或根文件报告
     var other: OtherFiles = .{ .server = server, .ctx = ctx };
+    defer other.release();
     const fr = try server.compilerResult(arena, file, &other);
     const current = text orelse if (fr) |r| r.base_text else "";
     var diags = try compiler.merge(arena, .{

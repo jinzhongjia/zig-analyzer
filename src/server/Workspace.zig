@@ -67,7 +67,7 @@ resolve_set: ?CompileSet.Result = null,
 /// 其余从磁盘读入），构建图读取失败时同样有效
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// 最近一次构建的编译器诊断
-result: ?compiler.BuildResult = null,
+result: ?*compiler.BuildResult = null,
 /// `result` 存入时取的编译结果序号（见 `Server.nextCompileGeneration`）：越大越新
 result_generation: u64 = 0,
 /// FileId → `result` 中的条目
@@ -179,7 +179,7 @@ fn destroy(ws: *Workspace) void {
     if (ws.compile_set) |*s| s.deinit(gpa);
     if (ws.resolve_set) |*s| s.deinit(gpa);
     ws.build_scripts.deinit(gpa);
-    if (ws.result) |*r| r.deinit(gpa);
+    if (ws.result) |r| r.release(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
     ws.config.deinit(gpa);
@@ -618,8 +618,8 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
     const build_zig = try std.fs.path.join(ws.gpa, &.{ ws.root, "build.zig" });
     defer ws.gpa.free(build_zig);
-    var result = try compiler.collect(ws.gpa, ws.bundles.items, ws.root, build_zig, ws, readDisk);
-    errdefer result.deinit(ws.gpa);
+    const result = try compiler.collect(ws.gpa, ws.bundles.items, ws.root, build_zig, ws, readDisk);
+    errdefer result.release(ws.gpa);
 
     var files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty;
     errdefer files.deinit(ws.gpa);
@@ -636,9 +636,8 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         defer ws.mutex.unlock(io);
         try affected.appendSlice(ws.gpa, ws.result_files.keys());
         try affected.appendSlice(ws.gpa, files.keys());
-        if (ws.result) |*old| old.deinit(ws.gpa);
+        if (ws.result) |old| old.release(ws.gpa);
         ws.result_files.deinit(ws.gpa);
-        // `files` 的值指向 `result.files` 的条目存储（在 arena 中），按值转移 `result` 后仍然有效
         ws.result = result;
         ws.result_generation = ws.server.nextCompileGeneration();
         ws.result_files = files;
@@ -667,7 +666,7 @@ fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
 pub fn clearResult(ws: *Workspace) void {
     ws.mutex.lockUncancelable(ws.server.io);
     const stale = ws.gpa.dupe(FileId, ws.result_files.keys()) catch &.{};
-    if (ws.result) |*r| r.deinit(ws.gpa);
+    if (ws.result) |r| r.release(ws.gpa);
     ws.result = null;
     ws.result_files.clearRetainingCapacity();
     ws.mutex.unlock(ws.server.io);

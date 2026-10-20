@@ -13,20 +13,6 @@ pub const FileResult = struct {
     /// 构建完成时读取的磁盘文本；诊断的字节区间以它为准
     base_text: []const u8,
     items: []const Item,
-
-    /// 复制到 `a` 中：所在的构建结果被新的结果替换时整体释放
-    pub fn dupe(fr: *const FileResult, a: Allocator) Allocator.Error!FileResult {
-        const items = try a.alloc(Item, fr.items.len);
-        for (fr.items, items) |item, *out| {
-            const notes = try a.alloc(Note, item.notes.len);
-            for (item.notes, notes) |n, *o| o.* = .{ .path = try a.dupe(u8, n.path), .start = n.start, .end = n.end, .message = try a.dupe(u8, n.message) };
-            out.* = item;
-            out.message = try a.dupe(u8, item.message);
-            out.notes = notes;
-            out.compile_log = try a.dupe(u8, item.compile_log);
-        }
-        return .{ .base_text = try a.dupe(u8, fr.base_text), .items = items };
-    }
 };
 
 pub const Item = struct {
@@ -49,18 +35,25 @@ pub const Note = struct {
     message: []const u8,
 };
 
-/// 一次构建的全部结果
+/// 一次构建的全部结果，连同自身分配在 arena 中。创建后不再修改，按引用计数共享：持有者（项目、单文件编译）
+/// 与读取方各持有一份引用。读取方在持有者的锁内取得引用后即可释放锁，结果被新的结果替换时由最后一份引用释放
 pub const BuildResult = struct {
     arena: std.heap.ArenaAllocator.State,
     /// 绝对路径 → 结果
     files: std.StringArrayHashMapUnmanaged(FileResult),
     /// 构建时读取的文本：`files` 中各文件，以及附注指向但没有错误的文件（按路径查找）
     texts: std.StringArrayHashMapUnmanaged([]const u8),
+    refs: std.atomic.Value(u32) = .init(1),
 
-    pub fn deinit(r: *BuildResult, gpa: Allocator) void {
+    pub fn retain(r: *BuildResult) *BuildResult {
+        _ = r.refs.fetchAdd(1, .monotonic);
+        return r;
+    }
+
+    pub fn release(r: *BuildResult, gpa: Allocator) void {
+        if (r.refs.fetchSub(1, .acq_rel) != 1) return;
         var arena = r.arena.promote(gpa);
         arena.deinit();
-        r.* = undefined;
     }
 };
 
@@ -78,7 +71,7 @@ pub fn collect(
     fallback_path: []const u8,
     read_ctx: *anyopaque,
     read: ReadFn,
-) Allocator.Error!BuildResult {
+) Allocator.Error!*BuildResult {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const a = arena_state.allocator();
@@ -162,7 +155,11 @@ pub fn collect(
         }
         try files.put(a, path, .{ .base_text = text, .items = items.items });
     }
-    return .{ .arena = arena_state.state, .files = files, .texts = texts };
+    const result = try a.create(BuildResult);
+    result.* = .{ .arena = undefined, .files = files, .texts = texts };
+    // arena 的状态在最后一次分配之后取
+    result.arena = arena_state.state;
+    return result;
 }
 
 /// 把源位置 `src_loc` 之后的引用链转换为附注，文案与 `zig build` 的输出一致。有位置的引用指向引用处；
