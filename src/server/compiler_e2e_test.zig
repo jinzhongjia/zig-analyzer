@@ -369,6 +369,20 @@ test "columns are UTF-16 when multi-byte characters precede the error" {
     try expectDiagnostics(diags, "main.zig", &.{"1:37 zig: expected type 'u32'"});
 }
 
+/// 在项目目录写出包装用户 zig 的脚本 zigw：除 `env` 外的命令先等待 2 秒。返回使用它的初始化选项
+fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(h.arena.allocator(),
+        \\#!/bin/sh
+        \\if [ "$1" = env ]; then exec "{s}" "$@"; fi
+        \\sleep 2
+        \\exec "{s}" "$@"
+        \\
+    , .{ zig, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+    return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
+}
+
 test "single-file mode: compile one file without build.zig, with progress" {
     const text =
         \\pub fn main() void {
@@ -391,6 +405,41 @@ test "single-file mode: compile one file without build.zig, with progress" {
     const titles = try progressTitles(&h);
     try testing.expect(titles.len >= 1);
     try testing.expectEqualStrings("Compiling one.zig", titles[0]);
+}
+
+test "single-file mode: disabling compiler diagnostics during a compile drops its result" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const text =
+        \\pub fn main() void {
+        \\    const x: u32 = "s";
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, true, try slowZig(&h, &project));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
+    // 等到编译器任务开始（包装脚本随后还会睡眠 2 秒）
+    while (true) {
+        const m = try h.next();
+        const method = if (m.object.get("method")) |x| x.string else continue;
+        if (!std.mem.eql(u8, method, "$/progress")) continue;
+        const value = m.object.get("params").?.object.get("value").?.object;
+        if (!std.mem.eql(u8, value.get("kind").?.string, "begin")) continue;
+        if (std.mem.eql(u8, value.get("title").?.string, "Compiling one.zig")) break;
+    }
+    // 编译结束前关闭编译器诊断：旧任务的结果必须被丢弃
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"zig-analyzer": {"diagnostics": {"compiler": false}}}
+    ) });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "one.zig", &.{});
+    try expectNoErrors(&h, uri);
+    try shutdown(&h);
 }
 
 test "files of the zig installation are not standalone compilation roots during startup or save" {

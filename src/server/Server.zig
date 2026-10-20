@@ -1780,8 +1780,9 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             const id = server.vfs.intern(p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
-        // 编译期间文件可能不再是独立文件（所属项目加载完成、所在根目录新建了 build.zig 等）
-        const detached = server.fileContext(file) == .detached;
+        // 编译期间文件可能不再是独立文件（所属项目加载完成、所在根目录新建了 build.zig 等），
+        // 编译器诊断也可能已被关闭：都不采用这次的结果
+        const detached = server.fileContext(file) == .detached and server.buildFlags().compiler;
         server.single_mutex.lockUncancelable(server.io);
         const sf = server.single.getPtr(file).?;
         if (detached and sf.rerun) {
