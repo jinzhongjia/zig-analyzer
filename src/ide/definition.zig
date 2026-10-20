@@ -589,7 +589,10 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
     }
     const e = b.exprAt(rel) orelse return null;
     switch (b.expr(e)) {
-        .name_ref => |name| return r.resolveName(file, item, b, b.expr_scopes[@backingInt(e)], name),
+        .name_ref => |name| {
+            if (Body.nameRefIsBuiltin(b, e)) return null;
+            return r.resolveName(file, item, b, b.expr_scopes[@backingInt(e)], name);
+        },
         .field_access => |fa| {
             // 光标在字段名上（不在左侧表达式内）
             if (rel < b.range(fa.lhs).end) return null;

@@ -107,6 +107,33 @@ test "member completion and goto definition through types" {
     }
 }
 
+test "definition of bare primitive names skips escaped declarations" {
+    const text =
+        \\pub fn escaped(@"u32": u32) u32 {
+        \\    const local: u32 = @"u32";
+        \\    return local;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+
+    // 裸 `u32` 是原始类型，不能解析到同名的转义参数
+    const bare = std.mem.indexOf(u8, text, "local: u32").? + "local: ".len;
+    try testing.expectEqual(null, try definition.definition(&r, file, @intCast(bare)));
+
+    // 转义引用仍解析到参数
+    const quoted = std.mem.indexOf(u8, text, "= @\"u32\"").? + 4;
+    const t = (try definition.definition(&r, file, @intCast(quoted))) orelse return error.NoTarget;
+    try testing.expectEqual(file, t.file);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "@\"u32\"").?)), t.start);
+}
+
 test "completion and hover quote names that shadow primitives or are not identifiers" {
     const text =
         \\pub const @"bool" = c_int;

@@ -65,7 +65,9 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
         tv = a.exprType(e);
         expr_id = e;
         switch (b.expr(e)) {
-            .name_ref => |name| def = try r.resolveName(file, a.item, b, b.expr_scopes[@backingInt(e)], name),
+            .name_ref => |name| {
+                if (!Body.nameRefIsBuiltin(b, e)) def = try r.resolveName(file, a.item, b, b.expr_scopes[@backingInt(e)], name);
+            },
             .field_access, .enum_literal => if (a.member(e)) |key| {
                 def = try context.defOfKey(r, key);
             } else if (b.expr(e) == .field_access) {

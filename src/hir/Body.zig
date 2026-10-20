@@ -214,6 +214,15 @@ pub fn nameRefIsEscaped(b: *const Body, id: ExprId) bool {
     return span.end - span.start > b.expr(id).name_ref.len;
 }
 
+/// 不带引号的原始类型 / 原始值名字：语言内建，不解析到同名声明（`@"u32"` 可以同名）
+pub fn nameRefIsBuiltin(b: *const Body, id: ExprId) bool {
+    if (b.nameRefIsEscaped(id)) return false;
+    const name = b.expr(id).name_ref;
+    if (std.zig.primitives.isPrimitive(name)) return true;
+    const values = std.StaticStringMap(void).initComptime(.{ .{"true"}, .{"false"}, .{"null"}, .{"undefined"} });
+    return values.has(name);
+}
+
 pub fn binding(b: *const Body, id: BindingId) Binding {
     return b.bindings[@backingInt(id)];
 }
