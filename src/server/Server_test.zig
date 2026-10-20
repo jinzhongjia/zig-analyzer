@@ -355,6 +355,44 @@ test "inspection requests for a standalone file: file status, syntax tree, modul
     try testing.expect(by_id[5].?.get("error") == null);
 }
 
+test "files under a build.zig outside the workspace belong to a project that is not loaded" {
+    const Harness = @import("test_harness.zig").Harness;
+    // `zig build test` 中找不到 zig：启动阶段的警告不写到 stderr
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "proj/src");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "proj/build.zig", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const cases = [_]struct { []const []const u8, []const u8 }{
+        .{ &.{ "proj", "src", "main.zig" }, "unloaded_project" },
+        // 临时目录在本仓库的 .zig-cache 中：查找所属的项目时不越过它
+        .{ &.{"scratch.zig"}, "detached" },
+    };
+    for (cases) |c| {
+        const path = try std.fs.path.join(a, &.{ root, try std.fs.path.join(a, c[0]) });
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "pub fn main() void {}\n" });
+        const document_uri = try za.base.uri.fromPath(a, path);
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = document_uri, .languageId = "zig", .version = 1, .text = "pub fn main() void {}\n" } });
+        const status = try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = document_uri } });
+        try testing.expectEqualStrings(c[1], status.object.get("result").?.object.get("context").?.string);
+    }
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "requests before initialize return ServerNotInitialized, unknown methods return MethodNotFound" {
     var s: Session = undefined;
     try s.run(frame(

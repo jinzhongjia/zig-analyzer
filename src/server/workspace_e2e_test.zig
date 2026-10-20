@@ -236,7 +236,7 @@ test "workspace folders: added folders start a project, removed ones clear its d
     try h.notify("exit", {});
 }
 
-test "removed workspace folder: open files switch to single-file compilation" {
+test "removed workspace folder: open files belong to a project that is not loaded, with a hint" {
     const main_text =
         \\pub fn main() void {
         \\    const x: u32 = "s";
@@ -274,17 +274,17 @@ test "removed workspace folder: open files switch to single-file compilation" {
     const before = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
     try testing.expect(std.mem.indexOf(u8, before[0], "expected type 'u32'") != null);
 
-    // 移除根目录：打开的文件转为单文件编译并重新发布
+    // 移除根目录：目录中仍有 build.zig，打开的文件属于没有加载的项目。项目的编译器诊断被清除，文件不单独编译，
+    // 只有提示
     try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &.{.{ .uri = root_uri, .name = "p" }} } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const after = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
     try testing.expectEqual(1, after.len);
-    try testing.expect(std.mem.indexOf(u8, after[0], "expected type 'u32'") != null);
-    // 结果来自单文件模式
+    try testing.expect(std.mem.startsWith(u8, after[0], "this file belongs to the project at"));
     h.server.single_mutex.lockUncancelable(testing.io);
     const single_count = h.server.single.count();
     h.server.single_mutex.unlock(testing.io);
-    try testing.expect(single_count > 0);
+    try testing.expectEqual(0, single_count);
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

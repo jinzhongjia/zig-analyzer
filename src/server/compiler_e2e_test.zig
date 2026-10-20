@@ -861,6 +861,50 @@ test "inspection requests for a project file: file status, module graph, reload 
     try shutdown(&h);
 }
 
+/// 工作区（ws，没有 build.zig）之外的项目 proj：main.zig 按名字 import 模块 dep，并有一个 Sema 错误
+const unloaded_project = [_]fixture.File{
+    .{ .path = "ws/scratch.zig", .text = "pub fn main() void {}\n" },
+    .{ .path = "proj/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const root = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "dep", .module = b.createModule(.{ .root_source_file = b.path("src/dep.zig") }) }},
+    \\    });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "probe", .root_module = root }).step);
+    \\}
+    \\
+    },
+    .{ .path = "proj/src/main.zig", .text = unloaded_main },
+    .{ .path = "proj/src/dep.zig", .text = "pub const name = \"dep\";\n" },
+};
+const unloaded_main = "const dep = @import(\"dep\");\nexport fn entry() void {\n    const x: u32 = dep.name;\n    _ = x;\n}\n";
+
+test "files of a project outside the workspace: not compiled alone, a hint until the project is added" {
+    var project = try fixture.Project.create(&unloaded_project);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "ws"), false);
+    const main_uri = try open(&h, try project.path(a, "proj/src/main.zig"), unloaded_main);
+    try waitIdle(&h);
+    // 单独编译会报出找不到模块 dep：不编译，只有提示
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"0:0 zig-analyzer: this file belongs to the project at"});
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = main_uri } })).object.get("result").?.object;
+    try testing.expectEqualStrings("unloaded_project", status.get("context").?.string);
+    try testing.expectEqual(0, status.get("single_file_roots").?.array.items.len);
+
+    // 把项目加入工作区：提示消失，诊断来自项目的构建
+    const proj_uri = try za.base.uri.fromPath(a, try project.path(a, "proj"));
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &.{.{ .uri = proj_uri, .name = "proj" }}, .removed = &[_]Empty{} } });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"2:19 zig: expected type 'u32'"});
+    try shutdown(&h);
+}
+
 test "single-file mode: errors in imported files are published on them and cleared after a fix" {
     const a_text =
         \\const b = @import("b.zig");

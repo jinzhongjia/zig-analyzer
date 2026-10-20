@@ -1463,7 +1463,8 @@ fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
 }
 
 /// 目录 `dir` 下的 build.zig 可能被新建或删除：按磁盘重新检查。`dir` 是根目录且有变化时，新出现则启动项目；
-/// 消失则停止项目，其中的文件改按单文件处理。返回是否有变化
+/// 消失则停止项目，其中的文件不再属于项目（改为独立文件；祖先目录还有 build.zig 时属于未加载的项目）。返回是否
+/// 有变化
 fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     const has_build = try server.hasBuildZig(dir);
     if (!server.setRootHasBuild(dir, has_build)) return false;
@@ -1678,7 +1679,8 @@ fn startup(server: *Server) Io.Cancelable!void {
 // ── 单文件模式 ───────────────────────────────────────────────────────
 
 /// 文件的编译上下文：决定它能否作为单文件模式的根编译，以及单文件编译的结果是否用于它的诊断。
-/// 依次判断：依赖库、项目的模块图、带 build.zig 的根目录；以上都不是的 .zig 文件才是独立文件
+/// 依次判断：依赖库、项目的模块图、带 build.zig 的根目录、祖先目录中没有加载的项目；以上都不是的 .zig 文件
+/// 才是独立文件
 const FileContext = enum {
     /// 不参与编译：虚拟文档，以及不属于任何项目的非 .zig 文件
     none,
@@ -1689,6 +1691,9 @@ const FileContext = enum {
     project,
     /// 带 build.zig 的根目录下、不在模块图中的文件：由项目处理，不单独编译
     project_dir,
+    /// 祖先目录有 build.zig、那个项目却没有加载的 .zig 文件（如工作区外另一个项目中的文件）：按名字的 import
+    /// 只有那个项目的构建能解析，不单独编译；打开时提示把项目加入工作区（见 `appendUnloadedProjectHint`）
+    unloaded_project,
     /// 独立的 .zig 文件：作为根单独编译
     detached,
 
@@ -1697,7 +1702,7 @@ const FileContext = enum {
     fn usesSingle(context: FileContext) bool {
         return switch (context) {
             .none, .library, .detached => true,
-            .project, .project_dir => false,
+            .project, .project_dir, .unloaded_project => false,
         };
     }
 };
@@ -1711,14 +1716,29 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     }
     if (in_project) return .project;
     const path = server.vfs.path(file);
-    if (server.buildFlags().build) {
+    const build = server.buildFlags().build;
+    if (build) {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
         for (server.roots.items, server.root_has_build.items) |root, has_build| {
             if (has_build and server.vfs.isUnder(path, root)) return .project_dir;
         }
     }
-    return if (std.mem.endsWith(u8, path, ".zig")) .detached else .none;
+    if (!std.mem.endsWith(u8, path, ".zig")) return .none;
+    if (build and server.projectDirOf(path) != null) return .unloaded_project;
+    return .detached;
+}
+
+/// 文件所属项目的目录：所在目录及其祖先中第一个有 build.zig 的。遇到 `.zig-cache`、`zig-pkg` 时停止：其中的
+/// 文件（缓存、获取的依赖包）不是外层项目的源码
+fn projectDirOf(server: *Server, path: []const u8) ?[]const u8 {
+    var dir = std.fs.path.dirname(path);
+    while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+        const name = std.fs.path.basename(d);
+        if (std.mem.eql(u8, name, ".zig-cache") or std.mem.eql(u8, name, "zig-pkg")) return null;
+        if (server.hasBuildZig(d) catch false) return d;
+    }
+    return null;
 }
 
 /// 有项目尚在首次加载（见 `Workspace.load_done`）：还不知道哪些根目录外的文件属于项目
@@ -1816,6 +1836,12 @@ pub fn reconcileSingle(server: *Server) void {
         for (open) |file| if (!server.single.contains(file)) compile.append(gpa, file) catch {};
     }
     for (compile.items) |file| server.compileSingle(file);
+    // 未加载的项目中的文件：提示推迟到了启动阶段结束、项目加载结束（见 `appendUnloadedProjectHint`），上下文也
+    // 可能刚变为这一种
+    var unloaded: std.ArrayList(Vfs.FileId) = .empty;
+    defer unloaded.deinit(gpa);
+    for (open) |file| if (server.fileContext(file) == .unloaded_project) unloaded.append(gpa, file) catch {};
+    server.publishFiles(unloaded.items, false);
 }
 
 /// 编译结果的序号：项目的构建与单文件编译存入结果时各取一个，越大越新
@@ -2034,6 +2060,8 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     for (params.event.removed) |f| try server.removeRoot(arena, f.uri);
     for (params.event.added) |f| try server.addRoot(f.uri);
     server.updateModuleGraph();
+    // 打开的文件可能进出项目目录与未加载的项目（提示随之出现或消失）
+    server.publishOpenFiles();
     server.reconcileSingle();
     server.resyncWatcher();
 }
@@ -2796,7 +2824,34 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     if (text) |t| if (server.wantsInactiveCode(file)) {
         diags = try server.appendInactiveCode(ctx, arena, file, t, diags);
     };
+    if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
     return .{ .uri = document_uri, .diagnostics = diags };
+}
+
+/// 打开的、属于没有加载的项目的文件（见 `FileContext.unloaded_project`）：提示把项目目录加入工作区。同
+/// rust-analyzer 对不属于任何 crate 的文件，是只标出文件开头几个字符的 Hint。启动阶段结束之前与项目首次加载
+/// 期间不提示：文件可能随后出现在项目的模块图中（以路径加入的模块）
+fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    const path = server.vfs.path(file);
+    if (!server.isOpen(path) or !server.startup_done.load(.acquire) or server.projectsLoading()) return diags;
+    if (server.fileContext(file) != .unloaded_project) return diags;
+    const dir = server.projectDirOf(path) orelse return diags;
+    var end: usize = 0;
+    var chars: usize = 0;
+    while (chars < 3 and end < text.len and text[end] != '\n' and text[end] != '\r') : (chars += 1) {
+        end += std.unicode.utf8ByteSequenceLength(text[end]) catch 1;
+    }
+    const lines = try offsets.LineIndex.init(arena, text);
+    const out = try arena.alloc(types.Diagnostic, diags.len + 1);
+    @memcpy(out[0..diags.len], diags);
+    out[diags.len] = .{
+        .range = lines.range(0, @intCast(@min(end, text.len)), server.encoding),
+        .severity = .Hint,
+        .source = "zig-analyzer",
+        .message = .{ .string = try std.fmt.allocPrint(arena, "this file belongs to the project at {s}, which is not loaded: it is not compiled on its own, " ++
+            "since only the project's build can resolve its imports by name; add the directory to the workspace folders to load the project", .{dir}) },
+    };
+    return out;
 }
 
 /// 只为打开的文件显示非活动代码：需要推导文件中的全部成员
