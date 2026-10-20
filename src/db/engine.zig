@@ -495,6 +495,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.rw.unlock(db.io);
         }
 
+        /// 确保 input 的 key 与 slot 已驻留；之后 `set` 不再分配。写事务内可借此避免两次 set 之间
+        /// 因 OOM 留下部分更新
+        pub fn ensureInput(db: *Db, comptime Q: type, key: Q.Key) Allocator.Error!void {
+            comptime assert(Q.kind == .input);
+            assert(db.writing);
+            _ = try db.internLocked(Q, key);
+        }
+
         /// 设置 input，引擎接管 `value` 的所有权。值与旧值相等时不推进 revision。
         pub fn set(db: *Db, comptime Q: type, key: Q.Key, value: Q.Value, durability: Durability) Allocator.Error!void {
             comptime assert(Q.kind == .input);
@@ -1085,6 +1093,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// 调用方须持有 mutex（或处于写事务中）。
         fn internLocked(db: *Db, comptime Q: type, key: Q.Key) Allocator.Error!u32 {
             const table = &db.tables[comptime queryIndex(Q)];
+            // 已驻留的 key 不分配：`set` 对已有 input 不会失败
+            if (table.keys.getIndex(key)) |index| return @intCast(index);
             try table.slots.ensureUnusedCapacity(db.gpa, 1);
             const gop = try table.keys.getOrPut(db.gpa, key);
             if (!gop.found_existing) table.slots.appendAssumeCapacity(.{});

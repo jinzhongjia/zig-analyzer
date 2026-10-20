@@ -752,7 +752,8 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     server.graph_mutex.lockUncancelable(server.io);
     defer server.graph_mutex.unlock(server.io);
     var b: ModuleGraph.Builder = .init(server.gpa, &server.vfs);
-    errdefer b.deinit();
+    var builder_owned = true;
+    errdefer if (builder_owned) b.deinit();
     const list = try server.workspaceList(server.gpa);
     defer server.releaseList(server.gpa, list);
     for (list) |ws| {
@@ -772,13 +773,20 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     };
     const t = try server.targetAbi(b.modules.items, default_builtin);
     const graph = try server.gpa.create(ModuleGraph);
-    errdefer server.gpa.destroy(graph);
+    var graph_owned = true;
+    errdefer if (graph_owned) server.gpa.destroy(graph);
     graph.* = try b.finish(std_root, default_builtin);
+    // `finish` 把 builder 的 arena 转移给了 graph
+    builder_owned = false;
     // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
     server.db.beginWrite();
     defer server.db.endWrite();
-    try server.db.set(ModuleGraph.Input, {}, graph, .medium);
-    try server.db.set(za.sema.queries.TargetAbi, {}, t, .medium);
+    // `set` 只在 key 尚未驻留时分配：先确保两个 key，之后两次 set 不会失败，也不会留下部分更新
+    try server.db.ensureInput(ModuleGraph.Input, {});
+    try server.db.ensureInput(za.sema.queries.TargetAbi, {});
+    server.db.set(ModuleGraph.Input, {}, graph, .medium) catch unreachable;
+    graph_owned = false;
+    server.db.set(za.sema.queries.TargetAbi, {}, t, .medium) catch unreachable;
     server.ip.setTarget(t);
 }
 
@@ -2544,6 +2552,71 @@ test "publishFiles: large batches use a bounded number of workers" {
         if (std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) published += 1;
     } else |err| if (err != error.EndOfStream) return err;
     try std.testing.expectEqual(files.len, published);
+}
+
+test "updateModuleGraph keeps the old inputs when an allocation fails" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, failing.allocator(), &writer);
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        server.deinit();
+    }
+
+    // 首次更新：任何失败点都不应留下部分写入的 input
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try std.testing.expect(fail_index < 10_000);
+        failing.alloc_index = 0;
+        failing.resize_index = 0;
+        failing.has_induced_failure = false;
+        failing.fail_index = fail_index;
+        if (server.updateModuleGraphInner()) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failing.fail_index = std.math.maxInt(usize);
+            server.db.beginWrite();
+            const graph = server.db.peek(ModuleGraph.Input, {});
+            const target = server.db.peek(za.sema.queries.TargetAbi, {});
+            server.db.endWrite();
+            try std.testing.expectEqual(null, graph);
+            try std.testing.expect(std.meta.eql(za.sema.queries.TargetAbi.default, target));
+        }
+    }
+
+    server.db.beginWrite();
+    const old_graph = server.db.peek(ModuleGraph.Input, {});
+    const old_target = server.db.peek(za.sema.queries.TargetAbi, {});
+    server.db.endWrite();
+    try std.testing.expect(old_graph != null);
+
+    // 之后的更新失败时保留旧图与 TargetAbi
+    fail_index = 0;
+    while (true) : (fail_index += 1) {
+        try std.testing.expect(fail_index < 10_000);
+        failing.alloc_index = 0;
+        failing.resize_index = 0;
+        failing.has_induced_failure = false;
+        failing.fail_index = fail_index;
+        if (server.updateModuleGraphInner()) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failing.fail_index = std.math.maxInt(usize);
+            server.db.beginWrite();
+            const graph = server.db.peek(ModuleGraph.Input, {});
+            const target = server.db.peek(za.sema.queries.TargetAbi, {});
+            server.db.endWrite();
+            try std.testing.expectEqual(old_graph, graph);
+            try std.testing.expect(std.meta.eql(old_target, target));
+        }
+    }
 }
 
 /// 是否发布文件的 live 诊断：不属于任何项目，或所属的项目中有一个认为需要（见 `Workspace.liveEligible`）
