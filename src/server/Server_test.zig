@@ -187,10 +187,15 @@ test "push live diagnostics, clear on close" {
         defer s.deinit();
 
         const notes = try s.notifications();
-        try testing.expect(notes.len >= 1);
-        const last = notes[notes.len - 1].object.get("params").?.object;
-        try testing.expectEqualStrings(file_uri, last.get("uri").?.string);
-        try testing.expectEqual(0, last.get("diagnostics").?.array.items.len);
+        for (notes) |n| {
+            const params = n.object.get("params").?.object;
+            try testing.expectEqualStrings(file_uri, params.get("uri").?.string);
+        }
+        // 打开与关闭的发布可能合并；有发布时最后一次必须是空列表
+        if (notes.len != 0) {
+            const last = notes[notes.len - 1].object.get("params").?.object;
+            try testing.expectEqual(0, last.get("diagnostics").?.array.items.len);
+        }
     }
 }
 
@@ -237,10 +242,15 @@ test "close: non-file documents clear diagnostics on the client URI" {
         ));
         defer s.deinit();
         const notes = try s.notifications();
-        try testing.expect(notes.len >= 1);
-        const params = notes[notes.len - 1].object.get("params").?.object;
-        try testing.expectEqualStrings(untitled, params.get("uri").?.string);
-        try testing.expectEqual(0, params.get("diagnostics").?.array.items.len);
+        for (notes) |n| {
+            const params = n.object.get("params").?.object;
+            try testing.expectEqualStrings(untitled, params.get("uri").?.string);
+        }
+        // 打开与关闭的发布可能合并；有发布时最后一次必须是空列表
+        if (notes.len != 0) {
+            const params = notes[notes.len - 1].object.get("params").?.object;
+            try testing.expectEqual(0, params.get("diagnostics").?.array.items.len);
+        }
     }
 }
 

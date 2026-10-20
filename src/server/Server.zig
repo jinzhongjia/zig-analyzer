@@ -2768,14 +2768,32 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     const lines = try offsets.LineIndex.init(arena, text);
     const out = try arena.alloc(types.Diagnostic, diags.len + ranges.len);
     @memcpy(out[0..diags.len], diags);
-    for (ranges, out[diags.len..]) |x, *d| d.* = .{
-        .range = lines.range(x.start, x.end, server.encoding),
-        .severity = .Hint,
-        .source = "zig-analyzer",
-        .message = .{ .string = "code is inactive: a comptime condition excludes it under the current build configuration" },
-        .tags = &.{.Unnecessary},
-    };
-    return out;
+    var n = diags.len;
+    for (ranges) |x| {
+        // builtin 按 zig test 生成，推导可能把诊断那次编译实际执行的分支标为非活动：与编译器诊断
+        // 重叠时不发布提示，避免同一处代码同时是错误与非活动
+        if (conflictsWithCompilerError(diags, text, server.encoding, x)) continue;
+        out[n] = .{
+            .range = lines.range(x.start, x.end, server.encoding),
+            .severity = .Hint,
+            .source = "zig-analyzer",
+            .message = .{ .string = "code is inactive: a comptime condition excludes it under the current build configuration" },
+            .tags = &.{.Unnecessary},
+        };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn conflictsWithCompilerError(diags: []const types.Diagnostic, text: []const u8, enc: offsets.Encoding, range: za.ide.inactive.Range) bool {
+    for (diags) |d| {
+        const source = d.source orelse continue;
+        if (!std.mem.eql(u8, source, "zig")) continue;
+        const start: u32 = @intCast(offsets.positionToOffset(text, d.range.start, enc));
+        const end: u32 = @intCast(offsets.positionToOffset(text, d.range.end, enc));
+        if (range.start < end and start < range.end) return true;
+    }
+    return false;
 }
 
 // ── 请求处理函数 ──────────────────────────────────────────────────────

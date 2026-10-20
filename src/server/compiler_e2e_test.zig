@@ -468,6 +468,45 @@ test "single-file mode: closing a file without errors drops its result" {
     try shutdown(&h);
 }
 
+test "inactive hints are not published inside compiler errors" {
+    const text =
+        \\const builtin = @import("builtin");
+        \\export fn entry() u32 {
+        \\    if (builtin.is_test) {
+        \\        return 0;
+        \\    } else {
+        \\        const x: u32 = "oops";
+        \\        return x;
+        \\    }
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    try waitIdle(&h);
+    const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
+    try waitIdle(&h);
+    var last: ?[]const std.json.Value = null;
+    for (try h.notifications("textDocument/publishDiagnostics")) |message| {
+        const params = message.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("uri").?.string, uri)) continue;
+        last = params.get("diagnostics").?.array.items;
+    }
+    var saw_compiler_error = false;
+    for (last orelse return error.NoDiagnostics) |d| {
+        const source = d.object.get("source").?.string;
+        if (std.mem.eql(u8, source, "zig")) saw_compiler_error = true;
+        try testing.expect(!std.mem.eql(u8, source, "zig-analyzer") or
+            std.mem.indexOf(u8, d.object.get("message").?.string, "code is inactive") == null);
+    }
+    try testing.expect(saw_compiler_error);
+    try shutdown(&h);
+}
+
 test "files of the zig installation are not standalone compilation roots during startup or save" {
     const text =
         \\pub fn main() void {
