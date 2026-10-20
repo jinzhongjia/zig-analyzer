@@ -80,11 +80,14 @@ test "semantic token full and delta responses replay and unknown baselines fall 
     const fresh = try full(&h, document);
     try testing.expectEqualSlices(u32, fresh.data, actual);
     const edit = edited.edits[0];
+    try testing.expectEqual(0, edit.start % 5);
+    try testing.expectEqual(0, edit.deleteCount % 5);
     if (edit.start > 0) try testing.expectEqualSlices(u32, first.data[0..edit.start], fresh.data[0..edit.start]);
     if (edit.data) |inserted| {
-        try testing.expect(first.data[edit.start] != inserted[0]);
+        try testing.expectEqual(0, inserted.len % 5);
+        try testing.expect(!std.mem.eql(u32, first.data[edit.start..][0..5], inserted[0..5]));
         if (edit.start + edit.deleteCount < first.data.len) {
-            try testing.expect(first.data[edit.start + edit.deleteCount - 1] != inserted[inserted.len - 1]);
+            try testing.expect(!std.mem.eql(u32, first.data[edit.start + edit.deleteCount - 5 ..][0..5], inserted[inserted.len - 5 ..][0..5]));
         }
     }
     const unknown = (try delta(&h, document, "unknown-result")).SemanticTokens;

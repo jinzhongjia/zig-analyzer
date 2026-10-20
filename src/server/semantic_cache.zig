@@ -10,6 +10,8 @@ const Cache = @This();
 pub const Result = std.meta.Child(types.ResultType("textDocument/semanticTokens/full/delta"));
 pub const max_documents = 128;
 pub const max_bytes = 16 * 1024 * 1024;
+/// 每个 token 占的整数个数
+const token_len = 5;
 
 mutex: Io.Mutex = .init,
 entries: std.AutoArrayHashMapUnmanaged(FileId, Snapshot) = .empty,
@@ -54,12 +56,19 @@ pub fn update(cache: *Cache, io: Io, gpa: Allocator, arena: Allocator, file: Fil
         var id_buf: [40]u8 = undefined;
         const cached_id = std.fmt.bufPrint(&id_buf, "{d}", .{snapshot.id}) catch unreachable;
         if (std.mem.eql(u8, previous, cached_id)) {
+            // 前后缀按整个 token 比较：客户端把 edits 套用到不一致的基线上时（Neovim 0.12 的请求竞态），
+            // 结果仍由完整的 token 组成，不会出现无法解码的残缺 token。
+            const shared = @min(snapshot.data.len, data.len);
             var prefix: usize = 0;
-            while (prefix < @min(snapshot.data.len, data.len) and snapshot.data[prefix] == data[prefix]) : (prefix += 1) {}
-            var suffix: usize = 0;
-            while (suffix < @min(snapshot.data.len, data.len) - prefix and
-                snapshot.data[snapshot.data.len - 1 - suffix] == data[data.len - 1 - suffix]) : (suffix += 1)
+            while (prefix + token_len <= shared and
+                std.mem.eql(u32, snapshot.data[prefix..][0..token_len], data[prefix..][0..token_len])) : (prefix += token_len)
             {}
+            var suffix: usize = 0;
+            while (prefix + suffix + token_len <= shared and std.mem.eql(
+                u32,
+                snapshot.data[snapshot.data.len - suffix - token_len ..][0..token_len],
+                data[data.len - suffix - token_len ..][0..token_len],
+            )) : (suffix += token_len) {}
             const removed = snapshot.data.len - prefix - suffix;
             const inserted = data[prefix .. data.len - suffix];
             unchanged = removed == 0 and inserted.len == 0;
@@ -104,7 +113,7 @@ pub fn update(cache: *Cache, io: Io, gpa: Allocator, arena: Allocator, file: Fil
     return result;
 }
 
-test "semantic cache uses minimal u32 edits including insertion and deletion" {
+test "semantic cache edits whole tokens including insertion and deletion" {
     const testing = std.testing;
     var cache: Cache = .{};
     defer cache.deinit(testing.allocator);
@@ -112,15 +121,20 @@ test "semantic cache uses minimal u32 edits including insertion and deletion" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const file: FileId = @fromBackingInt(@intCast(1));
-    const first = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 3, 1, 0 }, null)).SemanticTokens;
-    const changed = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 4, 1, 0 }, first.resultId)).SemanticTokensDelta;
+    const first = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 3, 1, 0, 1, 0, 5, 2, 0 }, null)).SemanticTokens;
+    // 只差长度或修饰符这一个整数时也替换整个 token
+    const changed = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 4, 1, 0, 1, 0, 5, 2, 0 }, first.resultId)).SemanticTokensDelta;
     try testing.expectEqual(1, changed.edits.len);
-    try testing.expectEqual(2, changed.edits[0].start);
-    try testing.expectEqual(1, changed.edits[0].deleteCount);
-    try testing.expectEqualSlices(u32, &.{4}, changed.edits[0].data.?);
-    const deleted = (try cache.update(testing.io, testing.allocator, arena, file, &.{}, changed.resultId)).SemanticTokensDelta;
+    try testing.expectEqual(0, changed.edits[0].start);
+    try testing.expectEqual(5, changed.edits[0].deleteCount);
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 4, 1, 0 }, changed.edits[0].data.?);
+    const modified = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 4, 1, 0, 1, 0, 5, 2, 1 }, changed.resultId)).SemanticTokensDelta;
+    try testing.expectEqual(5, modified.edits[0].start);
+    try testing.expectEqual(5, modified.edits[0].deleteCount);
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 5, 2, 1 }, modified.edits[0].data.?);
+    const deleted = (try cache.update(testing.io, testing.allocator, arena, file, &.{}, modified.resultId)).SemanticTokensDelta;
     try testing.expectEqual(0, deleted.edits[0].start);
-    try testing.expectEqual(5, deleted.edits[0].deleteCount);
+    try testing.expectEqual(10, deleted.edits[0].deleteCount);
     try testing.expect(deleted.edits[0].data == null);
     const inserted = (try cache.update(testing.io, testing.allocator, arena, file, &.{ 0, 0, 1, 0, 0 }, deleted.resultId)).SemanticTokensDelta;
     try testing.expectEqual(0, inserted.edits[0].deleteCount);
@@ -199,7 +213,8 @@ test "semantic cache byte eviction preserves recently refreshed snapshots and fa
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const data = try testing.allocator.alloc(u32, max_bytes / @sizeOf(u32) / 2);
+    // 两个文档放得下、三个放不下；数据由完整的 token 组成
+    const data = try testing.allocator.alloc(u32, max_bytes / @sizeOf(u32) / 2 / token_len * token_len);
     defer testing.allocator.free(data);
     @memset(data, 0);
     const first_file: FileId = @fromBackingInt(@intCast(1));
@@ -209,19 +224,19 @@ test "semantic cache byte eviction preserves recently refreshed snapshots and fa
     const second = (try cache.update(testing.io, gpa, arena, second_file, data, null)).SemanticTokens;
     const touched = (try cache.update(testing.io, gpa, arena, first_file, data, first.resultId)).SemanticTokensDelta;
     try testing.expectEqual(0, touched.edits.len);
-    try testing.expectEqual(max_bytes, cache.bytes);
+    try testing.expectEqual(2 * data.len * @sizeOf(u32), cache.bytes);
     const sequence = cache.sequence;
     failing.fail_index = failing.alloc_index;
     try testing.expectError(error.OutOfMemory, cache.update(testing.io, gpa, arena, third_file, data, null));
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(sequence, cache.sequence);
-    try testing.expectEqual(max_bytes, cache.bytes);
+    try testing.expectEqual(2 * data.len * @sizeOf(u32), cache.bytes);
     try testing.expectEqual(2, cache.entries.count());
     try testing.expect(cache.entries.contains(first_file));
     try testing.expect(cache.entries.contains(second_file));
     try testing.expect(!cache.entries.contains(third_file));
     _ = try cache.update(testing.io, gpa, arena, third_file, data, null);
-    try testing.expectEqual(max_bytes, cache.bytes);
+    try testing.expectEqual(2 * data.len * @sizeOf(u32), cache.bytes);
     try testing.expectEqual(2, cache.entries.count());
     try testing.expect(cache.entries.contains(first_file));
     try testing.expect(!cache.entries.contains(second_file));
@@ -229,7 +244,7 @@ test "semantic cache byte eviction preserves recently refreshed snapshots and fa
     try testing.expectEqual(0, retained.edits.len);
     const evicted = try cache.update(testing.io, gpa, arena, second_file, data, second.resultId);
     try testing.expect(evicted == .SemanticTokens);
-    try testing.expectEqual(max_bytes, cache.bytes);
+    try testing.expectEqual(2 * data.len * @sizeOf(u32), cache.bytes);
 }
 
 test "semantic cache initial allocation failures leave no partial baseline" {
