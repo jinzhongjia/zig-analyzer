@@ -16,6 +16,7 @@ pub const syntax = struct {
     pub const ast = @import("syntax/ast.zig");
     pub const FileIndex = @import("syntax/FileIndex.zig");
     pub const ErrorSets = @import("syntax/ErrorSets.zig");
+    pub const nesting = @import("syntax/nesting.zig");
     pub const SyntaxKind = @import("syntax/kind.zig").SyntaxKind;
     pub const SyntaxNode = tree.SyntaxNode;
     pub const SyntaxToken = tree.SyntaxToken;

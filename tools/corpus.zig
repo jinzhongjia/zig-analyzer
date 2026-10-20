@@ -19,6 +19,8 @@ const Stats = struct {
     files: usize = 0,
     bytes: usize = 0,
     std_errors: usize = 0,
+    /// 嵌套过深、跳过与官方解析器对拍的文件
+    std_skipped: usize = 0,
     lossless_failures: usize = 0,
     false_errors: usize = 0,
     structure_mismatches: usize = 0,
@@ -77,7 +79,7 @@ pub fn main(init: std.process.Init) !u8 {
     const secs = @as(f64, @floatFromInt(stats.parse_ns)) / std.time.ns_per_s;
     const ns = std.time.ns_per_s;
     std.debug.print(
-        \\files: {d} ({d:.1} MB, {d} with std.zig.Ast errors)
+        \\files: {d} ({d:.1} MB, {d} with std.zig.Ast errors, {d} skipped for depth)
         \\lossless failures: {d}
         \\false errors: {d}
         \\structure mismatches: {d}
@@ -89,18 +91,18 @@ pub fn main(init: std.process.Init) !u8 {
         \\  block-reparse edits only: incremental {d:.3}s / full parse of same text {d:.3}s ({d:.1}x)
         \\
     , .{
-        stats.files,                                                                                         mb,
-        stats.std_errors,                                                                                    stats.lossless_failures,
-        stats.false_errors,                                                                                  stats.structure_mismatches,
-        stats.truncations,                                                                                   secs,
-        mb / secs,                                                                                           stats.items,
-        stats.item_failures,                                                                                 @as(f64, @floatFromInt(stats.item_tree_ns)) / ns,
-        stats.hir_exprs,                                                                                     stats.hir_failures,
-        @as(f64, @floatFromInt(stats.hir_ns)) / ns,                                                          stats.reparse_edits,
-        stats.reparse_incremental,                                                                           stats.reparse_mismatches,
-        @as(f64, @floatFromInt(stats.reparse_inc_ns)) / ns,                                                  @as(f64, @floatFromInt(stats.reparse_full_ns)) / ns,
-        @as(f64, @floatFromInt(stats.local_inc_ns)) / ns,                                                    @as(f64, @floatFromInt(stats.local_full_ns)) / ns,
-        @as(f64, @floatFromInt(stats.local_full_ns)) / @as(f64, @floatFromInt(@max(stats.local_inc_ns, 1))),
+        stats.files,                                         mb,
+        stats.std_errors,                                    stats.std_skipped,
+        stats.lossless_failures,                             stats.false_errors,
+        stats.structure_mismatches,                          stats.truncations,
+        secs,                                                mb / secs,
+        stats.items,                                         stats.item_failures,
+        @as(f64, @floatFromInt(stats.item_tree_ns)) / ns,    stats.hir_exprs,
+        stats.hir_failures,                                  @as(f64, @floatFromInt(stats.hir_ns)) / ns,
+        stats.reparse_edits,                                 stats.reparse_incremental,
+        stats.reparse_mismatches,                            @as(f64, @floatFromInt(stats.reparse_inc_ns)) / ns,
+        @as(f64, @floatFromInt(stats.reparse_full_ns)) / ns, @as(f64, @floatFromInt(stats.local_inc_ns)) / ns,
+        @as(f64, @floatFromInt(stats.local_full_ns)) / ns,   @as(f64, @floatFromInt(stats.local_full_ns)) / @as(f64, @floatFromInt(@max(stats.local_inc_ns, 1))),
     });
     const failed = stats.lossless_failures + stats.false_errors + stats.structure_mismatches + stats.item_failures + stats.reparse_mismatches + stats.hir_failures;
     return if (failed == 0) 0 else 1;
@@ -183,24 +185,28 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
         }
     }
 
-    // 2. 与 std.zig.Ast 对比
+    // 2. 与 std.zig.Ast 对比（嵌套过深的文件跳过：官方解析器会耗尽栈）
     const source_z = try gpa.dupeSentinel(u8, source, 0);
     defer gpa.free(source_z);
-    var ast = try std.zig.Ast.parse(gpa, source_z, .{});
-    defer ast.deinit(gpa);
-    if (ast.errors.len != 0) {
-        stats.std_errors += 1;
+    if (try syntax.nesting.estimate(gpa, source_z) > syntax.nesting.inline_depth) {
+        stats.std_skipped += 1;
     } else {
-        if (parse.errors.len != 0) {
-            stats.false_errors += 1;
-            const e = parse.errors[0];
-            const loc = lineCol(source, e.offset);
-            report(stats, "[false error] {s}:{d}:{d}: {s} ({d} total)", .{ path, loc.line, loc.col, e.message, parse.errors.len });
-        }
-        // 3. 顶层结构
-        if (!try sameStructure(gpa, &ast, parse.rootNode(), source)) {
-            stats.structure_mismatches += 1;
-            report(stats, "[structure mismatch] {s}", .{path});
+        var ast = try std.zig.Ast.parse(gpa, source_z, .{});
+        defer ast.deinit(gpa);
+        if (ast.errors.len != 0) {
+            stats.std_errors += 1;
+        } else {
+            if (parse.errors.len != 0) {
+                stats.false_errors += 1;
+                const e = parse.errors[0];
+                const loc = lineCol(source, e.offset);
+                report(stats, "[false error] {s}:{d}:{d}: {s} ({d} total)", .{ path, loc.line, loc.col, e.message, parse.errors.len });
+            }
+            // 3. 顶层结构
+            if (!try sameStructure(gpa, &ast, parse.rootNode(), source)) {
+                stats.structure_mismatches += 1;
+                report(stats, "[structure mismatch] {s}", .{path});
+            }
         }
     }
 

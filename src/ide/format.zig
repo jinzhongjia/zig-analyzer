@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
+const nesting = @import("../syntax/nesting.zig");
 
 pub const Mode = enum { zig, zon };
 
@@ -12,6 +13,8 @@ pub const Mode = enum { zig, zon };
 pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offsets.Encoding) Allocator.Error!?[]const types.TextEdit {
     const text = lines.text;
     const source = try arena.dupeSentinel(u8, text, 0);
+    // 官方解析器逐层递归：深层嵌套会在请求线程上耗尽原生栈，直接拒绝
+    if (try nesting.estimate(arena, source) > nesting.inline_depth) return null;
     var ast = try std.zig.Ast.parse(arena, source, .{ .mode = switch (mode) {
         .zig => .zig,
         .zon => .zon,
@@ -41,6 +44,20 @@ const testing = std.testing;
 fn applyEdit(gpa: Allocator, text: []const u8, edit: types.TextEdit) ![]u8 {
     const changes = [_]types.TextDocumentContentChangeEvent{.{ .TextDocumentContentChangePartial = .{ .range = edit.range, .text = edit.newText } }};
     return offsets.applyChanges(gpa, text, &changes, .utf16);
+}
+
+test "deeply nested source is rejected instead of overflowing the stack" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "const x = ");
+    for (0..3000) |_| try text.append(a, '(');
+    try text.append(a, '1');
+    for (0..3000) |_| try text.append(a, ')');
+    try text.appendSlice(a, ";\n");
+    const lines = try offsets.LineIndex.init(a, text.items);
+    try testing.expectEqual(null, try format(a, lines, .zig, .utf16));
 }
 
 test format {

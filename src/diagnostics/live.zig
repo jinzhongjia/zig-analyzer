@@ -12,6 +12,7 @@ const engine = @import("../db/engine.zig");
 const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
 const mem = @import("../util/mem.zig");
+const nesting = @import("../syntax/nesting.zig");
 
 const log = std.log.scoped(.live);
 
@@ -49,12 +50,6 @@ pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
-/// 估计的嵌套深度（`nestingEstimate`）不超过它时在当前线程解析与 AstGen。官方实现逐层递归，
-/// Debug 构建中每层约用 16 KB 栈，而当前线程可能已处在较深的 query 嵌套中
-const inline_depth = 256;
-/// 不超过它时在专用的大栈线程上解析与 AstGen；更深的文本不做（官方 `zig ast-check` 同样会耗尽栈），
-/// 没有诊断，import 按 token 收集
-const thread_depth = 8192;
 const thread_stack_size = 512 * 1024 * 1024;
 
 /// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。按嵌套深度选择执行的线程，深层嵌套的文本
@@ -62,9 +57,9 @@ const thread_stack_size = 512 * 1024 * 1024;
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
     const source = try gpa.dupeSentinel(u8, text, 0);
     defer gpa.free(source);
-    const depth = try nestingEstimate(gpa, source);
-    if (depth <= inline_depth) return checkSource(gpa, source, mode);
-    if (depth <= thread_depth) {
+    const depth = try nesting.estimate(gpa, source);
+    if (depth <= nesting.inline_depth) return checkSource(gpa, source, mode);
+    if (depth <= nesting.thread_depth) {
         var result: Allocator.Error!*Result = undefined;
         if (std.Thread.spawn(.{ .stack_size = thread_stack_size }, checkInto, .{ gpa, source, mode, &result })) |thread| {
             thread.join();
@@ -76,59 +71,6 @@ pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Resu
 
 fn checkInto(gpa: Allocator, source: [:0]const u8, mode: Mode, result: *Allocator.Error!*Result) void {
     result.* = checkSource(gpa, source, mode);
-}
-
-/// 官方解析器与 AstGen 递归深度的上界估计。每层括号算一层；同一层括号内，以 `;` 或 `,` 分隔的一段中
-/// 每个 token 与括号对都可能使嵌套再深一层（运算符链、前缀与后缀、else-if 链）。`}` 之后接着的是新的
-/// 语句或声明（标识符、字面量、else 等之外的关键字）时，这一段重新计数。超过 `thread_depth` 时提前返回
-fn nestingEstimate(gpa: Allocator, source: [:0]const u8) Allocator.Error!u32 {
-    var segments: std.ArrayList(u32) = .empty;
-    defer segments.deinit(gpa);
-    try segments.append(gpa, 0);
-    var tokenizer: std.zig.Tokenizer = .init(source);
-    var total: u32 = 0;
-    var max: u32 = 0;
-    var after_brace = false;
-    while (true) {
-        const tag = tokenizer.next().tag;
-        if (tag == .eof) return max;
-        const top = &segments.items[segments.items.len - 1];
-        if (after_brace and startsStatement(tag)) {
-            total -= top.*;
-            top.* = 0;
-        }
-        after_brace = false;
-        switch (tag) {
-            .l_paren, .l_bracket, .l_brace => {
-                top.* += 1;
-                total += 2;
-                try segments.append(gpa, 0);
-            },
-            .r_paren, .r_bracket, .r_brace => {
-                if (segments.items.len > 1) total -= 1 + segments.pop().?;
-                after_brace = tag == .r_brace;
-            },
-            .semicolon, .comma => {
-                total -= top.*;
-                top.* = 0;
-            },
-            else => {
-                top.* += 1;
-                total += 1;
-            },
-        }
-        max = @max(max, total);
-        if (max > thread_depth) return max;
-    }
-}
-
-/// `}` 之后的这个 token 不能接续表达式，只能开始新的语句或声明
-fn startsStatement(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .keyword_else, .keyword_orelse, .keyword_catch, .keyword_and, .keyword_or => false,
-        .identifier, .builtin, .number_literal, .string_literal, .multiline_string_literal_line, .char_literal, .doc_comment, .container_doc_comment => true,
-        else => std.zig.Token.keywords.has(tag.lexeme() orelse return false),
-    };
 }
 
 /// 不做 AstGen 时的结果：没有诊断，import 按 token 收集（AstGen 记录的正是 `@import` 的字符串字面量）
