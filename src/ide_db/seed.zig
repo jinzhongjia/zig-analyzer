@@ -748,11 +748,6 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, strict)) |s| return s;
         if (try loopCall(r, in, @intCast(i), owner, body, seeded, outer.inst, names, file, item, root_key, null, strict)) |s| return s;
-        // 调用者经由自己的 comptime 类型参数调用（`Q.compute(ctx, key)`）：把该参数换成目标所在的容器
-        if (try substituted(r, in, @intCast(i), body, outer.inst, file, root)) |inst| {
-            const res2 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
-            if (try callIn(r, in, @intCast(i), body, res2, file, item, root_key, null, strict)) |s| return s;
-        }
         // 第一个实例下没有有效的调用（如调用位于该实例不执行的 `switch (Q.kind)` 分支中）：依次尝试调用者的其他实例
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1 })) |other| {
             if (other.inst == outer.inst) continue;
@@ -760,48 +755,6 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
             if (try callIn(r, in, @intCast(i), body, res3, file, item, root_key, null, strict)) |s| return s;
             if (try loopCall(r, in, @intCast(i), owner, body, res3, other.inst, names, file, item, root_key, null, strict)) |s| return s;
         }
-    }
-    return null;
-}
-
-/// 调用者 `caller`（位于 `in`）以自己的 comptime 类型参数 `P` 调用泛型函数 `root`（位于 `file`，`P.name(...)`）时，
-/// 把实例 `inst` 中 `P` 的实参换成 `root` 所在的容器得到的实例。容器位于泛型函数内（需要实例）时为 null
-fn substituted(r: *Resolver, in: FileId, caller: u32, body: *const Body, inst: ?Index, file: FileId, root: u32) resolve.Error!?Index {
-    const ip = r.ctx.db.env.ip;
-    const instance = switch (ip.key(inst orelse return null)) {
-        .instance => |x| x,
-        else => return null,
-    };
-    const tree = try r.itemTree(file);
-    const name = tree.items[root].name orelse return null;
-    const container = tree.items[root].container;
-    if (tree.containers[container].parent_item) |p| if (try genericRoot(r, file, p) != null) return null;
-    const target = try queries.containerType(r, .{ .file = file, .container = container }, null);
-    for (body.exprs) |e| {
-        const c = switch (e) {
-            .call => |c| c,
-            else => continue,
-        };
-        const fa = switch (body.expr(c.callee)) {
-            .field_access => |x| x,
-            else => continue,
-        };
-        if (!std.mem.eql(u8, fa.field orelse continue, name)) continue;
-        const n = switch (body.expr(fa.lhs)) {
-            .name_ref => |x| x,
-            else => continue,
-        };
-        const l = switch (try r.resolveName(in, caller, body, body.expr_scopes[@backingInt(fa.lhs)], n) orelse continue) {
-            .local => |x| x,
-            else => continue,
-        };
-        const binding = body.binding(l.binding);
-        if (binding.kind != .param or !binding.is_comptime) continue;
-        const pi = std.mem.indexOfScalar(Body.BindingId, body.params, l.binding) orelse continue;
-        if (pi >= instance.args.len or instance.args[pi] == target) continue;
-        const args = try r.arena.dupe(Index, instance.args);
-        args[pi] = target;
-        return try ip.get(.{ .instance = .{ .file = instance.file, .decl = instance.decl, .args = args, .parent = instance.parent } });
     }
     return null;
 }

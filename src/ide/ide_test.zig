@@ -1953,10 +1953,12 @@ test "the right side of a comptime short-circuited and / or is inactive" {
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "x;").?)), ranges[0].start);
 }
 
-test "callsite seeding substitutes the comptime type parameter a caller dispatches through" {
-    // `A.step` 只经由 `run` 中的 `Impl.step(ctx)` 调用，而 `run` 只以 B 调用：曾没有实例，`c` 的类型未知
+test "callsite seeding uses the caller instance with the matching comptime type argument" {
+    // `A.step` 与 `B.step` 都经 `run` 中的 `Impl.step(ctx)` 调用；`run` 先以 B 调用，
+    // A.step 内仍应使用 A 的实例
     const labels = try completionLabels(
-        \\const Ctx = struct { n: u32 };
+        \\const CA = struct { a_field: u32 };
+        \\const CB = struct { b_field: u32 };
         \\const A = struct {
         \\    pub fn step(c: anytype) u32 {
         \\        return c.<|>;
@@ -1968,17 +1970,107 @@ test "callsite seeding substitutes the comptime type parameter a caller dispatch
         \\        return 0;
         \\    }
         \\};
-        \\fn run(comptime Impl: type, ctx: *Ctx) u32 {
+        \\fn run(comptime Impl: type, ctx: anytype) u32 {
         \\    return Impl.step(ctx);
         \\}
         \\fn main() void {
-        \\    var ctx: Ctx = .{ .n = 1 };
-        \\    _ = run(B, &ctx);
+        \\    var ca: CA = .{ .a_field = 1 };
+        \\    var cb: CB = .{ .b_field = 2 };
+        \\    _ = run(B, &cb);
+        \\    _ = run(A, &ca);
         \\}
         \\
     );
     defer testing.allocator.free(labels);
-    try testing.expectEqualStrings("n", labels);
+    try testing.expectEqualStrings("a_field", labels);
+}
+
+test "via a comptime type parameter dispatch uses the real caller instance" {
+    const text =
+        \\const Foo = struct {
+        \\    fn hello(_: Foo) void {}
+        \\};
+        \\const Bar = struct {
+        \\    fn hello(_: Bar) void {}
+        \\};
+        \\const A = struct {
+        \\    fn name(x: anytype) void {
+        \\        x.hello();
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    fn name(x: anytype) void {
+        \\        _ = x;
+        \\    }
+        \\};
+        \\fn caller(comptime P: type, y: anytype) void {
+        \\    P.name(y);
+        \\}
+        \\pub fn main() void {
+        \\    caller(B, Bar{});
+        \\    caller(A, Foo{});
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at_x: u32 = @intCast(std.mem.indexOf(u8, text, "        x.hello").? + "        ".len);
+    const at_hello: u32 = @intCast(std.mem.indexOf(u8, text, "        x.hello").? + "        x.".len);
+
+    const x = (try hover.hover(&r, file, at_x)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nx: Foo\n```\n\ninferred from the call at main.zig:18", x.text);
+    const hello = (try hover.hover(&r, file, at_hello)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nfn hello(_: Foo) void\n```\n\ninferred from the call at main.zig:18", hello.text);
+    const t = (try definition.definition(&r, file, at_hello)) orelse return error.NoTarget;
+    try testing.expect(std.mem.startsWith(u8, text[t.start..], "hello(_: Foo)"));
+}
+
+test "via a comptime type parameter dispatch without a real instance stays abstract" {
+    // `caller(A, ..)` 不存在：编译器不会生成 `A.name` 的实例，不能借用 `caller(B, ..)` 的实例
+    const text =
+        \\const Foo = struct {
+        \\    fn hello(_: Foo) void {}
+        \\};
+        \\const Bar = struct {
+        \\    fn hello(_: Bar) void {}
+        \\};
+        \\const A = struct {
+        \\    fn name(x: anytype) void {
+        \\        x.hello();
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    fn name(x: anytype) void {
+        \\        _ = x;
+        \\    }
+        \\};
+        \\fn caller(comptime P: type, y: anytype) void {
+        \\    P.name(y);
+        \\}
+        \\pub fn main() void {
+        \\    caller(B, Bar{});
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at_x: u32 = @intCast(std.mem.indexOf(u8, text, "        x.hello").? + "        ".len);
+    const at_hello: u32 = at_x + @as(u32, @intCast("x.".len));
+
+    const x = (try hover.hover(&r, file, at_x)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nx: unknown\n```", x.text);
+    try testing.expect(try hover.hover(&r, file, at_hello) == null);
+    try testing.expect(try definition.definition(&r, file, at_hello) == null);
 }
 
 test "callsite seeding follows a container type passed as a comptime argument to the call that dispatches to it" {
