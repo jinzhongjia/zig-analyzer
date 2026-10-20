@@ -477,6 +477,34 @@ test "completion through a switch whose other prong is an empty tuple literal" {
     try testing.expectEqualStrings("label kind", labels);
 }
 
+test "goto declaration of a shorthand member of an inline reified enum" {
+    const text =
+        \\const Mode = @Enum(u8, .exhaustive, &.{ "fast", "slow" }, &.{ 0, 1 });
+        \\fn advanced() u64 {
+        \\    const mode: Mode = .fast;
+        \\    return @intFromEnum(mode);
+        \\}
+        \\comptime {
+        \\    _ = &advanced;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = std.mem.indexOf(u8, text, ".fast").? + 2;
+    const t = (try definition.definition(&r, file, @intCast(at))) orelse return error.NoTarget;
+    try testing.expectEqual(file, t.file);
+    testing.expect(std.mem.startsWith(u8, text[t.start..], "fast\"")) catch |err| {
+        std.debug.print("target `{s}`\n", .{text[t.start..t.end]});
+        return err;
+    };
+}
+
 test "goto declaration of reified enum members named by string literals or @typeInfo" {
     // `@Enum` 构造的枚举（如 SyntaxKind）的成员曾没有跳转目标
     const kind_text =

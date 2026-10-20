@@ -168,6 +168,7 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     if (try literalOrigin(r, file, .{ .item = item, .body = b, .at = a }, rt, name)) |found| return found;
     const owner = try ownerLocal(r, rt);
     if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
+    if (try constructionOrigin(r, rt, name)) |found| return found;
     return typeInfoOrigin(r, rt, name);
 }
 
@@ -239,6 +240,11 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
     if (shared > 1 or (shared == 0 and found > 1)) return null;
 
     const origin = try eval.stringOrigin(r, file, pick.cand.item, pick.cand.body, pick.cand.expr, pick.path) orelse return null;
+    return originTarget(r, origin, name);
+}
+
+/// 字符串来源 `origin` 对应源码中的字面量区间
+fn originTarget(r: *Resolver, origin: eval.StringOrigin, name: []const u8) resolve.Error!?Target {
     const lit_node = try r.itemNode(origin.file, origin.item) orelse return null;
     const lit_body = try r.body(origin.file, origin.item);
     const range = lit_body.range(origin.expr);
@@ -248,6 +254,27 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
     const start = Body.literalSourceOffset(src, origin.offset) orelse return null;
     const end = Body.literalSourceOffset(src, origin.offset + name.len) orelse return null;
     return .{ .file = origin.file, .start = lit_start + @as(u32, @intCast(start)), .end = lit_start + @as(u32, @intCast(end)) };
+}
+
+/// 名字切片直接写在构造调用中（`@Enum(..., &.{"fast", "slow"}, ...)`）时的来源：
+/// 求出构造的第 3 个实参（名字切片），在其中找到 `name`，再沿字符串来源跟踪到字面量
+fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
+    const local = (try ownerLocal(r, rt)) orelse return null;
+    const e: Body.ExprId = @fromBackingInt(rt.expr);
+    const args = switch (local.body.expr(e)) {
+        .builtin_call => |c| c.args,
+        else => return null,
+    };
+    if (args.len < 3) return null;
+    const names_e = args[2];
+    const ip = r.ctx.db.env.ip;
+    const tv = try eval.exprValue(r, rt.file, local.item, local.body, names_e, local.inst, local.at.res.bindings, null);
+    const value = tv.val orelse return null;
+    var path: std.ArrayList(u32) = .empty;
+    var chain: std.ArrayList(Index) = .empty;
+    if (!try eval.findString(ip, r.arena, value, name, &path, &chain)) return null;
+    const origin = try eval.stringOrigin(r, rt.file, local.item, local.body, names_e, path.items) orelse return null;
+    return originTarget(r, origin, name);
 }
 
 /// 构造类型的成员名来自 `@typeInfo(X)`（如 `@typeInfo(Tag).@"enum".field_names`）时，X 中的同名成员：
