@@ -255,7 +255,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 诊断发布：编辑触发的按文件防抖，被更新的编辑取代时放弃；live 诊断（进程内 AstGen 与子进程 `zig ast-check`）在读事务之外计算，不阻塞写事务。编译进行中保留上一轮结果，完成后原子替换。
   - 同一文件的发布任务并发计算，每次在读取状态之前取递增序号，只发送序号不小于已发送序号的结果。每次状态变化之后都会发起一次发布，最后发出的结果因此读到最后一次变化之后的状态。
 - 配置来自客户端（`initializationOptions`、`workspace/configuration`），项目根的 `zig-analyzer.json` 可覆盖与项目相关的项；各项说明见 `src/server/Config.zig`。
-- 退出：输入结束时不再等待客户端对配置请求的回复，停止各项目后退出。`initialize` 给出 `processId` 时每 2 秒检查一次客户端进程，它退出后服务器随之退出（stdin 的写端可能被客户端的其他子进程继承而一直不关闭）。
+- 退出：输入结束时不再等待客户端对配置请求的回复，停止各项目后退出。`initialize` 给出 `processId` 时等待客户端进程退出，之后服务器随之退出（stdin 的写端可能被客户端的其他子进程继承而一直不关闭）。等待使用操作系统的进程退出通知：Linux 用 pidfd（内核 5.3 起），macOS 与 FreeBSD、NetBSD、OpenBSD 用 kqueue 的 `EVFILT_PROC`，Windows 等待进程句柄；都用不了时（内核较旧、沙箱禁止、没有权限打开进程、其他平台）才每 2 秒检查一次进程是否还在。
 - 外部改动：客户端支持动态注册时注册 `workspace/didChangeWatchedFiles`。客户端不支持时（Linux 上的 Neovim 默认如此），或 `files.watcher` 为 `server` 时，由服务器监听，变化按同一条路径处理：
   - 关注驻留过的 `.zig` / `.zon` 文件与各根目录的 `build.zig`、`build.zig.zon`、`zig-analyzer.json`，不含 Zig 安装目录、全局缓存、各项目的本地缓存与获取的依赖包中的文件；打开的文档以缓冲区为准，跳过。
   - 用操作系统的原生通知监听这些文件所在的目录：Linux 用 inotify，macOS 用 FSEvents，Windows 用目录变化通知。目录不存在时监听最近一级存在的祖先目录，它出现后改为监听它自己，其中已经存在的文件按新建处理。驻留了新文件（Vfs 通知）、根目录增减、目录新建或删除、通知丢失时重新计算要监听的目录。一阵连续的通知合为一批（静默 50 ms，至多推迟 500 ms）。

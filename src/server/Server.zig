@@ -34,6 +34,7 @@ pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
 const SemanticCache = @import("semantic_cache.zig");
 const watch = @import("watch.zig");
+const client_process = @import("client_process.zig");
 
 const log = std.log.scoped(.server);
 
@@ -147,6 +148,8 @@ startup_pending: bool = false,
 initialized_received: bool = false,
 /// 监视客户端进程（`initialize` 的 `processId`）的后台任务
 parent_watch: ?Io.Future(void) = null,
+/// `parent_watch` 等待的客户端进程
+parent_process: ?*client_process.Watch = null,
 /// 项目已启动：此后修改 zig.path 需要重启服务器
 started: bool = false,
 
@@ -225,7 +228,12 @@ pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) All
 }
 
 pub fn deinit(server: *Server) void {
-    if (server.parent_watch) |*w| w.cancel(server.io);
+    if (server.parent_watch) |*f| {
+        // 等待退出通知时不响应取消：先让它返回
+        server.parent_process.?.stop();
+        f.cancel(server.io);
+        server.parent_process.?.destroy(server.gpa);
+    }
     server.group.cancel(server.io);
     server.stopWorkspaces();
     server.waitIdle();
@@ -301,60 +309,24 @@ fn abandonConfigRequests(server: *Server) void {
 }
 
 /// 每隔这么久检查一次客户端进程是否还在
-const parent_check_interval_ms = 2000;
-
-/// 监视客户端进程：它退出后服务器随之退出。客户端退出时 stdin 通常随之关闭（见 `run`），但管道的写端
-/// 可能被客户端的其他子进程继承而一直不关闭
+/// 监视客户端进程：它退出后服务器随之退出（见 `client_process.zig`）。在主循环中创建监视，之后的停止不会丢失
 fn watchParent(server: *Server, pid: i32) void {
     if (pid <= 0 or server.parent_watch != null) return;
-    server.parent_watch = server.io.concurrent(parentWatcher, .{ server, pid }) catch |err| {
+    const w = client_process.Watch.create(server.gpa, server.io, pid) catch
+        return log.warn("cannot watch the client process {d}: out of memory", .{pid});
+    server.parent_watch = server.io.concurrent(parentWatcher, .{ server, w }) catch |err| {
+        w.destroy(server.gpa);
         return log.warn("cannot watch the client process {d}: {t}", .{ pid, err });
     };
+    server.parent_process = w;
 }
 
-fn parentWatcher(server: *Server, pid: i32) void {
-    while (true) {
-        server.io.sleep(.fromMilliseconds(parent_check_interval_ms), .awake) catch return;
-        if (processAlive(pid)) continue;
-        log.warn("client process {d} has exited, exiting", .{pid});
-        server.stopWorkspaces();
-        std.process.exit(1);
-    }
+fn parentWatcher(server: *Server, w: *client_process.Watch) void {
+    if (w.wait() == .stopped) return;
+    log.warn("client process {d} has exited, exiting", .{w.pid});
+    server.stopWorkspaces();
+    std.process.exit(1);
 }
-
-/// 进程是否仍在运行；无法确定时（如没有权限）按仍在运行处理
-fn processAlive(pid: i32) bool {
-    if (@import("builtin").os.tag == .windows) {
-        const windows = std.os.windows;
-        const handle = win32.OpenProcess(win32.SYNCHRONIZE, 0, @bitCast(pid)) orelse
-            return windows.GetLastError() != .INVALID_PARAMETER;
-        defer windows.CloseHandle(handle);
-        // 已退出的进程处于有信号状态
-        return win32.WaitForSingleObject(handle, 0) != win32.WAIT_OBJECT_0;
-    }
-    // 信号 0 只检查进程是否存在
-    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err != error.ProcessNotFound;
-    return true;
-}
-
-test "processAlive: a running child process, then its pid after it has been reaped" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
-    var child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", "read line" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
-    const pid = child.id.?;
-    try std.testing.expect(processAlive(pid));
-    child.stdin.?.close(io);
-    child.stdin = null;
-    _ = try child.wait(io);
-    try std.testing.expect(!processAlive(pid));
-}
-
-const win32 = struct {
-    const SYNCHRONIZE: u32 = 0x00100000;
-    const WAIT_OBJECT_0: u32 = 0;
-    extern "kernel32" fn OpenProcess(access: u32, inherit: c_int, pid: u32) callconv(.winapi) ?*anyopaque;
-    extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, ms: u32) callconv(.winapi) u32;
-};
 
 const Flow = enum { @"continue", exit };
 
