@@ -12,6 +12,7 @@ const kind_mod = @import("kind.zig");
 const SyntaxKind = kind_mod.SyntaxKind;
 const lexer = @import("lexer.zig");
 const green = @import("green.zig");
+const TextRange = @import("tree.zig").TextRange;
 
 pub const Event = union(enum) {
     start: struct {
@@ -31,8 +32,8 @@ pub const Error = struct {
     message: []const u8,
 };
 
-/// 语法树的最大深度。更深的节点在构造绿树时展平：其 token 直接挂在这一层的节点下（见 `buildTree`）。
-/// 沿树递归的各处（HIR 降级、ItemTree、推导等）的递归深度因此有上限
+/// 语法树的最大深度。更深的节点在构造绿树时展平：其 token 直接挂在这一层的节点下，这一层的节点改为
+/// 错误节点（见 `buildTree`）。沿树递归的各处（HIR 降级、ItemTree、推导等）的递归深度因此有上限
 pub const max_depth = 1024;
 /// 解析器的递归上限，以未结束的节点个数计。未结束而之后被放弃的节点每层至多一个，到这里时所在位置
 /// 在树中至少 `max_depth` 层深，不再递归解析的结构反正会被展平（见 `Parser.skipNested`）
@@ -219,20 +220,25 @@ pub const CompletedMarker = struct {
 /// 因此节点总是以有效 token 开始；文件末尾的 trivia 挂在根节点上。
 ///
 /// `base_depth` 为所构造的树的根在整棵树中的深度（局部重解析时不为 0）。深度达到 `max_depth` 的节点
-/// 不开始，其内容直接挂在外层节点下；返回是否有这样展平的节点。
+/// 不开始，其内容直接挂在外层节点下。外层节点的子元素因此不再符合它的语法，改为错误节点，下游不会按
+/// 原来的种类解读其中的 token。返回这些错误节点的区间（相对于 `source`，分配在 `builder.arena` 中）
 pub fn buildTree(
     builder: *green.Builder,
     source: []const u8,
     tokens: []const lexer.Token,
     events: []Event,
     base_depth: usize,
-) Allocator.Error!bool {
+) Allocator.Error![]const TextRange {
     var cursor: usize = 0;
     var parents: std.ArrayList(SyntaxKind) = .empty;
     defer parents.deinit(builder.gpa);
     // 已展平（未开始）而尚未结束的节点个数：它们总是最内层的几个
     var flattened: usize = 0;
-    var any_flattened = false;
+    // 位于深度上限的未闭合节点（至多一个）的起点，以及它是否已收纳了展平的内容
+    var limit_start: u32 = 0;
+    var absorbing = false;
+    var ranges: std.ArrayList(TextRange) = .empty;
+    defer ranges.deinit(builder.gpa);
 
     for (events, 0..) |*event, i| switch (event.*) {
         .start => |s| {
@@ -254,9 +260,15 @@ pub fn buildTree(
             while (j > 0) {
                 j -= 1;
                 if (flattened > 0 or base_depth + builder.depth() >= max_depth) {
+                    if (!absorbing) {
+                        builder.retype(.error_node);
+                        absorbing = true;
+                    }
                     flattened += 1;
-                    any_flattened = true;
-                } else try builder.startNode(parents.items[j]);
+                } else {
+                    try builder.startNode(parents.items[j]);
+                    if (base_depth + builder.depth() == max_depth) limit_start = emittedEnd(source, tokens, cursor);
+                }
             }
         },
         .finish => {
@@ -271,6 +283,10 @@ pub fn buildTree(
                     try builder.token(t.kind, t.text(source));
                 }
             }
+            if (absorbing) {
+                absorbing = false;
+                try ranges.append(builder.gpa, .{ .start = limit_start, .end = emittedEnd(source, tokens, cursor) });
+            }
             try builder.finishNode();
         },
         .token => {
@@ -281,7 +297,12 @@ pub fn buildTree(
             cursor += 1;
         },
     };
-    return any_flattened;
+    return builder.arena.dupe(TextRange, ranges.items);
+}
+
+/// 已挂上的 token 在源码中的终点：token 首尾相接，即下一个 token 的起点
+fn emittedEnd(source: []const u8, tokens: []const lexer.Token, cursor: usize) u32 {
+    return if (cursor < tokens.len) tokens[cursor].start else @intCast(source.len);
 }
 
 fn emitTrivia(builder: *green.Builder, source: []const u8, tokens: []const lexer.Token, start: usize) Allocator.Error!usize {

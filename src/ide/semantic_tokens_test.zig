@@ -966,3 +966,39 @@ test "semantic inferred generic aliases refine declarations without guessing unr
     });
     _ = try rangeMatchesFull(&w, file, text, .utf16, needleRange(text, "Alias =", .utf16));
 }
+
+/// `offset` 处 token 的类型（没有 token 时为 null）
+fn typeAt(data: []const u32, text: []const u8, enc: offsets.Encoding, offset: usize) ?u32 {
+    const expected = offsets.offsetToPosition(text, offset, enc);
+    var pos: types.Position = .{ .line = 0, .character = 0 };
+    var i: usize = 0;
+    while (i < data.len) : (i += 5) {
+        if (data[i] != 0) pos.character = 0;
+        pos.line += data[i];
+        pos.character += data[i + 1];
+        if (std.meta.eql(pos, expected)) return data[i + 3];
+    }
+    return null;
+}
+
+test "semantic tokens do not classify code nested beyond the depth limit by the enclosing node" {
+    const a = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    // 字段访问链每段深一层：链底部的 `s` 与前面若干段在深度上限之外
+    try text.appendSlice(a, "const S = struct { n: *const S, v: u32 };\nconst s: S = undefined;\nconst z = s");
+    for (0..1100) |_| try text.appendSlice(a, ".n");
+    try text.appendSlice(a, ".v;\n");
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text.items)).file;
+    const data = try tokens(&w, file, text.items, .utf16, null);
+    try check(data, text.items, .utf16, &.{
+        .{ .needle = "s: S", .ty = .variable, .mods = M.declaration | M.readonly },
+        .{ .needle = "z =", .ty = .variable, .mods = M.declaration | M.readonly },
+    });
+    // 不按外层的字段访问节点把它标为 property
+    const base = std.mem.indexOf(u8, text.items, "s.n").?;
+    try testing.expectEqual(null, typeAt(data, text.items, .utf16, base));
+}

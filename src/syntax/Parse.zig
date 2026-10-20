@@ -33,6 +33,9 @@ full_bytes: usize,
 /// 解析触及了深度上限：有结构没有递归解析（`Parser.skipNested`），或构造时展平了节点。
 /// 这样的结果与局部重解析的结果无法保证一致，之后的编辑都做全量解析
 deep: bool = false,
+/// 收纳了展平内容的错误节点的区间（见 `parser.buildTree`），按位置排序。其中的代码没有语法结构，
+/// 名字解析与类型推导都看不到
+flattened: []const tree.TextRange = &.{},
 
 pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -62,7 +65,8 @@ pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
         .errors = errors,
         .chain_bytes = 0,
         .full_bytes = 0,
-        .deep = events.limited or flattened,
+        .deep = events.limited or flattened.len != 0,
+        .flattened = flattened,
     };
     result.arena = arena;
     result.full_bytes = result.arena.queryCapacity();
@@ -219,7 +223,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
 
     var builder: green.Builder = .{ .arena = a, .gpa = gpa };
     defer builder.deinit();
-    if (try parser.buildTree(&builder, sub_source, tokens, events.events, path.items.len)) {
+    if ((try parser.buildTree(&builder, sub_source, tokens, events.events, path.items.len)).len != 0) {
         arena.deinit();
         return null;
     }
@@ -319,7 +323,7 @@ pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.
     var builder: green.Builder = .{ .arena = a, .gpa = gpa };
     defer builder.deinit();
     // 片段与全量解析从同一层开始，触及深度上限时结果也相同；之后的编辑仍须全量解析，这里直接放弃
-    if (events.limited or try parser.buildTree(&builder, sub_source, tokens, events.events, 0)) {
+    if (events.limited or (try parser.buildTree(&builder, sub_source, tokens, events.events, 0)).len != 0) {
         arena.deinit();
         return null;
     }

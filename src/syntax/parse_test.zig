@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Parse = @import("Parse.zig");
+const tree = @import("tree.zig");
 
 fn dumpTree(source: []const u8) ![]u8 {
     const parse = try Parse.create(testing.allocator, source);
@@ -239,20 +240,38 @@ fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     return max;
 }
 
+/// 区间恰为 `range` 的最深节点
+fn nodeAt(root: tree.SyntaxNode, range: tree.TextRange) ?tree.SyntaxNode {
+    var node = root;
+    var found: ?tree.SyntaxNode = null;
+    outer: while (true) {
+        if (node.range().start == range.start and node.range().end == range.end) found = node;
+        var it = node.children();
+        while (it.nextNode()) |c| {
+            if (c.range().start <= range.start and range.end <= c.range().end) {
+                node = c;
+                continue :outer;
+            }
+        }
+        return found;
+    }
+}
+
 test "nesting beyond the limits: lossless, bounded depth, marked deep" {
     const a = testing.allocator;
     const max_depth = @import("parser.zig").max_depth;
-    // 解析器的递归与语法树的深度都有上限（深层嵌套耗尽原生栈时进程崩溃）
-    const Case = struct { head: []const u8, repeat: []const u8, middle: []const u8, close: []const u8, tail: []const u8 };
+    // 解析器的递归与语法树的深度都有上限（深层嵌套耗尽原生栈时进程崩溃）。`limited`：触及解析器的
+    // 递归上限（其余只在构造绿树时展平）
+    const Case = struct { head: []const u8, repeat: []const u8, middle: []const u8, close: []const u8, tail: []const u8, limited: bool };
     const cases = [_]Case{
-        .{ .head = "const x = ", .repeat = "(", .middle = "1", .close = ")", .tail = ";\n" },
-        .{ .head = "const x = ", .repeat = "!", .middle = "y", .close = "", .tail = ";\n" },
-        .{ .head = "const T = ", .repeat = "?", .middle = "u8", .close = "", .tail = ";\n" },
-        .{ .head = "fn f() void ", .repeat = "{", .middle = "", .close = "}", .tail = "\n" },
-        .{ .head = "fn f(x: u32) void {\n    if (x == 0) {}", .repeat = " else if (x == 1) {}", .middle = " else {}", .close = "", .tail = "\n}\n" },
-        .{ .head = "const x = ", .repeat = "1 + ", .middle = "1", .close = "", .tail = ";\n" },
-        .{ .head = "const x = a", .repeat = ".b", .middle = "", .close = "", .tail = ";\n" },
-        .{ .head = "const x = ", .repeat = "f(", .middle = "", .close = "", .tail = "" },
+        .{ .head = "const x = ", .repeat = "(", .middle = "1", .close = ")", .tail = ";\n", .limited = true },
+        .{ .head = "const x = ", .repeat = "!", .middle = "y", .close = "", .tail = ";\n", .limited = true },
+        .{ .head = "const T = ", .repeat = "?", .middle = "u8", .close = "", .tail = ";\n", .limited = true },
+        .{ .head = "fn f() void ", .repeat = "{", .middle = "", .close = "}", .tail = "\n", .limited = true },
+        .{ .head = "fn f(x: u32) void {\n    if (x == 0) {}", .repeat = " else if (x == 1) {}", .middle = " else {}", .close = "", .tail = "\n}\n", .limited = true },
+        .{ .head = "const x = ", .repeat = "1 + ", .middle = "1", .close = "", .tail = ";\n", .limited = false },
+        .{ .head = "const x = a", .repeat = ".b", .middle = "", .close = "", .tail = ";\n", .limited = false },
+        .{ .head = "const x = ", .repeat = "f(", .middle = "", .close = "", .tail = "", .limited = true },
     };
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(a);
@@ -267,6 +286,18 @@ test "nesting beyond the limits: lossless, bounded depth, marked deep" {
         defer parse.destroy();
         try testing.expect(parse.deep);
         try testing.expect(try treeDepth(parse.rootNode()) <= max_depth);
+        // 收纳了展平内容的节点改为只有 token 的错误节点，区间记录在 `flattened` 中
+        try testing.expect(parse.flattened.len > 0);
+        for (parse.flattened) |range| {
+            const node = nodeAt(parse.rootNode(), range) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(.error_node, node.kind());
+            var it = node.children();
+            while (it.next()) |e| try testing.expect(e == .token);
+        }
+        const limited = for (parse.errors) |e| {
+            if (std.mem.eql(u8, e.message, "nesting too deep")) break true;
+        } else false;
+        try testing.expectEqual(c.limited, limited);
         try expectLossless(src.items);
     }
 }

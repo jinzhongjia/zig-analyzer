@@ -85,6 +85,12 @@ pub const Builder = struct {
         try b.children.append(b.gpa, .initToken(kind, text));
     }
 
+    /// 改变最内层未闭合节点的种类
+    pub fn retype(b: *Builder, kind: SyntaxKind) void {
+        std.debug.assert(!isToken(kind));
+        b.stack.items[b.stack.items.len - 1].kind = kind;
+    }
+
     pub fn finishNode(b: *Builder) Allocator.Error!void {
         const open = b.stack.pop().?;
         const elems = b.children.items[open.start..];
