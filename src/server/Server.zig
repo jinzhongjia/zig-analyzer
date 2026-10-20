@@ -421,6 +421,10 @@ const request_handlers = .{
     .{ "shutdown", Mode.sync, shutdown },
     .{ "zig-analyzer/waitIdle", Mode.background, waitIdleRequest },
     .{ "zig-analyzer/status", Mode.read, status },
+    .{ "zig-analyzer/fileStatus", Mode.read, fileStatus },
+    .{ "zig-analyzer/syntaxTree", Mode.read, syntaxTree },
+    .{ "zig-analyzer/moduleGraph", Mode.read, moduleGraph },
+    .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
     .{ "textDocument/formatting", Mode.read, formatting },
     .{ "textDocument/documentSymbol", Mode.read, documentSymbol },
     .{ "textDocument/foldingRange", Mode.read, foldingRange },
@@ -3403,6 +3407,131 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         } };
     }
     return out;
+}
+
+/// 以文档为参数的检查请求
+const DocumentParams = struct { textDocument: types.TextDocumentIdentifier };
+
+const FileStatusResult = struct {
+    path: []const u8,
+    /// 文件的来源（见 `origin.Origin`）
+    origin: origin.Origin,
+    /// 编译上下文（见 `FileContext`）
+    context: FileContext,
+    open: bool,
+    /// 文件在模块图中所属的模块（以根文件表示，标准库为 `std`，尚未得知路径的生成文件为空串），按优先级排列；
+    /// 不在模块图中时为空
+    modules: []const []const u8,
+    /// 包含它的项目的根目录及其最近一次构建
+    projects: []const struct { root: []const u8, last_build: ?Workspace.LastBuild },
+    /// 读过它（或在其中报告了错误）的单文件编译的根文件
+    single_file_roots: []const []const u8,
+};
+
+/// 文件被当作什么处理：来源、编译上下文、所属的模块与项目、相关的单文件编译。用户报告诊断或名字解析的问题时
+/// 据此判断
+fn fileStatus(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?FileStatusResult {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const open = blk: {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        break :blk server.open_docs.contains(file);
+    };
+    var modules: std.ArrayList([]const u8) = .empty;
+    if (try ctx.get(ModuleGraph.Input, {})) |g| if (g.entry(file)) |e| {
+        try modules.append(arena, server.moduleName(g, e.module));
+        for (e.others) |m| try modules.append(arena, server.moduleName(g, m));
+    };
+    const Project = @typeInfo(@FieldType(FileStatusResult, "projects")).pointer.child;
+    var projects: std.ArrayList(Project) = .empty;
+    {
+        const list = try server.workspaceList(arena);
+        defer server.releaseList(arena, list);
+        for (list) |ws| if (ws.contains(file)) try projects.append(arena, .{ .root = try arena.dupe(u8, ws.root), .last_build = ws.lastBuild() });
+    }
+    var roots: std.ArrayList([]const u8) = .empty;
+    {
+        server.single_mutex.lockUncancelable(server.io);
+        defer server.single_mutex.unlock(server.io);
+        for (server.single.keys(), server.single.values()) |root, *sf| {
+            if (root == file or sf.inputs.contains(file) or sf.files.contains(file)) try roots.append(arena, server.vfs.path(root));
+        }
+    }
+    return .{
+        .path = server.vfs.path(file),
+        .origin = server.fileOrigin(file),
+        .context = server.fileContext(file),
+        .open = open,
+        .modules = modules.items,
+        .projects = projects.items,
+        .single_file_roots = roots.items,
+    };
+}
+
+fn moduleName(server: *Server, g: *const ModuleGraph, module: u32) []const u8 {
+    if (module == ModuleGraph.std_module) return "std";
+    const root = g.modules[module].root orelse return "";
+    return server.vfs.path(root);
+}
+
+/// 文档的语法树：缩进的节点与 token（不含 trivia），之后是语法错误。用于判断解析与错误恢复的问题
+fn syntaxTree(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?[]const u8 {
+    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    parse.rootNode().dump(&out.writer, .{}) catch return error.OutOfMemory;
+    for (parse.errors) |e| out.writer.print("error@{d}: {s}\n", .{ e.offset, e.message }) catch return error.OutOfMemory;
+    return out.written();
+}
+
+const ModuleGraphResult = struct {
+    /// 标准库的根文件
+    std_root: ?[]const u8,
+    modules: []const struct {
+        /// 根文件；尚未得知路径的生成文件为 null
+        root: ?[]const u8,
+        /// 按模块参数生成的 builtin.zig
+        builtin: ?[]const u8,
+        imports: []const struct { name: []const u8, module: u32 },
+        /// 属于它的文件数（含同时属于其他模块的）
+        files: usize,
+    },
+};
+
+/// 模块图（由各项目的构建图汇总，见 `updateModuleGraph`）：各模块的根文件、builtin、import 与文件数。用于判断
+/// import 与名字解析的问题
+fn moduleGraph(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) HandlerError!ModuleGraphResult {
+    const g = try ctx.get(ModuleGraph.Input, {}) orelse return .{ .std_root = null, .modules = &.{} };
+    const Item = @typeInfo(@FieldType(ModuleGraphResult, "modules")).pointer.child;
+    const Import = @typeInfo(@FieldType(Item, "imports")).pointer.child;
+    const out = try arena.alloc(Item, g.modules.len);
+    for (g.modules, out) |m, *o| {
+        const imports = try arena.alloc(Import, m.imports.len);
+        // 响应在读事务结束后才序列化：模块图可能已被替换，名字复制出来
+        for (m.imports, imports) |imp, *x| x.* = .{ .name = try arena.dupe(u8, imp.name), .module = imp.module };
+        o.* = .{
+            .root = if (m.root) |r| server.vfs.path(r) else null,
+            .builtin = if (m.builtin) |b| server.vfs.path(b) else null,
+            .imports = imports,
+            .files = 0,
+        };
+    }
+    // 标准库文件（`std_module`）不计入
+    for (g.files) |e| {
+        if (e.module < out.len) out[e.module].files += 1;
+        for (e.others) |m| if (m < out.len) {
+            out[m].files += 1;
+        };
+    }
+    return .{ .std_root = if (g.std_root) |r| server.vfs.path(r) else null, .modules = out };
+}
+
+/// 重启全部项目（同保存 build.zig）：构建图或编译结果需要手动刷新时使用
+fn reloadWorkspace(server: *Server, arena: Allocator, _: void) HandlerError!void {
+    const list = try server.workspaceList(arena);
+    defer server.releaseList(arena, list);
+    if (list.len != 0) log.info("restarting projects on request", .{});
+    for (list) |ws| server.restartWorkspace(ws, 0);
 }
 
 fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!StatusResult {

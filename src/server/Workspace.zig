@@ -70,6 +70,8 @@ build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 result: ?*compiler.BuildResult = null,
 /// `result` 存入时取的编译结果序号（见 `Server.nextCompileGeneration`）：越大越新
 result_generation: u64 = 0,
+/// `result` 存入的时刻（Unix 毫秒）
+result_at_ms: i64 = 0,
 /// FileId → `result` 中的条目
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
 building: bool = false,
@@ -640,6 +642,7 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         ws.result_files.deinit(ws.gpa);
         ws.result = result;
         ws.result_generation = ws.server.nextCompileGeneration();
+        ws.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
         ws.result_files = files;
     }
     // 重启产生的新实例：首个结果连同模型与编译集合一起替换旧实例
@@ -660,6 +663,19 @@ fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     defer ws.gpa.free(stale);
     ws.server.publishFiles(stale, true);
     ws.server.reconcileSingle();
+}
+
+/// 最近一次构建的结果：存入的时刻（Unix 毫秒）、有编译器诊断的文件数与诊断数
+pub const LastBuild = struct { at_ms: i64, files: usize, diagnostics: usize };
+
+/// 还没有结果时为 null
+pub fn lastBuild(ws: *Workspace) ?LastBuild {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const r = ws.result orelse return null;
+    var diagnostics: usize = 0;
+    for (r.files.values()) |fr| diagnostics += fr.items.len;
+    return .{ .at_ms = ws.result_at_ms, .files = r.files.count(), .diagnostics = diagnostics };
 }
 
 /// 清除编译器诊断，重新发布发布过诊断的文件

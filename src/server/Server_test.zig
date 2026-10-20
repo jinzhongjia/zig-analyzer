@@ -308,6 +308,53 @@ test "syntax features end to end" {
     try testing.expectEqual(4, sel.get("range").?.object.get("start").?.object.get("character").?.integer);
 }
 
+test "inspection requests for a standalone file: file status, syntax tree, module graph and reload" {
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\","languageId":"zig","version":1,"text":"const a = ;\n"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":2,"method":"zig-analyzer/fileStatus","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":3,"method":"zig-analyzer/syntaxTree","params":{"textDocument":{"uri":"
+    ++ file_uri ++
+        \\"}}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":4,"method":"zig-analyzer/moduleGraph"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":5,"method":"zig-analyzer/reloadWorkspace"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":6,"method":"shutdown"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+
+    const msgs = try s.messages();
+    var by_id: [7]?std.json.ObjectMap = @splat(null);
+    for (msgs) |m| by_id[@intCast(m.object.get("id").?.integer)] = m.object;
+
+    // 没有工作区、不属于任何项目的独立文件
+    const status = by_id[2].?.get("result").?.object;
+    try testing.expectEqualStrings("other", status.get("origin").?.string);
+    try testing.expectEqualStrings("detached", status.get("context").?.string);
+    try testing.expect(status.get("open").?.bool);
+    try testing.expectEqual(0, status.get("modules").?.array.items.len);
+    try testing.expectEqual(0, status.get("projects").?.array.items.len);
+
+    const tree = by_id[3].?.get("result").?.string;
+    try testing.expect(std.mem.startsWith(u8, tree, "source_file@0..12\n"));
+    try testing.expect(std.mem.indexOf(u8, tree, "error@") != null);
+
+    try testing.expectEqual(0, by_id[4].?.get("result").?.object.get("modules").?.array.items.len);
+    try testing.expect(by_id[5].?.get("error") == null);
+}
+
 test "requests before initialize return ServerNotInitialized, unknown methods return MethodNotFound" {
     var s: Session = undefined;
     try s.run(frame(

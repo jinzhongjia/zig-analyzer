@@ -822,6 +822,45 @@ test "workspace symbols list dependency packages only when enabled" {
     try shutdown(&h);
 }
 
+test "inspection requests for a project file: file status, module graph, reload restarts the project" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root, false);
+    try waitIdle(&h);
+    const main_path = try project.path(a, "src/main.zig");
+    const main_uri = try za.base.uri.fromPath(a, main_path);
+
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = main_uri } })).object.get("result").?.object;
+    try testing.expectEqualStrings("user", status.get("origin").?.string);
+    try testing.expectEqualStrings("project", status.get("context").?.string);
+    try testing.expectEqualStrings(main_path, status.get("modules").?.array.items[0].string);
+    const projects = status.get("projects").?.array.items;
+    try testing.expectEqual(1, projects.len);
+    try testing.expectEqualStrings(project.root, projects[0].object.get("root").?.string);
+    // 示例项目有编译错误
+    try testing.expect(projects[0].object.get("last_build").?.object.get("diagnostics").?.integer > 0);
+
+    const graph = (try h.request("zig-analyzer/moduleGraph", {})).object.get("result").?.object;
+    const main_module = for (graph.get("modules").?.array.items) |m| {
+        const root = m.object.get("root").?;
+        if (root == .string and std.mem.eql(u8, root.string, main_path)) break m.object;
+    } else return error.TestUnexpectedResult;
+    for (main_module.get("imports").?.array.items) |imp| {
+        if (std.mem.eql(u8, imp.object.get("name").?.string, "lib")) break;
+    } else return error.TestUnexpectedResult;
+
+    // 重新加载：新实例替换旧实例
+    const before = h.server.workspaces.items[0];
+    _ = try h.request("zig-analyzer/reloadWorkspace", {});
+    try waitIdle(&h);
+    try testing.expect(h.server.workspaces.items[0] != before);
+    try shutdown(&h);
+}
+
 test "single-file mode: errors in imported files are published on them and cleared after a fix" {
     const a_text =
         \\const b = @import("b.zig");
