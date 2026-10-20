@@ -499,6 +499,24 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "slice ptr keeps the sentinel" {
+    try expectTypes(
+        \\fn probe(s: [:0]const u8, m: [:0]u8, cs: []const u8) void {
+        \\    const v_sent_ptr = s.ptr;
+        \\    const v_sent_mut_ptr = m.ptr;
+        \\    const v_slice_ptr = cs.ptr;
+        \\    _ = .{ v_sent_ptr, v_sent_mut_ptr, v_slice_ptr };
+        \\}
+        \\comptime {
+        \\    _ = &probe;
+        \\}
+    , &.{
+        .{ "v_sent_ptr", "[*:0]const u8" },
+        .{ "v_sent_mut_ptr", "[*:0]u8" },
+        .{ "v_slice_ptr", "[*]const u8" },
+    });
+}
+
 test "switch on an error set narrows the capture" {
     try expectTypes(
         \\const E = error{ A, B, C };

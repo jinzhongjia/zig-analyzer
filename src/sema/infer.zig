@@ -989,7 +989,7 @@ const Inferrer = struct {
             },
             .ptr_type => |p| if (p.size == .slice) {
                 if (std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type };
-                if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.ptrTo(p.child, .many, p.is_const) };
+                if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } }) };
             },
             // 元组、匿名结构体、构造的结构体与 union
             .tuple_type, .anon_struct_type, .reified_type => {
