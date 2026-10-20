@@ -58,6 +58,10 @@ pending: std.ArrayList(*Pending) = .empty,
 /// 而 `Io.Group` 不允许在 await 期间提交，因此只在退出时（所有项目停止后）cancel 一次；
 /// 平时用 `busy` 计数判断是否空闲。
 bg_group: Io.Group = .init,
+/// 诊断发布队列：固定数量的 worker 依次取出，避免按文件线性的任务与读事务
+publish_queue_mutex: Io.Mutex = .init,
+publish_queue: std.ArrayList(PublishJob) = .empty,
+publish_workers: usize = 0,
 busy_mutex: Io.Mutex = .init,
 busy_cond: Io.Condition = .init,
 busy: usize = 0,
@@ -243,6 +247,7 @@ pub fn deinit(server: *Server) void {
         w.destroy();
     }
     // 后台任务都已结束，只剩列表持有的引用
+    server.publish_queue.deinit(server.gpa);
     for (server.workspaces.items) |ws| ws.release();
     server.workspaces.deinit(server.gpa);
     server.indexed.deinit(server.gpa);
@@ -2189,11 +2194,68 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
 
 // ── 诊断发布 ───────────────────────────────────────────────────
 
+/// 每批发布的并发上限：大批量变更（watcher、构建错误）不能按文件数生成任务与读事务
+pub const max_publish_workers = 8;
+
+const PublishJob = struct { file: Vfs.FileId, clear: bool };
+
 /// 在后台重新计算并发布这些文件的诊断。`clear` 为 true 时即使没有诊断也发布（用于清除旧诊断）。
+/// 任务数不超过 `max_publish_workers`，同一文件在一次调用中去重
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
+    if (files.len == 0) return;
+    // 同一次调用的文件去重；`clear` 取并集
+    var unique: std.AutoArrayHashMapUnmanaged(Vfs.FileId, bool) = .empty;
+    defer unique.deinit(server.gpa);
+    var deduped = true;
     for (files) |file| {
+        const gop = unique.getOrPut(server.gpa, file) catch {
+            deduped = false;
+            break;
+        };
+        if (gop.found_existing) gop.value_ptr.* = gop.value_ptr.* or clear else gop.value_ptr.* = clear;
+    }
+    var spawn_count: usize = 0;
+    {
+        server.publish_queue_mutex.lockUncancelable(server.io);
+        defer server.publish_queue_mutex.unlock(server.io);
+        if (deduped) {
+            for (unique.keys(), unique.values()) |file, c| server.publish_queue.append(server.gpa, .{ .file = file, .clear = c }) catch {};
+        } else {
+            for (files) |file| server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear }) catch {};
+        }
+        if (server.publish_workers < max_publish_workers and server.publish_queue.items.len != 0) {
+            spawn_count = @min(max_publish_workers - server.publish_workers, server.publish_queue.items.len);
+            server.publish_workers += spawn_count;
+        }
+    }
+    for (0..spawn_count) |_| {
         server.busyBegin();
-        spawn(server.io, &server.bg_group, publishTask, .{ server, file, clear });
+        spawn(server.io, &server.bg_group, publishWorker, .{server});
+    }
+}
+
+fn publishWorker(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    var counted = true;
+    defer if (counted) {
+        server.publish_queue_mutex.lockUncancelable(server.io);
+        server.publish_workers -= 1;
+        server.publish_queue_mutex.unlock(server.io);
+    };
+    while (true) {
+        const job = blk: {
+            server.publish_queue_mutex.lockUncancelable(server.io);
+            defer server.publish_queue_mutex.unlock(server.io);
+            if (server.publish_queue.items.len == 0) {
+                // 与入队用同一把锁：退出前先减计数，避免入队方看到 worker 仍在而不再补任务
+                server.publish_workers -= 1;
+                counted = false;
+                return;
+            }
+            break :blk server.publish_queue.swapRemove(0);
+        };
+        server.publishNow(job.file, job.clear, null);
+        server.maybeResetSema();
     }
 }
 
@@ -2254,12 +2316,6 @@ fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
     server.edits_mutex.lockUncancelable(server.io);
     defer server.edits_mutex.unlock(server.io);
     return if (server.edits.get(file)) |e| e.generation else 0;
-}
-
-fn publishTask(server: *Server, file: Vfs.FileId, clear: bool) Io.Cancelable!void {
-    defer server.busyEnd();
-    server.publishNow(file, clear, null);
-    server.maybeResetSema();
 }
 
 /// InternPool 超过 `sema.max_intern_pool_mb` 时整代回收（见 `resetSema`）。在读事务之外的空闲处调用
@@ -2448,6 +2504,46 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
         try sent.print(gpa, "{s}:{d} ", .{ uri_text[uri_text.len - 5 ..], params.get("diagnostics").?.array.items.len });
     } else |err| if (err != error.EndOfStream) return err;
     try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 ", sent.items);
+}
+
+test "publishFiles: large batches use a bounded number of workers" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    const text = "fn f() void {\n    var x = 1;\n}\n";
+    const files = try gpa.alloc(Vfs.FileId, 200);
+    defer gpa.free(files);
+    for (files, 0..) |*file, i| {
+        const path = try std.fmt.allocPrint(gpa, "/tmp/zig-analyzer-publish-{d}.zig", .{i});
+        defer gpa.free(path);
+        file.* = try server.vfs.intern(path);
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, file.*, try gpa.dupe(u8, text), .low);
+    }
+    server.publishFiles(files, true);
+    {
+        server.publish_queue_mutex.lockUncancelable(server.io);
+        defer server.publish_queue_mutex.unlock(server.io);
+        try std.testing.expect(server.publish_workers <= max_publish_workers);
+    }
+    server.waitIdle();
+
+    var reader: Io.Reader = .fixed(out.written());
+    var published: usize = 0;
+    while (transport.readMessage(&reader, gpa)) |body| {
+        defer gpa.free(body);
+        const msg = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer msg.deinit();
+        const method = msg.value.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) published += 1;
+    } else |err| if (err != error.EndOfStream) return err;
+    try std.testing.expectEqual(files.len, published);
 }
 
 /// 是否发布文件的 live 诊断：不属于任何项目，或所属的项目中有一个认为需要（见 `Workspace.liveEligible`）
