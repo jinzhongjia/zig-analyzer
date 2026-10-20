@@ -499,6 +499,39 @@ test "arithmetic operands have no result type" {
     });
 }
 
+test "float narrowing rounds to the target type" {
+    try expectTypes(
+        \\fn widen(x: f32) f64 {
+        \\    return x;
+        \\}
+        \\fn pick() u8 {
+        \\    const x: f32 = 0.1;
+        \\    const y: f64 = x;
+        \\    return if (y == 0.1) 1 else 2;
+        \\}
+        \\fn diff() f64 {
+        \\    const x: f32 = 0.1;
+        \\    const y: f64 = x;
+        \\    return y - 0.1;
+        \\}
+        \\const a = @as(f64, @as(f32, 0.1));
+        \\const b = widen(0.1);
+        \\const c = pick();
+        \\const d = diff();
+        \\const e = @as(f64, @as(f16, 0.1));
+        \\comptime {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+    , &.{
+        .{ "a", "f64 = 0.10000000149011612" },
+        .{ "b", "f64 = 0.10000000149011612" },
+        // f32 的 0.1 与字面量不等：走 else
+        .{ "c", "u8 = 2" },
+        .{ "d", "f64 = 0.0000000014901161138336505" },
+        .{ "e", "f64 = 0.0999755859375" },
+    });
+}
+
 test "slice ptr keeps the sentinel" {
     try expectTypes(
         \\fn probe(s: [:0]const u8, m: [:0]u8, cs: []const u8) void {

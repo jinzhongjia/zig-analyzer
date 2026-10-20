@@ -2171,6 +2171,11 @@ const Evaluator = struct {
                     }
                     return Val.of(t, cx);
                 },
+                // 浮点值转换到浮点 / 整数类型：按目标精度舍入或取整，不能只改类型标签
+                .float_value => if (ip.isFloat(t) or ip.isInt(t)) {
+                    const cx = try value.coerceValue(ip, x, t) orelse return error.Abort;
+                    return Val.of(t, cx);
+                },
                 .union_value => |u| if (value.isEnumType(ip, t)) {
                     // union 转换为其标签
                     return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = u.tag } }));
