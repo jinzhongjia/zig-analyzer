@@ -190,6 +190,60 @@ test "workspace folders: added folders start a project, removed ones clear its d
     try h.notify("exit", {});
 }
 
+test "removed workspace folder: open files switch to single-file compilation" {
+    const main_text =
+        \\pub fn main() void {
+        \\    const x: u32 = "s";
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    const build_zig =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.graph.host,
+        \\    }) });
+        \\    b.installArtifact(exe);
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = build_zig },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_path = try project.path(a, "main.zig");
+    const main_uri = try za.base.uri.fromPath(a, main_path);
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const before = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
+    try testing.expect(std.mem.indexOf(u8, before[0], "expected type 'u32'") != null);
+
+    // 移除根目录：打开的文件转为单文件编译并重新发布
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &.{.{ .uri = root_uri, .name = "p" }} } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const after = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
+    try testing.expectEqual(1, after.len);
+    try testing.expect(std.mem.indexOf(u8, after[0], "expected type 'u32'") != null);
+    // 结果来自单文件模式
+    h.server.single_mutex.lockUncancelable(testing.io);
+    const single_count = h.server.single.count();
+    h.server.single_mutex.unlock(testing.io);
+    try testing.expect(single_count > 0);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "untitled documents: diagnostics and hover use the original URI" {
     var project = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
     defer project.deinit();
