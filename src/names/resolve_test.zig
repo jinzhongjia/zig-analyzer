@@ -10,7 +10,8 @@ const ModuleGraph = @import("ModuleGraph.zig");
 const resolve = @import("resolve.zig");
 const definition = @import("../ide/definition.zig");
 const completion = @import("../ide/completion.zig");
-const native = @import("../util/test_path.zig").native;
+const test_path = @import("../util/test_path.zig");
+const native = test_path.native;
 const InternPool = @import("../sema/InternPool.zig");
 
 /// 内存中的项目：文件内容直接设置为 input，模块图手工构造
@@ -39,9 +40,16 @@ pub const World = struct {
         w.arena.deinit();
     }
 
-    /// 添加文件；返回去掉 `<|>` 后的光标位置（没有标记时为 0）
-    pub fn add(w: *World, comptime path: []const u8, text: []const u8) !struct { file: FileId, cursor: u32 } {
-        const file = try w.vfs.intern(native(path));
+    /// 添加的文件与去掉 `<|>` 后的光标位置（没有标记时为 0）
+    pub const Added = struct { file: FileId, cursor: u32 };
+
+    pub fn add(w: *World, comptime path: []const u8, text: []const u8) !Added {
+        return w.addNative(native(path), text);
+    }
+
+    /// 同 `add`，`path` 已是本机路径
+    fn addNative(w: *World, path: []const u8, text: []const u8) !Added {
+        const file = try w.vfs.intern(path);
         const cursor = std.mem.indexOf(u8, text, "<|>");
         const clean = if (cursor) |c| try std.mem.concat(testing.allocator, u8, &.{ text[0..c], text[c + 3 ..] }) else try testing.allocator.dupe(u8, text);
         w.db.beginWrite();
@@ -62,6 +70,140 @@ pub const World = struct {
         w.db.beginWrite();
         defer w.db.endWrite();
         try w.db.set(ModuleGraph.Input, {}, g, .low);
+    }
+
+    /// `fixture` 中的文件与 `<|>` 的位置
+    pub const Fixture = struct {
+        /// fixture 中写的路径（posix 写法）与对应的文件
+        paths: []const []const u8,
+        files: []const FileId,
+        /// `<|>` 所在的文件与去掉标记后的位置
+        cursor: ?struct { file: FileId, offset: u32 } = null,
+
+        pub fn file(f: Fixture, path: []const u8) FileId {
+            for (f.paths, f.files) |p, id| if (std.mem.eql(u8, p, path)) return id;
+            std.debug.panic("fixture has no file {s}", .{path});
+        }
+    };
+
+    /// 多文件、多模块的测试项目（参照 rust-analyzer 的 fixture）。每个文件以一行 `//- <路径> <属性>...` 开始，路径用
+    /// posix 写法。属性决定文件在模块图中的位置，没有属性的文件不在模块图中：
+    /// - `std`：标准库中的文件，其中的 `std.zig` 是标准库的根；
+    /// - `module:<名字>`：作为这个模块的根，紧随其后的 `deps:<名字>[=<模块>],...` 是这个模块的 import（import 的名字
+    ///   与模块名相同时省略 `=<模块>`）；同一行可以有多个 `module:`，即同一个根文件属于多个模块；
+    /// - `in:<模块>`：属于这个模块。
+    /// 模块按声明顺序编号，文件属于多个模块时先写的优先。模块的 `@import("root")` 指向按声明顺序第一个能经由
+    /// import 到达它的、没有被其他模块 import 的模块
+    pub fn fixture(w: *World, text: []const u8) !Fixture {
+        const a = w.arena.allocator();
+        const Block = struct { path: []const u8, attrs: []const u8, body: std.ArrayList(u8) = .empty };
+        var blocks: std.ArrayList(Block) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "//- ")) {
+                const spec = std.mem.trim(u8, line[4..], " ");
+                const space = std.mem.indexOfScalar(u8, spec, ' ') orelse spec.len;
+                try blocks.append(a, .{ .path = spec[0..space], .attrs = spec[space..] });
+                continue;
+            }
+            if (blocks.items.len == 0) return error.FixtureTextBeforeFirstFile;
+            const body = &blocks.items[blocks.items.len - 1].body;
+            try body.appendSlice(a, line);
+            try body.append(a, '\n');
+        }
+
+        var out: Fixture = .{ .paths = &.{}, .files = &.{} };
+        const paths = try a.alloc([]const u8, blocks.items.len);
+        const ids = try a.alloc(FileId, blocks.items.len);
+        for (blocks.items, paths, ids) |b, *p, *id| {
+            const added = try w.addNative(try test_path.nativeAlloc(a, b.path), b.body.items);
+            p.* = b.path;
+            id.* = added.file;
+            if (std.mem.indexOf(u8, b.body.items, "<|>") != null) out.cursor = .{ .file = added.file, .offset = added.cursor };
+        }
+        out.paths = paths;
+        out.files = ids;
+
+        // 模块按声明顺序编号
+        const Decl = struct { name: []const u8, root: FileId, deps: []const u8 = "" };
+        var decls: std.ArrayList(Decl) = .empty;
+        for (blocks.items, ids) |b, id| {
+            var it = std.mem.tokenizeScalar(u8, b.attrs, ' ');
+            while (it.next()) |attr| {
+                if (std.mem.startsWith(u8, attr, "module:")) {
+                    try decls.append(a, .{ .name = attr["module:".len..], .root = id });
+                } else if (std.mem.startsWith(u8, attr, "deps:")) {
+                    if (decls.items.len == 0) return error.FixtureDepsWithoutModule;
+                    decls.items[decls.items.len - 1].deps = attr["deps:".len..];
+                }
+            }
+        }
+        const Index = struct {
+            fn of(ds: []const Decl, name: []const u8) !u32 {
+                for (ds, 0..) |d, i| if (std.mem.eql(u8, d.name, name)) return @intCast(i);
+                return error.FixtureUnknownModule;
+            }
+        };
+        const modules = try a.alloc(ModuleGraph.Module, decls.items.len);
+        for (decls.items, modules) |d, *m| {
+            var imports: std.ArrayList(ModuleGraph.Import) = .empty;
+            var deps = std.mem.tokenizeScalar(u8, d.deps, ',');
+            while (deps.next()) |dep| {
+                const eq = std.mem.indexOfScalar(u8, dep, '=');
+                const target = if (eq) |e| dep[e + 1 ..] else dep;
+                try imports.append(a, .{ .name = if (eq) |e| dep[0..e] else dep, .module = try Index.of(decls.items, target) });
+            }
+            m.* = .{ .root = d.root, .imports = imports.items };
+        }
+
+        // 各模块的根模块：从没有被 import 的模块出发按声明顺序遍历，先到达的为准
+        const imported = try a.alloc(bool, modules.len);
+        @memset(imported, false);
+        for (modules) |m| for (m.imports) |imp| {
+            imported[imp.module] = true;
+        };
+        const root_of = try a.alloc(u32, modules.len);
+        @memset(root_of, 0);
+        const reached = try a.alloc(bool, modules.len);
+        @memset(reached, false);
+        for (0..modules.len) |r| {
+            if (imported[r]) continue;
+            var queue: std.ArrayList(u32) = .empty;
+            try queue.append(a, @intCast(r));
+            var i: usize = 0;
+            while (i < queue.items.len) : (i += 1) {
+                const m = queue.items[i];
+                if (reached[m]) continue;
+                reached[m] = true;
+                root_of[m] = @intCast(r);
+                for (modules[m].imports) |imp| try queue.append(a, imp.module);
+            }
+        }
+
+        var entries: std.ArrayList(ModuleGraph.FileEntry) = .empty;
+        var std_root: ?FileId = null;
+        for (blocks.items, ids) |b, id| {
+            var in: std.ArrayList(u32) = .empty;
+            var is_std = false;
+            var it = std.mem.tokenizeScalar(u8, b.attrs, ' ');
+            while (it.next()) |attr| {
+                if (std.mem.eql(u8, attr, "std")) {
+                    is_std = true;
+                } else if (std.mem.startsWith(u8, attr, "module:")) {
+                    try in.append(a, try Index.of(decls.items, attr["module:".len..]));
+                } else if (std.mem.startsWith(u8, attr, "in:")) {
+                    try in.append(a, try Index.of(decls.items, attr["in:".len..]));
+                } else if (!std.mem.startsWith(u8, attr, "deps:")) return error.FixtureUnknownAttribute;
+            }
+            if (is_std) {
+                try entries.append(a, .{ .file = id, .module = ModuleGraph.std_module, .root_module = 0 });
+                if (std.mem.endsWith(u8, b.path, "/std.zig")) std_root = id;
+            } else if (in.items.len != 0) {
+                try entries.append(a, .{ .file = id, .module = in.items[0], .root_module = root_of[in.items[0]], .others = in.items[1..] });
+            }
+        }
+        try w.setGraph(std_root, modules, entries.items);
+        return out;
     }
 
     /// 设置与目标相关的值运算参数（同 Server 更新模块图时）
@@ -113,6 +255,49 @@ pub const World = struct {
     }
 };
 
+test "fixture builds the module graph from file attributes" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:exe deps:dep=a module:test deps:dep=b
+        \\const dep = @import("dep");<|>
+        \\//- /p/a.zig module:a
+        \\//- /p/b.zig module:b
+        \\//- /p/b_util.zig in:b
+        \\//- /p/notes.zig
+        \\//- /zig/std/std.zig std
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    const g = (try ctx.get(ModuleGraph.Input, {})).?;
+    try testing.expectEqual(f.file("/zig/std/std.zig"), g.std_root.?);
+    try testing.expectEqual(4, g.modules.len);
+    try testing.expectEqual(f.file("/p/main.zig"), g.modules[1].root.?);
+    try testing.expectEqualStrings("dep", g.modules[1].imports[0].name);
+    try testing.expectEqual(3, g.modules[1].imports[0].module);
+    try testing.expectEqual(f.file("/p/main.zig"), f.cursor.?.file);
+    try testing.expectEqual(std.mem.indexOf(u8, "const dep = @import(\"dep\");", ";").? + 1, f.cursor.?.offset);
+    // 先写的模块优先，被 test 的模块 import 的 b 以它为根
+    const Expect = struct { path: []const u8, module: u32, root: u32, others: []const u32 = &.{} };
+    for ([_]Expect{
+        .{ .path = "/p/main.zig", .module = 0, .root = 0, .others = &.{1} },
+        .{ .path = "/p/a.zig", .module = 2, .root = 0 },
+        .{ .path = "/p/b.zig", .module = 3, .root = 1 },
+        .{ .path = "/p/b_util.zig", .module = 3, .root = 1 },
+        .{ .path = "/zig/std/std.zig", .module = ModuleGraph.std_module, .root = 0 },
+    }) |e| {
+        const entry = for (g.files) |x| {
+            if (x.file == f.file(e.path)) break x;
+        } else return error.TestUnexpectedResult;
+        try testing.expectEqual(e.module, entry.module);
+        try testing.expectEqual(e.root, entry.root_module);
+        try testing.expectEqualSlices(u32, e.others, entry.others);
+    }
+    // 没有属性的文件不在模块图中
+    for (g.files) |x| try testing.expect(x.file != f.file("/p/notes.zig"));
+}
+
 test "locals, params and container declarations" {
     var w: World = undefined;
     try w.init();
@@ -153,11 +338,6 @@ test "imports: relative files, modules, std and root" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
-    const std_root = try w.add("/zig/std/std.zig", "pub const mem = @import(\"mem.zig\");\nconst hidden = 1;\n");
-    const mem = try w.add("/zig/std/mem.zig", "pub const Allocator = @import(\"mem/Allocator.zig\");\npub fn eql() bool {}\nfn private() void {}\n");
-    _ = try w.add("/zig/std/mem/Allocator.zig", "ptr: *anyopaque,\npub fn alloc() void {}\n");
-    const lib = try w.add("/p/lib/lib.zig", "pub const Point = struct { x: i32, pub fn origin() Point {} };\n");
-    _ = try w.add("/p/src/util.zig", "pub fn helper() void {}\n");
     const src =
         \\const std = @import("std");
         \\const lib = @import("lib");
@@ -172,16 +352,23 @@ test "imports: relative files, modules, std and root" {
         \\    std.mem.<|>
         \\}
     ;
-    const main = try w.add("/p/src/main.zig", src);
-    try w.setGraph(std_root.file, &.{
-        .{ .root = main.file, .imports = &.{.{ .name = "lib", .module = 1 }} },
-        .{ .root = lib.file, .imports = &.{} },
-    }, &.{
-        .{ .file = main.file, .module = 0, .root_module = 0 },
-        .{ .file = lib.file, .module = 1, .root_module = 0 },
-        .{ .file = std_root.file, .module = ModuleGraph.std_module, .root_module = 0 },
-        .{ .file = mem.file, .module = ModuleGraph.std_module, .root_module = 0 },
-    });
+    const f = try w.fixture("//- /p/src/main.zig module:main deps:lib\n" ++ src ++ "\n" ++
+        \\//- /p/lib/lib.zig module:lib
+        \\pub const Point = struct { x: i32, pub fn origin() Point {} };
+        \\//- /p/src/util.zig
+        \\pub fn helper() void {}
+        \\//- /zig/std/std.zig std
+        \\pub const mem = @import("mem.zig");
+        \\const hidden = 1;
+        \\//- /zig/std/mem.zig std
+        \\pub const Allocator = @import("mem/Allocator.zig");
+        \\pub fn eql() bool {}
+        \\fn private() void {}
+        \\//- /zig/std/mem/Allocator.zig
+        \\ptr: *anyopaque,
+        \\pub fn alloc() void {}
+    );
+    const main: struct { file: FileId, cursor: u32 } = .{ .file = f.file("/p/src/main.zig"), .cursor = f.cursor.?.offset };
     const text = try std.mem.replaceOwned(u8, w.arena.allocator(), src, "<|>", "");
     const at = struct {
         fn of(t: []const u8, needle: []const u8) u32 {
@@ -205,8 +392,6 @@ test "imports of a file in several modules" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
-    const a = try w.add("/p/a.zig", "pub fn fromA() u32 {}\n");
-    const b = try w.add("/p/b.zig", "pub fn fromB() u32 {}\n");
     const src =
         \\const dep = @import("dep");
         \\pub fn main() void {
@@ -218,18 +403,14 @@ test "imports of a file in several modules" {
         \\    _ = @import("<|>");
         \\}
     ;
-    const main = try w.add("/p/src/main.zig", src);
-    // exe 的模块（0）与 test 的模块（1）共用根文件：exe 中 dep → a；test 中 dep → b，另有 helper → b
-    try w.setGraph(null, &.{
-        .{ .root = main.file, .imports = &.{.{ .name = "dep", .module = 2 }} },
-        .{ .root = main.file, .imports = &.{ .{ .name = "dep", .module = 3 }, .{ .name = "helper", .module = 3 } } },
-        .{ .root = a.file, .imports = &.{} },
-        .{ .root = b.file, .imports = &.{} },
-    }, &.{
-        .{ .file = main.file, .module = 0, .root_module = 0, .others = &.{1} },
-        .{ .file = a.file, .module = 2, .root_module = 0 },
-        .{ .file = b.file, .module = 3, .root_module = 1 },
-    });
+    // exe 的模块与 test 的模块共用根文件：exe 中 dep → a；test 中 dep → b，另有 helper → b
+    const f = try w.fixture("//- /p/src/main.zig module:exe deps:dep=a module:test deps:dep=b,helper=b\n" ++ src ++ "\n" ++
+        \\//- /p/a.zig module:a
+        \\pub fn fromA() u32 {}
+        \\//- /p/b.zig module:b
+        \\pub fn fromB() u32 {}
+    );
+    const main: struct { file: FileId, cursor: u32 } = .{ .file = f.file("/p/src/main.zig"), .cursor = f.cursor.?.offset };
     const text = try std.mem.replaceOwned(u8, w.arena.allocator(), src, "<|>", "");
     const at = struct {
         fn of(t: []const u8, needle: []const u8) u32 {

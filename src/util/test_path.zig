@@ -19,6 +19,15 @@ fn toWindows(comptime posix: []const u8) []const u8 {
     }.value;
 }
 
+/// 同 `native`，路径在运行时才知道（如从测试 fixture 中解析出来）
+pub fn nativeAlloc(a: @import("std").mem.Allocator, posix: []const u8) ![]const u8 {
+    if (builtin.os.tag != .windows) return a.dupe(u8, posix);
+    const out = try a.alloc(u8, posix.len + 2);
+    out[0..2].* = "C:".*;
+    for (posix, out[2..]) |c, *o| o.* = if (c == '/') '\\' else c;
+    return out;
+}
+
 test toWindows {
     const std = @import("std");
     try std.testing.expectEqualStrings("C:\\p\\src\\main.zig", toWindows("/p/src/main.zig"));
