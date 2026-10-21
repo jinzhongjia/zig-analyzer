@@ -628,7 +628,7 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
     std.debug.print("  completion   checked {d} member accesses: offered {d} ({d:.1}%), empty lists {d}\n", .{ n, found, @as(f64, @floatFromInt(found)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), empty });
 }
 
-/// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、补全、
+/// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、成员与名字补全、
 /// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     const a = c.arena.allocator();
@@ -664,6 +664,11 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             while (i < idents.len) : (i += step) _ = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i] });
             const dots = try samplePositions(a, text, true);
             if (dots.len > 0) _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
+            // 名字输入了两个字符时的补全：自动导入的索引（第一次在名字处补全后才建）也计入会话的内存
+            if (idents.len > 0) {
+                const at = idents[idents.len / 3];
+                _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = .{ .line = at.line, .character = at.character + 2 } });
+            }
             const end = positionOf(text, text.len);
             try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "// x" }} });
             version += 1;
