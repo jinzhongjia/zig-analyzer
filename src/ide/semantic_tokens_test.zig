@@ -751,6 +751,40 @@ test "semantic viewport inference does not grow with unrelated generic owners" {
     try testing.expectEqual(counts[0], counts[1]);
 }
 
+test "semantic tokens search no call sites where the class cannot depend on the instance" {
+    const seed = @import("../ide_db/seed.zig");
+    // 类型参数、对泛型函数的引用与对已知方法的访问在任何实例下分类相同
+    const text =
+        \\const Box = struct {
+        \\    pub fn put(self: Box, _: anytype) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn helper(_: anytype) void {}
+        \\fn generic(comptime T: type, box: Box) void {
+        \\    const size = @sizeOf(T);
+        \\    helper(size);
+        \\    box.put(size);
+        \\}
+        \\fn main() void {
+        \\    generic(u8, .{});
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const data = try tokens(&w, file, text, .utf16, null);
+    try check(data, text, .utf16, &.{
+        .{ .needle = "T: type", .ty = .typeParameter, .mods = M.declaration | M.readonly },
+        .{ .needle = "T);", .ty = .typeParameter, .mods = M.readonly },
+        .{ .needle = "helper(size)", .ty = .function },
+        .{ .needle = "put(size)", .ty = .method },
+    });
+    try testing.expectEqual(@as(u64, 0), w.db.executions(seed.Query));
+    try testing.expectEqual(@as(u64, 0), w.db.executions(seed.Instances));
+}
+
 test "semantic ranges retain uses outside the viewport and nested owner shadowing" {
     const text =
         \\fn outer() type {

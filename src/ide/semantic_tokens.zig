@@ -84,6 +84,11 @@ const Class = struct { type: TokenType, mods: u32 = 0 };
 const BindingKey = struct { owner: OwnerKey, binding: Body.BindingId };
 const BindingDecl = struct { key: BindingKey, end: u32, class: Class, can_be_unused: bool };
 
+/// 声明分类为变量或类型的成员在引用处按该处的具体类型细化（`itemClassAt`）；其他分类与类型无关
+fn dependsOnType(c: Class) bool {
+    return c.type == .variable or c.type == .type;
+}
+
 const Builder = struct {
     r: *Resolver,
     lines: offsets.LineIndex,
@@ -184,10 +189,30 @@ const Builder = struct {
     fn itemClassAt(b: *Builder, key: OwnerKey, tv: InternPool.TypedValue) resolve.Error!Class {
         const c = try b.itemClass(key);
         // 缓存只保存抽象声明分类；当前位置的具体类型不能写回并污染其他实例。
-        if ((c.type == .variable or c.type == .type) and !seed.wanted(b.r.ctx.db.env.ip, tv)) {
+        if (dependsOnType(c) and !seed.wanted(b.r.ctx.db.env.ip, tv)) {
             return b.valueClass(tv, c.type, c.mods);
         }
         return c;
+    }
+
+    /// 引用名字处的分类是否取决于该处的类型（见 `defClass`）：不取决时不必以调用点的实例推导
+    fn nameDependsOnType(b: *Builder, def: ?resolve.Def, abstract: InternPool.TypedValue, owner: OwnerKey, body: *const Body) resolve.Error!bool {
+        return switch (def orelse return false) {
+            .file => false,
+            .item => |it| dependsOnType(try b.itemClass(try b.r.ownerKey(it.file, it.item))),
+            // 类型参数在任何实例下都是类型（见 `bindingClass`）
+            .local => |local| !abstract.isType() or blk: {
+                const key = try b.r.ownerKey(local.file, local.item);
+                const lb = if (std.meta.eql(key, owner)) body else try b.r.body(local.file, local.item);
+                break :blk lb.binding(local.binding).kind != .param;
+            },
+        };
+    }
+
+    /// 成员访问与枚举字面量处的分类是否取决于该处的类型：抽象推导求不出成员时，实例可能补上成员
+    fn memberDependsOnType(b: *Builder, member: ?OwnerKey, abstract: InternPool.TypedValue) resolve.Error!bool {
+        const key = member orelse return true;
+        return seed.wanted(b.r.ctx.db.env.ip, abstract) and dependsOnType(try b.itemClass(key));
     }
 
     fn functionType(b: *Builder, key: OwnerKey, container: ItemTree.Container) resolve.Error!TokenType {
@@ -311,7 +336,11 @@ const Builder = struct {
                 if (b.visible != null and !b.visible_names.contains(node.offset + binding.range.end)) continue;
                 const id: Body.BindingId = @fromBackingInt(@as(u32, @intCast(i)));
                 a.seeded = null;
-                if (seed.wanted(a.ip, a.bindingType(id))) a.seeded = try refiner.at(binding.range.end - 1, .{ .binding = id });
+                // 类型参数在任何实例下都是类型，分类不变
+                const abstract_binding = a.bindingType(id);
+                if (seed.wanted(a.ip, abstract_binding) and !(binding.kind == .param and abstract_binding.isType())) {
+                    a.seeded = try refiner.at(binding.range.end - 1, .{ .binding = id });
+                }
                 var c = b.bindingClass(binding, a.bindingType(id));
                 c.mods |= Modifier.declaration;
                 try b.declarations.append(b.r.arena, .{
@@ -337,11 +366,15 @@ const Builder = struct {
                 if (b.visible != null and !b.visible_names.contains(node.offset + span.end)) continue;
                 a.seeded = null;
                 const abstract = a.exprType(expr_id);
+                // 只在分类可能取决于具体类型的位置以调用点的实例推导：指向函数、命名空间等的引用在任何实例下分类相同
                 switch (expr) {
-                    .name_ref => if (!builtin and seed.wanted(a.ip, abstract)) {
+                    .name_ref => if (!builtin and seed.wanted(a.ip, abstract) and try b.nameDependsOnType(lexical_def, abstract, key, body)) {
                         a.seeded = try refiner.at(span.end - 1, .{ .expr = expr_id });
                     },
-                    .field_access, .enum_literal => if (a.member(expr_id) == null or seed.wanted(a.ip, abstract)) {
+                    .field_access => |fa| if (fa.field != null and try b.memberDependsOnType(a.member(expr_id), abstract)) {
+                        a.seeded = try refiner.at(span.end - 1, .{ .expr = expr_id });
+                    },
+                    .enum_literal => if (try b.memberDependsOnType(a.member(expr_id), abstract)) {
                         a.seeded = try refiner.at(span.end - 1, .{ .expr = expr_id });
                     },
                     else => {},
@@ -397,7 +430,7 @@ const Builder = struct {
             // 裸枚举成员在容错 HIR 中也可能是 name_ref，声明覆盖该语法表达式。
             if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| if (b.visible == null or b.visible_names.contains(name.range().end)) {
                 var tv = initializer_value;
-                if ((item.kind == .@"const" or item.kind == .@"var") and seed.wanted(a.ip, tv)) if (body.value) |initializer| {
+                if ((item.kind == .@"const" or item.kind == .@"var") and seed.wanted(a.ip, tv) and dependsOnType(try b.itemClass(key))) if (body.value) |initializer| {
                     a.seeded = null;
                     const span = body.range(initializer);
                     if (span.end > span.start and seed.wanted(a.ip, a.exprType(initializer))) {
