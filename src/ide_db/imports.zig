@@ -841,6 +841,10 @@ pub const Exports = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { ns: Namespace };
     pub const Value = *const ExportIndex;
+    /// 打开过的文件各有别名指向的命名空间，闭包不淘汰时随会话增长；被淘汰的由不淘汰的 `FileDecls` 与
+    /// `FileLinks` 重新展开，只是查找与复制
+    pub const lru = 1024;
+    pub const lru_bytes = 16 * 1024 * 1024;
     pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
         const gpa = ctx.db.gpa;
         var arena: std.heap.ArenaAllocator = .init(gpa);
