@@ -170,7 +170,7 @@ pub const Resolver = struct {
             const b = try r.body(it.file, it.item);
             const value = b.value orelse return cur;
             cur = switch (b.expr(value)) {
-                .name_ref => |n| try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
+                .name_ref => |n| if (b.nameRefIsBuiltin(value)) null else try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
                 .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse return cur) else null,
                 else => null,
             } orelse return cur;
@@ -216,6 +216,7 @@ pub const Resolver = struct {
         if (depth > max_depth) return null;
         switch (b.expr(e)) {
             .name_ref => |name| {
+                if (b.nameRefIsBuiltin(e)) return null;
                 const def = try r.resolveName(file, item, b, b.expr_scopes[@backingInt(e)], name) orelse return null;
                 return r.namespaceOfDepth(def, depth + 1);
             },

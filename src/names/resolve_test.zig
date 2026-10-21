@@ -533,3 +533,32 @@ test "files that are not loaded are read from disk" {
     }
     try testing.expectEqualStrings("other.zig:thing", try w.goto(file, @intCast(std.mem.indexOf(u8, text, "thing").?)));
 }
+
+test "alias targets distinguish bare primitives from escaped declarations" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig",
+        \\const @"u32" = struct {};
+        \\const Bare = u32;
+        \\const Quoted = @"u32";
+        \\const Chained = Bare;
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const tree = try r.itemTree(added.file);
+    const escaped = resolve.Resolver.lookupDecl(tree, 0, "u32").?;
+    const bare = resolve.Resolver.lookupDecl(tree, 0, "Bare").?;
+    const quoted = resolve.Resolver.lookupDecl(tree, 0, "Quoted").?;
+    const chained = resolve.Resolver.lookupDecl(tree, 0, "Chained").?;
+    try testing.expectEqualDeep(resolve.Def{ .item = .{ .file = added.file, .item = bare } }, try r.aliasTarget(.{ .item = .{ .file = added.file, .item = bare } }));
+    try testing.expectEqualDeep(resolve.Def{ .item = .{ .file = added.file, .item = escaped } }, try r.aliasTarget(.{ .item = .{ .file = added.file, .item = quoted } }));
+    try testing.expectEqualDeep(resolve.Def{ .item = .{ .file = added.file, .item = bare } }, try r.aliasTarget(.{ .item = .{ .file = added.file, .item = chained } }));
+    try testing.expect(try r.namespaceOf(.{ .item = .{ .file = added.file, .item = bare } }) == null);
+    try testing.expect(try r.namespaceOf(.{ .item = .{ .file = added.file, .item = chained } }) == null);
+    try testing.expectEqualDeep(
+        (try r.namespaceOf(.{ .item = .{ .file = added.file, .item = escaped } })).?,
+        (try r.namespaceOf(.{ .item = .{ .file = added.file, .item = quoted } })).?,
+    );
+}
