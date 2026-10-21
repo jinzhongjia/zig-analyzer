@@ -933,7 +933,7 @@ fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
-        if (auto_import and za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) _ = try ctx.get(za.ide_db.imports.FileDecls, f);
+        if (auto_import and za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) _ = try ctx.get(za.ide_db.imports.FileLinks, f);
     }
 }
 
