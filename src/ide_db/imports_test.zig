@@ -111,6 +111,21 @@ test "auto imports traverse the full public std export closure and terminate cyc
     try testing.expectEqual(@as(usize, 0), (try run(&w, at.file, at.offset, "PrivateI", 128)).items.len);
 }
 
+test "auto imports skip module roots that are not zig source files" {
+    // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON），不能按 Zig 解析：大文件很慢
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app deps:data=data
+        \\fn main() void { _ = <|>missing; }
+        \\//- /data/meta.json module:data
+        \\pub const Leaked = u32;
+    );
+    const at = f.cursor.?;
+    try testing.expectEqual(@as(usize, 0), (try run(&w, at.file, at.offset, "Leak", 128)).items.len);
+}
+
 test "auto imports respect primary module boundaries root subtrees and public chains" {
     var w: World = undefined;
     try w.init();

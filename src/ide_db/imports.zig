@@ -13,6 +13,12 @@ const Body = @import("../hir/Body.zig");
 const Allocator = std.mem.Allocator;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 
+/// 只为 Zig 源文件建索引：模块的根可以是 `.zon` 或任意数据文件（如 `addAnonymousImport` 引入的 JSON），
+/// 按 Zig 解析它们没有意义，大文件还很慢
+pub fn isZigSource(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".zig");
+}
+
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 pub const Candidate = struct {
     label: []const u8,
@@ -130,6 +136,11 @@ pub const FileDecls = struct {
         const gpa = ctx.db.gpa;
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
+        if (!isZigSource(ctx.db.env.vfs.path(file))) {
+            const out = try gpa.create(DeclIndex);
+            out.* = .{ .arena = arena.state, .decls = &.{}, .public_decls = &.{} };
+            return out;
+        }
         const a = arena.allocator();
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
@@ -400,12 +411,13 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, lim
         // 项目文件只查询小索引的前缀区间，不在按键路径扫描 ItemTree/Body。
         for (g.files) |entry| {
             if (entry.file == file or entry.module == database.ModuleGraph.std_module) continue;
+            const path = r.ctx.db.env.vfs.path(entry.file);
+            if (!isZigSource(path)) continue;
             const index = try r.ctx.get(FileDecls, entry.file);
             const matches = index.matchingPublic(prefix);
             const ns: Namespace = .{ .file = entry.file, .container = 0 };
-            const path = r.ctx.db.env.vfs.path(entry.file);
             const basename = std.fs.path.basename(path);
-            const stem = if (std.mem.endsWith(u8, basename, ".zig")) basename[0 .. basename.len - 4] else continue;
+            const stem = basename[0 .. basename.len - ".zig".len];
             if (matches.len == 0 and !std.mem.startsWith(u8, stem, prefix)) continue;
             const spec = try importSpec(r, g, file, entry.file) orelse continue;
             if (std.mem.startsWith(u8, stem, prefix) and !builder.aliases.contains(ns) and try builder.visible(stem) == null)

@@ -883,7 +883,12 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
         break :blk za.ide_db.search.projectFiles(&r) catch return;
     };
-    try server.indexImportRoots();
+    const auto_import = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.completion_auto_import;
+    };
+    if (auto_import) try server.indexImportRoots();
     if (files.len == 0) return;
     // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
     const t0 = Io.Clock.awake.now(server.io);
@@ -900,7 +905,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         {
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
-            indexFiles(&ctx, files[done..end]) catch |err| switch (err) {
+            indexFiles(&ctx, files[done..end], auto_import) catch |err| switch (err) {
                 // 被编辑打断：重试这一批
                 error.Canceled => continue,
                 error.OutOfMemory => return log.err("out of memory while indexing", .{}),
@@ -922,23 +927,18 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     }
 }
 
-fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId) za.db.Error!void {
+/// `auto_import` 时一并建自动导入的声明索引（只为 Zig 源文件）
+fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.Error!void {
     for (files) |f| {
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
-        _ = try ctx.get(za.ide_db.imports.FileDecls, f);
+        if (auto_import and za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) _ = try ctx.get(za.ide_db.imports.FileDecls, f);
     }
 }
 
 /// 公共导出索引跨补全请求复用；标准库与命名模块不必等到用户输入名字时才展开。
 fn indexImportRoots(server: *Server) Io.Cancelable!void {
-    const enabled = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.completion_auto_import;
-    };
-    if (!enabled) return;
     var scratch: std.heap.ArenaAllocator = .init(server.gpa);
     defer scratch.deinit();
     while (!server.isShuttingDown()) {
@@ -965,6 +965,8 @@ fn warmImportRoots(ctx: *Db.Ctx, arena: Allocator) za.db.Error!void {
         if (graph.modules[imp.module].root) |file| try roots.put(arena, file, {});
     };
     for (roots.keys()) |file| {
+        // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON）
+        if (!za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(file))) continue;
         _ = try ctx.get(za.ide_db.imports.FileDecls, file);
         _ = try ctx.get(za.ide_db.imports.Exports, .{ .ns = .{ .file = file, .container = 0 } });
     }
