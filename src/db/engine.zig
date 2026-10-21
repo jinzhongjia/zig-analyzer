@@ -97,6 +97,8 @@ pub const Stats = struct {
     queries: []const QueryStats,
     /// 逐个依赖检查（未被 durability 跳过）的次数
     deep_verifications: u64,
+    /// 写事务的次数。值没有变化的写入不推进 revision，但同样会取消进行中的读查询
+    writes: u64,
     revision: Revision,
     /// 各原因导致结果不完整的次数
     incomplete_causes: std.EnumArray(IncompleteCause, u64),
@@ -202,6 +204,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         counters: [queries.len]Counters = @splat(.{}),
         incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
         deep_verifications: std.atomic.Value(u64) = .init(0),
+        /// 见 `Stats.writes`
+        writes: std.atomic.Value(u64) = .init(0),
         /// memo 最近使用时间的计数器（LRU）
         access_tick: std.atomic.Value(u64) = .init(0),
         /// 有声明了 `lru` 的 query 超出容量，等待 `sweep`
@@ -342,6 +346,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return .{
                 .queries = buf,
                 .deep_verifications = db.deep_verifications.load(.monotonic),
+                .writes = db.writes.load(.monotonic),
                 .revision = db.revision,
                 .incomplete_causes = causes,
             };
@@ -363,6 +368,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         /// 开始写事务：取消进行中的读查询，等待所有读事务结束。
         pub fn beginWrite(db: *Db) void {
+            _ = db.writes.fetchAdd(1, .monotonic);
             _ = db.pending_write.fetchAdd(1, .release);
             db.rw.lockUncancelable(db.io);
             _ = db.pending_write.fetchSub(1, .release);

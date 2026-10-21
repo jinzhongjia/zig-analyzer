@@ -404,6 +404,9 @@ test "setting the same input value does not bump revision" {
     const rev = d.revision;
     try setNumber(&d, Number, 1, 42, .low);
     try testing.expectEqual(rev, d.revision);
+    // 值没有变化的写事务仍会取消读查询，计入写事务次数
+    var buf: [Db.query_types.len]db.QueryStats = undefined;
+    try testing.expectEqual(2, d.stats(&buf).writes);
 }
 
 test "changes to unrelated keys do not trigger recomputation" {

@@ -3077,6 +3077,8 @@ const StatusResult = struct {
     revision: u64,
     files: usize,
     deep_verifications: u64,
+    /// 写事务的次数（见 `db.Stats.writes`）
+    writes: u64,
     /// 进程的常驻内存峰值（KB；不支持的平台为 0）
     max_rss_kb: u64,
     /// InternPool 中的类型与值的个数
@@ -3617,6 +3619,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         .revision = summary.revision,
         .files = server.vfs.count(),
         .deep_verifications = summary.deep_verifications,
+        .writes = summary.writes,
         .max_rss_kb = maxRssKb(),
         .intern_pool_items = server.ip.count(),
         .intern_pool_bytes = server.ip.bytes(),
