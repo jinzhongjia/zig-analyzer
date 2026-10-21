@@ -21,6 +21,18 @@ const Index = InternPool.Index;
 const database = @import("../database.zig");
 const ModuleGraph = @import("../names/ModuleGraph.zig");
 const builtins = @import("builtins.zig");
+const imports = @import("../ide_db/imports.zig");
+const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
+
+pub const Options = struct {
+    auto_import: bool = true,
+    max_auto_imports: usize = 128,
+};
+
+pub const Result = struct {
+    items: []const Item,
+    is_incomplete: bool = false,
+};
 
 pub const Item = struct {
     label: []const u8,
@@ -32,12 +44,63 @@ pub const Item = struct {
     /// 替换的范围（文件中的字节偏移，插入的文本为 `label`）；null 时由客户端按单词确定。
     /// `@`、路径中的 `/` 等不属于单词的字符需要它
     replace: ?Range = null,
+    filter: ?[]const u8 = null,
+    qualifier: ?[]const u8 = null,
+    sort: ?[]const u8 = null,
+    import_edit: ?imports.Edit = null,
 
     pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, error_name, builtin, module, file, folder, label };
     pub const Range = struct { start: u32, end: u32 };
 };
 
-pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Item {
+pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
+    const base = try completeVisible(r, file, offset);
+    if (!options.auto_import) return .{ .items = base };
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    if (offset == 0 or offset > text.len) return .{ .items = base };
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const name = try importPrefix(r.arena, root, text, offset) orelse return .{ .items = base };
+    const extra = try imports.complete(r, file, offset, name.prefix, options.max_auto_imports);
+    if (extra.items.len == 0) return .{ .items = base, .is_incomplete = extra.is_incomplete };
+    var items: std.ArrayList(Item) = .empty;
+    try items.appendSlice(r.arena, base);
+    for (extra.items) |candidate| {
+        // 核心已经逐段渲染了路径，不能把整个限定表达式再次当作标识符转义。
+        const filter = try completionFilter(r.arena, name, candidate.filter);
+        var duplicate = false;
+        for (items.items[0..base.len]) |*visible| if (std.mem.eql(u8, visible.label, candidate.label)) {
+            // 只合并可见绑定；不同来源的同名自动导入项必须继续作为独立选择。
+            if (candidate.import_edit == null) {
+                visible.replace = name.range;
+                visible.filter = filter;
+                visible.qualifier = candidate.qualifier;
+                visible.sort = candidate.sort;
+            }
+            duplicate = true;
+            break;
+        };
+        if (duplicate) continue;
+        try items.append(r.arena, .{
+            .label = candidate.label,
+            .kind = switch (candidate.kind) {
+                .function => .function,
+                .constant => .constant,
+                .variable => .variable,
+                .module => .module,
+                .file => .file,
+            },
+            .doc = candidate.doc,
+            .replace = name.range,
+            .filter = filter,
+            .qualifier = candidate.qualifier,
+            .sort = candidate.sort,
+            .import_edit = candidate.import_edit,
+        });
+    }
+    return .{ .items = items.items, .is_incomplete = extra.is_incomplete };
+}
+
+fn completeVisible(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Item {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return &.{};
@@ -123,6 +186,79 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const I
         container = tree.items[parent].container;
     }
     return out.items.items;
+}
+
+const ImportPrefix = struct {
+    prefix: []const u8,
+    range: Item.Range,
+    escaped_prefix: ?[]const u8 = null,
+    closed: bool = false,
+};
+
+/// 只接受表达式中的名字；声明名、成员名、标签与捕获名都不是 name_ref 的直接 token。
+fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u32) Allocator.Error!?ImportPrefix {
+    const token = root.tokenAtOffset(offset - 1) orelse return null;
+    if (token.kind != .identifier and token.kind != .invalid) return null;
+    const parent = tokenParent(root, offset - 1);
+    if (parent != .name_ref) return null;
+    const escaped = std.mem.startsWith(u8, token.text, "@\"");
+    if (token.kind == .invalid and !escaped) return null;
+    const spelling = if (token.kind == .invalid) std.mem.trimEnd(u8, token.text, "\r\n") else token.text;
+    const token_end = token.offset + @as(u32, @intCast(spelling.len));
+    if (offset <= token.offset or offset > token_end) return null;
+    // 错误 token 没有闭引号界定尾部；保留光标后的源码，不把后面的语句误当成名字一起替换。
+    const end = if (token.kind == .invalid) offset else token_end;
+    const raw = text[token.offset..offset];
+    const closed = token.kind == .identifier and offset == end;
+    var prefix = raw;
+    if (escaped) {
+        // 光标在引号内也按已输入的内容匹配；截断转义序列时不猜测名字。
+        if (raw.len <= 2) return null;
+        const literal: []const u8 = if (closed) raw[1..] else blk: {
+            const quoted = try arena.allocSentinel(u8, raw.len, 0);
+            @memcpy(quoted[0 .. raw.len - 1], raw[1..]);
+            quoted[raw.len - 1] = '"';
+            // 补上的引号不能被尚未完成的转义吃掉；只向字符串解码器传入词法闭合的单个字面量。
+            var tokenizer = std.zig.Tokenizer.init(quoted);
+            const checked = tokenizer.next();
+            if (checked.tag != .string_literal or checked.loc.end != quoted.len) return null;
+            break :blk quoted;
+        };
+        prefix = std.zig.string_literal.parseAlloc(arena, literal) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidLiteral => return null,
+        };
+    } else {
+        if (std.zig.primitives.isPrimitive(token.text) or std.mem.eql(u8, token.text, "_")) return null;
+    }
+    if (prefix.len == 0) return null;
+    return .{
+        .prefix = prefix,
+        .range = .{ .start = token.offset, .end = end },
+        .escaped_prefix = if (escaped) raw else null,
+        .closed = escaped and closed,
+    };
+}
+
+/// 客户端从替换范围起点过滤；保留用户输入的引号和转义拼写，而不是只返回解码后的名字。
+fn completionFilter(arena: Allocator, name: ImportPrefix, target: []const u8) Allocator.Error![]const u8 {
+    const raw = name.escaped_prefix orelse return target;
+    const closed = name.closed;
+    return std.fmt.allocPrint(arena, "{s}{f}{s}", .{
+        raw, std.zig.fmtString(target[name.prefix.len..]), if (closed) "" else "\"",
+    });
+}
+
+fn tokenParent(node: SyntaxNode, offset: u32) @import("../syntax/kind.zig").SyntaxKind {
+    var children = node.children();
+    while (children.next()) |child| {
+        if (!child.range().contains(offset)) continue;
+        return switch (child) {
+            .token => node.kind(),
+            .node => |inner| tokenParent(inner, offset),
+        };
+    }
+    return node.kind();
 }
 
 const Collector = struct {

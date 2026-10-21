@@ -14,6 +14,7 @@ pub const ModuleGraph = @import("names/ModuleGraph.zig");
 pub const sema = @import("sema/queries.zig");
 pub const ide_db = struct {
     pub const seed = @import("ide_db/seed.zig");
+    pub const imports = @import("ide_db/imports.zig");
 };
 
 const Vfs = @import("base/Vfs.zig");
@@ -59,5 +60,8 @@ pub const Db = engine.Engine(*const Env, &.{
     ide_db.seed.Query,
     ide_db.seed.Instances,
     ide_db.seed.Candidates,
+    ide_db.imports.FileDecls,
+    ide_db.imports.Exports,
+    ide_db.imports.BindingNames,
     @import("ide_db/search.zig").ProjectImporters,
 });

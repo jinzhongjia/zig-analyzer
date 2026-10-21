@@ -243,7 +243,7 @@ pub const World = struct {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-        const items = try completion.complete(&r, file, offset);
+        const items = (try completion.complete(&r, file, offset, .{ .auto_import = false })).items;
         const labels = try w.arena.allocator().alloc([]const u8, items.len);
         for (items, labels) |it, *l| l.* = it.label;
         std.mem.sort([]const u8, labels, {}, struct {

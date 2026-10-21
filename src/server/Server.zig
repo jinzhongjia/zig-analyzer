@@ -883,6 +883,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
         break :blk za.ide_db.search.projectFiles(&r) catch return;
     };
+    try server.indexImportRoots();
     if (files.len == 0) return;
     // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
     const t0 = Io.Clock.awake.now(server.io);
@@ -926,6 +927,46 @@ fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId) za.db.Error!void {
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
+        _ = try ctx.get(za.ide_db.imports.FileDecls, f);
+    }
+}
+
+/// 公共导出索引跨补全请求复用；标准库与命名模块不必等到用户输入名字时才展开。
+fn indexImportRoots(server: *Server) Io.Cancelable!void {
+    const enabled = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.completion_auto_import;
+    };
+    if (!enabled) return;
+    var scratch: std.heap.ArenaAllocator = .init(server.gpa);
+    defer scratch.deinit();
+    while (!server.isShuttingDown()) {
+        _ = scratch.reset(.retain_capacity);
+        var ctx = server.db.beginRead(scratch.allocator());
+        defer ctx.end();
+        warmImportRoots(&ctx, scratch.allocator()) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => {
+                log.err("out of memory while indexing imports", .{});
+                return;
+            },
+        };
+        return;
+    }
+}
+
+fn warmImportRoots(ctx: *Db.Ctx, arena: Allocator) za.db.Error!void {
+    const graph = try ctx.get(ModuleGraph.Input, {}) orelse return;
+    var roots: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    if (graph.std_root) |file| try roots.put(arena, file, {});
+    if (graph.default_builtin) |file| try roots.put(arena, file, {});
+    for (graph.modules) |module| for (module.imports) |imp| {
+        if (graph.modules[imp.module].root) |file| try roots.put(arena, file, {});
+    };
+    for (roots.keys()) |file| {
+        _ = try ctx.get(za.ide_db.imports.FileDecls, file);
+        _ = try ctx.get(za.ide_db.imports.Exports, .{ .ns = .{ .file = file, .container = 0 } });
     }
 }
 
@@ -1461,6 +1502,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
     const semantic_changed = server.config.callsite_seeding != new.callsite_seeding;
+    const imports_enabled = !server.config.completion_auto_import and new.completion_auto_import;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const build_was_enabled = server.config.build_enable;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
@@ -1479,6 +1521,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (compiler_disabled) server.clearSingleFileResults();
     if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
     if (semantic_changed) server.requestSemanticRefresh();
+    if (imports_enabled) server.scheduleIndexing();
     if (build_changed) {
         if (!new.build_enable) {
             // 关闭构建系统集成：停止各项目，其文件改按单文件处理
@@ -3340,10 +3383,15 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = try r.ctx.get(FileText, file) orelse return null;
     const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
-    const items = try ide.completion.complete(r, file, offset);
-    const out = try arena.alloc(types.CompletionItem, items.len);
+    const auto_import = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.completion_auto_import;
+    };
+    const result = try ide.completion.complete(r, file, offset, .{ .auto_import = auto_import });
+    const out = try arena.alloc(types.CompletionItem, result.items.len);
     var lines: ?offsets.LineIndex = null;
-    for (items, out) |it, *o| {
+    for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
             .kind = switch (it.kind) {
@@ -3360,12 +3408,22 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             },
             .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
             .detail = it.detail,
+            .filterText = it.filter,
+            .sortText = it.sort,
+            .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
         if (it.replace) |range| {
             if (lines == null) lines = try offsets.LineIndex.init(arena, text);
             o.textEdit = .{ .TextEdit = .{ .range = lines.?.range(range.start, range.end, server.encoding), .newText = it.label } };
         }
+        if (it.import_edit) |edit| {
+            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
+            const edits = try arena.alloc(types.TextEdit, 1);
+            edits[0] = .{ .range = lines.?.range(edit.start, edit.end, server.encoding), .newText = edit.text };
+            o.additionalTextEdits = edits;
+        }
     }
+    if (result.is_incomplete) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
     return .{ .array_of_CompletionItem = out };
 }
 
@@ -3895,4 +3953,5 @@ test {
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
+    _ = @import("auto_import_test.zig");
 }
