@@ -785,6 +785,20 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     graph.* = try b.finish(std_root, default_builtin);
     // `finish` 把 builder 的 arena 转移给了 graph
     builder_owned = false;
+    // 模块图与目标都没有变化时不开写事务：每次构建结束都会走到这里，而写事务会取消进行中的计算与请求
+    // （请求以 ContentModified 失败）
+    const unchanged = server.moduleGraphUnchanged(graph, t) catch |err| {
+        var unused: ModuleGraph.Input.Value = graph;
+        ModuleGraph.Input.deinit(&unused, server.gpa);
+        graph_owned = false;
+        return err;
+    };
+    if (unchanged) {
+        var unused: ModuleGraph.Input.Value = graph;
+        ModuleGraph.Input.deinit(&unused, server.gpa);
+        graph_owned = false;
+        return;
+    }
     // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
     server.db.beginWrite();
     defer server.db.endWrite();
@@ -795,6 +809,23 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     graph_owned = false;
     server.db.set(za.sema.queries.TargetAbi, {}, t, .medium) catch unreachable;
     server.ip.setTarget(t);
+}
+
+/// 当前的模块图与目标已与 `graph`、`t` 相同。在持有 graph_mutex 时调用：模块图只在这里写入，比较之后
+/// 不会被其他人改变
+fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target) Allocator.Error!bool {
+    var ctx = server.db.beginRead(server.gpa);
+    defer ctx.end();
+    const current = ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // 另有写事务在等待：按有变化处理
+        error.Canceled => return false,
+    };
+    const target = ctx.get(za.sema.queries.TargetAbi, {}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return false,
+    };
+    return ModuleGraph.Input.eql(current, graph) and std.meta.eql(target, t);
 }
 
 const index_progress_delay_ms = 200;
@@ -2669,7 +2700,8 @@ test "updateModuleGraph keeps the old inputs when an allocation fails" {
     server.db.endWrite();
     try std.testing.expect(old_graph != null);
 
-    // 之后的更新失败时保留旧图与 TargetAbi
+    // 之后的更新失败时保留旧图与 TargetAbi。换一个默认的 builtin.zig，使新图与旧图不同而走到写入
+    server.default_builtin = try failing.allocator().dupe(u8, "/zig-analyzer-test/builtin.zig");
     fail_index = 0;
     while (true) : (fail_index += 1) {
         try std.testing.expect(fail_index < 10_000);
@@ -2691,6 +2723,27 @@ test "updateModuleGraph keeps the old inputs when an allocation fails" {
             try std.testing.expect(std.meta.eql(old_target, target));
         }
     }
+    server.db.beginWrite();
+    const new_graph = server.db.peek(ModuleGraph.Input, {});
+    server.db.endWrite();
+    try std.testing.expect(new_graph != old_graph);
+}
+
+test "updateModuleGraph takes no write transaction when nothing changed" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, &writer);
+    defer server.deinit();
+    try server.updateModuleGraphInner();
+    const writes = server.db.writes.load(.monotonic);
+    // 每次构建结束都会更新模块图：没有变化时开写事务会取消进行中的计算与请求
+    try server.updateModuleGraphInner();
+    try std.testing.expectEqual(writes, server.db.writes.load(.monotonic));
+    server.default_builtin = try std.testing.allocator.dupe(u8, "/zig-analyzer-test/builtin.zig");
+    try server.updateModuleGraphInner();
+    try std.testing.expectEqual(writes + 1, server.db.writes.load(.monotonic));
 }
 
 /// 是否发布文件的 live 诊断：不属于任何项目，或所属的项目中有一个认为需要（见 `Workspace.liveEligible`）
