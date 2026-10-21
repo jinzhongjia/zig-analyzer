@@ -2651,6 +2651,47 @@ test "recursive chosen and negative seeds survive prefix edits without executing
     }
 }
 
+test "seed search skips callers whose calls resolve to other functions of the same name" {
+    // `format` 提到 print，但调用的是 Writer.print：任何实例下都调用不到目标，不查找它自己的调用点
+    const text =
+        \\pub fn print(comptime fmt: []const u8, args: anytype) void {
+        \\    _ = fmt;
+        \\    _ = args;
+        \\}
+        \\const Writer = struct {
+        \\    pub fn print(w: Writer, comptime fmt: []const u8) void {
+        \\        _ = w;
+        \\        _ = fmt;
+        \\    }
+        \\};
+        \\fn format(comptime T: type, w: Writer) void {
+        \\    w.print("{}");
+        \\    _ = T;
+        \\}
+        \\fn useFormat() void {
+        \\    format(u8, .{});
+        \\}
+        \\fn main() void {
+        \\    print("{}", .{@as(u8, 1)});
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const chosen = (try seedFor(&w, file, "print")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "print(\"{}\", .{").?)), chosen.offset);
+    // 只有目标自身的查找：`seedFor` 依次请求 Query、Instances 与 allInstances
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Query));
+    try testing.expectEqual(@as(u64, 2), w.db.executions(seed.Instances));
+    // 改为调用目标后不再跳过：以 `format` 的调用点实例找到它对目标的调用
+    const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "w.print(\"{}\");", "print(\"{}\", .{T});");
+    _ = try w.add("/p/main.zig", calling);
+    const moved = (try seedFor(&w, file, "print")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{T})").?)), moved.offset);
+}
+
 test "seed selection invalidates for arguments caller bodies signatures aliases and new candidates" {
     const decls =
         \\fn leaf(x: anytype) @TypeOf(x) { return x; }

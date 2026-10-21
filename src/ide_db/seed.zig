@@ -444,6 +444,7 @@ fn collectIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names
         _ = try callIn(r, in, @intCast(i), body, res, file, item, root_key, out, out.strict);
         _ = try loopCall(r, in, @intCast(i), owner, body, res, null, names, file, item, root_key, out, out.strict);
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
+        if (!mayCall(r.ctx.db.env.ip, body, res, root_key)) continue;
         for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1, .all = out.all })) |o| {
             if (out.full()) return;
             const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = o.inst });
@@ -744,6 +745,7 @@ fn findIn(r: *Resolver, in: FileId, file: FileId, item: u32, root: u32, names: [
         // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
         // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
         if (depth == 0 or try genericRoot(r, in, @intCast(i)) == null) continue;
+        if (!mayCall(r.ctx.db.env.ip, body, res, root_key)) continue;
         const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse continue;
         const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
         if (try callIn(r, in, @intCast(i), body, seeded, file, item, root_key, null, strict)) |s| return s;
@@ -788,6 +790,45 @@ fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer
         }
     }
     return null;
+}
+
+/// 推导结果 `res` 中是否可能有对 `root_key` 的调用：被调表达式，或随元组一起传入的函数实参（见 `Site.passed`）
+/// 的值不是已知的其他函数或其他值。抽象推导中已经求出的值在调用者的各个实例下相同（未知的条件不选分支），
+/// 全部排除时取调用者的实例也找不到调用，不必再查找调用者的调用点
+fn mayCall(ip: *InternPool, body: *const Body, res: *const infer.Result, root_key: hir.OwnerKey) bool {
+    if (res.exprs.len != body.exprs.len) return true;
+    for (body.exprs) |e| switch (e) {
+        .call => |c| if (mayBe(ip, res.exprs[@backingInt(c.callee)], root_key) or mayPass(ip, body, res, c.args, root_key)) return true,
+        .builtin_call => |b| if (mayPass(ip, body, res, b.args, root_key)) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// 同 `Site.passed`：后面紧跟匿名元组字面量的实参
+fn mayPass(ip: *InternPool, body: *const Body, res: *const infer.Result, args: []const Body.ExprId, root_key: hir.OwnerKey) bool {
+    if (args.len < 2) return false;
+    for (args[0 .. args.len - 1], args[1..]) |f_e, tuple_e| {
+        const init = switch (body.expr(tuple_e)) {
+            .init => |x| x,
+            else => continue,
+        };
+        if (init.ty != null) continue;
+        for (init.fields) |fi| {
+            if (fi.name != null) break;
+        } else if (mayBe(ip, res.exprs[@backingInt(f_e)], root_key)) return true;
+    }
+    return false;
+}
+
+/// 值 `tv` 在某个实例下可能是函数 `root_key`：值未知或含抽象部分，或者就是它
+fn mayBe(ip: *InternPool, tv: TypedValue, root_key: hir.OwnerKey) bool {
+    const v = tv.val orelse return true;
+    if (!value.isConcrete(ip, v)) return true;
+    return switch (ip.key(v)) {
+        .fn_value => |f| f.file == root_key.file and f.decl == root_key.item,
+        else => false,
+    };
 }
 
 /// `callIn` 中的一个调用表达式
