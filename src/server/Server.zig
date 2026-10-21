@@ -160,6 +160,9 @@ started: bool = false,
 
 /// 串行化修改服务器状态的消息处理：主循环处理每条消息时持有，服务器发现的外部改动也在它之下处理（见 `watch.zig`）
 write_mutex: Io.Mutex = .init,
+/// 未打开的已知文件在外部改动中读到、并已据此重新构建的磁盘内容（哈希；null 为不存在），见
+/// `didChangeWatchedFiles`。打开文档时清除：打开期间保存的内容不经过外部改动。只在 write_mutex 下访问
+watched_built: std.AutoHashMapUnmanaged(Vfs.FileId, ?u64) = .empty,
 /// 服务器发现外部改动的后台任务（`startProjects` 时创建）
 watcher: ?*watch.Watcher = null,
 /// 原生文件监听不可用时，轮询的最短间隔（毫秒）
@@ -271,6 +274,7 @@ pub fn deinit(server: *Server) void {
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
     server.semantic_cache.deinit(server.gpa);
+    server.watched_built.deinit(server.gpa);
     server.progress.deinit(server.gpa);
     server.config.deinit(server.gpa);
     server.pending.deinit(server.gpa);
@@ -1076,6 +1080,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         if (lgop.found_existing) server.gpa.free(lgop.value_ptr.*);
         lgop.value_ptr.* = last;
     }
+    _ = server.watched_built.remove(id);
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.text);
         server.db.beginWrite();
@@ -1179,10 +1184,22 @@ fn isProjectFile(base: []const u8) bool {
 }
 
 /// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
-/// 按磁盘内容更新（删除的置为不存在）。工作区根目录的 build.zig / build.zig.zon / zig-analyzer.json 或项目的构建脚本
-/// 变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时项目重新构建、单文件重新编译
+/// 按磁盘内容更新（删除的置为不存在），内容与已知的相同时不写入、不重新发布。工作区根目录的 build.zig / build.zig.zon /
+/// zig-analyzer.json 或项目的构建脚本变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时
+/// 项目重新构建、单文件重新编译；磁盘内容与上一次据此重新构建时的相同时不重新构建
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
-    const Change = struct { file: Vfs.FileId, text: ?[]u8, durability: database.Durability };
+    const Change = struct {
+        file: Vfs.FileId,
+        path: []const u8,
+        text: ?[]u8,
+        durability: database.Durability,
+        /// 磁盘内容的哈希，null 为不存在
+        disk: ?u64,
+        /// 与已知的文本不同：写入、重新发布
+        edited: bool = true,
+        /// 与 `watched_built` 记录的不同：重新构建
+        rebuild: bool = true,
+    };
     var changes: std.ArrayList(Change) = .empty;
     defer for (changes.items) |c| if (c.text) |t| server.gpa.free(t);
     const rules = try server.originRules(arena);
@@ -1190,37 +1207,86 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
     // 变化的已知文件（含打开的文件：maker 读取磁盘）
     var known: std.ArrayList(Vfs.FileId) = .empty;
+    // 同一个文件在一批中多次变化时以最后一次为准：原子保存先删除、再新建，内容不变时两次合起来不是改动
+    var events: std.StringArrayHashMapUnmanaged(types.FileChangeType) = .empty;
     for (params.changes) |event| {
         const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedScheme, error.InvalidUri => continue,
         };
         if (!std.fs.path.isAbsolute(path)) continue;
+        try events.put(arena, path, event.type);
+    }
+    for (events.keys(), events.values()) |path, kind| {
         const base = std.fs.path.basename(path);
-        if (isProjectFile(base)) try build_files.append(arena, std.fs.path.dirname(path) orelse "");
-        if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, std.fs.path.dirname(path) orelse "");
-        // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）
-        const file = try server.vfs.lookup(path) orelse continue;
-        try known.append(arena, file);
-        {
+        const dir = std.fs.path.dirname(path) orelse "";
+        if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, dir);
+        // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）；项目文件无从比较内容，按变化处理
+        const file = try server.vfs.lookup(path) orelse {
+            if (isProjectFile(base)) try build_files.append(arena, dir);
+            continue;
+        };
+        const is_open = blk: {
             server.docs_mutex.lockUncancelable(server.io);
             defer server.docs_mutex.unlock(server.io);
-            if (server.open_docs.contains(file)) continue;
+            break :blk server.open_docs.contains(file);
+        };
+        if (is_open) {
+            if (isProjectFile(base)) try build_files.append(arena, dir);
+            try known.append(arena, file);
+            continue;
         }
-        const text = if (event.type == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+        const text = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             error.FileTooBig => null,
         };
-        try changes.append(arena, .{ .file = file, .text = text, .durability = origin.classify(&server.vfs, rules, server.vfs.path(file), false).durability() });
+        changes.append(arena, .{
+            .file = file,
+            .path = path,
+            .text = text,
+            .durability = origin.classify(&server.vfs, rules, server.vfs.path(file), false).durability(),
+            .disk = if (text) |t| std.hash.Wyhash.hash(0, t) else null,
+        }) catch |err| {
+            if (text) |t| server.gpa.free(t);
+            return err;
+        };
     }
+    // 构建步骤每次都原样重写源码树中的文件（如生成代码）时，写事务会取消进行中的计算与请求，重新构建又会再次重写，
+    // 形成循环。是否重新构建不能按已知的文本判断：构建读取磁盘，而已知的文本也可能来自打开、关闭文档或首次加载时
+    // 的读取，构建不一定读到过
     if (changes.items.len != 0) {
+        var ctx = server.db.beginRead(arena);
+        defer ctx.end();
+        var kept: usize = 0;
+        for (changes.items) |*c| {
+            c.edited = !sameText(&ctx, c.file, c.text);
+            c.rebuild = if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
+            if (!c.edited and !c.rebuild) {
+                if (c.text) |t| server.gpa.free(t);
+                continue;
+            }
+            changes.items[kept] = c.*;
+            kept += 1;
+        }
+        changes.shrinkRetainingCapacity(kept);
+    }
+    var edited: std.ArrayList(Vfs.FileId) = .empty;
+    var rebuilt: std.ArrayList(Vfs.FileId) = .empty;
+    for (changes.items) |c| {
+        if (c.edited) try edited.append(arena, c.file);
+        if (!c.rebuild) continue;
+        try rebuilt.append(arena, c.file);
+        try known.append(arena, c.file);
+        if (isProjectFile(std.fs.path.basename(c.path))) try build_files.append(arena, std.fs.path.dirname(c.path) orelse "");
+    }
+    if (edited.items.len != 0) {
         server.db.beginWrite();
         defer server.db.endWrite();
-        for (changes.items) |*c| {
+        for (changes.items) |*c| if (c.edited) {
             try server.db.set(FileText, c.file, c.text, c.durability);
             c.text = null;
-        }
+        };
     }
 
     // 根目录下新建或删除了 build.zig：启动或停止项目，刚启动的项目不必重启
@@ -1243,21 +1309,30 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             if (!started) server.restartWorkspace(ws, 0);
             continue;
         }
-        for (changes.items) |c| if (ws.owns(c.file)) {
+        for (rebuilt.items) |file| if (ws.owns(file)) {
             server.requestBuild(ws);
             break;
         };
     }
-    if (changes.items.len == 0) return;
-    const files = try arena.alloc(Vfs.FileId, changes.items.len);
-    for (changes.items, files) |c, *f| f.* = c.file;
-    server.publishFiles(files, true);
-    server.requestSemanticRefresh();
+    if (edited.items.len != 0) {
+        server.publishFiles(edited.items, true);
+        server.requestSemanticRefresh();
+    }
+    if (rebuilt.items.len == 0) return;
     // 单文件模式：打开的文件 import 的文件可能变了
     server.docs_mutex.lockUncancelable(server.io);
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
     server.docs_mutex.unlock(server.io);
-    server.recompileSingle(open, files);
+    server.recompileSingle(open, rebuilt.items);
+    // 记录不了时下一次照常重新构建
+    for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+}
+
+/// 文件已知的文本与 `text` 相同（都不存在也算）；读取失败时按不同处理
+fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
+    const current = ctx.get(FileText, file) catch return false;
+    const known = current orelse return text == null;
+    return std.mem.eql(u8, known, text orelse return false);
 }
 
 /// 服务器发现的外部改动：与客户端的 `workspace/didChangeWatchedFiles` 通知同样处理，与主循环的消息处理串行

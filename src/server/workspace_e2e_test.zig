@@ -202,6 +202,178 @@ const Projects = struct {
     }
 };
 
+/// 等服务器在第 `after` 批之后又处理完一批外部改动，60 秒内没有时失败
+fn waitBatchAfter(h: *Harness, after: u64) !void {
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(60));
+    h.server.watch_mutex.lockUncancelable(testing.io);
+    defer h.server.watch_mutex.unlock(testing.io);
+    while (h.server.watch_batches <= after) {
+        h.server.watch_cond.waitTimeout(testing.io, &h.server.watch_mutex, .{ .deadline = .{ .raw = deadline, .clock = .awake } }) catch return error.ChangeNotNoticed;
+    }
+}
+
+/// 发出 waitIdle 并读取消息直到它的响应，`seconds` 秒内没有空闲时失败：一直有构建时 waitIdle 不会返回，
+/// 而不断到来的通知又使单条消息的读取不会超时。失败前先 shutdown 停止各项目，挂起的 waitIdle 随之返回，
+/// 服务器才能在测试结束时退出（退出前要等进行中的请求完成）
+fn waitIdleWithin(h: *Harness, seconds: i64) !void {
+    const id = try h.send("zig-analyzer/waitIdle", {});
+    const start = std.Io.Clock.awake.now(testing.io);
+    var seen: usize = 0;
+    while (true) {
+        for (h.received.items[seen..]) |msg| {
+            if (msg.object.get("method") == null) if (msg.object.get("id")) |i| if (i == .integer and i.integer == id) return;
+        }
+        seen = h.received.items.len;
+        if (start.durationTo(std.Io.Clock.awake.now(testing.io)).nanoseconds > seconds * std.time.ns_per_s) {
+            _ = try h.request("shutdown", {});
+            return error.NeverIdle;
+        }
+        _ = try h.next();
+    }
+}
+
+/// 完成并替换了结果的编译次数（项目构建与单文件编译）。构建期间又有改动时，那一轮的结果被丢弃、立即重新构建，不计入
+fn compiles(h: *Harness) u64 {
+    return h.server.compile_generation.load(.monotonic);
+}
+
+/// 服务器的写事务次数
+fn writeCount(h: *Harness) !i64 {
+    const status = try h.request("zig-analyzer/status", {});
+    return status.object.get("result").?.object.get("writes").?.integer;
+}
+
+/// 为 `uri` 发布诊断的次数
+fn publishCount(h: *Harness, uri: []const u8) !usize {
+    var n: usize = 0;
+    for (try h.notifications("textDocument/publishDiagnostics")) |m| {
+        if (std.mem.eql(u8, m.object.get("params").?.object.get("uri").?.string, uri)) n += 1;
+    }
+    return n;
+}
+
+test "rewriting files on disk without changing their content is not a change" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+    try h.notify("initialized", Empty{});
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "src/main.zig")), fixture.basic[1].text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const lib_path = try project.path(a, "src/lib.zig");
+    const lib_uri = try za.base.uri.fromPath(a, lib_path);
+    const builds = compiles(&h);
+    const writes = try writeCount(&h);
+    const published = try publishCount(&h, lib_uri);
+    try testing.expect(builds > 0);
+    try testing.expect(published > 0);
+
+    // 原样重写（构建步骤写出的生成代码）：已知的文本没有变，不写入。服务器不知道上一次构建是否读到过磁盘上的
+    // 这份内容，重新构建一次
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = fixture.basic[2].text });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(builds + 1, compiles(&h));
+    try testing.expectEqual(writes, try writeCount(&h));
+
+    // 再次原样重写，以及先删除、再新建的原子保存：不写入、不重新构建、不重新发布
+    const rebuilt = compiles(&h);
+    const republished = try publishCount(&h, lib_uri);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = fixture.basic[2].text });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = lib_uri, .type = 3 }, .{ .uri = lib_uri, .type = 1 } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(rebuilt, compiles(&h));
+    try testing.expectEqual(writes, try writeCount(&h));
+    try testing.expectEqual(republished, try publishCount(&h, lib_uri));
+
+    // 内容真正改变：写入、重新构建，lib.zig 的编译器诊断随之清除
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn hello() void {}\n" });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(compiles(&h) > rebuilt);
+    try testing.expect(try writeCount(&h) > writes);
+    try testing.expectEqual(@as(usize, 0), (try lastDiagnostics(&h, lib_uri)).?.len);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a build step that rewrites a source file with the same content does not rebuild in a loop" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const gen = b.addExecutable(.{ .name = "gen", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("tools/gen.zig"),
+        \\        .target = b.graph.host,
+        \\    }) });
+        \\    // 没有声明输出的运行步骤每次构建都运行：原样重写源码树中的 src/gen.zig
+        \\    const run = b.addRunArtifact(gen);
+        \\    run.addDirectoryArg(b.path("src"));
+        \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("src/main.zig"),
+        \\        .target = b.standardTargetOptions(.{}),
+        \\        .optimize = b.standardOptimizeOption(.{}),
+        \\    }) });
+        \\    exe.step.dependOn(&run.step);
+        \\    b.installArtifact(exe);
+        \\    const check = b.step("check", "Check that everything compiles");
+        \\    check.dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "tools/gen.zig", .text =
+        \\const std = @import("std");
+        \\pub fn main(init: std.process.Init) !void {
+        \\    var args = try init.minimal.args.iterateAllocator(init.gpa);
+        \\    defer args.deinit();
+        \\    _ = args.next();
+        \\    const path = try std.fs.path.join(init.gpa, &.{ args.next().?, "gen.zig" });
+        \\    defer init.gpa.free(path);
+        \\    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = "pub const value = 1;\n" });
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = "const gen = @import(\"gen.zig\");\npub fn main() void {\n    _ = gen.value;\n}\n" },
+        .{ .path = "src/gen.zig", .text = "pub const value = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // 客户端不能动态注册文件监听：由服务器监听，生成步骤的写入会被发现
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, "const gen = @import(\"gen.zig\");\npub fn main() void {\n    _ = gen.value;\n}\n");
+    // 把重写当作改动会再次构建、再次重写，一直不能空闲（首次构建时监听已就绪就会如此）
+    try waitIdleWithin(&h, 120);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    // 保存触发一次构建：生成步骤原样重写 src/gen.zig。服务器第一次发现时不知道上一次构建是否读到过这份内容，
+    // 可能再构建一次（启动时已经发现过则不会），此后发现时不再构建
+    for (0..2) |round| {
+        const builds = compiles(&h);
+        const batches = watchBatches(&h);
+        try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+        try waitBatchAfter(&h, batches);
+        try waitIdleWithin(&h, 60);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const n = compiles(&h) - builds;
+        if (round == 0) try testing.expect(n == 1 or n == 2) else try testing.expectEqual(1, n);
+    }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "workspace folders: added folders start a project, removed ones clear its diagnostics" {
     var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
     defer first.deinit();
