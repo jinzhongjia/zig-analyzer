@@ -26,6 +26,13 @@ fn position(text: []const u8, needle: []const u8, delta: u32, encoding: offsets.
     return lines.position(at + delta, encoding);
 }
 
+/// 第一次在可以自动导入的名字处补全时开始为自动导入建索引：这时还没有自动导入，结果标记为不完整。等索引建完
+fn startAutoImport(h: *Harness, uri: []const u8, at: types.Position) !void {
+    const first = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
+    try testing.expect(first.object.get("result").?.object.get("isIncomplete").?.bool);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+}
+
 fn completionItems(response: std.json.Value) []const std.json.Value {
     const result = response.object.get("result").?;
     return if (result == .array) result.array.items else result.object.get("items").?.array.items;
@@ -95,6 +102,9 @@ test "auto-import edits replace the whole identifier and resolve after applicati
         try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
         _ = try h.request("zig-analyzer/waitIdle", {});
         const params = .{ .textDocument = .{ .uri = uri }, .position = try position(source, "Widgxx", 4, encoding) };
+        // 补全之前不建自动导入的索引
+        try testing.expect(importedWidget(try h.request("textDocument/completion", params)) == null);
+        _ = try h.request("zig-analyzer/waitIdle", {});
         const response = try h.request("textDocument/completion", params);
         const item = importedWidget(response) orelse return error.MissingAutoImport;
         const edited = try applyCompletion(a, source, item, encoding);
@@ -158,6 +168,7 @@ test "auto-import completion reports truncation and recomputes for a narrower pr
     const broad = "pub fn main() void { _ = Widget; }\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = broad } });
     _ = try h.request("zig-analyzer/waitIdle", {});
+    try startAutoImport(&h, uri, try position(broad, "Widget", 6, .utf16));
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(broad, "Widget", 6, .utf16) });
     try testing.expect(response.object.get("result").?.object.get("isIncomplete").?.bool);
     const narrow = "pub fn main() void { _ = Widget139; }\n";
@@ -246,7 +257,10 @@ test "auto-import storage public paths and direct aliases resolve after applying
             .alias = true,
         },
     };
-    var version: i64 = 1;
+    var version: i64 = 2;
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = cases[0].source }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try startAutoImport(&h, uri, try position(cases[0].source, cases[0].needle, @intCast(cases[0].needle.len), .utf8));
     for (cases) |case| {
         version += 1;
         try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = case.source }} });

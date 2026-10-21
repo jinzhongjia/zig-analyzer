@@ -26,12 +26,16 @@ const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 
 pub const Options = struct {
     auto_import: bool = true,
+    /// 不提供自动导入时也判断光标是否位于可以自动导入的名字处（`Result.import_position`）
+    detect_import_position: bool = false,
     max_auto_imports: usize = 128,
 };
 
 pub const Result = struct {
     items: []const Item,
     is_incomplete: bool = false,
+    /// 光标位于可以自动导入的名字处（提供了自动导入，或要求判断时）
+    import_position: bool = false,
 };
 
 pub const Item = struct {
@@ -56,13 +60,14 @@ pub const Item = struct {
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
     const base = try completeVisible(r, file, offset, &owner);
-    if (!options.auto_import) return .{ .items = base };
+    if (!options.auto_import and !options.detect_import_position) return .{ .items = base };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset == 0 or offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = try importPrefix(r.arena, root, text, offset) orelse return .{ .items = base };
+    if (!options.auto_import) return .{ .items = base, .import_position = true };
     const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports);
-    if (extra.items.len == 0) return .{ .items = base, .is_incomplete = extra.is_incomplete };
+    if (extra.items.len == 0) return .{ .items = base, .is_incomplete = extra.is_incomplete, .import_position = true };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
     for (extra.items) |candidate| {
@@ -98,7 +103,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
             .import_edit = candidate.import_edit,
         });
     }
-    return .{ .items = items.items, .is_incomplete = extra.is_incomplete };
+    return .{ .items = items.items, .is_incomplete = extra.is_incomplete, .import_position = true };
 }
 
 /// `cursor_owner` 记下查到的光标所在成员，自动导入沿用

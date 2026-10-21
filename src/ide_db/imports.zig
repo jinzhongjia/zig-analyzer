@@ -812,6 +812,16 @@ pub const FileLinks = struct {
 
 // ── 公开导出闭包 ───────────────────────────────────────────────────
 
+/// `file` 中经公开路径可达的命名空间所在的其他 Zig 源文件（可能重复）：按批预热公开导出闭包时据此展开
+pub fn publicTargets(ctx: *database.Db.Ctx, file: FileId, out: *std.ArrayList(FileId), a: Allocator) engine.Error!void {
+    const index = try ctx.get(FileDecls, file);
+    const links = try ctx.get(FileLinks, file);
+    for (index.public_decls) |p| {
+        const ns = links.namespaces[p.decl] orelse continue;
+        if (ns.file != file and isZigSource(ctx.db.env.vfs.path(ns.file))) try out.append(a, ns.file);
+    }
+}
+
 pub const Export = struct {
     /// 指向 `FileDecls` 的值（不淘汰，依赖它的本 query 随它重算）
     name: []const u8,

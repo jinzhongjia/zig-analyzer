@@ -125,6 +125,12 @@ edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
 live_prepared: live.Prepared = undefined,
 /// 是否有索引任务在运行（同时只运行一个）
 indexing: std.atomic.Value(bool) = .init(false),
+/// 在可以自动导入的名字处补全过：此后才为自动导入建索引。不补全的会话（浏览、跳转）不为它展开标准库的公开导出闭包
+imports_wanted: std.atomic.Value(bool) = .init(false),
+/// 最近一轮建完自动导入索引时的模块图（值的地址，没有模块图为 0，尚未建完为 `imports_pending`）。补全时模块图
+/// 与它不同则不提供自动导入，标记为不完整，客户端随输入重新请求：以免在请求中同步为新的模块图展开标准库、项目
+/// 的公开导出闭包。构建结果没有变化时模块图不写入，不影响
+imports_graph: std.atomic.Value(usize) = .init(imports_pending),
 /// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
 indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 indexed_mutex: Io.Mutex = .init,
@@ -877,19 +883,24 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     defer pc.leave();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
+    var graph_id: usize = 0;
     const files = blk: {
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
+        graph_id = graphId(ctx.get(ModuleGraph.Input, {}) catch return);
         break :blk za.ide_db.search.projectFiles(&r) catch return;
     };
-    const auto_import = blk: {
+    const auto_import = server.imports_wanted.load(.acquire) and blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
         break :blk server.config.completion_auto_import;
     };
     if (auto_import) try server.indexImportRoots();
-    if (files.len == 0) return;
+    if (files.len == 0) {
+        if (auto_import) server.imports_graph.store(graph_id, .release);
+        return;
+    }
     // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
     const t0 = Io.Clock.awake.now(server.io);
     var progress: ?*Progress.Progress = null;
@@ -925,6 +936,14 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         var buf: [32]u8 = undefined;
         if (progress) |p| server.progress.report(server, p, std.fmt.bufPrint(&buf, "{d}/{d} files", .{ done, files.len }) catch null, @intCast(done * 100 / files.len));
     }
+    if (auto_import) server.imports_graph.store(graph_id, .release);
+}
+
+/// 尚未建完自动导入索引（见 `imports_graph`）
+const imports_pending = std.math.maxInt(usize);
+
+fn graphId(graph: ?*const ModuleGraph) usize {
+    return if (graph) |g| @intFromPtr(g) else 0;
 }
 
 /// `auto_import` 时一并建自动导入的声明索引（只为 Zig 源文件）
@@ -937,38 +956,87 @@ fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.
     }
 }
 
-/// 公共导出索引跨补全请求复用；标准库与命名模块不必等到用户输入名字时才展开。
+/// 公开导出索引跨补全请求复用，在后台为标准库、`builtin` 与各命名模块建好，不在补全请求中展开。闭包涉及的文件
+/// 按批建索引，批与批之间淘汰解析树等中间结果：一个读事务中展开整个标准库的闭包时，它们在事务结束前都不能淘汰
 fn indexImportRoots(server: *Server) Io.Cancelable!void {
+    server.warmImportRoots() catch log.err("out of memory while indexing imports", .{});
+}
+
+fn warmImportRoots(server: *Server) Allocator.Error!void {
+    const imports = za.ide_db.imports;
     var scratch: std.heap.ArenaAllocator = .init(server.gpa);
     defer scratch.deinit();
+    var files: std.ArrayList(Vfs.FileId) = .empty;
+    defer files.deinit(server.gpa);
+    var seen: std.AutoHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    defer seen.deinit(server.gpa);
+    while (true) {
+        if (server.isShuttingDown()) return;
+        var ctx = server.db.beginRead(scratch.allocator());
+        defer ctx.end();
+        const graph = (ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return;
+        var roots: std.ArrayList(Vfs.FileId) = .empty;
+        defer roots.deinit(server.gpa);
+        if (graph.std_root) |file| try roots.append(server.gpa, file);
+        if (graph.default_builtin) |file| try roots.append(server.gpa, file);
+        for (graph.modules) |module| for (module.imports) |imp| {
+            if (graph.modules[imp.module].root) |file| try roots.append(server.gpa, file);
+        };
+        // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON）
+        for (roots.items) |file| {
+            if (!imports.isZigSource(server.vfs.path(file))) continue;
+            if (!(try seen.getOrPut(server.gpa, file)).found_existing) try files.append(server.gpa, file);
+        }
+        break;
+    }
+    const root_count = files.items.len;
+    var done: usize = 0;
+    while (done < files.items.len) {
+        if (server.isShuttingDown()) return;
+        const end = @min(done + index_batch, files.items.len);
+        _ = scratch.reset(.retain_capacity);
+        var found: std.ArrayList(Vfs.FileId) = .empty;
+        var canceled = false;
+        {
+            var ctx = server.db.beginRead(scratch.allocator());
+            defer ctx.end();
+            for (files.items[done..end]) |file| {
+                imports.publicTargets(&ctx, file, &found, scratch.allocator()) catch |err| switch (err) {
+                    error.Canceled => {
+                        canceled = true;
+                        break;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+            }
+        }
+        if (server.db.wantsSweep()) _ = server.db.trySweep();
+        // 被编辑打断：重试这一批
+        if (canceled) continue;
+        for (found.items) |file| {
+            if (!(try seen.getOrPut(server.gpa, file)).found_existing) try files.append(server.gpa, file);
+        }
+        done = end;
+    }
+    // 各文件的索引都已建好，展开闭包只是查找与复制
     while (!server.isShuttingDown()) {
         _ = scratch.reset(.retain_capacity);
         var ctx = server.db.beginRead(scratch.allocator());
         defer ctx.end();
-        warmImportRoots(&ctx, scratch.allocator()) catch |err| switch (err) {
-            error.Canceled => continue,
-            error.OutOfMemory => {
-                log.err("out of memory while indexing imports", .{});
-                return;
-            },
-        };
-        return;
-    }
-}
-
-fn warmImportRoots(ctx: *Db.Ctx, arena: Allocator) za.db.Error!void {
-    const graph = try ctx.get(ModuleGraph.Input, {}) orelse return;
-    var roots: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-    if (graph.std_root) |file| try roots.put(arena, file, {});
-    if (graph.default_builtin) |file| try roots.put(arena, file, {});
-    for (graph.modules) |module| for (module.imports) |imp| {
-        if (graph.modules[imp.module].root) |file| try roots.put(arena, file, {});
-    };
-    for (roots.keys()) |file| {
-        // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON）
-        if (!za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(file))) continue;
-        _ = try ctx.get(za.ide_db.imports.FileDecls, file);
-        _ = try ctx.get(za.ide_db.imports.Exports, .{ .ns = .{ .file = file, .container = 0 } });
+        var canceled = false;
+        for (files.items[0..root_count]) |file| {
+            _ = ctx.get(imports.Exports, .{ .ns = .{ .file = file, .container = 0 } }) catch |err| switch (err) {
+                error.Canceled => {
+                    canceled = true;
+                    break;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
+        if (!canceled) return;
     }
 }
 
@@ -1523,7 +1591,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (compiler_disabled) server.clearSingleFileResults();
     if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
     if (semantic_changed) server.requestSemanticRefresh();
-    if (imports_enabled) server.scheduleIndexing();
+    if (imports_enabled and server.imports_wanted.load(.acquire)) server.scheduleIndexing();
     if (build_changed) {
         if (!new.build_enable) {
             // 关闭构建系统集成：停止各项目，其文件改按单文件处理
@@ -3390,7 +3458,15 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         defer server.config_mutex.unlock(server.io);
         break :blk server.config.completion_auto_import;
     };
-    const result = try ide.completion.complete(r, file, offset, .{ .auto_import = auto_import });
+    // 自动导入的索引为当前模块图建完之前不提供，标记为不完整：客户端随输入重新请求，届时再提供。第一次在可以自动
+    // 导入的名字处补全时开始建索引
+    const imports_ready = server.imports_graph.load(.acquire) == graphId(try r.ctx.get(ModuleGraph.Input, {}));
+    const result = try ide.completion.complete(r, file, offset, .{
+        .auto_import = auto_import and imports_ready,
+        .detect_import_position = auto_import and !imports_ready,
+    });
+    const imports_waiting = auto_import and !imports_ready and result.import_position;
+    if (imports_waiting and !server.imports_wanted.swap(true, .acq_rel)) server.scheduleIndexing();
     const out = try arena.alloc(types.CompletionItem, result.items.len);
     var lines: ?offsets.LineIndex = null;
     for (result.items, out) |it, *o| {
@@ -3425,7 +3501,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             o.additionalTextEdits = edits;
         }
     }
-    if (result.is_incomplete) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
+    if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
     return .{ .array_of_CompletionItem = out };
 }
 
