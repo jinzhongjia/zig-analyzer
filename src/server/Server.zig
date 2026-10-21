@@ -63,6 +63,8 @@ bg_group: Io.Group = .init,
 publish_queue_mutex: Io.Mutex = .init,
 publish_queue: std.ArrayList(PublishJob) = .empty,
 publish_workers: usize = 0,
+/// 排队中或正在发布的文件（受 publish_queue_mutex 保护），见 `publishFiles`
+publish_files: std.AutoHashMapUnmanaged(Vfs.FileId, PublishState) = .empty,
 busy_mutex: Io.Mutex = .init,
 busy_cond: Io.Condition = .init,
 busy: usize = 0,
@@ -254,6 +256,7 @@ pub fn deinit(server: *Server) void {
     }
     // 后台任务都已结束，只剩列表持有的引用
     server.publish_queue.deinit(server.gpa);
+    server.publish_files.deinit(server.gpa);
     for (server.workspaces.items) |ws| ws.release();
     server.workspaces.deinit(server.gpa);
     server.indexed.deinit(server.gpa);
@@ -2385,31 +2388,41 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
 /// 每批发布的并发上限：大批量变更（watcher、构建错误）不能按文件数生成任务与读事务
 pub const max_publish_workers = 8;
 
-const PublishJob = struct { file: Vfs.FileId, clear: bool };
+/// `tracked` 时文件的状态记在 `publish_files` 中，`clear` 在开始时从那里取；记不下状态（分配失败）时不合并
+const PublishJob = struct { file: Vfs.FileId, clear: bool = false, tracked: bool = true };
+
+const PublishState = struct {
+    /// 在队列中，尚未开始
+    queued: bool = true,
+    /// 开始计算之后又有了发布请求：完成后再发布一次
+    again: bool = false,
+    /// 下一次发布即使没有诊断也发送（合并的请求取并集）
+    clear: bool,
+};
 
 /// 在后台重新计算并发布这些文件的诊断。`clear` 为 true 时即使没有诊断也发布（用于清除旧诊断）。
-/// 任务数不超过 `max_publish_workers`，同一文件在一次调用中去重
+/// 同一文件已在排队时合并，正在计算时在完成后再发布一次：每次状态变化（如构建结束）都会请求发布打开的文件，
+/// 并发计算同一文件只是重复的工作，而完成后的那一次读到的是最新的状态。任务数不超过 `max_publish_workers`
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
     if (files.len == 0) return;
-    // 同一次调用的文件去重；`clear` 取并集
-    var unique: std.AutoArrayHashMapUnmanaged(Vfs.FileId, bool) = .empty;
-    defer unique.deinit(server.gpa);
-    var deduped = true;
-    for (files) |file| {
-        const gop = unique.getOrPut(server.gpa, file) catch {
-            deduped = false;
-            break;
-        };
-        if (gop.found_existing) gop.value_ptr.* = gop.value_ptr.* or clear else gop.value_ptr.* = clear;
-    }
     var spawn_count: usize = 0;
     {
         server.publish_queue_mutex.lockUncancelable(server.io);
         defer server.publish_queue_mutex.unlock(server.io);
-        if (deduped) {
-            for (unique.keys(), unique.values()) |file, c| server.publish_queue.append(server.gpa, .{ .file = file, .clear = c }) catch {};
-        } else {
-            for (files) |file| server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear }) catch {};
+        for (files) |file| {
+            const gop = server.publish_files.getOrPut(server.gpa, file) catch {
+                server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear, .tracked = false }) catch {};
+                continue;
+            };
+            if (gop.found_existing) {
+                gop.value_ptr.clear = gop.value_ptr.clear or clear;
+                if (!gop.value_ptr.queued) gop.value_ptr.again = true;
+                continue;
+            }
+            gop.value_ptr.* = .{ .clear = clear };
+            server.publish_queue.append(server.gpa, .{ .file = file }) catch {
+                _ = server.publish_files.remove(file);
+            };
         }
         if (server.publish_workers < max_publish_workers and server.publish_queue.items.len != 0) {
             spawn_count = @min(max_publish_workers - server.publish_workers, server.publish_queue.items.len);
@@ -2440,11 +2453,35 @@ fn publishWorker(server: *Server) Io.Cancelable!void {
                 counted = false;
                 return;
             }
-            break :blk server.publish_queue.swapRemove(0);
+            var job = server.publish_queue.swapRemove(0);
+            if (job.tracked) {
+                const state = server.publish_files.getPtr(job.file).?;
+                state.queued = false;
+                job.clear = state.clear;
+                state.clear = false;
+            }
+            break :blk job;
         };
         server.publishNow(job.file, job.clear, null);
+        if (job.tracked) server.publishDone(job.file);
         server.maybeResetSema();
     }
+}
+
+/// 一次发布完成：计算期间又有请求时重新排队（由仍在运行的 worker 处理）
+fn publishDone(server: *Server, file: Vfs.FileId) void {
+    server.publish_queue_mutex.lockUncancelable(server.io);
+    defer server.publish_queue_mutex.unlock(server.io);
+    const state = server.publish_files.getPtr(file).?;
+    if (!state.again) {
+        _ = server.publish_files.remove(file);
+        return;
+    }
+    state.again = false;
+    state.queued = true;
+    server.publish_queue.append(server.gpa, .{ .file = file }) catch {
+        _ = server.publish_files.remove(file);
+    };
 }
 
 pub fn publishOpenFiles(server: *Server) void {
@@ -2732,6 +2769,32 @@ test "publishFiles: large batches use a bounded number of workers" {
         if (std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) published += 1;
     } else |err| if (err != error.EndOfStream) return err;
     try std.testing.expectEqual(files.len, published);
+}
+
+test "publishFiles: requests for a file being published coalesce into one more run" {
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    const file = try server.vfs.intern("/tmp/zig-analyzer-publish-coalesce.zig");
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, file, try gpa.dupe(u8, "fn f() void {\n    var x = 1;\n}\n"), .low);
+    }
+    const before = server.publish_seq.load(.monotonic);
+    // 写事务期间发布任务停在读事务之前：之后的请求都在第一次发布排队或计算时到达
+    server.db.beginWrite();
+    for (0..10) |_| server.publishFiles(&.{file}, true);
+    server.db.endWrite();
+    server.waitIdle();
+    // 排队中的请求合并，计算开始之后的请求在完成后合为一次
+    const computed = server.publish_seq.load(.monotonic) - before;
+    try std.testing.expect(computed >= 1 and computed <= 2);
+    try std.testing.expectEqual(0, server.publish_files.count());
 }
 
 test "updateModuleGraph keeps the old inputs when an allocation fails" {
