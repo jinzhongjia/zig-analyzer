@@ -389,3 +389,42 @@ test "valid code has no parse errors" {
         try expectLossless(s);
     }
 }
+
+test "unclosed escaped identifiers retain syntax roles and invalid token diagnostics" {
+    const Kind = @import("kind.zig").SyntaxKind;
+    const cases = [_]struct { source: []const u8, parent: Kind }{
+        .{ .source = "const value = @\"EdgeWidg", .parent = .name_ref },
+        .{ .source = "fn main() void { _ = @\"EdgeWidg\n}", .parent = .name_ref },
+        .{ .source = "const @\"EdgeWidg", .parent = .var_decl },
+        .{ .source = "fn @\"EdgeWidg", .parent = .fn_proto },
+        .{ .source = "const value = object.@\"EdgeWidg", .parent = .field_access },
+        .{ .source = "const value = .@\"EdgeWidg", .parent = .enum_literal },
+        .{ .source = "const value = error.@\"EdgeWidg", .parent = .error_value },
+        .{ .source = "fn main() void { break :@\"EdgeWidg", .parent = .break_label },
+        .{ .source = "fn main() void { for (items) |@\"EdgeWidg", .parent = .payload },
+    };
+    const Parent = struct {
+        fn at(node: tree.SyntaxNode, offset: u32) Kind {
+            var children = node.children();
+            while (children.next()) |child| {
+                if (!child.range().contains(offset)) continue;
+                return switch (child) {
+                    .node => |inner| at(inner, offset),
+                    .token => node.kind(),
+                };
+            }
+            return node.kind();
+        }
+    };
+    for (cases) |case| {
+        const parse = try Parse.create(testing.allocator, case.source);
+        defer parse.destroy();
+        const offset: u32 = @intCast(std.mem.indexOf(u8, case.source, "@\"").?);
+        const root = parse.rootNode();
+        const token = root.tokenAtOffset(offset).?;
+        try testing.expectEqual(.invalid, token.kind);
+        try testing.expectEqual(case.parent, Parent.at(root, offset));
+        try testing.expectEqual(offset, parse.errors[0].offset);
+        try expectLossless(case.source);
+    }
+}
