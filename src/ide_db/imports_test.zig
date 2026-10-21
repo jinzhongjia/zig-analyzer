@@ -10,7 +10,7 @@ fn run(w: *World, file: FileId, offset: u32, prefix: []const u8, limit: usize) !
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    return imports.complete(&r, file, offset, prefix, limit);
+    return imports.complete(&r, file, offset, .unknown, prefix, limit);
 }
 fn find(result: imports.Result, label: []const u8) ?imports.Candidate {
     for (result.items) |item| if (std.mem.eql(u8, item.label, label)) return item;

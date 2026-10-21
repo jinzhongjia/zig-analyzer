@@ -910,39 +910,47 @@ fn sameSlice(a: []const u8, b: []const u8) bool {
     return a.ptr == b.ptr and a.len == b.len;
 }
 
-pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, limit: usize) resolve.Error!Result {
+/// 光标所在的成员：调用方已经查到时传入，免得再遍历一次文件的成员
+pub const Owner = union(enum) { unknown, known: ?u32 };
+
+pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: []const u8, limit: usize) resolve.Error!Result {
     if (prefix.len == 0) return .{ .items = &.{} };
     var builder: Builder = .{ .r = r, .file = file, .offset = offset, .prefix = prefix, .limit = limit };
     const current = try r.ctx.get(FileDecls, file);
     const links = try r.ctx.get(FileLinks, file);
     const graph = try r.ctx.get(database.ModuleGraph.Input, {});
-    builder.owner = try r.ownerAt(file, offset, true);
-    if (builder.owner) |owner| {
-        builder.body = try r.body(file, owner);
-        const base = try r.itemOffset(file, owner) orelse offset;
+    builder.owner = switch (owner) {
+        .unknown => try r.ownerAt(file, offset, true),
+        .known => |item| item,
+    };
+    if (builder.owner) |item| {
+        builder.body = try r.body(file, item);
+        // 成员的起点取自语法树（按键时本来就重算），不读 `ItemSummaries`：它要为整个文件重算
+        const base = if (try r.itemNode(file, item)) |node| node.offset else offset;
         builder.scope = builder.body.?.scopeAt((offset -| base) -| 1);
     }
-    // 当前可见的顶层直接别名：按规范目标建立反向映射。
-    for (current.decls, links.targets) |*decl, target| {
+    // 顶层 const 可能是别名；用到时才检查它在光标处是否可见
+    var top: std.ArrayList(Alias) = .empty;
+    for (current.decls, links.namespaces, links.targets) |*decl, ns, target| {
         if (decl.container != 0 or decl.kind != .@"const") continue;
-        if (deepEql(target, Declaration{ .file = file, .item = decl.item })) continue;
-        const visible = try builder.visible(decl.name) orelse continue;
-        if (!deepEql(visible, resolve.Def{ .item = .{ .file = file, .item = decl.item } })) continue;
-        const entry = try builder.direct_aliases.getOrPut(r.arena, target);
-        if (!entry.found_existing) entry.value_ptr.* = decl;
+        try top.append(r.arena, .{ .decl = decl, .ns = ns, .target = target });
+        if (ns) |n| try builder.alias_namespaces.put(r.arena, n, {});
+        if (!deepEql(target, Declaration{ .file = file, .item = decl.item })) try builder.alias_targets.put(r.arena, target, {});
     }
+    builder.top = top.items;
     const matches = current.matching(prefix);
     // 已有命名空间别名优先，不为同一入口再生成 import。
-    for (current.decls, links.namespaces) |decl, namespace| {
-        if (decl.container != 0 or decl.kind != .@"const") continue;
-        const ns = namespace orelse continue;
-        const visible = try builder.visible(decl.name) orelse continue;
-        if (!deepEql(visible, resolve.Def{ .item = .{ .file = file, .item = decl.item } })) continue;
-        const root = try renderName(r.arena, decl.name);
-        try builder.aliases.put(r.arena, ns, {});
+    for (top.items) |alias| {
+        const decl = alias.decl;
+        const ns = alias.ns orelse continue;
         const exports = try r.ctx.get(Exports, .{ .ns = ns });
-        for (exports.matching(prefix)) |declared| {
+        const declared_matches = exports.matching(prefix);
+        if (declared_matches.len == 0 and (ns.file != file or matches.start == matches.end)) continue;
+        if (!try builder.refersToSelf(decl)) continue;
+        const root = try renderName(r.arena, decl.name);
+        for (declared_matches) |declared| {
             if (try builder.reuseDirect(declared.target, declared.name, declared.kind, declared.doc)) continue;
+            if (builder.rejects("~0", &.{ root, ".", declared.path })) continue;
             if (try builder.visible(declared.name) != null) continue;
             try builder.reused.put(r.arena, declared.target, {});
             try builder.add(.{ .label = try joinPath(r.arena, root, declared.path), .kind = candidateKind(declared.kind), .filter = declared.name, .qualifier = root, .sort = "~0", .doc = declared.doc });
@@ -951,6 +959,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, lim
         if (ns.file == file) for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |nested, target| {
             if (try builder.reuseDirect(target, nested.name, nested.kind, nested.doc)) continue;
             const relative = try localRelative(r.arena, current, ns, nested) orelse continue;
+            if (builder.rejects("~0", &.{ root, ".", relative })) continue;
             if (try builder.visible(nested.name) != null) continue;
             try builder.reused.put(r.arena, target, {});
             try builder.add(.{ .label = try joinPath(r.arena, root, relative), .kind = candidateKind(nested.kind), .filter = nested.name, .qualifier = root, .sort = "~0", .doc = nested.doc });
@@ -960,6 +969,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, lim
     for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |decl, target| {
         if (try builder.reuseDirect(target, decl.name, decl.kind, decl.doc)) continue;
         const root_name = decl.root orelse continue;
+        if (builder.rejects("~1", &.{decl.path})) continue;
         if (try builder.visible(decl.name) != null) continue;
         const root_def = try builder.visible(root_name) orelse continue;
         const expected = findRoot(current, root_name) orelse continue;
@@ -973,7 +983,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, lim
             const target = g.importTarget(file, name) orelse continue;
             const ns: Namespace = .{ .file = target, .container = 0 };
             const spec = try r.arena.dupe(u8, name);
-            if (!builder.aliases.contains(ns) and std.mem.startsWith(u8, name, prefix) and try builder.visible(name) == null)
+            if (std.mem.startsWith(u8, name, prefix) and try builder.namespaceAlias(ns) == null and try builder.visible(name) == null)
                 try builder.importCandidate(name, .module, false, spec, "", null, "~2");
             try builder.exported(ns, spec);
         };
@@ -989,16 +999,17 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, lim
             const stem = basename[0 .. basename.len - ".zig".len];
             if (public.len == 0 and !std.mem.startsWith(u8, stem, prefix)) continue;
             const spec = try importSpec(r, g, file, entry.file) orelse continue;
-            if (std.mem.startsWith(u8, stem, prefix) and !builder.aliases.contains(ns) and try builder.visible(stem) == null)
+            const aliased = try builder.namespaceAlias(ns) != null;
+            if (std.mem.startsWith(u8, stem, prefix) and !aliased and try builder.visible(stem) == null)
                 try builder.importCandidate(stem, .file, false, spec, "", null, "~3");
-            if (builder.aliases.contains(ns) or public.len == 0) continue;
+            if (aliased or public.len == 0) continue;
             const targets = (try r.ctx.get(FileLinks, entry.file)).targets;
             for (public) |p| {
                 const decl = index.decls[p.decl];
                 const target = targets[p.decl];
                 if (try builder.reuseDirect(target, decl.name, decl.kind, decl.doc)) continue;
-                if (builder.reused.contains(target) or try builder.visible(decl.name) != null) continue;
-                try builder.importCandidate(decl.name, candidateKind(decl.kind), decl.is_extern, spec, p.path, decl.doc, if (std.mem.indexOfScalar(u8, p.path, '.') == null) "~3" else "~4");
+                if (builder.reused.contains(target)) continue;
+                try builder.importIfVisible(decl.name, candidateKind(decl.kind), decl.is_extern, spec, p.path, decl.doc, if (std.mem.indexOfScalar(u8, p.path, '.') == null) "~3" else "~4");
             }
         }
     }
@@ -1010,6 +1021,9 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, prefix: []const u8, lim
     return .{ .items = builder.items.items, .is_incomplete = builder.incomplete };
 }
 
+/// 当前文件的顶层 const 及其指向的命名空间、规范目标
+const Alias = struct { decl: *const Decl, ns: ?Namespace, target: Declaration };
+
 const Builder = struct {
     r: *Resolver,
     file: FileId,
@@ -1019,11 +1033,16 @@ const Builder = struct {
     owner: ?u32 = null,
     body: ?*const Body = null,
     scope: Body.ScopeId = .root,
-    aliases: std.AutoHashMapUnmanaged(Namespace, void) = .empty,
-    direct_aliases: std.AutoHashMapUnmanaged(Declaration, *const Decl) = .empty,
+    /// 当前文件的顶层 const，按名字排序
+    top: []const Alias = &.{},
+    /// `top` 中各项的命名空间与不是自身的规范目标：不在其中时不必逐个检查
+    alias_namespaces: std.AutoHashMapUnmanaged(Namespace, void) = .empty,
+    alias_targets: std.AutoHashMapUnmanaged(Declaration, void) = .empty,
     reused: std.AutoHashMapUnmanaged(Declaration, void) = .empty,
     visible_names: std.StringHashMapUnmanaged(?resolve.Def) = .empty,
     items: std.ArrayList(Candidate) = .empty,
+    /// `items` 已满时排序最差的一项；`items` 变化后重新计算
+    worst: ?usize = null,
     incomplete: bool = false,
     insertion: ?u32 = null,
     insertion_blocked: bool = false,
@@ -1050,8 +1069,27 @@ const Builder = struct {
         if (!(try b.r.ctx.get(database.FileIndex.Query, b.file)).contains(name)) return false;
         return BindingNames.contains(try b.r.ctx.get(BindingNames, b.file), name);
     }
+    /// 顶层声明的名字在光标处仍指向它自己（没有被局部的同名绑定遮蔽）
+    fn refersToSelf(b: *Builder, decl: *const Decl) resolve.Error!bool {
+        const def = try b.visible(decl.name) orelse return false;
+        return deepEql(def, resolve.Def{ .item = .{ .file = b.file, .item = decl.item } });
+    }
+    /// 光标处可见、指向 `ns` 的第一个顶层别名
+    fn namespaceAlias(b: *Builder, ns: Namespace) resolve.Error!?*const Decl {
+        if (!b.alias_namespaces.contains(ns)) return null;
+        for (b.top) |alias| if (alias.ns) |n| if (deepEql(n, ns) and try b.refersToSelf(alias.decl)) return alias.decl;
+        return null;
+    }
+    /// 光标处可见、规范目标为 `target` 的第一个顶层直接别名
+    fn directAlias(b: *Builder, target: Declaration) resolve.Error!?*const Decl {
+        if (!b.alias_targets.contains(target)) return null;
+        for (b.top) |alias| {
+            if (deepEql(alias.target, target) and !deepEql(alias.target, Declaration{ .file = b.file, .item = alias.decl.item }) and try b.refersToSelf(alias.decl)) return alias.decl;
+        }
+        return null;
+    }
     fn reuseDirect(b: *Builder, target: Declaration, name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8) resolve.Error!bool {
-        const alias = b.direct_aliases.get(target) orelse return false;
+        const alias = try b.directAlias(target) orelse return false;
         // 别名与目标共享前缀时，继续输入后须重新选择过滤名字，不能沿用另一条拼写。
         if (!std.mem.eql(u8, alias.name, name) and std.mem.startsWith(u8, alias.name, b.prefix)) b.incomplete = true;
         try b.add(.{ .label = try renderName(b.r.arena, alias.name), .kind = candidateKind(kind), .filter = name, .qualifier = "", .sort = "~0", .doc = doc });
@@ -1064,28 +1102,63 @@ const Builder = struct {
         }
         if (b.items.items.len < b.limit) {
             try b.items.append(b.r.arena, candidate);
+            b.worst = null;
         } else {
             b.incomplete = true;
             // 保留排序最好的有限个结果；截断不受图中 FileId 顺序影响。
             if (b.limit == 0) return;
-            var worst: usize = 0;
-            for (b.items.items, 0..) |item, i| if (candidateLess({}, b.items.items[worst], item)) {
-                worst = i;
-            };
-            if (candidateLess({}, candidate, b.items.items[worst])) b.items.items[worst] = candidate;
+            const worst = b.worstIndex();
+            if (candidateLess({}, candidate, b.items.items[worst])) {
+                b.items.items[worst] = candidate;
+                b.worst = null;
+            }
         }
     }
+    fn worstIndex(b: *Builder) usize {
+        if (b.worst) |worst| return worst;
+        var worst: usize = 0;
+        for (b.items.items, 0..) |item, i| if (candidateLess({}, b.items.items[worst], item)) {
+            worst = i;
+        };
+        b.worst = worst;
+        return worst;
+    }
+    /// 已满且排序（`sort`，再按依次拼接 `label` 各段得到的标签）比最差的一项差：不会进入结果，不必构造这一项，
+    /// 也不必检查它是否可见。短前缀可以匹配到上千个声明，只有排序最好的 `limit` 个需要构造。`label` 为 null
+    /// 时只比较 `sort`
+    fn rejects(b: *Builder, sort: []const u8, label: ?[]const []const u8) bool {
+        if (b.items.items.len < b.limit) return false;
+        b.incomplete = true;
+        if (b.limit == 0) return true;
+        const worst = b.items.items[b.worstIndex()];
+        return switch (std.mem.order(u8, sort, worst.sort)) {
+            .lt => false,
+            .gt => true,
+            .eq => if (label) |parts| orderJoined(parts, worst.label) == .gt else false,
+        };
+    }
     fn exported(b: *Builder, ns: Namespace, spec: []const u8) resolve.Error!void {
-        if (b.aliases.contains(ns)) return;
+        if (try b.namespaceAlias(ns) != null) return;
         const index = try b.r.ctx.get(Exports, .{ .ns = ns });
         for (index.matching(b.prefix)) |decl| {
             if (try b.reuseDirect(decl.target, decl.name, decl.kind, decl.doc)) continue;
-            if (b.reused.contains(decl.target) or try b.visible(decl.name) != null) continue;
-            try b.importCandidate(decl.name, candidateKind(decl.kind), decl.is_extern, spec, decl.path, decl.doc, if (std.mem.indexOfScalar(u8, decl.path, '.') == null) "~3" else "~4");
+            if (b.reused.contains(decl.target)) continue;
+            try b.importIfVisible(decl.name, candidateKind(decl.kind), decl.is_extern, spec, decl.path, decl.doc, if (std.mem.indexOfScalar(u8, decl.path, '.') == null) "~3" else "~4");
         }
+    }
+    /// 名字在当前位置不可见时提供 import；先按排序淘汰，再检查可见性
+    fn importIfVisible(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8) resolve.Error!void {
+        var buf: [256]u8 = undefined;
+        const args = importSortArgs(name, spec, path, rank);
+        const sort = std.fmt.bufPrint(&buf, import_sort, args) catch try std.fmt.allocPrint(b.r.arena, import_sort, args);
+        if (b.rejects(sort, null)) return;
+        if (try b.visible(name) != null) return;
+        try b.importCandidate(name, kind, is_extern, spec, path, doc, rank);
     }
     fn importCandidate(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8) resolve.Error!void {
         const a = b.r.arena;
+        const sort = try std.fmt.allocPrint(a, import_sort, importSortArgs(name, spec, path, rank));
+        if (b.rejects(sort, null)) return;
         const qualifier = if (path.len == 0) spec else try std.fmt.allocPrint(a, "{s}:{s}", .{ spec, path });
         var binding = name;
         var binding_path = path;
@@ -1124,15 +1197,30 @@ const Builder = struct {
             });
             break :blk .{ .start = offset, .end = offset, .text = text };
         };
-        try b.add(.{ .label = label, .kind = kind, .filter = name, .qualifier = qualifier, .sort = try std.fmt.allocPrint(a, "~2:{d}:{s}:{d:0>6}:{d:0>4}:{s}", .{
-            if (!std.mem.endsWith(u8, spec, ".zig")) @as(u8, 2) else if (std.mem.indexOfScalar(u8, spec, '/') == null) @as(u8, 0) else @as(u8, 1),
-            rank,
-            spec.len + path.len,
-            name.len,
-            qualifier,
-        }), .doc = doc, .import_edit = edit });
+        try b.add(.{ .label = label, .kind = kind, .filter = name, .qualifier = qualifier, .sort = sort, .doc = doc, .import_edit = edit });
     }
 };
+
+/// import 候选的排序：同目录的文件、其他相对路径、命名模块依次靠后，再按层级、路径长度、名字长度与来源
+const import_sort = "~2:{d}:{s}:{d:0>6}:{d:0>4}:{s}{s}{s}";
+
+fn importSortArgs(name: []const u8, spec: []const u8, path: []const u8, rank: []const u8) struct { u8, []const u8, usize, usize, []const u8, []const u8, []const u8 } {
+    const origin: u8 = if (!std.mem.endsWith(u8, spec, ".zig")) 2 else if (std.mem.indexOfScalar(u8, spec, '/') == null) 0 else 1;
+    return .{ origin, rank, spec.len + path.len, name.len, spec, if (path.len == 0) "" else ":", path };
+}
+
+/// `parts` 依次拼接后与 `other` 比较
+fn orderJoined(parts: []const []const u8, other: []const u8) std.math.Order {
+    var rest = other;
+    for (parts) |part| {
+        const n = @min(part.len, rest.len);
+        const order = std.mem.order(u8, part[0..n], rest[0..n]);
+        if (order != .eq) return order;
+        if (part.len > rest.len) return .gt;
+        rest = rest[part.len..];
+    }
+    return if (rest.len == 0) .eq else .lt;
+}
 
 fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, target: FileId) resolve.Error!?[]const u8 {
     for ([_][]const u8{ "std", "builtin" }) |name| if (graph.importTarget(from, name) == target) return name;

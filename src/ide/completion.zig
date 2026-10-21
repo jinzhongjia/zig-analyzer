@@ -54,13 +54,14 @@ pub const Item = struct {
 };
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
-    const base = try completeVisible(r, file, offset);
+    var owner: imports.Owner = .unknown;
+    const base = try completeVisible(r, file, offset, &owner);
     if (!options.auto_import) return .{ .items = base };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset == 0 or offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = try importPrefix(r.arena, root, text, offset) orelse return .{ .items = base };
-    const extra = try imports.complete(r, file, offset, name.prefix, options.max_auto_imports);
+    const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports);
     if (extra.items.len == 0) return .{ .items = base, .is_incomplete = extra.is_incomplete };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
@@ -100,7 +101,8 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     return .{ .items = items.items, .is_incomplete = extra.is_incomplete };
 }
 
-fn completeVisible(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Item {
+/// `cursor_owner` 记下查到的光标所在成员，自动导入沿用
+fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error![]const Item {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return &.{};
@@ -119,7 +121,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32) resolve.Error![]cons
     }
     if (literal == .string) return &.{};
 
-    const item = try r.ownerAt(file, offset, true) orelse return &.{};
+    cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) };
+    const item = cursor_owner.known orelse return &.{};
     const node = try r.itemNode(file, item) orelse return &.{};
     const b = try r.body(file, item);
     const rel = offset - node.offset;
