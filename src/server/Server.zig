@@ -616,6 +616,9 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
 /// 请求耗时超过 `log.slow_request_ms` 时记录：按 query 汇总的自身耗时与调用树中的耗时路径。
 /// 在读事务结束前调用（描述 key 时读取 ItemTree）
 fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timestamp, trace: *const za.db.Trace) void {
+    // 测试中请求耗时随机器负载波动，warn 会写到 stderr，让构建输出出现误导性的 `failed command`；
+    // 报告内容由直接调用 writeSlowReport 的测试覆盖
+    if (@import("builtin").is_test) return;
     const threshold = server.slow_request_ms.load(.monotonic);
     if (threshold == 0) return;
     const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds));
