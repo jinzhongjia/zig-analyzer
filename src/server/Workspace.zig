@@ -84,8 +84,9 @@ load_done: bool = false,
 rebuild: bool = false,
 /// 构建过程中得知了新的生成文件路径、但编译集合尚未重算（节流，见 `generated_recompute_interval_ms`）
 generated_dirty: bool = false,
-/// 上一次因生成文件重算编译集合的时间
+/// 上一次因生成文件重算编译集合结束的时间与耗时（见 `generatedRecomputeDue`）
 generated_recomputed_at: ?Io.Timestamp = null,
+generated_recompute_ns: u64 = 0,
 stopping: bool = false,
 /// 项目加载进度（启动到首次编译集合算出）
 loading: ?*Progress = null,
@@ -102,8 +103,12 @@ bundles: std.ArrayList(ErrorBundle) = .empty,
 /// 已尝试从磁盘加载的文件（不存在的文件也记录，避免反复尝试）
 loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
 
-/// 构建过程中因生成文件的路径而重算编译集合的最短间隔
+/// 构建过程中因生成文件的路径而重算编译集合：距上一次重算结束至少 `generated_recompute_interval_ms`，且不少于
+/// 上一次重算耗时的 `generated_recompute_cost_factor` 倍。大项目一次重算可达数秒（Zig 编译器的构建图有四千多个
+/// 编译 step，算出它们可达的文件约 1 秒），间隔固定时读取构建事件的任务一直在重算：maker 的事件积压、构建变慢，
+/// 模块图在整个构建中每秒更新一次，后台索引不停
 const generated_recompute_interval_ms = 1000;
+const generated_recompute_cost_factor = 4;
 
 /// 启动 maker 并在后台读取事件。返回的实例带有一个属于调用方的引用；调用方确定实例的位置后设置 `placed`
 pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
@@ -489,11 +494,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             if (roots_changed) ws.generated_dirty = true;
             if (ws.generated_dirty) {
                 const now = Io.Clock.awake.now(io);
-                const due = if (ws.generated_recomputed_at) |t| t.durationTo(now).nanoseconds >= generated_recompute_interval_ms * std.time.ns_per_ms else true;
-                if (due) {
+                if (generatedRecomputeDue(ws.generated_recomputed_at, ws.generated_recompute_ns, now)) {
                     ws.generated_dirty = false;
-                    ws.generated_recomputed_at = now;
                     try ws.recomputeCompileSet();
+                    const end = Io.Clock.awake.now(io);
+                    ws.generated_recompute_ns = @intCast(@max(0, now.durationTo(end).nanoseconds));
+                    ws.generated_recomputed_at = end;
                 }
             }
         },
@@ -540,6 +546,29 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         },
         else => {},
     }
+}
+
+/// 构建中是否该因生成文件重算编译集合：`last` 为上一次重算结束的时间，`last_ns` 为它的耗时
+fn generatedRecomputeDue(last: ?Io.Timestamp, last_ns: u64, now: Io.Timestamp) bool {
+    const end = last orelse return true;
+    const wait = @max(generated_recompute_interval_ms * std.time.ns_per_ms, generated_recompute_cost_factor * last_ns);
+    return end.durationTo(now).nanoseconds >= wait;
+}
+
+test "generated-file recomputes wait at least a second and in proportion to the last recompute" {
+    const end: Io.Timestamp = .{ .nanoseconds = 5 * std.time.ns_per_s };
+    const after = struct {
+        fn ms(n: i96) Io.Timestamp {
+            return .{ .nanoseconds = 5 * std.time.ns_per_s + n * std.time.ns_per_ms };
+        }
+    }.ms;
+    try std.testing.expect(generatedRecomputeDue(null, 0, after(0)));
+    // 重算很快：按最短间隔
+    try std.testing.expect(!generatedRecomputeDue(end, std.time.ns_per_ms, after(999)));
+    try std.testing.expect(generatedRecomputeDue(end, std.time.ns_per_ms, after(1000)));
+    // 一次重算 1.2 秒：等到它的 4 倍，读取构建事件的任务不会一直在重算
+    try std.testing.expect(!generatedRecomputeDue(end, 1200 * std.time.ns_per_ms, after(4799)));
+    try std.testing.expect(generatedRecomputeDue(end, 1200 * std.time.ns_per_ms, after(4800)));
 }
 
 /// 构建图中没有 compile step（只导出模块的库）：并入项目导出的模块，项目中的文件按它们得到模块归属
