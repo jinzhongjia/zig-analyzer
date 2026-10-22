@@ -70,7 +70,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 热 full p95 5.83 ms，注释插入/撤销后的 delta p95 10.12 ms、最大 20.71 ms，热 range p95 0.38 ms。
 Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；空 range 不执行 Infer / seed 查询。
 
-自动导入在逐字输入时测量（ReleaseSafe，固定在性能核上）：在名字表达式中编辑一个字符后立即请求补全（`BENCH_TYPE_COMPLETE`），计时包含编辑与补全；括号中为关闭 `completion.auto_import` 时的值。索引的内存为 `FileDecls`、`Exports`、`FileLinks`、`InitShapes`、`ShapeImports` 与 `BindingNames` 之和，不含引擎为 memo 保存的 key 与依赖元数据；`Exports` 的 16 MB 上限只约束闭包的值。
+自动导入在逐字输入时测量（ReleaseSafe，固定在性能核上；`BENCH_TYPE_COMPLETE` 实现同样的过程，见 §5.2）：在名字表达式中编辑一个字符后立即请求补全，计时包含编辑与补全；括号中为关闭 `completion.auto_import` 时的值。索引的内存为 `FileDecls`、`Exports`、`FileLinks`、`InitShapes`、`ShapeImports` 与 `BindingNames` 之和，不含引擎为 memo 保存的 key 与依赖元数据；`Exports` 的 16 MB 上限只约束闭包的值。
 
 | 项目（测量文件） | 补全 p50 | 补全 p95 | 单字符前缀 p50 | 索引的内存 |
 |---|---|---|---|---|
