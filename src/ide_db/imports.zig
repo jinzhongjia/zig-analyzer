@@ -1085,8 +1085,8 @@ const Builder = struct {
         return found;
     }
 
+    /// 不先用当前文件的 `FileIndex` 粗筛：逐字输入时补全紧跟在编辑之后，它总要重算，比 `BindingNames` 更贵
     fn bindingConflict(b: *Builder, name: []const u8) resolve.Error!bool {
-        if (!(try b.r.ctx.get(database.FileIndex.Query, b.file)).contains(name)) return false;
         return BindingNames.contains(try b.r.ctx.get(BindingNames, b.file), name);
     }
     /// 顶层声明的名字在光标处仍指向它自己（没有被局部的同名绑定遮蔽）
