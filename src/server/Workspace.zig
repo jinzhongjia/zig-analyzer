@@ -46,6 +46,9 @@ gpa: Allocator,
 root: []const u8,
 /// 启动时的配置副本（构建参数、诊断 step）；配置变化时整个实例被重启替换
 config: Server.Config,
+/// 项目根目录的 `zig-analyzer.json`（只含其中出现的项，见 `Config.parseProject`）；没有时为 null。启动后不变，
+/// 文件变化时整个实例被重启替换
+project: ?Server.Config = null,
 /// 本实例是 maker 连续崩溃后自动重启的第几次（0 表示正常启动）
 crash_restarts: u8 = 0,
 /// 引用计数，归零时释放（见 `acquire` / `release`）
@@ -121,7 +124,9 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
-    try loadProjectConfig(server, root, &ws.config);
+    ws.project = try loadProjectConfig(server, root);
+    errdefer if (ws.project) |*p| p.deinit(gpa);
+    if (ws.project) |*p| try ws.config.overlayProject(gpa, p);
     var title_buf: [256]u8 = undefined;
     ws.loading = server.progress.begin(server, std.fmt.bufPrint(&title_buf, "Loading project {s}", .{std.fs.path.basename(root)}) catch "Loading project", false);
     errdefer server.progress.end(server, ws.loading, null);
@@ -144,27 +149,30 @@ pub fn release(ws: *Workspace) void {
     if (ws.refs.fetchSub(1, .acq_rel) == 1) ws.destroy();
 }
 
-/// 以项目根目录的 `zig-analyzer.json` 覆盖配置；文件不存在时不变，有误时提示并忽略
-fn loadProjectConfig(server: *Server, root: []const u8, config: *Server.Config) Allocator.Error!void {
+/// 读取项目根目录的 `zig-analyzer.json`；文件不存在时为 null，有误时提示并忽略
+fn loadProjectConfig(server: *Server, root: []const u8) Allocator.Error!?Server.Config {
     const gpa = server.gpa;
     const path = try std.fs.path.join(gpa, &.{ root, Server.Config.project_file });
     defer gpa.free(path);
     const text = Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(1 << 20)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.FileNotFound => return,
-        else => return log.warn("{s}: cannot read: {t}", .{ path, err }),
+        error.FileNotFound => return null,
+        else => {
+            log.warn("{s}: cannot read: {t}", .{ path, err });
+            return null;
+        },
     };
     defer gpa.free(text);
     var project = Server.Config.parseProject(gpa, text) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidConfig => {
             var buf: [512]u8 = undefined;
-            return server.showWarning(std.fmt.bufPrint(&buf, "{s} is not a valid JSON object, it is ignored", .{path}) catch path);
+            server.showWarning(std.fmt.bufPrint(&buf, "{s} is not a valid JSON object, it is ignored", .{path}) catch path);
+            return null;
         },
     };
-    defer project.deinit(gpa);
     server.reportConfigWarnings(path, &project);
-    try config.overlayProject(gpa, &project);
+    return project;
 }
 
 /// 停止：立即结束 maker 及其子进程（进行中的构建不再继续），后台任务随即读到输入结束，收尾并回收进程
@@ -190,6 +198,7 @@ fn destroy(ws: *Workspace) void {
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
     ws.config.deinit(gpa);
+    if (ws.project) |*p| p.deinit(gpa);
     for (ws.bundles.items) |*eb| eb.deinit(gpa);
     ws.bundles.deinit(gpa);
     ws.loaded.deinit(gpa);
