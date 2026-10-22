@@ -61,6 +61,8 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     var owner: imports.Owner = .unknown;
     const base = try completeVisible(r, file, offset, &owner);
     if (!options.auto_import and !options.detect_import_position) return .{ .items = base };
+    // 只在 Zig 源文件中自动导入：向 `.zon` 等文件插入 import 声明会破坏它
+    if (!imports.isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = base };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset == 0 or offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();

@@ -928,7 +928,7 @@ fn sameSlice(a: []const u8, b: []const u8) bool {
 pub const Owner = union(enum) { unknown, known: ?u32 };
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: []const u8, limit: usize) resolve.Error!Result {
-    if (prefix.len == 0) return .{ .items = &.{} };
+    if (prefix.len == 0 or !isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = &.{} };
     var builder: Builder = .{ .r = r, .file = file, .offset = offset, .prefix = prefix, .limit = limit };
     const current = try r.ctx.get(FileDecls, file);
     const links = try r.ctx.get(FileLinks, file);

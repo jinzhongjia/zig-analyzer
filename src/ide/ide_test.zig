@@ -3030,6 +3030,24 @@ test "auto import does not leak into non-name contexts" {
     }
 }
 
+test "auto import is not offered outside zig source files" {
+    // 向 `.zon` 文件插入 import 声明会破坏它；也不为它开始建自动导入的索引
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/build.zig.zon", ".{ .value = st<|>d }");
+    const std_file = (try w.add("/lib/std/std.zig", "")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, added.file, added.cursor, .{});
+    try testing.expect(!result.import_position);
+    for (result.items) |item| try testing.expect(item.import_edit == null);
+    const detected = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false, .detect_import_position = true });
+    try testing.expect(!detected.import_position);
+}
+
 test "auto import preserves rendered qualified paths and metadata" {
     var w: World = undefined;
     try w.init();
