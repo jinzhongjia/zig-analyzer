@@ -3889,6 +3889,7 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 
 test {
     _ = origin;
+    _ = Workspace;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
     _ = @import("compiler_e2e_test.zig");
