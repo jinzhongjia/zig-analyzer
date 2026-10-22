@@ -272,6 +272,9 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
     if (token.kind != .identifier and token.kind != .invalid) return null;
     const parent = tokenParent(root, offset - 1);
     if (parent != .name_ref) return null;
+    // enum 成员与 union(enum) 的 tag 没有冒号，解析器把名字放在 container_field 的类型表达式位置。
+    // 它们仍是声明名，替换成限定路径会破坏声明。
+    if (try isBareEnumOrUnionMember(arena, root, token.offset)) return null;
     const escaped = std.mem.startsWith(u8, token.text, "@\"");
     if (token.kind == .invalid and !escaped) return null;
     const spelling = if (token.kind == .invalid) std.mem.trimEnd(u8, token.text, "\r\n") else token.text;
@@ -309,6 +312,22 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
         .escaped_prefix = if (escaped) raw else null,
         .closed = escaped and closed,
     };
+}
+
+/// enum 的成员与 `union(enum)` 的 tag 是无冒号的 container_field，名字位于类型表达式的位置；struct 的
+/// 元组字段没有冒号但类型表达式是真正的类型引用，不在此列。
+fn isBareEnumOrUnionMember(arena: Allocator, root: SyntaxNode, offset: u32) Allocator.Error!bool {
+    const path = try root.coveringPath(arena, offset);
+    if (path.len < 3) return false;
+    if (path[path.len - 1].kind() != .name_ref) return false;
+    const field = path[path.len - 2];
+    if (field.kind() != .container_field) return false;
+    const container = path[path.len - 3];
+    if (container.kind() != .container_decl) return false;
+    const keyword = (ast.ContainerDecl{ .syntax = container }).keyword() orelse return false;
+    if (keyword != .@"enum" and keyword != .@"union") return false;
+    const name = (ast.ContainerField{ .syntax = field }).enumName() orelse return false;
+    return name.offset == offset;
 }
 
 /// 客户端从替换范围起点过滤；保留用户输入的引号和转义拼写，而不是只返回解码后的名字。
