@@ -896,12 +896,20 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     var basis: u64 = 0;
-    const files = blk: {
+    const files = while (true) {
+        if (server.isShuttingDown()) return;
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
-        basis = importsBasis(ctx.get(ModuleGraph.Input, {}) catch return);
-        break :blk za.ide_db.search.projectFiles(&r) catch return;
+        // 被编辑打断：重试，不放弃这一轮
+        basis = importsBasis(ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        });
+        break za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        };
     };
     const auto_import = server.imports_wanted.load(.acquire) and blk: {
         server.config_mutex.lockUncancelable(server.io);
@@ -3517,14 +3525,17 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         break :blk server.config.completion_auto_import;
     };
     // 自动导入的索引为当前模块图建完之前不提供，标记为不完整：客户端随输入重新请求，届时再提供。第一次在可以自动
-    // 导入的名字处补全时开始建索引
+    // 导入的名字处补全时开始建索引；之后仍未建完而没有索引在进行时（上一轮出错、任务没能启动）重新开始
     const imports_ready = server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
-    if (imports_waiting and !server.imports_wanted.swap(true, .acq_rel)) server.scheduleIndexingFromRead();
+    if (imports_waiting) {
+        const first = !server.imports_wanted.swap(true, .acq_rel);
+        if (first or !server.indexing.load(.acquire)) server.scheduleIndexingFromRead();
+    }
     const out = try arena.alloc(types.CompletionItem, result.items.len);
     var lines: ?offsets.LineIndex = null;
     for (result.items, out) |it, *o| {

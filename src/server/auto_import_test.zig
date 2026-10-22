@@ -139,6 +139,42 @@ test "auto-import edits replace the whole identifier and resolve after applicati
     }
 }
 
+test "auto-import indexing restarts when an earlier pass did not finish" {
+    // 一轮索引没有建完（出错、任务没能启动）之后，补全请求重新开始建索引，不会一直不提供自动导入
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/lib.zig", .text = "pub const Widget = struct { size: u32 };\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const params = .{ .textDocument = .{ .uri = uri }, .position = try position(source, "Widgxx", 4, .utf16) };
+    try startAutoImport(&h, uri, params.position);
+    try testing.expect(importedWidget(try h.request("textDocument/completion", params)) != null);
+    h.server.imports_basis.store(std.math.maxInt(u64), .release);
+    const pending = try h.request("textDocument/completion", params);
+    try testing.expect(pending.object.get("result").?.object.get("isIncomplete").?.bool);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(importedWidget(try h.request("textDocument/completion", params)) != null);
+    _ = try h.request("shutdown", {});
+}
+
 test "completion does not run auto-import indexing inside its read transaction" {
     // 不能另起任务时任务就地执行：补全持有读事务，索引在其中就地执行时，编辑的写事务与之互相等待
     const prev_level = testing.log_level;
