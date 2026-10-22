@@ -215,9 +215,9 @@ const no_container = std.math.maxInt(u32);
 
 pub const DeclIndex = struct {
     arena: std.heap.ArenaAllocator.State,
-    /// 按名字排序
+    /// 按名字排序（`orderName`）
     decls: []const Decl = &.{},
-    /// 按名字排序
+    /// 按名字排序（`orderName`）
     public_decls: []const Public = &.{},
     /// `decls` 的下标，按 item 排序
     by_item: []const u32 = &.{},
@@ -227,11 +227,11 @@ pub const DeclIndex = struct {
     /// 各容器的外层容器（定义它的成员所在的容器），按容器下标
     outer: []const u32 = &.{},
 
-    /// 名字以 `prefix` 开头的声明在 `decls` 中的下标区间
+    /// 名字以 `prefix` 开头（不区分大小写）的声明在 `decls` 中的下标区间
     pub fn matching(index: *const DeclIndex, prefix: []const u8) struct { start: usize, end: usize } {
-        const start = lowerBound(Decl, index.decls, prefix);
+        const start = prefixStart(Decl, index.decls, prefix);
         var end = start;
-        while (end < index.decls.len and std.mem.startsWith(u8, index.decls[end].name, prefix)) : (end += 1) {}
+        while (end < index.decls.len and std.ascii.startsWithIgnoreCase(index.decls[end].name, prefix)) : (end += 1) {}
         return .{ .start = start, .end = end };
     }
 
@@ -240,10 +240,10 @@ pub const DeclIndex = struct {
         var high = index.public_decls.len;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            if (std.mem.lessThan(u8, index.decls[index.public_decls[mid].decl].name, prefix)) low = mid + 1 else high = mid;
+            if (std.ascii.lessThanIgnoreCase(index.decls[index.public_decls[mid].decl].name, prefix)) low = mid + 1 else high = mid;
         }
         var end = low;
-        while (end < index.public_decls.len and std.mem.startsWith(u8, index.decls[index.public_decls[end].decl].name, prefix)) : (end += 1) {}
+        while (end < index.public_decls.len and std.ascii.startsWithIgnoreCase(index.decls[index.public_decls[end].decl].name, prefix)) : (end += 1) {}
         return index.public_decls[low..end];
     }
 
@@ -272,7 +272,7 @@ pub const DeclIndex = struct {
         while (low < high) {
             const mid = low + (high - low) / 2;
             const decl = &index.decls[members[mid]];
-            switch (std.mem.order(u8, decl.name, name)) {
+            switch (orderName(decl.name, name)) {
                 .eq => return decl,
                 .lt => low = mid + 1,
                 .gt => high = mid,
@@ -511,7 +511,7 @@ const DeclBuilder = struct {
         }
         std.mem.sort(Public, list.items, index.decls, struct {
             fn less(decls: []const Decl, x: Public, y: Public) bool {
-                const order = std.mem.order(u8, decls[x.decl].name, decls[y.decl].name);
+                const order = orderName(decls[x.decl].name, decls[y.decl].name);
                 if (order != .eq) return order == .lt;
                 return std.mem.lessThan(u8, x.path, y.path);
             }
@@ -836,11 +836,13 @@ pub const Export = struct {
 };
 pub const ExportIndex = struct {
     arena: std.heap.ArenaAllocator.State,
+    /// 按名字排序（`orderName`）
     decls: []const Export,
+    /// 名字以 `prefix` 开头（不区分大小写）的导出
     pub fn matching(index: *const ExportIndex, prefix: []const u8) []const Export {
-        const start = lowerBound(Export, index.decls, prefix);
+        const start = prefixStart(Export, index.decls, prefix);
         var end = start;
-        while (end < index.decls.len and std.mem.startsWith(u8, index.decls[end].name, prefix)) : (end += 1) {}
+        while (end < index.decls.len and std.ascii.startsWithIgnoreCase(index.decls[end].name, prefix)) : (end += 1) {}
         return index.decls[start..end];
     }
 };
@@ -964,31 +966,34 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         const root = try renderName(r.arena, decl.name);
         for (declared_matches) |declared| {
             if (try builder.reuseDirect(declared.target, declared.name, declared.kind, declared.doc)) continue;
-            if (builder.rejects("~0", &.{ root, ".", declared.path })) continue;
+            const sort = builder.sortOf(declared.name, "~0");
+            if (builder.rejects(sort, &.{ root, ".", declared.path })) continue;
             if (try builder.visible(declared.name) != null) continue;
             try builder.reused.put(r.arena, declared.target, {});
-            try builder.add(.{ .label = try joinPath(r.arena, root, declared.path), .kind = candidateKind(declared.kind), .filter = declared.name, .qualifier = root, .sort = "~0", .doc = declared.doc });
+            try builder.add(.{ .label = try joinPath(r.arena, root, declared.path), .kind = candidateKind(declared.kind), .filter = declared.name, .qualifier = root, .sort = sort, .doc = declared.doc });
         }
         // 同文件可访问私有成员，公开闭包仍由所有请求共享。
         if (ns.file == file) for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |nested, target| {
             if (try builder.reuseDirect(target, nested.name, nested.kind, nested.doc)) continue;
             const relative = try localRelative(r.arena, current, ns, nested) orelse continue;
-            if (builder.rejects("~0", &.{ root, ".", relative })) continue;
+            const sort = builder.sortOf(nested.name, "~0");
+            if (builder.rejects(sort, &.{ root, ".", relative })) continue;
             if (try builder.visible(nested.name) != null) continue;
             try builder.reused.put(r.arena, target, {});
-            try builder.add(.{ .label = try joinPath(r.arena, root, relative), .kind = candidateKind(nested.kind), .filter = nested.name, .qualifier = root, .sort = "~0", .doc = nested.doc });
+            try builder.add(.{ .label = try joinPath(r.arena, root, relative), .kind = candidateKind(nested.kind), .filter = nested.name, .qualifier = root, .sort = sort, .doc = nested.doc });
         };
     }
     // 同文件的私有链合法；可见的顶层名由普通补全负责。
     for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |decl, target| {
         if (try builder.reuseDirect(target, decl.name, decl.kind, decl.doc)) continue;
         const root_name = decl.root orelse continue;
-        if (builder.rejects("~1", &.{decl.path})) continue;
+        const sort = builder.sortOf(decl.name, "~1");
+        if (builder.rejects(sort, &.{decl.path})) continue;
         if (try builder.visible(decl.name) != null) continue;
         const root_def = try builder.visible(root_name) orelse continue;
         const expected = findRoot(current, root_name) orelse continue;
         if (!deepEql(root_def, resolve.Def{ .item = .{ .file = file, .item = expected.item } })) continue;
-        try builder.add(.{ .label = try r.arena.dupe(u8, decl.path), .kind = candidateKind(decl.kind), .filter = decl.name, .qualifier = try r.arena.dupe(u8, root_name), .sort = "~1", .doc = decl.doc });
+        try builder.add(.{ .label = try r.arena.dupe(u8, decl.path), .kind = candidateKind(decl.kind), .filter = decl.name, .qualifier = try r.arena.dupe(u8, root_name), .sort = sort, .doc = decl.doc });
     }
     if (graph) |g| {
         // 模块名字即使没有任何声明也可补全；生成文件根未知时不提供。
@@ -997,7 +1002,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             const target = g.importTarget(file, name) orelse continue;
             const ns: Namespace = .{ .file = target, .container = 0 };
             const spec = try r.arena.dupe(u8, name);
-            if (std.mem.startsWith(u8, name, prefix) and try builder.namespaceAlias(ns) == null and try builder.visible(name) == null)
+            if (std.ascii.startsWithIgnoreCase(name, prefix) and try builder.namespaceAlias(ns) == null and try builder.visible(name) == null)
                 try builder.importCandidate(name, .module, false, spec, "", null, "~2");
             try builder.exported(ns, spec);
         };
@@ -1011,10 +1016,11 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             const ns: Namespace = .{ .file = entry.file, .container = 0 };
             const basename = std.fs.path.basename(path);
             const stem = basename[0 .. basename.len - ".zig".len];
-            if (public.len == 0 and !std.mem.startsWith(u8, stem, prefix)) continue;
+            const stem_matches = std.ascii.startsWithIgnoreCase(stem, prefix);
+            if (public.len == 0 and !stem_matches) continue;
             const spec = try importSpec(r, g, file, entry.file) orelse continue;
             const aliased = try builder.namespaceAlias(ns) != null;
-            if (std.mem.startsWith(u8, stem, prefix) and !aliased and try builder.visible(stem) == null)
+            if (stem_matches and !aliased and try builder.visible(stem) == null)
                 try builder.importCandidate(stem, .file, false, spec, "", null, "~3");
             if (aliased or public.len == 0) continue;
             const targets = (try r.ctx.get(FileLinks, entry.file)).targets;
@@ -1105,10 +1111,14 @@ const Builder = struct {
     fn reuseDirect(b: *Builder, target: Declaration, name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8) resolve.Error!bool {
         const alias = try b.directAlias(target) orelse return false;
         // 别名与目标共享前缀时，继续输入后须重新选择过滤名字，不能沿用另一条拼写。
-        if (!std.mem.eql(u8, alias.name, name) and std.mem.startsWith(u8, alias.name, b.prefix)) b.incomplete = true;
-        try b.add(.{ .label = try renderName(b.r.arena, alias.name), .kind = candidateKind(kind), .filter = name, .qualifier = "", .sort = "~0", .doc = doc });
+        if (!std.mem.eql(u8, alias.name, name) and std.ascii.startsWithIgnoreCase(alias.name, b.prefix)) b.incomplete = true;
+        try b.add(.{ .label = try renderName(b.r.arena, alias.name), .kind = candidateKind(kind), .filter = name, .qualifier = "", .sort = b.sortOf(name, "~0"), .doc = doc });
         try b.reused.put(b.r.arena, target, {});
         return true;
+    }
+    /// 分组为 `group` 的候选的排序（见 `caseMark`）
+    fn sortOf(b: *const Builder, name: []const u8, comptime group: []const u8) []const u8 {
+        return if (caseMark(name, b.prefix).len == 0) group else "~" ++ group;
     }
     fn add(b: *Builder, candidate: Candidate) resolve.Error!void {
         for (b.items.items) |existing| {
@@ -1163,7 +1173,7 @@ const Builder = struct {
     /// 名字在当前位置不可见时提供 import；先按排序淘汰，再检查可见性
     fn importIfVisible(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8) resolve.Error!void {
         var buf: [256]u8 = undefined;
-        const args = importSortArgs(name, spec, path, rank);
+        const args = importSortArgs(b.prefix, name, spec, path, rank);
         const sort = std.fmt.bufPrint(&buf, import_sort, args) catch try std.fmt.allocPrint(b.r.arena, import_sort, args);
         if (b.rejects(sort, null)) return;
         if (try b.visible(name) != null) return;
@@ -1171,7 +1181,7 @@ const Builder = struct {
     }
     fn importCandidate(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8) resolve.Error!void {
         const a = b.r.arena;
-        const sort = try std.fmt.allocPrint(a, import_sort, importSortArgs(name, spec, path, rank));
+        const sort = try std.fmt.allocPrint(a, import_sort, importSortArgs(b.prefix, name, spec, path, rank));
         if (b.rejects(sort, null)) return;
         const qualifier = if (path.len == 0) spec else try std.fmt.allocPrint(a, "{s}:{s}", .{ spec, path });
         var binding = name;
@@ -1215,12 +1225,19 @@ const Builder = struct {
     }
 };
 
-/// import 候选的排序：同目录的文件、其他相对路径、命名模块依次靠后，再按层级、路径长度、名字长度与来源
-const import_sort = "~2:{d}:{s}:{d:0>6}:{d:0>4}:{s}{s}{s}";
+/// 名字按前缀不区分大小写匹配；前缀的大小写与输入不一致时，排序前面加 `~`：排在所有大小写一致的候选之后，各自的
+/// 相对顺序不变，截断时不挤掉大小写一致的候选
+fn caseMark(name: []const u8, prefix: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, prefix)) "" else "~";
+}
 
-fn importSortArgs(name: []const u8, spec: []const u8, path: []const u8, rank: []const u8) struct { u8, []const u8, usize, usize, []const u8, []const u8, []const u8 } {
+/// import 候选的排序（见 `caseMark`）：同目录的文件、其他相对路径、命名模块依次靠后，再按层级、路径长度、名字长度
+/// 与来源
+const import_sort = "{s}~2:{d}:{s}:{d:0>6}:{d:0>4}:{s}{s}{s}";
+
+fn importSortArgs(prefix: []const u8, name: []const u8, spec: []const u8, path: []const u8, rank: []const u8) struct { []const u8, u8, []const u8, usize, usize, []const u8, []const u8, []const u8 } {
     const origin: u8 = if (!std.mem.endsWith(u8, spec, ".zig")) 2 else if (std.mem.indexOfScalar(u8, spec, '/') == null) 0 else 1;
-    return .{ origin, rank, spec.len + path.len, name.len, spec, if (path.len == 0) "" else ":", path };
+    return .{ caseMark(name, prefix), origin, rank, spec.len + path.len, name.len, spec, if (path.len == 0) "" else ":", path };
 }
 
 /// `parts` 依次拼接后与 `other` 比较
@@ -1332,21 +1349,38 @@ fn joinPath(a: Allocator, lhs: []const u8, rhs: []const u8) Allocator.Error![]co
     if (lhs.len == 0) return a.dupe(u8, rhs);
     return std.fmt.allocPrint(a, "{s}.{s}", .{ lhs, rhs });
 }
+/// 索引中名字的顺序：先不区分 ASCII 大小写，相同时再按字节。不区分大小写地以同一前缀开头的名字因此连续，可以
+/// 二分查找；按名字的精确查找用同一个顺序
+fn orderName(a: []const u8, b: []const u8) std.math.Order {
+    const order = std.ascii.orderIgnoreCase(a, b);
+    return if (order != .eq) order else std.mem.order(u8, a, b);
+}
 fn nameLess(comptime T: type) fn (void, T, T) bool {
     return struct {
         fn less(_: void, a: T, b: T) bool {
-            const order = std.mem.order(u8, a.name, b.name);
+            const order = orderName(a.name, b.name);
             if (order != .eq) return order == .lt;
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.less;
 }
+/// 第一个名字不小于 `name` 的项（按 `orderName`）
 fn lowerBound(comptime T: type, items: []const T, name: []const u8) usize {
     var low: usize = 0;
     var high = items.len;
     while (low < high) {
         const mid = low + (high - low) / 2;
-        if (std.mem.lessThan(u8, items[mid].name, name)) low = mid + 1 else high = mid;
+        if (orderName(items[mid].name, name) == .lt) low = mid + 1 else high = mid;
+    }
+    return low;
+}
+/// 第一个名字不区分大小写地不小于 `prefix` 的项：以 `prefix` 开头（不区分大小写）的项从这里开始
+fn prefixStart(comptime T: type, items: []const T, prefix: []const u8) usize {
+    var low: usize = 0;
+    var high = items.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (std.ascii.lessThanIgnoreCase(items[mid].name, prefix)) low = mid + 1 else high = mid;
     }
     return low;
 }

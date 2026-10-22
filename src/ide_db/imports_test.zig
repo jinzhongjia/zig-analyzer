@@ -576,3 +576,61 @@ test "project public path indexing stays within each file" {
     const at = f.cursor.?;
     try testing.expectEqual(@as(usize, 0), (try run(&w, at.file, at.offset, "Review", 128)).items.len);
 }
+
+test "auto imports match prefixes regardless of case and rank the typed case first" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\fn main() void { _ = <|>missing; }
+        \\//- /p/Lib.zig in:app
+        \\pub const ArrayList = struct {};
+        \\pub fn arrayCopy() void {}
+        \\//- /zig/std/std.zig std
+        \\pub const Io = struct {};
+    );
+    const at = f.cursor.?;
+    const lower = try run(&w, at.file, at.offset, "arr", 128);
+    try testing.expectEqual(@as(usize, 2), lower.items.len);
+    try testing.expectEqualStrings("arrayCopy", lower.items[0].label);
+    try testing.expectEqualStrings("ArrayList", lower.items[1].label);
+    const title = try run(&w, at.file, at.offset, "Arr", 128);
+    try testing.expectEqualStrings("ArrayList", title.items[0].label);
+    try testing.expectEqualStrings("arrayCopy", title.items[1].label);
+    // 截断时保留大小写一致的候选，无论先遇到哪一个
+    for ([_][2][]const u8{ .{ "arr", "arrayCopy" }, .{ "Arr", "ArrayList" } }) |case| {
+        const one = try run(&w, at.file, at.offset, case[0], 1);
+        try testing.expectEqual(@as(usize, 1), one.items.len);
+        try testing.expectEqualStrings(case[1], one.items[0].label);
+        try testing.expect(one.is_incomplete);
+    }
+    try testing.expect(find(try run(&w, at.file, at.offset, "ST", 128), "std") != null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "lib", 128), "Lib") != null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "io", 128), "Io") != null);
+}
+
+test "auto imports keep declarations whose names differ only in case apart" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    // 跨文件的精确查找须与索引的顺序一致：按字节比较时找不到排在 `alpha`、`beta`、`gamma` 之后的 `Zone`
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app deps:shapes=dep
+        \\fn main() void { _ = <|>missing; }
+        \\//- /dep/root.zig module:dep
+        \\pub const Alias = @import("parts.zig").Zone;
+        \\pub const Other = @import("parts.zig").zone;
+        \\//- /dep/parts.zig in:dep
+        \\pub const alpha = 1;
+        \\pub const beta = 2;
+        \\pub const gamma = 3;
+        \\pub const Zone = struct { pub const Wide = u8; };
+        \\pub const zone = struct { pub const Narrow = u8; };
+    );
+    const at = f.cursor.?;
+    const wide = editContaining(try run(&w, at.file, at.offset, "Wide", 128), "Wide") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("const Wide = @import(\"shapes\").Alias.Wide;\n", wide.import_edit.?.text);
+    const narrow = editContaining(try run(&w, at.file, at.offset, "Narrow", 128), "Narrow") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("const Narrow = @import(\"shapes\").Other.Narrow;\n", narrow.import_edit.?.text);
+}
