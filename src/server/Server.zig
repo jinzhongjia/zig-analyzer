@@ -139,6 +139,12 @@ register_config: bool = false,
 register_watch: bool = false,
 /// 客户端支持 `workspace/inlayHint/refresh`（inlay hints 的配置变化后请客户端重新请求）
 inlay_refresh: bool = false,
+/// 客户端支持 `codeAction/resolve` 延后计算 `edit`（且原样带回 `data`）：命名的修复在用户选择之后才查找引用
+code_action_resolve: bool = false,
+/// 客户端支持代码操作的 `disabled`（显示为不可用并说明原因）
+code_action_disabled: bool = false,
+/// 客户端支持 `documentChanges` 中带变更注解的编辑：公开名字的改名要求用户确认
+change_annotations: bool = false,
 /// 客户端支持工作区语义令牌刷新；同一时间最多等待一个刷新响应。
 semantic_refresh: bool = false,
 semantic_refresh_mutex: Io.Mutex = .init,
@@ -452,6 +458,7 @@ const request_handlers = .{
     .{ "textDocument/rename", Mode.semantic, rename },
     .{ "workspace/symbol", Mode.semantic, workspaceSymbol },
     .{ "textDocument/codeAction", Mode.semantic, codeAction },
+    .{ "codeAction/resolve", Mode.semantic, codeActionResolve },
 };
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
@@ -606,9 +613,24 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             };
             // 同 ReadTask：吞掉 `Canceled` 的处理函数结果不完整
             ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
-            server.sendResponse(pending.id, result);
+            if (comptime isOutcome(@TypeOf(result))) switch (result) {
+                .ok => |v| server.sendResponse(pending.id, v),
+                .failed => |message| server.sendError(pending.id, jsonrpc.error_codes.request_failed, message),
+            } else server.sendResponse(pending.id, result);
         }
     };
+}
+
+/// 处理函数的结果：成功，或失败的原因（以 `request_failed` 回复，客户端把原因显示给用户）
+fn Outcome(comptime T: type) type {
+    return union(enum) {
+        ok: T,
+        failed: []const u8,
+    };
+}
+
+fn isOutcome(comptime T: type) bool {
+    return @typeInfo(T) == .@"union" and @hasField(T, "ok") and @hasField(T, "failed");
 }
 
 // ── 慢请求日志 ─────────────────────────────────────────────────────
@@ -1465,6 +1487,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const build_changed = !server.config.sameBuild(&new);
     const semantic_changed = server.config.callsite_seeding != new.callsite_seeding;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
+    const naming_changed = !server.config.sameNaming(&new);
     const build_was_enabled = server.config.build_enable;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
     const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_parameters != new.inlay_parameters or
@@ -1475,7 +1498,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config.deinit(server.gpa);
     server.config = new;
     server.config_mutex.unlock(server.io);
-    if (inactive_changed) server.publishOpenFiles();
+    if (inactive_changed or naming_changed) server.publishOpenFiles();
     if (watcher_changed) server.resyncWatcher();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
@@ -3021,6 +3044,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     if (text) |t| if (server.wantsInactiveCode(file)) {
         diags = try server.appendInactiveCode(ctx, arena, file, t, diags);
     };
+    if (text) |t| if (try server.namingFor(arena, file, t)) |settings| {
+        diags = try server.appendNaming(ctx, arena, file, t, settings, diags);
+    };
     if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
     return .{ .uri = document_uri, .diagnostics = diags };
 }
@@ -3097,6 +3123,120 @@ fn conflictsWithCompilerError(diags: []const types.Diagnostic, text: []const u8,
         if (range.start < end and start < range.end) return true;
     }
     return false;
+}
+
+/// 一个文件的命名检查配置：客户端的配置，以包含文件的项目的 `zig-analyzer.json` 中出现的项覆盖
+const NamingSettings = struct {
+    ignore: []const []const u8,
+    rules: Config.NamingRules,
+
+    fn allows(s: NamingSettings, f: ide.naming.Located) bool {
+        const enabled = switch (f.rule) {
+            inline else => |rule| @field(s.rules, @tagName(rule)),
+        };
+        if (!enabled) return false;
+        for (s.ignore) |pattern| if (ide.naming.globMatch(pattern, f.name)) return false;
+        return true;
+    }
+};
+
+/// 文件是否做命名检查及其配置：开启了检查的、打开的用户代码（见 `origin.Origin.user`），不在 `naming.exclude` 中，
+/// 也不是生成的代码（见 `naming.isGenerated`）
+fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        if (!server.open_docs.contains(file)) return null;
+    }
+    const path = server.vfs.path(file);
+    var enable: bool = undefined;
+    var ignore: []const []const u8 = undefined;
+    var exclude: []const []const u8 = undefined;
+    var rules: Config.NamingRules = undefined;
+    {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        enable = server.config.naming_enable;
+        ignore = try dupeStrings(arena, server.config.naming_ignore);
+        exclude = try dupeStrings(arena, server.config.naming_exclude);
+        rules = server.config.naming_rules;
+    }
+    // `naming.exclude` 的路径相对工作区根目录，来自 `zig-analyzer.json` 时相对项目根目录
+    var base = try server.rootOf(arena, path);
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        // 嵌套的项目取最内层的
+        var best: ?*Workspace = null;
+        for (server.workspaces.items) |ws| {
+            if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+        }
+        if (best) |ws| if (ws.project) |*p| {
+            if (p.isSet("naming_enable")) enable = p.naming_enable;
+            if (p.isSet("naming_ignore")) ignore = try dupeStrings(arena, p.naming_ignore);
+            if (p.isSet("naming_rules")) rules = p.naming_rules;
+            if (p.isSet("naming_exclude")) {
+                exclude = try dupeStrings(arena, p.naming_exclude);
+                base = try arena.dupe(u8, ws.root);
+            }
+        };
+    }
+    if (!enable) return null;
+    if (exclude.len != 0) {
+        var rel = path;
+        if (base) |b| if (b.len < path.len) {
+            rel = path[b.len..];
+            while (rel.len > 0 and (rel[0] == '/' or rel[0] == '\\')) rel = rel[1..];
+        };
+        const normalized = try arena.dupe(u8, rel);
+        std.mem.replaceScalar(u8, normalized, '\\', '/');
+        for (exclude) |pattern| if (ide.naming.globMatch(pattern, normalized)) return null;
+    }
+    switch (server.fileOrigin(file)) {
+        .virtual, .user => {},
+        .zig_lib, .generated, .package, .other => return null,
+    }
+    if (ide.naming.isGenerated(text)) return null;
+    return .{ .ignore = ignore, .rules = rules };
+}
+
+fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]const []const u8 {
+    const out = try arena.alloc([]const u8, list.len);
+    for (list, out) |src, *dst| dst.* = try arena.dupe(u8, src);
+    return out;
+}
+
+/// 包含 `path` 的工作区根目录（嵌套时取最内层的），复制到 `arena` 中
+fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    var best: ?[]const u8 = null;
+    for (server.roots.items) |root| {
+        if (server.vfs.isUnder(path, root) and (best == null or root.len > best.?.len)) best = root;
+    }
+    return if (best) |b| try arena.dupe(u8, b) else null;
+}
+
+/// 不符合命名约定的名字（见 `naming`）：低强度的提示，code 为 `naming.<规则>`，附官方规则的链接
+fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, text: []const u8, settings: NamingSettings, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    var r: Resolver = .{ .ctx = ctx, .arena = arena };
+    const found = try ide.naming.findings(&r, file, null);
+    if (found.len == 0) return diags;
+    const lines = try offsets.LineIndex.init(arena, text);
+    var out: std.ArrayList(types.Diagnostic) = .empty;
+    try out.appendSlice(arena, diags);
+    for (found) |f| {
+        if (!settings.allows(f)) continue;
+        try out.append(arena, .{
+            .range = lines.range(f.start, f.end, server.encoding),
+            .severity = .Hint,
+            .code = .{ .string = f.rule.code() },
+            .codeDescription = .{ .href = ide.naming.guide_url },
+            .source = "zig-analyzer",
+            .message = .{ .string = try ide.naming.message(arena, f) },
+        });
+    }
+    return out.items;
 }
 
 // ── 请求处理函数 ──────────────────────────────────────────────────────
@@ -3199,7 +3339,14 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         if (ws.didChangeWatchedFiles) |d| server.register_watch = d.dynamicRegistration orelse false;
         if (ws.inlayHint) |ih| server.inlay_refresh = ih.refreshSupport orelse false;
         if (ws.semanticTokens) |st| server.semantic_refresh = st.refreshSupport orelse false;
+        if (ws.workspaceEdit) |we| server.change_annotations = (we.documentChanges orelse false) and we.changeAnnotationSupport != null;
     }
+    if (params.capabilities.textDocument) |td| if (td.codeAction) |ca| {
+        server.code_action_disabled = ca.disabledSupport orelse false;
+        if (ca.resolveSupport) |rs| for (rs.properties) |p| {
+            if (std.mem.eql(u8, p, "edit")) server.code_action_resolve = ca.dataSupport orelse false;
+        };
+    };
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -3245,7 +3392,10 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .renameProvider = .{ .RenameOptions = .{ .prepareProvider = true } },
             .workspaceSymbolProvider = .{ .boolean = true },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
-            .codeActionProvider = .{ .CodeActionOptions = .{ .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract } } },
+            .codeActionProvider = .{ .CodeActionOptions = .{
+                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract },
+                .resolveProvider = true,
+            } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .SemanticTokensFullDelta = .{ .delta = true } },
@@ -3554,19 +3704,47 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
         .local, .file => false,
     };
     const new_name = try identifierText(arena, params.newName, is_field);
+    return try server.renameEdit(r, arena, found.refs, new_name, null);
+}
+
+/// 把引用（按文件与位置排列，含声明处）改为 `new_text` 的编辑。`confirm` 不为 null 且客户端支持变更注解时，
+/// 编辑带上要求用户确认的注解（`confirm` 为其标签），客户端应用之前先让用户确认
+fn renameEdit(server: *Server, r: *Resolver, arena: Allocator, refs: []const za.ide_db.search.Reference, new_text: []const u8, confirm: ?[]const u8) !types.WorkspaceEdit {
+    const annotated = confirm != null and server.change_annotations;
+    const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child).pointer.child;
+    const DocumentEdit = @typeInfo(@FieldType(types.TextDocumentEdit, "edits")).pointer.child;
+    const annotation_id = "zig-analyzer.rename-public";
     var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+    var documents: std.ArrayList(DocumentChange) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     var i: usize = 0;
-    while (i < found.refs.len) {
-        const file = found.refs[i].file;
-        var edits: std.ArrayList(types.TextEdit) = .empty;
-        while (i < found.refs.len and found.refs[i].file == file) : (i += 1) {
-            const ref = found.refs[i];
-            try edits.append(arena, .{ .range = try m.range(file, ref.start, ref.end), .newText = new_name });
+    while (i < refs.len) {
+        const file = refs[i].file;
+        const file_uri = try server.uriFor(arena, file);
+        if (annotated) {
+            var edits: std.ArrayList(DocumentEdit) = .empty;
+            while (i < refs.len and refs[i].file == file) : (i += 1) {
+                const ref = refs[i];
+                try edits.append(arena, .{ .AnnotatedTextEdit = .{ .range = try m.range(file, ref.start, ref.end), .newText = new_text, .annotationId = annotation_id } });
+            }
+            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = null }, .edits = edits.items } });
+        } else {
+            var edits: std.ArrayList(types.TextEdit) = .empty;
+            while (i < refs.len and refs[i].file == file) : (i += 1) {
+                const ref = refs[i];
+                try edits.append(arena, .{ .range = try m.range(file, ref.start, ref.end), .newText = new_text });
+            }
+            try changes.map.put(arena, file_uri, edits.items);
         }
-        try changes.map.put(arena, try server.uriFor(arena, file), edits.items);
     }
-    return .{ .changes = changes };
+    if (!annotated) return .{ .changes = changes };
+    var annotations: std.json.ArrayHashMap(types.ChangeAnnotation) = .{};
+    try annotations.map.put(arena, annotation_id, .{
+        .label = confirm.?,
+        .needsConfirmation = true,
+        .description = "code outside this workspace that uses the name is not updated",
+    });
+    return .{ .documentChanges = documents.items, .changeAnnotations = annotations };
 }
 
 /// 新名字的源码写法：`@"..."` 校验后原样使用；其余按需用 `@"..."` 包裹：关键字、含特殊字符的名字、`_`，
@@ -3635,8 +3813,8 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     const lines = try offsets.LineIndex.init(arena, text);
     const doc_uri = try server.uriFor(arena, file);
     const Item = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
-    const out = try arena.alloc(Item, actions.len);
-    for (actions, out) |a, *o| {
+    var out: std.ArrayList(Item) = .empty;
+    for (actions) |a| {
         const edits = try arena.alloc(types.TextEdit, a.edits.len);
         for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
         var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
@@ -3649,7 +3827,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             }
             break :blk null;
         } else null;
-        o.* = .{ .CodeAction = .{
+        try out.append(arena, .{ .CodeAction = .{
             .title = a.title,
             .kind = switch (a.kind) {
                 .quickfix => types.CodeActionKind.QuickFix,
@@ -3658,9 +3836,147 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             .diagnostics = diagnostics,
             .isPreferred = if (a.diagnostic != null) true else null,
             .edit = .{ .changes = changes },
-        } };
+        } });
     }
-    return out;
+    if (try server.namingFor(arena, file, text)) |settings| {
+        for (try ide.naming.findings(r, file, .{ .start = start, .end = end })) |f| {
+            if (!settings.allows(f)) continue;
+            const range = lines.range(f.start, f.end, server.encoding);
+            if (try server.namingAction(r, arena, doc_uri, range, f, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
+        }
+    }
+    return out.items;
+}
+
+/// 命名修复在 `textDocument/codeAction` 与 `codeAction/resolve` 之间保存的数据（`CodeAction.data`）
+const NamingData = struct {
+    naming: struct {
+        uri: []const u8,
+        /// 名字的起点
+        line: u32,
+        character: u32,
+        name: []const u8,
+        new_name: []const u8,
+    },
+};
+
+/// 不符合命名约定的名字的改名修复，只在用户选择后应用（不标为 preferred）。客户端支持 `codeAction/resolve` 时
+/// 只给出标题与 `data`，选择之后才查找引用、检查冲突；否则当场算出编辑。不能安全改名时，客户端支持 `disabled`
+/// 则带上原因，否则不提供
+fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, f: ide.naming.Located, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
+    const what = if (f.def == .item and f.public) (if (f.rule == .field) "field " else "public ") else "";
+    var action: types.CodeAction = .{
+        .title = try std.fmt.allocPrint(arena, "rename {s}`{s}` to `{s}`", .{ what, f.name, f.suggestion }),
+        .kind = types.CodeActionKind.QuickFix,
+    };
+    // 关联客户端传来的同一条提示
+    for (client_diagnostics) |d| {
+        const c = d.code orelse continue;
+        if (c == .string and std.mem.eql(u8, c.string, f.rule.code()) and std.meta.eql(d.range, range)) {
+            action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
+            break;
+        }
+    }
+    // 声明处的冲突不必查找引用
+    if (try ide.rename.declarationConflict(r, f.def, f.suggestion)) |p| {
+        if (!server.code_action_disabled) return null;
+        action.disabled = .{ .reason = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+        return action;
+    }
+    if (server.code_action_resolve) {
+        const inner: std.json.ObjectMap = try .init(arena, &.{ "uri", "line", "character", "name", "new_name" }, &.{
+            .{ .string = doc_uri },
+            .{ .integer = range.start.line },
+            .{ .integer = range.start.character },
+            .{ .string = f.name },
+            .{ .string = f.suggestion },
+        });
+        action.data = .{ .object = try .init(arena, &.{"naming"}, &.{.{ .object = inner }}) };
+        return action;
+    }
+    switch (try server.namingEdit(r, arena, f)) {
+        .ok => |edit| action.edit = edit,
+        .failed => |reason| {
+            if (!server.code_action_disabled) return null;
+            action.disabled = .{ .reason = reason };
+        },
+    }
+    return action;
+}
+
+/// 补上命名修复的编辑；其他代码操作在 `textDocument/codeAction` 中已经完整，原样返回
+fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeAction) HandlerError!Outcome(types.CodeAction) {
+    const value = params.data orelse return .{ .ok = params };
+    const data = std.json.parseFromValueLeaky(NamingData, arena, value, .{ .ignore_unknown_fields = true }) catch return .{ .ok = params };
+    const d = data.naming;
+    const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
+        return .{ .failed = "cannot rename: the document is no longer available" };
+    // 两次请求之间文档可能已经改变：按位置重新找到这个名字
+    const found = for (try ide.naming.findings(r, at.file, .{ .start = at.offset, .end = at.offset })) |f| {
+        if (f.start == at.offset and std.mem.eql(u8, f.name, d.name) and std.mem.eql(u8, f.suggestion, d.new_name)) break f;
+    } else return .{ .failed = "cannot rename: the name has changed since the fix was offered" };
+    var action = params;
+    switch (try server.namingEdit(r, arena, found)) {
+        .ok => |edit| action.edit = edit,
+        .failed => |reason| return .{ .failed = reason },
+    }
+    return .{ .ok = action };
+}
+
+/// 把不符合命名约定的名字改为建议的写法。只返回完整而安全的编辑：引用有无法确认之处（歧义、未分析的代码、
+/// 类型未知的成员访问、有语法错误的文件），新名字与已有的名字冲突，或者名字以字符串出现（反射）时都不改
+fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
+    const def = f.def;
+    const def_file = switch (def) {
+        .item => |it| it.file,
+        .local => |l| l.file,
+        .file => unreachable,
+    };
+    if (!try server.renamable(r, def)) return .{ .failed = "cannot rename a symbol defined outside the workspace" };
+    const scope = try server.searchScope(r);
+    var ambiguous: ?za.ide_db.search.Reference = null;
+    var unanalyzed = false;
+    var uncertain: ?za.ide_db.search.Reference = null;
+    var syntax_error: ?Vfs.FileId = null;
+    const refs = try za.ide_db.search.findReferences(r, def, .{
+        .scope = scope,
+        .ambiguous = &ambiguous,
+        .unanalyzed = &unanalyzed,
+        .uncertain = &uncertain,
+        .syntax_error = &syntax_error,
+    });
+    if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, f, file, null, "the file has syntax errors, so references in it may be missed") };
+    if (unanalyzed) return .{ .failed = try server.renameProblem(r, arena, f, def_file, null, "the name appears in code nested too deeply to be analyzed, where references cannot be found") };
+    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, f, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
+    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
+    if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+    if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+    // 只有容器的成员能以字符串引用；不是 pub 的声明只能在所在的文件中访问
+    if (def == .item) {
+        const files = if (f.public) try za.ide_db.search.importers(r, def_file, scope) else try arena.dupe(Vfs.FileId, &.{def_file});
+        if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+    }
+    const is_field = switch (def) {
+        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
+        .local, .file => false,
+    };
+    const new_text = try identifierText(arena, f.suggestion, is_field);
+    // 遮蔽与重名只会出现在声明所在的文件中，这个文件中漏改的引用也会报出：以改名后的文本做 AstGen 确认
+    var edits: std.ArrayList(ide.rename.Edit) = .empty;
+    for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = new_text });
+    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+    const confirm = if (f.public) try std.fmt.allocPrint(arena, "Rename public `{s}` to `{s}`", .{ f.name, f.suggestion }) else null;
+    return .{ .ok = try server.renameEdit(r, arena, refs, new_text, confirm) };
+}
+
+/// 不能改名的说明：「cannot rename `a` to `b`: 原因 (文件:行:列)」，位置为 null 时只有文件
+fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
+    const path = server.vfs.path(file);
+    const shown = if (try server.rootOf(arena, path)) |root| std.mem.trimStart(u8, path[root.len..], "/\\") else path;
+    const at = offset orelse return std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s} ({s})", .{ f.name, f.suggestion, reason, shown });
+    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
+    const pos = (try offsets.LineIndex.init(arena, text)).position(at, server.encoding);
+    return std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s} ({s}:{d}:{d})", .{ f.name, f.suggestion, reason, shown, pos.line + 1, pos.character + 1 });
 }
 
 /// 以文档为参数的检查请求
@@ -3898,5 +4214,6 @@ test {
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
+    _ = @import("naming_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
 }
