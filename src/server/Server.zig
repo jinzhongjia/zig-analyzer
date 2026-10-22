@@ -449,6 +449,7 @@ const request_handlers = .{
     .{ "textDocument/declaration", Mode.semantic, declaration },
     .{ "textDocument/typeDefinition", Mode.semantic, typeDefinition },
     .{ "textDocument/completion", Mode.semantic, completion },
+    .{ "completionItem/resolve", Mode.semantic, completionResolve },
     .{ "textDocument/hover", Mode.semantic, hover },
     .{ "textDocument/signatureHelp", Mode.semantic, signatureHelp },
     .{ "textDocument/inlayHint", Mode.semantic, inlayHint },
@@ -3412,7 +3413,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .definitionProvider = .{ .boolean = true },
             .declarationProvider = .{ .boolean = true },
             .typeDefinitionProvider = .{ .boolean = true },
-            .completionProvider = .{ .triggerCharacters = &.{ ".", "@", "\"", "/" } },
+            .completionProvider = .{ .triggerCharacters = &.{ ".", "@", "\"", "/" }, .resolveProvider = true },
             .hoverProvider = .{ .boolean = true },
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
             .inlayHintProvider = .{ .boolean = true },
@@ -3557,6 +3558,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             .detail = it.detail,
             .filterText = it.filter,
             .sortText = it.sort,
+            .data = if (it.target) |t| try completionData(r, arena, file, t) else null,
             .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
         if (it.replace) |range| {
@@ -3572,6 +3574,49 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     }
     if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
     return .{ .array_of_CompletionItem = out };
+}
+
+/// 补全项的 `data`：在哪个文件中补全（`from`）、所指的文件与其中声明的 `AstId`（编辑后仍能找到同一个声明）。
+/// 选中时客户端带着它请求 `completionItem/resolve`
+fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.ide_db.imports.Target) !std.json.Value {
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(arena, "from", .{ .integer = from.index() });
+    switch (target) {
+        .decl => |d| {
+            try obj.put(arena, "file", .{ .integer = d.file.index() });
+            try obj.put(arena, "item", .{ .integer = @backingInt((try r.itemTree(d.file)).items[d.item].ast_id) });
+        },
+        .file => |f| try obj.put(arena, "file", .{ .integer = f.index() }),
+    }
+    return .{ .object = obj };
+}
+
+/// 补全项被选中：补上签名（`detail`）、文档注释与定义的位置（`documentation`）。`data` 不是本服务器给出的，
+/// 或所指的声明已经不在时原样返回
+fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
+    var item = params;
+    const data = switch (params.data orelse return item) {
+        .object => |o| o,
+        else => return item,
+    };
+    const from = server.dataFile(data, "from") orelse return item;
+    const file = server.dataFile(data, "file") orelse return item;
+    const target: za.ide_db.imports.Target = if (data.get("item")) |v| blk: {
+        if (v != .integer or v.integer < 0 or v.integer > std.math.maxInt(u32)) return item;
+        const def = try ide.context.defOfKey(r, .{ .file = file, .item = @fromBackingInt(@as(u32, @intCast(v.integer))) }) orelse return item;
+        break :blk .{ .decl = .{ .file = file, .item = def.item.item } };
+    } else .{ .file = file };
+    const description = try ide.completion.describe(r, from, target);
+    item.detail = description.detail;
+    item.documentation = .{ .MarkupContent = .{ .kind = .markdown, .value = description.doc } };
+    return item;
+}
+
+/// `data` 中名为 `key` 的文件；不是本次会话中的文件时为 null
+fn dataFile(server: *Server, data: std.json.ObjectMap, key: []const u8) ?Vfs.FileId {
+    const v = data.get(key) orelse return null;
+    if (v != .integer or v.integer < 0 or v.integer >= server.vfs.count()) return null;
+    return @fromBackingInt(@as(u32, @intCast(v.integer)));
 }
 
 /// 请求中的文件、内容与位置

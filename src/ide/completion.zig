@@ -23,6 +23,8 @@ const ModuleGraph = @import("../names/ModuleGraph.zig");
 const builtins = @import("builtins.zig");
 const imports = @import("../ide_db/imports.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
+const ast = @import("../syntax/ast.zig");
+const isTrivia = @import("../syntax/kind.zig").isTrivia;
 
 pub const Options = struct {
     auto_import: bool = true,
@@ -52,6 +54,8 @@ pub const Item = struct {
     qualifier: ?[]const u8 = null,
     sort: ?[]const u8 = null,
     import_edit: ?imports.Edit = null,
+    /// 自动导入候选所指的定义（见 `describe`）
+    target: ?imports.Target = null,
 
     pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, error_name, builtin, module, file, folder, label };
     pub const Range = struct { start: u32, end: u32 };
@@ -83,6 +87,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
                 visible.filter = filter;
                 visible.qualifier = candidate.qualifier;
                 visible.sort = candidate.sort;
+                visible.target = candidate.target;
             }
             duplicate = true;
             break;
@@ -103,9 +108,65 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
             .qualifier = candidate.qualifier,
             .sort = candidate.sort,
             .import_edit = candidate.import_edit,
+            .target = candidate.target,
         });
     }
     return .{ .items = items.items, .is_incomplete = extra.is_incomplete, .import_position = true };
+}
+
+pub const Description = struct {
+    /// 签名（同 hover）；模块与文件为 import 表达式
+    detail: []const u8,
+    /// markdown：文档注释与定义的位置
+    doc: []const u8,
+};
+
+/// 补全项被选中时的说明（`completionItem/resolve`）：在 `from` 中补全时所指的定义
+pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Error!Description {
+    var out: std.Io.Writer.Allocating = .init(r.arena);
+    const w = &out.writer;
+    switch (target) {
+        .decl => |d| {
+            const def: resolve.Def = .{ .item = .{ .file = d.file, .item = d.item } };
+            const tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(d.file, d.item) });
+            const detail = try context.signature(r, def, tv);
+            if (try context.doc(r, def)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
+            const text = (try r.ctx.get(database.syntax.SourceText, d.file)).text;
+            var offset: usize = 0;
+            if (try r.itemNode(d.file, d.item)) |node| {
+                offset = if (ast.memberName(node, try r.inEnum(d.file, d.item))) |tok| tok.offset else node.offset;
+            }
+            const line = std.mem.count(u8, text[0..@min(offset, text.len)], "\n") + 1;
+            w.print("Defined in `{s}:{d}`", .{ try imports.displayPath(r, from, d.file), line }) catch return error.OutOfMemory;
+            return .{ .detail = detail, .doc = out.written() };
+        },
+        .file => |f| {
+            const path = try imports.displayPath(r, from, f);
+            const spec = try imports.importPath(r, from, f) orelse path;
+            if (try fileDoc(r, f)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
+            w.print("File `{s}`", .{path}) catch return error.OutOfMemory;
+            return .{ .detail = try std.fmt.allocPrint(r.arena, "@import(\"{f}\")", .{std.zig.fmtString(spec)}), .doc = out.written() };
+        },
+    }
+}
+
+/// 文件开头的 `//!` 文档，整理方式同 `///` 文档（见 `ItemTree`）；没有时为 null
+fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    var out: std.ArrayList(u8) = .empty;
+    var it = root.children();
+    while (it.next()) |e| {
+        if (e != .token) break;
+        if (e.token.kind != .container_doc_comment) {
+            if (isTrivia(e.token.kind)) continue;
+            break;
+        }
+        var line = e.token.text["//!".len..];
+        if (std.mem.startsWith(u8, line, " ")) line = line[1..];
+        if (out.items.len != 0) try out.append(r.arena, '\n');
+        try out.appendSlice(r.arena, std.mem.trimEnd(u8, line, "\r"));
+    }
+    return if (out.items.len == 0) null else out.items;
 }
 
 /// `cursor_owner` 记下查到的光标所在成员，自动导入沿用

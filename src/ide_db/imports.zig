@@ -28,9 +28,16 @@ pub const Candidate = struct {
     sort: []const u8,
     doc: ?[]const u8 = null,
     import_edit: ?Edit = null,
+    target: Target,
 };
 pub const Result = struct { items: []const Candidate, is_incomplete: bool = false };
-const Declaration = struct { file: FileId, item: u32 };
+pub const Declaration = struct { file: FileId, item: u32 };
+/// 候选所指的定义：补全项被选中时据此给出签名、文档与位置
+pub const Target = union(enum) {
+    decl: Declaration,
+    /// 模块或文件本身
+    file: FileId,
+};
 
 /// 别名链与成员访问的最大求值深度
 const max_depth = 32;
@@ -970,7 +977,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             if (builder.rejects(sort, &.{ root, ".", declared.path })) continue;
             if (try builder.visible(declared.name) != null) continue;
             try builder.reused.put(r.arena, declared.target, {});
-            try builder.add(.{ .label = try joinPath(r.arena, root, declared.path), .kind = candidateKind(declared.kind), .filter = declared.name, .qualifier = root, .sort = sort, .doc = declared.doc });
+            try builder.add(.{ .label = try joinPath(r.arena, root, declared.path), .kind = candidateKind(declared.kind), .filter = declared.name, .qualifier = root, .sort = sort, .doc = declared.doc, .target = .{ .decl = .{ .file = declared.file, .item = declared.item } } });
         }
         // 同文件可访问私有成员，公开闭包仍由所有请求共享。
         if (ns.file == file) for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |nested, target| {
@@ -980,7 +987,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             if (builder.rejects(sort, &.{ root, ".", relative })) continue;
             if (try builder.visible(nested.name) != null) continue;
             try builder.reused.put(r.arena, target, {});
-            try builder.add(.{ .label = try joinPath(r.arena, root, relative), .kind = candidateKind(nested.kind), .filter = nested.name, .qualifier = root, .sort = sort, .doc = nested.doc });
+            try builder.add(.{ .label = try joinPath(r.arena, root, relative), .kind = candidateKind(nested.kind), .filter = nested.name, .qualifier = root, .sort = sort, .doc = nested.doc, .target = .{ .decl = .{ .file = file, .item = nested.item } } });
         };
     }
     // 同文件的私有链合法；可见的顶层名由普通补全负责。
@@ -993,7 +1000,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         const root_def = try builder.visible(root_name) orelse continue;
         const expected = findRoot(current, root_name) orelse continue;
         if (!deepEql(root_def, resolve.Def{ .item = .{ .file = file, .item = expected.item } })) continue;
-        try builder.add(.{ .label = try r.arena.dupe(u8, decl.path), .kind = candidateKind(decl.kind), .filter = decl.name, .qualifier = try r.arena.dupe(u8, root_name), .sort = sort, .doc = decl.doc });
+        try builder.add(.{ .label = try r.arena.dupe(u8, decl.path), .kind = candidateKind(decl.kind), .filter = decl.name, .qualifier = try r.arena.dupe(u8, root_name), .sort = sort, .doc = decl.doc, .target = .{ .decl = .{ .file = file, .item = decl.item } } });
     }
     if (graph) |g| {
         // 模块名字即使没有任何声明也可补全；生成文件根未知时不提供。
@@ -1003,7 +1010,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             const ns: Namespace = .{ .file = target, .container = 0 };
             const spec = try r.arena.dupe(u8, name);
             if (std.ascii.startsWithIgnoreCase(name, prefix) and try builder.namespaceAlias(ns) == null and try builder.visible(name) == null)
-                try builder.importCandidate(name, .module, false, spec, "", null, "~2");
+                try builder.importCandidate(name, .module, false, spec, "", null, "~2", .{ .file = target });
             try builder.exported(ns, spec);
         };
         // 项目文件只查询小索引的前缀区间，不在按键路径扫描 ItemTree/Body。
@@ -1021,7 +1028,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             const spec = try importSpec(r, g, file, entry.file) orelse continue;
             const aliased = try builder.namespaceAlias(ns) != null;
             if (stem_matches and !aliased and try builder.visible(stem) == null)
-                try builder.importCandidate(stem, .file, false, spec, "", null, "~3");
+                try builder.importCandidate(stem, .file, false, spec, "", null, "~3", .{ .file = entry.file });
             if (aliased or public.len == 0) continue;
             const targets = (try r.ctx.get(FileLinks, entry.file)).targets;
             for (public) |p| {
@@ -1029,7 +1036,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
                 const target = targets[p.decl];
                 if (try builder.reuseDirect(target, decl.name, decl.kind, decl.doc)) continue;
                 if (builder.reused.contains(target)) continue;
-                try builder.importIfVisible(decl.name, candidateKind(decl.kind), decl.is_extern, spec, p.path, decl.doc, if (std.mem.indexOfScalar(u8, p.path, '.') == null) "~3" else "~4");
+                try builder.importIfVisible(decl.name, candidateKind(decl.kind), decl.is_extern, spec, p.path, decl.doc, if (std.mem.indexOfScalar(u8, p.path, '.') == null) "~3" else "~4", .{ .decl = .{ .file = entry.file, .item = decl.item } });
             }
         }
     }
@@ -1112,7 +1119,7 @@ const Builder = struct {
         const alias = try b.directAlias(target) orelse return false;
         // 别名与目标共享前缀时，继续输入后须重新选择过滤名字，不能沿用另一条拼写。
         if (!std.mem.eql(u8, alias.name, name) and std.ascii.startsWithIgnoreCase(alias.name, b.prefix)) b.incomplete = true;
-        try b.add(.{ .label = try renderName(b.r.arena, alias.name), .kind = candidateKind(kind), .filter = name, .qualifier = "", .sort = b.sortOf(name, "~0"), .doc = doc });
+        try b.add(.{ .label = try renderName(b.r.arena, alias.name), .kind = candidateKind(kind), .filter = name, .qualifier = "", .sort = b.sortOf(name, "~0"), .doc = doc, .target = .{ .decl = .{ .file = b.file, .item = alias.item } } });
         try b.reused.put(b.r.arena, target, {});
         return true;
     }
@@ -1167,19 +1174,19 @@ const Builder = struct {
         for (index.matching(b.prefix)) |decl| {
             if (try b.reuseDirect(decl.target, decl.name, decl.kind, decl.doc)) continue;
             if (b.reused.contains(decl.target)) continue;
-            try b.importIfVisible(decl.name, candidateKind(decl.kind), decl.is_extern, spec, decl.path, decl.doc, if (std.mem.indexOfScalar(u8, decl.path, '.') == null) "~3" else "~4");
+            try b.importIfVisible(decl.name, candidateKind(decl.kind), decl.is_extern, spec, decl.path, decl.doc, if (std.mem.indexOfScalar(u8, decl.path, '.') == null) "~3" else "~4", .{ .decl = .{ .file = decl.file, .item = decl.item } });
         }
     }
     /// 名字在当前位置不可见时提供 import；先按排序淘汰，再检查可见性
-    fn importIfVisible(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8) resolve.Error!void {
+    fn importIfVisible(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8, target: Target) resolve.Error!void {
         var buf: [256]u8 = undefined;
         const args = importSortArgs(b.prefix, name, spec, path, rank);
         const sort = std.fmt.bufPrint(&buf, import_sort, args) catch try std.fmt.allocPrint(b.r.arena, import_sort, args);
         if (b.rejects(sort, null)) return;
         if (try b.visible(name) != null) return;
-        try b.importCandidate(name, kind, is_extern, spec, path, doc, rank);
+        try b.importCandidate(name, kind, is_extern, spec, path, doc, rank, target);
     }
-    fn importCandidate(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8) resolve.Error!void {
+    fn importCandidate(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, rank: []const u8, target: Target) resolve.Error!void {
         const a = b.r.arena;
         const sort = try std.fmt.allocPrint(a, import_sort, importSortArgs(b.prefix, name, spec, path, rank));
         if (b.rejects(sort, null)) return;
@@ -1221,7 +1228,7 @@ const Builder = struct {
             });
             break :blk .{ .start = offset, .end = offset, .text = text };
         };
-        try b.add(.{ .label = label, .kind = kind, .filter = name, .qualifier = qualifier, .sort = sort, .doc = doc, .import_edit = edit });
+        try b.add(.{ .label = label, .kind = kind, .filter = name, .qualifier = qualifier, .sort = sort, .doc = doc, .import_edit = edit, .target = target });
     }
 };
 
@@ -1270,6 +1277,38 @@ fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, ta
         c.* = '/';
     };
     return relative;
+}
+
+/// 当前文件 import `target` 用的路径或模块名；不能直接 import 时为 null
+pub fn importPath(r: *Resolver, from: FileId, target: FileId) resolve.Error!?[]const u8 {
+    const graph = try r.ctx.get(database.ModuleGraph.Input, {}) orelse return null;
+    return importSpec(r, graph, from, target);
+}
+
+/// 定义所在文件的显示路径：标准库中为 `std/` 下的路径；当前文件可以按路径 import 的为 import 路径；在当前文件
+/// 可以 import 的其他模块的根目录下时，为模块名加根目录下的路径（模块的根不一定在编译集合中）；都不是时为完整路径
+pub fn displayPath(r: *Resolver, from: FileId, target: FileId) resolve.Error![]const u8 {
+    const vfs = r.ctx.db.env.vfs;
+    const path = vfs.path(target);
+    const graph = try r.ctx.get(database.ModuleGraph.Input, {}) orelse return path;
+    if (graph.std_root) |root| if (std.fs.path.dirname(vfs.path(root))) |dir| if (vfs.isUnder(path, dir))
+        return under(r.arena, "std", dir, path);
+    if (try importSpec(r, graph, from, target)) |spec| if (isZigSource(spec)) return spec;
+    for ([_][]const []const u8{ &.{"builtin"}, try graph.importNames(r.arena, from) }) |group| for (group) |name| {
+        const root = graph.importTarget(from, name) orelse continue;
+        const dir = std.fs.path.dirname(vfs.path(root)) orelse continue;
+        if (vfs.isUnder(path, dir)) return under(r.arena, name, dir, path);
+    };
+    return path;
+}
+
+/// `path` 相对 `dir` 的部分，前面加上 `prefix/`，分隔符统一为 `/`
+fn under(a: Allocator, prefix: []const u8, dir: []const u8, path: []const u8) Allocator.Error![]const u8 {
+    const relative = try std.fs.path.relativeAlloc(a, dir, null, dir, path);
+    for (relative) |*c| if (c.* == '\\') {
+        c.* = '/';
+    };
+    return std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, relative });
 }
 
 fn insertionOffset(r: *Resolver, file: FileId) resolve.Error!u32 {

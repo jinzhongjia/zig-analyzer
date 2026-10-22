@@ -175,6 +175,44 @@ test "auto-import indexing restarts when an earlier pass did not finish" {
     _ = try h.request("shutdown", {});
 }
 
+test "auto-import items resolve to the signature, docs and where the target is defined" {
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/lib.zig", .text = "/// A widget.\npub const Widget = struct { size: u32 };\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    const init = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    const provider = init.object.get("result").?.object.get("capabilities").?.object.get("completionProvider").?;
+    try testing.expect(provider.object.get("resolveProvider").?.bool);
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = try position(source, "Widgxx", 4, .utf16);
+    try startAutoImport(&h, uri, at);
+    const item = importedWidget(try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at })).?;
+    try testing.expect(item.object.get("data") != null);
+    const resolved = (try h.request("completionItem/resolve", item)).object.get("result").?;
+    try testing.expectEqualStrings("const Widget = struct", resolved.object.get("detail").?.string);
+    try testing.expectEqualStrings("A widget.\n\nDefined in `lib/lib.zig:2`", resolved.object.get("documentation").?.object.get("value").?.string);
+    // 原有的编辑保持不变
+    try testing.expect(resolved.object.get("additionalTextEdits") != null);
+    _ = try h.request("shutdown", {});
+}
+
 test "completion does not run auto-import indexing inside its read transaction" {
     // 不能另起任务时任务就地执行：补全持有读事务，索引在其中就地执行时，编辑的写事务与之互相等待
     const prev_level = testing.log_level;

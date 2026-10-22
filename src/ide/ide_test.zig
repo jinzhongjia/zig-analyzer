@@ -3078,6 +3078,51 @@ test "auto import preserves rendered qualified paths and metadata" {
     try testing.expectEqual(@as(u32, 5), candidate.replace.?.end - candidate.replace.?.start);
 }
 
+test "selected auto-import candidates describe the signature, docs and where the target is defined" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/src/main.zig module:app deps:wire=dep
+        \\fn main() void { _ = <|>missing; }
+        \\//- /p/src/util/lines.zig in:app
+        \\//! Line utilities.
+        \\
+        \\/// Offsets of line starts.
+        \\pub const LineIndex = struct {};
+        \\pub fn lineOf(offset: u32) u32 { return offset; }
+        \\//- /dep/src/root.zig module:dep
+        \\pub const Header = struct {};
+        \\//- /zig/std/std.zig std
+        \\pub const mem = @import("mem.zig");
+        \\//- /zig/std/mem.zig std
+        \\pub fn eql() bool { return true; }
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const imports = @import("../ide_db/imports.zig");
+    const cases = [_]struct { prefix: []const u8, label: []const u8, detail: []const u8, doc: []const u8 }{
+        .{ .prefix = "LineIn", .label = "LineIndex", .detail = "const LineIndex = struct", .doc = "Offsets of line starts.\n\nDefined in `util/lines.zig:4`" },
+        .{ .prefix = "lineO", .label = "lineOf", .detail = "pub fn lineOf(offset: u32) u32", .doc = "Defined in `util/lines.zig:5`" },
+        // 文件本身：import 表达式与文件开头的 `//!` 文档
+        .{ .prefix = "lines", .label = "lines", .detail = "@import(\"util/lines.zig\")", .doc = "Line utilities.\n\nFile `util/lines.zig`" },
+        // 标准库按 `std/` 下的路径；其他模块按当前文件 import 它的名字
+        .{ .prefix = "eq", .label = "eql", .detail = "pub fn eql() bool", .doc = "Defined in `std/mem.zig:1`" },
+        .{ .prefix = "Head", .label = "Header", .detail = "const Header = struct", .doc = "Defined in `wire/root.zig:1`" },
+    };
+    for (cases) |case| {
+        const result = try imports.complete(&r, cursor.file, cursor.offset, .unknown, case.prefix, 128);
+        const candidate = for (result.items) |item| {
+            if (std.mem.eql(u8, item.label, case.label)) break item;
+        } else return error.MissingAutoImport;
+        const description = try completion.describe(&r, cursor.file, candidate.target);
+        try testing.expectEqualStrings(case.detail, description.detail);
+        try testing.expectEqualStrings(case.doc, description.doc);
+    }
+}
+
 test "auto import escaped filters preserve the raw input prefix" {
     const sources = [_][]const u8{
         "const value = @\"Ser<|>ver name\";",
