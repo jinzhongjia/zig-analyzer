@@ -46,6 +46,17 @@ fn importedWidget(response: std.json.Value) ?std.json.Value {
     return null;
 }
 
+/// `zig-analyzer/status` 中各自动导入 query 的 key 总数
+fn importQueryKeys(response: std.json.Value) i64 {
+    var keys: i64 = 0;
+    for (response.object.get("result").?.object.get("queries").?.array.items) |q| {
+        const name = q.object.get("name").?.string;
+        if (std.mem.indexOf(u8, name, ".imports.") == null) continue;
+        keys += q.object.get("keys").?.integer;
+    }
+    return keys;
+}
+
 fn applyCompletion(a: std.mem.Allocator, text: []const u8, item: std.json.Value, encoding: offsets.Encoding) ![]const u8 {
     const Change = struct { start: usize, end: usize, text: []const u8 };
     var changes: std.ArrayList(Change) = .empty;
@@ -175,6 +186,77 @@ test "auto-import indexing restarts when an earlier pass did not finish" {
     _ = try h.request("shutdown", {});
 }
 
+test "auto-import works in an unsaved untitled document" {
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/lib.zig", .text = "pub const Widget = struct { size: u32 };\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-1";
+    const text = "pub fn main() void { _ = ArrayL; }\n";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = try position(text, "ArrayL", 6, .utf16);
+    try startAutoImport(&h, uri, at);
+    const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
+    const item = for (completionItems(response)) |candidate| {
+        if (!std.mem.eql(u8, candidate.object.get("label").?.string, "ArrayList")) continue;
+        if (candidate.object.get("additionalTextEdits") != null) break candidate;
+    } else return error.MissingUntitledAutoImport;
+    try testing.expect(item.object.get("data") != null);
+    _ = try h.request("shutdown", {});
+}
+
+test "disabled auto-import does not build or query the import index" {
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/lib.zig", .text = "pub const Widget = struct { size: u32 };\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .completion = .{ .auto_import = false },
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    try h.notify("initialized", Empty{});
+    const text = "pub fn main() void { _ = Widg; }\n";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(text, "Widg", 4, .utf16) });
+    try testing.expect(response.object.get("result").? == .array);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), h.server.imports_basis.load(.acquire));
+    try testing.expect(!h.server.imports_wanted.load(.acquire));
+    try testing.expectEqual(@as(i64, 0), importQueryKeys(try h.request("zig-analyzer/status", {})));
+    _ = try h.request("shutdown", {});
+}
+
 test "auto-import items resolve to the signature, docs and where the target is defined" {
     const files = [_]fixture.File{
         .{ .path = "build.zig", .text = fixture.basic[0].text },
@@ -248,6 +330,52 @@ test "completion does not run auto-import indexing inside its read transaction" 
     _ = try h.request("shutdown", {});
 }
 
+test "auto-import module and file candidates resolve through completionItem/resolve" {
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/Util.zig", .text = "//! Utilities.\npub const Service = u32;\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    try h.notify("initialized", Empty{});
+    const text = "fn catalog() void { _ = @import(\"Util.zig\"); }\npub fn main() void { _ = Uti; }\n";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = try position(text, "_ = Uti", 7, .utf16);
+    try startAutoImport(&h, uri, at);
+    const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
+    const item = for (completionItems(response)) |candidate| {
+        if (!std.mem.eql(u8, candidate.object.get("label").?.string, "Util")) continue;
+        if (candidate.object.get("additionalTextEdits") != null) break candidate;
+    } else return error.MissingFileCandidate;
+    try testing.expect(item.object.get("data") != null);
+    const resolved = (try h.request("completionItem/resolve", item)).object.get("result").?;
+    try testing.expectEqualStrings("@import(\"Util.zig\")", resolved.object.get("detail").?.string);
+    try testing.expectEqualStrings("Utilities.\n\nFile `Util.zig`", resolved.object.get("documentation").?.object.get("value").?.string);
+    // 不是本服务器给出的 data：原样返回，不报错
+    var data: std.json.ObjectMap = .empty;
+    try data.put(a, "from", .{ .integer = 999999 });
+    const malformed = types.CompletionItem{ .label = "Util", .data = .{ .object = data } };
+    const unchanged = (try h.request("completionItem/resolve", malformed)).object.get("result").?;
+    try testing.expect(unchanged.object.get("detail") == null);
+    try testing.expectEqualStrings("Util", unchanged.object.get("label").?.string);
+    _ = try h.request("shutdown", {});
+}
+
 test "auto-import completion reports truncation and recomputes for a narrower prefix" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -280,6 +408,19 @@ test "auto-import completion reports truncation and recomputes for a narrower pr
     try startAutoImport(&h, uri, try position(broad, "Widget", 6, .utf16));
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(broad, "Widget", 6, .utf16) });
     try testing.expect(response.object.get("result").?.object.get("isIncomplete").?.bool);
+    var truncated: usize = 0;
+    var saw_000 = false;
+    var saw_139 = false;
+    for (completionItems(response)) |item| {
+        if (item.object.get("additionalTextEdits") == null) continue;
+        truncated += 1;
+        const label = item.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "Widget000")) saw_000 = true;
+        if (std.mem.eql(u8, label, "Widget139")) saw_139 = true;
+    }
+    try testing.expectEqual(@as(usize, 128), truncated);
+    try testing.expect(saw_000);
+    try testing.expect(!saw_139);
     const narrow = "pub fn main() void { _ = Widget139; }\n";
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text = narrow }} });
     _ = try h.request("zig-analyzer/waitIdle", {});

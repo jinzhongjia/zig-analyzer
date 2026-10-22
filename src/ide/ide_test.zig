@@ -3021,13 +3021,61 @@ test "auto import does not leak into non-name contexts" {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
+        const baseline = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false });
         const result = try completion.complete(&r, added.file, added.cursor, .{});
         try testing.expect(!result.is_incomplete);
+        // 这些上下文不提供自动导入，普通补全的结果不因此丢失或被改写
+        try testing.expectEqual(baseline.items.len, result.items.len);
         for (result.items) |item| {
             try testing.expect(item.import_edit == null);
             try testing.expect(item.filter == null);
         }
     }
+}
+
+test "auto import does not rewrite bare enum or union member declarations" {
+    const members = [_][]const u8{
+        "const E = enum { standard<|> };",
+        "const E = enum { standard<|> = 1 };",
+        "const E = enum(u8) { standard<|> };",
+        "const E = union(enum) { standard<|> };",
+    };
+    for (members) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:root\n{s}\n" ++
+            "//- /p/types.zig in:root\npub const standard = u32;\n", .{source});
+        const fixture = try w.fixture(text);
+        const cursor = fixture.cursor.?;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        for (result.items) |item| {
+            try testing.expect(item.import_edit == null);
+            try testing.expect(item.filter == null);
+        }
+    }
+    // struct 的元组字段没有冒号，但类型表达式是真正的名字引用，仍应自动导入
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:root
+        \\const S = struct { standard<|> };
+        \\//- /p/types.zig in:root
+        \\pub const standard = u32;
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+    const candidate = for (result.items) |item| {
+        if (item.filter) |filter| if (std.mem.eql(u8, filter, "standard")) break item;
+    } else return error.MissingTupleFieldAutoImport;
+    try testing.expect(candidate.import_edit != null);
 }
 
 test "auto import is not offered outside zig source files" {
@@ -3342,4 +3390,31 @@ test "auto import refreshes shared alias prefixes before filtering diverges" {
         }
         try testing.expectEqual(@as(usize, 1), count);
     }
+}
+
+test "visible completion precedes auto-import candidates" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:app deps:lib=dep
+        \\fn main() void { const item = 1; _ = it<|>em; }
+        \\//- /dep/root.zig module:dep
+        \\pub const itemized = u32;
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+    var visible_at: ?usize = null;
+    var auto_at: ?usize = null;
+    for (result.items, 0..) |item, i| {
+        if (item.filter == null and std.mem.eql(u8, item.label, "item")) visible_at = i;
+        if (item.filter) |filter| {
+            if (std.mem.eql(u8, filter, "itemized")) auto_at = i;
+        }
+    }
+    try testing.expect(visible_at != null and auto_at != null);
+    try testing.expect(visible_at.? < auto_at.?);
 }

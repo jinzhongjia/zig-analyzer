@@ -723,7 +723,7 @@ test "labels, switch captures and nested containers" {
 
 test "recovered invalid names remain unknown while preserving enclosing bindings" {
     const cases = [_]struct { source: []const u8, type_position: bool }{
-        .{ .source = "fn f(input: u32) void { const value: @\"EdgeWidg\n = input; _ = value; }", .type_position = true },
+        .{ .source = "fn f(input: u32) void { const value: @\"EdgeWidg\n = input; _ = value; _ = input; }", .type_position = true },
         .{ .source = "fn f(input: u32) void { const value = @\"EdgeWidg", .type_position = false },
     };
     for (cases) |case| {
@@ -739,5 +739,12 @@ test "recovered invalid names remain unknown while preserving enclosing bindings
         try testing.expectEqual(expr, body.exprAt(offsetOf(case.source, "@\"") + 2).?);
         const input = body.lookup(body.expr_scopes[@backingInt(expr)], "input").?;
         try testing.expectEqual(.param, body.binding(input).kind);
+        if (case.type_position) {
+            var saw_input_ref = false;
+            for (body.exprs) |e| if (e == .name_ref and std.mem.eql(u8, e.name_ref, "input")) {
+                saw_input_ref = true;
+            };
+            try testing.expect(saw_input_ref);
+        }
     }
 }

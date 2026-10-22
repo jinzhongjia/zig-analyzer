@@ -292,7 +292,6 @@ test "auto imports avoid bindings in other owners and container fields" {
         "fn other() void { const Widget = 1; _ = Widget; }\n",
         "fn other(xs: []const u32) void { for (xs) |Widget| { _ = Widget; } }\n",
         "const Inner = struct { const Widget = u32; };\n",
-        "Widget: u32,\n",
     };
     for (owners) |owner| {
         var w: World = undefined;
@@ -633,4 +632,177 @@ test "auto imports keep declarations whose names differ only in case apart" {
     try testing.expectEqualStrings("const Wide = @import(\"shapes\").Alias.Wide;\n", wide.import_edit.?.text);
     const narrow = editContaining(try run(&w, at.file, at.offset, "Narrow", 128), "Narrow") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("const Narrow = @import(\"shapes\").Other.Narrow;\n", narrow.import_edit.?.text);
+}
+
+test "auto import resolves short alias chains independently of earlier long chains" {
+    // 超过 max_depth 的长链不能把同一批声明里较短的链按起点深度截断：A30 距 Root 只有 19 跳，
+    // 从 A0 求值到它时已接近深度上限，必须仍能在自己的起点求值出命名空间。
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(w.arena.allocator(), "const Root = struct { pub const Member = u32; };\n");
+    for (0..50) |i| {
+        if (i == 49) {
+            try text.print(w.arena.allocator(), "const A{d} = Root;\n", .{i});
+        } else {
+            try text.print(w.arena.allocator(), "const A{d} = A{d};\n", .{ i, i + 1 });
+        }
+    }
+    try text.appendSlice(w.arena.allocator(), "fn main() void { _ = Mem<|>ber; }\n");
+    const added = try w.add("/p/main.zig", text.items);
+    const result = try run(&w, added.file, added.cursor, "Mem", 128);
+    try testing.expect(find(result, "A30.Member") != null);
+}
+
+test "auto import ignores member references and labels in other owners" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app deps:lib=dep
+        \\const S = @import("types.zig").S;
+        \\fn other(s: S) void { _ = s.Widget; }
+        \\fn labels() void { Widget: { break :Widget; } }
+        \\fn main() void { _ = Wid<|>get; }
+        \\//- /p/types.zig in:app
+        \\pub const S = struct { Widget: u32 };
+        \\//- /dep/root.zig module:dep
+        \\pub const Widget = struct {};
+    );
+    const at = f.cursor.?;
+    const result = try run(&w, at.file, at.offset, "Wid", 128);
+    const direct = find(result, "Widget") orelse return error.MissingDirectWidget;
+    try testing.expect(direct.import_edit != null);
+    try testing.expect(find(result, "lib.Widget") == null);
+}
+
+test "auto import inserts after a leading UTF-8 BOM" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "\xEF\xBB\xBFconst value = st<|>;");
+    const std_file = (try w.add("/lib/std/std.zig", "pub const standard = u32;\n")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    const standard = editContaining(try run(&w, added.file, added.cursor, "st", 128), "standard") orelse return error.MissingAutoImport;
+    try testing.expectEqual(@as(u32, 3), standard.import_edit.?.start);
+}
+
+test "auto import keeps a BOM and file doc before the inserted import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const source = "\xEF\xBB\xBF//! Docs.\nconst value = st<|>;";
+    const added = try w.add("/p/main.zig", source);
+    const std_file = (try w.add("/lib/std/std.zig", "pub const standard = u32;\n")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    const standard = editContaining(try run(&w, added.file, added.cursor, "st", 128), "standard") orelse return error.MissingAutoImport;
+    try testing.expectEqual(@as(u32, "//! Docs.\n".len + 3), standard.import_edit.?.start);
+}
+
+test "auto import does not add an edit that overlaps an unfinished escaped name" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const B = @import("other.zig")
+        \\@"Sta<|>
+        \\//- /p/other.zig in:app
+        \\pub const Other = u32;
+        \\//- /p/types.zig in:app
+        \\pub const standard = u32;
+    );
+    const at = f.cursor.?;
+    const result = try run(&w, at.file, at.offset, "Sta", 128);
+    try testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "escaped namespace alias roots produce one qualified candidate" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig",
+        \\const @"odd.name" = struct { pub fn bar() void {} };
+        \\fn main() void { _ = ba<|>r; }
+    );
+    const result = try run(&w, added.file, added.cursor, "ba", 128);
+    var count: usize = 0;
+    for (result.items) |item| {
+        if (!std.mem.eql(u8, item.label, "@\"odd.name\".bar")) continue;
+        count += 1;
+        try testing.expectEqualStrings("@\"odd.name\"", item.qualifier);
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "auto import offers the default builtin module and its exports" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn main() void { _ = st<|>; }\n");
+    const builtin = (try w.add("/zig/builtin.zig", "pub const Type = u32;\n")).file;
+    w.default_builtin = builtin;
+    try w.setGraph(null, &.{}, &.{});
+    const module = find(try run(&w, added.file, added.cursor, "buil", 128), "builtin") orelse return error.MissingBuiltinModule;
+    try testing.expectEqualStrings("const builtin = @import(\"builtin\");\n", module.import_edit.?.text);
+    const exported = editContaining(try run(&w, added.file, added.cursor, "Ty", 128), "@import(\"builtin\").Type") orelse return error.MissingBuiltinExport;
+    try testing.expectEqualStrings("const Type = @import(\"builtin\").Type;\n", exported.import_edit.?.text);
+}
+
+test "auto import uses the builtin of the file's module" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn main() void { _ = st<|>; }\n");
+    const builtin = (try w.add("/gen/builtin.zig", "pub const Type = u32;\n")).file;
+    const modules = [_]database.ModuleGraph.Module{.{ .root = added.file, .builtin = builtin, .imports = &.{} }};
+    const files = [_]database.ModuleGraph.FileEntry{.{ .file = added.file, .module = 0, .root_module = 0 }};
+    try w.setGraph(null, &modules, &files);
+    const module = find(try run(&w, added.file, added.cursor, "buil", 128), "builtin") orelse return error.MissingBuiltinModule;
+    try testing.expect(module.import_edit != null);
+    const exported = editContaining(try run(&w, added.file, added.cursor, "Ty", 128), "@import(\"builtin\").Type") orelse return error.MissingBuiltinExport;
+    try testing.expect(exported.import_edit != null);
+}
+
+test "auto import reuses an existing relative path import alias" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const S = @import("Server.zig");
+        \\fn main() void { _ = Serv<|>ice; }
+        \\//- /p/Server.zig in:app
+        \\pub const Service = struct {};
+    );
+    const at = f.cursor.?;
+    const candidate = find(try run(&w, at.file, at.offset, "Serv", 128), "S.Service") orelse return error.MissingPathAliasReuse;
+    try testing.expect(candidate.import_edit == null);
+}
+
+test "exports cache evicts least recently used closures and restores them" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(w.arena.allocator(), "//- /p/root.zig module:root\n");
+    for (0..1026) |i| try text.print(w.arena.allocator(), "//- /p/f{d}.zig in:root\npub const V = u32;\n", .{i});
+    const f = try w.fixture(text.items);
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        for (f.files[1..]) |file| {
+            _ = try ctx.get(imports.Exports, .{ .ns = .{ .file = file, .container = 0 } });
+        }
+    }
+    try testing.expect(w.db.wantsSweep());
+    try testing.expect(w.db.trySweep());
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    const first = try ctx.get(imports.Exports, .{ .ns = .{ .file = f.files[1], .container = 0 } });
+    const last = try ctx.get(imports.Exports, .{ .ns = .{ .file = f.files[f.files.len - 1], .container = 0 } });
+    try testing.expectEqual(@as(usize, 1), first.decls.len);
+    try testing.expectEqual(@as(usize, 1), last.decls.len);
+    try testing.expectEqualStrings("V", first.decls[0].name);
 }
