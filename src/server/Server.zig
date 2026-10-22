@@ -858,6 +858,18 @@ fn scheduleIndexing(server: *Server) void {
     spawn(server.io, &server.bg_group, indexTask, .{server});
 }
 
+/// 同 `scheduleIndexing`，供持有读事务的请求调用：索引任务可能就地执行，其中的读事务遇到等待中的写事务时，
+/// 与仍持有读锁的调用者互相等待。由另一个任务调度；任务启动不了时不建，留给之后的请求
+fn scheduleIndexingFromRead(server: *Server) void {
+    server.busyBegin();
+    server.bg_group.concurrent(server.io, scheduleIndexingTask, .{server}) catch server.busyEnd();
+}
+
+fn scheduleIndexingTask(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    server.scheduleIndexing();
+}
+
 fn indexTask(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     while (true) {
@@ -3512,7 +3524,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         .detect_import_position = auto_import and !imports_ready,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
-    if (imports_waiting and !server.imports_wanted.swap(true, .acq_rel)) server.scheduleIndexing();
+    if (imports_waiting and !server.imports_wanted.swap(true, .acq_rel)) server.scheduleIndexingFromRead();
     const out = try arena.alloc(types.CompletionItem, result.items.len);
     var lines: ?offsets.LineIndex = null;
     for (result.items, out) |it, *o| {

@@ -139,6 +139,41 @@ test "auto-import edits replace the whole identifier and resolve after applicati
     }
 }
 
+test "completion does not run auto-import indexing inside its read transaction" {
+    // 不能另起任务时任务就地执行：补全持有读事务，索引在其中就地执行时，编辑的写事务与之互相等待
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    var h: Harness = undefined;
+    try h.startIo(threaded.io());
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-1";
+    const text = "pub fn main() void {\n    _ = st;\n}\n";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // 服务器空闲时修改：补全请求与它要启动的任务都不能另起，只能就地执行
+    threaded.concurrent_limit = .nothing;
+    errdefer threaded.concurrent_limit = .unlimited;
+    const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(text, "st;", 2, .utf16) });
+    try testing.expect(response.object.get("result").?.object.get("isIncomplete").?.bool);
+    try testing.expectEqual(std.math.maxInt(u64), h.server.imports_basis.load(.acquire));
+    const busy = blk: {
+        h.server.busy_mutex.lockUncancelable(testing.io);
+        defer h.server.busy_mutex.unlock(testing.io);
+        const n = h.server.busy;
+        // 计数泄漏时 deinit 中的 waitIdle 永远等待：先归零，让失败的测试正常结束
+        h.server.busy = 0;
+        break :blk n;
+    };
+    try testing.expectEqual(0, busy);
+    threaded.concurrent_limit = .unlimited;
+    _ = try h.request("shutdown", {});
+}
+
 test "auto-import completion reports truncation and recomputes for a narrower prefix" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
