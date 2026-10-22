@@ -127,10 +127,10 @@ live_prepared: live.Prepared = undefined,
 indexing: std.atomic.Value(bool) = .init(false),
 /// 在可以自动导入的名字处补全过：此后才为自动导入建索引。不补全的会话（浏览、跳转）不为它展开标准库的公开导出闭包
 imports_wanted: std.atomic.Value(bool) = .init(false),
-/// 最近一轮建完自动导入索引时的模块图（值的地址，没有模块图为 0，尚未建完为 `imports_pending`）。补全时模块图
-/// 与它不同则不提供自动导入，标记为不完整，客户端随输入重新请求：以免在请求中同步为新的模块图展开标准库、项目
-/// 的公开导出闭包。构建结果没有变化时模块图不写入，不影响
-imports_graph: std.atomic.Value(usize) = .init(imports_pending),
+/// 最近一轮建完自动导入索引时模块图的构成（见 `importsBasis`；尚未建完为 `imports_pending`）。补全时与它不同
+/// 则不提供自动导入，标记为不完整，客户端随输入重新请求：以免在请求中同步为新的模块展开标准库、项目的公开导出
+/// 闭包。模块图只增减了文件（如构建中产生的生成文件）时不变，新文件的索引在补全时按需建立
+imports_basis: std.atomic.Value(u64) = .init(imports_pending),
 /// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
 indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 indexed_mutex: Io.Mutex = .init,
@@ -883,12 +883,12 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     defer pc.leave();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
-    var graph_id: usize = 0;
+    var basis: u64 = 0;
     const files = blk: {
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
-        graph_id = graphId(ctx.get(ModuleGraph.Input, {}) catch return);
+        basis = importsBasis(ctx.get(ModuleGraph.Input, {}) catch return);
         break :blk za.ide_db.search.projectFiles(&r) catch return;
     };
     const auto_import = server.imports_wanted.load(.acquire) and blk: {
@@ -898,7 +898,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     };
     if (auto_import) try server.indexImportRoots();
     if (files.len == 0) {
-        if (auto_import) server.imports_graph.store(graph_id, .release);
+        if (auto_import) server.imports_basis.store(basis, .release);
         return;
     }
     // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
@@ -936,14 +936,34 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         var buf: [32]u8 = undefined;
         if (progress) |p| server.progress.report(server, p, std.fmt.bufPrint(&buf, "{d}/{d} files", .{ done, files.len }) catch null, @intCast(done * 100 / files.len));
     }
-    if (auto_import) server.imports_graph.store(graph_id, .release);
+    if (auto_import) server.imports_basis.store(basis, .release);
 }
 
-/// 尚未建完自动导入索引（见 `imports_graph`）
-const imports_pending = std.math.maxInt(usize);
+/// 尚未建完自动导入索引（见 `imports_basis`）
+const imports_pending = std.math.maxInt(u64);
 
-fn graphId(graph: ?*const ModuleGraph) usize {
-    return if (graph) |g| @intFromPtr(g) else 0;
+/// 模块图中决定自动导入索引的构成：标准库、默认的 builtin 与各模块的根、builtin 和 import，不含文件
+fn importsBasis(graph: ?*const ModuleGraph) u64 {
+    const g = graph orelse return 0;
+    var h: std.hash.Wyhash = .init(0);
+    hashFile(&h, g.std_root);
+    hashFile(&h, g.default_builtin);
+    for (g.modules) |module| {
+        hashFile(&h, module.root);
+        hashFile(&h, module.builtin);
+        for (module.imports) |imp| {
+            h.update(imp.name);
+            h.update(&.{0});
+            h.update(std.mem.asBytes(&imp.module));
+        }
+        h.update(&.{0xff});
+    }
+    return h.final();
+}
+
+fn hashFile(h: *std.hash.Wyhash, file: ?Vfs.FileId) void {
+    const id: u32 = if (file) |f| f.index() else std.math.maxInt(u32);
+    h.update(std.mem.asBytes(&id));
 }
 
 /// `auto_import` 时一并建自动导入的声明索引（只为 Zig 源文件）
@@ -2910,6 +2930,32 @@ test "publishFiles: requests for a file being published coalesce into one more r
     try std.testing.expectEqual(0, server.publish_files.count());
 }
 
+test "importsBasis ignores the files of the module graph but follows modules and their imports" {
+    const main: Vfs.FileId = @fromBackingInt(@intCast(1));
+    const lib: Vfs.FileId = @fromBackingInt(@intCast(2));
+    const std_root: Vfs.FileId = @fromBackingInt(@intCast(3));
+    const modules = [_]ModuleGraph.Module{
+        .{ .root = main, .imports = &.{.{ .name = "lib", .module = 1 }} },
+        .{ .root = lib, .imports = &.{} },
+    };
+    const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .files = &.{.{ .file = main, .module = 0, .root_module = 0 }} };
+    // 构建中产生了生成文件：只多了文件，自动导入的索引仍然可用
+    var more_files = base;
+    more_files.files = &.{ .{ .file = main, .module = 0, .root_module = 0 }, .{ .file = lib, .module = 1, .root_module = 0 } };
+    try std.testing.expectEqual(importsBasis(&base), importsBasis(&more_files));
+    const renamed = [_]ModuleGraph.Module{
+        .{ .root = main, .imports = &.{.{ .name = "dep", .module = 1 }} },
+        .{ .root = lib, .imports = &.{} },
+    };
+    var changed = base;
+    changed.modules = &renamed;
+    try std.testing.expect(importsBasis(&base) != importsBasis(&changed));
+    var no_std = base;
+    no_std.std_root = null;
+    try std.testing.expect(importsBasis(&base) != importsBasis(&no_std));
+    try std.testing.expectEqual(@as(u64, 0), importsBasis(null));
+}
+
 test "updateModuleGraph keeps the old inputs when an allocation fails" {
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
@@ -3460,7 +3506,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     };
     // 自动导入的索引为当前模块图建完之前不提供，标记为不完整：客户端随输入重新请求，届时再提供。第一次在可以自动
     // 导入的名字处补全时开始建索引
-    const imports_ready = server.imports_graph.load(.acquire) == graphId(try r.ctx.get(ModuleGraph.Input, {}));
+    const imports_ready = server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
