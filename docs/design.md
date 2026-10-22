@@ -247,6 +247,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 直接作为官方构建系统协议 `zig build --listen=-` 的客户端：握手校验 `build_system_version`，读取 `bsp_configuration` 中的构建图（`std.Build.Configuration`）转换为 ProjectModel，按 step 请求构建并从 `bsp_step_completed` 取 `ErrorBundle` 与生成文件路径；`bsp_configuration_failed` 作为 `build.zig` 的诊断发布。
 - 构建图只包含 step 可达的模块。没有任何 compile step 的项目（只导出模块、由使用方编译的库）在 `.zig-cache/zig-analyzer/exports` 中生成探针包：以项目为 path 依赖，为每个导出的模块添加 object step，复用项目的 `zig-pkg`；读出的模块与 compile step 并入 ProjectModel，只用于模块归属，不出现在构建请求中。
 - C 绑定由构建系统的 translate-c 生成（Zig 0.17 已移除 `@cImport`），作为以生成文件为根的模块，构建后得知路径。
+- 构建中陆续得知生成文件根的路径时重算编译集合、更新模块图，不等整个构建结束，但要节流：距上一次重算结束至少 1 秒，且不少于它耗时的 4 倍。读取构建事件与重算在同一个任务中，大项目一次重算可达数秒（Zig 编译器的构建图有四千多个编译 step）；间隔固定时这个任务一直在重算，maker 的事件积压、构建变慢，模块图在整个构建中每秒更新一次。
 - maker 以 `local_cache` 前缀上报的生成文件路径，以及构建图中相对于本地缓存的路径，都按 maker 实际使用的本地缓存目录解析：由 `bsp_configuration` 给出的构建图路径（`<本地缓存>/c/<hash>`，不使用缓存时为 `tmp/<hex>`）反推，因此遵循 `build.args` 中的 `--cache-dir` 与 `ZIG_LOCAL_CACHE_DIR`。重命名不修改这个目录中的生成文件；本地缓存目录包含构建根时无法区分生成文件与项目文件，不按它排除。
 - 模块所在的依赖包中，根目录名就是包哈希的为获取的依赖包（maker 把获取的包存放在包目录的 `<哈希>` 子目录中），其根目录记入 ProjectModel，用于区分依赖的代码与用户的代码；`--fork` 指定的包使用用户给出的目录，不在其中。
 - 同一进程同时承担项目模型与编译器诊断。重启以新实例进行：
