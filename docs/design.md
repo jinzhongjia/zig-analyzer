@@ -70,6 +70,10 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 热 full p95 5.83 ms，注释插入/撤销后的 delta p95 10.12 ms、最大 20.71 ms，热 range p95 0.38 ms。
 Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；空 range 不执行 Infer / seed 查询。
 
+命名检查（开启时，ReleaseSafe）：Zig 编译器的 `src/Sema.zig` 上编辑 → 诊断 p50 170 ms（关闭时 169 ms），每次编辑只重算被编辑的
+成员，不读取其他文件；codeAction p50 3.8 ms，局部名字的修复（resolve，含改名后对整个文件的 AstGen）68 ms。ZLS、zigimg、Cubyz
+上 codeAction p50 1.0～1.5 ms，修复的 resolve p50 12～19 ms，跨文件最慢 128 ms（63 处引用的字段）。
+
 ### 2.3 已知差距
 
 - **超大文件的编辑 → 诊断**：`Sema.zig` 上主要耗时是重新解析（约 54 ms）、官方 AstGen（约 48 ms）与推导整个文件以求非活动代码区间；关闭 `diagnostics.inactive_code` 时约 85 ms。
@@ -224,8 +228,9 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
-| code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑 |
+| code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑；命名的修复见下 |
 | 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
+| 命名检查（默认关闭） | 按声明的类型与 comptime 值分类，结果按成员缓存；修复复用引用查找 |
 
 重命名只修改用户自己的代码（§3 的文件来源）：依赖库中的定义不能重命名。
 
@@ -241,6 +246,14 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - **编码与范围**：使用协商的位置编码，输出有序、单行、不重叠 token；空区间直接返回，其余按范围裁剪 CST 与 owner 分析，同时保留影响 `unused` 的范围外词法引用。返回相交的完整 token，坐标相对于文档起点。
 - **增量与缓存**：支持 full、delta、range；delta 按整个 token 求公共前后缀，用两者之间的一段替换表示，无变化时返回空 edits，基线不可用时返回全量。只缓存已打开文档的最新快照，最多 128 个文档、16 MiB；关闭释放，重新打开隔离旧会话，range 不修改快照。
 - **刷新**：客户端支持 refresh 时，语义依赖变化触发合并后的刷新请求。发出刷新后，此前的结果不再作为 delta 基线，各文档的下一次 delta 请求返回全量。
+
+命名检查（Zig 0.17.0 风格指南的 Names 一节，`naming.enable` 开启）：
+
+- **分类**：按声明实际表示的东西决定写法，不按 `fn` / `const` / `var` 关键字：类型与类型别名、返回 `type` 的可调用对象为 TitleCase；其他可调用对象（函数、函数别名、函数指针）为 camelCase；没有顶层字段的文件（命名空间）与其他值为 snake_case；字段与枚举成员按字段的类型。缩写按普通单词处理（`XMLParser` → `XmlParser`）。只用抽象实例的推导结果，不把某个调用点实例的结论推广为源码的规则。
+- **跳过**：类型未知或取决于泛型实例；没有字段的结构体（是命名空间还是要实例化的零大小类型取决于意图）；持有类型的字段与可选的函数指针（标准库中两种写法都有）；extern / export 声明与 extern 容器；以同名重新导出的别名（`const SDL_Window = c.SDL_Window;`，名字由被引用的声明决定）；`@"..."` 写出的名字；分词不明确的名字（没有小写字母的 `ENOENT`、`_` 前缀或后缀、从连续大写中分出的不到五个字母的单词 `URLs` / `CIELChuv`、数字后的单个大写字母 `Vec3D`）。依赖库中的文件、生成的代码（开头的注释带 `DO NOT EDIT`、`@generated` 等标记）与 `naming.exclude` 中的文件不检查。
+- **提示**：只为打开的文件发布，级别为 Hint，code 为 `naming.<规则>`，附官方规则的链接；`naming.ignore`（名字，`*` 通配）与 `naming.rules` 设置例外，这些项也可写在项目的 `zig-analyzer.json` 中。结果按成员缓存（`naming.Query`，不含位置与配置），编辑只重算改动的成员，不扫描其他文件，也不启动编译器进程。
+- **修复**：代码操作「rename ... to ...」，不标为 preferred，只在用户选择后应用；客户端支持 `codeAction/resolve` 时选择之后才查找引用。以下情况不返回编辑，只说明原因：有引用在泛型函数中有歧义、位于未分析的代码中、经由类型未知的成员访问，或出现在有语法错误的文件中；新名字与同一容器的成员重名、遮蔽或被遮蔽，或使容器中的名字改指另一个声明（内层容器的声明可以与外层同名，AstGen 不报错）；名字以字符串字面量出现（`@field`、`@hasDecl`、序列化的键）。最后以改名后的文本对声明所在的文件做 AstGen，出现新的错误同样拒绝：重名与遮蔽只会出现在这个文件中，其中漏改的引用也会报出。
+- **边界**：公开的名字（`pub` 声明与字段）只更新工作区中的引用，不更新工作区之外的使用者、外部 ABI 的符号，以及运行时构造或经由变量传递的字符串名字（如以字段名为键的 JSON 序列化）；客户端支持 `documentChanges` 与变更注解时，这类改名带上需要确认的注解，由用户确认后才应用。
 
 ### 4.7 构建集成（`project/`）
 
