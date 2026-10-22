@@ -55,6 +55,12 @@ pub const Options = struct {
     /// 不为 null 时，名字出现在所查找的文件中嵌套超过上限、没有分析的代码里（`FileIndex.unanalyzed`）则置为
     /// true：那里可能有无法确认的引用（重命名会漏改，应拒绝）
     unanalyzed: ?*bool = null,
+    /// 不为 null 时记录第一处无法确认的同名成员访问（字段访问、枚举字面量、初始化的字段）：左侧或期望的类型未知
+    /// 或是抽象的，任何调用点实例下也求不出成员，可能是引用
+    uncertain: ?*?Reference = null,
+    /// 不为 null 时记录第一个有语法错误、又出现了这个名字的文件：错误处的代码不一定降级为 HIR，其中的引用可能
+    /// 找不到
+    syntax_error: ?*?FileId = null,
 };
 
 /// `def` 的全部引用（含定义处），按文件与位置排序
@@ -70,13 +76,14 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .file => unreachable,
     };
 
-    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous };
+    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
             if (opts.unanalyzed) |u| if ((try r.ctx.get(FileIndex.Query, l.file)).containsUnanalyzed(name)) {
                 u.* = true;
             };
+            try noteSyntaxError(r, opts.syntax_error, l.file);
             // 局部名字：所在成员及其体内定义的容器中的成员
             const tree = try r.itemTree(l.file);
             for (0..tree.items.len) |i| {
@@ -91,6 +98,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
                 if (opts.unanalyzed) |u| if (index.containsUnanalyzed(name)) {
                     u.* = true;
                 };
+                try noteSyntaxError(r, opts.syntax_error, f);
                 const tree = try r.itemTree(f);
                 for (0..tree.items.len) |i| try finder.item(f, @intCast(i));
             }
@@ -115,6 +123,11 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         n += 1;
     }
     return out.items[0..n];
+}
+
+fn noteSyntaxError(r: *Resolver, slot: ?*?FileId, file: FileId) resolve.Error!void {
+    const s = slot orelse return;
+    if (s.* == null and (try r.ctx.get(database.syntax.ParseFile, file)).errors.len != 0) s.* = file;
 }
 
 /// 模块图中的项目文件（不含标准库）
@@ -192,6 +205,7 @@ const Finder = struct {
     name: []const u8,
     out: *std.ArrayList(Reference),
     ambiguous: ?*?Reference,
+    uncertain: ?*?Reference,
     /// 最近一个成员的调用点实例（`instances`）
     cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index } = null,
 
@@ -224,18 +238,30 @@ const Finder = struct {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
                     // 命名空间的声明直接比较；其他成员（带标签 union 的字段标签、其他目标分支中的声明）由推导给出
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
-                    const hit = if (ns_def) |d| deepEql(d, f.def) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
-                    if (hit) try f.addLastToken(file, base + range.end);
+                    const target: Target = if (ns_def) |d| (if (deepEql(d, f.def)) .hit else .miss) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    switch (target) {
+                        .hit => try f.addLastToken(file, base + range.end),
+                        .miss => {},
+                        .unknown => try f.noteUncertain(&res, file, item_index, fa.lhs, at),
+                    }
                 },
                 .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
-                    if (try f.refersTo(&res, file, item_index, .{ .e = id }, at)) try f.addLastToken(file, base + range.end);
+                    switch (try f.refersTo(&res, file, item_index, .{ .e = id }, at)) {
+                        .hit => try f.addLastToken(file, base + range.end),
+                        .miss => {},
+                        .unknown => try f.noteUncertain(&res, file, item_index, id, at),
+                    }
                 },
                 .init => |x| for (x.fields, 0..) |fi, k| {
                     const n = fi.name orelse continue;
                     if (!std.mem.eql(u8, n, f.name)) continue;
                     const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
-                    if (try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at)) try f.add(file, at.start, at.end);
+                    switch (try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at)) {
+                        .hit => try f.add(file, at.start, at.end),
+                        .miss => {},
+                        .unknown => try f.noteUncertain(&res, file, item_index, id, at),
+                    }
                 },
                 else => {},
             }
@@ -251,11 +277,11 @@ const Finder = struct {
 
     /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员、初始化的字段）是否为 `def`。
     /// 泛型函数体内抽象推导求不出时检查全部调用点实例：任一实例指向 `def` 即为引用；同时有实例指向
-    /// 其他定义时记为有歧义（`at`）
-    fn refersTo(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, l: Lookup, at: Reference) resolve.Error!bool {
+    /// 其他定义时记为有歧义（`at`）。抽象推导与各实例都求不出成员时为 `unknown`
+    fn refersTo(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, l: Lookup, at: Reference) resolve.Error!Target {
         if (l.member(try f.inferred(res, file, item_index))) |m| {
-            const d = try keyDef(f.r, m) orelse return false;
-            return deepEql(d, f.def);
+            const d = try keyDef(f.r, m) orelse return .miss;
+            return if (deepEql(d, f.def)) .hit else .miss;
         }
         const owner = try f.r.ownerKey(file, item_index);
         var hit = false;
@@ -268,7 +294,18 @@ const Finder = struct {
         if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
             a.* = at;
         };
-        return hit;
+        if (hit) return .hit;
+        return if (miss) .miss else .unknown;
+    }
+
+    /// 求不出成员的访问：决定成员的类型（字段访问的左侧，枚举字面量与初始化表达式自身）未知或是抽象的时，
+    /// 记为无法确认（具体的类型中没有这个成员时不是引用，如切片的 `len`）
+    fn noteUncertain(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, e: Body.ExprId, at: Reference) resolve.Error!void {
+        const slot = f.uncertain orelse return;
+        if (slot.* != null) return;
+        const exprs = (try f.inferred(res, file, item_index)).exprs;
+        const i = @backingInt(e);
+        if (i >= exprs.len or seed.wanted(f.r.ctx.db.env.ip, exprs[i])) slot.* = at;
     }
 
     fn instances(f: *Finder, file: FileId, item_index: u32) resolve.Error![]const InternPool.Index {
@@ -290,6 +327,9 @@ const Finder = struct {
         try f.add(file, start, end);
     }
 };
+
+/// 成员访问的目标与所查找的定义的关系
+const Target = enum { hit, miss, unknown };
 
 /// 推导结果中的成员：表达式 `e` 访问的成员，或初始化表达式 `e` 的第 `field` 个字段
 const Lookup = struct {
