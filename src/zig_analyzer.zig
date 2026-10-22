@@ -70,6 +70,7 @@ pub const ide = struct {
     pub const inactive = @import("ide/inactive.zig");
     pub const workspace_symbol = @import("ide/workspace_symbol.zig");
     pub const code_actions = @import("ide/code_actions.zig");
+    pub const naming = @import("ide/naming.zig");
 };
 pub const ide_db = struct {
     pub const search = @import("ide_db/search.zig");
