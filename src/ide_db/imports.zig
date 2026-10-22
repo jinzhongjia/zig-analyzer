@@ -233,6 +233,8 @@ pub const DeclIndex = struct {
     member_start: []const u32 = &.{},
     /// 各容器的外层容器（定义它的成员所在的容器），按容器下标
     outer: []const u32 = &.{},
+    /// 各容器从文件根开始的词法路径（已转义）；根容器为 ""，不可达的容器为 null
+    container_paths: []const ?[]const u8 = &.{},
 
     /// 名字以 `prefix` 开头（不区分大小写）的声明在 `decls` 中的下标区间
     pub fn matching(index: *const DeclIndex, prefix: []const u8) struct { start: usize, end: usize } {
@@ -298,7 +300,9 @@ pub const DeclIndex = struct {
     }
 };
 
-/// 文件级新绑定会影响其他函数的参数、局部变量和捕获；引用本身不构成声明冲突。
+/// 文件级新绑定只需避开真正的声明：容器成员（ItemTree）、其他函数的参数、局部变量与捕获（函数体）。
+/// 成员访问、初始化字段名、标签、类型引用与普通名字引用都不是声明，不构成冲突；按键时不必扫描并散列整棵
+/// 语法树里的所有标识符。
 pub const BindingNames = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -308,37 +312,44 @@ pub const BindingNames = struct {
         const gpa = ctx.db.gpa;
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
-        var names: std.StringHashMapUnmanaged(void) = .empty;
-        defer names.deinit(gpa);
+        const temp = scratch.allocator();
+        var list: std.ArrayList([]const u8) = .empty;
         const parse = try ctx.get(database.syntax.ParseFile, file);
-        try collect(&names, gpa, scratch.allocator(), parse.rootNode());
+        try collect(&list, temp, parse.rootNode());
         const tree = try ctx.get(database.syntax.FileItemTree, file);
-        for (tree.items) |item| if (item.kind == .field) {
-            if (item.name) |name| try names.put(gpa, name, {});
-        };
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        const sorted = try a.alloc([]const u8, names.count());
-        var keys = names.keyIterator();
-        for (sorted) |*out| out.* = try a.dupe(u8, keys.next().?.*);
-        std.mem.sort([]const u8, sorted, {}, struct {
+        for (tree.items) |item| if (item.kind != .@"test") if (item.name) |name| try list.append(temp, name);
+        std.mem.sort([]const u8, list.items, {}, struct {
             fn less(_: void, left: []const u8, right: []const u8) bool {
                 return std.mem.lessThan(u8, left, right);
             }
         }.less);
+        var unique: usize = 0;
+        for (list.items) |name| {
+            if (unique != 0 and std.mem.eql(u8, list.items[unique - 1], name)) continue;
+            list.items[unique] = name;
+            unique += 1;
+        }
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const sorted = try a.alloc([]const u8, unique);
+        for (list.items[0..unique], sorted) |name, *out| out.* = try a.dupe(u8, name);
         return .{ .arena = arena.state, .names = sorted };
     }
 
-    fn collect(names: *std.StringHashMapUnmanaged(void), gpa: Allocator, scratch: Allocator, node: ast.SyntaxNode) Allocator.Error!void {
-        if (node.kind() == .name_ref) return;
-        var children = node.children();
-        while (children.next()) |child| switch (child) {
-            .node => |inner| try collect(names, gpa, scratch, inner),
-            .token => |token| if (token.kind == .identifier) {
-                try names.put(gpa, try ast.identNameAlloc(scratch, token.text), {});
+    fn collect(names: *std.ArrayList([]const u8), scratch: Allocator, node: ast.SyntaxNode) Allocator.Error!void {
+        switch (node.kind()) {
+            .param => if ((ast.Param{ .syntax = node }).name()) |token| try names.append(scratch, try ast.identNameAlloc(scratch, token.text)),
+            .var_decl => if ((ast.VarDecl{ .syntax = node }).name()) |token| try names.append(scratch, try ast.identNameAlloc(scratch, token.text)),
+            .payload => {
+                var bindings = (ast.Payload{ .syntax = node }).bindings();
+                while (bindings.next()) |binding| try names.append(scratch, try ast.identNameAlloc(scratch, binding.name.text));
+                return;
             },
-        };
+            else => {},
+        }
+        var children = node.children();
+        while (children.nextNode()) |child| try collect(names, scratch, child);
     }
 
     pub fn contains(value: Value, name: []const u8) bool {
@@ -393,7 +404,8 @@ pub const FileDecls = struct {
 
     pub fn eql(a: Value, b: Value) bool {
         return deepEql(a.decls, b.decls) and deepEql(a.public_decls, b.public_decls) and deepEql(a.by_item, b.by_item) and
-            deepEql(a.members, b.members) and deepEql(a.member_start, b.member_start) and deepEql(a.outer, b.outer);
+            deepEql(a.members, b.members) and deepEql(a.member_start, b.member_start) and deepEql(a.outer, b.outer) and
+            deepEql(a.container_paths, b.container_paths);
     }
     pub fn bytes(v: Value) usize {
         return @sizeOf(DeclIndex) + mem.arenaBytes(v.arena);
@@ -416,9 +428,11 @@ const DeclBuilder = struct {
     names: []?[]const u8 = undefined,
     paths: []?[]const u8 = undefined,
     local: []?u32 = undefined,
-    state: []State = undefined,
+    state: []LocalState = undefined,
 
-    const State = enum { unknown, visiting, done };
+    /// 截断的结果不能缓存：从不同起点求值同一条别名链时可用深度不同
+    const LocalResult = union(enum) { value: ?u32, cutoff };
+    const LocalState = enum { unknown, visiting, done };
 
     fn build(b: *DeclBuilder) Allocator.Error!DeclIndex {
         const items = b.tree.items;
@@ -430,7 +444,7 @@ const DeclBuilder = struct {
         b.paths = try b.temp.alloc(?[]const u8, items.len);
         @memset(b.paths, null);
         b.local = try b.temp.alloc(?u32, items.len);
-        b.state = try b.temp.alloc(State, items.len);
+        b.state = try b.temp.alloc(LocalState, items.len);
         @memset(b.state, .unknown);
 
         var list: std.ArrayList(Decl) = .empty;
@@ -450,7 +464,10 @@ const DeclBuilder = struct {
                 .container = it.container,
                 .root = try b.rootName(it.container),
                 .path = try b.pathOf(item),
-                .local = b.localNamespace(item, 0),
+                .local = switch (b.localNamespace(item, 0)) {
+                    .value => |value| value,
+                    .cutoff => null,
+                },
                 .doc = if (it.doc) |d| try b.a.dupe(u8, d) else null,
             });
         }
@@ -486,7 +503,24 @@ const DeclBuilder = struct {
             o.* = if (b.isReachable(@intCast(i))) items[parent].container else no_container;
         }
 
-        var index: DeclIndex = .{ .arena = undefined, .decls = decls, .by_item = by_item, .members = members, .member_start = member_start, .outer = outer };
+        const container_paths = try b.a.alloc(?[]const u8, containers.len);
+        @memset(container_paths, null);
+        if (containers.len != 0) container_paths[0] = "";
+        for (containers, 0..) |c, i| {
+            if (i == 0 or !b.isReachable(@intCast(i))) continue;
+            const parent = c.parent_item orelse continue;
+            container_paths[i] = try b.pathOf(parent);
+        }
+
+        var index: DeclIndex = .{
+            .arena = undefined,
+            .decls = decls,
+            .by_item = by_item,
+            .members = members,
+            .member_start = member_start,
+            .outer = outer,
+            .container_paths = container_paths,
+        };
         index.public_decls = try b.publicPaths(&index);
         return index;
     }
@@ -578,36 +612,48 @@ const DeclBuilder = struct {
         return path;
     }
 
-    /// 本文件中的命名空间：只沿本文件的名字与成员求值，经过 import 时为 null
-    fn localNamespace(b: *DeclBuilder, item: u32, depth: u32) ?u32 {
-        if (depth > max_depth) return null;
+    /// 本文件中的命名空间：只沿本文件的名字与成员求值，经过 import 时为 null。只缓存完整结果；
+    /// 深度截断（以及环）返回 cutoff，不按起点深度污染缓存。
+    fn localNamespace(b: *DeclBuilder, item: u32, depth: u32) LocalResult {
+        if (depth > max_depth) return .cutoff;
         switch (b.state[item]) {
-            .done => return b.local[item],
-            .visiting => return null,
+            .done => return .{ .value = b.local[item] },
+            .visiting => return .cutoff,
             .unknown => {},
         }
         b.state[item] = .visiting;
         const result = b.localUncached(item, depth);
-        b.local[item] = result;
-        b.state[item] = .done;
+        switch (result) {
+            .cutoff => b.state[item] = .unknown,
+            .value => |value| {
+                b.local[item] = value;
+                b.state[item] = .done;
+            },
+        }
         return result;
     }
 
-    fn localUncached(b: *DeclBuilder, item: u32, depth: u32) ?u32 {
+    fn localUncached(b: *DeclBuilder, item: u32, depth: u32) LocalResult {
         const it = b.tree.items[item];
-        if (it.kind != .@"const" and it.kind != .@"var") return null;
-        const shape = b.shapes.get(item) orelse return null;
+        if (it.kind != .@"const" and it.kind != .@"var") return .{ .value = null };
+        const shape = b.shapes.get(item) orelse return .{ .value = null };
         var ns: u32 = switch (shape.base) {
-            .import => return null,
+            .import => return .{ .value = null },
             .this => it.container,
             .container => |c| c,
-            .name => |name| b.localNamespace(b.lookup(it.container, name) orelse return null, depth + 1) orelse return null,
+            .name => |name| switch (b.localNamespace(b.lookup(it.container, name) orelse return .{ .value = null }, depth + 1)) {
+                .cutoff => return .cutoff,
+                .value => |value| value orelse return .{ .value = null },
+            },
         };
         for (shape.fields) |field| {
-            const member = Resolver.lookupDecl(b.tree, ns, field) orelse return null;
-            ns = b.localNamespace(member, depth + 1) orelse return null;
+            const member = Resolver.lookupDecl(b.tree, ns, field) orelse return .{ .value = null };
+            ns = switch (b.localNamespace(member, depth + 1)) {
+                .cutoff => return .cutoff,
+                .value => |value| value orelse return .{ .value = null },
+            };
         }
-        return if (b.isReachable(ns)) ns else null;
+        return .{ .value = if (b.isReachable(ns)) ns else null };
     }
 
     fn lookup(b: *DeclBuilder, container: u32, name: []const u8) ?u32 {
@@ -623,52 +669,78 @@ const DeclBuilder = struct {
 // ── 跨文件求值 ─────────────────────────────────────────────────────
 
 /// 按各文件的 `FileDecls` 与 `InitShapes` 求值命名空间与别名的规范目标，与 `Resolver.namespaceOf`、
-/// `aliasTarget` 的结果相同（只认它们识别的形式）。只读取各文件的语法索引，不降级 HIR；结果在一次求值内缓存
+/// `aliasTarget` 的结果相同（只认它们识别的形式）。只读取各文件的语法索引，不降级 HIR。只缓存完整结果：
+/// 从不同起点求值同一条别名链时可用深度不同，深度截断（以及环）不写入缓存。
 const Eval = struct {
     r: *Resolver,
     temp: Allocator,
-    namespaces: std.AutoHashMapUnmanaged(Declaration, ?Namespace) = .empty,
-    targets: std.AutoHashMapUnmanaged(Declaration, Declaration) = .empty,
+    namespaces: std.AutoHashMapUnmanaged(Declaration, NamespaceEntry) = .empty,
+    targets: std.AutoHashMapUnmanaged(Declaration, TargetEntry) = .empty,
+
+    const NamespaceEntry = union(enum) { visiting, done: ?Namespace };
+    const TargetEntry = union(enum) { visiting, done: Declaration };
+    const NamespaceResult = union(enum) { value: ?Namespace, cutoff };
+    const TargetResult = union(enum) { value: Declaration, cutoff };
 
     fn namespaceOf(e: *Eval, file: FileId, item: u32) resolve.Error!?Namespace {
-        return e.namespaceDepth(file, item, 0);
+        return switch (try e.namespaceDepth(file, item, 0)) {
+            .value => |value| value,
+            .cutoff => null,
+        };
     }
 
     fn targetOf(e: *Eval, file: FileId, item: u32) resolve.Error!Declaration {
-        return e.targetDepth(file, item, 0);
+        return switch (try e.targetDepth(file, item, 0)) {
+            .value => |value| value,
+            .cutoff => .{ .file = file, .item = item },
+        };
     }
 
-    fn namespaceDepth(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!?Namespace {
-        if (depth > max_depth) return null;
+    fn namespaceDepth(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!NamespaceResult {
+        if (depth > max_depth) return .cutoff;
         const key: Declaration = .{ .file = file, .item = item };
-        if (e.namespaces.get(key)) |known| return known;
-        // 环：求值途中再遇到时按不是命名空间处理
-        try e.namespaces.put(e.temp, key, null);
-        const result = try e.namespaceUncached(file, item, depth);
-        try e.namespaces.put(e.temp, key, result);
+        if (e.namespaces.get(key)) |entry| switch (entry) {
+            .visiting => return .cutoff,
+            .done => |value| return .{ .value = value },
+        };
+        try e.namespaces.put(e.temp, key, .visiting);
+        const result = e.namespaceUncached(file, item, depth) catch |err| {
+            _ = e.namespaces.remove(key);
+            return err;
+        };
+        switch (result) {
+            .cutoff => _ = e.namespaces.remove(key),
+            .value => |value| try e.namespaces.put(e.temp, key, .{ .done = value }),
+        }
         return result;
     }
 
-    fn namespaceUncached(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!?Namespace {
+    fn namespaceUncached(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!NamespaceResult {
         const index = try e.r.ctx.get(FileDecls, file);
-        const decl = index.byItem(item) orelse return null;
-        if (decl.kind != .@"const" and decl.kind != .@"var") return null;
-        if (decl.local) |c| return .{ .file = file, .container = c };
-        const shape = (try e.r.ctx.get(InitShapes, file)).get(item) orelse return null;
-        var ns = try e.base(file, index, decl, shape.base, depth) orelse return null;
+        const decl = index.byItem(item) orelse return .{ .value = null };
+        if (decl.kind != .@"const" and decl.kind != .@"var") return .{ .value = null };
+        if (decl.local) |c| return .{ .value = .{ .file = file, .container = c } };
+        const shape = (try e.r.ctx.get(InitShapes, file)).get(item) orelse return .{ .value = null };
+        var ns = switch (try e.base(file, index, decl, shape.base, depth)) {
+            .cutoff => return .cutoff,
+            .value => |value| value orelse return .{ .value = null },
+        };
         for (shape.fields) |field| {
-            const member_item = try e.member(ns, field) orelse return null;
-            ns = try e.namespaceDepth(ns.file, member_item, depth + 1) orelse return null;
+            const member_item = try e.member(ns, field) orelse return .{ .value = null };
+            ns = switch (try e.namespaceDepth(ns.file, member_item, depth + 1)) {
+                .cutoff => return .cutoff,
+                .value => |value| value orelse return .{ .value = null },
+            };
         }
-        return ns;
+        return .{ .value = ns };
     }
 
-    fn base(e: *Eval, file: FileId, index: *const DeclIndex, decl: *const Decl, shape: Shape.Base, depth: u32) resolve.Error!?Namespace {
+    fn base(e: *Eval, file: FileId, index: *const DeclIndex, decl: *const Decl, shape: Shape.Base, depth: u32) resolve.Error!NamespaceResult {
         return switch (shape) {
-            .import => |spec| .{ .file = try e.importTarget(file, spec) orelse return null, .container = 0 },
-            .this => .{ .file = file, .container = decl.container },
-            .container => |c| .{ .file = file, .container = c },
-            .name => |name| try e.namespaceDepth(file, (index.lookup(decl.container, name) orelse return null).item, depth + 1),
+            .import => |spec| .{ .value = .{ .file = try e.importTarget(file, spec) orelse return .{ .value = null }, .container = 0 } },
+            .this => .{ .value = .{ .file = file, .container = decl.container } },
+            .container => |c| .{ .value = .{ .file = file, .container = c } },
+            .name => |name| try e.namespaceDepth(file, (index.lookup(decl.container, name) orelse return .{ .value = null }).item, depth + 1),
         };
     }
 
@@ -683,36 +755,51 @@ const Eval = struct {
         return (index.member(ns.container, name) orelse return null).item;
     }
 
-    fn targetDepth(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!Declaration {
+    fn targetDepth(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!TargetResult {
+        if (depth > max_depth) return .cutoff;
         const key: Declaration = .{ .file = file, .item = item };
-        if (depth > max_depth) return key;
-        if (e.targets.get(key)) |known| return known;
-        try e.targets.put(e.temp, key, key);
-        const result = try e.targetUncached(file, item, depth);
-        try e.targets.put(e.temp, key, result);
+        if (e.targets.get(key)) |entry| switch (entry) {
+            .visiting => return .cutoff,
+            .done => |value| return .{ .value = value },
+        };
+        try e.targets.put(e.temp, key, .visiting);
+        const result = e.targetUncached(file, item, depth) catch |err| {
+            _ = e.targets.remove(key);
+            return err;
+        };
+        switch (result) {
+            .cutoff => _ = e.targets.remove(key),
+            .value => |value| try e.targets.put(e.temp, key, .{ .done = value }),
+        }
         return result;
     }
 
-    fn targetUncached(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!Declaration {
+    fn targetUncached(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!TargetResult {
         const self: Declaration = .{ .file = file, .item = item };
         const index = try e.r.ctx.get(FileDecls, file);
-        const decl = index.byItem(item) orelse return self;
-        if (decl.kind != .@"const") return self;
-        const shape = (try e.r.ctx.get(InitShapes, file)).get(item) orelse return self;
+        const decl = index.byItem(item) orelse return .{ .value = self };
+        if (decl.kind != .@"const") return .{ .value = self };
+        const shape = (try e.r.ctx.get(InitShapes, file)).get(item) orelse return .{ .value = self };
         if (shape.fields.len == 0) {
             const name = switch (shape.base) {
                 .name => |name| name,
-                else => return self,
+                else => return .{ .value = self },
             };
-            const target = index.lookup(decl.container, name) orelse return self;
+            const target = index.lookup(decl.container, name) orelse return .{ .value = self };
             return e.targetDepth(file, target.item, depth + 1);
         }
-        var ns = try e.base(file, index, decl, shape.base, depth) orelse return self;
+        var ns = switch (try e.base(file, index, decl, shape.base, depth)) {
+            .cutoff => return .cutoff,
+            .value => |value| value orelse return .{ .value = self },
+        };
         for (shape.fields[0 .. shape.fields.len - 1]) |field| {
-            const member_item = try e.member(ns, field) orelse return self;
-            ns = try e.namespaceDepth(ns.file, member_item, depth + 1) orelse return self;
+            const member_item = try e.member(ns, field) orelse return .{ .value = self };
+            ns = switch (try e.namespaceDepth(ns.file, member_item, depth + 1)) {
+                .cutoff => return .cutoff,
+                .value => |value| value orelse return .{ .value = self },
+            };
         }
-        const last = try e.member(ns, shape.fields[shape.fields.len - 1]) orelse return self;
+        const last = try e.member(ns, shape.fields[shape.fields.len - 1]) orelse return .{ .value = self };
         return e.targetDepth(ns.file, last, depth + 1);
     }
 };
@@ -982,7 +1069,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         // 同文件可访问私有成员，公开闭包仍由所有请求共享。
         if (ns.file == file) for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |nested, target| {
             if (try builder.reuseDirect(target, nested.name, nested.kind, nested.doc)) continue;
-            const relative = try localRelative(r.arena, current, ns, nested) orelse continue;
+            const relative = localRelative(current, ns, nested) orelse continue;
             const sort = builder.sortOf(nested.name, "~0");
             if (builder.rejects(sort, &.{ root, ".", relative })) continue;
             if (try builder.visible(nested.name) != null) continue;
@@ -1000,7 +1087,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         const root_def = try builder.visible(root_name) orelse continue;
         const expected = findRoot(current, root_name) orelse continue;
         if (!deepEql(root_def, resolve.Def{ .item = .{ .file = file, .item = expected.item } })) continue;
-        try builder.add(.{ .label = try r.arena.dupe(u8, decl.path), .kind = candidateKind(decl.kind), .filter = decl.name, .qualifier = try r.arena.dupe(u8, root_name), .sort = sort, .doc = decl.doc, .target = .{ .decl = .{ .file = file, .item = decl.item } } });
+        try builder.add(.{ .label = try r.arena.dupe(u8, decl.path), .kind = candidateKind(decl.kind), .filter = decl.name, .qualifier = try renderName(r.arena, root_name), .sort = sort, .doc = decl.doc, .target = .{ .decl = .{ .file = file, .item = decl.item } } });
     }
     if (graph) |g| {
         // 模块名字即使没有任何声明也可补全；生成文件根未知时不提供。
@@ -1214,7 +1301,8 @@ const Builder = struct {
                 const root = (try b.r.ctx.get(database.syntax.ParseFile, b.file)).rootNode();
                 if (root.tokenAtOffset(b.offset -| 1)) |token| {
                     const end = token.offset + @as(u32, @intCast(token.text.len));
-                    b.insertion_blocked = token.kind == .identifier and token.offset <= b.insertion.? and b.insertion.? < end;
+                    b.insertion_blocked = (token.kind == .identifier or token.kind == .invalid) and
+                        token.offset <= b.insertion.? and b.insertion.? < end;
                 }
             }
             if (b.insertion_blocked) return;
@@ -1329,8 +1417,10 @@ fn insertionOffset(r: *Resolver, file: FileId) resolve.Error!u32 {
         if (pos < source.len and source[pos] == '\n') pos += 1;
         return @intCast(pos);
     }
-    var pos: usize = 0;
-    var docs_end: usize = 0;
+    // BOM 只允许在文件开头；import 不能插到它前面，否则 BOM 移到第二行成为非法 token
+    const start: usize = if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) 3 else 0;
+    var pos: usize = start;
+    var docs_end: usize = start;
     while (pos < source.len) {
         const end = if (std.mem.indexOfScalarPos(u8, source, pos, '\n')) |e| e + 1 else source.len;
         const line = std.mem.trim(u8, source[pos..end], " \t\r\n");
@@ -1360,16 +1450,14 @@ fn findRoot(index: *const DeclIndex, name: []const u8) ?Decl {
     }
     return null;
 }
-/// `decl` 相对同文件命名空间 `ns` 的路径
-fn localRelative(a: Allocator, index: *const DeclIndex, ns: Namespace, decl: Decl) Allocator.Error!?[]const u8 {
+/// `decl` 相对同文件命名空间 `ns` 的路径；容器的词法路径已预算，单次查找为 O(1)
+fn localRelative(index: *const DeclIndex, ns: Namespace, decl: Decl) ?[]const u8 {
     if (ns.container == 0) return decl.path;
-    for (index.decls) |parent| {
-        if (parent.local) |container| if (container == ns.container) {
-            if (decl.path.len > parent.path.len and std.mem.startsWith(u8, decl.path, parent.path) and decl.path[parent.path.len] == '.')
-                return try a.dupe(u8, decl.path[parent.path.len + 1 ..]);
-        };
-    }
-    return null;
+    if (ns.container >= index.container_paths.len) return null;
+    const prefix = index.container_paths[ns.container] orelse return null;
+    if (prefix.len == 0) return decl.path;
+    if (decl.path.len <= prefix.len or !std.mem.startsWith(u8, decl.path, prefix) or decl.path[prefix.len] != '.') return null;
+    return decl.path[prefix.len + 1 ..];
 }
 fn candidateKind(kind: ItemTree.Item.Kind) @FieldType(Candidate, "kind") {
     return switch (kind) {
