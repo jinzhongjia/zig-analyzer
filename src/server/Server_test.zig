@@ -424,6 +424,8 @@ test "responses for deeply nested code stay within the JSON nesting limit" {
     try h.notify("initialized", Empty{});
     const document_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "deep.zig" }));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = document_uri, .languageId = "zig", .version = 1, .text = text.items } });
+    // 等启动完成：查询 zig 环境之后更新模块图的写事务会取消进行中的请求（回复 ContentModified）
+    _ = try h.request("zig-analyzer/waitIdle", {});
     const symbols = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = document_uri } });
     try testing.expect(symbols.object.get("result").? == .array);
     const line: u32 = @intCast(std.mem.count(u8, text.items, "\n") - 1);
