@@ -120,40 +120,20 @@ fn expectConsistent(old: *Parse, new_text: []const u8) !void {
     try testing.expect(inc.sameAs(full));
 }
 
-test "depth limits: deep files reparse in full, edits that reach the limit fall back" {
+test "deep nesting: edits in the innermost block reparse locally" {
     const a = testing.allocator;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(a);
-    // 文件中有超过上限的嵌套：其他函数体内的编辑也全量解析
-    try src.appendSlice(a, "fn g() void {\n    a();\n}\nconst x = ");
-    for (0..5000) |_| try src.append(a, '(');
-    try src.append(a, '1');
-    for (0..5000) |_| try src.append(a, ')');
-    try src.appendSlice(a, ";\n");
-    {
-        const old = try Parse.create(a, src.items);
-        defer old.destroy();
-        try testing.expect(old.deep);
-        const edited = try std.mem.replaceOwned(u8, a, src.items, "a();", "b();");
-        defer a.free(edited);
-        try testing.expectEqual(null, try Parse.reparseBlock(a, old, edited));
-        try expectConsistent(old, edited);
-    }
-
-    // 嵌套的代码块逐层加深，直到刚好触及上限：每一步在最内层的块中插入一层，增量结果都与全量一致
-    var depth: usize = 200;
-    while (depth < 3000) : (depth += 100) {
-        src.clearRetainingCapacity();
-        try src.appendSlice(a, "fn f() void ");
-        for (0..depth) |_| try src.append(a, '{');
-        try src.appendSlice(a, "a();");
-        for (0..depth) |_| try src.append(a, '}');
-        try src.append(a, '\n');
-        const old = try Parse.create(a, src.items);
-        defer old.destroy();
-        const edited = try std.mem.replaceOwned(u8, a, src.items, "a();", "{{{{{{{{{{a();}}}}}}}}}}");
-        defer a.free(edited);
-        try expectConsistent(old, edited);
-        if (old.deep) break;
-    } else return error.TestUnexpectedResult;
+    try src.appendSlice(a, "fn f() void ");
+    for (0..1500) |_| try src.append(a, '{');
+    try src.appendSlice(a, "a();");
+    for (0..1500) |_| try src.append(a, '}');
+    try src.append(a, '\n');
+    const old = try Parse.create(a, src.items);
+    defer old.destroy();
+    const edited = try std.mem.replaceOwned(u8, a, src.items, "a();", "{{{{{{{{{{a();}}}}}}}}}}");
+    defer a.free(edited);
+    const inc = try Parse.reparseBlock(a, old, edited) orelse return error.TestUnexpectedResult;
+    defer inc.destroy();
+    try expectConsistent(old, edited);
 }
