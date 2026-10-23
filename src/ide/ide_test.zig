@@ -2692,13 +2692,39 @@ test "seed search skips callers whose calls resolve to other functions of the sa
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{T})").?)), moved.offset);
 }
 
-test "seed callers are listed once per file and shared by every depth" {
+test "callers whose mentions resolve to other functions without inference are skipped" {
+    // 经命名空间、全局声明的类型、参数的类型就能确定调用的是其他 print 的成员不推导；局部值求不出，别名与调用目标的
+    // 成员照常推导，按原顺序选出调用点
     const text =
         \\pub fn print(comptime fmt: []const u8, args: anytype) void {
         \\    _ = fmt;
         \\    _ = args;
         \\}
-        \\fn helper() void {}
+        \\const Writer = struct {
+        \\    pub fn print(w: Writer, comptime fmt: []const u8) void {
+        \\        _ = w;
+        \\        _ = fmt;
+        \\    }
+        \\};
+        \\const ns = struct {
+        \\    pub fn print(comptime fmt: []const u8) void {
+        \\        _ = fmt;
+        \\    }
+        \\};
+        \\var global: Writer = .{};
+        \\fn useNamespace() void {
+        \\    ns.print("{}");
+        \\}
+        \\fn useGlobal() void {
+        \\    global.print("{}");
+        \\}
+        \\fn useParam(p: *const Writer) void {
+        \\    p.print("{}");
+        \\}
+        \\fn useLocal() void {
+        \\    const l: Writer = .{};
+        \\    l.print("{}");
+        \\}
         \\const alias = print;
         \\fn useAlias() void {
         \\    alias("{}", .{@as(u16, 1)});
@@ -2714,16 +2740,16 @@ test "seed callers are listed once per file and shared by every depth" {
     const file = (try w.add("/p/main.zig", text)).file;
     const chosen = (try seedFor(&w, file, "print")).?;
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "alias(\"{}\"").?)), chosen.offset);
-    try expectCallers(&w, file, "print", &.{ "alias", "useAlias", "main" });
+    try expectCallers(&w, file, "print", &.{ "useLocal", "alias", "useAlias", "main" });
     // `seedFor` 依次请求各层的 Query 与 Instances：调用者列表只计算一次
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Callers));
 
-    // 新的调用者排在前面时被选中
-    const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "fn helper() void {}", "fn helper() void {\n    print(\"{}\", .{@as(u32, 1)});\n}");
+    // 改为调用目标后不再跳过，排在前面的调用点被选中
+    const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "ns.print(\"{}\");", "print(\"{}\", .{@as(u32, 1)});");
     _ = try w.add("/p/main.zig", calling);
     const moved = (try seedFor(&w, file, "print")).?;
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{@as(u32").?)), moved.offset);
-    try expectCallers(&w, file, "print", &.{ "helper", "alias", "useAlias", "main" });
+    try expectCallers(&w, file, "print", &.{ "useNamespace", "useLocal", "alias", "useAlias", "main" });
 }
 
 /// `file` 中名为 `name` 的泛型函数在 `file` 中的调用者（`seed.Callers`）依次为 `expected`

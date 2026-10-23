@@ -623,9 +623,9 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?F
     return null;
 }
 
-/// 泛型函数 `root` 的调用点查找在文件 `in` 中要推导的调用者（成员下标，按顺序）：提到函数名或别名的成员，不含
-/// 函数自身及其体内的成员。与层数、严格与否、是否收集全部实例无关：各层的 `Query` 与 `Instances` 共享，不必每次
-/// 重新扫描文件。按文件缓存：找到调用点即停止的查找不扫描其余文件
+/// 泛型函数 `root` 的调用点查找在文件 `in` 中要推导的调用者（成员下标，按顺序）：提到函数名或别名、且不能静态
+/// 排除（见 `mentionsOnlyOthers`）的成员，不含函数自身及其体内的成员。与层数、严格与否、是否收集全部实例无关：
+/// 各层的 `Query` 与 `Instances` 共享，不必每次重新扫描文件。按文件缓存：找到调用点即停止的查找不扫描其余文件
 pub const Callers = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { root: hir.OwnerKey, in: FileId };
@@ -647,7 +647,7 @@ pub const Callers = struct {
             if (key.in == file and try enclosedBy(&r, file, @intCast(i), root)) continue;
             if (!try mayMentionAny(&r, key.in, @intCast(i), names)) continue;
             const body = try ctx.get(hir.ItemBody, try r.ownerKey(key.in, @intCast(i)));
-            if (!mentionsAny(body, names)) continue;
+            if (!mentionsAny(body, names) or try mentionsOnlyOthers(&r, key.in, @intCast(i), body, names, key.root)) continue;
             try out.append(r.arena, @intCast(i));
         }
         return ctx.db.gpa.dupe(u32, out.items);
@@ -760,6 +760,80 @@ fn mayMentionAny(r: *Resolver, f: FileId, item: u32, names: []const []const u8) 
 fn mentionsAny(body: *const Body, names: []const []const u8) bool {
     for (names) |n| if (search.mentions(body, n)) return true;
     return false;
+}
+
+/// 成员 `i`（位于 `in`）提到 `names` 的每一处都不经推导就能确定指向 `root_key` 之外的函数声明：它不调用
+/// `root_key`，不必推导（推导提到常见名字的成员，如 `print`、`init`，是调用点查找的主要开销）。
+/// 求不出、指向别名或字段（其值可能是目标）、枚举字面量（decl literal 可能调用目标）、初始化的字段名时为 false
+fn mentionsOnlyOthers(r: *Resolver, in: FileId, i: u32, body: *const Body, names: []const []const u8, root_key: hir.OwnerKey) resolve.Error!bool {
+    for (body.exprs, 0..) |e, ei| {
+        switch (e) {
+            .name_ref => |n| if (!contains(names, n)) continue,
+            .field_access => |fa| if (!contains(names, fa.field orelse continue)) continue,
+            .enum_literal => |n| if (contains(names, n)) return false else continue,
+            .init => |x| {
+                for (x.fields) |fi| if (fi.name) |n| if (contains(names, n)) return false;
+                continue;
+            },
+            else => continue,
+        }
+        const def = try staticRef(r, in, i, body, @fromBackingInt(@as(u32, @intCast(ei)))) orelse return false;
+        const it = switch (def) {
+            .item => |x| x,
+            else => return false,
+        };
+        if ((try r.itemTree(it.file)).items[it.item].kind != .@"fn") return false;
+        if (std.meta.eql(try r.ownerKey(it.file, it.item), root_key)) return false;
+    }
+    return true;
+}
+
+/// 不经推导就能确定的 `e`（名字或成员访问）指向的声明：名字按词法作用域解析；成员访问的左侧是命名空间，或是
+/// 类型已知的值（见 `staticValueType`），在类型的命名空间中查找成员。求不出时为 null
+fn staticRef(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.ExprId) resolve.Error!?resolve.Def {
+    switch (body.expr(e)) {
+        .name_ref => |n| return r.resolveName(in, i, body, body.expr_scopes[@backingInt(e)], n),
+        .field_access => |fa| {
+            const field = fa.field orelse return null;
+            if (try r.evalNamespace(in, i, body, fa.lhs)) |ns| return r.memberDef(ns, field);
+            const ty = try staticValueType(r, in, i, body, fa.lhs) orelse return null;
+            const ns = try queries.namespaceOfType(r, ty) orelse return null;
+            return r.memberDef(ns, field);
+        },
+        else => return null,
+    }
+}
+
+/// 不经推导函数体就能确定的值 `e` 的类型（单项指针取指向的类型）：全局声明的值取声明的类型，当前成员的参数取
+/// 签名中的类型。求不出、是类型或抽象时为 null
+fn staticValueType(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.ExprId) resolve.Error!?Index {
+    switch (body.expr(e)) {
+        .name_ref, .field_access => {},
+        else => return null,
+    }
+    const tv: TypedValue = switch (try staticRef(r, in, i, body, e) orelse return null) {
+        .item => |it| blk: {
+            switch ((try r.itemTree(it.file)).items[it.item].kind) {
+                .@"const", .@"var" => {},
+                else => return null,
+            }
+            break :blk try queries.defType(r, .{ .item = it }, null, null);
+        },
+        .local => |l| blk: {
+            if (l.file != in or l.item != i or body.binding(l.binding).kind != .param) return null;
+            const sig = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(in, i), .mode = .signature });
+            if (@backingInt(l.binding) >= sig.bindings.len) return null;
+            break :blk sig.bindings[@backingInt(l.binding)];
+        },
+        .file => return null,
+    };
+    if (tv.ty == .unknown or tv.isType()) return null;
+    const ip = r.ctx.db.env.ip;
+    const ty = switch (ip.key(tv.ty)) {
+        .ptr_type => |p| if (p.size == .one) p.child else return null,
+        else => tv.ty,
+    };
+    return if (ty == .unknown) null else ty;
 }
 
 /// 调用者 `i`（位于 `in`，见 `Callers`）中第一个能求出具体实例的对泛型函数 `root_key` 的调用
