@@ -2797,9 +2797,9 @@ test "comptime evaluation: slices of interpreter storage read elements in place"
     });
 }
 
-test "comptime evaluation: element-wise work counts toward the step and memory limits" {
-    // 防止逐元素的操作绕过上限：表达式不多的求值中逐个写入数十万个元素，或在两次内存检查之间
-    // 复制出超过内存上限的大数组
+test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
+    // 编译器只按回跳计数：逐个写入数十万个元素的 `@memcpy` 不受限制。在两次内存检查之间复制出超过内存上限的
+    // 大数组时放弃
     try expectTypes(
         \\fn copyMany() u8 {
         \\    const buf: [60000]u8 = @splat(1);
@@ -2826,7 +2826,7 @@ test "comptime evaluation: element-wise work counts toward the step and memory l
         \\const few = copyFew();
         \\const large = copyLarge();
     , &.{
-        .{ "many", "u8" },
+        .{ "many", "u8 = 1" },
         .{ "few", "u8 = 1" },
         .{ "large", "u8" },
     });
@@ -2947,6 +2947,50 @@ test "calls returning types with comptime-only fields nested at any depth are ev
     , &.{
         .{ "deep", "type = u16" },
         .{ "first", "type = u32" },
+    });
+}
+
+test "comptime evaluation: backward branches follow the compiler's quota" {
+    // 防止按表达式个数或整个请求的燃料放弃：编译器只按回跳（循环迭代、调用）计数，`@setEvalBranchQuota`
+    // 调高配额，调用者调高的配额对被调函数同样有效；超过配额时编译器报错，结果未知
+    try expectTypes(
+        \\fn sum(n: usize) usize {
+        \\    var total: usize = 0;
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) total += i % 7;
+        \\    return total;
+        \\}
+        \\fn raised() usize {
+        \\    @setEvalBranchQuota(200_000);
+        \\    var total: usize = 0;
+        \\    for (0..100_000) |i| total += i % 3;
+        \\    return total;
+        \\}
+        \\fn caller() usize {
+        \\    @setEvalBranchQuota(10_000);
+        \\    return sum(5000);
+        \\}
+        \\fn lowered() usize {
+        \\    @setEvalBranchQuota(10);
+        \\    return sum(500);
+        \\}
+        \\const big = raised();
+        \\const via_caller = caller();
+        \\const default_ok = sum(500);
+        \\const kept = lowered();
+        \\const over = sum(5000);
+        \\fn f() void {
+        \\    @setEvalBranchQuota(10_000);
+        \\    const in_body = comptime sum(5000);
+        \\    _ = in_body;
+        \\}
+    , &.{
+        .{ "big", "usize = 99999" },
+        .{ "via_caller", "usize = 14995" },
+        .{ "default_ok", "usize = 1494" },
+        .{ "kept", "usize = 1494" },
+        .{ "over", "usize" },
+        .{ "in_body", "usize = 14995" },
     });
 }
 

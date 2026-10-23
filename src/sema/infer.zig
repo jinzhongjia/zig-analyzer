@@ -243,6 +243,8 @@ const Inferrer = struct {
     returns: std.ArrayList(TypedValue) = .empty,
     /// 大于 0 时位于 comptime 上下文中（类型表达式、数组长度、comptime 实参等）：其中的函数调用由解释器求值
     comptime_depth: u32 = 0,
+    /// 成员中直接发起的 comptime 求值的回跳配额（见 `eval.bodyQuota`），首次使用时计算
+    quota: ?u32 = null,
 
     /// break 的目标。只记录实际会执行到的 break（不在 comptime 已知不执行的分支中）
     const LabelFrame = struct {
@@ -301,6 +303,13 @@ const Inferrer = struct {
             .@"callconv" => try inf.stdType(&.{ "builtin", "CallingConvention" }),
             .@"addrspace" => try inf.stdType(&.{ "builtin", "AddressSpace" }),
         };
+    }
+
+    fn branchQuota(inf: *Inferrer) u32 {
+        if (inf.quota) |q| return q;
+        const q = eval.bodyQuota(inf.r, inf.body, inf.exprs);
+        inf.quota = q;
+        return q;
     }
 
     /// owner 自身（函数）的实例
@@ -500,7 +509,7 @@ const Inferrer = struct {
             .missing, .other, .literal, .name_ref => return tv,
             else => {},
         }
-        const ev = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, expected);
+        const ev = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, expected, inf.branchQuota());
         if (ev.val == null) return tv;
         inf.exprs[@backingInt(e)] = ev;
         return ev;
@@ -1124,7 +1133,7 @@ const Inferrer = struct {
     fn callResult(inf: *Inferrer, g: Generic, inst: Index, sig: *const Result, args: []const TypedValue) Error!TypedValue {
         const ret = try queries.returnType(inf.r, g.owner, g.body, sig, inst);
         if ((try eval.isComptimeOnly(inf.r, ret) or inf.comptime_depth > 0) and !inf.r.ctx.incomplete()) {
-            const tv = try eval.call(inf.r, inst, args);
+            const tv = try eval.call(inf.r, inst, args, inf.branchQuota());
             if (tv.val != null and (ret == .unknown or tv.ty == ret)) return tv;
         }
         if (ret == .type_type) {
@@ -1142,7 +1151,7 @@ const Inferrer = struct {
         };
         const body = try inf.r.ctx.get(hir.ItemBody, .{ .file = fv.file, .item = fv.decl });
         const inst = try runtimeInstance(inf.ip, inf.scratch, fv, body.params.len);
-        const tv = try eval.call(inf.r, inst, try inf.argValues(callee_e, args, skip, body.params.len));
+        const tv = try eval.call(inf.r, inst, try inf.argValues(callee_e, args, skip, body.params.len), inf.branchQuota());
         return if (tv.val != null) tv else null;
     }
 
@@ -1225,7 +1234,7 @@ const Inferrer = struct {
         for (reifying) |n| if (eq(u8, name, n)) {
             for (args) |a| _ = try inf.infer(a, null);
             if (inf.dead > 0 or inf.r.ctx.incomplete()) return typeUnknown();
-            const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null);
+            const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
             return if (tv.val != null) tv else typeUnknown();
         };
         if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
@@ -2040,7 +2049,7 @@ const Inferrer = struct {
         const ty = try inf.concatType(lhs.ty, rhs.ty);
         if (ty == .unknown) return .unknown;
         if (lhs.val != null and rhs.val != null and inf.dead == 0 and !inf.r.ctx.incomplete()) {
-            const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null);
+            const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
             if (tv.val != null and tv.ty == ty) return tv;
         }
         return .{ .ty = ty };

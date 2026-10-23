@@ -215,7 +215,7 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
         if (!literalWithin(l.body, init, name) and !nameRefWithin(l.body, init, holders.items)) continue;
         // 推导不为字符串生成值（如块中的 `const extra = [_][]const u8{"a"};`）：求不出时按 comptime 求值
         const v = l.at.bindingType(@fromBackingInt(@intCast(bi))).val orelse
-            (try eval.exprValue(r, file, l.item, l.body, init, l.inst, l.at.res.bindings, null)).val orelse continue;
+            (try eval.exprValue(r, file, l.item, l.body, init, l.inst, l.at.res.bindings, null, eval.bodyQuota(r, l.body, l.at.res.exprs))).val orelse continue;
         try cands.append(r.arena, .{ .item = l.item, .body = l.body, .expr = init, .value = v });
     };
 
@@ -268,7 +268,7 @@ fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) re
     if (args.len < 3) return null;
     const names_e = args[2];
     const ip = r.ctx.db.env.ip;
-    const tv = try eval.exprValue(r, rt.file, local.item, local.body, names_e, local.inst, local.at.res.bindings, null);
+    const tv = try eval.exprValue(r, rt.file, local.item, local.body, names_e, local.inst, local.at.res.bindings, null, eval.bodyQuota(r, local.body, local.at.res.exprs));
     const value = tv.val orelse return null;
     var path: std.ArrayList(u32) = .empty;
     var chain: std.ArrayList(Index) = .empty;

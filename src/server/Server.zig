@@ -3447,8 +3447,8 @@ const StatusResult = struct {
         deps: usize,
         incomplete: u64,
     },
-    /// 结果不完整的原因（环、栈深度、燃料）的累计次数
-    incomplete_causes: struct { cycle: u64, stack: u64, fuel: u64 },
+    /// 结果不完整的原因（环、栈深度）的累计次数
+    incomplete_causes: struct { cycle: u64, stack: u64 },
 };
 
 fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
@@ -4133,7 +4133,6 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         .incomplete_causes = .{
             .cycle = summary.incomplete_causes.get(.cycle),
             .stack = summary.incomplete_causes.get(.stack),
-            .fuel = summary.incomplete_causes.get(.fuel),
         },
     };
 }

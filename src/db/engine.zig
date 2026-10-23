@@ -76,9 +76,6 @@ pub const Error = error{ Canceled, OutOfMemory };
 /// 线程栈（Linux 主线程 8 MB），为两次检查之间的栈占用留出余量
 pub const max_stack_bytes = 4 * 1024 * 1024;
 
-/// 一个读事务中 comptime 求值可用的步数（燃料）。耗尽后的结果同样不写入 memo
-pub const default_fuel = 20_000_000;
-
 /// 一个读事务中「先从栈底计算中断处」的次数上限（见 `Ctx.get`），使无限递归也能结束
 pub const max_deepening = 16;
 
@@ -126,7 +123,7 @@ pub const QueryStats = struct {
     bytes: usize = 0,
     /// memo 记录的依赖边总数（值被淘汰的 memo 仍保留依赖）
     deps: usize = 0,
-    /// 结果不完整（环、栈深度或燃料用尽）而未写入 memo 的次数：这些结果每次读取都要重算
+    /// 结果不完整（环、栈深度）而未写入 memo 的次数：这些结果每次读取都要重算
     incomplete: u64 = 0,
 };
 
@@ -136,8 +133,6 @@ pub const IncompleteCause = enum {
     cycle,
     /// 嵌套计算超出栈深度上限
     stack,
-    /// comptime 求值的燃料耗尽
-    fuel,
 };
 
 /// 一次读事务中执行过的 query（先序，按深度可还原调用树），用于慢请求日志
@@ -580,8 +575,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             stack: std.ArrayList(Frame) = .empty,
             /// 读事务开始处的栈位置（栈向低地址增长）
             stack_base: usize,
-            /// 剩余的 comptime 求值步数，由解释器扣减
-            fuel: u64 = default_fuel,
             /// 本次顶层读取中第一次因栈深度上限中断的 query
             frontier: ?DepKey = null,
             /// 已经从栈底计算过的中断处个数
@@ -630,7 +623,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 return ctx.stack_base > here and ctx.stack_base - here > max_stack_bytes;
             }
 
-            /// 当前结果不完整（燃料耗尽等）：栈上的 query 都不写入 memo
+            /// 当前结果不完整：栈上的 query 都不写入 memo
             pub fn markIncomplete(ctx: *Ctx, cause: IncompleteCause) void {
                 _ = ctx.db.incomplete_causes[@backingInt(cause)].fetchAdd(1, .monotonic);
                 for (ctx.stack.items) |*frame| {
@@ -646,7 +639,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (ctx.frontier == null and ctx.stack.items.len > 0) ctx.frontier = ctx.stack.items[ctx.stack.items.len - 1].key;
             }
 
-            /// 当前计算的结果已经不完整（环、深度上限或燃料耗尽）：不应再为改进结果而深入计算，
+            /// 当前计算的结果已经不完整（环、深度上限）：不应再为改进结果而深入计算，
             /// 否则不写入 memo 的结果在每一层都会被重新计算
             pub fn incomplete(ctx: *const Ctx) bool {
                 const n = ctx.stack.items.len;
@@ -969,13 +962,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     break :blk t.events.items.len - 1;
                 } else null;
                 try ctx.stack.append(ctx.gpa, .{ .key = .{ .query = qi, .index = index } });
-                // 恢复被淘汰的值：此前已完整算出过，给它一份独立的燃料，不受本次请求剩余燃料的影响，
-                // 否则恢复出的结果可能不完整（如 hover 偶尔显示 unknown）
-                const saved_fuel = ctx.fuel;
-                if (restore) ctx.fuel = default_fuel;
-                defer if (restore) {
-                    ctx.fuel = saved_fuel;
-                };
                 const computed = if (@hasDecl(Q, "computeIncremental")) blk: {
                     // 上一次的值在下一次写事务前不会被释放，可安全地作为增量计算的基础
                     db.mutex.lockUncancelable(db.io);

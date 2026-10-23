@@ -28,10 +28,11 @@ const queries = @import("queries.zig");
 const infer = @import("infer.zig");
 const value = @import("value.zig");
 
-/// 单次求值的步数上限（求值的表达式个数）
-const max_steps = 200_000;
-/// 解释器内（不经 query）嵌套调用的深度上限
-const max_inline_calls = 64;
+/// 回跳（循环的每次迭代、每次调用）的默认配额，与编译器相同；`@setEvalBranchQuota` 调高。超过配额时编译器报错，
+/// 这里放弃求值
+pub const default_branch_quota = 1000;
+/// 求字符串来源时展开声明的嵌套深度上限：互相引用的声明不会结束，超过时只是不跟踪来源
+const max_tracked_decls = 64;
 /// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃
 const max_eval_bytes = 64 * 1024 * 1024;
 /// 解释器内展开的单个聚合的元素个数上限（在分配前检查）
@@ -53,15 +54,43 @@ pub const CallKey = struct {
     inst: Index,
     /// 各参数的值：`aggregate`（类型为 unknown），元素与形参一一对应，未知的为 unknown
     values: Index,
+    /// 回跳配额：调用处当前的配额。编译器中被调函数与调用者共用回跳计数，这里被调函数重新计数，
+    /// 不会比编译器先放弃
+    quota: u32 = default_branch_quota,
 };
 
-/// 以实例 `inst` 与实参 `args`（与形参一一对应）执行 comptime 调用
-pub fn call(r: *Resolver, inst: Index, args: []const TypedValue) Error!TypedValue {
+/// 以实例 `inst` 与实参 `args`（与形参一一对应）执行 comptime 调用，回跳配额为 `quota`
+pub fn call(r: *Resolver, inst: Index, args: []const TypedValue, quota: u32) Error!TypedValue {
     const ip = r.ctx.db.env.ip;
     const values = try r.arena.alloc(Index, args.len);
     for (args, values) |a, *v| v.* = a.val orelse .unknown;
-    const key: CallKey = .{ .inst = inst, .values = try ip.get(.{ .aggregate = .{ .ty = .unknown, .elems = values } }) };
+    const key: CallKey = .{ .inst = inst, .values = try ip.get(.{ .aggregate = .{ .ty = .unknown, .elems = values } }), .quota = quota };
     return r.ctx.get(queries.CallEval, key);
+}
+
+/// 成员体内 `@setEvalBranchQuota` 设置的最大配额（至少为默认配额）：推导与跳转在成员中直接发起的求值使用它。
+/// 不按出现的位置区分，不会比编译器先放弃。实参求不出时取最大值。`exprs` 为成员的推导结果（可能不完整）
+pub fn bodyQuota(r: *Resolver, body: *const Body, exprs: []const TypedValue) u32 {
+    const ip = r.ctx.db.env.ip;
+    var quota: u32 = default_branch_quota;
+    for (body.exprs) |e| {
+        const b = switch (e) {
+            .builtin_call => |b| b,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, b.name, "@setEvalBranchQuota") or b.args.len != 1) continue;
+        const arg = b.args[0];
+        const n: ?i128 = switch (body.expr(arg)) {
+            .literal => |text| switch (std.zig.parseNumberLiteral(text)) {
+                .int => |v| v,
+                else => null,
+            },
+            else => if (@backingInt(arg) < exprs.len) value.intOf(ip, exprs[@backingInt(arg)].val) else null,
+        };
+        const v = n orelse return std.math.maxInt(u32);
+        quota = @max(quota, std.math.cast(u32, v) orelse std.math.maxInt(u32));
+    }
+    return quota;
 }
 
 /// `CallEval` 的计算
@@ -70,7 +99,7 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
     defer scratch.deinit();
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-    var ev: Evaluator = .{ .r = &r, .ip = ctx.db.env.ip, .a = scratch.allocator(), .arena = &scratch };
+    var ev: Evaluator = .{ .r = &r, .ip = ctx.db.env.ip, .a = scratch.allocator(), .arena = &scratch, .quota = key.quota };
     const ip = ev.ip;
     const inst = ip.key(key.inst).instance;
     const args = switch (ip.key(key.values)) {
@@ -96,11 +125,12 @@ pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index)
     return ev.toTyped(v) catch |err| giveUp(err);
 }
 
-/// 表达式在给定绑定下的 comptime 值：类型推导在 comptime 上下文中求不出值时使用
-pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index) Error!TypedValue {
+/// 表达式在给定绑定下的 comptime 值：类型推导在 comptime 上下文中求不出值时使用。`quota` 为回跳配额
+/// （见 `bodyQuota`）
+pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index, quota: u32) Error!TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
-    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena, .quota = quota };
     var frame = try ev.newFrame(file, item, body, inst);
     for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
     const v = ev.eval(&frame, e, want) catch |err| return giveUp(err);
@@ -518,8 +548,13 @@ const Evaluator = struct {
     a: Allocator,
     /// `a` 的来源：检查求值占用的内存
     arena: ?*std.heap.ArenaAllocator = null,
+    /// 求值的表达式个数：每隔一段检查取消与内存
     steps: u32 = 0,
-    inline_calls: u32 = 0,
+    /// 回跳的次数与配额（见 `default_branch_quota`）
+    branches: u32 = 0,
+    quota: u32 = default_branch_quota,
+    /// `trackedDecl` 展开声明的嵌套深度
+    tracked_decls: u32 = 0,
     /// `freeze` 当前的嵌套深度
     freeze_depth: u32 = 0,
     /// 跟踪字符串字面量的来源（见 `stringOrigin`）
@@ -530,22 +565,22 @@ const Evaluator = struct {
 
     fn tick(ev: *Evaluator) EvalError!void {
         const ctx = ev.r.ctx;
-        ev.steps += 1;
-        if (ev.steps > max_steps) return error.Abort;
+        ev.steps +%= 1;
         if (ev.steps % 256 == 0) {
             try ctx.checkCanceled();
             if (ev.arena) |arena| if (arena.queryCapacity() > max_eval_bytes) return error.Abort;
         }
-        // 本次请求的燃料耗尽或嵌套过深：结果取决于请求，不写入 memo
-        if (ctx.fuel == 0) {
-            ctx.markIncomplete(.fuel);
-            return error.Abort;
-        }
+        // 嵌套过深（解释器内展开的递归调用）：结果取决于求值时的栈深度，不写入 memo
         if (ctx.stackExhausted()) {
             ctx.exhausted();
             return error.Abort;
         }
-        ctx.fuel -= 1;
+    }
+
+    /// 回跳（循环的一次迭代、一次调用）：超过配额时放弃，编译器在这里报错
+    fn backwardBranch(ev: *Evaluator) EvalError!void {
+        ev.branches += 1;
+        if (ev.branches > ev.quota) return error.Abort;
     }
 
     fn itemIndex(ev: *Evaluator, owner: hir.OwnerKey) Error!?u32 {
@@ -989,9 +1024,9 @@ const Evaluator = struct {
         const owner: hir.OwnerKey = .{ .file = it.file, .item = tree.items[it.item].ast_id };
         const body = try ev.r.ctx.get(hir.ItemBody, owner);
         const main = body.value orelse return null;
-        if (ev.inline_calls >= max_inline_calls) return null;
-        ev.inline_calls += 1;
-        defer ev.inline_calls -= 1;
+        if (ev.tracked_decls >= max_tracked_decls) return null;
+        ev.tracked_decls += 1;
+        defer ev.tracked_decls -= 1;
         var frame = try ev.newFrame(it.file, it.item, body, null);
         return try ev.eval(&frame, main, tv.ty);
     }
@@ -1295,15 +1330,13 @@ const Evaluator = struct {
             try infer.instanceOf(ev.r, ev.a, gg, fty, tvs)
         else
             try infer.runtimeInstance(ip, ev.a, fv, args.len);
+        try ev.backwardBranch();
         // 跟踪来源时在本次求值中展开：经 query 调用的结果是驻留的值，字面量的来源会丢失
         if (!local and ev.track == null) {
-            const tv = try call(ev.r, inst, tvs);
+            const tv = try call(ev.r, inst, tvs, ev.quota);
             if (tv.val == null) return error.Abort;
             return thaw(tv);
         }
-        if (ev.inline_calls >= max_inline_calls) return error.Abort;
-        ev.inline_calls += 1;
-        defer ev.inline_calls -= 1;
         return ev.runFunction(.{ .file = fv.file, .item = fv.decl }, inst, args);
     }
 
@@ -1463,6 +1496,7 @@ const Evaluator = struct {
         switch (l.kind) {
             .@"while" => while (true) {
                 try ev.tick();
+                try ev.backwardBranch();
                 const taken = try ev.condition(try ev.eval(f, l.inputs[0], null));
                 if (!taken.yes) {
                     if (l.else_capture.len != 0) try ev.bindCapture(f, l.else_capture[0], taken.payload);
@@ -1502,6 +1536,7 @@ const Evaluator = struct {
                 }
                 for (0..n orelse return error.Abort) |i| {
                     try ev.tick();
+                    try ev.backwardBranch();
                     for (inputs, 0..) |in, k| {
                         if (k >= l.capture.len) break;
                         const cap = l.capture[k];
@@ -1554,8 +1589,12 @@ const Evaluator = struct {
         try f.labels.append(ev.a, .{ .name = label, .kind = .@"switch", .want = want });
         defer f.labels.shrinkRetainingCapacity(index);
         var operand = try ev.eval(f, s.operand, null);
+        var first = true;
         while (true) {
             try ev.tick();
+            // 带标签的 switch 以 `continue :label` 再次分派：回跳
+            if (!first) try ev.backwardBranch();
+            first = false;
             const chosen = try ev.chooseProng(f, s.prongs, operand) orelse return error.Abort;
             const prong = s.prongs[chosen];
             if (prong.capture.len > 0) try ev.bindCapture(f, prong.capture[0], try ev.switchPayload(operand));
@@ -2297,7 +2336,14 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@compileError") or eq(u8, name, "@panic") or eq(u8, name, "@trap") or eq(u8, name, "@breakpoint")) return error.Abort;
         // 不影响 comptime 结果的提示
-        const hints = [_][]const u8{ "@setEvalBranchQuota", "@compileLog", "@setRuntimeSafety", "@setFloatMode", "@branchHint", "@disableInstrumentation", "@declareSideEffect", "@prefetch", "@export" };
+        if (eq(u8, name, "@setEvalBranchQuota")) {
+            if (args.len != 1) return error.Abort;
+            const n = try ev.evalInt(f, args[0], null);
+            // 比当前配额小时不起作用（与编译器相同）
+            ev.quota = @max(ev.quota, std.math.cast(u32, n) orelse return error.Abort);
+            return Val.void_val;
+        }
+        const hints = [_][]const u8{ "@compileLog", "@setRuntimeSafety", "@setFloatMode", "@branchHint", "@disableInstrumentation", "@declareSideEffect", "@prefetch", "@export" };
         for (hints) |h| if (eq(u8, name, h)) return Val.void_val;
         if (eq(u8, name, "@inComptime")) return boolVal(true);
         if (eq(u8, name, "@EnumLiteral")) return Val.ofType(.enum_literal_type);
