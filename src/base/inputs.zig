@@ -17,6 +17,7 @@ pub const FileText = struct {
         return std.mem.eql(u8, a.?, b.?);
     }
 
+    /// 参数取指针是引擎对 query `deinit` 的统一签名（见 `db/engine.zig`），这里只读取 `v.*`。
     pub fn deinit(v: *Value, gpa: Allocator) void {
         if (v.*) |text| gpa.free(text);
     }
