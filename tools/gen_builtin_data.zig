@@ -19,7 +19,8 @@ const Metadata = struct {
 };
 
 fn invalid(comptime fmt: []const u8, args: anytype) error{InvalidOfficialSource} {
-    std.debug.print("builtin metadata: " ++ fmt ++ "\n", args);
+    // 测试故意构造不合法的输入，写到 stderr 会让构建输出出现误导性的 `failed command`
+    if (!@import("builtin").is_test) std.debug.print("builtin metadata: " ++ fmt ++ "\n", args);
     return error.InvalidOfficialSource;
 }
 

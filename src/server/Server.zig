@@ -1761,7 +1761,10 @@ fn startup(server: *Server) Io.Cancelable!void {
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
     const env = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
-        log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
+        // `zig build test` 有意找不到 zig（见 `ZigEnv.query`）；warn 会写到 stderr，让构建输出出现误导性的
+        // `failed command`
+        if (!(@import("builtin").is_test and err == error.ZigNotFound))
+            log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
         return;
     };
     {
