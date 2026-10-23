@@ -4,7 +4,10 @@
 //! 身份键还会统一 ASCII 字母的大小写，使 `C:\Work\A.zig` 与 `c:/work/a.zig` 映射到同一个 FileId。
 //! 对外（显示、构造 URI）使用第一次见到的路径写法。
 //!
-//! 已知限制：只统一 ASCII 字母；NTFS 的 Unicode 大写映射与 APFS 的 Unicode 规范化不等价未处理。
+//! 已知限制：只统一 ASCII 字母（A–Z）的大小写。路径中有非 ASCII 字母时，文件系统视为同一个文件、
+//! 字节却不同的写法会映射到不同的 FileId：
+//! - 非 ASCII 字母的大小写：`Été.zig` 与 `été.zig`（NTFS 与 APFS 都不区分）；
+//! - APFS 上 Unicode 的合成与分解两种写法：`é` 可以是 U+00E9，也可以是 `e` + U+0301（APFS 不区分）。
 
 const std = @import("std");
 const Io = std.Io;
