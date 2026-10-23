@@ -1211,7 +1211,7 @@ fn isProjectFile(base: []const u8) bool {
 
 /// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
 /// 按磁盘内容更新（删除的置为不存在），内容与已知的相同时不写入、不重新发布。工作区根目录的 build.zig / build.zig.zon /
-/// zig-analyzer.json 或项目的构建脚本变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时
+/// zig-analyzer.zon 或项目的构建脚本变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时
 /// 项目重新构建、单文件重新编译；磁盘内容与上一次据此重新构建时的相同时不重新构建
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
     const Change = struct {
@@ -1710,7 +1710,7 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
     if (server.register_watch) {
         // 编辑器之外的改动（git checkout、代码生成等）：源文件、build.zig.zon 与项目配置文件
         const options = try std.json.parseFromSliceLeaky(std.json.Value, arena,
-            \\{"watchers": [{"globPattern": "**/*.zig"}, {"globPattern": "**/*.zon"}, {"globPattern": "**/zig-analyzer.json"}]}
+            \\{"watchers": [{"globPattern": "**/*.zig"}, {"globPattern": "**/*.zon"}]}
         , .{});
         try registrations.append(arena, .{ .id = "zig-analyzer/didChangeWatchedFiles", .method = "workspace/didChangeWatchedFiles", .registerOptions = options });
     }
@@ -3126,7 +3126,7 @@ fn conflictsWithCompilerError(diags: []const types.Diagnostic, text: []const u8,
     return false;
 }
 
-/// 一个文件的命名检查配置：客户端的配置，以包含文件的项目的 `zig-analyzer.json` 中出现的项覆盖
+/// 一个文件的命名检查配置：客户端的配置，以包含文件的项目的 `zig-analyzer.zon` 中出现的项覆盖
 const NamingSettings = struct {
     ignore: []const []const u8,
     rules: Config.NamingRules,
@@ -3162,7 +3162,7 @@ fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const 
         exclude = try dupeStrings(arena, server.config.naming_exclude);
         rules = server.config.naming_rules;
     }
-    // `naming.exclude` 的路径相对工作区根目录，来自 `zig-analyzer.json` 时相对项目根目录
+    // `naming.exclude` 的路径相对工作区根目录，来自 `zig-analyzer.zon` 时相对项目根目录
     var base = try server.rootOf(arena, path);
     {
         server.workspaces_mutex.lockUncancelable(server.io);

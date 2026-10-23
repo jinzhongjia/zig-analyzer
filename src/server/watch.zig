@@ -2,7 +2,7 @@
 //! Neovim 默认如此），或配置 `files.watcher` 为 `server` 时。
 //!
 //! 关注的文件：驻留过的 `.zig` / `.zon` 文件（分析会按需从磁盘读取被 import 的任意文件），以及各工作区根目录的
-//! `build.zig`、`build.zig.zon`、`zig-analyzer.json`；不含不会改变的依赖库（见 `Server.watchable`）。变化按
+//! `build.zig`、`build.zig.zon`、`zig-analyzer.zon`；不含不会改变的依赖库（见 `Server.watchable`）。变化按
 //! `workspace/didChangeWatchedFiles` 的通知处理，与客户端的通知走同一条路径；打开的文档以缓冲区为准，编辑器中的保存由
 //! `didSave` 处理，跳过。
 //!

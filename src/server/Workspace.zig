@@ -46,7 +46,7 @@ gpa: Allocator,
 root: []const u8,
 /// 启动时的配置副本（构建参数、诊断 step）；配置变化时整个实例被重启替换
 config: Server.Config,
-/// 项目根目录的 `zig-analyzer.json`（只含其中出现的项，见 `Config.parseProject`）；没有时为 null。启动后不变，
+/// 项目根目录的 `zig-analyzer.zon`（只含其中出现的项，见 `Config.parseProject`）；没有时为 null。启动后不变，
 /// 文件变化时整个实例被重启替换
 project: ?Server.Config = null,
 /// 本实例是 maker 连续崩溃后自动重启的第几次（0 表示正常启动）
@@ -149,7 +149,8 @@ pub fn release(ws: *Workspace) void {
     if (ws.refs.fetchSub(1, .acq_rel) == 1) ws.destroy();
 }
 
-/// 读取项目根目录的 `zig-analyzer.json`；文件不存在时为 null，有误时提示并忽略
+/// 读取项目根目录的 `zig-analyzer.zon`；文件不存在时为 null。其中的问题提示给用户，有问题的项（语法错误时为整个
+/// 文件）被忽略
 fn loadProjectConfig(server: *Server, root: []const u8) Allocator.Error!?Server.Config {
     const gpa = server.gpa;
     const path = try std.fs.path.join(gpa, &.{ root, Server.Config.project_file });
@@ -163,14 +164,7 @@ fn loadProjectConfig(server: *Server, root: []const u8) Allocator.Error!?Server.
         },
     };
     defer gpa.free(text);
-    var project = Server.Config.parseProject(gpa, text) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidConfig => {
-            var buf: [512]u8 = undefined;
-            server.showWarning(std.fmt.bufPrint(&buf, "{s} is not a valid JSON object, it is ignored", .{path}) catch path);
-            return null;
-        },
-    };
+    const project = try Server.Config.parseProject(gpa, text);
     server.reportConfigWarnings(path, &project);
     return project;
 }

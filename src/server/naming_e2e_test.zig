@@ -245,8 +245,8 @@ test "naming fixes: resolve, conflicts, public names and the project still build
         .{ .path = "src/lib.zig", .text = lib_text },
         .{ .path = "src/gen.zig", .text = gen_text },
         // 项目约定：开启检查，排除一个文件
-        .{ .path = "zig-analyzer.json", .text =
-        \\{"naming": {"enable": true, "exclude": ["src/gen.zig"]}}
+        .{ .path = "zig-analyzer.zon", .text =
+        \\.{ .naming = .{ .enable = true, .exclude = .{"src/gen.zig"} } }
         },
     });
     defer project.deinit();
