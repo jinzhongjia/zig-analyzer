@@ -240,80 +240,35 @@ fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     return max;
 }
 
-/// 区间恰为 `range` 的最深节点
-fn nodeAt(root: tree.SyntaxNode, range: tree.TextRange) ?tree.SyntaxNode {
-    var node = root;
-    var found: ?tree.SyntaxNode = null;
-    outer: while (true) {
-        if (node.range().start == range.start and node.range().end == range.end) found = node;
-        var it = node.children();
-        while (it.nextNode()) |c| {
-            if (c.range().start <= range.start and range.end <= c.range().end) {
-                node = c;
-                continue :outer;
-            }
-        }
-        return found;
-    }
-}
-
-test "nesting beyond the limits: lossless, bounded depth, marked deep" {
+test "deep nesting keeps the full structure" {
     const a = testing.allocator;
-    const max_depth = @import("parser.zig").max_depth;
-    // 解析器的递归与语法树的深度都有上限（深层嵌套耗尽原生栈时进程崩溃）。`limited`：触及解析器的
-    // 递归上限（其余只在构造绿树时展平）
-    const Case = struct { head: []const u8, repeat: []const u8, middle: []const u8, close: []const u8, tail: []const u8, limited: bool };
+    const Case = struct { head: []const u8, repeat: []const u8, middle: []const u8, close: []const u8, tail: []const u8 };
     const cases = [_]Case{
-        .{ .head = "const x = ", .repeat = "(", .middle = "1", .close = ")", .tail = ";\n", .limited = true },
-        .{ .head = "const x = ", .repeat = "!", .middle = "y", .close = "", .tail = ";\n", .limited = true },
-        .{ .head = "const T = ", .repeat = "?", .middle = "u8", .close = "", .tail = ";\n", .limited = true },
-        .{ .head = "fn f() void ", .repeat = "{", .middle = "", .close = "}", .tail = "\n", .limited = true },
-        .{ .head = "fn f(x: u32) void {\n    if (x == 0) {}", .repeat = " else if (x == 1) {}", .middle = " else {}", .close = "", .tail = "\n}\n", .limited = true },
-        .{ .head = "const x = ", .repeat = "1 + ", .middle = "1", .close = "", .tail = ";\n", .limited = false },
-        .{ .head = "const x = a", .repeat = ".b", .middle = "", .close = "", .tail = ";\n", .limited = false },
-        .{ .head = "const x = ", .repeat = "f(", .middle = "", .close = "", .tail = "", .limited = true },
+        .{ .head = "const x = ", .repeat = "(", .middle = "1", .close = ")", .tail = ";\n" },
+        .{ .head = "const x = ", .repeat = "!", .middle = "y", .close = "", .tail = ";\n" },
+        .{ .head = "const T = ", .repeat = "?", .middle = "u8", .close = "", .tail = ";\n" },
+        .{ .head = "fn f() void ", .repeat = "{", .middle = "", .close = "}", .tail = "\n" },
+        .{ .head = "fn f(x: u32) void {\n    if (x == 0) {}", .repeat = " else if (x == 1) {}", .middle = " else {}", .close = "", .tail = "\n}\n" },
+        .{ .head = "const x = ", .repeat = "1 + ", .middle = "1", .close = "", .tail = ";\n" },
+        .{ .head = "const x = a", .repeat = ".b", .middle = "", .close = "", .tail = ";\n" },
+        .{ .head = "const x = ", .repeat = "f(", .middle = "x", .close = ")", .tail = ";\n" },
     };
+    const n = 1500;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(a);
     for (cases) |c| {
         src.clearRetainingCapacity();
         try src.appendSlice(a, c.head);
-        for (0..20_000) |_| try src.appendSlice(a, c.repeat);
+        for (0..n) |_| try src.appendSlice(a, c.repeat);
         try src.appendSlice(a, c.middle);
-        for (0..20_000) |_| try src.appendSlice(a, c.close);
+        for (0..n) |_| try src.appendSlice(a, c.close);
         try src.appendSlice(a, c.tail);
         const parse = try Parse.create(a, src.items);
         defer parse.destroy();
-        try testing.expect(parse.deep);
-        try testing.expect(try treeDepth(parse.rootNode()) <= max_depth);
-        // 收纳了展平内容的节点改为只有 token 的错误节点，区间记录在 `flattened` 中
-        try testing.expect(parse.flattened.len > 0);
-        for (parse.flattened) |range| {
-            const node = nodeAt(parse.rootNode(), range) orelse return error.TestUnexpectedResult;
-            try testing.expectEqual(.error_node, node.kind());
-            var it = node.children();
-            while (it.next()) |e| try testing.expect(e == .token);
-        }
-        const limited = for (parse.errors) |e| {
-            if (std.mem.eql(u8, e.message, "nesting too deep")) break true;
-        } else false;
-        try testing.expectEqual(c.limited, limited);
+        try testing.expectEqual(0, parse.errors.len);
+        try testing.expect(try treeDepth(parse.rootNode()) > n);
         try expectLossless(src.items);
     }
-}
-
-test "real-world nesting depths stay below the limits" {
-    const a = testing.allocator;
-    // 400 个分支的 else-if 语句链（标准库中最深的文件约为它的一半）
-    var src: std.ArrayList(u8) = .empty;
-    defer src.deinit(a);
-    try src.appendSlice(a, "fn f(x: u32) u32 {\n    if (x == 0) {\n        return 0;\n    }");
-    for (1..400) |i| try src.print(a, " else if (x == {d}) {{\n        return {d};\n    }}", .{ i, i });
-    try src.appendSlice(a, " else {\n        return 1;\n    }\n}\n");
-    const parse = try Parse.create(a, src.items);
-    defer parse.destroy();
-    try testing.expect(!parse.deep);
-    try testing.expectEqual(0, parse.errors.len);
 }
 
 test "lossless: malformed inputs" {

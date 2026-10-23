@@ -309,10 +309,6 @@ fn label(p: *Parser) Error!void {
 }
 
 fn statement(p: *Parser, block_level: bool) Error!void {
-    if (p.tooDeep()) {
-        _ = try p.skipNested();
-        return;
-    }
     switch (p.peek()) {
         .keyword_comptime => {
             const n1 = p.nth(1);
@@ -795,7 +791,6 @@ fn binaryPrec(kind: SyntaxKind) ?u8 {
 }
 
 fn exprPrec(p: *Parser, min_prec: u8) Error!CM {
-    if (p.tooDeep()) return p.skipNested();
     var lhs = try prefixExpr(p) orelse return null;
     while (true) {
         const op = p.peek();
@@ -811,7 +806,6 @@ fn exprPrec(p: *Parser, min_prec: u8) Error!CM {
 }
 
 fn prefixExpr(p: *Parser) Error!CM {
-    if (p.tooDeep()) return p.skipNested();
     switch (p.peek()) {
         .bang, .minus, .tilde, .minus_percent, .ampersand, .keyword_try => {
             const m = try p.start();
@@ -926,7 +920,6 @@ fn initList(p: *Parser) Error!void {
 }
 
 fn typeExpr(p: *Parser) Error!CM {
-    if (p.tooDeep()) return p.skipNested();
     switch (p.peek()) {
         .question_mark => return try prefixedType(p, .optional_type, 1),
         .keyword_anyframe => if (p.nth(1) == .arrow) return try prefixedType(p, .anyframe_type, 2),

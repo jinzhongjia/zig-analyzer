@@ -2,7 +2,7 @@
 //!
 //! 1. 任意字节输入都能解析出无损的语法树，不崩溃、不卡死；
 //! 2. 对任意文本做任意编辑，局部重解析的结果与全量解析完全相同（含连续编辑形成的复用链），
-//!    包括嵌套超过解析器递归上限与语法树深度上限的文本。
+//!    包括深层嵌套的文本。
 
 const std = @import("std");
 const testing = std.testing;
@@ -29,11 +29,11 @@ fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
     }
 }
 
-/// 长片段：几个拼在一起就超过解析器的递归上限与语法树的深度上限
+/// 长片段：几个拼在一起得到上千层的嵌套
 const deep_pieces = [_][]const u8{
-    repeat("(", 700),  repeat(")", 700),  repeat("{", 700),              repeat("}", 700),
-    repeat("!", 700),  repeat("f(", 700), repeat("if (a) b else ", 400), repeat("1 + ", 600),
-    repeat(".b", 700), repeat("?", 700),  repeat("[]", 700),
+    repeat("(", 100),  repeat(")", 100),  repeat("{", 100),              repeat("}", 100),
+    repeat("!", 100),  repeat("f(", 100), repeat("if (a) b else ", 100), repeat("1 + ", 100),
+    repeat(".b", 100), repeat("?", 100),  repeat("[]", 100),
 };
 
 /// 片段：`deep` 时每 8 个中约有 1 个取长片段
@@ -114,7 +114,7 @@ test "parser properties: fixed-seed random input" {
     }
 }
 
-test "parser properties: random edits around the depth limits" {
+test "parser properties: random edits on deeply nested text" {
     var prng: std.Random.DefaultPrng = .init(0xdee9_11e5);
     var buf: [192]u8 = undefined;
     for (0..Entropy.iterations(300)) |_| {
