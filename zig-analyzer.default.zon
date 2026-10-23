@@ -1,0 +1,112 @@
+// Default zig-analyzer settings, with what each option does.
+//
+// Copy this file to `zig-analyzer.zon` in the project root to share settings with the team; the
+// settings in it take precedence over the editor's. Only the options written as fields below can
+// be set there. The options in comments marked "editor only" can only be set in the editor.
+//
+// Editor settings have the same structure, written as JSON in `initializationOptions` or the
+// `zig-analyzer` section of `workspace/configuration`:
+// `.build = .{ .args = .{"-Dfoo"} }` here is `{ "build": { "args": ["-Dfoo"] } }` there, and enum
+// literals such as `.auto` are strings ("auto").
+//
+// Omitted options keep their defaults. An error in this file (syntax, a wrong type, an unknown
+// option) is shown with its location, and the whole file is ignored.
+.{
+    // Path to the `zig` executable (editor only):
+    //   .zig = .{ .path = "/usr/local/bin/zig" },
+    // Default: looked up in PATH. It must be the Zig version zig-analyzer was built with (0.17.0);
+    // otherwise projects with build.zig are not loaded.
+
+    .build = .{
+        // Load projects through the build system protocol (`zig build --listen=-`); false handles
+        // every file in single-file mode (editor only):
+        //   .enable = true,
+
+        // Extra arguments passed to `zig build`, e.g. .{"-Dtarget=aarch64-linux"}.
+        .args = .{},
+    },
+
+    .diagnostics = .{
+        // Build steps for compiler diagnostics. Empty: `check` if the project has it, otherwise the
+        // default step. `.step = "name"` adds a single step.
+        .steps = .{},
+        // Run the compiler on save for diagnostics; false gives only live diagnostics (syntax and
+        // AstGen) while typing.
+        .compiler = true,
+
+        // Mark code that is not compiled in the current build configuration (branches comptime
+        // knows are not taken) as inactive (editor only):
+        //   .inactive_code = true,
+        // Milliseconds without edits before live diagnostics are computed; 0 for no delay
+        // (editor only):
+        //   .debounce_ms = 50,
+    },
+
+    // Inlay hints (editor only):
+    //   .inlay_hints = .{
+    //       // Inferred types.
+    //       .types = true,
+    //       // Parameter names at call arguments.
+    //       .parameters = true,
+    //       // Hide the parameter name when the argument already has that name (or is a field
+    //       // access ending in it).
+    //       .hide_redundant_param_names = true,
+    //   },
+
+    // Type inference (editor only):
+    //   .sema = .{
+    //       // Inside generic functions with no concrete types, infer with the instances from call
+    //       // sites (hover, completion, inlay hints, ...).
+    //       .callsite_seeding = true,
+    //       // Discard all cached type information when the intern pool exceeds this many MB; it
+    //       // is recomputed on demand. 0 never discards.
+    //       .max_intern_pool_mb = 64,
+    //   },
+
+    // Also list symbols from dependencies (fetched packages, generated files, opened std files)
+    // in workspace symbols (editor only):
+    //   .workspace_symbol = .{ .dependencies = false },
+
+    .naming = .{
+        // Hint names that do not follow the Names section of the Zig style guide, with rename
+        // fixes. Only open files of your own code are checked.
+        .enable = false,
+        // Names to skip; `*` matches any sequence of characters, e.g. .{"SDL_*"}.
+        .ignore = .{},
+        // Files to skip: `/`-separated paths relative to the project root (to the workspace root
+        // in editor settings); `*` matches any sequence of characters, including `/`.
+        .exclude = .{},
+        // Turn individual rules on or off; each matches the diagnostic code `naming.<rule>`.
+        .rules = .{
+            // Types and type aliases: TitleCase.
+            .type = true,
+            // Callables that return `type`: TitleCase.
+            .type_function = true,
+            // Other callables (functions, function aliases, function pointers): camelCase.
+            .function = true,
+            // Namespaces (files with no top-level fields): snake_case.
+            .namespace = true,
+            // Other values: snake_case.
+            .value = true,
+            // Fields and enum members, by the type of the field.
+            .field = true,
+        },
+    },
+
+    // Who detects changes on disk (editor only):
+    //   .files = .{ .watcher = .auto },
+    // .auto: the server watches files when the editor cannot register file watchers;
+    // .client: only the editor's notifications; .server: always the server (the editor's
+    // notifications are still handled).
+
+    // Logging (editor only):
+    //   .log = .{
+    //       // .err, .warn, .info or .debug. Logs go to stderr.
+    //       .level = .info,
+    //       // Also append logs to this file. Default: stderr only.
+    //       .file = "/tmp/zig-analyzer.log",
+    //       // Log a breakdown of the queries for requests slower than this many milliseconds;
+    //       // 0 turns it off.
+    //       .slow_request_ms = 100,
+    //   },
+}
