@@ -233,6 +233,8 @@ pub const HandlerError = error{
     InvalidIdentifier,
     /// 泛型函数体内的引用在一些实例下指向其他定义：重命名会破坏这些实例
     RenameAmbiguous,
+    /// 泛型函数体内的引用要按实例判断，而实例不完整（实例化无限增长）：无法确认全部引用
+    RenameIncomplete,
 };
 
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
@@ -2585,7 +2587,7 @@ fn maybeResetSema(server: *Server) void {
 const sema_reset_keys = 200_000;
 
 /// 整代回收所清空的 query
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.ide_db.seed.Query, database.ide_db.seed.Instances };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;
@@ -3617,12 +3619,12 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 }
 
 /// 光标处的定义及其全部引用
-/// `ambiguous` 不为 null 时记录第一处有歧义的引用（见 `search.Options.ambiguous`）
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// `ambiguous`、`incomplete` 不为 null 时记录第一处有歧义、实例不完整的引用（见 `search.Options`）
+fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference, incomplete: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
     const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous });
+    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous, .incomplete = incomplete });
     return .{ .def = def, .refs = refs };
 }
 
@@ -3643,7 +3645,7 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null, null) orelse return null;
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs) |ref| {
@@ -3654,7 +3656,7 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null, null) orelse return null;
     const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
@@ -3693,10 +3695,12 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
     _ = try identifierText(arena, params.newName, false);
     var ambiguous: ?za.ide_db.search.Reference = null;
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous) orelse return null;
+    var incomplete: ?za.ide_db.search.Reference = null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous, &incomplete) orelse return null;
     if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
     // 不返回只改了一部分的结果
     if (ambiguous != null) return error.RenameAmbiguous;
+    if (incomplete != null) return error.RenameIncomplete;
     const is_field = switch (found.def) {
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         .local, .file => false,
@@ -3934,16 +3938,19 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
     const scope = try server.searchScope(r);
     var ambiguous: ?za.ide_db.search.Reference = null;
     var uncertain: ?za.ide_db.search.Reference = null;
+    var incomplete: ?za.ide_db.search.Reference = null;
     var syntax_error: ?Vfs.FileId = null;
     const refs = try za.ide_db.search.findReferences(r, def, .{
         .scope = scope,
         .ambiguous = &ambiguous,
         .uncertain = &uncertain,
+        .incomplete = &incomplete,
         .syntax_error = &syntax_error,
     });
     if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, f, file, null, "the file has syntax errors, so references in it may be missed") };
     if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, f, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
     if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
+    if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
     if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
     if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
     // 只有容器的成员能以字符串引用；不是 pub 的声明只能在所在的文件中访问
@@ -4189,6 +4196,7 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
         error.RenameAmbiguous => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function also refers to other declarations in some instantiations"),
+        error.RenameIncomplete => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function depends on instantiations that grow without bound, so not all of them can be checked"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }

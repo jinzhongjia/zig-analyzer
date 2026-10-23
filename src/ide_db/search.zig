@@ -58,6 +58,9 @@ pub const Options = struct {
     /// 不为 null 时记录第一个有语法错误、又出现了这个名字的文件：错误处的代码不一定降级为 HIR，其中的引用可能
     /// 找不到
     syntax_error: ?*?FileId = null,
+    /// 不为 null 时记录第一处要按调用点实例判断、而实例不完整（实例化无限增长而截断，见 `seed.AllInstances`）的
+    /// 成员访问：其他实例中可能是或不是引用
+    incomplete: ?*?Reference = null,
 };
 
 /// `def` 的全部引用（含定义处），按文件与位置排序
@@ -73,7 +76,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .file => unreachable,
     };
 
-    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain };
+    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
@@ -197,8 +200,9 @@ const Finder = struct {
     out: *std.ArrayList(Reference),
     ambiguous: ?*?Reference,
     uncertain: ?*?Reference,
+    incomplete: ?*?Reference,
     /// 最近一个成员的调用点实例（`instances`）
-    cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index } = null,
+    cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index, complete: bool } = null,
 
     /// 检查文件 `file` 中的成员 `item`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
@@ -277,11 +281,15 @@ const Finder = struct {
         const owner = try f.r.ownerKey(file, item_index);
         var hit = false;
         var miss = false;
-        for (try f.instances(file, item_index)) |inst| {
+        const all = try f.instances(file, item_index);
+        for (all.list) |inst| {
             const m = l.member(try f.r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .inst = inst })) orelse continue;
             const d = try keyDef(f.r, m) orelse continue;
             if (deepEql(d, f.def)) hit = true else miss = true;
         }
+        if (!all.complete) if (f.incomplete) |slot| if (slot.* == null) {
+            slot.* = at;
+        };
         if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
             a.* = at;
         };
@@ -299,11 +307,11 @@ const Finder = struct {
         if (i >= exprs.len or seed.wanted(f.r.ctx.db.env.ip, exprs[i])) slot.* = at;
     }
 
-    fn instances(f: *Finder, file: FileId, item_index: u32) resolve.Error![]const InternPool.Index {
-        if (f.cached) |c| if (c.file == file and c.item == item_index) return c.list;
-        const list = try seed.allInstances(f.r, file, item_index);
-        f.cached = .{ .file = file, .item = item_index, .list = list };
-        return list;
+    fn instances(f: *Finder, file: FileId, item_index: u32) resolve.Error!struct { list: []const InternPool.Index, complete: bool } {
+        if (f.cached) |c| if (c.file == file and c.item == item_index) return .{ .list = c.list, .complete = c.complete };
+        const all = try seed.allInstances(f.r, file, item_index);
+        f.cached = .{ .file = file, .item = item_index, .list = all.insts, .complete = all.complete };
+        return .{ .list = all.insts, .complete = all.complete };
     }
 
     fn add(f: *Finder, file: FileId, start: u32, end: u32) resolve.Error!void {

@@ -2684,7 +2684,8 @@ test "seed search skips callers whose calls resolve to other functions of the sa
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "print(\"{}\", .{").?)), chosen.offset);
     // 只有目标自身的查找：`seedFor` 依次请求 Query、Instances 与 allInstances
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Query));
-    try testing.expectEqual(@as(u64, 2), w.db.executions(seed.Instances));
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Instances));
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.AllInstances));
     // 改为调用目标后不再跳过：以 `format` 的调用点实例找到它对目标的调用
     const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "w.print(\"{}\");", "print(\"{}\", .{T});");
     _ = try w.add("/p/main.zig", calling);
@@ -3030,4 +3031,82 @@ test "builtin hover source gaps and argument names remain distinct" {
             try testing.expect(std.mem.indexOf(u8, info.text, "Inferred result:") == null);
         }
     }
+}
+
+/// `file` 中名为 `name` 的成员的全部实例（`seed.allInstances`）
+fn allInstancesOf(w: *World, file: FileId, name: []const u8) !struct { count: usize, complete: bool } {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, name)) break @intCast(i);
+    } else return error.NoItem;
+    const all = try seed.allInstances(&r, file, item);
+    return .{ .count = all.insts.len, .complete = all.complete };
+}
+
+test "all instances follow generic callers to a fixpoint without depth or count limits" {
+    // 防止按层数或个数截断：7 层泛型调用者之后的具体调用、互相递归的泛型函数、70 个不同的实例都要找到
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(testing.allocator,
+        \\fn leaf(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\fn l1(x: anytype) void { leaf(x); }
+        \\fn l2(x: anytype) void { l1(x); }
+        \\fn l3(x: anytype) void { l2(x); }
+        \\fn l4(x: anytype) void { l3(x); }
+        \\fn l5(x: anytype) void { l4(x); }
+        \\fn l6(x: anytype) void { l5(x); }
+        \\fn l7(x: anytype) void { l6(x); }
+        \\fn ping(comptime T: type, n: u32) void { if (n > 0) pong(T, n - 1); }
+        \\fn pong(comptime T: type, n: u32) void { if (n > 0) ping(T, n - 1); }
+        \\fn many(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\fn main() void {
+        \\    l7(@as(u8, 1));
+        \\    l7(@as(u16, 1));
+        \\    ping(u32, 3);
+        \\
+    );
+    defer text.deinit(testing.allocator);
+    for (1..71) |k| try text.print(testing.allocator, "    many(@as([{d}]u8, undefined));\n", .{k});
+    try text.appendSlice(testing.allocator, "}\n");
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text.items)).file;
+    const leaf = try allInstancesOf(&w, file, "leaf");
+    try testing.expectEqual(2, leaf.count);
+    try testing.expect(leaf.complete);
+    const pong = try allInstancesOf(&w, file, "pong");
+    try testing.expectEqual(1, pong.count);
+    try testing.expect(pong.complete);
+    const many = try allInstancesOf(&w, file, "many");
+    try testing.expectEqual(70, many.count);
+    try testing.expect(many.complete);
+}
+
+test "all instances of unboundedly growing instantiations are reported incomplete" {
+    // 防止截断的实例被当作全部：`grow(T)` 调用 `other(?T)`，`other(T)` 又调用 `grow(T)`，实例无限增长
+    const text =
+        \\fn grow(comptime T: type) void {
+        \\    other(?T);
+        \\}
+        \\fn other(comptime T: type) void {
+        \\    grow(T);
+        \\}
+        \\fn main() void {
+        \\    grow(u8);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const grow = try allInstancesOf(&w, file, "grow");
+    try testing.expect(!grow.complete);
 }
