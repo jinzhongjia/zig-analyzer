@@ -62,6 +62,7 @@ pub const Db = engine.Engine(*const Env, &.{
     ide_db.seed.Query,
     ide_db.seed.Instances,
     ide_db.seed.Candidates,
+    ide_db.seed.Callers,
     @import("ide_db/search.zig").ProjectImporters,
     ide.naming.Query,
 });

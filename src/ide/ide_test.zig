@@ -2692,6 +2692,54 @@ test "seed search skips callers whose calls resolve to other functions of the sa
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{T})").?)), moved.offset);
 }
 
+test "seed callers are listed once per file and shared by every depth" {
+    const text =
+        \\pub fn print(comptime fmt: []const u8, args: anytype) void {
+        \\    _ = fmt;
+        \\    _ = args;
+        \\}
+        \\fn helper() void {}
+        \\const alias = print;
+        \\fn useAlias() void {
+        \\    alias("{}", .{@as(u16, 1)});
+        \\}
+        \\fn main() void {
+        \\    print("{}", .{@as(u8, 1)});
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const chosen = (try seedFor(&w, file, "print")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "alias(\"{}\"").?)), chosen.offset);
+    try expectCallers(&w, file, "print", &.{ "alias", "useAlias", "main" });
+    // `seedFor` 依次请求各层的 Query 与 Instances：调用者列表只计算一次
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Callers));
+
+    // 新的调用者排在前面时被选中
+    const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "fn helper() void {}", "fn helper() void {\n    print(\"{}\", .{@as(u32, 1)});\n}");
+    _ = try w.add("/p/main.zig", calling);
+    const moved = (try seedFor(&w, file, "print")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{@as(u32").?)), moved.offset);
+    try expectCallers(&w, file, "print", &.{ "helper", "alias", "useAlias", "main" });
+}
+
+/// `file` 中名为 `name` 的泛型函数在 `file` 中的调用者（`seed.Callers`）依次为 `expected`
+fn expectCallers(w: *World, file: FileId, name: []const u8, expected: []const []const u8) !void {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, name)) break @intCast(i);
+    } else return error.NoItem;
+    const callers = try ctx.get(seed.Callers, .{ .root = try r.ownerKey(file, item), .in = file });
+    try testing.expectEqual(expected.len, callers.len);
+    for (callers, expected) |i, n| try testing.expectEqualStrings(n, tree.items[i].name.?);
+}
+
 test "seed selection invalidates for arguments caller bodies signatures aliases and new candidates" {
     const decls =
         \\fn leaf(x: anytype) @TypeOf(x) { return x; }
