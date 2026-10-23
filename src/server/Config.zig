@@ -9,6 +9,7 @@
 //!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
 //!       "sema": { "callsite_seeding": true },
 //!       "workspace_symbol": { "dependencies": false },
+//!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
@@ -52,6 +53,15 @@ callsite_seeding: bool = true,
 max_intern_pool_mb: u32 = 64,
 /// workspace symbol 是否也列出依赖库（获取的依赖包、生成文件、打开的标准库文件）中的符号
 workspace_symbol_dependencies: bool = false,
+/// 命名检查（Zig 风格指南的 Names 一节）：是否为打开的文件提示不符合命名约定的名字，并提供改名的修复
+naming_enable: bool = false,
+/// 命名检查跳过的名字；`*` 匹配任意字符序列（`SDL_*`）
+naming_ignore: []const []const u8 = &.{},
+/// 命名检查跳过的文件：相对工作区根目录（`zig-analyzer.json` 中为相对项目根目录）、以 `/` 分隔的路径；
+/// `*` 匹配任意字符序列（含 `/`）
+naming_exclude: []const []const u8 = &.{},
+/// 命名检查的各条规则是否启用
+naming_rules: NamingRules = .{},
 /// 磁盘上的外部改动由谁发现（见 `Watcher`）
 files_watcher: Watcher = .auto,
 /// 日志级别（err / warn / info / debug）
@@ -75,6 +85,22 @@ pub const Watcher = enum {
     server,
 };
 
+/// 命名检查的规则，与诊断的 code `naming.<规则>` 一一对应
+pub const NamingRules = struct {
+    /// 类型与类型别名：TitleCase
+    type: bool = true,
+    /// 返回 `type` 的可调用对象：TitleCase
+    type_function: bool = true,
+    /// 其他可调用对象（函数、函数别名、函数指针）：camelCase
+    function: bool = true,
+    /// 命名空间（没有顶层字段的文件）：snake_case
+    namespace: bool = true,
+    /// 其他值：snake_case
+    value: bool = true,
+    /// 字段与枚举成员（写法按字段的类型）
+    field: bool = true,
+};
+
 /// 项目配置文件的文件名（位于项目根目录）
 pub const project_file = "zig-analyzer.json";
 
@@ -96,6 +122,10 @@ const settings = [_]Setting{
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "workspace_symbol", .key = "dependencies", .field = "workspace_symbol_dependencies" },
+    .{ .section = "naming", .key = "enable", .field = "naming_enable" },
+    .{ .section = "naming", .key = "ignore", .field = "naming_ignore" },
+    .{ .section = "naming", .key = "exclude", .field = "naming_exclude" },
+    .{ .section = "naming", .key = "rules", .field = "naming_rules" },
     .{ .section = "files", .key = "watcher", .field = "files_watcher" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },
@@ -103,7 +133,10 @@ const settings = [_]Setting{
 };
 
 /// 可以在项目配置文件中设置的项
-const project_settings = [_][]const u8{ "build_args", "diagnostics_step", "diagnostics_steps", "compiler_diagnostics" };
+const project_settings = [_][]const u8{
+    "build_args",    "diagnostics_step", "diagnostics_steps", "compiler_diagnostics",
+    "naming_enable", "naming_ignore",    "naming_exclude",    "naming_rules",
+};
 
 fn isProjectSetting(comptime field: []const u8) bool {
     for (project_settings) |f| if (std.mem.eql(u8, f, field)) return true;
@@ -213,6 +246,12 @@ fn dupeValue(a: Allocator, v: anytype) Allocator.Error!@TypeOf(v) {
     };
 }
 
+/// 字段 `field` 对应的项是否出现在配置中（且类型正确）
+pub fn isSet(c: *const Config, comptime field: []const u8) bool {
+    inline for (settings, 0..) |s, si| if (comptime std.mem.eql(u8, s.field, field)) return c.present.isSet(si);
+    @compileError("no setting for field " ++ field);
+}
+
 /// 深拷贝（不含 `warnings`）
 pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -244,6 +283,12 @@ pub fn sameBuild(a: *const Config, b: *const Config) bool {
 
 pub fn sameZig(a: *const Config, b: *const Config) bool {
     return eqlOptional(a.zig_path, b.zig_path);
+}
+
+/// 命名检查的配置是否相同（不同时重新发布打开的文件）
+pub fn sameNaming(a: *const Config, b: *const Config) bool {
+    return a.naming_enable == b.naming_enable and std.meta.eql(a.naming_rules, b.naming_rules) and
+        eqlList(a.naming_ignore, b.naming_ignore) and eqlList(a.naming_exclude, b.naming_exclude);
 }
 
 fn eqlOptional(a: ?[]const u8, b: ?[]const u8) bool {
@@ -356,4 +401,38 @@ test "project file: the parsed config owns the memory of its warnings" {
     defer project.deinit(gpa);
     try testing.expectEqual(2, project.warnings.len);
     try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.json", project.warnings[0]);
+}
+
+test "naming settings: client and project file" {
+    var empty = try parseText("{}");
+    defer empty.deinit(testing.allocator);
+    try testing.expect(!empty.naming_enable and empty.naming_rules.field and empty.naming_ignore.len == 0);
+
+    var client = try parseText(
+        \\{"naming": {"enable": true, "ignore": ["SDL_*"], "rules": {"field": false}}}
+    );
+    defer client.deinit(testing.allocator);
+    try testing.expectEqual(0, client.warnings.len);
+    try testing.expect(client.naming_enable and !client.naming_rules.field and client.naming_rules.value);
+    try testing.expectEqualStrings("SDL_*", client.naming_ignore[0]);
+    try testing.expect(!client.sameNaming(&empty));
+
+    // 未知的规则：整项取默认值
+    var unknown = try parseText(
+        \\{"naming": {"rules": {"constants": false}}}
+    );
+    defer unknown.deinit(testing.allocator);
+    try testing.expectEqualStrings("invalid value for `naming.rules`, using the default", unknown.warnings[0]);
+    try testing.expect(unknown.naming_rules.value);
+
+    // 项目中的命名约定覆盖客户端的
+    var project = try parseProject(testing.allocator,
+        \\{"naming": {"exclude": ["src/c/*"], "rules": {"value": false}}}
+    );
+    defer project.deinit(testing.allocator);
+    try testing.expectEqual(0, project.warnings.len);
+    try client.overlayProject(testing.allocator, &project);
+    try testing.expect(client.naming_enable and client.naming_rules.field and !client.naming_rules.value);
+    try testing.expectEqualStrings("src/c/*", client.naming_exclude[0]);
+    try testing.expectEqualStrings("SDL_*", client.naming_ignore[0]);
 }
