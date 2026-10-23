@@ -8,6 +8,10 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const ast = @import("../syntax/ast.zig");
 
+/// 符号嵌套的最大层数，更深的容器不列出。每层符号在 JSON 中嵌套两层（符号与 `children`），而
+/// `std.json.Stringify` 在带安全检查的构建中嵌套超过 256 层时 panic
+pub const max_levels = 100;
+
 pub fn documentSymbols(
     arena: Allocator,
     items: *const ItemTree,
@@ -16,7 +20,7 @@ pub fn documentSymbols(
     enc: offsets.Encoding,
 ) Allocator.Error![]const types.DocumentSymbol {
     var b: Builder = .{ .arena = arena, .items = items, .map = map, .lines = lines, .enc = enc };
-    return b.container(0);
+    return b.container(0, 1);
 }
 
 const Builder = struct {
@@ -26,7 +30,8 @@ const Builder = struct {
     lines: offsets.LineIndex,
     enc: offsets.Encoding,
 
-    fn container(b: *Builder, index: u32) Allocator.Error![]const types.DocumentSymbol {
+    /// `level` 为成员所在的层（顶层为 1）
+    fn container(b: *Builder, index: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
         const kind = b.items.containers[index].kind;
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
         for (b.items.containerMembers(index)) |i| {
@@ -34,7 +39,7 @@ const Builder = struct {
             if (item.kind == .@"comptime") continue;
             const node = b.map.get(item.ast_id) orelse continue;
             const name_tok = ast.memberName(node, ItemTree.bareFieldNames(kind));
-            const children = try b.childrenOf(i);
+            const children = if (level < max_levels) try b.childrenOf(i, level + 1) else &.{};
             const r = node.range();
             const sel = if (name_tok) |t| t.range() else r;
             try out.append(b.arena, .{
@@ -49,10 +54,10 @@ const Builder = struct {
     }
 
     /// 成员内部定义的容器（如 `const S = struct {...}` 的字段）作为该成员的子符号
-    fn childrenOf(b: *Builder, item: u32) Allocator.Error![]const types.DocumentSymbol {
+    fn childrenOf(b: *Builder, item: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
         for (b.items.containers, 0..) |c, ci| {
-            if (c.parent_item == item) try out.appendSlice(b.arena, try b.container(@intCast(ci)));
+            if (c.parent_item == item) try out.appendSlice(b.arena, try b.container(@intCast(ci), level));
         }
         return out.items;
     }
@@ -119,4 +124,28 @@ test documentSymbols {
     // selectionRange 指向名字
     try testing.expectEqual(types.Position{ .line = 0, .character = 6 }, syms[0].selectionRange.start);
     try testing.expectEqual(types.Position{ .line = 3, .character = 2 }, syms[0].range.end);
+}
+
+test "document symbols stop at the nesting limit" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "const S = struct {\n");
+    for (0..150) |_| try text.appendSlice(testing.allocator, "a: struct {\n");
+    for (0..150) |_| try text.appendSlice(testing.allocator, "},\n");
+    try text.appendSlice(testing.allocator, "};\n");
+    const parse = try Parse.create(testing.allocator, text.items);
+    defer parse.destroy();
+    var items = try ItemTree.build(testing.allocator, parse.rootNode());
+    defer items.deinit(testing.allocator);
+    var map = try ItemTree.AstIdMap.build(testing.allocator, &items, parse.rootNode());
+    defer map.deinit(testing.allocator);
+    var lines = try offsets.LineIndex.init(testing.allocator, text.items);
+    defer lines.deinit(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var syms = try documentSymbols(arena.allocator(), &items, &map, lines, .utf16);
+    var levels: usize = 0;
+    while (syms.len > 0) : (syms = syms[0].children orelse &.{}) levels += 1;
+    try testing.expectEqual(max_levels, levels);
 }

@@ -52,9 +52,6 @@ pub const Options = struct {
     /// 不为 null 时记录第一处有歧义的引用：泛型函数体内的成员访问，在一些调用点实例下指向 `def`，
     /// 另一些指向其他定义（重命名会破坏其他实例，应拒绝）
     ambiguous: ?*?Reference = null,
-    /// 不为 null 时，名字出现在所查找的文件中嵌套超过上限、没有分析的代码里（`FileIndex.unanalyzed`）则置为
-    /// true：那里可能有无法确认的引用（重命名会漏改，应拒绝）
-    unanalyzed: ?*bool = null,
     /// 不为 null 时记录第一处无法确认的同名成员访问（字段访问、枚举字面量、初始化的字段）：左侧或期望的类型未知
     /// 或是抽象的，任何调用点实例下也求不出成员，可能是引用
     uncertain: ?*?Reference = null,
@@ -80,9 +77,6 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
-            if (opts.unanalyzed) |u| if ((try r.ctx.get(FileIndex.Query, l.file)).containsUnanalyzed(name)) {
-                u.* = true;
-            };
             try noteSyntaxError(r, opts.syntax_error, l.file);
             // 局部名字：所在成员及其体内定义的容器中的成员
             const tree = try r.itemTree(l.file);
@@ -95,9 +89,6 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
             for (files) |f| {
                 const index = try r.ctx.get(FileIndex.Query, f);
                 if (!index.contains(name)) continue;
-                if (opts.unanalyzed) |u| if (index.containsUnanalyzed(name)) {
-                    u.* = true;
-                };
                 try noteSyntaxError(r, opts.syntax_error, f);
                 const tree = try r.itemTree(f);
                 for (0..tree.items.len) |i| try finder.item(f, @intCast(i));

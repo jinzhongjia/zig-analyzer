@@ -233,8 +233,6 @@ pub const HandlerError = error{
     InvalidIdentifier,
     /// 泛型函数体内的引用在一些实例下指向其他定义：重命名会破坏这些实例
     RenameAmbiguous,
-    /// 名字出现在嵌套超过上限、没有分析的代码中：那里的引用无法确认，重命名会漏改
-    RenameUnanalyzed,
 };
 
 /// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
@@ -3616,13 +3614,12 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 }
 
 /// 光标处的定义及其全部引用
-/// `ambiguous` 不为 null 时记录第一处有歧义的引用（见 `search.Options.ambiguous`），`unanalyzed` 同理
-/// （见 `search.Options.unanalyzed`）
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference, unanalyzed: ?*bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// `ambiguous` 不为 null 时记录第一处有歧义的引用（见 `search.Options.ambiguous`）
+fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
     const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous, .unanalyzed = unanalyzed });
+    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous });
     return .{ .def = def, .refs = refs };
 }
 
@@ -3643,7 +3640,7 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null, null) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null) orelse return null;
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs) |ref| {
@@ -3654,7 +3651,7 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null, null) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null) orelse return null;
     const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
@@ -3693,12 +3690,10 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
     _ = try identifierText(arena, params.newName, false);
     var ambiguous: ?za.ide_db.search.Reference = null;
-    var unanalyzed = false;
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous, &unanalyzed) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous) orelse return null;
     if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
     // 不返回只改了一部分的结果
     if (ambiguous != null) return error.RenameAmbiguous;
-    if (unanalyzed) return error.RenameUnanalyzed;
     const is_field = switch (found.def) {
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         .local, .file => false,
@@ -3923,8 +3918,8 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return .{ .ok = action };
 }
 
-/// 把不符合命名约定的名字改为建议的写法。只返回完整而安全的编辑：引用有无法确认之处（歧义、未分析的代码、
-/// 类型未知的成员访问、有语法错误的文件），新名字与已有的名字冲突，或者名字以字符串出现（反射）时都不改
+/// 把不符合命名约定的名字改为建议的写法。只返回完整而安全的编辑：引用有无法确认之处（歧义、类型未知的成员访问、
+/// 有语法错误的文件），新名字与已有的名字冲突，或者名字以字符串出现（反射）时都不改
 fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
     const def = f.def;
     const def_file = switch (def) {
@@ -3935,18 +3930,15 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
     if (!try server.renamable(r, def)) return .{ .failed = "cannot rename a symbol defined outside the workspace" };
     const scope = try server.searchScope(r);
     var ambiguous: ?za.ide_db.search.Reference = null;
-    var unanalyzed = false;
     var uncertain: ?za.ide_db.search.Reference = null;
     var syntax_error: ?Vfs.FileId = null;
     const refs = try za.ide_db.search.findReferences(r, def, .{
         .scope = scope,
         .ambiguous = &ambiguous,
-        .unanalyzed = &unanalyzed,
         .uncertain = &uncertain,
         .syntax_error = &syntax_error,
     });
     if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, f, file, null, "the file has syntax errors, so references in it may be missed") };
-    if (unanalyzed) return .{ .failed = try server.renameProblem(r, arena, f, def_file, null, "the name appears in code nested too deeply to be analyzed, where references cannot be found") };
     if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, f, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
     if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
     if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
@@ -4195,7 +4187,6 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
         error.RenameAmbiguous => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function also refers to other declarations in some instantiations"),
-        error.RenameUnanalyzed => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: the name appears in code nested too deeply to be analyzed, where references cannot be found"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
