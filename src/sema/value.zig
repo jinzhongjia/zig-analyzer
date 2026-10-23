@@ -584,7 +584,8 @@ pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
             else => false,
         },
         .fn_type => true,
-        .ptr_type => |p| isComptimeOnly(ip, p.child),
+        // 函数指针是运行时的值；指向其他 comptime-only 类型的指针才是
+        .ptr_type => |p| ip.key(p.child) != .fn_type and isComptimeOnly(ip, p.child),
         .array_type => |a| isComptimeOnly(ip, a.child),
         .abstract_array_type => |a| isComptimeOnly(ip, a.child),
         .optional_type => |c| isComptimeOnly(ip, c),

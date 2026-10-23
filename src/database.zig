@@ -55,6 +55,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.LocalValue,
     sema.DeclType,
     sema.CallEval,
+    sema.ComptimeOnly,
     sema.ErrorSetOf,
     sema.InactiveRanges,
     FileIndex.Query,

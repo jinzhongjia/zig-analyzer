@@ -2923,3 +2923,55 @@ test "comptime evaluation: self-referential and deeply nested values are unknown
         .{ "long", "Node" },
     });
 }
+
+test "calls returning types with comptime-only fields nested at any depth are evaluated at comptime" {
+    // 防止只检查两层嵌套：第三层的 `type` 字段同样使返回类型成为 comptime-only
+    try expectTypes(
+        \\const Inner = struct { t: type };
+        \\const Mid = struct { b: Inner };
+        \\const Outer = struct { a: Mid };
+        \\fn make(comptime X: type) Outer {
+        \\    return .{ .a = .{ .b = .{ .t = X } } };
+        \\}
+        \\const Node = struct { next: ?*const Node, t: type };
+        \\fn list(comptime X: type) []const Node {
+        \\    return &.{.{ .next = null, .t = X }};
+        \\}
+        \\fn f() void {
+        \\    const r = make(u16);
+        \\    const deep = r.a.b.t;
+        \\    const l = list(u32);
+        \\    const first = l[0].t;
+        \\    _ = .{ deep, first };
+        \\}
+    , &.{
+        .{ "deep", "type = u16" },
+        .{ "first", "type = u32" },
+    });
+}
+
+test "function pointers are runtime values, not comptime-only" {
+    // 防止把函数指针当作 comptime-only：含有函数指针字段的结构体（如 `std.mem.Allocator` 的 vtable）
+    // 不是 comptime-only，返回它的调用不在 comptime 求值，接收函数指针的函数也不是泛型函数
+    try expectTypes(
+        \\fn hello() void {}
+        \\const VTable = struct { call: *const fn () void };
+        \\const Iface = struct { vtable: *const VTable };
+        \\const Outer = struct { iface: Iface };
+        \\fn make() Outer {
+        \\    return .{ .iface = .{ .vtable = &.{ .call = &hello } } };
+        \\}
+        \\fn apply(cb: *const fn () void) u8 {
+        \\    cb();
+        \\    return 1;
+        \\}
+        \\fn f() void {
+        \\    const o = make();
+        \\    const n = apply(&hello);
+        \\    _ = .{ o, n };
+        \\}
+    , &.{
+        .{ "o", "Outer" },
+        .{ "n", "u8" },
+    });
+}

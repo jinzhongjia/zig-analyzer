@@ -368,22 +368,51 @@ fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
 /// 只能在 comptime 存在的类型，包括字段为这类类型的结构体与 union（如 `std.builtin.Type`、
 /// `std.meta.fieldInfo` 的结果）：返回它的调用在 comptime 执行
 pub fn isComptimeOnly(r: *Resolver, t: Index) Error!bool {
-    return comptimeOnly(r, t, 0);
+    return r.ctx.get(queries.ComptimeOnly, t);
 }
 
-fn comptimeOnly(r: *Resolver, t: Index, depth: u32) Error!bool {
+/// `ComptimeOnly` 的计算：结构体与 union 的字段（不含 comptime 字段），以及指针（函数指针除外）、数组、可选、
+/// 错误联合、元组中的类型，任一是 comptime-only 即是
+pub fn computeComptimeOnly(r: *Resolver, t: Index) Error!bool {
     const ip = r.ctx.db.env.ip;
     if (value.isComptimeOnly(ip, t)) return true;
-    // 嵌套的容器只看两层，避免递归类型
-    if (depth >= 2) return false;
     switch (ip.key(t)) {
-        .container_type => |c| if (c.kind == .@"struct" or c.kind == .@"union") {
-            var ev: Evaluator = .{ .r = r, .ip = ip, .a = r.arena };
-            for (try ev.fieldsOf(t) orelse return false) |f| if (try comptimeOnly(r, f.ty, depth + 1)) return true;
+        .container_type => |c| {
+            if (c.kind != .@"struct" and c.kind != .@"union") return false;
+            const ns = try queries.namespaceOfType(r, t) orelse return false;
+            const tree = try r.itemTree(ns.file);
+            for (tree.containerMembers(ns.container)) |m| {
+                const it = tree.items[m];
+                if (it.kind != .field or it.flags.is_comptime) continue;
+                const ty = (try queries.defType(r, .{ .item = .{ .file = ns.file, .item = m } }, null, c.inst)).ty;
+                if (try isComptimeOnly(r, ty)) return true;
+            }
+            return false;
         },
-        .optional_type => |c| return comptimeOnly(r, c, depth + 1),
-        .error_union_type => |e| return comptimeOnly(r, e.payload, depth + 1),
-        else => {},
+        .ptr_type => |p| return ip.key(p.child) != .fn_type and try isComptimeOnly(r, p.child),
+        .array_type => |a| return isComptimeOnly(r, a.child),
+        .abstract_array_type => |a| return isComptimeOnly(r, a.child),
+        .optional_type => |c| return isComptimeOnly(r, c),
+        .error_union_type => |e| return isComptimeOnly(r, e.payload),
+        .tuple_type => |tt| return anyRuntimeFieldComptimeOnly(r, tt.types, tt.values),
+        .anon_struct_type => |as| return anyRuntimeFieldComptimeOnly(r, as.types, as.values),
+        .reified_type => |rt| {
+            if (rt.kind == .@"enum") return false;
+            for (rt.types, 0..) |field_ty, i| {
+                if (i < rt.comptime_fields.len and rt.comptime_fields[i]) continue;
+                if (try isComptimeOnly(r, field_ty)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// 元组与匿名结构体中值不是 comptime 已知的字段（comptime 字段不使类型成为 comptime-only）
+fn anyRuntimeFieldComptimeOnly(r: *Resolver, types: []const Index, values: []const Index) Error!bool {
+    for (types, 0..) |t, i| {
+        const v = InternPool.fieldValue(values, i);
+        if ((v == .runtime or v == .unknown) and try isComptimeOnly(r, t)) return true;
     }
     return false;
 }
