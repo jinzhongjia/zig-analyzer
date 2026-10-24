@@ -3166,3 +3166,64 @@ test "all instances include anytype calls in files that do not import the method
     try testing.expectEqual(1, all.count);
     try testing.expect(all.complete);
 }
+
+test "callsite seeding uses an iteration of a loop over a comptime list of values" {
+    // 循环变量有类型但没有值（遍历的是 comptime 已知的值列表）：曾求不出 `PT` 的实例
+    const labels = try completionLabels(
+        \\const Help = struct {
+        \\    v: []const u8,
+        \\    pub fn value(h: Help) []const u8 {
+        \\        return h.v;
+        \\    }
+        \\};
+        \\fn Param(comptime Id: type) type {
+        \\    return struct { id: Id, takes: enum { none, one } };
+        \\}
+        \\fn PT(comptime Id: type, comptime param: Param(Id)) type {
+        \\    return switch (param.takes) {
+        \\        .none => void,
+        \\        .one => @TypeOf(param.id.<|>),
+        \\    };
+        \\}
+        \\fn Args(comptime Id: type, comptime params: []const Param(Id)) type {
+        \\    var t: type = void;
+        \\    for (params) |param| t = PT(Id, param);
+        \\    return t;
+        \\}
+        \\const ps = [_]Param(Help){ .{ .id = .{ .v = "a" }, .takes = .none }, .{ .id = .{ .v = "b" }, .takes = .one } };
+        \\const A = Args(Help, &ps);
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("v value", labels);
+}
+
+test "an iteration that leaves the loop before a declaration is not used for it" {
+    // 第 1 次迭代在 `.none => continue` 处离开循环：曾取这次迭代，`F` 显示为 noreturn
+    const text =
+        \\const P = struct { kind: enum { none, one }, T: type };
+        \\fn Make(comptime ps: []const P) type {
+        \\    var t: type = void;
+        \\    for (ps) |p| {
+        \\        const F = switch (p.kind) {
+        \\            .none => continue,
+        \\            .one => p.T,
+        \\        };
+        \\        t = F;
+        \\    }
+        \\    return t;
+        \\}
+        \\const ps = [_]P{ .{ .kind = .none, .T = u16 }, .{ .kind = .one, .T = u8 } };
+        \\const M = Make(&ps);
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "F =").?))) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
+}

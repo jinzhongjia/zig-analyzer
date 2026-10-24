@@ -191,8 +191,9 @@ pub const Refiner = struct {
 };
 
 /// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数：遍历 comptime 已知的类型列表
-/// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），或遍历各项类型不同的元组（`inline for
-/// (.{ &posix, &windows }) |cases|`；循环变量的类型求不出）
+/// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），遍历 comptime 已知的值列表
+/// （循环变量有类型但没有值），或遍历各项类型不同的元组（`inline for (.{ &posix, &windows }) |cases|`；
+/// 循环变量的类型求不出）
 fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) resolve.Error!?u32 {
     if (k >= l.inputs.len or k >= l.capture.len) return null;
     const ip = r.ctx.db.env.ip;
@@ -200,11 +201,12 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
     if (@backingInt(cap) >= res.bindings.len or @backingInt(l.inputs[k]) >= res.exprs.len) return null;
     const list = res.exprs[@backingInt(l.inputs[k])];
     const binding = res.bindings[@backingInt(cap)];
-    if (binding.val) |v| if (ip.key(v) == .opaque_param) {
+    const by_value = if (binding.val) |v| ip.key(v) == .opaque_param else binding.ty != .unknown and list.val != null;
+    if (by_value) {
         var n: u32 = 0;
         while (try eval.elemValue(r, list, n) != null) n += 1;
         return if (n > 0) n else null;
-    };
+    }
     if (binding.ty != .unknown) return null;
     const tt = infer.tupleOf(ip, list.ty) orelse return null;
     if (tt.types.len == 0) return null;
@@ -256,7 +258,8 @@ fn fits(ip: *InternPool, body: *const Body, res: *const infer.Result, rel: u32, 
         .expr => |e| if (@backingInt(e) < res.exprs.len) res.exprs[@backingInt(e)] else return false,
         .binding => |b| if (@backingInt(b) < res.bindings.len) res.bindings[@backingInt(b)] else return false,
     };
-    return !wanted(ip, tv) and tv.ty != .enum_literal_type;
+    // 类型为 noreturn：这个实例或这次迭代执行不到此处之后（如 `const T = switch (x) { .none => continue, ... }`）
+    return !wanted(ip, tv) and tv.ty != .enum_literal_type and tv.ty != .noreturn_type;
 }
 
 /// 相对位置 `rel` 落在推导结果的非活动分支中。分支的末尾也算在内：补全的位置常在刚输入的 `a.` 之后，
