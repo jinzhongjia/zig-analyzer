@@ -3300,3 +3300,27 @@ test "an iteration that leaves the loop before a declaration is not used for it"
     const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "F =").?))) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
 }
+
+test "try on a call whose error set depends on an abstract parameter gives the payload type" {
+    // 错误集 `B.Error` 求不出时整个 `Error!Event` 曾为 unknown，`try` 的结果没有类型
+    const labels = try completionLabels(
+        \\const Event = struct { kind: u8 };
+        \\fn Cursor(comptime B: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        const Error = B.Error;
+        \\        fn peek(self: *Self) Error!Event {
+        \\            _ = self;
+        \\            return .{ .kind = 0 };
+        \\        }
+        \\        fn f(self: *Self) Error!void {
+        \\            const event = try self.peek();
+        \\            _ = event.<|>;
+        \\        }
+        \\    };
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("kind", labels);
+}

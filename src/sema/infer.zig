@@ -764,7 +764,8 @@ const Inferrer = struct {
             .error_union_type => |eu| {
                 const err = (try inf.infer(eu.err, null)).asType() orelse .unknown;
                 const payload = (try inf.infer(eu.payload, null)).asType() orelse .unknown;
-                if (err == .unknown or payload == .unknown) return typeUnknown();
+                // 错误集求不出（抽象参数的 `B.Error`）时保留载荷类型：`try` 的结果仍可确定
+                if (payload == .unknown) return typeUnknown();
                 return TypedValue.ofType(try ip.get(.{ .error_union_type = .{ .err = err, .payload = payload } }));
             },
             .ptr_type => |p| {
