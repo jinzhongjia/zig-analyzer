@@ -850,3 +850,34 @@ test "auto imports follow namespaces chosen by comptime conditions" {
     // 没有选中的分支中的声明不可达
     try testing.expect(find(try run(&w, at.file, at.offset, "epoll", 128), "epoll_create") == null);
 }
+
+test "files used only by tests are imported only from test code" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const lib = @import("lib.zig");
+        \\const Harness = @import("harness.zig").Harness;
+        \\fn check(h: Harness) void { _ = h; }
+        \\pub fn main() void { lib.run(); _ = <|>missing; }
+        \\test { _ = @import("main_test.zig"); check(.{}); _ = missing2; }
+        \\//- /p/lib.zig in:app
+        \\pub fn run() void {}
+        \\pub const Widget = struct {};
+        \\//- /p/main_test.zig in:app
+        \\pub const Fixture = struct {};
+        \\//- /p/harness.zig in:app
+        \\pub const Harness = struct {};
+    );
+    const at = f.cursor.?;
+    try testing.expect(find(try run(&w, at.file, at.offset, "Widg", 128), "lib.Widget") != null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "Fixt", 128), "Fixture") == null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "main_t", 128), "main_test") == null);
+    // `harness.zig` 只经由只被 test 用到的 `check` 引用
+    try testing.expect(find(try run(&w, at.file, at.offset, "harn", 128), "harness") == null);
+    // test 声明中仍然提供
+    const in_test = at.offset + @as(u32, "missing; }\ntest { _ = @import(\"main_test.zig\"); check(.{}); _ = missing2".len);
+    try testing.expect(find(try run(&w, at.file, in_test, "Fixt", 128), "Fixture") != null);
+    try testing.expect(find(try run(&w, at.file, in_test, "harn", 128), "harness") != null);
+}

@@ -572,6 +572,197 @@ pub const FileLinks = struct {
     }
 };
 
+// ── 只被测试用到的文件 ─────────────────────────────────────────────
+
+/// 文件中按路径的 `@import("x.zig")` 及其是否只用于测试：位于 test 声明中，或位于只被测试用到的非 pub
+/// 顶层声明中。非 pub 顶层声明不被正式代码引用、而被 test 声明（直接或经由同样只被测试用到的声明）引用时
+/// 只被测试用到（如
+/// `const World = @import("x_test.zig").World;` 只在 test 与 test 调用的辅助函数中使用：按需分析的编译器只在
+/// 测试中编译它）。只依赖本文件的语法树
+pub const ImportSites = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = struct {
+        arena: std.heap.ArenaAllocator.State,
+        specs: []const []const u8 = &.{},
+        in_test: []const bool = &.{},
+    };
+
+    const Site = struct { spec: []const u8, in_test: bool, decl: ?u32 };
+    /// 顶层声明：名字（test 与无名的为 null）、是否为 pub、其中引用的名字
+    const TopDecl = struct { name: ?[]const u8, is_pub: bool, is_test: bool, refs: std.ArrayList([]const u8) = .empty };
+
+    pub fn compute(ctx: *database.Db.Ctx, file: Key) engine.Error!Value {
+        const gpa = ctx.db.gpa;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        if (!isZigSource(ctx.db.env.vfs.path(file))) return .{ .arena = arena.state };
+        const a = arena.allocator();
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const temp = scratch.allocator();
+        var sites: std.ArrayList(Site) = .empty;
+        var decls: std.ArrayList(TopDecl) = .empty;
+        const root = (try ctx.get(database.syntax.ParseFile, file)).rootNode();
+        var top = root.children();
+        while (top.nextNode()) |node| {
+            const index: u32 = @intCast(decls.items.len);
+            try decls.append(temp, try topDecl(temp, node));
+            try collect(a, temp, node, index, &decls.items[index], &sites);
+        }
+        // 正式代码：pub 声明与其他非 test 的顶层内容，以及被它们引用的非 pub 声明（按名字传递）
+        const live = try temp.alloc(bool, decls.items.len);
+        for (decls.items, live) |d, *l| l.* = !d.is_test and (d.is_pub or d.name == null);
+        try propagate(decls.items, live, null);
+        // 测试代码：test 声明，以及被它们引用的其余非 pub 声明（按名字传递）。两者都不引用的是死代码，按正式代码
+        const tested = try temp.alloc(bool, decls.items.len);
+        for (decls.items, tested) |d, *t| t.* = d.is_test;
+        try propagate(decls.items, tested, live);
+        const specs = try a.alloc([]const u8, sites.items.len);
+        const in_test = try a.alloc(bool, sites.items.len);
+        for (sites.items, specs, in_test) |site, *spec, *flag| {
+            spec.* = site.spec;
+            flag.* = site.in_test or (if (site.decl) |d| !live[d] and tested[d] else false);
+        }
+        return .{ .arena = arena.state, .specs = specs, .in_test = in_test };
+    }
+
+    /// `marked` 中的声明引用的其他声明（按名字）也标记，直到不再变化；`except` 中已标记的不再标记
+    fn propagate(decls: []const TopDecl, marked: []bool, except: ?[]const bool) Allocator.Error!void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (decls, 0..) |d, i| {
+                if (!marked[i]) continue;
+                for (d.refs.items) |ref| for (decls, 0..) |other, j| {
+                    if (marked[j] or other.is_test) continue;
+                    if (except) |e| if (e[j]) continue;
+                    const name = other.name orelse continue;
+                    if (!std.mem.eql(u8, name, ref)) continue;
+                    marked[j] = true;
+                    changed = true;
+                };
+            }
+        }
+    }
+
+    fn topDecl(temp: Allocator, node: ast.SyntaxNode) Allocator.Error!TopDecl {
+        const is_pub = node.childToken(.keyword_pub) != null;
+        switch (node.kind()) {
+            .test_decl => return .{ .name = null, .is_pub = false, .is_test = true },
+            .var_decl => if ((ast.VarDecl{ .syntax = node }).name()) |t| return .{ .name = try ast.identNameAlloc(temp, t.text), .is_pub = is_pub, .is_test = false },
+            .fn_decl => if ((ast.FnDecl{ .syntax = node }).proto()) |proto| if (proto.name()) |t| return .{ .name = try ast.identNameAlloc(temp, t.text), .is_pub = is_pub, .is_test = false },
+            else => {},
+        }
+        return .{ .name = null, .is_pub = is_pub, .is_test = false };
+    }
+
+    /// 顶层声明 `decl`（下标 `index`）中的 import 与引用的名字
+    fn collect(a: Allocator, temp: Allocator, node: ast.SyntaxNode, index: u32, decl: *TopDecl, sites: *std.ArrayList(Site)) Allocator.Error!void {
+        switch (node.kind()) {
+            .name_ref => if ((ast.NameRef{ .syntax = node }).name()) |t| try decl.refs.append(temp, try ast.identNameAlloc(temp, t.text)),
+            .builtin_call => if (try pathImport(a, node)) |spec| try sites.append(temp, .{ .spec = spec, .in_test = decl.is_test, .decl = if (decl.is_pub or decl.name == null) null else index }),
+            else => {},
+        }
+        var children = node.children();
+        while (children.nextNode()) |child| try collect(a, temp, child, index, decl, sites);
+    }
+
+    fn pathImport(a: Allocator, node: ast.SyntaxNode) Allocator.Error!?[]const u8 {
+        const call = ast.BuiltinCall{ .syntax = node };
+        const name = call.name() orelse return null;
+        if (!std.mem.eql(u8, name.text, "@import")) return null;
+        var args = call.args();
+        const arg = args.next() orelse return null;
+        if (arg.kind() != .literal) return null;
+        const raw = (arg.firstToken() orelse return null).text;
+        const spec = std.zig.string_literal.parseAlloc(a, raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidLiteral => return null,
+        };
+        return if (std.mem.endsWith(u8, spec, ".zig")) spec else null;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return deepEql(a.specs, b.specs) and deepEql(a.in_test, b.in_test);
+    }
+
+    pub fn bytes(value: Value) usize {
+        return mem.arenaBytes(value.arena);
+    }
+
+    pub fn deinit(value: *Value, gpa: Allocator) void {
+        var arena = value.arena.promote(gpa);
+        arena.deinit();
+    }
+};
+
+/// 项目中只被测试用到的文件（升序）：从各模块的根出发沿 import 可达、但只沿测试之外的 import 不可达的文件。
+/// 如只在 `test { _ = @import("x_test.zig"); }` 中 import 的测试文件，以及只被它们 import 的测试辅助文件
+pub const TestOnlyFiles = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = void;
+    pub const Value = []const FileId;
+
+    pub fn compute(ctx: *database.Db.Ctx, _: Key) engine.Error!Value {
+        const gpa = ctx.db.gpa;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const temp = scratch.allocator();
+        var r: Resolver = .{ .ctx = ctx, .arena = temp };
+        const graph = try ctx.get(database.ModuleGraph.Input, {}) orelse return gpa.dupe(FileId, &.{});
+        var roots: std.ArrayList(FileId) = .empty;
+        for (graph.modules) |module| if (module.root) |root| try roots.append(temp, root);
+        // 沿全部 import 可达的文件，与只沿测试之外的 import 可达的文件：前者减去后者只被测试用到。都不可达的
+        // 文件（如还没有被 import 的新文件）不归为测试文件
+        const all = try reach(&r, temp, roots.items, true);
+        const live = try reach(&r, temp, roots.items, false);
+        var out: std.ArrayList(FileId) = .empty;
+        var it = all.keyIterator();
+        while (it.next()) |file| if (!live.contains(file.*) and isZigSource(ctx.db.env.vfs.path(file.*))) try out.append(temp, file.*);
+        std.mem.sort(FileId, out.items, {}, struct {
+            fn less(_: void, x: FileId, y: FileId) bool {
+                return @backingInt(x) < @backingInt(y);
+            }
+        }.less);
+        return gpa.dupe(FileId, out.items);
+    }
+
+    /// 从 `roots` 沿 import 可达的文件；`with_tests` 为 false 时不经过只用于测试的 import
+    fn reach(r: *Resolver, temp: Allocator, roots: []const FileId, with_tests: bool) resolve.Error!std.AutoHashMapUnmanaged(FileId, void) {
+        var reached: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+        var queue: std.ArrayList(FileId) = .empty;
+        for (roots) |root| if (!(try reached.getOrPut(temp, root)).found_existing) try queue.append(temp, root);
+        var i: usize = 0;
+        while (i < queue.items.len) : (i += 1) {
+            const file = queue.items[i];
+            const sites = try r.ctx.get(ImportSites, file);
+            for (sites.specs, sites.in_test) |spec, in_test| {
+                if (in_test and !with_tests) continue;
+                const target = try r.resolveImport(file, spec) orelse continue;
+                if (!(try reached.getOrPut(temp, target)).found_existing) try queue.append(temp, target);
+            }
+        }
+        return reached;
+    }
+
+    pub fn contains(value: Value, file: FileId) bool {
+        return std.sort.binarySearch(FileId, value, file, struct {
+            fn order(needle: FileId, item: FileId) std.math.Order {
+                return std.math.order(@backingInt(needle), @backingInt(item));
+            }
+        }.order) != null;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(FileId, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
 // ── 公开导出闭包 ───────────────────────────────────────────────────
 
 /// `file` 中经公开路径可达的命名空间所在的其他 Zig 源文件（可能重复）：按批预热公开导出闭包时据此展开
@@ -768,9 +959,14 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
                 try builder.importCandidate(name, .module, false, spec, "", null, "~2", .{ .file = target });
             try builder.exported(ns, spec);
         };
-        // 项目文件只查询小索引的前缀区间，不在按键路径扫描 ItemTree/Body。
+        // 项目文件只查询小索引的前缀区间，不在按键路径扫描 ItemTree/Body。只被测试用到的文件只在测试代码（同样
+        // 只被测试用到的文件、test 声明）中导入
+        const test_only = try r.ctx.get(TestOnlyFiles, {});
+        const in_test = TestOnlyFiles.contains(test_only, file) or
+            (if (builder.owner) |item| (try r.itemTree(file)).items[item].kind == .@"test" else false);
         for (g.files) |entry| {
             if (entry.file == file or entry.module == database.ModuleGraph.std_module) continue;
+            if (!in_test and TestOnlyFiles.contains(test_only, entry.file)) continue;
             const path = r.ctx.db.env.vfs.path(entry.file);
             if (!isZigSource(path)) continue;
             const index = try r.ctx.get(FileDecls, entry.file);
