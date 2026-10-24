@@ -101,6 +101,7 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
         if (it.ast_id == owner.item) break @intCast(i);
     } else return empty(gpa);
     const body = try ctx.get(hir.ItemBody, owner);
+    const split = try splitIteration(ctx.db.env.ip, owner, inst);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -116,8 +117,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
         .bindings = try a.alloc(TypedValue, body.bindings.len),
         .members = try a.alloc(?hir.OwnerKey, body.exprs.len),
         .scratch = scratch.allocator(),
-        .inst = inst,
-        .loop_seed = loop_seed,
+        .inst = split.inst,
+        .loop_seed = split.seed orelse loop_seed,
     };
     @memset(inf.exprs, .unknown);
     @memset(inf.bindings, .unknown);
@@ -144,6 +145,7 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
         if (it.ast_id == owner.item) break @intCast(i);
     } else return .unknown;
     const body = try ctx.get(hir.ItemBody, owner);
+    const split = try splitIteration(ctx.db.env.ip, owner, inst);
     var inf: Inferrer = .{
         .r = &r,
         .ip = ctx.db.env.ip,
@@ -155,7 +157,8 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
         .bindings = try a.alloc(TypedValue, body.bindings.len),
         .members = try a.alloc(?hir.OwnerKey, body.exprs.len),
         .scratch = a,
-        .inst = inst,
+        .inst = split.inst,
+        .loop_seed = split.seed,
     };
     @memset(inf.exprs, .unknown);
     @memset(inf.bindings, .unknown);
@@ -191,7 +194,7 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
         },
         // 捕获的值取决于控制流：取整个成员的推导结果
         .capture => {
-            const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+            const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = split.inst, .loop = split.seed });
             return if (@backingInt(binding) < res.bindings.len) res.bindings[@backingInt(binding)] else .unknown;
         },
     }
@@ -313,6 +316,45 @@ const Inferrer = struct {
     }
 
     /// owner 自身（函数）的实例
+    /// 本成员按迭代推导时（`loop_seed`）的实例，见 `InternPool.Instance.iteration`；不按迭代推导时为 null
+    fn iterationInstance(inf: *Inferrer) Error!?Index {
+        const seed = inf.loop_seed orelse return null;
+        return try inf.instanceAt(seed.binding, seed.index);
+    }
+
+    /// 本成员的实例在循环变量 `binding` 取第 `index` 次迭代时
+    fn instanceAt(inf: *Inferrer, binding: u32, index: u32) Error!Index {
+        if (inf.ownInstance()) |own| {
+            var key = own;
+            key.iteration = .{ .binding = binding, .index = index, .abstract = false };
+            return inf.ip.get(.{ .instance = key });
+        }
+        const decl = (try inf.r.itemTree(inf.file)).items[inf.item].ast_id;
+        return inf.ip.get(.{ .instance = .{ .file = inf.file, .decl = decl, .args = &.{}, .parent = inf.inst, .iteration = .{ .binding = binding, .index = index, .abstract = true } } });
+    }
+
+    /// 本成员中定义在 `e` 处的容器的实例。每次迭代单独分析的循环体（`inline for`、`inline` switch 分支）内的
+    /// 容器，字段类型可以依赖循环变量：按迭代推导时取这次迭代的实例，否则取迭代未确定的实例（类型不具体）
+    fn containerInst(inf: *Inferrer, e: ExprId) Error!?Index {
+        const at = inf.body.range(e).start;
+        if (inf.loop_seed) |seed| if (seedRegion(inf.body, seed.binding)) |rg| if (rg.contains(at)) return try inf.instanceAt(seed.binding, seed.index);
+        var best: ?struct { binding: u32, len: u32 } = null;
+        for (inf.body.exprs) |x| {
+            const binding: Body.BindingId, const rg = switch (x) {
+                .loop => |l| if (l.is_inline and l.capture.len > 0) .{ l.capture[0], inf.body.range(l.body) } else continue,
+                .@"switch" => |sw| blk: {
+                    for (sw.prongs) |p| if (p.is_inline and p.capture.len > 0 and inf.body.range(p.body).contains(at)) break :blk .{ p.capture[0], inf.body.range(p.body) };
+                    continue;
+                },
+                else => continue,
+            };
+            if (!rg.contains(at)) continue;
+            if (best == null or rg.end - rg.start < best.?.len) best = .{ .binding = @backingInt(binding), .len = rg.end - rg.start };
+        }
+        const b = best orelse return inf.inst;
+        return try inf.instanceAt(b.binding, InternPool.Instance.Iteration.unknown_index);
+    }
+
     fn ownInstance(inf: *Inferrer) ?InternPool.Instance {
         const i = inf.inst orelse return null;
         const key = inf.ip.key(i).instance;
@@ -725,7 +767,7 @@ const Inferrer = struct {
             .container => |c| {
                 if (c.arg) |arg| _ = try inf.infer(arg, null);
                 const ns = try inf.containerAt(e) orelse return .unknown;
-                return TypedValue.ofType(try queries.containerType(inf.r, ns, inf.inst));
+                return TypedValue.ofType(try queries.containerType(inf.r, ns, try inf.containerInst(e)));
             },
             .fn_type => |f| {
                 const params = try inf.scratch.alloc(Index, f.params.len);
@@ -811,7 +853,7 @@ const Inferrer = struct {
             if (l.file != inf.file or l.item != inf.item) return queries.defType(inf.r, def, null, inf.inst);
             const binding = b.binding(l.binding);
             if (binding.kind != .param and !range.contains(binding.range.start)) {
-                return inf.r.ctx.get(queries.LocalValue, .{ .owner = try inf.r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = inf.inst });
+                return inf.r.ctx.get(queries.LocalValue, .{ .owner = try inf.r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try inf.iterationInstance() orelse inf.inst });
             }
         };
         return queries.defType(inf.r, def, .{ .file = inf.file, .item = inf.item, .bindings = inf.bindings }, inf.inst);
@@ -3089,6 +3131,30 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
 }
 
 /// 非泛型函数作为 comptime 调用执行时的实例（不区分实参，实参的值另行传入）
+/// 实例用于它所属的成员 `owner` 自身时：带迭代的实例（见 `InternPool.Instance.iteration`）拆成外层实例与
+/// 循环种子；其他实例原样返回
+fn splitIteration(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) Error!struct { inst: ?Index, seed: ?LoopSeed } {
+    const i = inst orelse return .{ .inst = null, .seed = null };
+    const key = ip.key(i).instance;
+    const it = key.iteration orelse return .{ .inst = i, .seed = null };
+    if (key.file != owner.file or key.decl != owner.item) return .{ .inst = i, .seed = null };
+    const seed: LoopSeed = .{ .binding = it.binding, .index = it.index };
+    if (it.abstract) return .{ .inst = key.parent, .seed = seed };
+    var base = key;
+    base.iteration = null;
+    return .{ .inst = try ip.get(.{ .instance = base }), .seed = seed };
+}
+
+/// 循环种子的循环变量所在的区域：`for` 循环体，或 `inline` switch 分支的分支体
+fn seedRegion(body: *const Body, binding: u32) ?Body.Range {
+    for (body.exprs) |x| switch (x) {
+        .loop => |l| for (l.capture) |c| if (@backingInt(c) == binding) return body.range(l.body),
+        .@"switch" => |sw| for (sw.prongs) |p| if (p.capture.len > 0 and @backingInt(p.capture[0]) == binding) return body.range(p.body),
+        else => {},
+    };
+    return null;
+}
+
 pub fn runtimeInstance(ip: *InternPool, scratch: Allocator, fv: @FieldType(InternPool.Key, "fn_value"), n: usize) Error!Index {
     const args = try scratch.alloc(Index, n);
     @memset(args, .runtime);

@@ -3392,3 +3392,27 @@ test "dereferencing a C pointer gives its child type" {
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("width rows", labels);
 }
+
+test "types defined inside an inline for take the loop variable of each iteration" {
+    // 循环体内定义的结构体的字段类型依赖循环变量：类型不区分迭代时字段类型求不出，`@hasField` 也求不出
+    const labels = try completionLabels(
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u8 };
+        \\fn read(comptime T: type) void {
+        \\    if (@hasField(T, "inner")) {
+        \\        var v: @FieldType(T, "inner") = undefined;
+        \\        _ = v.<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    inline for (.{ A{ .a_field = 0 }, B{ .b_field = 0 } }) |value| {
+        \\        const V = @TypeOf(value);
+        \\        const Wrapper = struct { inner: V };
+        \\        read(Wrapper);
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("a_field", labels);
+}

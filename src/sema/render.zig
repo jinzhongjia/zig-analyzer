@@ -17,7 +17,15 @@ const ContainerNames = struct {
         const found = n.name(c) catch null;
         try w.writeAll(found orelse @tagName(c.kind));
         // 泛型实例：`List(u8)`，只列出 comptime 已知的实参
-        try n.writeArgs(c.inst orelse return, w);
+        try n.writeArgs(n.shownInst(c.inst) orelse return, w);
+    }
+
+    /// 显示实参的实例：没有实例的成员按迭代推导时的实例（见 `InternPool.Instance.iteration`）显示外层实例
+    fn shownInst(n: ContainerNames, inst: ?Index) ?Index {
+        const i = inst orelse return null;
+        const key = n.r.ctx.db.env.ip.key(i).instance;
+        if (key.iteration) |it| if (it.abstract) return n.shownInst(key.parent);
+        return i;
     }
 
     /// 内置函数构造的类型：以构造它的函数实例命名（`FieldEnum(S)`）；不在函数中构造、正是某个常量的值时以常量命名

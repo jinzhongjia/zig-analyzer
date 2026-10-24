@@ -728,6 +728,7 @@ pub fn isConcrete(ip: *InternPool, t: Index) bool {
         .reified_type => |r| allConcrete(ip, r.types) and (r.inst == null or isConcrete(ip, r.inst.?)),
         .union_tag_type => |u| isConcrete(ip, u),
         .instance => |i| blk: {
+            if (i.iteration) |it| if (it.index == InternPool.Instance.Iteration.unknown_index) break :blk false;
             for (i.args) |a| if (a != .runtime and !isConcrete(ip, a)) break :blk false;
             break :blk i.parent == null or isConcrete(ip, i.parent.?);
         },
