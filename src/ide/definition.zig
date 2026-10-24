@@ -169,7 +169,21 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     const owner = try ownerLocal(r, rt);
     if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
     if (try constructionOrigin(r, rt, name)) |found| return found;
-    return typeInfoOrigin(r, rt, name);
+    if (try typeInfoOrigin(r, rt, name)) |found| return found;
+    return constructionSite(r, rt);
+}
+
+/// 名字的来源追不到具体字符时（如由单个字节 `@as(*const [1]u8, &c)` 构成的名字）：成员定义在构造类型的调用处
+fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target {
+    const tree = try r.itemTree(rt.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == rt.owner) break @intCast(i);
+    } else return null;
+    const node = try r.itemNode(rt.file, item) orelse return null;
+    const body = try r.body(rt.file, item);
+    if (rt.expr >= body.exprs.len) return null;
+    const range = body.range(@fromBackingInt(rt.expr));
+    return .{ .file = rt.file, .start = node.offset + range.start, .end = node.offset + range.end };
 }
 
 /// 构造类型的成员（`rt.owner`）：其中的局部绑定也是名字来源的候选
@@ -215,7 +229,7 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
         if (!literalWithin(l.body, init, name) and !nameRefWithin(l.body, init, holders.items)) continue;
         // 推导不为字符串生成值（如块中的 `const extra = [_][]const u8{"a"};`）：求不出时按 comptime 求值
         const v = l.at.bindingType(@fromBackingInt(@intCast(bi))).val orelse
-            (try eval.exprValue(r, file, l.item, l.body, init, l.inst, l.at.res.bindings, null)).val orelse continue;
+            (try eval.exprValue(r, file, l.item, l.body, init, l.inst, l.at.res.bindings, null, eval.bodyQuota(r, l.body, l.at.res.exprs))).val orelse continue;
         try cands.append(r.arena, .{ .item = l.item, .body = l.body, .expr = init, .value = v });
     };
 
@@ -268,7 +282,7 @@ fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) re
     if (args.len < 3) return null;
     const names_e = args[2];
     const ip = r.ctx.db.env.ip;
-    const tv = try eval.exprValue(r, rt.file, local.item, local.body, names_e, local.inst, local.at.res.bindings, null);
+    const tv = try eval.exprValue(r, rt.file, local.item, local.body, names_e, local.inst, local.at.res.bindings, null, eval.bodyQuota(r, local.body, local.at.res.exprs));
     const value = tv.val orelse return null;
     var path: std.ArrayList(u32) = .empty;
     var chain: std.ArrayList(Index) = .empty;

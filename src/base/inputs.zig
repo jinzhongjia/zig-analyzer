@@ -7,9 +7,9 @@ const Vfs = @import("Vfs.zig");
 
 /// 文件内容；`null` 表示文件不存在或尚未加载。
 pub const FileText = struct {
-    pub const kind: engine.Kind = .input;
     pub const Key = Vfs.FileId;
     pub const Value = ?[]const u8;
+    pub const kind: engine.Kind = .input;
     pub const default: Value = null;
 
     pub fn eql(a: Value, b: Value) bool {
@@ -17,6 +17,7 @@ pub const FileText = struct {
         return std.mem.eql(u8, a.?, b.?);
     }
 
+    /// 参数取指针是引擎对 query `deinit` 的统一签名（见 `db/engine.zig`），这里只读取 `v.*`。
     pub fn deinit(v: *Value, gpa: Allocator) void {
         if (v.*) |text| gpa.free(text);
     }

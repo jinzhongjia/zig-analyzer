@@ -16,6 +16,9 @@ pub const ide_db = struct {
     pub const seed = @import("ide_db/seed.zig");
     pub const imports = @import("ide_db/imports.zig");
 };
+pub const ide = struct {
+    pub const naming = @import("ide/naming.zig");
+};
 
 const Vfs = @import("base/Vfs.zig");
 const InternPool = @import("sema/InternPool.zig");
@@ -53,6 +56,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.LocalValue,
     sema.DeclType,
     sema.CallEval,
+    sema.ComptimeOnly,
     sema.ErrorSetOf,
     sema.InactiveRanges,
     FileIndex.Query,
@@ -66,5 +70,10 @@ pub const Db = engine.Engine(*const Env, &.{
     ide_db.imports.FileLinks,
     ide_db.imports.Exports,
     ide_db.imports.BindingNames,
+    ide_db.seed.Callers,
+    ide_db.seed.AllInstances,
+    ide_db.seed.RootCallers,
+    ide_db.seed.CallsIn,
     @import("ide_db/search.zig").ProjectImporters,
+    ide.naming.Query,
 });

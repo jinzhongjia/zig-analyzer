@@ -393,6 +393,48 @@ test "files under a build.zig outside the workspace belong to a project that is 
     try h.notify("exit", {});
 }
 
+test "responses for deeply nested code stay within the JSON nesting limit" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    // 嵌套 150 层的匿名结构体，以及 500 层括号
+    try text.appendSlice(testing.allocator, "const S = struct {\n");
+    for (0..150) |_| try text.appendSlice(testing.allocator, "a: struct {\n");
+    for (0..150) |_| try text.appendSlice(testing.allocator, "},\n");
+    try text.appendSlice(testing.allocator, "};\nconst x = ");
+    for (0..500) |_| try text.append(testing.allocator, '(');
+    try text.append(testing.allocator, '1');
+    for (0..500) |_| try text.append(testing.allocator, ')');
+    try text.appendSlice(testing.allocator, ";\n");
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const document_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "deep.zig" }));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = document_uri, .languageId = "zig", .version = 1, .text = text.items } });
+    // 等启动完成：查询 zig 环境之后更新模块图的写事务会取消进行中的请求（回复 ContentModified）
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const symbols = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = document_uri } });
+    try testing.expect(symbols.object.get("result").? == .array);
+    const line: u32 = @intCast(std.mem.count(u8, text.items, "\n") - 1);
+    const ranges = try h.request("textDocument/selectionRange", .{ .textDocument = .{ .uri = document_uri }, .positions = &[_]struct { line: u32, character: u32 }{.{ .line = line, .character = 510 }} });
+    try testing.expect(ranges.object.get("result").? == .array);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "requests before initialize return ServerNotInitialized, unknown methods return MethodNotFound" {
     var s: Session = undefined;
     try s.run(frame(

@@ -18,6 +18,9 @@ const FileIndex = @import("../syntax/FileIndex.zig");
 
 const ModuleGraph = @This();
 
+/// 其余字段的切片都分配在这块 arena 中。构建完成后不再分配，只用于整体释放，
+/// 因此只保存 `State`，释放时用同一个 gpa `promote` 回 `ArenaAllocator`。
+/// 不存整个 `ArenaAllocator`：`allocator()` 返回的 `Allocator` 指向 arena 自身，值被复制后会失效。
 arena: std.heap.ArenaAllocator.State,
 /// `<std_dir>/std.zig`；zig 环境未知时为 null
 std_root: ?FileId,
@@ -254,6 +257,7 @@ pub const FileImports = struct {
     pub const Value = *const Table;
 
     pub const Table = struct {
+        /// `Table` 自身与 `names`、`targets` 所在的 arena，只保存 `State` 的原因同 `ModuleGraph.arena`
         arena: std.heap.ArenaAllocator.State,
         names: []const []const u8,
         targets: []const ?FileId,

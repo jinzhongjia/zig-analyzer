@@ -546,6 +546,47 @@ test "completion through a switch whose other prong is an empty tuple literal" {
     try testing.expectEqualStrings("label kind", labels);
 }
 
+test "goto declaration of a reified field whose name is not traceable to a literal goes to the construction" {
+    // 名字由单个字节构成（zig-clap 的短参数名）：追不到字面量中的字符，曾没有跳转目标
+    const text =
+        \\const Names = struct {
+        \\    short: ?u8 = null,
+        \\    fn name(names: *const Names) []const u8 {
+        \\        if (names.short) |*short| return @as(*const [1]u8, short);
+        \\        return "";
+        \\    }
+        \\};
+        \\fn Args(comptime params: []const Names) type {
+        \\    var names: [params.len][]const u8 = undefined;
+        \\    var types: [params.len]type = undefined;
+        \\    for (params, 0..) |p, k| {
+        \\        const n = p.name();
+        \\        names[k] = n[0..n.len] ++ "";
+        \\        types[k] = bool;
+        \\    }
+        \\    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+        \\}
+        \\const params = [_]Names{.{ .short = 'h' }};
+        \\fn run(a: Args(&params)) bool {
+        \\    return a.h;
+        \\}
+        \\
+    ;
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root = try w.vfs.intern(try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" }));
+    const file = (try w.add("/p/main.zig", text)).file;
+    try w.setGraph(std_root, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const target = try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "a.h").? + 2)) orelse return error.NoDefinition;
+    try testing.expectEqual(std.mem.indexOf(u8, text, "@Struct(").?, target.start);
+}
+
 test "goto declaration of a shorthand member of an inline reified enum" {
     const text =
         \\const Mode = @Enum(u8, .exhaustive, &.{ "fast", "slow" }, &.{ 0, 1 });
@@ -2181,6 +2222,43 @@ test "callsite seeding uses an iteration of an inline for over types that the ca
     try testing.expectEqualStrings("x", labels);
 }
 
+/// `inline for (.{ E0, E1, ..., A }) |T|`，只有 `A`（第 `empty + 1` 次迭代）有 `run`
+fn manyTypesLoop(comptime empty: usize) []const u8 {
+    @setEvalBranchQuota(100_000);
+    var list: []const u8 = "";
+    var decls: []const u8 = "";
+    for (0..empty) |i| {
+        decls = decls ++ std.fmt.comptimePrint("const E{d} = struct {{}};\n", .{i});
+        list = list ++ std.fmt.comptimePrint("E{d}, ", .{i});
+    }
+    return decls ++
+        \\const A = struct {
+        \\    pub fn run() void {}
+        \\};
+        \\fn all() void {
+        \\
+    ++ "    inline for (.{ " ++ list ++ "A }) |T| {\n" ++
+        \\        if (@hasDecl(T, "run")) T.run();
+        \\    }
+        \\}
+        \\
+    ;
+}
+
+test "features inside an inline for over types use iterations past the first 64" {
+    // 曾只尝试前 64 次迭代：位于其后的 `A` 求不出
+    const text = comptime manyTypesLoop(80);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const target = try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "T.run()").? + 2)) orelse return error.NoDefinition;
+    try testing.expectEqual(std.mem.indexOf(u8, text, "run() void").?, target.start);
+}
+
 test "an inline for over a list that is a parameter of the enclosing generic function uses the call site's list" {
     const labels = try completionLabels(
         \\fn Engine(comptime queries: []const type) type {
@@ -2684,12 +2762,87 @@ test "seed search skips callers whose calls resolve to other functions of the sa
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "print(\"{}\", .{").?)), chosen.offset);
     // 只有目标自身的查找：`seedFor` 依次请求 Query、Instances 与 allInstances
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Query));
-    try testing.expectEqual(@as(u64, 2), w.db.executions(seed.Instances));
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Instances));
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.AllInstances));
     // 改为调用目标后不再跳过：以 `format` 的调用点实例找到它对目标的调用
     const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "w.print(\"{}\");", "print(\"{}\", .{T});");
     _ = try w.add("/p/main.zig", calling);
     const moved = (try seedFor(&w, file, "print")).?;
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{T})").?)), moved.offset);
+}
+
+test "callers whose mentions resolve to other functions without inference are skipped" {
+    // 经命名空间、全局声明的类型、参数的类型就能确定调用的是其他 print 的成员不推导；局部值求不出，别名与调用目标的
+    // 成员照常推导，按原顺序选出调用点
+    const text =
+        \\pub fn print(comptime fmt: []const u8, args: anytype) void {
+        \\    _ = fmt;
+        \\    _ = args;
+        \\}
+        \\const Writer = struct {
+        \\    pub fn print(w: Writer, comptime fmt: []const u8) void {
+        \\        _ = w;
+        \\        _ = fmt;
+        \\    }
+        \\};
+        \\const ns = struct {
+        \\    pub fn print(comptime fmt: []const u8) void {
+        \\        _ = fmt;
+        \\    }
+        \\};
+        \\var global: Writer = .{};
+        \\fn useNamespace() void {
+        \\    ns.print("{}");
+        \\}
+        \\fn useGlobal() void {
+        \\    global.print("{}");
+        \\}
+        \\fn useParam(p: *const Writer) void {
+        \\    p.print("{}");
+        \\}
+        \\fn useLocal() void {
+        \\    const l: Writer = .{};
+        \\    l.print("{}");
+        \\}
+        \\const alias = print;
+        \\fn useAlias() void {
+        \\    alias("{}", .{@as(u16, 1)});
+        \\}
+        \\fn main() void {
+        \\    print("{}", .{@as(u8, 1)});
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const chosen = (try seedFor(&w, file, "print")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "alias(\"{}\"").?)), chosen.offset);
+    try expectCallers(&w, file, "print", &.{ "useLocal", "alias", "useAlias", "main" });
+    // `seedFor` 依次请求各层的 Query 与 Instances：调用者列表只计算一次
+    try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Callers));
+
+    // 改为调用目标后不再跳过，排在前面的调用点被选中
+    const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "ns.print(\"{}\");", "print(\"{}\", .{@as(u32, 1)});");
+    _ = try w.add("/p/main.zig", calling);
+    const moved = (try seedFor(&w, file, "print")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, calling, "print(\"{}\", .{@as(u32").?)), moved.offset);
+    try expectCallers(&w, file, "print", &.{ "useNamespace", "useLocal", "alias", "useAlias", "main" });
+}
+
+/// `file` 中名为 `name` 的泛型函数在 `file` 中的调用者（`seed.Callers`）依次为 `expected`
+fn expectCallers(w: *World, file: FileId, name: []const u8, expected: []const []const u8) !void {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, name)) break @intCast(i);
+    } else return error.NoItem;
+    const callers = try ctx.get(seed.Callers, .{ .root = try r.ownerKey(file, item), .in = file });
+    try testing.expectEqual(expected.len, callers.len);
+    for (callers, expected) |i, n| try testing.expectEqualStrings(n, tree.items[i].name.?);
 }
 
 test "seed selection invalidates for arguments caller bodies signatures aliases and new candidates" {
@@ -3417,4 +3570,349 @@ test "visible completion precedes auto-import candidates" {
     }
     try testing.expect(visible_at != null and auto_at != null);
     try testing.expect(visible_at.? < auto_at.?);
+}
+
+/// `file` 中名为 `name` 的成员的全部实例（`seed.allInstances`）
+fn allInstancesOf(w: *World, file: FileId, name: []const u8) !struct { count: usize, complete: bool } {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, name)) break @intCast(i);
+    } else return error.NoItem;
+    const all = try seed.allInstances(&r, file, item);
+    return .{ .count = all.insts.len, .complete = all.complete };
+}
+
+test "all instances follow generic callers to a fixpoint without depth or count limits" {
+    // 防止按层数或个数截断：7 层泛型调用者之后的具体调用、互相递归的泛型函数、70 个不同的实例都要找到
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(testing.allocator,
+        \\fn leaf(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\fn l1(x: anytype) void { leaf(x); }
+        \\fn l2(x: anytype) void { l1(x); }
+        \\fn l3(x: anytype) void { l2(x); }
+        \\fn l4(x: anytype) void { l3(x); }
+        \\fn l5(x: anytype) void { l4(x); }
+        \\fn l6(x: anytype) void { l5(x); }
+        \\fn l7(x: anytype) void { l6(x); }
+        \\fn ping(comptime T: type, n: u32) void { if (n > 0) pong(T, n - 1); }
+        \\fn pong(comptime T: type, n: u32) void { if (n > 0) ping(T, n - 1); }
+        \\fn many(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\fn main() void {
+        \\    l7(@as(u8, 1));
+        \\    l7(@as(u16, 1));
+        \\    ping(u32, 3);
+        \\
+    );
+    defer text.deinit(testing.allocator);
+    for (1..71) |k| try text.print(testing.allocator, "    many(@as([{d}]u8, undefined));\n", .{k});
+    try text.appendSlice(testing.allocator, "}\n");
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text.items)).file;
+    const leaf = try allInstancesOf(&w, file, "leaf");
+    try testing.expectEqual(2, leaf.count);
+    try testing.expect(leaf.complete);
+    const pong = try allInstancesOf(&w, file, "pong");
+    try testing.expectEqual(1, pong.count);
+    try testing.expect(pong.complete);
+    const many = try allInstancesOf(&w, file, "many");
+    try testing.expectEqual(70, many.count);
+    try testing.expect(many.complete);
+}
+
+test "all instances of unboundedly growing instantiations are reported incomplete" {
+    // 防止截断的实例被当作全部：`grow(T)` 调用 `other(?T)`，`other(T)` 又调用 `grow(T)`，实例无限增长
+    const text =
+        \\fn grow(comptime T: type) void {
+        \\    other(?T);
+        \\}
+        \\fn other(comptime T: type) void {
+        \\    grow(T);
+        \\}
+        \\fn main() void {
+        \\    grow(u8);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const grow = try allInstancesOf(&w, file, "grow");
+    try testing.expect(!grow.complete);
+}
+
+test "all instances include anytype calls in files that do not import the method" {
+    // 防止只在导入了方法所在文件的文件中找调用者：`c.zig` 不导入 `a.zig`，经 anytype 的值（指向 `S` 的指针，
+    // 类型流只认实参类型恰为 `S` 的实例）调用其泛型方法
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = (try w.add("/p/a.zig", "pub const S = struct {\n    pub fn foo(self: *S, comptime n: u8) void {\n        _ = self;\n        _ = n;\n    }\n};\n")).file;
+    const c = (try w.add("/p/c.zig", "pub fn call(x: anytype) void {\n    x.foo(3);\n}\n")).file;
+    const main = (try w.add("/p/main.zig", "const a = @import(\"a.zig\");\nconst c = @import(\"c.zig\");\npub fn main() void {\n    var s: a.S = .{};\n    c.call(&s);\n}\n")).file;
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+        .{ .file = main, .module = 0, .root_module = 0 },
+        .{ .file = a, .module = 0, .root_module = 0 },
+        .{ .file = c, .module = 0, .root_module = 0 },
+    });
+    const all = try allInstancesOf(&w, a, "foo");
+    try testing.expectEqual(1, all.count);
+    try testing.expect(all.complete);
+}
+
+test "callsite seeding uses an iteration of a loop over a comptime list of values" {
+    // 循环变量有类型但没有值（遍历的是 comptime 已知的值列表）：曾求不出 `PT` 的实例
+    const labels = try completionLabels(
+        \\const Help = struct {
+        \\    v: []const u8,
+        \\    pub fn value(h: Help) []const u8 {
+        \\        return h.v;
+        \\    }
+        \\};
+        \\fn Param(comptime Id: type) type {
+        \\    return struct { id: Id, takes: enum { none, one } };
+        \\}
+        \\fn PT(comptime Id: type, comptime param: Param(Id)) type {
+        \\    return switch (param.takes) {
+        \\        .none => void,
+        \\        .one => @TypeOf(param.id.<|>),
+        \\    };
+        \\}
+        \\fn Args(comptime Id: type, comptime params: []const Param(Id)) type {
+        \\    var t: type = void;
+        \\    for (params) |param| t = PT(Id, param);
+        \\    return t;
+        \\}
+        \\const ps = [_]Param(Help){ .{ .id = .{ .v = "a" }, .takes = .none }, .{ .id = .{ .v = "b" }, .takes = .one } };
+        \\const A = Args(Help, &ps);
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("v value", labels);
+}
+
+test "a field name sliced from a comptime string in an inline for over pointers resolves @field" {
+    // 指针捕获在按迭代推导时曾没有值，comptime 已知的切片、解引用与取地址也曾没有值：`@field` 求不出字段
+    const labels = try completionLabels(
+        \\const Names = struct {
+        \\    long: []const u8,
+        \\    fn longest(names: *const Names) []const u8 {
+        \\        return names.long;
+        \\    }
+        \\};
+        \\const P = struct { names: Names, many: bool };
+        \\const L = struct {
+        \\    pub fn append(_: *L) void {}
+        \\};
+        \\const Args = struct { aa: u8 = 0, list: L = .{} };
+        \\const ps = [_]P{ .{ .names = .{ .long = "aa" }, .many = false }, .{ .names = .{ .long = "list" }, .many = true } };
+        \\fn parse(comptime params: []const P) void {
+        \\    var arguments: Args = .{};
+        \\    inline for (params) |*param| {
+        \\        const longest = comptime param.names.longest();
+        \\        const name = longest[0..longest.len].*;
+        \\        if (param.many) @field(arguments, &name).<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    parse(&ps);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("append", labels);
+}
+
+test "an iteration that leaves the loop before a declaration is not used for it" {
+    // 第 1 次迭代在 `.none => continue` 处离开循环：曾取这次迭代，`F` 显示为 noreturn
+    const text =
+        \\const P = struct { kind: enum { none, one }, T: type };
+        \\fn Make(comptime ps: []const P) type {
+        \\    var t: type = void;
+        \\    for (ps) |p| {
+        \\        const F = switch (p.kind) {
+        \\            .none => continue,
+        \\            .one => p.T,
+        \\        };
+        \\        t = F;
+        \\    }
+        \\    return t;
+        \\}
+        \\const ps = [_]P{ .{ .kind = .none, .T = u16 }, .{ .kind = .one, .T = u8 } };
+        \\const M = Make(&ps);
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "F =").?))) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
+}
+
+test "try on a call whose error set depends on an abstract parameter gives the payload type" {
+    // 错误集 `B.Error` 求不出时整个 `Error!Event` 曾为 unknown，`try` 的结果没有类型
+    const labels = try completionLabels(
+        \\const Event = struct { kind: u8 };
+        \\fn Cursor(comptime B: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        const Error = B.Error;
+        \\        fn peek(self: *Self) Error!Event {
+        \\            _ = self;
+        \\            return .{ .kind = 0 };
+        \\        }
+        \\        fn f(self: *Self) Error!void {
+        \\            const event = try self.peek();
+        \\            _ = event.<|>;
+        \\        }
+        \\    };
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("kind", labels);
+}
+
+test "@hasField on anonymous struct types decides branches in generic bodies" {
+    // 匿名结构体的 `@hasField` 曾求不出：分支不判为非活动，选了 `opt` 没有 `other` 的实例，补全为空
+    const labels = try completionLabels(
+        \\const A = struct {
+        \\    pub const opts = .{};
+        \\};
+        \\const B = struct {
+        \\    pub const opts = .{ .other = "x" };
+        \\};
+        \\fn g(comptime T: type) void {
+        \\    const opt = comptime T.opts;
+        \\    if (@hasField(@TypeOf(opt), "other")) {
+        \\        _ = opt.<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    g(A);
+        \\    g(B);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("other", labels);
+}
+
+test "callsite seeding uses each value of an inline switch prong" {
+    // `inline 0...1 => |index|` 的捕获每个取值单独实例化：曾按未知推导，`read(T, names[index])` 求不出实例
+    const labels = try completionLabels(
+        \\const S = struct {
+        \\    a: struct { x: u8 },
+        \\    b: struct { y: u8 },
+        \\};
+        \\fn readField(comptime name: []const u8) void {
+        \\    var v: @FieldType(S, name) = undefined;
+        \\    _ = v.<|>;
+        \\}
+        \\const names = [_][]const u8{ "a", "b" };
+        \\pub fn main() void {
+        \\    var found: usize = 1;
+        \\    _ = &found;
+        \\    switch (found) {
+        \\        inline 0...1 => |index| readField(names[index]),
+        \\        else => {},
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("x", labels);
+}
+
+test "dereferencing a C pointer gives its child type" {
+    // translate-c 生成的 `[*c]T` 解引用曾为 unknown：`face.*.glyph.*.bitmap` 之后的成员都求不出
+    const labels = try completionLabels(
+        \\const Bitmap = extern struct { width: c_uint, rows: c_uint };
+        \\const GlyphRec = extern struct { bitmap: Bitmap };
+        \\const FaceRec = extern struct { glyph: [*c]GlyphRec };
+        \\fn f(face: [*c]FaceRec) void {
+        \\    const glyph = face.*.glyph;
+        \\    const bitmap = glyph.*.bitmap;
+        \\    _ = bitmap.<|>;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("width rows", labels);
+}
+
+test "types defined inside an inline for take the loop variable of each iteration" {
+    // 循环体内定义的结构体的字段类型依赖循环变量：类型不区分迭代时字段类型求不出，`@hasField` 也求不出
+    const labels = try completionLabels(
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u8 };
+        \\fn read(comptime T: type) void {
+        \\    if (@hasField(T, "inner")) {
+        \\        var v: @FieldType(T, "inner") = undefined;
+        \\        _ = v.<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    inline for (.{ A{ .a_field = 0 }, B{ .b_field = 0 } }) |value| {
+        \\        const V = @TypeOf(value);
+        \\        const Wrapper = struct { inner: V };
+        \\        read(Wrapper);
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("a_field", labels);
+}
+
+test "an iteration of an inline for sees comptime vars as the earlier iterations left them" {
+    // 第 n 次迭代中 `comptime var` 取前 n 次迭代修改后的值：曾没有值，`items[i]` 求不出
+    const labels = try completionLabels(
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u8 };
+        \\const kinds = [_]bool{ false, true, false, true };
+        \\fn read(items: struct { A, B }) void {
+        \\    comptime var index = 0;
+        \\    inline for (kinds) |positional| {
+        \\        if (!positional) continue;
+        \\        const i = index;
+        \\        index += 1;
+        \\        if (i == 1) {
+        \\            const item = items[i];
+        \\            _ = item.<|>;
+        \\        }
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("b_field", labels);
+}
+
+test "comptime vars follow assignments in straight-line code" {
+    const labels = try completionLabels(
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u8 };
+        \\fn f(items: struct { A, B }) void {
+        \\    comptime var i = 0;
+        \\    i += 1;
+        \\    _ = items[i].<|>;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("b_field", labels);
 }

@@ -129,6 +129,60 @@ fn shr(ip: *InternPool, ty: Index, x: Wide, y: Wide) ?i128 {
     return fit(ip, ty, x >> @intCast(y), .check);
 }
 
+pub const OverflowOp = enum { add, sub, mul, shl };
+
+/// 带溢出位的整数运算（`@addWithOverflow` 等）：按 `ty` 回绕的结果与是否溢出。`ty` 须为定宽整数；
+/// 移位量须小于位宽（编译器中右侧的类型为 `Log2Int(T)`）；求不出时为 null
+pub fn overflowInt(ip: *InternPool, op: OverflowOp, ty: Index, a: i128, b: i128) ?struct { i128, bool } {
+    const info = intInfo(ip, ty) orelse return null;
+    if (ty == .comptime_int_type or info.bits > 128) return null;
+    const x: Wide = a;
+    const y: Wide = b;
+    const r: Wide = switch (op) {
+        .add => x + y,
+        .sub => x - y,
+        .mul => x * y,
+        .shl => if (y < 0 or y >= info.bits) return null else x << @intCast(y),
+    };
+    const wrapped = fit(ip, ty, r, .wrap) orelse return null;
+    return .{ wrapped, fit(ip, ty, r, .check) == null };
+}
+
+/// `@shlExact` / `@shrExact`：左移溢出、右移移出了 1 时编译器报错，为 null
+pub fn exactShift(ip: *InternPool, left: bool, ty: Index, a: i128, b: i128) ?i128 {
+    if (b < 0) return null;
+    const x: Wide = a;
+    if (ty == .comptime_int_type) {
+        if (b > 127) return if (a == 0) 0 else null;
+    } else {
+        const info = intInfo(ip, ty) orelse return null;
+        if (info.bits > 128 or b >= info.bits) return null;
+    }
+    const n: u8 = @intCast(b);
+    if (left) return fit(ip, ty, x << n, .check);
+    if (x & ((@as(Wide, 1) << n) - 1) != 0) return null;
+    return fit(ip, ty, x >> n, .check);
+}
+
+/// `@byteSwap`（`bytes`）/ `@bitReverse`：按 `ty` 的位宽取二进制补码表示后交换字节或反转位。
+/// `@byteSwap` 的位宽须为 8 的倍数
+pub fn reverseBits(ip: *InternPool, bytes: bool, ty: Index, a: i128) ?i128 {
+    if (ty == .comptime_int_type) return null;
+    const info = intInfo(ip, ty) orelse return null;
+    if (info.bits > 128 or (bytes and info.bits % 8 != 0)) return null;
+    if (info.bits == 0) return 0;
+    const mask: u128 = if (info.bits == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(info.bits)) - 1;
+    const src: u128 = @as(u128, @bitCast(a)) & mask;
+    var out: u128 = 0;
+    if (bytes) {
+        const n = info.bits / 8;
+        for (0..n) |i| out |= ((src >> @intCast(8 * i)) & 0xff) << @intCast(8 * (n - 1 - i));
+    } else {
+        for (0..info.bits) |i| out |= ((src >> @intCast(i)) & 1) << @intCast(info.bits - 1 - i);
+    }
+    return std.math.cast(i128, truncate(info, out));
+}
+
 /// `-x` / `-%x`
 pub fn negate(ip: *InternPool, ty: Index, a: i128, wrapping: bool) ?i128 {
     return fit(ip, ty, -@as(Wide, a), if (wrapping) .wrap else .check);
@@ -584,7 +638,8 @@ pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
             else => false,
         },
         .fn_type => true,
-        .ptr_type => |p| isComptimeOnly(ip, p.child),
+        // 函数指针是运行时的值；指向其他 comptime-only 类型的指针才是
+        .ptr_type => |p| ip.key(p.child) != .fn_type and isComptimeOnly(ip, p.child),
         .array_type => |a| isComptimeOnly(ip, a.child),
         .abstract_array_type => |a| isComptimeOnly(ip, a.child),
         .optional_type => |c| isComptimeOnly(ip, c),
@@ -673,6 +728,7 @@ pub fn isConcrete(ip: *InternPool, t: Index) bool {
         .reified_type => |r| allConcrete(ip, r.types) and (r.inst == null or isConcrete(ip, r.inst.?)),
         .union_tag_type => |u| isConcrete(ip, u),
         .instance => |i| blk: {
+            if (i.iteration) |it| if (it.index == InternPool.Instance.Iteration.unknown_index) break :blk false;
             for (i.args) |a| if (a != .runtime and !isConcrete(ip, a)) break :blk false;
             break :blk i.parent == null or isConcrete(ip, i.parent.?);
         },

@@ -303,6 +303,30 @@ fn inferredErrorSet(r: *Resolver, owner: hir.OwnerKey) resolve.Error!bool {
     return false;
 }
 
+/// 类型是否只能在 comptime 存在（见 `eval.computeComptimeOnly`），按类型缓存。递归类型经由指针引用自身
+/// 形成环：环本身不使类型成为 comptime-only，取最小不动点
+pub const ComptimeOnly = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Index;
+    pub const Value = bool;
+    pub const fixpoint = true;
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        return eval.computeComptimeOnly(&r, key);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return false;
+    }
+
+    pub fn depthFallback(_: Key) Value {
+        return false;
+    }
+};
+
 /// comptime 调用的结果：由解释器执行函数体，结果按实例与实参缓存
 pub const CallEval = struct {
     pub const kind: engine.Kind = .derived;

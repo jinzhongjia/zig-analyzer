@@ -352,3 +352,94 @@ test "references to tagged union fields through the type and error union results
     const fs: Files = .{ .main = f, .lib = f, .other = f };
     try testing.expectEqualStrings("x:1:null_val* x:3:null_val x:7:null_val", try refs(&w, fs, f, at(src, "null_val", 0), null));
 }
+
+test "member accesses whose target cannot be determined are reported as uncertain" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src =
+        \\const S = struct { fooBar: u32, len: u32 };
+        \\fn read(p: anytype) u32 {
+        \\    return p.fooBar;
+        \\}
+        \\fn size(s: []const u8) usize {
+        \\    return s.len;
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", src)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    // `p` 的类型未知，又没有调用点：`p.fooBar` 可能是引用
+    {
+        var uncertain: ?search.Reference = null;
+        const def = (try definition.defAt(&r, file, at(src, "fooBar", 0))).?;
+        _ = try search.findReferences(&r, def, .{ .scope = &.{file}, .uncertain = &uncertain });
+        try testing.expectEqualStrings("p.fooBar", src[uncertain.?.start..uncertain.?.end]);
+    }
+    // 切片的 `len` 不是 S 的成员：类型具体，不是无法确认的访问
+    {
+        var uncertain: ?search.Reference = null;
+        const def = (try definition.defAt(&r, file, at(src, "len", 0))).?;
+        _ = try search.findReferences(&r, def, .{ .scope = &.{file}, .uncertain = &uncertain });
+        try testing.expectEqual(null, uncertain);
+    }
+}
+
+test "files with syntax errors that mention the name are reported" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib =
+        \\pub const S = struct { x: u32 };
+    ;
+    const main =
+        \\const lib = @import("lib.zig");
+        \\fn f(s: lib.S) u32 {
+        \\    return s.x +;
+        \\}
+    ;
+    const other =
+        \\const lib = @import("lib.zig");
+        \\fn g() void {
+        \\    const y = ;
+        \\}
+    ;
+    const lib_file = (try w.add("/p/lib.zig", lib)).file;
+    const main_file = (try w.add("/p/main.zig", main)).file;
+    const other_file = (try w.add("/p/other.zig", other)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var syntax_error: ?FileId = null;
+    const def = (try definition.defAt(&r, lib_file, at(lib, "x", 0))).?;
+    _ = try search.findReferences(&r, def, .{ .scope = &.{ lib_file, other_file, main_file }, .syntax_error = &syntax_error });
+    // other.zig 也有语法错误，但没有出现这个名字
+    try testing.expectEqual(main_file, syntax_error.?);
+}
+
+test "references in generic code of files that do not import the definition" {
+    // 防止只在导入了定义所在文件的文件中查找：`c.zig` 不导入 `a.zig`，经 anytype 的值调用 `foo`
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a_src = "pub const S = struct {\n    pub fn foo(self: S) void {\n        _ = self;\n    }\n};\n";
+    const c_src = "pub fn call(x: anytype) void {\n    x.foo();\n}\n";
+    const main_text = "const a = @import(\"a.zig\");\nconst c = @import(\"c.zig\");\npub fn main() void {\n    c.call(a.S{});\n}\n";
+    const fa = (try w.add("/p/a.zig", a_src)).file;
+    const fc = (try w.add("/p/c.zig", c_src)).file;
+    const fm = (try w.add("/p/main.zig", main_text)).file;
+    try w.setGraph(null, &.{.{ .root = fm, .imports = &.{} }}, &.{
+        .{ .file = fm, .module = 0, .root_module = 0 },
+        .{ .file = fa, .module = 0, .root_module = 0 },
+        .{ .file = fc, .module = 0, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(testing.allocator);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const def = (try definition.defAt(&r, fa, at(a_src, "foo", 0))).?;
+    const list = try search.findReferences(&r, def, .{ .scope = &.{ fa, fc, fm } });
+    try testing.expectEqual(2, list.len);
+    try testing.expectEqual(fc, list[1].file);
+    try testing.expectEqual(at(c_src, "foo", 0), list[1].start);
+}

@@ -495,6 +495,10 @@ pub const SwitchProng = struct {
     syntax: SyntaxNode,
     pub const kind: SyntaxKind = .switch_prong;
 
+    pub fn isInline(n: SwitchProng) bool {
+        return n.syntax.childToken(.keyword_inline) != null;
+    }
+
     /// `else` 分支没有分支项
     pub fn isElse(n: SwitchProng) bool {
         const case = n.syntax.childNode(.switch_case) orelse return false;

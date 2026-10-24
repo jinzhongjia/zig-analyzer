@@ -10,13 +10,19 @@
 //!       "completion": { "auto_import": true },
 //!       "sema": { "callsite_seeding": true },
 //!       "workspace_symbol": { "dependencies": false },
+//!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
 //! 逐项解析：未知的项与类型错误的项只产生警告（`warnings`），类型错误的项取默认值，其余项照常生效。
 //!
-//! 项目根目录的 `zig-analyzer.json`（同样的结构）可以设置与项目相关的项（`project_settings`），
-//! 供团队共享；其中出现的项优先于客户端的配置（`overlayProject`）。
+//! 项目根目录的 `zig-analyzer.zon` 可以设置与项目相关的项（`project_settings`），供团队共享；其中出现的项优先于
+//! 客户端的配置（`overlayProject`）。结构相同，写成 ZON（可以有注释），枚举值写成枚举字面量：
+//!
+//!     .{
+//!         .build = .{ .args = .{"-Dtarget=aarch64-linux"} },
+//!         .naming = .{ .enable = true, .rules = .{ .field = false } },
+//!     }
 
 const std = @import("std");
 const json = std.json;
@@ -55,6 +61,15 @@ callsite_seeding: bool = true,
 max_intern_pool_mb: u32 = 64,
 /// workspace symbol 是否也列出依赖库（获取的依赖包、生成文件、打开的标准库文件）中的符号
 workspace_symbol_dependencies: bool = false,
+/// 命名检查（Zig 风格指南的 Names 一节）：是否为打开的文件提示不符合命名约定的名字，并提供改名的修复
+naming_enable: bool = false,
+/// 命名检查跳过的名字；`*` 匹配任意字符序列（`SDL_*`）
+naming_ignore: []const []const u8 = &.{},
+/// 命名检查跳过的文件：相对工作区根目录（`zig-analyzer.zon` 中为相对项目根目录）、以 `/` 分隔的路径；
+/// `*` 匹配任意字符序列（含 `/`）
+naming_exclude: []const []const u8 = &.{},
+/// 命名检查的各条规则是否启用
+naming_rules: NamingRules = .{},
 /// 磁盘上的外部改动由谁发现（见 `Watcher`）
 files_watcher: Watcher = .auto,
 /// 日志级别（err / warn / info / debug）
@@ -78,10 +93,26 @@ pub const Watcher = enum {
     server,
 };
 
-/// 项目配置文件的文件名（位于项目根目录）
-pub const project_file = "zig-analyzer.json";
+/// 命名检查的规则，与诊断的 code `naming.<规则>` 一一对应
+pub const NamingRules = struct {
+    /// 类型与类型别名：TitleCase
+    type: bool = true,
+    /// 返回 `type` 的可调用对象：TitleCase
+    type_function: bool = true,
+    /// 其他可调用对象（函数、函数别名、函数指针）：camelCase
+    function: bool = true,
+    /// 命名空间（没有顶层字段的文件）：snake_case
+    namespace: bool = true,
+    /// 其他值：snake_case
+    value: bool = true,
+    /// 字段与枚举成员（写法按字段的类型）
+    field: bool = true,
+};
 
-/// 配置项：JSON 中的「分组.名字」与对应的字段
+/// 项目配置文件的文件名（位于项目根目录）
+pub const project_file = "zig-analyzer.zon";
+
+/// 配置项：「分组.名字」与对应的字段
 const Setting = struct { section: []const u8, key: []const u8, field: []const u8 };
 
 const settings = [_]Setting{
@@ -100,6 +131,10 @@ const settings = [_]Setting{
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "workspace_symbol", .key = "dependencies", .field = "workspace_symbol_dependencies" },
+    .{ .section = "naming", .key = "enable", .field = "naming_enable" },
+    .{ .section = "naming", .key = "ignore", .field = "naming_ignore" },
+    .{ .section = "naming", .key = "exclude", .field = "naming_exclude" },
+    .{ .section = "naming", .key = "rules", .field = "naming_rules" },
     .{ .section = "files", .key = "watcher", .field = "files_watcher" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },
@@ -107,7 +142,10 @@ const settings = [_]Setting{
 };
 
 /// 可以在项目配置文件中设置的项
-const project_settings = [_][]const u8{ "build_args", "diagnostics_step", "diagnostics_steps", "compiler_diagnostics" };
+const project_settings = [_][]const u8{
+    "build_args",    "diagnostics_step", "diagnostics_steps", "compiler_diagnostics",
+    "naming_enable", "naming_ignore",    "naming_exclude",    "naming_rules",
+};
 
 fn isProjectSetting(comptime field: []const u8) bool {
     for (project_settings) |f| if (std.mem.eql(u8, f, field)) return true;
@@ -168,28 +206,73 @@ fn isSection(name: []const u8) bool {
     return false;
 }
 
-/// 解析项目配置文件的内容。JSON 有误时返回 `error.InvalidConfig`；不能在项目中设置的项记入 `warnings` 并忽略
-pub fn parseProject(gpa: Allocator, text: []const u8) error{ OutOfMemory, InvalidConfig }!Config {
-    const value = json.parseFromSlice(json.Value, gpa, text, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidConfig,
-    };
-    defer value.deinit();
-    var c = try parse(gpa, value.value);
-    errdefer c.deinit(gpa);
-    // arena 的状态须在 `return c` 复制返回值之前写回：defer 在复制之后才执行
-    {
-        var arena = c.arena.promote(gpa);
-        defer c.arena = arena.state;
-        const a = arena.allocator();
-        var warnings: std.ArrayList([]const u8) = .fromOwnedSlice(@constCast(c.warnings));
-        inline for (settings, 0..) |s, si| if (comptime !isProjectSetting(s.field)) if (c.present.isSet(si)) {
-            try warnings.append(a, try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }));
-            c.present.unset(si);
-        };
-        c.warnings = warnings.items;
-    }
+/// 解析项目配置文件（ZON）的内容。不能在项目中设置的项记入 `warnings` 并忽略；语法错误、类型错误或未知的项使整个
+/// 文件被忽略，第一处错误（含位置）记入 `warnings`
+pub fn parseProject(gpa: Allocator, text: []const u8) Allocator.Error!Config {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    var c: Config = .{};
+    var warnings: std.ArrayList([]const u8) = .empty;
+    try readProject(gpa, arena.allocator(), text, &c, &warnings);
+    c.warnings = warnings.items;
+    c.arena = arena.state;
     return c;
+}
+
+/// 项目配置文件的结构：分组与项同 `settings`，各项可选（没有写出时为 null）。
+/// 整个文件一次解析：`std.zon.parse.fromZoir` 不使用 `node` 选项，总是从根开始，不能逐项解析
+const ProjectFile = blk: {
+    const Attrs = std.lang.Type.Struct.FieldAttributes;
+    var names: []const []const u8 = &.{};
+    for (settings) |s| {
+        for (names) |n| {
+            if (std.mem.eql(u8, n, s.section)) break;
+        } else names = names ++ .{s.section};
+    }
+    var types: [names.len]type = undefined;
+    var attrs: [names.len]Attrs = undefined;
+    for (names, &types, &attrs) |name, *Section, *attr| {
+        var keys: []const []const u8 = &.{};
+        var key_types: []const type = &.{};
+        var key_attrs: []const Attrs = &.{};
+        for (settings) |s| if (std.mem.eql(u8, s.section, name)) {
+            // 本身可选的项（`zig.path` 等）不再包一层：ZON 不支持嵌套的可选类型，写成 null 等同于没写
+            const T = @FieldType(Config, s.field);
+            const V = if (@typeInfo(T) == .optional) T else ?T;
+            keys = keys ++ .{s.key};
+            key_types = key_types ++ .{V};
+            key_attrs = key_attrs ++ .{Attrs{ .default_value_ptr = &@as(V, null) }};
+        };
+        Section.* = @Struct(.auto, null, keys, key_types[0..keys.len], key_attrs[0..keys.len]);
+        attr.* = .{ .default_value_ptr = &@as(Section.*, .{}) };
+    }
+    break :blk @Struct(.auto, null, names, &types, &attrs);
+};
+
+/// `parseProject` 的主体：设置写入 `c`，问题记入 `warnings`，都分配在 `a` 中
+fn readProject(gpa: Allocator, a: Allocator, text: []const u8, c: *Config, warnings: *std.ArrayList([]const u8)) Allocator.Error!void {
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const file = std.zon.parse.fromSlice(ProjectFile, .{
+        .gpa = gpa,
+        .arena = a,
+        .source = try a.dupeSentinel(u8, text, 0),
+        .diagnostics = &diag,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => {
+            const e = diag.errors[0];
+            try warnings.append(a, try std.fmt.allocPrint(a, "{d}:{d}: {s}; the file is ignored", .{ e.loc.line + 1, e.loc.column + 1, e.msg }));
+            return;
+        },
+    };
+    inline for (settings, 0..) |s, si| if (@field(@field(file, s.section), s.key)) |v| {
+        if (comptime isProjectSetting(s.field)) {
+            @field(c, s.field) = v;
+            c.present.set(si);
+        } else {
+            try warnings.append(a, try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }));
+        }
+    };
 }
 
 /// 以项目配置中出现的项覆盖（`project` 由 `parseProject` 得到）
@@ -215,6 +298,12 @@ fn dupeValue(a: Allocator, v: anytype) Allocator.Error!@TypeOf(v) {
         },
         else => v,
     };
+}
+
+/// 字段 `field` 对应的项是否出现在配置中（且类型正确）
+pub fn isSet(c: *const Config, comptime field: []const u8) bool {
+    inline for (settings, 0..) |s, si| if (comptime std.mem.eql(u8, s.field, field)) return c.present.isSet(si);
+    @compileError("no setting for field " ++ field);
 }
 
 /// 深拷贝（不含 `warnings`）
@@ -248,6 +337,12 @@ pub fn sameBuild(a: *const Config, b: *const Config) bool {
 
 pub fn sameZig(a: *const Config, b: *const Config) bool {
     return eqlOptional(a.zig_path, b.zig_path);
+}
+
+/// 命名检查的配置是否相同（不同时重新发布打开的文件）
+pub fn sameNaming(a: *const Config, b: *const Config) bool {
+    return a.naming_enable == b.naming_enable and std.meta.eql(a.naming_rules, b.naming_rules) and
+        eqlList(a.naming_ignore, b.naming_ignore) and eqlList(a.naming_exclude, b.naming_exclude);
 }
 
 fn eqlOptional(a: ?[]const u8, b: ?[]const u8) bool {
@@ -334,11 +429,16 @@ test "project file: only project settings apply and override the client" {
     );
     defer client.deinit(testing.allocator);
     var project = try parseProject(testing.allocator,
-        \\{"build": {"args": ["-Dtarget=wasm32-freestanding"], "enable": false}, "diagnostics": {"compiler": false}, "log": {"level": "err"}}
+        \\// 注释
+        \\.{
+        \\    .build = .{ .args = .{"-Dtarget=wasm32-freestanding"}, .enable = false },
+        \\    .diagnostics = .{ .compiler = false },
+        \\    .log = .{ .level = .err },
+        \\}
     );
     defer project.deinit(testing.allocator);
     try testing.expectEqual(2, project.warnings.len);
-    try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.json", project.warnings[0]);
+    try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.zon", project.warnings[0]);
 
     try client.overlayProject(testing.allocator, &project);
     try testing.expectEqualStrings("-Dtarget=wasm32-freestanding", client.build_args[0]);
@@ -346,8 +446,30 @@ test "project file: only project settings apply and override the client" {
     // 项目中没有的项保留客户端的值
     try testing.expectEqualStrings("check", client.diagnostics_steps[0]);
     try testing.expectEqual(.debug, client.log_level);
+}
 
-    try testing.expectError(error.InvalidConfig, parseProject(testing.allocator, "{\"build\": "));
+test "project file: an error ignores the whole file and is reported with its location" {
+    const cases = [_]struct { text: []const u8, prefix: []const u8 }{
+        // 语法错误
+        .{ .text = ".{\n    .build = .{ .args = ,\n}", .prefix = "2:" },
+        // 类型错误、未知的项
+        .{ .text = ".{\n    .naming = .{ .enable = true },\n    .build = .{ .args = true },\n}", .prefix = "3:25: " },
+        .{ .text = ".{ .naming = .{ .rules = .{ .constants = false } } }", .prefix = "1:30: " },
+        .{ .text = ".{ .colors = .{} }", .prefix = "1:5: " },
+        .{ .text = "\"build\"", .prefix = "1:1: " },
+    };
+    for (cases) |case| {
+        var c = try parseProject(testing.allocator, case.text);
+        defer c.deinit(testing.allocator);
+        try testing.expectEqual(1, c.warnings.len);
+        try testing.expect(std.mem.startsWith(u8, c.warnings[0], case.prefix));
+        try testing.expect(std.mem.endsWith(u8, c.warnings[0], "; the file is ignored"));
+        try testing.expect(!c.isSet("naming_enable") and !c.isSet("build_args"));
+    }
+
+    var empty = try parseProject(testing.allocator, "// 只有注释\n.{}");
+    defer empty.deinit(testing.allocator);
+    try testing.expectEqual(0, empty.warnings.len);
 }
 
 test "project file: the parsed config owns the memory of its warnings" {
@@ -355,9 +477,43 @@ test "project file: the parsed config owns the memory of its warnings" {
     var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     const gpa = failing.allocator();
     var project = try parseProject(gpa,
-        \\{"build": {"enable": false}, "diagnostics": {"compiler": false}, "log": {"level": "err"}}
+        \\.{ .build = .{ .enable = false }, .diagnostics = .{ .compiler = false }, .log = .{ .level = .err } }
     );
     defer project.deinit(gpa);
     try testing.expectEqual(2, project.warnings.len);
-    try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.json", project.warnings[0]);
+    try testing.expectEqualStrings("`build.enable` cannot be set in zig-analyzer.zon", project.warnings[0]);
+}
+
+test "naming settings: client and project file" {
+    var empty = try parseText("{}");
+    defer empty.deinit(testing.allocator);
+    try testing.expect(!empty.naming_enable and empty.naming_rules.field and empty.naming_ignore.len == 0);
+
+    var client = try parseText(
+        \\{"naming": {"enable": true, "ignore": ["SDL_*"], "rules": {"field": false}}}
+    );
+    defer client.deinit(testing.allocator);
+    try testing.expectEqual(0, client.warnings.len);
+    try testing.expect(client.naming_enable and !client.naming_rules.field and client.naming_rules.value);
+    try testing.expectEqualStrings("SDL_*", client.naming_ignore[0]);
+    try testing.expect(!client.sameNaming(&empty));
+
+    // 未知的规则：整项取默认值
+    var unknown = try parseText(
+        \\{"naming": {"rules": {"constants": false}}}
+    );
+    defer unknown.deinit(testing.allocator);
+    try testing.expectEqualStrings("invalid value for `naming.rules`, using the default", unknown.warnings[0]);
+    try testing.expect(unknown.naming_rules.value);
+
+    // 项目中的命名约定覆盖客户端的
+    var project = try parseProject(testing.allocator,
+        \\.{ .naming = .{ .exclude = .{"src/c/*"}, .rules = .{ .value = false } } }
+    );
+    defer project.deinit(testing.allocator);
+    try testing.expectEqual(0, project.warnings.len);
+    try client.overlayProject(testing.allocator, &project);
+    try testing.expect(client.naming_enable and client.naming_rules.field and !client.naming_rules.value);
+    try testing.expectEqualStrings("src/c/*", client.naming_exclude[0]);
+    try testing.expectEqualStrings("SDL_*", client.naming_ignore[0]);
 }

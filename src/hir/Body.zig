@@ -149,6 +149,8 @@ pub const Loop = struct {
 pub const Prong = struct {
     items: []const ExprId,
     is_else: bool,
+    /// `inline` 分支：每个分支项单独实例化，捕获 comptime 已知
+    is_inline: bool = false,
     capture: []const BindingId,
     body: ExprId,
 };
@@ -172,7 +174,7 @@ pub const Binding = struct {
     init: ?ExprId = null,
     /// `|*x|`
     is_ptr: bool = false,
-    /// `comptime` 参数
+    /// `comptime` 参数，或 `comptime var` 局部变量
     is_comptime: bool = false,
 
     pub const Kind = enum { param, local_const, local_var, capture };

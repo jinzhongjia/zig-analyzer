@@ -748,7 +748,7 @@ const fetched_package = [_]fixture.File{
     \\
     },
     .{ .path = "proj/main.zig", .text = "export fn entry() u32 {\n    return @import(\"foo\").answer();\n}\n" },
-    .{ .path = "proj/zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--pkg-dir\", \"../pkgs\"]}}" },
+    .{ .path = "proj/zig-analyzer.zon", .text = ".{ .build = .{ .args = .{ \"--pkg-dir\", \"../pkgs\" } } }" },
     .{ .path = "pkgs/" ++ fetched_hash ++ "/build.zig.zon", .text = ".{ .name = .foo, .version = \"0.0.1\", .fingerprint = 0x8c736521e67512df, .paths = .{\"\"} }\n" },
     .{ .path = "pkgs/" ++ fetched_hash ++ "/build.zig", .text =
     \\const std = @import("std");
@@ -1118,7 +1118,7 @@ test "generated module roots: local cache directory moved with --cache-dir" {
         .{ .path = "build.zig", .text = options_build },
         .{ .path = "main.zig", .text = main_text },
         // 相对路径相对于构建根目录
-        .{ .path = "zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--cache-dir\", \"altcache\"]}}" },
+        .{ .path = "zig-analyzer.zon", .text = ".{ .build = .{ .args = .{ \"--cache-dir\", \"altcache\" } } }" },
     });
     defer project.deinit();
     var h: Harness = undefined;
@@ -1161,7 +1161,7 @@ test "generated files in a local cache directory outside the build root: never c
     var project = try fixture.Project.create(&.{
         .{ .path = "proj/build.zig", .text = options_build },
         .{ .path = "proj/main.zig", .text = options_main },
-        .{ .path = "proj/zig-analyzer.json", .text = "{\"build\": {\"args\": [\"--cache-dir\", \"../cache\"]}}" },
+        .{ .path = "proj/zig-analyzer.zon", .text = ".{ .build = .{ .args = .{ \"--cache-dir\", \"../cache\" } } }" },
     });
     defer project.deinit();
     var h: Harness = undefined;
@@ -1557,10 +1557,14 @@ test "settings: build.enable can be switched off and on at runtime" {
     try shutdown(&h);
 }
 
-test "project zig-analyzer.json: build settings apply, a change on disk restarts the project" {
+test "project zig-analyzer.zon: build settings apply, a change on disk restarts the project" {
     var project = try fixture.Project.create(settings_project ++ [_]fixture.File{
-        .{ .path = "zig-analyzer.json", .text =
-        \\{"build": {"args": ["-Dbad=true"]}, "log": {"level": "err"}}
+        .{ .path = "zig-analyzer.zon", .text =
+        \\// 项目的构建参数
+        \\.{
+        \\    .build = .{ .args = .{"-Dbad=true"} },
+        \\    .log = .{ .level = .err },
+        \\}
         },
     });
     defer project.deinit();
@@ -1571,12 +1575,12 @@ test "project zig-analyzer.json: build settings apply, a change on disk restarts
     try waitIdle(&h);
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"3:23 zig: expected type 'u32'"});
-    try testing.expect(anyContains(try shownMessages(&h), "`log.level` cannot be set in zig-analyzer.json"));
+    try testing.expect(anyContains(try shownMessages(&h), "`log.level` cannot be set in zig-analyzer.zon"));
 
     // 编辑器之外改为用 unit step 诊断、去掉 -D 参数：项目重启
     const a = h.arena.allocator();
-    const path = try project.path(a, "zig-analyzer.json");
-    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "{\"diagnostics\": {\"steps\": [\"unit\"]}}" });
+    const path = try project.path(a, "zig-analyzer.zon");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = ".{ .diagnostics = .{ .steps = .{\"unit\"} } }" });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, path), .type = 2 }} });
     try waitIdle(&h);
     diags = try h.diagnostics();

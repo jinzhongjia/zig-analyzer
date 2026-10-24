@@ -423,7 +423,11 @@ const Lowerer = struct {
             .comptime_stmt => {
                 // `comptime var x = ...;` 或 `comptime { ... }` / `comptime expr;`
                 const inner = firstChild(n) orelse return .{ .expr = try l.add(.missing, .none) };
-                if (inner.kind() == .var_decl) return .{ .local = try l.localDecl(inner) };
+                if (inner.kind() == .var_decl) {
+                    const b = try l.localDecl(inner);
+                    l.bindings.items[@backingInt(b)].is_comptime = true;
+                    return .{ .local = b };
+                }
                 return .{ .expr = try l.add(.{ .@"comptime" = try l.expr(inner) }, l.nodeRange(n)) };
             },
             .destructure => {
@@ -546,7 +550,7 @@ const Lowerer = struct {
             const items = try l.exprList(p.items());
             const caps = try l.captures(p.payload());
             if (caps.len != 0) _ = try l.pushScope(caps);
-            try prongs.append(l.a, .{ .items = items, .is_else = p.isElse(), .capture = caps, .body = try l.exprOrMissing(p.body()) });
+            try prongs.append(l.a, .{ .items = items, .is_else = p.isElse(), .is_inline = p.isInline(), .capture = caps, .body = try l.exprOrMissing(p.body()) });
             l.scope = outer;
         }
         l.exprs.items[@backingInt(id)] = .{ .@"switch" = .{ .operand = operand, .prongs = prongs.items } };

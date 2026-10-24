@@ -2797,9 +2797,9 @@ test "comptime evaluation: slices of interpreter storage read elements in place"
     });
 }
 
-test "comptime evaluation: element-wise work counts toward the step and memory limits" {
-    // 防止逐元素的操作绕过上限：表达式不多的求值中逐个写入数十万个元素，或在两次内存检查之间
-    // 复制出超过内存上限的大数组
+test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
+    // 编译器只按回跳计数：逐个写入数十万个元素的 `@memcpy` 不受限制。在两次内存检查之间复制出超过内存上限的
+    // 大数组时放弃
     try expectTypes(
         \\fn copyMany() u8 {
         \\    const buf: [60000]u8 = @splat(1);
@@ -2826,9 +2826,24 @@ test "comptime evaluation: element-wise work counts toward the step and memory l
         \\const few = copyFew();
         \\const large = copyLarge();
     , &.{
-        .{ "many", "u8" },
+        .{ "many", "u8 = 1" },
         .{ "few", "u8 = 1" },
         .{ "large", "u8" },
+    });
+}
+
+test "comptime evaluation: aggregates with more than 65536 elements are evaluated" {
+    // 曾在元素个数超过 65536 时放弃：只应受内存上限约束
+    try expectTypes(
+        \\const big: [100000]u8 = @splat(2);
+        \\fn last() u8 {
+        \\    const s = big[0..];
+        \\    const copy = s.*;
+        \\    return copy[99999];
+        \\}
+        \\const v = last();
+    , &.{
+        .{ "v", "u8 = 2" },
     });
 }
 
@@ -2921,5 +2936,204 @@ test "comptime evaluation: self-referential and deeply nested values are unknown
         .{ "v", "u32" },
         .{ "short", "u32 = 1" },
         .{ "long", "Node" },
+    });
+}
+
+test "calls returning types with comptime-only fields nested at any depth are evaluated at comptime" {
+    // 防止只检查两层嵌套：第三层的 `type` 字段同样使返回类型成为 comptime-only
+    try expectTypes(
+        \\const Inner = struct { t: type };
+        \\const Mid = struct { b: Inner };
+        \\const Outer = struct { a: Mid };
+        \\fn make(comptime X: type) Outer {
+        \\    return .{ .a = .{ .b = .{ .t = X } } };
+        \\}
+        \\const Node = struct { next: ?*const Node, t: type };
+        \\fn list(comptime X: type) []const Node {
+        \\    return &.{.{ .next = null, .t = X }};
+        \\}
+        \\fn f() void {
+        \\    const r = make(u16);
+        \\    const deep = r.a.b.t;
+        \\    const l = list(u32);
+        \\    const first = l[0].t;
+        \\    _ = .{ deep, first };
+        \\}
+    , &.{
+        .{ "deep", "type = u16" },
+        .{ "first", "type = u32" },
+    });
+}
+
+test "comptime evaluation: backward branches follow the compiler's quota" {
+    // 防止按表达式个数或整个请求的燃料放弃：编译器只按回跳（循环迭代、调用）计数，`@setEvalBranchQuota`
+    // 调高配额，调用者调高的配额对被调函数同样有效；超过配额时编译器报错，结果未知
+    try expectTypes(
+        \\fn sum(n: usize) usize {
+        \\    var total: usize = 0;
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) total += i % 7;
+        \\    return total;
+        \\}
+        \\fn raised() usize {
+        \\    @setEvalBranchQuota(200_000);
+        \\    var total: usize = 0;
+        \\    for (0..100_000) |i| total += i % 3;
+        \\    return total;
+        \\}
+        \\fn caller() usize {
+        \\    @setEvalBranchQuota(10_000);
+        \\    return sum(5000);
+        \\}
+        \\fn lowered() usize {
+        \\    @setEvalBranchQuota(10);
+        \\    return sum(500);
+        \\}
+        \\const big = raised();
+        \\const via_caller = caller();
+        \\const default_ok = sum(500);
+        \\const kept = lowered();
+        \\const over = sum(5000);
+        \\fn f() void {
+        \\    @setEvalBranchQuota(10_000);
+        \\    const in_body = comptime sum(5000);
+        \\    _ = in_body;
+        \\}
+    , &.{
+        .{ "big", "usize = 99999" },
+        .{ "via_caller", "usize = 14995" },
+        .{ "default_ok", "usize = 1494" },
+        .{ "kept", "usize = 1494" },
+        .{ "over", "usize" },
+        .{ "in_body", "usize = 14995" },
+    });
+}
+
+test "function pointers are runtime values, not comptime-only" {
+    // 防止把函数指针当作 comptime-only：含有函数指针字段的结构体（如 `std.mem.Allocator` 的 vtable）
+    // 不是 comptime-only，返回它的调用不在 comptime 求值，接收函数指针的函数也不是泛型函数
+    try expectTypes(
+        \\fn hello() void {}
+        \\const VTable = struct { call: *const fn () void };
+        \\const Iface = struct { vtable: *const VTable };
+        \\const Outer = struct { iface: Iface };
+        \\fn make() Outer {
+        \\    return .{ .iface = .{ .vtable = &.{ .call = &hello } } };
+        \\}
+        \\fn apply(cb: *const fn () void) u8 {
+        \\    cb();
+        \\    return 1;
+        \\}
+        \\fn f() void {
+        \\    const o = make();
+        \\    const n = apply(&hello);
+        \\    _ = .{ o, n };
+        \\}
+    , &.{
+        .{ "o", "Outer" },
+        .{ "n", "u8" },
+    });
+}
+
+test "comptime evaluation of integer builtins, @memset, @memmove and @call" {
+    try expectTypes(
+        \\const ov = @addWithOverflow(@as(u8, 250), 10);
+        \\const ov_sum = ov[0];
+        \\const ov_bit = ov[1];
+        \\const no_ov = @subWithOverflow(@as(u8, 5), 3)[1];
+        \\const mul_ov = @mulWithOverflow(@as(i8, 64), 2)[0];
+        \\const shl_ov = @shlWithOverflow(@as(u8, 0b1100_0000), 1);
+        \\const swapped = @byteSwap(@as(u16, 0x1234));
+        \\const swapped_signed = @byteSwap(@as(i16, 0x00ff));
+        \\const reversed = @bitReverse(@as(u8, 1));
+        \\const shl_exact = @shlExact(@as(u8, 1), 3);
+        \\const shr_exact = @shrExact(@as(u8, 8), 3);
+        \\const filled = blk: {
+        \\    var b: [3]u8 = undefined;
+        \\    @memset(&b, 7);
+        \\    break :blk b[1];
+        \\};
+        \\const moved = blk: {
+        \\    var b = [_]u8{ 1, 2, 3, 4 };
+        \\    @memmove(b[1..4], b[0..3]);
+        \\    break :blk b[3];
+        \\};
+        \\fn add(a: u8, b: u8) u8 {
+        \\    return a + b;
+        \\}
+        \\const called = @call(.auto, add, .{ 1, 2 });
+    , &.{
+        .{ "ov_sum", "u8 = 4" },
+        .{ "ov_bit", "u1 = 1" },
+        .{ "no_ov", "u1 = 0" },
+        .{ "mul_ov", "i8 = -128" },
+        .{ "shl_ov", "struct { u8, u1 } = .{ 128, 1 }" },
+        .{ "swapped", "u16 = 13330" },
+        .{ "swapped_signed", "i16 = -256" },
+        .{ "reversed", "u8 = 128" },
+        .{ "shl_exact", "u8 = 8" },
+        .{ "shr_exact", "u8 = 1" },
+        .{ "filled", "u8 = 7" },
+        .{ "moved", "u8 = 3" },
+        .{ "called", "u8 = 3" },
+    });
+}
+
+test "@embedFile reads the file next to the source; missing files are unknown" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/data/hello.txt", "hello");
+    _ = try w.add("/p/empty.txt", "");
+    const src =
+        \\const text = @embedFile("data/hello.txt");
+        \\const first = text[0];
+        \\const empty = @embedFile("empty.txt");
+        \\const missing = @embedFile("missing.txt");
+        \\const count = blk: {
+        \\    var n: usize = 0;
+        \\    for (@embedFile("data/hello.txt")) |c| {
+        \\        if (c == 'l') n += 1;
+        \\    }
+        \\    break :blk n;
+        \\};
+    ;
+    const f = try w.add("/p/main.zig", src);
+    try testing.expectEqualStrings("*const [5:0]u8 = \"hello\"", try typeAt(&w, f.file, src, "text", 0));
+    try testing.expectEqualStrings("u8 = 104", try typeAt(&w, f.file, src, "first", 0));
+    try testing.expectEqualStrings("*const [0:0]u8 = \"\"", try typeAt(&w, f.file, src, "empty", 0));
+    try testing.expectEqualStrings("unknown", try typeAt(&w, f.file, src, "missing", 0));
+    try testing.expectEqualStrings("usize = 2", try typeAt(&w, f.file, src, "count", 0));
+}
+
+test "@src has the type std.builtin.SourceLocation" {
+    try expectStdTypes(
+        \\fn f() void {
+        \\    const here = @src();
+        \\    _ = here;
+        \\}
+    , &.{.{ "here", "SourceLocation" }});
+}
+
+test "values of structs whose fields are all u8 keep the declared field types and display as structs" {
+    // 这样的值以字节表示：曾按 u8 取出 `?u8` 字段（`if (p.short) |s|` 求不出），并显示成字符串
+    try expectTypes(
+        \\const Names = struct {
+        \\    short: ?u8 = null,
+        \\};
+        \\const n0: Names = .{ .short = 'h' };
+        \\const arr = [_]Names{n0};
+        \\fn short(p: Names) u8 {
+        \\    if (p.short) |s| return s;
+        \\    return 0;
+        \\}
+        \\const v = short(n0);
+        \\const P = struct { a: u8, b: u8 };
+        \\const pp: P = .{ .a = 1, .b = 2 };
+    , &.{
+        .{ "n0", "Names = .{ .short = 104 }" },
+        .{ "arr", "[1]Names = .{ .{ .short = 104 } }" },
+        .{ "v", "u8 = 104" },
+        .{ "pp", "P = .{ .a = 1, .b = 2 }" },
     });
 }

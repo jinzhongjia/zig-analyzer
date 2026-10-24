@@ -174,6 +174,19 @@ pub const Instance = struct {
     decl: AstId,
     args: []const Index,
     parent: ?Index = null,
+    /// 按迭代推导时，成员 `decl` 中循环（或 `inline` switch 分支）体内定义的容器所在的实例：`decl` 的实例
+    /// （`abstract` 时 `decl` 没有实例，`args` 为空，外层实例为 `parent`）在 `binding` 取第 `index` 次迭代时。
+    /// 这些容器的字段类型可以依赖循环变量
+    iteration: ?Iteration = null,
+
+    /// `index` 为 `unknown_index` 时迭代未确定（不按迭代推导时循环体内的容器）：类型不具体
+    pub const Iteration = struct {
+        binding: u32,
+        index: u32,
+        abstract: bool,
+
+        pub const unknown_index = std.math.maxInt(u32);
+    };
 };
 
 /// 内置函数构造的容器类型。身份 = 构造位置（成员 + 表达式）+ 构造时的实例 + 内容
@@ -489,7 +502,7 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = try a.dupe(u8, t.len), .child = t.child, .sentinel = t.sentinel } },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
-        .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent } },
+        .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent, .iteration = i.iteration } },
         .tuple_type => |t| .{ .tuple_type = .{ .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values) } },
         .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values) } },
         .reified_type => |t| blk: {
@@ -730,7 +743,24 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             }
             try w.writeAll(if (v.elems.len == 0) "}" else " }");
         },
-        .bytes => |v| try w.print("\"{f}\"", .{std.zig.fmtString(v.bytes[0..@min(v.bytes.len, 64)])}),
+        .bytes => |v| switch (ip.key(v.ty)) {
+            .array_type, .ptr_type => try w.print("\"{f}\"", .{std.zig.fmtString(v.bytes[0..@min(v.bytes.len, 64)])}),
+            // 元素都是 u8 的结构体、元组与向量（同样以字节表示）：按聚合逐个显示
+            else => {
+                const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
+                try w.writeAll(".{");
+                for (v.bytes, 0..) |byte, i| {
+                    if (i == max_printed_elems) {
+                        try w.writeAll(", ...");
+                        break;
+                    }
+                    try w.writeAll(if (i == 0) " " else ", ");
+                    if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
+                    try w.print("{d}", .{byte});
+                }
+                try w.writeAll(if (v.bytes.len == 0) "}" else " }");
+            },
+        },
         .union_value => |v| {
             try w.print(".{{ .{f} = ", .{std.zig.fmtId(v.tag)});
             try ip.print(v.payload, w, container_name);
