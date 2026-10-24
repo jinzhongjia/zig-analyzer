@@ -77,6 +77,9 @@ pub const Watcher = struct {
     /// 所在目录无法监听、改为轮询的文件（路径在 `state_arena` 中）
     fallback: std.ArrayList([]const u8) = .empty,
     poller: Poller,
+    /// 由客户端发现外部改动时，已按文件名补充注册的其他文件（`registerClientGlobs`）；键由 `gpa` 分配
+    client_names: std.StringHashMapUnmanaged(void) = .empty,
+    client_registrations: u32 = 0,
     /// 上一次轮询的耗时（见 `min_idle_factor`）
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
@@ -103,6 +106,9 @@ pub const Watcher = struct {
 
     /// 后台任务结束后调用
     pub fn destroy(w: *Watcher) void {
+        var names = w.client_names.keyIterator();
+        while (names.next()) |k| w.gpa.free(k.*);
+        w.client_names.deinit(w.gpa);
         w.backend.destroy(w.gpa);
         w.fallback.deinit(w.gpa);
         w.files.deinit(w.gpa);
@@ -136,6 +142,11 @@ pub const Watcher = struct {
         while (!w.stopping.load(.acquire)) {
             if (!w.server.watchesFiles()) {
                 w.deactivate();
+                // 先清除再检查：检查期间驻留的新文件会再次唤醒（见 `onNewPath`）
+                w.resync_requested.store(false, .release);
+                if (w.server.register_watch) w.registerClientGlobs() catch |err| switch (err) {
+                    error.OutOfMemory => log.err("out of memory while registering file watchers", .{}),
+                };
                 w.backend.wait(null);
                 var discard: std.heap.ArenaAllocator = .init(w.gpa);
                 defer discard.deinit();
@@ -147,6 +158,36 @@ pub const Watcher = struct {
                 error.OutOfMemory => log.err("out of memory while watching files on disk", .{}),
             };
         }
+    }
+
+    /// 由客户端发现外部改动时，初始注册的 glob 只有 `.zig` 与 `.zon`：驻留过的其他文件（`@embedFile` 的文件）按
+    /// 文件名补充注册（`**/<文件名>`；同名的其他文件的通知因没有驻留而被忽略）。文件名含有 glob 的特殊字符时
+    /// 无法写成 glob，不注册
+    fn registerClientGlobs(w: *Watcher) Allocator.Error!void {
+        const server = w.server;
+        var arena: std.heap.ArenaAllocator = .init(w.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const rules = try server.originRules(a);
+        var out: std.Io.Writer.Allocating = .init(a);
+        var added: usize = 0;
+        for (0..server.vfs.count()) |i| {
+            const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
+            if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
+            if (!server.watchable(rules, path)) continue;
+            const base = std.fs.path.basename(path);
+            if (std.mem.indexOfAny(u8, base, "*?[]{}") != null or w.client_names.contains(base)) continue;
+            try w.client_names.put(w.gpa, try w.gpa.dupe(u8, base), {});
+            out.writer.writeAll(if (added == 0) "{\"watchers\": [" else ", ") catch return error.OutOfMemory;
+            std.json.Stringify.value(.{ .globPattern = try std.fmt.allocPrint(a, "**/{s}", .{base}) }, .{}, &out.writer) catch return error.OutOfMemory;
+            added += 1;
+        }
+        if (added == 0) return;
+        out.writer.writeAll("]}") catch return error.OutOfMemory;
+        const options = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{}) catch return error.OutOfMemory;
+        w.client_registrations += 1;
+        const id = try std.fmt.allocPrint(a, "zig-analyzer/didChangeWatchedFiles/{d}", .{w.client_registrations});
+        server.sendRequest(.{ .string = id }, "client/registerCapability", types.RegistrationParams{ .registrations = &.{.{ .id = id, .method = "workspace/didChangeWatchedFiles", .registerOptions = options }} });
     }
 
     /// 一轮：（必要时）重新计算监听的目录，等待通知或轮询的时刻，处理这一批变化

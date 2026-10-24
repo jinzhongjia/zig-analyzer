@@ -1133,3 +1133,74 @@ test "creating or deleting build.zig in a workspace folder starts or stops its p
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// `uri` 中 `line:character` 处的 hover 文本
+fn hoverText(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const u8 {
+    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
+    const result = resp.object.get("result") orelse return "";
+    if (result != .object) return "";
+    return result.object.get("contents").?.object.get("value").?.string;
+}
+
+/// `waitWatched` 的条件：hover 文本中含有 `want`
+const Hover = struct {
+    uri: []const u8,
+    line: u32,
+    character: u32,
+    want: []const u8,
+
+    fn done(c: Hover, h: *Harness) !bool {
+        return std.mem.indexOf(u8, try hoverText(h, c.uri, c.line, c.character), c.want) != null;
+    }
+};
+
+test "files read by @embedFile are watched on disk by the server, or registered with the client" {
+    const main_text = "const greeting = @embedFile(\"greeting.txt\");\n";
+    inline for (.{ false, true }) |client_watches| {
+        var project = try fixture.Project.create(&.{
+            .{ .path = "main.zig", .text = main_text },
+            .{ .path = "greeting.txt", .text = "hi" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const root_uri = try za.base.uri.fromPath(a, project.root);
+        if (client_watches) {
+            _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+        } else {
+            _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+        }
+        try h.notify("initialized", Empty{});
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+        try open(&h, main_uri, main_text);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "\"hi\"") != null);
+
+        const path = try project.path(a, "greeting.txt");
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "hello" });
+        if (client_watches) {
+            // 客户端按文件名注册了它（由后台任务在驻留后发出）
+            var registered = false;
+            while (!registered) {
+                for (h.received.items) |m| {
+                    const method = m.object.get("method") orelse continue;
+                    if (!std.mem.eql(u8, method.string, "client/registerCapability")) continue;
+                    for (m.object.get("params").?.object.get("registrations").?.array.items) |r| {
+                        const options = r.object.get("registerOptions") orelse continue;
+                        for (options.object.get("watchers").?.array.items) |watcher| {
+                            if (std.mem.eql(u8, watcher.object.get("globPattern").?.string, "**/greeting.txt")) registered = true;
+                        }
+                    }
+                }
+                if (!registered) _ = try h.next();
+            }
+            try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, path), .type = 2 }} });
+            _ = try h.request("zig-analyzer/waitIdle", {});
+            try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "\"hello\"") != null);
+        } else {
+            try waitWatched(&h, Hover{ .uri = main_uri, .line = 0, .character = 7, .want = "\"hello\"" });
+        }
+    }
+}

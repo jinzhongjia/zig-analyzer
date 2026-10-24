@@ -1381,10 +1381,9 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
 }
 
-/// 服务器发现外部改动时关注的文件（另有各根目录的项目文件）：`.zig` / `.zon`，不是虚拟文档，不在依赖库中。
-/// zig 环境未知时还分不出依赖库，都不关注
+/// 服务器发现外部改动时关注的文件（另有各根目录的项目文件）：驻留过的文件（`.zig` / `.zon` 与 `@embedFile` 的
+/// 文件），不是虚拟文档，不在依赖库中。zig 环境未知时还分不出依赖库，都不关注
 pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
-    if (!std.mem.endsWith(u8, path, ".zig") and !std.mem.endsWith(u8, path, ".zon")) return false;
     if (rules.zig_lib == null) return false;
     return switch (origin.classify(&server.vfs, rules, path, false)) {
         .user, .other => true,
