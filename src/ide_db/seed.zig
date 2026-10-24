@@ -548,8 +548,12 @@ fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
     return out;
 }
 
-/// 闭包中实例的总数上限：能通过编译的代码实例化的集合是有限的，超过时是实例化无限增长（类型随递归变大），截断
-const max_closure = 1 << 14;
+/// 闭包中实例的实参嵌套深度上限：能通过编译的代码实例化的集合是有限的，实参类型随递归越嵌越深（`grow(?T)`）
+/// 是实例化无限增长，超过时截断
+const max_closure_depth = 64;
+/// 闭包中实例的总数上限：实参不变深、个数无限增长（comptime 整数随递归增大）同样只出现在不能编译的代码中。
+/// 带大量测试的项目（每个测试类型经数十层泛型函数传播）的实例数可达数万，上限须远高于它
+const max_closure = 1 << 18;
 /// 闭包中类型流的层数上限（见 `typeFlow`；进入过的实例不再进入，层数只用于实例化无限增长的代码）
 const max_closure_flow_depth = 64;
 
@@ -772,6 +776,10 @@ const Closure = struct {
 
     fn add(c: *Closure, g: usize, found: Found) resolve.Error!void {
         if (found.inst != null) c.roots.items[g].seen = true;
+        if (found.inst) |inst| if (depthExceeds(c.r.ctx.db.env.ip, inst, max_closure_depth)) {
+            c.complete = false;
+            return;
+        };
         if (c.roots.items[g].filtered) if (found.inst) |inst| if (!try c.reaches(inst)) return;
         const before = c.roots.items[g].found.found.items.len;
         try c.roots.items[g].found.add(c.r.arena, found);
@@ -791,6 +799,35 @@ const Closure = struct {
         }
     }
 };
+
+/// 类型或值 `x` 的嵌套深度（实例的实参、指针与可选的子类型、聚合的元素等逐层）超过 `limit`
+fn depthExceeds(ip: *InternPool, x: Index, limit: u32) bool {
+    if (limit == 0) return true;
+    const sub = limit - 1;
+    return switch (ip.key(x)) {
+        .ptr_type => |p| depthExceeds(ip, p.child, sub),
+        .array_type => |a| depthExceeds(ip, a.child, sub),
+        .abstract_array_type => |a| depthExceeds(ip, a.child, sub),
+        .vector_type => |v| depthExceeds(ip, v.child, sub),
+        .optional_type => |o| depthExceeds(ip, o, sub),
+        .error_union_type => |e| depthExceeds(ip, e.payload, sub),
+        .fn_type => |f| anyExceeds(ip, f.params, sub) or depthExceeds(ip, f.ret, sub),
+        .container_type => |k| if (k.inst) |i| depthExceeds(ip, i, sub) else false,
+        .reified_type => |t| anyExceeds(ip, t.types, sub) or (if (t.inst) |i| depthExceeds(ip, i, sub) else false),
+        .tuple_type => |t| anyExceeds(ip, t.types, sub),
+        .anon_struct_type => |t| anyExceeds(ip, t.types, sub),
+        .aggregate => |a| anyExceeds(ip, a.elems, sub),
+        .ptr_value => |p| depthExceeds(ip, p.pointee, sub),
+        .union_value => |u| depthExceeds(ip, u.payload, sub),
+        .instance => |i| anyExceeds(ip, i.args, sub) or (if (i.parent) |p| depthExceeds(ip, p, sub) else false),
+        else => false,
+    };
+}
+
+fn anyExceeds(ip: *InternPool, xs: []const Index, limit: u32) bool {
+    for (xs) |x| if (depthExceeds(ip, x, limit)) return true;
+    return false;
+}
 
 /// 收集的实例：按实例去重，至多 `limit` 个
 const Collector = struct {
