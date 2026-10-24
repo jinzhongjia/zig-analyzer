@@ -1,9 +1,8 @@
 //! 自动导入：自持有的声明索引、公开导出闭包与安全的源码编辑。
 //!
-//! 索引只依赖各文件的语法：`InitShapes` 记录 const / var 初始化表达式中与命名空间有关的形状，`FileDecls` 由
-//! ItemTree 与这些形状得出可从文件根访问的声明，`FileLinks` 按形状跨文件求值各声明指向的命名空间与别名的规范
-//! 目标，`Exports` 沿公开成员展开闭包。都不降级成员的 HIR：只改变位置的编辑不改变这些值，按键时不必重新降级
-//! 当前文件的各个 const，为标准库建索引时也不必降级其中的成员。
+//! `FileDecls` 由 ItemTree 得出可从文件根访问的声明，`FileLinks` 记录各声明指向的命名空间与别名的规范目标，
+//! `Exports` 沿公开成员展开闭包。命名空间与别名都由 `Resolver.namespaceOf` / `aliasTarget` 求值，与跳转、
+//! hover 等功能是同一份实现；条件形式（`if` / `switch`）的命名空间由推导求出。
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -15,6 +14,7 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const ItemTree = @import("../syntax/ItemTree.zig");
 const ast = @import("../syntax/ast.zig");
 const Body = @import("../hir/Body.zig");
+const sema_queries = @import("../sema/queries.zig");
 const Allocator = std.mem.Allocator;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const mem = @import("../util/mem.zig");
@@ -46,153 +46,6 @@ const max_depth = 32;
 /// 按 Zig 解析它们没有意义，大文件还很慢
 pub fn isZigSource(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".zig");
-}
-
-// ── 初始化表达式的形状 ─────────────────────────────────────────────
-
-/// const / var 初始化表达式中决定它是否为命名空间、别名的部分：`base` 之后依次访问 `fields`。形式与
-/// `Resolver.namespaceOf`、`aliasTarget` 求值的相同（`@import`、`@This()`、容器字面量、名字与成员访问，
-/// 括号与 `comptime` 透明），其他形式不记录
-pub const Shape = struct {
-    base: Base,
-    /// 依次访问的成员名字（已解码）
-    fields: []const []const u8 = &.{},
-
-    pub const Base = union(enum) {
-        /// `@import` 的实参
-        import: []const u8,
-        this,
-        /// ItemTree 中的容器下标
-        container: u32,
-        /// 引用的名字（已解码）；不带引号的原始类型名与原始值不是引用
-        name: []const u8,
-    };
-};
-
-/// 文件中各 const / var 的 `Shape`。只依赖本文件的语法树且不含位置：只改变位置的编辑之后值不变，依赖它的
-/// `FileDecls` 不必重算
-pub const InitShapes = struct {
-    pub const kind: engine.Kind = .derived;
-    pub const Key = FileId;
-    pub const Value = struct {
-        arena: std.heap.ArenaAllocator.State,
-        /// 有形状的 item，升序
-        items: []const u32 = &.{},
-        shapes: []const Shape = &.{},
-
-        pub fn get(value: Value, item: u32) ?Shape {
-            const i = std.sort.binarySearch(u32, value.items, item, orderItem) orelse return null;
-            return value.shapes[i];
-        }
-    };
-
-    pub fn compute(ctx: *database.Db.Ctx, file: Key) engine.Error!Value {
-        const gpa = ctx.db.gpa;
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        errdefer arena.deinit();
-        if (!isZigSource(ctx.db.env.vfs.path(file))) return .{ .arena = arena.state };
-        const a = arena.allocator();
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
-        const temp = scratch.allocator();
-        const tree = try ctx.get(database.syntax.FileItemTree, file);
-        const map = try ctx.get(database.syntax.FileAstIdMap, file);
-        // 容器字面量按语法节点的起点对应到 ItemTree 中的容器
-        var containers: std.AutoHashMapUnmanaged(u32, u32) = .empty;
-        for (tree.containers, 0..) |c, i| {
-            if (i == 0) continue;
-            if (map.get(c.ast_id)) |node| try containers.put(temp, node.offset, @intCast(i));
-        }
-        var items: std.ArrayList(u32) = .empty;
-        var shapes: std.ArrayList(Shape) = .empty;
-        for (tree.items, 0..) |it, i| {
-            if (it.kind != .@"const" and it.kind != .@"var") continue;
-            const node = map.get(it.ast_id) orelse continue;
-            const init = (ast.VarDecl{ .syntax = node }).initExpr() orelse continue;
-            const shape = try shapeOf(a, temp, init, &containers) orelse continue;
-            try items.append(temp, @intCast(i));
-            try shapes.append(temp, shape);
-        }
-        const owned_items = try a.dupe(u32, items.items);
-        const owned_shapes = try a.dupe(Shape, shapes.items);
-        return .{ .arena = arena.state, .items = owned_items, .shapes = owned_shapes };
-    }
-
-    pub fn eql(a: Value, b: Value) bool {
-        return deepEql(a.items, b.items) and deepEql(a.shapes, b.shapes);
-    }
-
-    pub fn bytes(value: Value) usize {
-        return mem.arenaBytes(value.arena);
-    }
-
-    pub fn deinit(value: *Value, gpa: Allocator) void {
-        var arena = value.arena.promote(gpa);
-        arena.deinit();
-    }
-};
-
-fn shapeOf(a: Allocator, temp: Allocator, node: ast.SyntaxNode, containers: *const std.AutoHashMapUnmanaged(u32, u32)) Allocator.Error!?Shape {
-    var fields: std.ArrayList([]const u8) = .empty;
-    var cur = node;
-    while (true) switch (cur.kind()) {
-        .paren_expr, .comptime_expr => {
-            var children = cur.children();
-            cur = children.nextNode() orelse return null;
-        },
-        .field_access => {
-            const access = ast.FieldAccess{ .syntax = cur };
-            const name = access.name() orelse return null;
-            try fields.append(temp, try ownedName(a, name.text));
-            cur = access.lhs() orelse return null;
-        },
-        else => break,
-    };
-    const base: Shape.Base = switch (cur.kind()) {
-        .name_ref => blk: {
-            const token = (ast.NameRef{ .syntax = cur }).name() orelse return null;
-            if (!std.mem.startsWith(u8, token.text, "@\"") and isBuiltinName(token.text)) return null;
-            break :blk .{ .name = try ownedName(a, token.text) };
-        },
-        .builtin_call => blk: {
-            const call = ast.BuiltinCall{ .syntax = cur };
-            const builtin = (call.name() orelse return null).text;
-            if (std.mem.eql(u8, builtin, "@This")) break :blk .this;
-            if (!std.mem.eql(u8, builtin, "@import")) return null;
-            var args = call.args();
-            const arg = args.next() orelse return null;
-            if (args.next() != null or arg.kind() != .literal) return null;
-            const raw = (arg.firstToken() orelse return null).text;
-            if (raw.len < 2 or raw[0] != '"') return null;
-            break :blk .{ .import = std.zig.string_literal.parseAlloc(a, raw) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidLiteral => return null,
-            } };
-        },
-        .container_decl => .{ .container = containers.get(cur.offset) orelse return null },
-        else => return null,
-    };
-    std.mem.reverse([]const u8, fields.items);
-    return .{ .base = base, .fields = try a.dupe([]const u8, fields.items) };
-}
-
-/// 名字的解码结果复制到 `a`：不含转义时 `identNameAlloc` 引用语法树的原文，语法树会被淘汰
-fn ownedName(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    const name = try ast.identNameAlloc(a, text);
-    const start = @intFromPtr(text.ptr);
-    const inside = @intFromPtr(name.ptr) >= start and @intFromPtr(name.ptr) < start + text.len;
-    return if (inside) a.dupe(u8, name) else name;
-}
-
-/// 不带引号时由语言内建的名字（同 `Body.nameRefIsBuiltin`）
-fn isBuiltinName(name: []const u8) bool {
-    if (std.zig.primitives.isPrimitive(name)) return true;
-    for ([_][]const u8{ "true", "false", "null", "undefined" }) |value| if (std.mem.eql(u8, name, value)) return true;
-    return false;
-}
-
-fn orderItem(needle: u32, item: u32) std.math.Order {
-    return std.math.order(needle, item);
 }
 
 // ── 文件的声明 ─────────────────────────────────────────────────────
@@ -374,7 +227,7 @@ pub const BindingNames = struct {
     }
 };
 
-/// 不淘汰的小索引；只依赖本文件的 ItemTree 与 `InitShapes`，其他文件的变化不使它失效
+/// 不淘汰的小索引：本文件的 ItemTree，以及各容器是否从文件根可达（由 `Resolver` 求值）
 pub const FileDecls = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -388,9 +241,11 @@ pub const FileDecls = struct {
         if (isZigSource(ctx.db.env.vfs.path(file))) {
             var scratch: std.heap.ArenaAllocator = .init(gpa);
             defer scratch.deinit();
+            var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
             var b: DeclBuilder = .{
+                .r = &r,
+                .file = file,
                 .tree = try ctx.get(database.syntax.FileItemTree, file),
-                .shapes = try ctx.get(InitShapes, file),
                 .a = arena.allocator(),
                 .temp = scratch.allocator(),
             };
@@ -418,23 +273,18 @@ pub const FileDecls = struct {
 };
 
 const DeclBuilder = struct {
+    r: *Resolver,
+    file: FileId,
     tree: *const ItemTree,
-    shapes: InitShapes.Value,
     /// 结果的 arena
     a: Allocator,
     temp: Allocator,
-    /// 容器能否从文件根访问：容器字面量直接初始化的具名 const / var 之下的容器才能
+    /// 容器能否从文件根访问：具名 const / var 的值就是这个容器（容器字面量直接初始化）时才能
     reachable: []?bool = undefined,
     names: []?[]const u8 = undefined,
     paths: []?[]const u8 = undefined,
-    local: []?u32 = undefined,
-    state: []LocalState = undefined,
 
-    /// 截断的结果不能缓存：从不同起点求值同一条别名链时可用深度不同
-    const LocalResult = union(enum) { value: ?u32, cutoff };
-    const LocalState = enum { unknown, visiting, done };
-
-    fn build(b: *DeclBuilder) Allocator.Error!DeclIndex {
+    fn build(b: *DeclBuilder) resolve.Error!DeclIndex {
         const items = b.tree.items;
         const containers = b.tree.containers;
         b.reachable = try b.temp.alloc(?bool, containers.len);
@@ -443,9 +293,6 @@ const DeclBuilder = struct {
         @memset(b.names, null);
         b.paths = try b.temp.alloc(?[]const u8, items.len);
         @memset(b.paths, null);
-        b.local = try b.temp.alloc(?u32, items.len);
-        b.state = try b.temp.alloc(LocalState, items.len);
-        @memset(b.state, .unknown);
 
         var list: std.ArrayList(Decl) = .empty;
         for (items, 0..) |it, i| {
@@ -453,7 +300,7 @@ const DeclBuilder = struct {
                 .@"fn", .@"const", .@"var" => {},
                 else => continue,
             }
-            if (it.name == null or !b.isReachable(it.container)) continue;
+            if (it.name == null or !try b.isReachable(it.container)) continue;
             const item: u32 = @intCast(i);
             try list.append(b.temp, .{
                 .name = try b.ownName(item),
@@ -464,10 +311,7 @@ const DeclBuilder = struct {
                 .container = it.container,
                 .root = try b.rootName(it.container),
                 .path = try b.pathOf(item),
-                .local = switch (b.localNamespace(item, 0)) {
-                    .value => |value| value,
-                    .cutoff => null,
-                },
+                .local = try b.localNamespace(item),
                 .doc = if (it.doc) |d| try b.a.dupe(u8, d) else null,
             });
         }
@@ -500,14 +344,14 @@ const DeclBuilder = struct {
                 o.* = no_container;
                 continue;
             };
-            o.* = if (b.isReachable(@intCast(i))) items[parent].container else no_container;
+            o.* = if (try b.isReachable(@intCast(i))) items[parent].container else no_container;
         }
 
         const container_paths = try b.a.alloc(?[]const u8, containers.len);
         @memset(container_paths, null);
         if (containers.len != 0) container_paths[0] = "";
         for (containers, 0..) |c, i| {
-            if (i == 0 or !b.isReachable(@intCast(i))) continue;
+            if (i == 0 or !try b.isReachable(@intCast(i))) continue;
             const parent = c.parent_item orelse continue;
             container_paths[i] = try b.pathOf(parent);
         }
@@ -560,7 +404,7 @@ const DeclBuilder = struct {
         return b.a.dupe(Public, list.items);
     }
 
-    fn isReachable(b: *DeclBuilder, container: u32) bool {
+    fn isReachable(b: *DeclBuilder, container: u32) resolve.Error!bool {
         if (container == 0) return true;
         if (b.reachable[container]) |known| return known;
         // 先记为不可达：自引用的结构不会无限递归
@@ -569,13 +413,9 @@ const DeclBuilder = struct {
             const parent = b.tree.containers[container].parent_item orelse break :blk false;
             const it = b.tree.items[parent];
             if (it.kind != .@"const" and it.kind != .@"var" or it.name == null) break :blk false;
-            const shape = b.shapes.get(parent) orelse break :blk false;
-            if (shape.fields.len != 0) break :blk false;
-            switch (shape.base) {
-                .container => |c| if (c != container) break :blk false,
-                else => break :blk false,
-            }
-            break :blk b.isReachable(it.container);
+            const ns = try namespaceOfDecl(b.r, b.file, parent) orelse break :blk false;
+            if (ns.file != b.file or ns.container != container) break :blk false;
+            break :blk try b.isReachable(it.container);
         };
         b.reachable[container] = result;
         return result;
@@ -612,48 +452,13 @@ const DeclBuilder = struct {
         return path;
     }
 
-    /// 本文件中的命名空间：只沿本文件的名字与成员求值，经过 import 时为 null。只缓存完整结果；
-    /// 深度截断（以及环）返回 cutoff，不按起点深度污染缓存。
-    fn localNamespace(b: *DeclBuilder, item: u32, depth: u32) LocalResult {
-        if (depth > max_depth) return .cutoff;
-        switch (b.state[item]) {
-            .done => return .{ .value = b.local[item] },
-            .visiting => return .cutoff,
-            .unknown => {},
-        }
-        b.state[item] = .visiting;
-        const result = b.localUncached(item, depth);
-        switch (result) {
-            .cutoff => b.state[item] = .unknown,
-            .value => |value| {
-                b.local[item] = value;
-                b.state[item] = .done;
-            },
-        }
-        return result;
-    }
-
-    fn localUncached(b: *DeclBuilder, item: u32, depth: u32) LocalResult {
-        const it = b.tree.items[item];
-        if (it.kind != .@"const" and it.kind != .@"var") return .{ .value = null };
-        const shape = b.shapes.get(item) orelse return .{ .value = null };
-        var ns: u32 = switch (shape.base) {
-            .import => return .{ .value = null },
-            .this => it.container,
-            .container => |c| c,
-            .name => |name| switch (b.localNamespace(b.lookup(it.container, name) orelse return .{ .value = null }, depth + 1)) {
-                .cutoff => return .cutoff,
-                .value => |value| value orelse return .{ .value = null },
-            },
-        };
-        for (shape.fields) |field| {
-            const member = Resolver.lookupDecl(b.tree, ns, field) orelse return .{ .value = null };
-            ns = switch (b.localNamespace(member, depth + 1)) {
-                .cutoff => return .cutoff,
-                .value => |value| value orelse return .{ .value = null },
-            };
-        }
-        return .{ .value = if (b.isReachable(ns)) ns else null };
+    /// 指向本文件中可从文件根访问的容器时为该容器
+    fn localNamespace(b: *DeclBuilder, item: u32) resolve.Error!?u32 {
+        const kind = b.tree.items[item].kind;
+        if (kind != .@"const" and kind != .@"var") return null;
+        const ns = try namespaceOfDecl(b.r, b.file, item) orelse return null;
+        if (ns.file != b.file or !try b.isReachable(ns.container)) return null;
+        return ns.container;
     }
 
     fn lookup(b: *DeclBuilder, container: u32, name: []const u8) ?u32 {
@@ -668,200 +473,25 @@ const DeclBuilder = struct {
 
 // ── 跨文件求值 ─────────────────────────────────────────────────────
 
-/// 按各文件的 `FileDecls` 与 `InitShapes` 求值命名空间与别名的规范目标，与 `Resolver.namespaceOf`、
-/// `aliasTarget` 的结果相同（只认它们识别的形式）。只读取各文件的语法索引，不降级 HIR。只缓存完整结果：
-/// 从不同起点求值同一条别名链时可用深度不同，深度截断（以及环）不写入缓存。
-const Eval = struct {
-    r: *Resolver,
-    temp: Allocator,
-    namespaces: std.AutoHashMapUnmanaged(Declaration, NamespaceEntry) = .empty,
-    targets: std.AutoHashMapUnmanaged(Declaration, TargetEntry) = .empty,
-
-    const NamespaceEntry = union(enum) { visiting, done: ?Namespace };
-    const TargetEntry = union(enum) { visiting, done: Declaration };
-    const NamespaceResult = union(enum) { value: ?Namespace, cutoff };
-    const TargetResult = union(enum) { value: Declaration, cutoff };
-
-    fn namespaceOf(e: *Eval, file: FileId, item: u32) resolve.Error!?Namespace {
-        return switch (try e.namespaceDepth(file, item, 0)) {
-            .value => |value| value,
-            .cutoff => null,
-        };
+/// 声明指向的命名空间：`Resolver.namespaceOf`；初始化表达式是条件形式（`if` / `switch`）时由推导求出它的值
+/// （`pub const X = if (cond) A else B;` 取 comptime 选中的分支）
+fn namespaceOfDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!?Namespace {
+    if (try r.namespaceOf(.{ .item = .{ .file = file, .item = item } })) |ns| return ns;
+    const tree = try r.itemTree(file);
+    if (tree.items[item].kind != .@"const") return null;
+    const body = try r.body(file, item);
+    const value = body.value orelse return null;
+    switch (body.expr(value)) {
+        .@"if", .@"switch" => {},
+        else => return null,
     }
+    const tv = try r.ctx.get(sema_queries.DeclType, .{ .owner = try r.ownerKey(file, item) });
+    const t = tv.asType() orelse return null;
+    return sema_queries.namespaceOfType(r, t);
+}
 
-    fn targetOf(e: *Eval, file: FileId, item: u32) resolve.Error!Declaration {
-        return switch (try e.targetDepth(file, item, 0)) {
-            .value => |value| value,
-            .cutoff => .{ .file = file, .item = item },
-        };
-    }
-
-    fn namespaceDepth(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!NamespaceResult {
-        if (depth > max_depth) return .cutoff;
-        const key: Declaration = .{ .file = file, .item = item };
-        if (e.namespaces.get(key)) |entry| switch (entry) {
-            .visiting => return .cutoff,
-            .done => |value| return .{ .value = value },
-        };
-        try e.namespaces.put(e.temp, key, .visiting);
-        const result = e.namespaceUncached(file, item, depth) catch |err| {
-            _ = e.namespaces.remove(key);
-            return err;
-        };
-        switch (result) {
-            .cutoff => _ = e.namespaces.remove(key),
-            .value => |value| try e.namespaces.put(e.temp, key, .{ .done = value }),
-        }
-        return result;
-    }
-
-    fn namespaceUncached(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!NamespaceResult {
-        const index = try e.r.ctx.get(FileDecls, file);
-        const decl = index.byItem(item) orelse return .{ .value = null };
-        if (decl.kind != .@"const" and decl.kind != .@"var") return .{ .value = null };
-        if (decl.local) |c| return .{ .value = .{ .file = file, .container = c } };
-        const shape = (try e.r.ctx.get(InitShapes, file)).get(item) orelse return .{ .value = null };
-        var ns = switch (try e.base(file, index, decl, shape.base, depth)) {
-            .cutoff => return .cutoff,
-            .value => |value| value orelse return .{ .value = null },
-        };
-        for (shape.fields) |field| {
-            const member_item = try e.member(ns, field) orelse return .{ .value = null };
-            ns = switch (try e.namespaceDepth(ns.file, member_item, depth + 1)) {
-                .cutoff => return .cutoff,
-                .value => |value| value orelse return .{ .value = null },
-            };
-        }
-        return .{ .value = ns };
-    }
-
-    fn base(e: *Eval, file: FileId, index: *const DeclIndex, decl: *const Decl, shape: Shape.Base, depth: u32) resolve.Error!NamespaceResult {
-        return switch (shape) {
-            .import => |spec| .{ .value = .{ .file = try e.importTarget(file, spec) orelse return .{ .value = null }, .container = 0 } },
-            .this => .{ .value = .{ .file = file, .container = decl.container } },
-            .container => |c| .{ .value = .{ .file = file, .container = c } },
-            .name => |name| try e.namespaceDepth(file, (index.lookup(decl.container, name) orelse return .{ .value = null }).item, depth + 1),
-        };
-    }
-
-    /// 同 `Resolver.resolveImport`，命名模块经 `ShapeImports` 查找
-    fn importTarget(e: *Eval, file: FileId, spec: []const u8) resolve.Error!?FileId {
-        if (std.mem.endsWith(u8, spec, ".zig") or std.mem.endsWith(u8, spec, ".zon")) return e.r.resolveImport(file, spec);
-        return (try e.r.ctx.get(ShapeImports, file)).get(spec);
-    }
-
-    fn member(e: *Eval, ns: Namespace, name: []const u8) resolve.Error!?u32 {
-        const index = try e.r.ctx.get(FileDecls, ns.file);
-        return (index.member(ns.container, name) orelse return null).item;
-    }
-
-    fn targetDepth(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!TargetResult {
-        if (depth > max_depth) return .cutoff;
-        const key: Declaration = .{ .file = file, .item = item };
-        if (e.targets.get(key)) |entry| switch (entry) {
-            .visiting => return .cutoff,
-            .done => |value| return .{ .value = value },
-        };
-        try e.targets.put(e.temp, key, .visiting);
-        const result = e.targetUncached(file, item, depth) catch |err| {
-            _ = e.targets.remove(key);
-            return err;
-        };
-        switch (result) {
-            .cutoff => _ = e.targets.remove(key),
-            .value => |value| try e.targets.put(e.temp, key, .{ .done = value }),
-        }
-        return result;
-    }
-
-    fn targetUncached(e: *Eval, file: FileId, item: u32, depth: u32) resolve.Error!TargetResult {
-        const self: Declaration = .{ .file = file, .item = item };
-        const index = try e.r.ctx.get(FileDecls, file);
-        const decl = index.byItem(item) orelse return .{ .value = self };
-        if (decl.kind != .@"const") return .{ .value = self };
-        const shape = (try e.r.ctx.get(InitShapes, file)).get(item) orelse return .{ .value = self };
-        if (shape.fields.len == 0) {
-            const name = switch (shape.base) {
-                .name => |name| name,
-                else => return .{ .value = self },
-            };
-            const target = index.lookup(decl.container, name) orelse return .{ .value = self };
-            return e.targetDepth(file, target.item, depth + 1);
-        }
-        var ns = switch (try e.base(file, index, decl, shape.base, depth)) {
-            .cutoff => return .cutoff,
-            .value => |value| value orelse return .{ .value = self },
-        };
-        for (shape.fields[0 .. shape.fields.len - 1]) |field| {
-            const member_item = try e.member(ns, field) orelse return .{ .value = self };
-            ns = switch (try e.namespaceDepth(ns.file, member_item, depth + 1)) {
-                .cutoff => return .cutoff,
-                .value => |value| value orelse return .{ .value = self },
-            };
-        }
-        const last = try e.member(ns, shape.fields[shape.fields.len - 1]) orelse return .{ .value = self };
-        return e.targetDepth(ns.file, last, depth + 1);
-    }
-};
-
-/// 文件中各 const / var 的形状以名字 import 的模块（`@import("std")` 等）在模块图中的目标。只依赖本文件的
-/// `InitShapes` 与模块图：模块图的变化与这些名字无关时值不变，依赖它的 `FileLinks` 不必重算。不用
-/// `FileImports`：它依赖文件的名字索引，按键时要为当前文件重算
-pub const ShapeImports = struct {
-    pub const kind: engine.Kind = .derived;
-    pub const Key = FileId;
-    pub const Value = struct {
-        arena: std.heap.ArenaAllocator.State,
-        names: []const []const u8 = &.{},
-        targets: []const ?FileId = &.{},
-
-        pub fn get(value: Value, name: []const u8) ?FileId {
-            for (value.names, value.targets) |n, target| if (std.mem.eql(u8, n, name)) return target;
-            return null;
-        }
-    };
-
-    pub fn compute(ctx: *database.Db.Ctx, file: Key) engine.Error!Value {
-        const gpa = ctx.db.gpa;
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        const shapes = try ctx.get(InitShapes, file);
-        const graph = try ctx.get(database.ModuleGraph.Input, {});
-        var names: std.ArrayList([]const u8) = .empty;
-        var targets: std.ArrayList(?FileId) = .empty;
-        for (shapes.shapes) |shape| {
-            const spec = switch (shape.base) {
-                .import => |spec| spec,
-                else => continue,
-            };
-            if (std.mem.endsWith(u8, spec, ".zig") or std.mem.endsWith(u8, spec, ".zon")) continue;
-            for (names.items) |n| {
-                if (std.mem.eql(u8, n, spec)) break;
-            } else {
-                try names.append(a, try a.dupe(u8, spec));
-                try targets.append(a, if (graph) |g| g.importTarget(file, spec) else null);
-            }
-        }
-        return .{ .arena = arena.state, .names = names.items, .targets = targets.items };
-    }
-
-    pub fn eql(a: Value, b: Value) bool {
-        return deepEql(a.names, b.names) and deepEql(a.targets, b.targets);
-    }
-
-    pub fn bytes(value: Value) usize {
-        return mem.arenaBytes(value.arena);
-    }
-
-    pub fn deinit(value: *Value, gpa: Allocator) void {
-        var arena = value.arena.promote(gpa);
-        arena.deinit();
-    }
-};
-
-/// 文件中各声明指向的命名空间与别名的规范目标（按 `DeclIndex.decls` 的下标），由 `Eval` 跨文件求值。补全与
-/// 展开各个导出闭包都要用到；只依赖各文件的 `FileDecls` 与 `InitShapes`，按键时只需验证
+/// 文件中各声明指向的命名空间与别名的规范目标（按 `DeclIndex.decls` 的下标）。补全与展开各个导出闭包都要
+/// 用到
 pub const FileLinks = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -880,12 +510,14 @@ pub const FileLinks = struct {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        var eval: Eval = .{ .r = &r, .temp = scratch.allocator() };
         const namespaces = try a.alloc(?Namespace, index.decls.len);
         const targets = try a.alloc(Declaration, index.decls.len);
         for (index.decls, namespaces, targets) |decl, *ns, *target| {
-            ns.* = try eval.namespaceOf(file, decl.item);
-            target.* = try eval.targetOf(file, decl.item);
+            ns.* = try namespaceOfDecl(&r, file, decl.item);
+            target.* = switch (try r.aliasTarget(.{ .item = .{ .file = file, .item = decl.item } })) {
+                .item => |it| .{ .file = it.file, .item = it.item },
+                else => .{ .file = file, .item = decl.item },
+            };
         }
         return .{ .arena = arena.state, .namespaces = namespaces, .targets = targets };
     }

@@ -70,7 +70,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 热 full p95 5.83 ms，注释插入/撤销后的 delta p95 10.12 ms、最大 20.71 ms，热 range p95 0.38 ms。
 Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；空 range 不执行 Infer / seed 查询。
 
-自动导入在逐字输入时测量（ReleaseSafe，固定在性能核上；`BENCH_TYPE_COMPLETE` 实现同样的过程，见 §5.2）：在名字表达式中编辑一个字符后立即请求补全，计时包含编辑与补全；括号中为关闭 `completion.auto_import` 时的值。索引的内存为 `FileDecls`、`Exports`、`FileLinks`、`InitShapes`、`ShapeImports` 与 `BindingNames` 之和，不含引擎为 memo 保存的 key 与依赖元数据；`Exports` 的 16 MB 上限只约束闭包的值。
+自动导入在逐字输入时测量（ReleaseSafe，固定在性能核上；`BENCH_TYPE_COMPLETE` 实现同样的过程，见 §5.2）：在名字表达式中编辑一个字符后立即请求补全，计时包含编辑与补全；括号中为关闭 `completion.auto_import` 时的值。索引的内存为 `FileDecls`、`Exports`、`FileLinks` 与 `BindingNames` 之和，不含引擎为 memo 保存的 key 与依赖元数据；`Exports` 的 16 MB 上限只约束闭包的值。
 
 | 项目（测量文件） | 补全 p50 | 补全 p95 | 单字符前缀 p50 | 索引的内存 |
 |---|---|---|---|---|
@@ -243,7 +243,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致；嵌套深的文本在 2 GiB 栈的专用线程上格式化，深到 `zig fmt`（主线程栈 46 MiB）也耗尽栈时拒绝（估计深度超过 36864，按常见的嵌套形式标定；连续的前缀运算符 `zig fmt` 能格式化得更深） |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
 | 内置函数的补全、hover、参数提示 | 同版本 Zig 官方语言参考生成的静态签名、参数和 Markdown 说明；hover 同时保留推导结果 |
-| 自动导入补全 | 只依赖语法的按文件声明索引 `FileDecls` 与公开导出闭包 `Exports`，按名字前缀（不区分大小写）二分查找；模块、文件、顶层声明与嵌套声明共用模块可达性判断 |
+| 自动导入补全 | 按文件的声明索引 `FileDecls` 与公开导出闭包 `Exports`（命名空间与别名由 `Resolver` 求值），按名字前缀（不区分大小写）二分查找；模块、文件、顶层声明与嵌套声明共用模块可达性判断 |
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的文件（定义在标准库或依赖包中时，链可以经过范围外的文件），以及项目中的其余文件：泛型代码不必导入定义所在的文件就能经 `anytype` 的值或 comptime 类型参数访问其成员。不导入定义所在文件的文件中只检查泛型函数中的代码 |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
@@ -269,10 +269,9 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 新 import 放在最后一个顶层 import 声明之后，或文件头 `//!` 文档之后；保留同行注释与文档之前的普通注释。文件以 UTF-8 BOM 开头时保留 BOM 在最前，import 插在 BOM 之后。标识符和字符串分别按源码规则转义，附加编辑不与主编辑重叠。
 - 名字前缀不区分 ASCII 大小写匹配，是否按大小写过滤由客户端决定（如 Neovim 遵循 `ignorecase`/`smartcase`）。索引中的名字先不区分大小写、相同时再按字节排序，不区分大小写地以同一前缀开头的名字连续，按名字的精确查找用同一个顺序。前缀的大小写与输入不一致的候选排在所有一致的之后，二者内部仍按下述顺序；截断时不挤掉大小写一致的候选。
 - 可见补全排在自动导入之前，已有别名复用优先于新增导入；自动导入最多返回 128 项，截断时以 `CompletionList.isIncomplete` 请求客户端随前缀变化重新查询。短前缀可匹配上千个声明：结果已满时，排序不会进入前 128 项的候选在构造标签、检查可见性之前就跳过；顶层别名是否被遮蔽到用上时才检查。
-- 索引只依赖各文件的语法，不降级成员的 HIR，按键时不重新降级当前文件的各个 const：
-  - `InitShapes`：const / var 初始化表达式中与命名空间有关的形状（`@import`、`@This()`、容器字面量、名字与成员访问链），不含位置。
-  - `FileDecls`：由 ItemTree 与形状得出可从文件根访问的声明（容器字面量直接初始化的具名 const 之下）与同文件公开路径（公开别名可指向本文件的私有容器，不展开到其他文件）；自持有名字、路径与文档，不淘汰。
-  - `FileLinks`：各声明指向的命名空间与别名的规范目标，按形状跨文件求值，只读取各文件的 `FileDecls`、`InitShapes`；命名模块经 `ShapeImports`（本文件形状中的模块名在模块图中的目标），模块图的变化与这些名字无关时不失效。
+- 命名空间与别名的规范目标由 `Resolver.namespaceOf` / `aliasTarget` 求值，与跳转、hover 等功能是同一份实现；初始化表达式是条件形式（`pub const X = if (cond) A else B;`、`switch`）时由推导求出它的值，取 comptime 选中的分支：
+  - `FileDecls`：由 ItemTree 得出可从文件根访问的声明（值就是该容器的具名 const 之下）与同文件公开路径（公开别名可指向本文件的私有容器，不展开到其他文件）；自持有名字、路径与文档，不淘汰。
+  - `FileLinks`：各声明指向的命名空间与别名的规范目标。
   - `Exports`：沿公开成员展开的闭包，每个命名空间只保留一条最短跳数公开路径，终止别名环；名字与文档直接引用 `FileDecls` 的值，按指针比较相等。补全用到的每个命名空间（各模块的根、当前文件顶层别名指向的命名空间）各有一个闭包，值至多保留 1024 个、16 MB，淘汰的由 `FileDecls`、`FileLinks` 重新展开；引擎为每个 key 保留的依赖元数据不在这个上限内。
 - 只为 `.zig` 文件建索引，也只在 `.zig` 文档中提供：模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON），向 `.zon` 等文件插入 import 声明会破坏它。`completion.auto_import` 关闭时不建索引；已经开始的轮次在下一批之前停止，已建的值保留到会话结束。
 - 第一次在可以自动导入的名字处补全时才开始建索引，不补全的会话（浏览、跳转）不付出这部分内存与计算。之后后台随工作区符号一起为项目文件建索引；标准库、`builtin` 与各命名模块的公开闭包沿涉及的文件按批建索引，批间淘汰解析树等中间结果。索引为当前模块图的构成（标准库、各模块的根与 builtin、各模块的 import 表）建完之前，补全不提供自动导入并标记为不完整（客户端随输入重新请求），不在请求中同步展开闭包；模块图只增减了文件（构建中产生的生成文件、新 import 的文件）时不受影响，这些文件的语法索引在补全时按需建立。上一轮没有建完（出错、任务没能启动）而没有索引在进行时，下一次这样的补全重新开始。索引任务可能就地执行，补全持有读事务，就地执行时其中的读事务会与等待中的写事务互相等待，所以由另一个任务调度。

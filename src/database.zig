@@ -64,8 +64,6 @@ pub const Db = engine.Engine(*const Env, &.{
     ide_db.seed.Query,
     ide_db.seed.Instances,
     ide_db.seed.Candidates,
-    ide_db.imports.InitShapes,
-    ide_db.imports.ShapeImports,
     ide_db.imports.FileDecls,
     ide_db.imports.FileLinks,
     ide_db.imports.Exports,

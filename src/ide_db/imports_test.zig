@@ -806,3 +806,24 @@ test "exports cache evicts least recently used closures and restores them" {
     try testing.expectEqual(@as(usize, 1), last.decls.len);
     try testing.expectEqualStrings("V", first.decls[0].name);
 }
+
+test "auto imports follow namespaces chosen by comptime conditions" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\fn main() void { _ = <|>missing; }
+        \\//- /p/os.zig in:app
+        \\const Linux = struct { pub const epoll_create = 1; };
+        \\const Mac = struct { pub const kqueue_create = 2; };
+        \\pub const impl = if (false) Linux else Mac;
+        \\pub const by_tag = switch (1) { 0 => Linux, else => Mac };
+    );
+    const at = f.cursor.?;
+    const chosen = find(try run(&w, at.file, at.offset, "kqueue", 128), "kqueue_create").?;
+    try testing.expect(std.mem.indexOf(u8, chosen.import_edit.?.text, "impl.kqueue_create") != null or
+        std.mem.indexOf(u8, chosen.import_edit.?.text, "by_tag.kqueue_create") != null);
+    // 没有选中的分支中的声明不可达
+    try testing.expect(find(try run(&w, at.file, at.offset, "epoll", 128), "epoll_create") == null);
+}
