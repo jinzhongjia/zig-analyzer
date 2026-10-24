@@ -698,7 +698,8 @@ const Inferrer = struct {
             .deref => |x| {
                 const p = try inf.infer(x, null);
                 const pt = switch (ip.key(p.ty)) {
-                    .ptr_type => |pt| if (pt.size == .one) pt else return .unknown,
+                    // C 指针也可以解引用（translate-c 生成的 `[*c]T`）
+                    .ptr_type => |pt| if (pt.size == .one or pt.size == .c) pt else return .unknown,
                     else => return .unknown,
                 };
                 // 指向常量的 comptime 已知指针：由解释器取出所指的值

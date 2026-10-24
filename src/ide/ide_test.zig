@@ -3375,3 +3375,20 @@ test "callsite seeding uses each value of an inline switch prong" {
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("x", labels);
 }
+
+test "dereferencing a C pointer gives its child type" {
+    // translate-c 生成的 `[*c]T` 解引用曾为 unknown：`face.*.glyph.*.bitmap` 之后的成员都求不出
+    const labels = try completionLabels(
+        \\const Bitmap = extern struct { width: c_uint, rows: c_uint };
+        \\const GlyphRec = extern struct { bitmap: Bitmap };
+        \\const FaceRec = extern struct { glyph: [*c]GlyphRec };
+        \\fn f(face: [*c]FaceRec) void {
+        \\    const glyph = face.*.glyph;
+        \\    const bitmap = glyph.*.bitmap;
+        \\    _ = bitmap.<|>;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("width rows", labels);
+}
