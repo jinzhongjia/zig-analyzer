@@ -105,6 +105,7 @@ test "auto-import edits replace the whole identifier and resolve after applicati
             .rootUri = try za.base.uri.fromPath(a, project.root),
             .capabilities = .{ .general = .{ .positionEncodings = &[_][]const u8{encoding.toLsp()} } },
             .initializationOptions = .{
+                .completion = .{ .auto_import = true },
                 .diagnostics = .{ .compiler = false, .inactive_code = false },
                 .files = .{ .watcher = "client" },
             },
@@ -168,6 +169,7 @@ test "auto-import indexing restarts when an earlier pass did not finish" {
         .rootUri = try za.base.uri.fromPath(a, project.root),
         .capabilities = Empty{},
         .initializationOptions = .{
+            .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },
             .files = .{ .watcher = "client" },
         },
@@ -202,6 +204,7 @@ test "auto-import works in an unsaved untitled document" {
         .rootUri = try za.base.uri.fromPath(a, project.root),
         .capabilities = Empty{},
         .initializationOptions = .{
+            .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },
             .files = .{ .watcher = "client" },
         },
@@ -274,6 +277,7 @@ test "auto-import items resolve to the signature, docs and where the target is d
         .rootUri = try za.base.uri.fromPath(a, project.root),
         .capabilities = Empty{},
         .initializationOptions = .{
+            .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },
             .files = .{ .watcher = "client" },
         },
@@ -305,7 +309,7 @@ test "completion does not run auto-import indexing inside its read transaction" 
     var h: Harness = undefined;
     try h.startIo(threaded.io());
     defer h.finish();
-    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .completion = .{ .auto_import = true } } });
     try h.notify("initialized", Empty{});
     const uri = "untitled:Untitled-1";
     const text = "pub fn main() void {\n    _ = st;\n}\n";
@@ -347,6 +351,7 @@ test "auto-import module and file candidates resolve through completionItem/reso
         .rootUri = try za.base.uri.fromPath(a, project.root),
         .capabilities = Empty{},
         .initializationOptions = .{
+            .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },
             .files = .{ .watcher = "client" },
         },
@@ -397,6 +402,7 @@ test "auto-import completion reports truncation and recomputes for a narrower pr
         .rootUri = try za.base.uri.fromPath(a, project.root),
         .capabilities = Empty{},
         .initializationOptions = .{
+            .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },
             .files = .{ .watcher = "client" },
         },
@@ -458,6 +464,7 @@ test "auto-import storage public paths and direct aliases resolve after applying
         .rootUri = try za.base.uri.fromPath(a, project.root),
         .capabilities = .{ .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} } },
         .initializationOptions = .{
+            .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },
             .files = .{ .watcher = "client" },
         },
@@ -543,5 +550,80 @@ test "auto-import storage public paths and direct aliases resolve after applying
         const location = if (result == .array) result.array.items[0] else result;
         try testing.expectEqualStrings(try za.base.uri.fromPath(a, try project.path(a, case.target)), location.object.get("uri").?.string);
     }
+    _ = try h.request("shutdown", {});
+}
+
+fn importCount(response: std.json.Value) usize {
+    var n: usize = 0;
+    for (completionItems(response)) |item| {
+        if (item.object.get("additionalTextEdits") != null) n += 1;
+    }
+    return n;
+}
+
+fn isIncomplete(response: std.json.Value) bool {
+    const result = response.object.get("result").?;
+    return result == .object and result.object.get("isIncomplete").?.bool;
+}
+
+test "auto-import is off by default and its limit is configurable" {
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/lib.zig", .text = "pub const Alpha1 = 1;\npub const Alpha2 = 2;\npub const Alpha3 = 3;\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    try h.notify("initialized", Empty{});
+    const text = "fn catalog() void { _ = @import(\"lib.zig\"); }\npub fn main() void { _ = Alph; }\n";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = try position(text, "_ = Alph", 8, .utf16);
+    const params = .{ .textDocument = .{ .uri = uri }, .position = at };
+    // 默认关闭：不提供，也不要求客户端重新请求
+    const off = try h.request("textDocument/completion", params);
+    try testing.expectEqual(0, importCount(off));
+    try testing.expect(!isIncomplete(off));
+
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
+        .completion = .{ .auto_import = true, .max_auto_imports = 1 },
+        .diagnostics = .{ .compiler = false, .inactive_code = false },
+        .files = .{ .watcher = "client" },
+    } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try startAutoImport(&h, uri, at);
+    const limited = try h.request("textDocument/completion", params);
+    try testing.expectEqual(1, importCount(limited));
+    try testing.expect(isIncomplete(limited));
+
+    // 0 为不限
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
+        .completion = .{ .auto_import = true, .max_auto_imports = 0 },
+        .diagnostics = .{ .compiler = false, .inactive_code = false },
+        .files = .{ .watcher = "client" },
+    } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const unlimited = try h.request("textDocument/completion", params);
+    // lib.zig 的三个，以及标准库中同样以 `Alph` 开头的公开声明
+    try testing.expect(importCount(unlimited) >= 3);
+    for ([_][]const u8{ "Alpha1", "Alpha2", "Alpha3" }) |name| {
+        for (completionItems(unlimited)) |item| {
+            if (std.mem.eql(u8, item.object.get("label").?.string, name)) break;
+        } else return error.MissingCandidate;
+    }
+    try testing.expect(!isIncomplete(unlimited));
     _ = try h.request("shutdown", {});
 }

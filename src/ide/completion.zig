@@ -30,6 +30,7 @@ pub const Options = struct {
     auto_import: bool = true,
     /// 不提供自动导入时也判断光标是否位于可以自动导入的名字处（`Result.import_position`）
     detect_import_position: bool = false,
+    /// 至多提供的自动导入候选（保留排序最好的）；不限时为 `maxInt(usize)`
     max_auto_imports: usize = 128,
 };
 

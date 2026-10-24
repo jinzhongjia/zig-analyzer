@@ -3725,9 +3725,15 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // 导入的名字处补全时开始建索引；之后仍未建完而没有索引在进行时（上一轮出错、任务没能启动）重新开始
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
+    const max_auto_imports = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.completion_max_auto_imports;
+    };
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
+        .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
