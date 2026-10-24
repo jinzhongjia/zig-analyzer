@@ -382,10 +382,12 @@ pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error!struct 
 
 /// 泛型函数（`root`）的调用者，按顺序：各调用者在泛型函数之外推导时直接给出的实例；位于其他泛型函数中的调用者
 /// 另记下那个函数（`from`），闭包按它的每个实例推导（见 `CallsIn`）。最后是类型流给出的实例（`flow_start` 起）。
-/// 只取决于目标函数与 `strict`，各个目标的闭包共享
+/// 只取决于目标函数、`strict` 与 `target`，各个目标的闭包共享。`target` 不为 null 时（目标函数位于不导入
+/// `target` 的文件中，见 `Closure.importers`）只取能传入通向 `target` 的实参的调用者：导入了 `target` 的文件中的
+/// 调用者与泛型函数中的调用者
 pub const RootCallers = struct {
     pub const kind: engine.Kind = .derived;
-    pub const Key = struct { root: hir.OwnerKey, strict: bool };
+    pub const Key = struct { root: hir.OwnerKey, strict: bool, target: ?FileId = null };
     pub const Caller = struct { in: FileId, i: u32, from: ?hir.OwnerKey, found_start: usize, found_len: usize };
     pub const Value = struct { found: []const Found, callers: []const Caller, flow_start: usize, cut: bool };
 
@@ -399,13 +401,25 @@ pub const RootCallers = struct {
             if (it.ast_id == key.root.item) break @intCast(i);
         } else return empty;
         const candidates = try ctx.get(Candidates, key.root);
-        const files = candidates.files;
+        const files = candidates.all_files;
+        var importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+        for (candidates.files) |f| try importers.put(r.arena, f, {});
+        var target_importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+        if (key.target) |t| {
+            for (try ctx.get(search.ProjectImporters, t)) |f| try target_importers.put(r.arena, f, {});
+            try target_importers.put(r.arena, t, {});
+        }
         var out: Collector = .{ .limit = std.math.maxInt(usize), .strict = key.strict };
         var callers: std.ArrayList(Caller) = .empty;
         for (0..files.len + 1) |fi| {
             const f = if (fi == 0) key.root.file else files[fi - 1];
             if (fi != 0 and (f == key.root.file or !try containsAny(&r, f, candidates.names))) continue;
             for (try ctx.get(Callers, .{ .root = key.root, .in = f })) |i| {
+                // 不导入目标所在文件的文件中，泛型函数之外的代码不能指名目标的类型，不会调用目标；同样也不能传入
+                // 通向 `target` 的实参
+                const outside = (f != key.root.file and !importers.contains(f)) or
+                    (key.target != null and !target_importers.contains(f));
+                if (outside and try genericRoot(&r, f, i) == null) continue;
                 const owner = try r.ownerKey(f, i);
                 const body = try ctx.get(hir.ItemBody, owner);
                 const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
@@ -512,6 +526,9 @@ pub const AllInstances = struct {
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
         var c: Closure = .{ .r = &r };
+        for ((try ctx.get(Candidates, key)).files) |f| try c.importers.put(r.arena, f, {});
+        try c.importers.put(r.arena, key.file, {});
+        c.target_file = key.file;
         const target = try c.root(key) orelse return .{ .found = &.{}, .complete = true };
         try c.run();
         return .{ .found = try ctx.db.gpa.dupe(Found, c.roots.items[target].found.found.items), .complete = c.complete };
@@ -535,6 +552,11 @@ pub const AllInstances = struct {
 /// `AllInstances` 的计算：参与的泛型函数（目标及其泛型调用者，逐层向上）各自的实例集合，以工作队列传播到不动点
 const Closure = struct {
     r: *Resolver,
+    /// 能经由 `@import` 链到达目标所在文件的文件：其中的泛型函数的实例都参与传播；其余文件中的泛型函数不能
+    /// 指名目标的类型，只有实例实参通向这些文件中定义的类型时（见 `reaches`）才可能调用目标
+    importers: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+    target_file: FileId = undefined,
+    reach_memo: std.AutoHashMapUnmanaged(Index, bool) = .empty,
     roots: std.ArrayList(Root) = .empty,
     /// 待扫描（求调用者）的泛型函数
     unscanned: std.ArrayList(usize) = .empty,
@@ -554,8 +576,63 @@ const Closure = struct {
         outs: std.ArrayList(struct { to: usize, edge: usize }) = .empty,
         scanned: bool = false,
         dispatch_tried: bool = false,
+        /// 位于不导入目标所在文件的文件中：只保留实参通向目标的实例
+        filtered: bool,
+        /// 找到过实例（含被过滤的）：没有时才取分派处、放宽严格查找，与不过滤时相同
+        seen: bool = false,
     };
     const Edge = struct { in: FileId, i: u32, from: usize };
+
+    /// 类型或值 `x` 能否通向 `importers` 中定义的类型：容器定义在其中，或是实参通向它们的实例；指针、数组、
+    /// 元组、函数类型等看其组成部分。求不出的值、抽象参数与未列出的种类按能通向
+    fn reaches(c: *Closure, x: Index) resolve.Error!bool {
+        if (x == .runtime) return false;
+        if (x == .unknown) return true;
+        if (c.reach_memo.get(x)) |v| return v;
+        const v = try c.reachesInner(x);
+        try c.reach_memo.put(c.r.arena, x, v);
+        return v;
+    }
+
+    fn reachesInner(c: *Closure, x: Index) resolve.Error!bool {
+        const ip = c.r.ctx.db.env.ip;
+        return switch (ip.key(x)) {
+            .simple_type, .int_type, .error_set_type, .simple_value, .int_value, .float_value, .enum_literal, .error_value, .runtime => false,
+            .unknown, .opaque_param => true,
+            .ptr_type => |p| c.reaches(p.child),
+            .array_type => |a| c.reaches(a.child),
+            .abstract_array_type => |a| c.reaches(a.child),
+            .vector_type => |v| c.reaches(v.child),
+            .optional_type => |o| c.reaches(o),
+            .error_union_type => |e| c.reaches(e.payload),
+            .inferred_error_set => |e| c.importers.contains(e.file) or (if (e.inst) |i| try c.reaches(i) else false),
+            .fn_type => |f| blk: {
+                for (f.params) |t| if (try c.reaches(t)) break :blk true;
+                break :blk c.reaches(f.ret);
+            },
+            .container_type => |k| c.importers.contains(k.file) or (if (k.inst) |i| try c.reaches(i) else false),
+            .tuple_type => |t| c.anyReaches(t.types, t.values),
+            .anon_struct_type => |t| c.anyReaches(t.types, t.values),
+            .reified_type => |t| c.importers.contains(t.file) or (if (t.inst) |i| try c.reaches(i) else false) or try c.anyReaches(t.types, &.{}),
+            .union_tag_type => |u| c.reaches(u),
+            .enum_tag => |e| c.reaches(e.ty),
+            .fn_value => |f| c.importers.contains(f.file) or (if (f.inst) |i| try c.reaches(i) else false) or try c.reaches(f.ty),
+            .aggregate => |a| (try c.reaches(a.ty)) or try c.anyReaches(a.elems, &.{}),
+            .bytes => |b| c.reaches(b.ty),
+            .union_value => |u| (try c.reaches(u.ty)) or try c.reaches(u.payload),
+            .ptr_value => |p| (try c.reaches(p.ty)) or try c.reaches(p.pointee),
+            .instance => |i| blk: {
+                if (try c.anyReaches(i.args, &.{})) break :blk true;
+                break :blk if (i.parent) |p| try c.reaches(p) else false;
+            },
+        };
+    }
+
+    fn anyReaches(c: *Closure, a: []const Index, b: []const Index) resolve.Error!bool {
+        for (a) |x| if (try c.reaches(x)) return true;
+        for (b) |x| if (try c.reaches(x)) return true;
+        return false;
+    }
 
     /// 泛型函数 `key` 在 `roots` 中的下标，首次出现时加入（待扫描）
     fn root(c: *Closure, key: hir.OwnerKey) resolve.Error!?usize {
@@ -565,7 +642,7 @@ const Closure = struct {
         const item: u32 = for (tree.items, 0..) |it, i| {
             if (it.ast_id == key.item) break @intCast(i);
         } else return null;
-        try c.roots.append(r.arena, .{ .key = key, .file = key.file, .item = item, .found = .{ .limit = std.math.maxInt(usize) } });
+        try c.roots.append(r.arena, .{ .key = key, .file = key.file, .item = item, .found = .{ .limit = std.math.maxInt(usize) }, .filtered = !c.importers.contains(key.file) });
         try c.unscanned.append(r.arena, c.roots.items.len - 1);
         return c.roots.items.len - 1;
     }
@@ -583,7 +660,7 @@ const Closure = struct {
             var progressed = false;
             for (0..c.roots.items.len) |g| {
                 const st = &c.roots.items[g];
-                if (st.found.found.items.len != 0) continue;
+                if (st.seen) continue;
                 if (!st.dispatch_tried) {
                     st.dispatch_tried = true;
                     if (try dispatched(c.r, st.file, st.item, st.item)) |found| {
@@ -608,7 +685,11 @@ const Closure = struct {
         const r = c.r;
         if (c.roots.items[g].scanned) return;
         c.roots.items[g].scanned = true;
-        const rc = try r.ctx.get(RootCallers, .{ .root = c.roots.items[g].key, .strict = c.roots.items[g].found.strict });
+        const rc = try r.ctx.get(RootCallers, .{
+            .root = c.roots.items[g].key,
+            .strict = c.roots.items[g].found.strict,
+            .target = if (c.roots.items[g].filtered) c.target_file else null,
+        });
         if (rc.cut) c.complete = false;
         for (rc.callers) |caller| {
             for (rc.found[caller.found_start..][0..caller.found_len]) |found| try c.add(g, found);
@@ -651,6 +732,8 @@ const Closure = struct {
     }
 
     fn add(c: *Closure, g: usize, found: Found) resolve.Error!void {
+        if (found.inst != null) c.roots.items[g].seen = true;
+        if (c.roots.items[g].filtered) if (found.inst) |inst| if (!try c.reaches(inst)) return;
         const before = c.roots.items[g].found.found.items.len;
         try c.roots.items[g].found.add(c.r.arena, found);
         try c.queueFrom(g, before);
@@ -955,7 +1038,12 @@ pub const Candidates = struct {
 
     pub const Data = struct {
         arena: std.heap.ArenaAllocator,
+        /// 能经由 `@import` 链到达目标所在文件的项目文件：第一个实例与前几个实例的查找按它们的顺序，先找到的
+        /// 实例在前
         files: []const FileId,
+        /// `files` 之后是项目中的其余文件（见 `search.candidateFiles`）：全部实例的闭包不遗漏泛型代码中经
+        /// `anytype` 的值或 comptime 类型参数的调用
+        all_files: []const FileId,
         names: []const []const u8,
     };
 
@@ -972,11 +1060,16 @@ pub const Candidates = struct {
             if (it.ast_id == key.item) break @intCast(i);
         } else {
             data.files = &.{};
+            data.all_files = &.{};
             data.names = &.{};
             return data;
         };
         const allocator = data.arena.allocator();
         data.files = try allocator.dupe(FileId, try ctx.get(search.ProjectImporters, key.file));
+        var all: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        for (data.files) |f| try all.put(r.arena, f, {});
+        for (try search.projectFiles(&r)) |f| try all.put(r.arena, f, {});
+        data.all_files = try allocator.dupe(FileId, all.keys());
         const names = try callNames(&r, key.file, root, data.files);
         const owned = try allocator.alloc([]const u8, names.len);
         for (names, owned) |name, *out| out.* = try allocator.dupe(u8, name);
@@ -985,7 +1078,7 @@ pub const Candidates = struct {
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        if (!std.mem.eql(FileId, a.files, b.files) or a.names.len != b.names.len) return false;
+        if (!std.mem.eql(FileId, a.files, b.files) or !std.mem.eql(FileId, a.all_files, b.all_files) or a.names.len != b.names.len) return false;
         for (a.names, b.names) |x, y| if (!std.mem.eql(u8, x, y)) return false;
         return true;
     }
@@ -1286,7 +1379,7 @@ fn calleeInstance(r: *Resolver, res: *const infer.Result, callee: TypedValue, re
 }
 
 /// 包含成员 `item` 的最内层泛型函数（成员自身，或经由体内定义的容器的外层函数）
-fn genericRoot(r: *Resolver, file: FileId, item: u32) resolve.Error!?u32 {
+pub fn genericRoot(r: *Resolver, file: FileId, item: u32) resolve.Error!?u32 {
     const tree = try r.itemTree(file);
     var cur: ?u32 = item;
     while (cur) |it| : (cur = tree.containers[tree.items[it].container].parent_item) {

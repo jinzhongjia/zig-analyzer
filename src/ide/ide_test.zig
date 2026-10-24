@@ -3110,3 +3110,22 @@ test "all instances of unboundedly growing instantiations are reported incomplet
     const grow = try allInstancesOf(&w, file, "grow");
     try testing.expect(!grow.complete);
 }
+
+test "all instances include anytype calls in files that do not import the method" {
+    // 防止只在导入了方法所在文件的文件中找调用者：`c.zig` 不导入 `a.zig`，经 anytype 的值（指向 `S` 的指针，
+    // 类型流只认实参类型恰为 `S` 的实例）调用其泛型方法
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = (try w.add("/p/a.zig", "pub const S = struct {\n    pub fn foo(self: *S, comptime n: u8) void {\n        _ = self;\n        _ = n;\n    }\n};\n")).file;
+    const c = (try w.add("/p/c.zig", "pub fn call(x: anytype) void {\n    x.foo(3);\n}\n")).file;
+    const main = (try w.add("/p/main.zig", "const a = @import(\"a.zig\");\nconst c = @import(\"c.zig\");\npub fn main() void {\n    var s: a.S = .{};\n    c.call(&s);\n}\n")).file;
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+        .{ .file = main, .module = 0, .root_module = 0 },
+        .{ .file = a, .module = 0, .root_module = 0 },
+        .{ .file = c, .module = 0, .root_module = 0 },
+    });
+    const all = try allInstancesOf(&w, a, "foo");
+    try testing.expectEqual(1, all.count);
+    try testing.expect(all.complete);
+}

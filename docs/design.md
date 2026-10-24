@@ -202,7 +202,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 驻留的值至多嵌套 256 层（自引用的值按 `unknown`）。
 - **泛型函数体**：没有具体实例时以抽象实例推导（`comptime T: type` 为抽象参数，显示为 `T`；`comptime x: anytype` 的实例记录实参值）；**调用点种子**取一个能求出具体实例的调用点推导，hover 标注来源：
   - 经文件索引跨文件查找；调用者自身在泛型函数内时取调用者的实例，hover / 跳转 / 补全的第一个实例最多上溯 6 层
-  - 全部实例（查找引用、重命名，语义着色的最后一层候选）求闭包（`AllInstances`）：从泛型函数之外的调用、类型流与 std 中的分派处出发，沿泛型调用者的每个实例中对目标的调用传播，直到不再出现新的实例，不按层数或个数截断。能通过编译的代码实例化的集合是有限的；实例化无限增长（类型随递归变大）时截断并标记为不完整，重命名与命名修复因此拒绝。各泛型函数的调用者（`RootCallers`）与调用者在某个实例下的调用（`CallsIn`）按 query 缓存，同一组互相调用的泛型函数的闭包共享
+  - 全部实例（查找引用、重命名，语义着色的最后一层候选）求闭包（`AllInstances`）：从泛型函数之外的调用、类型流与 std 中的分派处出发，沿泛型调用者的每个实例中对目标的调用传播，直到不再出现新的实例，不按层数或个数截断。能通过编译的代码实例化的集合是有限的；实例化无限增长（类型随递归变大）时截断并标记为不完整，重命名与命名修复因此拒绝。各泛型函数的调用者（`RootCallers`）与调用者在某个实例下的调用（`CallsIn`）按 query 缓存，同一组互相调用的泛型函数的闭包共享。调用者取项目中的全部文件；不导入目标所在文件的文件中的泛型函数，只保留实参通向导入方中定义的类型的实例，扫描其调用者时只取导入方中与泛型函数中的调用者
   - 推导调用者之前先静态解析它提到函数名的每一处（命名空间、全局声明与参数的类型）：都指向其他函数时不推导（`print`、`init` 等常见名字）。调用者列表按目标与文件缓存（`Callers`），各层查找共享
   - 函数值与实参元组一起传入的调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`）以元组元素作为实参
   - 项目中没有调用点的泛型方法以标准库的分派处求实例：`std.Io.Writer.printValue` 中的 `value.format(w)`、`value.formatNumber(w, ...)` 等
@@ -229,7 +229,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
 | 内置函数的补全、hover、参数提示 | 同版本 Zig 官方语言参考生成的静态签名、参数和 Markdown 说明；hover 同时保留推导结果 |
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
-| references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的项目文件（定义在标准库或依赖包中时，链可以经过范围外的文件） |
+| references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的文件（定义在标准库或依赖包中时，链可以经过范围外的文件），以及项目中的其余文件：泛型代码不必导入定义所在的文件就能经 `anytype` 的值或 comptime 类型参数访问其成员。不导入定义所在文件的文件中只检查泛型函数中的代码 |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑；命名的修复见下 |
 | 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |

@@ -1,7 +1,8 @@
 //! 引用查找：按名字粗筛候选文件，再逐处精确解析确认。
 //!
-//! 候选文件：能经由 `@import` 链到达定义所在文件的文件（引用不到定义的文件不必检查），
-//! 且文件索引中包含该名字。局部名字只在所在成员（及其体内定义的容器成员）中查找。
+//! 候选文件：能经由 `@import` 链到达定义所在文件的文件，以及范围内的其余文件（泛型代码不导入定义所在的文件也能
+//! 经由 `anytype` 的值或 comptime 类型参数访问其成员，见 `candidateFiles`），且文件索引中包含该名字。局部名字只在
+//! 所在成员（及其体内定义的容器成员）中查找。
 //! 只在出现该名字的成员中解析；名字引用用名字解析，字段访问优先用命名空间求值，求不出时
 //! 才读取该成员的类型推导结果。
 
@@ -88,7 +89,8 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
             }
         },
         .item => {
-            const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try importers(r, def_file, opts.scope);
+            const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, def_file, opts.scope);
+            for (try importers(r, def_file, opts.scope)) |f| try finder.importing.put(r.arena, f, {});
             for (files) |f| {
                 const index = try r.ctx.get(FileIndex.Query, f);
                 if (!index.contains(name)) continue;
@@ -130,6 +132,16 @@ pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
     var out: std.ArrayList(FileId) = .empty;
     for (graph.files) |f| if (f.module != database.ModuleGraph.std_module) try out.append(r.arena, f.file);
     return out.items;
+}
+
+/// 引用 `target` 中的定义的候选文件：能经由 `@import` 链到达 `target` 的文件在前（见 `importers`），之后是
+/// `scope` 中的其余文件。泛型代码不必导入定义所在的文件就能访问其成员：`anytype` 参数的值（`x.foo()`，实例中
+/// `x` 的类型来自 `target`）、comptime 类型参数（`M.foo`）。与 ZLS 在构建系统下搜索模块的全部文件相同
+pub fn candidateFiles(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
+    var out: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    for (try importers(r, target, scope)) |f| try out.put(r.arena, f, {});
+    for (scope) |f| try out.put(r.arena, f, {});
+    return out.keys();
 }
 
 /// 在 `scope` 中能经由 `@import` 链到达 `target` 的文件（含 `target` 自身）。`target` 不在 `scope` 中
@@ -201,6 +213,8 @@ const Finder = struct {
     ambiguous: ?*?Reference,
     uncertain: ?*?Reference,
     incomplete: ?*?Reference,
+    /// 能经由 `@import` 链到达定义所在文件的文件（`.item` 定义）。其余文件中只有泛型函数中的代码可能引用定义
+    importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
     /// 最近一个成员的调用点实例（`instances`）
     cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index, complete: bool } = null,
 
@@ -219,6 +233,8 @@ const Finder = struct {
         if (!try r.mayMention(file, item_index, f.name)) return;
         const body = try r.body(file, item_index);
         if (!mentions(body, f.name)) return;
+        // 不导入定义所在文件的文件中，泛型函数之外的代码既不能按名字引用定义，也拿不到它所在的类型
+        if (f.def == .item and !f.importing.contains(file) and try seed.genericRoot(r, file, item_index) == null) return;
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
         for (body.exprs, 0..) |e, i| {

@@ -417,3 +417,29 @@ test "files with syntax errors that mention the name are reported" {
     // other.zig 也有语法错误，但没有出现这个名字
     try testing.expectEqual(main_file, syntax_error.?);
 }
+
+test "references in generic code of files that do not import the definition" {
+    // 防止只在导入了定义所在文件的文件中查找：`c.zig` 不导入 `a.zig`，经 anytype 的值调用 `foo`
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a_src = "pub const S = struct {\n    pub fn foo(self: S) void {\n        _ = self;\n    }\n};\n";
+    const c_src = "pub fn call(x: anytype) void {\n    x.foo();\n}\n";
+    const main_text = "const a = @import(\"a.zig\");\nconst c = @import(\"c.zig\");\npub fn main() void {\n    c.call(a.S{});\n}\n";
+    const fa = (try w.add("/p/a.zig", a_src)).file;
+    const fc = (try w.add("/p/c.zig", c_src)).file;
+    const fm = (try w.add("/p/main.zig", main_text)).file;
+    try w.setGraph(null, &.{.{ .root = fm, .imports = &.{} }}, &.{
+        .{ .file = fm, .module = 0, .root_module = 0 },
+        .{ .file = fa, .module = 0, .root_module = 0 },
+        .{ .file = fc, .module = 0, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(testing.allocator);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const def = (try definition.defAt(&r, fa, at(a_src, "foo", 0))).?;
+    const list = try search.findReferences(&r, def, .{ .scope = &.{ fa, fc, fm } });
+    try testing.expectEqual(2, list.len);
+    try testing.expectEqual(fc, list[1].file);
+    try testing.expectEqual(at(c_src, "foo", 0), list[1].start);
+}
