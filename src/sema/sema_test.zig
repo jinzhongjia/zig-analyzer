@@ -2832,6 +2832,21 @@ test "comptime evaluation: element-wise work is not limited by steps, but large 
     });
 }
 
+test "comptime evaluation: aggregates with more than 65536 elements are evaluated" {
+    // 曾在元素个数超过 65536 时放弃：只应受内存上限约束
+    try expectTypes(
+        \\const big: [100000]u8 = @splat(2);
+        \\fn last() u8 {
+        \\    const s = big[0..];
+        \\    const copy = s.*;
+        \\    return copy[99999];
+        \\}
+        \\const v = last();
+    , &.{
+        .{ "v", "u8 = 2" },
+    });
+}
+
 test "catch and orelse take the result type of the whole expression, labeled switch break values" {
     try expectTypes(
         \\fn parse(s: []const u8) error{Bad}!u8 {

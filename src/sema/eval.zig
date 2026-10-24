@@ -35,8 +35,6 @@ pub const default_branch_quota = 1000;
 const max_tracked_decls = 64;
 /// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃
 const max_eval_bytes = 64 * 1024 * 1024;
-/// 解释器内展开的单个聚合的元素个数上限（在分配前检查）
-const max_agg_elems = 1 << 16;
 /// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
 const max_layout_depth = 64;
 /// 驻留时值的嵌套深度上限（聚合与指针的层数）。驻留的值按内容唯一表示、没有环，
@@ -781,11 +779,11 @@ const Evaluator = struct {
         return cur;
     }
 
-    /// 展开 `n` 个元素的聚合：分配之前检查元素个数与本次求值的内存上限（`tick` 每隔一段才检查内存，
+    /// 展开 `n` 个元素的聚合：分配之前检查本次求值的内存上限（`tick` 每隔一段才检查内存，
     /// 单步展开的大聚合会越过它）
     fn allocElems(ev: *Evaluator, n: usize) EvalError![]Val {
-        if (n > max_agg_elems) return error.Abort;
-        if (ev.arena) |arena| if (arena.queryCapacity() + n * @sizeOf(Val) > max_eval_bytes) return error.Abort;
+        const used = if (ev.arena) |arena| arena.queryCapacity() else 0;
+        if (n > (max_eval_bytes - @min(used, max_eval_bytes)) / @sizeOf(Val)) return error.Abort;
         return ev.a.alloc(Val, n);
     }
 
@@ -2073,7 +2071,7 @@ const Evaluator = struct {
         const start = std.math.cast(usize, try ev.evalInt(f, s.start, .usize_type)) orelse return error.Abort;
         const count = try ev.elemCount(base) orelse return error.Abort;
         const end = if (s.end) |e| std.math.cast(usize, try ev.evalInt(f, e, .usize_type)) orelse return error.Abort else count;
-        if (start > end or end > count or end - start > max_agg_elems) return error.Abort;
+        if (start > end or end > count) return error.Abort;
         const child = ev.elemTypeOf(base.ty, 0);
         const is_const = switch (ip.key(base.ty)) {
             .ptr_type => |p| p.is_const,
@@ -2105,7 +2103,7 @@ const Evaluator = struct {
         if (try ev.sliceTarget(f, s.lhs, base)) |target| {
             const offset = if (target.window) |tw| tw.start else 0;
             var ref = target;
-            ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = @intCast(end - start) };
+            ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = std.math.cast(u32, end - start) orelse return error.Abort };
             return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
         }
         // 其他（驻留的常量等）：元素为复制，不驻留
