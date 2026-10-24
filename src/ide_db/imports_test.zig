@@ -807,6 +807,29 @@ test "exports cache evicts least recently used closures and restores them" {
     try testing.expectEqualStrings("V", first.decls[0].name);
 }
 
+test "auto imports leave out methods of containers" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\fn main() void { _ = <|>missing; }
+        \\//- /p/Server.zig in:app
+        \\pub const Service = struct {
+        \\    const Self = @This();
+        \\    pub fn create() Service { return .{}; }
+        \\    pub fn stop(self: *Service) void { _ = self; }
+        \\    pub fn restart(self: *const Self) void { _ = self; }
+        \\    pub fn resume_(self: @This()) void { _ = self; }
+        \\};
+    );
+    const at = f.cursor.?;
+    try testing.expect(find(try run(&w, at.file, at.offset, "create", 128), "create") != null);
+    for ([_][]const u8{ "stop", "restart", "resume_" }) |name| {
+        try testing.expect(find(try run(&w, at.file, at.offset, name, 128), name) == null);
+    }
+}
+
 test "auto imports follow namespaces chosen by comptime conditions" {
     var w: World = undefined;
     try w.init();

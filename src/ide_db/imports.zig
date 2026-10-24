@@ -302,6 +302,8 @@ const DeclBuilder = struct {
             }
             if (it.name == null or !try b.isReachable(it.container)) continue;
             const item: u32 = @intCast(i);
+            // 方法（第一个参数是所在容器的值或指针）经由实例调用，不作为可导入的函数
+            if (it.kind == .@"fn" and it.container != 0 and try b.isMethod(item)) continue;
             try list.append(b.temp, .{
                 .name = try b.ownName(item),
                 .item = item,
@@ -419,6 +421,40 @@ const DeclBuilder = struct {
         };
         b.reachable[container] = result;
         return result;
+    }
+
+    /// 函数 `item` 的第一个参数的类型是它所在的容器（`self: Self`、`self: *const @This()`、`s: *S`）
+    fn isMethod(b: *DeclBuilder, item: u32) resolve.Error!bool {
+        const node = try b.r.itemNode(b.file, item) orelse return false;
+        const proto = (ast.FnDecl{ .syntax = node }).proto() orelse (if (node.kind() == .fn_proto) ast.FnProto{ .syntax = node } else return false);
+        var params = proto.params();
+        const first = params.next() orelse return false;
+        var ty = (ast.Param{ .syntax = first }).typeExpr() orelse return false;
+        // `*T`、`*const T`：取被指向的类型
+        while (ty.kind() == .ptr_type) {
+            var last: ?ast.SyntaxNode = null;
+            var children = ty.children();
+            while (children.nextNode()) |c| switch (c.kind()) {
+                .sentinel, .align_clause, .addrspace_clause => {},
+                else => last = c,
+            };
+            ty = last orelse return false;
+        }
+        const container = b.tree.items[item].container;
+        switch (ty.kind()) {
+            .builtin_call => {
+                const name = (ast.BuiltinCall{ .syntax = ty }).name() orelse return false;
+                return std.mem.eql(u8, name.text, "@This");
+            },
+            .name_ref => {
+                const token = (ast.NameRef{ .syntax = ty }).name() orelse return false;
+                const name = try ast.identNameAlloc(b.temp, token.text);
+                const found = b.lookup(container, name) orelse return false;
+                const ns = try namespaceOfDecl(b.r, b.file, found) orelse return false;
+                return ns.file == b.file and ns.container == container;
+            },
+            else => return false,
+        }
     }
 
     fn ownName(b: *DeclBuilder, item: u32) Allocator.Error![]const u8 {
