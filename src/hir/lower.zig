@@ -545,7 +545,7 @@ const Lowerer = struct {
             const items = try l.exprList(p.items());
             const caps = try l.captures(p.payload());
             if (caps.len != 0) _ = try l.pushScope(caps);
-            try prongs.append(l.a, .{ .items = items, .is_else = p.isElse(), .capture = caps, .body = try l.exprOrMissing(p.body()) });
+            try prongs.append(l.a, .{ .items = items, .is_else = p.isElse(), .is_inline = p.isInline(), .capture = caps, .body = try l.exprOrMissing(p.body()) });
             l.scope = outer;
         }
         l.exprs.items[@backingInt(id)] = .{ .@"switch" = .{ .operand = operand, .prongs = prongs.items } };

@@ -149,6 +149,8 @@ pub const Loop = struct {
 pub const Prong = struct {
     items: []const ExprId,
     is_else: bool,
+    /// `inline` 分支：每个分支项单独实例化，捕获 comptime 已知
+    is_inline: bool = false,
     capture: []const BindingId,
     body: ExprId,
 };

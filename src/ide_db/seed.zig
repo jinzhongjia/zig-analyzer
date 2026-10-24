@@ -56,7 +56,8 @@ pub const Refiner = struct {
     stage_ends: [3]usize = @splat(0),
     loop_regions: ?[]const LoopRegion = null,
 
-    const LoopRegion = struct { expr: Body.ExprId, range: Body.Range };
+    /// 按迭代推导的区域：`for` 循环体，或 `inline` switch 分支（`prong` 为分支下标）的分支体
+    const LoopRegion = struct { expr: Body.ExprId, prong: ?u32 = null, range: Body.Range };
 
     const Variant = struct {
         res: ?*const infer.Result = null,
@@ -67,6 +68,7 @@ pub const Refiner = struct {
     };
     const LoopResults = struct {
         expr: Body.ExprId,
+        prong: ?u32,
         binding: u32,
         results: []?*const infer.Result,
     };
@@ -120,15 +122,14 @@ pub const Refiner = struct {
         if (f.loop_regions) |cached| return cached;
         var out: std.ArrayList(LoopRegion) = .empty;
         for (f.body.exprs, 0..) |expr, ei| {
-            const loop = switch (expr) {
-                .loop => |l| l,
-                else => continue,
-            };
-            if (loop.kind != .@"for") continue;
-            try out.append(f.r.arena, .{
-                .expr = @fromBackingInt(@as(u32, @intCast(ei))),
-                .range = f.body.range(loop.body),
-            });
+            const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(ei)));
+            switch (expr) {
+                .loop => |loop| if (loop.kind == .@"for") try out.append(f.r.arena, .{ .expr = id, .range = f.body.range(loop.body) }),
+                .@"switch" => |sw| for (sw.prongs, 0..) |prong, pi| {
+                    if (prong.is_inline and prong.capture.len > 0) try out.append(f.r.arena, .{ .expr = id, .prong = @intCast(pi), .range = f.body.range(prong.body) });
+                },
+                else => {},
+            }
         }
         f.loop_regions = out.items;
         return out.items;
@@ -149,16 +150,22 @@ pub const Refiner = struct {
             const range = region.range;
             if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
             const id = region.expr;
-            const loop = f.body.expr(id).loop;
             const cached = for (candidate.loops.items) |entry| {
-                if (entry.expr == id) break entry;
+                if (entry.expr == id and entry.prong == region.prong) break entry;
             } else blk: {
-                const entry: LoopResults = for (loop.capture, 0..) |capture, k| {
-                    const n = try iterations(f.r, res, loop, k) orelse continue;
+                const empty: LoopResults = .{ .expr = id, .prong = region.prong, .binding = 0, .results = &.{} };
+                const entry: LoopResults = if (region.prong) |pi| prong: {
+                    const sw = f.body.expr(id).@"switch";
+                    const n = try prongIterations(ip, f.body, res, sw, pi) orelse break :prong empty;
                     const results = try f.r.arena.alloc(?*const infer.Result, n);
                     @memset(results, null);
-                    break .{ .expr = id, .binding = @backingInt(capture), .results = results };
-                } else .{ .expr = id, .binding = 0, .results = &.{} };
+                    break :prong .{ .expr = id, .prong = pi, .binding = @backingInt(sw.prongs[pi].capture[0]), .results = results };
+                } else for (f.body.expr(id).loop.capture, 0..) |capture, k| {
+                    const n = try iterations(f.r, res, f.body.expr(id).loop, k) orelse continue;
+                    const results = try f.r.arena.alloc(?*const infer.Result, n);
+                    @memset(results, null);
+                    break .{ .expr = id, .prong = null, .binding = @backingInt(capture), .results = results };
+                } else empty;
                 try candidate.loops.append(f.r.arena, entry);
                 break :blk entry;
             };
@@ -190,6 +197,24 @@ pub const Refiner = struct {
     }
 };
 
+/// `inline` switch 分支（`sw` 的第 `pi` 个）按取值推导的次数：操作数不是 union 与错误集、捕获在推导中没有值
+/// 时为分支项展开后的取值个数（见 `infer.inlineProngValues`）
+fn prongIterations(ip: *InternPool, body: *const Body, res: *const infer.Result, sw: @FieldType(Body.Expr, "switch"), pi: u32) resolve.Error!?u32 {
+    const prong = sw.prongs[pi];
+    if (!prong.is_inline or prong.capture.len == 0 or res.exprs.len != body.exprs.len) return null;
+    const cap = prong.capture[0];
+    if (@backingInt(cap) >= res.bindings.len or res.bindings[@backingInt(cap)].val != null or body.binding(cap).is_ptr) return null;
+    const operand = res.exprs[@backingInt(sw.operand)].ty;
+    switch (ip.key(operand)) {
+        .container_type => |c| if (c.kind == .@"union") return null,
+        .reified_type => |rt| if (rt.kind == .@"union") return null,
+        .error_set_type, .inferred_error_set => return null,
+        else => {},
+    }
+    const n = (try infer.inlineProngValues(ip, body, res.exprs, prong, operand, null)).count orelse return null;
+    return if (n > 0) n else null;
+}
+
 /// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数：遍历 comptime 已知的类型列表
 /// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），遍历 comptime 已知的值列表
 /// （循环变量有类型但没有值），或遍历各项类型不同的元组（`inline for (.{ &posix, &windows }) |cases|`；
@@ -213,13 +238,27 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
     return @intCast(tt.types.len);
 }
 
-/// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）内提到 `names` 的调用：实参求不出
-/// 具体的实例；按各次迭代推导（实例 `inst` 下的结果为 `res`）再找。`all` 不为 null 时收集
+/// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）与 `inline` switch 分支（见
+/// `prongIterations`）内提到 `names` 的调用：实参求不出具体的实例；按各次迭代推导（实例 `inst` 下的结果为
+/// `res`）再找。`all` 不为 null 时收集
 fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
+    const ip = r.ctx.db.env.ip;
     for (body.exprs) |e| {
         const l = switch (e) {
             .loop => |l| l,
+            .@"switch" => |sw| {
+                for (sw.prongs, 0..) |prong, pi| {
+                    if (!prong.is_inline or !mentionsWithin(body, prong.body, names)) continue;
+                    const n = try prongIterations(ip, body, res, sw, @intCast(pi)) orelse continue;
+                    for (0..n) |idx| {
+                        const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(prong.capture[0]), .index = @intCast(idx) } });
+                        if (try callIn(r, in, i, body, res_i, file, item, root_key, all, strict)) |found| return found;
+                        if (all) |c| if (c.full()) return null;
+                    }
+                }
+                continue;
+            },
             else => continue,
         };
         if (l.kind != .@"for" or !mentionsWithin(body, l.body, names)) continue;

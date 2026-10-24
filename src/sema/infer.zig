@@ -87,8 +87,8 @@ pub const Mode = enum {
     full,
 };
 
-/// 遍历类型列表的循环（`inline for`、comptime 中的 `for`）的循环变量 `binding` 取列表的第 `index` 个元素
-/// （见 `queries.InferKey.loop`）
+/// 按迭代推导：循环（`inline for`、comptime 中的 `for`）的循环变量 `binding` 取列表的第 `index` 个元素，
+/// `inline` switch 分支的捕获 `binding` 取第 `index` 个分支项的值（见 `queries.InferKey.loop`）
 pub const LoopSeed = struct { binding: u32, index: u32 };
 
 pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_seed: ?LoopSeed) Error!Result {
@@ -1892,6 +1892,10 @@ const Inferrer = struct {
         };
         const cap = prong.capture[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
+        // 按 inline 分支的某个取值推导（见 `LoopSeed`）：捕获取这个分支项的值
+        if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
+            if ((try inlineProngValues(ip, inf.body, inf.exprs, prong, operand, seed.index)).value) |v| val = v;
+        };
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(operand_e)) else t, .val = if (is_ptr) null else val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
@@ -3164,6 +3168,39 @@ fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
     if (!decl) return fieldItem(tree, ns.container, name) != null;
     const m = Resolver.lookupDecl(tree, ns.container, name) orelse return false;
     return tree.items[m].flags.is_pub;
+}
+
+/// `inline` 分支的取值（非 union、非错误集的操作数）：分支项依次展开，区间 `a...b` 逐个整数。`count` 为
+/// 取值个数，`value` 为第 `want` 个；有求不出的分支项或是 `else` 分支时 `count` 为 null
+pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const TypedValue, prong: Body.Prong, ty: Index, want: ?u32) Error!struct { count: ?u32, value: ?Index } {
+    if (prong.is_else or !prong.is_inline) return .{ .count = null, .value = null };
+    const int_ty: Index = if (value.intInfo(ip, ty) != null) ty else .comptime_int_type;
+    var n: u64 = 0;
+    var found: ?Index = null;
+    for (prong.items) |item| {
+        if (@backingInt(item) >= exprs.len) return .{ .count = null, .value = null };
+        switch (body.expr(item)) {
+            .other => |range| {
+                if (range.len != 2) return .{ .count = null, .value = null };
+                const lo = value.intOf(ip, exprs[@backingInt(range[0])].val) orelse return .{ .count = null, .value = null };
+                const hi = value.intOf(ip, exprs[@backingInt(range[1])].val) orelse return .{ .count = null, .value = null };
+                if (hi < lo) continue;
+                const len: u64 = @intCast(hi - lo + 1);
+                if (want) |w| if (found == null and w >= n and w < n + len) {
+                    found = try ip.get(.{ .int_value = .{ .ty = int_ty, .value = lo + @as(i128, w - n) } });
+                };
+                n += len;
+            },
+            else => {
+                const v = exprs[@backingInt(item)].val orelse return .{ .count = null, .value = null };
+                if (want) |w| if (w == n) {
+                    found = v;
+                };
+                n += 1;
+            },
+        }
+    }
+    return .{ .count = std.math.cast(u32, n), .value = found };
 }
 
 fn hasName(names: []const []const u8, name: []const u8) bool {

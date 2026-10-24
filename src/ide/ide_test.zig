@@ -3349,3 +3349,29 @@ test "@hasField on anonymous struct types decides branches in generic bodies" {
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("other", labels);
 }
+
+test "callsite seeding uses each value of an inline switch prong" {
+    // `inline 0...1 => |index|` 的捕获每个取值单独实例化：曾按未知推导，`read(T, names[index])` 求不出实例
+    const labels = try completionLabels(
+        \\const S = struct {
+        \\    a: struct { x: u8 },
+        \\    b: struct { y: u8 },
+        \\};
+        \\fn readField(comptime name: []const u8) void {
+        \\    var v: @FieldType(S, name) = undefined;
+        \\    _ = v.<|>;
+        \\}
+        \\const names = [_][]const u8{ "a", "b" };
+        \\pub fn main() void {
+        \\    var found: usize = 1;
+        \\    _ = &found;
+        \\    switch (found) {
+        \\        inline 0...1 => |index| readField(names[index]),
+        \\        else => {},
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("x", labels);
+}
