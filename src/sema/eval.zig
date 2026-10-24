@@ -291,6 +291,18 @@ pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Er
     return if (tv.val != null) tv else null;
 }
 
+/// `@embedFile(path)`：`file` 所在目录中的文件的内容，类型与字符串字面量相同（`*const [len:0]u8`）。打开的
+/// 文档以缓冲区为准，否则读取磁盘（见 `SourceText`）。文件不存在时编译器报错，为 null
+pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue {
+    const target = try r.relativeFile(file, path) orelse return null;
+    const source = try r.ctx.get(syntax.SourceText, target);
+    // 没有打开、也没能从磁盘读到：文件不存在（空文件读到的是空的内容）
+    if (!source.owned and try r.ctx.get(database.inputs.FileText, target) == null) return null;
+    const ip = r.ctx.db.env.ip;
+    const ty = try ip.stringLiteralType(source.text.len);
+    return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = source.text } }) };
+}
+
 /// 元组、匿名结构体、构造的类型与源码容器中字段的类型
 pub fn fieldType(r: *Resolver, t: Index, name: []const u8) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
@@ -2330,6 +2342,11 @@ const Evaluator = struct {
             const target = try ev.r.importTarget(f.file, f.body, args) orelse return error.Abort;
             return Val.ofType(try queries.containerType(ev.r, .{ .file = target, .container = 0 }, null));
         }
+        if (eq(u8, name, "@embedFile")) {
+            if (args.len != 1) return error.Abort;
+            const path = try ev.stringOf(try ev.eval(f, args[0], null));
+            return thaw(try embedFile(ev.r, f.file, path) orelse return error.Abort);
+        }
         if (eq(u8, name, "@This")) {
             const tree = try ev.r.itemTree(f.file);
             return Val.ofType(try queries.containerType(ev.r, .{ .file = f.file, .container = tree.items[f.item].container }, f.inst));
@@ -2513,6 +2530,49 @@ const Evaluator = struct {
             }
             return Val.void_val;
         }
+        if (eq(u8, name, "@memset")) {
+            if (vals.len != 2) return error.Abort;
+            const dest = switch (vals[0].v) {
+                .ref => |r| r,
+                else => return error.Abort,
+            };
+            const n = try ev.elemCount(vals[0]) orelse return error.Abort;
+            for (0..n) |i| {
+                try ev.tick();
+                try ev.store(try ev.extend(dest, @intCast(i)), vals[1]);
+            }
+            return Val.void_val;
+        }
+        if (eq(u8, name, "@memmove")) {
+            if (vals.len != 2) return error.Abort;
+            const dest = switch (vals[0].v) {
+                .ref => |r| r,
+                else => return error.Abort,
+            };
+            // 源与目标可以重叠：先读出全部元素再写入
+            const n = try ev.elemCount(vals[1]) orelse return error.Abort;
+            const elems = try ev.a.alloc(Val, n);
+            for (elems, 0..) |*x, i| {
+                try ev.tick();
+                x.* = try ev.copy(try ev.elemAt(vals[1], i));
+            }
+            for (elems, 0..) |x, i| {
+                try ev.tick();
+                try ev.store(try ev.extend(dest, @intCast(i)), x);
+            }
+            return Val.void_val;
+        }
+        if (eq(u8, name, "@call")) {
+            if (vals.len != 3) return error.Abort;
+            const fty = switch (ip.key(vals[1].ty)) {
+                .fn_type => |ft| ft,
+                else => return error.Abort,
+            };
+            const n = try ev.elemCount(vals[2]) orelse return error.Abort;
+            const call_args = try ev.a.alloc(Val, n);
+            for (call_args, 0..) |*x, i| x.* = try ev.elemAt(vals[2], i);
+            return ev.callFn(vals[1], fty, call_args);
+        }
         return error.Abort;
     }
 
@@ -2623,6 +2683,28 @@ const Evaluator = struct {
             if (!value.intFits(ip, ty, r)) return error.Abort;
             return try ev.int(ty, r);
         };
+        const overflow_ops = [_]struct { []const u8, value.OverflowOp }{
+            .{ "@addWithOverflow", .add }, .{ "@subWithOverflow", .sub }, .{ "@mulWithOverflow", .mul }, .{ "@shlWithOverflow", .shl },
+        };
+        for (overflow_ops) |o| if (eq(u8, name, o[0])) {
+            if (vals.len != 2) return error.Abort;
+            // 结果类型为两侧的 peer（`@shlWithOverflow` 为左侧的类型）
+            const ty = if (o[1] == .shl) vals[0].ty else value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
+            const result, const overflow = value.overflowInt(ip, o[1], ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
+            const tuple = try ip.get(.{ .tuple_type = .{ .types = &.{ ty, .u1_type } } });
+            const elems = [_]Index{ (try ev.int(ty, result)).ip().?, (try ev.int(.u1_type, @intFromBool(overflow))).ip().? };
+            return Val.of(tuple, try ev.aggregate(tuple, &elems));
+        };
+        if (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact")) {
+            if (vals.len != 2) return error.Abort;
+            const r = value.exactShift(ip, eq(u8, name, "@shlExact"), vals[0].ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
+            return try ev.int(vals[0].ty, r);
+        }
+        if (eq(u8, name, "@byteSwap") or eq(u8, name, "@bitReverse")) {
+            if (vals.len != 1) return error.Abort;
+            const r = value.reverseBits(ip, eq(u8, name, "@byteSwap"), vals[0].ty, try ev.intArg(vals[0])) orelse return error.Abort;
+            return try ev.int(vals[0].ty, r);
+        }
         if (eq(u8, name, "@clz") or eq(u8, name, "@ctz") or eq(u8, name, "@popCount")) {
             if (vals.len != 1) return error.Abort;
             const info = value.intInfo(ip, vals[0].ty) orelse return error.Abort;

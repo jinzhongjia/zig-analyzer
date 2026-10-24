@@ -1202,6 +1202,14 @@ const Inferrer = struct {
             const tree = try inf.r.itemTree(inf.file);
             return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = inf.file, .container = tree.items[inf.item].container }, inf.inst));
         }
+        if (eq(u8, name, "@embedFile")) {
+            if (args.len != 1) return .unknown;
+            const arg = try inf.infer(args[0], null);
+            const path = try inf.stringArg(args[0]) orelse try eval.stringValue(inf.r, arg) orelse return .unknown;
+            return try eval.embedFile(inf.r, inf.file, path) orelse .unknown;
+        }
+        // 模块名由构建系统决定（见 `std.builtin.SourceLocation.module`），项目模型中没有，只给出类型
+        if (eq(u8, name, "@src")) return .{ .ty = try inf.stdType(&.{ "builtin", "SourceLocation" }) orelse .unknown };
         if (eq(u8, name, "@as")) {
             if (args.len != 2) return .unknown;
             const t = (try inf.infer(args[0], null)).asType() orelse .unknown;
@@ -1327,6 +1335,7 @@ const Inferrer = struct {
         // `struct { T, u1 }`：T 为两侧的 peer（`@shlWithOverflow` 为左侧的类型），向量时溢出位也是向量
         if (eq(u8, name, "@addWithOverflow") or eq(u8, name, "@subWithOverflow") or eq(u8, name, "@mulWithOverflow") or eq(u8, name, "@shlWithOverflow")) {
             if (args.len != 2) return .unknown;
+            if (try inf.pureValue(name, args)) |tv| return tv;
             const lhs = inf.get(args[0]).ty;
             const t = if (eq(u8, name, "@shlWithOverflow")) lhs else try inf.peer(&.{ lhs, inf.get(args[1]).ty });
             if (t == .unknown) return .unknown;

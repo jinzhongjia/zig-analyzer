@@ -3019,3 +3019,83 @@ test "function pointers are runtime values, not comptime-only" {
         .{ "n", "u8" },
     });
 }
+
+test "comptime evaluation of integer builtins, @memset, @memmove and @call" {
+    try expectTypes(
+        \\const ov = @addWithOverflow(@as(u8, 250), 10);
+        \\const ov_sum = ov[0];
+        \\const ov_bit = ov[1];
+        \\const no_ov = @subWithOverflow(@as(u8, 5), 3)[1];
+        \\const mul_ov = @mulWithOverflow(@as(i8, 64), 2)[0];
+        \\const shl_ov = @shlWithOverflow(@as(u8, 0b1100_0000), 1);
+        \\const swapped = @byteSwap(@as(u16, 0x1234));
+        \\const swapped_signed = @byteSwap(@as(i16, 0x00ff));
+        \\const reversed = @bitReverse(@as(u8, 1));
+        \\const shl_exact = @shlExact(@as(u8, 1), 3);
+        \\const shr_exact = @shrExact(@as(u8, 8), 3);
+        \\const filled = blk: {
+        \\    var b: [3]u8 = undefined;
+        \\    @memset(&b, 7);
+        \\    break :blk b[1];
+        \\};
+        \\const moved = blk: {
+        \\    var b = [_]u8{ 1, 2, 3, 4 };
+        \\    @memmove(b[1..4], b[0..3]);
+        \\    break :blk b[3];
+        \\};
+        \\fn add(a: u8, b: u8) u8 {
+        \\    return a + b;
+        \\}
+        \\const called = @call(.auto, add, .{ 1, 2 });
+    , &.{
+        .{ "ov_sum", "u8 = 4" },
+        .{ "ov_bit", "u1 = 1" },
+        .{ "no_ov", "u1 = 0" },
+        .{ "mul_ov", "i8 = -128" },
+        .{ "shl_ov", "struct { u8, u1 } = .{ 128, 1 }" },
+        .{ "swapped", "u16 = 13330" },
+        .{ "swapped_signed", "i16 = -256" },
+        .{ "reversed", "u8 = 128" },
+        .{ "shl_exact", "u8 = 8" },
+        .{ "shr_exact", "u8 = 1" },
+        .{ "filled", "u8 = 7" },
+        .{ "moved", "u8 = 3" },
+        .{ "called", "u8 = 3" },
+    });
+}
+
+test "@embedFile reads the file next to the source; missing files are unknown" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/data/hello.txt", "hello");
+    _ = try w.add("/p/empty.txt", "");
+    const src =
+        \\const text = @embedFile("data/hello.txt");
+        \\const first = text[0];
+        \\const empty = @embedFile("empty.txt");
+        \\const missing = @embedFile("missing.txt");
+        \\const count = blk: {
+        \\    var n: usize = 0;
+        \\    for (@embedFile("data/hello.txt")) |c| {
+        \\        if (c == 'l') n += 1;
+        \\    }
+        \\    break :blk n;
+        \\};
+    ;
+    const f = try w.add("/p/main.zig", src);
+    try testing.expectEqualStrings("*const [5:0]u8 = \"hello\"", try typeAt(&w, f.file, src, "text", 0));
+    try testing.expectEqualStrings("u8 = 104", try typeAt(&w, f.file, src, "first", 0));
+    try testing.expectEqualStrings("*const [0:0]u8 = \"\"", try typeAt(&w, f.file, src, "empty", 0));
+    try testing.expectEqualStrings("unknown", try typeAt(&w, f.file, src, "missing", 0));
+    try testing.expectEqualStrings("usize = 2", try typeAt(&w, f.file, src, "count", 0));
+}
+
+test "@src has the type std.builtin.SourceLocation" {
+    try expectStdTypes(
+        \\fn f() void {
+        \\    const here = @src();
+        \\    _ = here;
+        \\}
+    , &.{.{ "here", "SourceLocation" }});
+}

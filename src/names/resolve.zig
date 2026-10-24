@@ -273,6 +273,13 @@ pub const Resolver = struct {
         return graph.importTarget(file, name);
     }
 
+    /// `file` 所在目录中的相对路径 `path` 对应的文件（`@embedFile`）；绝对路径为 null（编译器不接受）
+    pub fn relativeFile(r: *Resolver, file: FileId, path: []const u8) Error!?FileId {
+        if (std.fs.path.isAbsolute(path)) return null;
+        const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
+        return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, path }));
+    }
+
     /// 文件中 `@import(name)` 的全部目标：文件所属的多个模块以 `name` import 不同的模块时有多个，按模块的
     /// 优先级排列，第一个即 `resolveImport` 的结果；相对路径至多一个。直接读取模块图、不经 `FileImports`
     /// 截断其他变化，供跳转等请求使用，推导中不要使用
