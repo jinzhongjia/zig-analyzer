@@ -753,7 +753,8 @@ const Evaluator = struct {
             },
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
-                .bytes => |b| return if (i < b.bytes.len) Val.of(.u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
+                // 元素都是 u8 的聚合也以字节表示（如 `struct { short: ?u8 }` 的值）：取元素的声明类型
+                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
                 .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
                 .union_value => |u| return if (i == 0) Val.of(ty, u.payload) else error.Abort,
                 else => return error.Abort,

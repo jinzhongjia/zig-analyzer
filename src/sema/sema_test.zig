@@ -3114,3 +3114,26 @@ test "@src has the type std.builtin.SourceLocation" {
         \\}
     , &.{.{ "here", "SourceLocation" }});
 }
+
+test "values of structs whose fields are all u8 keep the declared field types and display as structs" {
+    // 这样的值以字节表示：曾按 u8 取出 `?u8` 字段（`if (p.short) |s|` 求不出），并显示成字符串
+    try expectTypes(
+        \\const Names = struct {
+        \\    short: ?u8 = null,
+        \\};
+        \\const n0: Names = .{ .short = 'h' };
+        \\const arr = [_]Names{n0};
+        \\fn short(p: Names) u8 {
+        \\    if (p.short) |s| return s;
+        \\    return 0;
+        \\}
+        \\const v = short(n0);
+        \\const P = struct { a: u8, b: u8 };
+        \\const pp: P = .{ .a = 1, .b = 2 };
+    , &.{
+        .{ "n0", "Names = .{ .short = 104 }" },
+        .{ "arr", "[1]Names = .{ .{ .short = 104 } }" },
+        .{ "v", "u8 = 104" },
+        .{ "pp", "P = .{ .a = 1, .b = 2 }" },
+    });
+}

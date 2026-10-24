@@ -730,7 +730,24 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             }
             try w.writeAll(if (v.elems.len == 0) "}" else " }");
         },
-        .bytes => |v| try w.print("\"{f}\"", .{std.zig.fmtString(v.bytes[0..@min(v.bytes.len, 64)])}),
+        .bytes => |v| switch (ip.key(v.ty)) {
+            .array_type, .ptr_type => try w.print("\"{f}\"", .{std.zig.fmtString(v.bytes[0..@min(v.bytes.len, 64)])}),
+            // 元素都是 u8 的结构体、元组与向量（同样以字节表示）：按聚合逐个显示
+            else => {
+                const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
+                try w.writeAll(".{");
+                for (v.bytes, 0..) |byte, i| {
+                    if (i == max_printed_elems) {
+                        try w.writeAll(", ...");
+                        break;
+                    }
+                    try w.writeAll(if (i == 0) " " else ", ");
+                    if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
+                    try w.print("{d}", .{byte});
+                }
+                try w.writeAll(if (v.bytes.len == 0) "}" else " }");
+            },
+        },
         .union_value => |v| {
             try w.print(".{{ .{f} = ", .{std.zig.fmtId(v.tag)});
             try ip.print(v.payload, w, container_name);
