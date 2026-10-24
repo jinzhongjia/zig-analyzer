@@ -546,6 +546,47 @@ test "completion through a switch whose other prong is an empty tuple literal" {
     try testing.expectEqualStrings("label kind", labels);
 }
 
+test "goto declaration of a reified field whose name is not traceable to a literal goes to the construction" {
+    // 名字由单个字节构成（zig-clap 的短参数名）：追不到字面量中的字符，曾没有跳转目标
+    const text =
+        \\const Names = struct {
+        \\    short: ?u8 = null,
+        \\    fn name(names: *const Names) []const u8 {
+        \\        if (names.short) |*short| return @as(*const [1]u8, short);
+        \\        return "";
+        \\    }
+        \\};
+        \\fn Args(comptime params: []const Names) type {
+        \\    var names: [params.len][]const u8 = undefined;
+        \\    var types: [params.len]type = undefined;
+        \\    for (params, 0..) |p, k| {
+        \\        const n = p.name();
+        \\        names[k] = n[0..n.len] ++ "";
+        \\        types[k] = bool;
+        \\    }
+        \\    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+        \\}
+        \\const params = [_]Names{.{ .short = 'h' }};
+        \\fn run(a: Args(&params)) bool {
+        \\    return a.h;
+        \\}
+        \\
+    ;
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root = try w.vfs.intern(try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" }));
+    const file = (try w.add("/p/main.zig", text)).file;
+    try w.setGraph(std_root, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const target = try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "a.h").? + 2)) orelse return error.NoDefinition;
+    try testing.expectEqual(std.mem.indexOf(u8, text, "@Struct(").?, target.start);
+}
+
 test "goto declaration of a shorthand member of an inline reified enum" {
     const text =
         \\const Mode = @Enum(u8, .exhaustive, &.{ "fast", "slow" }, &.{ 0, 1 });

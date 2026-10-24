@@ -169,7 +169,21 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     const owner = try ownerLocal(r, rt);
     if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
     if (try constructionOrigin(r, rt, name)) |found| return found;
-    return typeInfoOrigin(r, rt, name);
+    if (try typeInfoOrigin(r, rt, name)) |found| return found;
+    return constructionSite(r, rt);
+}
+
+/// 名字的来源追不到具体字符时（如由单个字节 `@as(*const [1]u8, &c)` 构成的名字）：成员定义在构造类型的调用处
+fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target {
+    const tree = try r.itemTree(rt.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == rt.owner) break @intCast(i);
+    } else return null;
+    const node = try r.itemNode(rt.file, item) orelse return null;
+    const body = try r.body(rt.file, item);
+    if (rt.expr >= body.exprs.len) return null;
+    const range = body.range(@fromBackingInt(rt.expr));
+    return .{ .file = rt.file, .start = node.offset + range.start, .end = node.offset + range.end };
 }
 
 /// 构造类型的成员（`rt.owner`）：其中的局部绑定也是名字来源的候选
