@@ -190,10 +190,7 @@ pub const Refiner = struct {
     }
 };
 
-/// 循环按迭代推导时尝试的迭代次数上限
-const max_iterations = 64;
-
-/// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数（至多 `max_iterations`）：遍历 comptime 已知的类型列表
+/// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数：遍历 comptime 已知的类型列表
 /// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），或遍历各项类型不同的元组（`inline for
 /// (.{ &posix, &windows }) |cases|`；循环变量的类型求不出）
 fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) resolve.Error!?u32 {
@@ -205,13 +202,13 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
     const binding = res.bindings[@backingInt(cap)];
     if (binding.val) |v| if (ip.key(v) == .opaque_param) {
         var n: u32 = 0;
-        while (n < max_iterations and try eval.elemValue(r, list, n) != null) n += 1;
+        while (try eval.elemValue(r, list, n) != null) n += 1;
         return if (n > 0) n else null;
     };
     if (binding.ty != .unknown) return null;
     const tt = infer.tupleOf(ip, list.ty) orelse return null;
     if (tt.types.len == 0) return null;
-    return @intCast(@min(tt.types.len, max_iterations));
+    return @intCast(tt.types.len);
 }
 
 /// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）内提到 `names` 的调用：实参求不出

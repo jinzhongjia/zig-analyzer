@@ -2181,6 +2181,43 @@ test "callsite seeding uses an iteration of an inline for over types that the ca
     try testing.expectEqualStrings("x", labels);
 }
 
+/// `inline for (.{ E0, E1, ..., A }) |T|`，只有 `A`（第 `empty + 1` 次迭代）有 `run`
+fn manyTypesLoop(comptime empty: usize) []const u8 {
+    @setEvalBranchQuota(100_000);
+    var list: []const u8 = "";
+    var decls: []const u8 = "";
+    for (0..empty) |i| {
+        decls = decls ++ std.fmt.comptimePrint("const E{d} = struct {{}};\n", .{i});
+        list = list ++ std.fmt.comptimePrint("E{d}, ", .{i});
+    }
+    return decls ++
+        \\const A = struct {
+        \\    pub fn run() void {}
+        \\};
+        \\fn all() void {
+        \\
+    ++ "    inline for (.{ " ++ list ++ "A }) |T| {\n" ++
+        \\        if (@hasDecl(T, "run")) T.run();
+        \\    }
+        \\}
+        \\
+    ;
+}
+
+test "features inside an inline for over types use iterations past the first 64" {
+    // 曾只尝试前 64 次迭代：位于其后的 `A` 求不出
+    const text = comptime manyTypesLoop(80);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const target = try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "T.run()").? + 2)) orelse return error.NoDefinition;
+    try testing.expectEqual(std.mem.indexOf(u8, text, "run() void").?, target.start);
+}
+
 test "an inline for over a list that is a parameter of the enclosing generic function uses the call site's list" {
     const labels = try completionLabels(
         \\fn Engine(comptime queries: []const type) type {
