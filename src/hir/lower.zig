@@ -422,7 +422,11 @@ const Lowerer = struct {
             .comptime_stmt => {
                 // `comptime var x = ...;` 或 `comptime { ... }` / `comptime expr;`
                 const inner = firstChild(n) orelse return .{ .expr = try l.add(.missing, .none) };
-                if (inner.kind() == .var_decl) return .{ .local = try l.localDecl(inner) };
+                if (inner.kind() == .var_decl) {
+                    const b = try l.localDecl(inner);
+                    l.bindings.items[@backingInt(b)].is_comptime = true;
+                    return .{ .local = b };
+                }
                 return .{ .expr = try l.add(.{ .@"comptime" = try l.expr(inner) }, l.nodeRange(n)) };
             },
             .destructure => {

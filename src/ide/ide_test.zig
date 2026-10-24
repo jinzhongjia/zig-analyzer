@@ -3416,3 +3416,42 @@ test "types defined inside an inline for take the loop variable of each iteratio
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("a_field", labels);
 }
+
+test "an iteration of an inline for sees comptime vars as the earlier iterations left them" {
+    // 第 n 次迭代中 `comptime var` 取前 n 次迭代修改后的值：曾没有值，`items[i]` 求不出
+    const labels = try completionLabels(
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u8 };
+        \\const kinds = [_]bool{ false, true, false, true };
+        \\fn read(items: struct { A, B }) void {
+        \\    comptime var index = 0;
+        \\    inline for (kinds) |positional| {
+        \\        if (!positional) continue;
+        \\        const i = index;
+        \\        index += 1;
+        \\        if (i == 1) {
+        \\            const item = items[i];
+        \\            _ = item.<|>;
+        \\        }
+        \\    }
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("b_field", labels);
+}
+
+test "comptime vars follow assignments in straight-line code" {
+    const labels = try completionLabels(
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u8 };
+        \\fn f(items: struct { A, B }) void {
+        \\    comptime var i = 0;
+        \\    i += 1;
+        \\    _ = items[i].<|>;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("b_field", labels);
+}

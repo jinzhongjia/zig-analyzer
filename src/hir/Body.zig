@@ -174,7 +174,7 @@ pub const Binding = struct {
     init: ?ExprId = null,
     /// `|*x|`
     is_ptr: bool = false,
-    /// `comptime` 参数
+    /// `comptime` 参数，或 `comptime var` 局部变量
     is_comptime: bool = false,
 
     pub const Kind = enum { param, local_const, local_var, capture };
