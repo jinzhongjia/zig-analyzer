@@ -3146,13 +3146,29 @@ fn typeUnknown() TypedValue {
     return .{ .ty = .type_type };
 }
 
-/// `@hasDecl`（只计 pub 声明）/ `@hasField`；类型不是源码中的容器时为 null
+/// `@hasDecl`（只计 pub 声明）/ `@hasField`；元组、匿名结构体与构造的类型没有声明，字段名在类型中；
+/// 其他不是源码中的容器的类型为 null
 fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
+    switch (r.ctx.db.env.ip.key(t)) {
+        .tuple_type => |tt| {
+            if (decl) return false;
+            const i = std.fmt.parseInt(usize, name, 10) catch return false;
+            return i < tt.types.len;
+        },
+        .anon_struct_type => |s| return !decl and hasName(s.names, name),
+        .reified_type => |rt| return !decl and hasName(rt.names, name),
+        else => {},
+    }
     const ns = try queries.namespaceOfType(r, t) orelse return null;
     const tree = try r.itemTree(ns.file);
     if (!decl) return fieldItem(tree, ns.container, name) != null;
     const m = Resolver.lookupDecl(tree, ns.container, name) orelse return false;
     return tree.items[m].flags.is_pub;
+}
+
+fn hasName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// 容器中的字段（按名字）

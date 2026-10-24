@@ -3324,3 +3324,28 @@ test "try on a call whose error set depends on an abstract parameter gives the p
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("kind", labels);
 }
+
+test "@hasField on anonymous struct types decides branches in generic bodies" {
+    // 匿名结构体的 `@hasField` 曾求不出：分支不判为非活动，选了 `opt` 没有 `other` 的实例，补全为空
+    const labels = try completionLabels(
+        \\const A = struct {
+        \\    pub const opts = .{};
+        \\};
+        \\const B = struct {
+        \\    pub const opts = .{ .other = "x" };
+        \\};
+        \\fn g(comptime T: type) void {
+        \\    const opt = comptime T.opts;
+        \\    if (@hasField(@TypeOf(opt), "other")) {
+        \\        _ = opt.<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    g(A);
+        \\    g(B);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("other", labels);
+}
