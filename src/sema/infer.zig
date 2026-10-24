@@ -694,13 +694,16 @@ const Inferrer = struct {
                 };
                 return .{ .ty = elem };
             },
-            .slice => |s| return inf.slice(s.lhs, s.start, s.end, s.sentinel),
+            .slice => |s| return inf.slice(e, s.lhs, s.start, s.end, s.sentinel),
             .deref => |x| {
                 const p = try inf.infer(x, null);
-                return .{ .ty = switch (ip.key(p.ty)) {
-                    .ptr_type => |pt| if (pt.size == .one) pt.child else .unknown,
-                    else => .unknown,
-                } };
+                const pt = switch (ip.key(p.ty)) {
+                    .ptr_type => |pt| if (pt.size == .one) pt else return .unknown,
+                    else => return .unknown,
+                };
+                // 指向常量的 comptime 已知指针：由解释器取出所指的值
+                if (pt.is_const) if (try inf.knownValue(e, p.val, pt.child)) |tv| return tv;
+                return .{ .ty = pt.child };
             },
             .unwrap_optional => |x| {
                 const o = try inf.infer(x, null);
@@ -1713,10 +1716,13 @@ const Inferrer = struct {
                         const ty = if (ptr) try ip.ptrTo(elem, .one, is_const) else elem;
                         inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
                             try inf.typeCapture(cap, list, iteration)
-                        else if (iteration) |n|
-                            .{ .ty = try inf.iterationType(list.ty, elem, n, ptr, is_const), .val = if (ptr) null else try inf.iterationValue(list, start, n) }
-                        else
-                            .{ .ty = ty };
+                        else if (iteration) |n| blk: {
+                            const it_ty = try inf.iterationType(list.ty, elem, n, ptr, is_const);
+                            const v = try inf.iterationValue(list, start, n);
+                            // 指针捕获取指向这次迭代的元素的指针；可变列表的元素在运行时会变，不取值
+                            const val = if (!ptr) v else if (is_const) (if (v) |x| try ip.get(.{ .ptr_value = .{ .ty = it_ty, .pointee = x } }) else null) else null;
+                            break :blk .{ .ty = it_ty, .val = val };
+                        } else .{ .ty = ty };
                     }
                 }
             },
@@ -2064,6 +2070,13 @@ const Inferrer = struct {
         return .{ .ty = ty };
     }
 
+    /// 操作数的值 `operand` 已知时由解释器求 `e` 的值；求不出或类型不是 `ty` 时为 null
+    fn knownValue(inf: *Inferrer, e: ExprId, operand: ?Index, ty: Index) Error!?TypedValue {
+        if (operand == null or inf.dead != 0 or inf.r.ctx.incomplete()) return null;
+        const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
+        return if (tv.val != null and tv.ty == ty) tv else null;
+    }
+
     fn concatType(inf: *Inferrer, a: Index, b: Index) Error!Index {
         const ip = inf.ip;
         if (ip.key(a) == .tuple_type and ip.key(b) == .tuple_type) {
@@ -2141,8 +2154,9 @@ const Inferrer = struct {
                 const v = try inf.infer(operand_e, child_expected);
                 const is_const = try inf.isConstPlace(operand_e);
                 const ty = try ip.ptrTo(v.ty, .one, is_const);
-                // comptime 实参中指向常量的指针（`parseEx(Id, &params, ...)`）：值为指向该常量值的指针
-                if (inf.comptime_depth > 0 and is_const) if (v.val) |pointee| {
+                // 指向 comptime 已知的常量的指针（`parseEx(Id, &params, ...)`、`@field(x, &name)`）comptime 已知：
+                // 值为指向该常量值的指针
+                if (is_const) if (v.val) |pointee| {
                     return .{ .ty = ty, .val = try eval.constPointer(inf.r, ty, pointee) };
                 };
                 return .{ .ty = ty };
@@ -2458,7 +2472,7 @@ const Inferrer = struct {
 
     /// 切片（与编译器的 `analyzeSlice` 一致）：长度 comptime 已知时为指向数组的指针，否则为切片；多项指针
     /// 不给结束位置时为指针运算，仍是原指针类型。切到数组或切片的末尾时保留原有的哨兵
-    fn slice(inf: *Inferrer, lhs_e: ExprId, start_e: ExprId, end_e: ?ExprId, sentinel_e: ?ExprId) Error!TypedValue {
+    fn slice(inf: *Inferrer, e: ExprId, lhs_e: ExprId, start_e: ExprId, end_e: ?ExprId, sentinel_e: ?ExprId) Error!TypedValue {
         const ip = inf.ip;
         const lhs = try inf.infer(lhs_e, null);
         const start = try inf.infer(start_e, .usize_type);
@@ -2487,7 +2501,10 @@ const Inferrer = struct {
         const sentinel: ?Index = if (explicit) |x| (x.val orelse return .unknown) else if (end_is_len) src.sentinel else null;
         if (start_n != null and end_n != null and end_n.? >= start_n.?) {
             const array = try ip.get(.{ .array_type = .{ .len = end_n.? - start_n.?, .child = src.elem, .sentinel = sentinel } });
-            return .{ .ty = try ip.ptrTo(array, .one, src.is_const) };
+            const ty = try ip.ptrTo(array, .one, src.is_const);
+            // comptime 已知的常量与区间：由解释器求出切片的值
+            if (src.is_const) if (try inf.knownValue(e, lhs.val, ty)) |tv| return tv;
+            return .{ .ty = ty };
         }
         return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel } }) };
     }

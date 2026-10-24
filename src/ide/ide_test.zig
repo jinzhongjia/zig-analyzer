@@ -3198,6 +3198,38 @@ test "callsite seeding uses an iteration of a loop over a comptime list of value
     try testing.expectEqualStrings("v value", labels);
 }
 
+test "a field name sliced from a comptime string in an inline for over pointers resolves @field" {
+    // 指针捕获在按迭代推导时曾没有值，comptime 已知的切片、解引用与取地址也曾没有值：`@field` 求不出字段
+    const labels = try completionLabels(
+        \\const Names = struct {
+        \\    long: []const u8,
+        \\    fn longest(names: *const Names) []const u8 {
+        \\        return names.long;
+        \\    }
+        \\};
+        \\const P = struct { names: Names, many: bool };
+        \\const L = struct {
+        \\    pub fn append(_: *L) void {}
+        \\};
+        \\const Args = struct { aa: u8 = 0, list: L = .{} };
+        \\const ps = [_]P{ .{ .names = .{ .long = "aa" }, .many = false }, .{ .names = .{ .long = "list" }, .many = true } };
+        \\fn parse(comptime params: []const P) void {
+        \\    var arguments: Args = .{};
+        \\    inline for (params) |*param| {
+        \\        const longest = comptime param.names.longest();
+        \\        const name = longest[0..longest.len].*;
+        \\        if (param.many) @field(arguments, &name).<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    parse(&ps);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("append", labels);
+}
+
 test "an iteration that leaves the loop before a declaration is not used for it" {
     // 第 1 次迭代在 `.none => continue` 处离开循环：曾取这次迭代，`F` 显示为 noreturn
     const text =
