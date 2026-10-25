@@ -610,14 +610,17 @@ pub const ImportSites = struct {
             try decls.append(temp, try topDecl(temp, node));
             try collect(a, temp, node, index, &decls.items[index], &sites);
         }
-        // 正式代码：pub 声明与其他非 test 的顶层内容，以及被它们引用的非 pub 声明（按名字传递）
+        // 按名字传递只经过有名字的非 test 声明
+        var by_name: std.StringHashMapUnmanaged(u32) = .empty;
+        for (decls.items, 0..) |d, i| if (!d.is_test) if (d.name) |name| try by_name.put(temp, name, @intCast(i));
+        // 正式代码：pub 声明与其他非 test 的顶层内容，以及被它们引用的非 pub 声明
         const live = try temp.alloc(bool, decls.items.len);
         for (decls.items, live) |d, *l| l.* = !d.is_test and (d.is_pub or d.name == null);
-        try propagate(decls.items, live, null);
-        // 测试代码：test 声明，以及被它们引用的其余非 pub 声明（按名字传递）。两者都不引用的是死代码，按正式代码
+        try propagate(temp, decls.items, &by_name, live, null);
+        // 测试代码：test 声明，以及被它们引用的其余非 pub 声明。两者都不引用的是死代码，按正式代码
         const tested = try temp.alloc(bool, decls.items.len);
         for (decls.items, tested) |d, *t| t.* = d.is_test;
-        try propagate(decls.items, tested, live);
+        try propagate(temp, decls.items, &by_name, tested, live);
         const specs = try a.alloc([]const u8, sites.items.len);
         const in_test = try a.alloc(bool, sites.items.len);
         for (sites.items, specs, in_test) |site, *spec, *flag| {
@@ -628,22 +631,16 @@ pub const ImportSites = struct {
     }
 
     /// `marked` 中的声明引用的其他声明（按名字）也标记，直到不再变化；`except` 中已标记的不再标记
-    fn propagate(decls: []const TopDecl, marked: []bool, except: ?[]const bool) Allocator.Error!void {
-        var changed = true;
-        while (changed) {
-            changed = false;
-            for (decls, 0..) |d, i| {
-                if (!marked[i]) continue;
-                for (d.refs.items) |ref| for (decls, 0..) |other, j| {
-                    if (marked[j] or other.is_test) continue;
-                    if (except) |e| if (e[j]) continue;
-                    const name = other.name orelse continue;
-                    if (!std.mem.eql(u8, name, ref)) continue;
-                    marked[j] = true;
-                    changed = true;
-                };
-            }
-        }
+    fn propagate(temp: Allocator, decls: []const TopDecl, by_name: *const std.StringHashMapUnmanaged(u32), marked: []bool, except: ?[]const bool) Allocator.Error!void {
+        var queue: std.ArrayList(u32) = .empty;
+        for (marked, 0..) |m, i| if (m) try queue.append(temp, @intCast(i));
+        while (queue.pop()) |i| for (decls[i].refs.items) |ref| {
+            const j = by_name.get(ref) orelse continue;
+            if (marked[j]) continue;
+            if (except) |e| if (e[j]) continue;
+            marked[j] = true;
+            try queue.append(temp, j);
+        };
     }
 
     fn topDecl(temp: Allocator, node: ast.SyntaxNode) Allocator.Error!TopDecl {
