@@ -535,7 +535,7 @@ pub const CallsIn = struct {
 };
 
 /// 成员 `owner` 的全部实例的调用点（见 `AllInstances`），实例按成员规范化
-fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
+pub fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
     const tree = try r.itemTree(owner.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == owner.item) break @intCast(i);

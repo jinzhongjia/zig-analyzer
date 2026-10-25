@@ -18,6 +18,7 @@ const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
+const seed = @import("../ide_db/seed.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const ErrorSets = @import("../syntax/ErrorSets.zig");
@@ -169,6 +170,7 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     const owner = try ownerLocal(r, rt);
     if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
     if (try constructionOrigin(r, rt, name)) |found| return found;
+    if (rt.inst) |inst| if (try callSiteOrigin(r, inst, name, 0)) |found| return found;
     if (try typeInfoOrigin(r, rt, name)) |found| return found;
     return constructionSite(r, rt);
 }
@@ -184,6 +186,116 @@ fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target 
     if (rt.expr >= body.exprs.len) return null;
     const range = body.range(@fromBackingInt(rt.expr));
     return .{ .file = rt.file, .start = node.offset + range.start, .end = node.offset + range.end };
+}
+
+/// 沿调用处追溯的最大层数
+const max_call_site_depth = 16;
+
+/// 名字来自构造类型所在实例 `inst` 的实参（如 zig-clap 的 `clap.parse(clap.Help, &args.params, ...)` 传入、在
+/// 另一个文件中解析帮助文本得到的参数表）时的来源：在 `inst` 的调用处取对应的实参表达式。实参是外层泛型函数的
+/// 形参时，到外层函数中实参值与之相同的实例的调用处继续找；否则以跟踪字面量来源的方式求这个实参（实参指向
+/// 声明时求这个声明）
+fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, depth: u32) resolve.Error!?Target {
+    if (depth > max_call_site_depth) return null;
+    const ip = r.ctx.db.env.ip;
+    const ins = switch (ip.key(inst)) {
+        .instance => |x| x,
+        else => return null,
+    };
+    const fn_key: database.hir.OwnerKey = .{ .file = ins.file, .item = ins.decl };
+    const fn_body = try r.ctx.get(database.hir.ItemBody, fn_key);
+    const sites = try seed.allFound(r, fn_key);
+    for (ins.args, 0..) |arg, k| {
+        var path: std.ArrayList(u32) = .empty;
+        var chain: std.ArrayList(Index) = .empty;
+        if (!try eval.findString(ip, r.arena, arg, name, &path, &chain)) continue;
+        for (sites) |site| {
+            if (site.inst != inst) continue;
+            const site_item = try itemOf(r, site.owner) orelse continue;
+            const body = try r.ctx.get(database.hir.ItemBody, site.owner);
+            const args = switch (body.expr(site.expr)) {
+                .call => |c| c.args,
+                else => continue,
+            };
+            // 方法调用：接收者是第一个形参
+            const skip = fn_body.params.len -| args.len;
+            if (k < skip or k - skip >= args.len) continue;
+            const arg_e = stripAddress(body, args[k - skip]);
+            if (try paramOf(r, site.owner.file, site_item, body, arg_e)) |p| {
+                // 外层泛型函数的形参：外层函数中实参值与这里相同的实例
+                const outer_key = try r.ownerKey(p.file, p.item);
+                var seen: std.ArrayList(Index) = .empty;
+                for (try seed.allFound(r, outer_key)) |outer| {
+                    const outer_inst = outer.inst orelse continue;
+                    if (std.mem.indexOfScalar(Index, seen.items, outer_inst) != null) continue;
+                    try seen.append(r.arena, outer_inst);
+                    const outer_args = switch (ip.key(outer_inst)) {
+                        .instance => |x| x.args,
+                        else => continue,
+                    };
+                    if (p.index >= outer_args.len or !sharesValue(ip, outer_inst, chain.items)) continue;
+                    if (try callSiteOrigin(r, outer_inst, name, depth + 1)) |found| return found;
+                }
+                continue;
+            }
+            const origin = if (try declOf(r, site.owner.file, site_item, body, arg_e)) |d| blk: {
+                // 指向声明：重新求这个声明
+                const decl_body = try r.body(d.file, d.item);
+                const value = decl_body.value orelse continue;
+                break :blk try eval.stringOrigin(r, d.file, d.item, decl_body, value, path.items);
+            } else try eval.stringOrigin(r, site.owner.file, site_item, body, arg_e, path.items);
+            if (origin) |o| return originTarget(r, o, name);
+        }
+    }
+    return null;
+}
+
+/// 去掉取地址与括号、`comptime`：`&args.params` → `args.params`
+fn stripAddress(body: *const Body, e: Body.ExprId) Body.ExprId {
+    var cur = e;
+    while (true) switch (body.expr(cur)) {
+        .prefix => |p| if (p.op == .ampersand) {
+            cur = p.operand;
+        } else return cur,
+        .@"comptime" => |x| cur = x,
+        else => return cur,
+    };
+}
+
+/// `e` 是函数的形参（含外层函数的形参，如类型构造函数返回的容器中引用的 `params`）时，该函数与形参的下标
+fn paramOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.ExprId) resolve.Error!?struct { file: FileId, item: u32, index: u32 } {
+    const n = switch (body.expr(e)) {
+        .name_ref => |x| x,
+        else => return null,
+    };
+    const l = switch (try r.resolveName(file, item, body, body.expr_scopes[@backingInt(e)], n) orelse return null) {
+        .local => |x| x,
+        else => return null,
+    };
+    const owner_body = if (l.file == file and l.item == item) body else try r.body(l.file, l.item);
+    const index = std.mem.indexOfScalar(Body.BindingId, owner_body.params, l.binding) orelse return null;
+    return .{ .file = l.file, .item = l.item, .index = @intCast(index) };
+}
+
+/// `e`（名字或成员访问）指向的声明
+fn declOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.ExprId) resolve.Error!?@FieldType(resolve.Def, "item") {
+    const def: ?resolve.Def = switch (body.expr(e)) {
+        .name_ref => |n| try r.resolveName(file, item, body, body.expr_scopes[@backingInt(e)], n),
+        .field_access => |fa| blk: {
+            const ns = try r.evalNamespace(file, item, body, fa.lhs) orelse return null;
+            break :blk try r.memberDef(ns, fa.field orelse return null);
+        },
+        else => null,
+    };
+    return switch (def orelse return null) {
+        .item => |it| it,
+        else => null,
+    };
+}
+
+fn itemOf(r: *Resolver, key: database.hir.OwnerKey) resolve.Error!?u32 {
+    for ((try r.itemTree(key.file)).items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
+    return null;
 }
 
 /// 构造类型的成员（`rt.owner`）：其中的局部绑定也是名字来源的候选

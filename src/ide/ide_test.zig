@@ -637,6 +637,67 @@ test "goto declaration of a reified field named by a byte copied from a string l
     try testing.expectEqual(h + 1, target.end);
 }
 
+test "goto declaration of a reified field whose name comes from an argument in another file" {
+    // 帮助文本在第三个文件中、经两层泛型函数传入（zig-clap 的 `clap.parse(..., &args.params, ...)`）：曾只在使用处与
+    // 构造处的文件中找字面量，跳到构造调用
+    const lib =
+        \\pub const Param = struct { long: []const u8 };
+        \\pub fn parse(comptime str: []const u8) [1]Param {
+        \\    return .{.{ .long = str[2..] }};
+        \\}
+        \\pub fn Args(comptime params: []const Param) type {
+        \\    var names: [params.len][]const u8 = undefined;
+        \\    var types: [params.len]type = undefined;
+        \\    for (params, 0..) |p, k| {
+        \\        names[k] = p.long[0..p.long.len] ++ "";
+        \\        types[k] = bool;
+        \\    }
+        \\    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+        \\}
+        \\pub fn Result(comptime params: []const Param) type {
+        \\    return struct { args: Args(params) };
+        \\}
+        \\pub fn run(comptime params: []const Param) Result(params) {
+        \\    return undefined;
+        \\}
+        \\
+    ;
+    const args =
+        \\const lib = @import("lib.zig");
+        \\pub const params = lib.parse("--help");
+        \\
+    ;
+    const main =
+        \\const lib = @import("lib.zig");
+        \\const args = @import("args.zig");
+        \\pub fn main() bool {
+        \\    const res = lib.run(&args.params);
+        \\    return res.args.help;
+        \\}
+        \\
+    ;
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root = try w.vfs.intern(try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" }));
+    const lib_file = (try w.add("/p/lib.zig", lib)).file;
+    const args_file = (try w.add("/p/args.zig", args)).file;
+    const main_file = (try w.add("/p/main.zig", main)).file;
+    try w.setGraph(std_root, &.{.{ .root = main_file, .imports = &.{} }}, &.{
+        .{ .file = lib_file, .module = 0, .root_module = 0 },
+        .{ .file = args_file, .module = 0, .root_module = 0 },
+        .{ .file = main_file, .module = 0, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const target = try definition.definition(&r, main_file, @intCast(std.mem.indexOf(u8, main, "args.help").? + 6)) orelse return error.NoDefinition;
+    try testing.expectEqual(args_file, target.file);
+    try testing.expectEqual(std.mem.indexOf(u8, args, "help").?, target.start);
+}
+
 test "goto declaration of a shorthand member of an inline reified enum" {
     const text =
         \\const Mode = @Enum(u8, .exhaustive, &.{ "fast", "slow" }, &.{ 0, 1 });
