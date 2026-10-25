@@ -3916,3 +3916,22 @@ test "comptime vars follow assignments in straight-line code" {
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("b_field", labels);
 }
+
+test "an inline for over an undefined array in a generic body counts its elements" {
+    // 抽象实例中数组的值为 `undefined`，每个元素也是 `undefined`：曾按「元素有没有值」数迭代次数，数不到头而溢出
+    const labels = try completionLabels(
+        \\const S = struct { a_field: u8 };
+        \\fn f(comptime T: type) void {
+        \\    const list: [2]T = undefined;
+        \\    inline for (list) |x| {
+        \\        _ = x.<|>;
+        \\    }
+        \\}
+        \\pub fn main() void {
+        \\    f(S);
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("a_field", labels);
+}

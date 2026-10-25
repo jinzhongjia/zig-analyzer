@@ -206,6 +206,18 @@ pub fn elemValue(r: *Resolver, base: TypedValue, i: usize) Error!?TypedValue {
     return if (tv.val != null) tv else null;
 }
 
+/// 值的元素个数（数组、切片、元组、结构体等，值为 `undefined` 时由类型决定）；求不出时为 null
+pub fn elemCount(r: *Resolver, base: TypedValue) Error!?usize {
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    return ev.elemCount(Evaluator.thaw(base)) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 /// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），含容器的布局；求不出时为 null
 pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
