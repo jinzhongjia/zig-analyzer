@@ -165,19 +165,36 @@ pub fn stringOrigin(r: *Resolver, file: FileId, item: u32, body: *const Body, e:
 /// `chain` 为路径上依次经过的值（不含根与字符串本身）
 pub fn findString(ip: *InternPool, a: Allocator, root: Index, needle: []const u8, path: *std.ArrayList(u32), chain: *std.ArrayList(Index)) Allocator.Error!bool {
     var budget: u32 = 4096;
-    return findStringIn(ip, a, root, needle, path, chain, &budget, 0);
+    if (try findStringIn(ip, a, root, needle, path, chain, &budget, 0, false)) return true;
+    // 单个字符的名字也可能由一个字节构成（`@as(*const [1]u8, &c)`）：没有这个字符串时找值为它的 u8
+    if (needle.len != 1) return false;
+    path.clearRetainingCapacity();
+    chain.clearRetainingCapacity();
+    budget = 4096;
+    return findStringIn(ip, a, root, needle, path, chain, &budget, 0, true);
 }
 
-fn findStringIn(ip: *InternPool, a: Allocator, v: Index, needle: []const u8, path: *std.ArrayList(u32), chain: *std.ArrayList(Index), budget: *u32, depth: u32) Allocator.Error!bool {
+fn findStringIn(ip: *InternPool, a: Allocator, v: Index, needle: []const u8, path: *std.ArrayList(u32), chain: *std.ArrayList(Index), budget: *u32, depth: u32, byte: bool) Allocator.Error!bool {
     if (budget.* == 0 or depth > 12) return false;
     budget.* -= 1;
     switch (ip.key(v)) {
-        .bytes => |b| return std.mem.eql(u8, b.bytes, needle),
-        .ptr_value => |p| return findStringIn(ip, a, p.pointee, needle, path, chain, budget, depth + 1),
+        .int_value => |x| return byte and x.ty == .u8_type and x.value == needle[0],
+        .bytes => |b| switch (ip.key(b.ty)) {
+            // 字符串（数组与指向数组的指针）
+            .array_type, .ptr_type => return !byte and std.mem.eql(u8, b.bytes, needle),
+            // 元素都是 u8 的结构体等同样以字节表示：逐个元素
+            else => {
+                if (!byte) return false;
+                const i = std.mem.indexOfScalar(u8, b.bytes, needle[0]) orelse return false;
+                try path.append(a, @intCast(i));
+                return true;
+            },
+        },
+        .ptr_value => |p| return findStringIn(ip, a, p.pointee, needle, path, chain, budget, depth + 1, byte),
         .aggregate => |agg| for (agg.elems, 0..) |x, i| {
             try path.append(a, @intCast(i));
             if (depth > 0) try chain.append(a, v);
-            if (try findStringIn(ip, a, x, needle, path, chain, budget, depth + 1)) return true;
+            if (try findStringIn(ip, a, x, needle, path, chain, budget, depth + 1, byte)) return true;
             _ = path.pop();
             if (depth > 0) _ = chain.pop();
         },
@@ -493,6 +510,9 @@ fn giveUp(err: EvalError) Error!TypedValue {
 /// 解释器中的值
 const Val = struct {
     ty: Index,
+    /// 跟踪来源时，从字符串字面量中取出的字节的来源（`Tracking.bytes` 的下标加一）；0 为没有。占用 `ty` 之后的
+    /// 对齐空隙，不增大 `Val`
+    origin: u32 = 0,
     v: Repr = .unknown,
 
     const unknown: Val = .{ .ty = .unknown };
@@ -540,9 +560,16 @@ const Ref = struct {
 /// 求值中创建的字符串字面量的存储单元及其位置
 const Tracking = struct {
     literals: std.ArrayList(Literal) = .empty,
+    /// 从字面量中取出的单个字节：`literals` 的下标与字节在字面量内容中的偏移
+    bytes: std.ArrayList(Byte) = .empty,
 
     const Literal = struct { cell: *Val, file: FileId, item: u32, expr: ExprId };
+    const Byte = struct { literal: u32, offset: u32 };
 };
+
+comptime {
+    std.debug.assert(@sizeOf(Val) == @sizeOf(Index) * 2 + @sizeOf(Repr));
+}
 
 const Frame = struct {
     file: FileId,
@@ -759,9 +786,19 @@ const Evaluator = struct {
             .ref => |ref| {
                 // 区间：下标相对于区间的起点，在所在的聚合中直接取元素
                 const base = try ev.loadPath(ref);
-                const w = ref.window orelse return ev.elemAt(base, i);
-                if (i >= w.len) return error.Abort;
-                return ev.elemAt(base, w.start + i);
+                const index = if (ref.window) |w| blk: {
+                    if (i >= w.len) return error.Abort;
+                    break :blk w.start + i;
+                } else i;
+                var elem = try ev.elemAt(base, index);
+                // 跟踪来源时，字面量中的字节记下它的位置：逐字节构造的名字（`&[1]u8{c}`）也能追到字面量
+                if (ev.track) |t| if (ref.path.len == 0) for (t.literals.items, 0..) |lit, li| {
+                    if (lit.cell != ref.cell) continue;
+                    try t.bytes.append(ev.a, .{ .literal = @intCast(li), .offset = @intCast(index) });
+                    elem.origin = @intCast(t.bytes.items.len);
+                    break;
+                };
+                return elem;
             },
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
@@ -1057,6 +1094,12 @@ const Evaluator = struct {
     fn followOrigin(ev: *Evaluator, f: *Frame, e: ExprId, path: []const u32) EvalError!?StringOrigin {
         var v = try ev.eval(f, e, null);
         for (path) |i| v = try ev.elemAt(v, i);
+        // 从字面量中取出的单个字节
+        if (v.origin != 0) {
+            const byte = ev.track.?.bytes.items[v.origin - 1];
+            const lit = ev.track.?.literals.items[byte.literal];
+            return .{ .file = lit.file, .item = lit.item, .expr = lit.expr, .offset = byte.offset };
+        }
         const ref = switch (v.v) {
             .ref => |x| x,
             else => return null,
@@ -2233,6 +2276,15 @@ const Evaluator = struct {
 
     /// 按结果类型转换
     fn coerce(ev: *Evaluator, v: Val, want: ?Index) EvalError!Val {
+        var out = try ev.coerceValue(v, want);
+        // 字节的来源随类型转换保留（`u8` → `?u8`、`comptime_int` → `u8`）：值不变
+        if (v.origin != 0 and out.origin == 0) if (value.intOf(ev.ip, v.ip())) |a| if (value.intOf(ev.ip, out.ip())) |b| if (a == b) {
+            out.origin = v.origin;
+        };
+        return out;
+    }
+
+    fn coerceValue(ev: *Evaluator, v: Val, want: ?Index) EvalError!Val {
         const t = want orelse return v;
         if (t == .unknown or v.ty == t) return v;
         const ip = ev.ip;

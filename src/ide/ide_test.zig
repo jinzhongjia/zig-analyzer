@@ -587,6 +587,56 @@ test "goto declaration of a reified field whose name is not traceable to a liter
     try testing.expectEqual(std.mem.indexOf(u8, text, "@Struct(").?, target.start);
 }
 
+test "goto declaration of a reified field named by a byte copied from a string literal" {
+    // 短参数名由帮助文本中的一个字节拷贝而成（zig-clap 的 `-h`）：曾追不到字面量，跳到构造调用
+    const text =
+        \\const Names = struct {
+        \\    short: ?u8 = null,
+        \\    fn name(names: *const Names) []const u8 {
+        \\        if (names.short) |*short| return @as(*const [1]u8, short);
+        \\        return "";
+        \\    }
+        \\};
+        \\fn parse(comptime str: []const u8) [1]Names {
+        \\    var out: [1]Names = .{.{}};
+        \\    for (str, 0..) |c, i| {
+        \\        if (i > 0 and str[i - 1] == '-') out[0].short = c;
+        \\    }
+        \\    return out;
+        \\}
+        \\fn Args(comptime params: []const Names) type {
+        \\    var names: [params.len][]const u8 = undefined;
+        \\    var types: [params.len]type = undefined;
+        \\    for (params, 0..) |p, k| {
+        \\        const n = p.name();
+        \\        names[k] = n[0..n.len] ++ "";
+        \\        types[k] = bool;
+        \\    }
+        \\    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+        \\}
+        \\const params = parse("  -h  Display help");
+        \\fn run(a: Args(&params)) bool {
+        \\    return a.h;
+        \\}
+        \\
+    ;
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root = try w.vfs.intern(try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" }));
+    const file = (try w.add("/p/main.zig", text)).file;
+    try w.setGraph(std_root, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const target = try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "a.h").? + 2)) orelse return error.NoDefinition;
+    const h = std.mem.indexOf(u8, text, "-h  Display").? + 1;
+    try testing.expectEqual(h, target.start);
+    try testing.expectEqual(h + 1, target.end);
+}
+
 test "goto declaration of a shorthand member of an inline reified enum" {
     const text =
         \\const Mode = @Enum(u8, .exhaustive, &.{ "fast", "slow" }, &.{ 0, 1 });
