@@ -15,6 +15,7 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const ast = @import("../syntax/ast.zig");
 const Body = @import("../hir/Body.zig");
 const sema_queries = @import("../sema/queries.zig");
+const hir = @import("../hir/queries.zig");
 const Allocator = std.mem.Allocator;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const mem = @import("../util/mem.zig");
@@ -509,9 +510,60 @@ const DeclBuilder = struct {
 
 // ── 跨文件求值 ─────────────────────────────────────────────────────
 
-/// 声明指向的命名空间：`Resolver.namespaceOf`；初始化表达式是条件形式（`if` / `switch`）时由推导求出它的值
-/// （`pub const X = if (cond) A else B;` 取 comptime 选中的分支）
+/// 声明指向的命名空间（见 `DeclNamespace`）
 fn namespaceOfDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!?Namespace {
+    return r.ctx.get(DeclNamespace, try r.ownerKey(file, item));
+}
+
+/// 声明指向的命名空间：`Resolver.namespaceOf`；初始化表达式是条件形式（`if` / `switch`）时由推导求出它的值
+/// （`pub const X = if (cond) A else B;` 取 comptime 选中的分支）。按声明缓存：一个文件可以有上千个声明，
+/// 为它建索引的读事务被编辑打断时，已求出的声明不必重算；编辑后没有变化的声明也直接命中
+pub const DeclNamespace = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = hir.OwnerKey;
+    pub const Value = ?Namespace;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const item = try itemOf(&r, key) orelse return null;
+        return computeNamespace(&r, key.file, item);
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return deepEql(a, b);
+    }
+};
+
+/// 声明作为别名的规范目标（`Resolver.aliasTarget`；不是别名时为它自身），按声明缓存（同 `DeclNamespace`）
+pub const DeclTarget = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = hir.OwnerKey;
+    pub const Value = Declaration;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const item = try itemOf(&r, key) orelse return .{ .file = key.file, .item = 0 };
+        return switch (try r.aliasTarget(.{ .item = .{ .file = key.file, .item = item } })) {
+            .item => |it| .{ .file = it.file, .item = it.item },
+            else => .{ .file = key.file, .item = item },
+        };
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return deepEql(a, b);
+    }
+};
+
+fn itemOf(r: *Resolver, key: hir.OwnerKey) resolve.Error!?u32 {
+    for ((try r.itemTree(key.file)).items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
+    return null;
+}
+
+fn computeNamespace(r: *Resolver, file: FileId, item: u32) resolve.Error!?Namespace {
     if (try r.namespaceOf(.{ .item = .{ .file = file, .item = item } })) |ns| return ns;
     const tree = try r.itemTree(file);
     if (tree.items[item].kind != .@"const") return null;
@@ -550,10 +602,7 @@ pub const FileLinks = struct {
         const targets = try a.alloc(Declaration, index.decls.len);
         for (index.decls, namespaces, targets) |decl, *ns, *target| {
             ns.* = try namespaceOfDecl(&r, file, decl.item);
-            target.* = switch (try r.aliasTarget(.{ .item = .{ .file = file, .item = decl.item } })) {
-                .item => |it| .{ .file = it.file, .item = it.item },
-                else => .{ .file = file, .item = decl.item },
-            };
+            target.* = try ctx.get(DeclTarget, try r.ownerKey(file, decl.item));
         }
         return .{ .arena = arena.state, .namespaces = namespaces, .targets = targets };
     }
