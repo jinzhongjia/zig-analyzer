@@ -201,7 +201,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 ### 4.5 语义层（`sema/`）
 
-- **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。容器类型的身份不依赖字段类型，递归类型不会成环。
+- **InternPool**：类型与 comptime 值的唯一表示，相同 Key 得到相同 Index；超过 `sema.max_intern_pool_mb` 时整代回收，之后按需重新推导。comptime 解释器中的整数不驻留，交出结果时才驻留，编译期循环的中间值不撑大 InternPool；实参含这类整数的调用不经 `CallEval`，在新的解释器中执行（独立的内存与回跳计数，与 `CallEval` 相同），结果按实例、配额与实参缓存在本次求值中（项数有上限，满时清空）。原生栈用去一半之后改经 `CallEval`，很深的递归仍由查询引擎分段计算。容器类型的身份不依赖字段类型，递归类型不会成环。
 - **核心 query**：`DeclType`（声明的类型与 comptime 值，只读签名）、`Infer`（BodyOwner + 实例 → 每个表达式的类型与解析目标）、`CallEval`（comptime 调用按实例与实参记忆化）、`ErrorSetOf`（推导错误集）、`LocalValue`（单个局部绑定）。
 - **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution（含枚举字面量与枚举、`&.{}` 与切片），没有结果类型的分支中的枚举字面量按 peer 类型解析（`if (t) |x| x.kind else .invalid`）；`unknown` 吸收一切。调用处判断是否为泛型调用只读被调函数的参数形式（`ParamForms`），只改被调函数的函数体时调用者不重新推导。
   - anytype 形参收到的枚举字面量在被调函数的实例中被转换成的类型（每个参数取函数体中第一处）记入推导结果，调用处的字面量引用其中的成员：`testing.expectEqual(.x, actual)` 经 `@TypeOf(expected, actual)` 转换为 actual 的类型。

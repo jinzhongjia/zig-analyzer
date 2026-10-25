@@ -447,6 +447,55 @@ test "unknown parts stay unknown" {
     });
 }
 
+/// 求出 `r` 的值时 InternPool 增长的项数；源码中的 `{d}` 为循环次数
+fn loopInternGrowth(comptime n: u32) !usize {
+    const src = std.fmt.comptimePrint(
+        \\fn mix(x: u64) u64 {{
+        \\    return x *% 2654435761;
+        \\}}
+        \\fn slow() u64 {{
+        \\    @setEvalBranchQuota(1_000_000);
+        \\    var s: u64 = 0;
+        \\    var i: u64 = 0;
+        \\    while (i < {d}) : (i += 1) s +%= i *% 2654435761;
+        \\    i = 0;
+        \\    while (i < {d}) : (i += 1) s +%= mix(i);
+        \\    return s;
+        \\}}
+        \\fn f() void {{
+        \\    const r = comptime slow();
+        \\    _ = r;
+        \\}}
+    , .{ n, n });
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", src);
+    const before = w.ip.count();
+    try testing.expect(std.mem.startsWith(u8, try typeAt(&w, f.file, src, "r", 0), "u64 = "));
+    return w.ip.count() - before;
+}
+
+test "comptime loop intermediates are not interned" {
+    // 循环中整数运算的中间结果曾逐个驻留：InternPool 随循环次数增长，大的编译期计算触发整代回收
+    try testing.expectEqual(try loopInternGrowth(100), try loopInternGrowth(1000));
+}
+
+test "comptime recursive calls with integer arguments reuse earlier results" {
+    // 整数实参不驻留的调用按实参缓存结果：朴素递归不按指数次数执行
+    try expectTypes(
+        \\fn fib(n: u64) u64 {
+        \\    return if (n < 2) n else fib(n - 1) + fib(n - 2);
+        \\}
+        \\fn f() void {
+        \\    const r = comptime fib(80);
+        \\    _ = r;
+        \\}
+    , &.{
+        .{ "r", "u64 = 23416728348467685" },
+    });
+}
+
 test "comptime integer arithmetic follows the result type" {
     try expectTypes(
         \\fn f() void {
