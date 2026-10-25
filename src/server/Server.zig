@@ -944,13 +944,30 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
             error.OutOfMemory => return,
         };
     };
-    const auto_import = server.imports_wanted.load(.acquire) and server.autoImportEnabled();
+    // 两步：先为项目文件建普通索引（工作区符号），建完即可用；再建自动导入的索引（标准库与各模块的公开闭包、
+    // 项目文件的 `FileLinks`），期间补全照常提供，只是不含自动导入
+    if (!try server.indexBatches(files, "Indexing", false)) return;
+    if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
     // 预热失败（内存不足）时不标记索引可用：下一次补全重试，而不是在请求中同步展开闭包
-    if (auto_import and !server.indexImportRoots()) return;
-    if (files.len == 0) {
-        if (auto_import) server.imports_basis.store(basis, .release);
-        return;
+    if (!server.indexImportRoots()) return;
+    if (!try server.indexBatches(files, "Indexing for auto-import", true)) return;
+    // 补全要用的项目级结果也在标记可用之前求出，不留给第一次补全
+    while (true) {
+        if (server.isShuttingDown() or !server.autoImportEnabled()) return;
+        var ctx = server.db.beginRead(arena_state.allocator());
+        defer ctx.end();
+        _ = ctx.get(za.ide_db.imports.TestOnlyFiles, {}) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        };
+        break;
     }
+    if (server.autoImportEnabled()) server.imports_basis.store(basis, .release);
+}
+
+/// 逐批为 `files` 建索引（`auto_import` 时为自动导入的索引，否则为工作区符号的索引），超过一定时间显示进度。
+/// 建完返回 true；正在关闭、自动导入已关闭或内存不足时返回 false
+fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, auto_import: bool) Io.Cancelable!bool {
     // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
     const t0 = Io.Clock.awake.now(server.io);
     var progress: ?*Progress.Progress = null;
@@ -960,7 +977,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     var scratch: std.heap.ArenaAllocator = .init(server.gpa);
     defer scratch.deinit();
     while (done < files.len) {
-        if (server.isShuttingDown() or (auto_import and !server.autoImportEnabled())) return;
+        if (server.isShuttingDown() or (auto_import and !server.autoImportEnabled())) return false;
         const end = @min(done + index_batch, files.len);
         _ = scratch.reset(.retain_capacity);
         {
@@ -969,10 +986,13 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
             indexFiles(&ctx, files[done..end], auto_import) catch |err| switch (err) {
                 // 被编辑打断：重试这一批
                 error.Canceled => continue,
-                error.OutOfMemory => return log.err("out of memory while indexing", .{}),
+                error.OutOfMemory => {
+                    log.err("out of memory while indexing", .{});
+                    return false;
+                },
             };
         }
-        {
+        if (!auto_import) {
             server.indexed_mutex.lockUncancelable(server.io);
             defer server.indexed_mutex.unlock(server.io);
             for (files[done..end]) |f| server.indexed.put(server.gpa, f, {}) catch {};
@@ -980,13 +1000,13 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         done = end;
         if (server.db.wantsSweep()) _ = server.db.trySweep();
         if (!progress_started and t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds > index_progress_delay_ms * std.time.ns_per_ms) {
-            progress = server.progress.begin(server, "Indexing", true);
+            progress = server.progress.begin(server, title, true);
             progress_started = true;
         }
         var buf: [32]u8 = undefined;
         if (progress) |p| server.progress.report(server, p, std.fmt.bufPrint(&buf, "{d}/{d} files", .{ done, files.len }) catch null, @intCast(done * 100 / files.len));
     }
-    if (auto_import and server.autoImportEnabled()) server.imports_basis.store(basis, .release);
+    return true;
 }
 
 /// 尚未建完自动导入索引（见 `imports_basis`）
@@ -1016,13 +1036,16 @@ fn hashFile(h: *std.hash.Wyhash, file: ?Vfs.FileId) void {
     h.update(std.mem.asBytes(&id));
 }
 
-/// `auto_import` 时一并建自动导入的声明索引（只为 Zig 源文件）
+/// 工作区符号的索引；`auto_import` 时为自动导入的声明索引（只为 Zig 源文件）
 fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.Error!void {
     for (files) |f| {
+        if (auto_import) {
+            if (za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) _ = try ctx.get(za.ide_db.imports.FileLinks, f);
+            continue;
+        }
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
-        if (auto_import and za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) _ = try ctx.get(za.ide_db.imports.FileLinks, f);
     }
 }
 
