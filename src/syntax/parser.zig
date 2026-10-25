@@ -59,7 +59,10 @@ pub const Parser = struct {
         p.fuel -= 1;
         const i = p.pos + n;
         if (i >= p.significant.len) return .eof;
-        return p.tokens[p.significant[i]].kind;
+        const token = p.tokens[p.significant[i]];
+        // 未闭合的转义标识符仍占据名字位置；保留原始 invalid token，让语法决定它是引用还是声明等。
+        if (token.kind == .invalid and std.mem.startsWith(u8, token.text(p.source), "@\"")) return .identifier;
+        return token.kind;
     }
 
     pub fn peek(p: *Parser) SyntaxKind {
@@ -95,6 +98,9 @@ pub const Parser = struct {
 
     pub fn bump(p: *Parser) Allocator.Error!void {
         assert(!p.atEof());
+        const token = p.tokens[p.significant[p.pos]];
+        if (token.kind == .invalid and std.mem.startsWith(u8, token.text(p.source), "@\""))
+            try p.err("invalid identifier");
         p.pos += 1;
         p.fuel = max_fuel;
         try p.events.append(p.gpa, .token);

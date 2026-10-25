@@ -53,7 +53,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 
 | 项目（测量文件） | 规模 | hover p50 | 补全 p50 | 编辑 → 诊断 p50 | 按键 → hover p50 | 常驻内存 |
 |---|---|---|---|---|---|---|
-| Zig 0.17.0 编译器（`src/Sema.zig`） | 54 万行 + std | 2.8 ms | 1.5 ms | 177 ms | 97 ms | 459 MB |
+| Zig 0.17.0 编译器（`src/Sema.zig`） | 54 万行 + std | 2.8 ms | 1.5 ms | 177 ms | 97 ms | 718 MB |
 | ghostty（`src/terminal/Terminal.zig`） | 37 万行 | 1.6 ms | 1.2 ms | 118 ms | 21 ms | 112 MB |
 | ZLS（`src/analysis.zig`） | 5.7 万行 | 0.7 ms | 0.5 ms | 90 ms | 16 ms | 218 MB |
 | superhtml（`src/html/Tokenizer.zig`） | 4.3 万行 | 0.5 ms | 0.7 ms | 65 ms | 11 ms | 97 MB |
@@ -69,6 +69,17 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 语义着色另以 `docs/test-list.md` 的 97 个指定文件串行测量（ReleaseSafe，项目加载完成、调用点推导开启）：
 热 full p95 5.83 ms，注释插入/撤销后的 delta p95 10.12 ms、最大 20.71 ms，热 range p95 0.38 ms。
 Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；空 range 不执行 Infer / seed 查询。
+
+自动导入开启时测量（ReleaseSafe）：在测量文件末尾的函数中把八个需要导入的名字（`ArrayLi`、`Allocat`、`asser`、`Resolv`、`Hash`、`mem`、`Thread`、`parseIn`）逐字输入三遍，每个字符先编辑再请求补全，计时包含两者；每次补全都提供了自动导入候选。就绪为第一次补全触发建索引起、按 150 ms 的间隔持续输入时，到出现自动导入候选所用的时间，期间普通补全照常提供（其中最慢一次 24～31 ms）。内存为进程的常驻内存峰值。
+
+| 项目（测量文件） | 补全 p50 | 补全 p95 | 就绪 | 常驻内存 |
+|---|---|---|---|---|
+| Cubyz（`src/graphics.zig`） | 3.5 ms | 5.1 ms | 1.6 s | 275 MB |
+| flow（`src/tui/mainview.zig`） | 4.9 ms | 7.0 ms | 1.3 s | 411 MB |
+| zig-analyzer（`src/sema/infer.zig`） | 4.3 ms | 6.7 ms | 0.7 s | 188 MB |
+| Zig 编译器（`src/Sema.zig`，3.5 万行） | 24 ms | 51 ms | 2.9 s | 680 MB |
+
+`Sema.zig` 上同样输入、不开启自动导入时补全 p50 9.8 ms、p95 24.6 ms，常驻内存约 510 MB；多出的部分主要是按键后为当前文件重算的 `FileIndex`、`ItemSummaries`（`Resolver` 解析命名模块的 import、求容器位置时依赖它们）与 `ImportSites`。在文件头增删一行 `@import` 后紧接着补全，Cubyz、flow、zig-analyzer 上 p50 6～7 ms、最慢 17 ms，`Sema.zig` 上 p50 37 ms、最慢 70 ms，主要是编辑落在文件头部后的重新解析；其中 `TestOnlyFiles` 的重算不到 1 ms。
 
 命名检查（开启时，ReleaseSafe）：Zig 编译器的 `src/Sema.zig` 上编辑 → 诊断 p50 170 ms（关闭时 169 ms），每次编辑只重算被编辑的
 成员，不读取其他文件；codeAction p50 3.8 ms，局部名字的修复（resolve，含改名后对整个文件的 AstGen）68 ms。ZLS、zigimg、Cubyz
@@ -168,7 +179,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 
 不直接用 `std.zig.Ast` 作 IDE 语法树：它对 `foo.` 这类半截表达式恢复粒度粗、不保留 trivia 结构、节点下标全局平移无法局部重解析。
 
-- **红绿树 CST**：手写递归下降，以官方 PEG 语法为准，永不失败，错误处产出 `ERROR` 节点；无损（树文本拼接等于原文）。
+- **红绿树 CST**：手写递归下降，以官方 PEG 语法为准，永不失败；无法恢复结构的错误处产出 `ERROR` 节点，树文本拼接始终等于原文。
 - **局部重解析**：编辑落在花括号平衡的 `block` / `container_decl` 内时只重解析该节点，其余绿节点复用；结果必须与全量解析完全相同（语料与随机编辑测试保证）。
 - **嵌套深度**：解析器与语法树都不限制深度，深层嵌套的代码完整参与名字解析、推导与各项 IDE 功能。解析与沿树递归的各层（HIR 降级、推导、语义 token 等）只受线程栈限制：请求在 `Io.Threaded` 的工作线程上处理，栈为 16 MiB。实测 ReleaseSafe 下括号、调用、`+` 链、字段访问链、`!`、`?` 嵌套 10000 层，代码块与 else-if 链嵌套 5000 层都能正常处理；Debug 下约 1500 层。更深时栈溢出、进程崩溃，由客户端重启。标准库与 `lib/compiler` 中最深的文件为 319 层。
   - 返回嵌套结构的响应限制层数：`std.json.Stringify` 在带安全检查的构建中嵌套超过 256 层时 panic。selection range 保留最内的 200 层，document symbol 只列出 100 层以内的符号。
@@ -176,6 +187,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - **AstId**：由父 AstId + 种类 + 名字 + 同名序号得到，跨编辑稳定；函数体内节点用 HIR 的 `ExprId` 定位。
 - **位置无关摘要**：`ItemNames` 保存成员的名字布隆过滤器，`ContainerRels` 保存容器相对 owner 的位置；绝对位置留在 `ItemSummaries` / `FileAstIdMap` 中，避免仅移动源码使语义搜索失效。
 - **类型化访问层**（`ast.zig`）：手写，集中「某信息位于哪个子节点」的知识，访问器返回可选值。
+- **不完整名字**：未闭合转义标识符在语法判断中按名字恢复，CST 保留原始 `invalid` token 和诊断，仍区分引用、声明、成员与标签位置；HIR 将缺失有效名字的引用降级为未知表达式，不参与名字解析。
 - `std.zig.Ast` 只用于格式化与 AstGen 诊断。
 
 ### 4.4 名字层与 HIR（`names/`、`hir/`）
@@ -232,6 +244,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致；嵌套深的文本在 2 GiB 栈的专用线程上格式化，深到 `zig fmt`（主线程栈 46 MiB）也耗尽栈时拒绝（估计深度超过 36864，按常见的嵌套形式标定；连续的前缀运算符 `zig fmt` 能格式化得更深） |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
 | 内置函数的补全、hover、参数提示 | 同版本 Zig 官方语言参考生成的静态签名、参数和 Markdown 说明；hover 同时保留推导结果 |
+| 自动导入补全 | 按文件的声明索引 `FileDecls` 与公开导出闭包 `Exports`（命名空间与别名由 `Resolver` 求值），按名字前缀（不区分大小写）二分查找；模块、文件、顶层声明与嵌套声明共用模块可达性判断 |
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的文件（定义在标准库或依赖包中时，链可以经过范围外的文件），以及项目中的其余文件：泛型代码不必导入定义所在的文件就能经 `anytype` 的值或 comptime 类型参数访问其成员。不导入定义所在文件的文件中只检查泛型函数中的代码 |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
@@ -244,6 +257,27 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 内置元数据固定为 Zig 0.17.0，来源、源码包及输入文件哈希记录在 `tools/zig/metadata.json`，许可保留在同目录。
 `zig build gen` 离线生成 `src/ide/builtin_data.zig`，校验官方输入哈希、编译器版本、名称和参数数量；运行时只查静态表。
 128 个编译器登记项中，124 个有官方文档；其余 4 个明确说明来源缺口，不编造签名，也不提供虚假的参数提示。
+
+自动导入由 `completion.auto_import` 控制，默认关闭：
+
+- 只在普通名字表达式的非空前缀后提供，不进入声明名、成员名、标签、注释、字符串或 builtin 上下文；`enum` 成员与 `union(enum)` 的 tag 是没有冒号的 container field，同样按声明名排除，`struct` 的元组字段（类型表达式）仍可自动导入。普通与闭合的标识符替换完整 token，未闭合转义名只替换到光标，保留后面的语句、分号与换行。
+- `filterText` 与插入表达式分开：转义标识符保留用户已输入的引号和转义拼写作为过滤前缀，使原生客户端的普通与模糊匹配都能保留候选。
+- 候选被选中时（`completionItem/resolve`）给出所指定义的签名（`detail`，与 hover 相同）、文档注释与位置（`documentation`）。位置为定义所在的文件与行：标准库中为 `std/` 下的路径，当前文件可以按路径 import 的为 import 路径，其他模块为当前文件 import 它所用的模块名加模块根目录下的路径。补全项的 `data` 记下当前文件、所指的文件与声明的 `AstId`；签名要推导类型，只在选中时计算，不放进每次按键的补全。
+- 优先复用当前可见的顶层命名空间别名（如 `Ast.Node.Index`），不重复插入 import；同文件的嵌套私有声明可用限定路径访问。作用域中的同名绑定优先，不生成被遮蔽的绑定。
+- 直接别名按规范声明身份复用，覆盖类型、标量 typedef、函数和值；目标已绑定为 `Renamed` 时保留目标名过滤，替换为现有绑定且不新增 import。同 label 的可见项合并过滤和替换元数据，不合并不同来源的同名导入；别名和目标名共享前缀时用 `isIncomplete` 让客户端继续输入后重新选择过滤拼写。
+- 可变全局变量与运行时 `extern const` 通过命名空间限定访问（如 `lib.counter`），不在顶层常量初始化中复制存储的值；`extern const` 保留只读补全类别。新增顶层绑定前查询 `BindingNames`：容器成员（ItemTree）与其他函数的参数、局部变量、捕获。成员访问、初始化字段名、标签和类型引用不是声明，不计入冲突（不先用当前文件的名字索引 `FileIndex` 粗筛：逐字输入时它总要随编辑重算）；叶名字冲突时改用命名空间绑定，命名空间名字也冲突时直接插入 `@import("...").name`，不新增绑定。
+- 不提供的声明：结构体等容器的方法（第一个参数的类型是所在容器、`@This()` 或指向它们的指针，经由实例调用），以及只被测试用到的文件中的声明与这些文件本身。只被测试用到的文件由 `TestOnlyFiles` 求出：从各模块的根出发沿 import 可达、但只沿测试之外的 import 不可达；位于 test 声明中的 import，以及位于不被正式代码引用、而只被 test 引用的非 pub 顶层声明中的 import（如只在测试中用到的 `const World = @import("x_test.zig").World;`）只用于测试，从没被引用的声明是死代码，按正式代码。光标位于 test 声明或只被测试用到的文件中时，这些文件照常提供。
+- 跨文件只沿公开声明链导入；跨模块使用当前文件可用的命名 import，不生成越过模块边界的相对路径。同模块的相对路径必须留在最优先归属模块的根目录子树中，路径分隔符统一为 `/`。
+- 新 import 放在最后一个顶层 import 声明之后，或文件头 `//!` 文档之后；保留同行注释与文档之前的普通注释。文件以 UTF-8 BOM 开头时保留 BOM 在最前，import 插在 BOM 之后。标识符和字符串分别按源码规则转义，附加编辑不与主编辑重叠。
+- 名字前缀不区分 ASCII 大小写匹配，是否按大小写过滤由客户端决定（如 Neovim 遵循 `ignorecase`/`smartcase`）。索引中的名字先不区分大小写、相同时再按字节排序，不区分大小写地以同一前缀开头的名字连续，按名字的精确查找用同一个顺序。前缀的大小写与输入不一致的候选排在所有一致的之后，二者内部仍按下述顺序；截断时不挤掉大小写一致的候选。
+- 可见补全排在自动导入之前，已有别名复用优先于新增导入；自动导入至多返回 `completion.max_auto_imports` 项（默认 128，0 为不限，与 clangd 的 `--limit-results` 相同），截断时保留排序最好的，以 `CompletionList.isIncomplete` 请求客户端随前缀变化重新查询。短前缀可匹配上千个声明：结果已满时，排序不会进入结果的候选在构造标签、检查可见性之前就跳过；顶层别名是否被遮蔽到用上时才检查。
+- 命名空间与别名的规范目标由 `Resolver.namespaceOf` / `aliasTarget` 求值，与跳转、hover 等功能是同一份实现；初始化表达式是条件形式（`pub const X = if (cond) A else B;`、`switch`）时由推导求出它的值，取 comptime 选中的分支：
+  - `FileDecls`：由 ItemTree 得出可从文件根访问的声明（值就是该容器的具名 const 之下）与同文件公开路径（公开别名可指向本文件的私有容器，不展开到其他文件）；自持有名字、路径与文档，不淘汰。
+  - `FileLinks`：各声明指向的命名空间与别名的规范目标。
+  - `Exports`：沿公开成员展开的闭包，每个命名空间只保留一条最短跳数公开路径，终止别名环；名字与文档直接引用 `FileDecls` 的值，按指针比较相等。补全用到的每个命名空间（各模块的根、当前文件顶层别名指向的命名空间）各有一个闭包，值至多保留 1024 个、16 MB，淘汰的由 `FileDecls`、`FileLinks` 重新展开；引擎为每个 key 保留的依赖元数据不在这个上限内。
+- 只为 `.zig` 文件建索引，也只在 `.zig` 文档中提供：模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON），向 `.zon` 等文件插入 import 声明会破坏它。`completion.auto_import` 关闭时不建索引；已经开始的轮次在下一批之前停止，已建的值保留到会话结束。
+- 第一次在可以自动导入的名字处补全时才开始建索引，不补全的会话（浏览、跳转）不付出这部分内存与计算。后台索引分两步：先为项目文件建工作区符号的索引，建完即可用；再建自动导入的索引：标准库、`builtin` 与各命名模块的公开闭包沿涉及的文件按批建索引（批间淘汰解析树等中间结果），然后是项目文件的 `FileLinks` 与 `ImportSites`，最后求 `TestOnlyFiles`（只读取各文件已求出的 `ImportSites`，不在一个读事务中解析全部项目文件），都建完才标记可用。各声明的命名空间与别名目标按声明缓存（`DeclNamespace`、`DeclTarget`，以声明的 AstId 为键）：标准库的大文件有上千个声明，建索引的读事务被编辑打断时已求出的声明不必重算，持续输入时索引仍能建完；编辑后没有变化的声明也直接命中。单个声明本身的求值比两次按键的间隔还长时（如 `pub const X = if (slow()) A else B;` 的条件中有大量编译期循环），被打断后只能从头再算，持续输入期间建不完，停下输入后建完。索引为当前模块图的构成（标准库、各模块的根与 builtin、各模块的 import 表）建完之前，补全不提供自动导入并标记为不完整（客户端随输入重新请求），不在请求中同步展开闭包；模块图只增减了文件（构建中产生的生成文件、新 import 的文件）时不受影响，这些文件的语法索引在补全时按需建立。上一轮没有建完（出错、任务没能启动）而没有索引在进行时，下一次这样的补全重新开始。索引任务可能就地执行，补全持有读事务，就地执行时其中的读事务会与等待中的写事务互相等待，所以由另一个任务调度。
+- `BindingNames` 独立依赖当前文件语法树，只收集声明位置（ItemTree 的成员、参数、局部变量、捕获），不把普通名字引用、成员访问或标签当作声明；函数体内增加或移除绑定会更新冲突判断，也不扩大 `FileDecls` 对函数体的失效范围。
 
 语义着色的约束：
 
@@ -318,7 +352,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 |---|---|
 | `zig build test-all`（Debug 与 ReleaseSafe） | 全部测试：引擎（增量、cutoff、环、取消、淘汰）、语法、名字、sema、IDE 功能，以及运行 PATH 中 zig 的构建系统协议、单文件编译、诊断一致性与端到端测试 |
 | `zig build test --fuzz=<次数>` | 覆盖率引导模糊测试：URI ↔ 路径、解析器无损、增量与全量解析一致、位置换算 |
-| `zig build corpus -- <目录>...` | 解析器语料对拍：无损、无误报、与 `std.zig.Ast` 结构一致、截断不崩溃、HIR 降级无失败 |
+| `zig build corpus -- <目录>...` | 解析器语料对拍：无损、无误报、与 `std.zig.Ast` 结构一致、截断不崩溃；HIR 引用按源码位置与解码后的名字逐一对应，含 asm 输出目标，嵌套容器由各自 owner 检查 |
 | `zig fmt --check`、`zig build gen` 后无 diff | 格式与生成代码 |
 
 - `zig build test`：只运行不依赖外部工具的测试，供开发时快速验证。其中找不到 zig（`ZigEnv.query` 在这时返回 `ZigNotFound`），依赖它的测试（示例项目、真实的标准库）跳过，服务器不启动项目与编译。
@@ -340,7 +374,8 @@ zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项�
 | `BENCH_COMPLETE=<n>` | 源码中的 `a.b` 在 `.` 后补全，列表中应有 `b` | 召回 ≥ 95% |
 | `BENCH_REFS=<n>` | 查找引用与重命名；泛型函数体中在其他调用点实例下指向同名声明的引用另计 | 名字不符、误报、遗漏、重命名不一致均为 0 |
 | `BENCH_SAVE=1` | 保存 → 编译器诊断，与 `zig build` 逐条比较 | 完全一致 |
-| `BENCH_SESSION=<轮数>` | 长时间会话的内存 | 稳定，不超过预算 |
+| `BENCH_SESSION=<轮数>` | 长时间会话的内存（`imp MB` 为自动导入索引的值） | 稳定，不超过预算 |
+| `BENCH_TYPE_COMPLETE=<n>` | 逐字输入补全：名字表达式中插入字符 → 补全 → 撤销，同时报告自动导入候选数与索引 query 变化（自动导入默认关闭，测量它时以 `BENCH_CONFIG='{"completion":{"auto_import":true}}'` 开启） | 计入编辑与补全 |
 | `BENCH_QUICK=1` | 跳过编辑相关阶段，用于批量校验 | — |
 
 另以 `zig fmt` 对拍 `textDocument/formatting`（逐字一致）。

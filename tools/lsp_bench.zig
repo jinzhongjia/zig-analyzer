@@ -12,6 +12,9 @@
 //! - `BENCH_VERBOSE=1`：打印首轮中较慢的请求、其内存变化与各 query 的执行次数
 //! - `BENCH_CHECK=<n>`：校验跳转的正确性：对文件中的标识符请求 declaration，目标处的标识符应与请求处相同；
 //!   同时打印前 n 个未解析的标识符
+//! - `BENCH_TYPE_COMPLETE=<n>`：在 n 个名字表达式中各插入一个字符、立即请求补全再撤销；计时包含编辑与补全，
+//!   并报告自动导入候选数与索引 query 的变化（自动导入默认关闭，以 `BENCH_CONFIG='{"completion":{"auto_import":true}}'`
+//!   开启，与关闭时比较开销）
 //! - `BENCH_QUICK=1`：跳过编辑、连续输入与保存的各阶段（批量校验大量项目时使用）
 //! - `BENCH_COMPLETE=<n>`：补全的召回：源码中的成员访问 `a.b` 在 `.` 之后补全，列表中应有 `b`
 //! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致；
@@ -196,6 +199,43 @@ fn samplePositions(a: Allocator, text: [:0]const u8, after_dot: bool) ![]Positio
     const out = try a.alloc(Position, n);
     for (out, 0..) |*p, i| p.* = positionOf(text, all.items[i * all.items.len / n]);
     return out;
+}
+
+/// 逐字输入补全的取样：identifier 且前一个 token 不是 `.`，长度至少 3。返回插入位置（名字第二个字节）
+/// 与请求补全的位置（名字第三个字节），编辑与补全都落在同一个名字表达式内。
+const TypingPosition = struct { edit: Position, complete: Position };
+
+fn typingPositions(a: Allocator, text: [:0]const u8) ![]TypingPosition {
+    var all: std.ArrayList(TypingPosition) = .empty;
+    var tokenizer: std.zig.Tokenizer = .init(text);
+    var prev: std.zig.Token.Tag = .invalid;
+    while (true) {
+        const t = tokenizer.next();
+        if (t.tag == .eof) break;
+        if (t.tag == .identifier and prev != .period and t.loc.end - t.loc.start >= 3 and text[t.loc.start] != '@') {
+            try all.append(a, .{
+                .edit = positionOf(text, t.loc.start + 1),
+                .complete = positionOf(text, t.loc.start + 2),
+            });
+        }
+        prev = t.tag;
+    }
+    return all.items;
+}
+
+/// 补全响应中是否有自动导入项（带附加编辑或 data 的项）
+fn hasAutoImport(response: std.json.Value) bool {
+    const result = response.object.get("result") orelse return false;
+    const items = switch (result) {
+        .array => |array| array.items,
+        .object => |object| if (object.get("items")) |items| items.array.items else &.{},
+        else => return false,
+    };
+    for (items) |item| {
+        if (item != .object) continue;
+        if (item.object.get("additionalTextEdits") != null or item.object.get("data") != null) return true;
+    }
+    return false;
 }
 
 const Stats = struct {
@@ -628,7 +668,7 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
     std.debug.print("  completion   checked {d} member accesses: offered {d} ({d:.1}%), empty lists {d}\n", .{ n, found, @as(f64, @floatFromInt(found)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), empty });
 }
 
-/// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、补全、
+/// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、成员与名字补全、
 /// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     const a = c.arena.allocator();
@@ -647,7 +687,7 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     if (files.items.len == 0) return;
     const per_round = 25;
     std.debug.print("long session: {d} rounds × {d} files (of {d})\n", .{ rounds, per_round, files.items.len });
-    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "keys", "deps", "s" });
+    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s" });
     const t0 = Io.Clock.awake.now(io);
     var version: i64 = 1;
     for (0..rounds) |round| {
@@ -664,6 +704,11 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             while (i < idents.len) : (i += step) _ = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i] });
             const dots = try samplePositions(a, text, true);
             if (dots.len > 0) _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
+            // 名字输入了两个字符时的补全：自动导入的索引（第一次在名字处补全后才建）也计入会话的内存
+            if (idents.len > 0) {
+                const at = idents[idents.len / 3];
+                _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = .{ .line = at.line, .character = at.character + 2 } });
+            }
             const end = positionOf(text, text.len);
             try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "// x" }} });
             version += 1;
@@ -675,6 +720,7 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
         var infer_b: i64 = 0;
         var body_b: i64 = 0;
         var parse_b: i64 = 0;
+        var import_b: i64 = 0;
         var keys: i64 = 0;
         var deps: i64 = 0;
         for (o.get("queries").?.array.items) |q| {
@@ -685,13 +731,14 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             if (std.mem.endsWith(u8, name, ".Infer")) infer_b = b;
             if (std.mem.endsWith(u8, name, ".ItemBody")) body_b = b;
             if (std.mem.endsWith(u8, name, ".ParseFile")) parse_b = b;
+            if (std.mem.indexOf(u8, name, ".imports.") != null) import_b += b;
         }
         const mb = struct {
             fn f(x: i64) f64 {
                 return @as(f64, @floatFromInt(x)) / (1024 * 1024);
             }
         }.f;
-        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0}\n", .{
+        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0}\n", .{
             round + 1,
             (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
             mb(o.get("heap_bytes").?.integer),
@@ -700,6 +747,7 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             mb(infer_b),
             mb(body_b),
             mb(parse_b),
+            mb(import_b),
             @as(u64, @intCast(keys)),
             @as(u64, @intCast(deps)),
             @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s,
@@ -939,6 +987,40 @@ pub fn main(init: std.process.Init) !u8 {
             if (verbose) {
                 _ = try c.request("zig-analyzer/waitIdle", {});
                 try c.phase("in-body edits (incl. background work until idle)");
+            }
+
+            // 逐字输入补全（BENCH_TYPE_COMPLETE=<次数>）：在名字表达式中插入一个字符、立即请求补全，
+            // 再撤销。计时包含编辑与补全；同时报告自动导入候选的出现次数与索引 query 的变化
+            if (init.environ_map.get("BENCH_TYPE_COMPLETE")) |v| {
+                const wanted = std.fmt.parseInt(usize, v, 10) catch 40;
+                const names = try typingPositions(a, text);
+                const count = @min(wanted, names.len);
+                if (count == 0) {
+                    std.debug.print("  type→complete   no name expressions sampled\n", .{});
+                } else {
+                    const counts_before = try queryCounts(&c);
+                    const times = try a.alloc(f64, count);
+                    var offered: usize = 0;
+                    for (times, 0..) |*t, i| {
+                        const p = names[i * names.len / count];
+                        const t0 = Io.Clock.awake.now(io);
+                        try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = p.edit, .end = p.edit }, .text = "x" }} });
+                        version += 1;
+                        const resp, _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = p.complete });
+                        t.* = ms(io, t0);
+                        if (hasAutoImport(resp)) offered += 1;
+                        try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = p.edit, .end = p.complete }, .text = "" }} });
+                        version += 1;
+                    }
+                    Stats.print("type→complete", times);
+                    std.debug.print("  type→complete   auto-import offered in {d}/{d}\n", .{ offered, count });
+                    if (offered == 0) std.debug.print("  warning: no auto-import candidates were offered; the sample may not reach importable names\n", .{});
+                    _ = try c.request("zig-analyzer/waitIdle", {});
+                    const counts_after = try queryCounts(&c);
+                    for (counts_after, counts_before) |after, before| if (after.n != before.n)
+                        std.debug.print("    {s}: +{d}\n", .{ after.name, after.n - before.n });
+                    if (verbose) try c.phase("typed completions");
+                }
             }
 
             // 保存 → 编译器诊断（BENCH_SAVE=1）：在磁盘文件末尾写入一个语义错误（AstGen 不报，只有编译器报），

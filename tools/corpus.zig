@@ -7,7 +7,7 @@
 //! 2. 无误报：`std.zig.Ast` 无错误的文件，CST 也必须无错误
 //! 3. 结构一致：容器顶层成员的（种类, 名字）序列与 `std.zig.Ast` 一致
 //! 4. 健壮性：在多个位置截断文件后解析不崩溃且仍然无损
-//! 5. HIR：每个成员都能降级，表达式位置落在成员范围内，且没有遗漏任何名字引用
+//! 5. HIR：每个成员都能降级，表达式位置在成员内，名字引用逐一对应源码的标识符（含 asm 输出目标）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -169,18 +169,32 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             defer body.deinit(gpa);
             stats.hir_ns += @intCast(t2.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
             stats.hir_exprs += body.exprs.len;
-            var name_refs: usize = 0;
-            for (body.exprs) |e| if (e == .name_ref) {
-                name_refs += 1;
-            };
-            const in_range = for (body.expr_ranges) |r| {
+            var references: std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken) = .empty;
+            defer references.deinit(gpa);
+            const name_node = if (field_is_name) (syntax.ast.ContainerField{ .syntax = node }).typeExpr() else null;
+            const excluded = if (name_node) |name| if (name.kind() == .name_ref) name.offset else null else null;
+            try collectNameRefs(gpa, node, excluded, &references);
+            const expected = references.count();
+            const in_range = body.exprs.len == body.expr_ranges.len and for (body.expr_ranges) |r| {
                 if (r.start > r.end or r.end > node.green.text_len) break false;
             } else true;
-            const name_node = if (field_is_name) (syntax.ast.ContainerField{ .syntax = node }).typeExpr() else null;
-            const expected = countNameRefs(node) - @intFromBool(name_node != null and name_node.?.kind() == .name_ref);
-            if (!in_range or name_refs != expected) {
+            var decoded: std.heap.ArenaAllocator = .init(gpa);
+            defer decoded.deinit();
+            var names_match = in_range;
+            var name_refs: usize = 0;
+            if (in_range) for (body.exprs, body.expr_ranges) |expr, range| {
+                if (expr != .name_ref) continue;
+                name_refs += 1;
+                const key: syntax.TextRange = .{ .start = node.offset + range.start, .end = node.offset + range.end };
+                const ref = references.fetchRemove(key) orelse {
+                    names_match = false;
+                    continue;
+                };
+                if (!std.mem.eql(u8, expr.name_ref, try syntax.ast.identNameAlloc(decoded.allocator(), ref.value.text))) names_match = false;
+            };
+            if (!names_match or references.count() != 0) {
                 stats.hir_failures += 1;
-                report(stats, "[HIR failure] {s}: member at {d} (name refs {d} / {d})", .{ path, node.offset, name_refs, expected });
+                report(stats, "[HIR failure] {s}: member at {d} (name refs {d} / {d}, unmatched source refs {d})", .{ path, node.offset, name_refs, expected, references.count() });
             }
         }
     }
@@ -275,19 +289,34 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
     }
 }
 
-/// 成员子树中的 name_ref 节点数（不进入嵌套容器）
-fn countNameRefs(node: SyntaxNode) usize {
-    var n: usize = 0;
-    var it = node.children();
-    while (it.nextNode()) |c| switch (c.kind()) {
-        .name_ref => n += 1,
-        // 嵌套容器的成员不在本成员的 HIR 中；参数表达式（`enum(u8)`）在
-        .container_decl => if ((syntax.ast.ContainerDecl{ .syntax = c }).argExpr()) |arg| {
-            n += if (arg.kind() == .name_ref) 1 else countNameRefs(arg);
+/// 收集 HIR 中应存在的源码引用；嵌套容器的成员由各自的 owner 检查。
+fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references: *std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken)) !void {
+    switch (node.kind()) {
+        .name_ref => {
+            if (excluded == node.offset) return;
+            if ((syntax.ast.NameRef{ .syntax = node }).name()) |token| try references.put(gpa, token.range(), token);
+            return;
         },
-        else => n += countNameRefs(c),
-    };
-    return n;
+        .container_decl => {
+            if ((syntax.ast.ContainerDecl{ .syntax = node }).argExpr()) |arg| try collectNameRefs(gpa, arg, excluded, references);
+            return;
+        },
+        .asm_output => if (node.childToken(.arrow) == null) {
+            // 输出的局部变量是直接 token，不是 name_ref 子节点；寄存器标签不算引用。
+            var children = node.children();
+            var operand = false;
+            while (children.next()) |child| if (child == .token) {
+                if (child.token.kind == .l_paren) operand = true;
+                if (operand and child.token.kind == .identifier) {
+                    try references.put(gpa, child.token.range(), child.token);
+                    break;
+                }
+            };
+        },
+        else => {},
+    }
+    var children = node.children();
+    while (children.nextNode()) |child| try collectNameRefs(gpa, child, excluded, references);
 }
 
 fn isLossless(gpa: Allocator, root: SyntaxNode, source: []const u8) !bool {

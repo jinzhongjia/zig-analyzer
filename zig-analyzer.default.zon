@@ -53,6 +53,16 @@
     //       .hide_redundant_param_names = true,
     //   },
 
+    // Completion (editor only):
+    //   .completion = .{
+    //       // In name completion, also offer reachable declarations and modules that are not
+    //       // imported yet, adding the import when one is accepted.
+    //       .auto_import = false,
+    //       // At most this many auto-import candidates per completion (the best ranked are kept;
+    //       // the list is marked incomplete and refreshed as you type); 0 never limits.
+    //       .max_auto_imports = 128,
+    //   },
+
     // Type inference (editor only):
     //   .sema = .{
     //       // Inside generic functions with no concrete types, infer with the instances from call

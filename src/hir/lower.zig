@@ -247,7 +247,8 @@ const Lowerer = struct {
         const e: Expr = switch (n.kind()) {
             // 括号与语句形式的分支不单独成节点
             .paren_expr, .expr_stmt => return l.exprOrMissing(firstChild(n)),
-            .name_ref => .{ .name_ref = try l.ident((ast.NameRef{ .syntax = n }).name().?.text) },
+            // 恢复出的引用位置可能只有 invalid token；缺失名字保持未知，不进入名字解析。
+            .name_ref => if ((ast.NameRef{ .syntax = n }).name()) |name| .{ .name_ref = try l.ident(name.text) } else .missing,
             .literal => .{ .literal = try l.literal(n) },
             .field_access => blk: {
                 const fa = ast.FieldAccess{ .syntax = n };
@@ -722,4 +723,32 @@ test "labels, switch captures and nested containers" {
         containers += 1;
     };
     try testing.expectEqual(1, containers);
+}
+
+test "recovered invalid names remain unknown while preserving enclosing bindings" {
+    const cases = [_]struct { source: []const u8, type_position: bool }{
+        .{ .source = "fn f(input: u32) void { const value: @\"EdgeWidg\n = input; _ = value; _ = input; }", .type_position = true },
+        .{ .source = "fn f(input: u32) void { const value = @\"EdgeWidg", .type_position = false },
+    };
+    for (cases) |case| {
+        var result = try lowerFirst(case.source);
+        defer result.parse.destroy();
+        defer result.body.deinit(testing.allocator);
+        const body = &result.body;
+        const binding = for (body.bindings) |item| {
+            if (std.mem.eql(u8, item.name, "value")) break item;
+        } else return error.MissingRecoveredBinding;
+        const expr = if (case.type_position) binding.ty.? else binding.init.?;
+        try testing.expect(body.expr(expr) == .missing);
+        try testing.expectEqual(expr, body.exprAt(offsetOf(case.source, "@\"") + 2).?);
+        const input = body.lookup(body.expr_scopes[@backingInt(expr)], "input").?;
+        try testing.expectEqual(.param, body.binding(input).kind);
+        if (case.type_position) {
+            var saw_input_ref = false;
+            for (body.exprs) |e| if (e == .name_ref and std.mem.eql(u8, e.name_ref, "input")) {
+                saw_input_ref = true;
+            };
+            try testing.expect(saw_input_ref);
+        }
+    }
 }

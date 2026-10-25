@@ -7,6 +7,7 @@
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
+//!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
 //!       "workspace_symbol": { "dependencies": false },
 //!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
@@ -52,6 +53,10 @@ inlay_types: bool = true,
 inlay_parameters: bool = true,
 /// 实参与形参同名（或以形参名结尾的字段访问）时不显示形参名
 hide_redundant_param_names: bool = true,
+/// 普通名字补全中提供可达声明与模块的自动导入
+completion_auto_import: bool = false,
+/// 一次补全至多提供的自动导入候选（保留排序最好的，其余由客户端随输入重新请求得到）；0 为不限
+completion_max_auto_imports: u32 = 128,
 /// 泛型函数体内没有具体类型时以调用点的实例推导（hover、补全、inlay hints 等）
 callsite_seeding: bool = true,
 /// InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导）；0 为不回收
@@ -124,6 +129,8 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "types", .field = "inlay_types" },
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
+    .{ .section = "completion", .key = "auto_import", .field = "completion_auto_import" },
+    .{ .section = "completion", .key = "max_auto_imports", .field = "completion_max_auto_imports" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "workspace_symbol", .key = "dependencies", .field = "workspace_symbol_dependencies" },

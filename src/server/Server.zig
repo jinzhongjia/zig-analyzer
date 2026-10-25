@@ -125,6 +125,12 @@ edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
 live_prepared: live.Prepared = undefined,
 /// 是否有索引任务在运行（同时只运行一个）
 indexing: std.atomic.Value(bool) = .init(false),
+/// 在可以自动导入的名字处补全过：此后才为自动导入建索引。不补全的会话（浏览、跳转）不为它展开标准库的公开导出闭包
+imports_wanted: std.atomic.Value(bool) = .init(false),
+/// 最近一轮建完自动导入索引时模块图的构成（见 `importsBasis`；尚未建完为 `imports_pending`）。补全时与它不同
+/// 则不提供自动导入，标记为不完整，客户端随输入重新请求：以免在请求中同步为新的模块展开标准库、项目的公开导出
+/// 闭包。模块图只增减了文件（如构建中产生的生成文件）时不变，新文件的索引在补全时按需建立
+imports_basis: std.atomic.Value(u64) = .init(imports_pending),
 /// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
 indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 indexed_mutex: Io.Mutex = .init,
@@ -449,6 +455,7 @@ const request_handlers = .{
     .{ "textDocument/declaration", Mode.semantic, declaration },
     .{ "textDocument/typeDefinition", Mode.semantic, typeDefinition },
     .{ "textDocument/completion", Mode.semantic, completion },
+    .{ "completionItem/resolve", Mode.semantic, completionResolve },
     .{ "textDocument/hover", Mode.semantic, hover },
     .{ "textDocument/signatureHelp", Mode.semantic, signatureHelp },
     .{ "textDocument/inlayHint", Mode.semantic, inlayHint },
@@ -862,6 +869,13 @@ fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.I
 
 const index_progress_delay_ms = 200;
 
+/// 自动导入是否仍然开启：索引任务在每批之前复查，关闭后不再继续建索引
+fn autoImportEnabled(server: *Server) bool {
+    server.config_mutex.lockUncancelable(server.io);
+    defer server.config_mutex.unlock(server.io);
+    return server.config.completion_auto_import;
+}
+
 /// 每批索引的文件数：每批一个读事务，编辑（写事务）最多等一批
 const index_batch = 8;
 
@@ -875,6 +889,18 @@ fn scheduleIndexing(server: *Server) void {
     if (server.indexing.swap(true, .acq_rel)) return;
     server.busyBegin();
     spawn(server.io, &server.bg_group, indexTask, .{server});
+}
+
+/// 同 `scheduleIndexing`，供持有读事务的请求调用：索引任务可能就地执行，其中的读事务遇到等待中的写事务时，
+/// 与仍持有读锁的调用者互相等待。由另一个任务调度；任务启动不了时不建，留给之后的请求
+fn scheduleIndexingFromRead(server: *Server) void {
+    server.busyBegin();
+    server.bg_group.concurrent(server.io, scheduleIndexingTask, .{server}) catch server.busyEnd();
+}
+
+fn scheduleIndexingTask(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    server.scheduleIndexing();
 }
 
 fn indexTask(server: *Server) Io.Cancelable!void {
@@ -902,13 +928,46 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     defer pc.leave();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
-    const files = blk: {
+    var basis: u64 = 0;
+    const files = while (true) {
+        if (server.isShuttingDown()) return;
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
-        break :blk za.ide_db.search.projectFiles(&r) catch return;
+        // 被编辑打断：重试，不放弃这一轮
+        basis = importsBasis(ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        });
+        break za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        };
     };
-    if (files.len == 0) return;
+    // 两步：先为项目文件建普通索引（工作区符号），建完即可用；再建自动导入的索引（标准库与各模块的公开闭包、
+    // 项目文件的 `FileLinks`），期间补全照常提供，只是不含自动导入
+    if (!try server.indexBatches(files, "Indexing", false)) return;
+    if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
+    // 预热失败（内存不足）时不标记索引可用：下一次补全重试，而不是在请求中同步展开闭包
+    if (!server.indexImportRoots()) return;
+    if (!try server.indexBatches(files, "Indexing for auto-import", true)) return;
+    // 补全要用的项目级结果也在标记可用之前求出，不留给第一次补全
+    while (true) {
+        if (server.isShuttingDown() or !server.autoImportEnabled()) return;
+        var ctx = server.db.beginRead(arena_state.allocator());
+        defer ctx.end();
+        _ = ctx.get(za.ide_db.imports.TestOnlyFiles, {}) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        };
+        break;
+    }
+    if (server.autoImportEnabled()) server.imports_basis.store(basis, .release);
+}
+
+/// 逐批为 `files` 建索引（`auto_import` 时为自动导入的索引，否则为工作区符号的索引），超过一定时间显示进度。
+/// 建完返回 true；正在关闭、自动导入已关闭或内存不足时返回 false
+fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, auto_import: bool) Io.Cancelable!bool {
     // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
     const t0 = Io.Clock.awake.now(server.io);
     var progress: ?*Progress.Progress = null;
@@ -918,19 +977,22 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     var scratch: std.heap.ArenaAllocator = .init(server.gpa);
     defer scratch.deinit();
     while (done < files.len) {
-        if (server.isShuttingDown()) return;
+        if (server.isShuttingDown() or (auto_import and !server.autoImportEnabled())) return false;
         const end = @min(done + index_batch, files.len);
         _ = scratch.reset(.retain_capacity);
         {
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
-            indexFiles(&ctx, files[done..end]) catch |err| switch (err) {
+            indexFiles(&ctx, files[done..end], auto_import) catch |err| switch (err) {
                 // 被编辑打断：重试这一批
                 error.Canceled => continue,
-                error.OutOfMemory => return log.err("out of memory while indexing", .{}),
+                error.OutOfMemory => {
+                    log.err("out of memory while indexing", .{});
+                    return false;
+                },
             };
         }
-        {
+        if (!auto_import) {
             server.indexed_mutex.lockUncancelable(server.io);
             defer server.indexed_mutex.unlock(server.io);
             for (files[done..end]) |f| server.indexed.put(server.gpa, f, {}) catch {};
@@ -938,20 +1000,156 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         done = end;
         if (server.db.wantsSweep()) _ = server.db.trySweep();
         if (!progress_started and t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds > index_progress_delay_ms * std.time.ns_per_ms) {
-            progress = server.progress.begin(server, "Indexing", true);
+            progress = server.progress.begin(server, title, true);
             progress_started = true;
         }
         var buf: [32]u8 = undefined;
         if (progress) |p| server.progress.report(server, p, std.fmt.bufPrint(&buf, "{d}/{d} files", .{ done, files.len }) catch null, @intCast(done * 100 / files.len));
     }
+    return true;
 }
 
-fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId) za.db.Error!void {
+/// 尚未建完自动导入索引（见 `imports_basis`）
+const imports_pending = std.math.maxInt(u64);
+
+/// 模块图中决定自动导入索引的构成：标准库、默认的 builtin 与各模块的根、builtin 和 import，不含文件
+fn importsBasis(graph: ?*const ModuleGraph) u64 {
+    const g = graph orelse return 0;
+    var h: std.hash.Wyhash = .init(0);
+    hashFile(&h, g.std_root);
+    hashFile(&h, g.default_builtin);
+    for (g.modules) |module| {
+        hashFile(&h, module.root);
+        hashFile(&h, module.builtin);
+        for (module.imports) |imp| {
+            h.update(imp.name);
+            h.update(&.{0});
+            h.update(std.mem.asBytes(&imp.module));
+        }
+        h.update(&.{0xff});
+    }
+    return h.final();
+}
+
+fn hashFile(h: *std.hash.Wyhash, file: ?Vfs.FileId) void {
+    const id: u32 = if (file) |f| f.index() else std.math.maxInt(u32);
+    h.update(std.mem.asBytes(&id));
+}
+
+/// 工作区符号的索引；`auto_import` 时为自动导入的声明索引（只为 Zig 源文件）
+fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.Error!void {
     for (files) |f| {
+        if (auto_import) {
+            if (!za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) continue;
+            _ = try ctx.get(za.ide_db.imports.FileLinks, f);
+            // `TestOnlyFiles` 读取各文件的 `ImportSites`：在这里随批求出，批间淘汰解析树。否则它在一个读事务中
+            // 解析全部项目文件，解析树在事务结束前都不能淘汰（Zig 编译器源码上约 700 MB）
+            _ = try ctx.get(za.ide_db.imports.ImportSites, f);
+            continue;
+        }
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
     }
+}
+
+/// 公开导出索引跨补全请求复用，在后台为标准库、各模块的 `builtin` 与命名模块建好，不在补全请求中展开。
+/// 闭包涉及的文件按批建索引，批与批之间淘汰解析树等中间结果：一个读事务中展开整个标准库的闭包时，它们在
+/// 事务结束前都不能淘汰。返回 false 表示这一轮没有建完（配置已关闭、正在关闭或内存不足），调用方不得把索引
+/// 标记为可用。
+fn indexImportRoots(server: *Server) bool {
+    return server.warmImportRoots() catch |err| {
+        log.err("failed to index import roots: {t}", .{err});
+        return false;
+    };
+}
+
+/// 需要预热公开闭包的根：标准库、默认 builtin、各模块的 builtin 与被 import 的模块根
+fn appendImportRoots(graph: ?*const ModuleGraph, roots: *std.ArrayList(Vfs.FileId), gpa: Allocator) Allocator.Error!void {
+    const g = graph orelse return;
+    if (g.std_root) |file| try roots.append(gpa, file);
+    if (g.default_builtin) |file| try roots.append(gpa, file);
+    for (g.modules) |module| {
+        // 每个模块的 `@import("builtin")` 指向自己的生成文件，补全会无条件查询这个命名空间
+        if (module.builtin) |file| try roots.append(gpa, file);
+        for (module.imports) |imp| if (g.modules[imp.module].root) |file| try roots.append(gpa, file);
+    }
+}
+
+fn warmImportRoots(server: *Server) Allocator.Error!bool {
+    const imports = za.ide_db.imports;
+    var scratch: std.heap.ArenaAllocator = .init(server.gpa);
+    defer scratch.deinit();
+    var files: std.ArrayList(Vfs.FileId) = .empty;
+    defer files.deinit(server.gpa);
+    var seen: std.AutoHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    defer seen.deinit(server.gpa);
+    while (true) {
+        if (server.isShuttingDown() or !server.autoImportEnabled()) return false;
+        var ctx = server.db.beginRead(scratch.allocator());
+        defer ctx.end();
+        const graph = (ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return true;
+        var roots: std.ArrayList(Vfs.FileId) = .empty;
+        defer roots.deinit(server.gpa);
+        try appendImportRoots(graph, &roots, server.gpa);
+        // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON）
+        for (roots.items) |file| {
+            if (!imports.isZigSource(server.vfs.path(file))) continue;
+            if (!(try seen.getOrPut(server.gpa, file)).found_existing) try files.append(server.gpa, file);
+        }
+        break;
+    }
+    const root_count = files.items.len;
+    var done: usize = 0;
+    while (done < files.items.len) {
+        if (server.isShuttingDown() or !server.autoImportEnabled()) return false;
+        const end = @min(done + index_batch, files.items.len);
+        _ = scratch.reset(.retain_capacity);
+        var found: std.ArrayList(Vfs.FileId) = .empty;
+        var canceled = false;
+        {
+            var ctx = server.db.beginRead(scratch.allocator());
+            defer ctx.end();
+            for (files.items[done..end]) |file| {
+                imports.publicTargets(&ctx, file, &found, scratch.allocator()) catch |err| switch (err) {
+                    error.Canceled => {
+                        canceled = true;
+                        break;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+            }
+        }
+        if (server.db.wantsSweep()) _ = server.db.trySweep();
+        // 被编辑打断：重试这一批
+        if (canceled) continue;
+        for (found.items) |file| {
+            if (!(try seen.getOrPut(server.gpa, file)).found_existing) try files.append(server.gpa, file);
+        }
+        done = end;
+    }
+    // 各文件的索引都已建好，展开闭包只是查找与复制
+    while (!server.isShuttingDown()) {
+        if (!server.autoImportEnabled()) return false;
+        _ = scratch.reset(.retain_capacity);
+        var ctx = server.db.beginRead(scratch.allocator());
+        defer ctx.end();
+        var canceled = false;
+        for (files.items[0..root_count]) |file| {
+            _ = ctx.get(imports.Exports, .{ .ns = .{ .file = file, .container = 0 } }) catch |err| switch (err) {
+                error.Canceled => {
+                    canceled = true;
+                    break;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
+        if (!canceled) return true;
+    }
+    return false;
 }
 
 fn removePending(server: *Server, pending: *Pending) void {
@@ -1485,6 +1683,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
     const semantic_changed = server.config.callsite_seeding != new.callsite_seeding;
+    const imports_enabled = !server.config.completion_auto_import and new.completion_auto_import;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const naming_changed = !server.config.sameNaming(&new);
     const build_was_enabled = server.config.build_enable;
@@ -1504,6 +1703,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (compiler_disabled) server.clearSingleFileResults();
     if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
     if (semantic_changed) server.requestSemanticRefresh();
+    if (imports_enabled and server.imports_wanted.load(.acquire)) server.scheduleIndexing();
     if (build_changed) {
         if (!new.build_enable) {
             // 关闭构建系统集成：停止各项目，其文件改按单文件处理
@@ -2825,6 +3025,58 @@ test "publishFiles: requests for a file being published coalesce into one more r
     try std.testing.expectEqual(0, server.publish_files.count());
 }
 
+test "importsBasis ignores the files of the module graph but follows modules and their imports" {
+    const main: Vfs.FileId = @fromBackingInt(@intCast(1));
+    const lib: Vfs.FileId = @fromBackingInt(@intCast(2));
+    const std_root: Vfs.FileId = @fromBackingInt(@intCast(3));
+    const modules = [_]ModuleGraph.Module{
+        .{ .root = main, .imports = &.{.{ .name = "lib", .module = 1 }} },
+        .{ .root = lib, .imports = &.{} },
+    };
+    const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .files = &.{.{ .file = main, .module = 0, .root_module = 0 }} };
+    // 构建中产生了生成文件：只多了文件，自动导入的索引仍然可用
+    var more_files = base;
+    more_files.files = &.{ .{ .file = main, .module = 0, .root_module = 0 }, .{ .file = lib, .module = 1, .root_module = 0 } };
+    try std.testing.expectEqual(importsBasis(&base), importsBasis(&more_files));
+    const renamed = [_]ModuleGraph.Module{
+        .{ .root = main, .imports = &.{.{ .name = "dep", .module = 1 }} },
+        .{ .root = lib, .imports = &.{} },
+    };
+    var changed = base;
+    changed.modules = &renamed;
+    try std.testing.expect(importsBasis(&base) != importsBasis(&changed));
+    var no_std = base;
+    no_std.std_root = null;
+    try std.testing.expect(importsBasis(&base) != importsBasis(&no_std));
+    try std.testing.expectEqual(@as(u64, 0), importsBasis(null));
+}
+
+test "appendImportRoots warms std, module builtins and imported module roots" {
+    const main: Vfs.FileId = @fromBackingInt(@intCast(1));
+    const lib: Vfs.FileId = @fromBackingInt(@intCast(2));
+    const std_root: Vfs.FileId = @fromBackingInt(@intCast(3));
+    const default_builtin: Vfs.FileId = @fromBackingInt(@intCast(4));
+    const module_builtin: Vfs.FileId = @fromBackingInt(@intCast(5));
+    const modules = [_]ModuleGraph.Module{
+        .{ .root = main, .builtin = module_builtin, .imports = &.{.{ .name = "lib", .module = 1 }} },
+        .{ .root = lib, .imports = &.{} },
+    };
+    const graph: ModuleGraph = .{
+        .arena = .{},
+        .std_root = std_root,
+        .default_builtin = default_builtin,
+        .modules = &modules,
+        .files = &.{},
+    };
+    var roots: std.ArrayList(Vfs.FileId) = .empty;
+    defer roots.deinit(std.testing.allocator);
+    try appendImportRoots(&graph, &roots, std.testing.allocator);
+    for ([_]Vfs.FileId{ std_root, default_builtin, module_builtin, lib }) |expected|
+        try std.testing.expect(std.mem.indexOfScalar(Vfs.FileId, roots.items, expected) != null);
+    // 没有被任何模块 import 的根不必预热
+    try std.testing.expect(std.mem.indexOfScalar(Vfs.FileId, roots.items, main) == null);
+}
+
 test "updateModuleGraph keeps the old inputs when an allocation fails" {
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
@@ -3385,7 +3637,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .definitionProvider = .{ .boolean = true },
             .declarationProvider = .{ .boolean = true },
             .typeDefinitionProvider = .{ .boolean = true },
-            .completionProvider = .{ .triggerCharacters = &.{ ".", "@", "\"", "/" } },
+            .completionProvider = .{ .triggerCharacters = &.{ ".", "@", "\"", "/" }, .resolveProvider = true },
             .hoverProvider = .{ .boolean = true },
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
             .inlayHintProvider = .{ .boolean = true },
@@ -3495,10 +3747,29 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = try r.ctx.get(FileText, file) orelse return null;
     const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
-    const items = try ide.completion.complete(r, file, offset);
-    const out = try arena.alloc(types.CompletionItem, items.len);
+    const auto_import = server.autoImportEnabled();
+    // 自动导入的索引为当前模块图建完之前不提供，标记为不完整：客户端随输入重新请求，届时再提供。第一次在可以
+    // 导入的名字处补全时开始建索引；之后仍未建完而没有索引在进行时（上一轮出错、任务没能启动）重新开始
+    const imports_ready = auto_import and
+        server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
+    const max_auto_imports = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.completion_max_auto_imports;
+    };
+    const result = try ide.completion.complete(r, file, offset, .{
+        .auto_import = auto_import and imports_ready,
+        .detect_import_position = auto_import and !imports_ready,
+        .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
+    });
+    const imports_waiting = auto_import and !imports_ready and result.import_position;
+    if (imports_waiting) {
+        const first = !server.imports_wanted.swap(true, .acq_rel);
+        if (first or !server.indexing.load(.acquire)) server.scheduleIndexingFromRead();
+    }
+    const out = try arena.alloc(types.CompletionItem, result.items.len);
     var lines: ?offsets.LineIndex = null;
-    for (items, out) |it, *o| {
+    for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
             .kind = switch (it.kind) {
@@ -3515,13 +3786,67 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             },
             .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
             .detail = it.detail,
+            .filterText = it.filter,
+            .sortText = it.sort,
+            .data = if (it.target) |t| try completionData(r, arena, file, t) else null,
+            .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
         if (it.replace) |range| {
             if (lines == null) lines = try offsets.LineIndex.init(arena, text);
             o.textEdit = .{ .TextEdit = .{ .range = lines.?.range(range.start, range.end, server.encoding), .newText = it.label } };
         }
+        if (it.import_edit) |edit| {
+            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
+            const edits = try arena.alloc(types.TextEdit, 1);
+            edits[0] = .{ .range = lines.?.range(edit.start, edit.end, server.encoding), .newText = edit.text };
+            o.additionalTextEdits = edits;
+        }
     }
+    if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
     return .{ .array_of_CompletionItem = out };
+}
+
+/// 补全项的 `data`：在哪个文件中补全（`from`）、所指的文件与其中声明的 `AstId`（编辑后仍能找到同一个声明）。
+/// 选中时客户端带着它请求 `completionItem/resolve`
+fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.ide_db.imports.Target) !std.json.Value {
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(arena, "from", .{ .integer = from.index() });
+    switch (target) {
+        .decl => |d| {
+            try obj.put(arena, "file", .{ .integer = d.file.index() });
+            try obj.put(arena, "item", .{ .integer = @backingInt((try r.itemTree(d.file)).items[d.item].ast_id) });
+        },
+        .file => |f| try obj.put(arena, "file", .{ .integer = f.index() }),
+    }
+    return .{ .object = obj };
+}
+
+/// 补全项被选中：补上签名（`detail`）、文档注释与定义的位置（`documentation`）。`data` 不是本服务器给出的，
+/// 或所指的声明已经不在时原样返回
+fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
+    var item = params;
+    const data = switch (params.data orelse return item) {
+        .object => |o| o,
+        else => return item,
+    };
+    const from = server.dataFile(data, "from") orelse return item;
+    const file = server.dataFile(data, "file") orelse return item;
+    const target: za.ide_db.imports.Target = if (data.get("item")) |v| blk: {
+        if (v != .integer or v.integer < 0 or v.integer > std.math.maxInt(u32)) return item;
+        const def = try ide.context.defOfKey(r, .{ .file = file, .item = @fromBackingInt(@as(u32, @intCast(v.integer))) }) orelse return item;
+        break :blk .{ .decl = .{ .file = file, .item = def.item.item } };
+    } else .{ .file = file };
+    const description = try ide.completion.describe(r, from, target);
+    item.detail = description.detail;
+    item.documentation = .{ .MarkupContent = .{ .kind = .markdown, .value = description.doc } };
+    return item;
+}
+
+/// `data` 中名为 `key` 的文件；不是本次会话中的文件时为 null
+fn dataFile(server: *Server, data: std.json.ObjectMap, key: []const u8) ?Vfs.FileId {
+    const v = data.get(key) orelse return null;
+    if (v != .integer or v.integer < 0 or v.integer >= server.vfs.count()) return null;
+    return @fromBackingInt(@as(u32, @intCast(v.integer)));
 }
 
 /// 请求中的文件、内容与位置
@@ -4216,4 +4541,5 @@ test {
     _ = @import("refs_e2e_test.zig");
     _ = @import("naming_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
+    _ = @import("auto_import_test.zig");
 }

@@ -76,6 +76,7 @@ pub const ide = struct {
 pub const ide_db = struct {
     pub const search = @import("ide_db/search.zig");
     pub const seed = @import("ide_db/seed.zig");
+    pub const imports = @import("ide_db/imports.zig");
 };
 pub const util = struct {
     pub const offsets = @import("util/offsets.zig");

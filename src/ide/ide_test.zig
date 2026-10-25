@@ -83,13 +83,13 @@ test "member completion and goto definition through types" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     // `ptr.` 之后（经由指针）：字段与方法
-    const items = try completion.complete(&r, file, offsetOf("ptr.x", 0) + 4);
+    const items = (try completion.complete(&r, file, offsetOf("ptr.x", 0) + 4, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("x y init dist", try std.mem.join(w.arena.allocator(), " ", labels.items));
     try testing.expectEqualStrings("i32", items[0].detail.?);
     // 切片
-    const slice_items = try completion.complete(&r, file, offsetOf("buf.len", 0) + 4);
+    const slice_items = (try completion.complete(&r, file, offsetOf("buf.len", 0) + 4, .{ .auto_import = false })).items;
     try testing.expectEqualStrings("len", slice_items[0].label);
 
     const cases = [_]struct { []const u8, []const u8 }{
@@ -197,7 +197,7 @@ test "completion and hover quote names that shadow primitives or are not identif
     defer ctx.end();
     var r = resolver(&w, &ctx);
 
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var saw = [4]bool{ false, false, false, false };
     const expected = [_][]const u8{ "@\"a b\"", "@\"i32\"", "@\"bool\"", "f" };
     for (items) |it| for (expected, 0..) |e, i| {
@@ -728,7 +728,7 @@ test "member completion of reified, tuple and anonymous struct types" {
     };
     for (cases) |c| {
         const at: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).? + std.mem.indexOfScalar(u8, c[0], '.').? + 1);
-        const items = try completion.complete(&r, file, at);
+        const items = (try completion.complete(&r, file, at, .{ .auto_import = false })).items;
         var labels: std.ArrayList([]const u8) = .empty;
         for (items) |it| try labels.append(w.arena.allocator(), it.label);
         testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
@@ -1064,7 +1064,7 @@ test "completion after `.` lists members of the expected type" {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        const items = try completion.complete(&r, added.file, added.cursor);
+        const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
         var labels: std.ArrayList([]const u8) = .empty;
         for (items) |it| try labels.append(w.arena.allocator(), it.label);
         testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
@@ -1262,7 +1262,7 @@ test "completion, goto, signature help and inlay hints in generic bodies use a c
     }.f;
 
     // `p.` 之后：调用点实例中 `p` 为 Point
-    const items = try completion.complete(&r, file, at("p.x") + 2);
+    const items = (try completion.complete(&r, file, at("p.x") + 2, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("x scale", try std.mem.join(w.arena.allocator(), " ", labels.items));
@@ -1320,7 +1320,7 @@ test "completion: builtins, labels, init fields and import names" {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        const items = try completion.complete(&r, added.file, added.cursor);
+        const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
         var labels: std.ArrayList([]const u8) = .empty;
         for (items) |it| try labels.append(w.arena.allocator(), it.label);
         testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
@@ -1337,7 +1337,7 @@ test "completion: builtins, labels, init fields and import names" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     try testing.expectEqual(std.zig.BuiltinFn.list.keys().len, items.len);
     const import = for (items) |it| {
         if (std.mem.eql(u8, it.label, "@import")) break it;
@@ -1667,7 +1667,7 @@ test "named error sets: goto and completion of their members" {
             return err;
         };
     }
-    const items = try @import("completion.zig").complete(&r, file, @intCast(std.mem.indexOf(u8, text, "MissingValue or").?));
+    const items = (try completion.complete(&r, file, @intCast(std.mem.indexOf(u8, text, "MissingValue or").?), .{ .auto_import = false })).items;
     var found = false;
     for (items) |it| if (std.mem.eql(u8, it.label, "InvalidArgument")) {
         found = true;
@@ -1756,7 +1756,7 @@ test "member completion on values lists function aliases as methods" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     // 函数的别名 `isARM` 可作为方法调用；值常量 `count` 不列出
@@ -1787,7 +1787,7 @@ test "completion in a branch inactive for the first call site uses a call site w
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     // 第一个调用点（Rgb）下该分支不生效：取第二个调用点（Rgba）
@@ -1820,7 +1820,7 @@ test "completion in a switch prong on @typeInfo uses a call site where the prong
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("len ptr", try std.mem.join(w.arena.allocator(), " ", labels.items));
@@ -1835,7 +1835,7 @@ fn completionLabels(text: []const u8) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(testing.allocator, it.label);
     defer labels.deinit(testing.allocator);
@@ -2159,7 +2159,7 @@ test "callsite seeding follows a container type passed as a comptime argument to
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("n", try std.mem.join(w.arena.allocator(), " ", labels.items));
@@ -2445,7 +2445,7 @@ test "an inline switch prong over several tags captures the payload of the opera
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var found = false;
     for (items) |it| {
         if (std.mem.eql(u8, it.label, "field_types")) found = true;
@@ -2468,7 +2468,7 @@ test "completion through single pointers to arrays, tuples and slices" {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        const items = try completion.complete(&r, added.file, added.cursor);
+        const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
         var labels: std.ArrayList([]const u8) = .empty;
         for (items) |it| try labels.append(w.arena.allocator(), it.label);
         try testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items));
@@ -2995,7 +2995,7 @@ test "builtin completion exposes official details and undocumented source notes"
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const items = try completion.complete(&r, added.file, added.cursor);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var size_found = false;
     var gap_found = false;
     for (items) |item| {
@@ -3071,7 +3071,7 @@ test "builtin metadata excludes strings comments unknown names and escaped ident
         if (try hover.hover(&r, added.file, added.cursor)) |info|
             try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/") == null);
         try testing.expect((try signature_help.signatureHelp(&r, added.file, added.cursor)) == null);
-        if (i != 0) for (try completion.complete(&r, added.file, added.cursor)) |item|
+        if (i != 0) for ((try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items) |item|
             try testing.expect(item.kind != .builtin);
     }
     for ([_][]const u8{ "const n = @Frame(<|>);", "const n = @madeup(<|>);" }) |text| {
@@ -3109,6 +3109,467 @@ test "builtin hover source gaps and argument names remain distinct" {
             try testing.expect(std.mem.indexOf(u8, info.text, "Inferred result:") == null);
         }
     }
+}
+
+test "auto import ordinary contexts and full token replacement" {
+    const cases = [_][]const u8{
+        "const value = st<|>andard;",
+        "const value: st<|>andard = undefined;",
+        "fn run() void { _ = st<|>andard; }",
+        "const value = st<|>andard",
+        "const value = @\"st<|>andard\";",
+    };
+    for (cases) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", source);
+        const std_file = (try w.add("/lib/std/std.zig", "")).file;
+        try w.setGraph(std_file, &.{}, &.{});
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, added.file, added.cursor, .{});
+        const candidate = for (result.items) |item| {
+            if (std.mem.eql(u8, item.label, "std") and item.import_edit != null) break item;
+        } else return error.MissingAutoImport;
+        try testing.expect(candidate.qualifier != null);
+        try testing.expect(candidate.sort != null);
+        try testing.expectEqualStrings("const std = @import(\"std\");\n", candidate.import_edit.?.text);
+        const text = (try r.ctx.get(database.syntax.SourceText, added.file)).text;
+        try testing.expect(std.mem.startsWith(u8, candidate.filter.?, text[candidate.replace.?.start..added.cursor]));
+        const replaced = text[candidate.replace.?.start..candidate.replace.?.end];
+        try testing.expectEqualStrings(if (std.mem.indexOf(u8, source, "@\"") != null) "@\"standard\"" else "standard", replaced);
+        try testing.expect(candidate.import_edit.?.end <= candidate.replace.?.start);
+        const disabled = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false });
+        try testing.expect(!disabled.is_incomplete);
+        for (disabled.items) |item| try testing.expect(item.import_edit == null);
+    }
+}
+
+test "auto import does not leak into non-name contexts" {
+    const cases = [_][]const u8{
+        "const st<|>d = 1;",
+        "fn st<|>d() void {}",
+        "fn run(st<|>d: u32) void {}",
+        "const S = struct { st<|>d: u32 };",
+        "const value = \"st<|>d\";",
+        "// st<|>d\nconst value = 1;",
+        "const value = @import(\"st<|>d\");",
+        "const value = object.st<|>d;",
+        "const value = .st<|>d;",
+        "const value = error.st<|>d;",
+        "fn run() void { break :st<|>d; }",
+        "const value: u3<|>2 = undefined;",
+        "fn run() void { _<|> = 1; }",
+        "fn run() void { <|> }",
+    };
+    for (cases) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", source);
+        const std_file = (try w.add("/lib/std/std.zig", "")).file;
+        try w.setGraph(std_file, &.{}, &.{});
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const baseline = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false });
+        const result = try completion.complete(&r, added.file, added.cursor, .{});
+        try testing.expect(!result.is_incomplete);
+        // 这些上下文不提供自动导入，普通补全的结果不因此丢失或被改写
+        try testing.expectEqual(baseline.items.len, result.items.len);
+        for (result.items) |item| {
+            try testing.expect(item.import_edit == null);
+            try testing.expect(item.filter == null);
+        }
+    }
+}
+
+test "auto import does not rewrite bare enum or union member declarations" {
+    const members = [_][]const u8{
+        "const E = enum { standard<|> };",
+        "const E = enum { standard<|> = 1 };",
+        "const E = enum(u8) { standard<|> };",
+        "const E = union(enum) { standard<|> };",
+    };
+    for (members) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:root\n{s}\n" ++
+            "//- /p/types.zig in:root\npub const standard = u32;\n", .{source});
+        const fixture = try w.fixture(text);
+        const cursor = fixture.cursor.?;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        for (result.items) |item| {
+            try testing.expect(item.import_edit == null);
+            try testing.expect(item.filter == null);
+        }
+    }
+    // struct 的元组字段没有冒号，但类型表达式是真正的名字引用，仍应自动导入
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:root
+        \\const S = struct { standard<|> };
+        \\//- /p/types.zig in:root
+        \\pub const standard = u32;
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+    const candidate = for (result.items) |item| {
+        if (item.filter) |filter| if (std.mem.eql(u8, filter, "standard")) break item;
+    } else return error.MissingTupleFieldAutoImport;
+    try testing.expect(candidate.import_edit != null);
+}
+
+test "auto import is not offered outside zig source files" {
+    // 向 `.zon` 文件插入 import 声明会破坏它；也不为它开始建自动导入的索引
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/build.zig.zon", ".{ .value = st<|>d }");
+    const std_file = (try w.add("/lib/std/std.zig", "")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, added.file, added.cursor, .{});
+    try testing.expect(!result.import_position);
+    for (result.items) |item| try testing.expect(item.import_edit == null);
+    const detected = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false, .detect_import_position = true });
+    try testing.expect(!detected.import_position);
+}
+
+test "auto import preserves rendered qualified paths and metadata" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:root
+        \\const Alias = @import("types.zig").Outer;
+        \\const value = Ind<|>ex;
+        \\//- /p/types.zig in:root
+        \\pub const Outer = struct {
+        \\    pub const Node = struct {
+        \\        pub const Index = u32;
+        \\    };
+        \\};
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+    const candidate = for (result.items) |item| {
+        if (std.mem.eql(u8, item.label, "Alias.Node.Index")) break item;
+    } else return error.MissingQualifiedAutoImport;
+    try testing.expectEqualStrings("Index", candidate.filter.?);
+    try testing.expect(candidate.import_edit == null);
+    try testing.expect(candidate.qualifier != null);
+    try testing.expect(candidate.sort != null);
+    try testing.expectEqual(@as(u32, 5), candidate.replace.?.end - candidate.replace.?.start);
+}
+
+test "selected auto-import candidates describe the signature, docs and where the target is defined" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/src/main.zig module:app deps:wire=dep
+        \\fn main() void { _ = <|>missing; }
+        \\//- /p/src/util/lines.zig in:app
+        \\//! Line utilities.
+        \\
+        \\/// Offsets of line starts.
+        \\pub const LineIndex = struct {};
+        \\pub fn lineOf(offset: u32) u32 { return offset; }
+        \\//- /dep/src/root.zig module:dep
+        \\pub const Header = struct {};
+        \\//- /zig/std/std.zig std
+        \\pub const mem = @import("mem.zig");
+        \\//- /zig/std/mem.zig std
+        \\pub fn eql() bool { return true; }
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const imports = @import("../ide_db/imports.zig");
+    const cases = [_]struct { prefix: []const u8, label: []const u8, detail: []const u8, doc: []const u8 }{
+        .{ .prefix = "LineIn", .label = "LineIndex", .detail = "const LineIndex = struct", .doc = "Offsets of line starts.\n\nDefined in `util/lines.zig:4`" },
+        .{ .prefix = "lineO", .label = "lineOf", .detail = "pub fn lineOf(offset: u32) u32", .doc = "Defined in `util/lines.zig:5`" },
+        // 文件本身：import 表达式与文件开头的 `//!` 文档
+        .{ .prefix = "lines", .label = "lines", .detail = "@import(\"util/lines.zig\")", .doc = "Line utilities.\n\nFile `util/lines.zig`" },
+        // 标准库按 `std/` 下的路径；其他模块按当前文件 import 它的名字
+        .{ .prefix = "eq", .label = "eql", .detail = "pub fn eql() bool", .doc = "Defined in `std/mem.zig:1`" },
+        .{ .prefix = "Head", .label = "Header", .detail = "const Header = struct", .doc = "Defined in `wire/root.zig:1`" },
+    };
+    for (cases) |case| {
+        const result = try imports.complete(&r, cursor.file, cursor.offset, .unknown, case.prefix, 128);
+        const candidate = for (result.items) |item| {
+            if (std.mem.eql(u8, item.label, case.label)) break item;
+        } else return error.MissingAutoImport;
+        const description = try completion.describe(&r, cursor.file, candidate.target);
+        try testing.expectEqualStrings(case.detail, description.detail);
+        try testing.expectEqualStrings(case.doc, description.doc);
+    }
+}
+
+test "auto import escaped filters preserve the raw input prefix" {
+    const sources = [_][]const u8{
+        "const value = @\"Ser<|>ver name\";",
+        "const value = @\"S\\x65r<|>ver name\";",
+        "const value = @\"Ser\"<|>;",
+    };
+    for (sources) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:root\nconst Alias = @import(\"types.zig\");\n{s}\n" ++
+            "//- /p/types.zig in:root\npub const @\"Server name\" = u32;\n", .{source});
+        const fixture = try w.fixture(text);
+        const cursor = fixture.cursor.?;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        const candidate = for (result.items) |item| {
+            if (std.mem.eql(u8, item.label, "Alias.@\"Server name\"")) break item;
+        } else return error.MissingEscapedAutoImport;
+        try testing.expect(candidate.import_edit == null);
+        const current = (try r.ctx.get(database.syntax.SourceText, cursor.file)).text;
+        const prefix = current[candidate.replace.?.start..cursor.offset];
+        try testing.expect(std.mem.startsWith(u8, prefix, "@\""));
+        try testing.expect(std.mem.startsWith(u8, candidate.filter.?, prefix));
+    }
+}
+
+test "auto import propagates candidate truncation" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "const value = st<|>;");
+    const std_file = (try w.add("/lib/std/std.zig", "pub const standard = u32;\npub const static_value = 1;\n")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, added.file, added.cursor, .{ .max_auto_imports = 1 });
+    try testing.expect(result.is_incomplete);
+    var imported: usize = 0;
+    for (result.items) |item| {
+        if (item.filter != null) imported += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), imported);
+}
+
+test "auto import merges direct aliases without losing target filters" {
+    const cases = [_]struct { alias: []const u8, source: []const u8, target_filter: bool }{
+        .{ .alias = "Renamed", .source = "pub fn main() void { _ = EdgeWidg<|>et; }", .target_filter = true },
+        .{ .alias = "Renamed", .source = "pub fn main() void { _ = Renam<|>ed; }", .target_filter = false },
+        .{ .alias = "@\"Renamed type\"", .source = "pub fn main() void { _ = EdgeWidg<|>et; }", .target_filter = true },
+        .{ .alias = "@\"Renamed type\"", .source = "pub fn main() void { _ = @\"EdgeWidg<|>et\"; }", .target_filter = true },
+    };
+    for (cases) |case| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app deps:lib=dep\nconst {s} = @import(\"lib\").EdgeWidget;\n{s}\n" ++
+            "//- /dep/root.zig module:dep\npub const EdgeWidget = struct {{}};\n", .{ case.alias, case.source });
+        const fixture = try w.fixture(text);
+        const cursor = fixture.cursor.?;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        var count: usize = 0;
+        for (result.items) |item| {
+            try testing.expect(item.import_edit == null);
+            if (!std.mem.eql(u8, item.label, case.alias)) continue;
+            count += 1;
+            if (case.target_filter) {
+                const current = (try r.ctx.get(database.syntax.SourceText, cursor.file)).text;
+                const raw = current[item.replace.?.start..cursor.offset];
+                try testing.expect(std.mem.startsWith(u8, item.filter.?, raw));
+                try testing.expectEqualStrings(if (raw[0] == '@') "@\"EdgeWidget\"" else "EdgeWidget", current[item.replace.?.start..item.replace.?.end]);
+            } else {
+                try testing.expect(std.mem.startsWith(u8, item.filter orelse item.label, "Renam"));
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+}
+
+test "auto import recovers unclosed escaped expression prefixes without consuming following source" {
+    const cases = [_]struct { source: []const u8, label: []const u8 }{
+        .{ .source = "pub fn main() void { _ = @\"EdgeWidg<|>", .label = "Alias.EdgeWidget" },
+        .{ .source = "pub fn main() void { _ = @\"EdgeWidg<|>\n}", .label = "Alias.EdgeWidget" },
+        .{ .source = "pub fn main() void { _ = @\"EdgeWidg<|>; }", .label = "Alias.EdgeWidget" },
+        .{ .source = "pub fn main() void { const value: @\"EdgeWidg<|>\n = .{}; _ = value; }", .label = "Alias.EdgeWidget" },
+        .{ .source = "pub fn main() void { _ = @\"Server na<|>", .label = "Alias.@\"Server name\"" },
+        .{ .source = "pub fn main() void { _ = @\"S\\x65rver na<|>\r\n}", .label = "Alias.@\"Server name\"" },
+        .{ .source = "const value = @\"S\\x65r<|>", .label = "Alias.@\"Server name\"" },
+        .{ .source = "const value = @\"Uni\\u{63}<|>", .label = "Alias.Unicode" },
+    };
+    for (cases) |case| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture("//- /p/main.zig module:root\n" ++
+            "//- /p/types.zig in:root\npub const EdgeWidget = struct {};\npub const @\"Server name\" = u32;\npub const Unicode = u32;\n");
+        const source = try std.fmt.allocPrint(w.arena.allocator(), "const Alias = @import(\"types.zig\");\n{s}", .{case.source});
+        const added = try w.add("/p/main.zig", source);
+        const cursor = .{ .file = added.file, .offset = added.cursor };
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        const candidate = for (result.items) |item| {
+            if (std.mem.eql(u8, item.label, case.label)) break item;
+        } else return error.MissingUnclosedEscapedAutoImport;
+        const current = (try r.ctx.get(database.syntax.SourceText, cursor.file)).text;
+        const range = candidate.replace.?;
+        try testing.expectEqual(cursor.offset, range.end);
+        try testing.expect(std.mem.startsWith(u8, current[range.start..range.end], "@\""));
+        try testing.expect(std.mem.indexOfAny(u8, current[range.start..range.end], "\r\n") == null);
+        try testing.expect(std.mem.startsWith(u8, candidate.filter.?, current[range.start..cursor.offset]));
+        try testing.expect(candidate.import_edit == null);
+    }
+}
+
+test "auto import unclosed escaped recovery preserves non-reference contexts and incomplete escapes" {
+    const sources = [_][]const u8{
+        "const @\"EdgeWidg<|>",
+        "fn @\"EdgeWidg<|>",
+        "const value = object.@\"EdgeWidg<|>",
+        "const value = .@\"EdgeWidg<|>",
+        "const value = error.@\"EdgeWidg<|>",
+        "pub fn main() void { break :@\"EdgeWidg<|>",
+        "pub fn main() void { for (items) |@\"EdgeWidg<|>",
+        "const value = \"EdgeWidg<|>",
+        "const value = 'E<|>",
+        "// @\"EdgeWidg<|>",
+        "const value = @import(\"EdgeWidg<|>",
+        "const value = @EdgeWidg<|>",
+        "const value = @\"EdgeWidg\\<|>",
+        "const value = @\"EdgeWidg\\x6<|>",
+        "const value = @\"EdgeWidg\\u{6<|>",
+        "const value = @\"EdgeWidg\\q<|>",
+    };
+    for (sources) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:root\n{s}\n" ++
+            "//- /p/types.zig in:root\npub const EdgeWidget = struct {{}};\n", .{source});
+        const fixture = try w.fixture(text);
+        const cursor = fixture.cursor.?;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        for (result.items) |item| {
+            try testing.expect(item.import_edit == null);
+            try testing.expect(item.filter == null);
+        }
+    }
+}
+
+test "auto import keeps distinct origins with the same completion label" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const value = Widg<|>;
+        \\//- /p/First.zig in:app
+        \\pub const Widget = struct { tag: u8 };
+        \\//- /p/Second.zig in:app
+        \\pub const Widget = struct { tag: u16 };
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+    var origins = [2]bool{ false, false };
+    var choices: usize = 0;
+    for (result.items) |item| {
+        if (!std.mem.eql(u8, item.label, "Widget")) continue;
+        const edit = item.import_edit orelse continue;
+        choices += 1;
+        if (std.mem.indexOf(u8, edit.text, "@import(\"First.zig\").Widget") != null) origins[0] = true;
+        if (std.mem.indexOf(u8, edit.text, "@import(\"Second.zig\").Widget") != null) origins[1] = true;
+    }
+    try testing.expectEqual(@as(usize, 2), choices);
+    try testing.expect(origins[0] and origins[1]);
+}
+
+test "auto import refreshes shared alias prefixes before filtering diverges" {
+    const cases = [_]struct { prefix: []const u8, incomplete: bool }{
+        .{ .prefix = "Widg", .incomplete = true },
+        .{ .prefix = "WidgetA", .incomplete = false },
+        .{ .prefix = "WidgetT", .incomplete = false },
+    };
+    for (cases) |case| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app deps:lib=dep\nconst Lib = @import(\"lib\");\n" ++
+            "const WidgetAlias = Lib.WidgetThing;\nconst value = {s}<|>;\n" ++
+            "//- /dep/root.zig module:dep\npub const WidgetThing = struct {{}};\n", .{case.prefix});
+        const fixture = try w.fixture(text);
+        const cursor = fixture.cursor.?;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+        try testing.expectEqual(case.incomplete, result.is_incomplete);
+        var count: usize = 0;
+        for (result.items) |item| {
+            if (!std.mem.eql(u8, item.label, "WidgetAlias")) continue;
+            count += 1;
+            try testing.expect(item.import_edit == null);
+            try testing.expect(std.mem.startsWith(u8, item.filter.?, case.prefix));
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+}
+
+test "visible completion precedes auto-import candidates" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:app deps:lib=dep
+        \\fn main() void { const item = 1; _ = it<|>em; }
+        \\//- /dep/root.zig module:dep
+        \\pub const itemized = u32;
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
+    var visible_at: ?usize = null;
+    var auto_at: ?usize = null;
+    for (result.items, 0..) |item, i| {
+        if (item.filter == null and std.mem.eql(u8, item.label, "item")) visible_at = i;
+        if (item.filter) |filter| {
+            if (std.mem.eql(u8, filter, "itemized")) auto_at = i;
+        }
+    }
+    try testing.expect(visible_at != null and auto_at != null);
+    try testing.expect(visible_at.? < auto_at.?);
 }
 
 /// `file` 中名为 `name` 的成员的全部实例（`seed.allInstances`）
