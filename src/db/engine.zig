@@ -616,6 +616,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 ctx.* = undefined;
             }
 
+            /// 本读事务的嵌套计算已占用的原生栈字节数
+            pub fn stackUsed(ctx: *const Ctx) usize {
+                const here = @frameAddress();
+                return if (ctx.stack_base > here) ctx.stack_base - here else 0;
+            }
+
             /// 本读事务的嵌套计算占用的原生栈超过 `max_stack_bytes`。递归的 compute 应在深入前检查，
             /// 超过时以未知结果返回并调用 `markIncomplete`
             pub fn stackExhausted(ctx: *const Ctx) bool {
