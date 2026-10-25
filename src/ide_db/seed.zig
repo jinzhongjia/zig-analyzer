@@ -228,8 +228,10 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
     const binding = res.bindings[@backingInt(cap)];
     const by_value = if (binding.val) |v| ip.key(v) == .opaque_param else binding.ty != .unknown and list.val != null;
     if (by_value) {
+        // 以元素个数为界：值为 `undefined` 的元素也有值（`undefined`），只看元素有没有值时取不到头
+        const count = try eval.elemCount(r, list) orelse return null;
         var n: u32 = 0;
-        while (try eval.elemValue(r, list, n) != null) n += 1;
+        while (n < count and try eval.elemValue(r, list, n) != null) n += 1;
         return if (n > 0) n else null;
     }
     if (binding.ty != .unknown) return null;
