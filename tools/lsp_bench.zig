@@ -366,6 +366,8 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     var texts: std.StringHashMapUnmanaged([]const u8) = .empty;
     var resolved: usize = 0;
     var mismatched: usize = 0;
+    // 构造的类型（`@Struct` 等）的成员名追不到源码中的来源时跳到构造调用：成员在那里生成，不算跳错
+    var at_construction: usize = 0;
     var samples_shown: usize = 0;
     var unresolved_shown: usize = 0;
     // BENCH_CHECK=<n>：打印前 n 个未解析的标识符
@@ -403,6 +405,13 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
         const target_off = offsetOf(target_text, .{ .line = @intCast(start.get("line").?.integer), .character = @intCast(start.get("character").?.integer) }) orelse continue;
         const target_name = identAt(target_text, target_off);
         if (std.mem.eql(u8, name, target_name)) continue;
+        const constructions = [_][]const u8{ "@Struct(", "@Enum(", "@Union(" };
+        if (for (constructions) |prefix| {
+            if (std.mem.startsWith(u8, target_text[target_off..], prefix)) break true;
+        } else false) {
+            at_construction += 1;
+            continue;
+        }
         mismatched += 1;
         if (samples_shown < 12) {
             samples_shown += 1;
@@ -411,7 +420,7 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
             std.debug.print("    mismatch {s}:{d}:{d} `{s}` -> {s}:{d}:{d} `{s}`\n", .{ rel, p.line + 1, p.character + 1, name, std.fs.path.basename(target_uri), tp.line + 1, tp.character + 1, target_name });
         }
     }
-    std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched });
+    std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}, at construction {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched, at_construction });
     std.debug.print("  declaration  unresolved by kind:", .{});
     for (kinds, 0..) |k, i| std.debug.print(" {t} {d}", .{ @as(UnresolvedKind, @fromBackingInt(@intCast(i))), k });
     // 内置类型与值、len / ptr、error.X 本来就没有声明位置，不计入分母
