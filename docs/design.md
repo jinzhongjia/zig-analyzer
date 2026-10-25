@@ -43,7 +43,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | | 编辑 → live 诊断 | < 30 ms（不含防抖） | 普通文件 ≤ 9 ms；`Sema.zig`（3.5 万行）p50 177 ms（含 50 ms 防抖） | ⚠️ 超大文件 |
 | | 按键 → hover（连续输入） | — | `Sema.zig` p50 97 ms；其他项目 5～21 ms | — |
 | | 保存 → 编译器诊断（`check` step） | < 1 s | 小项目约 120 ms；Zig 编译器 5.2 s | ⚠️ 受编译器限制 |
-| | 常驻内存（长时间会话） | < 500 MB | 40 轮后 718 MB，峰值 723 MB（每个文件含 hover、成员与名字补全） | ⚠️ 超出（见 §2.3） |
+| | 常驻内存（长时间会话） | 不随会话增长 | Zig 编译器源码 720 轮（全部 2940 个文件轮换约六遍）：第 120 轮起持平在 1.5～1.6 GB，堆 280～500 MB | ✅ |
 | 冷启动 | 进程启动 → `initialize` | < 100 ms | 1～9 ms | ✅ |
 | | 打开文件 → 语法功能 | < 200 ms | 53 ms（`Sema.zig`） | ✅ |
 | | 打开文件 → hover / goto / completion | < 3 s | 项目加载 1.5～4.4 s，加载完成前 hover 已可用（名字解析不完整） | ✅ |
@@ -89,7 +89,6 @@ Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；�
 
 - **超大文件的编辑 → 诊断**：`Sema.zig` 上主要耗时是重新解析（约 54 ms）、官方 AstGen（约 48 ms）与推导整个文件以求非活动代码区间；关闭 `diagnostics.inactive_code` 时约 85 ms。
 - **超大文件的按键 → hover**：每次按键后需重新解析并重建 ItemTree、FileIndex，`Sema.zig` 上约 100 ms 为下限。
-- **长时间会话的内存**：Zig 编译器 40 轮（每个文件含 hover、成员与名字补全）后约 720 MB，超出 500 MB：文件文本 87 MB，解析树与 AstIdMap 缓存约 93 MB，HIR 44 MB，推导 39 MB，ItemTree 31 MB，InternPool 31 MB，自动导入的索引 47 MB，其余未归属。
 - **保存 → 编译器诊断**：耗时在编译器本身；`-fincremental` 在 0.17 中会漏报错误，默认不开启。
 - **引用查找冷启动**：被大量文件引用的声明最坏 1.9 s（候选文件超过解析缓存容量而反复解析）；热状态 p95 124 ms。
 - **`error.Foo` 跳转的冷启动**：期望的错误集不对应某个声明（推导的错误集、`A || B`）或这个名字没有声明时，要为整个 import 闭包建立文件索引；本仓库的 `src/server/Server.zig` 上首次约 0.3 s，之后文件索引常驻、不再重复。
@@ -173,6 +172,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 验证时依赖经由环回到栈上 query 的 memo，在那个 query 出栈前视为无法验证：读取时直接重算，验证其他 memo 时视为已变化。环中每个 memo 只验证一次，重算代价与首次计算相当。
 - **取消**：`pending_write` 是等待独占锁的写事务数，非零时读查询在 `get` 入口返回 `error.Canceled`，被取消的计算不写 memo；读请求回复 `ContentModified`。写事务拿到锁后才减一，重叠的写事务不会清掉彼此的登记。
 - **内存回收**：query 可声明 `lru`（个数）与 `lru_bytes`（字节数），淘汰只删值、保留依赖；`resetQueries` 整代清空类型相关的 query（与 `InternPool.reset` 配合）。
+- **分配器**：release 构建用 `SharedAllocator`：按大小档分的空闲链表由所有线程共用、一把锁保护（拿不到时休眠），任何线程释放的块都能被任何线程复用；大于 64 KB 的分配直接映射、释放时归还系统。不用 `std.heap.smp_allocator`：它的空闲链表按线程槽位分开，缓存值在工作线程上分配、在清扫的线程上释放，释放的块分配方取不到，常驻内存随会话持续增长（Zig 编译器源码 720 轮到 4.5 GB 仍在涨）。并发请求下单把锁与它的吞吐相同。
 - 引擎内只传播 `Canceled`、`OutOfMemory` 两类错误；query 结果是自包含的不可变值，只存 ID 不存指向其他 memo 的指针。
 
 ### 4.3 语法层（`syntax/`）

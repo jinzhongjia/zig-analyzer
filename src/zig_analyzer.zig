@@ -83,6 +83,7 @@ pub const util = struct {
     pub const log = @import("util/log.zig");
     pub const tracy = @import("util/tracy.zig");
     pub const mem = @import("util/mem.zig");
+    pub const SharedAllocator = @import("util/SharedAllocator.zig");
     pub const panic_context = @import("util/panic_context.zig");
     pub const assert = @import("util/assert.zig");
     /// 仅供测试：posix 写法的路径转为本机路径
