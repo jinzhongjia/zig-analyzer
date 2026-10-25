@@ -1040,7 +1040,11 @@ fn hashFile(h: *std.hash.Wyhash, file: ?Vfs.FileId) void {
 fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.Error!void {
     for (files) |f| {
         if (auto_import) {
-            if (za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) _ = try ctx.get(za.ide_db.imports.FileLinks, f);
+            if (!za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) continue;
+            _ = try ctx.get(za.ide_db.imports.FileLinks, f);
+            // `TestOnlyFiles` 读取各文件的 `ImportSites`：在这里随批求出，批间淘汰解析树。否则它在一个读事务中
+            // 解析全部项目文件，解析树在事务结束前都不能淘汰（Zig 编译器源码上约 700 MB）
+            _ = try ctx.get(za.ide_db.imports.ImportSites, f);
             continue;
         }
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
