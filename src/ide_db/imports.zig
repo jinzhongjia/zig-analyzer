@@ -19,6 +19,7 @@ const hir = @import("../hir/queries.zig");
 const Allocator = std.mem.Allocator;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const mem = @import("../util/mem.zig");
+const organize_imports = @import("organize_imports.zig");
 
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 pub const Candidate = struct {
@@ -928,9 +929,10 @@ fn sameSlice(a: []const u8, b: []const u8) bool {
 /// 光标所在的成员：调用方已经查到时传入，免得再遍历一次文件的成员
 pub const Owner = union(enum) { unknown, known: ?u32 };
 
-pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: []const u8, limit: usize) resolve.Error!Result {
+/// `import_options` 决定新 import 插入的位置（见 `organize_imports.Inserter`）
+pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: []const u8, limit: usize, import_options: organize_imports.Options) resolve.Error!Result {
     if (prefix.len == 0 or !isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = &.{} };
-    var builder: Builder = .{ .r = r, .file = file, .offset = offset, .prefix = prefix, .limit = limit };
+    var builder: Builder = .{ .r = r, .file = file, .offset = offset, .prefix = prefix, .limit = limit, .import_options = import_options };
     const current = try r.ctx.get(FileDecls, file);
     const links = try r.ctx.get(FileLinks, file);
     const graph = try r.ctx.get(database.ModuleGraph.Input, {});
@@ -1068,8 +1070,12 @@ const Builder = struct {
     /// `items` 已满时排序最差的一项；`items` 变化后重新计算
     worst: ?usize = null,
     incomplete: bool = false,
-    insertion: ?u32 = null,
-    insertion_blocked: bool = false,
+    /// import 声明的排列规则（新 import 按它放到整理好的块中应在的位置）
+    import_options: organize_imports.Options = .{},
+    /// 首次生成 import 编辑时准备
+    inserter: ?organize_imports.Inserter = null,
+    /// 光标前正在输入的名字：插入的编辑与它重叠时不提供
+    typing: ?@import("../syntax/tree.zig").TextRange = null,
 
     fn visible(b: *Builder, name: []const u8) resolve.Error!?resolve.Def {
         if (b.visible_names.get(name)) |result| return result;
@@ -1205,26 +1211,20 @@ const Builder = struct {
             binding_path = "";
             break :blk if (path.len == 0) try renderName(a, namespace) else try std.fmt.allocPrint(a, "{f}.{s}", .{ std.zig.fmtId(namespace), path });
         } else try renderName(a, name);
-        if (!direct) {
-            if (b.insertion == null) {
-                b.insertion = try insertionOffset(b.r, b.file);
-                const root = (try b.r.ctx.get(database.syntax.ParseFile, b.file)).rootNode();
-                if (root.tokenAtOffset(b.offset -| 1)) |token| {
-                    const end = token.offset + @as(u32, @intCast(token.text.len));
-                    b.insertion_blocked = (token.kind == .identifier or token.kind == .invalid) and
-                        token.offset <= b.insertion.? and b.insertion.? < end;
-                }
-            }
-            if (b.insertion_blocked) return;
-        }
         const edit: ?Edit = if (direct) null else blk: {
-            const offset = b.insertion.?;
-            const source = (try b.r.ctx.get(database.syntax.SourceText, b.file)).text;
-            const newline: []const u8 = if (offset > 0 and source[offset - 1] != '\n') "\n" else "";
-            const text = try std.fmt.allocPrint(a, "{s}const {f} = @import(\"{f}\"){s}{s};\n", .{
-                newline, std.zig.fmtId(binding), std.zig.fmtString(spec), if (binding_path.len == 0) "" else ".", binding_path,
+            if (b.inserter == null) {
+                const parse = try b.r.ctx.get(database.syntax.ParseFile, b.file);
+                b.inserter = try organize_imports.Inserter.init(a, parse, b.import_options);
+                if (parse.rootNode().tokenAtOffset(b.offset -| 1)) |token| if (token.kind == .identifier or token.kind == .invalid) {
+                    b.typing = token.range();
+                };
+            }
+            const decl = try std.fmt.allocPrint(a, "const {f} = @import(\"{f}\"){s}{s};", .{
+                std.zig.fmtId(binding), std.zig.fmtString(spec), if (binding_path.len == 0) "" else ".", binding_path,
             });
-            break :blk .{ .start = offset, .end = offset, .text = text };
+            const e = try b.inserter.?.edit(a, binding, spec, binding_path, decl);
+            if (b.typing) |t| if (e.start < t.end and @max(e.end, e.start + 1) > t.start) return;
+            break :blk .{ .start = e.start, .end = e.end, .text = e.text };
         };
         try b.add(.{ .label = label, .kind = kind, .filter = name, .qualifier = qualifier, .sort = sort, .doc = doc, .import_edit = edit, .target = target });
     }
@@ -1307,49 +1307,6 @@ fn under(a: Allocator, prefix: []const u8, dir: []const u8, path: []const u8) Al
         c.* = '/';
     };
     return std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, relative });
-}
-
-fn insertionOffset(r: *Resolver, file: FileId) resolve.Error!u32 {
-    const parse = try r.ctx.get(database.syntax.ParseFile, file);
-    var last: ?u32 = null;
-    var children = parse.rootNode().children();
-    while (children.nextNode()) |node| {
-        if (node.kind() != .var_decl or node.childToken(.keyword_const) == null) continue;
-        const init = (ast.VarDecl{ .syntax = node }).initExpr() orelse continue;
-        if (importInitializer(init)) last = node.range().end;
-    }
-    const source = (try r.ctx.get(database.syntax.SourceText, file)).text;
-    if (last) |end| {
-        var pos: usize = end;
-        // 保留 import 同行的注释；下一行插入，不吞掉下一条声明。
-        while (pos < source.len and (source[pos] == ' ' or source[pos] == '\t' or source[pos] == '\r')) : (pos += 1) {}
-        if (std.mem.startsWith(u8, source[pos..], "//")) while (pos < source.len and source[pos] != '\n') : (pos += 1) {};
-        if (pos < source.len and source[pos] == '\n') pos += 1;
-        return @intCast(pos);
-    }
-    // BOM 只允许在文件开头；import 不能插到它前面，否则 BOM 移到第二行成为非法 token
-    const start: usize = if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) 3 else 0;
-    var pos: usize = start;
-    var docs_end: usize = start;
-    while (pos < source.len) {
-        const end = if (std.mem.indexOfScalarPos(u8, source, pos, '\n')) |e| e + 1 else source.len;
-        const line = std.mem.trim(u8, source[pos..end], " \t\r\n");
-        if (std.mem.startsWith(u8, line, "//!")) {
-            docs_end = end;
-        } else if (line.len != 0 and !std.mem.startsWith(u8, line, "//")) break;
-        pos = end;
-    }
-    return @intCast(docs_end);
-}
-
-fn importInitializer(node: ast.SyntaxNode) bool {
-    if (node.kind() == .builtin_call) return node.childToken(.builtin) != null and std.mem.eql(u8, node.childToken(.builtin).?.text, "@import");
-    if (node.kind() == .field_access or node.kind() == .paren_expr) {
-        var children = node.children();
-        const lhs = children.nextNode() orelse return false;
-        return importInitializer(lhs);
-    }
-    return false;
 }
 
 fn findRoot(index: *const DeclIndex, name: []const u8) ?Decl {

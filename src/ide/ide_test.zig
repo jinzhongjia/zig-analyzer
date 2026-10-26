@@ -3708,7 +3708,7 @@ test "selected auto-import candidates describe the signature, docs and where the
         .{ .prefix = "Head", .label = "Header", .detail = "const Header = struct", .doc = "Defined in `wire/root.zig:1`" },
     };
     for (cases) |case| {
-        const result = try imports.complete(&r, cursor.file, cursor.offset, .unknown, case.prefix, 128);
+        const result = try imports.complete(&r, cursor.file, cursor.offset, .unknown, case.prefix, 128, .{});
         const candidate = for (result.items) |item| {
             if (std.mem.eql(u8, item.label, case.label)) break item;
         } else return error.MissingAutoImport;

@@ -32,6 +32,8 @@ pub const Options = struct {
     detect_import_position: bool = false,
     /// 至多提供的自动导入候选（保留排序最好的）；不限时为 `maxInt(usize)`
     max_auto_imports: usize = 128,
+    /// 自动导入的新 import 按它放到整理好的 import 块中应在的位置（配置 `imports.*`）
+    imports: @import("../ide_db/organize_imports.zig").Options = .{},
 };
 
 pub const Result = struct {
@@ -73,7 +75,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = try importPrefix(r.arena, root, text, offset) orelse return .{ .items = base };
     if (!options.auto_import) return .{ .items = base, .import_position = true };
-    const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports);
+    const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports, options.imports);
     if (extra.items.len == 0) return .{ .items = base, .is_incomplete = extra.is_incomplete, .import_position = true };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);

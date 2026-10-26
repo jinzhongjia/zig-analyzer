@@ -10,7 +10,7 @@ fn run(w: *World, file: FileId, offset: u32, prefix: []const u8, limit: usize) !
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    return imports.complete(&r, file, offset, .unknown, prefix, limit);
+    return imports.complete(&r, file, offset, .unknown, prefix, limit, .{});
 }
 fn find(result: imports.Result, label: []const u8) ?imports.Candidate {
     for (result.items) |item| if (std.mem.eql(u8, item.label, label)) return item;
@@ -85,7 +85,8 @@ test "auto imports reuse deep aliases and never leak dependency internal paths" 
     try testing.expect(index.import_edit == null);
     try testing.expect(find(aliases, "Index") == null);
     const wire = find(try run(&w, at.file, at.offset, "Wire", 128), "WireIndex").?;
-    try testing.expectEqualStrings("const WireIndex = @import(\"wire\").Exported.WireIndex;\n", wire.import_edit.?.text);
+    // 依赖模块与 std 不在同一组：新的组前空一行
+    try testing.expectEqualStrings("\nconst WireIndex = @import(\"wire\").Exported.WireIndex;\n", wire.import_edit.?.text);
     try testing.expectEqual(@as(usize, 0), (try run(&w, at.file, at.offset, "Unexport", 128)).items.len);
 }
 
