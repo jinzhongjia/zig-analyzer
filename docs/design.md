@@ -248,7 +248,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | `error.Foo` 的跳转与 hover | 在 `error{ ... }` 声明中查找：成员与期望的错误集完全相同的优先，其次是期望错误集的一部分（`A \|\| B` 中的 `A`），再次是任何含这个名字的；先查当前文件，再查沿 `@import` 可达的文件（以 `FileIndex` 按名字筛选），直到找到不会被取代的（没有期望的错误集时为第一个）；各文件的错误集声明按文件记忆（`ErrorSets`），重复查找不重新解析 |
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的文件（定义在标准库或依赖包中时，链可以经过范围外的文件），以及项目中的其余文件：泛型代码不必导入定义所在的文件就能经 `anytype` 的值或 comptime 类型参数访问其成员。不导入定义所在文件的文件中只检查泛型函数中的代码 |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
-| code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑；命名的修复见下 |
+| code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑；命名的修复见下；整理 import 只看语法树与源码文本 |
 | 非活动代码（默认关闭，`diagnostics.inactive_code`） | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
 | 命名检查（默认关闭） | 按声明的类型与 comptime 值分类，结果按成员缓存；修复复用引用查找 |
 
@@ -268,7 +268,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - 可变全局变量与运行时 `extern const` 通过命名空间限定访问（如 `lib.counter`），不在顶层常量初始化中复制存储的值；`extern const` 保留只读补全类别。新增顶层绑定前查询 `BindingNames`：容器成员（ItemTree）与其他函数的参数、局部变量、捕获。成员访问、初始化字段名、标签和类型引用不是声明，不计入冲突（不先用当前文件的名字索引 `FileIndex` 粗筛：逐字输入时它总要随编辑重算）；叶名字冲突时改用命名空间绑定，命名空间名字也冲突时直接插入 `@import("...").name`，不新增绑定。
 - 不提供的声明：结构体等容器的方法（第一个参数的类型是所在容器、`@This()` 或指向它们的指针，经由实例调用），以及只被测试用到的文件中的声明与这些文件本身。只被测试用到的文件由 `TestOnlyFiles` 求出：从各模块的根出发沿 import 可达、但只沿测试之外的 import 不可达；位于 test 声明中的 import，以及位于不被正式代码引用、而只被 test 引用的非 pub 顶层声明中的 import（如只在测试中用到的 `const World = @import("x_test.zig").World;`）只用于测试，从没被引用的声明是死代码，按正式代码。光标位于 test 声明或只被测试用到的文件中时，这些文件照常提供。
 - 跨文件只沿公开声明链导入；跨模块使用当前文件可用的命名 import，不生成越过模块边界的相对路径。同模块的相对路径必须留在最优先归属模块的根目录子树中，路径分隔符统一为 `/`。
-- 新 import 放在最后一个顶层 import 声明之后，或文件头 `//!` 文档之后；保留同行注释与文档之前的普通注释。文件以 UTF-8 BOM 开头时保留 BOM 在最前，import 插在 BOM 之后。标识符和字符串分别按源码规则转义，附加编辑不与主编辑重叠。
+- 新 import 按整理 import 的规则放置（见下）：包含最后一条顶层 import 声明的块已经整理好时，放到它所在的组与排序位置（新的组前后空一行）；块没有整理好时不顺带重排，放在最后一条 import 声明之后；还没有 import 时放在文件头 `//!` 文档之后。保留同行注释与文档之前的普通注释。文件以 UTF-8 BOM 开头时保留 BOM 在最前，import 插在 BOM 之后。标识符和字符串分别按源码规则转义，附加编辑不与主编辑重叠。
 - 名字前缀不区分 ASCII 大小写匹配，是否按大小写过滤由客户端决定（如 Neovim 遵循 `ignorecase`/`smartcase`）。索引中的名字先不区分大小写、相同时再按字节排序，不区分大小写地以同一前缀开头的名字连续，按名字的精确查找用同一个顺序。前缀的大小写与输入不一致的候选排在所有一致的之后，二者内部仍按下述顺序；截断时不挤掉大小写一致的候选。
 - 可见补全排在自动导入之前，已有别名复用优先于新增导入；自动导入至多返回 `completion.max_auto_imports` 项（默认 128，0 为不限，与 clangd 的 `--limit-results` 相同），截断时保留排序最好的，以 `CompletionList.isIncomplete` 请求客户端随前缀变化重新查询。短前缀可匹配上千个声明：结果已满时，排序不会进入结果的候选在构造标签、检查可见性之前就跳过；顶层别名是否被遮蔽到用上时才检查。
 - 命名空间与别名的规范目标由 `Resolver.namespaceOf` / `aliasTarget` 求值，与跳转、hover 等功能是同一份实现；初始化表达式是条件形式（`pub const X = if (cond) A else B;`、`switch`）时由推导求出它的值，取 comptime 选中的分支：
@@ -301,6 +301,12 @@ inlay hints 的约束：
 - **刷新**：任一项配置变化时，客户端支持的话请求刷新（`workspace/inlayHint/refresh`）。
 
 类型的显示（hover、inlay hints、补全详情共用 `render.zig`）：容器是成员的值时以成员命名：`const S = struct {...}` 为 `S`，函数体中按局部常量命名，`return` 的容器以函数和 comptime 实参命名（`List(u8)`）；值是在几个容器中选一个的 `if` / `switch` 时同样以成员命名（编译器在这里命名为 `S__struct_1`，以成员命名更易读）。字段与变量的类型标注、实参、`?struct {...}` 等处的容器在源码中没有名字，按内容显示：`packed struct { x: u8 }`、`union(enum) { a: u32, b: void }` 中列出字段与类型（枚举只列名字，至多 16 个），其中再有的匿名容器显示为 `struct {...}`，不会因为自引用（`?*const @This()`）无限展开。
+
+整理 import（`source.organizeImports`，`ide_db/organize_imports.zig`）：
+
+- **块**：连续的顶层 import 声明（`const x = @import("...")`，可带成员访问）与派生声明（右侧是以同一文件的 import 或派生声明开头的成员访问，可多层）组成一个块，声明之间只有空行；紧贴在上方的注释与行尾注释随声明移动。隔着空行的注释、其他声明结束一个块；每条声明须独占整行。一个文件可以有多个块，各自原地整理，不在块之间移动声明，也不删除声明（未使用的由编译器诊断）。有语法错误时不整理。
+- **分组与排序**：`std` / `builtin` / `root`（固定顺序）、依赖模块、文件三组，组之间空一行；分组只看 `@import` 的字符串（以 `.zig` / `.zon` 结尾的是文件）。派生声明默认紧跟在它依赖的声明之后（`imports.derived = .with_import`），或在最后单独成一组（`.separate`）；依赖的声明在别的块中时总在最后一组。组内默认按引用的东西排序（`imports.sort = .path`）：模块名、文件路径（`../` 少的在前，再逐段比较）、派生声明展开到 import 声明名的访问路径；`.name` 按声明名。比较用 rustfmt 的 version sort（数字按数值，大写在小写之前，`_` 在一切字符之前），与 rust-analyzer 一致。这两项是团队共享的风格，可以写在 `zig-analyzer.zon` 中。
+- **提供的时机**：客户端在 `context.only` 中要求这一类（含 `source`）时总是提供，用于快捷键与保存时整理；菜单请求（没有 `only`）只在请求的范围与某个块相交时提供。执行时整理全部块；已经整理好时不提供，整理的结果再整理没有变化。其他代码操作同样按 `only` 过滤。
 
 命名检查（Zig 0.17.0 风格指南的 Names 一节，`naming.enable` 开启）：
 

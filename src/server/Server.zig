@@ -3657,7 +3657,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .workspaceSymbolProvider = .{ .boolean = true },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
             .codeActionProvider = .{ .CodeActionOptions = .{
-                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract },
+                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.SourceOrganizeImports },
                 .resolveProvider = true,
             } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
@@ -3762,15 +3762,16 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // 导入的名字处补全时开始建索引；之后仍未建完而没有索引在进行时（上一轮出错、任务没能启动）重新开始
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports = blk: {
+    const max_auto_imports, const import_options = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
-        break :blk server.config.completion_max_auto_imports;
+        break :blk .{ server.config.completion_max_auto_imports, server.config.importOptions() };
     };
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
         .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
+        .imports = import_options,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
@@ -4150,16 +4151,45 @@ fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: type
     return .{ .array_of_WorkspaceSymbol = out };
 }
 
+/// 客户端要求的代码操作种类（`context.only`）包含 `kind`：种类按 `.` 分层，`source` 包含 `source.organizeImports`。
+/// 没有要求时任何种类都可以
+fn wantsKind(only: ?[]const []const u8, kind: []const u8) bool {
+    const list = only orelse return true;
+    for (list) |k| {
+        if (std.mem.eql(u8, kind, k)) return true;
+        if (kind.len > k.len and std.mem.startsWith(u8, kind, k) and kind[k.len] == '.') return true;
+    }
+    return false;
+}
+
 fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const start, const end = server.rangeOffsets(text, params.range);
-    const actions = try ide.code_actions.codeActions(r, file, start, end);
+    const only = params.context.only;
+    const import_options = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.importOptions();
+    };
+    var actions: std.ArrayList(ide.code_actions.Action) = .empty;
+    if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract))
+        try actions.appendSlice(arena, try ide.code_actions.codeActions(r, file, start, end));
+    // 明确要求整理 import 时不看光标位置（快捷键、保存时整理）
+    if (wantsKind(only, types.CodeActionKind.SourceOrganizeImports)) {
+        if (try ide.code_actions.organizeImports(r, file, start, end, import_options, only != null)) |a| try actions.append(arena, a);
+    }
     const lines = try offsets.LineIndex.init(arena, text);
     const doc_uri = try server.uriFor(arena, file);
     const Item = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
     var out: std.ArrayList(Item) = .empty;
-    for (actions) |a| {
+    for (actions.items) |a| {
+        const kind = switch (a.kind) {
+            .quickfix => types.CodeActionKind.QuickFix,
+            .refactor_extract => types.CodeActionKind.RefactorExtract,
+            .source_organize_imports => types.CodeActionKind.SourceOrganizeImports,
+        };
+        if (!wantsKind(only, kind)) continue;
         const edits = try arena.alloc(types.TextEdit, a.edits.len);
         for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
         var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
@@ -4174,22 +4204,19 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         } else null;
         try out.append(arena, .{ .CodeAction = .{
             .title = a.title,
-            .kind = switch (a.kind) {
-                .quickfix => types.CodeActionKind.QuickFix,
-                .refactor_extract => types.CodeActionKind.RefactorExtract,
-            },
+            .kind = kind,
             .diagnostics = diagnostics,
             .isPreferred = if (a.diagnostic != null) true else null,
             .edit = .{ .changes = changes },
         } });
     }
-    if (try server.namingFor(arena, file, text)) |settings| {
+    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (try server.namingFor(arena, file, text)) |settings| {
         for (try ide.naming.findings(r, file, .{ .start = start, .end = end })) |f| {
             if (!settings.allows(f)) continue;
             const range = lines.range(f.start, f.end, server.encoding);
             if (try server.namingAction(r, arena, doc_uri, range, f, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
         }
-    }
+    };
     return out.items;
 }
 

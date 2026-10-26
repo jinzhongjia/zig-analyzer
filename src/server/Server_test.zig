@@ -707,3 +707,59 @@ test "inlay hint settings apply to requests and refresh the client when they cha
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "organize imports is offered with the cursor in an import block or when requested, and follows the imports settings" {
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{
+        .capabilities = struct {}{},
+        .initializationOptions = .{ .imports = .{ .derived = "separate" } },
+    });
+    const uri = "untitled:organize-imports.zig";
+    const text =
+        \\const zed = @import("zed.zig");
+        \\const Allocator = std.mem.Allocator;
+        \\const std = @import("std");
+        \\
+        \\pub fn main() void {}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const Pos = struct { line: u32, character: u32 };
+    const actions = struct {
+        fn at(hh: *Harness, line: u32, only: ?[]const []const u8) ![]const std.json.Value {
+            const pos: Pos = .{ .line = line, .character = 0 };
+            const resp = try hh.request("textDocument/codeAction", .{
+                .textDocument = .{ .uri = "untitled:organize-imports.zig" },
+                .range = .{ .start = pos, .end = pos },
+                .context = .{ .diagnostics = &[_]std.json.Value{}, .only = only },
+            });
+            var out: std.ArrayList(std.json.Value) = .empty;
+            for (resp.object.get("result").?.array.items) |a| {
+                if (std.mem.eql(u8, a.object.get("kind").?.string, "source.organizeImports")) try out.append(hh.arena.allocator(), a);
+            }
+            return out.items;
+        }
+    }.at;
+    // 菜单（没有指定种类）：光标在 import 块中才提供
+    try testing.expectEqual(1, (try actions(&h, 1, null)).len);
+    try testing.expectEqual(0, (try actions(&h, 4, null)).len);
+    try testing.expectEqual(0, (try actions(&h, 1, &.{"quickfix"})).len);
+    // 明确要求（快捷键、保存时整理）：不看光标位置；`source` 包含 `source.organizeImports`
+    const requested = try actions(&h, 4, &.{"source"});
+    try testing.expectEqual(1, requested.len);
+    const edits = requested[0].object.get("edit").?.object.get("changes").?.object.get(uri).?.array.items;
+    try testing.expectEqual(1, edits.len);
+    try testing.expectEqualStrings(
+        \\const std = @import("std");
+        \\
+        \\const zed = @import("zed.zig");
+        \\
+        \\const Allocator = std.mem.Allocator;
+    , edits[0].object.get("newText").?.string);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

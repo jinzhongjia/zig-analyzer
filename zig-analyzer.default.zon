@@ -88,6 +88,19 @@
     //       .max_auto_imports = 128,
     //   },
 
+    // How top-level imports are arranged, by "Organize imports" (`source.organizeImports`) and when
+    // auto-import adds one. Imports are grouped std / builtin / root, modules, then files, with a
+    // blank line between groups.
+    .imports = .{
+        // Where declarations derived from an import (`const Allocator = std.mem.Allocator;`) go:
+        // .with_import right after the import they come from; .separate in a last group of their
+        // own.
+        .derived = .with_import,
+        // Order within a group: .path by what is imported (module name, file path with nearer
+        // files first, the full access path of derived declarations); .name by declaration name.
+        .sort = .path,
+    },
+
     // Type inference (editor only):
     //   .sema = .{
     //       // Inside generic functions with no concrete types, infer with the instances from call

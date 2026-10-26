@@ -9,6 +9,7 @@
 //!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
 //!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
+//!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
 //!       "workspace_symbol": { "dependencies": false },
@@ -29,6 +30,7 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
+const ImportOptions = @import("../ide_db/organize_imports.zig").Options;
 
 const Config = @This();
 
@@ -67,6 +69,10 @@ hide_redundant_param_names: bool = true,
 semantic_tokens_mode: SemanticTokensMode = .full,
 /// 语义着色：容器级 `var` 的声明与引用带 `global` modifier
 semantic_tokens_global_var: bool = false,
+/// import 块中派生声明（`const Allocator = std.mem.Allocator;`）的位置：整理 import 与自动导入都按它
+imports_derived: ImportOptions.Derived = .with_import,
+/// import 块的组内排序：按引用的路径或声明名
+imports_sort: ImportOptions.Sort = .path,
 /// 普通名字补全中提供可达声明与模块的自动导入
 completion_auto_import: bool = false,
 /// 一次补全至多提供的自动导入候选（保留排序最好的，其余由客户端随输入重新请求得到）；0 为不限
@@ -157,6 +163,8 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
     .{ .section = "semantic_tokens", .key = "mode", .field = "semantic_tokens_mode" },
     .{ .section = "semantic_tokens", .key = "global_var", .field = "semantic_tokens_global_var" },
+    .{ .section = "imports", .key = "derived", .field = "imports_derived" },
+    .{ .section = "imports", .key = "sort", .field = "imports_sort" },
     .{ .section = "completion", .key = "auto_import", .field = "completion_auto_import" },
     .{ .section = "completion", .key = "max_auto_imports", .field = "completion_max_auto_imports" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
@@ -174,8 +182,9 @@ const settings = [_]Setting{
 
 /// 可以在项目配置文件中设置的项
 const project_settings = [_][]const u8{
-    "build_args",    "diagnostics_step", "diagnostics_steps", "compiler_diagnostics",
-    "naming_enable", "naming_ignore",    "naming_exclude",    "naming_rules",
+    "build_args",      "diagnostics_step", "diagnostics_steps", "compiler_diagnostics",
+    "naming_enable",   "naming_ignore",    "naming_exclude",    "naming_rules",
+    "imports_derived", "imports_sort",
 };
 
 fn isProjectSetting(comptime field: []const u8) bool {
@@ -361,6 +370,11 @@ pub fn diagnosticsSteps(c: *const Config, a: Allocator) Allocator.Error![]const 
     return out;
 }
 
+/// import 块的排列规则（整理 import、自动导入）
+pub fn importOptions(c: *const Config) ImportOptions {
+    return .{ .derived = c.imports_derived, .sort = c.imports_sort };
+}
+
 /// 影响构建系统协议进程的配置是否相同（不同时需要重启项目）
 pub fn sameBuild(a: *const Config, b: *const Config) bool {
     if (a.build_enable != b.build_enable or a.compiler_diagnostics != b.compiler_diagnostics) return false;
@@ -466,7 +480,7 @@ test "parse: unknown and invalid settings are reported, the rest still applies" 
 
 test "project file: only project settings apply and override the client" {
     var client = try parseText(
-        \\{"build": {"args": ["-Dclient"]}, "diagnostics": {"steps": ["check"]}, "log": {"level": "debug"}}
+        \\{"build": {"args": ["-Dclient"]}, "diagnostics": {"steps": ["check"]}, "log": {"level": "debug"}, "imports": {"sort": "name"}}
     );
     defer client.deinit(testing.allocator);
     var project = try parseProject(testing.allocator,
@@ -475,6 +489,7 @@ test "project file: only project settings apply and override the client" {
         \\    .build = .{ .args = .{"-Dtarget=wasm32-freestanding"}, .enable = false },
         \\    .diagnostics = .{ .compiler = false },
         \\    .log = .{ .level = .err },
+        \\    .imports = .{ .derived = .separate },
         \\}
     );
     defer project.deinit(testing.allocator);
@@ -487,6 +502,8 @@ test "project file: only project settings apply and override the client" {
     // 项目中没有的项保留客户端的值
     try testing.expectEqualStrings("check", client.diagnostics_steps[0]);
     try testing.expectEqual(.debug, client.log_level);
+    // import 的排列是团队共享的风格，可以写在项目配置中
+    try testing.expect(client.imports_derived == .separate and client.imports_sort == .name);
 }
 
 test "project file: an error ignores the whole file and is reported with its location" {

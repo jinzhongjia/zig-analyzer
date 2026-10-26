@@ -31,7 +31,8 @@ Zig **0.17.0**。请用项目所用的同一个 Zig 编译 zig-analyzer。
   - 丢弃未使用的名字，或删除多余的丢弃；
   - 补上 switch 缺少的分支；
   - 补上结构体初始化缺少的字段；
-  - 把表达式提取为局部常量。
+  - 把表达式提取为局部常量；
+  - 整理 import：把顶层的 `@import` 声明（以及由它们派生的声明）按 std、依赖模块、文件分组排序；自动导入按同样的顺序插入新的 import。
 - **格式化**：与 `zig fmt` 逐字一致，支持 `.zig` 与 `.zon`。
 - **结构**：折叠，选择范围。
 - **命名检查**（默认关闭）：依据 Zig 风格指南的 [Names](https://ziglang.org/documentation/0.17.0/#Names) 一节，按声明实际表示的东西（类型、函数、值）判断，并提供改名修复；改名不安全时拒绝。
@@ -66,7 +67,7 @@ vim.lsp.enable('zig_analyzer')
 
 编辑器的配置来自 `initializationOptions` 与 `workspace/configuration` 的 `zig-analyzer` 一节，各项都可以省略。
 
-项目根目录的 `zig-analyzer.zon` 用于团队共享项目的配置（构建参数、诊断的 step、命名检查），优先于编辑器的配置。
+项目根目录的 `zig-analyzer.zon` 用于团队共享项目的配置（构建参数、诊断的 step、命名检查、import 的排列），优先于编辑器的配置。
 
 [`zig-analyzer.default.zon`](zig-analyzer.default.zon) 列出了全部配置项、默认值与作用（英文注释）。可以复制为 `zig-analyzer.zon` 使用；只能在编辑器中设置的项写在注释里。
 

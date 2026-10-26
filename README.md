@@ -31,7 +31,8 @@ If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `bu
   - discard an unused name, or remove a pointless discard;
   - add missing switch prongs;
   - add missing struct fields;
-  - extract an expression to a local constant.
+  - extract an expression to a local constant;
+  - organize imports: sort the top-level `@import` declarations (and declarations derived from them) into std / modules / files groups; auto-import adds new imports in the same order.
 - **Formatting**: identical to `zig fmt`, for `.zig` and `.zon`.
 - **Structure**: folding ranges, selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.0/#Names) section of the Zig style guide, judged by what each declaration actually is (type, function, value), with rename fixes that refuse unsafe renames.
@@ -66,7 +67,7 @@ vim.lsp.enable('zig_analyzer')
 
 Editor settings are read from `initializationOptions` and the `zig-analyzer` section of `workspace/configuration`. Every option is optional.
 
-A `zig-analyzer.zon` in the project root shares project settings (build arguments, diagnostic steps, naming checks) with the team; they take precedence over editor settings.
+A `zig-analyzer.zon` in the project root shares project settings (build arguments, diagnostic steps, naming checks, import order) with the team; they take precedence over editor settings.
 
 [`zig-analyzer.default.zon`](zig-analyzer.default.zon) lists every option with its default and what it does. Copy it as `zig-analyzer.zon` to start; the options only available in editor settings are listed in comments.
 

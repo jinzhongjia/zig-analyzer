@@ -4,7 +4,7 @@
 //! - switch 缺少的枚举 / 联合分支：补上 `.name => {},`
 //! - 结构体初始化缺少的字段（没有默认值的）：补上 `.name = undefined`
 //!
-//! 以及重构：选中的表达式提取为局部常量。
+//! 重构：选中的表达式提取为局部常量。源码操作：整理 import（见 `ide_db/organize_imports.zig`）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,6 +20,7 @@ const Index = InternPool.Index;
 const FileId = @import("../base/Vfs.zig").FileId;
 const definition = @import("definition.zig");
 const render = @import("../sema/render.zig");
+const organize_imports = @import("../ide_db/organize_imports.zig");
 
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
@@ -30,7 +31,7 @@ pub const Action = struct {
     /// 所修复的诊断（`live.AstCheck` 的位置）；没有对应诊断时为 null
     diagnostic: ?struct { start: u32, end: u32 } = null,
 
-    pub const Kind = enum { quickfix, refactor_extract };
+    pub const Kind = enum { quickfix, refactor_extract, source_organize_imports };
 };
 
 /// `[start, end]` 区间内可用的快速修复
@@ -58,6 +59,23 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
     if (try missingFields(r, file, text, start)) |a| try out.append(r.arena, a);
     if (try extractVariable(r, file, text, start, end)) |a| try out.append(r.arena, a);
     return out.items;
+}
+
+/// 整理文件中的全部 import 块（`source.organizeImports`）。客户端明确要求这一类时（`requested`）总是提供，否则只在
+/// `[start, end]` 与某个块相交时提供；已经整理好时不提供
+pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: organize_imports.Options, requested: bool) resolve.Error!?Action {
+    const parse = try r.ctx.get(database.syntax.ParseFile, file);
+    const result = try organize_imports.organize(r.arena, parse, opts);
+    if (result.edits.len == 0) return null;
+    if (!requested) {
+        const inside = for (result.blocks) |b| {
+            if (start <= b.end and end >= b.start) break true;
+        } else false;
+        if (!inside) return null;
+    }
+    const edits = try r.arena.alloc(Edit, result.edits.len);
+    for (result.edits, edits) |e, *out| out.* = .{ .start = e.start, .end = e.end, .text = e.text };
+    return .{ .title = "Organize imports", .kind = .source_organize_imports, .edits = edits };
 }
 
 /// 选中的表达式（两端空白不计）提取为所在语句之前的局部常量，原处替换为它的名字。
