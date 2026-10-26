@@ -196,8 +196,8 @@ pub fn readFromDisk(vfs: *Vfs, id: FileId, gpa: Allocator) ReadError!?[]u8 {
     };
 }
 
-/// 超过此大小的文件不加载（与 Zig 编译器对单个源文件的限制同量级）
-pub const max_file_size = 64 * 1024 * 1024;
+/// 超过此大小的文件不加载：源码位置以 u32 表示
+pub const max_file_size = std.math.maxInt(u32);
 
 test "interning and normalization" {
     var vfs: Vfs = .init(std.testing.io, std.testing.allocator);

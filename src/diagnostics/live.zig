@@ -60,7 +60,7 @@ pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Resu
     if (depth <= nesting.inline_depth) return checkSource(gpa, source, mode);
     if (depth <= nesting.thread_depth) {
         var result: Allocator.Error!*Result = undefined;
-        if (std.Thread.spawn(.{ .stack_size = nesting.thread_stack_size }, checkInto, .{ gpa, source, mode, &result })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = nesting.threadStackSize(depth, nesting.thread_depth) }, checkInto, .{ gpa, source, mode, &result })) |thread| {
             thread.join();
             return result;
         } else |err| log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});

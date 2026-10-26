@@ -12,7 +12,8 @@ pub const ReadError = error{
     OutOfMemory,
 };
 
-pub const max_message_len = 256 * 1024 * 1024;
+/// 单条消息体的上限，与文件大小的上限相同（打开的文档随消息传来）
+pub const max_message_len = std.math.maxInt(u32);
 
 /// 读取一条消息体，调用方拥有返回的内存。
 pub fn readMessage(reader: *Io.Reader, gpa: Allocator) ReadError![]u8 {

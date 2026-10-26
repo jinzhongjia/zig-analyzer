@@ -35,13 +35,13 @@ pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offse
 }
 
 /// 官方解析器与渲染器（同 `zig fmt`）的结果，有语法错误时为 null。两者逐层递归：按嵌套深度选择执行的
-/// 线程，深到 `zig fmt` 也会耗尽栈的文本不格式化
+/// 线程，超过 `nesting.format_depth` 的文本不格式化
 fn render(arena: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!?[]const u8 {
     const depth = try nesting.estimate(arena, source, nesting.format_depth);
     if (depth <= nesting.inline_depth) return renderSource(arena, source, mode);
     if (depth > nesting.format_depth) return null;
     var result: Allocator.Error!?[]const u8 = undefined;
-    const thread = std.Thread.spawn(.{ .stack_size = nesting.thread_stack_size }, renderInto, .{ arena, source, mode, &result }) catch |err| {
+    const thread = std.Thread.spawn(.{ .stack_size = nesting.threadStackSize(depth, nesting.format_depth) }, renderInto, .{ arena, source, mode, &result }) catch |err| {
         log.warn("cannot spawn a thread to format a deeply nested file: {t}", .{err});
         return null;
     };
@@ -69,7 +69,7 @@ fn applyEdit(gpa: Allocator, text: []const u8, edit: types.TextEdit) ![]u8 {
     return offsets.applyChanges(gpa, text, &changes, .utf16);
 }
 
-test "deeply nested source is formatted on a large stack, beyond what zig fmt handles it is rejected" {
+test "deeply nested source is formatted on a large stack, beyond the depth limit it is rejected" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -85,7 +85,7 @@ test "deeply nested source is formatted on a large stack, beyond what zig fmt ha
     try testing.expectEqual(1, edits.len);
     try testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, text.items, "const  x", "const x"), try applyEdit(a, text.items, edits[0]));
 
-    // 更深的文本 `zig fmt` 同样耗尽栈：拒绝
+    // 超过深度上限：拒绝
     text.clearRetainingCapacity();
     try text.appendSlice(a, "const x = ");
     for (0..nesting.format_depth) |_| try text.append(a, '(');
