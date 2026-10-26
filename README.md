@@ -33,6 +33,7 @@ If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `bu
   - add missing switch prongs;
   - add missing struct fields;
   - extract an expression to a local constant;
+  - convert between string literals and multiline string literals, keeping the bytes;
   - organize imports: sort the top-level `@import` declarations (and declarations derived from them) into std / modules / files groups; auto-import adds new imports in the same order.
 - **Formatting**: identical to `zig fmt`, for `.zig` and `.zon`.
 - **Structure**: folding ranges, selection ranges.
