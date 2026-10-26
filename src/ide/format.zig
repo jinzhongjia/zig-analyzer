@@ -14,24 +14,32 @@ pub const Mode = enum { zig, zon };
 /// 有语法错误时返回 null（与 `zig fmt` 一样拒绝格式化）；已格式化时返回空数组。
 pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offsets.Encoding) Allocator.Error!?[]const types.TextEdit {
     const text = lines.text;
-    const source = try arena.dupeSentinel(u8, text, 0);
-    const formatted = try render(arena, source, mode) orelse return null;
+    const formatted = try renderText(arena, text, mode) orelse return null;
     if (std.mem.eql(u8, formatted, text)) return &.{};
-
-    // 公共前缀 / 后缀按整行计算，保证替换区间落在字符边界上
-    var prefix = std.mem.indexOfDiff(u8, text, formatted) orelse @min(text.len, formatted.len);
-    prefix = if (std.mem.lastIndexOfScalar(u8, text[0..prefix], '\n')) |nl| nl + 1 else 0;
-    var suffix: usize = 0;
-    while (suffix < text.len - prefix and suffix < formatted.len - prefix and
-        text[text.len - 1 - suffix] == formatted[formatted.len - 1 - suffix]) suffix += 1;
-    // 后缀也从行首开始
-    while (suffix > 0 and text.len - suffix > 0 and text[text.len - suffix - 1] != '\n') suffix -= 1;
-
+    const d = lineDiff(text, formatted);
     const edit: types.TextEdit = .{
-        .range = lines.range(prefix, text.len - suffix, enc),
-        .newText = formatted[prefix .. formatted.len - suffix],
+        .range = lines.range(d.start, d.old_end, enc),
+        .newText = formatted[d.start..d.new_end],
     };
     return try arena.dupe(types.TextEdit, &.{edit});
+}
+
+/// `zig fmt` 对文本的结果；有语法错误或嵌套过深时为 null
+pub fn renderText(arena: Allocator, text: []const u8, mode: Mode) Allocator.Error!?[]const u8 {
+    return render(arena, try arena.dupeSentinel(u8, text, 0), mode);
+}
+
+/// 把 `old` 变为 `new` 的最小替换区间：公共前缀与后缀之外的部分，按整行计算，区间落在字符边界上。
+/// 替换 `old[start..old_end]` 为 `new[start..new_end]`
+pub fn lineDiff(old: []const u8, new: []const u8) struct { start: usize, old_end: usize, new_end: usize } {
+    var prefix = std.mem.indexOfDiff(u8, old, new) orelse @min(old.len, new.len);
+    prefix = if (std.mem.lastIndexOfScalar(u8, old[0..prefix], '\n')) |nl| nl + 1 else 0;
+    var suffix: usize = 0;
+    while (suffix < old.len - prefix and suffix < new.len - prefix and
+        old[old.len - 1 - suffix] == new[new.len - 1 - suffix]) suffix += 1;
+    // 后缀也从行首开始
+    while (suffix > 0 and old.len - suffix > 0 and old[old.len - suffix - 1] != '\n') suffix -= 1;
+    return .{ .start = prefix, .old_end = old.len - suffix, .new_end = new.len - suffix };
 }
 
 /// 官方解析器与渲染器（同 `zig fmt`）的结果，有语法错误时为 null。两者逐层递归：按嵌套深度选择执行的

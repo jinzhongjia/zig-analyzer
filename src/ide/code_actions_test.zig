@@ -368,6 +368,10 @@ test "string conversion preserves bytes and surrounding syntax" {
         .{ "const text = call(", ");" },
         .{ "const text =\n    ", ";" },
         .{ "const text = ", "; // comment\r\n" },
+        // 已按 zig fmt 格式化的文件：结果按 zig fmt 排版
+        .{ "const text = ", ";\n" },
+        .{ "fn f() void {\n    const text = ", ";\n    _ = text;\n}\n" },
+        .{ "test {\n    try call(", ", 42);\n}\n" },
     };
     inline for (cases) |case| {
         inline for (contexts) |context| {
@@ -387,6 +391,24 @@ test "string conversion preserves bytes and surrounding syntax" {
             defer testing.allocator.free(roundtrip);
             try testing.expectEqualStrings(case[1], roundtrip);
         }
+    }
+}
+
+test "string conversion in a file formatted by zig fmt keeps it formatted" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // `=` 之后不留空白，`;` 在语句的缩进处
+        .{ "const text = <|>\"a\\nb\";\n", "convert to a multiline", "const text =\n    \\\\a\n    \\\\b\n;\n" },
+        .{ "fn f() void {\n    const text =\n        <|>\"a\\n\";\n    _ = text;\n}\n", "convert to a multiline", "fn f() void {\n    const text =\n        \\\\a\n        \\\\\n    ;\n    _ = text;\n}\n" },
+        // 初始化列表改为每行一个元素
+        .{ "const text = .{ <|>\"a\", 42 };\n", "convert to a multiline", "const text = .{\n    \\\\a\n    ,\n    42,\n};\n" },
+        // 转换回普通字符串后合并行
+        .{ "const text =\n    \\\\<|>a\n    \\\\b\n;\n", "convert to a string", "const text =\n    \"a\\nb\";\n" },
+        .{ "fn f() void {\n    call(\n        \\\\<|>a\n    , 42);\n}\n", "convert to a string", "fn f() void {\n    call(\"a\", 42);\n}\n" },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], c[1]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
     }
 }
 

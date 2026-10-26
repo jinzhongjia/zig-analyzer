@@ -21,6 +21,7 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const definition = @import("definition.zig");
 const render = @import("../sema/render.zig");
 const organize_imports = @import("../ide_db/organize_imports.zig");
+const format = @import("format.zig");
 
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
@@ -79,7 +80,8 @@ pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: o
     return .{ .title = "Organize imports", .kind = .source_organize_imports, .edits = edits };
 }
 
-/// 只替换完整的字符串字面量；多行形式按 token 解码，避免把源码缩进或 CRLF 计入字符串值。
+/// 只替换完整的字符串字面量；多行形式按 token 解码，避免把源码缩进或 CRLF 计入字符串值。排版与 `zig fmt` 一致
+/// （见 `zigFmtEdit`）
 fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -115,6 +117,7 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
     }
     const literal_end = last.range().end;
     if (start < first.offset or start >= literal_end or end > literal_end) return null;
+    var edit_start = first.offset;
     const replacement = if (multiline)
         try std.fmt.allocPrint(r.arena, "\"{f}\"", .{std.zig.fmtString(bytes.items)})
     else blk: {
@@ -128,6 +131,8 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
         const newline: []const u8 = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
         var out: std.ArrayList(u8) = .empty;
         if (!own_line) {
+            // 字面量换到下一行：不留行尾空白
+            while (edit_start > line_start and (text[edit_start - 1] == ' ' or text[edit_start - 1] == '\t')) edit_start -= 1;
             try out.appendSlice(r.arena, newline);
             try out.appendSlice(r.arena, indent);
             try out.appendSlice(r.arena, "    ");
@@ -149,11 +154,26 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
         try out.appendSlice(r.arena, indent);
         break :blk out.items;
     };
+    const raw: Edit = .{ .start = edit_start, .end = literal_end, .text = replacement };
     return .{
         .title = if (multiline) "convert to a string literal" else "convert to a multiline string literal",
         .kind = .refactor_rewrite,
-        .edits = try r.arena.dupe(Edit, &.{.{ .start = first.offset, .end = literal_end, .text = replacement }}),
+        .edits = try r.arena.dupe(Edit, &.{try zigFmtEdit(r, file, text, raw)}),
     };
+}
+
+/// `raw` 替换之后按 `zig fmt` 排版：文件原本已按 `zig fmt` 格式化时，改为格式化替换后的全文、与原文的差异（按整行，
+/// 只有替换附近的行，如多行字符串之后的 `;` 移到行首、元素改为每行一个的初始化列表、转换回普通字符串后合并的行）。
+/// 文件没有格式化（格式化会改动无关的代码）、有语法错误或嵌套过深时保留 `raw`
+fn zigFmtEdit(r: *Resolver, file: FileId, text: []const u8, raw: Edit) resolve.Error!Edit {
+    const a = r.arena;
+    const mode: format.Mode = if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) .zon else .zig;
+    const before = try format.renderText(a, text, mode) orelse return raw;
+    if (!std.mem.eql(u8, before, text)) return raw;
+    const edited = try std.mem.concat(a, u8, &.{ text[0..raw.start], raw.text, text[raw.end..] });
+    const after = try format.renderText(a, edited, mode) orelse return raw;
+    const d = format.lineDiff(text, after);
+    return .{ .start = @intCast(d.start), .end = @intCast(d.old_end), .text = after[d.start..d.new_end] };
 }
 
 /// 选中的表达式（两端空白不计）提取为所在语句之前的局部常量，原处替换为它的名字。
