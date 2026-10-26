@@ -708,6 +708,35 @@ test "inlay hint settings apply to requests and refresh the client when they cha
     try h.notify("exit", {});
 }
 
+test "cache settings from initialization and later configuration limit the retained syntax trees" {
+    // 防止只在推送配置时设置缓存容量，初始化时的配置不生效
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = struct {}{}, .initializationOptions = .{ .cache = .{ .capacity = 2 } } });
+    const uris = [_][]const u8{ "untitled:a.zig", "untitled:b.zig", "untitled:c.zig", "untitled:d.zig" };
+    for (uris) |uri| try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const x: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const trees = struct {
+        /// 逐个请求各文件的 document symbol（读取解析结果），之后保留着的解析结果个数
+        fn retained(hh: *Harness) !i64 {
+            for (uris) |uri| _ = try hh.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
+            const status = try hh.request("zig-analyzer/status", {});
+            for (status.object.get("result").?.object.get("queries").?.array.items) |q| {
+                if (std.mem.endsWith(u8, q.object.get("name").?.string, ".ParseFile")) return q.object.get("memos").?.integer;
+            }
+            return error.TestUnexpectedResult;
+        }
+    }.retained;
+    try testing.expect(try trees(&h) <= 2);
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .cache = .{ .capacity = 0 } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(@as(i64, uris.len), try trees(&h));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "organize imports is offered with the cursor in an import block or when requested, and follows the imports settings" {
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;

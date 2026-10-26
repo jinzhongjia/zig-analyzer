@@ -972,6 +972,30 @@ test "lru_bytes: values are evicted by size, oldest first" {
     try testing.expectEqual(before + 1, executions(&d, Sized));
 }
 
+test "lru: capacities set at runtime apply at the next sweep, 0 is unlimited" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    {
+        d.beginWrite();
+        defer d.endWrite();
+        for (1..4) |k| try d.set(Text, @intCast(k), try testing.allocator.dupe(u8, "abcdef"), .low);
+    }
+    const live = &d.tables[comptime Db.queryIndex(Sized)].live;
+    // 字节数不限：默认 10 字节只容得下一个值，现在 3 个都保留
+    d.setLru(Sized, null, 0);
+    for (1..4) |k| _ = try read(&d, Sized, @intCast(k));
+    try testing.expect(d.trySweep());
+    try testing.expectEqual(3, live.*);
+    // 调低个数：清扫时淘汰到 3/4，留下最近使用的
+    d.setLru(Sized, 2, 0);
+    try testing.expect(d.wantsSweep());
+    try testing.expect(d.trySweep());
+    try testing.expectEqual(1, live.*);
+    const before = executions(&d, Sized);
+    _ = try read(&d, Sized, 3);
+    try testing.expectEqual(before, executions(&d, Sized));
+}
+
 test "concurrent reads: readers of the same query agree" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

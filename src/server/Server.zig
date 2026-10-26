@@ -1697,6 +1697,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
     const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
     server.applyLogging(&new, log_file_changed);
+    server.applyCacheLimits(&new);
     server.config.deinit(server.gpa);
     server.config = new;
     server.config_mutex.unlock(server.io);
@@ -1857,6 +1858,27 @@ fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void 
         log.warn("cannot open log file {s}: {t}", .{ config.log_file.?, err });
         server.showWarning("cannot open log.file, logging to stderr only");
     };
+}
+
+/// 缓存容量：`cache.queries` 中设置的优先；语法树（`ParseFile` 与 `FileAstIdMap`）的个数默认取 `cache.capacity`
+fn applyCacheLimits(server: *Server, config: *const Config) void {
+    inline for (@typeInfo(Config.CacheQueries).@"struct".field_names) |name| {
+        const limit = @field(config.cache_queries, name);
+        const syntax_tree = comptime std.mem.eql(u8, name, "ParseFile") or std.mem.eql(u8, name, "FileAstIdMap");
+        const count: ?usize = limit.count orelse if (syntax_tree) config.cache_capacity else null;
+        const bytes: ?usize = if (limit.mb) |mb| @as(usize, mb) * 1024 * 1024 else null;
+        server.db.setLru(QueryNamed(name), count, bytes);
+    }
+}
+
+/// `Db` 中名为 `name` 的 query
+fn QueryNamed(comptime name: []const u8) type {
+    var found: ?type = null;
+    for (Db.query_types) |Q| if (std.mem.endsWith(u8, @typeName(Q), "." ++ name)) {
+        if (found != null) @compileError("more than one query named " ++ name);
+        found = Q;
+    };
+    return found orelse @compileError("no query named " ++ name);
 }
 
 fn eqlOptionalStr(a: ?[]const u8, b: ?[]const u8) bool {
@@ -3621,6 +3643,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         };
         server.reportConfigWarnings("zig-analyzer settings", &server.config);
         server.applyLogging(&server.config, server.config.log_file != null);
+        server.applyCacheLimits(&server.config);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});
     if (params.processId) |pid| server.watchParent(pid);

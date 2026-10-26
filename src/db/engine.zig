@@ -37,7 +37,7 @@
 //! derived query 可声明 `pub const lru: usize = N`：保留值的 memo 超过 N 个时，最久未使用的 memo
 //! 被淘汰，只删除值，保留依赖与 changed_at。被淘汰的 memo 验证通过时重算并沿用原 changed_at
 //! （compute 是确定的，依赖未变则结果相同），下游不会因此重算。淘汰在写事务开始时或 `trySweep` 中进行
-//! （此时没有读事务持有值）。
+//! （此时没有读事务持有值）。`lru` 与 `lru_bytes` 是默认容量，运行时可用 `setLru` 修改。
 //!
 //! 并发模型：读事务（`beginRead`）持有共享锁，可并发；写事务（`beginWrite`）先登记到
 //! `pending_write` 使进行中的读查询尽快以 `error.Canceled` 退出，再获取独占锁。
@@ -212,8 +212,24 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         access_tick: std.atomic.Value(u64) = .init(0),
         /// 有声明了 `lru` 的 query 超出容量，等待 `sweep`
         sweep_wanted: std.atomic.Value(bool) = .init(false),
+        /// 声明了 `lru` 的 query 当前的容量（见 `setLru`），下标对应 `queries`
+        lru_limits: [queries.len]LruLimit = lru_defaults,
         /// 读事务可占用的原生栈；在开始读事务之前设置
         stack_budget: StackBudget = .{},
+
+        /// 保留值的 memo 个数与字节数的上限
+        const LruLimit = struct {
+            count: std.atomic.Value(usize),
+            bytes: std.atomic.Value(usize),
+        };
+        const lru_defaults = blk: {
+            var limits: [queries.len]LruLimit = undefined;
+            for (queries, &limits) |Q, *l| l.* = .{
+                .count = .init(if (@hasDecl(Q, "lru")) Q.lru else std.math.maxInt(usize)),
+                .bytes = .init(if (@hasDecl(Q, "lru_bytes")) Q.lru_bytes else std.math.maxInt(usize)),
+            };
+            break :blk limits;
+        };
 
         const Tables = @Tuple(&table_types);
         const table_types = blk: {
@@ -387,6 +403,26 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return db.sweep_wanted.load(.monotonic);
         }
 
+        /// 修改声明了 `lru` 与 `lru_bytes` 的 query 的容量：保留值的 memo 个数与字节数，null 为声明的默认值，
+        /// 0 为不限。超出新容量的部分在下一次清扫时淘汰
+        pub fn setLru(db: *Db, comptime Q: type, count: ?usize, bytes: ?usize) void {
+            if (comptime !@hasDecl(Q, "lru") or !@hasDecl(Q, "lru_bytes")) @compileError(@typeName(Q) ++ " does not declare lru and lru_bytes");
+            const limit = &db.lru_limits[comptime queryIndex(Q)];
+            limit.count.store(lruValue(count, Q.lru), .monotonic);
+            limit.bytes.store(lruValue(bytes, Q.lru_bytes), .monotonic);
+            db.sweep_wanted.store(true, .monotonic);
+        }
+
+        fn lruValue(configured: ?usize, default: usize) usize {
+            const v = configured orelse return default;
+            return if (v == 0) std.math.maxInt(usize) else v;
+        }
+
+        fn overLru(db: *Db, comptime Q: type, table: *const Table(Q)) bool {
+            const limit = &db.lru_limits[comptime queryIndex(Q)];
+            return table.live > limit.count.load(.monotonic) or table.live_bytes > limit.bytes.load(.monotonic);
+        }
+
         /// 淘汰超出 `lru` 容量的 memo 值。只在没有读事务时进行：读写锁写者优先，排队等待的
         /// 清扫会挡住之后的所有读事务，直到最慢的那个读事务结束。拿不到锁时返回 false，
         /// 留到下一次写事务或下一次清扫
@@ -406,16 +442,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             inline for (queries, 0..) |Q, qi| {
                 if (comptime Q.kind == .derived and @hasDecl(Q, "lru")) {
                     const table = &db.tables[qi];
-                    const over_bytes = if (@hasDecl(Q, "lru_bytes")) table.live_bytes > Q.lru_bytes else false;
-                    if (table.live > Q.lru or over_bytes) evictTable(Q, table, db.gpa);
+                    if (db.overLru(Q, table)) {
+                        const limit = &db.lru_limits[qi];
+                        evictTable(Q, table, db.gpa, limit.count.load(.monotonic), limit.bytes.load(.monotonic));
+                    }
                 }
             }
         }
 
         /// 按最近使用时间从旧到新淘汰，直到个数与字节数都降到上限的 3/4（留出余量，避免频繁清扫）
-        fn evictTable(comptime Q: type, table: *Table(Q), gpa: Allocator) void {
-            const target_count = Q.lru * 3 / 4;
-            const target_bytes: usize = if (@hasDecl(Q, "lru_bytes")) Q.lru_bytes * 3 / 4 else std.math.maxInt(usize);
+        fn evictTable(comptime Q: type, table: *Table(Q), gpa: Allocator, count: usize, bytes: usize) void {
+            const target_count = threeQuarters(count);
+            const target_bytes = threeQuarters(bytes);
             const Entry = struct { tick: u64, slot: u32 };
             // 内存不足时退而淘汰全部
             const entries = gpa.alloc(Entry, table.live) catch {
@@ -437,6 +475,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (table.live <= target_count and table.live_bytes <= target_bytes) break;
                 evictMemo(Q, table, &table.slots.items[e.slot].memo.?, gpa);
             }
+        }
+
+        /// ⌊n × 3/4⌋，n 为最大值（不限）时不溢出
+        fn threeQuarters(n: usize) usize {
+            return n / 4 * 3 + n % 4 * 3 / 4;
         }
 
         fn evictMemo(comptime Q: type, table: *Table(Q), m: *Table(Q).Memo, gpa: Allocator) void {
@@ -1096,8 +1139,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (@hasDecl(Q, "lru")) table.live += 1;
                     if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                 }
-                if (@hasDecl(Q, "lru") and table.live > Q.lru) db.sweep_wanted.store(true, .monotonic);
-                if (@hasDecl(Q, "lru_bytes") and table.live_bytes > Q.lru_bytes) db.sweep_wanted.store(true, .monotonic);
+                if (@hasDecl(Q, "lru") and db.overLru(Q, table)) db.sweep_wanted.store(true, .monotonic);
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,

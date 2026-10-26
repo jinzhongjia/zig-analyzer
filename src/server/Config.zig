@@ -12,6 +12,7 @@
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
+//!       "cache": { "capacity": 64, "queries": { "Infer": { "count": 16384, "mb": 48 } } },
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
 //!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
 //!       "files": { "watcher": "auto" },
@@ -31,6 +32,7 @@ const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
 const ImportOptions = @import("../ide_db/organize_imports.zig").Options;
+const syntax_queries = @import("../syntax/queries.zig");
 
 const Config = @This();
 
@@ -81,6 +83,10 @@ completion_max_auto_imports: u32 = 128,
 callsite_seeding: bool = true,
 /// InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导）；0 为不回收
 max_intern_pool_mb: u32 = 64,
+/// 保留的语法树个数（`ParseFile` 与 `FileAstIdMap`，被淘汰的按需重新解析）；0 为不限
+cache_capacity: u32 = syntax_queries.parse_lru,
+/// 按 query 设置的缓存容量，优先于 `cache_capacity`
+cache_queries: CacheQueries = .{},
 /// workspace symbol 是否也列出依赖库（获取的依赖包、生成文件、打开的标准库文件）中的符号
 workspace_symbol_dependencies: bool = false,
 /// workspace symbol 至多返回的符号数（保留匹配最好的）；0 为不限。随输入重新查询的客户端不需要一次拿到全部，
@@ -124,6 +130,23 @@ pub const SemanticTokensMode = enum {
     full,
     /// 只发需要名字解析与类型推导才能确定分类的 token；关键字、注释、字面量、运算符、标签与内建名留给编辑器的语法高亮
     partial,
+};
+
+/// 一个 query 的缓存容量：保留的值的个数与 MB 数，null 为默认值，0 为不限。超出时淘汰最久未使用的值，之后按需重算，
+/// 结果不变
+pub const CacheLimit = struct {
+    count: ?u32 = null,
+    mb: ?u32 = null,
+};
+
+/// 可以设置缓存容量的 query，字段名即 query 名
+pub const CacheQueries = struct {
+    ParseFile: CacheLimit = .{},
+    FileAstIdMap: CacheLimit = .{},
+    FileItemTree: CacheLimit = .{},
+    ItemBody: CacheLimit = .{},
+    Infer: CacheLimit = .{},
+    Exports: CacheLimit = .{},
 };
 
 /// 命名检查的规则，与诊断的 code `naming.<规则>` 一一对应
@@ -172,6 +195,8 @@ const settings = [_]Setting{
     .{ .section = "completion", .key = "max_auto_imports", .field = "completion_max_auto_imports" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
+    .{ .section = "cache", .key = "capacity", .field = "cache_capacity" },
+    .{ .section = "cache", .key = "queries", .field = "cache_queries" },
     .{ .section = "workspace_symbol", .key = "dependencies", .field = "workspace_symbol_dependencies" },
     .{ .section = "workspace_symbol", .key = "limit", .field = "workspace_symbol_limit" },
     .{ .section = "naming", .key = "enable", .field = "naming_enable" },
@@ -460,6 +485,23 @@ test "parse: nested fields, optional wrapper" {
     defer partial.deinit(testing.allocator);
     try testing.expect(partial.semantic_tokens_mode == .partial and partial.semantic_tokens_global_var);
     try testing.expectEqual(0, partial.warnings.len);
+
+    try testing.expect(empty.cache_capacity == 64 and empty.cache_queries.Infer.count == null and empty.cache_queries.Infer.mb == null);
+    var cache = try parseText(
+        \\{"cache": {"capacity": 0, "queries": {"Infer": {"count": 32768, "mb": 96}, "ParseFile": {"mb": 0}}}}
+    );
+    defer cache.deinit(testing.allocator);
+    try testing.expectEqual(0, cache.cache_capacity);
+    try testing.expect(cache.cache_queries.Infer.count.? == 32768 and cache.cache_queries.Infer.mb.? == 96);
+    try testing.expect(cache.cache_queries.ParseFile.count == null and cache.cache_queries.ParseFile.mb.? == 0 and cache.cache_queries.ItemBody.count == null);
+    try testing.expectEqual(0, cache.warnings.len);
+    // 不能设置容量的 query：整项取默认值并警告
+    var unknown_query = try parseText(
+        \\{"cache": {"queries": {"Infer": {"count": 1}, "LocalValue": {"count": 1}}}}
+    );
+    defer unknown_query.deinit(testing.allocator);
+    try testing.expect(unknown_query.cache_queries.Infer.count == null);
+    try testing.expectEqual(1, unknown_query.warnings.len);
 }
 
 test "parse: unknown and invalid settings are reported, the rest still applies" {
