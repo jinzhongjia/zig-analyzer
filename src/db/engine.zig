@@ -71,12 +71,19 @@ pub const Durability = enum(u2) {
 
 pub const Error = error{ Canceled, OutOfMemory };
 
-/// 一个读事务中嵌套计算可占用的原生栈。超过后有 `cycleFallback` 的 query 不再深入：返回回退值，
+/// 一个读事务中嵌套计算默认可占用的原生栈。超过后有 `cycleFallback` 的 query 不再深入：返回回退值，
 /// 当前栈上的 query 都不写入 memo（结果取决于求值时的栈深度，不能缓存）。上限须明显小于最小的
-/// 线程栈（Linux 主线程 8 MB），为两次检查之间的栈占用留出余量
+/// 线程栈（Linux 主线程 8 MB），为两次检查之间的栈占用留出余量。栈更大的线程见 `Db.stack_budget`
 pub const max_stack_bytes = 4 * 1024 * 1024;
 
-/// 一个读事务中「先从栈底计算中断处」的次数上限（见 `Ctx.get`），使无限递归也能结束
+/// 读事务可占用的原生栈：`main` 以外的线程（服务器的工作线程，栈的大小由设置方保证）可占用 `worker_bytes`，
+/// `main` 线程与没有设置 `main` 时的所有线程为 `max_stack_bytes`
+pub const StackBudget = struct {
+    main: ?std.Thread.Id = null,
+    worker_bytes: usize = max_stack_bytes,
+};
+
+/// 一次顶层读取中「先从栈底计算中断处」的次数上限（见 `Ctx.get`），使无限递归也能结束
 pub const max_deepening = 16;
 
 /// 依赖边：(query 序号, key 驻留后的下标)
@@ -205,6 +212,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         access_tick: std.atomic.Value(u64) = .init(0),
         /// 有声明了 `lru` 的 query 超出容量，等待 `sweep`
         sweep_wanted: std.atomic.Value(bool) = .init(false),
+        /// 读事务可占用的原生栈；在开始读事务之前设置
+        stack_budget: StackBudget = .{},
 
         const Tables = @Tuple(&table_types);
         const table_types = blk: {
@@ -562,7 +571,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         pub fn beginRead(db: *Db, gpa: Allocator) Ctx {
             db.rw.lockSharedUncancelable(db.io);
             _ = db.active_readers.fetchAdd(1, .acq_rel);
-            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress() };
+            const main = db.stack_budget.main orelse std.Thread.getCurrentId();
+            const budget = if (std.Thread.getCurrentId() == main) max_stack_bytes else db.stack_budget.worker_bytes;
+            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget };
         }
 
         pub const Ctx = struct {
@@ -575,12 +586,19 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             stack: std.ArrayList(Frame) = .empty,
             /// 读事务开始处的栈位置（栈向低地址增长）
             stack_base: usize,
+            /// 嵌套计算可占用的原生栈（字节）
+            stack_budget: usize,
             /// 本次顶层读取中第一次因栈深度上限中断的 query
             frontier: ?DepKey = null,
-            /// 已经从栈底计算过的中断处个数
+            /// 本次顶层读取已经从栈底计算过的中断处个数
             deepening: u32 = 0,
             /// 在当前栈上无法验证的 memo，按 key 去重
             unverifiable: std.ArrayList(Unverifiable) = .empty,
+            /// 栈上下标不小于 `linear_frames` 的帧的 key，按栈的顺序（第 i 项是下标 `linear_frames + i` 的帧）。
+            /// 判断 query 是否在栈上时，栈底的帧线性查找，其余的查这里：栈很深时逐帧比较使计算的代价随深度按平方增长
+            deep_frames: std.array_hash_map.Auto(DepKey, void) = .empty,
+
+            const linear_frames = 64;
 
             /// memo 的依赖经由环回到了栈上下标为 `depth` 的 query（验证时遇到它，或重算时在环中）。
             /// 这个 query 出栈前，memo 视为无法验证：读取时直接重算（结果在环中时不写入 memo），验证其他 memo 时
@@ -608,9 +626,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             };
 
             pub fn end(ctx: *Ctx) void {
-                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0);
+                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0);
                 ctx.stack.deinit(ctx.gpa);
                 ctx.unverifiable.deinit(ctx.gpa);
+                ctx.deep_frames.deinit(ctx.gpa);
                 _ = ctx.db.active_readers.fetchSub(1, .acq_rel);
                 ctx.db.rw.unlockShared(ctx.db.io);
                 ctx.* = undefined;
@@ -622,11 +641,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 return if (ctx.stack_base > here) ctx.stack_base - here else 0;
             }
 
-            /// 本读事务的嵌套计算占用的原生栈超过 `max_stack_bytes`。递归的 compute 应在深入前检查，
+            /// 本读事务的嵌套计算占用的原生栈超过 `stack_budget`。递归的 compute 应在深入前检查，
             /// 超过时以未知结果返回并调用 `markIncomplete`
             pub fn stackExhausted(ctx: *const Ctx) bool {
                 const here = @frameAddress();
-                return ctx.stack_base > here and ctx.stack_base - here > max_stack_bytes;
+                return ctx.stack_base > here and ctx.stack_base - here > ctx.stack_budget;
             }
 
             /// 当前结果不完整：栈上的 query 都不写入 memo
@@ -662,14 +681,21 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// 返回值在本读事务结束前有效。
             ///
             /// 顶层读取（不在其他 query 的计算中）的嵌套计算因栈深度上限中断时，先从栈底计算
-            /// 中断处的 query（结果完整时写入 memo），再重新计算，直到结果完整或没有进展。
-            /// 很深的依赖链因此分段计算，总代价与链长成正比，结果也是完整的
+            /// 中断处的 query（结果完整时写入 memo），再重新计算，直到结果完整、没有进展或已经计算过
+            /// `max_deepening` 个中断处。很深的依赖链因此分段计算，总代价与链长成正比，结果也是完整的
             pub fn get(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
                 if (Q.kind == .input or ctx.stack.items.len != 0) return ctx.getInner(Q, key);
                 // panic 时写出正在计算的 query
                 var entry: panic_context.Entry = .{ .data = ctx, .write = writeStack };
                 panic_context.push(&entry);
                 defer panic_context.pop(&entry);
+                ctx.deepening = 0;
+                return ctx.getDeepening(Q, key);
+            }
+
+            /// 顶层读取的分段计算。从栈底计算中断处时嵌套调用它，与外层共用中断处的计数：
+            /// 无限递归的每一段都不完整，计数使嵌套的层数有上限
+            fn getDeepening(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
                 while (true) {
                     ctx.frontier = null;
                     const v = try ctx.getInner(Q, key);
@@ -707,7 +733,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                         db.mutex.lockUncancelable(db.io);
                         const key = db.tables[qi].keys.keys()[dep.index];
                         db.mutex.unlock(db.io);
-                        _ = try ctx.get(Q, key);
+                        _ = try ctx.getDeepening(Q, key);
                         return ctx.verifiedMemo(Q, dep.index) != null;
                     }
                 }
@@ -730,9 +756,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const fresh = switch (Q.kind) {
                     .input => db.readInput(Q, index),
                     .derived => blk: {
-                        for (ctx.stack.items, 0..) |frame, i| {
-                            if (frame.key.eql(dep)) return ctx.onCycle(Q, @intCast(i), key);
-                        }
+                        if (ctx.stackIndex(dep)) |i| return ctx.onCycle(Q, i, key);
                         if (@hasDecl(Q, "cycleFallback") and ctx.stackExhausted()) {
                             // 本 revision 已验证的结果可以直接使用，不会再深入
                             if (ctx.verifiedMemo(Q, index)) |fresh| break :blk fresh;
@@ -882,10 +906,29 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 try ctx.unverifiable.append(ctx.gpa, .{ .key = dep, .depth = depth });
             }
 
+            /// `dep` 在栈上时它的下标（每个 query 在栈上至多出现一次）
+            fn stackIndex(ctx: *const Ctx, dep: DepKey) ?u32 {
+                const frames = ctx.stack.items;
+                for (frames[0..@min(frames.len, linear_frames)], 0..) |frame, i| {
+                    if (frame.key.eql(dep)) return @intCast(i);
+                }
+                if (frames.len <= linear_frames) return null;
+                const i = ctx.deep_frames.getIndex(dep) orelse return null;
+                return @intCast(linear_frames + i);
+            }
+
+            fn pushFrame(ctx: *Ctx, key: DepKey) Allocator.Error!void {
+                const index: u32 = @intCast(ctx.stack.items.len);
+                if (index >= linear_frames) try ctx.deep_frames.ensureUnusedCapacity(ctx.gpa, 1);
+                try ctx.stack.append(ctx.gpa, .{ .key = key });
+                if (index >= linear_frames) ctx.deep_frames.putAssumeCapacityNoClobber(key, {});
+            }
+
             /// 弹出栈顶帧：依赖经由环回到这一帧的 memo 不再无法验证
             fn popFrame(ctx: *Ctx) Frame {
                 const frame = ctx.stack.pop().?;
                 const depth = ctx.stack.items.len;
+                if (depth >= linear_frames) assert(ctx.deep_frames.pop().?.key.eql(frame.key));
                 var i: usize = 0;
                 while (i < ctx.unverifiable.items.len) {
                     if (ctx.unverifiable.items[i].depth >= depth) {
@@ -940,10 +983,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                             db.mutex.lockUncancelable(db.io);
                             const key = db.tables[qi].keys.keys()[dep.index];
                             db.mutex.unlock(db.io);
-                            for (ctx.stack.items, 0..) |frame, i| {
-                                // 验证路径上回到了栈上的 query：它出栈前无法验证，强制上层重算
-                                if (frame.key.eql(dep)) return .{ .changed_at = db.revision, .durability = .low, .cycle = @intCast(i) };
-                            }
+                            // 验证路径上回到了栈上的 query：它出栈前无法验证，强制上层重算
+                            if (ctx.stackIndex(dep)) |i| return .{ .changed_at = db.revision, .durability = .low, .cycle = i };
                             // 栈深度超过上限：同样视为已变化，由重算处理（重算时以回退值代替）
                             if (ctx.stackExhausted()) return .{ .changed_at = db.revision, .durability = .low };
                             const fresh = try ctx.ensureFresh(Q, dep.index, key, false);
@@ -967,7 +1008,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     t.events.append(t.gpa, .{ .query = qi, .key = index, .depth = @intCast(ctx.stack.items.len) }) catch break :blk null;
                     break :blk t.events.items.len - 1;
                 } else null;
-                try ctx.stack.append(ctx.gpa, .{ .key = .{ .query = qi, .index = index } });
+                try ctx.pushFrame(.{ .query = qi, .index = index });
                 const computed = if (@hasDecl(Q, "computeIncremental")) blk: {
                     // 上一次的值在下一次写事务前不会被释放，可安全地作为增量计算的基础
                     db.mutex.lockUncancelable(db.io);

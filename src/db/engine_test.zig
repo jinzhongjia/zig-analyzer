@@ -232,6 +232,23 @@ const Layer = struct {
 };
 var layer_max_deps: usize = 0;
 
+/// 链接环：Lasso(k) = Label(k) ∪ 下一个。k > 10 时下一个是 k - 1，环 10 → 9 → … → 0 → 10
+const Lasso = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = u32;
+    pub const fixpoint = true;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return try ctx.get(Label, key) | try ctx.get(Lasso, if (key == 0) 10 else key - 1);
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return 0;
+    }
+    pub fn depthFallback(_: Key) Value {
+        return std.math.maxInt(Value);
+    }
+};
+
 /// 读到 Number 后一直等待，直到被取消
 const Spin = struct {
     pub const kind: db.Kind = .derived;
@@ -308,7 +325,7 @@ const CachedLen = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Spin, Swallow, Cached, Sized, CachedLen });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -762,6 +779,49 @@ test "stack limit: unwinding an incomplete deep recursion does not collect depen
     // 远超栈上限的链
     try testing.expectEqual(std.math.maxInt(u32), try read(&d, Layer, .{ .k = 100_000 }));
     try testing.expectEqual(2, layer_max_deps);
+}
+
+test "stack limit: each top-level read in a transaction gets its own deepenings" {
+    // 防止同一读事务中前面的读取用完分段计算的次数，后面需要分段的读取被截断
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expect(try ctx.get(Depth, 2_000_000) < 0);
+    try testing.expectEqual(5000, try ctx.get(Depth, 5000));
+}
+
+test "stack limit: threads other than the configured main thread use the worker budget" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    d.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = 48 * 1024 * 1024 };
+    // 主线程按默认上限分段，算不完；栈更大的线程能算完
+    try testing.expect(try read(&d, Depth, 100_000) < 0);
+    const Worker = struct {
+        fn run(dd: *Db, out: *?db.Error!i64) void {
+            out.* = read(dd, Depth, 100_000);
+        }
+    };
+    var result: ?db.Error!i64 = null;
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, Worker.run, .{ &d, &result });
+    thread.join();
+    try testing.expectEqual(100_000, try result.?);
+}
+
+test "cycles entered deep in the stack are detected at the right frame" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    {
+        d.beginWrite();
+        defer d.endWrite();
+        for (0..201) |k| try d.set(Label, @intCast(k), @as(u32, 1) << @intCast(k % 32), .low);
+    }
+    // 环的入口 10 在栈上第 190 帧
+    try testing.expectEqual(0xffff_ffff, try read(&d, Lasso, 200));
+    // 入口之上的帧不在环中，写入了 memo
+    const before = executions(&d, Lasso);
+    try testing.expectEqual(0xfff, try read(&d, Lasso, 11));
+    try testing.expectEqual(before, executions(&d, Lasso));
 }
 
 test "cancellation: reads return Canceled when pending_write is set" {

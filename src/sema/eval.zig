@@ -36,8 +36,6 @@ pub const default_branch_quota = 1000;
 const max_tracked_decls = 64;
 /// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃
 const max_eval_bytes = 64 * 1024 * 1024;
-/// `scalarCall` 在本解释器内执行调用的原生栈用量上限
-const max_inline_stack_bytes = engine.max_stack_bytes / 2;
 /// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
 const max_layout_depth = 64;
 /// 驻留时值的嵌套深度上限（聚合与指针的层数）。驻留的值按内容唯一表示、没有环，
@@ -1492,7 +1490,7 @@ const Evaluator = struct {
         // 跟踪来源时在本次求值中展开：经 query 调用的结果是驻留的值，字面量的来源会丢失
         if (!local and ev.track == null) {
             // 原生栈用去一半之后经 query 调用：很深的递归由查询引擎在栈将尽处中断、从中断处分段计算
-            if (scalar and ev.r.ctx.stackUsed() < max_inline_stack_bytes) return ev.scalarCall(.{ .file = fv.file, .item = fv.decl }, inst, args);
+            if (scalar and ev.r.ctx.stackUsed() < ev.r.ctx.stack_budget / 2) return ev.scalarCall(.{ .file = fv.file, .item = fv.decl }, inst, args);
             for (args, tvs) |a, *tv| if (a.v == .int) {
                 tv.val = try ev.freeze(a);
             };
