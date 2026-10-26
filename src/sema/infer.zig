@@ -2391,25 +2391,9 @@ const Inferrer = struct {
             want.?;
         const ns: ?Namespace = if (t != .unknown and ip.key(t) == .container_type) try queries.namespaceOfType(inf.r, t) else null;
         for (fields, 0..) |f, fi_index| {
-            var field_ty: ?Index = switch (ip.key(t)) {
-                .array_type => |a| a.child,
-                .abstract_array_type => |a| a.child,
-                .vector_type => |v| v.child,
-                .tuple_type => |tt| if (f.name == null and fi_index < tt.types.len) tt.types[fi_index] else null,
-                else => null,
-            };
-            if (f.name) |name| if (ns) |n| {
-                const tree = try inf.r.itemTree(n.file);
-                if (fieldItem(tree, n.container, name)) |fi| {
-                    field_ty = (try queries.defType(inf.r, .{ .item = .{ .file = n.file, .item = fi } }, null, queries.instOfType(ip, t))).ty;
-                    if (inf.current_init) |init_e| try inf.field_refs.append(inf.scratch, .{ .init = init_e, .index = @intCast(fi_index), .member = .{ .file = n.file, .item = tree.items[fi].ast_id } });
-                }
-            } else switch (ip.key(t)) {
-                // 构造的类型、元组与匿名结构体的字段
-                .reified_type, .tuple_type, .anon_struct_type => field_ty = try eval.fieldType(inf.r, t, name),
-                else => {},
-            };
-            _ = try inf.infer(f.value, if (field_ty) |x| (if (x != .unknown) x else null) else null);
+            const field = try initField(inf.r, t, ns, fi_index, f.name);
+            if (field.member) |m| if (inf.current_init) |init_e| try inf.field_refs.append(inf.scratch, .{ .init = init_e, .index = @intCast(fi_index), .member = m });
+            _ = try inf.infer(f.value, if (field.ty) |x| (if (x != .unknown) x else null) else null);
         }
         return .{ .ty = t };
     }
@@ -3426,6 +3410,34 @@ pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const Type
 fn hasName(names: []const []const u8, name: []const u8) bool {
     for (names) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
+}
+
+/// 初始化表达式中一项的结果类型与字段名解析到的字段
+pub const InitField = struct { ty: ?Index = null, member: ?hir.OwnerKey = null };
+
+/// 类型为 `t` 的初始化表达式中第 `index` 项（`name` 为字段名，元组形式为 null）的结果类型与字段；`ns` 为
+/// `t` 的命名空间（`t` 不是容器类型时为 null）
+pub fn initField(r: *Resolver, t: Index, ns: ?Namespace, index: usize, name: ?[]const u8) Error!InitField {
+    const ip = r.ctx.db.env.ip;
+    var field: InitField = .{ .ty = switch (ip.key(t)) {
+        .array_type => |a| a.child,
+        .abstract_array_type => |a| a.child,
+        .vector_type => |v| v.child,
+        .tuple_type => |tt| if (name == null and index < tt.types.len) tt.types[index] else null,
+        else => null,
+    } };
+    if (name) |n| if (ns) |space| {
+        const tree = try r.itemTree(space.file);
+        if (fieldItem(tree, space.container, n)) |fi| {
+            field.ty = (try queries.defType(r, .{ .item = .{ .file = space.file, .item = fi } }, null, queries.instOfType(ip, t))).ty;
+            field.member = .{ .file = space.file, .item = tree.items[fi].ast_id };
+        }
+    } else switch (ip.key(t)) {
+        // 构造的类型、元组与匿名结构体的字段
+        .reified_type, .tuple_type, .anon_struct_type => field.ty = try eval.fieldType(r, t, n),
+        else => {},
+    };
+    return field;
 }
 
 /// 容器中的字段（按名字）
