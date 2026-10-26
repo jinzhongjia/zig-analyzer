@@ -1693,7 +1693,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         server.config.inlay_anonymous_containers != new.inlay_anonymous_containers or
         server.config.inlay_parameters != new.inlay_parameters or server.config.inlay_builtin_parameters != new.inlay_builtin_parameters or
         server.config.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
-        server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.callsite_seeding != new.callsite_seeding;
+        server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.inlay_max_length != new.inlay_max_length or
+        server.config.callsite_seeding != new.callsite_seeding;
     const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
     const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
     server.applyLogging(&new, log_file_changed);
@@ -3931,6 +3932,7 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
             .builtin_parameters = c.inlay_builtin_parameters,
             .exclude_single_argument = c.inlay_exclude_single_argument,
             .hide_redundant_param_names = c.hide_redundant_param_names,
+            .max_length = c.inlay_max_length,
         };
     };
     const hints = try ide.inlay_hints.inlayHints(r, file, start, end, opts);

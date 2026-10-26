@@ -7,7 +7,8 @@
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": false, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
-//!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true },
+//!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true,
+//!                        "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
@@ -67,6 +68,8 @@ inlay_builtin_parameters: bool = true,
 inlay_exclude_single_argument: bool = true,
 /// 实参去掉 `&`、`.*`、`.?`、`try` 后与形参同名（或是以形参名结尾的字段访问）时不显示形参名
 hide_redundant_param_names: bool = true,
+/// inlay hints：类型提示的字符数上限，超出时列表（字段、实参等）的其余项显示为 `…`；0 为不限
+inlay_max_length: u32 = 25,
 /// 语义着色发出哪些 token
 semantic_tokens_mode: SemanticTokensMode = .full,
 /// 语义着色：容器级 `var` 的声明与引用带 `global` modifier
@@ -187,6 +190,7 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "builtin_parameters", .field = "inlay_builtin_parameters" },
     .{ .section = "inlay_hints", .key = "exclude_single_argument", .field = "inlay_exclude_single_argument" },
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
+    .{ .section = "inlay_hints", .key = "max_length", .field = "inlay_max_length" },
     .{ .section = "semantic_tokens", .key = "mode", .field = "semantic_tokens_mode" },
     .{ .section = "semantic_tokens", .key = "global_var", .field = "semantic_tokens_global_var" },
     .{ .section = "imports", .key = "derived", .field = "imports_derived" },

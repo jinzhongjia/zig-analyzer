@@ -35,6 +35,8 @@ pub const Options = struct {
     exclude_single_argument: bool = true,
     /// 实参去掉 `&`、`.*`、`.?`、`try` 后是同名的变量（或以形参名结尾的字段访问）时不提示形参名
     hide_redundant_param_names: bool = true,
+    /// 类型提示的字符数上限：超出时列表（字段、实参等）的其余项显示为 `…`，可能超出一项；0 为不限
+    max_length: u32 = 25,
 };
 
 /// `[start, end)` 范围内的提示
@@ -132,7 +134,7 @@ fn fieldTypeHints(r: *Resolver, a: context.At, e: Body.ExprId, init: @FieldType(
 
 /// 类型提示的文字；类型中有按内容显示的匿名容器而 `anonymous_containers` 关闭时为 null
 fn typeLabel(r: *Resolver, t: InternPool.Index, opts: Options) resolve.Error!?[]const u8 {
-    const shown = try render.typeAllocNoting(r, t);
+    const shown = try render.typeAllocNoting(r, t, if (opts.max_length == 0) null else opts.max_length);
     if (shown.anonymous and !opts.anonymous_containers) return null;
     return try std.fmt.allocPrint(r.arena, ": {s}", .{shown.text});
 }

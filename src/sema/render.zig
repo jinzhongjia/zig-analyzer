@@ -20,15 +20,19 @@ const ContainerNames = struct {
     /// 显示过按内容显示的匿名容器时置为 true
     anonymous: ?*bool = null,
 
-    /// 列出全部内容：hover、补全详情与 `@typeName`。否则（inlay hints 等）元组、匿名结构体与按内容显示的容器至多列出
-    /// `InternPool.max_printed_elems` 个字段，聚合值至多 16 个元素，字符串至多 64 字节
+    /// 列出全部内容：hover、`@typeName` 与值的显示。否则（inlay hints、补全详情等）其中再有的匿名容器显示为 `struct {...}`
     full: bool = false,
+    /// 输出的字符数上限（inlay hints 的 `max_length`），null 为不限。见 `InternPool.truncateList`；输出须写入
+    /// `Io.Writer.Allocating`，已写的内容都在缓冲区中
+    max_length: ?usize = null,
 
     const Outer = struct { c: InternPool.Container, parent: ?*const Outer };
 
-    /// 是否列出全部内容（`InternPool.print` 读取）
-    pub fn fullText(n: ContainerNames) bool {
-        return n.full;
+    /// 输出还能写的字符数（`InternPool.print` 读取），null 为不限
+    pub fn remaining(n: ContainerNames, w: *Io.Writer) ?usize {
+        const max = n.max_length orelse return null;
+        const written = w.buffered();
+        return max -| (std.unicode.utf8CountCodepoints(written) catch written.len);
     }
 
     pub fn write(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
@@ -54,19 +58,16 @@ const ContainerNames = struct {
             while (o) |up| : (o = up.parent) if (up.c.file == c.file and up.c.ast_id == c.ast_id) return w.writeAll(" {...}");
         } else if (n.outer != null) return w.writeAll(" {...}");
         const here: Outer = .{ .c = c, .parent = n.outer };
-        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full };
+        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full, .max_length = n.max_length };
         const ip = n.r.ctx.db.env.ip;
         try w.writeAll(" {");
         var count: usize = 0;
         for (tree.containerMembers(@intCast(ci))) |m| {
             const it = tree.items[m];
             if (it.kind != .field) continue;
-            if (!n.full and count == InternPool.max_printed_elems) {
-                try w.writeAll(", ...");
-                break;
-            }
             try w.writeAll(if (count == 0) " " else ", ");
             count += 1;
+            if (try InternPool.truncateList(n, w)) break;
             // 元组字段没有名字
             if (it.name) |field| try w.print("{f}", .{std.zig.fmtId(field)});
             if (c.kind == .@"enum") continue;
@@ -152,6 +153,7 @@ const ContainerNames = struct {
             if (arg == .runtime) continue;
             if (!first) try w.writeAll(", ");
             first = false;
+            if (try InternPool.truncateList(n, w)) break;
             if (arg == .unknown) try w.writeAll("_") else try ip.print(arg, w, n);
         }
         try w.writeAll(")");
@@ -210,14 +212,15 @@ pub fn writeFull(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
 }
 
 pub fn typeAlloc(r: *Resolver, t: Index) error{OutOfMemory}![]const u8 {
-    return (try typeAllocNoting(r, t)).text;
+    return (try typeAllocNoting(r, t, null)).text;
 }
 
-/// 同 `typeAlloc`，并说明其中是否有按内容显示的匿名容器
-pub fn typeAllocNoting(r: *Resolver, t: Index) error{OutOfMemory}!struct { text: []const u8, anonymous: bool } {
+/// 同 `typeAlloc`，输出至多约 `max_length` 个字符（见 `ContainerNames.max_length`），并说明其中是否有按内容显示的
+/// 匿名容器
+pub fn typeAllocNoting(r: *Resolver, t: Index, max_length: ?usize) error{OutOfMemory}!struct { text: []const u8, anonymous: bool } {
     var out: Io.Writer.Allocating = .init(r.arena);
     var anonymous = false;
-    r.ctx.db.env.ip.print(t, &out.writer, ContainerNames{ .r = r, .anonymous = &anonymous }) catch return error.OutOfMemory;
+    r.ctx.db.env.ip.print(t, &out.writer, ContainerNames{ .r = r, .anonymous = &anonymous, .max_length = max_length }) catch return error.OutOfMemory;
     return .{ .text = out.written(), .anonymous = anonymous };
 }
 

@@ -1927,9 +1927,11 @@ test "hover shows tuples whose fields are all comptime by value and does not tru
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    // inlay hints 仍至多列出 16 个字段
+    // inlay hints 的类型至多约 `max_length` 个字符（默认 25）：写下一个字段之前已经写满时，其余的显示为 `…`；0 为不限
     const hinted = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false });
-    try testing.expect(std.mem.indexOf(u8, hinted, "const many: struct { u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, ... } =") != null);
+    try testing.expect(std.mem.indexOf(u8, hinted, "const many: struct { u8, u8, u8, u8, … } =") != null);
+    const unlimited = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false, .max_length = 0 });
+    try testing.expect(std.mem.indexOf(u8, unlimited, "const many: struct { u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8 } =") != null);
 
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
