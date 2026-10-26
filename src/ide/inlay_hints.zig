@@ -1,11 +1,15 @@
-//! inlay hints：没有类型标注的局部变量的类型；调用处的参数名。
+//! inlay hints：没有类型标注的局部变量的类型；初始化表达式中字段的类型；调用处（含内置函数）的参数名。
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const context = @import("context.zig");
+const builtins = @import("builtins.zig");
 const seed = @import("../ide_db/seed.zig");
 const render = @import("../sema/render.zig");
+const infer = @import("../sema/infer.zig");
+const queries = @import("../sema/queries.zig");
+const InternPool = @import("../sema/InternPool.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
@@ -20,8 +24,14 @@ pub const Hint = struct {
 /// 配置 `inlay_hints.*`
 pub const Options = struct {
     types: bool = true,
+    /// 初始化表达式中字段名之后的字段类型
+    field_types: bool = true,
     parameters: bool = true,
-    /// 实参是同名的变量（或以形参名结尾的字段访问）时不提示形参名
+    /// 内置函数调用的参数名；`parameters` 关闭时同样不提示
+    builtin_parameters: bool = true,
+    /// 只有一个实参的调用（含内置函数与去掉接收者后只剩一个实参的方法调用）不提示参数名
+    exclude_single_argument: bool = true,
+    /// 实参去掉 `&`、`.*`、`.?`、`try` 后是同名的变量（或以形参名结尾的字段访问）时不提示形参名
     hide_redundant_param_names: bool = true,
 };
 
@@ -62,26 +72,169 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
         const tooltip: ?[]const u8 = if (abstract.ty == .unknown) if (a.seeded) |s| try seedNote(r, s) else null else null;
         try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, tv.ty)}), .kind = .type, .tooltip = tooltip });
     };
+    if (opts.field_types) for (b.exprs, 0..) |e, i| {
+        if (e != .init) continue;
+        try fieldTypeHints(r, a, @fromBackingInt(@as(u32, @intCast(i))), e.init, start, end, out);
+    };
     if (opts.parameters) for (b.exprs, 0..) |e, i| {
-        if (e != .call) continue;
         const range = b.expr_ranges[i];
         if (base + range.end < start or base + range.start > end) continue;
-        const target = try context.callee(r, a, e.call.callee) orelse continue;
-        const params = try context.fnParams(r, target.def);
-        const skip: usize = if (target.bound) 1 else 0;
-        for (e.call.args, 0..) |arg, ai| {
-            if (ai + skip >= params.len) break;
-            const name = (params[ai + skip].name() orelse continue).text;
-            if (std.mem.eql(u8, name, "_")) continue;
-            // 实参就是同名变量时不提示
-            if (opts.hide_redundant_param_names) switch (b.expr(arg)) {
-                .name_ref => |n| if (std.mem.eql(u8, n, name)) continue,
-                .field_access => |fa| if (fa.field) |f| if (std.mem.eql(u8, f, name)) continue,
-                else => {},
-            };
-            try out.append(r.arena, .{ .offset = base + b.range(arg).start, .label = try std.fmt.allocPrint(r.arena, "{s}:", .{name}), .kind = .parameter });
+        switch (e) {
+            .call => |c| {
+                if (opts.exclude_single_argument and c.args.len == 1) continue;
+                const target = try context.callee(r, a, c.callee) orelse continue;
+                const params = try context.fnParams(r, target.def);
+                const skip: usize = if (target.bound) 1 else 0;
+                for (c.args, 0..) |arg, ai| {
+                    if (ai + skip >= params.len) break;
+                    const name = (params[ai + skip].name() orelse continue).text;
+                    try paramHint(r, a, arg, name, opts, out);
+                }
+            },
+            .builtin_call => |c| {
+                if (!opts.builtin_parameters) continue;
+                if (opts.exclude_single_argument and c.args.len == 1) continue;
+                const entry = builtins.get(c.name) orelse continue;
+                if (!showsParamNames(entry)) continue;
+                const n = @min(c.args.len, entry.parameters.len);
+                for (c.args[0..n], entry.parameters[0..n]) |arg, param| try paramHint(r, a, arg, builtinParamName(param), opts, out);
+            },
+            else => {},
         }
     };
+}
+
+/// 初始化表达式中各字段名之后的字段类型。初始化的类型与推导时一致：写出的类型，或结果类型去掉 error union 与
+/// optional（表达式本身记录的类型已转换为结果类型，不能直接用）。没有结果类型的 `.{ ... }`（匿名结构体）不提示：
+/// 它的字段类型就是值的类型
+fn fieldTypeHints(r: *Resolver, a: context.At, e: Body.ExprId, init: @FieldType(Body.Expr, "init"), start: u32, end: u32, out: *std.ArrayList(Hint)) resolve.Error!void {
+    const ip = a.ip;
+    const t: InternPool.Index = if (init.ty) |te| a.exprType(te).asType() orelse return else t: {
+        var want = a.literalExpected(e) orelse return;
+        if (ip.key(want) == .error_union_type) want = ip.key(want).error_union_type.payload;
+        if (ip.key(want) == .optional_type) want = ip.key(want).optional_type;
+        break :t want;
+    };
+    if (t == .unknown) return;
+    const ns = try queries.namespaceOfType(r, t);
+    for (init.fields, 0..) |f, k| {
+        if (f.name == null) continue;
+        const at = a.node.offset + f.name_range.end;
+        if (at < start or at > end) continue;
+        const ty = (try infer.initField(r, t, ns, k, f.name)).ty orelse continue;
+        if (ty == .unknown) continue;
+        try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, ty)}), .kind = .type });
+    }
+}
+
+fn paramHint(r: *Resolver, a: context.At, arg: Body.ExprId, name: []const u8, opts: Options, out: *std.ArrayList(Hint)) resolve.Error!void {
+    if (std.mem.eql(u8, name, "_")) return;
+    if (opts.hide_redundant_param_names and namesParam(a.body, arg, name)) return;
+    try out.append(r.arena, .{ .offset = a.node.offset + a.body.range(arg).start, .label = try std.fmt.allocPrint(r.arena, "{s}:", .{name}), .kind = .parameter });
+}
+
+/// 实参去掉不改变所指的值的外壳（`&x`、`x.*`、`x.?`、`try x`，可多层）后是名为 `name` 的变量，或最后一段为
+/// `name` 的字段访问。其他运算（`a + x`、`-x`、`x orelse y` 等）得到新的值，不算
+fn namesParam(b: *const Body, arg: Body.ExprId, name: []const u8) bool {
+    var e = arg;
+    while (true) switch (b.expr(e)) {
+        .prefix => |p| switch (p.op) {
+            .ampersand, .keyword_try => e = p.operand,
+            else => return false,
+        },
+        .deref, .unwrap_optional => |x| e = x,
+        .name_ref => |n| return std.mem.eql(u8, n, name),
+        .field_access => |fa| return if (fa.field) |f| std.mem.eql(u8, f, name) else false,
+        else => return false,
+    };
+}
+
+/// 内置函数参数的名字：`comptime T: type` 的 `T`、`noalias dest` 的 `dest`
+fn builtinParamName(param: []const u8) []const u8 {
+    var p = param;
+    for ([_][]const u8{ "comptime ", "noalias " }) |prefix| {
+        if (std.mem.startsWith(u8, p, prefix)) p = p[prefix.len..];
+    }
+    return std.mem.trim(u8, p[0 .. std.mem.indexOfScalar(u8, p, ':') orelse p.len], " ");
+}
+
+/// 内置函数是否提示参数名。单参数的都提示（由 `exclude_single_argument` 决定）；没有参数与变参的没有可提示的名字；
+/// 多参数的按 `multi_param_hints`
+fn showsParamNames(entry: *const builtins.Entry) bool {
+    if (entry.variadic) return false;
+    return switch (entry.parameters.len) {
+        0 => false,
+        1 => true,
+        else => multi_param_hints.get(entry.name).?,
+    };
+}
+
+/// 多参数内置函数是否提示参数名。只在参数名能补上实参看不出的信息时提示：同类型的实参顺序不合惯例、容易传反
+/// （`@memcpy`、`@cmpxchgStrong`）；类型构造函数按位置传的配置（`@Struct(.auto, null, ...)` 中的 `null`）；
+/// 参数顺序反常（`@fieldParentPtr`）。必须覆盖所有多参数内置函数，新增的内置函数在这里决定之前编译不过
+const multi_param_hints = std.StaticStringMap(bool).initComptime(.{
+    .{ "@memcpy", true },
+    .{ "@memmove", true },
+    .{ "@cmpxchgStrong", true },
+    .{ "@cmpxchgWeak", true },
+    .{ "@wasmMemoryGrow", true },
+    .{ "@Enum", true },
+    .{ "@Fn", true },
+    .{ "@Pointer", true },
+    .{ "@Struct", true },
+    .{ "@Union", true },
+    .{ "@fieldParentPtr", true },
+    // 顺序与 `a / b`、`a << b` 一致
+    .{ "@divExact", false },
+    .{ "@divFloor", false },
+    .{ "@divTrunc", false },
+    .{ "@divCeil", false },
+    .{ "@mod", false },
+    .{ "@rem", false },
+    .{ "@addWithOverflow", false },
+    .{ "@subWithOverflow", false },
+    .{ "@mulWithOverflow", false },
+    .{ "@shlWithOverflow", false },
+    .{ "@shlExact", false },
+    .{ "@shrExact", false },
+    // 参数名（`a`、`b`）没有信息量
+    .{ "@mulAdd", false },
+    .{ "@select", false },
+    .{ "@shuffle", false },
+    // 各实参的类型不同，看实参就知道是哪个参数
+    .{ "@as", false },
+    .{ "@Int", false },
+    .{ "@Vector", false },
+    .{ "@FieldType", false },
+    .{ "@atomicLoad", false },
+    .{ "@atomicStore", false },
+    .{ "@atomicRmw", false },
+    .{ "@call", false },
+    .{ "@export", false },
+    .{ "@extern", false },
+    .{ "@prefetch", false },
+    .{ "@field", false },
+    .{ "@hasDecl", false },
+    .{ "@hasField", false },
+    .{ "@offsetOf", false },
+    .{ "@bitOffsetOf", false },
+    .{ "@reduce", false },
+    .{ "@unionInit", false },
+    .{ "@cVaArg", false },
+    .{ "@memset", false },
+});
+
+comptime {
+    @setEvalBranchQuota(20000);
+    var multi = 0;
+    for (builtins.entries) |entry| {
+        if (entry.variadic or entry.parameters.len < 2) continue;
+        multi += 1;
+        if (multi_param_hints.get(entry.name) == null)
+            @compileError("inlay hints: decide whether " ++ entry.name ++ " shows parameter names in multi_param_hints");
+    }
+    if (multi != multi_param_hints.keys().len)
+        @compileError("inlay hints: multi_param_hints lists a builtin that is not a multi-parameter builtin");
 }
 
 /// 「inferred from the call at file.zig:123」

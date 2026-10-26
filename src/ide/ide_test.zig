@@ -234,8 +234,8 @@ test "signature help and inlay hints" {
         try out.appendSlice(w.arena.allocator(), h.label);
         try out.append(w.arena.allocator(), ' ');
     }
-    // 局部变量类型；调用处参数名（实参与参数同名时省略）
-    try testing.expectEqualStrings("x: y: : u32 scale: : u32 a: b: ", out.items);
+    // 初始化表达式的字段类型；局部变量类型；调用处参数名（实参与参数同名、只有一个实参的 `p.dist(3)` 省略）
+    try testing.expectEqualStrings(": i32 : i32 : i32 x: y: : u32 : u32 a: b: ", out.items);
 }
 
 test "calls through function fields are not method calls" {
@@ -1791,10 +1791,16 @@ test "inlay hint options" {
         \\fn add(a: u32, b: u32) u32 {
         \\    return a + b;
         \\}
-        \\fn f() void {
+        \\fn one(n: u32) u32 {
+        \\    return n;
+        \\}
+        \\const P = struct { x: u32 };
+        \\fn f(dest: []u8, src: []const u8) void {
         \\    const a: u32 = 1;
         \\    const v = add(a, 2);
-        \\    _ = v;
+        \\    const p: P = .{ .x = one(v) };
+        \\    @memcpy(dest, src);
+        \\    _ = p;
         \\}
         \\
     ;
@@ -1806,11 +1812,14 @@ test "inlay hint options" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { inlay_hints.Options, []const u8 }{
-        // 默认：类型；形参名，与实参同名的 `a` 不提示
-        .{ .{}, ": u32 b:" },
-        .{ .{ .types = false }, "b:" },
-        .{ .{ .parameters = false }, ": u32" },
-        .{ .{ .hide_redundant_param_names = false }, ": u32 a: b:" },
+        // 默认：局部变量与字段的类型；形参名，与实参同名的 `a`、`dest` 与单参数调用 `one(v)` 不提示
+        .{ .{}, ": u32 b: : u32 source:" },
+        .{ .{ .types = false }, "b: : u32 source:" },
+        .{ .{ .field_types = false }, ": u32 b: source:" },
+        .{ .{ .parameters = false }, ": u32 : u32" },
+        .{ .{ .builtin_parameters = false }, ": u32 b: : u32" },
+        .{ .{ .exclude_single_argument = false }, ": u32 b: : u32 n: source:" },
+        .{ .{ .hide_redundant_param_names = false }, ": u32 a: b: : u32 dest: source:" },
     };
     for (cases, 0..) |c, i| {
         const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), c[0]);
@@ -1821,6 +1830,211 @@ test "inlay hint options" {
             return err;
         };
     }
+}
+
+/// 把提示插到源码中对应的位置：参数名提示后带一个空格，与编辑器中显示的一样
+fn inlaid(w: *World, file: FileId, text: []const u8, opts: inlay_hints.Options) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), opts);
+    const a = w.arena.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+    for (hints) |h| {
+        try out.appendSlice(a, text[pos..h.offset]);
+        try out.appendSlice(a, h.label);
+        if (h.kind == .parameter) try out.append(a, ' ');
+        pos = h.offset;
+    }
+    try out.appendSlice(a, text[pos..]);
+    return out.items;
+}
+
+test "inlay hints: field types in initializers that have a result type" {
+    const text =
+        \\const Point = struct { x: i32, y: i32 = 0 };
+        \\const Wrap = struct { p: Point };
+        \\const U = union(enum) { a: u8, b: bool };
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T, len: usize };
+        \\}
+        \\fn take(p: Point) void {
+        \\    _ = p;
+        \\}
+        \\fn f() !?Point {
+        \\    const p = Point{ .x = 1, .y = 2 };
+        \\    take(.{ .x = 3 });
+        \\    const u: U = .{ .b = true };
+        \\    const l: List(u8) = .{ .items = &.{}, .len = 0 };
+        \\    const w: Wrap = .{ .p = .{ .x = 4 } };
+        \\    const anon = .{ .x = 5 };
+        \\    _ = .{ p, u, l, w, anon };
+        \\    return .{ .x = 6, .y = 7 };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    // 字段类型取自初始化表达式的结果类型（写出的类型、形参、标注、外层字段、去掉 error union 与 optional 的返回类型），
+    // 泛型容器取实例中的类型；没有结果类型的匿名初始化不提示
+    try testing.expectEqualStrings(
+        \\const Point = struct { x: i32, y: i32 = 0 };
+        \\const Wrap = struct { p: Point };
+        \\const U = union(enum) { a: u8, b: bool };
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T, len: usize };
+        \\}
+        \\fn take(p: Point) void {
+        \\    _ = p;
+        \\}
+        \\fn f() !?Point {
+        \\    const p = Point{ .x: i32 = 1, .y: i32 = 2 };
+        \\    take(.{ .x: i32 = 3 });
+        \\    const u: U = .{ .b: bool = true };
+        \\    const l: List(u8) = .{ .items: []u8 = &.{}, .len: usize = 0 };
+        \\    const w: Wrap = .{ .p: Point = .{ .x: i32 = 4 } };
+        \\    const anon = .{ .x = 5 };
+        \\    _ = .{ p, u, l, w, anon };
+        \\    return .{ .x: i32 = 6, .y: i32 = 7 };
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .types = false, .parameters = false }));
+}
+
+test "inlay hints: builtin parameter names" {
+    const text =
+        \\fn f(buf: []u8, data: []const u8, ptr: *u32, x: u64) void {
+        \\    @memcpy(buf, data);
+        \\    _ = @cmpxchgStrong(u32, ptr, 1, 2, .seq_cst, .monotonic);
+        \\    _ = @divExact(x, 2);
+        \\    _ = @as(u32, @intCast(x));
+        \\    @panic("unreachable");
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    // 去掉 `comptime` / `noalias` 前缀取参数名；`@divExact`、`@as` 不提示；同名的 `ptr` 与单参数调用不提示
+    try testing.expectEqualStrings(
+        \\fn f(buf: []u8, data: []const u8, ptr: *u32, x: u64) void {
+        \\    @memcpy(dest: buf, source: data);
+        \\    _ = @cmpxchgStrong(T: u32, ptr, expected_value: 1, new_value: 2, success_order: .seq_cst, fail_order: .monotonic);
+        \\    _ = @divExact(x, 2);
+        \\    _ = @as(u32, @intCast(x));
+        \\    @panic("unreachable");
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{}));
+    // 单参数的内置函数只由 exclude_single_argument 决定
+    try testing.expectEqualStrings(
+        \\fn f(buf: []u8, data: []const u8, ptr: *u32, x: u64) void {
+        \\    @memcpy(dest: buf, source: data);
+        \\    _ = @cmpxchgStrong(T: u32, ptr, expected_value: 1, new_value: 2, success_order: .seq_cst, fail_order: .monotonic);
+        \\    _ = @divExact(x, 2);
+        \\    _ = @as(u32, @intCast(int: x));
+        \\    @panic(message: "unreachable");
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .exclude_single_argument = false }));
+}
+
+test "inlay hints: calls with a single argument, including method calls" {
+    const text =
+        \\const S = struct {
+        \\    v: u32,
+        \\    fn set(self: *S, value: u32) void {
+        \\        self.v = value;
+        \\    }
+        \\    fn pair(self: *S, a: u32, b: u32) void {
+        \\        _ = .{ self, a, b };
+        \\    }
+        \\};
+        \\fn one(n: u32) void {
+        \\    _ = n;
+        \\}
+        \\fn f(s: *S) void {
+        \\    one(1);
+        \\    s.set(2);
+        \\    S.set(s, 3);
+        \\    s.pair(4, 5);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const calls = struct {
+        fn of(annotated: []const u8) []const u8 {
+            return annotated[std.mem.indexOf(u8, annotated, "fn f(").?..];
+        }
+    }.of;
+    // 按写出的实参个数：方法调用去掉接收者后只剩一个实参也不提示，经类型调用的 `S.set(s, 3)` 有两个实参
+    try testing.expectEqualStrings(
+        \\fn f(s: *S) void {
+        \\    one(1);
+        \\    s.set(2);
+        \\    S.set(self: s, value: 3);
+        \\    s.pair(a: 4, b: 5);
+        \\}
+        \\
+    , calls(try inlaid(&w, file, text, .{})));
+    try testing.expectEqualStrings(
+        \\fn f(s: *S) void {
+        \\    one(n: 1);
+        \\    s.set(value: 2);
+        \\    S.set(self: s, value: 3);
+        \\    s.pair(a: 4, b: 5);
+        \\}
+        \\
+    , calls(try inlaid(&w, file, text, .{ .exclude_single_argument = false })));
+}
+
+test "inlay hints: redundant parameter names look through address-of, deref, unwrap and try" {
+    const text =
+        \\const S = struct { buf: u32, len: ?u32 };
+        \\fn take(buf: *const u32, len: u32) void {
+        \\    _ = .{ buf, len };
+        \\}
+        \\fn f(s: *S, buf: *u32, len: anyerror!u32, opt: ?*const u32) !void {
+        \\    take(buf, try len);
+        \\    take(&s.buf, s.len.?);
+        \\    take(&s.*.buf, (try len) + 1);
+        \\    take(opt.?, -%(try len));
+        \\    take(buf, s.len orelse 0);
+        \\}
+        \\fn g(buf: **u32, len: *const ?u32) void {
+        \\    take(buf.*, len.*.?);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    // 可以多层；`+`、`-%`、`orelse` 得到新的值，照常提示
+    try testing.expectEqualStrings(
+        \\const S = struct { buf: u32, len: ?u32 };
+        \\fn take(buf: *const u32, len: u32) void {
+        \\    _ = .{ buf, len };
+        \\}
+        \\fn f(s: *S, buf: *u32, len: anyerror!u32, opt: ?*const u32) !void {
+        \\    take(buf, try len);
+        \\    take(&s.buf, s.len.?);
+        \\    take(&s.*.buf, len: (try len) + 1);
+        \\    take(buf: opt.?, len: -%(try len));
+        \\    take(buf, len: s.len orelse 0);
+        \\}
+        \\fn g(buf: **u32, len: *const ?u32) void {
+        \\    take(buf.*, len.*.?);
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .types = false }));
 }
 
 test "callsite seeding can be switched off" {
