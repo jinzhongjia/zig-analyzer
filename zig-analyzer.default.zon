@@ -64,6 +64,9 @@
     //       // Hide the parameter name when the argument already has that name: a variable or a
     //       // field access ending in it, also behind `&`, `.*`, `.?` and `try`.
     //       .hide_redundant_param_names = true,
+    //       // Type hints longer than this many characters end with `…` instead of their remaining
+    //       // fields or arguments (it may run over by one). 0 never truncates.
+    //       .max_length = 25,
     //   },
 
     // Semantic tokens (editor only):
@@ -109,6 +112,18 @@
     //       // Discard all cached type information when the intern pool exceeds this many MB; it
     //       // is recomputed on demand. 0 never discards.
     //       .max_intern_pool_mb = 64,
+    //   },
+
+    // Caches (editor only). An evicted value is recomputed when needed, so these limits only
+    // trade memory for time; results are the same.
+    //   .cache = .{
+    //       // Syntax trees kept in memory. 0 keeps all.
+    //       .capacity = 64,
+    //       // Per query: how many values and how many MB are kept, taking precedence over
+    //       // .capacity. Queries: ParseFile, FileAstIdMap (syntax trees, default 64 values and
+    //       // 128 MB), FileItemTree (16384, 32 MB), ItemBody (16384, 48 MB), Infer (16384, 48 MB),
+    //       // Exports (1024, 16 MB). 0 removes the limit.
+    //       .queries = .{ .Infer = .{ .count = 32768, .mb = 96 } },
     //   },
 
     // Workspace symbols (editor only):
