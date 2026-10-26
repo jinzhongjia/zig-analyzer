@@ -87,7 +87,7 @@ Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；�
 
 ### 2.3 已知差距
 
-- **超大文件的编辑 → 诊断**：`Sema.zig` 上主要耗时是重新解析（约 54 ms）、官方 AstGen（约 48 ms）与推导整个文件以求非活动代码区间；关闭 `diagnostics.inactive_code` 时约 85 ms。
+- **超大文件的编辑 → 诊断**：`Sema.zig` 上主要耗时是重新解析（约 54 ms）与官方 AstGen（约 48 ms），默认配置下约 85 ms；开启 `diagnostics.inactive_code` 时还要推导整个文件以求非活动代码区间。
 - **超大文件的按键 → hover**：每次按键后需重新解析并重建 ItemTree、FileIndex，`Sema.zig` 上约 100 ms 为下限。
 - **保存 → 编译器诊断**：耗时在编译器本身；`-fincremental` 在 0.17 中会漏报错误，默认不开启。
 - **引用查找冷启动**：被大量文件引用的声明最坏 1.9 s（候选文件超过解析缓存容量而反复解析）；热状态 p95 124 ms。
@@ -249,7 +249,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | references / document highlight / rename | `FileIndex` 按名字粗筛文件 → `ItemNames` 的布隆过滤器粗筛成员 → 逐处精确解析确认；候选文件为能经 `@import` 链到达定义的文件（定义在标准库或依赖包中时，链可以经过范围外的文件），以及项目中的其余文件：泛型代码不必导入定义所在的文件就能经 `anytype` 的值或 comptime 类型参数访问其成员。不导入定义所在文件的文件中只检查泛型函数中的代码 |
 | workspace symbol | 后台为全部项目文件建索引（ItemTree 与 `ItemSummaries`）；按 ItemTree 匹配名字，名字的位置取自 `ItemSummaries`（值很小、不淘汰），查询不需要解析结果；未完成时返回已索引部分。默认不列出依赖库中的符号，由 `workspace_symbol.dependencies` 开启 |
 | code actions | 以编译器诊断的 span 为锚点（丢弃未使用参数等）与 CST 构造编辑；命名的修复见下 |
-| 非活动代码 | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
+| 非活动代码（默认关闭，`diagnostics.inactive_code`） | comptime 已知不执行的分支；comptime 已知为 noreturn 的语句（条件 comptime 已知成立的 `if (...) return ...;`、被选中的 `@compileError`）之后的语句；左侧 comptime 已知、决定结果的 `and` / `or` 的右侧 |
 | 命名检查（默认关闭） | 按声明的类型与 comptime 值分类，结果按成员缓存；修复复用引用查找 |
 
 重命名只修改用户自己的代码（§3 的文件来源）：依赖库中的定义不能重命名。

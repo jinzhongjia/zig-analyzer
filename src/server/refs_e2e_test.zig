@@ -169,6 +169,8 @@ test "references, highlight, rename and workspace symbol" {
 
     // 可观测性：status 的查询统计与慢请求报告
     {
+        // hover 推导 main 的函数体，统计中有执行过的 Infer
+        _ = try h.request("textDocument/hover", .{ .textDocument = doc, .position = position(main_text, "hello();") });
         const st = try h.request("zig-analyzer/status", {});
         var found = false;
         for (st.object.get("result").?.object.get("queries").?.array.items) |q| {

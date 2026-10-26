@@ -36,7 +36,7 @@
 
         // Mark code that is not compiled in the current build configuration (branches comptime
         // knows are not taken) as inactive (editor only):
-        //   .inactive_code = true,
+        //   .inactive_code = false,
         // Milliseconds without edits before live diagnostics are computed; 0 for no delay
         // (editor only):
         //   .debounce_ms = 50,

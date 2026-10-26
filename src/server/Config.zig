@@ -5,7 +5,7 @@
 //!
 //!     { "zig": { "path": "/usr/local/bin/zig" },
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
-//!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
+//!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": false, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
 //!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
@@ -48,7 +48,7 @@ compiler_diagnostics: bool = true,
 /// 编辑后等待这么多毫秒没有新的编辑才计算 live 诊断；0 为不等待
 debounce_ms: u32 = 50,
 /// 是否把当前构建配置下不编译的代码（comptime 已知不执行的分支）显示为非活动代码
-inactive_code: bool = true,
+inactive_code: bool = false,
 /// inlay hints：推导出的类型
 inlay_types: bool = true,
 /// inlay hints：初始化表达式中字段名之后的字段类型
@@ -417,7 +417,7 @@ test "parse: nested fields, optional wrapper" {
 
     var empty = try parseText("{}");
     defer empty.deinit(testing.allocator);
-    try testing.expect(empty.zig_path == null and empty.build_args.len == 0 and empty.inactive_code and empty.build_enable and empty.callsite_seeding);
+    try testing.expect(empty.zig_path == null and empty.build_args.len == 0 and !empty.inactive_code and empty.build_enable and empty.callsite_seeding);
     try testing.expectEqual(0, (try empty.diagnosticsSteps(testing.allocator)).len);
     try testing.expect(!c.sameBuild(&empty) and !c.sameZig(&empty));
 

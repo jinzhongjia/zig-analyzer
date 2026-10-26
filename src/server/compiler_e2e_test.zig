@@ -486,7 +486,9 @@ test "inactive hints are not published inside compiler errors" {
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    try initialize(&h, project.root, false);
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"diagnostics": {"inactive_code": true}}
+    ));
     try waitIdle(&h);
     const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
     try waitIdle(&h);

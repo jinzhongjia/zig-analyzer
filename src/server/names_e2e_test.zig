@@ -402,7 +402,7 @@ test "code excluded by a comptime condition is published as an unnecessary hint"
     try h.start();
     defer h.finish();
     const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
-    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = .{ .diagnostics = .{ .inactive_code = true } } });
     try h.notify("initialized", Empty{});
     const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "one.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = inactive_main } });

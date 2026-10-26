@@ -20,7 +20,7 @@ If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `bu
 - **Diagnostics**
   - Live, while typing: syntax and AstGen errors.
   - On save: compiler errors from the build (the `check` step by default, or `diagnostics.steps`), with notes and reference traces.
-  - Inactive code: code that comptime knows is not compiled in the current build configuration is marked as unnecessary.
+  - Inactive code (opt-in, `diagnostics.inactive_code`): code that comptime knows is not compiled in the current build configuration is marked as unnecessary.
 - **Navigation**: goto definition / declaration / type definition, find references, document highlight, document symbols, workspace symbols.
 - **Editing**
   - Completion, including builtins with official documentation.

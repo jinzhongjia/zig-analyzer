@@ -20,7 +20,7 @@ Zig **0.17.0**。请用项目所用的同一个 Zig 编译 zig-analyzer。
 - **诊断**
   - 编辑时：语法与 AstGen 错误。
   - 保存时：构建给出的编译错误（默认 `check` step，可用 `diagnostics.steps` 指定），附带 note 与引用链。
-  - 非活动代码：当前构建配置下 comptime 已知不编译的代码标为 unnecessary。
+  - 非活动代码（默认关闭，`diagnostics.inactive_code`）：当前构建配置下 comptime 已知不编译的代码标为 unnecessary。
 - **导航**：跳转到定义 / 声明 / 类型定义，查找引用，文档内高亮，文档符号，工作区符号。
 - **编辑**
   - 补全，包括带官方文档的内置函数。
