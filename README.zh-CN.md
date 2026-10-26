@@ -29,6 +29,7 @@ Zig **0.17.0**。请用项目所用的同一个 Zig 编译 zig-analyzer。
   - 语义着色（full、delta、range），标出未使用的绑定；可以只发需要语义分析的 token（`semantic_tokens.mode = .partial`，叠加在编辑器的语法高亮之上），以及为容器级的 `var` 标上 `global`。
 - **重构**：重命名（支持 prepare）；代码操作：
   - 丢弃未使用的名字，或删除多余的丢弃；
+  - 把从未修改的局部 `var` 改为 `const`；
   - 补上 switch 缺少的分支；
   - 补上结构体初始化缺少的字段；
   - 把表达式提取为局部常量；

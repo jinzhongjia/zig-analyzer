@@ -1,6 +1,7 @@
 //! textDocument/codeAction 的快速修复：
 //! - 未使用的局部名字（AstGen 的 `unused ...` 诊断）：插入 `_ = name;`
 //! - 多余的丢弃（`pointless discard of ...`）：删除 `_ = name;`
+//! - 从未修改的局部变量（`local variable is never mutated`）：`var` 改为 `const`
 //! - switch 缺少的枚举 / 联合分支：补上 `.name => {},`
 //! - 结构体初始化缺少的字段（没有默认值的）：补上 `.name = undefined`
 //!
@@ -42,6 +43,11 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
     const check = try r.ctx.get(database.live.AstCheck, file);
     for (check.items) |d| {
         if (d.end < start or d.start > end) continue;
+        if (std.mem.eql(u8, d.message, "local variable is never mutated")) {
+            const edits = try useConst(r, file, text, d.start) orelse continue;
+            try out.append(r.arena, .{ .title = "use 'const'", .edits = edits, .diagnostic = .{ .start = d.start, .end = d.end } });
+            continue;
+        }
         const edit = if (std.mem.startsWith(u8, d.message, "unused ") and !std.mem.endsWith(u8, d.message, " label"))
             try discard(r, file, text, d.start)
         else if (std.mem.startsWith(u8, d.message, "pointless discard of "))
@@ -428,6 +434,34 @@ fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Er
         .param => return blockStart(r, text, base, b, b.value orelse return null, line),
         .capture => return blockStart(r, text, base, b, captureBody(b, l.binding) orelse return null, line),
     }
+}
+
+/// 名字在 `offset` 处、从未修改的局部 `var` 改为 `const`，只替换关键字。`comptime var` 整体改为 `const`，
+/// 初始化表达式包上 `comptime`：`comptime const` 不合法，初始化仍须在编译期求值；已经是 `comptime` 表达式时不再包。
+/// 带 `comptime` 的解构中的变量不提供（`comptime` 作用于整条语句）
+fn useConst(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?[]const Edit {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const path = try root.coveringPath(r.arena, offset);
+    if (path.len < 2 or path[path.len - 1].kind() != .var_decl) return null;
+    const decl: ast.VarDecl = .{ .syntax = path[path.len - 1] };
+    const name = decl.name() orelse return null;
+    if (name.offset != offset) return null;
+    const keyword = decl.syntax.childToken(.keyword_var) orelse return null;
+    const parent = path[path.len - 2];
+    switch (parent.kind()) {
+        .comptime_stmt => {
+            const ct = parent.childToken(.keyword_comptime) orelse return null;
+            const replace: Edit = .{ .start = ct.offset, .end = keyword.range().end, .text = "const" };
+            const init = decl.initExpr() orelse return null;
+            if (init.kind() == .comptime_expr) return try r.arena.dupe(Edit, &.{replace});
+            var at = init.range().start;
+            while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
+            return try r.arena.dupe(Edit, &.{ replace, .{ .start = at, .end = at, .text = "comptime " } });
+        },
+        .destructure => if (parent.childToken(.keyword_comptime) != null) return null,
+        else => {},
+    }
+    return try r.arena.dupe(Edit, &.{.{ .start = keyword.offset, .end = keyword.range().end, .text = "const" }});
 }
 
 /// 名字 token 的长度（含 `@"..."`）

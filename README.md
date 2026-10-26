@@ -29,6 +29,7 @@ If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `bu
   - Semantic tokens (full, delta, range), with unused bindings marked; optionally only the tokens that need semantic analysis (`semantic_tokens.mode = .partial`, to layer over the editor's syntax highlighting), and container-level `var`s marked `global`.
 - **Refactoring**: rename (with prepare); code actions:
   - discard an unused name, or remove a pointless discard;
+  - change a local `var` that is never mutated to `const`;
   - add missing switch prongs;
   - add missing struct fields;
   - extract an expression to a local constant;

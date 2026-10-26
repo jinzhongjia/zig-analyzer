@@ -93,6 +93,61 @@ test "discard unused locals, parameters and captures" {
     );
 }
 
+/// AstGen（同 `zig ast-check`）没有错误
+fn expectAstCheckClean(source: []const u8) !void {
+    const z = try testing.allocator.dupeSentinel(u8, source, 0);
+    defer testing.allocator.free(z);
+    var tree = try std.zig.Ast.parse(testing.allocator, z, .{});
+    defer tree.deinit(testing.allocator);
+    var zir = try std.zig.AstGen.generate(testing.allocator, tree);
+    defer zir.deinit(testing.allocator);
+    try testing.expect(!zir.hasCompileErrors());
+}
+
+test "use 'const' for locals that are never mutated" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 只替换关键字，类型标注与初始化表达式不变
+        .{
+            "fn f() u32 {\n    var <|>x: u32 = 1 + 2;\n    return x;\n}\n",
+            "fn f() u32 {\n    const x: u32 = 1 + 2;\n    return x;\n}\n",
+        },
+        .{
+            "fn f() u32 {\n    var <|>@\"x y\" = @as(u32, 1);\n    return @\"x y\";\n}\n",
+            "fn f() u32 {\n    const @\"x y\" = @as(u32, 1);\n    return @\"x y\";\n}\n",
+        },
+        // `comptime const` 不合法：初始化在编译期求值，改为包上 `comptime`
+        .{
+            "fn g() u32 {\n    return 1;\n}\nfn f() u32 {\n    comptime var <|>c = g();\n    return c;\n}\n",
+            "fn g() u32 {\n    return 1;\n}\nfn f() u32 {\n    const c = comptime g();\n    return c;\n}\n",
+        },
+        .{
+            "fn f() u32 {\n    comptime var <|>c: u32 = comptime 1;\n    return c;\n}\n",
+            "fn f() u32 {\n    const c: u32 = comptime 1;\n    return c;\n}\n",
+        },
+        // 解构中的一个变量
+        .{
+            "fn f() u32 {\n    var a, var <|>b = .{ @as(u32, 1), @as(u32, 2) };\n    a += 1;\n    return a + b;\n}\n",
+            "fn f() u32 {\n    var a, const b = .{ @as(u32, 1), @as(u32, 2) };\n    a += 1;\n    return a + b;\n}\n",
+        },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], "use 'const'");
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[1], got);
+        try expectAstCheckClean(got);
+    }
+    for ([_][]const u8{
+        // 被修改的变量没有诊断
+        "fn f() u32 {\n    var <|>x: u32 = 1;\n    x += 1;\n    return x;\n}\n",
+        // 带 `comptime` 的解构：`comptime` 作用于整条语句
+        "fn f() u32 {\n    comptime var <|>a, var b = .{ 1, 2 };\n    return a + b;\n}\n",
+    }) |source| {
+        const got = try apply(source, "use 'const'");
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("no action", got);
+    }
+}
+
 test "add missing switch prongs" {
     try expectAction(
         \\const E = enum { a, b, c };
