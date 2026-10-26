@@ -57,7 +57,11 @@ Neovim 0.11+：
 vim.lsp.config('zig_analyzer', {
   cmd = { 'zig-analyzer' },
   filetypes = { 'zig', 'zon' },
-  root_markers = { 'build.zig', '.git' },
+  -- 按目录项的实际名字匹配。`root_markers = { 'build.zig', '.git' }` 按路径查找，在大小写不敏感的
+  -- 文件系统（macOS 与 Windows 的默认）上也会找到标准库的 `std/Build.zig`，把标准库目录当作工作区根目录
+  root_dir = function(bufnr, on_dir)
+    on_dir(vim.fs.root(bufnr, function(name) return name == 'build.zig' or name == '.git' end))
+  end,
   settings = { ['zig-analyzer'] = {} },
 })
 vim.lsp.enable('zig_analyzer')

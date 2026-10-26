@@ -57,7 +57,12 @@ Neovim 0.11+:
 vim.lsp.config('zig_analyzer', {
   cmd = { 'zig-analyzer' },
   filetypes = { 'zig', 'zon' },
-  root_markers = { 'build.zig', '.git' },
+  -- Match directory entries by their exact names. `root_markers = { 'build.zig', '.git' }` checks paths,
+  -- which on case-insensitive file systems (macOS and Windows by default) also finds the standard
+  -- library's `std/Build.zig` and makes the standard library directory a workspace root.
+  root_dir = function(bufnr, on_dir)
+    on_dir(vim.fs.root(bufnr, function(name) return name == 'build.zig' or name == '.git' end))
+  end,
   settings = { ['zig-analyzer'] = {} },
 })
 vim.lsp.enable('zig_analyzer')
