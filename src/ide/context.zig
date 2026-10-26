@@ -160,7 +160,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .container_type => |c| if (c.kind != .file) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),
                 else => {},
             };
-            return std.fmt.allocPrint(r.arena, "{s}{s}: {s}", .{ keyword, name, try render.typedValueAlloc(r, tv) });
+            return std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ keyword, name, try render.annotationAlloc(r, tv) });
         },
         .local => |l| {
             const b = (try r.body(l.file, l.item)).binding(l.binding);
@@ -169,7 +169,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .local_var => "var ",
                 .param, .capture => "",
             };
-            return std.fmt.allocPrint(r.arena, "{s}{f}: {s}", .{ keyword, std.zig.fmtId(b.name), try render.typedValueAlloc(r, tv) });
+            return std.fmt.allocPrint(r.arena, "{s}{f}{s}", .{ keyword, std.zig.fmtId(b.name), try render.annotationAlloc(r, tv) });
         },
         .file => |f| return std.fmt.allocPrint(r.arena, "@import(\"{s}\")", .{std.fs.path.basename(r.ctx.db.env.vfs.path(f))}),
     }

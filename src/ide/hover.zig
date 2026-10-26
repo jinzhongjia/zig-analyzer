@@ -111,7 +111,7 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
-    const code = if (def) |d| try context.signature(r, d, tv) else try render.typedValueAlloc(r, tv);
+    const code = if (def) |d| try context.signature(r, d, tv) else try render.exprAlloc(r, tv);
     if (tv.ty == .unknown and def == null) return null;
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
     if (seeded_from) |s| {

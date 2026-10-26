@@ -683,6 +683,10 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             if (t.types.len == 0) return w.writeAll("@TypeOf(.{})");
             try w.writeAll("struct {");
             for (t.types, 0..) |ty, i| {
+                if (i == elemLimit(container_name)) {
+                    try w.writeAll(", ...");
+                    break;
+                }
                 try w.writeAll(if (i == 0) " " else ", ");
                 try ip.printField(null, ty, fieldValue(t.values, i), w, container_name);
             }
@@ -696,6 +700,10 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         .anon_struct_type => |t| {
             try w.writeAll("struct {");
             for (t.names, t.types, 0..) |n, ty, i| {
+                if (i == elemLimit(container_name)) {
+                    try w.writeAll(", ...");
+                    break;
+                }
                 try w.writeAll(if (i == 0) " " else ", ");
                 try ip.printField(n, ty, fieldValue(t.values, i), w, container_name);
             }
@@ -733,7 +741,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
             try w.writeAll(".{");
             for (v.elems, 0..) |e, i| {
-                if (i == max_printed_elems) {
+                if (i == elemLimit(container_name)) {
                     try w.writeAll(", ...");
                     break;
                 }
@@ -744,13 +752,13 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll(if (v.elems.len == 0) "}" else " }");
         },
         .bytes => |v| switch (ip.key(v.ty)) {
-            .array_type, .ptr_type => try w.print("\"{f}\"", .{std.zig.fmtString(v.bytes[0..@min(v.bytes.len, 64)])}),
+            .array_type, .ptr_type => try w.print("\"{f}\"", .{std.zig.fmtString(if (fullText(container_name)) v.bytes else v.bytes[0..@min(v.bytes.len, 64)])}),
             // 元素都是 u8 的结构体、元组与向量（同样以字节表示）：按聚合逐个显示
             else => {
                 const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
                 try w.writeAll(".{");
                 for (v.bytes, 0..) |byte, i| {
-                    if (i == max_printed_elems) {
+                    if (i == elemLimit(container_name)) {
                         try w.writeAll(", ...");
                         break;
                     }
@@ -779,6 +787,16 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
 /// 聚合值与按内容显示的类型最多显示的元素（字段）个数
 pub const max_printed_elems = 16;
 
+/// `container_name.fullText()` 为 true 时列出全部内容（hover、`@typeName`）；否则聚合值、元组与匿名结构体类型至多
+/// `max_printed_elems` 个元素 / 字段，字符串至多 64 字节
+fn fullText(container_name: anytype) bool {
+    return @hasDecl(@TypeOf(container_name), "fullText") and container_name.fullText();
+}
+
+fn elemLimit(container_name: anytype) usize {
+    return if (fullText(container_name)) std.math.maxInt(usize) else max_printed_elems;
+}
+
 /// 元组与匿名结构体的字段：comptime 字段带值（`comptime a: u8 = 1`）
 fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     const is_comptime = v != .runtime and v != .unknown;
@@ -795,7 +813,7 @@ fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Wr
 pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     try w.print("{t} {{", .{t.kind});
     for (t.names, 0..) |n, i| {
-        if (i == max_printed_elems) {
+        if (i == elemLimit(container_name)) {
             try w.writeAll(", ...");
             break;
         }

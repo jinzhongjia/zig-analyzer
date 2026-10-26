@@ -1904,6 +1904,58 @@ test "inlay hints: field types in initializers that have a result type" {
     , try inlaid(&w, file, text, .{ .types = false, .parameters = false }));
 }
 
+test "hover shows tuples whose fields are all comptime by value and does not truncate" {
+    const text =
+        \\const A = struct {};
+        \\const B = struct {};
+        \\const Alpha_Long_Name = struct {};
+        \\const Beta_Long_Name = struct {};
+        \\const qs = .{ A, B };
+        \\const point = .{ .x = 1, .y = true };
+        \\const long = .{ Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name };
+        \\const msg = "a message that is longer than sixty-four bytes, all of it shown in hover";
+        \\const name_len = @typeName(@TypeOf(.{ @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0), @as(u8, 0) })).len;
+        \\const Outer = struct { inner: struct { deep: struct { z: u8 }, next: ?*const @This() } };
+        \\fn f(a: u8, o: Outer) void {
+        \\    const many = .{ a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a };
+        \\    const in = o.inner;
+        \\    _ = .{ many, in };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    // inlay hints 仍至多列出 16 个字段
+    const hinted = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false });
+    try testing.expect(std.mem.indexOf(u8, hinted, "const many: struct { u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, ... } =") != null);
+
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // 类型完全由值决定：只显示值
+        .{ "qs =", "const qs = .{ A, B }" },
+        .{ "point =", "const point = .{ .x = 1, .y = true }" },
+        // hover 不截断：长的值、超过 64 字节的字符串、超过 16 个字段的元组都完整显示
+        .{ "long =", "const long = .{ Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name }" },
+        .{ "msg =", "const msg: *const [72:0]u8 = \"a message that is longer than sixty-four bytes, all of it shown in hover\"" },
+        .{ "many =", "const many: struct { u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8 }" },
+        // 嵌套的匿名容器同样展开，只有自引用显示为 `{...}`
+        .{ "in =", "const in: struct { deep: struct { z: u8 }, next: ?*const struct {...} }" },
+        // `@typeName` 是完整的名字（与编译器相同，315 字节）
+        .{ "name_len =", "const name_len: usize = 315" },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))).?;
+        testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "anonymous containers are shown by content, and their type hints only when enabled" {
     const text =
         \\const Kind = union(enum) { compile: struct { root: u32 }, none };

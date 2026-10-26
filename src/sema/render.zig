@@ -11,13 +11,25 @@ const queries = @import("queries.zig");
 const Body = @import("../hir/Body.zig");
 
 /// 容器类型的名字：声明它的成员名（`const Point = struct {...}` → `Point`），文件为文件名。没有名字的容器（字段类型、
-/// 变量的类型标注、实参中的容器）按内容显示：`struct { x: u8 }`，其中再有没有名字的容器显示为 `struct {...}`
+/// 变量的类型标注、实参中的容器）按内容显示：`struct { x: u8 }`。其中再有的没有名字的容器：列出全部内容时同样展开，
+/// 只有自引用（`?*const @This()`）显示为 `struct {...}`；否则一律显示为 `struct {...}`
 const ContainerNames = struct {
     r: *Resolver,
-    /// 正在按内容显示外层的匿名容器
-    nested: bool = false,
+    /// 正在按内容显示的外层匿名容器
+    outer: ?*const Outer = null,
     /// 显示过按内容显示的匿名容器时置为 true
     anonymous: ?*bool = null,
+
+    /// 列出全部内容：hover、补全详情与 `@typeName`。否则（inlay hints 等）元组、匿名结构体与按内容显示的容器至多列出
+    /// `InternPool.max_printed_elems` 个字段，聚合值至多 16 个元素，字符串至多 64 字节
+    full: bool = false,
+
+    const Outer = struct { c: InternPool.Container, parent: ?*const Outer };
+
+    /// 是否列出全部内容（`InternPool.print` 读取）
+    pub fn fullText(n: ContainerNames) bool {
+        return n.full;
+    }
 
     pub fn write(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         const found = n.name(c) catch null;
@@ -26,7 +38,7 @@ const ContainerNames = struct {
         try n.writeArgs(n.shownInst(c.inst) orelse return, w);
     }
 
-    /// 匿名容器的内容：布局、种类与字段（枚举只有名字），至多列出 `InternPool.max_printed_elems` 个字段
+    /// 匿名容器的内容：布局、种类与字段（枚举只有名字）
     fn writeContent(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         if (n.anonymous) |seen| seen.* = true;
         const tree = n.r.itemTree(c.file) catch return w.writeAll(@tagName(c.kind));
@@ -37,15 +49,19 @@ const ContainerNames = struct {
         if (x.layout != .auto) try w.print("{t} ", .{x.layout});
         try w.writeAll(@tagName(c.kind));
         if (x.auto_enum) try w.writeAll("(enum)");
-        if (n.nested) return w.writeAll(" {...}");
-        const inner: ContainerNames = .{ .r = n.r, .nested = true, .anonymous = n.anonymous };
+        if (n.full) {
+            var o = n.outer;
+            while (o) |up| : (o = up.parent) if (up.c.file == c.file and up.c.ast_id == c.ast_id) return w.writeAll(" {...}");
+        } else if (n.outer != null) return w.writeAll(" {...}");
+        const here: Outer = .{ .c = c, .parent = n.outer };
+        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full };
         const ip = n.r.ctx.db.env.ip;
         try w.writeAll(" {");
         var count: usize = 0;
         for (tree.containerMembers(@intCast(ci))) |m| {
             const it = tree.items[m];
             if (it.kind != .field) continue;
-            if (count == InternPool.max_printed_elems) {
+            if (!n.full and count == InternPool.max_printed_elems) {
                 try w.writeAll(", ...");
                 break;
             }
@@ -188,8 +204,9 @@ const ContainerNames = struct {
     }
 };
 
-pub fn writeType(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
-    try r.ctx.db.env.ip.print(t, w, ContainerNames{ .r = r });
+/// 列出全部内容的显示：`@typeName` 的结果，hover 与补全详情中的类型与值
+pub fn writeFull(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
+    try r.ctx.db.env.ip.print(t, w, ContainerNames{ .r = r, .full = true });
 }
 
 pub fn typeAlloc(r: *Resolver, t: Index) error{OutOfMemory}![]const u8 {
@@ -204,28 +221,50 @@ pub fn typeAllocNoting(r: *Resolver, t: Index) error{OutOfMemory}!struct { text:
     return .{ .text = out.written(), .anonymous = anonymous };
 }
 
-/// 值为类型时显示 `type = T`；comptime 已知的其他值显示 `T = v`
+/// 值为类型时显示 `type = T`；comptime 已知的其他值显示 `T = v`。列出全部内容，不截断（hover、补全详情）
 pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     var out: Io.Writer.Allocating = .init(r.arena);
-    const w = &out.writer;
-    (blk: {
-        writeType(r, tv.ty, w) catch |e| break :blk e;
-        if (tv.val) |v| switch (r.ctx.db.env.ip.key(v)) {
-            .fn_value, .simple_value => {},
-            else => {
-                w.writeAll(" = ") catch |e| break :blk e;
-                const start = out.written().len;
-                writeType(r, v, w) catch |e| break :blk e;
-                // 很长的值（如 `@typeInfo` 的结果）截断显示
-                if (out.written().len - start > max_value_len) {
-                    out.shrinkRetainingCapacity(start + max_value_len);
-                    w.writeAll("...") catch |e| break :blk e;
-                }
-            },
-        };
-    }) catch return error.OutOfMemory;
+    writeFull(r, tv.ty, &out.writer) catch return error.OutOfMemory;
+    if (try shownValue(r, tv)) |v| out.writer.print(" = {s}", .{v}) catch return error.OutOfMemory;
     return out.written();
 }
 
-/// 值显示的最大长度（字节）
-const max_value_len = 120;
+/// 声明名之后的部分：`: T = v`；值决定类型时（见 `valueDetermined`）只显示 ` = v`
+pub fn annotationAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
+    if (valueDetermined(r.ctx.db.env.ip, tv)) return std.fmt.allocPrint(r.arena, " = {s}", .{(try shownValue(r, tv)).?});
+    return std.fmt.allocPrint(r.arena, ": {s}", .{try typedValueAlloc(r, tv)});
+}
+
+/// 没有声明时（表达式）的显示：值决定类型时只显示值，否则同 `typedValueAlloc`
+pub fn exprAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
+    if (valueDetermined(r.ctx.db.env.ip, tv)) return (try shownValue(r, tv)).?;
+    return typedValueAlloc(r, tv);
+}
+
+/// 字段都是 comptime 字段的元组与匿名结构体，值已知时：类型完全由值决定（`.{ A, B }` 的类型是
+/// `struct { comptime type = A, comptime type = B }`），显示值即可
+fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
+    if (tv.val == null) return false;
+    const types, const values = switch (ip.key(tv.ty)) {
+        .tuple_type => |t| .{ t.types, t.values },
+        .anon_struct_type => |s| .{ s.types, s.values },
+        else => return false,
+    };
+    for (0..types.len) |i| switch (InternPool.fieldValue(values, i)) {
+        .runtime, .unknown => return false,
+        else => {},
+    };
+    return true;
+}
+
+/// comptime 已知的值（函数与 `simple_value` 不显示）
+fn shownValue(r: *Resolver, tv: TypedValue) error{OutOfMemory}!?[]const u8 {
+    const v = tv.val orelse return null;
+    switch (r.ctx.db.env.ip.key(v)) {
+        .fn_value, .simple_value => return null,
+        else => {},
+    }
+    var out: Io.Writer.Allocating = .init(r.arena);
+    writeFull(r, v, &out.writer) catch return error.OutOfMemory;
+    return out.written();
+}

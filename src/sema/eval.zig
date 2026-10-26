@@ -2624,7 +2624,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@typeName")) {
             if (vals.len != 1) return error.Abort;
             var out: std.Io.Writer.Allocating = .init(ev.a);
-            @import("render.zig").writeType(ev.r, try asType(vals[0]), &out.writer) catch return error.OutOfMemory;
+            @import("render.zig").writeFull(ev.r, try asType(vals[0]), &out.writer) catch return error.OutOfMemory;
             return ev.stringLiteral(out.written());
         }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
@@ -2821,7 +2821,7 @@ const Evaluator = struct {
             const t = asType(vals[0]) catch return null;
             if (!value.isConcrete(ip, t)) return null;
             var out: std.Io.Writer.Allocating = .init(ev.a);
-            @import("render.zig").writeType(ev.r, t, &out.writer) catch return error.OutOfMemory;
+            @import("render.zig").writeFull(ev.r, t, &out.writer) catch return error.OutOfMemory;
             return try ev.stringLiteral(out.written());
         }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {

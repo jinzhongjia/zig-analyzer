@@ -300,7 +300,9 @@ inlay hints 的约束：
 - **冗余参数名**（`inlay_hints.hide_redundant_param_names`，默认开启）：实参去掉不改变所指的值的外壳（`&x`、`x.*`、`x.?`、`try x`，可多层）后是与形参同名的变量，或最后一段与形参同名的字段访问时不显示。在 HIR 上判断而不是比较实参的最后一个 token：`a + x`、`-%x`、`x orelse y` 得到新的值，照常显示。同样作用于内置函数。
 - **刷新**：任一项配置变化时，客户端支持的话请求刷新（`workspace/inlayHint/refresh`）。
 
-类型的显示（hover、inlay hints、补全详情共用 `render.zig`）：容器是成员的值时以成员命名：`const S = struct {...}` 为 `S`，函数体中按局部常量命名，`return` 的容器以函数和 comptime 实参命名（`List(u8)`）；值是在几个容器中选一个的 `if` / `switch` 时同样以成员命名（编译器在这里命名为 `S__struct_1`，以成员命名更易读）。字段与变量的类型标注、实参、`?struct {...}` 等处的容器在源码中没有名字，按内容显示：`packed struct { x: u8 }`、`union(enum) { a: u32, b: void }` 中列出字段与类型（枚举只列名字，至多 16 个），其中再有的匿名容器显示为 `struct {...}`，不会因为自引用（`?*const @This()`）无限展开。
+类型的显示（hover、inlay hints、补全详情共用 `render.zig`）：容器是成员的值时以成员命名：`const S = struct {...}` 为 `S`，函数体中按局部常量命名，`return` 的容器以函数和 comptime 实参命名（`List(u8)`）；值是在几个容器中选一个的 `if` / `switch` 时同样以成员命名（编译器在这里命名为 `S__struct_1`，以成员命名更易读）。字段与变量的类型标注、实参、`?struct {...}` 等处的容器在源码中没有名字，按内容显示：`packed struct { x: u8 }`、`union(enum) { a: u32, b: void }` 中列出字段与类型（枚举只列名字）；其中再有的匿名容器同样展开，自引用（`?*const @This()`）显示为 `struct {...}`，不会无限展开。
+
+值的显示：声明显示为 `const x: T = v`，comptime 已知的值写在类型之后。字段都是 comptime 字段的元组与匿名结构体的类型完全由值决定（`.{ A, B }` 的类型是 `struct { comptime type = A, comptime type = B }`，与编译器相同），只显示值：`const qs = .{ A, B }`。hover、补全详情与 `@typeName` 列出全部内容，不截断。inlay hints 在行内显示，元组、匿名结构体与按内容显示的容器至多列出 16 个字段（多出的写成 `, ...`），嵌套的匿名容器显示为 `struct {...}`。
 
 整理 import（`source.organizeImports`，`ide_db/organize_imports.zig`）：
 

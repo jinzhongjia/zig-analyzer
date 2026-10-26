@@ -2385,9 +2385,9 @@ test "std generic containers" {
         .{ "xs", "[]i32" },
         .{ "flag", "?bool" },
         .{ "entry", "GetOrPutResult(u32, []const u8, AutoContext(u32), 80)" },
-        // @typeInfo 的结果 comptime 已知
+        // @typeInfo 的结果 comptime 已知，完整显示
         .{ "fs", "[]const [:0]const u8 = &.{ \"x\", \"y\" }" },
-        .{ "info", "Type = .{ .@\"struct\" = .{ .is_tuple = false, .layout = .auto, .backing_integer = null, .field_names = &.{ \"x\", \"y\" }, .field_ty..." },
+        .{ "info", "Type = .{ .@\"struct\" = .{ .is_tuple = false, .layout = .auto, .backing_integer = null, .field_names = &.{ \"x\", \"y\" }, .field_types = &.{ i32, i32 }, .field_attrs = &.{ .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null }, .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null } }, .decl_names = &.{} } }" },
         .{ "FT", "type = i32" },
         .{ "num", "u32" },
         .{ "it", "SplitIterator(u8, .scalar)" },
