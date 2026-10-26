@@ -763,3 +763,38 @@ test "organize imports is offered with the cursor in an import block or when req
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "workspace symbol returns at most workspace_symbol.limit best matches, all of them with 0" {
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{
+        .capabilities = struct {}{},
+        .initializationOptions = .{ .workspace_symbol = .{ .limit = 2 } },
+    });
+    const text =
+        \\const another_alpha = 3;
+        \\const alphabet = 2;
+        \\const alpha = 1;
+        \\const zeta = 4;
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = "untitled:symbols.zig", .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const names = struct {
+        fn of(hh: *Harness) ![]const u8 {
+            const resp = try hh.request("workspace/symbol", .{ .query = "alpha" });
+            var out: std.ArrayList([]const u8) = .empty;
+            for (resp.object.get("result").?.array.items) |s| try out.append(hh.arena.allocator(), s.object.get("name").?.string);
+            return std.mem.join(hh.arena.allocator(), " ", out.items);
+        }
+    }.of;
+    // 保留匹配最好的：完全相同、前缀，然后是子序列
+    try testing.expectEqualStrings("alpha alphabet", try names(&h));
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .workspace_symbol = .{ .limit = 0 } } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("alpha alphabet another_alpha", try names(&h));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

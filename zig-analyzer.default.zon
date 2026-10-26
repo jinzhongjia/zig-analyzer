@@ -111,9 +111,17 @@
     //       .max_intern_pool_mb = 64,
     //   },
 
-    // Also list symbols from dependencies (fetched packages, generated files, opened std files)
-    // in workspace symbols (editor only):
-    //   .workspace_symbol = .{ .dependencies = false },
+    // Workspace symbols (editor only):
+    //   .workspace_symbol = .{
+    //       // Also list symbols from dependencies (fetched packages, generated files, opened std
+    //       // files).
+    //       .dependencies = false,
+    //       // At most this many symbols per query (the best matches are kept); 0 never limits.
+    //       // Clients that query again as you type do not need more; clients that query once and
+    //       // filter on their side (e.g. Neovim's `vim.lsp.buf.workspace_symbol`) may need a higher
+    //       // limit or 0.
+    //       .limit = 256,
+    //   },
 
     .naming = .{
         // Hint names that do not follow the Names section of the Zig style guide, with rename

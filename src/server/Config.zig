@@ -12,7 +12,7 @@
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
-//!       "workspace_symbol": { "dependencies": false },
+//!       "workspace_symbol": { "dependencies": false, "limit": 256 },
 //!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
@@ -83,6 +83,9 @@ callsite_seeding: bool = true,
 max_intern_pool_mb: u32 = 64,
 /// workspace symbol 是否也列出依赖库（获取的依赖包、生成文件、打开的标准库文件）中的符号
 workspace_symbol_dependencies: bool = false,
+/// workspace symbol 至多返回的符号数（保留匹配最好的）；0 为不限。随输入重新查询的客户端不需要一次拿到全部，
+/// 只查询一次、在客户端过滤的需要调高或设为 0
+workspace_symbol_limit: u32 = 256,
 /// 命名检查（Zig 风格指南的 Names 一节）：是否为打开的文件提示不符合命名约定的名字，并提供改名的修复
 naming_enable: bool = false,
 /// 命名检查跳过的名字；`*` 匹配任意字符序列（`SDL_*`）
@@ -170,6 +173,7 @@ const settings = [_]Setting{
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "workspace_symbol", .key = "dependencies", .field = "workspace_symbol_dependencies" },
+    .{ .section = "workspace_symbol", .key = "limit", .field = "workspace_symbol_limit" },
     .{ .section = "naming", .key = "enable", .field = "naming_enable" },
     .{ .section = "naming", .key = "ignore", .field = "naming_ignore" },
     .{ .section = "naming", .key = "exclude", .field = "naming_exclude" },

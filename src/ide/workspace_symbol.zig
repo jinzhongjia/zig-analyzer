@@ -22,12 +22,9 @@ pub const Symbol = struct {
     rank: u8,
 };
 
-/// 最多返回的符号数
-pub const limit = 256;
-
-/// 名字的位置取自 `ItemSummaries`（不淘汰）：项目文件多于解析结果的缓存容量时，
-/// 重复的查询不必重新解析各文件
-pub fn search(r: *Resolver, files: []const FileId, query: []const u8) resolve.Error![]const Symbol {
+/// 至多返回 `limit` 个（按匹配等级排序后最好的）。名字的位置取自 `ItemSummaries`（不淘汰）：项目文件多于解析结果的
+/// 缓存容量时，重复的查询不必重新解析各文件
+pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usize) resolve.Error![]const Symbol {
     var out: std.ArrayList(Symbol) = .empty;
     for (files) |file| {
         const tree = try r.itemTree(file);
@@ -96,7 +93,7 @@ fn describe(w: *World, file: FileId, text: []const u8, query: []const u8) ![]con
     defer ctx.end();
     var r: Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
     var out: std.ArrayList(u8) = .empty;
-    for (try search(&r, &.{file}, query), 0..) |s, i| {
+    for (try search(&r, &.{file}, query, std.math.maxInt(usize)), 0..) |s, i| {
         try testing.expectEqual(file, s.file);
         if (i > 0) try out.append(w.arena.allocator(), ' ');
         try out.print(w.arena.allocator(), "{s}({s}):{s}", .{ s.name, s.container orelse "-", text[s.start..s.end] });
@@ -140,7 +137,7 @@ test "repeated searches do not reparse files evicted from the parse cache" {
             var ctx = world.db.beginRead(world.arena.allocator());
             defer ctx.end();
             var r: Resolver = .{ .ctx = &ctx, .arena = world.arena.allocator() };
-            return (try search(&r, scope, "a")).len;
+            return (try search(&r, scope, "a", std.math.maxInt(usize))).len;
         }
     };
     try testing.expectEqual(3 * n, try Run.run(&w, &files));
