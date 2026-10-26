@@ -170,7 +170,8 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     const owner = try ownerLocal(r, rt);
     if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
     if (try constructionOrigin(r, rt, name)) |found| return found;
-    if (rt.inst) |inst| if (try callSiteOrigin(r, inst, name, 0)) |found| return found;
+    var visited: std.AutoHashMapUnmanaged(Index, void) = .empty;
+    if (rt.inst) |inst| if (try callSiteOrigin(r, inst, name, &visited)) |found| return found;
     if (try typeInfoOrigin(r, rt, name)) |found| return found;
     return constructionSite(r, rt);
 }
@@ -188,15 +189,12 @@ fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target 
     return .{ .file = rt.file, .start = node.offset + range.start, .end = node.offset + range.end };
 }
 
-/// 沿调用处追溯的最大层数
-const max_call_site_depth = 16;
-
 /// 名字来自构造类型所在实例 `inst` 的实参（如 zig-clap 的 `clap.parse(clap.Help, &args.params, ...)` 传入、在
 /// 另一个文件中解析帮助文本得到的参数表）时的来源：在 `inst` 的调用处取对应的实参表达式。实参是外层泛型函数的
 /// 形参时，到外层函数中实参值与之相同的实例的调用处继续找；否则以跟踪字面量来源的方式求这个实参（实参指向
-/// 声明时求这个声明）
-fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, depth: u32) resolve.Error!?Target {
-    if (depth > max_call_site_depth) return null;
+/// 声明时求这个声明）。走过的实例记在 `visited` 中，不再重复：结果只取决于实例，互相调用的泛型函数也不会成环
+fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.AutoHashMapUnmanaged(Index, void)) resolve.Error!?Target {
+    if ((try visited.getOrPut(r.arena, inst)).found_existing) return null;
     const ip = r.ctx.db.env.ip;
     const ins = switch (ip.key(inst)) {
         .instance => |x| x,
@@ -224,17 +222,14 @@ fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, depth: u32) resol
             if (try paramOf(r, site.owner.file, site_item, body, arg_e)) |p| {
                 // 外层泛型函数的形参：外层函数中实参值与这里相同的实例
                 const outer_key = try r.ownerKey(p.file, p.item);
-                var seen: std.ArrayList(Index) = .empty;
                 for (try seed.allFound(r, outer_key)) |outer| {
                     const outer_inst = outer.inst orelse continue;
-                    if (std.mem.indexOfScalar(Index, seen.items, outer_inst) != null) continue;
-                    try seen.append(r.arena, outer_inst);
                     const outer_args = switch (ip.key(outer_inst)) {
                         .instance => |x| x.args,
                         else => continue,
                     };
                     if (p.index >= outer_args.len or !sharesValue(ip, outer_inst, chain.items)) continue;
-                    if (try callSiteOrigin(r, outer_inst, name, depth + 1)) |found| return found;
+                    if (try callSiteOrigin(r, outer_inst, name, visited)) |found| return found;
                 }
                 continue;
             }

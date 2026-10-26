@@ -347,7 +347,7 @@ fn present(r: *Resolver, target: hir.OwnerKey, found: Found) resolve.Error!?Seed
 /// 经由泛型调用者传递的最大层数：z2d 的 `toRGBA` 由泛型的 `hue` 调用，`hue` 又由泛型的 `run` 分派；
 /// websocket.zig 的 `_handleClientData` 经 `handleClientData`、`NonBlockingBase` 的方法、`NonBlocking` 的字段、
 /// `listen`、`listenInNewThread`（`Thread.spawn` 传入）才到具体的 `Server(TestHandler)`
-pub const max_depth = 6;
+pub const max_depth = 16;
 
 /// 调用点的查找按成员与层数缓存：补全、inlay hints 等频繁的请求不必每次重新查找。先严格查找，没有结果时放宽
 /// （见 `callIn`）。
@@ -372,7 +372,7 @@ pub const Query = struct {
 };
 
 /// `Instances` 保留的实例个数：第一个实例不适用时依次尝试，调用点很多时只取前几个
-pub const max_seeds = 8;
+pub const max_seeds = 32;
 
 /// 成员在各调用点的前 `max_seeds` 个不同实例（按查找顺序，去重）：第一个实例不适用时（光标处的代码不执行、
 /// 表达式求不出类型、调用位于该实例不执行的分支中）依次尝试。调用者自身位于泛型函数内时取调用者的实例（层数

@@ -2869,7 +2869,7 @@ fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
 /// 声明 `owner` 在各种构建配置下可能的值（容器类型）：初始化为按 comptime 条件选择的 `if` / `switch` 时取
 /// 各分支，分支或初始化本身是别名（`linux`、`std.c`、`system.SO`）时沿别名查找。用于当前配置下不存在的成员
 fn alternativeContainers(r: *Resolver, a: Allocator, owner: hir.OwnerKey, out: *std.ArrayList(Index), depth: u32) Error!void {
-    if (depth > 4 or out.items.len >= max_alternatives) return;
+    if (depth > max_alternative_depth) return;
     const item = try itemOfKey(r, owner) orelse return;
     const body = try r.ctx.get(hir.ItemBody, owner);
     const init = body.value orelse return;
@@ -2880,11 +2880,12 @@ fn alternativeContainers(r: *Resolver, a: Allocator, owner: hir.OwnerKey, out: *
     for (leaves.items) |leaf| try leafAlternatives(r, a, owner.file, item, body, res.exprs, leaf, out, depth);
 }
 
-const max_alternatives = 64;
+/// 查找其他配置下的候选时沿别名与推导链的最大层数：互相引用的声明不会结束
+const max_alternative_depth = 16;
 
 /// 表达式 `e` 在各种构建配置下可能的值（容器类型）：当前的值，以及它引用的声明在其他配置下的值
 fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *const Body, exprs: []const TypedValue, e: ExprId, out: *std.ArrayList(Index), depth: u32) Error!void {
-    if (depth > 4 or out.items.len >= max_alternatives) return;
+    if (depth > max_alternative_depth) return;
     const ip = r.ctx.db.env.ip;
     if (@backingInt(e) < exprs.len) if (exprs[@backingInt(e)].asType()) |t| if (ip.key(t) == .container_type) try appendUnique(a, out, t);
     switch (body.expr(e)) {
@@ -2932,7 +2933,7 @@ fn ownerCtx(r: *Resolver, key: hir.OwnerKey, mode: Mode) Error!?ExprCtx {
 /// 表达式 `e` 的值在各种构建配置下可能的类型（容器类型）：当前的类型；局部变量与参数的类型标注或初始化；
 /// 全局变量的类型标注或初始化；调用的返回类型（`X.Y.init()` 还取 `X.Y`）；字段访问取左侧各种类型中同名字段的类型
 fn valueAlternatives(r: *Resolver, a: Allocator, c: ExprCtx, e: ExprId, out: *std.ArrayList(Index), depth: u32) Error!void {
-    if (depth > 6 or out.items.len >= max_alternatives) return;
+    if (depth > max_alternative_depth) return;
     const ip = r.ctx.db.env.ip;
     if (@backingInt(e) < c.exprs.len) {
         var t = c.exprs[@backingInt(e)].ty;
@@ -3012,7 +3013,7 @@ fn typeAlternatives(r: *Resolver, a: Allocator, c: ExprCtx, t: ExprId, out: *std
 }
 
 fn appendUnique(a: Allocator, out: *std.ArrayList(Index), t: Index) Allocator.Error!void {
-    if (std.mem.indexOfScalar(Index, out.items, t) == null and out.items.len < max_alternatives) try out.append(a, t);
+    if (std.mem.indexOfScalar(Index, out.items, t) == null) try out.append(a, t);
 }
 
 /// `ItemTree.items` 中 AST id 为 `key.item` 的项的下标
