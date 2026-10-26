@@ -8,16 +8,57 @@ const TypedValue = InternPool.TypedValue;
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const queries = @import("queries.zig");
+const Body = @import("../hir/Body.zig");
 
-/// 容器类型的名字：声明它的成员名（`const Point = struct {...}` → `Point`），文件为文件名
+/// 容器类型的名字：声明它的成员名（`const Point = struct {...}` → `Point`），文件为文件名。没有名字的容器（字段类型、
+/// 变量的类型标注、实参中的容器）按内容显示：`struct { x: u8 }`，其中再有没有名字的容器显示为 `struct {...}`
 const ContainerNames = struct {
     r: *Resolver,
+    /// 正在按内容显示外层的匿名容器
+    nested: bool = false,
+    /// 显示过按内容显示的匿名容器时置为 true
+    anonymous: ?*bool = null,
 
     pub fn write(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         const found = n.name(c) catch null;
-        try w.writeAll(found orelse @tagName(c.kind));
+        try w.writeAll(found orelse return n.writeContent(c, w));
         // 泛型实例：`List(u8)`，只列出 comptime 已知的实参
         try n.writeArgs(n.shownInst(c.inst) orelse return, w);
+    }
+
+    /// 匿名容器的内容：布局、种类与字段（枚举只有名字），至多列出 `InternPool.max_printed_elems` 个字段
+    fn writeContent(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
+        if (n.anonymous) |seen| seen.* = true;
+        const tree = n.r.itemTree(c.file) catch return w.writeAll(@tagName(c.kind));
+        const ci = for (tree.containers, 0..) |x, i| {
+            if (x.ast_id == c.ast_id) break i;
+        } else return w.writeAll(@tagName(c.kind));
+        const x = tree.containers[ci];
+        if (x.layout != .auto) try w.print("{t} ", .{x.layout});
+        try w.writeAll(@tagName(c.kind));
+        if (x.auto_enum) try w.writeAll("(enum)");
+        if (n.nested) return w.writeAll(" {...}");
+        const inner: ContainerNames = .{ .r = n.r, .nested = true, .anonymous = n.anonymous };
+        const ip = n.r.ctx.db.env.ip;
+        try w.writeAll(" {");
+        var count: usize = 0;
+        for (tree.containerMembers(@intCast(ci))) |m| {
+            const it = tree.items[m];
+            if (it.kind != .field) continue;
+            if (count == InternPool.max_printed_elems) {
+                try w.writeAll(", ...");
+                break;
+            }
+            try w.writeAll(if (count == 0) " " else ", ");
+            count += 1;
+            // 元组字段没有名字
+            if (it.name) |field| try w.print("{f}", .{std.zig.fmtId(field)});
+            if (c.kind == .@"enum") continue;
+            if (it.name != null) try w.writeAll(": ");
+            const tv = queries.defType(n.r, .{ .item = .{ .file = c.file, .item = m } }, null, c.inst) catch TypedValue.unknown;
+            try ip.print(tv.ty, w, inner);
+        }
+        try w.writeAll(if (count == 0) "}" else " }");
     }
 
     /// 显示实参的实例：没有实例的成员按迭代推导时的实例（见 `InternPool.Instance.iteration`）显示外层实例
@@ -100,6 +141,9 @@ const ContainerNames = struct {
         try w.writeAll(")");
     }
 
+    /// 容器是成员的值时以成员命名：`const S = struct {...}` 为 `S`，函数体中按局部常量命名，`return` 的容器以函数命名
+    /// （`List(u8)`）；值是在几个容器中选一个的 `if` / `switch` 时同样命名（编译器在这里命名为 `S__struct_1`，以成员
+    /// 命名更易读）。字段与变量的类型标注、实参、`?struct {...}` 中的容器没有名字，返回 null
     fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?[]const u8 {
         if (c.kind == .file) {
             const base = std.fs.path.basename(n.r.ctx.db.env.vfs.path(c.file));
@@ -109,27 +153,38 @@ const ContainerNames = struct {
         for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
             const parent = x.parent_item orelse return null;
             const item = tree.items[parent];
-            switch (item.kind) {
-                // `const S = struct {...}`、字段类型中的容器
-                .@"const", .@"var", .field => return item.name,
-                else => {},
+            if (item.kind == .field) return null;
+            const rel = try n.r.containerRel(.{ .file = c.file, .container = @intCast(ci) }) orelse return null;
+            const b = try n.r.body(c.file, parent);
+            if (item.kind == .@"const" or item.kind == .@"var") {
+                const value = b.value orelse return null;
+                return if (yields(b, value, rel)) item.name else null;
             }
-            // 函数 / test 体内：绑定它的局部变量名；否则为类型构造函数返回的容器，取函数名
-            if (try n.localName(c.file, parent, @intCast(ci))) |local| return local;
-            return if (item.kind == .@"fn") item.name else null;
+            for (b.bindings) |binding| {
+                const init = binding.init orelse continue;
+                if (yields(b, init, rel)) return binding.name;
+            }
+            if (item.kind != .@"fn") return null;
+            for (b.exprs) |e| switch (e) {
+                .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return item.name,
+                else => {},
+            };
+            return null;
         };
         return null;
     }
 
-    /// 体内 `const E = enum {...}` 的局部变量名
-    fn localName(n: ContainerNames, file: @import("../base/Vfs.zig").FileId, item: u32, container: u32) resolve.Error!?[]const u8 {
-        const rel = try n.r.containerRel(.{ .file = file, .container = container }) orelse return null;
-        const b = try n.r.body(file, item);
-        for (b.bindings) |binding| {
-            const init = binding.init orelse continue;
-            if (b.expr(init) == .container and b.range(init).start == rel) return binding.name;
-        }
-        return null;
+    /// 表达式的结果是否就是位于 `rel` 的容器：容器本身，或 `if` / `switch` 某个分支的结果
+    fn yields(b: *const Body, e: Body.ExprId, rel: u32) bool {
+        return switch (b.expr(e)) {
+            .container => b.range(e).start == rel,
+            .@"if" => |x| yields(b, x.then, rel) or (if (x.@"else") |other| yields(b, other, rel) else false),
+            .@"switch" => |s| for (s.prongs) |p| {
+                if (yields(b, p.body, rel)) break true;
+            } else false,
+            .@"comptime" => |x| yields(b, x, rel),
+            else => false,
+        };
     }
 };
 
@@ -138,9 +193,15 @@ pub fn writeType(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
 }
 
 pub fn typeAlloc(r: *Resolver, t: Index) error{OutOfMemory}![]const u8 {
+    return (try typeAllocNoting(r, t)).text;
+}
+
+/// 同 `typeAlloc`，并说明其中是否有按内容显示的匿名容器
+pub fn typeAllocNoting(r: *Resolver, t: Index) error{OutOfMemory}!struct { text: []const u8, anonymous: bool } {
     var out: Io.Writer.Allocating = .init(r.arena);
-    writeType(r, t, &out.writer) catch return error.OutOfMemory;
-    return out.written();
+    var anonymous = false;
+    r.ctx.db.env.ip.print(t, &out.writer, ContainerNames{ .r = r, .anonymous = &anonymous }) catch return error.OutOfMemory;
+    return .{ .text = out.written(), .anonymous = anonymous };
 }
 
 /// 值为类型时显示 `type = T`；comptime 已知的其他值显示 `T = v`

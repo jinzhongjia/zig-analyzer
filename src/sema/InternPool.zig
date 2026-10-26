@@ -776,8 +776,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
     }
 }
 
-/// 聚合值最多显示的元素个数
-const max_printed_elems = 16;
+/// 聚合值与按内容显示的类型最多显示的元素（字段）个数
+pub const max_printed_elems = 16;
 
 /// 元组与匿名结构体的字段：comptime 字段带值（`comptime a: u8 = 1`）
 fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
