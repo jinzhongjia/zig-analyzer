@@ -1689,7 +1689,9 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const naming_changed = !server.config.sameNaming(&new);
     const build_was_enabled = server.config.build_enable;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
-    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_parameters != new.inlay_parameters or
+    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_field_types != new.inlay_field_types or
+        server.config.inlay_parameters != new.inlay_parameters or server.config.inlay_builtin_parameters != new.inlay_builtin_parameters or
+        server.config.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
         server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.callsite_seeding != new.callsite_seeding;
     const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
     const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
@@ -3895,7 +3897,15 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     const opts: ide.inlay_hints.Options = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
-        break :blk .{ .types = server.config.inlay_types, .parameters = server.config.inlay_parameters, .hide_redundant_param_names = server.config.hide_redundant_param_names };
+        const c = &server.config;
+        break :blk .{
+            .types = c.inlay_types,
+            .field_types = c.inlay_field_types,
+            .parameters = c.inlay_parameters,
+            .builtin_parameters = c.inlay_builtin_parameters,
+            .exclude_single_argument = c.inlay_exclude_single_argument,
+            .hide_redundant_param_names = c.hide_redundant_param_names,
+        };
     };
     const hints = try ide.inlay_hints.inlayHints(r, file, start, end, opts);
     const lines = try offsets.LineIndex.init(arena, text);

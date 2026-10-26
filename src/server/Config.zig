@@ -6,7 +6,8 @@
 //!     { "zig": { "path": "/usr/local/bin/zig" },
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
-//!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
+//!       "inlay_hints": { "types": true, "field_types": true, "parameters": true, "builtin_parameters": true,
+//!                        "exclude_single_argument": true, "hide_redundant_param_names": true },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
@@ -50,9 +51,15 @@ debounce_ms: u32 = 50,
 inactive_code: bool = true,
 /// inlay hints：推导出的类型
 inlay_types: bool = true,
+/// inlay hints：初始化表达式中字段名之后的字段类型
+inlay_field_types: bool = true,
 /// inlay hints：实参对应的形参名
 inlay_parameters: bool = true,
-/// 实参与形参同名（或以形参名结尾的字段访问）时不显示形参名
+/// inlay hints：内置函数调用的参数名（`inlay_parameters` 关闭时同样不显示）
+inlay_builtin_parameters: bool = true,
+/// 只有一个实参的调用（含内置函数）不显示形参名
+inlay_exclude_single_argument: bool = true,
+/// 实参去掉 `&`、`.*`、`.?`、`try` 后与形参同名（或是以形参名结尾的字段访问）时不显示形参名
 hide_redundant_param_names: bool = true,
 /// 语义着色发出哪些 token
 semantic_tokens_mode: SemanticTokensMode = .full,
@@ -140,7 +147,10 @@ const settings = [_]Setting{
     .{ .section = "diagnostics", .key = "inactive_code", .field = "inactive_code" },
     .{ .section = "diagnostics", .key = "debounce_ms", .field = "debounce_ms" },
     .{ .section = "inlay_hints", .key = "types", .field = "inlay_types" },
+    .{ .section = "inlay_hints", .key = "field_types", .field = "inlay_field_types" },
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
+    .{ .section = "inlay_hints", .key = "builtin_parameters", .field = "inlay_builtin_parameters" },
+    .{ .section = "inlay_hints", .key = "exclude_single_argument", .field = "inlay_exclude_single_argument" },
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
     .{ .section = "semantic_tokens", .key = "mode", .field = "semantic_tokens_mode" },
     .{ .section = "semantic_tokens", .key = "global_var", .field = "semantic_tokens_global_var" },

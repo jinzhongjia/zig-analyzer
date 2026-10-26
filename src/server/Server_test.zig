@@ -652,3 +652,58 @@ test "resetting type information gives the same hover results" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "inlay hint settings apply to requests and refresh the client when they change" {
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .workspace = .{ .inlayHint = .{ .refreshSupport = true } } },
+        .initializationOptions = .{ .inlay_hints = .{ .types = false, .exclude_single_argument = false } },
+    });
+    const uri = "untitled:inlay-hints.zig";
+    const text =
+        \\const P = struct { x: u32 };
+        \\fn one(n: u32) u32 {
+        \\    return n;
+        \\}
+        \\fn f() void {
+        \\    const p: P = .{ .x = one(1) };
+        \\    _ = p;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const labels = struct {
+        fn of(hh: *Harness) ![]const u8 {
+            const resp = try hh.request("textDocument/inlayHint", .{
+                .textDocument = .{ .uri = "untitled:inlay-hints.zig" },
+                .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 8, .character = 0 } },
+            });
+            var out: std.ArrayList([]const u8) = .empty;
+            for (resp.object.get("result").?.array.items) |hint| try out.append(hh.arena.allocator(), hint.object.get("label").?.string);
+            return std.mem.join(hh.arena.allocator(), " ", out.items);
+        }
+    }.of;
+    const refreshes = struct {
+        fn count(hh: *Harness) usize {
+            var n: usize = 0;
+            for (hh.received.items) |message| if (message.object.get("method")) |method| {
+                if (std.mem.eql(u8, method.string, "workspace/inlayHint/refresh")) n += 1;
+            };
+            return n;
+        }
+    }.count;
+    try testing.expectEqualStrings(": u32 n:", try labels(&h));
+
+    const before = refreshes(&h);
+    // 只改 field_types：推送的配置替换整份配置，其余项与初始化时相同
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{ .types = false, .field_types = false, .exclude_single_argument = false } } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(refreshes(&h) > before);
+    try testing.expectEqualStrings("n:", try labels(&h));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

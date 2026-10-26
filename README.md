@@ -25,7 +25,7 @@ If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `bu
 - **Editing**
   - Completion, including builtins with official documentation.
   - Hover, signature help.
-  - Inlay hints: inferred types and parameter names.
+  - Inlay hints: inferred types, field types in struct and union initializers, and parameter names (including builtins whose arguments are easy to confuse); single-argument calls and arguments that already carry the parameter's name (also behind `&`, `.*`, `.?`, `try`) are left unannotated.
   - Semantic tokens (full, delta, range), with unused bindings marked; optionally only the tokens that need semantic analysis (`semantic_tokens.mode = .partial`, to layer over the editor's syntax highlighting), and container-level `var`s marked `global`.
 - **Refactoring**: rename (with prepare); code actions:
   - discard an unused name, or remove a pointless discard;

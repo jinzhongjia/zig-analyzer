@@ -44,12 +44,22 @@
 
     // Inlay hints (editor only):
     //   .inlay_hints = .{
-    //       // Inferred types.
+    //       // Inferred types of local variables without a type annotation.
     //       .types = true,
+    //       // Field types after the field names in initializers that have a result type
+    //       // (`.{ .x: i32 = 1 }`).
+    //       .field_types = true,
     //       // Parameter names at call arguments.
     //       .parameters = true,
-    //       // Hide the parameter name when the argument already has that name (or is a field
-    //       // access ending in it).
+    //       // Parameter names at builtin call arguments (`@memcpy(dest: a, source: b)`), for
+    //       // builtins whose arguments do not show what they are (`@memcpy`, `@cmpxchgStrong`,
+    //       // `@Struct`, ...). Needs `.parameters`.
+    //       .builtin_parameters = true,
+    //       // No parameter names for calls with a single argument (including builtins and
+    //       // method calls like `list.append(item)`).
+    //       .exclude_single_argument = true,
+    //       // Hide the parameter name when the argument already has that name: a variable or a
+    //       // field access ending in it, also behind `&`, `.*`, `.?` and `try`.
     //       .hide_redundant_param_names = true,
     //   },
 
