@@ -324,3 +324,101 @@ test "extract to local constant" {
         };
     }
 }
+
+/// 用编译器的语法树验证编辑结果，并从字符串 token 读取字节值。
+fn stringValue(source: []const u8) ![]u8 {
+    const z = try testing.allocator.allocSentinel(u8, source.len, 0);
+    @memcpy(z, source);
+    defer testing.allocator.free(z);
+    var tree = try std.zig.Ast.parse(testing.allocator, z, .{});
+    defer tree.deinit(testing.allocator);
+    try testing.expectEqual(0, tree.errors.len);
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(testing.allocator);
+    var lines: usize = 0;
+    for (tree.tokens.items(.tag), 0..) |tag, i| switch (tag) {
+        .string_literal => return std.zig.string_literal.parseAlloc(testing.allocator, tree.tokenSlice(@intCast(i))),
+        .multiline_string_literal_line => {
+            if (lines != 0) try value.append(testing.allocator, '\n');
+            const token = tree.tokenSlice(@intCast(i));
+            var end = token.len;
+            if (end > 0 and token[end - 1] == '\n') end -= 1;
+            if (end > 0 and token[end - 1] == '\r') end -= 1;
+            try value.appendSlice(testing.allocator, token[2..end]);
+            lines += 1;
+        },
+        else => {},
+    };
+    try testing.expect(lines != 0);
+    return value.toOwnedSlice(testing.allocator);
+}
+
+test "string conversion preserves bytes and surrounding syntax" {
+    const cases = .{
+        .{ "\"\"", "" },
+        .{ "\"abc\"", "abc" },
+        .{ "\"a\\nb\"", "a\nb" },
+        .{ "\"\\n\\na\\n\\n\"", "\n\na\n\n" },
+        .{ "\"\\\"\\\\\\x41\\u{4e2d}  \"", "\"\\A中  " },
+    };
+    const contexts = .{
+        .{ "const text = ", ";" },
+        .{ "fn f() void {\n    const text = ", ";\n    _ = text;\n}" },
+        .{ "const text = .{ ", ", 42 };" },
+        .{ "const text = call(", ");" },
+        .{ "const text =\n    ", ";" },
+        .{ "const text = ", "; // comment\r\n" },
+    };
+    inline for (cases) |case| {
+        inline for (contexts) |context| {
+            const source = try std.mem.concat(testing.allocator, u8, &.{ context[0], "<|>", case[0], context[1] });
+            defer testing.allocator.free(source);
+            const multi = try apply(source, "convert to a multiline");
+            defer testing.allocator.free(multi);
+            const value = try stringValue(multi);
+            defer testing.allocator.free(value);
+            try testing.expectEqualStrings(case[1], value);
+            const marker = std.mem.indexOf(u8, multi, "\\\\").?;
+            const marked = try std.mem.concat(testing.allocator, u8, &.{ multi[0..marker], "<|>", multi[marker..] });
+            defer testing.allocator.free(marked);
+            const ordinary = try apply(marked, "convert to a string");
+            defer testing.allocator.free(ordinary);
+            const roundtrip = try stringValue(ordinary);
+            defer testing.allocator.free(roundtrip);
+            try testing.expectEqualStrings(case[1], roundtrip);
+        }
+    }
+}
+
+test "multiline conversion preserves whitespace and selects the whole literal" {
+    for ([_][]const u8{
+        "const text =\n    \\\\<|> a  \n    \\\\b\\\\\"\n    \\\\\n;",
+        "const text =\r\n    \\\\ a  \r\n    \\\\b<|>\\\\\"\r\n    \\\\\r\n;",
+        "const text = «\n    \\\\ a  \n    \\\\b\\\\\"\n    \\\\\n»;",
+    }) |source| {
+        const converted = try apply(source, "convert to a string");
+        defer testing.allocator.free(converted);
+        const value = try stringValue(converted);
+        defer testing.allocator.free(value);
+        try testing.expectEqualStrings(" a  \nb\\\\\"\n", value);
+    }
+}
+
+test "string conversion rejects unrepresentable bytes and invalid selections" {
+    for ([_][]const u8{
+        "const s = <|>\"\\t\";",
+        "const s = <|>\"\\r\\n\";",
+        "const s = <|>\"\\x00\";",
+        "const s = <|>\"\\x7f\";",
+        "const s = <|>\"\\xff\";",
+        "const s = <|>\"\\q\";",
+        "const s = <|>\"unfinished",
+        "const s = @\"<|>name\";",
+        "const s = '<|>x';",
+        "const s = «\"a\", \"b\"»;",
+    }) |source| {
+        const converted = try apply(source, "convert to");
+        defer testing.allocator.free(converted);
+        try testing.expectEqualStrings("no action", converted);
+    }
+}

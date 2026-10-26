@@ -3681,7 +3681,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .workspaceSymbolProvider = .{ .boolean = true },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
             .codeActionProvider = .{ .CodeActionOptions = .{
-                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.SourceOrganizeImports },
+                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.RefactorRewrite, types.CodeActionKind.SourceOrganizeImports },
                 .resolveProvider = true,
             } },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
@@ -4203,7 +4203,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         break :blk server.config.importOptions();
     };
     var actions: std.ArrayList(ide.code_actions.Action) = .empty;
-    if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract))
+    if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or wantsKind(only, types.CodeActionKind.RefactorRewrite))
         try actions.appendSlice(arena, try ide.code_actions.codeActions(r, file, start, end));
     // 明确要求整理 import 时不看光标位置（快捷键、保存时整理）
     if (wantsKind(only, types.CodeActionKind.SourceOrganizeImports)) {
@@ -4217,6 +4217,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         const kind = switch (a.kind) {
             .quickfix => types.CodeActionKind.QuickFix,
             .refactor_extract => types.CodeActionKind.RefactorExtract,
+            .refactor_rewrite => types.CodeActionKind.RefactorRewrite,
             .source_organize_imports => types.CodeActionKind.SourceOrganizeImports,
         };
         if (!wantsKind(only, kind)) continue;

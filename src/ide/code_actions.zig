@@ -4,7 +4,7 @@
 //! - switch 缺少的枚举 / 联合分支：补上 `.name => {},`
 //! - 结构体初始化缺少的字段（没有默认值的）：补上 `.name = undefined`
 //!
-//! 重构：选中的表达式提取为局部常量。源码操作：整理 import（见 `ide_db/organize_imports.zig`）。
+//! 重构：选中的表达式提取为局部常量，普通字符串与多行字符串无损互转。源码操作：整理 import（见 `ide_db/organize_imports.zig`）。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,7 +31,7 @@ pub const Action = struct {
     /// 所修复的诊断（`live.AstCheck` 的位置）；没有对应诊断时为 null
     diagnostic: ?struct { start: u32, end: u32 } = null,
 
-    pub const Kind = enum { quickfix, refactor_extract, source_organize_imports };
+    pub const Kind = enum { quickfix, refactor_extract, refactor_rewrite, source_organize_imports };
 };
 
 /// `[start, end]` 区间内可用的快速修复
@@ -58,6 +58,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
     if (try missingProngs(r, file, text, start)) |a| try out.append(r.arena, a);
     if (try missingFields(r, file, text, start)) |a| try out.append(r.arena, a);
     if (try extractVariable(r, file, text, start, end)) |a| try out.append(r.arena, a);
+    if (try convertString(r, file, text, start, end)) |a| try out.append(r.arena, a);
     return out.items;
 }
 
@@ -76,6 +77,83 @@ pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: o
     const edits = try r.arena.alloc(Edit, result.edits.len);
     for (result.edits, edits) |e, *out| out.* = .{ .start = e.start, .end = e.end, .text = e.text };
     return .{ .title = "Organize imports", .kind = .source_organize_imports, .edits = edits };
+}
+
+/// 只替换完整的字符串字面量；多行形式按 token 解码，避免把源码缩进或 CRLF 计入字符串值。
+fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
+    var start = sel_start;
+    var end = @min(sel_end, @as(u32, @intCast(text.len)));
+    if (start > end) return null;
+    while (start < end and std.ascii.isWhitespace(text[start])) start += 1;
+    while (end > start and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const path = try root.coveringPath(r.arena, start);
+    var literal: ?ast.SyntaxNode = null;
+    for (path) |n| if (n.kind() == .literal) {
+        literal = n;
+    };
+    const node = literal orelse return null;
+    const first = node.firstToken() orelse return null;
+    const multiline = first.kind == .multiline_string_literal_line;
+    if (!multiline and first.kind != .string_literal) return null;
+    var last = first;
+    var bytes: std.ArrayList(u8) = .empty;
+    var children = node.children();
+    var count: usize = 0;
+    while (children.next()) |child| {
+        if (child != .token) return null;
+        const t = child.token;
+        if (t.kind == .whitespace) continue;
+        if (t.kind != first.kind) return null;
+        last = t;
+        if (multiline) {
+            if (count != 0) try bytes.append(r.arena, '\n');
+            const line = std.mem.trimEnd(u8, t.text[2..], "\r\n");
+            try bytes.appendSlice(r.arena, line);
+        }
+        count += 1;
+    }
+    const literal_end = last.range().end;
+    if (start < first.offset or start >= literal_end or end > literal_end) return null;
+    const replacement = if (multiline)
+        try std.fmt.allocPrint(r.arena, "\"{f}\"", .{std.zig.fmtString(bytes.items)})
+    else blk: {
+        const value = try Body.stringLiteralValue(r.arena, first.text) orelse return null;
+        // 多行字符串不支持转义，控制字节（包括 TAB、CR）与非法 UTF-8 不能原样写入源码。
+        if (!std.unicode.utf8ValidateSlice(value)) return null;
+        for (value) |c| if (c != '\n' and std.ascii.isControl(c)) return null;
+        const indent = lineIndent(text, first.offset);
+        const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..first.offset], '\n')) |i| i + 1 else 0;
+        const own_line = line_start + indent.len == first.offset;
+        const newline: []const u8 = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
+        var out: std.ArrayList(u8) = .empty;
+        if (!own_line) {
+            try out.appendSlice(r.arena, newline);
+            try out.appendSlice(r.arena, indent);
+            try out.appendSlice(r.arena, "    ");
+        }
+        var lines = std.mem.splitScalar(u8, value, '\n');
+        var first_line = true;
+        while (lines.next()) |line| {
+            if (!first_line) {
+                try out.appendSlice(r.arena, newline);
+                try out.appendSlice(r.arena, indent);
+                if (!own_line) try out.appendSlice(r.arena, "    ");
+            }
+            first_line = false;
+            try out.appendSlice(r.arena, "\\\\");
+            try out.appendSlice(r.arena, line);
+        }
+        // 后续分号、逗号或表达式必须位于新行，否则会成为字符串内容。
+        try out.appendSlice(r.arena, newline);
+        try out.appendSlice(r.arena, indent);
+        break :blk out.items;
+    };
+    return .{
+        .title = if (multiline) "convert to a string literal" else "convert to a multiline string literal",
+        .kind = .refactor_rewrite,
+        .edits = try r.arena.dupe(Edit, &.{.{ .start = first.offset, .end = literal_end, .text = replacement }}),
+    };
 }
 
 /// 选中的表达式（两端空白不计）提取为所在语句之前的局部常量，原处替换为它的名字。
