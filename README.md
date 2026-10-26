@@ -26,7 +26,7 @@ If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `bu
   - Completion, including builtins with official documentation.
   - Hover, signature help.
   - Inlay hints: inferred types and parameter names.
-  - Semantic tokens (full, delta, range), with unused bindings marked.
+  - Semantic tokens (full, delta, range), with unused bindings marked; optionally only the tokens that need semantic analysis (`semantic_tokens.mode = .partial`, to layer over the editor's syntax highlighting), and container-level `var`s marked `global`.
 - **Refactoring**: rename (with prepare); code actions:
   - discard an unused name, or remove a pointless discard;
   - add missing switch prongs;

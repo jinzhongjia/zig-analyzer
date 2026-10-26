@@ -53,6 +53,18 @@
     //       .hide_redundant_param_names = true,
     //   },
 
+    // Semantic tokens (editor only):
+    //   .semantic_tokens = .{
+    //       // .full: every token. .partial: only tokens whose class needs name resolution and
+    //       // types (types, functions, namespaces, fields, parameters, ...); keywords, comments,
+    //       // literals, operators, labels and built-in names (`@import`, `u32`, `true`) are left to
+    //       // the editor's syntax highlighting. Each token sent is the same as in .full.
+    //       .mode = .full,
+    //       // Mark container-level `var` declarations and their references with the `global`
+    //       // modifier.
+    //       .global_var = false,
+    //   },
+
     // Completion (editor only):
     //   .completion = .{
     //       // In name completion, also offer reachable declarations and modules that are not

@@ -1682,7 +1682,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config_mutex.lockUncancelable(server.io);
     const zig_changed = !server.config.sameZig(&new);
     const build_changed = !server.config.sameBuild(&new);
-    const semantic_changed = server.config.callsite_seeding != new.callsite_seeding;
+    const semantic_changed = server.config.callsite_seeding != new.callsite_seeding or server.config.semantic_tokens_mode != new.semantic_tokens_mode or
+        server.config.semantic_tokens_global_var != new.semantic_tokens_global_var;
     const imports_enabled = !server.config.completion_auto_import and new.completion_auto_import;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const naming_changed = !server.config.sameNaming(&new);
@@ -3546,7 +3547,7 @@ fn selectionRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types
 fn semanticTokensFull(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensParams) HandlerError!types.ResultType("textDocument/semanticTokens/full") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(r.ctx, arena, file);
-    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, .{});
+    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, server.semanticTokensOptions());
     const result = try server.semanticTokensResult(r.ctx, arena, file, data, null);
     return result.SemanticTokens;
 }
@@ -3554,8 +3555,14 @@ fn semanticTokensFull(server: *Server, r: *Resolver, arena: Allocator, params: t
 fn semanticTokensDelta(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensDeltaParams) HandlerError!types.ResultType("textDocument/semanticTokens/full/delta") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(r.ctx, arena, file);
-    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, .{});
+    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, server.semanticTokensOptions());
     return try server.semanticTokensResult(r.ctx, arena, file, data, params.previousResultId);
+}
+
+fn semanticTokensOptions(server: *Server) ide.semantic_tokens.Options {
+    server.config_mutex.lockUncancelable(server.io);
+    defer server.config_mutex.unlock(server.io);
+    return .{ .partial = server.config.semantic_tokens_mode == .partial, .global_var = server.config.semantic_tokens_global_var };
 }
 
 fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, data: []const u32, previous_id: ?[]const u8) HandlerError!SemanticCache.Result {
@@ -3573,7 +3580,7 @@ fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: V
 fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensRangeParams) HandlerError!types.ResultType("textDocument/semanticTokens/range") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(r.ctx, arena, file);
-    return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range, .{}) };
+    return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range, server.semanticTokensOptions()) };
 }
 
 fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {

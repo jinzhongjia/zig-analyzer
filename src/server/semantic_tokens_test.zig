@@ -462,3 +462,50 @@ test "semantic tokens remain single line nonoverlapping and within legend intege
         _ = try h.request("shutdown", {});
     }
 }
+
+test "semantic token settings apply to full delta and range requests and refresh when changed" {
+    const semantic = za.ide.semantic_tokens;
+    const T = semantic.TokenType;
+    const M = semantic.Modifier;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .workspace = .{ .semanticTokens = .{ .refreshSupport = true } } },
+        .initializationOptions = .{ .diagnostics = .{ .debounce_ms = 0 }, .semantic_tokens = .{ .mode = "partial" } },
+    });
+    const source = "// comment\nvar counter: u32 = 0;\nfn bump() void { counter += 1; }\n";
+    try open(&h, document, source);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const variable = @backingInt(T.variable);
+    const function = @backingInt(T.function);
+    const partial = try full(&h, document);
+    try testing.expectEqualSlices(u32, &.{ 1, 4, 7, variable, M.declaration, 1, 3, 4, function, M.declaration, 0, 14, 7, variable, 0 }, partial.data);
+    const unchanged = (try delta(&h, document, partial.resultId.?)).SemanticTokensDelta;
+    try testing.expectEqual(0, unchanged.edits.len);
+    const ranged = try decode(types.SemanticTokens, &h, try h.request("textDocument/semanticTokens/range", .{
+        .textDocument = document,
+        .range = types.Range{ .start = .{ .line = 2, .character = 0 }, .end = .{ .line = 3, .character = 0 } },
+    }));
+    try testing.expectEqualSlices(u32, &.{ 2, 3, 4, function, M.declaration, 0, 14, 7, variable, 0 }, ranged.data);
+
+    const refreshes = refreshCount(&h);
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .semantic_tokens = .{ .global_var = true } } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(refreshCount(&h) > refreshes);
+    const current = switch (try delta(&h, document, unchanged.resultId.?)) {
+        .SemanticTokens => |tokens| tokens.data,
+        .SemanticTokensDelta => |tokens| try replay(&h, partial.data, tokens.edits),
+    };
+    const fresh = try full(&h, document);
+    try testing.expectEqualSlices(u32, fresh.data, current);
+    // 回到 full：首个 token 是注释，`var` 关键字之后是带 `global` 的声明
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 10, @backingInt(T.comment), 0 }, fresh.data[0..5]);
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 3, @backingInt(T.keyword), 0, 0, 4, 7, variable, M.declaration | M.global }, fresh.data[5..15]);
+    const marked = try decode(types.SemanticTokens, &h, try h.request("textDocument/semanticTokens/range", .{
+        .textDocument = document,
+        .range = types.Range{ .start = .{ .line = 2, .character = 17 }, .end = .{ .line = 2, .character = 18 } },
+    }));
+    try testing.expectEqualSlices(u32, &.{ 2, 17, 7, variable, M.global }, marked.data);
+    _ = try h.request("shutdown", {});
+}

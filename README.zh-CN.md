@@ -26,7 +26,7 @@ Zig **0.17.0**。请用项目所用的同一个 Zig 编译 zig-analyzer。
   - 补全，包括带官方文档的内置函数。
   - hover，参数提示。
   - inlay hints：推导出的类型与形参名。
-  - 语义着色（full、delta、range），标出未使用的绑定。
+  - 语义着色（full、delta、range），标出未使用的绑定；可以只发需要语义分析的 token（`semantic_tokens.mode = .partial`，叠加在编辑器的语法高亮之上），以及为容器级的 `var` 标上 `global`。
 - **重构**：重命名（支持 prepare）；代码操作：
   - 丢弃未使用的名字，或删除多余的丢弃；
   - 补上 switch 缺少的分支；

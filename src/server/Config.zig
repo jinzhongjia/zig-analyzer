@@ -7,6 +7,7 @@
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "parameters": true, "hide_redundant_param_names": true },
+//!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
 //!       "workspace_symbol": { "dependencies": false },
@@ -53,6 +54,10 @@ inlay_types: bool = true,
 inlay_parameters: bool = true,
 /// 实参与形参同名（或以形参名结尾的字段访问）时不显示形参名
 hide_redundant_param_names: bool = true,
+/// 语义着色发出哪些 token
+semantic_tokens_mode: SemanticTokensMode = .full,
+/// 语义着色：容器级 `var` 的声明与引用带 `global` modifier
+semantic_tokens_global_var: bool = false,
 /// 普通名字补全中提供可达声明与模块的自动导入
 completion_auto_import: bool = false,
 /// 一次补全至多提供的自动导入候选（保留排序最好的，其余由客户端随输入重新请求得到）；0 为不限
@@ -95,6 +100,14 @@ pub const Watcher = enum {
     server,
 };
 
+/// 语义着色发出的 token
+pub const SemanticTokensMode = enum {
+    /// 全部 token
+    full,
+    /// 只发需要名字解析与类型推导才能确定分类的 token；关键字、注释、字面量、运算符、标签与内建名留给编辑器的语法高亮
+    partial,
+};
+
 /// 命名检查的规则，与诊断的 code `naming.<规则>` 一一对应
 pub const NamingRules = struct {
     /// 类型与类型别名：TitleCase
@@ -129,6 +142,8 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "types", .field = "inlay_types" },
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
     .{ .section = "inlay_hints", .key = "hide_redundant_param_names", .field = "hide_redundant_param_names" },
+    .{ .section = "semantic_tokens", .key = "mode", .field = "semantic_tokens_mode" },
+    .{ .section = "semantic_tokens", .key = "global_var", .field = "semantic_tokens_global_var" },
     .{ .section = "completion", .key = "auto_import", .field = "completion_auto_import" },
     .{ .section = "completion", .key = "max_auto_imports", .field = "completion_max_auto_imports" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
@@ -404,6 +419,14 @@ test "parse: nested fields, optional wrapper" {
     );
     defer server_watcher.deinit(testing.allocator);
     try testing.expectEqual(Watcher.server, server_watcher.files_watcher);
+
+    try testing.expect(empty.semantic_tokens_mode == .full and !empty.semantic_tokens_global_var);
+    var partial = try parseText(
+        \\{"semantic_tokens": {"mode": "partial", "global_var": true}}
+    );
+    defer partial.deinit(testing.allocator);
+    try testing.expect(partial.semantic_tokens_mode == .partial and partial.semantic_tokens_global_var);
+    try testing.expectEqual(0, partial.warnings.len);
 }
 
 test "parse: unknown and invalid settings are reported, the rest still applies" {
