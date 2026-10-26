@@ -2848,7 +2848,7 @@ test "comptime evaluation: slices of interpreter storage read elements in place"
 
 test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
     // 编译器只按回跳计数：逐个写入数十万个元素的 `@memcpy` 不受限制。在两次内存检查之间复制出超过内存上限的
-    // 大数组时放弃
+    // 大数组时放弃：`copyLarge` 每次复制 2^20 个元素，48 次的总量超过 1 GB
     try expectTypes(
         \\fn copyMany() u8 {
         \\    const buf: [60000]u8 = @splat(1);
@@ -2863,9 +2863,9 @@ test "comptime evaluation: element-wise work is not limited by steps, but large 
         \\    return out[0];
         \\}
         \\fn copyLarge() u8 {
-        \\    const buf: [65536]u8 = @splat(1);
+        \\    const buf: [1 << 20]u8 = @splat(1);
         \\    var sum: u8 = 0;
-        \\    for (0..24) |_| {
+        \\    for (0..48) |_| {
         \\        const c = buf;
         \\        sum +%= c[0];
         \\    }

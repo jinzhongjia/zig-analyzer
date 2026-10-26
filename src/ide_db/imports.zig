@@ -41,8 +41,8 @@ pub const Target = union(enum) {
     file: FileId,
 };
 
-/// 别名链与成员访问的最大求值深度
-const max_depth = 32;
+/// 别名链与成员访问的最大求值深度，与 `Resolver` 的别名链上限相同
+const max_depth = 100;
 
 /// 只为 Zig 源文件建索引：模块的根可以是 `.zon` 或任意数据文件（如 `addAnonymousImport` 引入的 JSON），
 /// 按 Zig 解析它们没有意义，大文件还很慢

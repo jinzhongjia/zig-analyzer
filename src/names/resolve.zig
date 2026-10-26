@@ -34,8 +34,8 @@ pub const Namespace = struct {
 
 pub const Error = error{ Canceled, OutOfMemory };
 
-/// 别名链的最大长度，防止 `const a = b; const b = a;` 这类环
-const max_depth = 64;
+/// 别名链的最大长度，防止 `const a = b; const b = a;` 这类环。与 rust-analyzer 名字解析中 glob 导入的递归上限相同
+const max_depth = 100;
 
 pub const Resolver = struct {
     ctx: *Db.Ctx,

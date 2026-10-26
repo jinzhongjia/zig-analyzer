@@ -34,8 +34,8 @@ const value = @import("value.zig");
 pub const default_branch_quota = 1000;
 /// 求字符串来源时展开声明的嵌套深度上限：互相引用的声明不会结束，超过时只是不跟踪来源
 const max_tracked_decls = 64;
-/// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃
-const max_eval_bytes = 64 * 1024 * 1024;
+/// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃。与 rust-analyzer 常量求值的内存上限相同
+const max_eval_bytes = 1024 * 1024 * 1024;
 /// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
 const max_layout_depth = 64;
 /// 驻留时值的嵌套深度上限（聚合与指针的层数）。驻留的值按内容唯一表示、没有环，
