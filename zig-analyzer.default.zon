@@ -49,6 +49,9 @@
     //       // Field types after the field names in initializers that have a result type
     //       // (`.{ .x: i32 = 1 }`).
     //       .field_types = true,
+    //       // Also show type hints (local variables and fields) whose type has an anonymous
+    //       // container, which is shown by its content (`.kind: struct { root: u32 }`).
+    //       .anonymous_containers = false,
     //       // Parameter names at call arguments.
     //       .parameters = true,
     //       // Parameter names at builtin call arguments (`@memcpy(dest: a, source: b)`), for

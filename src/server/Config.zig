@@ -6,8 +6,8 @@
 //!     { "zig": { "path": "/usr/local/bin/zig" },
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": true, "debounce_ms": 50 },
-//!       "inlay_hints": { "types": true, "field_types": true, "parameters": true, "builtin_parameters": true,
-//!                        "exclude_single_argument": true, "hide_redundant_param_names": true },
+//!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
+//!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "completion": { "auto_import": false, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
@@ -53,6 +53,8 @@ inactive_code: bool = true,
 inlay_types: bool = true,
 /// inlay hints：初始化表达式中字段名之后的字段类型
 inlay_field_types: bool = true,
+/// inlay hints：类型中有按内容显示的匿名容器（`struct { a: u32 }`）时也显示类型提示
+inlay_anonymous_containers: bool = false,
 /// inlay hints：实参对应的形参名
 inlay_parameters: bool = true,
 /// inlay hints：内置函数调用的参数名（`inlay_parameters` 关闭时同样不显示）
@@ -148,6 +150,7 @@ const settings = [_]Setting{
     .{ .section = "diagnostics", .key = "debounce_ms", .field = "debounce_ms" },
     .{ .section = "inlay_hints", .key = "types", .field = "inlay_types" },
     .{ .section = "inlay_hints", .key = "field_types", .field = "inlay_field_types" },
+    .{ .section = "inlay_hints", .key = "anonymous_containers", .field = "inlay_anonymous_containers" },
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
     .{ .section = "inlay_hints", .key = "builtin_parameters", .field = "inlay_builtin_parameters" },
     .{ .section = "inlay_hints", .key = "exclude_single_argument", .field = "inlay_exclude_single_argument" },
@@ -250,6 +253,8 @@ pub fn parseProject(gpa: Allocator, text: []const u8) Allocator.Error!Config {
 /// 项目配置文件的结构：分组与项同 `settings`，各项可选（没有写出时为 null）。
 /// 整个文件一次解析：`std.zon.parse.fromZoir` 不使用 `node` 选项，总是从根开始，不能逐项解析
 const ProjectFile = blk: {
+    // 每个分组都遍历一遍全部配置项
+    @setEvalBranchQuota(4000);
     const Attrs = std.lang.Type.Struct.FieldAttributes;
     var names: []const []const u8 = &.{};
     for (settings) |s| {

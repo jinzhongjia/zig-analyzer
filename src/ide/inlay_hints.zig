@@ -26,6 +26,8 @@ pub const Options = struct {
     types: bool = true,
     /// 初始化表达式中字段名之后的字段类型
     field_types: bool = true,
+    /// 类型中有按内容显示的匿名容器（`.kind: struct { a: u32 }`、`[]const struct { y: u8 }`）时也显示类型提示
+    anonymous_containers: bool = false,
     parameters: bool = true,
     /// 内置函数调用的参数名；`parameters` 关闭时同样不提示
     builtin_parameters: bool = true,
@@ -70,11 +72,12 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
         // 未知的类型与值为类型的常量（`const T = u8`）不提示
         if (tv.ty == .unknown or tv.ty == .type_type) continue;
         const tooltip: ?[]const u8 = if (abstract.ty == .unknown) if (a.seeded) |s| try seedNote(r, s) else null else null;
-        try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, tv.ty)}), .kind = .type, .tooltip = tooltip });
+        const label = try typeLabel(r, tv.ty, opts) orelse continue;
+        try out.append(r.arena, .{ .offset = at, .label = label, .kind = .type, .tooltip = tooltip });
     };
     if (opts.field_types) for (b.exprs, 0..) |e, i| {
         if (e != .init) continue;
-        try fieldTypeHints(r, a, @fromBackingInt(@as(u32, @intCast(i))), e.init, start, end, out);
+        try fieldTypeHints(r, a, @fromBackingInt(@as(u32, @intCast(i))), e.init, start, end, opts, out);
     };
     if (opts.parameters) for (b.exprs, 0..) |e, i| {
         const range = b.expr_ranges[i];
@@ -107,7 +110,7 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
 /// 初始化表达式中各字段名之后的字段类型。初始化的类型与推导时一致：写出的类型，或结果类型去掉 error union 与
 /// optional（表达式本身记录的类型已转换为结果类型，不能直接用）。没有结果类型的 `.{ ... }`（匿名结构体）不提示：
 /// 它的字段类型就是值的类型
-fn fieldTypeHints(r: *Resolver, a: context.At, e: Body.ExprId, init: @FieldType(Body.Expr, "init"), start: u32, end: u32, out: *std.ArrayList(Hint)) resolve.Error!void {
+fn fieldTypeHints(r: *Resolver, a: context.At, e: Body.ExprId, init: @FieldType(Body.Expr, "init"), start: u32, end: u32, opts: Options, out: *std.ArrayList(Hint)) resolve.Error!void {
     const ip = a.ip;
     const t: InternPool.Index = if (init.ty) |te| a.exprType(te).asType() orelse return else t: {
         var want = a.literalExpected(e) orelse return;
@@ -123,8 +126,15 @@ fn fieldTypeHints(r: *Resolver, a: context.At, e: Body.ExprId, init: @FieldType(
         if (at < start or at > end) continue;
         const ty = (try infer.initField(r, t, ns, k, f.name)).ty orelse continue;
         if (ty == .unknown) continue;
-        try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, ty)}), .kind = .type });
+        try out.append(r.arena, .{ .offset = at, .label = try typeLabel(r, ty, opts) orelse continue, .kind = .type });
     }
+}
+
+/// 类型提示的文字；类型中有按内容显示的匿名容器而 `anonymous_containers` 关闭时为 null
+fn typeLabel(r: *Resolver, t: InternPool.Index, opts: Options) resolve.Error!?[]const u8 {
+    const shown = try render.typeAllocNoting(r, t);
+    if (shown.anonymous and !opts.anonymous_containers) return null;
+    return try std.fmt.allocPrint(r.arena, ": {s}", .{shown.text});
 }
 
 fn paramHint(r: *Resolver, a: context.At, arg: Body.ExprId, name: []const u8, opts: Options, out: *std.ArrayList(Hint)) resolve.Error!void {

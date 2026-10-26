@@ -1904,6 +1904,75 @@ test "inlay hints: field types in initializers that have a result type" {
     , try inlaid(&w, file, text, .{ .types = false, .parameters = false }));
 }
 
+test "anonymous containers are shown by content, and their type hints only when enabled" {
+    const text =
+        \\const Kind = union(enum) { compile: struct { root: u32 }, none };
+        \\const S = struct { inner: packed struct { x: u8 }, list: []const struct { y: u8, next: ?*const @This() } };
+        \\const B = if (@sizeOf(usize) == 8) struct { b: u8 } else struct { b: u16 };
+        \\fn Ret(comptime n: u8) type {
+        \\    return struct { r: [n]u8 };
+        \\}
+        \\fn f(s: S) void {
+        \\    const k: Kind = .{ .compile = .{ .root = 1 } };
+        \\    const i = s.inner;
+        \\    const l = s.list;
+        \\    var v: struct { e: enum { a, b } } = .{ .e = .a };
+        \\    const b: B = .{ .b = 1 };
+        \\    const L = struct { q: u8 };
+        \\    const q = L{ .q = 1 };
+        \\    const r = Ret(2){ .r = .{ 1, 2 } };
+        \\    _ = .{ k, i, l, &v, b, q, r };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const body = struct {
+        fn of(annotated: []const u8) []const u8 {
+            return annotated[std.mem.indexOf(u8, annotated, "fn f(").?..];
+        }
+    }.of;
+    // 字段、变量的类型标注中的容器没有名字，按内容显示（其中再有的显示为 `{...}`）；值是容器或 `if` 选出的容器、
+    // `return` 的容器、局部常量的容器以成员命名
+    try testing.expectEqualStrings(
+        \\fn f(s: S) void {
+        \\    const k: Kind = .{ .compile: struct { root: u32 } = .{ .root: u32 = 1 } };
+        \\    const i: packed struct { x: u8 } = s.inner;
+        \\    const l: []const struct { y: u8, next: ?*const struct {...} } = s.list;
+        \\    var v: struct { e: enum { a, b } } = .{ .e: enum { a, b } = .a };
+        \\    const b: B = .{ .b: u8 = 1 };
+        \\    const L = struct { q: u8 };
+        \\    const q: L = L{ .q: u8 = 1 };
+        \\    const r: Ret(2) = Ret(2){ .r: [2]u8 = .{ 1, 2 } };
+        \\    _ = .{ k, i, l, &v, b, q, r };
+        \\}
+        \\
+    , body(try inlaid(&w, file, text, .{ .anonymous_containers = true, .parameters = false })));
+    // 默认不显示类型中有匿名容器的提示
+    try testing.expectEqualStrings(
+        \\fn f(s: S) void {
+        \\    const k: Kind = .{ .compile = .{ .root: u32 = 1 } };
+        \\    const i = s.inner;
+        \\    const l = s.list;
+        \\    var v: struct { e: enum { a, b } } = .{ .e = .a };
+        \\    const b: B = .{ .b: u8 = 1 };
+        \\    const L = struct { q: u8 };
+        \\    const q: L = L{ .q: u8 = 1 };
+        \\    const r: Ret(2) = Ret(2){ .r: [2]u8 = .{ 1, 2 } };
+        \\    _ = .{ k, i, l, &v, b, q, r };
+        \\}
+        \\
+    , body(try inlaid(&w, file, text, .{ .parameters = false })));
+    // hover 不受 inlay hints 的配置影响
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "i = s.inner").?))).?;
+    try testing.expectEqualStrings("```zig\nconst i: packed struct { x: u8 }\n```", info.text);
+}
+
 test "inlay hints: builtin parameter names" {
     const text =
         \\fn f(buf: []u8, data: []const u8, ptr: *u32, x: u64) void {
