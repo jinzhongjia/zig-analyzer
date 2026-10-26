@@ -1785,12 +1785,20 @@ fn startProjectsForRoots(server: *Server) void {
     }
 }
 
-/// 目录下是否有 build.zig
+/// 目录 `dir` 下有名为 build.zig 的文件。名字须完全相同：大小写不敏感的文件系统（macOS 与 Windows 的默认）上，
+/// 按路径访问 build.zig 对 Build.zig 同样成功，标准库目录（有 `std/Build.zig`）因此会被当作项目，`zig build` 再以
+/// Build.zig 为构建脚本，编译失败的错误落在标准库的文件上
 fn hasBuildZig(server: *Server, dir: []const u8) Allocator.Error!bool {
     const path = try std.fs.path.join(server.gpa, &.{ dir, "build.zig" });
     defer server.gpa.free(path);
     Io.Dir.cwd().access(server.io, path, .{}) catch return false;
-    return true;
+    var d = Io.Dir.cwd().openDir(server.io, dir, .{ .iterate = true }) catch return false;
+    defer d.close(server.io);
+    var it = d.iterate();
+    while (it.next(server.io) catch return false) |entry| {
+        if (std.mem.eql(u8, entry.name, "build.zig")) return true;
+    }
+    return false;
 }
 
 /// 记录根目录 `root` 下是否有 build.zig；返回记录是否因此改变（`root` 不是根目录时为 false）

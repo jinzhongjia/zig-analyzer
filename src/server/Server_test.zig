@@ -365,6 +365,8 @@ test "files under a build.zig outside the workspace belong to a project that is 
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "proj/src");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "proj/build.zig", .data = "" });
+    try tmp.dir.createDirPath(testing.io, "capital");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "capital/Build.zig", .data = "" });
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(root);
 
@@ -379,6 +381,9 @@ test "files under a build.zig outside the workspace belong to a project that is 
         .{ &.{ "proj", "src", "main.zig" }, "unloaded_project" },
         // 临时目录在本仓库的 .zig-cache 中：查找所属的项目时不越过它
         .{ &.{"scratch.zig"}, "detached" },
+        // 只有 Build.zig（如标准库的 `std/Build.zig`）：大小写不敏感的文件系统上按路径访问 build.zig 同样成功，
+        // 防止把这样的目录当作项目
+        .{ &.{ "capital", "main.zig" }, "detached" },
     };
     for (cases) |c| {
         const path = try std.fs.path.join(a, &.{ root, try std.fs.path.join(a, c[0]) });
