@@ -47,6 +47,7 @@ pub const Modifier = struct {
     pub const documentation: u32 = 1 << 2;
     pub const defaultLibrary: u32 = 1 << 3;
     pub const unused: u32 = 1 << 4;
+    pub const global: u32 = 1 << 5;
 };
 
 pub const legend: types.SemanticTokensLegend = .{
@@ -57,12 +58,19 @@ pub const legend: types.SemanticTokensLegend = .{
         const final = out;
         break :blk &final;
     },
-    .tokenModifiers = &.{ "declaration", "readonly", "documentation", "defaultLibrary", "unused" },
+    .tokenModifiers = &.{ "declaration", "readonly", "documentation", "defaultLibrary", "unused", "global" },
 };
 
-pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc: offsets.Encoding, range: ?types.Range) resolve.Error![]const u32 {
+pub const Options = struct {
+    /// 不发 `syntactic` 的 token，留给编辑器的语法高亮；发出的 token 与全量结果中的同一 token 相同
+    partial: bool = false,
+    /// 容器级 `var` 的声明与引用带 `global`
+    global_var: bool = false,
+};
+
+pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc: offsets.Encoding, range: ?types.Range, options: Options) resolve.Error![]const u32 {
     if (range) |requested| if (!before(requested.start, requested.end)) return &.{};
-    var b: Builder = .{ .r = r, .lines = lines, .enc = enc, .range = range };
+    var b: Builder = .{ .r = r, .lines = lines, .enc = enc, .range = range, .options = options };
     if (range) |requested| {
         const start = offsets.positionToOffset(lines.text, requested.start, enc);
         var end = offsets.positionToOffset(lines.text, requested.end, enc);
@@ -89,11 +97,20 @@ fn dependsOnType(c: Class) bool {
     return c.type == .variable or c.type == .type;
 }
 
+/// 不需要名字解析与类型推导就能确定的分类：关键字、注释、字面量、运算符、标签与内建名（`@import`、`u32`、`true`）
+fn syntactic(c: Class) bool {
+    return switch (c.type) {
+        .keyword, .comment, .string, .number, .operator, .label => true,
+        else => c.mods & Modifier.defaultLibrary != 0,
+    };
+}
+
 const Builder = struct {
     r: *Resolver,
     lines: offsets.LineIndex,
     enc: offsets.Encoding,
     range: ?types.Range,
+    options: Options,
     visible: ?tree.TextRange = null,
     /// 以名字 token 的末尾寻址，字段访问不需要重新遍历其左侧表达式。
     names: std.AutoHashMapUnmanaged(u32, Class) = .empty,
@@ -179,7 +196,9 @@ const Builder = struct {
         const c: Class = switch (item.kind) {
             .@"fn" => .{ .type = try b.functionType(key, itree.containers[item.container]) },
             .field => .{ .type = if (itree.containers[item.container].kind == .@"enum") .enumMember else .property },
-            .@"const", .@"var" => b.valueClass(try b.r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable, if (item.kind == .@"const") Modifier.readonly else 0),
+            .@"const" => b.valueClass(try b.r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable, Modifier.readonly),
+            // ItemTree 的成员都在容器级
+            .@"var" => b.valueClass(try b.r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable, if (b.options.global_var) Modifier.global else 0),
             else => .{ .type = .variable },
         };
         try b.classes.put(b.r.arena, key, c);
@@ -463,7 +482,8 @@ const Builder = struct {
             .token => |token| {
                 if (!b.intersects(token.range())) continue;
                 const semantic = if (token.kind == .identifier) b.names.get(token.offset + @as(u32, @intCast(token.text.len))) else null;
-                if (semantic orelse syntaxClass(token, node, child_in_enum)) |c| try b.emit(token, c);
+                const c = semantic orelse syntaxClass(token, node, child_in_enum) orelse continue;
+                if (!(b.options.partial and syntactic(c))) try b.emit(token, c);
             },
         };
     }

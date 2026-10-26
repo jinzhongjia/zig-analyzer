@@ -3546,7 +3546,7 @@ fn selectionRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types
 fn semanticTokensFull(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensParams) HandlerError!types.ResultType("textDocument/semanticTokens/full") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(r.ctx, arena, file);
-    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null);
+    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, .{});
     const result = try server.semanticTokensResult(r.ctx, arena, file, data, null);
     return result.SemanticTokens;
 }
@@ -3554,7 +3554,7 @@ fn semanticTokensFull(server: *Server, r: *Resolver, arena: Allocator, params: t
 fn semanticTokensDelta(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensDeltaParams) HandlerError!types.ResultType("textDocument/semanticTokens/full/delta") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(r.ctx, arena, file);
-    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null);
+    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, .{});
     return try server.semanticTokensResult(r.ctx, arena, file, data, params.previousResultId);
 }
 
@@ -3573,7 +3573,7 @@ fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: V
 fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensRangeParams) HandlerError!types.ResultType("textDocument/semanticTokens/range") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(r.ctx, arena, file);
-    return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range) };
+    return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range, .{}) };
 }
 
 fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {

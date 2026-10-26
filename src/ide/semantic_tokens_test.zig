@@ -10,12 +10,16 @@ const T = semantic.TokenType;
 const M = semantic.Modifier;
 
 fn tokens(w: *World, file: FileId, text: []const u8, enc: offsets.Encoding, range: ?types.Range) ![]const u32 {
+    return tokensWith(w, file, text, enc, range, .{});
+}
+
+fn tokensWith(w: *World, file: FileId, text: []const u8, enc: offsets.Encoding, range: ?types.Range, options: semantic.Options) ![]const u32 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
     var lines = try offsets.LineIndex.init(testing.allocator, text);
     defer lines.deinit(testing.allocator);
-    return semantic.semanticTokens(&r, file, lines, enc, range);
+    return semantic.semanticTokens(&r, file, lines, enc, range, options);
 }
 
 const Case = struct {
@@ -1017,5 +1021,183 @@ test "semantic tokens classify the bottom of a deep field access chain" {
     try check(data, text.items, .utf16, &.{
         .{ .needle = "s.n", .ty = .variable, .mods = M.readonly },
         .{ .needle = "v;", .ty = .property },
+    });
+}
+
+fn isSyntactic(ty: u32, mods: u32) bool {
+    return switch (@as(T, @fromBackingInt(ty))) {
+        .keyword, .comment, .string, .number, .operator, .label => true,
+        else => mods & M.defaultLibrary != 0,
+    };
+}
+
+/// 去掉全量结果中的语法类 token 后按相对位置重新编码
+fn withoutSyntactic(w: *World, full: []const u32) ![]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var position: types.Position = .{ .line = 0, .character = 0 };
+    var previous: types.Position = .{ .line = 0, .character = 0 };
+    var i: usize = 0;
+    while (i < full.len) : (i += 5) {
+        if (full[i] != 0) position.character = 0;
+        position.line += full[i];
+        position.character += full[i + 1];
+        if (isSyntactic(full[i + 3], full[i + 4])) continue;
+        const delta_line = position.line - previous.line;
+        try out.appendSlice(w.arena.allocator(), &.{
+            delta_line,
+            if (delta_line == 0) position.character - previous.character else position.character,
+            full[i + 2],
+            full[i + 3],
+            full[i + 4],
+        });
+        previous = position;
+    }
+    return out.items;
+}
+
+test "semantic partial tokens are the full tokens without syntactic classes in full and range requests" {
+    const text =
+        \\//! Module docs.
+        \\const dep = @import("dep.zig");
+        \\/// Point docs.
+        \\const Point = struct {
+        \\    x: i32 = 0,
+        \\    fn length(self: Point) i32 {
+        \\        return self.x * 2;
+        \\    }
+        \\};
+        \\const Color = enum { red, green };
+        \\const Fail = error{Broken};
+        \\fn pick(comptime T: type, value: T, flag: bool) !T {
+        \\    // line comment
+        \\    const text = "str";
+        \\    const char = 'c';
+        \\    const multi =
+        \\        \\multi
+        \\    ;
+        \\    _ = .{ text, char, multi, dep.helper() };
+        \\    if (!flag) return error.Broken;
+        \\    const p: Point = .{ .x = 1 };
+        \\    var color: Color = .red;
+        \\    color = .green;
+        \\    var unused_local: u32 = 0;
+        \\    unused_local = 1;
+        \\    const n = blk: {
+        \\        break :blk p.length() + @as(i32, 3);
+        \\    };
+        \\    _ = .{ n, color, @as(u8, 1), null, true, undefined, Fail };
+        \\    return value;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/dep.zig", "pub fn helper() void {}");
+    const file = (try w.add("/p/main.zig", text)).file;
+    const full = try tokens(&w, file, text, .utf16, null);
+    const partial = try tokensWith(&w, file, text, .utf16, null, .{ .partial = true });
+    try testing.expectEqualSlices(u32, try withoutSyntactic(&w, full), partial);
+
+    // 全量结果含各种语法类 token，partial 去掉了它们
+    try check(full, text, .utf16, &.{
+        .{ .needle = "//!", .ty = .comment, .mods = M.documentation },
+        .{ .needle = "// line", .ty = .comment },
+        .{ .needle = "const dep", .ty = .keyword },
+        .{ .needle = "@import", .ty = .function, .mods = M.defaultLibrary },
+        .{ .needle = "\"str\"", .ty = .string },
+        .{ .needle = "'c'", .ty = .string },
+        .{ .needle = "\\\\multi", .ty = .string },
+        .{ .needle = "2;", .ty = .number },
+        .{ .needle = "* 2", .ty = .operator },
+        .{ .needle = "blk:", .ty = .label, .mods = M.declaration },
+        .{ .needle = "blk p", .ty = .label },
+        .{ .needle = "i32 =", .ty = .type, .mods = M.defaultLibrary },
+        .{ .needle = "null,", .ty = .keyword, .mods = M.defaultLibrary },
+    });
+    var i: usize = 0;
+    while (i < partial.len) : (i += 5) try testing.expect(!isSyntactic(partial[i + 3], partial[i + 4]));
+    try check(partial, text, .utf16, &.{
+        .{ .needle = "dep =", .ty = .namespace, .mods = M.declaration | M.readonly },
+        .{ .needle = "Point =", .ty = .@"struct", .mods = M.declaration | M.readonly },
+        .{ .needle = "x:", .ty = .property, .mods = M.declaration },
+        .{ .needle = "length(self", .ty = .method, .mods = M.declaration },
+        .{ .needle = "Color =", .ty = .@"enum", .mods = M.declaration | M.readonly },
+        .{ .needle = "red,", .ty = .enumMember, .mods = M.declaration },
+        .{ .needle = "pick(", .ty = .function, .mods = M.declaration },
+        .{ .needle = "T:", .ty = .typeParameter, .mods = M.declaration | M.readonly },
+        .{ .needle = "value:", .ty = .parameter, .mods = M.declaration | M.readonly },
+        .{ .needle = "helper()", .ty = .function },
+        .{ .needle = "Broken;", .ty = .enumMember },
+        .{ .needle = "red;", .ty = .enumMember },
+        .{ .needle = "length()", .ty = .method },
+        .{ .needle = "Fail }", .ty = .type, .mods = M.readonly },
+    });
+
+    for ([_][]const u8{ "fn length", "const text", "if (!flag)", "break :blk", "_ = .{ n" }) |needle| {
+        const line = needleRange(text, needle, .utf16).start.line;
+        const range: types.Range = .{ .start = .{ .line = line, .character = 0 }, .end = .{ .line = line + 2, .character = 0 } };
+        const ranged_full = try tokens(&w, file, text, .utf16, range);
+        const ranged_partial = try tokensWith(&w, file, text, .utf16, range, .{ .partial = true });
+        try testing.expect(ranged_partial.len != 0 and ranged_partial.len < ranged_full.len);
+        try testing.expectEqualSlices(u32, try withoutSyntactic(&w, ranged_full), ranged_partial);
+    }
+}
+
+test "semantic global var modifier marks container level var declarations and references" {
+    const text =
+        \\const dep = @import("dep.zig");
+        \\var counter: u32 = 0;
+        \\const limit = 10;
+        \\const S = struct {
+        \\    var instances: usize = 0;
+        \\    callback: *const fn () void,
+        \\    fn bump() void {
+        \\        instances += 1;
+        \\        S.instances += 1;
+        \\    }
+        \\};
+        \\var handler: *const fn () void = run;
+        \\fn run() void {
+        \\    var local: u32 = 0;
+        \\    local += counter;
+        \\    counter += limit;
+        \\    dep.total += 1;
+        \\    handler();
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/dep.zig", "pub var total: u32 = 0;");
+    const file = (try w.add("/p/main.zig", text)).file;
+    const G = M.global;
+    const marked = [_]Case{
+        .{ .needle = "counter:", .ty = .variable, .mods = M.declaration | G },
+        .{ .needle = "counter;", .ty = .variable, .mods = G },
+        .{ .needle = "counter +=", .ty = .variable, .mods = G },
+        .{ .needle = "instances:", .ty = .variable, .mods = M.declaration | G },
+        .{ .needle = "instances +=", .ty = .variable, .mods = G },
+        .{ .needle = "instances +=", .nth = 1, .ty = .variable, .mods = G },
+        .{ .needle = "handler:", .ty = .function, .mods = M.declaration | G },
+        .{ .needle = "handler()", .ty = .function, .mods = G },
+        .{ .needle = "total", .ty = .variable, .mods = G },
+        // 常量、字段与局部变量不带 `global`
+        .{ .needle = "limit =", .ty = .variable, .mods = M.declaration | M.readonly },
+        .{ .needle = "limit;", .ty = .variable, .mods = M.readonly },
+        .{ .needle = "callback:", .ty = .property, .mods = M.declaration },
+        .{ .needle = "local:", .ty = .variable, .mods = M.declaration },
+        .{ .needle = "local +=", .ty = .variable },
+    };
+    try check(try tokensWith(&w, file, text, .utf16, null, .{ .global_var = true }), text, .utf16, &marked);
+    try check(try tokensWith(&w, file, text, .utf16, null, .{ .global_var = true, .partial = true }), text, .utf16, &marked);
+    try check(try tokensWith(&w, file, text, .utf16, needleRange(text, "counter +=", .utf16), .{ .global_var = true }), text, .utf16, &.{
+        .{ .needle = "counter +=", .ty = .variable, .mods = G },
+    });
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &.{
+        .{ .needle = "counter:", .ty = .variable, .mods = M.declaration },
+        .{ .needle = "counter;", .ty = .variable },
+        .{ .needle = "instances +=", .nth = 1, .ty = .variable },
+        .{ .needle = "handler()", .ty = .function },
+        .{ .needle = "total", .ty = .variable },
     });
 }
