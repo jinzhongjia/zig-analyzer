@@ -2,6 +2,8 @@
 //! - Unused local names (AstGen's `unused ...` diagnostics): insert `_ = name;`
 //! - Unused function parameters: alternatively, remove the parameter and the argument at each
 //!   call site (across files; see `remove_param.zig`)
+//! - Unused captures: alternatively, remove the capture or rename it to `_` (see
+//!   `unused_capture.zig`)
 //! - Pointless discards (`pointless discard of ...`): delete `_ = name;`
 //! - Local variables that are never mutated (`local variable is never mutated`): change `var` to
 //!   `const`
@@ -29,6 +31,7 @@ const definition = @import("definition.zig");
 const render = @import("../sema/render.zig");
 const organize_imports = @import("../ide_db/organize_imports.zig");
 const format = @import("format.zig");
+const unused_capture = @import("unused_capture.zig");
 
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
@@ -39,6 +42,9 @@ pub const Action = struct {
     /// The diagnostic being fixed (position from `live.AstCheck`); null when there is no
     /// corresponding diagnostic
     diagnostic: ?struct { start: u32, end: u32 } = null,
+    /// Whether this is the preferred fix for the diagnostic (LSP's `isPreferred`); when a
+    /// diagnostic has several fixes, only one of them is preferred
+    preferred: bool = true,
 
     pub const Kind = enum { quickfix, refactor_extract, refactor_rewrite, source_organize_imports };
 };
@@ -61,13 +67,26 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
             removeDiscard(text, d.start)
         else
             null;
-        const e = edit orelse continue;
         const name = ast.identName(text[d.start..d.end]);
-        try out.append(r.arena, .{
+        if (edit) |e| try out.append(r.arena, .{
             .title = try std.fmt.allocPrint(r.arena, "{s} `{s}`", .{ if (e.text.len == 0) "remove discard of" else "discard", name }),
             .edits = try r.arena.dupe(Edit, &.{e}),
             .diagnostic = .{ .start = d.start, .end = d.end },
         });
+        if (std.mem.eql(u8, d.message, "unused capture") or std.mem.eql(u8, d.message, "unused switch tag capture")) {
+            const f = try unused_capture.fix(r, file, d.start) orelse continue;
+            try out.append(r.arena, .{
+                .title = if (f.removed)
+                    try std.fmt.allocPrint(r.arena, "remove capture `{s}`", .{name})
+                else
+                    try std.fmt.allocPrint(r.arena, "rename `{s}` to `_`", .{name}),
+                .edits = f.edits,
+                .diagnostic = .{ .start = d.start, .end = d.end },
+                // A discard, when offered, is preferred: it leaves the capture intact, and using
+                // the name later only takes deleting the discard
+                .preferred = edit == null,
+            });
+        }
     }
     if (try missingProngs(r, file, text, start)) |a| try out.append(r.arena, a);
     if (try missingFields(r, file, text, start)) |a| try out.append(r.arena, a);

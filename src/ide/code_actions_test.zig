@@ -149,6 +149,721 @@ test "use 'const' for locals that are never mutated" {
     }
 }
 
+test "remove unused captures or rename them to _" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // Optional if / while: the condition is compared with null
+        .{
+            \\fn f(o: ?u32) u32 {
+            \\    if (o) |<|>v| {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+            ,
+            "remove capture `v`",
+            \\fn f(o: ?u32) u32 {
+            \\    if (o != null) {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+        },
+        .{
+            \\fn f(o: ?u32) u32 {
+            \\    return if (o) |<|>v| 1 else 0;
+            \\}
+            ,
+            "remove capture `v`",
+            \\fn f(o: ?u32) u32 {
+            \\    return if (o != null) 1 else 0;
+            \\}
+        },
+        .{
+            \\fn f(o: *?u32) u32 {
+            \\    if (o.*) |*<|>v| {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+            ,
+            "remove capture `v`",
+            \\fn f(o: *?u32) u32 {
+            \\    if (o.* != null) {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+        },
+        // The comparison must not be taken into an operation of lower precedence or into a
+        // condition that ends with an expression
+        .{
+            \\fn f(a: ?u32, b: ?u32) u32 {
+            \\    if (a orelse b) |<|>v| {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+            ,
+            "remove capture `v`",
+            \\fn f(a: ?u32, b: ?u32) u32 {
+            \\    if ((a orelse b) != null) {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+        },
+        .{
+            \\fn g() !?u32 {
+            \\    return null;
+            \\}
+            \\fn f() !u32 {
+            \\    if (try g()) |<|>v| {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+            ,
+            "remove capture `v`",
+            \\fn g() !?u32 {
+            \\    return null;
+            \\}
+            \\fn f() !u32 {
+            \\    if ((try g()) != null) {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+        },
+        .{
+            \\fn next(i: *u32) ?u32 {
+            \\    i.* += 1;
+            \\    return if (i.* < 3) i.* else null;
+            \\}
+            \\fn f() u32 {
+            \\    var i: u32 = 0;
+            \\    var n: u32 = 0;
+            \\    while (next(&i)) |<|>v| : (n += 1) {}
+            \\    return n;
+            \\}
+            ,
+            "remove capture `v`",
+            \\fn next(i: *u32) ?u32 {
+            \\    i.* += 1;
+            \\    return if (i.* < 3) i.* else null;
+            \\}
+            \\fn f() u32 {
+            \\    var i: u32 = 0;
+            \\    var n: u32 = 0;
+            \\    while (next(&i) != null) : (n += 1) {}
+            \\    return n;
+            \\}
+        },
+        // Error union if / while: both captures are renamed to `_`, a pointer capture together
+        // with its `*`
+        .{
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    if (g()) |<|>v| {
+            \\        return 1;
+            \\    } else |err| {
+            \\        return @intFromError(err);
+            \\    }
+            \\}
+            ,
+            "rename `v` to `_`",
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    if (g()) |_| {
+            \\        return 1;
+            \\    } else |err| {
+            \\        return @intFromError(err);
+            \\    }
+            \\}
+        },
+        .{
+            \\fn f(e: *anyerror!u32) u32 {
+            \\    if (e.*) |*<|>v| {
+            \\        return 1;
+            \\    } else |err| {
+            \\        return @intFromError(err);
+            \\    }
+            \\}
+            ,
+            "rename `v` to `_`",
+            \\fn f(e: *anyerror!u32) u32 {
+            \\    if (e.*) |_| {
+            \\        return 1;
+            \\    } else |err| {
+            \\        return @intFromError(err);
+            \\    }
+            \\}
+        },
+        .{
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    if (g()) |v| {
+            \\        return v;
+            \\    } else |<|>err| {
+            \\        return 0;
+            \\    }
+            \\}
+            ,
+            "rename `err` to `_`",
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    if (g()) |v| {
+            \\        return v;
+            \\    } else |_| {
+            \\        return 0;
+            \\    }
+            \\}
+        },
+        .{
+            \\fn next(i: *u32) !u32 {
+            \\    i.* += 1;
+            \\    if (i.* > 3) return error.Done;
+            \\    return i.*;
+            \\}
+            \\fn f() u32 {
+            \\    var i: u32 = 0;
+            \\    var n: u32 = 0;
+            \\    while (next(&i)) |<|>v| {
+            \\        n += 1;
+            \\    } else |err| {
+            \\        n += @intFromError(err);
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "rename `v` to `_`",
+            \\fn next(i: *u32) !u32 {
+            \\    i.* += 1;
+            \\    if (i.* > 3) return error.Done;
+            \\    return i.*;
+            \\}
+            \\fn f() u32 {
+            \\    var i: u32 = 0;
+            \\    var n: u32 = 0;
+            \\    while (next(&i)) |_| {
+            \\        n += 1;
+            \\    } else |err| {
+            \\        n += @intFromError(err);
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn next(i: *u32) !u32 {
+            \\    i.* += 1;
+            \\    if (i.* > 3) return error.Done;
+            \\    return i.*;
+            \\}
+            \\fn f() u32 {
+            \\    var i: u32 = 0;
+            \\    var n: u32 = 0;
+            \\    while (next(&i)) |v| {
+            \\        n += v;
+            \\    } else |<|>err| {}
+            \\    return n;
+            \\}
+            ,
+            "rename `err` to `_`",
+            \\fn next(i: *u32) !u32 {
+            \\    i.* += 1;
+            \\    if (i.* > 3) return error.Done;
+            \\    return i.*;
+            \\}
+            \\fn f() u32 {
+            \\    var i: u32 = 0;
+            \\    var n: u32 = 0;
+            \\    while (next(&i)) |v| {
+            \\        n += v;
+            \\    } else |_| {}
+            \\    return n;
+            \\}
+        },
+        // catch: the capture is removed
+        .{
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    return g() catch |<|>err| 0;
+            \\}
+            ,
+            "remove capture `err`",
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    return g() catch 0;
+            \\}
+        },
+        .{
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    const x = g() catch |<|>err| {
+            \\        return 0;
+            \\    };
+            \\    return x;
+            \\}
+            ,
+            "remove capture `err`",
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    const x = g() catch {
+            \\        return 0;
+            \\    };
+            \\    return x;
+            \\}
+        },
+        // for: elements and bounded counters are renamed to `_`
+        .{
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs) |<|>x| {
+            \\        n += 1;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "rename `x` to `_`",
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs) |_| {
+            \\        n += 1;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(xs: []u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs) |*<|>x| {
+            \\        n += 1;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "rename `x` to `_`",
+            \\fn f(xs: []u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs) |_| {
+            \\        n += 1;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(xs: []const u32, ys: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, ys) |<|>x, y| {
+            \\        n += y;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "rename `x` to `_`",
+            \\fn f(xs: []const u32, ys: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, ys) |_, y| {
+            \\        n += y;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, 0..xs.len) |x, <|>i| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "rename `i` to `_`",
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, 0..xs.len) |x, _| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(n: usize) usize {
+            \\    var s: usize = 0;
+            \\    for (0..n) |<|>i| {
+            \\        s += 1;
+            \\    }
+            \\    return s;
+            \\}
+            ,
+            "rename `i` to `_`",
+            \\fn f(n: usize) usize {
+            \\    var s: usize = 0;
+            \\    for (0..n) |_| {
+            \\        s += 1;
+            \\    }
+            \\    return s;
+            \\}
+        },
+        // An unbounded for counter: removed together with its input
+        .{
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, 0..) |x, <|>i| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "remove capture `i`",
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs) |x| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (0.., xs) |<|>i, x| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "remove capture `i`",
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs) |x| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(xs: []const u32, ys: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, 1.., ys) |x, <|>i, y| {
+            \\        n += x + y;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "remove capture `i`",
+            \\fn f(xs: []const u32, ys: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (xs, ys) |x, y| {
+            \\        n += x + y;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        .{
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (
+            \\        xs,
+            \\        0..,
+            \\    ) |x, <|>i| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "remove capture `i`",
+            \\fn f(xs: []const u32) u32 {
+            \\    var n: u32 = 0;
+            \\    for (
+            \\        xs,
+            \\    ) |x| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        // The name in the start is still used elsewhere
+        .{
+            \\fn f(xs: []const u32, base: usize) usize {
+            \\    var n: usize = base;
+            \\    for (xs, base..) |x, <|>i| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+            ,
+            "remove capture `i`",
+            \\fn f(xs: []const u32, base: usize) usize {
+            \\    var n: usize = base;
+            \\    for (xs) |x| {
+            \\        n += x;
+            \\    }
+            \\    return n;
+            \\}
+        },
+        // switch: with only the payload capture, the whole capture is removed
+        .{
+            \\const U = union(enum) { a: u32, b: void };
+            \\fn f(u: U) u32 {
+            \\    switch (u) {
+            \\        .a => |<|>p| {
+            \\            return 1;
+            \\        },
+            \\        .b => return 0,
+            \\    }
+            \\}
+            ,
+            "remove capture `p`",
+            \\const U = union(enum) { a: u32, b: void };
+            \\fn f(u: U) u32 {
+            \\    switch (u) {
+            \\        .a => {
+            \\            return 1;
+            \\        },
+            \\        .b => return 0,
+            \\    }
+            \\}
+        },
+        .{
+            \\const U = union(enum) { a: u32, b: void };
+            \\fn f(u: *U) u32 {
+            \\    return switch (u.*) {
+            \\        .a => |*<|>p| 1,
+            \\        .b => 0,
+            \\    };
+            \\}
+            ,
+            "remove capture `p`",
+            \\const U = union(enum) { a: u32, b: void };
+            \\fn f(u: *U) u32 {
+            \\    return switch (u.*) {
+            \\        .a => 1,
+            \\        .b => 0,
+            \\    };
+            \\}
+        },
+        // The tag capture of a switch prong: removed together with the comma, or the whole capture
+        // when the payload capture is `_`
+        .{
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: U) usize {
+            \\    switch (u) {
+            \\        inline else => |p, <|>tag| {
+            \\            return @sizeOf(@TypeOf(p));
+            \\        },
+            \\    }
+            \\}
+            ,
+            "remove capture `tag`",
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: U) usize {
+            \\    switch (u) {
+            \\        inline else => |p| {
+            \\            return @sizeOf(@TypeOf(p));
+            \\        },
+            \\    }
+            \\}
+        },
+        .{
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: *U) usize {
+            \\    switch (u.*) {
+            \\        inline else => |*p, <|>tag| {
+            \\            return @sizeOf(@TypeOf(p.*));
+            \\        },
+            \\    }
+            \\}
+            ,
+            "remove capture `tag`",
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: *U) usize {
+            \\    switch (u.*) {
+            \\        inline else => |*p| {
+            \\            return @sizeOf(@TypeOf(p.*));
+            \\        },
+            \\    }
+            \\}
+        },
+        .{
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: U) usize {
+            \\    switch (u) {
+            \\        inline else => |_, <|>tag| {
+            \\            return 1;
+            \\        },
+            \\    }
+            \\}
+            ,
+            "remove capture `tag`",
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: U) usize {
+            \\    switch (u) {
+            \\        inline else => {
+            \\            return 1;
+            \\        },
+            \\    }
+            \\}
+        },
+        // With a tag capture, the payload capture of a switch prong is renamed to `_`
+        .{
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: U) usize {
+            \\    switch (u) {
+            \\        inline else => |<|>p, tag| {
+            \\            return @intFromEnum(tag);
+            \\        },
+            \\    }
+            \\}
+            ,
+            "rename `p` to `_`",
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: U) usize {
+            \\    switch (u) {
+            \\        inline else => |_, tag| {
+            \\            return @intFromEnum(tag);
+            \\        },
+            \\    }
+            \\}
+        },
+        .{
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: *U) usize {
+            \\    switch (u.*) {
+            \\        inline else => |*<|>p, tag| {
+            \\            return @intFromEnum(tag);
+            \\        },
+            \\    }
+            \\}
+            ,
+            "rename `p` to `_`",
+            \\const U = union(enum) { a: u32, b: u64 };
+            \\fn f(u: *U) usize {
+            \\    switch (u.*) {
+            \\        inline else => |_, tag| {
+            \\            return @intFromEnum(tag);
+            \\        },
+            \\    }
+            \\}
+        },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], c[1]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
+        try expectAstCheckClean(got);
+    }
+    for ([_][]const u8{
+        // Removing the input would remove the evaluation of its start (a call)
+        \\fn g() usize {
+        \\    return 0;
+        \\}
+        \\fn f(xs: []const u32) u32 {
+        \\    var n: u32 = 0;
+        \\    for (xs, g()..) |x, <|>i| {
+        \\        n += x;
+        \\    }
+        \\    return n;
+        \\}
+        ,
+        // The name in the start is used only here: removing the input would leave an unused
+        // local constant
+        \\fn f(xs: []const u32) u32 {
+        \\    const base: usize = 1;
+        \\    var n: u32 = 0;
+        \\    for (xs, base..) |x, <|>i| {
+        \\        n += x;
+        \\    }
+        \\    return n;
+        \\}
+        ,
+    }) |source| {
+        for ([_][]const u8{ "remove capture", "rename" }) |title| {
+            const got = try apply(source, title);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings("no action", got);
+        }
+        // The discard is still offered
+        const got = try apply(source, "discard `i`");
+        defer testing.allocator.free(got);
+        try testing.expect(!std.mem.eql(u8, got, "no action"));
+    }
+}
+
+/// The titles of all fixes at `<|>`, one per line, with `(preferred)` after the preferred ones
+fn titles(text: []const u8) ![]const u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    for (try code_actions.codeActions(&r, added.file, added.cursor, added.cursor)) |a| {
+        try out.print(testing.allocator, "{s}{s}\n", .{ a.title, if (a.preferred) " (preferred)" else "" });
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "unused capture fixes are preferred only without a discard" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{
+            \\fn f(o: ?u32) u32 {
+            \\    if (o) |<|>v| {
+            \\        return 1;
+            \\    }
+            \\    return 0;
+            \\}
+            ,
+            \\discard `v` (preferred)
+            \\remove capture `v`
+            \\
+        },
+        // The body is not a block, so no discard can be inserted
+        .{
+            \\fn f(o: ?u32) u32 {
+            \\    return if (o) |<|>v| 1 else 0;
+            \\}
+            ,
+            \\remove capture `v` (preferred)
+            \\
+        },
+        .{
+            \\fn g() !u32 {
+            \\    return 1;
+            \\}
+            \\fn f() u32 {
+            \\    return g() catch |<|>err| 0;
+            \\}
+            ,
+            \\remove capture `err` (preferred)
+            \\
+        },
+    };
+    for (cases) |c| {
+        const got = try titles(c[0]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+}
+
 test "add missing switch prongs" {
     try expectAction(
         \\const E = enum { a, b, c };
