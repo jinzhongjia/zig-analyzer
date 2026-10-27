@@ -28,6 +28,7 @@ const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 const queries = @import("queries.zig");
 const infer = @import("infer.zig");
 const value = @import("value.zig");
+const zon = @import("zon.zig");
 
 /// 回跳（循环的每次迭代、每次调用）的默认配额，与编译器相同；`@setEvalBranchQuota` 调高。超过配额时编译器报错，
 /// 这里放弃求值
@@ -2574,7 +2575,11 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (eq(u8, name, "@import")) {
             const target = try ev.r.importTarget(f.file, f.body, args) orelse return error.Abort;
-            return Val.ofType(try queries.containerType(ev.r, .{ .file = target, .container = 0 }, null));
+            const tv = try queries.importValue(ev.r, target);
+            if (tv.ty == .unknown) return error.Abort;
+            // 有结果类型时编译器按结果类型解析 ZON：标量以外的值不能由转换得到（见 `zon.isScalar`）
+            if (ev.r.isZon(target)) if (want) |t| if (t != .unknown and t != tv.ty and !zon.isScalar(tv.ty)) return error.Abort;
+            return thaw(tv);
         }
         if (eq(u8, name, "@embedFile")) {
             if (args.len != 1) return error.Abort;

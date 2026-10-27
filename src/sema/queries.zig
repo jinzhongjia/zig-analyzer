@@ -361,6 +361,12 @@ pub const ZonValue = struct {
     }
 };
 
+/// `@import` 的值：`.zon` 文件为其中的值（见 `ZonValue`），`.zig` 文件为文件容器类型
+pub fn importValue(r: *Resolver, target: FileId) resolve.Error!TypedValue {
+    if (r.isZon(target)) return r.ctx.get(ZonValue, target);
+    return TypedValue.ofType(try containerType(r, .{ .file = target, .container = 0 }, null));
+}
+
 /// 推导进行中的局部绑定（同一 owner 内直接读取，避免循环）
 pub const LocalKey = struct {
     owner: hir.OwnerKey,
@@ -410,7 +416,7 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
             if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
             return r.ctx.get(LocalValue, .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) });
         },
-        .file => |f| return TypedValue.ofType(try containerType(r, .{ .file = f, .container = 0 }, null)),
+        .file => |f| return importValue(r, f),
     }
 }
 

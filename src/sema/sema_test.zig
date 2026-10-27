@@ -3155,6 +3155,59 @@ test "@embedFile reads the file next to the source; missing files are unknown" {
     try testing.expectEqualStrings("usize = 2", try typeAt(&w, f.file, src, "count", 0));
 }
 
+test "@import of a zon file is its value in inference and comptime evaluation" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/pos.zon", ".{ .x = 3, .y = 4, .list = .{ 1, 2, 3 } }");
+    _ = try w.add("/p/cfg.zon", ".{ .port = 8080 }");
+    _ = try w.add("/p/n.zon", "5");
+    // 超出 i128 的整数
+    _ = try w.add("/p/big.zon", "0x1_0000_0000_0000_0000_0000_0000_0000_0000");
+    const src =
+        \\const pos = @import("pos.zon");
+        \\const sum = pos.x + pos.y;
+        \\fn lengthSquared() comptime_int {
+        \\    const p = @import("pos.zon");
+        \\    return p.x * p.x + p.y * p.y;
+        \\}
+        \\const len2 = lengthSquared();
+        \\fn second() comptime_int {
+        \\    return @import("pos.zon").list[1];
+        \\}
+        \\const second_value = second();
+        \\fn five() u32 {
+        \\    return @import("n.zon");
+        \\}
+        \\const five_value = five();
+        \\const Cfg = struct { port: u16 };
+        \\fn port() u16 {
+        \\    const c: Cfg = @import("cfg.zon");
+        \\    return c.port;
+        \\}
+        \\const port_value = port();
+        \\const big = @import("big.zon");
+    ;
+    const f = try w.add("/p/main.zig", src);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "pos", "struct { comptime x: comptime_int = 3, comptime y: comptime_int = 4, comptime list: struct { comptime comptime_int = 1, comptime comptime_int = 2, comptime comptime_int = 3 } = .{ 1, 2, 3 } } = .{ .x = 3, .y = 4, .list = .{ 1, 2, 3 } }" },
+        .{ "sum", "comptime_int = 7" },
+        .{ "len2", "comptime_int = 25" },
+        .{ "second_value", "comptime_int = 2" },
+        // 标量按结果类型转换
+        .{ "five_value", "u32 = 5" },
+        // 结构体按结果类型解析，不由匿名的值转换：值求不出
+        .{ "port_value", "u16" },
+        .{ "big", "comptime_int" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "@src has the type std.builtin.SourceLocation" {
     try expectStdTypes(
         \\fn f() void {
