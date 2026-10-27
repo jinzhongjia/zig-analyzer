@@ -1,5 +1,6 @@
-//! 测试用：把 posix 写法的绝对路径转为本机绝对路径（Windows 上加盘符并改用反斜杠），
-//! 使依赖本机路径规则的代码在各平台上得到相同的结果。
+//! For tests: converts a posix-style absolute path to a native absolute path (on Windows, adds a
+//! drive letter and switches to backslashes), so that code that depends on native path rules gets
+//! the same results on every platform.
 
 const builtin = @import("builtin");
 
@@ -19,7 +20,7 @@ fn toWindows(comptime posix: []const u8) []const u8 {
     }.value;
 }
 
-/// 同 `native`，路径在运行时才知道（如从测试 fixture 中解析出来）
+/// Same as `native`, for paths known only at runtime (e.g. parsed from a test fixture)
 pub fn nativeAlloc(a: @import("std").mem.Allocator, posix: []const u8) ![]const u8 {
     if (builtin.os.tag != .windows) return a.dupe(u8, posix);
     const out = try a.alloc(u8, posix.len + 2);

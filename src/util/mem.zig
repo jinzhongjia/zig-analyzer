@@ -1,14 +1,15 @@
-//! 内存统计（`zig-analyzer/status`、基准与语料工具）。
+//! Memory statistics (`zig-analyzer/status`, the benchmark and corpus tools).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// arena 当前占用的字节数（不含内部簿记）
+/// Number of bytes the arena currently occupies (excluding internal bookkeeping)
 pub fn arenaBytes(state: std.heap.ArenaAllocator.State) usize {
     return state.promote(std.mem.Allocator.failing).queryCapacity();
 }
 
-/// 统计经由它分配、尚未释放的字节数。子分配器须线程安全时它也线程安全
+/// Counts the bytes allocated through it and not yet freed. It is thread-safe whenever the child
+/// allocator is.
 pub const Counting = struct {
     child: Allocator,
     live: std.atomic.Value(usize) = .init(0),

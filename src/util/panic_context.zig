@@ -1,7 +1,10 @@
-//! panic 上下文：每个线程记下正在做的事（处理的请求、发布诊断的文件、执行中的 query），panic 时与消息一起
-//! 写入日志。Zig 没有栈展开，panic 总是结束进程；调用栈只说明在哪段代码，这里补上是哪个请求、哪个文件。
+//! Panic context: each thread records what it is doing (the request being handled, the file whose
+//! diagnostics are being published, the query being executed), which is written to the log together
+//! with the message on panic. Zig has no stack unwinding, so a panic always ends the process; the
+//! stack trace only shows which code was running, and this adds which request and which file.
 //!
-//! 条目是调用方栈上的值，按嵌套顺序链接：进入时 `push`，离开时 `pop`（同一线程内后进先出）。
+//! Entries are values on the callers' stacks, linked in nesting order: `push` on entering, `pop` on
+//! leaving (last in, first out within a thread).
 
 const std = @import("std");
 const Io = std.Io;
@@ -9,13 +12,14 @@ const Io = std.Io;
 pub const Entry = struct {
     prev: ?*const Entry = null,
     data: *const anyopaque,
-    /// 写出条目的描述（一行，不含换行）。panic 时调用：不能分配内存、不能获取锁
+    /// Writes the description of the entry (one line, without a newline). Called on panic: must not
+    /// allocate memory or acquire locks.
     write: *const fn (data: *const anyopaque, w: *Io.Writer) Io.Writer.Error!void,
 };
 
 threadlocal var top: ?*const Entry = null;
 
-/// `entry` 须在 `pop` 之前保持有效
+/// `entry` must stay valid until `pop`
 pub fn push(entry: *Entry) void {
     entry.prev = top;
     top = entry;
@@ -26,13 +30,14 @@ pub fn pop(entry: *const Entry) void {
     top = entry.prev;
 }
 
-/// 一行文字描述的条目，文字在进入时格式化并保存在条目自身中（过长时截断）
+/// Entry described by one line of text; the text is formatted when entering and kept in the entry
+/// itself (truncated when too long)
 pub const Text = struct {
     buf: [512]u8 = undefined,
     len: usize = 0,
     entry: Entry = undefined,
 
-    /// `t` 须在 `leave` 之前保持在同一地址
+    /// `t` must stay at the same address until `leave`
     pub fn enter(t: *Text, comptime format: []const u8, args: anytype) void {
         var w: Io.Writer = .fixed(&t.buf);
         w.print(format, args) catch {};
@@ -51,7 +56,8 @@ pub const Text = struct {
     }
 };
 
-/// 写出当前线程的条目，外层在前，每条一行。没有条目时不写
+/// Writes the current thread's entries, outermost first, one per line. Writes nothing when there
+/// are no entries.
 pub fn dump(w: *Io.Writer) Io.Writer.Error!void {
     var entries: [64]*const Entry = undefined;
     var n: usize = 0;

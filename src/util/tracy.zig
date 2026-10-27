@@ -1,6 +1,8 @@
-//! tracy 性能分析器的接入：`zig build -Dtracy=<tracy 源码目录>` 时生效，否则全部为空操作。
+//! Integration of the tracy profiler: active with `zig build -Dtracy=<tracy source directory>`,
+//! otherwise everything is a no-op.
 //!
-//! zone 的粒度：每次 query 计算（以 query 名标注，附带 key）与每个请求（以方法名标注）。
+//! Zone granularity: each query computation (labeled with the query name, with the key attached)
+//! and each request (labeled with the method name).
 
 const std = @import("std");
 const options = @import("build_options");
@@ -27,13 +29,13 @@ pub const Zone = struct {
         if (enabled) ___tracy_emit_zone_end(z.ctx);
     }
 
-    /// 附在 zone 上的文字（如 query 的 key）
+    /// Text attached to the zone (such as the query key)
     pub inline fn text(z: Zone, s: []const u8) void {
         if (enabled) ___tracy_emit_zone_text(z.ctx, s.ptr, s.len);
     }
 };
 
-/// 开始一个以 `name` 标注的 zone，结束时调用 `end`
+/// Starts a zone labeled `name`; call `end` when it is done
 pub inline fn zone(comptime src: std.builtin.SourceLocation, comptime name: []const u8) Zone {
     if (!enabled) return .{ .ctx = {} };
     const S = struct {
