@@ -658,6 +658,45 @@ test "resetting type information gives the same hover results" {
     try h.notify("exit", {});
 }
 
+test "function completions carry no signature in the list and resolve to the signature and doc" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-3";
+    const text =
+        \\/// Adds two numbers.
+        \\fn add(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+        \\pub fn main() void {
+        \\    _ = ad;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const resp = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 5, .character = 10 } });
+    const result = resp.object.get("result").?;
+    const items = if (result == .array) result.array.items else result.object.get("items").?.array.items;
+    const item = for (items) |it| {
+        if (std.mem.eql(u8, it.object.get("label").?.string, "add")) break it;
+    } else return error.MissingCompletion;
+    try testing.expect(item.object.get("detail") == null);
+    try testing.expect(item.object.get("labelDetails") == null);
+    try testing.expect(item.object.get("data") != null);
+    const resolved = (try h.request("completionItem/resolve", item)).object.get("result").?;
+    try testing.expectEqualStrings("fn add(a: u32, b: u32) u32", resolved.object.get("detail").?.string);
+    const doc = resolved.object.get("documentation").?.object.get("value").?.string;
+    try testing.expect(std.mem.startsWith(u8, doc, "Adds two numbers.\n\nDefined in `"));
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "inlay hint settings apply to requests and refresh the client when they change" {
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;

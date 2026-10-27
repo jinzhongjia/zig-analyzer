@@ -336,6 +336,79 @@ test "hover and signature help drop comments from multi-line function prototypes
     try testing.expectEqualStrings("b: u32", s.params[1]);
 }
 
+test "selected function completions resolve to the signature as written in the source" {
+    const text =
+        \\const Point = struct {
+        \\    x: i32,
+        \\    pub fn init(x: i32, y: i32) Point { return .{ .x = x + y }; }
+        \\    /// 到原点的距离
+        \\    pub fn dist(self: Point, scale: u32) u32 { _ = .{ self, scale }; return 0; }
+        \\    pub const length = dist;
+        \\};
+        \\fn List(comptime T: type) type {
+        \\    return struct {
+        \\        const Self = @This();
+        \\        items: []T,
+        \\        pub fn append(self: *Self, item: T) !void { _ = .{ self, item }; }
+        \\    };
+        \\}
+        \\fn add(
+        \\    /// the first
+        \\    a: u32,
+        \\    b: u32, // the second
+        \\) callconv(.c) u32 { return a + b; }
+        \\fn run(p: Point, list: *List(u8)) void {
+        \\    const q: Point = .init(1, 2);
+        \\    _ = .{ p.dist(1), list.append(1), q, add(1, 2) };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn of(needle: []const u8, delta: u32) u32 {
+            return @as(u32, @intCast(std.mem.indexOf(u8, text, needle).?)) + delta;
+        }
+    }.of;
+    const cases = [_]struct { u32, []const u8, ?[]const u8 }{
+        // 方法，以及指向它的别名（给出所指函数的签名）；字段没有
+        .{ at("p.dist", 2), "dist", "pub fn dist(self: Point, scale: u32) u32" },
+        .{ at("p.dist", 2), "length", "pub fn dist(self: Point, scale: u32) u32" },
+        .{ at("p.dist", 2), "x", null },
+        // 泛型实例的方法：按源码，不代入推导出的类型
+        .{ at("list.append", 5), "append", "pub fn append(self: *Self, item: T) !void" },
+        // decl literal
+        .{ at(".init(1", 1), "init", "pub fn init(x: i32, y: i32) Point" },
+        // 作用域中的名字；多行参数列表去掉注释与末尾的逗号；常量没有
+        .{ at("add(1, 2)", 3), "add", "fn add(a: u32, b: u32) callconv(.c) u32" },
+        .{ at("add(1, 2)", 3), "List", "fn List(comptime T: type) type" },
+        .{ at("add(1, 2)", 3), "Point", null },
+    };
+    for (cases) |c| {
+        const items = (try completion.complete(&r, file, c[0], .{ .auto_import = false })).items;
+        const item = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[1])) break it;
+        } else return error.MissingCompletion;
+        const expected = c[2] orelse {
+            try testing.expect(item.target == null);
+            continue;
+        };
+        const description = try completion.describe(&r, file, item.target orelse return error.NoTarget);
+        testing.expectEqualStrings(expected, description.detail) catch |err| {
+            std.debug.print("completion `{s}`\n", .{c[1]});
+            return err;
+        };
+        // 列表中不带签名
+        try testing.expect(item.detail == null);
+        if (std.mem.eql(u8, c[1], "dist")) try testing.expect(std.mem.startsWith(u8, description.doc, "到原点的距离\n\n"));
+    }
+}
+
 test "goto declaration of reified fields named by comptime parsed strings" {
     // 字段名从帮助文本中解析出来（zig-clap 的用法）：跳到帮助文本中的参数名
     const text =

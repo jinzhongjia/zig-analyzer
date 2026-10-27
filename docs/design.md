@@ -39,7 +39,7 @@ zig-analyzer 是面向 Zig 0.17 的语言服务器（LSP）。当前阶段：功
 | 场景 | 指标 | 目标 | 现状 | 状态 |
 |---|---|---|---|---|
 | 热状态 | hover / goto p95 | < 50 ms | ≤ 1.3 ms（首轮最慢 34 ms） | ✅ |
-| | completion p95 | < 100 ms | ≤ 0.9 ms（首轮最慢 13 ms） | ✅ |
+| | completion p95 | < 100 ms | ≤ 1.2 ms（首轮最慢 13 ms） | ✅ |
 | | 编辑 → live 诊断 | < 30 ms（不含防抖） | 普通文件 ≤ 9 ms；`Sema.zig`（3.5 万行）p50 177 ms（含 50 ms 防抖） | ⚠️ 超大文件 |
 | | 按键 → hover（连续输入） | — | `Sema.zig` p50 97 ms；其他项目 5～21 ms | — |
 | | 保存 → 编译器诊断（`check` step） | < 1 s | 小项目约 120 ms；Zig 编译器 5.2 s | ⚠️ 受编译器限制 |
@@ -257,6 +257,8 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 内置元数据固定为 Zig 0.17.0，来源、源码包及输入文件哈希记录在 `tools/zig/metadata.json`，许可保留在同目录。
 `zig build gen` 离线生成 `src/ide/builtin_data.zig`，校验官方输入哈希、编译器版本、名称和参数数量；运行时只查静态表。
 128 个编译器登记项中，124 个有官方文档；其余 4 个明确说明来源缺口，不编造签名，也不提供虚假的参数提示。
+
+补全项被选中时（`completionItem/resolve`）给出签名与文档：函数（作用域中的函数、成员与方法、decl literal，以及经实例访问的函数别名所指的函数）与自动导入的候选在 `data` 中记下所指的声明，`detail` 为签名，`documentation` 为文档注释与定义的位置（格式见下面的自动导入）。函数的签名与 hover、signature help 相同（`ast.FnProto.writeSignature`），按源码显示：去掉注释与参数的文档注释，空白折叠为单个空格，多行参数列表末尾的逗号不显示；泛型实例的方法不代入推导出的类型。补全列表中不带签名，签名只在选中时计算。作用域与成员补全中的常量、变量只有文档注释。
 
 自动导入由 `completion.auto_import` 控制，默认关闭：
 

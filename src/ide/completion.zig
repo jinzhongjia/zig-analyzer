@@ -57,7 +57,7 @@ pub const Item = struct {
     qualifier: ?[]const u8 = null,
     sort: ?[]const u8 = null,
     import_edit: ?imports.Edit = null,
-    /// 自动导入候选所指的定义（见 `describe`）
+    /// 所指的定义，被选中时据此给出签名与文档（见 `describe`）：自动导入的候选与函数
     target: ?imports.Target = null,
 
     pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, error_name, builtin, module, file, folder, label };
@@ -250,7 +250,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     const tree = try r.itemTree(file);
     var container = tree.items[item].container;
     while (true) {
-        try decls(&out, tree, container, true);
+        try decls(&out, file, tree, container, true);
         const parent = tree.containers[container].parent_item orelse break;
         // 体内定义的容器：外层成员在容器位置可见的局部名字
         const owner = try r.itemNode(file, parent) orelse break;
@@ -390,7 +390,7 @@ fn locals(out: *Collector, b: *const Body, from: Body.ScopeId) Allocator.Error!v
     }
 }
 
-fn decls(out: *Collector, tree: *const ItemTree, container: u32, private: bool) Allocator.Error!void {
+fn decls(out: *Collector, file: FileId, tree: *const ItemTree, container: u32, private: bool) Allocator.Error!void {
     const is_enum = tree.containers[container].kind == .@"enum";
     for (tree.containerMembers(container)) |m| {
         const it = tree.items[m];
@@ -404,7 +404,7 @@ fn decls(out: *Collector, tree: *const ItemTree, container: u32, private: bool) 
             .@"test", .@"comptime" => continue,
         };
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
-        try out.add(.{ .label = name, .kind = kind, .doc = it.doc });
+        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") .{ .decl = .{ .file = file, .item = m } } else null });
     }
 }
 
@@ -465,11 +465,11 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
                 const fty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(r.ctx.db.env.ip, t) })).ty;
                 try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
             },
-            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = .function, .doc = it.doc }),
-            // 函数的别名（`pub const isPowerPC = isPowerpc;`）同样可以作为方法调用
+            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = .function, .doc = it.doc, .target = .{ .decl = .{ .file = ns.file, .item = m } } }),
+            // 函数的别名（`pub const isPowerPC = isPowerpc;`）同样可以作为方法调用，选中时给出所指函数的签名
             .@"const" => if (same_file or it.flags.is_pub) {
-                const cty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) })).ty;
-                if (ip.key(cty) == .fn_type) try out.add(.{ .label = name, .kind = .function, .doc = it.doc });
+                const ctv = try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) });
+                if (ip.key(ctv.ty) == .fn_type) try out.add(.{ .label = name, .kind = .function, .doc = it.doc, .target = try fnTarget(r, ctv) });
             },
             else => {},
         }
@@ -512,7 +512,8 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resol
                 if (ns.file != from and !it.flags.is_pub) continue;
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
                 if (!producesType(ip, decl_ty, t, it.kind == .@"fn")) continue;
-                try out.add(.{ .label = name, .kind = if (it.kind == .@"fn") .function else .constant, .doc = it.doc });
+                const is_fn = it.kind == .@"fn";
+                try out.add(.{ .label = name, .kind = if (is_fn) .function else .constant, .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
             },
             else => {},
         }
@@ -532,6 +533,17 @@ fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
         .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
         else => false,
     };
+}
+
+/// 函数值所指的函数声明
+fn fnTarget(r: *Resolver, tv: TypedValue) resolve.Error!?imports.Target {
+    const v = tv.val orelse return null;
+    const f = switch (r.ctx.db.env.ip.key(v)) {
+        .fn_value => |f| f,
+        else => return null,
+    };
+    const def = try context.defOfKey(r, .{ .file = f.file, .item = f.decl }) orelse return null;
+    return .{ .decl = .{ .file = def.item.file, .item = def.item.item } };
 }
 
 fn isIdentChar(c: u8) bool {
@@ -687,7 +699,7 @@ fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.Fiel
 fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolve.Error!void {
     const tree = try r.itemTree(ns.file);
     if (ns.container >= tree.containers.len) return;
-    try decls(out, tree, ns.container, same_file);
+    try decls(out, ns.file, tree, ns.container, same_file);
     const kind = tree.containers[ns.container].kind;
     // 同一文件中的枚举成员（其他文件的由 `decls` 给出）；带标签的 union 在类型上访问字段得到字段的标签
     // （`Value.null_val`），可以转换为 union

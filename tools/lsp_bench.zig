@@ -223,7 +223,7 @@ fn typingPositions(a: Allocator, text: [:0]const u8) ![]TypingPosition {
     return all.items;
 }
 
-/// 补全响应中是否有自动导入项（带附加编辑或 data 的项）
+/// 补全响应中是否有自动导入项：带附加编辑或限定名（`labelDetails`）的项。函数项也带 data，不能据此判断
 fn hasAutoImport(response: std.json.Value) bool {
     const result = response.object.get("result") orelse return false;
     const items = switch (result) {
@@ -233,7 +233,7 @@ fn hasAutoImport(response: std.json.Value) bool {
     };
     for (items) |item| {
         if (item != .object) continue;
-        if (item.object.get("additionalTextEdits") != null or item.object.get("data") != null) return true;
+        if (item.object.get("additionalTextEdits") != null or item.object.get("labelDetails") != null) return true;
     }
     return false;
 }
