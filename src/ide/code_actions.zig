@@ -1,5 +1,6 @@
 //! textDocument/codeAction 的快速修复：
 //! - 未使用的局部名字（AstGen 的 `unused ...` 诊断）：插入 `_ = name;`
+//! - 未使用的函数参数：另可删除参数与各调用处的实参（跨文件，见 `remove_param.zig`）
 //! - 多余的丢弃（`pointless discard of ...`）：删除 `_ = name;`
 //! - 从未修改的局部变量（`local variable is never mutated`）：`var` 改为 `const`
 //! - switch 缺少的枚举 / 联合分支：补上 `.name => {},`
@@ -362,7 +363,7 @@ const Purity = struct {
 };
 
 /// 没有副作用的内建函数
-const pure_builtins = [_][]const u8{
+pub const pure_builtins = [_][]const u8{
     "@as",              "@sizeOf",          "@alignOf",   "@bitSizeOf",  "@TypeOf",       "@typeInfo",        "@typeName",
     "@This",            "@min",             "@max",       "@abs",        "@intFromEnum",  "@intFromBool",     "@tagName",
     "@errorName",       "@truncate",        "@intCast",   "@floatCast",  "@floatFromInt", "@intFromFloat",    "@enumFromInt",

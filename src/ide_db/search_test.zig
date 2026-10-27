@@ -386,6 +386,42 @@ test "member accesses whose target cannot be determined are reported as uncertai
     }
 }
 
+test "initializer field names are not uncertain references to other declarations" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src =
+        \\const S = struct {
+        \\    range: u32,
+        \\    pub fn span(s: S) u32 {
+        \\        return s.range;
+        \\    }
+        \\};
+        \\fn make(comptime T: type) T {
+        \\    return .{ .span = 1, .range = 2 };
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", src)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    // 初始化的字段名只能是字段：`T` 未知时 `.span = 1` 也不会是函数 `span` 的引用
+    {
+        var uncertain: ?search.Reference = null;
+        const def = (try definition.defAt(&r, file, at(src, "span", 0))).?;
+        const found = try search.findReferences(&r, def, .{ .scope = &.{file}, .uncertain = &uncertain });
+        try testing.expectEqual(null, uncertain);
+        try testing.expectEqual(1, found.len);
+    }
+    // 字段 `range` 的同名初始化字段在 `T` 未知时仍无法确认
+    {
+        var uncertain: ?search.Reference = null;
+        const def = (try definition.defAt(&r, file, at(src, "range", 0))).?;
+        _ = try search.findReferences(&r, def, .{ .scope = &.{file}, .uncertain = &uncertain });
+        try testing.expectEqualStrings("range", src[uncertain.?.start..uncertain.?.end]);
+    }
+}
+
 test "files with syntax errors that mention the name are reported" {
     var w: World = undefined;
     try w.init();

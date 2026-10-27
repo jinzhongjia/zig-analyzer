@@ -27,6 +27,12 @@ pub const Problem = struct {
 /// 替换 `[start, end)` 的文本
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
+/// 一个文件中的编辑，按位置排列、互不重叠
+pub const FileEdits = struct { file: FileId, edits: []const Edit };
+
+/// AstGen 报出的错误：位置（字节偏移）与文案
+pub const AstGenError = struct { start: u32, message: []const u8 };
+
 /// 声明处的冲突（改名为 `new` 后 AstGen 会报错）：同一容器中已有名为 `new` 的成员；局部名字与它处可见的名字
 /// 同名（遮蔽外层），或与它作用域内更深处的局部名字同名（被遮蔽）；函数体内的容器的声明与函数中可见的局部名字同名
 pub fn declarationConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error!?Problem {
@@ -143,17 +149,36 @@ pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) re
 /// 文件应用 `edits`（按位置排列、互不重叠）之后，比之前多出的第一个 AstGen 错误：重名、遮蔽，以及文件中漏改的
 /// 引用（引用不到声明）都会报出。位置换算回改名之前的文本
 pub fn verifyAstGen(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!?Problem {
+    const errors = try astGenErrors(r, file, edits);
+    // 按文案对应，改名前已有的错误不算。不比较个数：新的错误可能使 AstGen 不再报出原有的错误
+    var known: std.StringHashMapUnmanaged(u32) = .empty;
+    for (errors.before) |d| {
+        const gop = try known.getOrPut(r.arena, d.message);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    }
+    for (errors.after) |d| {
+        if (known.getPtr(d.message)) |n| if (n.* > 0) {
+            n.* -= 1;
+            continue;
+        };
+        return .{ .file = file, .offset = d.start, .message = d.message };
+    }
+    return null;
+}
+
+/// 文件应用 `edits`（按位置排列、互不重叠）之前与之后的 AstGen 错误。之后的错误的位置换算回应用之前的文本
+pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!struct { before: []const AstGenError, after: []const AstGenError } {
     const ctx = r.ctx;
     const gpa = ctx.db.gpa;
     const text = (try ctx.get(database.syntax.SourceText, file)).text;
-    var renamed: std.ArrayList(u8) = .empty;
+    var edited: std.ArrayList(u8) = .empty;
     var pos: u32 = 0;
     for (edits) |e| {
-        try renamed.appendSlice(r.arena, text[pos..e.start]);
-        try renamed.appendSlice(r.arena, e.text);
+        try edited.appendSlice(r.arena, text[pos..e.start]);
+        try edited.appendSlice(r.arena, e.text);
         pos = e.end;
     }
-    try renamed.appendSlice(r.arena, text[pos..]);
+    try edited.appendSlice(r.arena, text[pos..]);
     const backend = try ctx.get(live.LiveBackend, {});
     const mode = live.modeOf(ctx.db.env.vfs.path(file));
     // 当前文本的结果：打开的文件已由诊断发布算出（`AstCheck` 读取的是 `FileText`）
@@ -163,22 +188,13 @@ pub fn verifyAstGen(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
         own_before = try live.checkWith(gpa, ctx.db.io, backend, text, mode);
         break :blk own_before.?;
     };
-    const after = try live.checkWith(gpa, ctx.db.io, backend, renamed.items, mode);
+    const after = try live.checkWith(gpa, ctx.db.io, backend, edited.items, mode);
     defer after.destroy(gpa);
-    // 按文案对应，改名前已有的错误不算。不比较个数：新的错误可能使 AstGen 不再报出原有的错误
-    var known: std.StringHashMapUnmanaged(u32) = .empty;
-    for (before.items) |d| {
-        const gop = try known.getOrPut(r.arena, d.message);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
-    }
-    for (after.items) |d| {
-        if (known.getPtr(d.message)) |n| if (n.* > 0) {
-            n.* -= 1;
-            continue;
-        };
-        return .{ .file = file, .offset = mapBack(edits, d.start), .message = try r.arena.dupe(u8, d.message) };
-    }
-    return null;
+    const out_before = try r.arena.alloc(AstGenError, before.items.len);
+    for (before.items, out_before) |d, *o| o.* = .{ .start = d.start, .message = try r.arena.dupe(u8, d.message) };
+    const out_after = try r.arena.alloc(AstGenError, after.items.len);
+    for (after.items, out_after) |d, *o| o.* = .{ .start = mapBack(edits, d.start), .message = try r.arena.dupe(u8, d.message) };
+    return .{ .before = out_before, .after = out_after };
 }
 
 /// 应用 `edits` 之后的位置换算回之前的文本；位于替换的文本中时取被替换区间的起点

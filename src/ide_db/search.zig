@@ -77,7 +77,11 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .file => unreachable,
     };
 
-    var finder: Finder = .{ .r = r, .def = def, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete };
+    const is_field = switch (def) {
+        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
+        else => false,
+    };
+    var finder: Finder = .{ .r = r, .def = def, .is_field = is_field, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
@@ -208,6 +212,8 @@ pub const ProjectImporters = struct {
 const Finder = struct {
     r: *Resolver,
     def: Def,
+    /// `def` 是字段：初始化表达式中的字段名（`.{ .x = v }`）只能指向字段，不会是其他定义的引用
+    is_field: bool,
     name: []const u8,
     out: *std.ArrayList(Reference),
     ambiguous: ?*?Reference,
@@ -264,7 +270,7 @@ const Finder = struct {
                         .unknown => try f.noteUncertain(&res, file, item_index, id, at),
                     }
                 },
-                .init => |x| for (x.fields, 0..) |fi, k| {
+                .init => |x| if (f.is_field) for (x.fields, 0..) |fi, k| {
                     const n = fi.name orelse continue;
                     if (!std.mem.eql(u8, n, f.name)) continue;
                     const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
