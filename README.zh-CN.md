@@ -15,6 +15,8 @@ Zig **0.17.0**。请用项目所用的同一个 Zig 编译 zig-analyzer。
 
 `PATH` 中（或 `zig.path` 指定）的 `zig` 版本不同时，带 `build.zig` 的项目不加载：没有编译器诊断，命名模块（依赖包、构建选项）的 import 无法解析。live 诊断改用 `zig ast-check`。
 
+lib 目录与全局缓存目录取自 `zig env`，可由 `zig.lib_path`、`zig.global_cache_path` 覆盖；`zig.builtin_path` 指定不属于任何项目的文件的 `@import("builtin")`。
+
 ## 功能
 
 - **诊断**

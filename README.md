@@ -15,6 +15,8 @@ Zig **0.17.0**. Build zig-analyzer with the same Zig you use for your projects.
 
 If the `zig` in `PATH` (or `zig.path`) is a different version, projects with `build.zig` are not loaded: there are no compiler diagnostics, and imports of named modules (dependencies, build options) are not resolved. Live diagnostics fall back to `zig ast-check`.
 
+The lib and global cache directories come from `zig env`; `zig.lib_path` and `zig.global_cache_path` override them. `zig.builtin_path` sets `@import("builtin")` for files outside any project.
+
 ## Features
 
 - **Diagnostics**
