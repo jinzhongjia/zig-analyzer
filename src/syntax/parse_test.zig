@@ -4,7 +4,11 @@ const Parse = @import("Parse.zig");
 const tree = @import("tree.zig");
 
 fn dumpTree(source: []const u8) ![]u8 {
-    const parse = try Parse.create(testing.allocator, source);
+    return dumpTreeIn(.zig, source);
+}
+
+fn dumpTreeIn(mode: Parse.Mode, source: []const u8) ![]u8 {
+    const parse = try Parse.create(testing.allocator, source, mode);
     defer parse.destroy();
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     errdefer out.deinit();
@@ -19,9 +23,19 @@ fn expectTree(source: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, actual);
 }
 
+fn expectZonTree(source: []const u8, expected: []const u8) !void {
+    const actual = try dumpTreeIn(.zon, source);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(expected, actual);
+}
+
 /// Lossless: the root node's text equals the source
 fn expectLossless(source: []const u8) !void {
-    const parse = try Parse.create(testing.allocator, source);
+    return expectLosslessIn(.zig, source);
+}
+
+fn expectLosslessIn(mode: Parse.Mode, source: []const u8) !void {
+    const parse = try Parse.create(testing.allocator, source, mode);
     defer parse.destroy();
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -39,7 +53,7 @@ fn writeText(n: @import("tree.zig").SyntaxNode, w: *std.Io.Writer) !void {
 }
 
 fn expectNoErrors(source: []const u8) !void {
-    const parse = try Parse.create(testing.allocator, source);
+    const parse = try Parse.create(testing.allocator, source, .zig);
     defer parse.destroy();
     if (parse.errors.len != 0) {
         const tree_text = try dumpTree(source);
@@ -264,7 +278,7 @@ test "deep nesting keeps the full structure" {
         try src.appendSlice(a, c.middle);
         for (0..n) |_| try src.appendSlice(a, c.close);
         try src.appendSlice(a, c.tail);
-        const parse = try Parse.create(a, src.items);
+        const parse = try Parse.create(a, src.items, .zig);
         defer parse.destroy();
         try testing.expectEqual(0, parse.errors.len);
         try testing.expect(try treeDepth(parse.rootNode()) > n);
@@ -373,7 +387,7 @@ test "unclosed escaped identifiers retain syntax roles and invalid token diagnos
         }
     };
     for (cases) |case| {
-        const parse = try Parse.create(testing.allocator, case.source);
+        const parse = try Parse.create(testing.allocator, case.source, .zig);
         defer parse.destroy();
         const offset: u32 = @intCast(std.mem.indexOf(u8, case.source, "@\"").?);
         const root = parse.rootNode();
@@ -383,4 +397,77 @@ test "unclosed escaped identifiers retain syntax roles and invalid token diagnos
         try testing.expectEqual(offset, parse.errors[0].offset);
         try expectLossless(case.source);
     }
+}
+
+test "zon file is a single expression" {
+    try expectZonTree(".{\n    .name = .demo,\n    .paths = .{\"src\"},\n}\n",
+        \\source_file@0..47
+        \\  init_expr@0..46
+        \\    period "."
+        \\    init_list@1..46
+        \\      l_brace "{"
+        \\      field_init@7..20
+        \\        period "."
+        \\        identifier "name"
+        \\        equal "="
+        \\        enum_literal@15..20
+        \\          period "."
+        \\          identifier "demo"
+        \\      comma ","
+        \\      field_init@26..43
+        \\        period "."
+        \\        identifier "paths"
+        \\        equal "="
+        \\        init_expr@35..43
+        \\          period "."
+        \\          init_list@36..43
+        \\            l_brace "{"
+        \\            literal@37..42
+        \\              string_literal "\"src\""
+        \\            r_brace "}"
+        \\      comma ","
+        \\      r_brace "}"
+        \\
+    );
+}
+
+test "zon tokens around the expression are errors" {
+    try expectZonTree("//! doc\n.{}\n.{}",
+        \\source_file@0..15
+        \\  error_node@0..7
+        \\    container_doc_comment "//! doc"
+        \\  init_expr@8..11
+        \\    period "."
+        \\    init_list@9..11
+        \\      l_brace "{"
+        \\      r_brace "}"
+        \\  error_node@12..15
+        \\    period "."
+        \\    l_brace "{"
+        \\    r_brace "}"
+        \\error@0: expected expression
+        \\error@12: expected end of file
+        \\
+    );
+    try expectZonTree("",
+        \\source_file@0..0
+        \\error@0: expected expression
+        \\
+    );
+    try expectZonTree("// c\n",
+        \\source_file@0..5
+        \\error@5: expected expression
+        \\
+    );
+}
+
+test "zon files are lossless" {
+    const cases = [_][]const u8{
+        ".{ .a = inf, .b = -inf, .c = nan }",
+        ".{ .a = 1, . }",
+        "/// doc\n/// doc\n.{ .x = 1 } }\n;",
+        ".{\n    .s = \\\\multi\n    ,\n}",
+        "}",
+    };
+    for (cases) |source| try expectLosslessIn(.zon, source);
 }

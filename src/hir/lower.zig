@@ -613,7 +613,7 @@ const testing = std.testing;
 const Parse = @import("../syntax/Parse.zig");
 
 fn lowerFirst(text: []const u8) !struct { parse: *Parse, body: Body } {
-    const p = try Parse.create(testing.allocator, text);
+    const p = try Parse.create(testing.allocator, text, .zig);
     errdefer p.destroy();
     var it = ast.childNodes(p.rootNode());
     return .{ .parse = p, .body = try lower(testing.allocator, it.next().?, false) };

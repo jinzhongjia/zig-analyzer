@@ -34,8 +34,8 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe
       - name: Compile check (including benchmark tools)
         run: zig build check -Doptimize=ReleaseSafe
-      - name: Corpus cross-check (Zig standard library + this repository's sources)
-        run: zig build corpus -Doptimize=ReleaseSafe -- src tools
+      - name: Corpus cross-check (Zig standard library + this repository's sources and .zon files)
+        run: zig build corpus -Doptimize=ReleaseSafe -- src tools build.zig.zon zig-analyzer.default.zon
 
   lint:
     name: Formatting and generated code

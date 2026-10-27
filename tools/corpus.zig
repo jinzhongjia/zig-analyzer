@@ -1,12 +1,12 @@
-//! Corpus cross-check: validates the project's own CST parser on a set of Zig sources.
+//! Corpus cross-check: validates the project's own CST parser on a set of Zig and ZON sources.
 //!
 //! Usage: zig build corpus -- <dir or file>...
 //!
-//! Checks:
+//! `.zon` files are parsed in ZON mode and compared with the ZON mode of `std.zig.Ast`. Checks:
 //! 1. Lossless: the concatenated text of the syntax tree equals the source
 //! 2. No false errors: a file without `std.zig.Ast` errors must have no CST errors either
 //! 3. Same structure: the (kind, name) sequence of the top-level members of each container
-//!    matches `std.zig.Ast`
+//!    matches `std.zig.Ast` (the root of a ZON file is one expression)
 //! 4. Robustness: parsing a file truncated at several positions does not crash and is still
 //!    lossless
 //! 5. HIR: every member can be lowered, expression positions lie within the member, and name
@@ -72,7 +72,8 @@ pub fn main(init: std.process.Init) !u8 {
         var walker = try dir.walk(gpa);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".zig") and !std.mem.endsWith(u8, entry.basename, ".zon")) continue;
             const path = try std.fs.path.join(gpa, &.{ root, entry.path });
             defer gpa.free(path);
             try checkFile(gpa, io, cwd, path, &stats);
@@ -125,9 +126,10 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     defer gpa.free(source);
     stats.files += 1;
     stats.bytes += source.len;
+    const mode = syntax.Parse.modeOf(path);
 
     const t0 = std.Io.Clock.awake.now(io);
-    const parse = try syntax.Parse.create(gpa, source);
+    const parse = try syntax.Parse.create(gpa, source, mode);
     stats.parse_ns += @intCast(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     defer parse.destroy();
 
@@ -211,7 +213,10 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     if (try syntax.nesting.estimate(gpa, source_z, syntax.nesting.inline_depth) > syntax.nesting.inline_depth) {
         stats.std_skipped += 1;
     } else {
-        var ast = try std.zig.Ast.parse(gpa, source_z, .{});
+        var ast = try std.zig.Ast.parse(gpa, source_z, .{ .mode = switch (mode) {
+            .zig => .zig,
+            .zon => .zon,
+        } });
         defer ast.deinit(gpa);
         if (ast.errors.len != 0) {
             stats.std_errors += 1;
@@ -223,7 +228,11 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
                 report(stats, "[false error] {s}:{d}:{d}: {s} ({d} total)", .{ path, loc.line, loc.col, e.message, parse.errors.len });
             }
             // 3. Top-level structure
-            if (!try sameStructure(gpa, &ast, parse.rootNode(), source)) {
+            const same = switch (mode) {
+                .zig => try sameStructure(gpa, &ast, parse.rootNode(), source),
+                .zon => zonRootIsExpr(parse.rootNode()),
+            };
+            if (!same) {
                 stats.structure_mismatches += 1;
                 report(stats, "[structure mismatch] {s}", .{path});
             }
@@ -238,7 +247,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     const cuts = 8;
     for (1..cuts) |i| {
         const end = source.len * i / cuts;
-        const partial = try syntax.Parse.create(gpa, source[0..end]);
+        const partial = try syntax.Parse.create(gpa, source[0..end], mode);
         defer partial.destroy();
         stats.truncations += 1;
         if (!try isLossless(gpa, partial.rootNode(), source[0..end])) {
@@ -258,7 +267,7 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
     var prng: std.Random.DefaultPrng = .init(std.hash.Wyhash.hash(0, path));
     const rand = prng.random();
 
-    var chain = try syntax.Parse.create(gpa, source);
+    var chain = try syntax.Parse.create(gpa, source, syntax.Parse.modeOf(path));
     defer chain.destroy();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
@@ -275,7 +284,7 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
         const t0 = std.Io.Clock.awake.now(io);
         const inc = try syntax.Parse.reparse(gpa, chain, text.items);
         const t1 = std.Io.Clock.awake.now(io);
-        const full = try syntax.Parse.create(gpa, text.items);
+        const full = try syntax.Parse.create(gpa, text.items, chain.mode);
         const t2 = std.Io.Clock.awake.now(io);
         defer full.destroy();
 
@@ -351,6 +360,17 @@ fn lineCol(source: []const u8, offset: u32) struct { line: usize, col: usize } {
 }
 
 const Member = struct { kind: []const u8, name: []const u8 };
+
+/// The root of a ZON file has exactly one child node (the expression) and no error node
+fn zonRootIsExpr(root: SyntaxNode) bool {
+    var it = root.children();
+    var count: usize = 0;
+    while (it.nextNode()) |n| {
+        if (n.kind() == .error_node) return false;
+        count += 1;
+    }
+    return count == 1;
+}
 
 /// Compares the member sequences container by container. A container is identified by the
 /// offset of its keyword (struct/enum/...); the file root uses offset maxInt.

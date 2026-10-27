@@ -4,7 +4,7 @@ const Parse = @import("Parse.zig");
 const ItemTree = @import("ItemTree.zig");
 
 fn buildTree(source: []const u8) !struct { parse: *Parse, items: ItemTree } {
-    const parse = try Parse.create(testing.allocator, source);
+    const parse = try Parse.create(testing.allocator, source, .zig);
     errdefer parse.destroy();
     return .{ .parse = parse, .items = try ItemTree.build(testing.allocator, parse.rootNode()) };
 }

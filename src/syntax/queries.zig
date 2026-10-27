@@ -71,12 +71,15 @@ pub const ParseFile = struct {
         return @sizeOf(Parse) + v.chain_bytes;
     }
 
-    /// When there is a previous result, attempts a local reparse (the result is the same as a
-    /// full parse; see `Parse.reparse`)
+    /// Picks the parse mode by path (`.zon` is ZON). When there is a previous result, attempts a
+    /// local reparse (the mode is kept and the result is the same as a full parse; see
+    /// `Parse.reparse`)
     pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const text = (try ctx.get(SourceText, file)).text;
         if (prev) |old| return Parse.reparse(ctx.db.gpa, old, text);
-        return Parse.create(ctx.db.gpa, text);
+        // The test Db without a Vfs only has Zig files
+        const mode: Parse.Mode = if (comptime @TypeOf(ctx.db.env) == void) .zig else Parse.modeOf(ctx.db.env.vfs.path(file));
+        return Parse.create(ctx.db.gpa, text, mode);
     }
 
     pub fn eql(a: Value, b: Value) bool {

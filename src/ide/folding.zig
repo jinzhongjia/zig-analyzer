@@ -102,7 +102,7 @@ test foldingRanges {
         \\    ;
         \\}
     ;
-    const parse = try Parse.create(testing.allocator, text);
+    const parse = try Parse.create(testing.allocator, text, .zig);
     defer parse.destroy();
     var lines = try offsets.LineIndex.init(testing.allocator, text);
     defer lines.deinit(testing.allocator);
@@ -118,4 +118,40 @@ test foldingRanges {
         if (r.startLine == 6 and r.endLine == 7) found[3] = true; // multiline string literal
     }
     try testing.expectEqual([4]bool{ true, true, true, true }, found);
+}
+
+test "zon files fold like the same text parsed as zig" {
+    const text =
+        \\// a
+        \\// b
+        \\.{
+        \\    .name = .demo,
+        \\    .dependencies = .{
+        \\        .foo = .{
+        \\            .url = "https://example.com/foo.tar.gz",
+        \\        },
+        \\    },
+        \\    .text =
+        \\        \\l1
+        \\        \\l2
+        \\    ,
+        \\    .paths = .{
+        \\        "src",
+        \\    },
+        \\}
+        \\
+    ;
+    var lines = try offsets.LineIndex.init(testing.allocator, text);
+    defer lines.deinit(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Parsed as Zig, the root expression sits in an unnamed field
+    const zig = try Parse.create(testing.allocator, text, .zig);
+    defer zig.destroy();
+    const zon = try Parse.create(testing.allocator, text, .zon);
+    defer zon.destroy();
+
+    const expected = try foldingRanges(arena.allocator(), zig.rootNode(), lines);
+    try testing.expectEqual(6, expected.len);
+    try testing.expectEqualDeep(expected, try foldingRanges(arena.allocator(), zon.rootNode(), lines));
 }

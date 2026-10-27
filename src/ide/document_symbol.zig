@@ -107,7 +107,7 @@ test documentSymbols {
         \\const E = enum { x };
         \\test "t" {}
     ;
-    const parse = try Parse.create(testing.allocator, text);
+    const parse = try Parse.create(testing.allocator, text, .zig);
     defer parse.destroy();
     var items = try ItemTree.build(testing.allocator, parse.rootNode());
     defer items.deinit(testing.allocator);
@@ -141,7 +141,7 @@ test "document symbols stop at the nesting limit" {
     for (0..150) |_| try text.appendSlice(testing.allocator, "a: struct {\n");
     for (0..150) |_| try text.appendSlice(testing.allocator, "},\n");
     try text.appendSlice(testing.allocator, "};\n");
-    const parse = try Parse.create(testing.allocator, text.items);
+    const parse = try Parse.create(testing.allocator, text.items, .zig);
     defer parse.destroy();
     var items = try ItemTree.build(testing.allocator, parse.rootNode());
     defer items.deinit(testing.allocator);
@@ -167,7 +167,7 @@ test "tuple fields are named by their index" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const parse = try Parse.create(a, text);
+    const parse = try Parse.create(a, text, .zig);
     var items = try ItemTree.build(a, parse.rootNode());
     var map = try ItemTree.AstIdMap.build(a, &items, parse.rootNode());
     const lines = try offsets.LineIndex.init(a, text);

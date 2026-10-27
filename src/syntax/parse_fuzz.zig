@@ -66,8 +66,8 @@ fn writeText(n: @import("tree.zig").SyntaxNode, w: *std.Io.Writer) !void {
 fn checkAll(input: []const u8) !void {
     const a = testing.allocator;
     // Raw bytes used directly as source
-    {
-        const p = try Parse.create(a, input);
+    for ([_]Parse.Mode{ .zig, .zon }) |mode| {
+        const p = try Parse.create(a, input, mode);
         defer p.destroy();
         try expectLossless(p, input);
     }
@@ -81,7 +81,7 @@ fn checkEdits(input: []const u8, deep: bool) !void {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
     try genSource(&e, &text, deep);
-    var chain = try Parse.create(a, text.items);
+    var chain = try Parse.create(a, text.items, .zig);
     defer chain.destroy();
     try expectLossless(chain, text.items);
 
@@ -95,7 +95,7 @@ fn checkEdits(input: []const u8, deep: bool) !void {
         const inc = try Parse.reparse(a, chain, text.items);
         chain.destroy();
         chain = inc;
-        const full = try Parse.create(a, text.items);
+        const full = try Parse.create(a, text.items, .zig);
         defer full.destroy();
         if (!inc.sameAs(full)) {
             std.debug.print("incremental and full parse differ:\n---\n{s}\n---\n", .{text.items});

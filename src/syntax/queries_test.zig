@@ -64,7 +64,7 @@ test "ItemSummary mentions long escaped names" {
 test "ParseFile bytes include the incremental chain" {
     const Parse = @import("Parse.zig");
     const base = "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n";
-    const old = try Parse.create(testing.allocator, base);
+    const old = try Parse.create(testing.allocator, base, .zig);
     defer old.destroy();
     // An edit at the end takes the top-level local reparse path: the new result holds the old one
     const inc = try Parse.reparse(testing.allocator, old, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// endx\n");
@@ -137,7 +137,7 @@ test "ParseFile uses block reparse after edits inside a function body" {
     defer ctx.end();
     const parse = try ctx.get(q.ParseFile, file);
     try testing.expect(parse.base != null);
-    const full = try @import("Parse.zig").create(testing.allocator, "fn f() void {\n    b(1);\n}\n");
+    const full = try @import("Parse.zig").create(testing.allocator, "fn f() void {\n    b(1);\n}\n", .zig);
     defer full.destroy();
     try testing.expect(parse.sameAs(full));
 }
