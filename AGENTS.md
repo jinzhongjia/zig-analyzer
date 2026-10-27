@@ -10,8 +10,8 @@
 
 ## 代码语言
 
-- 只有注释使用中文。
-- 日志、错误消息、panic / compileError、发给客户端的文案（进度、showMessage、错误响应）、工具输出、build step 描述、测试名一律使用英文。
+- 代码一律使用英文：注释、日志、错误消息、panic / compileError、发给客户端的文案（进度、showMessage、错误响应）、工具输出、build step 描述、测试名。
+- 例外：测试数据中刻意使用的非 ASCII 文本（如检验 UTF-8 / UTF-16 位置换算的中文字符串）。
 
 ## 注释
 
