@@ -51,7 +51,7 @@ jobs:
       - name: Generated code matches the committed files
         run: |
           zig build gen
-          git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig
+          git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig src/ide/manifest_data.zig
 
   fuzz:
     name: Coverage-guided fuzzing

@@ -4201,9 +4201,13 @@ fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []
 }
 
 fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.definition.Target) !types.Location {
+    const target_uri = try server.uriFor(arena, t.file);
+    // The start of a file (the target of an import or of a path in `build.zig.zon`) needs no read
+    // of the file: a path can point to a file of any size and content
+    if (t.start == 0 and t.end == 0) return .{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } };
     const target_text = (try r.ctx.get(syntax_q.SourceText, t.file)).text;
     const lines = try offsets.LineIndex.init(arena, target_text);
-    return .{ .uri = try server.uriFor(arena, t.file), .range = lines.range(t.start, t.end, server.encoding) };
+    return .{ .uri = target_uri, .range = lines.range(t.start, t.end, server.encoding) };
 }
 
 fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {

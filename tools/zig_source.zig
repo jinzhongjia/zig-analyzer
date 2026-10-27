@@ -13,6 +13,8 @@ pub const Metadata = struct {
     langref_sha256: []const u8,
     builtin_registry_path: []const u8,
     builtin_registry_sha256: []const u8,
+    build_zig_zon_path: []const u8,
+    build_zig_zon_sha256: []const u8,
     documentation_url: []const u8,
     license: []const u8,
 };
@@ -42,6 +44,7 @@ pub fn validateMetadata(a: Allocator, metadata: Metadata, compiler_version: []co
     const docs = try std.fmt.allocPrint(a, "https://ziglang.org/documentation/{s}/", .{metadata.version});
     if (!eql(metadata.source_archive, archive) or !eql(metadata.documentation_url, docs) or
         !eql(metadata.langref_path, "doc/langref.html.in") or !eql(metadata.builtin_registry_path, "lib/std/zig/BuiltinFn.zig") or
+        !eql(metadata.build_zig_zon_path, "doc/build.zig.zon.md") or
         !eql(metadata.license, "MIT") or metadata.source_archive_sha256.len != 64)
         return invalid("unexpected official source provenance for Zig {s}", .{metadata.version});
 }

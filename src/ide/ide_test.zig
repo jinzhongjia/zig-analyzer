@@ -1440,6 +1440,260 @@ test "zon result types follow the importers across files and edits" {
     }
 }
 
+test "build.zig.zon fields are completed from the schema" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .<|> }", "name fingerprint version minimum_zig_version dependencies paths" },
+        // Fields already given are not listed again
+        .{ ".{ .name = .demo, .version = \"0.1.0\", .<|> }", "fingerprint minimum_zig_version dependencies paths" },
+        // The `url` and `path` of a dependency are mutually exclusive; dependencies can have any
+        // name
+        .{ ".{ .dependencies = .{ .foo = .{ .<|> } } }", "url hash path lazy" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"https://example.com/foo.tar.gz\", .<|> } } }", "hash lazy" },
+        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "hash lazy" },
+        // Dependency names, elements of `.paths`, field values, and objects outside the schema
+        .{ ".{ .dependencies = .{ .<|> } }", "" },
+        .{ ".{ .paths = .{ .<|> } }", "" },
+        .{ ".{ .name = .<|> }", "" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"u\", .extra = .{ .<|> } } } }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.add("/p/build.zig.zon", c[0]);
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = try w.add("/p/build.zig.zon", ".{ .<|> }");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const first = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items[0];
+    try testing.expectEqual(.field, first.kind);
+    try testing.expect(std.mem.startsWith(u8, first.doc.?, "Enum literal. Required."));
+}
+
+test "build.zig.zon uses the schema only without a result type" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // Build scripts usually import it without a result type
+        .{ "/p/build.zig.zon", "const zon = @import(\"build.zig.zon\");", "name fingerprint version minimum_zig_version dependencies paths" },
+        // With a result type, the file is inferred with that type
+        .{ "/p/build.zig.zon", "const M = struct { a: u8, b: u8 };\nconst m: M = @import(\"build.zig.zon\");", "a b" },
+        // `.zon` files with other names don't use the schema
+        .{ "/p/cfg.zon", "const zon = @import(\"cfg.zon\");", "" },
+        .{ "/p/sub/build.zig.zon.zig", "", "" },
+    };
+    inline for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture("//- /p/build.zig module:app\n" ++ c[1]);
+        const at = try w.add(c[0], ".{ .<|> }");
+        testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
+            std.debug.print("{s} imported by:\n{s}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon fields have the official documentation" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .name = .demo,
+        \\    .@"version" = "0.1.0",
+        \\    .dependencies = .{
+        \\        .foo = .{ .url = "https://example.com/foo.tar.gz", .hash = "abc", .lazy = true },
+        \\        .paths = .{ .path = "libs/paths" },
+        \\    },
+        \\    .paths = .{ "build.zig", .{ .name = 1 } },
+        \\    .unknown = .{ .url = "u" },
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/build.zig.zon", text)).file;
+    const cfg = (try w.add("/p/cfg.zon", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "name =", "Enum literal. Required." },
+        .{ "@\"version\"", "String. Required." },
+        .{ "dependencies", "Struct." },
+        .{ "url = \"https://", "String.\n\nWhen updating" },
+        .{ "hash", "String.\n\n[multihash]" },
+        .{ "lazy", "Boolean." },
+        // A dependency named `paths` and the `path` in it
+        .{ "path = ", "String.\n\nWhen this is provided" },
+        .{ "paths = .{ \"", "List. Required." },
+        // Dependency names, values, and fields and objects outside the schema
+        .{ "foo", null },
+        .{ "paths = .{ .path", null },
+        .{ "demo", null },
+        .{ "name = 1", null },
+        .{ "unknown", null },
+        .{ "url = \"u\"", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const info = try hover.hover(&r, file, offset);
+        const other = try hover.hover(&r, cfg, offset);
+        const got = if (info) |i| i.text else "";
+        if (c[1]) |want| {
+            testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+            try testing.expectEqual(offset, info.?.start);
+            // `.zon` files with other names have no schema documentation
+            try testing.expectEqual(null, other);
+        } else {
+            // Outside the schema, the same as in other `.zon` files
+            testing.expectEqualStrings(if (other) |o| o.text else "", got) catch |err| {
+                std.debug.print("hover at `{s}`\n", .{c[0]});
+                return err;
+            };
+        }
+    }
+}
+
+/// A build root: `build.zig.zon` and some files and directories (entries starting with `.` and
+/// `zig-out` are not listed)
+const ManifestRoot = struct {
+    tmp: testing.TmpDir,
+    dir: [:0]const u8,
+
+    fn create() !ManifestRoot {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        for ([_][]const u8{ "src/util", "libs/foo", "zig-out/bin", ".zig-cache" }) |d| try tmp.dir.createDirPath(testing.io, d);
+        for ([_][]const u8{ "build.zig", "build.zig.zon", "README.md", ".gitignore", "src/main.zig", "src/util/a.zig", "libs/foo/build.zig.zon" }) |f| {
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = f, .data = "" });
+        }
+        return .{ .tmp = tmp, .dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator) };
+    }
+
+    fn deinit(m: *ManifestRoot) void {
+        testing.allocator.free(m.dir);
+        m.tmp.cleanup();
+    }
+
+    /// Uses `text` as the content of its `build.zig.zon`
+    fn add(m: ManifestRoot, w: *World, text: []const u8) !World.Added {
+        return w.addNative(try std.fs.path.join(w.arena.allocator(), &.{ m.dir, "build.zig.zon" }), text);
+    }
+};
+
+test "build.zig.zon paths are completed relative to the build root" {
+    var root: ManifestRoot = try .create();
+    defer root.deinit();
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Elements of `.paths`: files and directories
+        .{ ".{ .paths = .{ \"<|>\" } }", "README.md build.zig build.zig.zon libs src" },
+        .{ ".{ .paths = .{ \"build.zig\", \"src/<|>\" } }", "src/main.zig src/util" },
+        .{ ".{ .paths = .{ \"src/util/a<|>\" } }", "src/util/a.zig" },
+        // The `.path` of a dependency: directories only
+        .{ ".{ .dependencies = .{ .foo = .{ .path = \"<|>\" } } }", "libs src" },
+        .{ ".{ .dependencies = .{ .foo = .{ .path = \"libs/<|>\" } } }", "libs/foo" },
+        // Unclosed strings
+        .{ ".{\n    .paths = .{ \"build.zig\", \"sr<|>\n    },\n}", "README.md build.zig build.zig.zon libs src" },
+        .{ ".{\n    .dependencies = .{ .foo = .{ .path = \"li<|>\n    } },\n}", "libs src" },
+        // Strings that are not paths
+        .{ ".{ .version = \"<|>\" }", "" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"<|>\" } } }", "" },
+        .{ ".{ .paths = .{ .{ .path = \"<|>\" } } }", "" },
+        .{ ".{ .other = .{ \"<|>\" } }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try root.add(&w, c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        const text = (try ctx.get(database.syntax.SourceText, at.file)).text;
+        for (items) |it| {
+            try labels.append(w.arena.allocator(), it.label);
+            // The replacement range starts at the start of the string content
+            const quote = std.mem.lastIndexOfScalar(u8, text[0..at.cursor], '"').?;
+            try testing.expectEqual(quote + 1, it.replace.?.start);
+            try testing.expectEqual(at.cursor, it.replace.?.end);
+        }
+        std.mem.sort([]const u8, labels.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon paths go to the files they name" {
+    var root: ManifestRoot = try .create();
+    defer root.deinit();
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .version = "build.zig",
+        \\    .dependencies = .{
+        \\        .foo = .{ .path = "libs/foo" },
+        \\        .bar = .{ .path = "build.zig" },
+        \\    },
+        \\    .paths = .{ "build.zig", "src/main.zig", "src", "", "missing.zig", "/build.zig" },
+        \\}
+        \\
+    ;
+    const file = (try root.add(&w, text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "\"build.zig\", \"src", "build.zig" },
+        .{ "src/main.zig", "src/main.zig" },
+        // The `.path` of a dependency goes to a file as well
+        .{ "build.zig\" }", "build.zig" },
+        // Directories, missing files, absolute paths, and strings that are not paths
+        .{ "\"src\"", null },
+        .{ "\"\"", null },
+        .{ "missing.zig", null },
+        .{ "/build.zig", null },
+        .{ "libs/foo", null },
+        .{ "build.zig\",\n", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).? + 1);
+        const t = try definition.definition(&r, file, offset);
+        if (c[1]) |want| {
+            const got = t orelse {
+                std.debug.print("no definition at `{s}`\n", .{c[0]});
+                return error.NoDefinition;
+            };
+            try testing.expectEqualStrings(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, want }), w.vfs.path(got.file));
+            try testing.expectEqual(0, got.start);
+            try testing.expectEqual(0, got.end);
+        } else testing.expectEqual(null, t) catch |err| {
+            std.debug.print("definition at `{s}`: {s}\n", .{ c[0], w.vfs.path(t.?.file) });
+            return err;
+        };
+    }
+}
+
 test "hover in generic bodies is inferred from a call site" {
     const text =
         \\fn List(comptime T: type) type {

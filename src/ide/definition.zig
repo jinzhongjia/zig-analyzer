@@ -1,5 +1,5 @@
 //! Goto definition / declaration / type definition: names, member access, field names in
-//! initializers, labels, and `@import` strings.
+//! initializers, labels, `@import` strings, and paths to files in `build.zig.zon`.
 //!
 //! Declaration jumps to the declaration that a name resolves to directly; definition additionally
 //! follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition; type
@@ -25,10 +25,12 @@ const seed = @import("../ide_db/seed.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const ErrorSets = @import("../syntax/ErrorSets.zig");
+const manifest = @import("manifest.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    if (try manifestPathTarget(r, file, offset)) |t| return t;
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
     if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
@@ -38,6 +40,7 @@ pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    if (try manifestPathTarget(r, file, offset)) |t| return t;
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
     if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
@@ -63,6 +66,14 @@ pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error
 
 fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
     return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
+}
+
+/// A path string in `build.zig.zon` that points to a file (an element of `.paths`, the `.path` of
+/// a dependency): the start of that file
+fn manifestPathTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    const path_file = try manifest.pathTarget(r, file, tok) orelse return null;
+    return .{ .file = path_file, .start = 0, .end = 0 };
 }
 
 /// All targets of the import (start of each file) when the cursor is on `@import(...)` or its

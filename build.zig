@@ -78,6 +78,19 @@ pub fn build(b: *std.Build) void {
     gen_builtins_run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "std/zig/BuiltinFn.zig"));
     const builtin_data = gen_builtins_run.addOutputFileArg("builtin_data.zig");
     update_sources.addCopyFileToSource(builtin_data, "src/ide/builtin_data.zig");
+    const gen_manifest = b.addExecutable(.{
+        .name = "gen_manifest_data",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_manifest_data.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const gen_manifest_run = b.addRunArtifact(gen_manifest);
+    gen_manifest_run.addFileArg(b.path("tools/zig/build.zig.zon.md"));
+    gen_manifest_run.addFileArg(b.path("tools/zig/metadata.json"));
+    const manifest_data = gen_manifest_run.addOutputFileArg("manifest_data.zig");
+    update_sources.addCopyFileToSource(manifest_data, "src/ide/manifest_data.zig");
     gen_step.dependOn(&update_sources.step);
 
     // Corpus cross-check: checks the standard library of the current Zig by default; more
@@ -151,11 +164,20 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     }));
+    const manifest_generator_run = b.addRunArtifact(b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_manifest_data.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    }));
     const test_step = b.step("test", "Run the tests that need no external tools");
     test_step.dependOn(&generator_run.step);
+    test_step.dependOn(&manifest_generator_run.step);
     test_step.dependOn(&b.addRunArtifact(analyzerTests(b, target, optimize, test_runner, tracy != null, false, null)).step);
     const all_step = b.step("test-all", "Run all tests, including those that run the zig in PATH");
     all_step.dependOn(&generator_run.step);
+    all_step.dependOn(&manifest_generator_run.step);
     all_step.dependOn(&b.addRunArtifact(analyzerTests(b, target, optimize, test_runner, tracy != null, true, null)).step);
 
     // Stress verification (for concurrency-related changes): run the selected tests repeatedly, one
