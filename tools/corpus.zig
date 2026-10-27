@@ -142,7 +142,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     // ItemTree and AstIdMap: every member maps back to a node of the matching kind
     {
         const t1 = std.Io.Clock.awake.now(io);
-        var items = try syntax.ItemTree.build(gpa, parse.rootNode());
+        var items = try syntax.ItemTree.build(gpa, parse.rootNode(), mode);
         defer items.deinit(gpa);
         var map = try syntax.ItemTree.AstIdMap.build(gpa, &items, parse.rootNode());
         defer map.deinit(gpa);
@@ -156,6 +156,9 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
                 .field => .container_field,
                 .@"test" => .test_decl,
                 .@"comptime" => .comptime_decl,
+                // The root expression of ZON can be any expression: the node that `zonRoot`
+                // returns
+                .zon => syntax.ItemTree.zonRoot(parse.rootNode()).?.kind(),
             };
             if (node.kind() != expected_kind) break false;
         } else true;
@@ -171,8 +174,9 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             const container_kind = items.containers[item.container].kind;
             const field_is_name = item.kind == .field and (container_kind == .@"enum" or container_kind == .@"union") and
                 (syntax.ast.ContainerField{ .syntax = node }).name() == null;
+            const owner: za.hir.lower.Owner = if (mode == .zon) .zon else if (field_is_name) .bare_field else .member;
             const t2 = std.Io.Clock.awake.now(io);
-            var body = try za.hir.lower.lower(gpa, node, field_is_name);
+            var body = try za.hir.lower.lower(gpa, node, owner);
             defer body.deinit(gpa);
             stats.hir_ns += @intCast(t2.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
             stats.hir_exprs += body.exprs.len;
@@ -180,7 +184,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             defer references.deinit(gpa);
             const name_node = if (field_is_name) (syntax.ast.ContainerField{ .syntax = node }).typeExpr() else null;
             const excluded = if (name_node) |name| if (name.kind() == .name_ref) name.offset else null else null;
-            try collectNameRefs(gpa, node, excluded, &references);
+            try collectNameRefs(gpa, node, excluded, mode, &references);
             const expected = references.count();
             const in_range = body.exprs.len == body.expr_ranges.len and for (body.expr_ranges) |r| {
                 if (r.start > r.end or r.end > node.green.text_len) break false;
@@ -307,15 +311,18 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
 
 /// Collects the source references that must appear in the HIR; members of nested containers
 /// are checked by their own owners.
-fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references: *std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken)) !void {
+fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, mode: syntax.Parse.Mode, references: *std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken)) !void {
     switch (node.kind()) {
         .name_ref => {
             if (excluded == node.offset) return;
-            if ((syntax.ast.NameRef{ .syntax = node }).name()) |token| try references.put(gpa, token.range(), token);
+            const token = (syntax.ast.NameRef{ .syntax = node }).name() orelse return;
+            // `inf` and `nan` are float literals in ZON
+            if (mode == .zon and za.hir.Body.zonFloatValue(token.text) != null) return;
+            try references.put(gpa, token.range(), token);
             return;
         },
         .container_decl => {
-            if ((syntax.ast.ContainerDecl{ .syntax = node }).argExpr()) |arg| try collectNameRefs(gpa, arg, excluded, references);
+            if ((syntax.ast.ContainerDecl{ .syntax = node }).argExpr()) |arg| try collectNameRefs(gpa, arg, excluded, mode, references);
             return;
         },
         .asm_output => if (node.childToken(.arrow) == null) {
@@ -334,7 +341,7 @@ fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references:
         else => {},
     }
     var children = node.children();
-    while (children.nextNode()) |child| try collectNameRefs(gpa, child, excluded, references);
+    while (children.nextNode()) |child| try collectNameRefs(gpa, child, excluded, mode, references);
 }
 
 fn isLossless(gpa: Allocator, root: SyntaxNode, source: []const u8) !bool {

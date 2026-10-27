@@ -316,7 +316,7 @@ const Inferrer = struct {
                     _ = try inf.infer(v, annotation);
                 };
             },
-            .@"test", .@"comptime" => if (mode == .full) if (b.value) |v| {
+            .@"test", .@"comptime", .zon => if (mode == .full) if (b.value) |v| {
                 _ = try inf.infer(v, null);
             },
         }
@@ -956,7 +956,9 @@ const Inferrer = struct {
                 };
                 return .{ .ty = .comptime_int_type, .val = if (code) |v| try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } }) else null };
             },
-            else => switch (std.zig.parseNumberLiteral(text)) {
+            else => if (Body.zonFloatValue(text)) |x| {
+                return .{ .ty = .comptime_float_type, .val = try value.floatValue(ip, .comptime_float_type, x) };
+            } else switch (std.zig.parseNumberLiteral(text)) {
                 .int => |v| return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } }) },
                 .big_int => return .{ .ty = .comptime_int_type },
                 .float => {

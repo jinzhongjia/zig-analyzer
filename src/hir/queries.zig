@@ -7,9 +7,17 @@ const Vfs = @import("../base/Vfs.zig");
 const ItemTree = @import("../syntax/ItemTree.zig");
 const syntax = @import("../syntax/queries.zig");
 const ast = @import("../syntax/ast.zig");
+const Parse = @import("../syntax/Parse.zig");
 const Body = @import("Body.zig");
-const lower = @import("lower.zig").lower;
+const lower_mod = @import("lower.zig");
+const lower = lower_mod.lower;
 const mem = @import("../util/mem.zig");
+
+/// How the member node `node` is lowered. The only member of a ZON file is its root expression
+fn ownerOf(ctx: anytype, key: OwnerKey, mode: Parse.Mode, node: ast.SyntaxNode) engine.Error!lower_mod.Owner {
+    if (mode == .zon) return .zon;
+    return if (try fieldIsName(ctx, key, node)) .bare_field else .member;
+}
 
 /// Enum members and union fields written as just a name (no `:`): the type expression position
 /// holds the name. Fields of tuple-like structs have no `:` either, but there it is a type, so
@@ -53,7 +61,7 @@ pub const ItemBody = struct {
         body: Body,
         refs: std.atomic.Value(u32) = .init(1),
         source_hash: u64,
-        field_is_name: bool,
+        owner: lower_mod.Owner,
 
         fn of(v: Value) *Owned {
             return @alignCast(@fieldParentPtr("body", @constCast(v)));
@@ -69,14 +77,15 @@ pub const ItemBody = struct {
     pub fn computeIncremental(ctx: anytype, key: Key, prev: ?Value) engine.Error!Value {
         const map = try ctx.get(syntax.FileAstIdMap, key.file);
         const parse = try ctx.get(syntax.ParseFile, key.file);
-        // When it is not found (the member was deleted), lower the root node: it is not a
-        // member, so the Body is empty
-        const node = map.get(key.item) orelse parse.rootNode();
-        const field_is_name = try fieldIsName(ctx, key, node);
+        // When it is not found (the member was deleted), lower the root node as a member: it is
+        // not a member, so the Body is empty
+        const found = map.get(key.item);
+        const node = found orelse parse.rootNode();
+        const owner: lower_mod.Owner = if (found != null) try ownerOf(ctx, key, parse.mode, node) else .member;
         const source_hash = std.hash.Wyhash.hash(0, node.text(parse.source));
         if (prev) |p| {
             const o = Owned.of(p);
-            if (o.source_hash == source_hash and o.field_is_name == field_is_name) {
+            if (o.source_hash == source_hash and o.owner == owner) {
                 _ = o.refs.fetchAdd(1, .monotonic);
                 return p;
             }
@@ -84,7 +93,7 @@ pub const ItemBody = struct {
         const gpa = ctx.db.gpa;
         const result = try gpa.create(Owned);
         errdefer gpa.destroy(result);
-        result.* = .{ .body = try lower(gpa, node, field_is_name), .source_hash = source_hash, .field_is_name = field_is_name };
+        result.* = .{ .body = try lower(gpa, node, owner), .source_hash = source_hash, .owner = owner };
         return &result.body;
     }
 

@@ -38,7 +38,7 @@ const Builder = struct {
         var fields: u32 = 0;
         for (b.items.containerMembers(index)) |i| {
             const item = b.items.items[i];
-            if (item.kind == .@"comptime") continue;
+            if (item.kind == .@"comptime" or item.kind == .zon) continue;
             const field_index = fields;
             if (item.kind == .field) fields += 1;
             const node = b.map.get(item.ast_id) orelse continue;
@@ -92,6 +92,7 @@ pub fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.C
         .field => if (container_kind == .@"enum") .EnumMember else .Field,
         .@"test" => .Method,
         .@"comptime" => .Namespace,
+        .zon => .Object,
     };
 }
 
@@ -109,7 +110,7 @@ test documentSymbols {
     ;
     const parse = try Parse.create(testing.allocator, text, .zig);
     defer parse.destroy();
-    var items = try ItemTree.build(testing.allocator, parse.rootNode());
+    var items = try ItemTree.build(testing.allocator, parse.rootNode(), .zig);
     defer items.deinit(testing.allocator);
     var map = try ItemTree.AstIdMap.build(testing.allocator, &items, parse.rootNode());
     defer map.deinit(testing.allocator);
@@ -143,7 +144,7 @@ test "document symbols stop at the nesting limit" {
     try text.appendSlice(testing.allocator, "};\n");
     const parse = try Parse.create(testing.allocator, text.items, .zig);
     defer parse.destroy();
-    var items = try ItemTree.build(testing.allocator, parse.rootNode());
+    var items = try ItemTree.build(testing.allocator, parse.rootNode(), .zig);
     defer items.deinit(testing.allocator);
     var map = try ItemTree.AstIdMap.build(testing.allocator, &items, parse.rootNode());
     defer map.deinit(testing.allocator);
@@ -168,7 +169,7 @@ test "tuple fields are named by their index" {
     defer arena.deinit();
     const a = arena.allocator();
     const parse = try Parse.create(a, text, .zig);
-    var items = try ItemTree.build(a, parse.rootNode());
+    var items = try ItemTree.build(a, parse.rootNode(), .zig);
     var map = try ItemTree.AstIdMap.build(a, &items, parse.rootNode());
     const lines = try offsets.LineIndex.init(a, text);
 

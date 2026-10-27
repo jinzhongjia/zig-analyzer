@@ -155,6 +155,8 @@ pub const DeclType = struct {
                 return .{ .ty = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else .unknown };
             },
             .@"test", .@"comptime" => return .{ .ty = .void_type },
+            // The root of a ZON file is not a declaration; the value of importing it is `ZonValue`
+            .zon => return .unknown,
         }
     }
 

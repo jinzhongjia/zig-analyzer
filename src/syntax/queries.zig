@@ -112,7 +112,7 @@ pub const FileItemTree = struct {
         const gpa = ctx.db.gpa;
         const result = try gpa.create(ItemTree);
         errdefer gpa.destroy(result);
-        result.* = try ItemTree.build(gpa, parse.rootNode());
+        result.* = try ItemTree.build(gpa, parse.rootNode(), parse.mode);
         return result;
     }
 

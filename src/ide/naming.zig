@@ -224,7 +224,7 @@ const Collector = struct {
                     if (ty != .type_type) if (valueCategory(ip, ty)) |rule| try c.check(name, null, .field, rule.style());
                 }
             },
-            .@"test", .@"comptime" => {},
+            .@"test", .@"comptime", .zon => {},
         };
         if (body.bindings.len == 0) return;
         const res = try r.ctx.get(sema.Infer, .{ .owner = key, .mode = .full });

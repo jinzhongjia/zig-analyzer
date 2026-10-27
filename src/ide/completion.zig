@@ -494,7 +494,7 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
             .@"fn", .@"const", .@"var" => {},
             // Fields are not names in scope; enum members can be accessed through the type
             .field => if (!is_enum or private) continue,
-            .@"test", .@"comptime" => continue,
+            .@"test", .@"comptime", .zon => continue,
         }
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
         const kind = kindOf(try symbol_kind.ofDecl(r, file, m));

@@ -1293,7 +1293,9 @@ const Evaluator = struct {
                 .success => |c| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = c } })),
                 .failure => return error.Abort,
             },
-            else => switch (std.zig.parseNumberLiteral(text)) {
+            else => if (Body.zonFloatValue(text)) |x| {
+                return Val.of(.comptime_float_type, (try value.floatValue(ip, .comptime_float_type, x)).?);
+            } else switch (std.zig.parseNumberLiteral(text)) {
                 .int => |v| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } })),
                 .float => {
                     const x = std.fmt.parseFloat(f128, text) catch return error.Abort;
