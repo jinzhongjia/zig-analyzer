@@ -1,11 +1,11 @@
-//! 引擎的 input query。
+//! Input queries of the engine.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const engine = @import("../db/engine.zig");
 const Vfs = @import("Vfs.zig");
 
-/// 文件内容；`null` 表示文件不存在或尚未加载。
+/// File contents; `null` means the file does not exist or has not been loaded yet.
 pub const FileText = struct {
     pub const Key = Vfs.FileId;
     pub const Value = ?[]const u8;
@@ -17,7 +17,8 @@ pub const FileText = struct {
         return std.mem.eql(u8, a.?, b.?);
     }
 
-    /// 参数取指针是引擎对 query `deinit` 的统一签名（见 `db/engine.zig`），这里只读取 `v.*`。
+    /// Taking a pointer parameter is the engine's uniform signature for query `deinit` (see
+    /// `db/engine.zig`); only `v.*` is read here.
     pub fn deinit(v: *Value, gpa: Allocator) void {
         if (v.*) |text| gpa.free(text);
     }

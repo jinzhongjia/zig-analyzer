@@ -1,14 +1,16 @@
-//! `file://` URI 与文件系统路径互转。
+//! Conversion between `file://` URIs and file system paths.
 //!
-//! 两种路径风格都实现为显式参数（`Style`），使 Windows 规则也能在任何平台上测试：
+//! Both path styles are implemented as an explicit parameter (`Style`), so the Windows rules can
+//! also be tested on any platform:
 //!
-//! | 路径                         | URI                              |
+//! | Path                         | URI                              |
 //! |------------------------------|----------------------------------|
 //! | `/home/a b/x.zig`            | `file:///home/a%20b/x.zig`       |
 //! | `C:\work\x.zig`              | `file:///C:/work/x.zig`          |
-//! | `\\server\share\x.zig`（UNC） | `file://server/share/x.zig`      |
+//! | `\\server\share\x.zig` (UNC) | `file://server/share/x.zig`      |
 //!
-//! 解析时兼容 VS Code 的写法：盘符小写、冒号编码为 `%3A`、`file://localhost/`。
+//! Parsing accepts VS Code's spellings: lowercase drive letters, the colon encoded as `%3A`, and
+//! `file://localhost/`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,7 +39,8 @@ pub fn toPathStyle(comptime style: Style, gpa: Allocator, uri: []const u8) Error
     var rest = uri[prefix.len..];
     if (std.mem.indexOfAny(u8, rest, "?#")) |end| rest = rest[0..end];
 
-    // authority：空或 localhost 表示本机；Windows 下其余视为 UNC 主机名
+    // authority: empty or localhost means the local machine; on Windows, anything else is
+    // treated as a UNC host name
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const authority = rest[0..slash];
     const encoded_path = rest[slash..];
@@ -50,7 +53,7 @@ pub fn toPathStyle(comptime style: Style, gpa: Allocator, uri: []const u8) Error
     if (!is_local) {
         try out.appendSlice(gpa, "\\\\");
         try appendDecoded(gpa, &out, authority);
-        // 主机名不能为空，也不能包含路径分隔符
+        // The host name must not be empty or contain path separators
         const host = out.items[2..];
         if (host.len == 0 or std.mem.indexOfAny(u8, host, "\\/") != null) return error.InvalidUri;
     }
@@ -68,13 +71,14 @@ pub fn toPathStyle(comptime style: Style, gpa: Allocator, uri: []const u8) Error
                 _ = out.orderedRemove(0);
                 out.items[0] = std.ascii.toUpper(out.items[0]);
                 if (out.items.len == 2) try out.append(gpa, '\\');
-            } else return error.InvalidUri; // Windows 本地路径必须带盘符
+            } else return error.InvalidUri; // a local Windows path must have a drive letter
         }
     }
     return out.toOwnedSlice(gpa);
 }
 
-/// 百分号解码；拒绝原始控制字符、解码出的 NUL 字节与非法的转义序列
+/// Percent-decodes; rejects raw control characters, decoded NUL bytes, and invalid escape
+/// sequences
 fn appendDecoded(gpa: Allocator, out: *std.ArrayList(u8), encoded: []const u8) Error!void {
     var i: usize = 0;
     while (i < encoded.len) : (i += 1) {
@@ -101,7 +105,7 @@ pub fn fromPathStyle(comptime style: Style, gpa: Allocator, path: []const u8) Al
         var rest = path;
         if (style == .windows) {
             if (std.mem.startsWith(u8, path, "\\\\") or std.mem.startsWith(u8, path, "//")) {
-                // UNC：`\\server\share\x` → `file://server/share/x`
+                // UNC: `\\server\share\x` → `file://server/share/x`
                 rest = path[2..];
                 const end = std.mem.indexOfAny(u8, rest, "\\/") orelse rest.len;
                 encode(w, style, rest[0..end]) catch break :write;
@@ -160,7 +164,7 @@ test "posix" {
 test "windows drive letters" {
     try expectFromPath(.windows, "C:\\work\\x y.zig", "file:///C:/work/x%20y.zig");
     try expectFromPath(.windows, "c:\\work", "file:///C:/work");
-    // VS Code：盘符小写、冒号编码
+    // VS Code: lowercase drive letter, encoded colon
     try expectToPath(.windows, "file:///c%3A/work/x%20y.zig", "C:\\work\\x y.zig");
     try expectToPath(.windows, "file:///C:/work/x.zig", "C:\\work\\x.zig");
     try expectToPath(.windows, "file:///d:", "D:\\");

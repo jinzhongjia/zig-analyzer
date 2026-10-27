@@ -1,5 +1,6 @@
-//! 项目模型：构建图中与语言分析相关的部分（step、模块、根文件、import 表）。
-//! 由 `project/configuration.zig` 从 `std.Build.Configuration` 转换而来。
+//! Project model: the parts of the build graph relevant to language analysis (steps, modules,
+//! root files, import tables).
+//! Converted from `std.Build.Configuration` by `project/configuration.zig`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -7,52 +8,58 @@ const Allocator = std.mem.Allocator;
 const ProjectModel = @This();
 
 arena: std.heap.ArenaAllocator.State,
-/// 构建根目录（绝对路径）
+/// Build root (absolute path)
 build_root: []const u8,
-/// maker 使用的本地缓存目录（绝对路径）：生成文件多在其中。由 `configuration.convert` 设置，
-/// 默认的空值只供测试中手写的模型使用
+/// Local cache directory used by the maker (absolute path): most generated files are in it. Set
+/// by `configuration.convert`; the empty default is only for hand-written models in tests
 local_cache_root: []const u8 = "",
-/// 模块所在的、按哈希获取的依赖包的根目录（绝对路径，`<包目录>/<哈希>`，包目录默认为 `<构建根>/zig-pkg`）。
-/// 其中是依赖的代码而不是用户的代码；`--fork` 指定的包与按路径的依赖不在其中
+/// Root directories of the dependency packages fetched by hash that contain modules (absolute
+/// paths, `<package dir>/<hash>`; the package directory defaults to `<build root>/zig-pkg`).
+/// They contain dependency code rather than user code; packages given by `--fork` and path
+/// dependencies are not included
 package_roots: []const []const u8 = &.{},
-/// 标准库根文件 `<std_dir>/std.zig`
+/// Standard library root file `<std_dir>/std.zig`
 std_root: []const u8,
 steps: []const Step,
-/// 可变：生成文件的路径在构建中得知后，由 `setGeneratedPath` 填入对应模块的 `root_file`
+/// Mutable: once the path of a generated file becomes known during the build,
+/// `setGeneratedPath` fills it into the `root_file` of the corresponding module
 modules: []Module,
 default_step: u32,
-/// 生成文件编号 → 产出它的 step（构建图中的 `GeneratedFileIndex`）
+/// Generated file index → the step that produces it (`GeneratedFileIndex` in the build graph)
 producers: []const ?u32 = &.{},
-/// 用于诊断的 step：构建图转换时为默认值（项目定义了 `check` 就用它，否则用默认 step），
-/// 用户配置了 `diagnostics.steps` 时由 `setDiagnosticsSteps` 替换
+/// Steps used for diagnostics: set to the default when the build graph is converted (`check` if
+/// the project defines it, otherwise the default step), and replaced by `setDiagnosticsSteps`
+/// when the user configures `diagnostics.steps`
 diagnostics_steps: []const u32 = &.{},
 
 pub const Step = struct {
     name: []const u8,
     kind: Kind,
-    /// 直接依赖的 step（下标）
+    /// Steps depended on directly (indices)
     deps: []const u32,
 
     pub const Kind = union(enum) {
         top_level: struct { description: []const u8 },
-        /// 根模块（`modules` 下标）
+        /// Root module (index into `modules`)
         compile: struct { root_module: u32 },
         other,
     };
 };
 
 pub const Module = struct {
-    /// 根文件绝对路径；未设置，或为尚未得知路径的生成文件时为 null
+    /// Absolute path of the root file; null when unset or when it is a generated file whose path
+    /// is not known yet
     root_file: ?[]const u8,
-    /// 根文件是构建时生成的文件
+    /// The root file is a file generated during the build
     generated_root: ?GeneratedPath = null,
     imports: []const Import,
-    /// 生成该模块 `builtin.zig` 的编译器参数：子命令（`build-exe` 等）与影响 builtin 的模块参数
+    /// Compiler arguments for generating this module's `builtin.zig`: the subcommand
+    /// (`build-exe`, etc.) and the module arguments that affect builtin
     builtin_args: []const []const u8 = &.{},
-    /// 生成的 `builtin.zig` 的路径（由 Workspace 在加载构建图后填入）
+    /// Path of the generated `builtin.zig` (filled in by Workspace after loading the build graph)
     builtin_file: ?[]const u8 = null,
 
-    /// 目标为本机（没有指定 `-target`，或指定的是 `native` 开头的三元组）
+    /// The target is native (no `-target` given, or a triple starting with `native`)
     pub fn isNativeTarget(m: *const Module) bool {
         for (m.builtin_args, 0..) |arg, i| {
             if (!std.mem.eql(u8, arg, "-target") or i + 1 >= m.builtin_args.len) continue;
@@ -62,7 +69,8 @@ pub const Module = struct {
     }
 };
 
-/// 相对于生成文件的路径：从生成文件向上 `up` 级目录，再拼上 `sub_path`
+/// A path relative to a generated file: `up` directory levels up from the generated file, then
+/// joined with `sub_path`
 pub const GeneratedPath = struct {
     file: u32,
     up: u32 = 0,
@@ -87,12 +95,14 @@ pub fn topLevelStep(m: *const ProjectModel, name: []const u8) ?u32 {
     return null;
 }
 
-/// 默认的诊断 step：项目定义了 `check` 就用它，否则用默认 step（通常是 install）
+/// Default diagnostics step: `check` if the project defines it, otherwise the default step
+/// (usually install)
 pub fn defaultDiagnosticsStep(m: *const ProjectModel) u32 {
     return m.topLevelStep("check") orelse m.default_step;
 }
 
-/// 按名字设置诊断 step（顶层 step）；返回找不到的名字的个数。一个都找不到时保留默认值
+/// Sets the diagnostics steps (top-level steps) by name; returns the number of names not found.
+/// Keeps the default when none of them is found
 pub fn setDiagnosticsSteps(m: *ProjectModel, gpa: Allocator, names: []const []const u8) Allocator.Error!usize {
     var arena = m.arena.promote(gpa);
     defer m.arena = arena.state;
@@ -109,7 +119,7 @@ pub fn setDiagnosticsSteps(m: *ProjectModel, gpa: Allocator, names: []const []co
     return missing;
 }
 
-/// `roots` 及其传递依赖的 step 集合
+/// The set of `roots` and the steps they transitively depend on
 pub fn dependencyClosure(m: *const ProjectModel, gpa: Allocator, roots: []const u32) Allocator.Error!std.DynamicBitSetUnmanaged {
     var seen: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, m.steps.len);
     errdefer seen.deinit(gpa);
@@ -124,8 +134,10 @@ pub fn dependencyClosure(m: *const ProjectModel, gpa: Allocator, roots: []const 
     return seen;
 }
 
-/// 每次构建请求的 step：诊断 step（`diagnostics` 为 false 时不含），加上所有生成模块根文件的产出 step。
-/// 后者让诊断 step 不依赖的模块（如只在 test step 中使用的）也能得知根文件路径。
+/// Steps requested in each build: the diagnostics steps (omitted when `diagnostics` is false),
+/// plus the steps producing every generated module root file.
+/// The latter let modules the diagnostics steps do not depend on (such as ones used only in a
+/// test step) learn their root file paths too.
 pub fn buildSteps(m: *const ProjectModel, gpa: Allocator, diagnostics: bool) Allocator.Error![]u32 {
     var steps: std.ArrayList(u32) = .empty;
     errdefer steps.deinit(gpa);
@@ -138,8 +150,9 @@ pub fn buildSteps(m: *const ProjectModel, gpa: Allocator, diagnostics: bool) All
     return steps.toOwnedSlice(gpa);
 }
 
-/// 记录生成文件 `file` 的绝对路径，更新以它为根的模块；有模块根文件变化时返回 true
-/// 记录模块 `builtin.zig` 的路径
+/// Records the absolute path of generated file `file` and updates the modules rooted at it;
+/// returns true when the root file of some module changed
+/// Records the path of a module's `builtin.zig`
 pub fn setBuiltinFile(m: *ProjectModel, gpa: Allocator, module: u32, path: []const u8) Allocator.Error!void {
     var arena = m.arena.promote(gpa);
     defer m.arena = arena.state;
@@ -168,9 +181,11 @@ pub fn hasCompileSteps(m: *const ProjectModel) bool {
     return false;
 }
 
-/// 并入另一个构建图（项目导出的模块，见 `project/exports.zig`）的模块与 compile step。
-/// 并入的 step 没有依赖、也不被任何 step 依赖，不会出现在构建请求中，只参与模块归属；
-/// 生成文件的编号属于另一个构建图，以生成文件为根的模块没有根文件
+/// Merges in the modules and compile steps of another build graph (the modules exported by the
+/// project; see `project/exports.zig`).
+/// The merged steps have no dependencies and no step depends on them, so they never appear in
+/// build requests and only take part in module membership; generated file indices belong to the
+/// other build graph, so modules rooted at generated files have no root file
 pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectModel) Allocator.Error!void {
     var arena = m.arena.promote(gpa);
     defer m.arena = arena.state;
@@ -208,7 +223,7 @@ pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectMo
     m.package_roots = package_roots.items;
 }
 
-/// `step` 传递依赖的所有 compile step（下标），按发现顺序
+/// All compile steps (indices) that `step` transitively depends on, in discovery order
 pub fn compileStepsOf(m: *const ProjectModel, gpa: Allocator, roots: []const u32) Allocator.Error![]u32 {
     var seen: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, m.steps.len);
     defer seen.deinit(gpa);
@@ -276,7 +291,8 @@ test appendExports {
     try std.testing.expectEqualStrings("/p/lib.zig", m.modules[1].root_file.?);
     try std.testing.expectEqual(2, m.modules[1].imports[0].module);
     try std.testing.expectEqualStrings("build-obj", m.modules[1].builtin_args[0]);
-    // 生成文件的编号属于探针的构建图，不能当作本项目的生成文件
+    // The generated file index belongs to the probe's build graph and must not be taken as a
+    // generated file of this project
     try std.testing.expectEqual(null, m.modules[2].root_file);
     try std.testing.expectEqual(null, m.modules[2].generated_root);
 }

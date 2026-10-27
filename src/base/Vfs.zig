@@ -1,13 +1,17 @@
-//! 虚拟文件系统：路径 ↔ `FileId` 的驻留表。文件内容作为 `FileText` input 存放在查询引擎中。
+//! Virtual file system: an interning table of paths ↔ `FileId`. File contents are stored in the
+//! query engine as `FileText` inputs.
 //!
-//! 文件身份由「规范化路径」决定；在大小写不敏感的文件系统上（Windows、macOS 的默认设置），
-//! 身份键还会统一 ASCII 字母的大小写，使 `C:\Work\A.zig` 与 `c:/work/a.zig` 映射到同一个 FileId。
-//! 对外（显示、构造 URI）使用第一次见到的路径写法。
+//! File identity is determined by the "normalized path"; on case-insensitive file systems (the
+//! default on Windows and macOS), the identity key also folds the case of ASCII letters, so that
+//! `C:\Work\A.zig` and `c:/work/a.zig` map to the same FileId.
+//! Externally (display, building URIs), the path as first seen is used.
 //!
-//! 已知限制：只统一 ASCII 字母（A–Z）的大小写。路径中有非 ASCII 字母时，文件系统视为同一个文件、
-//! 字节却不同的写法会映射到不同的 FileId：
-//! - 非 ASCII 字母的大小写：`Été.zig` 与 `été.zig`（NTFS 与 APFS 都不区分）；
-//! - APFS 上 Unicode 的合成与分解两种写法：`é` 可以是 U+00E9，也可以是 `e` + U+0301（APFS 不区分）。
+//! Known limitation: only the case of ASCII letters (A-Z) is folded. When a path contains
+//! non-ASCII letters, spellings that the file system treats as the same file but that differ in
+//! bytes map to different FileIds:
+//! - Case of non-ASCII letters: `Été.zig` and `été.zig` (neither NTFS nor APFS distinguishes them);
+//! - The composed and decomposed Unicode forms on APFS: `é` can be U+00E9 or `e` + U+0301 (APFS
+//!   does not distinguish them).
 
 const std = @import("std");
 const Io = std.Io;
@@ -28,7 +32,7 @@ pub const CaseMode = enum {
     sensitive,
     insensitive,
 
-    /// Windows 与 macOS 的默认文件系统不区分大小写
+    /// The default file systems of Windows and macOS are case-insensitive
     pub const native: CaseMode = switch (@import("builtin").target.os.tag) {
         .windows, .macos, .ios => .insensitive,
         else => .sensitive,
@@ -39,18 +43,20 @@ gpa: Allocator,
 io: Io,
 style: Style,
 case: CaseMode,
-/// 同一文件可能在读事务中被 import 解析驻留，因此需要加锁
+/// The same file may be interned by import resolution in read transactions, so a lock is needed
 mutex: Io.Mutex = .init,
-/// 身份键（规范化路径，大小写不敏感时再统一为小写），下标即 FileId
+/// Identity keys (normalized paths, additionally lowercased when case-insensitive); the index
+/// is the FileId
 keys: std.StringArrayHashMapUnmanaged(void) = .empty,
-/// 与 `keys` 一一对应：第一次见到的规范化路径（保留原始大小写）
+/// One-to-one with `keys`: the normalized path as first seen (original case preserved)
 paths: std.ArrayList([]const u8) = .empty,
-/// 驻留了新路径时通知（如文件监听需要关注新出现的文件所在的目录）；在锁外、驻留它的线程上调用
+/// Notified when a new path is interned (e.g. file watching needs to watch the directories of
+/// newly appearing files); called outside the lock, on the thread that interned the path
 listener: std.atomic.Value(?*const Listener) = .init(null),
 
 pub const Listener = struct {
     ctx: *anyopaque,
-    /// 须是线程安全的轻量操作：任何线程驻留新路径时都会调用
+    /// Must be a thread-safe, lightweight operation: called whenever any thread interns a new path
     notify: *const fn (ctx: *anyopaque) void,
 };
 
@@ -63,7 +69,7 @@ pub fn init(io: Io, gpa: Allocator) Vfs {
     return initOptions(io, gpa, .{});
 }
 
-/// 指定路径风格与大小写模式（测试中用于在任意平台上覆盖两种规则）
+/// Specifies the path style and case mode (used in tests to cover both rule sets on any platform)
 pub fn initOptions(io: Io, gpa: Allocator, options: Options) Vfs {
     return .{ .io = io, .gpa = gpa, .style = options.style, .case = options.case };
 }
@@ -88,15 +94,17 @@ pub fn count(vfs: *Vfs) usize {
     return vfs.keys.count();
 }
 
-/// 由规范化路径得到身份键（调用方拥有返回值）
+/// Derives the identity key from a normalized path (the caller owns the returned value)
 fn identityKey(vfs: *const Vfs, normalized: []const u8) Allocator.Error![]u8 {
     const key = try vfs.gpa.dupe(u8, normalized);
     if (vfs.case == .insensitive) _ = std.ascii.lowerString(key, key);
     return key;
 }
 
-/// 规范化绝对路径：消除 `.`、`..`、重复与末尾分隔符；Windows 下统一使用反斜杠并把盘符转为大写。
-/// 不是绝对路径时返回 null。两种风格在任何平台上都可调用，便于测试。
+/// Normalizes an absolute path: removes `.`, `..`, and duplicate and trailing separators; on
+/// Windows, uses backslashes throughout and uppercases the drive letter.
+/// Returns null when the path is not absolute. Both styles can be called on any platform, which
+/// makes testing easier.
 pub fn normalize(comptime style: Style, gpa: Allocator, file_path: []const u8) Allocator.Error!?[]u8 {
     return switch (style) {
         .posix => if (std.fs.path.isAbsolutePosix(file_path)) try std.fs.path.resolveAllocPosix(gpa, &.{file_path}) else null,
@@ -104,9 +112,11 @@ pub fn normalize(comptime style: Style, gpa: Allocator, file_path: []const u8) A
     };
 }
 
-/// 按 `std.fs.path.resolve` 的规则把 `sub_path` 相对于绝对路径 `base` 解析。结果不是绝对路径时返回 null：
-/// Windows 上另一驱动器的相对路径（如 `D:a.zig`）解析后仍是相对路径。返回非 null 时可以传给 `intern`。
-/// 两种风格在任何平台上都可调用，便于测试。
+/// Resolves `sub_path` against the absolute path `base` following the rules of
+/// `std.fs.path.resolve`. Returns null when the result is not absolute: on Windows, a path
+/// relative to another drive (e.g. `D:a.zig`) is still relative after resolution. A non-null
+/// result can be passed to `intern`.
+/// Both styles can be called on any platform, which makes testing easier.
 pub fn resolve(comptime style: Style, gpa: Allocator, base: []const u8, sub_path: []const u8) Allocator.Error!?[]u8 {
     const isAbsolute, const resolveAlloc = switch (style) {
         .posix => .{ std.fs.path.isAbsolutePosix, std.fs.path.resolveAllocPosix },
@@ -118,15 +128,16 @@ pub fn resolve(comptime style: Style, gpa: Allocator, base: []const u8, sub_path
     return null;
 }
 
-/// `file_path` 是否就是目录 `dir` 或位于其下（两者都是规范化的绝对路径）。与文件身份的规则一致：
-/// 大小写不敏感时不区分 ASCII 字母的大小写
+/// Whether `file_path` is the directory `dir` itself or lies under it (both are normalized
+/// absolute paths). Consistent with the file identity rules: when case-insensitive, the case of
+/// ASCII letters is ignored
 pub fn isUnder(vfs: *const Vfs, file_path: []const u8, dir: []const u8) bool {
     return switch (vfs.style) {
         inline else => |style| isUnderStyle(style, vfs.case, file_path, dir),
     };
 }
 
-/// 同 `isUnder`，显式指定路径风格与大小写规则，便于测试
+/// Same as `isUnder`, with the path style and case rule given explicitly, for testing
 pub fn isUnderStyle(comptime style: Style, case: CaseMode, file_path: []const u8, dir: []const u8) bool {
     if (file_path.len < dir.len) return false;
     const prefix = file_path[0..dir.len];
@@ -143,7 +154,8 @@ pub fn isUnderStyle(comptime style: Style, case: CaseMode, file_path: []const u8
     return path_type.isSep(u8, file_path[dir.len]) or (dir.len > 0 and path_type.isSep(u8, dir[dir.len - 1]));
 }
 
-/// 驻留路径。调用方须保证 `file_path` 是绝对路径；路径会被规范化（见 `normalize`）。
+/// Interns a path. The caller must ensure that `file_path` is absolute; the path is normalized
+/// (see `normalize`).
 pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
     const normalized = try vfs.normalizeOwn(file_path) orelse unreachable;
     errdefer vfs.gpa.free(normalized);
@@ -177,7 +189,7 @@ pub fn lookup(vfs: *Vfs, file_path: []const u8) Allocator.Error!?FileId {
     return if (vfs.keys.getIndex(key)) |i| @fromBackingInt(@intCast(i)) else null;
 }
 
-/// 返回的切片在 Vfs 生命周期内有效。
+/// The returned slice is valid for the lifetime of the Vfs.
 pub fn path(vfs: *Vfs, id: FileId) []const u8 {
     vfs.mutex.lockUncancelable(vfs.io);
     defer vfs.mutex.unlock(vfs.io);
@@ -186,7 +198,7 @@ pub fn path(vfs: *Vfs, id: FileId) []const u8 {
 
 pub const ReadError = error{ Canceled, OutOfMemory, FileTooBig };
 
-/// 从磁盘读取文件；文件不存在或不可读时返回 null。
+/// Reads the file from disk; returns null when the file does not exist or is unreadable.
 pub fn readFromDisk(vfs: *Vfs, id: FileId, gpa: Allocator) ReadError!?[]u8 {
     return std.Io.Dir.cwd().readFileAlloc(vfs.io, vfs.path(id), gpa, .limited(max_file_size)) catch |err| switch (err) {
         error.Canceled => error.Canceled,
@@ -196,7 +208,7 @@ pub fn readFromDisk(vfs: *Vfs, id: FileId, gpa: Allocator) ReadError!?[]u8 {
     };
 }
 
-/// 超过此大小的文件不加载：源码位置以 u32 表示
+/// Files larger than this are not loaded: source positions are represented as u32
 pub const max_file_size = std.math.maxInt(u32);
 
 test "interning and normalization" {
@@ -238,7 +250,7 @@ test isUnderStyle {
     try t.expect(isUnderStyle(.posix, .sensitive, "/work/src/a.zig", "/work"));
     try t.expect(isUnderStyle(.posix, .sensitive, "/work", "/work"));
     try t.expect(isUnderStyle(.posix, .sensitive, "/work/a.zig", "/"));
-    // 目录名只是前缀相同
+    // The directory names only share a prefix
     try t.expect(!isUnderStyle(.posix, .sensitive, "/workspace/a.zig", "/work"));
     try t.expect(!isUnderStyle(.posix, .sensitive, "/Work/a.zig", "/work"));
     try t.expect(isUnderStyle(.posix, .insensitive, "/Work/a.zig", "/work"));
@@ -291,7 +303,8 @@ test "resolve: results that are not absolute paths are rejected" {
         .{ .base = "C:\\proj", .sub_path = "D:\\other\\b.zig", .expected = "D:\\other\\b.zig" },
         .{ .base = "C:\\proj", .sub_path = "\\\\server\\share\\c.zig", .expected = "\\\\server\\share\\c.zig" },
         .{ .base = "C:\\proj", .sub_path = "C:a.zig", .expected = "C:\\proj\\a.zig" },
-        // 另一驱动器的相对路径：错误包格式不符时，路径下标可能指向源码行中间的 `x: u32 = 1;`
+        // Paths relative to another drive: when the error bundle format does not match, a path
+        // index may point into the middle of a source line, at `x: u32 = 1;`
         .{ .base = "C:\\proj", .sub_path = "x: u32 = 1;", .expected = null },
         .{ .base = "C:\\proj", .sub_path = "D:a.zig", .expected = null },
         .{ .base = "C:\\proj", .sub_path = "::", .expected = null },
