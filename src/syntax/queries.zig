@@ -1,6 +1,7 @@
-//! 语法层 query。
+//! Syntax-layer queries.
 //!
-//! `compute` 的 ctx 参数为 `anytype`，使这些 query 可以注册到不同的 Db 类型中（例如测试专用的 Db）。
+//! The ctx parameter of `compute` is `anytype` so that these queries can be registered in
+//! different Db types (e.g. a test-only Db).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -12,19 +13,21 @@ const ItemTree = @import("ItemTree.zig");
 const ast = @import("ast.zig");
 const mem = @import("../util/mem.zig");
 
-/// 文件内容：有 `FileText`（打开的文档、项目加载的文件）时用它，否则从磁盘读取。
+/// File contents: uses `FileText` when present (open documents, files loaded by the project),
+/// otherwise reads from disk.
 ///
-/// 使名字解析与类型推导可以在查询内部访问任意文件（标准库、依赖包）。从磁盘读到的内容
-/// 不会随磁盘变化而失效（没有对应的 input），只有 `FileText` 被设置时才重新计算。
+/// Lets name resolution and type inference access any file (standard library, dependency
+/// packages) from inside queries. Contents read from disk are not invalidated when the disk
+/// changes (there is no corresponding input); it is recomputed only when `FileText` is set.
 pub const SourceText = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
-    /// `owned` 时内容由本 query 持有；否则借用 `FileText` 的值
+    /// If `owned`, this query owns the contents; otherwise they borrow the value of `FileText`
     pub const Value = struct { text: []const u8, owned: bool };
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         if (try ctx.get(inputs.FileText, file)) |text| return .{ .text = text, .owned = false };
-        // 不带 Vfs 的测试用 Db
+        // Test Db without a Vfs
         if (comptime @TypeOf(ctx.db.env) == void) return .{ .text = "", .owned = false };
         const vfs: *Vfs = ctx.db.env.vfs;
         const text = vfs.readFromDisk(file, ctx.db.gpa) catch |err| switch (err) {
@@ -35,7 +38,8 @@ pub const SourceText = struct {
         return .{ .text = text orelse "", .owned = text != null };
     }
 
-    /// 借用的旧值可能已随 `FileText` 一起释放，不能读取：总是视为已变化
+    /// A borrowed old value may already have been freed along with `FileText` and must not be
+    /// read: always treat it as changed
     pub fn eql(_: Value, _: Value) bool {
         return false;
     }
@@ -45,10 +49,13 @@ pub const SourceText = struct {
     }
 };
 
-/// 文件的语法树。文本变化后总是视为已变化（不做 cutoff），由 ItemTree 截断变化的传播。
-/// 解析结果占内存最多（约为源码的十几倍）：只保留最近使用的若干个，其余淘汰后按需重新解析
+/// Syntax tree of a file. Always treated as changed after the text changes (no cutoff); ItemTree
+/// stops the change from propagating.
+/// Parse results use the most memory (about a dozen times the size of the source): only the few
+/// most recently used are kept; the others are evicted and reparsed on demand
 pub const parse_lru = 64;
-/// 解析结果的字节上限：单个大文件即可超过个数上限对应的内存
+/// Byte limit on parse results: a single large file can by itself exceed the memory implied by
+/// the count limit
 pub const parse_lru_bytes = 128 * 1024 * 1024;
 
 pub const ParseFile = struct {
@@ -58,12 +65,14 @@ pub const ParseFile = struct {
     pub const lru = parse_lru;
     pub const lru_bytes = parse_lru_bytes;
 
-    /// 增量解析的结果复用上一棵树的节点并持有其引用：计入整条链的 arena
+    /// An incremental parse result reuses the previous tree's nodes and holds a reference to it:
+    /// count the arenas of the whole chain
     pub fn bytes(v: Value) usize {
         return @sizeOf(Parse) + v.chain_bytes;
     }
 
-    /// 有上一次的结果时尝试局部重解析（结果与全量解析相同，见 `Parse.reparse`）
+    /// When there is a previous result, attempts a local reparse (the result is the same as a
+    /// full parse; see `Parse.reparse`)
     pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const text = (try ctx.get(SourceText, file)).text;
         if (prev) |old| return Parse.reparse(ctx.db.gpa, old, text);
@@ -79,13 +88,15 @@ pub const ParseFile = struct {
     }
 };
 
-/// 文件的声明骨架，最重要的 early cutoff 点。
+/// Declaration skeleton of a file; the most important early cutoff point.
 pub const FileItemTree = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree;
-    /// 约束长时间会话的内存：每个访问过的文件都有一份，大项目（Zig 编译器源码与标准库）中可达 50 MB。
-    /// 被淘汰的按需重建；依赖未变时沿用原 changed_at，下游不重算
+    /// Bounds memory in long sessions: every visited file has one, which can reach 50 MB in a
+    /// large project (the Zig compiler sources and standard library).
+    /// Evicted ones are rebuilt on demand; when the dependencies are unchanged, the original
+    /// changed_at is kept and downstream is not recomputed
     pub const lru = 16 * 1024;
     pub const lru_bytes = 32 * 1024 * 1024;
 
@@ -113,16 +124,18 @@ pub const FileItemTree = struct {
     }
 };
 
-/// AstId → 当前语法树节点。随每次解析重建，只在读取时使用，不应作为其他缓存结果的一部分。
-/// 成员的摘要：位置与可能提到的名字
+/// AstId → node in the current syntax tree. Rebuilt with every parse and used only for reading;
+/// must not become part of other cached results.
+/// Summary of a member: its position and the names it may mention
 pub const ItemSummary = struct {
-    /// 成员节点在文件中的起始位置；找不到节点时为 null
+    /// Start offset of the member node in the file; null when the node is not found
     offset: ?u32,
-    /// 名字 token 在文件中的起始位置与长度；没有名字（或找不到节点）时长度为 0
+    /// Start offset and length of the name token in the file; the length is 0 when there is no
+    /// name (or the node is not found)
     name_offset: u32 = 0,
     name_len: u32 = 0,
-    /// 成员节点内出现的标识符（含嵌套成员）的布隆过滤器：判断「可能提到某个名字」，
-    /// 有假阳性、无假阴性
+    /// Bloom filter of the identifiers appearing in the member node (including nested members):
+    /// tells whether it "may mention a name", with false positives but no false negatives
     names: [4]u64 = @splat(0),
 
     pub fn mayMention(s: ItemSummary, name: []const u8) bool {
@@ -144,10 +157,13 @@ pub const ItemSummary = struct {
     }
 };
 
-/// 文件中各成员与容器的摘要（与 `ItemTree.items` / `containers` 一一对应）。值很小且不淘汰：
-/// 只需要位置或只需判断成员是否提到某个名字的场景（引用查找、调用点种子、定位体内的容器、workspace symbol），
-/// 不必为已被淘汰的解析结果重新解析，也不必为不相关的成员生成 Body。
-/// 单独作为一个 query，不放进 ItemTree：函数体内的编辑会改变它，而 ItemTree 必须保持不变
+/// Summaries of the members and containers in a file (one-to-one with `ItemTree.items` /
+/// `containers`). The value is small and never evicted: uses that only need positions or only
+/// need to know whether a member mentions a name (find references, call-site seeding, locating
+/// containers inside bodies, workspace symbol) need not reparse evicted parse results, nor
+/// generate Body for unrelated members.
+/// A separate query rather than part of ItemTree: edits inside function bodies change it, while
+/// ItemTree must stay unchanged
 pub const ItemSummaries = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -159,7 +175,7 @@ pub const ItemSummaries = struct {
 
     pub const Summaries = struct {
         items: []ItemSummary,
-        /// 容器节点在文件中的起始位置；找不到节点时为 null
+        /// Start offset of the container node in the file; null when the node is not found
         container_offsets: []?u32,
     };
 
@@ -172,7 +188,7 @@ pub const ItemSummaries = struct {
         out.items = try gpa.alloc(ItemSummary, items.items.len);
         errdefer gpa.free(out.items);
         out.container_offsets = try gpa.alloc(?u32, items.containers.len);
-        // 解码后的名字只用于哈希，临时分配随本次计算释放
+        // Decoded names are only hashed; temporary allocations are freed after this computation
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
         for (items.items, out.items) |it, *o| {
@@ -212,7 +228,8 @@ pub const ItemSummaries = struct {
     }
 };
 
-/// 只保留名字布隆位：文件前缀等位置变化不使语义候选筛选失效。
+/// Keeps only the name Bloom bits: position changes (from a changed file prefix and the like) do
+/// not invalidate semantic candidate filtering.
 pub const ItemNames = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -234,7 +251,8 @@ pub const ItemNames = struct {
     }
 };
 
-/// 容器相对于所属成员的位置：保留词法作用域与容器布局依赖，不依赖文件中的绝对位置。
+/// Positions of containers relative to their owning members: keeps what lexical scopes and
+/// container layout depend on, without depending on absolute positions in the file.
 pub const ContainerRels = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -266,7 +284,8 @@ pub const ContainerRels = struct {
     }
 };
 
-/// 值中的节点指向解析结果：持有其一份引用，`ParseFile` 的值被淘汰后仍然有效
+/// The nodes in the value point into the parse result: holds a reference to it, so the value
+/// stays valid after the `ParseFile` value is evicted
 pub const FileAstIdMap = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -279,7 +298,8 @@ pub const FileAstIdMap = struct {
         parse: *Parse,
     };
 
-    /// 哈希表与它 retain 的解析结果（`ParseFile` 被淘汰后仍可能由这里持有）
+    /// The hash table and the parse result it retains (which may still be held here after
+    /// `ParseFile` is evicted)
     pub fn bytes(v: Value) usize {
         const owned: *const Owned = @fieldParentPtr("map", v);
         return owned.map.bytes() + owned.parse.chain_bytes;

@@ -1,7 +1,8 @@
-//! 文件中的错误集声明 `error{ ... }`：各成员的名字、位置与文档注释。
+//! Error set declarations `error{ ... }` in a file: each member's name, position, and doc comment.
 //!
-//! `error.Foo` 的跳转沿 import 在多个文件中查找声明，重复查找时从这里读取，不必重新解析这些文件。
-//! 值很小，不淘汰。
+//! Go-to-definition for `error.Foo` searches for declarations in several files along imports;
+//! repeated lookups read from here instead of reparsing those files.
+//! The value is small and never evicted.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,21 +17,22 @@ const mem = @import("../util/mem.zig");
 const ErrorSets = @This();
 
 arena: std.heap.ArenaAllocator.State,
-/// 按源码顺序
+/// In source order
 sets: []const Set,
 
 pub const Set = struct {
-    /// 按源码顺序
+    /// In source order
     members: []const Member,
 };
 
 pub const Member = struct {
-    /// 已去掉 `@"..."` 的引号
+    /// With the `@"..."` quotes removed
     name: []const u8,
-    /// 名字 token 的起止位置
+    /// Start and end positions of the name token
     start: u32,
     end: u32,
-    /// 紧挨在成员之前的文档注释（去掉 `///` 与其后的一个空格，多行以换行连接）
+    /// Doc comment immediately preceding the member (`///` and one following space removed,
+    /// lines joined with newlines)
     doc: ?[]const u8,
 };
 
@@ -66,7 +68,7 @@ fn collect(a: Allocator, set: SyntaxNode) Allocator.Error!Set {
                 try doc.appendSlice(a, std.mem.trimEnd(u8, line, "\r"));
             },
             .identifier => {
-                // 与 FileIndex、HIR 一致：解码 `@"..."` 中的转义
+                // Consistent with FileIndex and HIR: decode the escapes in `@"..."`
                 const name = try ast.identNameAlloc(a, t.text);
                 try members.append(a, .{
                     .name = try a.dupe(u8, name),
@@ -142,7 +144,7 @@ test build {
     try std.testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "A,").?)), e[0].start);
     try std.testing.expectEqualStrings("b c", e[1].name);
     try std.testing.expectEqual(null, e[1].doc);
-    // 转义按解码后的名字保存，区间覆盖 token 本身
+    // Escaped names are stored decoded; the range covers the token itself
     try std.testing.expectEqualStrings("Escaped", e[2].name);
     const escaped: u32 = @intCast(std.mem.indexOf(u8, text, "@\"\\x45scaped\"").?);
     try std.testing.expectEqual(escaped, e[2].start);

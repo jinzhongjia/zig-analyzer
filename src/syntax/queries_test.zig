@@ -5,7 +5,7 @@ const Vfs = @import("../base/Vfs.zig");
 const FileText = @import("../base/inputs.zig").FileText;
 const q = @import("queries.zig");
 
-/// 依赖 ItemTree 的下游 query：统计成员数
+/// Downstream query depending on ItemTree: counts the members
 const ItemCount = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -48,7 +48,7 @@ test "ItemSummary mentions long escaped names" {
     defer db.deinit();
     const file: Vfs.FileId = @fromBackingInt(@intCast(0));
     const suffix: [300]u8 = @splat('b');
-    // 解码后 301 字节，超过旧实现的 256 字节缓冲
+    // 301 bytes after decoding, more than the 256-byte buffer of the old implementation
     const source = try std.fmt.allocPrint(testing.allocator, "fn f() void {{\n    const x = @\"\\x41{s}\";\n}}\n", .{suffix});
     defer testing.allocator.free(source);
     const name = try std.fmt.allocPrint(testing.allocator, "A{s}", .{suffix});
@@ -66,7 +66,7 @@ test "ParseFile bytes include the incremental chain" {
     const base = "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n";
     const old = try Parse.create(testing.allocator, base);
     defer old.destroy();
-    // 末尾编辑走顶层局部重解析：新结果持有旧结果
+    // An edit at the end takes the top-level local reparse path: the new result holds the old one
     const inc = try Parse.reparse(testing.allocator, old, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// endx\n");
     defer inc.destroy();
     try testing.expect(inc.base != null);
@@ -100,7 +100,7 @@ test "body-only edit: reparse and rebuild ItemTree, downstream not recomputed" {
     try testing.expectEqual(2, executions(&db, q.FileItemTree));
     try testing.expectEqual(1, executions(&db, ItemCount));
 
-    // 新增声明：ItemTree 变化，下游重算
+    // New declaration: ItemTree changes, downstream is recomputed
     try setText(&db, file, "const a = 1;\nconst b = 2;\nfn f() void {}\n");
     try testing.expectEqual(3, try count(&db, file));
     try testing.expectEqual(2, executions(&db, ItemCount));

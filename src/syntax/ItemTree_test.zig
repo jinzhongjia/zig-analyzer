@@ -9,7 +9,7 @@ fn buildTree(source: []const u8) !struct { parse: *Parse, items: ItemTree } {
     return .{ .parse = parse, .items = try ItemTree.build(testing.allocator, parse.rootNode()) };
 }
 
-/// 以文本形式描述 ItemTree，便于断言
+/// Describes an ItemTree as text for assertions
 fn describe(t: *const ItemTree, w: *std.Io.Writer, container: u32, depth: usize) !void {
     for (t.containerMembers(container)) |i| {
         const item = t.items[i];

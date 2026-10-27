@@ -1,5 +1,6 @@
-//! 无损词法分析：复用 `std.zig.Tokenizer` 得到与编译器一致的 token，
-//! 再把 token 之间的空隙切分为 trivia（空白、普通注释），保证所有 token 拼接后等于原文。
+//! Lossless lexing: reuses `std.zig.Tokenizer` to get the same tokens as the compiler,
+//! then splits the gaps between tokens into trivia (whitespace, plain comments), so that all
+//! tokens concatenated equal the source text.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,11 +17,11 @@ pub const Token = struct {
     }
 };
 
-/// 返回全部 token（含 trivia，不含 eof），调用方拥有内存。
+/// Returns all tokens (including trivia, excluding eof); the caller owns the memory.
 pub fn tokenize(gpa: Allocator, source: [:0]const u8) Allocator.Error![]Token {
     var tokens: std.ArrayList(Token) = .empty;
     errdefer tokens.deinit(gpa);
-    // 经验值：每 8 字节约一个 token，trivia 约占一半
+    // Rule of thumb: about one token per 8 bytes, with trivia making up about half
     try tokens.ensureTotalCapacity(gpa, source.len / 4 + 16);
 
     var tokenizer: std.zig.Tokenizer = .init(source);
@@ -39,7 +40,8 @@ pub fn tokenize(gpa: Allocator, source: [:0]const u8) Allocator.Error![]Token {
         });
         pos = tok.loc.end;
     }
-    // 源码中间出现 0 字节时 tokenizer 会提前结束，剩余部分作为 unknown 保留
+    // When a 0 byte appears in the middle of the source, the tokenizer stops early;
+    // the rest is kept as unknown
     if (pos < source.len) try tokens.append(gpa, .{ .kind = .unknown, .start = @intCast(pos), .len = @intCast(source.len - pos) });
     return tokens.toOwnedSlice(gpa);
 }

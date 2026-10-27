@@ -1,4 +1,5 @@
-//! 绿树：不可变、只记录长度不记录位置，子树可在多个版本之间共享。
+//! Green tree: immutable, records only lengths and no positions; subtrees can be shared
+//! between versions.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -7,7 +8,7 @@ const isToken = @import("kind.zig").isToken;
 
 pub const GreenToken = struct {
     kind: SyntaxKind,
-    /// 指向 `Parse.source`
+    /// Points into `Parse.source`
     text: []const u8,
 };
 
@@ -17,12 +18,12 @@ pub const GreenNode = struct {
     children: []const GreenElement,
 };
 
-/// 节点的子元素：节点或 token。压缩为 16 字节（标签联合需要 32 字节）：一个 token 一个元素，
-/// 绿树的内存主要花在这里
+/// Child element of a node: a node or a token. Packed into 16 bytes (a tagged union would need
+/// 32): one element per token, and most of the green tree's memory goes here
 pub const GreenElement = struct {
-    /// 节点：`*const GreenNode`；token：文本起始（指向 `Parse.source`）
+    /// Node: `*const GreenNode`; token: start of the text (points into `Parse.source`)
     ptr: [*]const u8,
-    /// 节点：`text_len`；token：文本长度
+    /// Node: `text_len`; token: text length
     len: u32,
     syntax_kind: SyntaxKind,
     is_node: bool,
@@ -62,13 +63,13 @@ pub const GreenElement = struct {
     }
 };
 
-/// 自底向上构造绿树。节点内存分配在 `arena` 上。
+/// Builds a green tree bottom-up. Node memory is allocated in `arena`.
 pub const Builder = struct {
     arena: Allocator,
     gpa: Allocator,
-    /// 当前所有未闭合节点的子元素，按层级连续存放
+    /// Children of all currently open nodes, stored contiguously level by level
     children: std.ArrayList(GreenElement) = .empty,
-    /// 未闭合节点：种类与其子元素在 `children` 中的起始位置
+    /// Open nodes: the kind and the start of their children in `children`
     stack: std.ArrayList(struct { kind: SyntaxKind, start: usize }) = .empty,
 
     pub fn deinit(b: *Builder) void {
@@ -100,7 +101,7 @@ pub const Builder = struct {
         return b.stack.items.len;
     }
 
-    /// 结束构造，返回根节点。
+    /// Finishes building and returns the root node.
     pub fn finish(b: *Builder) *const GreenNode {
         std.debug.assert(b.stack.items.len == 0 and b.children.items.len == 1);
         return b.children.items[0].node().?;
