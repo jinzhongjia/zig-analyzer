@@ -29,7 +29,9 @@ const imports = @import("../ide_db/imports.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const ast = @import("../syntax/ast.zig");
 const isTrivia = @import("../syntax/kind.zig").isTrivia;
+const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 const fuzzy = @import("../ide_db/fuzzy.zig");
+const value = @import("../sema/value.zig");
 
 pub const Options = struct {
     auto_import: bool = true,
@@ -75,6 +77,18 @@ pub const Item = struct {
     /// The definition referred to, from which the signature and documentation are given when the
     /// item is selected (see `describe`): for auto-import candidates and functions
     target: ?imports.Target = null,
+    /// The value the candidate refers to in name completion, whose type is computed when ranking
+    /// by the expected type (see `Expected`)
+    origin: Origin = .none,
+
+    pub const Origin = union(enum) {
+        none,
+        /// The type is known: local names and member paths of local values
+        value: TypedValue,
+        /// A declaration or a file (declarations in scope, auto-import candidates): the type is
+        /// computed only when needed
+        target: imports.Target,
+    };
 
     pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label };
     pub const Range = struct { start: u32, end: u32 };
@@ -140,6 +154,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
                 .score = candidate.score,
                 .import_edit = candidate.import_edit,
                 .target = candidate.target,
+                .origin = .{ .target = candidate.target },
             });
         }
     }
@@ -149,7 +164,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         result.is_incomplete = true;
     }
     try items.appendSlice(r.arena, extra.items);
-    try rank(r.arena, items.items, name.prefix);
+    try rank(r.arena, items.items, name.prefix, try expectedAt(r, file, offset, names.at));
     result.items = items.items;
     return result;
 }
@@ -157,13 +172,19 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
 /// Order of name completion (`Item.sort`): the score of a name in scope is its match score (see
 /// `fuzzy`) multiplied by its source weight (`Item.weight`), and member paths of local values and
 /// auto-import candidates take their own scores (see `localMembers` and `imports.Candidate.score`);
-/// from high to low, keeping the collection order among equal scores. Names in scope that do not
-/// match the input score 0, sort last, and are filtered by the client.
-fn rank(arena: Allocator, items: []Item, prefix: []const u8) Allocator.Error!void {
+/// candidates whose type fits the expected type at the cursor are further multiplied by
+/// `expected_boost` (see `Expected`). From high to low, keeping the collection order among equal
+/// scores. Names in scope that do not match the input score 0, sort last, and are filtered by the
+/// client. The expected type only changes the order of the returned candidates, not which ones are
+/// kept (the limit applies to the unboosted scores)
+fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected) resolve.Error!void {
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
-    for (items) |*it| if (it.weight != 0) {
-        it.score = ((try matcher.score(it.label)) orelse 0) * it.weight;
-    };
+    for (items) |*it| {
+        if (it.weight != 0) it.score = ((try matcher.score(it.label)) orelse 0) * it.weight;
+        if (expected) |x| if (it.score > 0 and try x.matches(it.origin)) {
+            it.score *= expected_boost;
+        };
+    }
     std.mem.sort(Item, items, {}, higherScore);
     for (items, 0..) |*it, i| it.sort = try std.fmt.allocPrint(arena, "{d:0>5}", .{i});
 }
@@ -230,7 +251,8 @@ fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
 }
 
 /// `cursor_owner` records the member found at the cursor, which auto-import reuses; in name
-/// completion, `names` records the roots of the member paths of local values
+/// completion, `names` records the roots of the member paths of local values and the inference
+/// result of the member at the cursor
 fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner, names: *NameContext) resolve.Error![]const Item {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
@@ -309,7 +331,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     } else b.scopeAt(rel) else b.scopeAt(rel);
     // The kinds of local names come from the inference result of the member at the cursor
     // (inside a generic function body, from a call-site instance)
-    const types: BindingTypes = if (try context.atSeeded(r, file, offset, true)) |a| .{ .at = a } else .none;
+    names.at = try context.atSeeded(r, file, offset, true);
+    const types: BindingTypes = if (names.at) |a| .{ .at = a } else .none;
     try locals(&out, r.ctx.db.env.ip, b, scope, null, types, &names.roots);
 
     const tree = try r.itemTree(file);
@@ -497,6 +520,7 @@ fn locals(out: *Collector, ip: *InternPool, b: *const Body, from: Body.ScopeId, 
                 .label = binding.name,
                 .kind = kindOf(symbol_kind.ofBinding(ip, binding, tv)),
                 .weight = weight orelse if (binding.kind == .param) param_weight else local_weight,
+                .origin = .{ .value = tv },
             });
         }
     }
@@ -529,7 +553,8 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
         }
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
         const kind = kindOf(try symbol_kind.ofDecl(r, file, m));
-        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") .{ .decl = .{ .file = file, .item = m } } else null, .weight = weight });
+        const decl: imports.Target = .{ .decl = .{ .file = file, .item = m } };
+        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") decl else null, .weight = weight, .origin = .{ .target = decl } });
     }
 }
 
@@ -712,6 +737,9 @@ const Root = struct {
 const NameContext = struct {
     /// From the innermost outward
     roots: std.ArrayList(Root) = .empty,
+    /// The member at the cursor and its inference result (with a call-site instance inside a
+    /// generic function body), for computing the expected type
+    at: ?context.At = null,
 };
 
 /// The value a member path refers to: its type, and whether it can be modified (methods that
@@ -898,10 +926,14 @@ const MemberSearch = struct {
         const ip = r.ctx.db.env.ip;
         var item: Item = .{ .label = "", .kind = .field, .doc = p.leaf.doc, .replace = name.range, .score = p.score };
         switch (p.leaf.what) {
-            .typed => |t| item.detail = if (t != .unknown) try render.typeAlloc(r, t) else null,
+            .typed => |t| {
+                item.detail = if (t != .unknown) try render.typeAlloc(r, t) else null;
+                item.origin = .{ .value = .{ .ty = t } };
+            },
             .field => |f| {
                 const t = (try declType(r, f)).ty;
                 item.detail = if (t != .unknown) try render.typeAlloc(r, t) else null;
+                item.origin = .{ .value = .{ .ty = t } };
             },
             .method => |f| {
                 const tv = try declType(r, f);
@@ -912,6 +944,7 @@ const MemberSearch = struct {
                 if (sig.params.len == 0 or !receives(ip, sig.params[0], p.holder)) return null;
                 item.kind = .method;
                 item.target = if (f.alias) try fnTarget(r, tv) else .{ .decl = .{ .file = f.file, .item = f.item } };
+                item.origin = .{ .value = tv };
             },
         }
         var label: std.Io.Writer.Allocating = .init(r.arena);
@@ -966,6 +999,229 @@ fn onlySelf(r: *Resolver, file: FileId, item: u32) resolve.Error!bool {
     var n: usize = 0;
     while (params.next()) |_| n += 1;
     return n == 1;
+}
+
+/// The scores of candidates whose types fit the expected type at the cursor are multiplied by this
+/// factor (see `rank`): it exceeds the ratio between any two weights of names in scope, so fitting
+/// members of outer containers rank before local names that do not fit
+const expected_boost = 1.25;
+
+/// The expected type of the name at the cursor (see `expectedAt`), and the context needed to decide
+/// whether a candidate fits it
+const Expected = struct {
+    r: *Resolver,
+    ty: Index,
+    /// The instance of the member at the cursor (the call-site instance inside a generic function
+    /// body), for computing the types of declarations in scope
+    inst: ?Index,
+
+    /// Whether the type of the candidate fits the expected type (see `fits`); the types of
+    /// declarations and files are computed only here
+    fn matches(x: Expected, origin: Item.Origin) resolve.Error!bool {
+        const tv: TypedValue = switch (origin) {
+            .none => return false,
+            .value => |tv| tv,
+            .target => |t| switch (t) {
+                .decl => |d| try queries.defType(x.r, .{ .item = .{ .file = d.file, .item = d.item } }, null, x.inst),
+                .file => |f| try queries.importValue(x.r, f),
+            },
+        };
+        return fits(x.r.ctx.db.env.ip, x.ty, tv.ty);
+    }
+};
+
+/// The expected type of the name at the cursor (see `expectedOf`). Only concrete types count:
+/// anytype parameters and parameters that depend on comptime parameters have none, and none is
+/// taken when the statement at the cursor has syntax errors (see `wellFormed`)
+fn expectedAt(r: *Resolver, file: FileId, offset: u32, at: ?context.At) resolve.Error!?Expected {
+    const a = at orelse return null;
+    if (a.rel == 0) return null;
+    const e = a.body.exprAt(a.rel - 1) orelse return null;
+    if (a.body.expr(e) != .name_ref) return null;
+    const want = try expectedOf(r, a, e) orelse return null;
+    if (!value.isConcrete(a.ip, want) or !try wellFormed(r, file, offset)) return null;
+    return .{ .r = r, .ty = want, .inst = if (a.seeded) |s| s.inst else null };
+}
+
+/// The expected type of the expression `e`, computed from the parent expression and the inference
+/// result: a call argument takes the type of the called function's parameter; `const x: T = e`
+/// (including declarations in containers and default values of fields) takes the annotated type;
+/// `return e` takes the return type of the function; `.f = e` in an initializer takes the type of
+/// the field; `lhs = e` takes the type of the left-hand side; a comparison takes the type of the
+/// other side
+fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index {
+    const b = a.body;
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .call => |c| for (c.args, 0..) |arg, n| {
+            if (arg == e) return argType(r, a, c.callee, n);
+        },
+        .init => |init| for (init.fields) |f| {
+            if (f.value == e) return initFieldType(r, a, @fromBackingInt(@as(u32, @intCast(i))), f.name orelse return null);
+        },
+        .@"return" => |v| if (v == e) {
+            if ((try r.itemTree(a.file)).items[a.item].kind != .@"fn") return null;
+            return a.exprType(b.type_expr orelse return null).asType();
+        },
+        .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
+        .binary => |s| if (isComparison(s.op) and (s.lhs == e or s.rhs == e)) {
+            return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty);
+        },
+        else => {},
+    };
+    for (b.bindings) |binding| if (binding.init == e) return a.exprType(binding.ty orelse return null).asType();
+    if (b.value == e) return a.exprType(b.type_expr orelse return null).asType();
+    return null;
+}
+
+/// The expected type of argument `n` of a call: the type of the called function's parameter.
+/// Calling a function declaration through a value (a method call) skips self, while fields of
+/// function type do not bind a receiver (the same as `infer`)
+fn argType(r: *Resolver, a: context.At, callee: Body.ExprId, n: usize) resolve.Error!?Index {
+    const ip = a.ip;
+    const ct = a.exprType(callee).ty;
+    const f = switch (ip.key(ct)) {
+        .fn_type => |f| f,
+        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
+            .fn_type => |f| f,
+            else => return null,
+        } else return null,
+        else => return null,
+    };
+    var skip: usize = 0;
+    switch (a.body.expr(callee)) {
+        .field_access => |fa| if (ip.key(ct) == .fn_type and !a.exprType(fa.lhs).isType()) {
+            const def = try context.defOfKey(r, a.member(callee) orelse return null) orelse return null;
+            const it = switch (def) {
+                .item => |it| it,
+                else => return null,
+            };
+            if ((try r.itemTree(it.file)).items[it.item].kind != .field) skip = 1;
+        },
+        else => {},
+    }
+    return if (n + skip < f.params.len) f.params[n + skip] else null;
+}
+
+/// The type of the field `name` in the initializer `init_e`: the field of the initializer's type
+/// (`T` for `?T` and `E!T`)
+fn initFieldType(r: *Resolver, a: context.At, init_e: Body.ExprId, name: []const u8) resolve.Error!?Index {
+    const ip = a.ip;
+    var t = if (a.body.expr(init_e).init.ty != null) a.exprType(init_e).ty else a.literalExpected(init_e) orelse return null;
+    while (true) switch (ip.key(t)) {
+        .optional_type => |c| t = c,
+        .error_union_type => |eu| t = eu.payload,
+        else => break,
+    };
+    switch (ip.key(t)) {
+        .container_type => |c| {
+            if (c.kind == .@"enum" or c.kind == .@"opaque") return null;
+            const ns = try queries.namespaceOfType(r, t) orelse return null;
+            const tree = try r.itemTree(ns.file);
+            for (tree.containerMembers(ns.container)) |m| {
+                const it = tree.items[m];
+                if (it.kind != .field or !std.mem.eql(u8, it.name orelse continue, name)) continue;
+                return (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = c.inst })).ty;
+            }
+            return null;
+        },
+        .tuple_type, .anon_struct_type, .reified_type => return eval.fieldType(r, t, name),
+        else => return null,
+    }
+}
+
+fn isComparison(op: SyntaxKind) bool {
+    return switch (op) {
+        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => true,
+        else => false,
+    };
+}
+
+/// The type of one side of a comparison as the expected type of the other side: a tagged union is
+/// compared with its tag (`u == .none`); comptime numbers, enum literals, null, and undefined have
+/// no definite type
+fn comparedType(r: *Resolver, t: Index) resolve.Error!?Index {
+    switch (t) {
+        .unknown, .comptime_int_type, .comptime_float_type, .enum_literal_type, .null_type, .undefined_type => return null,
+        else => {},
+    }
+    const is_union = switch (r.ctx.db.env.ip.key(t)) {
+        .container_type => |c| c.kind == .@"union",
+        .reified_type => |rt| rt.kind == .@"union",
+        else => false,
+    };
+    return if (is_union) eval.unionTag(r, t) else t;
+}
+
+/// Whether the structure of the statement at the cursor (the innermost item of a block, file, or
+/// container that contains the cursor) can be trusted: error recovery can produce a wrong
+/// structure, e.g. after an unclosed call, `const x: u32 = cd` on the next line is recovered as an
+/// error node and `u32 = cd`. It cannot be trusted when there is a syntax error inside the
+/// statement, the previous item is an error node, or the call or initializer at the cursor is not
+/// closed; an error at the start of the statement belongs to the previous statement (a missing
+/// `;`), and errors at its end or after it are outside the statement
+fn wellFormed(r: *Resolver, file: FileId, offset: u32) resolve.Error!bool {
+    const parse = try r.ctx.get(database.syntax.ParseFile, file);
+    const path = try parse.rootNode().coveringPath(r.arena, offset - 1);
+    var i = path.len;
+    const stmt = while (i > 1) {
+        i -= 1;
+        switch (path[i - 1].kind()) {
+            .block, .source_file, .container_decl => break path[i],
+            else => {},
+        }
+    } else return false;
+    if (stmt.kind() == .error_node) return false;
+    var siblings = path[i - 1].children();
+    var prev: ?SyntaxNode = null;
+    while (siblings.nextNode()) |n| {
+        if (n.offset == stmt.offset and n.green == stmt.green) break;
+        prev = n;
+    }
+    if (prev) |p| if (p.kind() == .error_node) return false;
+    const range = stmt.range();
+    for (parse.errors) |err| if (err.offset > range.start and err.offset < range.end) return false;
+    for (path[i..]) |n| switch (n.kind()) {
+        .arg_list => if (n.childToken(.r_paren) == null) return false,
+        .init_list => if (n.childToken(.r_brace) == null) return false,
+        else => {},
+    };
+    return true;
+}
+
+/// Whether a candidate of type `have` can be a value of the expected type `want`, counting only
+/// what can be decided exactly: the same type; `T` when `?T` or `E!T` is expected; `*T` as
+/// `*const T` and `[]T` as `[]const T`; functions (including function pointers) whose return value
+/// fits. Other conversions (integer widening, comptime_int, and so on) do not count
+fn fits(ip: *InternPool, want: Index, have: Index) bool {
+    if (coerces(ip, want, have)) return true;
+    const f = switch (ip.key(have)) {
+        .fn_type => |f| f,
+        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
+            .fn_type => |f| f,
+            else => return false,
+        } else return false,
+        else => return false,
+    };
+    return coerces(ip, want, f.ret);
+}
+
+fn coerces(ip: *InternPool, want: Index, have: Index) bool {
+    if (have == .unknown) return false;
+    if (value.eqlTypes(ip, want, have) orelse false) return true;
+    switch (ip.key(want)) {
+        .optional_type => |child| return coerces(ip, child, have),
+        .error_union_type => |eu| return coerces(ip, eu.payload, have),
+        .ptr_type => |w| {
+            const h = switch (ip.key(have)) {
+                .ptr_type => |h| h,
+                else => return false,
+            };
+            if (w.size != h.size or (w.size != .one and w.size != .slice)) return false;
+            if (!w.is_const or h.is_const or !std.meta.eql(w.sentinel, h.sentinel)) return false;
+            return value.eqlTypes(ip, w.child, h.child) orelse false;
+        },
+        else => return false,
+    }
 }
 
 fn isIdentChar(c: u8) bool {

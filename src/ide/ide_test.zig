@@ -634,6 +634,206 @@ test "local member paths and auto-import candidates share the candidate limit" {
     }
 }
 
+/// Labels of the candidates that match the input in name completion, in rank order, joined by
+/// spaces
+fn rankedLabels(source: []const u8, auto_import: bool) ![]u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = auto_import })).items) |it| {
+        if (it.score > 0) try labels.append(w.arena.allocator(), it.label);
+    }
+    return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
+/// Checks `cases` in order: the completion ranking at the cursor in the source of each case,
+/// placed after `decls`
+fn expectRanked(decls: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ decls, c[0] });
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+/// Three container members matching `cd` equally: without the expected-type boost, they rank in
+/// declaration order
+const expected_decls =
+    \\const Want = enum { a, b };
+    \\const Other = struct {
+    \\    w: Want = .a,
+    \\    pub fn put(self: Other, w: Want) void { _ = .{ self, w }; }
+    \\};
+    \\const Hook = struct { call: *const fn (Want) void };
+    \\const Tagged = union(Want) { a: u8, b: void };
+    \\const cd_n: u8 = 0;
+    \\const cd_o: Other = .{};
+    \\const cd_w: Want = .a;
+    \\fn take(w: Want) void { _ = w; }
+    \\fn takeOther(o: Other) void { _ = o; }
+    \\
+;
+const unchanged = "cd_n cd_o cd_w";
+const want_first = "cd_w cd_n cd_o";
+const other_first = "cd_o cd_n cd_w";
+
+test "name completion ranks candidates fitting the expected type first" {
+    try expectRanked(expected_decls, &.{
+        .{ "fn run() void { _ = cd<|>; }", unchanged },
+        // Call arguments: calling a method through a value skips self; calling through the type
+        // or calling a field of function type does not
+        .{ "fn run() void { take(cd<|>); }", want_first },
+        .{ "fn run() void { cd_o.put(cd<|>); }", want_first },
+        .{ "fn run() void { Other.put(cd<|>, .a); }", other_first },
+        .{ "fn run() void { Other.put(cd_o, cd<|>); }", want_first },
+        .{ "fn run(h: Hook) void { h.call(cd<|>); }", want_first },
+        // Declarations with a type annotation, including declarations in containers and default
+        // values of fields; the same while typing, before the `;` exists
+        .{ "fn run() void { const x: Want = cd<|>; _ = x; }", want_first },
+        .{ "fn run() void { var x: Want = cd<|>; _ = &x; }", want_first },
+        .{ "fn run() void {\n    const x: Want = cd<|>\n}", want_first },
+        .{ "const top: Want = cd<|>;", want_first },
+        .{ "const Holder = struct { w: Want = cd<|> };", want_first },
+        // Return values
+        .{ "fn run() Want { return cd<|>; }", want_first },
+        .{ "fn run() !Want { return cd<|>; }", want_first },
+        .{ "fn run() Other { return cd<|>; }", other_first },
+        // Fields in initializers: the field of the initializer's type (annotated, written out, or
+        // from the parameter it is passed to); no expected type when there is no such field
+        .{ "fn run() void { const o: Other = .{ .w = cd<|> }; _ = o; }", want_first },
+        .{ "fn run() void { _ = Other{ .w = cd<|> }; }", want_first },
+        .{ "fn run() void { takeOther(.{ .w = cd<|> }); }", want_first },
+        .{ "fn run() void { takeOther(.{ .missing = cd<|> }); }", unchanged },
+        // Assignments and comparisons; a tagged union compared with its tag
+        .{ "fn run() void { var x: Want = .a; x = cd<|>; }", want_first },
+        .{ "fn run(w: Want) void { if (w == cd<|>) {} }", want_first },
+        .{ "fn run(o: Other) void { if (o.w != cd<|>) {} }", want_first },
+        .{ "fn run(t: Tagged) void { if (t == cd<|>) {} }", want_first },
+    });
+}
+
+test "candidates fit the expected type only by exact rules" {
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ "Want", "const cd_b: Want = .a;", true },
+        .{ "?Want", "const cd_b: Want = .a;", true },
+        .{ "anyerror!Want", "const cd_b: Want = .a;", true },
+        .{ "?*const Want", "const cd_b: *Want = undefined;", true },
+        .{ "*const Want", "const cd_b: *Want = undefined;", true },
+        .{ "[]const u8", "const cd_b: []u8 = undefined;", true },
+        .{ "type", "const cd_b = u8;", true },
+        // Functions (including function pointers) whose return value fits
+        .{ "Want", "fn cd_b() Want { return .a; }", true },
+        .{ "Want", "const cd_b: *const fn () Want = undefined;", true },
+        // Other conversions, such as integer widening and comptime_int, do not count
+        .{ "u64", "const cd_b: u32 = 0;", false },
+        .{ "u32", "const cd_b = 1;", false },
+        .{ "*Want", "const cd_b: *const Want = undefined;", false },
+        .{ "[]u8", "const cd_b: []const u8 = undefined;", false },
+        .{ "Want", "const cd_b: ?Want = .a;", false },
+        .{ "Want", "fn cd_b() ?Want { return .a; }", false },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\const Want = enum {{ a, b }};
+            \\const Other = struct {{}};
+            \\const cd_a: Other = .{{}};
+            \\{s}
+            \\fn run() void {{
+            \\    const x: {s} = cd<|>;
+            \\    _ = x;
+            \\}}
+            \\
+        , .{ c[1], c[0] });
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(if (c[2]) "cd_b cd_a" else "cd_a cd_b", got) catch |err| {
+            std.debug.print("expected `{s}`, candidate `{s}`\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
+test "expected types are not used where the syntax tree may be wrong" {
+    try expectRanked(expected_decls ++ "const cd_t = u8;\n", &.{
+        // An unclosed call makes the next line recover as an error node and `Want = cd`; the type
+        // of the left-hand side, `type`, is not the expected type
+        .{ "fn run() void {\n    take(cd_n,\n    const x: Want = cd<|>;\n    _ = x;\n}", "cd_n cd_o cd_w cd_t" },
+        // The call at the cursor is not closed; the statement has a syntax error
+        .{ "fn run() void {\n    take(cd<|>\n}", "cd_n cd_o cd_w cd_t" },
+        .{ "fn run() void {\n    const o: Other = .{ .w = cd<|>, .w = };\n    _ = o;\n}", "cd_n cd_o cd_w cd_t" },
+        // Syntax errors in other statements do not matter, including a `;` missing from the
+        // previous statement
+        .{ "fn run() void {\n    const y: u8 = ;\n    const x: Want = cd<|>;\n    _ = .{ x, y };\n}", "cd_w cd_n cd_o cd_t" },
+        .{ "fn run() void {\n    const y: u8 = 0\n    const x: Want = cd<|>;\n    _ = .{ x, y };\n}", "cd_w cd_n cd_o cd_t" },
+    });
+}
+
+test "expected types of generic parameters are not used" {
+    try expectRanked(expected_decls ++
+        \\fn generic(comptime T: type, v: T) void { _ = v; }
+        \\fn any(v: anytype) void { _ = v; }
+        \\
+    , &.{
+        // Parameters that depend on comptime parameters, and anytype parameters
+        .{ "fn run() void { generic(Want, cd<|>); }", unchanged },
+        .{ "fn run() void { any(cd<|>); }", unchanged },
+        // Inside a generic function body, types are inferred from the call-site instance; without
+        // a call site the type is unknown
+        .{ "fn inner(comptime T: type) void { const x: T = cd<|>; _ = x; }\nfn caller() void { inner(Want); }", want_first },
+        .{ "fn inner(comptime T: type) void { const x: T = cd<|>; _ = x; }", unchanged },
+    });
+}
+
+test "local member paths and auto-import candidates fitting the expected type rank first" {
+    const source =
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\const Pair = struct {{ a: u8, z: std.Want }};
+        \\fn run(cd_p: Pair) void {{
+        \\    _ = cd_p;
+        \\    {s}
+        \\}}
+        \\//- /zig/std/std.zig std
+        \\pub const Want = enum {{ a, b }};
+        \\pub const cd_a: u8 = 0;
+        \\pub const cd_z: Want = .a;
+        \\
+    ;
+    const cases = [_]struct { []const u8, bool }{ .{ "_ = cd<|>;", false }, .{ "const x: std.Want = cd<|>;\n    _ = x;", true } };
+    for (cases) |c| {
+        const text = try std.fmt.allocPrint(testing.allocator, source, .{c[0]});
+        defer testing.allocator.free(text);
+        const got = try rankedLabels(text, true);
+        defer testing.allocator.free(got);
+        var it = std.mem.tokenizeScalar(u8, got, ' ');
+        var rank: std.StringHashMapUnmanaged(usize) = .empty;
+        defer rank.deinit(testing.allocator);
+        var i: usize = 0;
+        while (it.next()) |label| : (i += 1) try rank.put(testing.allocator, label, i);
+        for ([_][2][]const u8{ .{ "cd_p.a", "cd_p.z" }, .{ "std.cd_a", "std.cd_z" } }) |pair| {
+            const a = rank.get(pair[0]) orelse return error.MissingCompletion;
+            const z = rank.get(pair[1]) orelse return error.MissingCompletion;
+            testing.expectEqual(c[1], z < a) catch |err| {
+                std.debug.print("case: {s}\nranked: {s}\n", .{ c[0], got });
+                return err;
+            };
+        }
+    }
+}
+
 test "completion item kinds follow what each symbol is" {
     var w: World = undefined;
     try w.init();
