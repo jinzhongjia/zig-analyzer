@@ -1,5 +1,6 @@
-//! 外部进程的等待超时：到时间后向 pid 发送 SIGKILL，使阻塞在管道读取或 wait 上的调用返回。
-//! 子进程可能被包装脚本（asdf、mise、网络文件系统上的 zig）卡住，没有超时会让关闭流程永久等待。
+//! Wait timeout for external processes: when the time is up, sends SIGKILL to the pid so that calls
+//! blocked on a pipe read or wait return. Child processes can get stuck in wrapper scripts (asdf,
+//! mise, zig on a network file system), and without a timeout the shutdown would wait forever.
 
 const std = @import("std");
 const Io = std.Io;
@@ -16,7 +17,8 @@ pub const Watchdog = struct {
         done: bool = false,
     };
 
-    /// `pid` 为直接子进程的 pid：只传值，不与 `Child` 的其他状态并发访问
+    /// `pid` is the pid of a direct child process: only the value is passed, with no concurrent
+    /// access to the other state of `Child`
     pub fn start(w: *Watchdog, io: Io, pid: std.process.Child.Id, timeout: Io.Timeout) void {
         switch (builtin.os.tag) {
             .windows, .wasi => {},
@@ -29,7 +31,7 @@ pub const Watchdog = struct {
         }
     }
 
-    /// 取消看门狗并等待其退出；子进程已正常结束时调用
+    /// Cancels the watchdog and waits for it to exit; called after the child process exits normally
     pub fn stop(w: *Watchdog) void {
         const thread = w.thread orelse return;
         w.state.mutex.lockUncancelable(w.io);

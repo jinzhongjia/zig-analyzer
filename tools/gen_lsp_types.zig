@@ -1,6 +1,6 @@
-//! 从 LSP 官方 metaModel.json 生成 `src/lsp/types.zig`。
+//! Generates `src/lsp/types.zig` from the official LSP metaModel.json.
 //!
-//! 用法：gen_lsp_types <metaModel.json> <输出路径>
+//! Usage: gen_lsp_types <metaModel.json> <output path>
 
 const std = @import("std");
 const json = std.json;
@@ -13,19 +13,19 @@ const Gen = struct {
     structures: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
     enumerations: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
     aliases: std.StringArrayHashMapUnmanaged(json.Value) = .empty,
-    /// 可取自定义值的字符串枚举，字段类型直接用 `[]const u8`
+    /// String enums that allow custom values; fields of these types use `[]const u8` directly
     open_string_enums: std.StringHashMapUnmanaged(void) = .empty,
-    /// 按值包含关系图上的可达性缓存，key = "from\x00to"
+    /// Reachability cache on the by-value containment graph, key = "from\x00to"
     reach_cache: std.StringHashMapUnmanaged(bool) = .empty,
 
-    /// 在 LSP 中直接映射到 std.json 的别名
+    /// LSP aliases that map directly to std.json
     const special_aliases = std.StaticStringMap([]const u8).initComptime(.{
         .{ "LSPAny", "std.json.Value" },
         .{ "LSPObject", "std.json.ArrayHashMap(std.json.Value)" },
         .{ "LSPArray", "[]const std.json.Value" },
     });
 
-    // ── metaModel 取值：格式不符合预期时带上下文 panic，便于升级 metaModel 时排查 ──
+    // ── metaModel access: panic with context on unexpected formats, to debug metaModel upgrades ──
 
     fn invalid(v: json.Value, comptime fmt: []const u8, args: anytype) noreturn {
         var buf: [512]u8 = undefined;
@@ -40,24 +40,24 @@ const Gen = struct {
         return v.object;
     }
 
-    /// 可选字段
+    /// Optional field
     fn opt(v: json.Value, key: []const u8) ?json.Value {
         return obj(v).get(key);
     }
 
-    /// 必需字段
+    /// Required field
     fn field(v: json.Value, key: []const u8) json.Value {
         return opt(v, key) orelse invalid(v, "missing field \"{s}\"", .{key});
     }
 
-    /// 可选字符串字段；存在但不是字符串时 panic
+    /// Optional string field; panics if it is present but not a string
     fn str(v: json.Value, key: []const u8) ?[]const u8 {
         const f = opt(v, key) orelse return null;
         if (f != .string) invalid(v, "field \"{s}\" should be a string", .{key});
         return f.string;
     }
 
-    /// 必需字符串字段
+    /// Required string field
     fn req(v: json.Value, key: []const u8) []const u8 {
         return str(v, key) orelse invalid(v, "missing string field \"{s}\"", .{key});
     }
@@ -79,7 +79,7 @@ const Gen = struct {
         return f == .bool and f.bool;
     }
 
-    // ── 文档注释 ───────────────────────────────────────────────────────
+    // ── Doc comments ───────────────────────────────────────────────────
 
     fn doc(g: *Gen, v: json.Value) !void {
         if (str(v, "documentation")) |text| {
@@ -94,7 +94,7 @@ const Gen = struct {
         }
     }
 
-    // ── 递归检测：按值包含形成环时需要用指针 ─────────────────────────────
+    // ── Recursion detection: by-value containment cycles need pointers ───
 
     fn byValueRefs(g: *Gen, t: json.Value, out: *std.ArrayList([]const u8)) !void {
         const kind = req(t, "kind");
@@ -105,7 +105,7 @@ const Gen = struct {
         } else if (std.mem.eql(u8, kind, "literal")) {
             for (arr(field(t, "value"), "properties")) |p| try g.byValueRefs(field(p, "type"), out);
         }
-        // array / map 是间接引用，不形成按值环
+        // array / map are indirect references and form no by-value cycle
     }
 
     fn edges(g: *Gen, name: []const u8) ![]const []const u8 {
@@ -134,7 +134,7 @@ const Gen = struct {
         return result;
     }
 
-    // ── 结构体属性展开（extends + mixins） ───────────────────────────────
+    // ── Structure property flattening (extends + mixins) ─────────────────
 
     fn flattenProperties(g: *Gen, s: json.Value) ![]const json.Value {
         var out: std.ArrayList(json.Value) = .empty;
@@ -147,7 +147,7 @@ const Gen = struct {
         }
         for (arr(s, "properties")) |p| {
             const name = req(p, "name");
-            // 子结构覆盖同名属性
+            // A derived structure overrides properties with the same name
             for (out.items, 0..) |existing, i| {
                 if (std.mem.eql(u8, req(existing, "name"), name)) {
                     _ = out.orderedRemove(i);
@@ -159,12 +159,12 @@ const Gen = struct {
         return out.items;
     }
 
-    // ── 类型表达式 ─────────────────────────────────────────────────────
+    // ── Type expressions ───────────────────────────────────────────────
 
     const Ctx = struct {
-        /// 正在生成的命名类型（结构体或别名），用于判断是否需要指针
+        /// Named type being generated (structure or alias), to decide whether a pointer is needed
         owner: []const u8,
-        /// 当前位置是否为按值位置（不在 array/map 内）
+        /// Whether the current position is a by-value position (not inside an array/map)
         by_value: bool = true,
     };
 
@@ -192,7 +192,7 @@ const Gen = struct {
         return map.get(name) orelse std.debug.panic("unknown base type: {s}", .{name});
     }
 
-    /// 输出类型表达式。nullable 的 `or` 输出为 `?T`。
+    /// Emits a type expression. A nullable `or` is emitted as `?T`.
     fn emitType(g: *Gen, t: json.Value, ctx: Ctx) anyerror!void {
         const kind = req(t, "kind");
         const w = g.w;
@@ -298,7 +298,7 @@ const Gen = struct {
         try g.w.writeAll(",\n");
     }
 
-    // ── 顶层声明 ───────────────────────────────────────────────────────
+    // ── Top-level declarations ─────────────────────────────────────────
 
     fn emitStructure(g: *Gen, name: []const u8, s: json.Value) !void {
         try g.doc(s);
@@ -313,14 +313,15 @@ const Gen = struct {
         const values = arr(e, "values");
         if (std.mem.eql(u8, base, "string")) {
             if (flag(e, "supportsCustomValues")) {
-                // 开放枚举：字段类型为 []const u8，这里只提供常量
+                // Open enum: the field type is []const u8; only constants are provided here
                 try g.w.print("pub const {f} = struct {{\n", .{std.zig.fmtId(name)});
                 for (values) |v| {
                     try g.doc(v);
                     try g.w.print("pub const {f}: []const u8 = \"{f}\";\n", .{ std.zig.fmtId(req(v, "name")), std.zig.fmtString(req(v, "value")) });
                 }
             } else {
-                // 闭合字符串枚举：tag 名即 JSON 值，std.json 可直接解析与序列化
+                // Closed string enum: the tag names are the JSON values, so std.json can parse
+                // and serialize it directly
                 try g.w.print("pub const {f} = enum {{\n", .{std.zig.fmtId(name)});
                 for (values) |v| {
                     try g.doc(v);
@@ -384,7 +385,7 @@ const Gen = struct {
 
         const version = req(field(model, "metaData"), "version");
         try g.w.print(
-            \\//! 由 tools/gen_lsp_types.zig 从 metaModel.json（LSP {s}）生成，请勿手改。
+            \\//! Generated by tools/gen_lsp_types.zig from metaModel.json (LSP {s}); do not edit by hand.
             \\
             \\const std = @import("std");
             \\const json_ext = @import("json_ext.zig");
@@ -453,7 +454,7 @@ pub fn main(init: std.process.Init) !void {
     var gen: Gen = .{ .arena = arena, .w = &out.writer };
     try gen.run(model);
 
-    // 用 std.zig 格式化输出，失败时打印错误便于排查生成器问题
+    // Format the output with std.zig; on failure, print the errors to help debug the generator
     const source = try out.toOwnedSliceSentinel(0);
     var tree = try std.zig.Ast.parse(arena, source, .{});
     if (tree.errors.len != 0) {

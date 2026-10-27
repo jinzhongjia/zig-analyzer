@@ -27,8 +27,10 @@ test "build system protocol: read build graph and get compile errors" {
             .handshake => |h| try testing.expectEqual(bsp.protocol_version, h.version),
             .configuration => |path| {
                 model = try configuration.load(gpa, testing.io, project.root, path, &project.env);
-                // 回归：模型中最后分配的字段曾在复制 arena 状态之后分配，新开的 arena 块随模型释放时被漏掉
-                // （是否新开块取决于路径长度，CI 上偶发）。超长的标准库路径保证新开块
+                // Regression: the last field of the model used to be allocated after the arena
+                // state was copied, so a newly opened arena chunk leaked when the model was freed
+                // (whether a new chunk is opened depends on the path length, so it failed only
+                // occasionally on CI). The overlong standard library path guarantees a new chunk.
                 var long_env = project.env;
                 const long_dir = try gpa.alloc(u8, 64 * 1024);
                 defer gpa.free(long_dir);
@@ -53,7 +55,7 @@ test "build system protocol: read build graph and get compile errors" {
         }
     }
 
-    // 构建图：check step → compile step → 根模块 main.zig，import "lib" → lib.zig
+    // Build graph: check step → compile step → root module main.zig, import "lib" → lib.zig
     const m = &model.?;
     try testing.expectEqual(1, m.diagnostics_steps.len);
     try testing.expectEqualStrings("check", m.steps[m.diagnostics_steps[0]].name);
@@ -66,7 +68,8 @@ test "build system protocol: read build graph and get compile errors" {
     try testing.expect(std.mem.endsWith(u8, m.modules[root.imports[0].module].root_file.?, "lib.zig"));
     try testing.expect(std.fs.path.isAbsolute(root.root_file.?));
 
-    // 编译错误：AstGen 错误（含从未调用的函数中导入的文件）与 Sema 错误；未导入的文件没有错误
+    // Compile errors: AstGen errors (including in a file imported from a function that is never
+    // called) and Sema errors; files that are not imported have no errors
     std.mem.sort([]u8, errors.items, {}, struct {
         fn lt(_: void, a: []u8, b: []u8) bool {
             return std.mem.lessThan(u8, a, b);
@@ -97,7 +100,7 @@ test "build system protocol: zig build and the processes it started end when the
     const pgid = client.group.pgid;
     var model: ?@import("../base/ProjectModel.zig") = null;
     defer if (model) |*m| m.deinit(gpa);
-    // 等到运行 sleep 的 step 开始
+    // Wait until the step running sleep starts
     while (true) {
         var event = try client.next();
         defer event.deinit(gpa);
@@ -111,11 +114,13 @@ test "build system protocol: zig build and the processes it started end when the
         }
     }
 
-    // 服务器进程退出时（不论如何退出）操作系统关闭看门狗输入的写端
+    // When the server process exits (no matter how), the operating system closes the write end
+    // of the watchdog's input
     const watchdog = &client.group.watchdog.?;
     watchdog.stdin.?.close(io);
     watchdog.stdin = null;
-    // 看门狗没有结束进程组时由这里结束：测试失败而不是等构建跑完
+    // If the watchdog does not end the process group, end it here: the test fails instead of
+    // waiting for the build to finish
     var fired = false;
     var fallback = try io.concurrent(stopAfter, .{ io, client, &fired });
     while (true) {
@@ -129,6 +134,6 @@ test "build system protocol: zig build and the processes it started end when the
     try testing.expect(!fired);
     client.deinit();
     deinited = true;
-    // maker 启动的 sleep 也已结束
+    // The sleep started by the maker has ended too
     try fixture.expectGroupGone(pgid);
 }

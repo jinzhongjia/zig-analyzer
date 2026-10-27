@@ -1,4 +1,4 @@
-//! 与当前编译器版本一致的官方内建函数元数据。
+//! Metadata of the official builtin functions, matching the current compiler version.
 const std = @import("std");
 const data = @import("builtin_data.zig");
 

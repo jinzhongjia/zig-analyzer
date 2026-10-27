@@ -1,10 +1,11 @@
-//! 模糊测试与随机性质测试共用的熵源：把一段字节按需解释为各种选择，字节耗尽后恒为 0。
-//! 同一份输入既可以来自 `std.testing.Smith`（覆盖率引导），也可以来自固定种子的伪随机数。
+//! Entropy source shared by fuzz tests and randomized property tests: interprets a byte string as
+//! various choices on demand, and yields 0 forever once the bytes run out. The same input can come
+//! either from `std.testing.Smith` (coverage-guided) or from a fixed-seed pseudo-random generator.
 
 const Entropy = @This();
 
-/// 随机性质测试的迭代次数：Debug 下（带分配检查，慢一个数量级）取十分之一，
-/// 优化构建（CI 的 ReleaseSafe 测试）跑全量
+/// Iteration count of randomized property tests: one tenth under Debug (with allocation checks, an
+/// order of magnitude slower), the full count in optimized builds (the ReleaseSafe tests on CI)
 pub fn iterations(comptime full: usize) usize {
     return if (@import("builtin").mode == .debug) full / 10 else full;
 }

@@ -1,4 +1,5 @@
-//! 按结构比较两个值：切片逐元素比较，联合体比较标签与内容。用于给含切片的 query 值实现 `eql`。
+//! Compares two values structurally: slices element by element, unions by tag and payload. Used to
+//! implement `eql` for query values that contain slices.
 
 const std = @import("std");
 

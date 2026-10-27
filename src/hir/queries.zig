@@ -1,4 +1,4 @@
-//! HIR query。
+//! HIR queries.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,8 +11,9 @@ const Body = @import("Body.zig");
 const lower = @import("lower.zig").lower;
 const mem = @import("../util/mem.zig");
 
-/// enum 成员与 union 中只写名字的字段（没有 `:`）：类型表达式的位置是名字。元组式结构体的字段同样
-/// 没有 `:`，那里是类型，因此须由 ItemTree 得到所在容器的种类
+/// Enum members and union fields written as just a name (no `:`): the type expression position
+/// holds the name. Fields of tuple-like structs have no `:` either, but there it is a type, so
+/// the kind of the enclosing container must come from the ItemTree
 fn fieldIsName(ctx: anytype, key: OwnerKey, node: ast.SyntaxNode) engine.Error!bool {
     if (node.kind() != .container_field or (ast.ContainerField{ .syntax = node }).name() != null) return false;
     const tree = try ctx.get(syntax.FileItemTree, key.file);
@@ -23,27 +24,31 @@ fn fieldIsName(ctx: anytype, key: OwnerKey, node: ast.SyntaxNode) engine.Error!b
     return false;
 }
 
-/// BodyOwner：文件中的一个容器成员（按稳定的 AstId 标识）
+/// BodyOwner: a container member in a file (identified by its stable AstId)
 pub const OwnerKey = struct {
     file: Vfs.FileId,
     item: ItemTree.AstId,
 };
 
-/// 成员的 HIR。Body 内容（位置相对 owner）不变时视为未变化，下游不重算
+/// HIR of a member. When the contents of the Body (positions relative to the owner) are
+/// unchanged, it counts as unchanged and downstream queries are not recomputed
 pub const ItemBody = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = OwnerKey;
     pub const Value = *const Body;
-    /// 约束长时间会话的内存：被淘汰的 Body 按需重新降级
+    /// Bounds memory in long sessions: an evicted Body is lowered again on demand
     pub const lru = 16 * 1024;
-    /// 值的大小差别很大（长函数的 HIR / 推导结果可达数百 KB），同时按字节数限制
+    /// Value sizes vary widely (the HIR / inference result of a long function can reach
+    /// hundreds of KB), so the cache is also bounded by bytes
     pub const lru_bytes = 48 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         return @sizeOf(Owned) + mem.arenaBytes(v.arena);
     }
 
-    /// Body 与降级它的成员源码：文本不变时下一次计算直接沿用（引用计数，与 `ParseFile` 沿用旧结果相同）
+    /// A Body together with the source of the member it was lowered from: when the text is
+    /// unchanged, the next computation reuses it directly (reference counted, the same way
+    /// `ParseFile` reuses an old result)
     const Owned = struct {
         body: Body,
         refs: std.atomic.Value(u32) = .init(1),
@@ -55,13 +60,17 @@ pub const ItemBody = struct {
         }
     };
 
-    /// 文件中任何编辑都使 `FileAstIdMap` 变化（按指针比较），各成员的 Body 随之重算：成员的源码文本与降级
-    /// 参数未变时沿用上一次的 Body（降级只读取成员自身的语法树，位置相对成员起点），不再重新降级。
-    /// 非活动代码等需要文件中全部成员的功能，在大文件上每次编辑都要重新降级上千个成员
+    /// Any edit in a file changes `FileAstIdMap` (compared by pointer), so the Body of every
+    /// member is recomputed: when the source text of the member and the lowering parameters are
+    /// unchanged, the previous Body is reused (lowering reads only the member's own syntax tree,
+    /// and positions are relative to the start of the member) instead of lowering again.
+    /// Features that need every member of the file, such as inactive code, would otherwise
+    /// re-lower thousands of members on every edit in a large file
     pub fn computeIncremental(ctx: anytype, key: Key, prev: ?Value) engine.Error!Value {
         const map = try ctx.get(syntax.FileAstIdMap, key.file);
         const parse = try ctx.get(syntax.ParseFile, key.file);
-        // 找不到时（成员已被删除）降级根节点：不是成员，得到空 Body
+        // When it is not found (the member was deleted), lower the root node: it is not a
+        // member, so the Body is empty
         const node = map.get(key.item) orelse parse.rootNode();
         const field_is_name = try fieldIsName(ctx, key, node);
         const source_hash = std.hash.Wyhash.hash(0, node.text(parse.source));
@@ -91,11 +100,13 @@ pub const ItemBody = struct {
     }
 };
 
-/// 参数的形式：有无类型标注（`anytype`）与是否 comptime
+/// Form of a parameter: whether it has a type annotation (`anytype`) and whether it is comptime
 pub const ParamForm = enum(u8) { typed, comptime_typed, any, comptime_any };
 
-/// 成员（函数）各参数的形式。调用处据此判断是否为泛型调用：只改函数体时值不变，调用者不随之重算
-/// （直接依赖 `ItemBody` 时，改被调函数的函数体会使它的全部调用者失效）
+/// Forms of the parameters of a member (function). Call sites use them to decide whether a call
+/// is generic: editing only the function body leaves the value unchanged, so callers are not
+/// recomputed (with a direct dependency on `ItemBody`, editing the body of the callee would
+/// invalidate all of its callers)
 pub const ParamForms = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = OwnerKey;

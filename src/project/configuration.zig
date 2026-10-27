@@ -1,7 +1,9 @@
-//! 把构建系统协议给出的构建图（`std.Build.Configuration`）转换为 `ProjectModel`。
+//! Converts the build graph (`std.Build.Configuration`) given by the build system protocol into a
+//! `ProjectModel`.
 //!
-//! 构建图的二进制格式由标准库定义，只有在用户 zig 与 zig-analyzer 编译时的版本一致时才能加载
-//! （见 `ZigEnv.matchesBuiltin`）。
+//! The binary format of the build graph is defined by the standard library and can be loaded only
+//! when the user's zig is the same version as the one zig-analyzer was compiled with
+//! (see `ZigEnv.matchesBuiltin`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -10,7 +12,8 @@ const Configuration = std.Build.Configuration;
 const ProjectModel = @import("../base/ProjectModel.zig");
 const ZigEnv = @import("ZigEnv.zig");
 
-/// 读取 maker 给出的构建图文件（`path` 相对于构建根目录）并转换
+/// Reads the build graph file given by the maker (`path` is relative to the build root) and
+/// converts it
 pub fn load(gpa: Allocator, io: Io, build_root: []const u8, path: []const u8, env: *const ZigEnv) !ProjectModel {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
@@ -22,16 +25,20 @@ pub fn load(gpa: Allocator, io: Io, build_root: []const u8, path: []const u8, en
     return convert(gpa, &conf, build_root, try localCacheRoot(scratch.allocator(), build_root, path), env);
 }
 
-/// maker 使用的本地缓存目录（绝对路径），由构建图文件的路径 `configuration_path`（相对于构建根目录或为
-/// 绝对路径）得出：maker 把构建图写在本地缓存目录下的 `c/<hash>`（不使用缓存时为 `tmp/<hex>`）。
-/// 本地缓存目录取决于 `--cache-dir`、环境变量 `ZIG_LOCAL_CACHE_DIR` 与默认的 `<构建根>/.zig-cache`，
-/// 从 maker 给出的路径反推，不必重复 maker 解析参数与环境变量的规则
+/// The local cache directory used by the maker (absolute path), derived from the path of the build
+/// graph file `configuration_path` (relative to the build root, or absolute): the maker writes the
+/// build graph to `c/<hash>` under the local cache directory (`tmp/<hex>` when no cache is used).
+/// The local cache directory depends on `--cache-dir`, the environment variable
+/// `ZIG_LOCAL_CACHE_DIR`, and the default `<build root>/.zig-cache`; inferring it from the path
+/// the maker gives avoids duplicating the maker's rules for parsing arguments and environment
+/// variables
 pub fn localCacheRoot(a: Allocator, build_root: []const u8, configuration_path: []const u8) Allocator.Error![]u8 {
     const dir = std.fs.path.dirname(configuration_path) orelse "";
     return std.fs.path.resolveAlloc(a, &.{ build_root, std.fs.path.dirname(dir) orelse "" });
 }
 
-/// `local_cache_root` 为 maker 使用的本地缓存目录（绝对路径，见 `localCacheRoot`）
+/// `local_cache_root` is the local cache directory used by the maker (absolute path; see
+/// `localCacheRoot`)
 pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, local_cache_root: []const u8, env: *const ZigEnv) Allocator.Error!ProjectModel {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
@@ -39,7 +46,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
 
     const ctx: Ctx = .{ .arena = a, .c = c, .build_root = try a.dupe(u8, build_root), .local_cache_root = try a.dupe(u8, local_cache_root), .env = env };
 
-    // 模块按 Configuration.Module.Index 去重，下标为发现顺序
+    // Modules are deduplicated by Configuration.Module.Index; indices follow discovery order
     var module_ids: std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void) = .empty;
     defer module_ids.deinit(gpa);
 
@@ -60,7 +67,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         };
     }
 
-    // 沿 import 表发现全部模块（迭代过程中 module_ids 会增长）
+    // Discover all modules along the import tables (module_ids grows during the iteration)
     var modules: std.ArrayList(ProjectModel.Module) = .empty;
     var package_roots: std.StringArrayHashMapUnmanaged(void) = .empty;
     defer package_roots.deinit(gpa);
@@ -85,9 +92,10 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         });
     }
 
-    // builtin 的子命令与编译后端取以该模块为根的 compile step（决定 output_mode / is_test / zig_backend），
-    // 其他模块按 build-obj。同一模块常常既是可执行文件也是 test 的根，这时取 test：test 块中的
-    // `std.testing.allocator` 等依赖 `builtin.is_test`
+    // The subcommand and compiler backend for builtin come from the compile step rooted at the
+    // module (they determine output_mode / is_test / zig_backend); other modules use build-obj.
+    // The same module is often the root of both an executable and a test, in which case the test
+    // is used: `std.testing.allocator` and the like in test blocks depend on `builtin.is_test`
     const chosen = try a.alloc(?usize, modules.items.len);
     @memset(chosen, null);
     for (c.steps, 0..) |*src, si| switch (src.extended.get(c.extra)) {
@@ -110,7 +118,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
             .test_obj => "test-obj",
         };
         if (comp.flags3.kind == .test_obj) try args.append(a, "--test-no-exec");
-        // 编译后端决定 builtin 中的 `zig_backend`（向量的布局取决于它）
+        // The compiler backend determines `zig_backend` in builtin (vector layout depends on it)
         if (comp.flags2.use_llvm.toBool()) |on| try args.append(a, if (on) "-fllvm" else "-fno-llvm");
         mod.builtin_args = args.items;
     }
@@ -128,7 +136,8 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     } else @backingInt(c.default_step);
     const diagnostics_steps = try a.dupe(u32, &.{default_diag});
     const roots = try a.dupe([]const u8, package_roots.keys());
-    // arena 的状态复制进结果之后不能再分配：新增的缓冲区不在复制的状态中，释放时会泄漏
+    // Nothing may be allocated after the arena state is copied into the result: new
+    // buffers are not in the copied state and would leak when freed
     return .{
         .arena = arena_state.state,
         .build_root = ctx.build_root,
@@ -153,7 +162,8 @@ const ProducerVisitor = struct {
     }
 };
 
-/// 枚举 step 产出的生成文件（与 maker 上报 `bsp_step_completed` 时的遍历一致）
+/// Enumerates the generated files a step produces (same traversal as the maker uses when
+/// reporting `bsp_step_completed`)
 fn walkGeneratedFiles(c: *const Configuration, step: *const Configuration.Step, v: *ProducerVisitor) void {
     switch (step.extended.get(c.extra)) {
         .check_file, .fail, .fmt, .install_artifact, .install_dir, .install_file, .top_level, .update_source_files => {},
@@ -185,15 +195,16 @@ fn walkGeneratedFiles(c: *const Configuration, step: *const Configuration.Step, 
     }
 }
 
-/// maker 上报的生成文件路径（前缀 + 子路径）转为绝对路径
+/// Converts a generated file path reported by the maker (prefix + sub path) to an absolute path
 pub fn generatedPath(gpa: Allocator, model: *const ProjectModel, env: *const ZigEnv, prefix: std.zig.Server.Message.PathPrefix, sub_path: []const u8) Allocator.Error![]u8 {
     const base: []const u8 = switch (prefix) {
-        // maker 的 cwd 就是构建根目录
+        // The maker's cwd is the build root
         .cwd, .build_root => model.build_root,
         .zig_lib => env.lib_dir,
         .global_cache => env.global_cache_dir,
         .local_cache => blk: {
-            // 测试中手写的模型可以不设本地缓存目录，`convert` 得到的模型总是带绝对路径
+            // Hand-written models in tests may leave the local cache directory unset; models from
+            // `convert` always have an absolute path
             std.debug.assert(std.fs.path.isAbsolute(model.local_cache_root));
             break :blk model.local_cache_root;
         },
@@ -201,7 +212,8 @@ pub fn generatedPath(gpa: Allocator, model: *const ProjectModel, env: *const Zig
     return std.fs.path.resolveAlloc(gpa, &.{ base, sub_path });
 }
 
-/// 影响 `builtin.zig` 的模块参数，与构建系统传给编译器的写法一致（见 Maker/Step/Compile.zig 的 appendModuleFlags）
+/// Module arguments that affect `builtin.zig`, written the same way the build system passes them
+/// to the compiler (see appendModuleFlags in Maker/Step/Compile.zig)
 fn builtinArgs(a: Allocator, c: *const Configuration, m: *const Configuration.Module) Allocator.Error![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     try args.append(a, "build-obj");
@@ -250,7 +262,8 @@ const Ctx = struct {
     local_cache_root: []const u8,
     env: *const ZigEnv,
 
-    /// 解析为绝对路径；生成文件等构建前无法确定的路径返回 null
+    /// Resolves to an absolute path; returns null for paths that cannot be known before the
+    /// build, such as generated files
     fn resolve(ctx: Ctx, lp: Configuration.LazyPath) Allocator.Error!?[]const u8 {
         const c = ctx.c;
         return switch (lp) {
@@ -273,12 +286,14 @@ const Ctx = struct {
         };
     }
 
-    /// 依赖包的根目录（绝对路径）：maker 给出的路径相对于它的 cwd（即构建根目录）或为绝对路径
+    /// Root directory of a dependency package (absolute path): the path the maker gives is
+    /// relative to its cwd (i.e. the build root) or absolute
     fn packageRoot(ctx: Ctx, package: Configuration.Package) Allocator.Error![]const u8 {
         return std.fs.path.resolveAlloc(ctx.arena, &.{ ctx.build_root, package.root_path.slice(ctx.c) });
     }
 
-    /// `lp` 所在的、按哈希获取的依赖包的根目录（绝对路径）；不在这样的包中时为 null
+    /// Root directory (absolute path) of the dependency package fetched by hash that contains
+    /// `lp`; null when `lp` is not in such a package
     fn fetchedPackageRoot(ctx: Ctx, lp: Configuration.LazyPath) Allocator.Error!?[]const u8 {
         const sp = switch (lp) {
             .source_path => |sp| sp,
@@ -295,8 +310,10 @@ const Ctx = struct {
     }
 };
 
-/// 根目录为 `root`、哈希为 `hash` 的依赖包是否是获取来的：maker 把获取的包存放在包目录（`--pkg-dir`、`--system`
-/// 或 `<构建根>/zig-pkg`）的 `<哈希>` 子目录中。`--fork` 指定的包使用用户给出的目录
+/// Whether the dependency package with root directory `root` and hash `hash` was fetched: the
+/// maker stores fetched packages in the `<hash>` subdirectory of the package directory
+/// (`--pkg-dir`, `--system`, or `<build root>/zig-pkg`). A package given by `--fork` uses the
+/// directory the user specifies
 fn isFetched(root: []const u8, hash: []const u8) bool {
     return hash.len != 0 and std.mem.eql(u8, std.fs.path.basename(root), hash);
 }
@@ -317,13 +334,13 @@ test localCacheRoot {
     const a = arena.allocator();
     const root = native("/p");
     try std.testing.expectEqualStrings(native("/p/.zig-cache"), try localCacheRoot(a, root, ".zig-cache/c/0123"));
-    // `ZIG_LOCAL_CACHE_DIR` / `--cache-dir` 为相对路径：相对于构建根目录
+    // `ZIG_LOCAL_CACHE_DIR` / `--cache-dir` is a relative path: relative to the build root
     try std.testing.expectEqualStrings(native("/p/relcache"), try localCacheRoot(a, root, "relcache/c/0123"));
     try std.testing.expectEqualStrings(native("/altcache"), try localCacheRoot(a, root, "../altcache/c/0123"));
     try std.testing.expectEqualStrings(native("/elsewhere/cache"), try localCacheRoot(a, root, native("/elsewhere/cache/c/0123")));
-    // 本地缓存目录就是构建根目录
+    // The local cache directory is the build root itself
     try std.testing.expectEqualStrings(root, try localCacheRoot(a, root, "c/0123"));
-    // 不使用缓存时构建图在 `tmp` 下
+    // When no cache is used, the build graph is under `tmp`
     try std.testing.expectEqualStrings(native("/p/sub/cache"), try localCacheRoot(a, root, "sub/cache/tmp/1f"));
 }
 

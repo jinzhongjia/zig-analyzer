@@ -1,4 +1,5 @@
-//! 端到端：查找引用、文档高亮、重命名、workspace symbol 与 code action（跨模块，未打开的文件经由模块图纳入范围）。
+//! End-to-end: find references, document highlight, rename, workspace symbol and code actions
+//! (across modules; unopened files are brought into scope through the module graph).
 
 const std = @import("std");
 const testing = std.testing;
@@ -42,7 +43,7 @@ fn basename(u: []const u8) []const u8 {
     return u[std.mem.lastIndexOfScalar(u8, u, '/').? + 1 ..];
 }
 
-/// 「文件名:行:列」
+/// "file:line:column"
 fn loc(h: *Harness, u: []const u8, range: std.json.Value) ![]const u8 {
     const start = range.object.get("start").?.object;
     return std.fmt.allocPrint(h.arena.allocator(), "{s}:{d}:{d}", .{ basename(u), start.get("line").?.integer, start.get("character").?.integer });
@@ -67,7 +68,8 @@ test "references, highlight, rename and workspace symbol" {
     _ = try h.request("zig-analyzer/waitIdle", {});
     const doc = .{ .uri = uri };
 
-    // 后台索引已为未打开的 lib.zig 算出成员摘要：workspace symbol 不在请求中计算（计算要用到语法树）
+    // Background indexing has already computed member summaries for the unopened lib.zig: workspace
+    // symbol does not compute them in the request (computing them needs the syntax tree)
     {
         const before = h.server.db.executions(za.syntax.queries.ItemSummaries);
         const resp = try h.request("workspace/symbol", .{ .query = "hello" });
@@ -75,7 +77,7 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqual(before, h.server.db.executions(za.syntax.queries.ItemSummaries));
     }
 
-    // 查找引用：lib.zig 未打开，经由模块图纳入
+    // Find references: lib.zig is not open and is included through the module graph
     {
         const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(main_text, "hello"), .context = .{ .includeDeclaration = true } });
         var out: std.ArrayList([]const u8) = .empty;
@@ -88,7 +90,7 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("lib.zig:0:7 lib.zig:2:4 main.zig:3:8 main.zig:4:8", try join(&h, out.items));
     }
 
-    // 文档高亮：只在当前文件
+    // Document highlight: only in the current file
     {
         const resp = try h.request("textDocument/documentHighlight", .{ .textDocument = doc, .position = position(main_text, "hello") });
         var out: std.ArrayList([]const u8) = .empty;
@@ -96,7 +98,7 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("main.zig:3:8 main.zig:4:8", try join(&h, out.items));
     }
 
-    // 重命名
+    // Rename
     {
         const prep = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(main_text, "hello") });
         try testing.expectEqualStrings("hello", prep.object.get("result").?.object.get("placeholder").?.string);
@@ -109,15 +111,16 @@ test "references, highlight, rename and workspace symbol" {
             try testing.expectEqual(2, edits.len);
             for (edits) |e| try testing.expectEqualStrings("greet", e.object.get("newText").?.string);
         }
-        // 关键字作为新名字：用 @"..." 包裹
+        // A keyword as the new name: wrapped in @"..."
         const kw = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "hello"), .newName = "fn" });
         var kw_it = kw.object.get("result").?.object.get("changes").?.object.iterator();
         try testing.expectEqualStrings("@\"fn\"", kw_it.next().?.value_ptr.array.items[0].object.get("newText").?.string);
-        // 原生类型的名字：同样用 @"..." 包裹（原样写入时与原生类型同名，编译错误）
+        // Names of primitive types: also wrapped in @"..." (written as is, the name would clash
+        // with the primitive type, which is a compile error)
         const prim = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "hello"), .newName = "u8" });
         var prim_it = prim.object.get("result").?.object.get("changes").?.object.iterator();
         try testing.expectEqualStrings("@\"u8\"", prim_it.next().?.value_ptr.array.items[0].object.get("newText").?.string);
-        // 标准库中的声明不能重命名
+        // Declarations in the standard library cannot be renamed
         const std_rename = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(main_text, "Allocator") });
         try testing.expect(std_rename.object.get("error") != null);
     }
@@ -129,7 +132,8 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expect(syms.len >= 1);
         try testing.expectEqualStrings("hello", syms[0].object.get("name").?.string);
 
-        // 索引进行中：只在已建立索引的文件与打开的文档中查找（lib.zig 尚未索引、也未打开）
+        // Indexing in progress: only indexed files and open documents are searched (lib.zig is
+        // neither indexed yet nor open)
         h.server.indexing.store(true, .release);
         h.server.indexed_mutex.lockUncancelable(testing.io);
         h.server.indexed.clearRetainingCapacity();
@@ -141,7 +145,7 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("main", open_doc.object.get("result").?.array.items[0].object.get("name").?.string);
     }
 
-    // code action：未使用的局部常量
+    // code action: unused local constant
     {
         const extra = "const y = 2;\nfn f() void {\n    const x = 1;\n}\n";
         const extra_uri = try za.base.uri.fromPath(a, try project.path(a, "src/extra.zig"));
@@ -158,7 +162,8 @@ test "references, highlight, rename and workspace symbol" {
         const edits = actions[0].object.get("edit").?.object.get("changes").?.object.get(extra_uri).?.array.items;
         try testing.expectEqualStrings("\n    _ = x;", edits[0].object.get("newText").?.string);
 
-        // 起止颠倒的区间按交换后处理（未交换时偏移相减下溢，服务器崩溃）
+        // A range with start and end reversed is handled as if swapped (without the swap,
+        // subtracting the offsets underflows and the server crashes)
         const reversed = try h.request("textDocument/codeAction", .{
             .textDocument = .{ .uri = extra_uri },
             .range = .{ .start = p, .end = .{ .line = 0, .character = 0 } },
@@ -167,9 +172,9 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expect(reversed.object.get("result") != null);
     }
 
-    // 可观测性：status 的查询统计与慢请求报告
+    // Observability: query statistics in status and slow request reports
     {
-        // hover 推导 main 的函数体，统计中有执行过的 Infer
+        // hover infers the body of main, so the statistics include executed Infer queries
         _ = try h.request("textDocument/hover", .{ .textDocument = doc, .position = position(main_text, "hello();") });
         const st = try h.request("zig-analyzer/status", {});
         var found = false;
@@ -182,7 +187,8 @@ test "references, highlight, rename and workspace symbol" {
         }
         try testing.expect(found);
 
-        // lib.zig 的 test 体尚未推导过：hover 时记录实际执行的 query 并生成报告
+        // The test body in lib.zig has not been inferred yet: hover records the queries actually
+        // executed and generates a report
         var ctx = h.server.db.beginRead(a);
         defer ctx.end();
         var trace: za.db.Trace = .{ .gpa = a };
@@ -195,7 +201,7 @@ test "references, highlight, rename and workspace symbol" {
         try h.server.writeSlowReport(&out.writer, &ctx, &trace, 0);
         const report = out.written();
         try testing.expect(std.mem.indexOf(u8, report, "by query (self time):") != null);
-        // 调用树中的 key 以「文件名:成员名」显示（test 没有名字）
+        // Keys in the call tree are shown as "file:member" (a test has no name)
         try testing.expect(std.mem.indexOf(u8, report, "queries.Infer {owner=lib.zig:_") != null);
     }
     _ = try h.request("shutdown", {});
@@ -205,7 +211,8 @@ test "references, highlight, rename and workspace symbol" {
 test "rename reaches references in deeply nested code" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
-    // 左结合的运算链每项深一层：最左边的 `one` 在语法树中 1500 多层深
+    // Each term of a left-associative operator chain is one level deeper: the leftmost `one` is
+    // over 1500 levels deep in the syntax tree
     try text.appendSlice(testing.allocator, "const one: u32 = 1;\nconst sum = one");
     for (0..1500) |_| try text.appendSlice(testing.allocator, " + one");
     try text.appendSlice(testing.allocator, ";\npub fn main() void {\n    _ = sum;\n}\n");
@@ -259,10 +266,10 @@ test "rename refuses when a generic reference also refers to other declarations"
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // `read` 中的 `p.x` 在 T 的实例下是 T.x：不返回只改了一部分的结果
+    // `p.x` in `read` is T.x in T's instance: no partially renamed result is returned
     const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x"), .newName = "y" });
     try testing.expect(resp.object.get("error") != null);
-    // 查找引用仍然包含它
+    // Find references still includes it
     const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x"), .context = .{ .includeDeclaration = true } });
     try testing.expectEqual(3, refs.object.get("result").?.array.items.len);
     _ = try h.request("shutdown", {});

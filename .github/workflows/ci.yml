@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    name: 测试 (${{ matrix.os }})
+    name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -26,19 +26,19 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: 全部测试（Debug）
+      - name: All tests (Debug)
         run: zig build test-all --summary all
-      - name: 全部测试（ReleaseSafe）
+      - name: All tests (ReleaseSafe)
         run: zig build test-all -Doptimize=ReleaseSafe --summary all
-      - name: 构建可执行文件
+      - name: Build the executable
         run: zig build -Doptimize=ReleaseSafe
-      - name: 编译检查（含基准工具）
+      - name: Compile check (including benchmark tools)
         run: zig build check -Doptimize=ReleaseSafe
-      - name: 语料对拍（Zig 标准库 + 本仓库源码）
+      - name: Corpus cross-check (Zig standard library + this repository's sources)
         run: zig build corpus -Doptimize=ReleaseSafe -- src tools
 
   lint:
-    name: 格式与生成代码
+    name: Formatting and generated code
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -48,13 +48,13 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         run: zig fmt --check src tools build.zig
-      - name: 生成代码与提交一致
+      - name: Generated code matches the committed files
         run: |
           zig build gen
           git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig
 
   fuzz:
-    name: 覆盖率引导模糊测试
+    name: Coverage-guided fuzzing
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -62,7 +62,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      # 使用 ReleaseSafe：Linux x86_64 的 Debug 构建默认走自研后端，不支持覆盖率插桩
-      # （覆盖率文件 pcs_len 为 0）；ReleaseSafe 走 LLVM，吞吐量也更高。每个模糊目标 5 万次。
+      # Use ReleaseSafe: Debug builds on Linux x86_64 use the self-hosted backend by default, which
+      # does not support coverage instrumentation (pcs_len in the coverage file is 0); ReleaseSafe
+      # uses LLVM and also has higher throughput. 50K runs per fuzz target.
       - name: zig build test --fuzz
         run: zig build test -Doptimize=ReleaseSafe --fuzz=50K

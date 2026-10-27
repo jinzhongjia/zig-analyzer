@@ -1,16 +1,26 @@
-//! 整理顶层 import（`source.organizeImports`），以及自动导入时新 import 的位置。只看语法树与源码文本。
+//! Organizing top-level imports (`source.organizeImports`), and the position of a new import
+//! added by auto-import. Only the syntax tree and the source text are examined.
 //!
-//! 可整理的块由连续的顶层 import 声明与派生声明组成：
-//! - import 声明：`const x = @import("...");`，可以带成员访问（`const T = @import("x.zig").T;`）；
-//! - 派生声明：右侧是以同一文件的 import 或派生声明开头的成员访问（`const Allocator = std.mem.Allocator;`）。
+//! An organizable block consists of consecutive top-level import declarations and derived
+//! declarations:
+//! - import declaration: `const x = @import("...");`, optionally with a member access
+//!   (`const T = @import("x.zig").T;`);
+//! - derived declaration: the right-hand side is a member access starting with an import or
+//!   derived declaration of the same file (`const Allocator = std.mem.Allocator;`).
 //!
-//! 声明之间只能有空行；紧贴在声明上方的注释与行尾注释属于它。与下一条声明之间隔着空行的注释、其他声明结束一个块。
-//! 每条声明须独占若干整行，否则不属于任何块。
+//! Only blank lines may separate declarations; comments directly above a declaration and its
+//! trailing comment belong to it. A comment separated from the next declaration by a blank line,
+//! or any other declaration, ends a block.
+//! Each declaration must occupy whole lines by itself; otherwise it belongs to no block.
 //!
-//! 块内按组排列，组之间空一行：`std` / `builtin` / `root`（固定顺序）、依赖模块、文件。派生声明紧跟在它依赖的声明之后
-//! （`with_import`），或在所有 import 之后单独成一组（`separate`）；依赖的声明不在同一块中的派生声明总是在最后一组。
-//! 组内按引用的东西（`sort = .path`：模块名、文件路径、派生声明展开后的访问路径）或声明名（`.name`）排序，每段用
-//! rustfmt 的 version sort 比较；文件路径中离得近的在前（同目录与子目录、`../`、`../../`）。
+//! Within a block, declarations are arranged in groups separated by one blank line:
+//! `std` / `builtin` / `root` (fixed order), dependency modules, files. A derived declaration
+//! directly follows the declaration it depends on (`with_import`), or derived declarations form a
+//! group of their own after all imports (`separate`); a derived declaration whose dependency is
+//! not in the same block always goes in the last group. Within a group, entries are sorted by
+//! what they reference (`sort = .path`: module name, file path, the expanded access path of a
+//! derived declaration) or by declaration name (`.name`), comparing each segment with rustfmt's
+//! version sort; nearer file paths come first (same directory and subdirectories, `../`, `../../`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,7 +29,7 @@ const Parse = @import("../syntax/Parse.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 
-/// 配置 `imports.*`
+/// The `imports.*` configuration
 pub const Options = struct {
     derived: Derived = .with_import,
     sort: Sort = .path,
@@ -31,33 +41,36 @@ pub const Options = struct {
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
 pub const Block = struct {
-    /// 首条声明（含上方的注释）所在行的开头
+    /// Start of the line of the first declaration (including the comments above it)
     start: u32,
-    /// 末条声明所在行的行尾（不含换行）
+    /// End of the line of the last declaration (excluding the newline)
     end: u32,
     entries: []const Entry,
 };
 
 pub const Entry = struct {
-    /// 与块的范围相同的粒度：上方注释所在行的开头到声明所在行的行尾
+    /// Same granularity as the range of a block: from the start of the line of the comments above
+    /// to the end of the line of the declaration
     start: u32,
     end: u32,
-    /// 声明节点的起点
+    /// Start of the declaration node
     decl: u32,
     name: []const u8,
     what: What,
 };
 
 pub const What = union(enum) {
-    /// `member` 为 `@import(...)` 之后的成员访问（`Service.Index`，没有时为空）
+    /// `member` is the member access following `@import(...)` (`Service.Index`; empty if none)
     import: struct { spec: []const u8, member: []const u8 },
-    /// `root` 为右侧开头的名字，`path` 为展开到 import 声明名的完整访问路径（`std.mem.Allocator`）
+    /// `root` is the name at the start of the right-hand side; `path` is the full access path
+    /// expanded up to the name of the import declaration (`std.mem.Allocator`)
     derived: struct { root: []const u8, path: []const u8 },
 };
 
 pub const Result = struct { blocks: []const Block, edits: []const Edit };
 
-/// 整理文件中的全部块：已经整理好的块没有编辑。有语法错误时不整理
+/// Organizes all blocks in the file: blocks that are already organized get no edits. Does not
+/// organize when there are syntax errors.
 pub fn organize(a: Allocator, parse: *const Parse, opts: Options) Allocator.Error!Result {
     if (parse.errors.len != 0) return .{ .blocks = &.{}, .edits = &.{} };
     const all = try blocks(a, parse);
@@ -69,14 +82,16 @@ pub fn organize(a: Allocator, parse: *const Parse, opts: Options) Allocator.Erro
     return .{ .blocks = all, .edits = edits.items };
 }
 
-/// 自动导入的新 import 的位置。包含最后一条 import 声明的块已经整理好时，按同样的规则放到它应在的位置；否则（块没有
-/// 整理好、还没有 import）放在最后一条 import 声明之后，或文件头的 `//!` 文档之后
+/// Position of a new import added by auto-import. When the block containing the last import
+/// declaration is already organized, the import is placed where it belongs by the same rules;
+/// otherwise (the block is not organized, or there are no imports yet) it goes after the last
+/// import declaration, or after the `//!` docs at the top of the file.
 pub const Inserter = struct {
     source: []const u8,
     opts: Options,
-    /// 包含最后一条 import 声明、已经整理好的块
+    /// The already organized block containing the last import declaration
     block: ?Block,
-    /// 其他情况下的插入位置（行首）
+    /// Insertion position in the other cases (start of a line)
     fallback: u32,
 
     pub fn init(a: Allocator, parse: *const Parse, opts: Options) Allocator.Error!Inserter {
@@ -92,7 +107,8 @@ pub const Inserter = struct {
         return ins;
     }
 
-    /// 插入 `const {name} = @import("{spec}"){.member};`（`decl` 为这一行的文本，不含换行）的编辑
+    /// Edit that inserts `const {name} = @import("{spec}"){.member};` (`decl` is the text of this
+    /// line, without the newline)
     pub fn edit(ins: Inserter, a: Allocator, name: []const u8, spec: []const u8, member: []const u8, decl: []const u8) Allocator.Error!Edit {
         const b = ins.block orelse {
             const offset = ins.fallback;
@@ -106,7 +122,8 @@ pub const Inserter = struct {
     }
 };
 
-/// `@import(...)` 或它的成员访问（可加括号）：import 声明的初始化表达式
+/// `@import(...)` or a member access on it (possibly parenthesized): the initializer expression
+/// of an import declaration
 pub fn isImportInit(node: SyntaxNode) bool {
     if (node.kind() == .builtin_call) {
         const name = node.childToken(.builtin) orelse return false;
@@ -119,7 +136,7 @@ pub fn isImportInit(node: SyntaxNode) bool {
     return false;
 }
 
-/// 最后一条顶层 import 声明（含不属于任何块的）的起点
+/// Start of the last top-level import declaration (including ones that belong to no block)
 fn lastImport(parse: *const Parse) ?u32 {
     var last: ?u32 = null;
     var children = parse.rootNode().children();
@@ -135,7 +152,8 @@ fn importDecl(node: SyntaxNode) bool {
     return isImportInit(init);
 }
 
-/// 最后一条 import 声明所在行的下一行行首（保留同行的注释）；没有 import 时为文件头 `//!` 文档之后（UTF-8 BOM 之后）
+/// Start of the line after the last import declaration (keeping a comment on the same line);
+/// without imports, after the `//!` docs at the top of the file (after the UTF-8 BOM)
 fn fallbackOffset(parse: *const Parse) u32 {
     const source = parse.source;
     var last: ?u32 = null;
@@ -150,7 +168,8 @@ fn fallbackOffset(parse: *const Parse) u32 {
         if (pos < source.len and source[pos] == '\n') pos += 1;
         return @intCast(pos);
     }
-    // BOM 只允许在文件开头；import 不能插到它前面，否则 BOM 移到第二行成为非法 token
+    // A BOM is only allowed at the start of the file; an import must not be inserted before it,
+    // otherwise the BOM moves to the second line and becomes an invalid token
     const start: usize = bomLen(source);
     var pos: usize = start;
     var docs_end: usize = start;
@@ -169,9 +188,10 @@ fn bomLen(source: []const u8) usize {
     return if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) 3 else 0;
 }
 
-// ── 块 ───────────────────────────────────────────────────────────────
+// ── Blocks ───────────────────────────────────────────────────────────
 
-/// 顶层 const 声明解析出的 import 或派生声明（派生声明在 `blocks` 中检查它开头的名字）
+/// Import or derived declaration parsed from a top-level const declaration (for a derived
+/// declaration, the name it starts with is checked in `blocks`)
 const Candidate = struct { node: SyntaxNode, name: []const u8, what: What };
 
 fn candidate(a: Allocator, node: SyntaxNode) Allocator.Error!?Candidate {
@@ -182,7 +202,7 @@ fn candidate(a: Allocator, node: SyntaxNode) Allocator.Error!?Candidate {
     const decl: ast.VarDecl = .{ .syntax = node };
     const name = decl.name() orelse return null;
     var e = decl.initExpr() orelse return null;
-    // 成员访问由外向内
+    // Member accesses, from the outside in
     var members: std.ArrayList([]const u8) = .empty;
     while (true) switch (e.kind()) {
         .field_access => {
@@ -222,7 +242,7 @@ fn candidate(a: Allocator, node: SyntaxNode) Allocator.Error!?Candidate {
     }
 }
 
-/// 文件中可整理的块
+/// Organizable blocks in the file
 pub fn blocks(a: Allocator, parse: *const Parse) Allocator.Error![]const Block {
     const source = parse.source;
     const root = parse.rootNode();
@@ -234,7 +254,8 @@ pub fn blocks(a: Allocator, parse: *const Parse) Allocator.Error![]const Block {
         if (!gop.found_existing) gop.value_ptr.* = cands.items.len;
         try cands.append(a, c);
     };
-    // 派生声明须沿开头的名字追溯到 import 声明；按确认的顺序展开完整路径（依赖的声明总是先确认）
+    // A derived declaration must trace back to an import declaration through its leading name;
+    // full paths are expanded in the order of confirmation (a dependency is always confirmed first)
     const valid = try a.alloc(bool, cands.items.len);
     for (cands.items, valid) |c, *v| v.* = c.what == .import;
     var changed = true;
@@ -295,7 +316,9 @@ fn close(a: Allocator, out: *std.ArrayList(Block), current: *std.ArrayList(Entry
     current.clearRetainingCapacity();
 }
 
-/// 声明独占整行时的条目：前面只有缩进（或文件开头的 BOM），后面只有空白与行尾注释；上方紧贴的 `//` 注释行一并归入
+/// Entry for a declaration that occupies whole lines by itself: only indentation (or the BOM at
+/// the start of the file) before it, and only whitespace and a trailing comment after it; `//`
+/// comment lines directly above it are included as well
 fn lineEntry(source: []const u8, node: SyntaxNode, c: Candidate) ?Entry {
     const range = node.range();
     var line_start: usize = if (std.mem.lastIndexOfScalar(u8, source[0..range.start], '\n')) |i| i + 1 else bomLen(source);
@@ -314,13 +337,13 @@ fn lineEntry(source: []const u8, node: SyntaxNode, c: Candidate) ?Entry {
     return .{ .start = @intCast(line_start), .end = @intCast(end), .decl = range.start, .name = c.name, .what = c.what };
 }
 
-/// 块中使用的换行
+/// Newline sequence used in the block
 fn newline(source: []const u8, b: Block) []const u8 {
     const line_end = std.mem.indexOfScalarPos(u8, source, b.entries[0].decl, '\n') orelse return "\n";
     return if (line_end > 0 and source[line_end - 1] == '\r') "\r\n" else "\n";
 }
 
-// ── 排序 ─────────────────────────────────────────────────────────────
+// ── Sorting ──────────────────────────────────────────────────────────
 
 const Group = enum { std, module, file, derived };
 
@@ -341,10 +364,10 @@ fn stdRank(spec: []const u8) ?u8 {
     return null;
 }
 
-/// 自动导入加入的一条：`text` 为它的源码
+/// Entry added by auto-import: `text` is its source
 const Extra = struct { entry: Entry, text: []const u8 };
 
-/// 块（加上 `extra`）整理后的文本
+/// Organized text of the block (plus `extra`)
 fn render(a: Allocator, source: []const u8, entries: []const Entry, extra: ?Extra, nl: []const u8, opts: Options) Allocator.Error![]const u8 {
     var all: std.ArrayList(Entry) = .empty;
     try all.appendSlice(a, entries);
@@ -353,7 +376,7 @@ fn render(a: Allocator, source: []const u8, entries: []const Entry, extra: ?Extr
     const texts = try a.alloc([]const u8, items.len);
     for (items, texts, 0..) |e, *t, i| t.* = if (extra != null and i == items.len - 1) extra.?.text else source[e.start..e.end];
 
-    // 派生声明的上级：依赖的声明在同一块中时
+    // Parent of a derived declaration: when the declaration it depends on is in the same block
     const parent = try a.alloc(?usize, items.len);
     for (items, parent) |e, *p| p.* = switch (e.what) {
         .import => null,
@@ -366,11 +389,11 @@ fn render(a: Allocator, source: []const u8, entries: []const Entry, extra: ?Extr
     var groups: [4]std.ArrayList(usize) = @splat(.empty);
     for (items, parent, 0..) |e, p, i| {
         const g = groupOf(e);
-        // 跟在上级之后的派生声明由上级带出
+        // A derived declaration that follows its parent is emitted by the parent
         if (g == .derived and opts.derived == .with_import and p != null) continue;
         try groups[@backingInt(g)].append(a, i);
     }
-    // 组之间空一行
+    // One blank line between groups
     var out: std.ArrayList(u8) = .empty;
     for (&groups) |*group| {
         if (group.items.len == 0) continue;
@@ -381,7 +404,7 @@ fn render(a: Allocator, source: []const u8, entries: []const Entry, extra: ?Extr
     return out.items;
 }
 
-/// 输出一行，`with_import` 时随后输出跟在它之后的派生声明
+/// Emits one line; with `with_import`, then emits the derived declarations that follow it
 fn emit(a: Allocator, out: *std.ArrayList(u8), ctx: SortCtx, texts: []const []const u8, parent: []const ?usize, i: usize, nl: []const u8) Allocator.Error!void {
     if (out.items.len != 0) try out.appendSlice(a, nl);
     try out.appendSlice(a, texts[i]);
@@ -400,7 +423,7 @@ const SortCtx = struct {
         return ctx.order(ctx.items[x], ctx.items[y]) == .lt;
     }
 
-    /// 同一组中的两条（`std` 组总是按固定顺序）
+    /// Order of two entries in the same group (the `std` group always uses the fixed order)
     fn order(ctx: SortCtx, x: Entry, y: Entry) std.math.Order {
         if (ctx.opts.sort == .name and groupOf(x) != .std) {
             const o = versionOrder(x.name, y.name);
@@ -424,7 +447,7 @@ fn importOrder(spec_x: []const u8, member_x: []const u8, spec_y: []const u8, mem
     return if (o != .eq) o else segmentsOrder(member_x, member_y, '.');
 }
 
-/// 文件路径：`../` 少的（离得近的）在前，然后逐段比较
+/// File paths: fewer `../` (nearer) first, then compared segment by segment
 fn pathOrder(x: []const u8, y: []const u8) std.math.Order {
     const rx = stripUps(x);
     const ry = stripUps(y);
@@ -445,7 +468,8 @@ fn stripUps(path: []const u8) struct { ups: usize, rest: []const u8 } {
     }
 }
 
-/// 逐段比较，前面各段相同时段少的在前
+/// Compares segment by segment; when the leading segments are equal, the one with fewer
+/// segments comes first
 fn segmentsOrder(x: []const u8, y: []const u8, sep: u8) std.math.Order {
     var ix = std.mem.splitScalar(u8, x, sep);
     var iy = std.mem.splitScalar(u8, y, sep);
@@ -476,8 +500,11 @@ fn nextChunk(s: []const u8, i: *usize) ?Chunk {
     return if (digits) .{ .num = s[start..end] } else .{ .str = s[start..end] };
 }
 
-/// rustfmt 的 version sort（Rust Style Guide 的 Sorting 一节）：按连续的数字与非数字分段，数字段按数值比较（数值相同时
-/// 记下第一处前导零多的一方，其余都相同时它在前），其他段按字节比较（大写字母在小写字母之前），`_` 排在一切字符之前
+/// rustfmt's version sort (the Sorting section of the Rust Style Guide): strings are split into
+/// runs of digits and non-digits; digit runs are compared by numeric value (on equal values, the
+/// side with more leading zeros at the first such difference is remembered, and it comes first if
+/// everything else is equal), other runs are compared bytewise (uppercase letters before
+/// lowercase), and `_` sorts before every other character
 pub fn versionOrder(x: []const u8, y: []const u8) std.math.Order {
     var ix: usize = 0;
     var iy: usize = 0;
@@ -513,9 +540,10 @@ pub fn versionOrder(x: []const u8, y: []const u8) std.math.Order {
     }
 }
 
-// ── 插入的编辑 ───────────────────────────────────────────────────────
+// ── Insertion edits ──────────────────────────────────────────────────
 
-/// 整理好的块变为 `text`（只多出新的一条与可能的空行）：按行比较，只替换不同的行
+/// The organized block becomes `text` (with only the new entry and possibly a blank line added):
+/// compares line by line and replaces only the lines that differ
 fn lineDiff(a: Allocator, source: []const u8, b: Block, text: []const u8, nl: []const u8) Allocator.Error!Edit {
     var old_lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitSequence(u8, source[b.start..b.end], nl);
@@ -529,14 +557,15 @@ fn lineDiff(a: Allocator, source: []const u8, b: Block, text: []const u8, nl: []
     while (p < old.len and p < new.len and std.mem.eql(u8, old[p], new[p])) p += 1;
     var s: usize = 0;
     while (s < old.len - p and s < new.len - p and std.mem.eql(u8, old[old.len - 1 - s], new[new.len - 1 - s])) s += 1;
-    // 第 i 行的行首（相对源码）
+    // Start of line i (relative to the source)
     var starts = try a.alloc(u32, old.len + 1);
     starts[0] = b.start;
     for (old, 0..) |l, i| starts[i + 1] = starts[i] + @as(u32, @intCast(l.len + nl.len));
     var out: std.ArrayList(u8) = .empty;
     const middle = new[p .. new.len - s];
     if (p + s == old.len and s == 0) {
-        // 追加在块末尾：插在下一行行首；文件以块结尾、没有换行时补上换行
+        // Appended at the end of the block: insert at the start of the next line; when the file
+        // ends with the block and has no newline, add one
         if (b.end < source.len) {
             for (middle) |l| {
                 try out.appendSlice(a, l);

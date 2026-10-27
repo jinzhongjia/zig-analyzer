@@ -1,8 +1,11 @@
-//! 自动导入：自持有的声明索引、公开导出闭包与安全的源码编辑。
+//! Auto-import: its own declaration index, the public export closure, and safe source edits.
 //!
-//! `FileDecls` 由 ItemTree 得出可从文件根访问的声明，`FileLinks` 记录各声明指向的命名空间与别名的规范目标，
-//! `Exports` 沿公开成员展开闭包。命名空间与别名都由 `Resolver.namespaceOf` / `aliasTarget` 求值，与跳转、
-//! hover 等功能是同一份实现；条件形式（`if` / `switch`）的命名空间由推导求出。
+//! `FileDecls` derives from the ItemTree the declarations accessible from the file root,
+//! `FileLinks` records the namespace each declaration refers to and the canonical target of
+//! aliases, and `Exports` expands the closure along public members. Namespaces and aliases are
+//! both evaluated by `Resolver.namespaceOf` / `aliasTarget`, the same implementation as goto,
+//! hover and other features; namespaces in conditional form (`if` / `switch`) are computed by
+//! inference.
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -26,11 +29,13 @@ const symbol_kind = @import("symbol_kind.zig");
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 pub const Candidate = struct {
     label: []const u8,
-    /// 声明的种类见 `symbol_kind`；`module`、`file` 为新增 import 的模块与文件本身
+    /// Declaration kinds as in `symbol_kind`; `module` and `file` are a newly imported module or
+    /// file itself
     kind: enum { function, constant, variable, namespace, @"struct", @"enum", type, module, file },
     filter: []const u8,
     qualifier: []const u8,
-    /// 匹配分（见 `fuzzy`）乘以来源的权重与路径的深度系数，越大越靠前
+    /// Match score (see `fuzzy`) multiplied by the weight of the source and the depth factor of
+    /// the path; higher scores come first
     score: f32,
     doc: ?[]const u8 = null,
     import_edit: ?Edit = null,
@@ -38,26 +43,29 @@ pub const Candidate = struct {
 };
 pub const Result = struct { items: []const Candidate, is_incomplete: bool = false };
 pub const Declaration = struct { file: FileId, item: u32 };
-/// 候选所指的定义：补全项被选中时据此给出签名、文档与位置
+/// The definition a candidate refers to: provides the signature, documentation and location when
+/// the completion item is selected
 pub const Target = union(enum) {
     decl: Declaration,
-    /// 模块或文件本身
+    /// The module or file itself
     file: FileId,
 };
 
-/// 别名链与成员访问的最大求值深度，与 `Resolver` 的别名链上限相同
+/// Maximum evaluation depth of alias chains and member accesses, the same as the alias chain limit
+/// of `Resolver`
 const max_depth = 100;
 
-/// 补全对命名空间之下至多这么多段的路径做模糊匹配（`std.mem.eql` 在 `std` 之下 2 段），更深的只按名字的前缀匹配
+/// Completion fuzzy-matches the paths of at most this many segments below a namespace
+/// (`std.mem.eql` is 2 segments below `std`); deeper ones are matched only by name prefix
 pub const shallow_depth = 2;
 
-/// 只为 Zig 源文件建索引：模块的根可以是 `.zon` 或任意数据文件（如 `addAnonymousImport` 引入的 JSON），
-/// 按 Zig 解析它们没有意义，大文件还很慢
+/// Only Zig source files are indexed: a module root can be `.zon` or any data file (such as JSON
+/// added by `addAnonymousImport`); parsing those as Zig is meaningless, and slow for large files
 pub fn isZigSource(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".zig");
 }
 
-// ── 文件的声明 ─────────────────────────────────────────────────────
+// ── File declarations ──────────────────────────────────────────────
 
 pub const Decl = struct {
     name: []const u8,
@@ -66,41 +74,48 @@ pub const Decl = struct {
     is_pub: bool,
     is_extern: bool,
     container: u32,
-    /// 顶层祖先（经由它访问）的名字；顶层声明为 null
+    /// Name of the top-level ancestor (through which it is accessed); null for top-level decls
     root: ?[]const u8,
-    /// 从文件根访问它的路径（各段已转义）
+    /// Path to access it from the file root (each segment escaped)
     path: []const u8,
-    /// 指向本文件中的容器时为该容器（容器字面量、`@This()`、指向同文件容器的别名）；指向其他文件的由
-    /// `Eval` 求值
+    /// The container when it refers to a container in this file (a container literal,
+    /// `@This()`, an alias to a container in the same file); references to other files are
+    /// evaluated by `Eval`
     local: ?u32,
     doc: ?[]const u8,
-    /// 按语法能确定的种类（const 与 var），补全的候选据此显示种类，不必为它求声明的类型
+    /// The kind as far as the syntax determines it (const and var); completion candidates show
+    /// their kind from it without inferring the declaration's type
     form: symbol_kind.Form = .unknown,
 };
 
-/// 经由公开成员（包括指向同文件私有容器的公开别名）从文件根可达的声明：`decl` 为 `DeclIndex.decls` 的下标
+/// A declaration reachable from the file root through public members (including public aliases to
+/// private containers in the same file): `decl` is an index into `DeclIndex.decls`
 pub const Public = struct { decl: u32, path: []const u8 };
 
-/// 不能从文件根访问的容器与文件根的外层容器
+/// Containers that cannot be accessed from the file root, and the outer container of the file root
 const no_container = std.math.maxInt(u32);
 
 pub const DeclIndex = struct {
     arena: std.heap.ArenaAllocator.State,
-    /// 按名字排序（`orderName`）
+    /// Sorted by name (`orderName`)
     decls: []const Decl = &.{},
-    /// 按名字排序（`orderName`）
+    /// Sorted by name (`orderName`)
     public_decls: []const Public = &.{},
-    /// `decls` 的下标，按 item 排序
+    /// Indices into `decls`, sorted by item
     by_item: []const u32 = &.{},
-    /// `decls` 的下标按容器分组、组内按名字排序：容器 c 的成员为 `members[member_start[c]..member_start[c + 1]]`
+    /// Indices into `decls` grouped by container, sorted by name within each group: the members
+    /// of container c are `members[member_start[c]..member_start[c + 1]]`
     members: []const u32 = &.{},
     member_start: []const u32 = &.{},
-    /// 各容器的外层容器（定义它的成员所在的容器），按容器下标
+    /// Outer container of each container (the container of the member that defines it), indexed
+    /// by container
     outer: []const u32 = &.{},
-    /// 各容器从文件根开始的词法路径（已转义）；根容器为 ""，不可达的容器为 null
+    /// Lexical path of each container from the file root (escaped); "" for the root container and
+    /// null for unreachable containers
     container_paths: []const ?[]const u8 = &.{},
 
-    /// 名字以 `prefix` 开头（不区分大小写）的声明在 `decls` 中的下标区间
+    /// Index range in `decls` of the declarations whose names start with `prefix`
+    /// (case-insensitive)
     pub fn matching(index: *const DeclIndex, prefix: []const u8) struct { start: usize, end: usize } {
         const start = prefixStart(Decl, index.decls, prefix);
         var end = start;
@@ -137,7 +152,7 @@ pub const DeclIndex = struct {
         return index.members[index.member_start[container]..index.member_start[container + 1]];
     }
 
-    /// 容器中名为 `name` 的声明
+    /// The declaration named `name` in the container
     pub fn member(index: *const DeclIndex, container: u32, name: []const u8) ?*const Decl {
         const members = index.containerMembers(container);
         var low: usize = 0;
@@ -154,7 +169,7 @@ pub const DeclIndex = struct {
         return null;
     }
 
-    /// 容器层级的作用域：从 `container` 起向外查找名字
+    /// Scope over the container hierarchy: looks up the name from `container` outward
     pub fn lookup(index: *const DeclIndex, container: u32, name: []const u8) ?*const Decl {
         var c = container;
         while (c != no_container and c < index.outer.len) : (c = index.outer[c]) {
@@ -164,9 +179,11 @@ pub const DeclIndex = struct {
     }
 };
 
-/// 文件级新绑定只需避开真正的声明：容器成员（ItemTree）、其他函数的参数、局部变量与捕获（函数体）。
-/// 成员访问、初始化字段名、标签、类型引用与普通名字引用都不是声明，不构成冲突；按键时不必扫描并散列整棵
-/// 语法树里的所有标识符。
+/// A new file-level binding only needs to avoid real declarations: container members (ItemTree),
+/// parameters of other functions, and local variables and captures (function bodies).
+/// Member accesses, initializer field names, labels, type references and plain name references
+/// are not declarations and cause no conflicts, so keystrokes need not scan and hash every
+/// identifier in the whole syntax tree.
 pub const BindingNames = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -238,7 +255,8 @@ pub const BindingNames = struct {
     }
 };
 
-/// 不淘汰的小索引：本文件的 ItemTree，以及各容器是否从文件根可达（由 `Resolver` 求值）
+/// Small index that is never evicted: this file's ItemTree, and whether each container is
+/// reachable from the file root (evaluated by `Resolver`)
 pub const FileDecls = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -287,10 +305,11 @@ const DeclBuilder = struct {
     r: *Resolver,
     file: FileId,
     tree: *const ItemTree,
-    /// 结果的 arena
+    /// Arena for the result
     a: Allocator,
     temp: Allocator,
-    /// 容器能否从文件根访问：具名 const / var 的值就是这个容器（容器字面量直接初始化）时才能
+    /// Whether a container is accessible from the file root: only when the value of a named const /
+    /// var is that container (initialized directly with the container literal)
     reachable: []?bool = undefined,
     names: []?[]const u8 = undefined,
     paths: []?[]const u8 = undefined,
@@ -313,7 +332,8 @@ const DeclBuilder = struct {
             }
             if (it.name == null or !try b.isReachable(it.container)) continue;
             const item: u32 = @intCast(i);
-            // 方法（第一个参数是所在容器的值或指针）经由实例调用，不作为可导入的函数
+            // Methods (whose first parameter is a value of or pointer to the enclosing container)
+            // are called through instances and are not importable functions
             if (it.kind == .@"fn" and it.container != 0 and try b.isMethod(item)) continue;
             try list.append(b.temp, .{
                 .name = try b.ownName(item),
@@ -340,7 +360,8 @@ const DeclBuilder = struct {
             }
         }.less);
 
-        // decls 已按名字排序，依次放入各容器的分组，组内仍按名字排序
+        // decls is already sorted by name; placed in order into each container's group, every
+        // group stays sorted by name
         const member_start = try b.a.alloc(u32, containers.len + 1);
         @memset(member_start, 0);
         for (decls) |d| member_start[d.container + 1] += 1;
@@ -383,7 +404,8 @@ const DeclBuilder = struct {
         return index;
     }
 
-    /// 经由公开成员从文件根可达的路径：公开别名可以指向本文件的私有容器，不展开到其他文件
+    /// Paths reachable from the file root through public members: a public alias may refer to a
+    /// private container of this file; other files are not expanded
     fn publicPaths(b: *DeclBuilder, index: *const DeclIndex) Allocator.Error![]const Public {
         const Pending = struct { container: u32, path: []const u8, lexical: bool };
         var queue: std.ArrayList(Pending) = .empty;
@@ -421,7 +443,7 @@ const DeclBuilder = struct {
     fn isReachable(b: *DeclBuilder, container: u32) resolve.Error!bool {
         if (container == 0) return true;
         if (b.reachable[container]) |known| return known;
-        // 先记为不可达：自引用的结构不会无限递归
+        // Mark as unreachable first, so self-referential structures do not recurse infinitely
         b.reachable[container] = false;
         const result = blk: {
             const parent = b.tree.containers[container].parent_item orelse break :blk false;
@@ -435,14 +457,15 @@ const DeclBuilder = struct {
         return result;
     }
 
-    /// 函数 `item` 的第一个参数的类型是它所在的容器（`self: Self`、`self: *const @This()`、`s: *S`）
+    /// The type of the first parameter of function `item` is its enclosing container
+    /// (`self: Self`, `self: *const @This()`, `s: *S`)
     fn isMethod(b: *DeclBuilder, item: u32) resolve.Error!bool {
         const node = try b.r.itemNode(b.file, item) orelse return false;
         const proto = (ast.FnDecl{ .syntax = node }).proto() orelse (if (node.kind() == .fn_proto) ast.FnProto{ .syntax = node } else return false);
         var params = proto.params();
         const first = params.next() orelse return false;
         var ty = (ast.Param{ .syntax = first }).typeExpr() orelse return false;
-        // `*T`、`*const T`：取被指向的类型
+        // `*T`, `*const T`: take the pointee type
         while (ty.kind() == .ptr_type) {
             var last: ?ast.SyntaxNode = null;
             var children = ty.children();
@@ -500,7 +523,7 @@ const DeclBuilder = struct {
         return path;
     }
 
-    /// 指向本文件中可从文件根访问的容器时为该容器
+    /// The container, when it refers to a container in this file accessible from the file root
     fn localNamespace(b: *DeclBuilder, item: u32) resolve.Error!?u32 {
         const kind = b.tree.items[item].kind;
         if (kind != .@"const" and kind != .@"var") return null;
@@ -519,16 +542,19 @@ const DeclBuilder = struct {
     }
 };
 
-// ── 跨文件求值 ─────────────────────────────────────────────────────
+// ── Cross-file evaluation ──────────────────────────────────────────
 
-/// 声明指向的命名空间（见 `DeclNamespace`）
+/// The namespace a declaration refers to (see `DeclNamespace`)
 fn namespaceOfDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!?Namespace {
     return r.ctx.get(DeclNamespace, try r.ownerKey(file, item));
 }
 
-/// 声明指向的命名空间：`Resolver.namespaceOf`；初始化表达式是条件形式（`if` / `switch`）时由推导求出它的值
-/// （`pub const X = if (cond) A else B;` 取 comptime 选中的分支）。按声明缓存：一个文件可以有上千个声明，
-/// 为它建索引的读事务被编辑打断时，已求出的声明不必重算；编辑后没有变化的声明也直接命中
+/// The namespace a declaration refers to: `Resolver.namespaceOf`; when the initializer is in
+/// conditional form (`if` / `switch`), its value is computed by inference
+/// (`pub const X = if (cond) A else B;` takes the branch selected at comptime). Cached per
+/// declaration: a file can have thousands of declarations, and when the read transaction that
+/// indexes it is interrupted by an edit, declarations already computed need not be recomputed;
+/// declarations unchanged by an edit also hit the cache directly.
 pub const DeclNamespace = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -547,7 +573,8 @@ pub const DeclNamespace = struct {
     }
 };
 
-/// 声明作为别名的规范目标（`Resolver.aliasTarget`；不是别名时为它自身），按声明缓存（同 `DeclNamespace`）
+/// The canonical target of a declaration as an alias (`Resolver.aliasTarget`; the declaration
+/// itself when it is not an alias), cached per declaration (like `DeclNamespace`)
 pub const DeclTarget = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -589,8 +616,8 @@ fn computeNamespace(r: *Resolver, file: FileId, item: u32) resolve.Error!?Namesp
     return sema_queries.namespaceOfType(r, t);
 }
 
-/// 文件中各声明指向的命名空间与别名的规范目标（按 `DeclIndex.decls` 的下标）。补全与展开各个导出闭包都要
-/// 用到
+/// The namespaces the declarations of a file refer to and the canonical targets of aliases (by
+/// index into `DeclIndex.decls`). Used by both completion and the expansion of export closures.
 pub const FileLinks = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -632,13 +659,15 @@ pub const FileLinks = struct {
     }
 };
 
-// ── 只被测试用到的文件 ─────────────────────────────────────────────
+// ── Files used only by tests ───────────────────────────────────────
 
-/// 文件中按路径的 `@import("x.zig")` 及其是否只用于测试：位于 test 声明中，或位于只被测试用到的非 pub
-/// 顶层声明中。非 pub 顶层声明不被正式代码引用、而被 test 声明（直接或经由同样只被测试用到的声明）引用时
-/// 只被测试用到（如
-/// `const World = @import("x_test.zig").World;` 只在 test 与 test 调用的辅助函数中使用：按需分析的编译器只在
-/// 测试中编译它）。只依赖本文件的语法树
+/// The by-path `@import("x.zig")` calls of a file and whether each is used only for tests: inside
+/// a test declaration, or inside a non-pub top-level declaration used only by tests. A non-pub
+/// top-level declaration is used only by tests when production code does not reference it but
+/// test declarations do (directly or via declarations likewise used only by tests), e.g.
+/// `const World = @import("x_test.zig").World;` used only in tests and in helper functions
+/// called by tests: the compiler, which analyzes lazily, compiles it only in tests. Depends only
+/// on this file's syntax tree.
 pub const ImportSites = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
@@ -649,7 +678,8 @@ pub const ImportSites = struct {
     };
 
     const Site = struct { spec: []const u8, in_test: bool, decl: ?u32 };
-    /// 顶层声明：名字（test 与无名的为 null）、是否为 pub、其中引用的名字
+    /// A top-level declaration: its name (null for tests and unnamed ones), whether it is pub, and
+    /// the names it references
     const TopDecl = struct { name: ?[]const u8, is_pub: bool, is_test: bool, refs: std.ArrayList([]const u8) = .empty };
 
     pub fn compute(ctx: *database.Db.Ctx, file: Key) engine.Error!Value {
@@ -670,14 +700,16 @@ pub const ImportSites = struct {
             try decls.append(temp, try topDecl(temp, node));
             try collect(a, temp, node, index, &decls.items[index], &sites);
         }
-        // 按名字传递只经过有名字的非 test 声明
+        // Propagation by name only goes through named non-test declarations
         var by_name: std.StringHashMapUnmanaged(u32) = .empty;
         for (decls.items, 0..) |d, i| if (!d.is_test) if (d.name) |name| try by_name.put(temp, name, @intCast(i));
-        // 正式代码：pub 声明与其他非 test 的顶层内容，以及被它们引用的非 pub 声明
+        // Production code: pub declarations and other non-test top-level content, plus the
+        // non-pub declarations they reference
         const live = try temp.alloc(bool, decls.items.len);
         for (decls.items, live) |d, *l| l.* = !d.is_test and (d.is_pub or d.name == null);
         try propagate(temp, decls.items, &by_name, live, null);
-        // 测试代码：test 声明，以及被它们引用的其余非 pub 声明。两者都不引用的是死代码，按正式代码
+        // Test code: test declarations, plus the remaining non-pub declarations they reference.
+        // Declarations referenced by neither are dead code and count as production code.
         const tested = try temp.alloc(bool, decls.items.len);
         for (decls.items, tested) |d, *t| t.* = d.is_test;
         try propagate(temp, decls.items, &by_name, tested, live);
@@ -690,7 +722,8 @@ pub const ImportSites = struct {
         return .{ .arena = arena.state, .specs = specs, .in_test = in_test };
     }
 
-    /// `marked` 中的声明引用的其他声明（按名字）也标记，直到不再变化；`except` 中已标记的不再标记
+    /// Also marks the other declarations (by name) referenced by declarations in `marked`, until
+    /// nothing changes; declarations already marked in `except` are not marked
     fn propagate(temp: Allocator, decls: []const TopDecl, by_name: *const std.StringHashMapUnmanaged(u32), marked: []bool, except: ?[]const bool) Allocator.Error!void {
         var queue: std.ArrayList(u32) = .empty;
         for (marked, 0..) |m, i| if (m) try queue.append(temp, @intCast(i));
@@ -714,7 +747,7 @@ pub const ImportSites = struct {
         return .{ .name = null, .is_pub = is_pub, .is_test = false };
     }
 
-    /// 顶层声明 `decl`（下标 `index`）中的 import 与引用的名字
+    /// The imports and referenced names in top-level declaration `decl` (index `index`)
     fn collect(a: Allocator, temp: Allocator, node: ast.SyntaxNode, index: u32, decl: *TopDecl, sites: *std.ArrayList(Site)) Allocator.Error!void {
         switch (node.kind()) {
             .name_ref => if ((ast.NameRef{ .syntax = node }).name()) |t| try decl.refs.append(temp, try ast.identNameAlloc(temp, t.text)),
@@ -754,8 +787,9 @@ pub const ImportSites = struct {
     }
 };
 
-/// 项目中只被测试用到的文件（升序）：从各模块的根出发沿 import 可达、但只沿测试之外的 import 不可达的文件。
-/// 如只在 `test { _ = @import("x_test.zig"); }` 中 import 的测试文件，以及只被它们 import 的测试辅助文件
+/// Files of the project used only by tests (ascending): files reachable via imports from the
+/// module roots, but not reachable via non-test imports alone. For example, test files imported
+/// only in `test { _ = @import("x_test.zig"); }`, and test helper files imported only by them.
 pub const TestOnlyFiles = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = void;
@@ -770,8 +804,9 @@ pub const TestOnlyFiles = struct {
         const graph = try ctx.get(database.ModuleGraph.Input, {}) orelse return gpa.dupe(FileId, &.{});
         var roots: std.ArrayList(FileId) = .empty;
         for (graph.modules) |module| if (module.root) |root| try roots.append(temp, root);
-        // 沿全部 import 可达的文件，与只沿测试之外的 import 可达的文件：前者减去后者只被测试用到。都不可达的
-        // 文件（如还没有被 import 的新文件）不归为测试文件
+        // Files reachable via all imports, and files reachable via non-test imports only: the
+        // former minus the latter are used only by tests. Files reachable by neither (such as a
+        // new file not imported yet) are not classified as test files.
         const all = try reach(&r, temp, roots.items, true);
         const live = try reach(&r, temp, roots.items, false);
         var out: std.ArrayList(FileId) = .empty;
@@ -785,7 +820,8 @@ pub const TestOnlyFiles = struct {
         return gpa.dupe(FileId, out.items);
     }
 
-    /// 从 `roots` 沿 import 可达的文件；`with_tests` 为 false 时不经过只用于测试的 import
+    /// Files reachable from `roots` via imports; when `with_tests` is false, imports used only
+    /// for tests are not followed
     fn reach(r: *Resolver, temp: Allocator, roots: []const FileId, with_tests: bool) resolve.Error!std.AutoHashMapUnmanaged(FileId, void) {
         var reached: std.AutoHashMapUnmanaged(FileId, void) = .empty;
         var queue: std.ArrayList(FileId) = .empty;
@@ -820,9 +856,10 @@ pub const TestOnlyFiles = struct {
     }
 };
 
-// ── 公开导出闭包 ───────────────────────────────────────────────────
+// ── Public export closure ──────────────────────────────────────────
 
-/// `file` 中经公开路径可达的命名空间所在的其他 Zig 源文件（可能重复）：按批预热公开导出闭包时据此展开
+/// Other Zig source files containing namespaces reachable via public paths in `file` (possibly
+/// with duplicates): used for expansion when warming up public export closures in batches
 pub fn publicTargets(ctx: *database.Db.Ctx, file: FileId, out: *std.ArrayList(FileId), a: Allocator) engine.Error!void {
     const index = try ctx.get(FileDecls, file);
     const links = try ctx.get(FileLinks, file);
@@ -833,26 +870,28 @@ pub fn publicTargets(ctx: *database.Db.Ctx, file: FileId, out: *std.ArrayList(Fi
 }
 
 pub const Export = struct {
-    /// 指向 `FileDecls` 的值（不淘汰，依赖它的本 query 随它重算）
+    /// Points into the value of `FileDecls` (never evicted; this query depends on it and is
+    /// recomputed along with it)
     name: []const u8,
     path: []const u8,
-    /// 路径的段数
+    /// Number of segments in the path
     depth: u32,
     kind: ItemTree.Item.Kind,
     is_extern: bool,
     file: FileId,
     item: u32,
     target: Declaration,
-    /// 指向 `FileDecls` 的值
+    /// Points into the value of `FileDecls`
     doc: ?[]const u8,
 };
 pub const ExportIndex = struct {
     arena: std.heap.ArenaAllocator.State,
-    /// 按名字排序（`orderName`）
+    /// Sorted by name (`orderName`)
     decls: []const Export,
-    /// 路径至多 `shallow_depth` 段的导出（`decls` 的下标）：补全对它们的整条路径做模糊匹配
+    /// Exports whose paths have at most `shallow_depth` segments (indices into `decls`):
+    /// completion fuzzy-matches their full paths
     shallow: []const u32,
-    /// 名字以 `prefix` 开头（不区分大小写）的导出
+    /// Exports whose names start with `prefix` (case-insensitive)
     pub fn matching(index: *const ExportIndex, prefix: []const u8) []const Export {
         const start = prefixStart(Export, index.decls, prefix);
         var end = start;
@@ -861,14 +900,17 @@ pub const ExportIndex = struct {
     }
 };
 
-/// 沿真正的公开成员边遍历，不把依赖内部文件的相对路径泄漏到调用模块。
-/// 每个命名空间取最短的公开路径，既终止自引用，也避免别名造成指数级路径展开。
+/// Traverses only real public member edges, so relative paths to a dependency's internal files
+/// do not leak into the calling module.
+/// Each namespace takes its shortest public path, which both terminates self-references and
+/// avoids exponential path expansion through aliases.
 pub const Exports = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { ns: Namespace };
     pub const Value = *const ExportIndex;
-    /// 打开过的文件各有别名指向的命名空间，闭包不淘汰时随会话增长；被淘汰的由不淘汰的 `FileDecls` 与
-    /// `FileLinks` 重新展开，只是查找与复制
+    /// Every opened file has namespaces its aliases point to, so without eviction the closures
+    /// would grow with the session; evicted ones are expanded again from the never-evicted
+    /// `FileDecls` and `FileLinks`, which takes only lookups and copying
     pub const lru = 1024;
     pub const lru_bytes = 16 * 1024 * 1024;
     pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
@@ -919,7 +961,9 @@ pub const Exports = struct {
         index.* = .{ .arena = arena.state, .decls = decls, .shallow = shallow_decls };
         return index;
     }
-    /// 名字与文档指向 `FileDecls` 的值，按指针比较：同一个值才相等。被替换的旧值可能已经释放，不能读取内容
+    /// Names and docs point into the value of `FileDecls` and are compared by pointer: equal only
+    /// when they come from the same value. A replaced old value may already be freed, so its
+    /// contents must not be read.
     pub fn eql(a: Value, b: Value) bool {
         if (a.decls.len != b.decls.len) return false;
         for (a.decls, b.decls) |x, y| {
@@ -944,22 +988,29 @@ fn sameSlice(a: []const u8, b: []const u8) bool {
     return a.ptr == b.ptr and a.len == b.len;
 }
 
-/// 光标所在的成员：调用方已经查到时传入，免得再遍历一次文件的成员
+/// The member at the cursor: passed in when the caller has already looked it up, to avoid walking
+/// the file's members again
 pub const Owner = union(enum) { unknown, known: ?u32 };
 
-/// 候选来源的权重（见 `Candidate.score`）：经由光标处可见的名字访问的（命名空间别名的成员、复用的直接别名、同文件的
-/// 私有链）优先于需要新增 import 的
+/// Weights of candidate sources (see `Candidate.score`): candidates accessed through a name
+/// visible at the cursor (members of a namespace alias, reused direct aliases, private chains in
+/// the same file) rank above those that need a new import
 pub const visible_weight = 0.85;
 pub const import_weight = 0.75;
-/// 只按名字前缀找到、整条路径又没有模糊匹配上的候选（名字含转义字符时）的匹配分
+/// Match score of a candidate found only by name prefix whose full path does not fuzzy-match
+/// (when the name contains escaped characters)
 const min_match = 0.01;
 
-/// 候选的路径每多一段，分数乘以的系数少 `depth_step`（至少为 `min_depth_factor`）：同样匹配时浅的优先
+/// Each additional segment in a candidate's path reduces the factor the score is multiplied by
+/// by `depth_step` (to no less than `min_depth_factor`): among equal matches, shallower ones come
+/// first
 const depth_step = 0.05;
 const min_depth_factor = 0.5;
 
-/// `import_options` 决定新 import 插入的位置（见 `organize_imports.Inserter`）。候选先按分数排序（见
-/// `Candidate.score`），再依次构造（检查可见性、生成 import 编辑），构造满 `limit` 个为止；结果按这个次序
+/// `import_options` determines where new imports are inserted (see `organize_imports.Inserter`).
+/// Candidates are first sorted by score (see `Candidate.score`), then built in order (checking
+/// visibility, generating the import edit) until `limit` have been built; the results keep this
+/// order.
 pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: []const u8, limit: usize, import_options: organize_imports.Options) resolve.Error!Result {
     if (prefix.len == 0 or !isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = &.{} };
     const current = try r.ctx.get(FileDecls, file);
@@ -972,11 +1023,13 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
     };
     if (builder.owner) |item| {
         builder.body = try r.body(file, item);
-        // 成员的起点取自语法树（按键时本来就重算），不读 `ItemSummaries`：它要为整个文件重算
+        // The member's start comes from the syntax tree (recomputed on keystrokes anyway)
+        // instead of `ItemSummaries`, which would have to be recomputed for the whole file
         const base = if (try r.itemNode(file, item)) |node| node.offset else offset;
         builder.scope = builder.body.?.scopeAt((offset -| base) -| 1);
     }
-    // 顶层 const 可能是别名；用到时才检查它在光标处是否可见
+    // A top-level const may be an alias; whether it is visible at the cursor is checked only when
+    // it is used
     var top: std.ArrayList(Alias) = .empty;
     for (current.decls, links.namespaces, links.targets) |*decl, ns, target| {
         if (decl.container != 0 or decl.kind != .@"const") continue;
@@ -986,7 +1039,9 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
     }
     builder.top = top.items;
     const matches = current.matching(prefix);
-    // 已有命名空间别名优先，不为同一入口再生成 import。浅层的导出按整条路径模糊匹配，更深的按名字的前缀
+    // Existing namespace aliases take precedence; no additional import is generated for the
+    // same entry. Shallow exports are fuzzy-matched by their full path, deeper ones by name
+    // prefix.
     for (top.items) |alias| {
         const decl = alias.decl;
         const ns = alias.ns orelse continue;
@@ -997,7 +1052,8 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         const root = try renderName(r.arena, decl.name);
         for (exports.shallow) |j| try builder.member(root, &exports.decls[j], false);
         for (declared_matches) |*declared| if (declared.depth > shallow_depth) try builder.member(root, declared, true);
-        // 同文件可访问私有成员，公开闭包仍由所有请求共享。
+        // Private members are accessible within the same file; the public closure is still
+        // shared by all requests.
         if (ns.file == file) for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |*nested, target| {
             const relative = localRelative(current, ns, nested.*);
             const parts: Parts = if (relative) |rel| .{ root, rel } else .{ nested.path, "" };
@@ -1008,7 +1064,8 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             try builder.push(.{ .score = score * visible_weight, .parts = parts, .what = .{ .member = .{ .name = nested.name, .kind = nested.kind, .doc = nested.doc, .decl = .{ .file = file, .item = nested.item } } } });
         };
     }
-    // 同文件的私有链合法；可见的顶层名由普通补全负责。
+    // Private chains within the same file are legal; visible top-level names are left to regular
+    // completion.
     for (current.decls[matches.start..matches.end], links.targets[matches.start..matches.end]) |*decl, target| {
         const parts: Parts = .{ decl.path, "" };
         const score = try builder.byNameScore(parts);
@@ -1017,7 +1074,8 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         try builder.push(.{ .score = score * visible_weight, .parts = parts, .what = .{ .chain = .{ .decl = decl, .root = root_name } } });
     }
     if (graph) |g| {
-        // 模块名字即使没有任何声明也可补全；生成文件根未知时不提供。
+        // Module names can be completed even when they have no declarations; not offered while
+        // the root is a generated file whose path is unknown.
         const names = try g.importNames(r.arena, file);
         for ([_][]const []const u8{ &.{ "std", "builtin" }, names }) |group| for (group) |name| {
             const target = g.importTarget(file, name) orelse continue;
@@ -1027,8 +1085,9 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
                 try builder.push(.{ .score = score * import_weight, .parts = .{ spec, "" }, .what = .{ .module = .{ .name = spec, .kind = .module, .spec = spec, .target = target } } });
             try builder.exported(ns, spec);
         };
-        // 项目文件只查询小索引的前缀区间，不在按键路径扫描 ItemTree/Body。只被测试用到的文件只在测试代码（同样
-        // 只被测试用到的文件、test 声明）中导入
+        // For project files, only the prefix range of the small index is queried; ItemTree/Body
+        // are not scanned on the keystroke path. Files used only by tests are imported only in
+        // test code (files likewise used only by tests, test declarations).
         const test_only = try r.ctx.get(TestOnlyFiles, {});
         const in_test = TestOnlyFiles.contains(test_only, file) or
             (if (builder.owner) |item| (try r.itemTree(file)).items[item].kind == .@"test" else false);
@@ -1076,28 +1135,31 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
     return .{ .items = builder.items.items, .is_incomplete = builder.incomplete };
 }
 
-/// 当前文件的顶层 const 及其指向的命名空间、规范目标
+/// A top-level const of the current file, with the namespace it refers to and its canonical target
 const Alias = struct { decl: *const Decl, ns: ?Namespace, target: Declaration };
 
-/// 候选的路径：两部分以 `.` 连接（第二部分为空时只有第一部分），打分与同分时的排序都按它
+/// Path of a candidate: the two parts joined by `.` (only the first part when the second is
+/// empty); both scoring and the order among equal scores use it
 const Parts = [2][]const u8;
 
-/// 已匹配、尚未构造的候选：构造时才检查可见性、生成标签与 import 编辑
+/// A matched candidate that is not built yet: visibility is checked, and the label and the
+/// import edit are generated, only when it is built
 const Found = struct {
     score: f32,
     parts: Parts,
-    /// 名字以输入开头且大小写一致：同分时优先（全为小写的输入不区分大小写打分）
+    /// The name starts with the input in the same case: preferred among equal scores (an
+    /// all-lowercase input is scored case-insensitively)
     case_exact: bool = false,
     what: union(enum) {
-        /// 经由可见的命名空间访问，标签为路径
+        /// Accessed through a visible namespace; the label is the path
         member: struct { name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8, decl: Declaration },
-        /// 复用指向同一规范目标的直接别名
+        /// Reuses a direct alias to the same canonical target
         reuse: struct { alias: *const Decl, name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8 },
-        /// 同文件的私有链，标签为声明的路径
+        /// A private chain in the same file; the label is the declaration's path
         chain: struct { decl: *const Decl, root: []const u8 },
-        /// 新增 import 的模块或文件
+        /// A newly imported module or file
         module: struct { name: []const u8, kind: @FieldType(Candidate, "kind"), spec: []const u8, target: FileId },
-        /// 新增 import 的声明
+        /// A newly imported declaration
         import: struct { name: []const u8, kind: ItemTree.Item.Kind, is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, target: Target },
     },
 };
@@ -1112,9 +1174,10 @@ const Builder = struct {
     owner: ?u32 = null,
     body: ?*const Body = null,
     scope: Body.ScopeId = .root,
-    /// 当前文件的顶层 const，按名字排序
+    /// Top-level consts of the current file, sorted by name
     top: []const Alias = &.{},
-    /// `top` 中各项的命名空间与不是自身的规范目标：不在其中时不必逐个检查
+    /// Namespaces of the entries in `top` and their canonical targets other than themselves: when
+    /// something is not among them, the entries need not be checked one by one
     alias_namespaces: std.AutoHashMapUnmanaged(Namespace, void) = .empty,
     alias_targets: std.AutoHashMapUnmanaged(Declaration, void) = .empty,
     reused: std.AutoHashMapUnmanaged(Declaration, void) = .empty,
@@ -1122,11 +1185,13 @@ const Builder = struct {
     found: std.ArrayList(Found) = .empty,
     items: std.ArrayList(Candidate) = .empty,
     incomplete: bool = false,
-    /// import 声明的排列规则（新 import 按它放到整理好的块中应在的位置）
+    /// Ordering rules for import declarations (by which a new import is placed where it belongs
+    /// in the organized block)
     import_options: organize_imports.Options = .{},
-    /// 首次生成 import 编辑时准备
+    /// Prepared when the first import edit is generated
     inserter: ?organize_imports.Inserter = null,
-    /// 光标前正在输入的名字：插入的编辑与它重叠时不提供
+    /// The name being typed before the cursor: a candidate whose insertion edit overlaps it is
+    /// not offered
     typing: ?@import("../syntax/tree.zig").TextRange = null,
 
     fn visible(b: *Builder, name: []const u8) resolve.Error!?resolve.Def {
@@ -1146,22 +1211,25 @@ const Builder = struct {
         return found;
     }
 
-    /// 不先用当前文件的 `FileIndex` 粗筛：逐字输入时补全紧跟在编辑之后，它总要重算，比 `BindingNames` 更贵
+    /// No coarse filtering by the current file's `FileIndex` first: when typing character by
+    /// character, completion comes right after each edit, so `FileIndex` always has to be
+    /// recomputed, which is more expensive than `BindingNames`
     fn bindingConflict(b: *Builder, name: []const u8) resolve.Error!bool {
         return BindingNames.contains(try b.r.ctx.get(BindingNames, b.file), name);
     }
-    /// 顶层声明的名字在光标处仍指向它自己（没有被局部的同名绑定遮蔽）
+    /// The top-level declaration's name still refers to the declaration itself at the cursor (not
+    /// shadowed by a local binding of the same name)
     fn refersToSelf(b: *Builder, decl: *const Decl) resolve.Error!bool {
         const def = try b.visible(decl.name) orelse return false;
         return deepEql(def, resolve.Def{ .item = .{ .file = b.file, .item = decl.item } });
     }
-    /// 光标处可见、指向 `ns` 的第一个顶层别名
+    /// The first top-level alias visible at the cursor that refers to `ns`
     fn namespaceAlias(b: *Builder, ns: Namespace) resolve.Error!?*const Decl {
         if (!b.alias_namespaces.contains(ns)) return null;
         for (b.top) |alias| if (alias.ns) |n| if (deepEql(n, ns) and try b.refersToSelf(alias.decl)) return alias.decl;
         return null;
     }
-    /// 光标处可见、规范目标为 `target` 的第一个顶层直接别名
+    /// The first top-level direct alias visible at the cursor whose canonical target is `target`
     fn directAlias(b: *Builder, target: Declaration) resolve.Error!?*const Decl {
         if (!b.alias_targets.contains(target)) return null;
         for (b.top) |alias| {
@@ -1169,16 +1237,19 @@ const Builder = struct {
         }
         return null;
     }
-    /// 规范目标已有可见的直接别名时改为复用它（`score` 为路径 `parts` 的匹配分）
+    /// Reuses a direct alias visible for the canonical target instead, when there is one (`score`
+    /// is the match score of the path `parts`)
     fn reuse(b: *Builder, target: Declaration, name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8, score: f32, parts: Parts) resolve.Error!bool {
         const alias = try b.directAlias(target) orelse return false;
-        // 别名与目标共享前缀时，继续输入后须重新选择过滤名字，不能沿用另一条拼写。
+        // When the alias and the target share the prefix, the filter name must be chosen again
+        // after further typing; the other spelling cannot be kept.
         if (!std.mem.eql(u8, alias.name, name) and std.ascii.startsWithIgnoreCase(alias.name, b.prefix)) b.incomplete = true;
         try b.push(.{ .score = score * visible_weight, .parts = parts, .what = .{ .reuse = .{ .alias = alias, .name = name, .kind = kind, .doc = doc } } });
         try b.reused.put(b.r.arena, target, {});
         return true;
     }
-    /// 可见的命名空间别名 `root` 的导出 `declared`；`by_name` 时它已按名字前缀匹配
+    /// The export `declared` of the visible namespace alias `root`; with `by_name`, it has already
+    /// matched by name prefix
     fn member(b: *Builder, root: []const u8, declared: *const Export, by_name: bool) resolve.Error!void {
         const parts: Parts = .{ root, declared.path };
         const score = try b.matchOf(parts, by_name) orelse return;
@@ -1199,14 +1270,15 @@ const Builder = struct {
         if (b.reused.contains(decl.target)) return;
         try b.push(.{ .score = score * import_weight, .parts = parts, .what = .{ .import = .{ .name = decl.name, .kind = decl.kind, .is_extern = decl.is_extern, .spec = spec, .path = decl.path, .doc = decl.doc, .target = .{ .decl = .{ .file = decl.file, .item = decl.item } } } } });
     }
-    /// 路径的匹配分乘以深度系数；不匹配时为 null。`by_name` 时已按名字前缀匹配，路径没有匹配上（名字含转义字符）
-    /// 时取最低分
+    /// The match score of the path multiplied by the depth factor; null when it does not match.
+    /// With `by_name`, the candidate has already matched by name prefix, and when its path does not
+    /// match (the name contains escaped characters), the minimum score is used
     fn matchOf(b: *Builder, parts: Parts, by_name: bool) resolve.Error!?f32 {
         const score = try b.matcher.scoreJoined(&joined(parts)) orelse
             (if (by_name) min_match else return null);
         return score * depthFactor(parts);
     }
-    /// 已按名字前缀匹配上的候选的分数（见 `matchOf`）
+    /// Score of a candidate that has already matched by name prefix (see `matchOf`)
     fn byNameScore(b: *Builder, parts: Parts) resolve.Error!f32 {
         return (try b.matchOf(parts, true)).?;
     }
@@ -1222,7 +1294,8 @@ const Builder = struct {
         found.case_exact = std.mem.startsWith(u8, name, b.prefix);
         try b.found.append(b.r.arena, found);
     }
-    /// 名字以输入的前缀开头时按名字过滤；按路径匹配上的按路径过滤，客户端不会把它滤掉
+    /// Filters by name when the name starts with the typed prefix; a candidate matched by path is
+    /// filtered by its path, so the client does not filter it out
     fn filterOf(b: *Builder, name: []const u8, parts: Parts) resolve.Error![]const u8 {
         if (std.ascii.startsWithIgnoreCase(name, b.prefix)) return name;
         return joinPath(b.r.arena, parts[0], parts[1]);
@@ -1244,7 +1317,8 @@ const Builder = struct {
             .module => |m| try b.importCandidate(m.name, m.kind, false, m.spec, "", null, p, .{ .file = m.target }),
             .import => |i| {
                 if (try b.visible(i.name) != null) return;
-                // 运行期存储（容器级 var、extern const）不能复制到新的 comptime 常量中
+                // Runtime storage (container-level vars, extern consts) cannot be copied into a
+                // new comptime constant
                 const storage = i.kind == .@"var" or (i.is_extern and i.kind == .@"const");
                 try b.importCandidate(i.name, try b.declKind(i.target.decl), storage, i.spec, i.path, i.doc, p, i.target);
             },
@@ -1256,8 +1330,10 @@ const Builder = struct {
         }
         try b.items.append(b.r.arena, candidate);
     }
-    /// 构造的候选的种类（见 `symbol_kind`）。先取建索引时已求出、常驻的结果：函数、按语法能确定种类的声明
-    /// （`Decl.form`）、值为命名空间的 const 以及指向它们的别名，不必为所在的文件解析、求声明的类型；其余求声明的类型
+    /// Kind of a built candidate (see `symbol_kind`). First takes the resident results already
+    /// computed when the index was built: functions, declarations whose kind the syntax determines
+    /// (`Decl.form`), consts whose value is a namespace, and aliases to them, without parsing their
+    /// file or inferring the declaration's type; for the rest, the declaration's type is inferred.
     fn declKind(b: *Builder, decl: Declaration) resolve.Error!@FieldType(Candidate, "kind") {
         const key = try b.r.ownerKey(decl.file, decl.item);
         if (try b.indexedKind(decl, key)) |kind| return kind;
@@ -1273,8 +1349,9 @@ const Builder = struct {
             .variable, .field, .enum_member, .parameter, .type_parameter => if (symbol.readonly) .constant else .variable,
         };
     }
-    /// 函数（自动导入不提供方法，见 `DeclBuilder.isMethod`）、按语法能确定种类的 const / var 与值为 Zig 文件或容器的
-    /// const 的种类
+    /// Kind of functions (auto-import does not offer methods; see `DeclBuilder.isMethod`), of
+    /// consts and vars whose kind the syntax determines, and of consts whose value is a Zig file
+    /// or a container
     fn indexedKind(b: *Builder, decl: Declaration, key: hir.OwnerKey) resolve.Error!?@FieldType(Candidate, "kind") {
         const item_kind = (try b.r.itemTree(decl.file)).items[decl.item].kind;
         switch (item_kind) {
@@ -1304,7 +1381,8 @@ const Builder = struct {
         var binding = name;
         var binding_path = path;
         var direct = false;
-        // 运行期存储经由命名空间访问；extern const 仍保留只读补全类别。
+        // Runtime storage is accessed through the namespace; an extern const still keeps the
+        // read-only completion kind.
         const label = if (storage or try b.bindingConflict(name)) blk: {
             const base = std.fs.path.basename(spec);
             const namespace = if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else base;
@@ -1337,14 +1415,15 @@ const Builder = struct {
     }
 };
 
-/// 路径每多一段，系数少 `depth_step`
+/// Each additional segment in the path reduces the factor by `depth_step`
 fn depthFactor(parts: Parts) f32 {
     var segments: usize = 1 + std.mem.count(u8, parts[0], ".");
     if (parts[1].len != 0) segments += 1 + std.mem.count(u8, parts[1], ".");
     return @max(min_depth_factor, 1 - depth_step * @as(f32, @floatFromInt(segments - 1)));
 }
 
-/// 分数从高到低，同分时名字的大小写与输入一致的优先，再按路径、来源
+/// By score from high to low; among equal scores, names whose case matches the input come first,
+/// then by path and source
 fn foundLess(_: void, a: Found, b: Found) bool {
     if (a.score != b.score) return a.score > b.score;
     if (a.case_exact != b.case_exact) return a.case_exact;
@@ -1353,7 +1432,7 @@ fn foundLess(_: void, a: Found, b: Found) bool {
     return @backingInt(a.what) < @backingInt(b.what);
 }
 
-/// 两个路径依次拼接（中间的 `.` 见 `Parts`）后比较
+/// Compares two paths, each concatenated in order (for the `.` in between, see `Parts`)
 fn orderParts(a: Parts, b: Parts) std.math.Order {
     const x = joined(a);
     const y = joined(b);
@@ -1397,14 +1476,18 @@ fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, ta
     return relative;
 }
 
-/// 当前文件 import `target` 用的路径或模块名；不能直接 import 时为 null
+/// The path or module name the current file uses to import `target`; null when it cannot be
+/// imported directly
 pub fn importPath(r: *Resolver, from: FileId, target: FileId) resolve.Error!?[]const u8 {
     const graph = try r.ctx.get(database.ModuleGraph.Input, {}) orelse return null;
     return importSpec(r, graph, from, target);
 }
 
-/// 定义所在文件的显示路径：标准库中为 `std/` 下的路径；当前文件可以按路径 import 的为 import 路径；在当前文件
-/// 可以 import 的其他模块的根目录下时，为模块名加根目录下的路径（模块的根不一定在编译集合中）；都不是时为完整路径
+/// Display path of the file containing a definition: in the standard library, the path under
+/// `std/`; for a file the current file can import by path, the import path; under the root
+/// directory of another module the current file can import, the module name plus the path under
+/// the root directory (the module root is not necessarily in the compile set); otherwise the
+/// full path
 pub fn displayPath(r: *Resolver, from: FileId, target: FileId) resolve.Error![]const u8 {
     const vfs = r.ctx.db.env.vfs;
     const path = vfs.path(target);
@@ -1420,7 +1503,8 @@ pub fn displayPath(r: *Resolver, from: FileId, target: FileId) resolve.Error![]c
     return path;
 }
 
-/// `path` 相对 `dir` 的部分，前面加上 `prefix/`，分隔符统一为 `/`
+/// The part of `path` relative to `dir`, prefixed with `prefix/`, with separators normalized
+/// to `/`
 fn under(a: Allocator, prefix: []const u8, dir: []const u8, path: []const u8) Allocator.Error![]const u8 {
     const relative = try std.fs.path.relativeAlloc(a, dir, null, dir, path);
     for (relative) |*c| if (c.* == '\\') {
@@ -1437,7 +1521,8 @@ fn findRoot(index: *const DeclIndex, name: []const u8) ?Decl {
     }
     return null;
 }
-/// `decl` 相对同文件命名空间 `ns` 的路径；容器的词法路径已预算，单次查找为 O(1)
+/// Path of `decl` relative to namespace `ns` in the same file; lexical paths of containers are
+/// precomputed, so each lookup is O(1)
 fn localRelative(index: *const DeclIndex, ns: Namespace, decl: Decl) ?[]const u8 {
     if (ns.container == 0) return decl.path;
     if (ns.container >= index.container_paths.len) return null;
@@ -1456,8 +1541,9 @@ fn joinPath(a: Allocator, lhs: []const u8, rhs: []const u8) Allocator.Error![]co
     if (lhs.len == 0) return a.dupe(u8, rhs);
     return std.fmt.allocPrint(a, "{s}.{s}", .{ lhs, rhs });
 }
-/// 索引中名字的顺序：先不区分 ASCII 大小写，相同时再按字节。不区分大小写地以同一前缀开头的名字因此连续，可以
-/// 二分查找；按名字的精确查找用同一个顺序
+/// Order of names in the indexes: ASCII case-insensitive first, then by bytes on ties. Names that
+/// start with the same prefix case-insensitively are therefore contiguous and can be binary
+/// searched; exact lookup by name uses the same order.
 fn orderName(a: []const u8, b: []const u8) std.math.Order {
     const order = std.ascii.orderIgnoreCase(a, b);
     return if (order != .eq) order else std.mem.order(u8, a, b);
@@ -1471,7 +1557,7 @@ fn nameLess(comptime T: type) fn (void, T, T) bool {
         }
     }.less;
 }
-/// 第一个名字不小于 `name` 的项（按 `orderName`）
+/// The first item whose name is not less than `name` (by `orderName`)
 fn lowerBound(comptime T: type, items: []const T, name: []const u8) usize {
     var low: usize = 0;
     var high = items.len;
@@ -1481,7 +1567,8 @@ fn lowerBound(comptime T: type, items: []const T, name: []const u8) usize {
     }
     return low;
 }
-/// 第一个名字不区分大小写地不小于 `prefix` 的项：以 `prefix` 开头（不区分大小写）的项从这里开始
+/// The first item whose name is case-insensitively not less than `prefix`: items starting with
+/// `prefix` (case-insensitive) begin here
 fn prefixStart(comptime T: type, items: []const T, prefix: []const u8) usize {
     var low: usize = 0;
     var high = items.len;

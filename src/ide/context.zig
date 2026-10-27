@@ -1,4 +1,5 @@
-//! IDE 功能的公共部分：光标所在的成员、Body 与推导结果；定义的签名与文档。
+//! Shared parts of the IDE features: the member at the cursor, its Body and inference result;
+//! signatures and documentation of definitions.
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -25,11 +26,11 @@ pub const At = struct {
     owner: hir.OwnerKey,
     body: *const Body,
     res: *const infer.Result,
-    /// 相对成员起点的位置
+    /// Position relative to the start of the member
     rel: u32,
     ip: *InternPool,
-    /// 成员位于泛型函数内时以调用点的实例推导的结果（见 `atSeeded`）：`res` 中含抽象参数或
-    /// 未知的部分取自这里
+    /// Inference result for a call-site instance when the member is in a generic function (see
+    /// `atSeeded`): parts of `res` that contain abstract parameters or are unknown come from here
     seeded: ?seed.Seed = null,
 
     pub fn exprType(a: At, e: Body.ExprId) TypedValue {
@@ -46,14 +47,14 @@ pub const At = struct {
         return tv;
     }
 
-    /// 枚举字面量的期望类型（没有期望类型时为 null）
+    /// Expected type of an enum literal (null when there is no expected type)
     pub fn literalExpected(a: At, e: Body.ExprId) ?Index {
         for (a.res.literal_expected) |x| if (x.expr == e) return x.ty;
         if (a.seeded) |s| for (s.res.literal_expected) |x| if (x.expr == e) return x.ty;
         return null;
     }
 
-    /// 初始化表达式 `init` 中第 `index` 个字段名解析到的字段
+    /// Field that the `index`-th field name in the initializer `init` resolves to
     pub fn fieldRef(a: At, init: Body.ExprId, index: u32) ?hir.OwnerKey {
         for (a.res.field_refs) |f| if (f.init == init and f.index == index) return f.member;
         if (a.seeded) |s| for (s.res.field_refs) |f| if (f.init == init and f.index == index) return f.member;
@@ -84,8 +85,9 @@ pub fn at(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.
     };
 }
 
-/// 同 `at`；成员位于泛型函数内时附带调用点实例的推导结果（`At.seeded`），实例须使该位置的代码会执行、
-/// 该处的表达式能求出类型（见 `subjectAt`）
+/// Same as `at`; when the member is inside a generic function, also attaches the inference result
+/// of a call-site instance (`At.seeded`). The instance must make the code at the position execute
+/// and the expression there have a known type (see `subjectAt`)
 pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) resolve.Error!?At {
     var a = try at(r, file, offset, inclusive_end) orelse return null;
     const subject = subjectAt(a.body, a.rel, inclusive_end);
@@ -94,8 +96,10 @@ pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) re
     return a;
 }
 
-/// 位置处须能求出类型的表达式：位于成员访问的成员名处时取左侧，否则取所在的表达式。`inclusive_end` 时位置在
-/// 刚输入的内容之后（补全），取前一个字符所在的表达式（如 `a.` 的 `.`）
+/// Expression at the position whose type must be known: the left-hand side when the position is
+/// on the member name of a member access, otherwise the expression containing it. With
+/// `inclusive_end`, the position is right after just-typed text (completion), so the expression
+/// at the previous character is taken (such as the `.` of `a.`)
 fn subjectAt(b: *const Body, rel: u32, inclusive_end: bool) ?seed.Subject {
     const at_ = if (inclusive_end and rel > 0) rel - 1 else rel;
     const e = b.exprAt(at_) orelse return null;
@@ -105,7 +109,7 @@ fn subjectAt(b: *const Body, rel: u32, inclusive_end: bool) ?seed.Subject {
     };
 }
 
-/// 推导结果中记录的成员（按 AstId）对应的定义
+/// Definition of a member recorded in an inference result (by AstId)
 pub fn defOfKey(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {
     const tree = try r.itemTree(key.file);
     for (tree.items, 0..) |it, i| if (it.ast_id == key.item) return .{ .item = .{ .file = key.file, .item = @intCast(i) } };
@@ -119,7 +123,8 @@ pub fn doc(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
     };
 }
 
-/// 定义的签名：函数为原型（见 `ast.FnProto.writeSignature`），其他为 `const name: T = v` 形式
+/// Signature of a definition: the prototype for functions (see `ast.FnProto.writeSignature`), the
+/// `const name: T = v` form for everything else
 pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u8 {
     const ip = r.ctx.db.env.ip;
     switch (def) {
@@ -139,7 +144,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 else => "",
             };
             const name = if (item.name) |n| try std.fmt.allocPrint(r.arena, "{f}", .{std.zig.fmtId(n)}) else "_";
-            // 容器定义：`const S = struct`
+            // Container definition: `const S = struct`
             if (tv.asType()) |t| switch (ip.key(t)) {
                 .container_type => |c| if (c.kind != .file) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),
                 else => {},
@@ -159,7 +164,8 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
     }
 }
 
-/// 调用的目标函数：返回函数声明与是否为方法调用（跳过 self 参数）
+/// Target function of a call: returns the function declaration and whether it is a method call
+/// (which skips the self parameter)
 pub fn callee(r: *Resolver, a: At, callee_e: Body.ExprId) resolve.Error!?struct { def: Def, bound: bool } {
     const b = a.body;
     switch (b.expr(callee_e)) {
@@ -170,7 +176,8 @@ pub fn callee(r: *Resolver, a: At, callee_e: Body.ExprId) resolve.Error!?struct 
         .field_access => |fa| {
             const key = a.member(callee_e) orelse return null;
             const def = try defOfKey(r, key) orelse return null;
-            // 只有成员是函数声明且左侧是值（不是类型）时才是方法调用：函数类型的字段不绑定接收者
+            // It is a method call only when the member is a function declaration and the left-hand
+            // side is a value (not a type): fields of function type do not bind a receiver
             const method = switch (def) {
                 .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"fn",
                 else => false,
@@ -185,8 +192,10 @@ pub fn callee(r: *Resolver, a: At, callee_e: Body.ExprId) resolve.Error!?struct 
     }
 }
 
-/// 被调用的名字是别名（`const assert = std.debug.assert;`，含局部常量）时取它指向的函数声明：
-/// 先沿容器成员的别名链，仍不是函数时取推导出的函数值的声明
+/// When the called name is an alias (`const assert = std.debug.assert;`, including local
+/// constants), takes the function declaration it points to: first follows the alias chain of
+/// container members, and when that is still not a function, takes the declaration of the
+/// inferred function value
 fn fnDecl(r: *Resolver, a: At, callee_e: Body.ExprId, def: Def) resolve.Error!Def {
     const target = try r.aliasTarget(def);
     switch (target) {
@@ -200,7 +209,7 @@ fn fnDecl(r: *Resolver, a: At, callee_e: Body.ExprId, def: Def) resolve.Error!De
     };
 }
 
-/// 函数声明的参数节点（按顺序）
+/// Parameter nodes of a function declaration (in order)
 pub fn fnParams(r: *Resolver, def: Def) resolve.Error![]const ast.Param {
     const it = switch (def) {
         .item => |x| x,

@@ -1,9 +1,11 @@
-//! Zig 语法规则（容错递归下降）。
+//! Zig grammar rules (error-tolerant recursive descent).
 //!
-//! 规则对应 langref 中的 PEG 语法，具体决策与 `std.zig.Parse` 保持一致；不同之处在于
-//! 任何失败都只记录错误并继续，保证对任意输入都能产出完整的语法树。
+//! The rules follow the PEG grammar in the langref, with specific decisions consistent with
+//! `std.zig.Parse`; the difference is that any failure only records an error and continues,
+//! guaranteeing a complete syntax tree for any input.
 //!
-//! 约定：返回 `?CompletedMarker` 的函数在当前 token 无法开始该结构时返回 null 且不消费任何 token。
+//! Convention: functions returning `?CompletedMarker` return null without consuming any token
+//! when the current token cannot start that construct.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,12 +19,12 @@ const SyntaxKind = @import("kind.zig").SyntaxKind;
 const Error = Allocator.Error;
 const CM = ?CompletedMarker;
 
-// ── 顶层与容器 ────────────────────────────────────────────────────────
+// ── Top level and containers ──────────────────────────────────────────
 
 pub fn sourceFile(p: *Parser) Error!void {
     const m = try p.start();
     try containerMembers(p);
-    // 顶层多余的 `}` 等
+    // Stray `}` and the like at the top level
     while (!p.atEof()) {
         try p.errBump("unexpected token");
         try containerMembers(p);
@@ -30,7 +32,7 @@ pub fn sourceFile(p: *Parser) Error!void {
     _ = try m.complete(p, .source_file);
 }
 
-/// 解析容器成员，直到 `}` 或文件结束（不消费 `}`）。
+/// Parses container members up to `}` or the end of the file (does not consume `}`).
 fn containerMembers(p: *Parser) Error!void {
     while (p.at(.container_doc_comment)) try p.bump();
     while (true) {
@@ -128,7 +130,8 @@ fn decl(p: *Parser, m: Marker) Error!void {
     _ = try m.complete(p, .error_node);
 }
 
-/// `(const|var) name [: Type] [align] [addrspace] [linksection]`，当前 token 必须是 const/var。
+/// `(const|var) name [: Type] [align] [addrspace] [linksection]`;
+/// the current token must be const/var.
 fn varDeclProto(p: *Parser) Error!void {
     try p.bump();
     _ = try p.expect(.identifier);
@@ -224,7 +227,7 @@ fn param(p: *Parser) Error!void {
     }
     if (!try p.eat(.keyword_anytype)) {
         if (try typeExpr(p) == null) {
-            // 什么都没解析到时不产生空节点
+            // Do not produce an empty node when nothing was parsed
             if (p.events.items.len == m.index + 1) {
                 m.abandon(p);
                 return;
@@ -235,7 +238,7 @@ fn param(p: *Parser) Error!void {
     _ = try m.complete(p, .param);
 }
 
-/// `align(expr)` 或位域 `align(expr:expr:expr)`
+/// `align(expr)` or the bit-field form `align(expr:expr:expr)`
 fn byteAlign(p: *Parser) Error!CM {
     if (!p.at(.keyword_align)) return null;
     const m = try p.start();
@@ -251,7 +254,7 @@ fn byteAlign(p: *Parser) Error!CM {
     return try m.complete(p, .align_clause);
 }
 
-/// `keyword(expr)` 形式的子句：addrspace / linksection / callconv
+/// Clause of the form `keyword(expr)`: addrspace / linksection / callconv
 fn clause(p: *Parser, comptime keyword: SyntaxKind, comptime kind: SyntaxKind) Error!CM {
     if (!p.at(keyword)) return null;
     const m = try p.start();
@@ -262,9 +265,10 @@ fn clause(p: *Parser, comptime keyword: SyntaxKind, comptime kind: SyntaxKind) E
     return try m.complete(p, kind);
 }
 
-// ── 语句 ─────────────────────────────────────────────────────────────
+// ── Statements ───────────────────────────────────────────────────────
 
-/// `{ statements }`；`m` 非空时表示已经开始的节点（例如已消费了标签）。
+/// `{ statements }`; a non-null `m` is an already started node (e.g. the label has already
+/// been consumed).
 fn block(p: *Parser, started: ?Marker) Error!CM {
     if (!p.at(.l_brace)) {
         if (started) |m| {
@@ -351,7 +355,7 @@ fn statement(p: *Parser, block_level: bool) Error!void {
     _ = try m.complete(p, .expr_stmt);
 }
 
-/// 前缀语句：只有 errdefer 允许在主体前捕获错误。
+/// Prefixed statements: only errdefer allows capturing the error before the body.
 fn prefixedStatement(p: *Parser, kind: SyntaxKind) Error!void {
     const m = try p.start();
     try p.bump();
@@ -369,7 +373,7 @@ fn blockExprStatement(p: *Parser) Error!void {
     _ = try p.expect(.semicolon);
 }
 
-/// `[label:] (block / loop / switch)`；当前位置不是这些结构时返回 false。
+/// `[label:] (block / loop / switch)`; returns false when not at one of these constructs.
 fn labeledStatement(p: *Parser) Error!bool {
     var has_label = false;
     if (p.at(.identifier) and p.nth(1) == .colon) {
@@ -392,7 +396,7 @@ fn labeledStatement(p: *Parser) Error!bool {
     return true;
 }
 
-/// 块级语句：变量声明、赋值、解构或表达式语句。
+/// Block-level statement: variable declaration, assignment, destructuring, or expression statement.
 fn varAssignStatement(p: *Parser) Error!void {
     const sm = try p.start();
     const has_comptime = try p.eat(.keyword_comptime);
@@ -404,7 +408,7 @@ fn varAssignStatement(p: *Parser) Error!void {
             const vm = try p.start();
             try varDeclProto(p);
             if (lhs_count == 0 and !p.at(.comma)) {
-                // 单个变量声明：`var x = expr;`
+                // Single variable declaration: `var x = expr;`
                 if (!p.at(.equal) and !p.at(.equal_equal)) try p.err("expected '='");
                 try varDeclInit(p);
                 _ = try p.expect(.semicolon);
@@ -443,7 +447,7 @@ fn varAssignStatement(p: *Parser) Error!void {
         return;
     }
 
-    // 解构：`a, var b = expr;`
+    // Destructuring: `a, var b = expr;`
     _ = try p.expect(.equal);
     if (try expr(p) == null) try p.err("expected expression");
     _ = try p.expect(.semicolon);
@@ -503,9 +507,10 @@ fn finishAssign(p: *Parser, lhs: CompletedMarker) Error!CompletedMarker {
     return m.complete(p, .assign_expr);
 }
 
-// ── 控制流 ───────────────────────────────────────────────────────────
+// ── Control flow ─────────────────────────────────────────────────────
 
-/// 控制流结构的主体形式：语句级（then 分支可以是 `表达式;`）、表达式、类型表达式。
+/// Body form of a control-flow construct: statement level (the then branch may be
+/// `expression;`), expression, or type expression.
 const Form = enum { statement, expr, type };
 
 fn ifExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
@@ -596,11 +601,11 @@ fn loop(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
 }
 
 const BodyEnd = enum {
-    /// 主体后可以接 else
+    /// An else may follow the body
     open,
-    /// 语句形式中以 `;` 结束，不能再接 else
+    /// In statement form, ends with `;` and no else may follow
     closed,
-    /// 语句形式中主体为代码块，else 可选
+    /// In statement form, the body is a block and the else is optional
     block,
 };
 
@@ -645,7 +650,7 @@ fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error
     _ = try m.complete(p, .else_clause);
 }
 
-/// `|x|`、`|*x|`、`|x, i|`、`|*a, b, c|`：统一接受所有形式。
+/// `|x|`, `|*x|`, `|x, i|`, `|*a, b, c|`: all forms are accepted uniformly.
 fn optPayload(p: *Parser) Error!void {
     if (!p.at(.pipe)) return;
     const m = try p.start();
@@ -771,7 +776,7 @@ fn asmItems(p: *Parser, comptime kind: SyntaxKind) Error!void {
     }
 }
 
-// ── 表达式 ───────────────────────────────────────────────────────────
+// ── Expressions ──────────────────────────────────────────────────────
 
 pub fn expr(p: *Parser) Error!CM {
     return exprPrec(p, 0);
@@ -877,7 +882,7 @@ fn curlySuffixExpr(p: *Parser) Error!CM {
     return try m.complete(p, .init_expr);
 }
 
-/// `{ .a = x, .b = y }` 或 `{ x, y }`
+/// `{ .a = x, .b = y }` or `{ x, y }`
 fn initList(p: *Parser) Error!void {
     const m = try p.start();
     try p.bump(); // {
@@ -934,7 +939,7 @@ fn typeExpr(p: *Parser) Error!CM {
             const m = try p.start();
             try p.bump();
             if (try p.eat(.asterisk)) {
-                // `[*]T`、`[*c]T`、`[*:s]T`
+                // `[*]T`, `[*c]T`, `[*:s]T`
                 if (p.at(.identifier) and std.mem.eql(u8, p.nthText(0), "c")) {
                     try p.bump();
                 } else if (p.at(.colon)) {
@@ -1027,7 +1032,8 @@ fn suffixExpr(p: *Parser) Error!CM {
                 },
                 .l_brace => return lhs,
                 else => {
-                    // `foo.` 尚未写完：保留字段访问结构，补全依赖它
+                    // `foo.` is not finished yet: keep the field access structure,
+                    // which completion relies on
                     const m = try lhs.precede(p);
                     try p.bump();
                     try p.err("expected field name");
@@ -1134,8 +1140,8 @@ fn primaryTypeExpr(p: *Parser) Error!CM {
                 try initList(p);
                 return try m.complete(p, .init_expr);
             },
-            // `.` 后还没写名字（正在输入）：作为缺少名字的枚举字面量留在所在的表达式中，
-            // 补全可以按期望类型列出成员
+            // No name after `.` yet (still typing): keep it in the enclosing expression as an enum
+            // literal with a missing name, so that completion can list members by expected type
             else => {
                 const m = try p.start();
                 try p.bump();
@@ -1228,7 +1234,7 @@ pub fn containerDecl(p: *Parser) Error!CompletedMarker {
     return m.complete(p, .container_decl);
 }
 
-/// 当前 token 能否开始一个类型表达式（与 `typeExpr` 的分支一致）。
+/// Whether the current token can start a type expression (matching the branches of `typeExpr`).
 fn atTypeExprStart(p: *Parser) bool {
     return switch (p.peek()) {
         .question_mark,

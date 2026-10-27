@@ -1,4 +1,5 @@
-//! 端到端：Server + 真实的构建系统协议，校验发布的诊断与编译器一致，以及构建进度通知。
+//! End-to-end: Server + the real build system protocol; checks that the published diagnostics
+//! agree with the compiler, as well as the build progress notifications.
 
 const std = @import("std");
 const testing = std.testing;
@@ -7,7 +8,7 @@ const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 const live = @import("../database.zig").live;
 
-/// 空对象（`.{}` 是空元组，会被序列化为 `[]`）
+/// Empty object (`.{}` is an empty tuple, which would be serialized as `[]`)
 const Empty = struct {};
 
 const Diagnostics = std.StringArrayHashMapUnmanaged([]const []const u8);
@@ -70,7 +71,7 @@ fn shutdown(h: *Harness) !void {
     try h.notify("exit", {});
 }
 
-/// 所有 begin 进度的标题
+/// Titles of all begin progress notifications
 fn progressTitles(h: *Harness) ![]const []const u8 {
     var titles: std.ArrayList([]const u8) = .empty;
     for (try h.notifications("$/progress")) |m| {
@@ -95,24 +96,26 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     const main_uri = try open(&h, main_path, main_text);
     try waitIdle(&h);
 
-    // 1. 打开后：缓冲区与磁盘一致，main.zig 只有编译器的 Sema 错误；未打开的文件也有编译器诊断
+    // 1. After opening: the buffer matches the disk and main.zig has only the compiler's Sema
+    //    error; files that are not open also have compiler diagnostics
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"2:19 zig: expected type 'u32'"});
     try expectDiagnostics(diags, "lib.zig", &.{"1:8 zig: unused local variable"});
     try expectDiagnostics(diags, "orphan.zig", &.{"1:8 zig: unused local variable"});
     try testing.expect(diags.get("unrelated.zig") == null);
 
-    // 2. 未保存修改：Sema 错误随插入的一行下移
-    const edited = try std.mem.concat(a, u8, &.{ "// 新的一行\n", main_text });
+    // 2. Unsaved edit: the Sema error moves down with the inserted line
+    const edited = try std.mem.concat(a, u8, &.{ "// a new line\n", main_text });
     defer a.free(edited);
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = edited }} });
     try waitIdle(&h);
     diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"3:19 zig: expected type 'u32'"});
 
-    // 3. 修复错误、写入磁盘并保存：重建后 main.zig 的诊断被清空。编译器得以继续分析到 lib.hello()，
-    //    在 lib.zig 中多报出一个 Sema 错误（与直接运行 zig build check 的结果相同）
-    const fixed = try std.mem.replaceOwned(u8, a, edited, "const x: u32 = \"不是数字\";", "const x: u32 = 1;");
+    // 3. Fix the error, write it to disk and save: after the rebuild, the diagnostics of main.zig
+    //    are cleared. The compiler can now go on to analyze lib.hello() and reports one more Sema
+    //    error in lib.zig (the same result as running zig build check directly).
+    const fixed = try std.mem.replaceOwned(u8, a, edited, "const x: u32 = \"not a number\";", "const x: u32 = 1;");
     defer a.free(fixed);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/main.zig", .data = fixed });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 3 }, .contentChanges = &.{.{ .text = fixed }} });
@@ -126,7 +129,7 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     });
     try shutdown(&h);
 
-    // 4. 进度：项目加载与两次构建，每个都有 begin 与 end；构建有百分比
+    // 4. Progress: project loading and two builds, each with begin and end; builds have percentages
     const titles = try progressTitles(&h);
     var ends: usize = 0;
     var percentages: usize = 0;
@@ -142,7 +145,7 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     for (titles) |t| {
         if (std.mem.eql(u8, t, "zig build check")) builds += 1;
     }
-    // maker 崩溃自动重启时会多一次构建
+    // There is one more build when maker crashes and is restarted automatically
     try testing.expect(builds >= 2);
     if (titles.len != ends) {
         for (try h.notifications("$/progress")) |m| {
@@ -170,7 +173,8 @@ test "compiler diagnostics: a save while the finished build is being published s
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"2:19 zig: expected type 'u32'"});
 
-    // 构建进度一结束就保存修复后的文件：服务器此时还在发布这一轮的结果与重算编译集合
+    // Save the fixed file as soon as the build progress ends: the server is then still publishing
+    // the results of this round and recomputing the compile set
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
     var build_token: ?[]const u8 = null;
     while (true) {
@@ -184,13 +188,13 @@ test "compiler diagnostics: a save while the finished build is being published s
         if (std.mem.eql(u8, kind, "begin") and std.mem.startsWith(u8, value.get("title").?.string, "zig build")) build_token = token;
         if (std.mem.eql(u8, kind, "end") and build_token != null and std.mem.eql(u8, token, build_token.?)) break;
     }
-    const fixed = try std.mem.replaceOwned(u8, a, main_text, "const x: u32 = \"不是数字\";", "const x: u32 = 1;");
+    const fixed = try std.mem.replaceOwned(u8, a, main_text, "const x: u32 = \"not a number\";", "const x: u32 = 1;");
     defer a.free(fixed);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/main.zig", .data = fixed });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
     try waitIdle(&h);
-    // 这次保存的构建请求丢失时，main.zig 仍挂着已修复的错误
+    // If the build request for this save is lost, main.zig still shows the already fixed error
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{});
     try shutdown(&h);
 }
@@ -243,7 +247,8 @@ const simple_build =
     \\
 ;
 
-/// 只打开项目、等待构建，返回各文件最后一次发布的诊断
+/// Only opens the project and waits for the build, then returns the diagnostics last published
+/// for each file
 fn runProject(h: *Harness, project: *fixture.Project) !Diagnostics {
     try initialize(h, project.root, false);
     try waitIdle(h);
@@ -312,7 +317,7 @@ test "build scripts: live diagnostics in build.zig, build.zig.zon and files buil
     try waitIdle(&h);
     try testing.expect(h.server.workspaces.items[0].compile_set != null);
 
-    // 未保存的语法错误：与编译集合中的文件一样有 live 诊断
+    // Unsaved syntax error: it gets live diagnostics just like files in the compile set
     try change(&h, build_uri, 2, try std.mem.replaceOwned(u8, a, scripts_build, "@import(\"std\");", "@import(\"std\")"));
     try change(&h, helper_uri, 2, try std.mem.replaceOwned(u8, a, scripts_helper, "\"demo\";", "\"demo\""));
     try change(&h, zon_uri, 2, try std.mem.replaceOwned(u8, a, scripts_zon, "\"0.0.0\",", "\"0.0.0\""));
@@ -324,7 +329,8 @@ test "build scripts: live diagnostics in build.zig, build.zig.zon and files buil
     try change(&h, build_uri, 3, scripts_build);
     try change(&h, zon_uri, 3, scripts_zon);
 
-    // 保存 build.zig 导入的文件：重新配置，构建程序的编译错误发布在这个文件上
+    // Save a file that build.zig imports: the project is reconfigured, and the compile error of
+    // the build program is published on that file
     const bad_helper = try std.mem.replaceOwned(u8, a, scripts_helper, "\"demo\"", "42");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = helper_path, .data = bad_helper });
     try change(&h, helper_uri, 3, bad_helper);
@@ -332,14 +338,14 @@ test "build scripts: live diagnostics in build.zig, build.zig.zon and files buil
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "helper.zig", &.{"zig: expected type '[]const u8', found 'comptime_int'"});
 
-    // 编辑器之外改动它：同样重新配置
+    // Change it outside the editor: the project is reconfigured likewise
     try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = helper_uri } });
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = helper_path, .data = try std.mem.replaceOwned(u8, a, scripts_helper, "\"demo\"", "true") });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = helper_uri, .type = 2 }} });
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "helper.zig", &.{"zig: expected type '[]const u8', found 'bool'"});
 
-    // build.zig.zon 的错误不在 maker 发来的错误中：提示用户
+    // Errors in build.zig.zon are not among the errors maker sends: the user is notified
     const bad_zon = try std.mem.replaceOwned(u8, a, scripts_zon, "0xd642dfa0858809cc", "0x1");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = zon_path, .data = bad_zon });
     try change(&h, zon_uri, 4, bad_zon);
@@ -354,7 +360,7 @@ test "columns are UTF-16 when multi-byte characters precede the error" {
         .{ .path = "build.zig", .text = simple_build },
         .{ .path = "main.zig", .text =
         \\pub fn main() void {
-        \\    const s = "中文😀"; const x: u32 = s;
+        \\    const s = "€€😀"; const x: u32 = s;
         \\    _ = x;
         \\}
         \\
@@ -365,11 +371,13 @@ test "columns are UTF-16 when multi-byte characters precede the error" {
     try h.start();
     defer h.finish();
     const diags = try runProject(&h, &project);
-    // `s` 位于字节列 43、UTF-16 列 37（中、文各 3 字节 1 单位，😀 4 字节 2 单位）
+    // `s` is at byte column 43 and UTF-16 column 37 (each of the two euro signs is 3 bytes and
+    // 1 code unit, the emoji is 4 bytes and 2 code units)
     try expectDiagnostics(diags, "main.zig", &.{"1:37 zig: expected type 'u32'"});
 }
 
-/// 在项目目录写出包装用户 zig 的脚本 zigw：除 `env` 外的命令先等待 2 秒。返回使用它的初始化选项
+/// Writes zigw, a script wrapping the user's zig, into the project directory: commands other
+/// than `env` first wait 2 seconds. Returns the initialization options that use it.
 fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     const zig = project.env.zig_exe;
     const script = try std.fmt.allocPrint(h.arena.allocator(),
@@ -423,7 +431,7 @@ test "single-file mode: disabling compiler diagnostics during a compile drops it
     defer h.finish();
     try initializeWith(&h, project.root, true, try slowZig(&h, &project));
     const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
-    // 等到编译器任务开始（包装脚本随后还会睡眠 2 秒）
+    // Wait until the compiler task starts (the wrapper script still sleeps 2 seconds after that)
     while (true) {
         const m = try h.next();
         const method = if (m.object.get("method")) |x| x.string else continue;
@@ -432,7 +440,8 @@ test "single-file mode: disabling compiler diagnostics during a compile drops it
         if (!std.mem.eql(u8, value.get("kind").?.string, "begin")) continue;
         if (std.mem.eql(u8, value.get("title").?.string, "Compiling one.zig")) break;
     }
-    // 编译结束前关闭编译器诊断：旧任务的结果必须被丢弃
+    // Disable compiler diagnostics before the compile finishes: the results of the old task
+    // must be discarded
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
         \\{"zig-analyzer": {"diagnostics": {"compiler": false}}}
     ) });
@@ -530,7 +539,8 @@ test "files of the zig installation are not standalone compilation roots during 
     try waitIdle(&h);
     try expectNoErrors(&h, std_uri);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = std_uri } });
-    // 标准库以外的文件同样只作为依赖参与编译：单独编译它们缺少构建系统提供的模块与 builtin 成员
+    // Files outside the standard library likewise take part in compiles only as dependencies:
+    // compiling them alone lacks the modules and builtin members provided by the build system
     var lib_uris: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{ "configurer.zig", "test_runner.zig" }) |name| {
         const path = try std.fs.path.join(a, &.{ project.env.lib_dir, "compiler", name });
@@ -571,19 +581,21 @@ test "single-file mode: errors a root reports in the standard library are publis
     const one_path = try project.path(a, "scratch/one.zig");
     const one_uri = try open(&h, one_path, bad);
     try waitIdle(&h);
-    // 错误的位置在标准库中，one.zig 自身没有错误：发布在标准库的文件上
+    // The error is located in the standard library, and one.zig itself has no error: it is
+    // published on the standard library file
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "one.zig", &.{});
     try expectDiagnostics(diags, "Writer.zig", &.{"zig: too few arguments"});
 
-    // 加入一个项目：标准库也在它的编译集合中，单文件编译的结果仍然用于标准库的文件
+    // Add a project: the standard library is also in its compile set, and the single-file compile
+    // results are still used for the standard library files
     const proj_uri = try za.base.uri.fromPath(a, try project.path(a, "proj"));
     try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &.{.{ .uri = proj_uri, .name = "proj" }}, .removed = &[_]Empty{} } });
     try waitIdle(&h);
     try testing.expectEqual(1, h.server.workspaces.items.len);
     try expectDiagnostics(try h.diagnostics(), "Writer.zig", &.{"zig: too few arguments"});
 
-    // 修复并保存 one.zig：标准库中的错误随之清除
+    // Fix and save one.zig: the error in the standard library is cleared along with it
     const fixed = try std.mem.replaceOwned(u8, a, bad, ".{});", ".{1});");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = one_path, .data = fixed });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = one_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
@@ -595,7 +607,8 @@ test "single-file mode: errors a root reports in the standard library are publis
     try shutdown(&h);
 }
 
-/// 构建根目录（project）之外的模块：dep.zig 按名字 import support，只有在项目的模块图中才能解析
+/// Modules outside the build root (project): dep.zig imports support by name, which can only be
+/// resolved in the project's module graph
 const outside_root = [_]fixture.File{
     .{ .path = "project/build.zig", .text =
     \\const std = @import("std");
@@ -630,7 +643,7 @@ fn countTitles(titles: []const []const u8, title: []const u8) usize {
     return n;
 }
 
-/// 保存文件：写入磁盘，同步缓冲区，再通知保存
+/// Saves a file: writes it to disk, syncs the buffer, then notifies the save
 fn save(h: *Harness, path: []const u8, file_uri: []const u8, version: i64, text: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = text });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = file_uri, .version = version }, .contentChanges = &.{.{ .text = text }} });
@@ -645,28 +658,31 @@ test "modules outside the build root: never compiled alone, saving them rebuilds
     defer h.finish();
     const a = h.arena.allocator();
     try initialize(&h, try project.path(a, "project"), true);
-    // 项目加载期间打开：此时还不知道 dep.zig 属于项目，单文件编译推迟到加载结束，届时它已归入项目
+    // Opened while the project is loading: it is not yet known that dep.zig belongs to the
+    // project, so the single-file compile is postponed until loading ends, by which time it
+    // has been assigned to the project
     const dep_path = try project.path(a, "dependency/dep.zig");
     const dep_uri = try open(&h, dep_path, dep_good);
     try waitIdle(&h);
-    // 加载之后打开
+    // Opened after loading
     _ = try open(&h, try project.path(a, "dependency/support.zig"), support_text);
     try waitIdle(&h);
     const builds = countTitles(try progressTitles(&h), "zig build check");
     try testing.expect(builds >= 1);
 
-    // 只保存 dep.zig：项目重新构建，在真实的模块图中报告错误（而不是找不到 support）
+    // Save only dep.zig: the project is rebuilt and the error is reported in the real module
+    // graph (rather than support not being found)
     try save(&h, dep_path, dep_uri, 2, dep_bad);
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "dep.zig", &.{"3:11 zig: expected type 'u32'"});
     try testing.expect(countTitles(try progressTitles(&h), "zig build check") > builds);
 
-    // 根目录外、属于项目的用户代码可以重命名
+    // User code outside the root directory that belongs to the project can be renamed
     const prepared = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = dep_uri }, .position = .{ .line = 1, .character = 8 } });
     try testing.expect(prepared.object.get("error") == null);
     try testing.expect(prepared.object.get("result").? != .null);
 
-    // 修复后同样只保存 dep.zig：错误被清除
+    // After the fix, again save only dep.zig: the error is cleared
     try save(&h, dep_path, dep_uri, 3, dep_good);
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "dep.zig", &.{});
@@ -674,7 +690,7 @@ test "modules outside the build root: never compiled alone, saving them rebuilds
     for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
 }
 
-/// 以绝对路径（相对于构建根目录）共用 shared/x.zig 的项目
+/// Projects that share shared/x.zig through an absolute path (relative to the build root)
 const shared_build =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
@@ -693,7 +709,7 @@ const shared_bad = "pub fn fine() u32 {\n    return 1;\n}\npub fn broken() u32 {
 
 test "a module shared by two projects: saving it rebuilds both, the errors of either build are published" {
     var project = try fixture.Project.create(&.{
-        // b 不调用 broken：它的构建不分析其中的错误
+        // b does not call broken: its build does not analyze the error in it
         .{ .path = "b/build.zig", .text = shared_build },
         .{ .path = "b/main.zig", .text = "export fn entry() u32 {\n    return @import(\"shared\").fine();\n}\n" },
         .{ .path = "a/build.zig", .text = shared_build },
@@ -718,7 +734,7 @@ test "a module shared by two projects: saving it rebuilds both, the errors of ei
     try testing.expect(std.mem.endsWith(u8, h.server.workspaces.items[0].root, "b"));
     const builds = countTitles(try progressTitles(&h), "zig build check");
 
-    // 只有 a 的构建报告 x.zig 中的错误；包含 x.zig 的第一个项目是 b
+    // Only the build of a reports the error in x.zig; the first project containing x.zig is b
     try save(&h, x_path, x_uri, 2, shared_bad);
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "x.zig", &.{"4:11 zig: expected type 'u32'"});
@@ -731,7 +747,9 @@ test "a module shared by two projects: saving it rebuilds both, the errors of ei
     for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
 }
 
-/// 按哈希获取的依赖包（伪造：包目录中已经有它时 maker 不再获取）。项目用 `--pkg-dir` 把包目录放在构建根目录之外
+/// Dependency package fetched by hash (faked: maker does not fetch it again when the package
+/// directory already has it). The project uses `--pkg-dir` to put the package directory outside
+/// the build root.
 const fetched_hash = "foo-0.0.1-OjQ08eFlFQAb4BLnwZNNE3R5Dx2TI67EIpAsy2h0ZyoC";
 const fetched_package = [_]fixture.File{
     .{ .path = "proj/build.zig.zon", .text = ".{ .name = .proj, .version = \"0.0.0\", .fingerprint = 0x520c3c90be36badb, .paths = .{\"\"}, " ++
@@ -760,7 +778,7 @@ const fetched_package = [_]fixture.File{
     \\
     },
     .{ .path = "pkgs/" ++ fetched_hash ++ "/src/root.zig", .text = fetched_root },
-    // 没有被任何模块用到的文件
+    // A file not used by any module
     .{ .path = "pkgs/" ++ fetched_hash ++ "/src/unused.zig", .text = "const x: u32 = \"s\";\ncomptime {\n    _ = x;\n}\n" },
 };
 const fetched_root = "pub fn answer() u32 {\n    return 42;\n}\n";
@@ -807,7 +825,8 @@ test "workspace symbols list dependency packages only when enabled" {
     const a = h.arena.allocator();
     try initialize(&h, try project.path(a, "proj"), false);
     try waitIdle(&h);
-    // 默认不列出依赖库中的符号：依赖包中的 `answer` 不在其中
+    // By default, symbols in dependencies are not listed: `answer` in the dependency package is
+    // not among them
     const user = try h.request("workspace/symbol", .{ .query = "answer" });
     try testing.expectEqual(0, user.object.get("result").?.array.items.len);
     const entry = try h.request("workspace/symbol", .{ .query = "entry" });
@@ -843,7 +862,7 @@ test "inspection requests for a project file: file status, module graph, reload 
     const projects = status.get("projects").?.array.items;
     try testing.expectEqual(1, projects.len);
     try testing.expectEqualStrings(project.root, projects[0].object.get("root").?.string);
-    // 示例项目有编译错误
+    // The example project has compile errors
     try testing.expect(projects[0].object.get("last_build").?.object.get("diagnostics").?.integer > 0);
 
     const graph = (try h.request("zig-analyzer/moduleGraph", {})).object.get("result").?.object;
@@ -855,7 +874,7 @@ test "inspection requests for a project file: file status, module graph, reload 
         if (std.mem.eql(u8, imp.object.get("name").?.string, "lib")) break;
     } else return error.TestUnexpectedResult;
 
-    // 重新加载：新实例替换旧实例
+    // Reload: a new instance replaces the old one
     const before = h.server.workspaces.items[0];
     _ = try h.request("zig-analyzer/reloadWorkspace", {});
     try waitIdle(&h);
@@ -863,7 +882,8 @@ test "inspection requests for a project file: file status, module graph, reload 
     try shutdown(&h);
 }
 
-/// 工作区（ws，没有 build.zig）之外的项目 proj：main.zig 按名字 import 模块 dep，并有一个 Sema 错误
+/// Project proj outside the workspace (ws, without build.zig): main.zig imports module dep by
+/// name and has a Sema error
 const unloaded_project = [_]fixture.File{
     .{ .path = "ws/scratch.zig", .text = "pub fn main() void {}\n" },
     .{ .path = "proj/build.zig", .text =
@@ -893,13 +913,14 @@ test "files of a project outside the workspace: not compiled alone, a hint until
     try initialize(&h, try project.path(a, "ws"), false);
     const main_uri = try open(&h, try project.path(a, "proj/src/main.zig"), unloaded_main);
     try waitIdle(&h);
-    // 单独编译会报出找不到模块 dep：不编译，只有提示
+    // Compiling it alone would report that module dep is not found: not compiled, only a hint
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"0:0 zig-analyzer: this file belongs to the project at"});
     const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = main_uri } })).object.get("result").?.object;
     try testing.expectEqualStrings("unloaded_project", status.get("context").?.string);
     try testing.expectEqual(0, status.get("single_file_roots").?.array.items.len);
 
-    // 把项目加入工作区：提示消失，诊断来自项目的构建
+    // Add the project to the workspace: the hint disappears and the diagnostics come from the
+    // project's build
     const proj_uri = try za.base.uri.fromPath(a, try project.path(a, "proj"));
     try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &.{.{ .uri = proj_uri, .name = "proj" }}, .removed = &[_]Empty{} } });
     try waitIdle(&h);
@@ -936,7 +957,7 @@ test "single-file mode: errors in imported files are published on them and clear
     try waitIdle(&h);
     const arena = h.arena.allocator();
 
-    // 编译 a.zig 时报告在 b.zig 中的错误发布在 b.zig 上（b.zig 尚未打开）
+    // Errors that compiling a.zig reports in b.zig are published on b.zig (b.zig is not open yet)
     const a_path = try project.path(arena, "a.zig");
     const a_uri = try open(&h, a_path, a_text);
     try waitIdle(&h);
@@ -944,13 +965,15 @@ test "single-file mode: errors in imported files are published on them and clear
     try expectDiagnostics(diags, "a.zig", &.{});
     try expectDiagnostics(diags, "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
 
-    // 打开 b.zig：单独编译 b.zig 只报告 comptime 块中的错误，与 a.zig 的编译结果合并（相同的错误只保留一条）
+    // Open b.zig: compiling b.zig alone reports only the error in the comptime block, which is
+    // merged with the compile results of a.zig (identical errors are kept only once)
     const b_path = try project.path(arena, "b.zig");
     const b_uri = try open(&h, b_path, b_text);
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
 
-    // 在错误位置之外修复并保存 b.zig：在 b.zig 中报告过错误的 a.zig 随之重新编译，错误全部被清除
+    // Fix b.zig away from the error locations and save it: a.zig, which reported errors in
+    // b.zig, is recompiled as a result, and all errors are cleared
     const fixed = try std.mem.replaceOwned(u8, arena, b_text, "T = u32", "T = []const u8");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = b_path, .data = fixed });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = b_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
@@ -960,22 +983,25 @@ test "single-file mode: errors in imported files are published on them and clear
     try expectDiagnostics(diags, "a.zig", &.{});
     try expectDiagnostics(diags, "b.zig", &.{});
 
-    // 再把错误改回去并保存：a.zig 上一次编译读取过 b.zig（虽然没有在其中报告错误），同样重新编译
+    // Change the error back and save: a.zig's last compile read b.zig (though it reported no
+    // errors in it), so it is recompiled too
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = b_path, .data = b_text });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = b_uri, .version = 3 }, .contentChanges = &.{.{ .text = b_text }} });
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = b_uri } });
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "b.zig", &.{ "2:15 zig: expected type 'u32'", "5:17 zig: expected type 'u32'" });
 
-    // 关闭 a.zig 并在编辑器之外删除它：丢弃它的编译结果，b.zig 上只剩单独编译 b.zig 报告的错误
+    // Close a.zig and delete it outside the editor: its compile results are dropped, and b.zig
+    // keeps only the errors reported by compiling b.zig alone
     try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = a_uri } });
     try std.Io.Dir.cwd().deleteFile(testing.io, a_path);
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = a_uri, .type = 3 }} });
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "b.zig", &.{"2:15 zig: expected type 'u32'"});
 
-    // 重新创建并打开 a.zig（自身也有错误），先在编辑器之外删除再关闭：删除时 a.zig 仍打开着，
-    // 关闭时同样丢弃它的编译结果
+    // Recreate and open a.zig (which has its own error too), then delete it outside the editor
+    // before closing it: a.zig is still open when it is deleted, and closing it likewise drops
+    // its compile results
     const a_bad = a_text ++ "comptime {\n    _ = @as(u8, 300);\n}\n";
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = a_path, .data = a_bad });
     _ = try open(&h, a_path, a_bad);
@@ -1009,7 +1035,8 @@ test "single-file mode: a root deleted while it compiles leaves no diagnostics" 
     try waitIdle(&h);
     const path = try project.path(h.arena.allocator(), "a.zig");
     const a_uri = try open(&h, path, text);
-    // 编译开始（请求创建进度）后在编辑器之外删除 a.zig 再关闭：这次编译的结果不再发布
+    // After the compile starts (the request to create progress), delete a.zig outside the editor
+    // and then close it: the results of this compile are no longer published
     while (true) {
         const msg = try h.next();
         const method = msg.object.get("method") orelse continue;
@@ -1064,7 +1091,8 @@ test "generated module roots: resolved from build results, including modules che
     try initialize(&h, project.root, false);
     try waitIdle(&h);
 
-    // 编译器诊断与 zig build check 一致：只有 main.zig 的错误，test step 的 t.zig 没有诊断
+    // Compiler diagnostics agree with zig build check: only main.zig's error, and t.zig of the
+    // test step has no diagnostics
     const diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"2:20 zig: expected type 'bool', found 'u32'"});
     try testing.expect(diags.get("t.zig") == null);
@@ -1072,7 +1100,8 @@ test "generated module roots: resolved from build results, including modules che
     const ws = h.server.workspaces.items[0];
     ws.mutex.lockUncancelable(testing.io);
     defer ws.mutex.unlock(testing.io);
-    // 两个生成的模块根文件（包括 check 不依赖的 test_options）都已得知路径
+    // The paths of both generated module root files (including test_options, which check does
+    // not depend on) are known
     var generated: usize = 0;
     for (ws.model.?.modules) |m| {
         if (m.generated_root == null) continue;
@@ -1081,7 +1110,7 @@ test "generated module roots: resolved from build results, including modules che
         try testing.expect(std.fs.path.isAbsolute(m.root_file.?));
     }
     try testing.expectEqual(2, generated);
-    // 编译集合只含 check 用到的生成文件
+    // The compile set contains only the generated files that check uses
     var in_set: usize = 0;
     for (ws.compile_set.?.files.keys()) |f| {
         if (std.mem.endsWith(u8, h.server.vfs.path(f), "options.zig")) in_set += 1;
@@ -1089,7 +1118,7 @@ test "generated module roots: resolved from build results, including modules che
     try testing.expectEqual(1, in_set);
 }
 
-/// 以生成的 options 模块为 `build_options` 的项目
+/// Project whose `build_options` is a generated options module
 const options_build =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
@@ -1112,14 +1141,15 @@ const options_main =
     \\
 ;
 
-// 防止本地缓存目录固定按 `<构建根>/.zig-cache` 计算：`--cache-dir`（或 `ZIG_LOCAL_CACHE_DIR`）把生成文件放到
-// 别处时，生成的模块根文件的路径不存在，模块中的名字全部无法解析
+// Guards against always computing the local cache directory as `<build root>/.zig-cache`: when
+// `--cache-dir` (or `ZIG_LOCAL_CACHE_DIR`) puts generated files elsewhere, the paths of the
+// generated module root files do not exist and none of the names in those modules resolve
 test "generated module roots: local cache directory moved with --cache-dir" {
     const main_text = options_main;
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = options_build },
         .{ .path = "main.zig", .text = main_text },
-        // 相对路径相对于构建根目录
+        // Relative paths are relative to the build root
         .{ .path = "zig-analyzer.zon", .text = ".{ .build = .{ .args = .{ \"--cache-dir\", \"altcache\" } } }" },
     });
     defer project.deinit();
@@ -1151,7 +1181,8 @@ test "generated module roots: local cache directory moved with --cache-dir" {
     try testing.expect(result == .object);
     const value = result.object.get("contents").?.object.get("value").?.string;
     try testing.expect(std.mem.indexOf(u8, value, "answer: u32 = 42") != null);
-    // 生成文件位于构建根目录下的 altcache 中，不能重命名（maker 会覆盖改动）
+    // Generated files are in altcache under the build root and cannot be renamed (maker would
+    // overwrite the changes)
     const rename_at = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 2, .character = 14 } };
     try testing.expect((try h.request("textDocument/prepareRename", rename_at)).object.get("error") != null);
     const rename = .{ .textDocument = rename_at.textDocument, .position = rename_at.position, .newName = "answer2" };
@@ -1184,14 +1215,14 @@ test "generated files in a local cache directory outside the build root: never c
     try testing.expect(std.mem.startsWith(u8, generated, cache));
     try testing.expectEqual(.generated, h.server.fileOrigin(try h.server.vfs.intern(generated)));
 
-    // 打开、保存生成的 options.zig：它只作为项目的依赖参与编译
+    // Open and save the generated options.zig: it is compiled only as a dependency of the project
     const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, generated, a, .limited(1024 * 1024));
     const uri = try open(&h, generated, text);
     try waitIdle(&h);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = uri } });
     try waitIdle(&h);
     try expectNoErrors(&h, uri);
-    // 其中的定义由 maker 生成，不能重命名
+    // The definitions in it are generated by maker and cannot be renamed
     const offset = std.mem.indexOf(u8, text, "answer").?;
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
     const position = .{ .line = std.mem.count(u8, text[0..offset], "\n"), .character = offset - line_start + 1 };
@@ -1200,7 +1231,8 @@ test "generated files in a local cache directory outside the build root: never c
     for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling"));
 }
 
-/// 配置测试的项目：`-Dbad=true` 时 main.zig 中被屏蔽的错误出现；`unit` step 编译 t.zig（有错误）
+/// Project for the configuration tests: with `-Dbad=true` the masked error in main.zig appears;
+/// the `unit` step compiles t.zig (which has an error)
 const settings_project: []const fixture.File = &.{
     .{ .path = "build.zig", .text =
     \\const std = @import("std");
@@ -1241,7 +1273,8 @@ test "settings: -D build args from initializationOptions, diagnostics.step chang
     try h.start();
     defer h.finish();
 
-    // 1. -Dbad=true：分支被分析，报错（不带参数时 o.bad 为 false，分支不会被分析）
+    // 1. -Dbad=true: the branch is analyzed and reports an error (without the argument, o.bad is
+    //    false and the branch is not analyzed)
     try initializeWith(&h, project.root, false, try jsonValue(&h,
         \\{"build": {"args": ["-Dbad=true"]}}
     ));
@@ -1250,7 +1283,8 @@ test "settings: -D build args from initializationOptions, diagnostics.step chang
     try expectDiagnostics(diags, "main.zig", &.{"3:23 zig: expected type 'u32'"});
     try testing.expect(diags.get("t.zig") == null);
 
-    // 2. 改为用 unit step 诊断、去掉 -D 参数：项目重启，main.zig 的旧诊断被清除，t.zig 报错
+    // 2. Switch to the unit step for diagnostics and drop the -D argument: the project restarts,
+    //    main.zig's old diagnostics are cleared, and t.zig reports an error
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
         \\{"zig-analyzer": {"diagnostics": {"step": "unit"}}}
     ) });
@@ -1277,11 +1311,11 @@ test "settings: pulled with workspace/configuration at startup and on change not
     } } });
     try h.notify("initialized", Empty{});
     try waitIdle(&h);
-    // 启动前拉取到的构建参数生效
+    // Build arguments pulled before startup take effect
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"3:23 zig: expected type 'u32'"});
 
-    // 配置变化通知不带内容：服务器重新拉取
+    // The configuration change notification carries no content: the server pulls again
     h.configuration = try jsonValue(&h,
         \\{"diagnostics": {"step": "unit"}}
     );
@@ -1297,7 +1331,8 @@ test "settings: pulled with workspace/configuration at startup and on change not
 }
 
 test "few CPU cores: async tasks run inline, waitIdle, progress and pulled settings still work" {
-    // 模拟 CI 等核数少的机器：`async` 全部在调用方线程同步执行
+    // Simulate machines with few cores, such as CI: every `async` runs synchronously on the
+    // caller's thread
     const old_limit = testing.io_instance.async_limit;
     testing.io_instance.setAsyncLimit(.nothing);
     defer testing.io_instance.setAsyncLimit(old_limit);
@@ -1319,7 +1354,8 @@ test "few CPU cores: async tasks run inline, waitIdle, progress and pulled setti
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"3:23 zig: expected type 'u32'"});
 
-    // 配置变化后重新拉取，waitIdle 等到项目重启并构建完成
+    // Pulled again after the configuration change; waitIdle waits until the project restarts and
+    // the build finishes
     h.configuration = try jsonValue(&h,
         \\{"diagnostics": {"step": "unit"}}
     );
@@ -1328,7 +1364,8 @@ test "few CPU cores: async tasks run inline, waitIdle, progress and pulled setti
     try expectDiagnostics(try h.diagnostics(), "t.zig", &.{"1:18 zig: expected type 'u8'"});
     try shutdown(&h);
 
-    // 主循环没有被阻塞：create 的响应在构建结束前被处理，进度正常发送
+    // The main loop is not blocked: the response to create is handled before the build ends, and
+    // progress is sent normally
     var builds: usize = 0;
     for (try progressTitles(&h)) |t| {
         if (std.mem.startsWith(u8, t, "zig build")) builds += 1;
@@ -1336,7 +1373,9 @@ test "few CPU cores: async tasks run inline, waitIdle, progress and pulled setti
     try testing.expect(builds >= 2);
 }
 
-/// 在项目目录写出包装用户 zig 的脚本 zigw：`zig env` 报告另一个版本，其余命令照常执行。返回使用它的初始化选项
+/// Writes zigw, a script wrapping the user's zig, into the project directory: `zig env` reports
+/// a different version, and other commands run as usual. Returns the initialization options that
+/// use it.
 fn mismatchedZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     const zig = project.env.zig_exe;
     const script = try std.fmt.allocPrint(h.arena.allocator(),
@@ -1360,15 +1399,17 @@ test "zig version mismatch: no build system is started, live diagnostics run zig
     const lib_uri = try open(&h, lib_path, fixture.basic[2].text);
     try waitIdle(&h);
 
-    // 不启动构建系统：没有一直不结束的加载进度，也没有编译器诊断
+    // The build system is not started: there is no loading progress that never ends, and no
+    // compiler diagnostics
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try expectProgressEnded(&h);
-    // 提示写出两个版本以及受影响的功能
+    // The message states both versions and the affected features
     const messages = try shownMessages(&h);
     const expected_head = "zig 0.0.0-mismatch differs from zig " ++ @import("builtin").zig_version_string ++ " that zig-analyzer was built with.";
     try testing.expect(anyContains(messages, expected_head));
     try testing.expect(anyContains(messages, "imports of named modules (dependencies, build options) are not resolved"));
-    // live 诊断来自子进程 zig ast-check，在读事务之外取得
+    // Live diagnostics come from a zig ast-check child process, obtained outside the read
+    // transaction
     {
         var ctx = h.server.db.beginRead(testing.allocator);
         defer ctx.end();
@@ -1400,7 +1441,8 @@ test "zig version mismatch: files under a newly created build.zig drop their sin
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"zig: no module named 'geo'"});
 
-    // 新建 build.zig：版本不同，不启动项目，main.zig 也不再按单文件编译，此前的结果随之失效
+    // Create build.zig: the versions differ, so the project is not started, main.zig is no longer
+    // compiled as a single file, and the earlier results are invalidated
     const build_path = try project.path(a, "build.zig");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = simple_build });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, build_path), .type = 1 }} });
@@ -1414,8 +1456,8 @@ test "unreadable build graph: loading ends, the build system is stopped and the 
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
-    // 假的 maker：发出指向不存在的文件的构建图，然后一直等待输入。`zig env` 报告包装脚本自身为 zig，
-    // 其余命令照常执行
+    // A fake maker: sends a build graph pointing to a nonexistent file, then waits for input
+    // forever. `zig env` reports the wrapper script itself as zig; other commands run as usual.
     const a = testing.allocator;
     {
         const missing = "missing-configuration";
@@ -1447,7 +1489,7 @@ test "unreadable build graph: loading ends, the build system is stopped and the 
 
     try expectProgressEnded(&h);
     try testing.expect(anyContains(try shownMessages(&h), "cannot read the build graph"));
-    // maker 被结束：后台任务读到输入结束后收尾
+    // maker is terminated: the background task cleans up after reading the end of input
     const ws = h.server.workspaces.items[0];
     for (0..100) |_| {
         ws.mutex.lockUncancelable(testing.io);
@@ -1459,7 +1501,7 @@ test "unreadable build graph: loading ends, the build system is stopped and the 
     try shutdown(&h);
 }
 
-/// 每个开始的进度都已结束
+/// Every progress that was begun has ended
 fn expectProgressEnded(h: *Harness) !void {
     var begins: usize = 0;
     var ends: usize = 0;
@@ -1471,7 +1513,7 @@ fn expectProgressEnded(h: *Harness) !void {
     try testing.expectEqual(begins, ends);
 }
 
-/// 收到的 window/showMessage 文案
+/// Message texts of the window/showMessage notifications received
 fn shownMessages(h: *Harness) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (try h.notifications("window/showMessage")) |m| try out.append(h.arena.allocator(), m.object.get("params").?.object.get("message").?.string);
@@ -1530,7 +1572,7 @@ test "settings: build.enable can be switched off and on at runtime" {
         \\{"build": {"enable": false, "args": ["-Dbad=true"]}}
     ));
     try waitIdle(&h);
-    // 不启动构建系统
+    // The build system is not started
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try testing.expect((try h.diagnostics()).get("main.zig") == null);
     const std_path = try std.fs.path.join(h.arena.allocator(), &.{ project.env.std_dir, "std.zig" });
@@ -1539,7 +1581,7 @@ test "settings: build.enable can be switched off and on at runtime" {
     try waitIdle(&h);
     try expectNoErrors(&h, std_uri);
 
-    // 打开：启动项目并发布编译器诊断
+    // Enable: the project is started and compiler diagnostics are published
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
         \\{"build": {"enable": true, "args": ["-Dbad=true"]}}
     ) });
@@ -1548,7 +1590,7 @@ test "settings: build.enable can be switched off and on at runtime" {
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{"3:23 zig: expected type 'u32'"});
     try expectNoErrors(&h, std_uri);
 
-    // 再关闭：项目停止，其诊断被清除
+    // Disable again: the project stops and its diagnostics are cleared
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
         \\{"build": {"enable": false}}
     ) });
@@ -1562,7 +1604,7 @@ test "settings: build.enable can be switched off and on at runtime" {
 test "project zig-analyzer.zon: build settings apply, a change on disk restarts the project" {
     var project = try fixture.Project.create(settings_project ++ [_]fixture.File{
         .{ .path = "zig-analyzer.zon", .text =
-        \\// 项目的构建参数
+        \\// Build settings of the project
         \\.{
         \\    .build = .{ .args = .{"-Dbad=true"} },
         \\    .log = .{ .level = .err },
@@ -1579,7 +1621,8 @@ test "project zig-analyzer.zon: build settings apply, a change on disk restarts 
     try expectDiagnostics(diags, "main.zig", &.{"3:23 zig: expected type 'u32'"});
     try testing.expect(anyContains(try shownMessages(&h), "`log.level` cannot be set in zig-analyzer.zon"));
 
-    // 编辑器之外改为用 unit step 诊断、去掉 -D 参数：项目重启
+    // Outside the editor, switch to the unit step for diagnostics and drop the -D argument:
+    // the project restarts
     const a = h.arena.allocator();
     const path = try project.path(a, "zig-analyzer.zon");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = ".{ .diagnostics = .{ .steps = .{\"unit\"} } }" });
@@ -1591,17 +1634,18 @@ test "project zig-analyzer.zon: build settings apply, a change on disk restarts 
     try shutdown(&h);
 }
 
-/// 设置转为 JSON（路径中的字符按 JSON 转义）
+/// Settings converted to JSON (characters in paths are escaped as in JSON)
 fn settingsValue(h: *Harness, settings: anytype) !std.json.Value {
     return jsonValue(h, try std.json.Stringify.valueAlloc(h.arena.allocator(), settings, .{}));
 }
 
-/// 模块图中标准库的根文件
+/// Root file of the standard library in the module graph
 fn stdRoot(h: *Harness) ![]const u8 {
     return (try h.request("zig-analyzer/moduleGraph", {})).object.get("result").?.object.get("std_root").?.string;
 }
 
-/// 在 `text` 中 `needle` 的开头处 goto definition，返回目标文件的路径
+/// Requests goto definition at the start of `needle` in `text` and returns the path of the target
+/// file
 fn definitionPath(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
     const offset = std.mem.indexOf(u8, text, needle).?;
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
@@ -1614,7 +1658,8 @@ fn definitionPath(h: *Harness, uri: []const u8, text: []const u8, needle: []cons
     return za.base.uri.toPath(h.arena.allocator(), result.object.get("uri").?.string);
 }
 
-/// 包装脚本记下的 zig 命令（`zig env` 除外）：每行为「子命令 ZIG_LIB_DIR」
+/// zig commands recorded by the wrapper script (except `zig env`): each line is
+/// "<subcommand> <ZIG_LIB_DIR>"
 fn zigCalls(h: *Harness, path: []const u8) ![]const []const u8 {
     const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, h.arena.allocator(), .limited(1024 * 1024));
     var out: std.ArrayList([]const u8) = .empty;
@@ -1652,14 +1697,16 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    // 工作区之外：指向用户 zig 的 lib 目录的另一个路径，以及按单文件编译的独立文件
+    // Outside the workspace: another path pointing to the lib directory of the user's zig, and a
+    // standalone file compiled in single-file mode
     var other = testing.tmpDir(.{});
     defer other.cleanup();
     try other.dir.symLink(testing.io, project.env.lib_dir, "zig-lib", .{ .is_directory = true });
     try other.dir.writeFile(testing.io, .{ .sub_path = "solo.zig", .data = lib_path_main });
     const other_root = try other.dir.realPathFileAlloc(testing.io, ".", a);
     const lib = try std.fs.path.join(a, &.{ other_root, "zig-lib" });
-    // 包装用户 zig 的脚本 zigw：记下每条命令的子命令与 ZIG_LIB_DIR；`zig env` 报告脚本自身为 zig，其余命令照常执行
+    // Script zigw wrapping the user's zig: records the subcommand and ZIG_LIB_DIR of each command;
+    // `zig env` reports the script itself as zig, and other commands run as usual
     const zig = project.env.zig_exe;
     const calls = try project.path(a, "zig-calls");
     const zigw = try project.path(a, "zigw");
@@ -1687,14 +1734,16 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"2:19 zig: expected type 'u32'"});
     try expectDiagnostics(diags, "solo.zig", &.{"2:19 zig: expected type 'u32'"});
-    // 项目的构建、单文件编译等 zig 子进程都使用覆盖的 lib 目录（缓存中没有默认 builtin.zig 的记录时，生成它的
-    // 命令先于构建运行）
+    // The project build, single-file compiles and other zig child processes all use the overriding
+    // lib directory (when the cache has no record of the default builtin.zig, the command
+    // generating it runs before the build)
     const before = try zigCalls(&h, calls);
     try testing.expect(hasLine(before, try std.fmt.allocPrint(a, "build {s}", .{lib})));
     try testing.expect(hasLine(before, try std.fmt.allocPrint(a, "build-obj {s}", .{lib})));
     for (before) |line| try testing.expect(std.mem.endsWith(u8, line, lib));
 
-    // 去掉覆盖：标准库重新加载，项目按 `zig env` 给出的 lib 目录重启，独立文件重新编译
+    // Remove the override: the standard library is reloaded, the project restarts with the lib
+    // directory reported by `zig env`, and standalone files are recompiled
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .zig = .{ .path = zigw } } });
     try waitIdle(&h);
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
@@ -1720,7 +1769,7 @@ test "settings: invalid zig paths fall back to zig env with a message, zig.built
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    // 没有 std/std.zig 的 lib 目录，不存在的缓存目录与 builtin.zig
+    // A lib directory without std/std.zig, and a nonexistent cache directory and builtin.zig
     const missing = try project.path(a, "missing");
     try initializeWith(&h, project.root, false, try settingsValue(&h, .{ .zig = .{
         .lib_path = project.root,
@@ -1733,18 +1782,19 @@ test "settings: invalid zig paths fall back to zig env with a message, zig.built
     try testing.expect(anyContains(messages, try std.fmt.allocPrint(a, "zig.lib_path {s} does not contain std/std.zig, using {s}", .{ project.root, project.env.lib_dir })));
     try testing.expect(anyContains(messages, try std.fmt.allocPrint(a, "zig.global_cache_path {s} is not an existing directory, using {s}", .{ missing, project.env.global_cache_dir })));
     try testing.expect(anyContains(messages, try std.fmt.allocPrint(a, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{missing})));
-    // 服务器给出的路径是规范化的（Windows 上分隔符为 `\`、盘符大写），预期的路径同样规范化后比较
+    // Paths from the server are normalized (on Windows, `\` separators and an uppercase drive
+    // letter), so the expected paths are normalized the same way before comparing
     try testing.expectEqualStrings(try std.fs.path.resolveAlloc(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
     try testing.expectEqualStrings(project.env.global_cache_dir, h.server.zigEnv().?.global_cache_dir);
     const generated = try definitionPath(&h, uri, builtin_main, "mode;");
     try testing.expect(std.mem.startsWith(u8, generated, try std.fs.path.resolveAlloc(a, &.{project.env.global_cache_dir})));
 
-    // 改为存在的 builtin.zig：不属于项目的文件改用它
+    // Switch to an existing builtin.zig: files outside any project use it
     const custom = try std.fs.path.resolveAlloc(a, &.{ project.root, "target", "builtin.zig" });
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .zig = .{ .builtin_path = custom } } });
     try waitIdle(&h);
     try testing.expectEqualStrings(custom, try definitionPath(&h, uri, builtin_main, "mode;"));
-    // 去掉覆盖：回到生成的 builtin.zig
+    // Remove the override: back to the generated builtin.zig
     try h.notify("workspace/didChangeConfiguration", .{ .settings = Empty{} });
     try waitIdle(&h);
     try testing.expectEqualStrings(generated, try definitionPath(&h, uri, builtin_main, "mode;"));

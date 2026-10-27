@@ -1,5 +1,6 @@
-//! textDocument/formatting：使用标准库的渲染器，结果与 `zig fmt` 逐字一致。
-//! 输出以行为单位的最小替换区间（公共前缀 / 后缀之外的部分），避免整篇替换导致光标与折叠丢失。
+//! textDocument/formatting: uses the standard library renderer, matching `zig fmt` exactly.
+//! Outputs the minimal replacement range in whole lines (the part outside the common prefix /
+//! suffix), avoiding a whole-document replacement that would lose the cursor and folds.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,7 +12,8 @@ const log = std.log.scoped(.format);
 
 pub const Mode = enum { zig, zon };
 
-/// 有语法错误时返回 null（与 `zig fmt` 一样拒绝格式化）；已格式化时返回空数组。
+/// Returns null on syntax errors (refusing to format, like `zig fmt`); returns an empty array
+/// when the text is already formatted.
 pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offsets.Encoding) Allocator.Error!?[]const types.TextEdit {
     const text = lines.text;
     const formatted = try renderText(arena, text, mode) orelse return null;
@@ -24,26 +26,28 @@ pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offse
     return try arena.dupe(types.TextEdit, &.{edit});
 }
 
-/// `zig fmt` 对文本的结果；有语法错误或嵌套过深时为 null
+/// Result of `zig fmt` on the text; null on syntax errors or when nesting is too deep
 pub fn renderText(arena: Allocator, text: []const u8, mode: Mode) Allocator.Error!?[]const u8 {
     return render(arena, try arena.dupeSentinel(u8, text, 0), mode);
 }
 
-/// 把 `old` 变为 `new` 的最小替换区间：公共前缀与后缀之外的部分，按整行计算，区间落在字符边界上。
-/// 替换 `old[start..old_end]` 为 `new[start..new_end]`
+/// Minimal replacement range that turns `old` into `new`: the part outside the common prefix and
+/// suffix, computed in whole lines, with the range falling on character boundaries.
+/// `old[start..old_end]` is replaced with `new[start..new_end]`
 pub fn lineDiff(old: []const u8, new: []const u8) struct { start: usize, old_end: usize, new_end: usize } {
     var prefix = std.mem.indexOfDiff(u8, old, new) orelse @min(old.len, new.len);
     prefix = if (std.mem.lastIndexOfScalar(u8, old[0..prefix], '\n')) |nl| nl + 1 else 0;
     var suffix: usize = 0;
     while (suffix < old.len - prefix and suffix < new.len - prefix and
         old[old.len - 1 - suffix] == new[new.len - 1 - suffix]) suffix += 1;
-    // 后缀也从行首开始
+    // The suffix also starts at the beginning of a line
     while (suffix > 0 and old.len - suffix > 0 and old[old.len - suffix - 1] != '\n') suffix -= 1;
     return .{ .start = prefix, .old_end = old.len - suffix, .new_end = new.len - suffix };
 }
 
-/// 官方解析器与渲染器（同 `zig fmt`）的结果，有语法错误时为 null。两者逐层递归：按嵌套深度选择执行的
-/// 线程，超过 `nesting.format_depth` 的文本不格式化
+/// Result of the official parser and renderer (same as `zig fmt`); null on syntax errors. Both
+/// recurse once per nesting level: the thread to run on is chosen by nesting depth, and text
+/// nested deeper than `nesting.format_depth` is not formatted
 fn render(arena: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!?[]const u8 {
     const depth = try nesting.estimate(arena, source, nesting.format_depth);
     if (depth <= nesting.inline_depth) return renderSource(arena, source, mode);
@@ -81,7 +85,7 @@ test "deeply nested source is formatted on a large stack, beyond the depth limit
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // 超过当前线程的上限，在专用线程上格式化
+    // Beyond the limit of the current thread: formatted on a dedicated thread
     var text: std.ArrayList(u8) = .empty;
     try text.appendSlice(a, "const  x = ");
     for (0..3000) |_| try text.append(a, '(');
@@ -93,7 +97,7 @@ test "deeply nested source is formatted on a large stack, beyond the depth limit
     try testing.expectEqual(1, edits.len);
     try testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, text.items, "const  x", "const x"), try applyEdit(a, text.items, edits[0]));
 
-    // 超过深度上限：拒绝
+    // Beyond the depth limit: rejected
     text.clearRetainingCapacity();
     try text.appendSlice(a, "const x = ");
     for (0..nesting.format_depth) |_| try text.append(a, '(');
@@ -113,7 +117,7 @@ test format {
     const lines = try offsets.LineIndex.init(a, text);
     const edits = (try format(a, lines, .zig, .utf16)).?;
     try testing.expectEqual(1, edits.len);
-    // 只替换第二行
+    // Only the second line is replaced
     try testing.expectEqual(1, edits[0].range.start.line);
     try testing.expectEqual(2, edits[0].range.end.line);
     try testing.expectEqualStrings("const a = 1;\nfn f() void {}\nconst b = 2;\n", try applyEdit(a, text, edits[0]));

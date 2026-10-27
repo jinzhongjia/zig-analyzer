@@ -1,4 +1,5 @@
-//! 红树：在绿树上按需计算绝对位置的轻量游标（值类型，不分配内存）。
+//! Red tree: lightweight cursors over the green tree that compute absolute positions on demand
+//! (value types, no allocation).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -88,14 +89,14 @@ pub const SyntaxNode = struct {
         }
     };
 
-    /// 第一个指定种类的直接子节点
+    /// The first direct child node of the given kind
     pub fn childNode(n: SyntaxNode, k: SyntaxKind) ?SyntaxNode {
         var it = n.children();
         while (it.nextNode()) |c| if (c.kind() == k) return c;
         return null;
     }
 
-    /// 第一个指定种类的直接子 token
+    /// The first direct child token of the given kind
     pub fn childToken(n: SyntaxNode, k: SyntaxKind) ?SyntaxToken {
         var it = n.children();
         while (it.next()) |e| if (e == .token and e.token.kind == k) return e.token;
@@ -111,8 +112,8 @@ pub const SyntaxNode = struct {
         return null;
     }
 
-    /// 包含 `offset` 的最深 token。`offset` 落在两个 token 的边界上时取右侧 token；
-    /// 等于文本末尾时取最后一个 token。
+    /// The deepest token containing `offset`. When `offset` falls on the boundary of two tokens,
+    /// the token on the right is taken; when it equals the end of the text, the last token.
     pub fn tokenAtOffset(n: SyntaxNode, offset: u32) ?SyntaxToken {
         var node = n;
         outer: while (true) {
@@ -129,7 +130,7 @@ pub const SyntaxNode = struct {
                     },
                 }
             }
-            // offset == 文本末尾
+            // offset == end of text
             const tail = last orelse return null;
             if (offset != tail.range().end) return null;
             switch (tail) {
@@ -139,7 +140,7 @@ pub const SyntaxNode = struct {
         }
     }
 
-    /// 从根到覆盖 `offset` 的最深节点的路径（含两端）。
+    /// Path from the root to the deepest node covering `offset` (both ends included).
     pub fn coveringPath(n: SyntaxNode, gpa: Allocator, offset: u32) Allocator.Error![]SyntaxNode {
         var path: std.ArrayList(SyntaxNode) = .empty;
         errdefer path.deinit(gpa);
@@ -159,7 +160,7 @@ pub const SyntaxNode = struct {
         return path.toOwnedSlice(gpa);
     }
 
-    /// 以缩进树的形式输出，用于测试快照与调试。
+    /// Writes the tree as an indented tree, for test snapshots and debugging.
     pub fn dump(n: SyntaxNode, w: *std.Io.Writer, opts: DumpOptions) std.Io.Writer.Error!void {
         try dumpRec(n, w, opts, 0);
     }

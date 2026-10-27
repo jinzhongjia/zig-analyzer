@@ -1,13 +1,17 @@
-//! 软断言：不应发生、但出现时可以降级的情况（对应 rust-analyzer 的 `never!`）。Debug 构建与测试中同 `assert`，
-//! 让问题尽早暴露；其余构建中每个调用处只记录一次日志，由调用方走降级路径（结果按 `unknown`、跳过这一项等）。
-//! 只用于分析代码对输入数据的假设，不替代内存安全检查：继续执行会读写越界的地方仍然用 `assert` 或 `.?`。
+//! Soft assertions: conditions that should never happen but can be handled by degrading when they
+//! do (the counterpart of rust-analyzer's `never!`). In Debug builds and tests they behave like
+//! `assert`, so that problems surface early; in other builds each call site logs only once, and the
+//! caller takes a degraded path (treating the result as `unknown`, skipping the item, etc.). Only
+//! for assumptions that analysis code makes about input data, not a substitute for memory-safety
+//! checks: where continuing would read or write out of bounds, still use `assert` or `.?`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const log = std.log.scoped(.assert);
 
-/// `cond` 为 true 表示出现了不应发生的情况，调用方据此降级：`if (never(i >= len, @src(), "...")) return null;`
+/// `cond` being true means that something that should never happen did happen, and the caller
+/// degrades accordingly: `if (never(i >= len, @src(), "...")) return null;`
 pub fn never(cond: bool, comptime src: std.builtin.SourceLocation, comptime msg: []const u8) bool {
     if (!cond) return false;
     report(src, msg);
@@ -23,7 +27,7 @@ fn report(comptime src: std.builtin.SourceLocation, comptime msg: []const u8) vo
     if (!Site.logged.swap(true, .monotonic)) log.err("{s}:{d}: {s} (reported once)", .{ src.file, src.line, msg });
 }
 
-/// `never(!cond, ...)` 的另一种写法：返回 `cond`
+/// Another way to write `never(!cond, ...)`: returns `cond`
 pub fn always(cond: bool, comptime src: std.builtin.SourceLocation, comptime msg: []const u8) bool {
     return !never(!cond, src, msg);
 }

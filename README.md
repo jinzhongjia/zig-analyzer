@@ -1,7 +1,5 @@
 # zig-analyzer
 
-English | [简体中文](README.zh-CN.md)
-
 A language server (LSP) for Zig, built on an incremental query engine.
 
 - **Diagnostics match the compiler**: errors come only from Zig itself (in-process AstGen while typing, `zig build` on save), never from guesses.
@@ -83,4 +81,4 @@ A `zig-analyzer.zon` in the project root shares project settings (build argument
 
 ## Documentation
 
-[`docs/design.md`](docs/design.md) (in Chinese) covers the architecture, performance targets and current measurements, and how correctness is verified.
+[`docs/design.md`](docs/design.md) covers the architecture, performance targets and current measurements, and how correctness is verified.

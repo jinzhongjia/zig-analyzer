@@ -4,12 +4,12 @@ const resolve = @import("../names/resolve.zig");
 const World = @import("../names/resolve_test.zig").World;
 const code_actions = @import("code_actions.zig");
 
-/// 在 `<|>` 处（或 `«...»` 选区上）取标题为 `title` 的修复，返回应用后的文本
+/// Applies the fix titled `title` at `<|>` (or on the `«...»` selection) and returns the new text
 fn apply(text: []const u8, title_prefix: []const u8) ![]const u8 {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
-    // 选区：去掉 `«` `»` 标记
+    // Selection: strip the `«` `»` markers
     var start: ?u32 = null;
     var end: u32 = 0;
     const plain = blk: {
@@ -93,7 +93,7 @@ test "discard unused locals, parameters and captures" {
     );
 }
 
-/// AstGen（同 `zig ast-check`）没有错误
+/// AstGen (same as `zig ast-check`) reports no errors
 fn expectAstCheckClean(source: []const u8) !void {
     const z = try testing.allocator.dupeSentinel(u8, source, 0);
     defer testing.allocator.free(z);
@@ -106,7 +106,7 @@ fn expectAstCheckClean(source: []const u8) !void {
 
 test "use 'const' for locals that are never mutated" {
     const cases = [_]struct { []const u8, []const u8 }{
-        // 只替换关键字，类型标注与初始化表达式不变
+        // Only the keyword is replaced; the type annotation and the initializer stay unchanged
         .{
             "fn f() u32 {\n    var <|>x: u32 = 1 + 2;\n    return x;\n}\n",
             "fn f() u32 {\n    const x: u32 = 1 + 2;\n    return x;\n}\n",
@@ -115,7 +115,8 @@ test "use 'const' for locals that are never mutated" {
             "fn f() u32 {\n    var <|>@\"x y\" = @as(u32, 1);\n    return @\"x y\";\n}\n",
             "fn f() u32 {\n    const @\"x y\" = @as(u32, 1);\n    return @\"x y\";\n}\n",
         },
-        // `comptime const` 不合法：初始化在编译期求值，改为包上 `comptime`
+        // `comptime const` is invalid: the initializer is evaluated at compile time, so it is
+        // wrapped in `comptime` instead
         .{
             "fn g() u32 {\n    return 1;\n}\nfn f() u32 {\n    comptime var <|>c = g();\n    return c;\n}\n",
             "fn g() u32 {\n    return 1;\n}\nfn f() u32 {\n    const c = comptime g();\n    return c;\n}\n",
@@ -124,7 +125,7 @@ test "use 'const' for locals that are never mutated" {
             "fn f() u32 {\n    comptime var <|>c: u32 = comptime 1;\n    return c;\n}\n",
             "fn f() u32 {\n    const c: u32 = comptime 1;\n    return c;\n}\n",
         },
-        // 解构中的一个变量
+        // One variable of a destructuring
         .{
             "fn f() u32 {\n    var a, var <|>b = .{ @as(u32, 1), @as(u32, 2) };\n    a += 1;\n    return a + b;\n}\n",
             "fn f() u32 {\n    var a, const b = .{ @as(u32, 1), @as(u32, 2) };\n    a += 1;\n    return a + b;\n}\n",
@@ -137,9 +138,9 @@ test "use 'const' for locals that are never mutated" {
         try expectAstCheckClean(got);
     }
     for ([_][]const u8{
-        // 被修改的变量没有诊断
+        // A mutated variable has no diagnostic
         "fn f() u32 {\n    var <|>x: u32 = 1;\n    x += 1;\n    return x;\n}\n",
-        // 带 `comptime` 的解构：`comptime` 作用于整条语句
+        // Destructuring with `comptime`: `comptime` applies to the whole statement
         "fn f() u32 {\n    comptime var <|>a, var b = .{ 1, 2 };\n    return a + b;\n}\n",
     }) |source| {
         const got = try apply(source, "use 'const'");
@@ -166,7 +167,7 @@ test "add missing switch prongs" {
         \\    }
         \\}
     );
-    // 没有结尾逗号、联合
+    // No trailing comma, and a union
     try expectAction(
         \\const U = union(enum) { a: u8, b };
         \\fn f(u: U) void {
@@ -255,7 +256,7 @@ test "extract to local constant" {
         \\    return c;
         \\}
     );
-    // 表达式位于语句开头；名字已被占用时换一个
+    // The expression is at the start of a statement; when the name is taken, another one is chosen
     try expectAction(
         \\fn g(x: u32) u32 {
         \\    return x;
@@ -276,7 +277,7 @@ test "extract to local constant" {
         \\    }
         \\}
     );
-    // 类型取决于结果位置：标注原处的类型
+    // The type depends on the result location: the type at the original position is annotated
     try expectAction(
         \\pub fn f(x: u64) u8 {
         \\    return «@intCast(x)»;
@@ -287,7 +288,7 @@ test "extract to local constant" {
         \\    return value;
         \\}
     );
-    // 短路的左侧总会求值
+    // The left-hand side of a short circuit is always evaluated
     try expectAction(
         \\fn g() bool {
         \\    return true;
@@ -304,7 +305,7 @@ test "extract to local constant" {
         \\    return value and flag;
         \\}
     );
-    // 选区是纯的：可以越过之前的调用
+    // The selection is pure: it can be moved ahead of an earlier call
     try expectAction(
         \\fn g(x: u32) u32 {
         \\    return x;
@@ -321,7 +322,8 @@ test "extract to local constant" {
         \\    return g(1) + value;
         \\}
     );
-    // 之前的部分是纯的（参数、常量）：有副作用的选区可以提前
+    // The preceding parts are pure (parameters, constants): a selection with side effects
+    // can be moved ahead of them
     try expectAction(
         \\const k: u32 = 2;
         \\fn g() u32 {
@@ -346,29 +348,31 @@ test "extract to local constant" {
         \\    return h(n, k * 2, value);
         \\}
     );
-    // 不提取：赋值的左侧、取地址的操作数、while 的条件、不是完整表达式的选区
+    // Not extracted: the left-hand side of an assignment, the operand of address-of, the
+    // condition of a while, a selection that is not a complete expression
     for ([_][]const u8{
         "fn f() void {\n    var x: u32 = 0;\n    «x» = 1;\n}",
         "fn f() void {\n    var x: u32 = 0;\n    const p = &«x»;\n    _ = p;\n}",
         "fn f(n: u32) void {\n    var i: u32 = 0;\n    while («i < n») : (i += 1) {}\n}",
         "fn f(a: u32) u32 {\n    return «a +» 1;\n}",
-        // 有条件求值：短路的右侧、if 的分支、catch / orelse 的右侧、循环体
+        // Conditionally evaluated: the right-hand side of a short circuit, if branches, the
+        // right-hand side of catch / orelse, loop bodies
         "var hits: u32 = 0;\nfn hit() bool {\n    hits += 1;\n    return true;\n}\npub fn f(flag: bool) bool {\n    return flag and «hit()»;\n}",
         "fn g() u32 {\n    return 1;\n}\nfn f(c: bool) u32 {\n    return if (c) «g()» else 0;\n}",
         "fn g() u32 {\n    return 1;\n}\nfn f(x: ?u32) u32 {\n    return x orelse «g()»;\n}",
         "fn g() u32 {\n    return 1;\n}\nfn f(x: anyerror!u32) u32 {\n    return x catch «g()»;\n}",
         "fn g(x: u32) void {\n    _ = x;\n}\nfn f(xs: []const u32) void {\n    for (xs) |x| g(«x + 1»);\n}",
-        // 顺序：选区与之前的部分都有副作用
+        // Ordering: both the selection and the preceding parts have side effects
         "fn g(x: u32) u32 {\n    return x;\n}\nfn f() u32 {\n    return g(1) + «g(2)»;\n}",
-        // 顺序：之前读取的 var 可能被选区中的调用修改
+        // Ordering: a var read earlier may be modified by a call in the selection
         "fn g() u32 {\n    return 1;\n}\nfn f() u32 {\n    var i: u32 = 0;\n    i += 1;\n    return i + «g()»;\n}",
-        // 顺序：之前的 try 可能提前返回
+        // Ordering: an earlier try may return early
         "fn h() !u32 {\n    return 1;\n}\nfn g() u32 {\n    return 1;\n}\nfn f(x: anyerror!u32) !u32 {\n    return (try x) + «g()»;\n}",
-        // 纯的表达式也不提出短路的保护（除零）
+        // A pure expression is not hoisted out of a short-circuit guard either (division by zero)
         "fn f(x: u32, y: u32) bool {\n    return x != 0 and «y / x» > 1;\n}",
-        // defer 中的表达式在离开作用域时求值
+        // Expressions in a defer are evaluated when leaving the scope
         "fn g(x: u32) void {\n    _ = x;\n}\nfn f(a: u32) void {\n    defer g(«a + 1»);\n}",
-        // 结果类型标注不出
+        // The result type cannot be annotated
         "const E = enum { a, b };\nfn f() E {\n    return «.a»;\n}",
     }) |text| {
         const got = try apply(text, "extract");
@@ -380,7 +384,8 @@ test "extract to local constant" {
     }
 }
 
-/// 用编译器的语法树验证编辑结果，并从字符串 token 读取字节值。
+/// Verifies the edit result with the compiler's syntax tree and reads the byte value from the
+/// string token.
 fn stringValue(source: []const u8) ![]u8 {
     const z = try testing.allocator.allocSentinel(u8, source.len, 0);
     @memcpy(z, source);
@@ -414,7 +419,7 @@ test "string conversion preserves bytes and surrounding syntax" {
         .{ "\"abc\"", "abc" },
         .{ "\"a\\nb\"", "a\nb" },
         .{ "\"\\n\\na\\n\\n\"", "\n\na\n\n" },
-        .{ "\"\\\"\\\\\\x41\\u{4e2d}  \"", "\"\\A中  " },
+        .{ "\"\\\"\\\\\\x41\\u{20ac}  \"", "\"\\A€  " },
     };
     const contexts = .{
         .{ "const text = ", ";" },
@@ -423,7 +428,7 @@ test "string conversion preserves bytes and surrounding syntax" {
         .{ "const text = call(", ");" },
         .{ "const text =\n    ", ";" },
         .{ "const text = ", "; // comment\r\n" },
-        // 已按 zig fmt 格式化的文件：结果按 zig fmt 排版
+        // Files already formatted by zig fmt: the result is laid out the way zig fmt does
         .{ "const text = ", ";\n" },
         .{ "fn f() void {\n    const text = ", ";\n    _ = text;\n}\n" },
         .{ "test {\n    try call(", ", 42);\n}\n" },
@@ -451,12 +456,12 @@ test "string conversion preserves bytes and surrounding syntax" {
 
 test "string conversion in a file formatted by zig fmt keeps it formatted" {
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
-        // `=` 之后不留空白，`;` 在语句的缩进处
+        // No whitespace after `=`, and `;` at the indentation of the statement
         .{ "const text = <|>\"a\\nb\";\n", "convert to a multiline", "const text =\n    \\\\a\n    \\\\b\n;\n" },
         .{ "fn f() void {\n    const text =\n        <|>\"a\\n\";\n    _ = text;\n}\n", "convert to a multiline", "fn f() void {\n    const text =\n        \\\\a\n        \\\\\n    ;\n    _ = text;\n}\n" },
-        // 初始化列表改为每行一个元素
+        // The initializer list becomes one element per line
         .{ "const text = .{ <|>\"a\", 42 };\n", "convert to a multiline", "const text = .{\n    \\\\a\n    ,\n    42,\n};\n" },
-        // 转换回普通字符串后合并行
+        // Converting back to an ordinary string joins the lines
         .{ "const text =\n    \\\\<|>a\n    \\\\b\n;\n", "convert to a string", "const text =\n    \"a\\nb\";\n" },
         .{ "fn f() void {\n    call(\n        \\\\<|>a\n    , 42);\n}\n", "convert to a string", "fn f() void {\n    call(\"a\", 42);\n}\n" },
     };

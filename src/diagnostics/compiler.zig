@@ -1,4 +1,5 @@
-//! `compiler` 诊断来源：把构建结果中的 ErrorBundle 转换为按文件组织的诊断，并与 live 诊断合并。
+//! `compiler` diagnostic source: converts the ErrorBundles in build results into per-file
+//! diagnostics and merges them with live diagnostics.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -8,9 +9,9 @@ const offsets = @import("../util/offsets.zig");
 const live = @import("live.zig");
 const Vfs = @import("../base/Vfs.zig");
 
-/// 一次构建中某个文件的编译器诊断
+/// Compiler diagnostics of one file in one build
 pub const FileResult = struct {
-    /// 构建完成时读取的磁盘文本；诊断的字节区间以它为准
+    /// Disk text read when the build finished; the byte ranges of the diagnostics refer to it
     base_text: []const u8,
     items: []const Item,
 };
@@ -19,29 +20,35 @@ pub const Item = struct {
     start: u32,
     end: u32,
     message: []const u8,
-    /// 是否也是 AstGen（`zig ast-check`）错误。缓冲区有未保存修改时，这类错误改由 live 来源提供。
+    /// Whether this is also an AstGen (`zig ast-check`) error. When the buffer has unsaved
+    /// changes, such errors come from the live source instead.
     is_astgen: bool,
     notes: []const Note,
-    /// 附在这条错误上的 `@compileLog` 输出（各行，不含末尾换行），发布时接在文案之后；没有时为空。
-    /// 与 `message` 分开存放：去重与 AstGen 匹配都按编译器的原始文案进行
+    /// `@compileLog` output attached to this error (its lines, without the trailing newline),
+    /// appended to the message when published; empty when there is none. Stored separately from
+    /// `message`: dedup and AstGen matching both use the compiler's original message.
     compile_log: []const u8 = "",
 };
 
 pub const Note = struct {
-    /// 绝对路径
+    /// Absolute path
     path: []const u8,
     start: u32,
     end: u32,
     message: []const u8,
 };
 
-/// 一次构建的全部结果，连同自身分配在 arena 中。创建后不再修改，按引用计数共享：持有者（项目、单文件编译）
-/// 与读取方各持有一份引用。读取方在持有者的锁内取得引用后即可释放锁，结果被新的结果替换时由最后一份引用释放
+/// All results of one build, allocated in an arena together with this struct itself. Immutable
+/// after creation and shared by reference counting: the owner (a project or a single-file
+/// compile) and each reader hold one reference. A reader can release the owner's lock as soon
+/// as it has taken a reference under that lock; once the result is replaced by a new one, it is
+/// freed when the last reference is released.
 pub const BuildResult = struct {
     arena: std.heap.ArenaAllocator.State,
-    /// 绝对路径 → 结果
+    /// Absolute path → result
     files: std.StringArrayHashMapUnmanaged(FileResult),
-    /// 构建时读取的文本：`files` 中各文件，以及附注指向但没有错误的文件（按路径查找）
+    /// Texts read during the build: each file in `files`, plus files that notes point to but that
+    /// have no errors (looked up by path)
     texts: std.StringArrayHashMapUnmanaged([]const u8),
     refs: std.atomic.Value(u32) = .init(1),
 
@@ -57,13 +64,15 @@ pub const BuildResult = struct {
     }
 };
 
-/// 文件读取接口：返回文件当前的磁盘文本（失败返回 null）
+/// File reading interface: returns the current disk text of a file (null on failure)
 pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8;
 
-/// 把一组 ErrorBundle 转换为按文件组织的结果。
-/// `src_path` 为相对路径时相对于 `build_root`；没有位置信息的错误（如链接错误）挂在 `fallback_path`（通常是 build.zig）的开头。
-/// `src_path` 解析后不是绝对路径时（格式不符的错误包，见 `absolute`）按没有位置处理：错误挂在 `fallback_path`
-/// 的开头，附注与引用链放在错误的起点。
+/// Converts a set of ErrorBundles into per-file results.
+/// A relative `src_path` is relative to `build_root`; errors without location information (such
+/// as link errors) are attached to the start of `fallback_path` (usually build.zig).
+/// When `src_path` does not resolve to an absolute path (a malformed error bundle, see
+/// `absolute`), it is treated as having no location: the error is attached to the start of
+/// `fallback_path`, and the notes and reference trace are placed at the start of the error.
 pub fn collect(
     gpa: Allocator,
     bundles: []const ErrorBundle,
@@ -77,13 +86,15 @@ pub fn collect(
     const a = arena_state.allocator();
 
     var lists: std.StringArrayHashMapUnmanaged(std.ArrayList(Item)) = .empty;
-    // 去重：多个 compile step 可能报告同一文件的同一错误。值为保留的那条在该文件列表中的下标
+    // Dedup: several compile steps may report the same error in the same file. The value is the
+    // index of the kept error in that file's list.
     var seen: std.StringHashMapUnmanaged(usize) = .empty;
 
     for (bundles) |eb| {
         if (eb.errorMessageCount() == 0) continue;
         const log_text = try a.dupe(u8, std.mem.trimEnd(u8, eb.getCompileLogOutput(), "\n"));
-        // `@compileLog` 的输出附在 "found compile log statement" 错误上（没有这条错误时附在第一条错误上）
+        // The `@compileLog` output is attached to the "found compile log statement" error (or to
+        // the first error when there is no such error)
         const log_target: ?ErrorBundle.MessageIndex = if (log_text.len == 0) null else for (eb.getMessages()) |mi| {
             if (std.mem.eql(u8, eb.nullTerminatedString(eb.getErrorMessage(mi).msg), "found compile log statement")) break mi;
         } else eb.getMessages()[0];
@@ -108,7 +119,7 @@ pub fn collect(
                 continue;
             }
 
-            // 附注之后是引用链（reference trace）
+            // The notes are followed by the reference trace
             const refs: u32 = if (msg.src_loc != .none) eb.getSourceLocation(msg.src_loc).reference_trace_len else 0;
             const notes = try a.alloc(Note, msg.notes_len + refs);
             for (notes[0..msg.notes_len], eb.getNotes(mi)) |*note, ni| {
@@ -131,7 +142,8 @@ pub fn collect(
     }
 
     var files: std.StringArrayHashMapUnmanaged(FileResult) = .empty;
-    // 附注指向的文件自身没有错误时不在 `files` 中；同样保存构建时的文本，用于平移附注
+    // A file that notes point to is not in `files` when it has no errors of its own; its
+    // build-time text is saved as well, for shifting the notes
     var texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (lists.values()) |items| for (items.items) |item| for (item.notes) |n| {
         if (texts.contains(n.path)) continue;
@@ -144,7 +156,7 @@ pub fn collect(
             try texts.put(a, path, t);
             break :blk t;
         };
-        // 标记 AstGen 错误：在同一份文本上运行 AstGen，按区间与文案匹配
+        // Mark AstGen errors: run AstGen on the same text and match by range and message
         const mode: live.Mode = if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
         const astgen = try live.check(gpa, text, mode);
         defer astgen.destroy(gpa);
@@ -157,16 +169,19 @@ pub fn collect(
     }
     const result = try a.create(BuildResult);
     result.* = .{ .arena = undefined, .files = files, .texts = texts };
-    // arena 的状态在最后一次分配之后取
+    // Take the arena state after the last allocation
     result.arena = arena_state.state;
     return result;
 }
 
-/// 把源位置 `src_loc` 之后的引用链转换为附注，文案与 `zig build` 的输出一致。有位置的引用指向引用处；
-/// 末尾的隐藏标记没有位置，与没有位置的附注一样放在错误的起点（`path` 中的 `start`）
+/// Converts the reference trace following source location `src_loc` into notes, with messages
+/// matching the output of `zig build`. A reference with a location points to the referencing
+/// site; the trailing hidden marker has no location and, like notes without a location, is
+/// placed at the start of the error (`start` in `path`).
 fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLocationIndex, build_root: []const u8, path: []const u8, start: u32, out: []Note) Allocator.Error!void {
-    // ErrorBundle 没有公开读取引用链的接口：按其布局从 `extra` 中读取。`SourceLocation` 之后依次是各个
-    // `ReferenceTrace`，每个按字段顺序存放 `decl_name` 与 `src_loc`
+    // ErrorBundle has no public interface for reading the reference trace: it is read from
+    // `extra` according to its layout. `SourceLocation` is followed by the `ReferenceTrace`s one
+    // after another, each storing `decl_name` and `src_loc` in field order.
     const first = @backingInt(src_loc) + @typeInfo(ErrorBundle.SourceLocation).@"struct".field_names.len;
     const stride = @typeInfo(ErrorBundle.ReferenceTrace).@"struct".field_names.len;
     for (out, 0..) |*note, k| {
@@ -182,7 +197,7 @@ fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLoca
             }
             note.message = try std.fmt.allocPrint(a, "referenced by: {s}", .{eb.nullTerminatedString(decl_name)});
         } else if (decl_name != 0) {
-            // 隐藏标记：`decl_name` 为隐藏的引用数
+            // Hidden marker: `decl_name` is the number of hidden references
             note.message = try std.fmt.allocPrint(a, "{d} reference(s) hidden; use '-freference-trace={d}' to see all references", .{ decl_name, decl_name + out.len - 1 });
         } else {
             note.message = "remaining reference traces hidden; use '-freference-trace' to see all reference traces";
@@ -190,29 +205,37 @@ fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLoca
     }
 }
 
-/// 重复的错误只保留一条时，被丢弃的那条带有的 compile log 并到保留的那条上（相同的只保留一份）
+/// When only one of several duplicate errors is kept, the compile log of a dropped one is merged
+/// into the kept one (identical logs are kept only once)
 fn addCompileLog(a: Allocator, item: *Item, compile_log: []const u8) Allocator.Error!void {
     if (compile_log.len == 0 or std.mem.eql(u8, item.compile_log, compile_log)) return;
     item.compile_log = if (item.compile_log.len == 0) compile_log else try std.mem.join(a, "\n", &.{ item.compile_log, compile_log });
 }
 
-/// 源位置的字节区间。数值来自子进程回传的错误包，不受校验：终点在起点之前时改为起点处的空区间，
-/// 发布的 Range 不会反向
+/// Byte range of a source location. The values come from the error bundle sent back by the child
+/// process and are not validated: an end before the start becomes an empty range at the start, so
+/// a published Range is never reversed.
 fn byteSpan(loc: ErrorBundle.SourceLocation) [2]u32 {
     return .{ loc.span_start, @max(loc.span_start, loc.span_end) };
 }
 
-/// `path` 相对于 `base` 的绝对路径。结果作为文件驻留到 Vfs，必须是绝对路径；`path` 来自子进程回传的错误包，
-/// 内容不受校验，解析后不是绝对路径时返回 null（例如格式不符时路径下标指向源码行中间的 `x: u32 = 1;`，在
-/// Windows 上它是另一驱动器的相对路径）
+/// Absolute path of `path` resolved relative to `base`. The result is interned into the Vfs as a
+/// file and must be an absolute path; `path` comes from the error bundle sent back by the child
+/// process and its contents are not validated, so null is returned when it does not resolve to an
+/// absolute path (e.g. in a malformed bundle the path index may point into the middle of a source
+/// line, at `x: u32 = 1;`, which on Windows is a path relative to another drive).
 fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error!?[]const u8 {
     return Vfs.resolve(.native, a, base, path);
 }
 
-/// 合并同一文件在多次编译中的结果（包含它的各个项目的构建，单文件模式下 import 它的各个根文件的编译）。`results` 按编译完成的
-/// 先后从新到旧排列，以最新一次读取的文本为准：文本相同的结果直接并入；文本不同的（两次编译之间文件被修改）
-/// 只并入非 AstGen 错误，按文本差异平移，落在修改区域内的丢弃，与 `merge` 处理未保存修改的方式相同。
-/// 区间与文案相同的错误只保留一条（compile log 并到保留的那条上）
+/// Combines the results of several compilations of the same file (the builds of each project
+/// containing it, and in single-file mode the compilations of each root file that imports it).
+/// `results` is ordered by compile completion, newest first, and the most recently read text is
+/// authoritative: results with the same text are merged as is; for results with a different text
+/// (the file was modified between the two compilations), only non-AstGen errors are merged,
+/// shifted according to the text diff, and those falling inside a modified region are dropped,
+/// the same way `merge` handles unsaved changes. Errors with the same range and message are kept
+/// only once (the compile log is merged into the kept one).
 pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.Error!FileResult {
     const base = results[0].base_text;
     var items: std.ArrayList(Item) = .empty;
@@ -238,33 +261,34 @@ pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.E
     return .{ .base_text = base, .items = items.items };
 }
 
-// ── 合并 ──────────────────────────────────────────────────────────
+// ── Merging ───────────────────────────────────────────────────────
 
 pub const MergeInput = struct {
-    /// 当前缓冲区文本
+    /// Current buffer text
     text: []const u8,
     lines: offsets.LineIndex,
     encoding: offsets.Encoding,
     uri: []const u8,
-    /// live 诊断；文件不在编译集合中时为 null
+    /// Live diagnostics; null when the file is not in the compile set
     live: ?*const live.Result,
-    /// 最近一次构建中本文件的编译器诊断
+    /// Compiler diagnostics of this file from the latest build
     compiler: ?*const FileResult,
-    /// 附注位于其他文件时，用于计算其位置与 URI
+    /// Used to compute the position and URI of notes located in other files
     other_file: OtherFileFn,
     other_ctx: *anyopaque,
 };
 
 pub const OtherFile = struct { uri: []const u8, text: []const u8, base_text: ?[]const u8 = null };
 
-/// 返回其他文件的 URI 与文本（用于附注位置）；文件不可读时返回 null
+/// Returns the URI and text of another file (for note positions); null when the file cannot be
+/// read
 pub const OtherFileFn = *const fn (ctx: *anyopaque, arena: Allocator, path: []const u8) ?OtherFile;
 
 pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Diagnostic {
     var out: std.ArrayList(types.Diagnostic) = .empty;
     if (in.compiler) |c| {
         if (std.mem.eql(u8, c.base_text, in.text)) {
-            // 缓冲区与构建时一致：编译器诊断已包含 AstGen 错误
+            // The buffer matches the build: compiler diagnostics already include AstGen errors
             for (c.items) |item| try out.append(arena, try compilerDiagnostic(arena, in, item, item.start, item.end));
             return out.items;
         }
@@ -273,7 +297,8 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
         for (l.items) |d| try out.append(arena, try liveDiagnostic(arena, in, d));
     }
     if (in.compiler) |c| {
-        // 有未保存修改：编译器的非 AstGen 错误按文本差异平移，落在修改区域内的隐藏
+        // Unsaved changes: the compiler's non-AstGen errors are shifted according to the text
+        // diff, and those inside a modified region are hidden
         const edits = try diffEdits(arena, c.base_text, in.text);
         for (c.items) |item| {
             if (item.is_astgen) continue;
@@ -284,16 +309,20 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
     return out.items;
 }
 
-/// 新旧文本的差异区间：旧文本 [start, old_end) 被替换为新文本 [start, new_end)
+/// A differing range between the old and new text: old text [start, old_end) is replaced by new
+/// text [start, new_end)
 const Edit = struct { start: u32, old_end: u32, new_end: u32 };
 
 const Line = struct { start: u32, end: u32 };
 
-/// 行级锚点：两侧都唯一且内容相同的行
+/// Line anchor: a line with identical content that is unique on both sides
 const Anchor = struct { old: usize, new: usize };
 
-/// 按行比较新旧文本，返回按位置排序、互不相交的替换区间。两侧都唯一的相同行作为锚点，其最长递增子序列
-/// 之间的行整体视为修改区域。行粒度是保守的：修改一行会隐藏该行上的诊断，不会牵连未修改的行
+/// Compares the old and new text line by line and returns disjoint replacement ranges sorted by
+/// position. Identical lines that are unique on both sides serve as anchors, and the lines between
+/// the anchors of their longest increasing subsequence are treated as modified regions as a whole.
+/// Line granularity is conservative: modifying a line hides the diagnostics on that line without
+/// affecting unmodified lines.
 fn diffEdits(a: Allocator, old: []const u8, new: []const u8) Allocator.Error![]const Edit {
     if (std.mem.eql(u8, old, new)) return &.{};
     const old_lines = try splitLines(a, old);
@@ -369,7 +398,8 @@ fn addEdit(
     try edits.append(a, .{ .start = os, .old_end = oe, .new_end = ne });
 }
 
-/// `pairs` 按 `new` 递增；返回 `old` 严格递增的最长子序列
+/// `pairs` is sorted by increasing `new`; returns the longest subsequence with strictly increasing
+/// `old`
 fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]const Anchor {
     if (pairs.len == 0) return &.{};
     const tails = try a.alloc(usize, pairs.len);
@@ -396,8 +426,10 @@ fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]cons
     return out;
 }
 
-/// 区间完全在修改区域之前不变，完全在之后按长度差平移，与任一修改区域相交返回 null。
-/// 编译器给出的区间不一定合法（终点在起点之前、远超出文本）：平移后超出 u32 的同样返回 null
+/// A range entirely before the modified regions stays unchanged, one entirely after them is
+/// shifted by the length difference, and one that intersects any modified region yields null.
+/// Ranges from the compiler are not necessarily valid (end before start, far beyond the text): a
+/// range that exceeds u32 after shifting also yields null.
 fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
     var delta: i64 = 0;
     for (edits) |e| {
@@ -410,8 +442,10 @@ fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
     return .{ shifted_start, shifted_end };
 }
 
-// 文案复制到 `arena`：live 结果属于 `AstCheck` 的 memo，编译结果属于工作区（新的构建结果到达时释放），
-// 发布在读事务结束、工作区的锁释放之后才序列化，期间两者都可能被释放
+// Messages are copied into `arena`: live results belong to the `AstCheck` memo and compile
+// results belong to the workspace (freed when a new build result arrives), while publishing
+// serializes only after the read transaction ends and the workspace lock is released; either may
+// be freed in the meantime
 fn liveDiagnostic(arena: Allocator, in: MergeInput, d: live.Diagnostic) Allocator.Error!types.Diagnostic {
     const related = try arena.alloc(types.DiagnosticRelatedInformation, d.notes.len);
     for (d.notes, related) |n, *r| r.* = .{
@@ -432,7 +466,7 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
     for (item.notes) |n| {
         const other = in.other_file(in.other_ctx, arena, n.path) orelse continue;
         const lines = try offsets.LineIndex.init(arena, other.text);
-        // 附注文件在构建后也有未保存修改：按该文件自己的差异平移
+        // The note's file also has unsaved changes since the build: shift by that file's own diff
         var note_start = n.start;
         var note_end = n.end;
         if (other.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {

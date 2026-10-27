@@ -1,8 +1,12 @@
-//! 监视客户端进程（`initialize` 的 `processId`）：它退出后服务器随之退出。客户端退出时 stdin 通常随之关闭（见
-//! `Server.run`），但管道的写端可能被客户端的其他子进程继承而一直不关闭。
+//! Watches the client process (the `processId` of `initialize`): when it exits, the server exits
+//! too. When the client exits, stdin is usually closed as well (see `Server.run`), but the write
+//! end of the pipe may be inherited by other child processes of the client and never be closed.
 //!
-//! 等待操作系统的进程退出通知：Linux 用 pidfd（内核 5.3 起），macOS 与 BSD 用 kqueue 的 `EVFILT_PROC`，Windows 等待
-//! 进程句柄。都用不了时（内核较旧、沙箱禁止、没有权限打开进程、其他平台）才定期检查进程是否还在（轮询），这是最后的退路。
+//! Waits for the operating system's process exit notification: a pidfd on Linux (since kernel
+//! 5.3), kqueue's `EVFILT_PROC` on macOS and BSD, and the process handle on Windows. Polling
+//! (periodically checking whether the process still exists) is the last resort, used only when
+//! none of these is available (old kernel, forbidden by a sandbox, no permission to open the
+//! process, other platforms).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,9 +16,9 @@ const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.server);
 
 pub const Outcome = enum {
-    /// 客户端进程已退出（或打开时已经不存在）
+    /// The client process has exited (or no longer existed when opened)
     exited,
-    /// 被 `stop` 结束（服务器关闭）
+    /// Ended by `stop` (the server is shutting down)
     stopped,
 };
 
@@ -22,16 +26,16 @@ pub const Watch = struct {
     io: Io,
     pid: i32,
     native: ?Native,
-    /// 打开时进程已经不存在
+    /// The process no longer existed when opened
     gone: bool = false,
-    /// 轮询的间隔（毫秒）
+    /// Polling interval (milliseconds)
     poll_interval_ms: u32 = 2000,
-    // ── 轮询时的停止通知 ──
+    // ── Stop notification while polling ──
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     stopped: bool = false,
 
-    /// 在调用 `wait` 的任务开始之前创建：之后的 `stop` 不会丢失
+    /// Created before the task that calls `wait` starts: a later `stop` is not lost
     pub fn create(gpa: Allocator, io: Io, pid: i32) Allocator.Error!*Watch {
         const w = try gpa.create(Watch);
         w.* = .{ .io = io, .pid = pid, .native = null };
@@ -43,13 +47,13 @@ pub const Watch = struct {
         return w;
     }
 
-    /// `wait` 返回后调用
+    /// Called after `wait` returns
     pub fn destroy(w: *Watch, gpa: Allocator) void {
         if (w.native) |*n| n.close();
         gpa.destroy(w);
     }
 
-    /// 等到客户端进程退出，或被 `stop` 结束
+    /// Waits until the client process exits or `stop` ends the wait
     pub fn wait(w: *Watch) Outcome {
         if (w.gone) return .exited;
         if (w.native) |*n| {
@@ -59,7 +63,8 @@ pub const Watch = struct {
         return w.poll();
     }
 
-    /// 让 `wait` 返回 `.stopped`；任何线程都可以调用，在 `wait` 之前调用也有效
+    /// Makes `wait` return `.stopped`; can be called from any thread, and also takes effect when
+    /// called before `wait`
     pub fn stop(w: *Watch) void {
         {
             w.mutex.lockUncancelable(w.io);
@@ -70,7 +75,7 @@ pub const Watch = struct {
         if (w.native) |*n| n.stop();
     }
 
-    /// 轮询：每隔 `poll_interval_ms` 检查一次进程是否还在
+    /// Polling: checks whether the process still exists every `poll_interval_ms`
     fn poll(w: *Watch) Outcome {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
@@ -86,13 +91,13 @@ pub const Watch = struct {
     }
 };
 
-/// 打开原生通知的结果
+/// Result of opening the native notification
 fn Open(comptime T: type) type {
     return union(enum) {
         watching: T,
-        /// 进程已经不存在
+        /// The process no longer exists
         gone,
-        /// 原生通知不可用（原因）
+        /// The native notification is unavailable (the reason)
         unavailable: []const u8,
     };
 }
@@ -119,7 +124,7 @@ const Unsupported = struct {
     }
 };
 
-/// Linux：进程退出后 pidfd 变为可读；eventfd 用于停止
+/// Linux: the pidfd becomes readable once the process exits; an eventfd is used for stopping
 const Pidfd = struct {
     const linux = std.os.linux;
 
@@ -164,11 +169,11 @@ const Pidfd = struct {
     }
 };
 
-/// macOS 与 BSD：kqueue 等待进程的 `NOTE_EXIT`；管道用于停止
+/// macOS and BSD: kqueue waits for the process's `NOTE_EXIT`; a pipe is used for stopping
 const Kqueue = struct {
     const c = std.c;
     const Kevent = std.posix.Kevent;
-    /// 区分两个事件的 udata
+    /// udata that tells the two events apart
     const exit_tag = 0;
     const stop_tag = 1;
 
@@ -238,7 +243,8 @@ const Kqueue = struct {
     }
 };
 
-/// Windows：进程退出后进程句柄变为有信号；事件对象用于停止
+/// Windows: the process handle becomes signaled once the process exits; an event object is
+/// used for stopping
 const ProcessHandle = struct {
     process: *anyopaque,
     stop_event: *anyopaque,
@@ -273,17 +279,18 @@ const ProcessHandle = struct {
     }
 };
 
-/// 进程是否仍在运行；无法确定时（如没有权限）按仍在运行处理
+/// Whether the process is still running; when this cannot be determined (e.g. no permission),
+/// it is treated as still running
 fn processAlive(pid: i32) bool {
     if (builtin.os.tag == .windows) {
         const windows = std.os.windows;
         const handle = win32.OpenProcess(win32.SYNCHRONIZE, 0, @bitCast(pid)) orelse
             return windows.GetLastError() != .INVALID_PARAMETER;
         defer windows.CloseHandle(handle);
-        // 已退出的进程处于有信号状态
+        // A process that has exited is in the signaled state
         return win32.WaitForSingleObject(handle, 0) != win32.WAIT_OBJECT_0;
     }
-    // 信号 0 只检查进程是否存在
+    // Signal 0 only checks whether the process exists
     std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err != error.ProcessNotFound;
     return true;
 }
@@ -301,7 +308,7 @@ const win32 = struct {
 
 const testing = std.testing;
 
-/// 测试用：stdin 关闭后退出的子进程
+/// For tests: a child process that exits once its stdin is closed
 fn spawnChild() !std.process.Child {
     return std.process.spawn(testing.io, .{ .argv = &.{ "/bin/sh", "-c", "read line" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
 }
@@ -328,7 +335,7 @@ test "watch: the exit of the process ends the wait" {
     const w = try Watch.create(testing.allocator, testing.io, child.id.?);
     defer w.destroy(testing.allocator);
     if (Native != Unsupported) try testing.expect(w.native != null);
-    // 关闭 stdin 后子进程退出（尚未回收时退出通知就已到达）
+    // Closing stdin makes the child exit (the exit notification arrives before it is reaped)
     child.stdin.?.close(testing.io);
     child.stdin = null;
     try testing.expectEqual(Outcome.exited, w.wait());
@@ -359,7 +366,8 @@ test "watch: without native notification, the process is checked periodically" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var child = try spawnChild();
     var w: Watch = .{ .io = testing.io, .pid = child.id.?, .native = null, .poll_interval_ms = 20 };
-    // 退出后未回收的进程（僵尸进程）仍然存在，回收后才检查得到
+    // An exited but unreaped process (a zombie) still exists; the check detects the exit only
+    // after it is reaped
     finishChild(&child);
     try testing.expectEqual(Outcome.exited, w.wait());
 

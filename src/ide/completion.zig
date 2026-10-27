@@ -1,7 +1,9 @@
-//! 补全：`a.` 之后列出命名空间的成员；`.` 之后按期望类型列出成员，初始化中列出未赋值的字段；
-//! `error.` 之后列出错误名；`@` 之后列出内置函数；`@import("` 中列出模块与文件；
-//! `break :` / `continue :` 之后列出标签；否则列出光标处可见的名字（局部名字与外层容器的声明）。
-//! 注释与字符串中（`@import("` 之外）不补全。
+//! Completion: after `a.`, lists the members of the namespace; after `.`, lists members by the
+//! expected type, and in initializers the fields not yet assigned; after `error.`, lists error
+//! names; after `@`, lists builtins; inside `@import("`, lists modules and files; after `break :` /
+//! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
+//! the declarations of enclosing containers).
+//! No completion in comments and strings (other than `@import("`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,40 +33,46 @@ const fuzzy = @import("../ide_db/fuzzy.zig");
 
 pub const Options = struct {
     auto_import: bool = true,
-    /// 不提供自动导入时也判断光标是否位于可以自动导入的名字处（`Result.import_position`）
+    /// Even when auto-import is not offered, determine whether the cursor is at a name that can be
+    /// auto-imported (`Result.import_position`)
     detect_import_position: bool = false,
-    /// 至多提供的自动导入候选（保留排序最好的）；不限时为 `maxInt(usize)`
+    /// Maximum number of auto-import candidates offered (the best-ranked ones are kept);
+    /// `maxInt(usize)` for no limit
     max_auto_imports: usize = 128,
-    /// 自动导入的新 import 按它放到整理好的 import 块中应在的位置（配置 `imports.*`）
+    /// A new import added by auto-import is placed where it belongs in an organized import block
+    /// (configuration `imports.*`)
     imports: @import("../ide_db/organize_imports.zig").Options = .{},
 };
 
 pub const Result = struct {
     items: []const Item,
     is_incomplete: bool = false,
-    /// 光标位于可以自动导入的名字处（提供了自动导入，或要求判断时）
+    /// The cursor is at a name that can be auto-imported (when auto-import is offered, or when the
+    /// check is requested)
     import_position: bool = false,
 };
 
 pub const Item = struct {
     label: []const u8,
     kind: Kind,
-    /// 文档注释
+    /// Doc comment
     doc: ?[]const u8 = null,
-    /// 类型
+    /// Type
     detail: ?[]const u8 = null,
-    /// 替换的范围（文件中的字节偏移，插入的文本为 `label`）；null 时由客户端按单词确定。
-    /// `@`、路径中的 `/` 等不属于单词的字符需要它
+    /// Range to replace (byte offsets in the file; the inserted text is `label`); when null, the
+    /// client determines it by word. Needed for characters that are not part of a word, such as `@`
+    /// and the `/` in paths.
     replace: ?Range = null,
     filter: ?[]const u8 = null,
     qualifier: ?[]const u8 = null,
-    /// 名字补全时为排名（见 `rank`）
+    /// The rank in name completion (see `rank`)
     sort: ?[]const u8 = null,
-    /// 作用域中的名字的来源权重（见 `rank`）；不是作用域中的名字时为 0
+    /// Source weight of a name in scope (see `rank`); 0 when it is not a name in scope
     weight: f32 = 0,
     score: f32 = 0,
     import_edit: ?imports.Edit = null,
-    /// 所指的定义，被选中时据此给出签名与文档（见 `describe`）：自动导入的候选与函数
+    /// The definition referred to, from which the signature and documentation are given when the
+    /// item is selected (see `describe`): for auto-import candidates and functions
     target: ?imports.Target = null,
 
     pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label };
@@ -74,7 +82,8 @@ pub const Item = struct {
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
     const base = try completeVisible(r, file, offset, &owner);
-    // 只在 Zig 源文件中自动导入：向 `.zon` 等文件插入 import 声明会破坏它
+    // Auto-import only in Zig source files: inserting an import declaration into a `.zon` or
+    // similar file would break it
     if (!imports.isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = base };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset == 0 or offset > text.len) return .{ .items = base };
@@ -87,11 +96,13 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports, options.imports);
         result.is_incomplete = extra.is_incomplete;
         for (extra.items) |candidate| {
-            // 核心已经逐段渲染了路径，不能把整个限定表达式再次当作标识符转义。
+            // The core (`imports.complete`) has already rendered the path segment by segment;
+            // the whole qualified expression must not be escaped as an identifier again.
             const filter = try completionFilter(r.arena, name, candidate.filter);
             var duplicate = false;
             for (items.items[0..base.len]) |*visible| if (std.mem.eql(u8, visible.label, candidate.label)) {
-                // 只合并可见绑定；不同来源的同名自动导入项必须继续作为独立选择。
+                // Only visible bindings are merged; auto-import items with the same name from
+                // different sources must remain separate choices.
                 if (candidate.import_edit == null) {
                     visible.replace = name.range;
                     visible.filter = filter;
@@ -130,9 +141,11 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     return result;
 }
 
-/// 名字补全的排序（`Item.sort`）：作用域中的名字的分数为匹配分（见 `fuzzy`）乘以来源的权重（`Item.weight`），
-/// 自动导入的候选取其分数（见 `imports.Candidate.score`）；从高到低，同分时保持收集的顺序。作用域中不匹配输入的
-/// 名字分数为 0，排在最后，由客户端过滤
+/// Order of name completion (`Item.sort`): the score of a name in scope is its match score (see
+/// `fuzzy`) multiplied by its source weight (`Item.weight`), and an auto-import candidate takes
+/// its own score (see `imports.Candidate.score`); from high to low, keeping the collection order
+/// among equal scores. Names in scope that do not match the input score 0, sort last, and are
+/// filtered by the client.
 fn rank(arena: Allocator, items: []Item, prefix: []const u8) Allocator.Error!void {
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
     for (items) |*it| if (it.weight != 0) {
@@ -147,13 +160,14 @@ fn rank(arena: Allocator, items: []Item, prefix: []const u8) Allocator.Error!voi
 }
 
 pub const Description = struct {
-    /// 签名（同 hover）；模块与文件为 import 表达式
+    /// Signature (as in hover); for modules and files, the import expression
     detail: []const u8,
-    /// markdown：文档注释与定义的位置
+    /// Markdown: doc comment and location of the definition
     doc: []const u8,
 };
 
-/// 补全项被选中时的说明（`completionItem/resolve`）：在 `from` 中补全时所指的定义
+/// Description shown when a completion item is selected (`completionItem/resolve`): the
+/// definition referred to when completing in `from`
 pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Error!Description {
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
@@ -182,7 +196,8 @@ pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Erro
     }
 }
 
-/// 文件开头的 `//!` 文档，整理方式同 `///` 文档（见 `ItemTree`）；没有时为 null
+/// The `//!` doc at the start of the file, cleaned up the same way as `///` docs (see
+/// `ItemTree`); null when there is none
 fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     var out: std.ArrayList(u8) = .empty;
@@ -201,7 +216,7 @@ fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
     return if (out.items.len == 0) null else out.items;
 }
 
-/// `cursor_owner` 记下查到的光标所在成员，自动导入沿用
+/// `cursor_owner` records the member found at the cursor, which auto-import reuses
 fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error![]const Item {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
@@ -209,7 +224,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
 
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return &.{};
-    // 以下几种上下文在语法树中多为错误节点（如单独的 `@`、未闭合的字符串），直接按源码文本识别
+    // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
+    // unterminated string), so they are recognized directly from the source text
     if (literal == .none) if (builtinStart(text, offset)) |start| {
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
@@ -233,7 +249,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         return out.items.items;
     }
 
-    // `lhs.` / `lhs.na`：光标前一个字符在字段访问内、且不在左侧表达式内
+    // `lhs.` / `lhs.na`: the character before the cursor is inside a field access, and not
+    // inside the left-hand expression
     if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .field_access => |fa| if (rel - 1 >= b.range(fa.lhs).end) {
             out.member_mode = true;
@@ -241,7 +258,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 try members(r, &out, ns, ns.file == file);
                 return out.items.items;
             }
-            // 经由类型：实例的字段与方法（泛型函数体内取调用点的实例）
+            // Via the type: fields and methods of the instance (inside the body of a generic
+            // function, use the instance from a call site)
             const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
             try typedMembers(r, &out, a.exprType(fa.lhs), file);
             return out.items.items;
@@ -255,7 +273,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         return out.items.items;
     };
 
-    // `.` / `.na`（枚举字面量、decl literal）：按期望类型列出成员；初始化中（`.{ .x = 1, .| }`）列出未赋值的字段
+    // `.` / `.na` (enum literals, decl literals): list members by the expected type; in an
+    // initializer (`.{ .x = 1, .| }`), list the fields not yet assigned
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
         out.member_mode = true;
         const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
@@ -269,12 +288,13 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         return out.items.items;
     };
 
-    // 作用域中的名字：光标紧跟在名字之后时取该名字所在的作用域
+    // Names in scope: when the cursor immediately follows a name, use the scope of that name
     const scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .name_ref => b.expr_scopes[@backingInt(e)],
         else => b.scopeAt(rel),
     } else b.scopeAt(rel) else b.scopeAt(rel);
-    // 局部名字的种类取光标所在成员的推导结果（泛型函数体内以调用点的实例）
+    // The kinds of local names come from the inference result of the member at the cursor
+    // (inside a generic function body, from a call-site instance)
     const types: BindingTypes = if (try context.atSeeded(r, file, offset, true)) |a| .{ .at = a } else .none;
     try locals(&out, r.ctx.db.env.ip, b, scope, null, types);
 
@@ -282,11 +302,12 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     var container = tree.items[item].container;
     var level: f32 = 0;
     while (true) : (level += 1) {
-        // 内层容器的成员优先于外层的
+        // Members of inner containers rank above those of outer ones
         const weight = @max(min_container_weight, container_weight - container_step * level);
         try decls(r, &out, file, tree, container, true, weight);
         const parent = tree.containers[container].parent_item orelse break;
-        // 体内定义的容器：外层成员在容器位置可见的局部名字
+        // A container defined in a body: the local names of the enclosing member that are
+        // visible at the position of the container
         const owner = try r.itemNode(file, parent) orelse break;
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
@@ -304,33 +325,38 @@ const ImportPrefix = struct {
     closed: bool = false,
 };
 
-/// 只接受表达式中的名字；声明名、成员名、标签与捕获名都不是 name_ref 的直接 token。
+/// Accepts only names in expressions; declaration names, member names, labels, and capture names
+/// are not direct tokens of a name_ref.
 fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u32) Allocator.Error!?ImportPrefix {
     const token = root.tokenAtOffset(offset - 1) orelse return null;
     if (token.kind != .identifier and token.kind != .invalid) return null;
     const parent = tokenParent(root, offset - 1);
     if (parent != .name_ref) return null;
-    // enum 成员与 union(enum) 的 tag 没有冒号，解析器把名字放在 container_field 的类型表达式位置。
-    // 它们仍是声明名，替换成限定路径会破坏声明。
+    // Enum members and union(enum) tags have no colon, so the parser puts the name in the type
+    // expression position of the container_field. They are still declaration names, and replacing
+    // them with a qualified path would break the declaration.
     if (try isBareEnumOrUnionMember(arena, root, token.offset)) return null;
     const escaped = std.mem.startsWith(u8, token.text, "@\"");
     if (token.kind == .invalid and !escaped) return null;
     const spelling = if (token.kind == .invalid) std.mem.trimEnd(u8, token.text, "\r\n") else token.text;
     const token_end = token.offset + @as(u32, @intCast(spelling.len));
     if (offset <= token.offset or offset > token_end) return null;
-    // 错误 token 没有闭引号界定尾部；保留光标后的源码，不把后面的语句误当成名字一起替换。
+    // An invalid token has no closing quote to delimit its end; keep the source after the cursor
+    // instead of mistaking the following statements for part of the name and replacing them too.
     const end = if (token.kind == .invalid) offset else token_end;
     const raw = text[token.offset..offset];
     const closed = token.kind == .identifier and offset == end;
     var prefix = raw;
     if (escaped) {
-        // 光标在引号内也按已输入的内容匹配；截断转义序列时不猜测名字。
+        // Also match by the text typed so far when the cursor is inside the quotes; do not guess
+        // the name when an escape sequence is cut off.
         if (raw.len <= 2) return null;
         const literal: []const u8 = if (closed) raw[1..] else blk: {
             const quoted = try arena.allocSentinel(u8, raw.len, 0);
             @memcpy(quoted[0 .. raw.len - 1], raw[1..]);
             quoted[raw.len - 1] = '"';
-            // 补上的引号不能被尚未完成的转义吃掉；只向字符串解码器传入词法闭合的单个字面量。
+            // The added closing quote must not be swallowed by an unfinished escape; only pass a
+            // single, lexically closed literal to the string decoder.
             var tokenizer = std.zig.Tokenizer.init(quoted);
             const checked = tokenizer.next();
             if (checked.tag != .string_literal or checked.loc.end != quoted.len) return null;
@@ -352,8 +378,9 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
     };
 }
 
-/// enum 的成员与 `union(enum)` 的 tag 是无冒号的 container_field，名字位于类型表达式的位置；struct 的
-/// 元组字段没有冒号但类型表达式是真正的类型引用，不在此列。
+/// Enum members and `union(enum)` tags are container_fields without a colon, with the name in the
+/// type expression position; tuple fields of a struct have no colon either, but their type
+/// expression is a real type reference, so they are not included.
 fn isBareEnumOrUnionMember(arena: Allocator, root: SyntaxNode, offset: u32) Allocator.Error!bool {
     const path = try root.coveringPath(arena, offset);
     if (path.len < 3) return false;
@@ -368,10 +395,11 @@ fn isBareEnumOrUnionMember(arena: Allocator, root: SyntaxNode, offset: u32) Allo
     return name.offset == offset;
 }
 
-/// 客户端从替换范围起点过滤；保留用户输入的引号和转义拼写，而不是只返回解码后的名字。
+/// The client filters from the start of the replace range; keep the quotes and escape spelling
+/// that the user typed instead of returning only the decoded name.
 fn completionFilter(arena: Allocator, name: ImportPrefix, target: []const u8) Allocator.Error![]const u8 {
     const raw = name.escaped_prefix orelse return target;
-    // 按路径匹配上的候选按路径过滤（见 `imports.Builder.filterOf`）
+    // A candidate matched by path is filtered by its path (see `imports.Builder.filterOf`)
     if (!std.ascii.startsWithIgnoreCase(target, name.prefix)) return target;
     const closed = name.closed;
     return std.fmt.allocPrint(arena, "{s}{f}{s}", .{
@@ -395,11 +423,13 @@ const Collector = struct {
     arena: Allocator,
     items: std.ArrayList(Item) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
-    /// `.` 之后的成员 / 字段：原始类型与原始值的名字可以不加引号（`S.u8`）
+    /// Members / fields after `.`: names of primitive types and primitive values need no quoting
+    /// (`S.u8`)
     member_mode: bool = false,
 
-    /// 内层的名字遮蔽外层的同名名字。作用域中的名字一律按 `fmtId` 加引号（原始类型、
-    /// 含特殊字符的名字），`.` 之后的成员允许原始名字
+    /// Inner names shadow outer names of the same name. Names in scope are always quoted per
+    /// `fmtId` (primitive types, names with special characters); members after `.` may use
+    /// primitive names.
     fn add(c: *Collector, item: Item) Allocator.Error!void {
         if (item.label.len == 0) return;
         if ((try c.seen.getOrPut(c.arena, item.label)).found_existing) return;
@@ -413,15 +443,18 @@ const Collector = struct {
     }
 };
 
-/// 作用域中的名字的来源权重（见 `rank`）：局部名字、参数、所在容器的成员依次靠后，外层容器的成员每层再少
-/// `container_step`；都高于经由命名空间访问的自动导入候选（`imports.visible_weight`）
+/// Source weights of names in scope (see `rank`): local names, parameters and members of the
+/// enclosing container come in that order, and members of outer containers lose another
+/// `container_step` per level; all are above auto-import candidates accessed through a namespace
+/// (`imports.visible_weight`)
 const local_weight = 1.0;
 const param_weight = 0.98;
 const container_weight = 0.94;
 const container_step = 0.02;
 const min_container_weight = 0.86;
 
-/// 绑定的类型：光标所在的成员取 `At`，外层函数取它的推导结果
+/// Types of bindings: from `At` for the member at the cursor, and from the inference result for
+/// an enclosing function
 const BindingTypes = union(enum) {
     none,
     at: context.At,
@@ -436,7 +469,8 @@ const BindingTypes = union(enum) {
     }
 };
 
-/// `weight` 为 null 时按绑定的种类取权重，否则都取 `weight`（外层函数中的名字）
+/// When `weight` is null, the weight follows the kind of the binding; otherwise every name gets
+/// `weight` (names in an enclosing function)
 fn locals(out: *Collector, ip: *InternPool, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes) Allocator.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
@@ -458,7 +492,7 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
         const name = it.name orelse continue;
         switch (it.kind) {
             .@"fn", .@"const", .@"var" => {},
-            // 字段不是作用域中的名字；枚举成员可以通过类型访问
+            // Fields are not names in scope; enum members can be accessed through the type
             .field => if (!is_enum or private) continue,
             .@"test", .@"comptime" => continue,
         }
@@ -468,7 +502,7 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
     }
 }
 
-/// 补全项的种类：不可修改的变量为常量
+/// Kind of a completion item: a variable that cannot be modified is a constant
 fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
     return switch (symbol.kind) {
         .namespace => .namespace,
@@ -485,17 +519,18 @@ fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
     };
 }
 
-/// 按类型列出成员：值为类型时列出声明；实例（含单指针）列出字段与方法；切片与数组有 len
+/// Lists members by type: declarations when the value is a type; fields and methods for
+/// instances (including single pointers); slices and arrays have len
 fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
-        // 构造的枚举（`@Enum`、union(enum) 的标签枚举）：成员
+        // Constructed enums (`@Enum`, the tag enum of a union(enum)): members
         switch (ip.key(t)) {
             .reified_type, .union_tag_type => {
                 for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
                 return;
             },
-            // 错误集（`Error.` 之后）：其中的错误名
+            // Error set (after `Error.`): its error names
             .error_set_type => |names| {
                 for (names) |name| try out.add(.{ .label = name, .kind = .enum_member });
                 return;
@@ -506,7 +541,8 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
         return members(r, out, ns, ns.file == from);
     }
     var t = tv.ty;
-    // 单指针自动解引用一次：`*[N]T` 的 len、`*S` 的字段与方法、`*[]T` 的 len 与 ptr
+    // A single pointer is dereferenced automatically once: len of `*[N]T`, fields and methods of
+    // `*S`, len and ptr of `*[]T`
     switch (ip.key(t)) {
         .ptr_type => |p| if (p.size == .one) {
             t = p.child;
@@ -515,7 +551,7 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
     }
     switch (ip.key(t)) {
         .ptr_type => |p| {
-            // 指向指针的单指针与多元素指针没有成员
+            // Single pointers to pointers and many-item pointers have no members
             if (p.size == .slice) {
                 try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
                 try out.add(.{ .label = "ptr", .kind = .field });
@@ -523,7 +559,7 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
             return;
         },
         .array_type => return out.add(.{ .label = "len", .kind = .field, .detail = "usize" }),
-        // 元组、匿名结构体、构造的结构体与 union：字段
+        // Tuples, anonymous structs, constructed structs and unions: fields
         .tuple_type, .anon_struct_type, .reified_type => {
             for (try eval.fieldNames(r, t)) |f| try out.add(.{ .label = f.name, .kind = .field, .detail = if (f.ty != .unknown) try render.typeAlloc(r, f.ty) else null });
             if (ip.key(t) == .tuple_type) try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
@@ -543,7 +579,8 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
                 try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
             },
             .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = .{ .decl = .{ .file = ns.file, .item = m } } }),
-            // 函数的别名（`pub const isPowerPC = isPowerpc;`）同样可以作为方法调用，选中时给出所指函数的签名
+            // Function aliases (`pub const isPowerPC = isPowerpc;`) can also be called as methods;
+            // when selected, they show the signature of the aliased function
             .@"const" => if (same_file or it.flags.is_pub) {
                 const ctv = try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) });
                 if (ip.key(ctv.ty) == .fn_type) try out.add(.{ .label = name, .kind = .function, .doc = it.doc, .target = try fnTarget(r, ctv) });
@@ -553,11 +590,13 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
     }
 }
 
-/// `.` 之后：期望类型（`?T` 取 `T`）的枚举成员、union 的字段，以及可以作为 decl literal 的声明
-/// （类型为 `T` 的常量、返回 `T` 或 `!T` 的函数；类型推导不出时也列出）
+/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and
+/// declarations that can serve as decl literals (constants of type `T`, functions returning `T`
+/// or `!T`; also listed when their type cannot be inferred)
 fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
-    // 与编译器一致，结果类型去掉 error union 与 optional（`fn f() !Color { return .red; }`）
+    // Matching the compiler, strip error unions and optionals from the result type
+    // (`fn f() !Color { return .red; }`)
     var t = ty;
     while (true) t = switch (ip.key(t)) {
         .error_union_type => |eu| eu.payload,
@@ -597,7 +636,8 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resol
     }
 }
 
-/// 声明能否作为类型 `t` 的 decl literal：常量的类型为 `t`，函数返回 `t` 或 `!t`；类型未知时视为可以
+/// Whether a declaration can serve as a decl literal of type `t`: a constant of type `t`, or a
+/// function returning `t` or `!t`; an unknown type counts as yes
 fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
     if (decl_ty == .unknown) return true;
     if (!is_fn) return decl_ty == t;
@@ -612,7 +652,7 @@ fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
     };
 }
 
-/// 函数值所指的函数声明
+/// The function declaration that a function value refers to
 fn fnTarget(r: *Resolver, tv: TypedValue) resolve.Error!?imports.Target {
     const v = tv.val orelse return null;
     const f = switch (r.ctx.db.env.ip.key(v)) {
@@ -633,25 +673,28 @@ fn identEnd(text: []const u8, offset: u32) u32 {
     return i;
 }
 
-/// 光标是否在注释中，或在字符串、字符字面量之内（光标前一个字符所在的 token）
+/// Whether the cursor is in a comment, or inside a string or character literal (judged by the
+/// token containing the character before the cursor)
 fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum { none, comment, string } {
     if (offset == 0) return .none;
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const t = root.tokenAtOffset(offset - 1) orelse return .none;
     return switch (t.kind) {
         .line_comment, .doc_comment, .container_doc_comment => .comment,
-        // 光标在闭合的引号之后时已在字面量之外
+        // A cursor after the closing quote is already outside the literal
         .string_literal, .char_literal => if (offset < t.offset + t.text.len) .string else .none,
         .identifier => if (std.mem.startsWith(u8, t.text, "@\"") and offset < t.offset + t.text.len) .string else .none,
         .multiline_string_literal_line => .string,
-        // 未闭合的字符串
+        // Unterminated string
         .invalid => if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'' or std.mem.startsWith(u8, t.text, "@\""))) .string else .none,
         else => .none,
     };
 }
 
-/// `error.` 之后的错误名：期望类型为错误集（或 error union）时列出它的成员，否则列出本文件中出现的
-/// 错误名（错误集定义与 `error.X`，光标处的这个除外：未写完的 `error.` 会接上下一行的名字）
+/// Error names after `error.`: when the expected type is an error set (or error union), lists its
+/// members; otherwise lists the error names that appear in this file (in error set definitions and
+/// `error.X`, except the one at the cursor: an unfinished `error.` picks up the name on the next
+/// line)
 fn errorNames(r: *Resolver, out: *Collector, file: FileId, offset: u32, item: u32, e: Body.ExprId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (try context.atSeeded(r, file, offset, true)) |a| if (a.literalExpected(e)) |want| {
@@ -675,7 +718,8 @@ fn errorNames(r: *Resolver, out: *Collector, file: FileId, offset: u32, item: u3
     }
 }
 
-/// 光标在 `@` 或 `@name` 中时 `@` 的位置（不含 `@"..."` 形式的标识符）
+/// Position of the `@` when the cursor is in `@` or `@name` (excluding identifiers of the form
+/// `@"..."`)
 fn builtinStart(text: []const u8, offset: u32) ?u32 {
     var i = offset;
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
@@ -683,7 +727,8 @@ fn builtinStart(text: []const u8, offset: u32) ?u32 {
     return i - 1;
 }
 
-/// 光标在 `@import("` 的字符串中时字符串内容的起始位置（字符串可以尚未闭合）
+/// Start of the string content when the cursor is in the string of `@import("` (the string may
+/// be unterminated)
 fn importString(text: []const u8, offset: u32) ?u32 {
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
     const quote = std.mem.lastIndexOfScalar(u8, text[line_start..offset], '"') orelse return null;
@@ -695,7 +740,7 @@ fn importString(text: []const u8, offset: u32) ?u32 {
     return start;
 }
 
-/// 光标在 `break :` / `continue :` 之后的标签位置时标签的起始位置
+/// Start of the label when the cursor is at the label position after `break :` / `continue :`
 fn labelStart(text: []const u8, offset: u32) ?u32 {
     var i = offset;
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
@@ -711,8 +756,9 @@ fn labelStart(text: []const u8, offset: u32) ?u32 {
     return start;
 }
 
-/// `@import("...` 中的模块名（std、builtin、root、所属各模块 import 的模块）与相对路径下的
-/// `.zig` / `.zon` 文件、子目录。补全项为从字符串开头起的完整路径
+/// Module names in `@import("...` (std, builtin, root, and the modules imported by each module
+/// the file belongs to), and `.zig` / `.zon` files and subdirectories under the relative path.
+/// Completion items are full paths from the start of the string.
 fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range) resolve.Error!void {
     const slash = std.mem.lastIndexOfScalar(u8, typed, '/');
     if (slash == null) {
@@ -740,7 +786,7 @@ fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, r
     }
 }
 
-/// 以枚举字面量 `e` 为元素（没有字段名）的初始化表达式
+/// The initializer that has the enum literal `e` as an element (without a field name)
 fn initOf(b: *const Body, e: Body.ExprId) ?Body.ExprId {
     for (b.exprs, 0..) |x, i| switch (x) {
         .init => |init| for (init.fields) |f| if (f.name == null and f.value == e) return @fromBackingInt(@as(u32, @intCast(i))),
@@ -749,7 +795,7 @@ fn initOf(b: *const Body, e: Body.ExprId) ?Body.ExprId {
     return null;
 }
 
-/// 初始化类型（`?T` 取 `T`）中尚未赋值的字段
+/// Fields of the initialized type (`T` for `?T`) that have not been assigned yet
 fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.FieldInit) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     const t = switch (ip.key(ty)) {
@@ -772,14 +818,15 @@ fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.Fiel
     }
 }
 
-/// `ns.` 之后的成员；同一文件中可以访问非 pub 声明
+/// Members after `ns.`; non-pub declarations are accessible within the same file
 fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolve.Error!void {
     const tree = try r.itemTree(ns.file);
     if (ns.container >= tree.containers.len) return;
     try decls(r, out, ns.file, tree, ns.container, same_file, 0);
     const kind = tree.containers[ns.container].kind;
-    // 同一文件中的枚举成员（其他文件的由 `decls` 给出）；带标签的 union 在类型上访问字段得到字段的标签
-    // （`Value.null_val`），可以转换为 union
+    // Enum members in the same file (those of other files come from `decls`); accessing a field
+    // on the type of a tagged union yields the tag of the field (`Value.null_val`), which can
+    // be coerced to the union
     const fields = (same_file and kind == .@"enum") or
         (kind == .@"union" and try eval.unionTag(r, try queries.containerType(r, ns, null)) != null);
     if (!fields) return;

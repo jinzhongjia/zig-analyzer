@@ -1,4 +1,4 @@
-//! LSP 基础协议：`Content-Length` 头部分帧的 JSON-RPC 消息读写。
+//! LSP base protocol: reading and writing JSON-RPC messages framed by `Content-Length` headers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -12,10 +12,11 @@ pub const ReadError = error{
     OutOfMemory,
 };
 
-/// 单条消息体的上限，与文件大小的上限相同（打开的文档随消息传来）
+/// Maximum size of a single message body, the same as the file size limit (open documents
+/// arrive in messages)
 pub const max_message_len = std.math.maxInt(u32);
 
-/// 读取一条消息体，调用方拥有返回的内存。
+/// Reads one message body; the caller owns the returned memory.
 pub fn readMessage(reader: *Io.Reader, gpa: Allocator) ReadError![]u8 {
     var content_length: ?usize = null;
     while (true) {
@@ -32,7 +33,7 @@ pub fn readMessage(reader: *Io.Reader, gpa: Allocator) ReadError![]u8 {
         if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidHeader;
         }
-        // Content-Type 等其他头部忽略
+        // Other headers such as Content-Type are ignored
     }
     const len = content_length orelse return error.InvalidHeader;
     if (len > max_message_len) return error.MessageTooLong;
@@ -43,7 +44,8 @@ pub fn readMessage(reader: *Io.Reader, gpa: Allocator) ReadError![]u8 {
     };
 }
 
-/// 线程安全的消息写端：请求处理在多个任务中并发完成，响应需要串行写出。
+/// Thread-safe message writer: requests are handled concurrently in multiple tasks, and
+/// responses must be written serially.
 pub const Writer = struct {
     io: Io,
     inner: *Io.Writer,

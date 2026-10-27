@@ -19,7 +19,7 @@ fn expectTree(source: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, actual);
 }
 
-/// 无损：根节点文本等于原文
+/// Lossless: the root node's text equals the source
 fn expectLossless(source: []const u8) !void {
     const parse = try Parse.create(testing.allocator, source);
     defer parse.destroy();
@@ -208,7 +208,8 @@ test "recovery: unwinding deep unclosed nesting and long else-if chains" {
     const a = testing.allocator;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(a);
-    // 出错处逐层退出未闭合的嵌套，每层都查看 token 而不消费（查看次数上限过小时 panic）
+    // At the error, unclosed nesting unwinds level by level, each level peeking at tokens without
+    // consuming them (panics if the peek limit is too small)
     for ([_][]const u8{ "f(", ".{", "a[", "(" }) |open| {
         src.clearRetainingCapacity();
         try src.appendSlice(a, "const x = ");
@@ -216,7 +217,7 @@ test "recovery: unwinding deep unclosed nesting and long else-if chains" {
         try src.appendSlice(a, "\nconst y = 1;\n");
         try expectLossless(src.items);
     }
-    // 合法代码：表达式形式的 else-if 链在末尾逐层退出
+    // Valid code: an expression-form else-if chain unwinds level by level at the end
     src.clearRetainingCapacity();
     try src.appendSlice(a, "fn f(x: u32) u32 {\n    return ");
     for (0..1000) |i| try src.print(a, "if (x == {d}) {d} else ", .{ i, i });
@@ -225,7 +226,7 @@ test "recovery: unwinding deep unclosed nesting and long else-if chains" {
     try expectLossless(src.items);
 }
 
-/// 语法树的深度（迭代计算）
+/// Depth of the syntax tree (computed iteratively)
 fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     const Entry = struct { node: @import("tree.zig").SyntaxNode, depth: usize };
     var stack: std.ArrayList(Entry) = .empty;

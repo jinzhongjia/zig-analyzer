@@ -1,10 +1,10 @@
-//! 生成的 LSP 类型所用的 JSON 辅助：联合类型、字符串字面量类型、整数枚举。
+//! JSON helpers for the generated LSP types: union types, string literal types, and integer enums.
 
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
 
-/// LSP 中 `kind: "create"` 这类字符串字面量类型。解析时校验值必须相等。
+/// String literal types in LSP such as `kind: "create"`. Parsing checks that the value matches.
 pub fn StringLiteral(comptime value: []const u8) type {
     return struct {
         pub const literal = value;
@@ -25,7 +25,7 @@ pub fn StringLiteral(comptime value: []const u8) type {
     };
 }
 
-/// 整数枚举：以数字形式序列化。
+/// Integer enum: serialized as a number.
 pub fn IntEnum(comptime T: type) type {
     return struct {
         pub fn jsonStringify(self: T, jw: anytype) !void {
@@ -34,8 +34,9 @@ pub fn IntEnum(comptime T: type) type {
     };
 }
 
-/// LSP 的 `A | B | C` 联合类型：先按 JSON 值的形状筛选变体，对象类型先严格（不允许未知字段）
-/// 再宽松地尝试，取第一个成功的变体。
+/// LSP `A | B | C` union types: variants are first filtered by the shape of the JSON value;
+/// object types are tried strictly (no unknown fields) first, then leniently; the first variant
+/// that succeeds is used.
 pub fn Union(comptime T: type) type {
     const info = @typeInfo(T).@"union";
     return struct {
@@ -70,7 +71,8 @@ pub fn Union(comptime T: type) type {
     };
 }
 
-/// 判断 JSON 值的形状能否解析为 `T`，避免把 `"5"` 解析成整数这类误匹配。
+/// Checks whether the shape of a JSON value can be parsed as `T`, avoiding mismatches such as
+/// parsing `"5"` as an integer.
 fn shapeMatches(comptime T: type, v: json.Value) bool {
     if (T == json.Value) return true;
     return switch (@typeInfo(T)) {

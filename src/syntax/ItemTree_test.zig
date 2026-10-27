@@ -9,7 +9,7 @@ fn buildTree(source: []const u8) !struct { parse: *Parse, items: ItemTree } {
     return .{ .parse = parse, .items = try ItemTree.build(testing.allocator, parse.rootNode()) };
 }
 
-/// 以文本形式描述 ItemTree，便于断言
+/// Describes an ItemTree as text for assertions
 fn describe(t: *const ItemTree, w: *std.Io.Writer, container: u32, depth: usize) !void {
     for (t.containerMembers(container)) |i| {
         const item = t.items[i];
@@ -40,7 +40,7 @@ fn expectItems(source: []const u8, expected: []const u8) !void {
 
 test "collects top-level and nested container members" {
     try expectItems(
-        \\/// 点
+        \\/// A point
         \\pub const Point = struct {
         \\    x: i32,
         \\    y: i32 = 0,
@@ -53,7 +53,7 @@ test "collects top-level and nested container members" {
         \\comptime {}
         \\const Tuple = struct { u32, u8 };
     ,
-        \\const Point pub doc="点"
+        \\const Point pub doc="A point"
         \\  <struct>
         \\    field x
         \\    field y
@@ -87,7 +87,7 @@ test "ItemTree unchanged by body, comment or whitespace edits" {
         \\fn f(x: u32) u32 { return x + 1; }
     ;
     try testing.expect(try treesEqual(base,
-        \\// 新增注释
+        \\// A new comment
         \\const S = struct { a: u32 };
         \\
         \\fn f(x: u32) u32 {
@@ -110,7 +110,7 @@ test "AstId stable across edits, AstIdMap finds the node" {
     var a = try buildTree("const A = 1;\nfn f() void {}\n");
     defer a.parse.destroy();
     defer a.items.deinit(testing.allocator);
-    var b = try buildTree("// 前面插入注释与声明\nconst Z = 0;\nconst A = 1;\nfn f() void { _ = 1; }\n");
+    var b = try buildTree("// A comment and a declaration inserted in front\nconst Z = 0;\nconst A = 1;\nfn f() void { _ = 1; }\n");
     defer b.parse.destroy();
     defer b.items.deinit(testing.allocator);
 

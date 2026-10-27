@@ -1,18 +1,19 @@
-//! 查询统计的文本报告：基准工具、语料工具与慢请求日志共用。
+//! Text report of query statistics, shared by the benchmark tool, the corpus tool, and the
+//! slow-request log.
 
 const std = @import("std");
 const engine = @import("engine.zig");
 const QueryStats = engine.QueryStats;
 
-/// query 的显示名：类型全名的最后两段（如 `queries.Infer`）
+/// Display name of a query: the last two components of the full type name (e.g. `queries.Infer`)
 pub fn shortName(full: []const u8) []const u8 {
     const last = std.mem.lastIndexOfScalar(u8, full, '.') orelse return full;
     const prev = std.mem.lastIndexOfScalar(u8, full[0..last], '.') orelse return full;
     return full[prev + 1 ..];
 }
 
-/// 按自身耗时降序列出前 `limit` 个执行过的 query：执行次数、命中率、cutoff、结果不完整的次数、
-/// 累计 / 自身 / 最长耗时、memo 数
+/// Lists the first `limit` executed queries in descending order of self time: executions, hit rate,
+/// cutoffs, incomplete results, total / self / max time, and memo count
 pub fn writeTable(w: *std.Io.Writer, names: []const []const u8, stats: []const QueryStats, limit: usize) std.Io.Writer.Error!void {
     var order: [256]usize = undefined;
     const n = @min(stats.len, order.len);

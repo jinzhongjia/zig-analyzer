@@ -1,8 +1,9 @@
-//! 位置换算的性质测试（固定种子随机输入 + 覆盖率引导模糊测试）：
+//! Property tests for position conversion (fixed-seed random input + coverage-guided fuzzing):
 //!
-//! 1. `LineIndex.position` 与逐字扫描的 `offsetToPosition` 结果一致；
-//! 2. 位置 → 偏移 → 位置 往返稳定，偏移不会落在多字节字符或 `\r\n` 中间；
-//! 3. 增量变更与「从文本直接拼接」的结果一致。
+//! 1. `LineIndex.position` agrees with `offsetToPosition`, which scans character by character;
+//! 2. position → offset → position round-trips are stable, and offsets never land in the middle of
+//!    a multi-byte character or `\r\n`;
+//! 3. incremental changes give the same result as "splicing the text directly".
 
 const std = @import("std");
 const testing = std.testing;
@@ -10,7 +11,7 @@ const offsets = @import("offsets.zig");
 const types = @import("../lsp/types.zig");
 const Entropy = @import("Entropy.zig");
 
-const pieces = [_][]const u8{ "a", "Z", " ", "\n", "\r\n", "\r", "\t", "é", "中", "😀", "\xff", "\xe4\xb8", "\x00" };
+const pieces = [_][]const u8{ "a", "Z", " ", "\n", "\r\n", "\r", "\t", "é", "€", "😀", "\xff", "\xe2\x82", "\x00" };
 
 fn genText(e: *Entropy, out: *std.ArrayList(u8)) !void {
     const n = e.below(48);
@@ -30,18 +31,20 @@ fn checkAll(input: []const u8) !void {
         for (0..text.items.len + 1) |off| {
             const pos = li.position(off, enc);
             try testing.expectEqual(offsets.offsetToPosition(text.items, off, enc), pos);
-            // 往返：位置换回的偏移不超过原偏移，再换一次位置不变
+            // Round trip: the offset converted back from the position does not exceed the original
+            // offset, and converting it again gives the same position
             const back = offsets.positionToOffset(text.items, pos, enc);
             try testing.expect(back <= off);
             try testing.expectEqual(pos, li.position(back, enc));
         }
     }
 
-    // 增量变更：按字节偏移选区间，转换为位置后应用，结果等于直接拼接
+    // Incremental change: pick a range by byte offsets, convert it to positions and apply it; the
+    // result equals direct splicing
     const enc: offsets.Encoding = e.pick(offsets.Encoding, &.{ .utf8, .utf16, .utf32 });
     var start = e.below(text.items.len + 1);
     var end = start + e.below(text.items.len - start + 1);
-    // 对齐到位置可以精确表示的边界
+    // Align to boundaries that positions can represent exactly
     start = offsets.positionToOffset(text.items, li.position(start, enc), enc);
     end = @max(start, offsets.positionToOffset(text.items, li.position(end, enc), enc));
     var insert: std.ArrayList(u8) = .empty;

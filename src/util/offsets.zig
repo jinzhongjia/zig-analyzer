@@ -1,4 +1,5 @@
-//! LSP 位置（行 + 按编码计数的列）与字节偏移的换算，以及文档增量变更的应用。
+//! Conversion between LSP positions (line + column counted in units of the encoding) and byte
+//! offsets, and application of incremental document changes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,7 +28,7 @@ pub const Encoding = enum {
     }
 };
 
-/// 第 `line` 行起始的字节偏移；超出行数时返回文本末尾。
+/// Byte offset where line `line` starts; returns the end of the text when `line` is out of range.
 fn lineStart(text: []const u8, line: u32) usize {
     var current: u32 = 0;
     var i: usize = 0;
@@ -43,7 +44,8 @@ fn lineEnd(text: []const u8, start: usize) usize {
     return std.mem.indexOfAnyPos(u8, text, start, "\r\n") orelse text.len;
 }
 
-/// 解码一个 UTF-8 字符，返回其字节长度与在 `enc` 下的单元数。非法字节按 1 字节 1 单元处理。
+/// Decodes one UTF-8 character and returns its byte length and its number of units in `enc`.
+/// Invalid bytes count as 1 byte and 1 unit.
 fn charWidth(bytes: []const u8, enc: Encoding) struct { len: usize, units: u32 } {
     const len = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return .{ .len = 1, .units = 1 };
     if (len > bytes.len) return .{ .len = 1, .units = 1 };
@@ -62,7 +64,7 @@ pub fn positionToOffset(text: []const u8, pos: types.Position, enc: Encoding) us
     var units: u32 = 0;
     while (i < end and units < pos.character) {
         const w = charWidth(text[i..end], enc);
-        // 列落在一个多单元字符中间时向前取整到字符起点
+        // When the column falls in the middle of a multi-unit character, round down to its start
         if (units + w.units > pos.character) break;
         units += w.units;
         i += w.len;
@@ -87,7 +89,7 @@ pub fn offsetToPosition(text: []const u8, offset: usize, enc: Encoding) types.Po
     var units: u32 = 0;
     while (i < @min(target, end)) {
         const w = charWidth(text[i..end], enc);
-        // 偏移落在多字节字符中间时向前取整到字符起点
+        // When the offset falls in the middle of a multi-byte character, round down to its start
         if (i + w.len > target) break;
         units += w.units;
         i += w.len;
@@ -95,7 +97,7 @@ pub fn offsetToPosition(text: []const u8, offset: usize, enc: Encoding) types.Po
     return .{ .line = line, .character = units };
 }
 
-/// 行起始偏移表：O(log n) 把字节偏移换算为 LSP 位置。
+/// Table of line start offsets: converts byte offsets to LSP positions in O(log n).
 pub const LineIndex = struct {
     text: []const u8,
     line_starts: []const u32,
@@ -119,7 +121,7 @@ pub const LineIndex = struct {
 
     pub fn lineOf(li: LineIndex, offset: usize) u32 {
         const target: u32 = @intCast(@min(offset, li.text.len));
-        // 最后一个 <= target 的行起点
+        // The last line start <= target
         var lo: usize = 0;
         var hi: usize = li.line_starts.len;
         while (hi - lo > 1) {
@@ -134,15 +136,18 @@ pub const LineIndex = struct {
         return .{ .line = line, .character = li.units(line, li.line_starts[line], offset, enc) };
     }
 
-    /// 同 `position`。`prev` 为 `prev_offset`（字符边界）的位置：与 `offset` 在同一行且不晚于它时从这里
-    /// 继续计数。按偏移递增逐个换算时使用，每次从行首计数在很长的行上是二次的
+    /// Same as `position`. `prev` is the position of `prev_offset` (a character boundary): when it
+    /// is on the same line as `offset` and not after it, counting continues from there. Used when
+    /// converting offsets one by one in increasing order, since counting from the start of the line
+    /// each time is quadratic on very long lines.
     pub fn positionAfter(li: LineIndex, prev_offset: usize, prev: types.Position, offset: usize, enc: Encoding) types.Position {
         const line = li.lineOf(offset);
         if (line != prev.line or offset < prev_offset or prev_offset < li.line_starts[line]) return li.position(offset, enc);
         return .{ .line = line, .character = prev.character + li.units(line, prev_offset, offset, enc) };
     }
 
-    /// 第 `line` 行中从 `from`（字符边界）到 `offset` 的代码单元数；偏移落在多字节字符中间时向前取整
+    /// Number of code units in line `line` from `from` (a character boundary) to `offset`; an
+    /// offset in the middle of a multi-byte character is rounded down
     fn units(li: LineIndex, line: u32, from: usize, offset: usize, enc: Encoding) u32 {
         const end = li.contentEnd(line);
         const target = @min(offset, end);
@@ -157,7 +162,7 @@ pub const LineIndex = struct {
         return n;
     }
 
-    /// 第 `line` 行内容的结束偏移（不含换行符）
+    /// End offset of the content of line `line` (excluding the line break)
     fn contentEnd(li: LineIndex, line: u32) usize {
         if (line + 1 >= li.line_starts.len) return li.text.len;
         var end: usize = li.line_starts[line + 1];
@@ -182,7 +187,7 @@ test LineIndex {
             const expected = offsetToPosition(text, off, enc);
             try testing.expectEqual(expected, li.position(off, enc));
             try testing.expectEqual(expected, li.positionAfter(prev_offset, prev, off, enc));
-            // 只从字符边界继续
+            // Continue only from character boundaries
             if (off == text.len or (text[off] & 0xc0) != 0x80) {
                 prev_offset = off;
                 prev = expected;
@@ -191,7 +196,7 @@ test LineIndex {
     }
 }
 
-/// 依次应用增量变更，返回新文本（调用方拥有）。
+/// Applies incremental changes in order and returns the new text (owned by the caller).
 pub fn applyChanges(
     gpa: Allocator,
     text: []const u8,
@@ -219,7 +224,7 @@ pub fn applyChanges(
 const testing = std.testing;
 
 test "positionToOffset / offsetToPosition round trip in all three encodings" {
-    // "a😀b" 中 😀 为 4 字节、2 个 UTF-16 单元、1 个码点
+    // In "a😀b", 😀 is 4 bytes, 2 UTF-16 units, and 1 code point
     const text = "x\r\na😀b\nlast";
     const b_offset = std.mem.indexOfScalar(u8, text, 'b').?;
     try testing.expectEqual(b_offset, positionToOffset(text, .{ .line = 1, .character = 5 }, .utf8));
@@ -229,7 +234,8 @@ test "positionToOffset / offsetToPosition round trip in all three encodings" {
         for (0..text.len + 1) |off| {
             const pos = offsetToPosition(text, off, enc);
             const back = positionToOffset(text, pos, enc);
-            // 落在多字节字符或 \r\n 中间的偏移无法精确往返，只要求不越过原偏移
+            // An offset in the middle of a multi-byte character or \r\n cannot round-trip exactly,
+            // so only require that it does not move past the original offset
             try testing.expect(back <= off);
         }
         try testing.expectEqual(b_offset, positionToOffset(text, offsetToPosition(text, b_offset, enc), enc));

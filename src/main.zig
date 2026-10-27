@@ -2,13 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const za = @import("zig_analyzer");
 
-/// 级别由配置在运行时决定（`log.level`），编译期不过滤
+/// The level is decided at runtime by the configuration (`log.level`); no compile-time filtering
 pub const std_options: std.Options = .{
     .log_level = .debug,
     .logFn = za.util.log.logFn,
 };
 
-/// panic 时先把当前线程的上下文（请求、文件、执行中的 query）与调用栈写入日志，再按默认方式结束进程
+/// On panic, first writes the current thread's context (request, file, running queries) and the
+/// stack trace to the log, then ends the process in the default way
 pub const panic = std.debug.FullPanic(panicFn);
 
 fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -17,9 +18,11 @@ fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
 
-/// 服务器工作线程的栈大小：只占地址空间，用到的部分才分配内存
+/// Stack size of the server's worker threads: it only takes address space, and memory is
+/// allocated only for the part that is used
 const worker_stack_size = 64 * 1024 * 1024;
-/// 工作线程上读事务可占用的栈（见 `engine.StackBudget`），为两次检查之间的占用留出余量
+/// Stack a read transaction may use on a worker thread (see `engine.StackBudget`), leaving
+/// headroom for the usage between two checks
 const worker_stack_budget = 48 * 1024 * 1024;
 
 const usage =
@@ -48,12 +51,17 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // ReleaseSafe 下 `init.gpa` 是查错用的 `SafeAllocator`：每次分配附带元数据与调用栈，小分配所在的桶
-    // 要等其中全部释放才归还，长时间运行时常驻内存远超实际使用。只在 Debug 下保留它（退出时报告泄漏）。
-    // 不用 `std.heap.smp_allocator`：它的空闲链表按线程槽位分开，缓存值在工作线程上分配、在清扫的线程上释放，
-    // 释放的块分配方取不到，常驻内存随会话持续增长（见 `SharedAllocator`）
+    // In ReleaseSafe, `init.gpa` is the error-checking `SafeAllocator`: every allocation carries
+    // metadata and a stack trace, and a bucket of small allocations is returned only once all of
+    // them are freed, so over a long run the resident memory far exceeds actual usage. It is kept
+    // only in Debug (where it reports leaks at exit).
+    // `std.heap.smp_allocator` is not used: its free lists are split by thread slot, and cached
+    // values are allocated on worker threads but freed on the sweeping thread, so the allocating
+    // side cannot get the freed blocks back, and the resident memory keeps growing over the
+    // session (see `SharedAllocator`)
     const backing = if (builtin.mode == .debug) init.gpa else za.util.SharedAllocator.allocator;
-    // 不用 `init.io`：它的工作线程的栈是默认大小，很深的依赖链要多次中断、分段计算
+    // `init.io` is not used: its worker threads have the default stack size, so a very deep
+    // dependency chain would have to be interrupted many times and computed in segments
     var threaded: std.Io.Threaded = .init(backing, .{
         .stack_size = worker_stack_size,
         .argv0 = .init(init.minimal.args),
@@ -68,11 +76,13 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
     var writer: za.lsp.transport.Writer = .{ .io = io, .inner = &stdout.interface };
 
-    // 统计存活的堆内存（`zig-analyzer/status`）
+    // Counts the live heap memory (`zig-analyzer/status`)
     var counting: za.util.mem.Counting = .{ .child = backing };
     var server: za.Server = undefined;
     try server.init(io, counting.allocator(), &writer);
-    // 请求在工作线程上执行；无法创建工作线程时在调用方的线程（可能是主线程）上执行，主线程仍按默认的栈上限
+    // Requests run on worker threads; when no worker thread can be created, they run on the
+    // caller's thread (possibly the main thread), and the main thread still has the default
+    // stack limit
     server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = worker_stack_budget };
     server.heap = &counting;
     server.environ = init.minimal.environ;

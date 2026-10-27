@@ -1,8 +1,10 @@
-//! 类型化 AST 访问层：在 CST 之上按语义访问子结构。
+//! Typed AST access layer: semantic access to substructures on top of the CST.
 //!
-//! 「某信息位于哪个子节点」的知识集中在这里，调用方写 `decl.proto().?.name()` 而不是数子节点；
-//! 语法树结构调整时只改这一处。所有访问器返回可选值：容错解析的树中任何部分都可能缺失。
-//! 表达式不区分具体种类，统一用 `SyntaxNode`，由使用方按 `kind()` 分派。
+//! The knowledge of "which child node holds which information" is centralized here; callers
+//! write `decl.proto().?.name()` instead of counting child nodes, and when the syntax tree
+//! structure changes, only this place changes. All accessors return optionals: any part of an
+//! error-tolerant parse tree may be missing. Expressions are not distinguished by kind; they all
+//! use `SyntaxNode`, and users dispatch on `kind()`.
 
 const std = @import("std");
 const tree = @import("tree.zig");
@@ -11,17 +13,17 @@ pub const SyntaxNode = tree.SyntaxNode;
 pub const SyntaxToken = tree.SyntaxToken;
 pub const SyntaxKind = kind_mod.SyntaxKind;
 
-/// 节点是 `T` 的种类时转换为 `T`
+/// Converts to `T` when the node is of `T`'s kind
 pub fn cast(comptime T: type, n: SyntaxNode) ?T {
     return if (n.kind() == T.kind) .{ .syntax = n } else null;
 }
 
-/// 第一个种类为 `T` 的直接子节点
+/// The first direct child node of kind `T`
 fn child(n: SyntaxNode, comptime T: type) ?T {
     return if (n.childNode(T.kind)) |c| .{ .syntax = c } else null;
 }
 
-/// 第 `index` 个直接子节点
+/// The `index`-th direct child node
 fn nthNode(n: SyntaxNode, index: usize) ?SyntaxNode {
     var it = n.children();
     var i: usize = 0;
@@ -29,7 +31,7 @@ fn nthNode(n: SyntaxNode, index: usize) ?SyntaxNode {
     return null;
 }
 
-/// 第一个出现在 `token` 之后的直接子节点
+/// The first direct child node that appears after `token`
 fn nodeAfter(n: SyntaxNode, token: SyntaxKind) ?SyntaxNode {
     var it = n.children();
     var seen = false;
@@ -42,7 +44,7 @@ fn nodeAfter(n: SyntaxNode, token: SyntaxKind) ?SyntaxNode {
     return null;
 }
 
-/// 第一个不属于 `skip` 中种类的直接子节点
+/// The first direct child node whose kind is not in `skip`
 fn firstNodeExcept(n: SyntaxNode, skip: []const SyntaxKind) ?SyntaxNode {
     var it = n.children();
     while (it.nextNode()) |c| {
@@ -51,7 +53,7 @@ fn firstNodeExcept(n: SyntaxNode, skip: []const SyntaxKind) ?SyntaxNode {
     return null;
 }
 
-/// `token` 之后、第一个不属于 `skip` 中种类的直接子节点
+/// The first direct child node after `token` whose kind is not in `skip`
 fn nodeAfterExcept(n: SyntaxNode, token: SyntaxKind, skip: []const SyntaxKind) ?SyntaxNode {
     var it = n.children();
     var seen = false;
@@ -64,7 +66,7 @@ fn nodeAfterExcept(n: SyntaxNode, token: SyntaxKind, skip: []const SyntaxKind) ?
     return null;
 }
 
-/// 直接子节点迭代器（可按种类过滤）
+/// Iterator over direct child nodes (optionally filtered by kind)
 pub const Nodes = struct {
     inner: SyntaxNode.Children,
     only: ?SyntaxKind = null,
@@ -84,9 +86,9 @@ fn nodes(n: SyntaxNode) Nodes {
     return .{ .inner = n.children() };
 }
 
-// ── 容器与声明 ───────────────────────────────────────────────────────
+// ── Containers and declarations ──────────────────────────────────────
 
-/// 容器成员：fn_decl、var_decl、container_field、test_decl、comptime_decl
+/// Container members: fn_decl, var_decl, container_field, test_decl, comptime_decl
 pub fn isMember(k: SyntaxKind) bool {
     return switch (k) {
         .fn_decl, .var_decl, .container_field, .test_decl, .comptime_decl => true,
@@ -94,8 +96,10 @@ pub fn isMember(k: SyntaxKind) bool {
     };
 }
 
-/// 标识符的名字：`@"name"` 形式去掉引号（含转义的保留原文，解码见 `identNameAlloc`）。
-/// 语义层（名字解析、字段、枚举成员）一律使用去掉引号并解码的名字，显示时再按需加回（`std.zig.fmtId`）
+/// Name of an identifier: the quotes of the `@"name"` form are removed (names with escapes keep
+/// the source text; see `identNameAlloc` for decoding).
+/// The semantic layers (name resolution, fields, enum members) always use the unquoted, decoded
+/// name, adding the quotes back for display when needed (`std.zig.fmtId`)
 pub fn identName(text: []const u8) []const u8 {
     if (isQuotedIdent(text)) {
         const inner = text[2 .. text.len - 1];
@@ -108,7 +112,8 @@ fn isQuotedIdent(text: []const u8) bool {
     return text.len >= 3 and text[0] == '@' and text[1] == '"' and text[text.len - 1] == '"';
 }
 
-/// 同 `identName`，含转义时解码（`@"\x66oo"` 即 `foo`）。不含转义时引用原文；转义不合法时保留原文
+/// Like `identName`, but decodes escapes (`@"\x66oo"` is `foo`). Without escapes the result
+/// references the source text; with invalid escapes the source text is kept as is
 pub fn identNameAlloc(a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     const name = identName(text);
     if (name.ptr != text.ptr or !isQuotedIdent(text)) return name;
@@ -118,8 +123,10 @@ pub fn identNameAlloc(a: std.mem.Allocator, text: []const u8) std.mem.Allocator.
     };
 }
 
-/// 容器成员的名字 token：函数名、变量名、字段名、test 名（字符串或标识符）；没有名字时为 null。
-/// 枚举成员与联合的 void 字段可以没有冒号，名字在类型表达式的位置，需要由调用方说明（`in_enum`）
+/// Name token of a container member: function, variable, field, or test name (a string or an
+/// identifier); null when there is no name.
+/// Enum members and void fields of unions may lack the colon, with the name where the type
+/// expression goes; the caller has to indicate this (`in_enum`)
 pub fn memberName(member: SyntaxNode, in_enum: bool) ?SyntaxToken {
     return switch (member.kind()) {
         .fn_decl => if ((FnDecl{ .syntax = member }).proto()) |p| p.name() else null,
@@ -157,9 +164,10 @@ pub const ContainerDecl = struct {
         return null;
     }
 
-    /// `enum(u8)` 的整数类型、`union(E)` 的标签类型
-    /// `enum(u8)` / `union(E)` / `packed struct(u32)` 中括号内的表达式。`union(enum)` 的括号内没有表达式，
-    /// 不能越过 `)` 取到第一个成员
+    /// The integer type of `enum(u8)`, the tag type of `union(E)`
+    /// The expression inside the parentheses of `enum(u8)` / `union(E)` / `packed struct(u32)`.
+    /// `union(enum)` has no expression inside the parentheses; must not reach past `)` and take
+    /// the first member
     pub fn argExpr(n: ContainerDecl) ?SyntaxNode {
         var it = n.syntax.children();
         var depth: u32 = 0;
@@ -214,12 +222,12 @@ pub const FnProto = struct {
         return last;
     }
 
-    /// `!T`：返回类型带推导的错误集
+    /// `!T`: the return type has an inferred error set
     pub fn inferredErrorSet(n: FnProto) bool {
         return n.syntax.childToken(.bang) != null;
     }
 
-    /// 子句（align / addrspace / linksection / callconv）中的表达式
+    /// Expressions in the clauses (align / addrspace / linksection / callconv)
     pub fn clauses(n: FnProto) [4]?SyntaxNode {
         var out: [4]?SyntaxNode = @splat(null);
         for ([_]SyntaxKind{ .align_clause, .addrspace_clause, .linksection_clause, .callconv_clause }, &out) |k, *o| {
@@ -228,7 +236,8 @@ pub const FnProto = struct {
         return out;
     }
 
-    /// 签名的显示：`fn name(a: T, b: U) callconv(.c) R`，由 `writeParams` 与 `writeReturnType` 组成
+    /// Display of the signature: `fn name(a: T, b: U) callconv(.c) R`, made up of `writeParams`
+    /// and `writeReturnType`
     pub fn writeSignature(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("fn");
         if (n.name()) |t| try w.print(" {s}", .{t.text});
@@ -238,8 +247,9 @@ pub const FnProto = struct {
         try n.writeReturnType(w);
     }
 
-    /// 参数列表与其后的子句：`(a: T, b: U) callconv(.c)`。各部分见 `writeCollapsed`，参数以 `, ` 分隔
-    /// （多行参数列表末尾的逗号不显示）
+    /// Parameter list and the clauses after it: `(a: T, b: U) callconv(.c)`. For each part see
+    /// `writeCollapsed`; parameters are separated by `, `
+    /// (the trailing comma of a multiline parameter list is not shown)
     pub fn writeParams(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeByte('(');
         var it = n.params();
@@ -259,7 +269,8 @@ pub const FnProto = struct {
         };
     }
 
-    /// 返回类型（推导的错误集带 `!`），见 `writeCollapsed`；缺失时不输出
+    /// Return type (with `!` for an inferred error set), see `writeCollapsed`;
+    /// writes nothing when missing
     pub fn writeReturnType(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const ret = n.returnType() orelse return;
         if (n.inferredErrorSet()) try w.writeByte('!');
@@ -275,7 +286,7 @@ pub const Param = struct {
         return n.syntax.childToken(.identifier);
     }
 
-    /// `anytype` 与 `...` 没有类型表达式
+    /// `anytype` and `...` have no type expression
     pub fn typeExpr(n: Param) ?SyntaxNode {
         return nthNode(n.syntax, 0);
     }
@@ -311,7 +322,7 @@ pub const ContainerField = struct {
     syntax: SyntaxNode,
     pub const kind: SyntaxKind = .container_field;
 
-    /// 元组字段没有名字
+    /// Tuple fields have no name
     pub fn name(n: ContainerField) ?SyntaxToken {
         if (n.syntax.childToken(.colon) == null) return null;
         return n.syntax.childToken(.identifier);
@@ -321,7 +332,7 @@ pub const ContainerField = struct {
         return firstNodeExcept(n.syntax, &.{.align_clause});
     }
 
-    /// 枚举成员 `red` / `red = 1`：名字位于类型表达式的位置
+    /// Enum member `red` / `red = 1`: the name is in the position of the type expression
     pub fn enumName(n: ContainerField) ?SyntaxToken {
         if (n.name()) |t| return t;
         const first = cast(NameRef, n.typeExpr() orelse return null) orelse return null;
@@ -351,7 +362,7 @@ pub const ComptimeDecl = struct {
     }
 };
 
-// ── 语句与控制流 ─────────────────────────────────────────────────────
+// ── Statements and control flow ──────────────────────────────────────
 
 pub const Label = struct {
     syntax: SyntaxNode,
@@ -375,7 +386,7 @@ pub const Block = struct {
     }
 };
 
-/// `|x|`、`|*x, i|`：每个绑定是一个 identifier token
+/// `|x|`, `|*x, i|`: each binding is an identifier token
 pub const Payload = struct {
     syntax: SyntaxNode,
     pub const kind: SyntaxKind = .payload;
@@ -462,7 +473,7 @@ pub const WhileExpr = struct {
         return child(n.syntax, Payload);
     }
 
-    /// `: (i += 1)` 中的表达式
+    /// The expression in `: (i += 1)`
     pub fn continueExpr(n: WhileExpr) ?SyntaxNode {
         const c = n.syntax.childNode(.while_continue) orelse return null;
         return nthNode(c, 0);
@@ -489,7 +500,7 @@ pub const ForExpr = struct {
         return child(n.syntax, Label);
     }
 
-    /// 每个输入是表达式，或 `a..b` 形式的 for_input 节点
+    /// Each input is an expression, or a for_input node of the form `a..b`
     pub fn inputs(n: ForExpr) Nodes {
         const list = n.syntax.childNode(.for_inputs) orelse return .{ .inner = .{ .elems = &.{}, .offset = 0 } };
         return nodes(list);
@@ -537,13 +548,13 @@ pub const SwitchProng = struct {
         return n.syntax.childToken(.keyword_inline) != null;
     }
 
-    /// `else` 分支没有分支项
+    /// The `else` prong has no items
     pub fn isElse(n: SwitchProng) bool {
         const case = n.syntax.childNode(.switch_case) orelse return false;
         return case.childToken(.keyword_else) != null;
     }
 
-    /// 分支项：表达式，或 `a...b` 形式的 switch_item 节点
+    /// Prong items: expressions, or switch_item nodes of the form `a...b`
     pub fn items(n: SwitchProng) Nodes {
         const case = n.syntax.childNode(.switch_case) orelse return .{ .inner = .{ .elems = &.{}, .offset = 0 } };
         return nodes(case);
@@ -571,7 +582,8 @@ pub const AssignExpr = struct {
     }
 };
 
-/// `a, var b = expr`：左侧是表达式或 var_decl（无初始化），最后一个子节点是右侧
+/// `a, var b = expr`: the left side holds expressions or var_decls (without initializers);
+/// the last child node is the right side
 pub const Destructure = struct {
     syntax: SyntaxNode,
     pub const kind: SyntaxKind = .destructure;
@@ -599,7 +611,7 @@ pub const BreakExpr = struct {
     }
 };
 
-// ── 表达式 ───────────────────────────────────────────────────────────
+// ── Expressions ──────────────────────────────────────────────────────
 
 pub const BinaryExpr = struct {
     syntax: SyntaxNode,
@@ -609,7 +621,7 @@ pub const BinaryExpr = struct {
         return nthNode(n.syntax, 0);
     }
 
-    /// 运算符 token
+    /// Operator token
     pub fn op(n: BinaryExpr) ?SyntaxToken {
         var it = n.syntax.children();
         var seen_lhs = false;
@@ -620,7 +632,7 @@ pub const BinaryExpr = struct {
         return null;
     }
 
-    /// `catch |err|` 的捕获
+    /// The capture of `catch |err|`
     pub fn payload(n: BinaryExpr) ?Payload {
         return child(n.syntax, Payload);
     }
@@ -664,7 +676,7 @@ pub const BuiltinCall = struct {
     syntax: SyntaxNode,
     pub const kind: SyntaxKind = .builtin_call;
 
-    /// 含 `@`，如 `@import`
+    /// Includes the `@`, e.g. `@import`
     pub fn name(n: BuiltinCall) ?SyntaxToken {
         return n.syntax.childToken(.builtin);
     }
@@ -683,7 +695,7 @@ pub const FieldAccess = struct {
         return nthNode(n.syntax, 0);
     }
 
-    /// `foo.` 尚未写完时为 null
+    /// null while `foo.` is not yet complete
     pub fn name(n: FieldAccess) ?SyntaxToken {
         return n.syntax.childToken(.identifier);
     }
@@ -711,17 +723,17 @@ pub const EnumLiteral = struct {
     }
 };
 
-/// `T{ ... }` 或 `.{ ... }`
+/// `T{ ... }` or `.{ ... }`
 pub const InitExpr = struct {
     syntax: SyntaxNode,
     pub const kind: SyntaxKind = .init_expr;
 
-    /// `.{}` 没有类型
+    /// `.{}` has no type
     pub fn typeExpr(n: InitExpr) ?SyntaxNode {
         return firstNodeExcept(n.syntax, &.{.init_list});
     }
 
-    /// 每项是 field_init 或表达式
+    /// Each item is a field_init or an expression
     pub fn items(n: InitExpr) Nodes {
         const list = n.syntax.childNode(.init_list) orelse return .{ .inner = .{ .elems = &.{}, .offset = 0 } };
         return nodes(list);
@@ -750,12 +762,13 @@ pub const ErrorValue = struct {
     }
 };
 
-/// 直接子节点（表达式按出现顺序）
+/// Direct child nodes (expressions in order of appearance)
 pub fn childNodes(n: SyntaxNode) Nodes {
     return nodes(n);
 }
 
-/// 节点的显示文本（签名的各部分）：源码去掉注释与文档注释，token 之间的空白与注释折叠为单个空格
+/// Display text of a node (parts of a signature): the source with comments and doc comments
+/// removed, and whitespace and comments between tokens collapsed into a single space
 pub fn writeCollapsed(n: SyntaxNode, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var c: Collapser = .{ .w = w };
     try c.walk(n);
@@ -854,7 +867,7 @@ test "fn signature display drops comments and collapses whitespace" {
         .{ "fn lazy(b: *Build, comptime T: type, x:anytype) align(4) callconv(.c) error{ A, B }!?[]const u8", "(b: *Build, comptime T: type, x:anytype) align(4) callconv(.c)", "error{ A, B }!?[]const u8" },
         .{ "fn g(fmt: [*:0]const u8, ...) !void", "(fmt: [*:0]const u8, ...)", "!void" },
         .{ "fn h() E!T", "()", "E!T" },
-        // 字符串内的空白保持原样
+        // Whitespace inside strings is kept as is
         .{ "fn s(m: []const u8) @TypeOf(\"a  b\")", "(m: []const u8)", "@TypeOf(\"a  b\")" },
         .{ "fn missing(a: u32)", "(a: u32)", "" },
     };
@@ -896,7 +909,7 @@ test "control flow" {
     try testing.expectEqualStrings("x", b.next().?.name.text);
     try testing.expectEqualStrings("b", if_e.then().?.text(p.source));
     try testing.expectEqualStrings("e", if_e.@"else"().?.payload().?.first().?.name.text);
-    // 语句形式的 else 分支是带分号的 expr_stmt
+    // The else branch in statement form is an expr_stmt with a semicolon
     try testing.expectEqualStrings("c;", if_e.@"else"().?.body().?.text(p.source));
 
     const w = cast(WhileExpr, stmts.next().?).?;
@@ -932,7 +945,7 @@ test "control flow" {
     try testing.expectEqualStrings("err", catch_e.payload().?.first().?.name.text);
     try testing.expectEqualStrings("b", catch_e.rhs().?.text(p.source));
 
-    // `foo.`：字段名缺失
+    // `foo.`: the field name is missing
     const stmt = stmts.next().?;
     const fa = cast(FieldAccess, stmt.childNode(.field_access).?).?;
     try testing.expect(fa.name() == null);

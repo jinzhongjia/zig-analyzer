@@ -1,9 +1,14 @@
-//! 未使用的函数参数（AstGen 的 `unused function parameter`）的快速修复：删除参数，同时删除全部调用处对应的实参。
+//! Quick fix for an unused function parameter (AstGen's `unused function parameter`): removes the
+//! parameter together with the matching argument at every call site.
 //!
-//! 只给出完整而正确的编辑。函数的每一处引用都必须是直接调用（`f(...)`、`x.f(...)`、`S.f(...)`、`.f(...)`），
-//! 实参与参数一一对应；以其他方式使用函数（作为值传递、取地址、`@call`、`@TypeOf`）、引用无法确认（歧义、类型
-//! 未知、有语法错误的文件）、名字以字符串出现（反射）、删除的实参有副作用时都不改。方法的接收者、`export` /
-//! `extern` 函数与可变参数函数不提供。删除之后以 AstGen 确认各个文件没有新的错误（如调用处的局部名字不再被使用）。
+//! Only complete and correct edits are offered. Every reference to the function must be a direct
+//! call (`f(...)`, `x.f(...)`, `S.f(...)`, `.f(...)`) whose arguments match the parameters one to
+//! one; nothing is changed when the function is used in other ways (passing it as a value, taking
+//! its address, `@call`, `@TypeOf`), a reference cannot be confirmed (ambiguity, an unknown type, a
+//! file with syntax errors), the name appears as a string (reflection), or a removed argument has
+//! side effects. The fix is not offered for method receivers, `export` / `extern` functions, or
+//! variadic functions. After the removal, AstGen is used to confirm that no file has new errors
+//! (such as a local name at a call site that is no longer used).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -29,37 +34,37 @@ const builtins = @import("builtins.zig");
 
 pub const unused_message = "unused function parameter";
 
-/// 可以删除的参数
+/// A parameter that can be removed
 pub const Target = struct {
     file: FileId,
-    /// 函数（`ItemTree.items` 下标）
+    /// The function (index into `ItemTree.items`)
     item: u32,
-    /// 参数在参数列表中的下标
+    /// Index of the parameter in the parameter list
     index: u32,
-    /// 参数的名字（去掉 `@"..."` 的引号）
+    /// Name of the parameter (with the `@"..."` quoting removed)
     name: []const u8,
-    /// 参数名 token 的位置（即诊断的位置）
+    /// Position of the parameter name token (that is, the position of the diagnostic)
     start: u32,
     end: u32,
-    /// 函数是 pub 的：其他文件可能调用它
+    /// The function is pub: other files may call it
     public: bool,
 };
 
-/// 不能删除的原因
+/// Reason why the parameter cannot be removed
 pub const Problem = struct {
     file: FileId,
-    /// 问题所在的位置（字节偏移）；为 null 时问题在整个文件
+    /// Position of the problem (byte offset); null when the problem concerns the whole file
     offset: ?u32,
     message: []const u8,
 };
 
 pub const Outcome = union(enum) {
-    /// 各文件的编辑，按文件排列
+    /// Edits of each file, sorted by file
     ok: []const rename.FileEdits,
     failed: Problem,
 };
 
-/// `[start, end]` 区间内的未使用的参数中可以删除的
+/// The unused parameters within `[start, end]` that can be removed
 pub fn targets(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Error![]const Target {
     var out: std.ArrayList(Target) = .empty;
     const check = try r.ctx.get(database.live.AstCheck, file);
@@ -71,7 +76,8 @@ pub fn targets(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Error![
     return out.items;
 }
 
-/// 名字位于 `offset` 处的参数：函数须有函数体，不是 `export` / `extern` / 可变参数函数，参数不是方法的接收者
+/// The parameter whose name is at `offset`: the function must have a body and not be an
+/// `export` / `extern` / variadic function, and the parameter must not be a method receiver
 pub fn target(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const item = try r.ownerAt(file, offset, false) orelse return null;
     const it = (try r.itemTree(file)).items[item];
@@ -96,13 +102,15 @@ pub fn target(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     };
 }
 
-/// 函数的第一个参数是否为方法的接收者：类型为函数所在的容器，或指向它的单项指针
+/// Whether the first parameter of the function is a method receiver: its type is the container
+/// the function is in, or a single-item pointer to it
 fn isReceiver(r: *Resolver, file: FileId, item: u32) resolve.Error!bool {
     const items = try r.itemTree(file);
     const container = items.items[item].container;
     const b = try r.body(file, item);
     if (b.params.len == 0) return false;
-    // 按名字求出容器（`@This()`、`Self`）；求不出时（类型函数的结果等）看推导出的签名
+    // Evaluate the container by name (`@This()`, `Self`); when that fails (the result of a type
+    // function, etc.), check the inferred signature
     if (b.binding(b.params[0]).ty) |ty| {
         const e = switch (b.expr(ty)) {
             .ptr_type => |p| if (p.size == .one) p.child else ty,
@@ -127,7 +135,8 @@ fn isReceiver(r: *Resolver, file: FileId, item: u32) resolve.Error!bool {
     };
 }
 
-/// 删除参数 `t` 与全部调用处对应的实参的编辑。`scope` 为查找引用的范围（项目中的文件）
+/// Edits that remove parameter `t` and the matching argument at every call site. `scope` is the
+/// search scope for references (files in the project).
 pub fn edits(r: *Resolver, t: Target, scope: []const FileId) resolve.Error!Outcome {
     const def: Def = .{ .item = .{ .file = t.file, .item = t.item } };
     var ambiguous: ?search.Reference = null;
@@ -145,7 +154,7 @@ pub fn edits(r: *Resolver, t: Target, scope: []const FileId) resolve.Error!Outco
     if (ambiguous) |a| return fail(a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations");
     if (uncertain) |u| return fail(u.file, u.start, "the type here is unknown, so whether this refers to the function cannot be confirmed");
     if (incomplete) |u| return fail(u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked");
-    // 不是 pub 的函数只能在所在的文件中访问
+    // A function that is not pub can only be accessed in its own file
     const files = if (t.public) try search.importers(r, t.file, scope) else try r.arena.dupe(FileId, &.{t.file});
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse return fail(t.file, t.start, "the function has no name");
     if (try rename.stringReference(r, files, fn_name)) |p| return fail(p.file, p.offset, p.message);
@@ -177,7 +186,8 @@ pub fn edits(r: *Resolver, t: Target, scope: []const FileId) resolve.Error!Outco
                 return a.start < b.start;
             }
         }.lt);
-        // 删除的实参中的调用（类型函数）随之删除：去掉位于其他编辑之内的编辑
+        // Calls inside removed arguments (type functions) are removed with them: drop edits that
+        // lie within other edits
         var kept: std.ArrayList(rename.Edit) = .empty;
         for (list.items) |e| {
             if (kept.items.len > 0) {
@@ -209,8 +219,11 @@ fn fail(file: FileId, offset: ?u32, message: []const u8) Outcome {
     return .{ .failed = .{ .file = file, .offset = offset, .message = message } };
 }
 
-/// 文件应用编辑之后不能有新的 AstGen 错误（按位置与文案对应编辑之前的错误）。唯一的例外是参数列表中的
-/// 其他参数因此不再被使用（`comptime T: type, x: T` 删除 `x` 后 `T` 未使用）：这与删除前的错误相当，可以再删除它
+/// After the edits are applied, the file must have no new AstGen errors (matched against the
+/// errors before the edits by position and message). The only exception is another parameter in
+/// the parameter list becoming unused as a result (removing `x` from `comptime T: type, x: T`
+/// leaves `T` unused): this is equivalent to the error before the removal, and that parameter
+/// can be removed next.
 fn verify(r: *Resolver, t: Target, param_list: TextRange, fe: rename.FileEdits) resolve.Error!?Problem {
     const errors = try rename.astGenErrors(r, fe.file, fe.edits);
     const matched = try r.arena.alloc(bool, errors.before.len);
@@ -229,13 +242,14 @@ fn verify(r: *Resolver, t: Target, param_list: TextRange, fe: rename.FileEdits) 
 }
 
 const Site = union(enum) {
-    /// 不依赖签名的引用（decltest 的名字）
+    /// A reference that does not depend on the signature (the name of a decltest)
     skip,
     edit: rename.Edit,
     failed: Problem,
 };
 
-/// 引用 `ref` 处的调用中删除实参的编辑。`index` 为参数的下标，`param_count` 为参数的个数
+/// The edit that removes the argument from the call at reference `ref`. `index` is the index of
+/// the parameter, and `param_count` the number of parameters.
 fn callSite(r: *Resolver, ref: search.Reference, index: u32, param_count: u32) resolve.Error!Site {
     const root = (try r.ctx.get(database.syntax.ParseFile, ref.file)).rootNode();
     const path = try root.coveringPath(r.arena, ref.start);
@@ -245,14 +259,15 @@ fn callSite(r: *Resolver, ref: search.Reference, index: u32, param_count: u32) r
         .name_ref, .field_access, .enum_literal => {},
         else => return siteFail(ref.file, ref.start, not_call),
     }
-    // 括号不改变调用：`(f)(x)`
+    // Parentheses do not change the call: `(f)(x)`
     while (top > 0 and path[top - 1].kind() == .paren_expr) top -= 1;
     if (top == 0) return siteFail(ref.file, ref.start, not_call);
     const call = ast.cast(ast.CallExpr, path[top - 1]) orelse return siteFail(ref.file, ref.start, not_call);
     const callee = call.callee() orelse return siteFail(ref.file, ref.start, not_call);
     if (callee.offset != path[top].offset or callee.kind() != path[top].kind()) return siteFail(ref.file, ref.start, not_call);
 
-    // 调用所在的成员的 HIR：区分方法调用，检查实参的副作用
+    // HIR of the member containing the call: to recognize method calls and to check the
+    // arguments for side effects
     const item = try r.ownerAt(ref.file, ref.start, false) orelse return siteFail(ref.file, ref.start, not_analyzed);
     const b = try r.body(ref.file, item);
     const base = try r.itemOffset(ref.file, item) orelse return siteFail(ref.file, ref.start, not_analyzed);
@@ -291,7 +306,7 @@ fn siteFail(file: FileId, offset: u32, message: []const u8) Site {
     return .{ .failed = .{ .file = file, .offset = offset, .message = message } };
 }
 
-/// 位于 `[start, end)`（相对成员起点）的 `tag` 种类的表达式
+/// The expression of kind `tag` at `[start, end)` (relative to the start of the member)
 fn exprAt(b: *const Body, tag: std.meta.Tag(Body.Expr), start: u32, end: u32) ?Body.ExprId {
     for (b.exprs, b.expr_ranges, 0..) |e, range, i| {
         if (e == tag and range.start == start and range.end == end) return @fromBackingInt(@as(u32, @intCast(i)));
@@ -299,8 +314,10 @@ fn exprAt(b: *const Body, tag: std.meta.Tag(Body.Expr), start: u32, end: u32) ?B
     return null;
 }
 
-/// `lhs.f(...)` 是否以 `lhs` 为第一个实参（方法调用）：`lhs` 是值时是，是类型或命名空间时不是。泛型函数中按
-/// 全部调用点实例判断，各实例不一致或都求不出时为 null
+/// Whether `lhs.f(...)` passes `lhs` as the first argument (a method call): it does when `lhs`
+/// is a value, and does not when it is a type or a namespace. In a generic function this is
+/// decided over all call-site instances; null when the instances disagree or none of them
+/// determines it.
 fn isBound(r: *Resolver, file: FileId, item: u32, b: *const Body, lhs: Body.ExprId) resolve.Error!?bool {
     if (try r.evalNamespace(file, item, b, lhs) != null) return false;
     const ip = r.ctx.db.env.ip;
@@ -321,15 +338,18 @@ fn isBound(r: *Resolver, file: FileId, item: u32, b: *const Body, lhs: Body.Expr
     return result;
 }
 
-/// 类型为 `tv` 的左侧：是类型时为 false，是具体类型的值时为 true，未知或抽象时为 null
+/// For a left-hand side of type `tv`: false when it is a type, true when it is a value of a
+/// concrete type, null when it is unknown or abstract
 fn boundness(ip: *InternPool, tv: TypedValue) ?bool {
     if (tv.ty == .type_type) return false;
     if (seed.wanted(ip, tv)) return null;
     return true;
 }
 
-/// 位于 `[start, end)`（相对成员起点）的实参有无副作用：调用（结果是类型的类型函数除外）、赋值、控制流（`try`、
-/// `return`、`break`、`continue`、`unreachable`）、有副作用或不认识的内建函数、内联汇编等
+/// Whether the argument at `[start, end)` (relative to the start of the member) has side effects:
+/// calls (except calls to type functions whose result is a type), assignments, control flow
+/// (`try`, `return`, `break`, `continue`, `unreachable`), builtins that have side effects or are
+/// unrecognized, inline assembly, etc.
 fn hasSideEffects(r: *Resolver, file: FileId, item: u32, b: *const Body, start: u32, end: u32) resolve.Error!bool {
     var res: ?*const @import("../sema/infer.zig").Result = null;
     for (b.exprs, b.expr_ranges, 0..) |e, range, i| {
@@ -349,7 +369,7 @@ fn hasSideEffects(r: *Resolver, file: FileId, item: u32, b: *const Body, start: 
     return false;
 }
 
-/// 没有副作用的内建函数（`code_actions.pure_builtins` 之外的）
+/// Builtins without side effects (other than those in `code_actions.pure_builtins`)
 const extra_pure_builtins = [_][]const u8{
     "@field",      "@FieldType",    "@intFromPtr",    "@ptrFromInt",     "@intFromError",   "@errorFromInt", "@errorCast",
     "@unionInit",  "@volatileCast", "@addrSpaceCast", "@fieldParentPtr", "@select",         "@shuffle",      "@reduce",
@@ -372,23 +392,28 @@ fn isPure(name: []const u8) bool {
     return false;
 }
 
-/// 列表中的一项
+/// An item of a list
 const ListItem = struct {
     start: u32,
     end: u32,
-    /// 其后的逗号
+    /// The comma after it
     comma: ?TextRange = null,
-    /// 以多行字符串开始或结束：其后的逗号须另起一行
+    /// Starts or ends with a multiline string literal: the comma after it must go on a new line
     multiline: bool,
 };
 
-/// 删除参数列表或实参列表 `list` 中第 `index` 项的编辑，保持排版：
-/// - 独占若干行的项（多行列表的一项，可带行尾注释）删除这些行
-/// - 与其他项同行的项连同一个逗号删除：最后一项删除其前的逗号，其余删除其后的逗号。与多行字符串相邻时只删到
-///   逗号为止，保留多行字符串前后的换行
-/// - 删除后括号之间只剩空白时删除括号之间的全部内容：`f()`
+/// The edit that removes the item at `index` from the parameter or argument list `list`,
+/// preserving the layout:
+/// - An item on lines of its own (an item of a multiline list, possibly with a trailing
+///   comment): those lines are removed
+/// - An item sharing a line with other items is removed together with one comma: the comma
+///   before it for the last item, the comma after it for the others. Next to a multiline string
+///   literal, only the text up to the comma is removed, keeping the line breaks before and
+///   after the multiline string literal
+/// - When only whitespace is left between the parentheses after the removal, everything between
+///   them is removed: `f()`
 ///
-/// 列表的结构不完整（缺少括号、逗号）时为 null
+/// null when the structure of the list is incomplete (missing parentheses or commas)
 pub fn removeItem(arena: Allocator, text: []const u8, list: SyntaxNode, index: u32) Allocator.Error!?rename.Edit {
     var items: std.ArrayList(ListItem) = .empty;
     var open: ?u32 = null;
@@ -415,7 +440,8 @@ pub fn removeItem(arena: Allocator, text: []const u8, list: SyntaxNode, index: u
         .node => |n| {
             if (open == null or close != null) return null;
             if (items.items.len > 0 and items.items[items.items.len - 1].comma == null) return null;
-            // 节点以有效 token 开始与结束（前后的 trivia 属于列表）
+            // A node starts and ends with significant tokens (trivia before and after it belongs
+            // to the list)
             const first = n.firstToken() orelse return null;
             const last = lastToken(n) orelse return null;
             const range = n.range();
@@ -447,8 +473,10 @@ pub fn removeItem(arena: Allocator, text: []const u8, list: SyntaxNode, index: u
     return .{ .start = span[0], .end = span[1], .text = "" };
 }
 
-/// 项 `x` 独占若干行时这些行的区间（含末尾的换行）：所在行之前只有缩进，之后（逗号之后）只有空白与注释。
-/// 区间不越过下一项的起点 `limit`（下一项的文档注释可以紧跟在逗号之后）
+/// When item `x` is on lines of its own, the range of those lines (including the final newline):
+/// on its line only indentation comes before it, and after it (after the comma) there is only
+/// whitespace and a comment. The range does not extend past `limit`, the start of the next item
+/// (the doc comment of the next item may immediately follow the comma).
 fn ownLines(text: []const u8, x: ListItem, limit: u32) ?[2]u32 {
     var line_start = x.start;
     while (line_start > 0 and text[line_start - 1] != '\n') line_start -= 1;
@@ -469,7 +497,7 @@ fn isBlank(s: []const u8) bool {
     return true;
 }
 
-/// 节点的最后一个有效 token
+/// The last significant token of the node
 fn lastToken(n: SyntaxNode) ?SyntaxToken {
     var last: ?tree.SyntaxElement = null;
     var it = n.children();

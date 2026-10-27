@@ -1,8 +1,9 @@
-//! InternPool：类型与 comptime 值的唯一表示。
+//! InternPool: the unique representation of types and comptime values.
 //!
-//! 类型本身也是值（其类型为 `type`）。相同的 Key 总是得到相同的 Index，与驻留顺序无关，
-//! 因此 query 结果中的 Index 可以直接比较。只追加不删除：类型身份在整个进程内稳定。
-//! 多个 query 并发驻留，以互斥锁保护。
+//! Types are values too (of type `type`). The same Key always yields the same Index regardless of
+//! the interning order, so Indexes in query results can be compared directly. Items are only
+//! appended, never removed: type identity is stable for the whole process. Multiple queries
+//! intern concurrently, protected by a mutex.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,16 +18,19 @@ const InternPool = @This();
 gpa: Allocator,
 io: Io,
 mutex: Io.Mutex = .init,
-/// 与目标相关的值运算参数。与 `queries.TargetAbi` input 在同一写事务中设置，读取它的 query 都先读该
-/// input 以记录依赖；读事务与写事务互斥，读取时不会同时被修改
+/// Target-dependent parameters for value computations. Set in the same write transaction as the
+/// `queries.TargetAbi` input; every query that reads it reads that input first to record the
+/// dependency. Read and write transactions are mutually exclusive, so it is never modified while
+/// being read.
 target: Target = .{},
-/// Key 中切片的存储
+/// Storage for the slices in Keys
 arena: std.heap.ArenaAllocator,
 items: std.ArrayList(Key) = .empty,
 map: std.HashMapUnmanaged(Key, Index, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
 
 pub const Index = enum(u32) {
-    /// 未知类型（吸收一切：参与运算的结果也是 unknown，不产生诊断）
+    /// Unknown type (absorbs everything: any operation involving it also yields unknown, and no
+    /// diagnostic is produced)
     unknown,
     type_type,
     void_type,
@@ -48,7 +52,8 @@ pub const Index = enum(u32) {
     false_value,
     null_value,
     undefined_value,
-    /// 实例实参中非 comptime 参数的占位（不属于实例的身份）；元组与匿名结构体中运行时字段的标记
+    /// Placeholder for non-comptime parameters among the arguments of an instance (not part of
+    /// the instance's identity); marker for runtime fields in tuples and anonymous structs
     runtime,
     /// `error{}`
     empty_error_set,
@@ -96,74 +101,85 @@ pub const Key = union(enum) {
     int_type: struct { signedness: std.builtin.Signedness, bits: u16 },
     ptr_type: struct { child: Index, size: PtrSize, is_const: bool = false, sentinel: ?Index = null },
     array_type: struct { len: u64, child: Index, sentinel: ?Index = null },
-    /// 长度取决于抽象参数的数组（泛型函数体没有具体实例时，如 `[block_length]u8`）：元素类型已知，
-    /// 长度未知；`len` 为长度表达式的源码形式，只用于显示
+    /// An array whose length depends on an abstract parameter (in a generic function body without
+    /// a concrete instance, e.g. `[block_length]u8`): the element type is known, the length is
+    /// not; `len` is the source text of the length expression, used only for display
     abstract_array_type: struct { len: []const u8, child: Index, sentinel: ?Index = null },
     optional_type: Index,
     error_union_type: struct { err: Index, payload: Index },
-    /// 名字按字典序排列、去重
+    /// Names sorted lexicographically, without duplicates
     error_set_type: []const []const u8,
-    /// 函数 `!T` 中由函数体推导的错误集。签名只记录这个标记，成员由 `ErrorSetOf` 按需求出
+    /// The error set of a function's `!T` inferred from the function body. The signature records
+    /// only this marker; the members are computed on demand by `ErrorSetOf`.
     inferred_error_set: struct { file: FileId, decl: AstId, inst: ?Index = null },
     fn_type: struct { params: []const Index, ret: Index, varargs: bool = false },
-    /// 身份 = 定义位置（文件 + 容器的 AstId）
+    /// Identity = definition location (file + AstId of the container)
     container_type: Container,
-    /// 元组 `struct { A, B }`（`@Tuple`、元组字面量）
+    /// Tuple `struct { A, B }` (`@Tuple`, tuple literals)
     tuple_type: Tuple,
     /// `@Vector(len, T)`
     vector_type: struct { len: u32, child: Index },
-    /// 没有结果类型的匿名结构体字面量 `.{ .a = x }` 的类型；`values` 同 `Tuple`
+    /// Type of an anonymous struct literal `.{ .a = x }` without a result type; `values` as in
+    /// `Tuple`
     anon_struct_type: struct { names: []const []const u8, types: []const Index, values: []const Index = &.{} },
-    /// `@Enum` / `@Struct` / `@Union` 构造的类型
+    /// Types constructed by `@Enum` / `@Struct` / `@Union`
     reified_type: Reified,
-    /// `union(enum)` 自动生成的标签枚举（值为 union 类型）
+    /// The tag enum generated automatically for a `union(enum)` (the value is the union type)
     union_tag_type: Index,
 
     simple_value: SimpleValue,
     int_value: struct { ty: Index, value: i128 },
-    /// 浮点值（f128 的位表示，已按类型的精度舍入）
+    /// Float value (the bit representation as f128, already rounded to the precision of the type)
     float_value: struct { ty: Index, bits: u128 },
     enum_literal: []const u8,
-    /// 枚举类型的某个成员
+    /// A member of an enum type
     enum_tag: struct { ty: Index, name: []const u8 },
     error_value: []const u8,
-    /// 函数声明；`inst` 为函数所在的实例（泛型容器的方法）
+    /// Function declaration; `inst` is the instance the function belongs to (methods of generic
+    /// containers)
     fn_value: struct { ty: Index, file: FileId, decl: AstId, inst: ?Index = null },
 
-    /// 数组、向量、元组、结构体（按字段顺序）的值。类型为切片或指向数组的指针时表示所指向的元素
+    /// Value of an array, vector, tuple or struct (in field order). When the type is a slice or a
+    /// pointer to an array, it represents the elements pointed to.
     aggregate: struct { ty: Index, elems: []const Index },
-    /// 元素为 u8 的聚合（字符串），类型的含义同 `aggregate`
+    /// Aggregate with u8 elements (a string); the type means the same as in `aggregate`
     bytes: struct { ty: Index, bytes: []const u8 },
-    /// union 的值
+    /// Value of a union
     union_value: struct { ty: Index, tag: []const u8, payload: Index },
-    /// 指向 comptime 值的单项指针
+    /// Single-item pointer to a comptime value
     ptr_value: struct { ty: Index, pointee: Index },
 
-    /// 泛型函数的一次实例化：函数 + 各参数的值（comptime 参数为实参值，未知时为 unknown；
-    /// anytype 参数为实参类型；非 comptime 参数为 `runtime`）。
-    /// `parent` 为函数自身所在的实例（定义在另一个实例化容器中的函数）
+    /// One instantiation of a generic function: the function + the value of each parameter (the
+    /// argument value for comptime parameters, unknown when it is not known; the argument type
+    /// for anytype parameters; `runtime` for non-comptime parameters).
+    /// `parent` is the instance the function itself belongs to (for a function defined in another
+    /// instantiated container).
     instance: Instance,
-    /// 没有具体实例时的 comptime 类型参数（抽象实例），显示为参数名
+    /// A comptime type parameter without a concrete instance (abstract instance), displayed as the
+    /// parameter name
     opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
-    /// 实例实参中非 comptime 参数的占位
+    /// Placeholder for non-comptime parameters among the arguments of an instance
     runtime,
 };
 
-/// 元组的字段
+/// Fields of a tuple
 pub const Tuple = struct {
     types: []const Index,
-    /// 各字段的 comptime 值，见 `fieldValue`
+    /// Comptime value of each field; see `fieldValue`
     values: []const Index = &.{},
 };
 
-/// 元组与匿名结构体第 `i` 个字段的 comptime 值。字面量中 comptime 已知的字段是 comptime 字段（与编译器
-/// 一致），值属于类型；运行时字段为 `runtime`，是否 comptime 或值求不出时为 `unknown`。`values` 为空时
-/// 都是运行时字段（`@Tuple` 构造的元组）
+/// Comptime value of field `i` of a tuple or anonymous struct. Fields of a literal that are known
+/// at comptime are comptime fields (matching the compiler), and their values belong to the type;
+/// runtime fields are `runtime`, and fields whose comptime-ness or value cannot be determined are
+/// `unknown`. When `values` is empty, all fields are runtime fields (tuples constructed by
+/// `@Tuple`).
 pub fn fieldValue(values: []const Index, i: usize) Index {
     return if (values.len == 0) .runtime else values[i];
 }
 
-/// 都是运行时字段时为空：与 `@Tuple` 构造的元组是同一个类型
+/// Empty when all fields are runtime fields: the type is then the same as a tuple constructed by
+/// `@Tuple`
 pub fn fieldValues(values: []const Index) []const Index {
     for (values) |v| if (v != .runtime) return values;
     return &.{};
@@ -174,12 +190,15 @@ pub const Instance = struct {
     decl: AstId,
     args: []const Index,
     parent: ?Index = null,
-    /// 按迭代推导时，成员 `decl` 中循环（或 `inline` switch 分支）体内定义的容器所在的实例：`decl` 的实例
-    /// （`abstract` 时 `decl` 没有实例，`args` 为空，外层实例为 `parent`）在 `binding` 取第 `index` 次迭代时。
-    /// 这些容器的字段类型可以依赖循环变量
+    /// When inferring per iteration, the instance that containers defined inside a loop body (or
+    /// an `inline` switch prong) of member `decl` belong to: the instance of `decl` (when
+    /// `abstract`, `decl` has no instance, `args` is empty, and the enclosing instance is
+    /// `parent`) with `binding` at iteration `index`. The field types of these containers can
+    /// depend on the loop variable.
     iteration: ?Iteration = null,
 
-    /// `index` 为 `unknown_index` 时迭代未确定（不按迭代推导时循环体内的容器）：类型不具体
+    /// When `index` is `unknown_index`, the iteration is undetermined (containers in a loop body
+    /// when not inferring per iteration): the type is not concrete
     pub const Iteration = struct {
         binding: u32,
         index: u32,
@@ -189,28 +208,31 @@ pub const Instance = struct {
     };
 };
 
-/// 内置函数构造的容器类型。身份 = 构造位置（成员 + 表达式）+ 构造时的实例 + 内容
+/// Container type constructed by a builtin. Identity = construction location (member +
+/// expression) + the instance at construction + the contents
 pub const Reified = struct {
     kind: Kind,
     file: FileId,
     owner: AstId,
     expr: u32,
-    /// 构造所在的实例（显示为 `FieldEnum(S)`）
+    /// The instance where it is constructed (displayed as `FieldEnum(S)`)
     inst: ?Index = null,
     layout: Layout = .auto,
-    /// enum：标签的整数类型；union：标签枚举（untagged 为 null）；packed struct：backing 整数
+    /// enum: the integer type of the tag; union: the tag enum (null when untagged); packed struct:
+    /// the backing integer
     tag: ?Index = null,
     names: []const []const u8,
-    /// struct / union 的字段类型
+    /// Field types of a struct / union
     types: []const Index = &.{},
-    /// enum 成员的值
+    /// Values of the enum members
     values: []const i128 = &.{},
     nonexhaustive: bool = false,
-    /// struct / union 字段的显式对齐（0 为未指定）；为空时都未指定
+    /// Explicit alignments of struct / union fields (0 when unspecified); empty when none is
+    /// specified
     field_aligns: []const u64 = &.{},
-    /// struct 的 comptime 字段；为空时都不是
+    /// Whether each struct field is comptime; empty when none is
     comptime_fields: []const bool = &.{},
-    /// 字段属性求不出（布局未知）
+    /// Field attributes cannot be computed (the layout is unknown)
     attrs_unknown: bool = false,
 
     pub const Kind = enum { @"struct", @"enum", @"union" };
@@ -221,13 +243,14 @@ pub const Container = struct {
     file: FileId,
     ast_id: AstId,
     kind: Kind,
-    /// 容器定义在泛型函数体内时，该函数的实例（`ArrayList(u8)` 与 `ArrayList(i32)` 是不同的类型）
+    /// When the container is defined in a generic function body, the instance of that function
+    /// (`ArrayList(u8)` and `ArrayList(i32)` are different types)
     inst: ?Index = null,
 
     pub const Kind = enum { file, @"struct", @"enum", @"union", @"opaque" };
 };
 
-/// 类型与（若 comptime 已知）值。`ty == .unknown` 表示未知
+/// A type and (if known at comptime) a value. `ty == .unknown` means unknown.
 pub const TypedValue = struct {
     ty: Index,
     val: ?Index = null,
@@ -238,7 +261,7 @@ pub const TypedValue = struct {
         return tv.ty == .type_type;
     }
 
-    /// 值为某个类型时返回该类型
+    /// Returns the type when the value is a type
     pub fn asType(tv: TypedValue) ?Index {
         return if (tv.ty == .type_type) tv.val else null;
     }
@@ -251,7 +274,7 @@ pub const TypedValue = struct {
 const KeyContext = struct {
     pub fn hash(_: KeyContext, k: Key) u64 {
         var h: std.hash.Wyhash = .init(0);
-        // 错误集是切片的切片：要逐层跟随指针
+        // Error sets are slices of slices: pointers must be followed at every level
         std.hash.autoHashStrat(&h, k, .DeepRecursive);
         return h.final();
     }
@@ -260,7 +283,7 @@ const KeyContext = struct {
     }
 };
 
-/// 与 `Index` 的预置成员一一对应
+/// Corresponds one-to-one to the preset members of `Index`
 const preset = [_]Key{
     .unknown,
     .{ .simple_type = .type },
@@ -301,10 +324,13 @@ pub fn deinit(ip: *InternPool) void {
     ip.* = undefined;
 }
 
-/// 回收全部非预置的项（整代回收）。调用方须保证此后没有任何地方使用非预置的 Index：
-/// 引用它们的 query 同时清空（`Db.resetQueries`），且没有读事务在进行
+/// Reclaims all non-preset items (whole-generation reclamation). The caller must ensure that no
+/// non-preset Index is used anywhere afterwards: the queries referring to them are cleared at the
+/// same time (`Db.resetQueries`), and no read transaction is in progress.
 ///
-/// 先在新的表中建好预置项再整体替换：分配失败时原来的池保持完整（预置的 Index 仍然有效），只是没有回收
+/// The preset items are built in a new table first, which then replaces the old one as a whole:
+/// if an allocation fails, the original pool stays intact (preset Indexes remain valid) and is
+/// just not reclaimed.
 pub fn reset(ip: *InternPool) Allocator.Error!void {
     var fresh: InternPool = .{ .gpa = ip.gpa, .io = ip.io, .arena = .init(ip.gpa) };
     errdefer fresh.deinit();
@@ -315,11 +341,12 @@ pub fn reset(ip: *InternPool) Allocator.Error!void {
     std.mem.swap(@TypeOf(ip.map), &ip.map, &fresh.map);
     std.mem.swap(std.heap.ArenaAllocator, &ip.arena, &fresh.arena);
     ip.mutex.unlock(ip.io);
-    // 换出的旧表
+    // The old table that was swapped out
     fresh.deinit();
 }
 
-/// 占用的字节数（Key 表、哈希表与存放 Key 中切片的 arena），用于统计
+/// Bytes in use (the Key table, the hash table, and the arena holding the slices in Keys), for
+/// statistics
 pub fn bytes(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
@@ -338,38 +365,45 @@ pub fn scalarAbi(ip: *const InternPool) *const ScalarAbi {
     return &ip.target.scalar_abi;
 }
 
-/// 只能在写事务中调用
+/// May only be called in a write transaction
 pub fn setTarget(ip: *InternPool, t: Target) void {
     ip.target = t;
 }
 
-/// 与目标相关的值运算参数（各模块一致的部分）；默认为本机
+/// Target-dependent parameters for value computations (the parts consistent across modules);
+/// defaults to the native target
 pub const Target = struct {
-    /// 指针位宽；各模块不一致时为 null
+    /// Pointer bit width; null when the modules disagree
     pointer_bits: ?u16 = @bitSizeOf(usize),
     vector_abi: VectorAbi = .unknown,
     scalar_abi: ScalarAbi = .native,
 };
 
-/// 整数、浮点与 C 类型的布局，以及 C 整数类型的位宽与符号（编译器 `Type.abiAlignment` / `abiSize` /
-/// `intInfo` 的对应分支），由 `std.Target` 按编译器的规则算出
+/// Layouts of integer, float and C types, and the bit widths and signedness of C integer types
+/// (the corresponding branches of the compiler's `Type.abiAlignment` / `abiSize` / `intInfo`),
+/// computed from `std.Target` by the compiler's rules
 pub const ScalarAbi = struct {
-    /// 定宽整数的最大对齐（`std.Target.cMaxIntAlignment`）在各模块中的最小值与最大值。整数的对齐为不小于
-    /// 其字节数的 2 的幂，且不超过最大对齐；两者不同时，对齐受最大对齐影响的整数的布局未知
+    /// The minimum and maximum across modules of the maximum alignment of fixed-width integers
+    /// (`std.Target.cMaxIntAlignment`). The alignment of an integer is its byte size rounded up
+    /// to a power of 2, but no larger than the maximum alignment; when the two differ, the layout
+    /// of integers whose alignment is affected by the maximum alignment is unknown.
     max_int_align: struct { min: u16, max: u16 },
-    /// `c_char` 的符号；目标没有 C ABI 或各模块不一致时为 null
+    /// Signedness of `c_char`; null when the target has no C ABI or the modules disagree
     c_char_signedness: ?std.builtin.Signedness,
-    /// 各类型的布局；目标没有定义（没有 C ABI 等）或各模块不一致时为 null
+    /// Layout of each type; null when the target does not define it (no C ABI, etc.) or the
+    /// modules disagree
     types: std.EnumArray(Type, ?Scalar),
 
-    /// 布局取决于目标、且不能由整数规则得出的类型（`c_ushort` 等无符号类型与对应的有符号类型相同）
+    /// Types whose layout depends on the target and cannot be derived from the integer rules
+    /// (unsigned types such as `c_ushort` are the same as the corresponding signed types)
     pub const Type = enum { c_char, c_short, c_int, c_long, c_longlong, c_longdouble, f32, f64, f80, f128 };
 
     pub const Scalar = struct { size: u16, alignment: u16, bits: u16 };
 
     pub const native: ScalarAbi = .of(&builtin.target);
 
-    /// 目标未知：只有对齐与目标无关的整数（不超过 1 字节）有确定的布局
+    /// Unknown target: only integers whose alignment does not depend on the target (at most 1
+    /// byte) have a determined layout
     pub const unknown: ScalarAbi = .{
         .max_int_align = .{ .min = 1, .max = std.math.maxInt(u16) },
         .c_char_signedness = null,
@@ -383,7 +417,8 @@ pub const ScalarAbi = struct {
             .c_char_signedness = null,
             .types = .initFill(null),
         };
-        // std 没有为这些系统定义 C 类型的大小（`cTypeBitSize` 中为 panic），浮点的规则也依赖它
+        // std does not define the sizes of C types for these systems (`cTypeBitSize` panics),
+        // and the float rules depend on them too
         switch (t.os.tag) {
             .ps3, .contiki, .managarm => return r,
             else => {},
@@ -392,19 +427,20 @@ pub const ScalarAbi = struct {
         inline for (.{ .c_char, .c_short, .c_int, .c_long, .c_longlong }, .{ .char, .short, .int, .long, .longlong }) |k, c| {
             r.types.set(k, cType(t, c));
         }
-        // long double 只有 64、80、128 位时 std 定义了大小（AVR 的 32 位 long double 在 `cTypeByteSize`
-        // 中为 unreachable）
+        // std defines the size of long double only when it is 64, 80 or 128 bits (the 32-bit
+        // long double of AVR is unreachable in `cTypeByteSize`)
         if (t.cTypeBitSize(.longdouble)) |bits| switch (bits) {
             64, 80, 128 => r.types.set(.c_longdouble, cType(t, .longdouble)),
             else => {},
         };
-        // 以下与编译器 `Type.abiAlignment` / `abiSize` 的浮点分支一致：与 C 类型位宽相同时按 C 类型，
-        // 否则按表示它的整数，或 compiler-rt 的软浮点表示
+        // The following matches the float branches of the compiler's `Type.abiAlignment` /
+        // `abiSize`: the C type when the bit width matches the C type, otherwise the integer
+        // that represents it, or the soft float representation of compiler-rt
         r.types.set(.f32, if (t.cTypeBitSize(.float) == 32) cType(t, .float) else intScalar(t, 32));
         r.types.set(.f64, if (t.cTypeBitSize(.double) == 64) cType(t, .double) else intScalar(t, 64));
         r.types.set(.f80, if (t.cTypeBitSize(.longdouble) == 80) r.types.get(.c_longdouble) else switch (std.zig.target.compilerRtFloatAbi(t, 80)) {
             .hard => intScalar(t, 80),
-            // 尾数 u64 与指数 u16
+            // u64 mantissa and u16 exponent
             .soft => blk: {
                 const alignment = @max(std.zig.target.intAlignment(t, 64), std.zig.target.intAlignment(t, 16));
                 const size = std.mem.alignForward(u16, std.zig.target.intByteSize(t, 64) + std.zig.target.intByteSize(t, 16), alignment);
@@ -412,9 +448,9 @@ pub const ScalarAbi = struct {
             },
         });
         r.types.set(.f128, if (t.cTypeBitSize(.longdouble) == 128) r.types.get(.c_longdouble) else switch (std.zig.target.compilerRtFloatAbi(t, 128)) {
-            // x86 按 C 的 `__float128`
+            // x86 follows C's `__float128`
             .hard => if (t.cpu.arch.isX86()) .{ .size = 16, .alignment = 16, .bits = 128 } else intScalar(t, 128),
-            // 两个 u64
+            // Two u64s
             .soft => .{ .size = 2 * std.zig.target.intByteSize(t, 64), .alignment = std.zig.target.intAlignment(t, 64), .bits = 128 },
         });
         return r;
@@ -432,7 +468,7 @@ pub const ScalarAbi = struct {
         return .{ .size = std.zig.target.intByteSize(t, bits), .alignment = std.zig.target.intAlignment(t, bits), .bits = bits };
     }
 
-    /// 两组参数中一致的部分（项目中有多个目标时）
+    /// The parts on which two sets of parameters agree (when a project has multiple targets)
     pub fn merge(a: ScalarAbi, b: ScalarAbi) ScalarAbi {
         var r = a;
         r.max_int_align = .{ .min = @min(a.max_int_align.min, b.max_int_align.min), .max = @max(a.max_int_align.max, b.max_int_align.max) };
@@ -444,28 +480,32 @@ pub const ScalarAbi = struct {
     }
 };
 
-/// 向量的布局规则（`Type.abiAlignment` / `abiSize` 的 vector 分支），由编译后端、架构与 CPU 特性决定
+/// Layout rules for vectors (the vector branch of `Type.abiAlignment` / `abiSize`), determined by
+/// the compiler backend, the architecture and the CPU features
 pub const VectorAbi = enum(u8) {
     unknown,
-    /// 对齐为不小于字节数的 2 的幂（LLVM 等后端）
+    /// The alignment is the byte size rounded up to a power of 2 (LLVM and other backends)
     llvm,
-    /// 同 `llvm`，但不超过栈对齐 16（aarch64）
+    /// Like `llvm`, but no larger than the stack alignment of 16 (aarch64)
     llvm_aarch64,
-    /// 自研 x86_64 后端：对齐至少为 16；有 AVX / AVX-512 时超过 16 / 32 字节的向量为 32 / 64
+    /// The self-hosted x86_64 backend: the alignment is at least 16; with AVX / AVX-512,
+    /// vectors larger than 16 / 32 bytes are aligned to 32 / 64
     x86_64,
     x86_64_avx,
     x86_64_avx512,
-    /// 按元素的对齐（C、wasm 后端）
+    /// The alignment of the element (C and wasm backends)
     elem,
 
     pub fn of(backend: std.lang.CompilerBackend, arch: std.Target.Cpu.Arch, avx: bool, avx512f: bool, soft_float: bool) VectorAbi {
-        // x86 的软浮点：浮点元素按元素布局，这里不区分元素类型
+        // Soft float on x86: float elements use the element layout, and element types are not
+        // distinguished here
         if (soft_float) return .unknown;
         return switch (backend) {
             .stage2_x86_64 => if (avx512f) .x86_64_avx512 else if (avx) .x86_64_avx else .x86_64,
             .stage2_c, .stage2_wasm => .elem,
-            // 其余后端按字节数。ARM 与 s390x 的对齐不超过各自的栈对齐，MIPS 与 PowerPC 的 f16 为软浮点，
-            // 只处理常见的架构
+            // Other backends go by the byte size. On ARM and s390x the alignment does not exceed
+            // their respective stack alignments, and f16 is soft float on MIPS and PowerPC, so
+            // only common architectures are handled
             else => switch (arch) {
                 .x86, .x86_64, .riscv32, .riscv64, .wasm32, .wasm64, .loongarch64 => .llvm,
                 .aarch64, .aarch64_be => .llvm_aarch64,
@@ -475,7 +515,7 @@ pub const VectorAbi = enum(u8) {
     }
 };
 
-/// 驻留：相同的 Key 返回相同的 Index
+/// Interns: the same Key returns the same Index
 pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
@@ -488,7 +528,7 @@ pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
     return index;
 }
 
-/// Key 中的切片复制到 arena
+/// Copies the slices in a Key into the arena
 fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
     const a = ip.arena.allocator();
     return switch (k) {
@@ -528,8 +568,8 @@ fn dupeNames(a: Allocator, names: []const []const u8) Allocator.Error![]const []
     return out;
 }
 
-/// 返回的 Key 中的切片在 InternPool 生命周期内有效
-/// 已驻留的类型与值的个数
+/// The slices in the returned Key are valid for the lifetime of the InternPool
+/// Number of interned types and values
 pub fn count(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
@@ -542,7 +582,7 @@ pub fn key(ip: *InternPool, index: Index) Key {
     return ip.items.items[@backingInt(index)];
 }
 
-// ── 常用构造 ─────────────────────────────────────────────────────────
+// ── Common constructors ──────────────────────────────────────────────
 
 pub fn intType(ip: *InternPool, signedness: std.builtin.Signedness, bits: u16) Allocator.Error!Index {
     return ip.get(.{ .int_type = .{ .signedness = signedness, .bits = bits } });
@@ -558,7 +598,7 @@ pub fn ptrTo(ip: *InternPool, child: Index, size: PtrSize, is_const: bool) Alloc
     return ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const } });
 }
 
-/// 错误集：名字排序去重
+/// Error set: the names are sorted and deduplicated
 pub fn errorSet(ip: *InternPool, gpa: Allocator, names: []const []const u8) Allocator.Error!Index {
     const sorted = try gpa.dupe([]const u8, names);
     defer gpa.free(sorted);
@@ -576,7 +616,7 @@ pub fn errorSet(ip: *InternPool, gpa: Allocator, names: []const []const u8) Allo
     return ip.get(.{ .error_set_type = sorted[0..n] });
 }
 
-/// 字符串字面量的类型 `*const [len:0]u8`
+/// Type of a string literal, `*const [len:0]u8`
 pub fn stringLiteralType(ip: *InternPool, len: u64) Allocator.Error!Index {
     const zero = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
     const array = try ip.get(.{ .array_type = .{ .len = len, .child = .u8_type, .sentinel = zero } });
@@ -604,9 +644,10 @@ pub fn isFloat(ip: *InternPool, t: Index) bool {
     };
 }
 
-// ── 显示 ─────────────────────────────────────────────────────────────
+// ── Display ──────────────────────────────────────────────────────────
 
-/// 以 Zig 语法输出类型或值。`container_name` 给出容器类型的名字（如 `mem.Allocator`）
+/// Prints a type or value in Zig syntax. `container_name` provides the names of container types
+/// (such as `mem.Allocator`).
 pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     switch (ip.key(index)) {
         .unknown => try w.writeAll("unknown"),
@@ -680,7 +721,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(f.ret, w, container_name);
         },
         .container_type => |c| try container_name.write(c, w),
-        // 与编译器一致：`struct { comptime u8 = 1, u32 }`，空元组为 `@TypeOf(.{})`
+        // Matches the compiler: `struct { comptime u8 = 1, u32 }`, and the empty tuple is
+        // `@TypeOf(.{})`
         .tuple_type => |t| {
             if (t.types.len == 0) return w.writeAll("@TypeOf(.{})");
             try w.writeAll("struct {");
@@ -714,7 +756,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         .simple_value => |v| try w.writeAll(@tagName(v)),
         .int_value => |v| try w.print("{d}", .{v.value}),
         .float_value => |v| {
-            // 按值的类型输出最短表示（f32 的 √2 为 1.4142135，而不是 f128 下的展开）
+            // Prints the shortest representation for the type of the value (√2 as f32 is
+            // 1.4142135, not its expansion as f128)
             const x: f128 = @bitCast(v.bits);
             switch (ip.key(v.ty)) {
                 .simple_type => |t| switch (t) {
@@ -733,7 +776,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         .fn_value => |f| try ip.print(f.ty, w, container_name),
         .aggregate => |v| {
             if (ip.key(v.ty) == .ptr_type) try w.writeAll("&");
-            // 结构体的值带字段名
+            // Struct values include the field names
             const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
             try w.writeAll(".{");
             for (v.elems, 0..) |e, i| {
@@ -749,7 +792,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
                 const shown = v.bytes[0..@min(v.bytes.len, remaining(container_name, w) orelse v.bytes.len)];
                 try w.print("\"{f}{s}\"", .{ std.zig.fmtString(shown), if (shown.len < v.bytes.len) "…" else "" });
             },
-            // 元素都是 u8 的结构体、元组与向量（同样以字节表示）：按聚合逐个显示
+            // Structs, tuples and vectors whose elements are all u8 (also represented as
+            // bytes): shown element by element like an aggregate
             else => {
                 const names: ?[]const []const u8 = if (@hasDecl(@TypeOf(container_name), "fieldNames")) container_name.fieldNames(v.ty) else null;
                 try w.writeAll(".{");
@@ -777,20 +821,23 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
     }
 }
 
-/// `container_name.remaining(w)`：输出还能写的字符数（inlay hints 的长度上限），null 为不限
+/// `container_name.remaining(w)`: the number of characters the output can still take (the
+/// length limit of inlay hints); null means unlimited
 fn remaining(container_name: anytype, w: *Io.Writer) ?usize {
     return if (@hasDecl(@TypeOf(container_name), "remaining")) container_name.remaining(w) else null;
 }
 
-/// 写列表（字段、元素、参数）的下一项之前调用：输出已经写满时写 `…` 并返回 true，列表就此停止。输出因此可能超出上限
-/// 一项；字符串只写到上限为止
+/// Called before writing the next item of a list (fields, elements, parameters): when the output
+/// is already full, writes `…` and returns true, and the list stops there. The output can thus
+/// exceed the limit by one item; strings are written only up to the limit.
 pub fn truncateList(container_name: anytype, w: *Io.Writer) Io.Writer.Error!bool {
     if (remaining(container_name, w) != 0) return false;
     try w.writeAll("…");
     return true;
 }
 
-/// 元组与匿名结构体的字段：comptime 字段带值（`comptime a: u8 = 1`）
+/// A field of a tuple or anonymous struct: comptime fields include their value
+/// (`comptime a: u8 = 1`)
 fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     const is_comptime = v != .runtime and v != .unknown;
     if (is_comptime) try w.writeAll("comptime ");
@@ -798,11 +845,12 @@ fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Wr
     try ip.print(ty, w, container_name);
     if (!is_comptime) return;
     try w.writeAll(" = ");
-    // void 的值写作 `{}`
+    // The void value is written as `{}`
     if (v == .void_value) try w.writeAll("{}") else try ip.print(v, w, container_name);
 }
 
-/// 没有构造位置的名字时，按内容显示构造的类型
+/// Displays a constructed type by its contents when there is no name for its construction
+/// location
 pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     try w.print("{t} {{", .{t.kind});
     for (t.names, 0..) |n, i| {
@@ -854,7 +902,7 @@ test "reset keeps the presets and frees everything else" {
     try ip.reset();
     try testing.expectEqual(n, ip.count());
     try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
-    // 重新驻留得到同样的位置（下标只取决于驻留顺序）
+    // Interning again yields the same position (the index depends only on the interning order)
     try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
 }
 
@@ -867,7 +915,7 @@ test "reset that runs out of memory leaves the pool intact" {
     failing.fail_index = failing.alloc_index;
     try testing.expectError(error.OutOfMemory, ip.reset());
     failing.fail_index = std.math.maxInt(usize);
-    // 没有回收，原来的项（含预置项）仍然有效
+    // Nothing was reclaimed; the original items (including the presets) are still valid
     try testing.expectEqual(n, ip.count());
     try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
     try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));

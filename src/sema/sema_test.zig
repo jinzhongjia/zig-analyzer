@@ -1,4 +1,4 @@
-//! 类型推导测试：在内存项目中查询表达式与绑定的类型。
+//! Type inference tests: query the types of expressions and bindings in an in-memory project.
 
 const std = @import("std");
 const testing = std.testing;
@@ -12,7 +12,8 @@ const InternPool = @import("InternPool.zig");
 const value = @import("value.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
-/// `needle` 第 `nth` 次出现处：名字与绑定重合时取绑定的类型，否则取区间恰好为 `needle` 的表达式的类型
+/// Type at the `nth` occurrence of `needle`: the type of the binding when the name coincides with
+/// a binding, otherwise the type of the expression whose range is exactly `needle`
 fn typeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, nth: usize) ![]const u8 {
     const offset = try wordAt(text, needle, nth);
     const end: u32 = offset + @as(u32, @intCast(needle.len));
@@ -33,12 +34,12 @@ fn typeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, nth: us
     for (body.expr_ranges, 0..) |range, i| if (range.start == rel_start and range.end == rel_end) {
         return render.typedValueAlloc(&r, res.exprs[i]);
     };
-    // 成员自身：声明类型
+    // The member itself: its declared type
     const tv = try ctx.get(queries.DeclType, .{ .owner = owner });
     return render.typedValueAlloc(&r, tv);
 }
 
-/// `needle` 第 `nth` 次作为完整单词出现的位置
+/// Position of the `nth` occurrence of `needle` as a whole word
 fn wordAt(text: []const u8, needle: []const u8, nth: usize) !u32 {
     var start: usize = 0;
     var seen: usize = 0;
@@ -61,7 +62,7 @@ fn expectTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }
     return expectTypesTargeted(.{}, src, cases);
 }
 
-/// 同 `expectTypes`，使用给定的目标参数（指针位宽、向量的布局规则）
+/// Same as `expectTypes`, with the given target parameters (pointer bit width, vector layout rules)
 fn expectTypesTargeted(target: InternPool.Target, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var w: World = undefined;
     try w.init();
@@ -330,7 +331,7 @@ test "decl literals" {
         \\    _ = .{ a, b, m, s, T };
         \\}
     , &.{
-        // 容器级常量的值由解释器求出
+        // Values of container-level constants are computed by the interpreter
         .{ "a", "Buf = .{ .len = 0 }" },
         .{ "b", "Buf" },
         .{ "init", "fn (usize) Buf" },
@@ -362,7 +363,7 @@ test "generic type constructors and instances" {
         .{ "l", "List(u8)" },
         .{ "w", "List(i32)" },
         .{ "its", "[]u8" },
-        // 泛型定义处（没有具体实例）：抽象参数
+        // At the generic definition (no concrete instance): abstract parameters
         .{ "items", "[]T" },
         .{ "x", "u8" },
         .{ "y", "i32" },
@@ -403,7 +404,8 @@ test "generic functions, anytype and comptime branches" {
         .{ "Q", "type = u8" },
         .{ "S", "type = []u8" },
         .{ "B", "type = u8" },
-        // 无限递归的类型构造：到达深度上限后为未知值，不会卡住
+        // Infinitely recursive type construction: the value is unknown once the depth limit is
+        // reached, without hanging
         .{ "R", "type" },
     });
 }
@@ -442,12 +444,14 @@ test "unknown parts stay unknown" {
         \\    _ = T;
         \\}
     , &.{
-        // 返回 type 的函数：实参不是 comptime 值时仍按实例求值（函数体不依赖参数时可以求出）
+        // Function returning type: still evaluated per instance when the argument is not a comptime
+        // value (computable when the body does not depend on the parameter)
         .{ "T", "type = u8" },
     });
 }
 
-/// 求出 `r` 的值时 InternPool 增长的项数；源码中的 `{d}` 为循环次数
+/// Number of items the InternPool grows by while computing the value of `r`; `{d}` in the source
+/// is the loop count
 fn loopInternGrowth(comptime n: u32) !usize {
     const src = std.fmt.comptimePrint(
         \\fn mix(x: u64) u64 {{
@@ -477,12 +481,15 @@ fn loopInternGrowth(comptime n: u32) !usize {
 }
 
 test "comptime loop intermediates are not interned" {
-    // 循环中整数运算的中间结果曾逐个驻留：InternPool 随循环次数增长，大的编译期计算触发整代回收
+    // Intermediate results of integer arithmetic in loops used to be interned one by one: the
+    // InternPool grew with the iteration count, and large comptime computations triggered a
+    // whole-generation reclaim
     try testing.expectEqual(try loopInternGrowth(100), try loopInternGrowth(1000));
 }
 
 test "comptime recursive calls with integer arguments reuse earlier results" {
-    // 整数实参不驻留的调用按实参缓存结果：朴素递归不按指数次数执行
+    // Calls whose integer arguments are not interned cache their results by argument: naive
+    // recursion does not run an exponential number of times
     try expectTypes(
         \\fn fib(n: u64) u64 {
         \\    return if (n < 2) n else fib(n - 1) + fib(n - 2);
@@ -516,7 +523,7 @@ test "comptime integer arithmetic follows the result type" {
         .{ "wrapped", "u8 = 0" },
         .{ "below", "u8 = 255" },
         .{ "sat", "u8 = 255" },
-        // 越界是编译错误：不给出值
+        // An out-of-range result is a compile error: no value is given
         .{ "overflow", "u8" },
         .{ "e", "i8 = -128" },
         .{ "shifted", "u8 = 2" },
@@ -525,7 +532,7 @@ test "comptime integer arithmetic follows the result type" {
 }
 
 test "arithmetic operands have no result type" {
-    // 预期值与编译器一致（comptime 块中以 @compileError 核对过）
+    // The expected values match the compiler (verified with @compileError in a comptime block)
     try expectTypes(
         \\const m: u8 = (0xFF << 4) >> 4;
         \\const w: u8 = (200 +% 100) / 2;
@@ -537,12 +544,12 @@ test "arithmetic operands have no result type" {
         \\    _ = y;
         \\}
     , &.{
-        // 按结果类型 u8 计算时左移丢掉了高位，得 15
+        // Computing with the result type u8 would drop the high bits in the left shift, giving 15
         .{ "m", "u8 = 255" },
         .{ "w", "u8 = 150" },
         .{ "r", "f32 = 0" },
         .{ "n", "i8 = 100" },
-        // u32 的乘法溢出（编译错误）：没有值，不能按 u64 计算
+        // The u32 multiplication overflows (compile error): no value; must not be computed as u64
         .{ "big", "u64" },
         .{ "x + 1", "u8" },
     });
@@ -574,7 +581,7 @@ test "float narrowing rounds to the target type" {
     , &.{
         .{ "a", "f64 = 0.10000000149011612" },
         .{ "b", "f64 = 0.10000000149011612" },
-        // f32 的 0.1 与字面量不等：走 else
+        // The f32 0.1 is not equal to the literal: takes the else branch
         .{ "c", "u8 = 2" },
         .{ "d", "f64 = 0.0000000014901161138336505" },
         .{ "e", "f64 = 0.0999755859375" },
@@ -624,7 +631,7 @@ test "switch on an error set narrows the capture" {
     , &.{
         .{ "v_one", "error{A}" },
         .{ "v_two", "error{B}" },
-        // else 分支为其余的错误
+        // The else prong gets the remaining errors
         .{ "v_else", "error{C}" },
     });
 }
@@ -641,10 +648,10 @@ test "false payloads are not null or failed" {
         \\    _ = .{ y, z, q };
         \\}
     , &.{
-        // `?bool` 的 false 载荷与成功的 `E!bool` 仍是非 null / 成功
+        // A false payload of `?bool` and a successful `E!bool` are still non-null / success
         .{ "y", "u8 = 1" },
         .{ "z", "u8 = 3" },
-        // 失败的错误联合仍取 else 分支
+        // A failed error union still takes the else branch
         .{ "q", "u16 = 6" },
     });
 }
@@ -664,11 +671,11 @@ test "comptime name builtins produce string literal types" {
         \\    _ = &probe;
         \\}
     , &.{
-        // 编译期已知的名字是字符串字面量
+        // Names known at compile time are string literals
         .{ "v_typename", "*const [2:0]u8 = \"u8\"" },
         .{ "v_tagname", "*const [2:0]u8 = \"yy\"" },
         .{ "v_errname", "*const [3:0]u8 = \"Foo\"" },
-        // 运行时操作数仍是切片
+        // A runtime operand still gives a slice
         .{ "v_tagname_rt", "[:0]const u8" },
     });
 }
@@ -689,10 +696,10 @@ test "comptime slices keep their sentinel" {
         \\const V = ToEnd();
         \\const W = Prefix();
     , &.{
-        // 解释器与推导路径得到同一个类型
+        // The interpreter and the inference path produce the same type
         .{ "T", "type = *const [3:0]u8" },
         .{ "U", "type = *const [3:0]u8" },
-        // 切到末尾时保留源数组的哨兵
+        // Slicing to the end keeps the sentinel of the source array
         .{ "V", "type = *const [3:0]u8" },
         .{ "W", "type = *const [2]u8" },
     });
@@ -703,7 +710,7 @@ test "wide integer shift by more than 255 bits does not panic" {
         \\const E = enum(u1000) { a = 5 };
         \\const v = @intFromEnum(E.a) >> 300;
     , &.{
-        // 位宽超过 128 的值不折叠
+        // Values wider than 128 bits are not folded
         .{ "v", "u1000" },
     });
 }
@@ -725,7 +732,7 @@ test "comptime array concatenation length overflow does not panic" {
         \\}
         \\const T = cat(undefined);
     , &.{
-        // 拼接本身不产生结果，函数返回值不受影响
+        // The concatenation itself produces no result; the function's return value is unaffected
         .{ "T", "type = u8" },
     });
 }
@@ -758,10 +765,10 @@ test "comptime arguments are coerced to their instantiated parameter types" {
         .{ "si", "type = u16" },
         .{ "se", "type = u16" },
         .{ "same", "type = u8" },
-        // 类型为 `type` 的参数不写 comptime 也是 comptime 参数
+        // A parameter of type `type` is a comptime parameter even without `comptime`
         .{ "imp", "type = Implicit(u8)" },
         .{ "m", "u32" },
-        // 返回 type 的函数在 comptime 执行，所有实参都参与实例
+        // A function returning type runs at comptime, and all arguments take part in the instance
         .{ "arr", "type = [3]u8" },
     });
 }
@@ -779,7 +786,7 @@ test "comparisons that depend on unknown parts stay unknown" {
     , &.{
         .{ "arr_eq", "u8" },
         .{ "eu_eq", "u8" },
-        // 实参未知的两个实例可能是不同的类型
+        // Two instances with unknown arguments may be different types
         .{ "unknown_args", "u8" },
         .{ "same_param", "u8 = 1" },
     });
@@ -806,7 +813,7 @@ test "comptime float values" {
 }
 
 test "instances of the same container compare by their captured values" {
-    // 与编译器一致：容器的身份 = 定义位置 + 捕获的值
+    // Matches the compiler: the identity of a container = definition position + captured values
     try expectTypes(
         \\fn NoCapture(comptime T: type) type {
         \\    _ = T;
@@ -883,17 +890,17 @@ test "inferred error sets from function bodies" {
     , &.{
         .{ "w", "error{}!u8" },
         .{ "ra", "error{Oops}!u8" },
-        // return 的错误与 try 传播的错误
+        // Errors from return and errors propagated by try
         .{ "rb", "error{Bad,Oops}!u8" },
         .{ "rc", "error{}!void" },
-        // 递归的函数取最小不动点（与编译器一致）
+        // Recursive functions take the least fixpoint (matches the compiler)
         .{ "rr", "error{Done,TooBig}!u32" },
         .{ "rr2", "error{Done}!u32" },
         .{ "ru", "error{Done,Own,TooBig}!void" },
-        // 相互递归（编译器报错）：取两者的并集
+        // Mutual recursion (a compiler error): take the union of both
         .{ "rp", "error{Ping,Pong}!void" },
         .{ "rq", "error{Ping,Pong}!void" },
-        // comptime 不活跃的分支与 noreturn 之后的代码不并入
+        // Branches that are inactive at comptime and code after noreturn are not included
         .{ "ri", "error{Real}!u8" },
     });
 }
@@ -947,7 +954,8 @@ test "escaped identifiers name the same declaration as plain ones" {
 }
 
 test "oversized layouts degrade to unknown instead of overflowing" {
-    // 大小无法用 u64 表示的类型：布局求不出，不能使宿主溢出崩溃
+    // Types whose size cannot be represented in a u64: the layout cannot be computed, and the host
+    // must not crash on overflow
     try expectTypes(
         \\const S = extern struct {
         \\    a: [2305843009213693952]u8,
@@ -972,7 +980,7 @@ test "oversized layouts degrade to unknown instead of overflowing" {
 }
 
 test "container layouts match the compiler" {
-    // 期望值为 zig 0.17.0 在 x86_64-linux 上的结果
+    // Expected values are the results of zig 0.17.0 on x86_64-linux
     try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
         \\const A = struct { a: u8, b: u32, c: u16 };
         \\const B = extern struct { a: u8, b: u32, c: u16 };
@@ -1045,18 +1053,18 @@ test "container layouts match the compiler" {
     , &.{
         .{ "size_a", "comptime_int = 8" },
         .{ "align_a", "comptime_int = 4" },
-        // auto 布局按对齐降序重排字段
+        // Auto layout reorders fields by descending alignment
         .{ "a_a", "comptime_int = 6" },
         .{ "a_b", "comptime_int = 0" },
         .{ "a_c", "comptime_int = 4" },
-        // extern 按声明顺序
+        // extern keeps declaration order
         .{ "size_b", "comptime_int = 12" },
         .{ "b_c", "comptime_int = 8" },
         .{ "size_c", "comptime_int = 4" },
         .{ "bits_c", "comptime_int = 24" },
         .{ "c_b", "comptime_int = 3" },
         .{ "c_c", "comptime_int = 1" },
-        // 对齐相同的字段保持声明顺序
+        // Fields with the same alignment keep their declaration order
         .{ "d_a", "comptime_int = 14" },
         .{ "d_c", "comptime_int = 15" },
         .{ "d_e", "comptime_int = 12" },
@@ -1073,16 +1081,17 @@ test "container layouts match the compiler" {
         .{ "size_ue", "comptime_int = 8" },
         .{ "size_x", "comptime_int = 8" },
         .{ "bits_p", "comptime_int = 16" },
-        // 只有一个字段的 union(enum) 没有运行时的标签
+        // A union(enum) with a single field has no runtime tag
         .{ "size_one", "comptime_int = 4" },
         .{ "size_opt_u", "comptime_int = 24" },
         .{ "nest_c", "comptime_int = 48" },
         .{ "size_nest", "comptime_int = 56" },
-        // comptime 字段不占空间
+        // comptime fields take no space
         .{ "size_k", "comptime_int = 4" },
         .{ "k_a", "comptime_int = 2" },
         .{ "pair_a", "comptime_int = 4" },
-        // 显式对齐：可以大于或小于类型的对齐，参与重排；泛型实例中按实参求值
+        // Explicit alignment: can be larger or smaller than the type's alignment, takes part in the
+        // reordering, and is evaluated from the arguments in generic instances
         .{ "size_l", "comptime_int = 4" },
         .{ "align_l", "comptime_int = 4" },
         .{ "l_b", "comptime_int = 1" },
@@ -1112,24 +1121,24 @@ test "layouts that are invalid or depend on the build mode stay unknown" {
         \\    _ = .{ size_bare, bits_s, bits_slice, bits_opt, bits_ptr, bits_arr, bits_sent, bits_autos, size_pa };
         \\}
     , &.{
-        // 不带标签的 union：没有 builtin（不知道优化模式）
+        // Untagged union: no builtin (the optimize mode is unknown)
         .{ "size_bare", "comptime_int" },
-        // 没有位表示的类型（编译器报错）
+        // Types without a bit representation (a compiler error)
         .{ "bits_s", "comptime_int" },
         .{ "bits_slice", "comptime_int" },
         .{ "bits_opt", "comptime_int" },
         .{ "bits_ptr", "comptime_int = 64" },
-        // 数组的位宽含哨兵
+        // The bit size of an array includes the sentinel
         .{ "bits_arr", "comptime_int = 15" },
         .{ "bits_sent", "comptime_int = 24" },
         .{ "bits_autos", "comptime_int" },
-        // packed 结构体不能包含未指定标签类型的枚举
+        // A packed struct cannot contain an enum without an explicit tag type
         .{ "size_pa", "comptime_int" },
     });
 }
 
 test "float math builtins use the precision of the operand type" {
-    // 期望值为 zig 0.17.0 的结果
+    // Expected values are the results of zig 0.17.0
     try expectTypes(
         \\fn g() void {
         \\    const r32 = @sqrt(@as(f32, 2));
@@ -1171,10 +1180,11 @@ test "float math builtins use the precision of the operand type" {
         .{ "mn", "f32 = 1.5" },
         .{ "dc", "f64 = 4" },
         .{ "df", "f64 = -4" },
-        // 有符号整数的绝对值为无符号整数
+        // The absolute value of a signed integer is an unsigned integer
         .{ "ai", "u8 = 128" },
         .{ "ic", "i32 = -3" },
-        // 负除数：整数按向下取整的语义；浮点的 `@mod` 与编译器一致，只按被除数的符号调整
+        // Negative divisor: integers use floored semantics; float `@mod` matches the compiler and
+        // adjusts only by the sign of the dividend
         .{ "mi", "i32 = -2" },
         .{ "rn", "f64 = -1" },
         .{ "mf", "f64 = 1" },
@@ -1183,7 +1193,7 @@ test "float math builtins use the precision of the operand type" {
 }
 
 test "@min and @max narrow the result type like the compiler" {
-    // 期望值为 zig 0.17.0 的结果
+    // Expected values are the results of zig 0.17.0
     try expectTypes(
         \\fn h(x: u8, y: u16, z: i8) void {
         \\    const lo = @min(x, y);
@@ -1199,7 +1209,8 @@ test "@min and @max narrow the result type like the compiler" {
         \\    _ = .{ lo, hi, lim, mixed, neg, k_lo, k_hi, k_neg, k_ct, k_f };
         \\}
     , &.{
-        // 结果类型为容纳结果范围的最小整数类型：参数的值已知时取值，否则取类型的范围
+        // The result type is the smallest integer type that holds the range of the result: the
+        // value of an argument when it is known, otherwise the range of its type
         .{ "lo", "u8" },
         .{ "hi", "u16" },
         .{ "lim", "u4" },
@@ -1214,7 +1225,7 @@ test "@min and @max narrow the result type like the compiler" {
 }
 
 test "peer types of different integer and float types" {
-    // 期望值为 zig 0.17.0 的结果
+    // Expected values are the results of zig 0.17.0
     try expectTypes(
         \\fn h(a: usize, b: u64, c: u32, d: i64, x: f32, y: f64, u: u8, w: u16, g: bool) void {
         \\    const s1 = a + b;
@@ -1230,7 +1241,7 @@ test "peer types of different integer and float types" {
         \\    _ = .{ s1, s2, s3, s4, s5, b1, b2, b3, skip, next };
         \\}
     , &.{
-        // 位宽相同时取前者
+        // With equal bit widths, the first one is taken
         .{ "s1", "usize" },
         .{ "s2", "u64" },
         .{ "s3", "usize" },
@@ -1245,7 +1256,8 @@ test "peer types of different integer and float types" {
 }
 
 test "vector layouts follow the backend and CPU features" {
-    // 期望值为 zig 0.17.0 的结果：x86_64-linux 的 Debug 默认使用自研后端，`-fllvm` 为 LLVM
+    // Expected values are the results of zig 0.17.0: Debug on x86_64-linux uses the self-hosted
+    // backend by default, and `-fllvm` uses LLVM
     const src =
         \\fn g() void {
         \\    const v2u8 = @sizeOf(@Vector(2, u8));
@@ -1258,7 +1270,8 @@ test "vector layouts follow the backend and CPU features" {
         \\    _ = .{ v2u8, v3u5, v16f32, v8u32, v100bool, v3ptr, bits };
         \\}
     ;
-    // 自研 x86_64 后端：对齐至少为 16，AVX 下超过 16 字节为 32，AVX-512 下超过 32 字节为 64
+    // Self-hosted x86_64 backend: the alignment is at least 16; it is 32 above 16 bytes with AVX,
+    // and 64 above 32 bytes with AVX-512
     try expectTypesTargeted(.{ .vector_abi = .x86_64_avx }, src, &.{
         .{ "v2u8", "comptime_int = 16" },
         .{ "v3u5", "comptime_int = 16" },
@@ -1276,7 +1289,7 @@ test "vector layouts follow the backend and CPU features" {
         .{ "v16f32", "comptime_int = 64" },
         .{ "v8u32", "comptime_int = 32" },
     });
-    // LLVM：对齐为不小于字节数的 2 的幂；aarch64 不超过 16
+    // LLVM: the alignment is the byte size rounded up to a power of two; at most 16 on aarch64
     try expectTypesTargeted(.{ .vector_abi = .llvm }, src, &.{
         .{ "v2u8", "comptime_int = 2" },
         .{ "v3u5", "comptime_int = 2" },
@@ -1289,21 +1302,22 @@ test "vector layouts follow the backend and CPU features" {
         .{ "v8u32", "comptime_int = 16" },
         .{ "v3ptr", "comptime_int = 32" },
     });
-    // 后端未知（各模块不一致等）
+    // Unknown backend (e.g. inconsistent across modules)
     try expectTypesTargeted(.{ .vector_abi = .unknown }, src, &.{
         .{ "v2u8", "comptime_int" },
         .{ "bits", "comptime_int" },
     });
 }
 
-/// 目标 `arch_os_abi` 与 CPU（同编译器的 `-target` / `-mcpu`）的目标参数：指针位宽与标量类型的布局规则
+/// Target parameters for `arch_os_abi` and the CPU (as with the compiler's `-target` / `-mcpu`):
+/// pointer bit width and layout rules of scalar types
 fn targetOf(arch_os_abi: []const u8, cpu: ?[]const u8) !InternPool.Target {
     const query = try std.Target.Query.parse(.{ .arch_os_abi = arch_os_abi, .cpu_features = cpu });
     const t = try std.zig.system.resolveTargetQuery(testing.io, query);
     return .{ .pointer_bits = t.ptrBitWidth(), .scalar_abi = .of(&t) };
 }
 
-/// 布局随目标变化的类型：`s_T` / `a_T` 为 `@sizeOf(T)` / `@alignOf(T)`
+/// Types whose layout varies by target: `s_T` / `a_T` is `@sizeOf(T)` / `@alignOf(T)`
 const target_layout_src =
     \\const S = struct { a: u8, b: u64, c: u16, d: f80 };
     \\fn g(c: bool) void {
@@ -1334,7 +1348,8 @@ const target_layout_src =
 
 const target_layout_types = [_][]const u8{ "u24", "u64", "u128", "f80", "f128", "c_int", "c_longdouble", "S" };
 
-/// `target_layout_src` 在目标上的结果：`expected[i]` 为 `target_layout_types[i]` 的大小与对齐（null 为未知）
+/// Results of `target_layout_src` on the target: `expected[i]` is the size and alignment of
+/// `target_layout_types[i]` (null when unknown)
 fn expectTargetLayouts(target: InternPool.Target, expected: [target_layout_types.len]?[2]u64, max_c_uint: u64) !void {
     var w: World = undefined;
     try w.init();
@@ -1357,18 +1372,20 @@ fn expectTargetLayouts(target: InternPool.Target, expected: [target_layout_types
 }
 
 test "integer, float and C type layouts follow the target" {
-    // 期望值为 zig 0.17.0 的结果（`zig build-obj -target <目标>` 中以 @compileError 输出）。类型顺序：
+    // Expected values are the results of zig 0.17.0 (printed with @compileError in
+    // `zig build-obj -target <target>`). Type order:
     // u24, u64, u128, f80, f128, c_int, c_longdouble, S
     try expectTargetLayouts(try targetOf("x86_64-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 16, 16 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 16 } }, 4294967295);
-    // 整数的最大对齐为 4；long double 为 80 位、按 4 字节对齐
+    // The maximum alignment of integers is 4; long double is 80 bits with 4-byte alignment
     try expectTargetLayouts(try targetOf("x86-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 4 }, .{ 16, 4 }, .{ 12, 4 }, .{ 16, 16 }, .{ 4, 4 }, .{ 12, 4 }, .{ 24, 4 } }, 4294967295);
-    // 布局也取决于操作系统：Windows 上整数的最大对齐为 8
+    // The layout also depends on the OS: on Windows the maximum alignment of integers is 8
     try expectTargetLayouts(try targetOf("x86-windows-gnu", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 12, 4 }, .{ 16, 16 }, .{ 4, 4 }, .{ 12, 4 }, .{ 24, 8 } }, 4294967295);
-    // long double 为 128 位：f80 按软浮点（u64 与 u16）布局
+    // long double is 128 bits: f80 uses the soft-float layout (u64 and u16)
     try expectTargetLayouts(try targetOf("aarch64-linux-musl", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 16, 8 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 8 } }, 4294967295);
     try expectTargetLayouts(try targetOf("arm-linux-musleabihf", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 4, 4 }, .{ 8, 8 }, .{ 32, 8 } }, 4294967295);
     try expectTargetLayouts(try targetOf("riscv32-freestanding-none", null), .{ .{ 4, 4 }, .{ 8, 8 }, .{ 16, 8 }, .{ 16, 8 }, .{ 16, 16 }, .{ 4, 4 }, .{ 16, 16 }, .{ 32, 8 } }, 4294967295);
-    // AVR：整数与浮点按 1 字节对齐，c_int 为 16 位；std 没有定义 32 位 long double 的大小，为未知
+    // AVR: integers and floats are 1-byte aligned, c_int is 16 bits;
+    // std does not define the size of a 32-bit long double, so it is unknown
     try expectTargetLayouts(try targetOf("avr-freestanding-none", "atmega328p"), .{ .{ 3, 1 }, .{ 8, 1 }, .{ 16, 1 }, .{ 10, 1 }, .{ 16, 1 }, .{ 2, 1 }, null, .{ 21, 1 } }, 65535);
     try expectTargetLayouts(try targetOf("msp430-freestanding-none", null), .{ .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 10, 2 }, .{ 16, 2 }, .{ 2, 2 }, .{ 8, 2 }, .{ 22, 2 } }, 65535);
 }
@@ -1377,7 +1394,8 @@ test "type layouts with several targets keep only what the targets agree on" {
     const x86_64 = try targetOf("x86_64-linux-musl", null);
     const x86 = try targetOf("x86-linux-musl", null);
     const src = target_layout_src;
-    // 整数的最大对齐为 16 与 4：不超过 4 字节的整数仍有确定的布局；f128 在两者上相同
+    // The maximum alignments of integers are 16 and 4: integers of at most 4 bytes still have a
+    // definite layout; f128 is the same on both
     try expectTypesTargeted(.{ .pointer_bits = null, .scalar_abi = x86_64.scalar_abi.merge(x86.scalar_abi) }, src, &.{
         .{ "s_u32", "comptime_int = 4" },
         .{ "a_u32", "comptime_int = 4" },
@@ -1389,7 +1407,8 @@ test "type layouts with several targets keep only what the targets agree on" {
         .{ "s_c_int", "comptime_int = 4" },
         .{ "max_c_uint", "c_uint = 4294967295" },
     });
-    // 目标未知：只有不超过 1 字节的整数有确定的布局；浮点的位宽与目标无关
+    // Unknown target: only integers of at most 1 byte have a definite layout;
+    // the bit widths of floats do not depend on the target
     try expectTypesTargeted(.{ .pointer_bits = null, .scalar_abi = .unknown }, src, &.{
         .{ "s_u8", "comptime_int = 1" },
         .{ "s_u32", "comptime_int" },
@@ -1417,7 +1436,7 @@ test "integer layouts match std.zig.target for every width" {
 }
 
 test "tuple and anonymous struct literals have comptime fields like the compiler" {
-    // 期望值为 zig 0.17.0 的结果
+    // Expected values are the results of zig 0.17.0
     try expectTypes(
         \\fn foo() u32 {
         \\    return 7;
@@ -1459,7 +1478,8 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
         \\    _ = .{ t1, t2, t3, t4, t5, tc, tu, a1, a2, first, s1, s2, o2, s3, s4, su, sa1, sa2, oa2, empty, s0 };
         \\}
     , &.{
-        // comptime 已知的值（含 `{}`、字符串）是 comptime 字段；var、参数、函数调用与循环的捕获是运行时的
+        // Comptime-known values (including `{}` and strings) are comptime fields;
+        // vars, parameters, function calls and loop captures are runtime
         .{ "t1", "struct { comptime u8 = 1, u32 }" },
         .{ "t2", "struct { u8, u32, u64 }" },
         .{ "t3", "struct { u8, comptime void = {}, u32 }" },
@@ -1468,9 +1488,10 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
         .{ "tc", "struct { u32 }" },
         .{ "tl", "struct { u8 }" },
         .{ "a1", "struct { comptime a: u8 = 1, b: u32 }" },
-        // comptime 字段的值属于类型
+        // The value of a comptime field belongs to the type
         .{ "first", "u8 = 1" },
-        // 元组按声明顺序排列，comptime 字段不占空间；匿名结构体与 auto 结构体相同，按对齐重排
+        // Tuples are laid out in declaration order and comptime fields take no space;
+        // anonymous structs are like auto structs and are reordered by alignment
         .{ "s1", "comptime_int = 4" },
         .{ "s2", "comptime_int = 16" },
         .{ "o2", "comptime_int = 4" },
@@ -1479,10 +1500,11 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
         .{ "sa1", "comptime_int = 4" },
         .{ "sa2", "comptime_int = 16" },
         .{ "oa2", "comptime_int = 12" },
-        // inline 函数的结果是否 comptime 已知取决于函数体：字段是否占空间未知
+        // Whether the result of an inline function is comptime-known depends on its body:
+        // whether the field takes space is unknown
         .{ "su", "comptime_int" },
         .{ "empty", "@TypeOf(.{}) = .{}" },
-        // 字段都是 comptime 字段
+        // All fields are comptime fields
         .{ "s0", "comptime_int = 0" },
     });
 }
@@ -1532,14 +1554,15 @@ test "labeled blocks, array literals and type queries" {
         .{ "Q", "type = u32" },
         .{ "arr", "[3]u16" },
         .{ "sz", "comptime_int = 8" },
-        // @hasDecl 只计 pub 声明
+        // @hasDecl counts only pub declarations
         .{ "has_hidden", "u16 = 2" },
         .{ "has_a", "u8 = 1" },
     });
 }
 
 test "deep dependency chains neither overflow nor pollute shallower results" {
-    // 链的顶端远超栈上限：最先查询它，链底的结果仍然正确
+    // The top of the chain is far beyond the stack limit: it is queried first,
+    // and the result at the bottom of the chain is still correct
     const n = 3000;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(testing.allocator);
@@ -1596,19 +1619,21 @@ test "comptime evaluation runs loops, mutation and calls" {
         \\    _ = .{ A, N, F, C, third, S };
         \\}
     , &.{
-        // 数组长度是 comptime 上下文：普通函数的调用也由解释器求值
+        // Array length is a comptime context:
+        // calls to ordinary functions are also evaluated by the interpreter
         .{ "A", "type = [8]u8" },
         .{ "N", "type = ??u8" },
         .{ "F", "type = u16" },
         .{ "C", "type = [3]u8" },
-        // 经由指针捕获写入的数组
+        // Array written through a pointer capture
         .{ "third", "u8 = 4" },
         .{ "S", "type = u8" },
     });
 }
 
 test "anytype arguments do not expand large arrays" {
-    // 曾经：anytype 实参被当作 comptime 上下文求值，巨大数组的切片在解释器中逐个展开元素
+    // Previously: anytype arguments were evaluated as a comptime context,
+    // and slicing a huge array expanded its elements one by one in the interpreter
     try expectTypes(
         \\var memory: [1 << 30]u8 = undefined;
         \\fn Wrapper(comptime T: type) type { return struct { inner: T }; }
@@ -1685,7 +1710,8 @@ test "tuple declarations are structural" {
         \\}
     , &.{
         .{ "A", "type = struct { u8, bool }" },
-        // 两个声明是同一个类型：比较 comptime 已知，只取 then 分支
+        // The two declarations are the same type: the comparison is comptime-known,
+        // so only the then branch is taken
         .{ "same", "u8 = 1" },
         .{ "p", "struct { u32, bool }" },
         .{ "first", "u32" },
@@ -1709,7 +1735,7 @@ test "destructuring infers each element" {
         .{ "a2", "u16" },
         .{ "v0", "f32" },
         .{ "v1", "f32" },
-        // 元组字面量的 comptime 字段：值属于类型
+        // Comptime fields of a tuple literal: the value belongs to the type
         .{ "k0", "comptime_int = 5" },
         .{ "k1", "bool" },
     });
@@ -1751,7 +1777,7 @@ test "slices with comptime-known bounds are pointers to arrays" {
         .{ "t7", "[]u8" },
         .{ "t8", "*const [2]u8" },
         .{ "t9", "*[4:1]u8" },
-        // 切到末尾（含结束位置等于长度）时保留数组的哨兵
+        // Slicing to the end (including an end equal to the length) keeps the array's sentinel
         .{ "t10", "*[6:0]u8" },
         .{ "t11", "*[8:0]u8" },
         .{ "t12", "[*]u8" },
@@ -1760,7 +1786,7 @@ test "slices with comptime-known bounds are pointers to arrays" {
         .{ "t15", "[:0]u8" },
         .{ "t16", "*[2]u8" },
         .{ "t17", "*[2:1]u8" },
-        // 指向单个元素的指针按长度为 1 的数组切片
+        // A pointer to a single element is sliced as an array of length 1
         .{ "t18", "*[1]u8" },
     });
 }
@@ -1781,7 +1807,7 @@ test "concatenation follows the compiler" {
         \\}
     , &.{
         .{ "c1", "*const [4:0]u8" },
-        // 只有一侧有哨兵时保留它，两侧的哨兵不同时没有哨兵
+        // When only one side has a sentinel, it is kept; when the sentinels differ, there is none
         .{ "c2", "*const [4:0]u8" },
         .{ "c3", "*const [4:0]u8" },
         .{ "c4", "[3]u8" },
@@ -1806,7 +1832,7 @@ test "pointer arithmetic and vector operations" {
         .{ "p1", "[*]const u8" },
         .{ "d", "usize" },
         .{ "h", "u32" },
-        // 向量逐元素比较
+        // Vectors compare element-wise
         .{ "vc", "@Vector(4, bool)" },
     });
 }
@@ -1857,7 +1883,7 @@ test "builtin result types follow the compiler" {
     , &.{
         .{ "q1", "u4" },
         .{ "q2", "u12" },
-        // 带标签的 union：标签的整数
+        // Tagged union: the integer value of the tag
         .{ "q3", "u2" },
         .{ "q4", "u2" },
         .{ "q5", "u4 = 2" },
@@ -1896,15 +1922,17 @@ test "builtin arguments get their result types" {
         \\    _ = .{ ee, pk, sp, outer };
         \\}
     , &.{
-        // 转换的目标类型去掉 error union 与 optional
+        // The destination type of the conversion drops the error union and optional
         .{ "@enumFromInt(n)", "E" },
         .{ "pk", "P" },
-        // 参数的结果类型：backing 整数、向量与切片的元素类型、原子操作的类型参数
+        // Result types of arguments: the backing integer, the element types of vectors and slices,
+        // the type argument of atomic operations
         .{ "61", "u12 = 61" },
         .{ "62", "u8 = 62" },
         .{ "63", "u16 = 63" },
         .{ "48", "u32 = 48" },
-        // `@alignCast(@fieldParentPtr(...))` 合并为一次转换：内层取外层的结果类型
+        // `@alignCast(@fieldParentPtr(...))` is merged into one conversion:
+        // the inner call takes the result type of the outer one
         .{ "@fieldParentPtr(\"inner\", p)", "*Outer" },
     });
 }
@@ -1943,22 +1971,23 @@ test "result types reach operands like the compiler" {
     , &.{
         .{ "d", "Buf" },
         .{ "cur", "*Buf" },
-        // 移位的右侧为 `Log2Int(T)`
+        // The right-hand side of a shift is `Log2Int(T)`
         .{ "31", "u5 = 31" },
         .{ "29", "u5 = 29" },
-        // 多个分支项的捕获为各字段类型的 peer，第二个捕获为标签
+        // The capture of a prong with several items is the peer type of the field types;
+        // the second capture is the tag
         .{ "pay", "u16" },
         .{ "tag", "Tag" },
         .{ "41", "f32 = 41" },
         .{ "43", "u8 = 43" },
         .{ "45", "u16 = 45" },
         .{ ".{ 46, 47 }", "[2]u16" },
-        // labeled switch 的 `continue` 的值按操作数的类型推导
+        // The value of `continue` in a labeled switch is inferred from the operand's type
         .{ "49", "u8 = 49" },
-        // 循环的 break 与 else 取循环的结果类型
+        // The break and else of a loop take the loop's result type
         .{ "72", "u8 = 72" },
         .{ "73", "u8 = 73" },
-        // 枚举成员的值按标签类型推导
+        // Values of enum members are inferred from the tag type
         .{ "71", "u8 = 71" },
     });
 }
@@ -1980,7 +2009,8 @@ test "peer types of pointers and optionals" {
         \\    _ = .{ &arr, &arr4, s1, s2, s3, s4, s5, s6, s7, s8, s9 };
         \\}
     , &.{
-        // 长度不同的数组指针统一为切片，哨兵只在两侧相同时保留
+        // Pointers to arrays of different lengths unify to a slice;
+        // the sentinel is kept only when both sides have the same one
         .{ "s1", "[:0]const u8" },
         .{ "s2", "[]const u8" },
         .{ "s3", "[]const u8" },
@@ -1989,7 +2019,7 @@ test "peer types of pointers and optionals" {
         .{ "s6", "[]const u8" },
         .{ "s7", "*const [3]u8" },
         .{ "s8", "[:0]const u8" },
-        // optional 与另一侧按载荷的 peer 包为 optional
+        // An optional and the other side: the peer type of the payloads, wrapped in an optional
         .{ "s9", "?[]const u8" },
     });
 }
@@ -2019,17 +2049,19 @@ test "generic bodies without an instance use values that do not depend on the pa
         \\    _ = x;
         \\}
     , &.{
-        // 条件取决于抽象参数，但两个分支的值相同（不区分指针的对齐）
+        // The condition depends on abstract parameters, but both branches have the same value
+        // (pointer alignment is not distinguished)
         .{ "head", "[]T" },
-        // 自递归的类型函数：取本实例中的容器
+        // Self-recursive type function: the container in this instance is taken
         .{ "S", "type = []T" },
-        // 运行时的条件：值不是 comptime 已知的
+        // Runtime condition: the value is not comptime-known
         .{ "x", "u32" },
     });
 }
 
 test "@hasDecl and @hasField on abstract parameters are unknown" {
-    // 防止解释器把抽象参数当作没有该成员：类型标注与 comptime 调用中按 false 选择分支
+    // Guards against the interpreter treating abstract parameters as not having the member:
+    // in type annotations and comptime calls, the false branch would be selected
     try expectTypes(
         \\const HasInner = struct { pub const Inner = u32; x: u8 };
         \\fn Sel(comptime T: type) type {
@@ -2060,7 +2092,7 @@ test "@hasDecl and @hasField on abstract parameters are unknown" {
         .{ "va", "unknown" },
         .{ "vb", "unknown" },
         .{ "S", "type" },
-        // 抽象实例中的容器：成员只取决于源码
+        // Container in an abstract instance: its members depend only on the source
         .{ "P", "type = u8" },
         .{ "real", "type = u32" },
     });
@@ -2089,7 +2121,7 @@ test "arrays whose length depends on abstract parameters keep their element type
         \\    _ = .{ &tmp, zeros };
         \\}
     , &.{
-        // 长度按源码显示
+        // The length is shown as in the source
         .{ "whole", "[block_length]u8" },
         .{ "b", "u8" },
         .{ "head", "*[4]u8" },
@@ -2112,7 +2144,8 @@ test "loops over types bind an abstract type" {
         \\    }
         \\}
     , &.{
-        // 每次迭代的类型不同：与泛型函数的类型参数一样是抽象的
+        // Each iteration has a different type:
+        // abstract, like the type parameter of a generic function
         .{ "x", "T" },
         .{ "g", "T" },
     });
@@ -2131,17 +2164,19 @@ test "members missing for the current target are looked up in other targets' nam
         \\}
     , &.{
         .{ "here", "u8 = 1" },
-        // 当前目标的命名空间中没有：取其他分支选择的容器中的定义
+        // Missing from the namespace of the current target:
+        // the definition is taken from the container that another branch selects
         .{ "elsewhere", "u16 = 2" },
     });
 }
 
-/// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）
+/// Uses the real standard library of the local zig (skipped when zig is not in PATH)
 fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     return expectStdTypesOptimized(null, src, cases);
 }
 
-/// 同 `expectStdTypes`；`optimize` 不为 null 时提供该优化模式的 builtin（`std.lang.Optimize` 的成员名）
+/// Same as `expectStdTypes`; when `optimize` is not null, provides a builtin with that
+/// optimize mode (a member name of `std.lang.Optimize`)
 fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
@@ -2198,7 +2233,8 @@ test "std.meta type functions" {
         .{ "tag_e", "type = u8" },
         .{ "tag_u", "type = E" },
         .{ "active", "E" },
-        // @Enum 构造的类型以构造它的函数实例命名（编译器显示为 meta.FieldEnum(main.S)）
+        // A type constructed by @Enum is named after the function instance that constructs it
+        // (the compiler shows it as meta.FieldEnum(main.S))
         .{ "FE", "type = FieldEnum(S)" },
         .{ "fe", "FieldEnum(S) = .y" },
         .{ "DE", "type = DeclEnum(S)" },
@@ -2207,7 +2243,7 @@ test "std.meta type functions" {
         .{ "slice", "type = []i32" },
         .{ "tags", "*const [3]E" },
         .{ "field_ty", "type = i32" },
-        // 函数体内递归调用自身的类型函数（std.meta.Elem）能正常结束
+        // A type function whose body calls itself recursively (std.meta.Elem) terminates normally
         .{ "sliced", "type = [:0]const u8" },
     });
 }
@@ -2237,14 +2273,14 @@ test "type reflection and reification" {
         .{ "F", "type = Fields(S)" },
         .{ "fb", "Fields(S) = .b" },
         .{ "Ptr", "type = []const u8" },
-        // 与编译器一致：字面量中 comptime 已知的字段是 comptime 字段
+        // Matches the compiler: comptime-known fields in a literal are comptime fields
         .{ "tuple", "struct { comptime u8 = 1, comptime bool = true } = .{ 1, true }" },
         .{ "first", "u8 = 1" },
     });
 }
 
 test "layouts of reified containers" {
-    // 期望值为 zig 0.17.0 的结果
+    // Expected values are the results of zig 0.17.0
     try expectStdTypes(
         \\const std = @import("std");
         \\const E = enum { a, b, c };
@@ -2272,12 +2308,12 @@ test "layouts of reified containers" {
     , &.{
         .{ "size_rf", "comptime_int = 16" },
         .{ "rf_x", "comptime_int = 8" },
-        // 字段属性中的显式对齐与 comptime 字段
+        // Explicit alignment and comptime fields in the field attributes
         .{ "size_ra", "comptime_int = 16" },
         .{ "align_ra", "comptime_int = 16" },
         .{ "ra_x", "comptime_int = 8" },
         .{ "size_rc", "comptime_int = 4" },
-        // @typeInfo 报告字段的显式对齐
+        // @typeInfo reports the explicit alignment of fields
         .{ "la", "?usize = 4" },
         .{ "lb", "usize = 0" },
         .{ "size_ru", "comptime_int = 8" },
@@ -2287,7 +2323,7 @@ test "layouts of reified containers" {
 }
 
 test "bare unions have a safety tag in safe build modes" {
-    // 期望值为 zig 0.17.0 的结果
+    // Expected values are the results of zig 0.17.0
     const src =
         \\const Bare = union { a: u32, b: u8 };
         \\const One = union { a: u32 };
@@ -2306,10 +2342,10 @@ test "bare unions have a safety tag in safe build modes" {
     ;
     try expectStdTypesOptimized("debug", src, &.{
         .{ "size_bare", "comptime_int = 8" },
-        // 只有一个字段时没有标签
+        // No tag when there is only one field
         .{ "size_one", "comptime_int = 4" },
         .{ "size_rb", "comptime_int = 8" },
-        // `@setRuntimeSafety` 的作用取决于调用的位置与参数
+        // The effect of `@setRuntimeSafety` depends on where it is called and its argument
         .{ "size_unsafe", "comptime_int" },
     });
     try expectStdTypesOptimized("fast", src, &.{
@@ -2381,11 +2417,11 @@ test "std generic containers" {
         .{ "popped", "?u8" },
         .{ "got", "?[]const u8" },
         .{ "n", "usize" },
-        // FieldEnum 构造的枚举、@FieldType 与 @tagName
+        // FieldEnum-constructed enums, @FieldType and @tagName
         .{ "xs", "[]i32" },
         .{ "flag", "?bool" },
         .{ "entry", "GetOrPutResult(u32, []const u8, AutoContext(u32), 80)" },
-        // @typeInfo 的结果 comptime 已知，完整显示
+        // The result of @typeInfo is comptime-known and shown in full
         .{ "fs", "[]const [:0]const u8 = &.{ \"x\", \"y\" }" },
         .{ "info", "Type = .{ .@\"struct\" = .{ .is_tuple = false, .layout = .auto, .backing_integer = null, .field_names = &.{ \"x\", \"y\" }, .field_types = &.{ i32, i32 }, .field_attrs = &.{ .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null }, .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null } }, .decl_names = &.{} } }" },
         .{ "FT", "type = i32" },
@@ -2398,8 +2434,10 @@ test "std generic containers" {
 }
 
 test "local types used by containers in the body: no cycle through the whole function" {
-    // 体内容器的方法用到外层函数的局部类型，外层函数体又引用这个方法；体内有 `enum(u32)`。
-    // 此前取外层函数整体的推导结果，形成环，结果不完整、不写入 memo
+    // A method of a container in the body uses a local type of the outer function, and the outer
+    // function body references that method; the body has an `enum(u32)`.
+    // Previously the inference result of the whole outer function was used, forming a cycle:
+    // the result was incomplete and was not written to the memo
     const text =
         \\fn f() u32 {
         \\    const P = struct { a: u32 };
@@ -2428,7 +2466,7 @@ test "local types used by containers in the body: no cycle through the whole fun
         _ = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         n.* = w.db.executions(queries.Infer);
     }
-    // 结果完整、写入 memo：第二次读取不再执行
+    // The result is complete and written to the memo: the second read does not execute again
     try testing.expectEqual(executions[0], executions[1]);
     var stats: [database.Db.query_types.len]@import("../db/engine.zig").QueryStats = undefined;
     try testing.expectEqual(0, w.db.stats(&stats).incomplete_causes.get(.cycle));
@@ -2437,8 +2475,10 @@ test "local types used by containers in the body: no cycle through the whole fun
 }
 
 test "container arguments that refer to locals of an outer function" {
-    // `enum(T)` 的参数只推导这一个表达式，其中的 `T` 是更外层函数的局部常量。
-    // `T` 在外层函数中的下标大于内层函数的绑定数（曾以内层函数的 Body 取外层的绑定而越界）
+    // Only this one expression, the argument of `enum(T)`, is inferred; the `T` in it is a local
+    // constant of an enclosing outer function.
+    // The index of `T` in the outer function exceeds the number of bindings of the inner function
+    // (the outer binding used to be fetched with the inner function's Body, going out of bounds)
     const text =
         \\fn f() void {
         \\    const a = 1;
@@ -2465,7 +2505,8 @@ test "container arguments that refer to locals of an outer function" {
 }
 
 test "slicing an outer function's local from a container in the body" {
-    // 外层函数的局部变量按其所在成员的 Body 判断常量性（此前用内层成员的 Body 查绑定，越界）
+    // The constness of a local of an outer function is determined by the Body of the member
+    // containing it (the binding used to be looked up in the inner member's Body, out of bounds)
     try expectTypes(
         \\fn f() void {
         \\    const a = 1;
@@ -2485,8 +2526,10 @@ test "slicing an outer function's local from a container in the body" {
 }
 
 test "union(enum) without a tag expression: field names are not lowered as expressions" {
-    // `union(enum) { unneeded, ... }` 的括号内没有表达式，此前取到了第一个成员，`unneeded` 被当作名字
-    // 引用解析到外层的同名声明，与该声明的初始化形成环（Zig 编译器源码中 `LazySrcLoc.Offset`）
+    // `union(enum) { unneeded, ... }` has no expression in the parentheses; previously the first
+    // member was taken, so `unneeded` was resolved as a name reference to the outer declaration of
+    // the same name, forming a cycle with that declaration's initializer (`LazySrcLoc.Offset` in
+    // the Zig compiler source)
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -2512,7 +2555,7 @@ test "union(enum) without a tag expression: field names are not lowered as expre
             for (body.exprs) |e| try testing.expect(e != .name_ref);
             _ = try ctx.get(queries.DeclType, .{ .owner = .{ .file = f.file, .item = it.ast_id } });
         }
-        // `union(enum(u8))` 的参数仍然取到
+        // The argument of `union(enum(u8))` is still found
         if (std.mem.eql(u8, name, "Tagged")) {
             const body = try ctx.get(database.hir.ItemBody, .{ .file = f.file, .item = it.ast_id });
             var has_arg = false;
@@ -2550,13 +2593,14 @@ test "member bodies are reused when their source is unchanged" {
     const before = try read(&w, f.file);
     _ = try w.add("/p/main.zig", v2);
     const after = try read(&w, f.file);
-    // a 的源码未变：沿用同一个 Body；b 改了：重新降级
+    // The source of a is unchanged: the same Body is reused; b changed: it is lowered again
     try testing.expectEqual(before.a, after.a);
     try testing.expect(before.b != after.b);
 }
 
 test "editing a callee body does not invalidate the inference of its callers" {
-    // 判断是否为泛型调用时依赖被调函数的整个 Body：改它的函数体会使全部调用者重新推导
+    // If deciding whether a call is generic depended on the callee's whole Body, editing its
+    // function body would make all callers re-infer
     const v1 = "fn callee(a: u32) u32 {\n    return a + 1;\n}\nfn generic(x: anytype) @TypeOf(x) {\n    return x;\n}\nfn caller(v: u32) u32 {\n    const r = callee(v);\n    return generic(r);\n}\n";
     const v2 = "fn callee(a: u32) u32 {\n    var b = a;\n    b += 2;\n    return b;\n}\nfn generic(x: anytype) @TypeOf(x) {\n    return x;\n}\nfn caller(v: u32) u32 {\n    const r = callee(v);\n    return generic(r);\n}\n";
     var w: World = undefined;
@@ -2573,7 +2617,8 @@ test "editing a callee body does not invalidate the inference of its callers" {
         const owner = try r.ownerKey(f.file, resolve.Resolver.lookupDecl(try r.itemTree(f.file), 0, "caller").?);
         _ = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
         if (round == 0) continue;
-        // 被调函数自身（签名部分）重新推导，值不变；调用者不重算
+        // The callee itself (its signature part) is re-inferred, with an unchanged value;
+        // callers are not recomputed
         const infer_index = comptime for (database.Db.query_types, 0..) |Q, qi| {
             if (Q == queries.Infer) break qi;
         } else unreachable;
@@ -2617,9 +2662,10 @@ test "switch on a type: unevaluable prong items do not hide a matching prong" {
         \\    _ = .{ hit, miss };
         \\}
     , &.{
-        // 分支项的值互不相同：`u16` 匹配时，求不出的 `Vec` 不可能也匹配
+        // The prong items have distinct values:
+        // when `u16` matches, the unevaluable `Vec` cannot match as well
         .{ "hit", "u32 = 0" },
-        // 都不匹配且有求不出的分支项：不能落到 else
+        // None matches and some prong items cannot be evaluated: must not fall back to else
         .{ "miss", "unknown" },
     });
 }
@@ -2639,7 +2685,7 @@ test "a comptime branch that is @compileError gives way to the other branch" {
         \\    _ = .{ v_in, v_out, v_both, v_plain };
         \\}
     , &.{
-        // 被使用的声明不可能是编译错误：取另一个分支
+        // A declaration that is used cannot be a compile error: the other branch is taken
         .{ "v_in", "u32 = 1" },
         .{ "v_out", "u8 = 2" },
         .{ "v_both", "noreturn" },
@@ -2656,7 +2702,8 @@ test "a field of a literal-initialized constant is known when other fields are n
         \\const the_arch = cpu.arch;
         \\const Platform = if (cpu.arch == .wasm32) u8 else u16;
     , &.{
-        // `features` 求不出，整个 `cpu` 没有值；`arch` 仍取初始化中的值，按它选择分支
+        // `features` cannot be evaluated, so the whole `cpu` has no value;
+        // `arch` still gets its value from the initializer, which selects the branch
         .{ "the_arch", "Arch = .wasm32" },
         .{ "Platform", "type = u8" },
     });
@@ -2708,13 +2755,13 @@ test "comptime evaluation: multiline strings, string arguments and comptime expr
         \\    _ = local;
         \\}
     , &.{
-        // 各行去掉 `\\` 后以换行符连接
+        // Lines are joined with newlines after removing `\\`
         .{ "text", "*const [13:0]u8 = \"-a, --aa\\n  -b\"" },
         .{ "lines", "usize = 2" },
-        // 字符串字面量作为 comptime 实参有值
+        // A string literal as a comptime argument has a value
         .{ "FromLiteral", "type = [3]u8" },
         .{ "FromMultiline", "type = [4]u8" },
-        // 函数体中的 `comptime` 表达式在 comptime 求值
+        // A `comptime` expression in a function body is evaluated at comptime
         .{ "local", "usize = 3" },
     });
 }
@@ -2785,23 +2832,26 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
         \\const r_short = shortName(&.{ .short = 'h' });
         \\const r_bump = bump();
     , &.{
-        // 函数执行到末尾时的 `E!void` 与 `catch` 中指向局部存储的载荷
+        // `E!void` when the function runs to its end,
+        // and a payload in `catch` pointing into local storage
         .{ "r_eu", "usize = 7" },
-        // 修改切片的 `len`
+        // Modifying the `len` of a slice
         .{ "r_grow", "usize = 206" },
-        // 算术的操作数不按 optional 结果类型转换
+        // Arithmetic operands are not converted to the optional result type
         .{ "r_opt", "usize = 5" },
-        // 切片的 `ptr` 比较（`std.mem.eql` 中的快速路径）
+        // Comparing the `ptr` of slices (the fast path in `std.mem.eql`)
         .{ "r_ptr", "usize = 1" },
-        // optional 的指针捕获与 `*const T` 到 `*const [1]T`
+        // Pointer capture of an optional, and `*const T` to `*const [1]T`
         .{ "r_short", "usize = 104" },
         .{ "r_bump", "usize = 3" },
     });
 }
 
 test "comptime evaluation: slices of interpreter storage read elements in place" {
-    // 防止取切片的元素或长度时复制整个区间：逐次切片的循环（comptime 分词器的常见写法）分配量与
-    // 长度的平方成正比，超过内存上限后结果未知
+    // Guards against copying the whole range when taking an element or the length of a slice:
+    // a loop that slices repeatedly (a common pattern in comptime tokenizers) would allocate in
+    // proportion to the square of the length, and the result would be unknown once the memory
+    // limit is exceeded
     const text = comptime blk: {
         @setEvalBranchQuota(2000);
         var buf: [1024]u8 = undefined;
@@ -2841,14 +2891,16 @@ test "comptime evaluation: slices of interpreter storage read elements in place"
         \\const copied = copies(big);
     , &.{
         .{ "counted", "usize = 512" },
-        // 经由区间读取、复制、拼接与写入
+        // Reading, copying, concatenating and writing through ranges
         .{ "copied", "usize = 12344" },
     });
 }
 
 test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
-    // 编译器只按回跳计数：逐个写入数十万个元素的 `@memcpy` 不受限制。在两次内存检查之间复制出超过内存上限的
-    // 大数组时放弃：`copyLarge` 每次复制 2^20 个元素，48 次的总量超过 1 GB
+    // The compiler counts only backward branches: a `@memcpy` writing hundreds of thousands of
+    // elements one by one is not limited. Evaluation gives up when a large array exceeding the
+    // memory limit is copied between two memory checks: `copyLarge` copies 2^20 elements each
+    // time, and the 48 copies total more than 1 GB.
     try expectTypes(
         \\fn copyMany() u8 {
         \\    const buf: [60000]u8 = @splat(1);
@@ -2882,7 +2934,7 @@ test "comptime evaluation: element-wise work is not limited by steps, but large 
 }
 
 test "comptime evaluation: aggregates with more than 65536 elements are evaluated" {
-    // 曾在元素个数超过 65536 时放弃：只应受内存上限约束
+    // Evaluation used to give up beyond 65536 elements: only the memory limit should apply
     try expectTypes(
         \\const big: [100000]u8 = @splat(2);
         \\fn last() u8 {
@@ -2936,17 +2988,18 @@ test "catch and orelse take the result type of the whole expression, labeled swi
         \\    _ = .{ a, b, c, d, e, f, k, k2, k3, k4 };
         \\}
     , &.{
-        // 右侧按载荷类型转换时 `null` 被当作 `u8`
+        // Converting the right-hand side to the payload type would treat `null` as `u8`
         .{ "a", "?u8" },
         .{ "b", "u8" },
         .{ "c", "?u16" },
         .{ "d", "Color" },
         .{ "e", "?u8" },
         .{ "f", "u8" },
-        // 不收集 `break :sw` 的值时各分支都是 noreturn
+        // Without collecting the values of `break :sw`, every prong is noreturn
         .{ "k", "u8" },
         .{ "k2", "u16" },
-        // comptime 已知的操作数只执行匹配的分支；有 `continue :sw4` 时可能转到其他分支
+        // With a comptime-known operand, only the matching prong is executed;
+        // with `continue :sw4`, control may move to another prong
         .{ "k3", "u8 = 1" },
         .{ "k4", "u16" },
     });
@@ -2978,10 +3031,12 @@ test "comptime evaluation: self-referential and deeply nested values are unknown
         \\const short = chain(3).next.?.v;
         \\const long = chain(1000);
     , &.{
-        // 自引用的值沿指针展开不会结束（原生栈耗尽，进程崩溃）
+        // Expanding a self-referential value along pointers never terminates
+        // (the native stack is exhausted and the process crashes)
         .{ "loop", "Node" },
         .{ "both", "[2]Node" },
-        // 调用的结果整体驻留，含环时其中的字段也未知
+        // The result of a call is interned as a whole;
+        // when it contains a cycle, its fields are unknown too
         .{ "v", "u32" },
         .{ "short", "u32 = 1" },
         .{ "long", "Node" },
@@ -2989,7 +3044,8 @@ test "comptime evaluation: self-referential and deeply nested values are unknown
 }
 
 test "calls returning types with comptime-only fields nested at any depth are evaluated at comptime" {
-    // 防止只检查两层嵌套：第三层的 `type` 字段同样使返回类型成为 comptime-only
+    // Guards against checking only two levels of nesting:
+    // a `type` field at the third level also makes the return type comptime-only
     try expectTypes(
         \\const Inner = struct { t: type };
         \\const Mid = struct { b: Inner };
@@ -3015,8 +3071,10 @@ test "calls returning types with comptime-only fields nested at any depth are ev
 }
 
 test "comptime evaluation: backward branches follow the compiler's quota" {
-    // 防止按表达式个数或整个请求的燃料放弃：编译器只按回跳（循环迭代、调用）计数，`@setEvalBranchQuota`
-    // 调高配额，调用者调高的配额对被调函数同样有效；超过配额时编译器报错，结果未知
+    // Guards against giving up by the number of expressions or by the fuel of the whole request:
+    // the compiler only counts backward branches (loop iterations, calls), `@setEvalBranchQuota`
+    // raises the quota, and a quota raised by a caller also applies to callees; when the quota is
+    // exceeded, the compiler reports an error and the result is unknown
     try expectTypes(
         \\fn sum(n: usize) usize {
         \\    var total: usize = 0;
@@ -3059,8 +3117,10 @@ test "comptime evaluation: backward branches follow the compiler's quota" {
 }
 
 test "function pointers are runtime values, not comptime-only" {
-    // 防止把函数指针当作 comptime-only：含有函数指针字段的结构体（如 `std.mem.Allocator` 的 vtable）
-    // 不是 comptime-only，返回它的调用不在 comptime 求值，接收函数指针的函数也不是泛型函数
+    // Guards against treating function pointers as comptime-only: a struct containing a function
+    // pointer field (such as the vtable of `std.mem.Allocator`) is not comptime-only, calls
+    // returning it are not evaluated at comptime, and functions taking a function pointer
+    // are not generic either
     try expectTypes(
         \\fn hello() void {}
         \\const VTable = struct { call: *const fn () void };
@@ -3162,7 +3222,7 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
     _ = try w.add("/p/pos.zon", ".{ .x = 3, .y = 4, .list = .{ 1, 2, 3 } }");
     _ = try w.add("/p/cfg.zon", ".{ .port = 8080 }");
     _ = try w.add("/p/n.zon", "5");
-    // 超出 i128 的整数
+    // An integer beyond i128
     _ = try w.add("/p/big.zon", "0x1_0000_0000_0000_0000_0000_0000_0000_0000");
     const src =
         \\const pos = @import("pos.zon");
@@ -3194,9 +3254,10 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
         .{ "sum", "comptime_int = 7" },
         .{ "len2", "comptime_int = 25" },
         .{ "second_value", "comptime_int = 2" },
-        // 标量按结果类型转换
+        // Scalars are converted to the result type
         .{ "five_value", "u32 = 5" },
-        // 结构体按结果类型解析，不由匿名的值转换：值求不出
+        // Structs are parsed according to the result type, not converted from the anonymous
+        // value: the value cannot be evaluated
         .{ "port_value", "u16" },
         .{ "big", "comptime_int" },
     };
@@ -3218,7 +3279,8 @@ test "@src has the type std.builtin.SourceLocation" {
 }
 
 test "values of structs whose fields are all u8 keep the declared field types and display as structs" {
-    // 这样的值以字节表示：曾按 u8 取出 `?u8` 字段（`if (p.short) |s|` 求不出），并显示成字符串
+    // Such values are represented as bytes: a `?u8` field used to be read as u8
+    // (`if (p.short) |s|` could not be evaluated), and the value was displayed as a string
     try expectTypes(
         \\const Names = struct {
         \\    short: ?u8 = null,

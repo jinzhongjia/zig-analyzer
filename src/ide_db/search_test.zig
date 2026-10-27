@@ -34,7 +34,7 @@ const lib_src =
     \\    _ = q.x;
     \\}
 ;
-// 不导入 lib.zig：其中的同名声明不是引用
+// Does not import lib.zig: the declaration with the same name in it is not a reference
 const other_src =
     \\fn add() void {}
     \\test {
@@ -53,14 +53,14 @@ fn setup(w: *World) !Files {
     };
 }
 
-/// `src` 中第 `nth` 个 `needle` 的位置
+/// Position of the `nth` occurrence of `needle` in `src`
 fn at(src: []const u8, needle: []const u8, nth: usize) u32 {
     var start: usize = 0;
     for (0..nth) |_| start = std.mem.indexOfPos(u8, src, start, needle).? + 1;
     return @intCast(std.mem.indexOfPos(u8, src, start, needle).?);
 }
 
-/// 引用列表：「文件名:行」以空格连接（定义处带 `*`）
+/// Reference list: `file:line` entries joined by spaces (the definition is marked with `*`)
 fn refs(w: *World, fs: Files, file: FileId, offset: u32, only_file: ?FileId) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -82,16 +82,16 @@ test "find references" {
     const fs = try setup(&w);
     defer w.deinit();
     const cases = [_]struct { FileId, []const u8, []const u8, usize, []const u8 }{
-        // 跨文件的函数；other.zig 中的同名函数不算
+        // Cross-file function; the function with the same name in other.zig does not count
         .{ fs.lib, lib_src, "add(a", 0, "main:5:add lib:3:add* lib:7:add" },
         .{ fs.main, main_src, "add(p", 0, "main:5:add lib:3:add* lib:7:add" },
-        // 字段：类型推导得到的访问与初始化
+        // Field: accesses and initializations found by type inference
         .{ fs.lib, lib_src, "x: i32", 0, "main:4:x main:5:x main:5:x lib:1:x* lib:8:x lib:9:x" },
-        // 枚举成员：枚举字面量
+        // Enum member: enum literals
         .{ fs.lib, lib_src, "red", 0, "main:6:red main:8:red lib:2:red*" },
-        // 经由别名引用的声明
+        // Declaration referenced through an alias
         .{ fs.lib, lib_src, "Color", 0, "main:2:Color lib:2:Color*" },
-        // 局部变量
+        // Local variable
         .{ fs.main, main_src, "local", 1, "main:11:local* main:12:local main:12:local" },
         .{ fs.other, other_src, "add", 1, "other:1:add* other:3:add" },
     };
@@ -102,12 +102,13 @@ test "find references" {
             return err;
         };
     }
-    // 只在一个文件中查找（document highlight）
+    // Search in a single file only (document highlight)
     try testing.expectEqualStrings("lib:3:add* lib:7:add", try refs(&w, fs, fs.lib, at(lib_src, "add", 0), fs.lib));
 }
 
 test "references to standard library declarations from project files" {
-    // 项目文件只导入 std.zig：std.zig → mem.zig 这条边来自搜索范围外的文件，没有它时只在 mem.zig 中查找
+    // Project files import only std.zig: the edge std.zig → mem.zig comes from a file outside the
+    // search scope; without it, only mem.zig would be searched
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -134,7 +135,7 @@ test "references to standard library declarations from project files" {
         const text = (try ctx.get(database.syntax.SourceText, ref.file)).text;
         try out.print(w.arena.allocator(), "{s}:{d}{s} ", .{ std.fs.path.stem(w.vfs.path(ref.file)), std.mem.count(u8, text[0..ref.start], "\n") + 1, if (ref.is_decl) "*" else "" });
     }
-    // 范围外的其他文件（std.zig）不查找
+    // Other files outside the scope (std.zig) are not searched
     try testing.expectEqualStrings("mem:1* mem:4 main:3 ", out.items);
 }
 
@@ -153,7 +154,7 @@ test "enum member names are not references to declarations of the same name" {
     const f = (try w.add("/p/x.zig", src)).file;
     const fs: Files = .{ .main = f, .lib = f, .other = f };
     try testing.expectEqualStrings("x:1:read* x:5:read", try refs(&w, fs, f, at(src, "read", 0), null));
-    // 在成员名处查找：是该成员自身，不是同名的函数
+    // Searching at the member name finds the member itself, not the function with the same name
     try testing.expectEqualStrings("x:2:read*", try refs(&w, fs, f, at(src, "read", 1), null));
 }
 
@@ -174,7 +175,7 @@ test "member references inside generic functions use the call-site instance" {
     const f = (try w.add("/p/x.zig", src)).file;
     const fs: Files = .{ .main = f, .lib = f, .other = f };
     try testing.expectEqualStrings("x:1:x* x:3:x x:6:x", try refs(&w, fs, f, at(src, "x", 0), null));
-    // 只有一种实例：没有歧义
+    // Only one instance: no ambiguity
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
@@ -198,7 +199,7 @@ test "references to quoted names with escaped quotes" {
     const f = (try w.add("/p/x.zig", src)).file;
     const fs: Files = .{ .main = f, .lib = f, .other = f };
     try testing.expectEqualStrings("x:1:@\"a\\\"b\"* x:3:@\"a\\\"b\"", try refs(&w, fs, f, at(src, "@\"a", 0), null));
-    // 转义的名字与普通写法是同一个名字
+    // A quoted name and its plain spelling are the same name
     try testing.expectEqualStrings("x:5:@\"\\x66oo\"* x:6:foo x:6:@\"foo\"", try refs(&w, fs, f, at(src, "@\"\\x66", 0), null));
 }
 
@@ -222,11 +223,12 @@ test "member references inside generic functions cover every call-site instance"
     try w.init();
     defer w.deinit();
     const f = (try w.add("/p/x.zig", src)).file;
-    // 第一个调用点的实例是 T：仍能找到 S 实例中的引用
+    // The instance at the first call site is T: references in the S instance are still found
     const fs: Files = .{ .main = f, .lib = f, .other = f };
     try testing.expectEqualStrings("x:1:x* x:4:x x:7:x x:11:x x:12:x", try refs(&w, fs, f, at(src, "x", 0), null));
 
-    // `both` 中的 `p.x` 在 T 的实例下指向 T.x：有歧义（重命名会破坏 T 的实例）
+    // `p.x` in `both` refers to T.x under the T instance: ambiguous
+    // (renaming would break the T instance)
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
@@ -234,7 +236,7 @@ test "member references inside generic functions cover every call-site instance"
     const def = (try definition.defAt(&r, f, at(src, "x", 0))).?;
     _ = try search.findReferences(&r, def, .{ .scope = &.{f}, .ambiguous = &ambiguous });
     try testing.expectEqual(at(src, "p.x", 0), ambiguous.?.start);
-    // T.x 同样在 `both` 中有歧义
+    // T.x is ambiguous in `both` as well
     ambiguous = null;
     const t_def = (try definition.defAt(&r, f, at(src, "x", 1))).?;
     _ = try search.findReferences(&r, t_def, .{ .scope = &.{f}, .ambiguous = &ambiguous });
@@ -261,12 +263,14 @@ test "references in generic bodies use a call site instance" {
     defer w.deinit();
     const f = (try w.add("/p/x.zig", src)).file;
     const fs: Files = .{ .main = f, .lib = f, .other = f };
-    // `system` 在抽象的推导中未知：与跳转一样取调用点（`lookup(Real, ..)`）的实例
+    // `system` is unknown in abstract inference: like goto, take the instance at the call site
+    // (`lookup(Real, ..)`)
     try testing.expectEqualStrings("x:2:getenv* x:7:getenv", try refs(&w, fs, f, at(src, "getenv", 0), null));
 }
 
 test "references in generic bodies use the instance a comptime type argument dispatches to" {
-    // 分派处（`Q.compute(ctx)`）所在的文件不 import 被调函数所在的文件：曾只有跳转找到这个实例，引用与重命名遗漏
+    // The file containing the dispatch site (`Q.compute(ctx)`) does not import the file containing
+    // the callee: only goto used to find this instance; references and rename missed it
     const queries_src =
         \\pub const Cache = struct {
         \\    pub fn take(c: *Cache) u32 {
@@ -311,7 +315,8 @@ test "references in generic bodies use the instance a comptime type argument dis
 }
 
 test "references to enum members include literals that a generic callee converts to the enum" {
-    // anytype 形参收到的 `.green` 经被调函数中的 `@TypeOf(expected, actual)` 转换：曾不算引用，重命名漏改
+    // `.green` received by an anytype parameter is converted by `@TypeOf(expected, actual)` in the
+    // callee: it used not to count as a reference, and rename missed it
     const src =
         \\const Color = enum { red, green };
         \\fn expectEqual(expected: anytype, actual: anytype) !void {
@@ -370,14 +375,14 @@ test "member accesses whose target cannot be determined are reported as uncertai
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    // `p` 的类型未知，又没有调用点：`p.fooBar` 可能是引用
+    // The type of `p` is unknown and there is no call site: `p.fooBar` may be a reference
     {
         var uncertain: ?search.Reference = null;
         const def = (try definition.defAt(&r, file, at(src, "fooBar", 0))).?;
         _ = try search.findReferences(&r, def, .{ .scope = &.{file}, .uncertain = &uncertain });
         try testing.expectEqualStrings("p.fooBar", src[uncertain.?.start..uncertain.?.end]);
     }
-    // 切片的 `len` 不是 S 的成员：类型具体，不是无法确认的访问
+    // `len` of a slice is not a member of S: the type is concrete, so the access is not uncertain
     {
         var uncertain: ?search.Reference = null;
         const def = (try definition.defAt(&r, file, at(src, "len", 0))).?;
@@ -405,7 +410,8 @@ test "initializer field names are not uncertain references to other declarations
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    // 初始化的字段名只能是字段：`T` 未知时 `.span = 1` 也不会是函数 `span` 的引用
+    // A field name in an initializer can only be a field: when `T` is unknown, `.span = 1` is not
+    // a reference to the function `span` either
     {
         var uncertain: ?search.Reference = null;
         const def = (try definition.defAt(&r, file, at(src, "span", 0))).?;
@@ -413,7 +419,8 @@ test "initializer field names are not uncertain references to other declarations
         try testing.expectEqual(null, uncertain);
         try testing.expectEqual(1, found.len);
     }
-    // 字段 `range` 的同名初始化字段在 `T` 未知时仍无法确认
+    // An initializer field with the same name as the field `range` still cannot be confirmed when
+    // `T` is unknown
     {
         var uncertain: ?search.Reference = null;
         const def = (try definition.defAt(&r, file, at(src, "range", 0))).?;
@@ -450,12 +457,13 @@ test "files with syntax errors that mention the name are reported" {
     var syntax_error: ?FileId = null;
     const def = (try definition.defAt(&r, lib_file, at(lib, "x", 0))).?;
     _ = try search.findReferences(&r, def, .{ .scope = &.{ lib_file, other_file, main_file }, .syntax_error = &syntax_error });
-    // other.zig 也有语法错误，但没有出现这个名字
+    // other.zig also has a syntax error, but does not contain the name
     try testing.expectEqual(main_file, syntax_error.?);
 }
 
 test "references in generic code of files that do not import the definition" {
-    // 防止只在导入了定义所在文件的文件中查找：`c.zig` 不导入 `a.zig`，经 anytype 的值调用 `foo`
+    // Guards against searching only the files that import the file containing the definition:
+    // `c.zig` does not import `a.zig` and calls `foo` through an anytype value
     var w: World = undefined;
     try w.init();
     defer w.deinit();

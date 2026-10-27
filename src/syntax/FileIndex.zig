@@ -1,7 +1,9 @@
-//! 文件索引：文件中出现的标识符名字与 `@import` 字符串。
+//! File index: the identifier names and `@import` strings that appear in a file.
 //!
-//! 引用查找、调用点种子与 workspace symbol 先用它粗筛候选文件，再在候选文件中精确解析。
-//! 名字已去掉 `@"..."` 的引号；只依赖语法树，内容不变（名字与 import 都相同）时下游不重算。
+//! Find references, call-site seeding, and workspace symbol use it to pre-filter candidate files,
+//! then resolve precisely within the candidates.
+//! Names have the `@"..."` quotes removed. Depends only on the syntax tree: when the content is
+//! unchanged (same names and imports), downstream is not recomputed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,9 +18,9 @@ const mem = @import("../util/mem.zig");
 const FileIndex = @This();
 
 arena: std.heap.ArenaAllocator.State,
-/// 去重并按字典序排列
+/// Deduplicated and sorted lexicographically
 names: []const []const u8,
-/// `@import("...")` 的字符串（已解码），按出现顺序
+/// Strings of `@import("...")` (decoded), in order of appearance
 imports: []const []const u8,
 
 pub fn contains(index: *const FileIndex, name: []const u8) bool {

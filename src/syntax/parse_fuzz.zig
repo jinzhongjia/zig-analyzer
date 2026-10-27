@@ -1,15 +1,16 @@
-//! 解析器的性质测试（固定种子随机输入 + 覆盖率引导模糊测试）：
+//! Property tests for the parser (fixed-seed random input + coverage-guided fuzzing):
 //!
-//! 1. 任意字节输入都能解析出无损的语法树，不崩溃、不卡死；
-//! 2. 对任意文本做任意编辑，局部重解析的结果与全量解析完全相同（含连续编辑形成的复用链），
-//!    包括深层嵌套的文本。
+//! 1. Any byte input parses into a lossless syntax tree without crashing or hanging;
+//! 2. For any edit to any text, local reparse gives exactly the same result as a full parse
+//!    (including reuse chains formed by consecutive edits), including deeply nested text.
 
 const std = @import("std");
 const testing = std.testing;
 const Parse = @import("Parse.zig");
 const Entropy = @import("../util/Entropy.zig");
 
-/// 片段偏向 Zig 语法中的结构性 token，更容易触发各类恢复与重解析路径
+/// Pieces favor structural tokens of Zig syntax, which more readily trigger the various
+/// recovery and reparse paths
 const pieces = [_][]const u8{
     "{",      "}",   "(",      ")",      "[",     "]",     ";",        ",",     ".",      ":",
     "=",      "\n",  " ",      "\"",     "'",     "//",    "///",      "\\\\",  "fn",     "f",
@@ -29,14 +30,14 @@ fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
     }
 }
 
-/// 长片段：几个拼在一起得到上千层的嵌套
+/// Long pieces: a few of them together give over a thousand levels of nesting
 const deep_pieces = [_][]const u8{
     repeat("(", 100),  repeat(")", 100),  repeat("{", 100),              repeat("}", 100),
     repeat("!", 100),  repeat("f(", 100), repeat("if (a) b else ", 100), repeat("1 + ", 100),
     repeat(".b", 100), repeat("?", 100),  repeat("[]", 100),
 };
 
-/// 片段：`deep` 时每 8 个中约有 1 个取长片段
+/// Picks a piece: with `deep`, about 1 in 8 is a long piece
 fn pickPiece(e: *Entropy, deep: bool) []const u8 {
     if (deep and e.below(8) == 0) return e.pick([]const u8, &deep_pieces);
     return e.pick([]const u8, &pieces);
@@ -64,7 +65,7 @@ fn writeText(n: @import("tree.zig").SyntaxNode, w: *std.Io.Writer) !void {
 
 fn checkAll(input: []const u8) !void {
     const a = testing.allocator;
-    // 原始字节直接作为源码
+    // Raw bytes used directly as source
     {
         const p = try Parse.create(a, input);
         defer p.destroy();
@@ -73,7 +74,7 @@ fn checkAll(input: []const u8) !void {
     try checkEdits(input, false);
 }
 
-/// 由片段拼出源码，再连续做随机编辑
+/// Builds source from pieces, then applies random edits in succession
 fn checkEdits(input: []const u8, deep: bool) !void {
     const a = testing.allocator;
     var e: Entropy = .{ .bytes = input };

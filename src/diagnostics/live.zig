@@ -1,6 +1,7 @@
-//! `live` 诊断来源：官方解析器 + AstGen（等价于 `zig ast-check`），保证与编译器一致。
+//! `live` diagnostic source: the official parser + AstGen (equivalent to `zig ast-check`),
+//! guaranteed to match the compiler.
 //!
-//! 自研 CST 的错误不参与诊断。
+//! Errors from the in-house CST do not contribute to diagnostics.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,7 +19,7 @@ const Watchdog = @import("../util/watchdog.zig").Watchdog;
 const log = std.log.scoped(.live);
 
 pub const Diagnostic = struct {
-    /// 字节偏移区间（ErrorBundle 的 span_start / span_end）
+    /// Byte offset range (span_start / span_end of the ErrorBundle)
     start: u32,
     end: u32,
     message: []const u8,
@@ -34,8 +35,10 @@ pub const Note = struct {
 pub const Result = struct {
     arena: std.heap.ArenaAllocator.State,
     items: []const Diagnostic,
-    /// ZIR 中记录的 `@import` 字符串（含函数体内的）。编译器正是沿这些 import 确定要做 AstGen 的文件；
-    /// 解析错误或根结构的致命 AstGen 错误会导致不生成 ZIR，此时为空，与编译器行为一致。
+    /// `@import` strings recorded in ZIR (including those in function bodies). These are exactly
+    /// the imports the compiler follows to determine which files to run AstGen on; a parse error or
+    /// a fatal AstGen error in the root struct means no ZIR is generated, in which case this is
+    /// empty, matching the compiler's behavior.
     imports: []const []const u8,
 
     pub fn destroy(r: *Result, gpa: Allocator) void {
@@ -46,13 +49,13 @@ pub const Result = struct {
 
 pub const Mode = enum { zig, zon };
 
-/// `.zon` 文件按 ZON 处理
+/// `.zon` files are treated as ZON
 pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
-/// 对文本运行解析与 AstGen（或 ZonGen），返回全部错误。按嵌套深度选择执行的线程，深层嵌套的文本
-/// 不会耗尽原生栈
+/// Runs parsing and AstGen (or ZonGen) on the text and returns all errors. The thread to run on is
+/// chosen by nesting depth, so deeply nested text does not exhaust the native stack.
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
     const source = try gpa.dupeSentinel(u8, text, 0);
     defer gpa.free(source);
@@ -72,7 +75,8 @@ fn checkInto(gpa: Allocator, source: [:0]const u8, mode: Mode, result: *Allocato
     result.* = checkSource(gpa, source, mode);
 }
 
-/// 不做 AstGen 时的结果：没有诊断，import 按 token 收集（AstGen 记录的正是 `@import` 的字符串字面量）
+/// Result when AstGen is skipped: no diagnostics, and imports are collected from tokens (what
+/// AstGen records is exactly the string literals of `@import`)
 fn importsOnly(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
@@ -80,7 +84,7 @@ fn importsOnly(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error
     var imports: std.ArrayList([]const u8) = .empty;
     if (mode == .zig) {
         var tokenizer: std.zig.Tokenizer = .init(source);
-        // 前两个 token：`@import` 与 `(`
+        // The previous two tokens: `@import` and `(`
         var prev: [2]std.zig.Token = @splat(.{ .tag = .invalid, .loc = .{ .start = 0, .end = 0 } });
         while (true) {
             const t = tokenizer.next();
@@ -174,15 +178,17 @@ fn spanOf(bundle: ErrorBundle, loc: ErrorBundle.SourceLocationIndex) [2]u32 {
     return .{ sl.span_start, sl.span_end };
 }
 
-/// live 诊断的执行方式。进程内 AstGen 只有在用户 zig 与 zig-analyzer 编译时的版本完全相同时
-/// 才与编译器一致；否则调用用户的 `zig ast-check`。
+/// Backend for live diagnostics. In-process AstGen matches the compiler only when the user's zig is
+/// exactly the same version that zig-analyzer was built with; otherwise the user's `zig ast-check`
+/// is invoked.
 pub const Backend = union(enum) {
     in_process,
-    /// 用户 zig 可执行文件路径
+    /// Path of the user's zig executable
     subprocess: []const u8,
 };
 
-/// 当前使用的执行方式；启动后确认 zig 版本时写入，变化时所有 `AstCheck` 重算
+/// The backend currently in use; set when the zig version is confirmed after startup, and all
+/// `AstCheck`s are recomputed when it changes
 pub const LiveBackend = struct {
     pub const kind: engine.Kind = .input;
     pub const Key = void;
@@ -201,7 +207,7 @@ pub const LiveBackend = struct {
     }
 };
 
-/// 文件的 live 诊断。`.zon` 文件按 ZON 处理。
+/// Live diagnostics of a file. `.zon` files are treated as ZON.
 pub const AstCheck = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -229,30 +235,34 @@ pub const AstCheck = struct {
     }
 };
 
-/// 按执行方式对文本做 live 检查
+/// Runs the live check on the text with the given backend
 pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
     return switch (backend) {
         .in_process => check(gpa, text, mode),
         .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, text, mode) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Canceled => error.Canceled,
-            // zig 无法运行：没有 live 诊断（编译器诊断仍可用）
+            // zig cannot be run: no live diagnostics (compiler diagnostics are still available)
             else => empty(gpa),
         },
     };
 }
 
-/// 在读事务之外预先算好的 `checkWith` 结果，按文本、模式与执行方式索引。AstGen 与子进程 `zig ast-check`
-/// 都不检查取消，在读事务中执行时写事务（逐字输入）要等它结束；诊断发布先在锁外算好放入这里，`AstCheck`
-/// 计算时取走命中的结果。结果只取决于文本，因此不影响 query 的纯函数语义。容量很小：未被取走的结果
-/// （memo 已有效）按先进先出淘汰
+/// `checkWith` results computed ahead of time outside read transactions, indexed by text, mode and
+/// backend. Neither AstGen nor a `zig ast-check` child process checks for cancellation, so when one
+/// runs inside a read transaction, write transactions (typing) must wait for it to finish;
+/// diagnostics publishing computes the result outside the lock first and puts it here, and
+/// `AstCheck` takes a matching result when it computes. Results depend only on the text, so this
+/// does not affect the pure-function semantics of queries. The capacity is small: results that are
+/// never taken (the memo is already valid) are evicted in FIFO order.
 pub const Prepared = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
     entries: std.ArrayList(Entry) = .empty,
-    /// 每个文件最近一次准备好（已放入）的文本哈希：文本未变时不重复准备
+    /// Hash of the text most recently prepared (put) for each file: an unchanged text is not
+    /// prepared again
     last: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
-    /// `take` 命中的次数（统计与测试用）
+    /// Number of `take` hits (for statistics and tests)
     hits: usize = 0,
 
     const Entry = struct { mode: Mode, backend: BackendKind, text: []const u8, result: *Result };
@@ -269,20 +279,23 @@ pub const Prepared = struct {
         return std.hash.Wyhash.hash(@as(u64, @backingInt(mode)) << 8 | @backingInt(std.meta.activeTag(backend)), text);
     }
 
-    /// 文件的这个文本是否还需要准备。放入之后才算准备好：并发的两次发布可能都准备同一个文本（在读事务
-    /// 之外重复一次 AstGen），但不会有发布在准备完成之前进入读事务、在其中做 AstGen
+    /// Whether this text of the file still needs to be prepared. A text counts as prepared only
+    /// once it has been put: two concurrent publishes may both prepare the same text (repeating
+    /// AstGen once outside the read transaction), but no publish enters the read transaction before
+    /// preparation completes and runs AstGen in it.
     pub fn claim(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) bool {
         return !p.prepared(io, file, h);
     }
 
-    /// 文件的这个文本是否已经准备好
+    /// Whether this text of the file has already been prepared
     pub fn prepared(p: *Prepared, io: Io, file: Vfs.FileId, h: u64) bool {
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
         return if (p.last.get(file)) |last| last == h else false;
     }
 
-    /// 放入文件 `file` 的 `checkWith(backend, text, mode)` 的结果，取得 `result` 的所有权，并记这个文本已准备好
+    /// Puts the result of `checkWith(backend, text, mode)` for file `file`, taking ownership of
+    /// `result`, and records this text as prepared
     pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, backend: Backend, result: *Result) Allocator.Error!void {
         errdefer result.destroy(p.gpa);
         const owned = try p.gpa.dupe(u8, text);
@@ -300,7 +313,7 @@ pub const Prepared = struct {
         try p.entries.append(p.gpa, .{ .mode = mode, .backend = kind, .text = owned, .result = result });
     }
 
-    /// 取走 `checkWith(backend, text, mode)` 的结果（调用方取得所有权）
+    /// Takes the result of `checkWith(backend, text, mode)` (the caller takes ownership)
     pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode, backend: Backend) ?*Result {
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
@@ -330,10 +343,11 @@ fn empty(gpa: Allocator) Allocator.Error!*Result {
     return result;
 }
 
-// ── 子进程后端：zig ast-check ────────────────────────────────────────
+// ── Subprocess backend: zig ast-check ────────────────────────────────
 
-/// 通过 stdin 把文本交给 `zig ast-check --color off`，解析其错误输出。
-/// 子进程模式下没有 import 列表（此时构建图也无法加载，不存在编译集合）。
+/// Passes the text to `zig ast-check --color off` through stdin and parses its error output.
+/// There is no import list in subprocess mode (the build graph cannot be loaded then either, so
+/// there is no compile set).
 pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []const u8, mode: Mode) !*Result {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -345,7 +359,8 @@ pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []
     watchdog.start(io, child.id.?, .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } });
     defer watchdog.stop();
 
-    // ast-check 先读完全部输入再输出，因此先写后读不会死锁
+    // ast-check reads all of its input before writing any output, so writing first and reading
+    // afterwards cannot deadlock
     {
         var buf: [4096]u8 = undefined;
         var w = child.stdin.?.writerStreaming(io, &buf);
@@ -361,7 +376,7 @@ pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []
     return parseAstCheckOutput(gpa, text, output);
 }
 
-/// 解析 `zig ast-check --color off` 的输出：
+/// Parses the output of `zig ast-check --color off`:
 ///
 /// ```
 /// <stdin>:2:9: error: unused local variable
@@ -370,7 +385,9 @@ pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []
 /// <stdin>:3:7: note: ...
 /// ```
 ///
-/// 标记行开头的空格数为区间起点的字节列，`^` 与 `~` 的个数为区间的字节长度（多行区间截断到首行行尾）。
+/// The number of leading spaces on the marker line is the byte column of the range start, and the
+/// number of `^` and `~` is the byte length of the range (a multi-line range is truncated at the
+/// end of its first line).
 pub fn parseAstCheckOutput(gpa: Allocator, text: []const u8, output: []const u8) Allocator.Error!*Result {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
@@ -388,7 +405,7 @@ pub fn parseAstCheckOutput(gpa: Allocator, text: []const u8, output: []const u8)
         const line_start = lineStartOffset(text, header.line);
         var start: u32 = @intCast(@min(text.len, line_start + header.column));
         var end = start;
-        // 紧随的「源码行 + 标记行」
+        // The "source line + marker line" pair that follows
         if (i + 2 < lines.items.len and parseHeader(lines.items[i + 1]) == null and isCaretLine(lines.items[i + 2])) {
             const caret = lines.items[i + 2];
             const first = std.mem.indexOfNone(u8, caret, " ").?;
@@ -416,7 +433,7 @@ pub fn parseAstCheckOutput(gpa: Allocator, text: []const u8, output: []const u8)
 
 const Header = struct { line: u32, column: u32, kind: enum { @"error", note }, message: []const u8 };
 
-/// `<stdin>:行:列: error|note: 文案`（行列从 1 开始）
+/// `<stdin>:line:column: error|note: message` (lines and columns start at 1)
 fn parseHeader(line: []const u8) ?Header {
     const prefix = "<stdin>:";
     if (!std.mem.startsWith(u8, line, prefix)) return null;
@@ -497,7 +514,7 @@ test "subprocess backend matches in-process (skipped when zig is not in PATH)" {
         .{ .text = "const a = 1;\nconst a = 2;\n", .mode = .zig },
         .{ .text = "const = ;\n", .mode = .zig },
         .{ .text = "pub fn main() void {}\n", .mode = .zig },
-        .{ .text = "fn f() void {\n    const s = \"中文\"; var x = s;\n}\n", .mode = .zig },
+        .{ .text = "fn f() void {\n    const s = \"€€\"; var x = s;\n}\n", .mode = .zig },
         .{ .text = ".{ .a = 1, .a = 2 }\n", .mode = .zon },
     };
     for (samples) |sample| {
@@ -521,7 +538,7 @@ fn expectMessages(text: []const u8, mode: Mode, expected: []const []const u8) !v
     for (expected, r.items) |e, d| try testing.expectEqualStrings(e, d.message);
 }
 
-// 预期值取自 `zig ast-check` 的实际输出
+// Expected values are taken from the actual output of `zig ast-check`
 test "errors match zig ast-check" {
     try expectMessages("fn f() void { var x = 1; }", .zig, &.{"unused local variable"});
     try expectMessages("const a = ;", .zig, &.{"expected expression, found ';'"});
@@ -538,8 +555,9 @@ test "deeply nested text: AstGen on a large stack, imports only beyond the limit
     const gpa = testing.allocator;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(gpa);
-    // 10000 项的加法链（`zig ast-check` 能检查）：官方 AstGen 在普通线程上耗尽栈（进程崩溃），在大栈线程上
-    // 照常得到诊断
+    // An addition chain of 10000 terms (which `zig ast-check` can check): the official AstGen
+    // exhausts the stack on a normal thread (crashing the process), but on a large-stack thread it
+    // produces diagnostics as usual
     try src.appendSlice(gpa, "const std = @import(\"std\");\nfn f() void {\n    var unused = 1;\n}\nconst x = ");
     for (0..10000) |_| try src.appendSlice(gpa, "1 + ");
     try src.appendSlice(gpa, "1;\n");
@@ -550,7 +568,7 @@ test "deeply nested text: AstGen on a large stack, imports only beyond the limit
         try testing.expectEqualStrings("unused local variable", r.items[0].message);
         try testing.expectEqual(1, r.imports.len);
     }
-    // 超过上限：不做 AstGen，没有诊断，import 按 token 收集
+    // Beyond the limit: no AstGen, no diagnostics, imports collected from tokens
     src.clearRetainingCapacity();
     try src.appendSlice(gpa, "const std = @import(\"std\");\nconst x = ");
     for (0..nesting.thread_depth) |_| try src.append(gpa, '(');
@@ -569,17 +587,17 @@ test "deeply nested text: AstGen on a large stack, imports only beyond the limit
 
 test "ZIR import list matches the compiler" {
     const a = testing.allocator;
-    // 函数体内的 import 也会被收录
+    // Imports inside function bodies are included too
     const ok = try check(a, "const x = @import(\"x.zig\");\nfn f() void { _ = @import(\"y.zig\"); }\n", .zig);
     defer ok.destroy(a);
     try testing.expectEqual(2, ok.imports.len);
     try testing.expectEqualStrings("x.zig", ok.imports[0]);
     try testing.expectEqualStrings("y.zig", ok.imports[1]);
-    // 非致命 AstGen 错误：仍有 import
+    // Non-fatal AstGen error: imports are still present
     const nonfatal = try check(a, "fn f() void { var u = 1; }\nconst d = @import(\"d.zig\");\n", .zig);
     defer nonfatal.destroy(a);
     try testing.expectEqual(1, nonfatal.imports.len);
-    // 根结构的致命错误与解析错误：不生成 ZIR，没有 import
+    // Fatal errors in the root struct and parse errors: no ZIR is generated, so no imports
     const fatal = try check(a, "const a = 1;\nconst a = 2;\nconst d = @import(\"d.zig\");\n", .zig);
     defer fatal.destroy(a);
     try testing.expectEqual(0, fatal.imports.len);
@@ -605,7 +623,7 @@ test "prepared results: matched by text, mode and backend, taken once, oldest ev
     var p: Prepared = .{ .gpa = gpa };
     defer p.deinit();
     try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, .in_process, try check(gpa, "const a = ;", .zig));
-    // 同样的文本不同的模式或执行方式不命中
+    // The same text with a different mode or backend does not match
     try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon, .in_process));
     try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .{ .subprocess = "zig" }));
     const r = p.take(io, "const a = ;", .zig, .in_process).?;
@@ -621,7 +639,8 @@ test "prepared results: matched by text, mode and backend, taken once, oldest ev
     try std.testing.expectEqual(Prepared.capacity, p.entries.items.len);
     try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig, .in_process));
 
-    // 放入之后同一文件的同一文本不再准备，其他文本、其他执行方式仍需准备
+    // After a put, the same text of the same file is not prepared again; other texts and other
+    // backends still need preparation
     try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .in_process)));
     try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig, .in_process)));
     try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .{ .subprocess = "zig" })));

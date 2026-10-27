@@ -1,7 +1,10 @@
-//! 生成测试运行器：Zig 自带的运行器只在 Debug 下为测试分配器记录分配处的调用栈，ReleaseSafe 下
-//! 泄漏报告没有调用栈（CI 上偶发的泄漏因此无从定位）。这里给它的分配器选项加上调用栈帧数。
+//! Generates the test runner: the runner bundled with Zig records allocation stack traces for the
+//! testing allocator only in Debug, so under ReleaseSafe leak reports have no stack trace (which
+//! makes occasional leaks on CI impossible to track down). This adds a stack trace frame count to
+//! its allocator options.
 //!
-//! 用法：patch_test_runner <输入 test_runner.zig> <输出>；找不到要修改的选项时原样输出
+//! Usage: patch_test_runner <input test_runner.zig> <output>; when the option to modify is not
+//! found, the input is written out unchanged
 
 const std = @import("std");
 

@@ -1,9 +1,12 @@
-//! 定位 zig 可执行文件并读取 `zig env`：标准库路径、全局缓存目录与版本。lib 目录与全局缓存目录可以由配置覆盖
-//! （`withOverrides`）。
+//! Locates the zig executable and reads `zig env`: the standard library path, the global cache
+//! directory, and the version. The lib directory and the global cache directory can be
+//! overridden by the configuration (`withOverrides`).
 //!
-//! 版本检查决定两件事：
-//! - 进程内 AstGen 只有在用户 zig 与 zig-analyzer 编译时的标准库版本完全相同时才与编译器一致；
-//! - 构建系统协议的 `Configuration` 二进制格式由标准库定义，版本不同时不能加载。
+//! The version check decides two things:
+//! - In-process AstGen matches the compiler only when the user's zig is exactly the same version
+//!   as the standard library zig-analyzer was compiled with;
+//! - The binary format of the build system protocol's `Configuration` is defined by the standard
+//!   library and cannot be loaded when the versions differ.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,8 +22,10 @@ lib_dir: []const u8,
 std_dir: []const u8,
 global_cache_dir: []const u8,
 version: []const u8,
-/// 运行 zig（`zig build`、`zig build-obj` 等）的子进程的环境变量；null 时继承当前进程的。lib 目录或全局缓存目录
-/// 被覆盖时经 `ZIG_LIB_DIR`、`ZIG_GLOBAL_CACHE_DIR` 告诉 zig：`zig build` 没有指定全局缓存目录的参数
+/// Environment variables of the child processes running zig (`zig build`, `zig build-obj` and so
+/// on); when null, they inherit those of the current process. When the lib directory or the global
+/// cache directory is overridden, zig is told through `ZIG_LIB_DIR` and `ZIG_GLOBAL_CACHE_DIR`:
+/// `zig build` has no argument for specifying the global cache directory.
 environ_map: ?Environ.Map = null,
 
 pub fn deinit(env: *ZigEnv, gpa: Allocator) void {
@@ -30,28 +35,30 @@ pub fn deinit(env: *ZigEnv, gpa: Allocator) void {
     env.* = undefined;
 }
 
-/// 运行 zig 时传给 `std.process.spawn` / `run` 的 `environ_map`
+/// The `environ_map` passed to `std.process.spawn` / `run` when running zig
 pub fn childEnviron(env: *const ZigEnv) ?*const Environ.Map {
     return if (env.environ_map) |*m| m else null;
 }
 
-/// 用户 zig 与 zig-analyzer 编译时所用 zig 的版本完全相同（含预发布与构建号）
+/// The user's zig is exactly the same version as the zig that zig-analyzer was compiled with
+/// (including pre-release and build number)
 pub fn matchesBuiltin(env: *const ZigEnv) bool {
     return std.mem.eql(u8, env.version, builtin.zig_version_string);
 }
 
 pub const QueryError = error{ ZigNotFound, ZigEnvFailed } || Allocator.Error || Io.Cancelable;
 
-/// 运行 `<zig_exe> env` 并解析结果。`zig_exe` 为 null 时从 PATH 查找 `zig`。
+/// Runs `<zig_exe> env` and parses the result. When `zig_exe` is null, looks up `zig` in PATH.
 pub fn query(gpa: Allocator, io: Io, zig_exe: ?[]const u8) QueryError!ZigEnv {
-    // `zig build test` 只运行不依赖外部工具的测试：找不到 zig，依赖它的测试跳过，服务器不启动项目与编译
+    // `zig build test` runs only the tests that do not depend on external tools: zig is not found,
+    // tests that depend on it are skipped, and the server starts no projects or compilations
     if (builtin.is_test and !@import("build_options").zig_tests) return error.ZigNotFound;
     const exe = zig_exe orelse "zig";
     const result = std.process.run(gpa, io, .{
         .argv = &.{ exe, "env" },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
-        // 包装脚本（asdf、mise）或网络文件系统上的 zig 可能永久挂起
+        // zig behind a wrapper script (asdf, mise) or on a network file system may hang forever
         .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } },
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -73,12 +80,14 @@ pub fn query(gpa: Allocator, io: Io, zig_exe: ?[]const u8) QueryError!ZigEnv {
     };
 }
 
-/// 解析 `zig env` 的输出。`zig env` 原样输出 ZIG_GLOBAL_CACHE_DIR 等环境变量，可能是相对路径：
-/// 按当前目录 `cwd` 转为绝对路径
+/// Parses the output of `zig env`. `zig env` prints environment variables such as
+/// ZIG_GLOBAL_CACHE_DIR verbatim, so they may be relative paths: they are made absolute against
+/// the current directory `cwd`
 fn fromOutput(gpa: Allocator, text: []const u8, cwd: []const u8) error{ OutOfMemory, ParseZon }!ZigEnv {
     var env = try parse(gpa, text);
     errdefer env.deinit(gpa);
-    // arena 的状态须在 `return env` 复制返回值之前写回：defer 在复制之后才执行
+    // The arena state must be written back before `return env` copies the return value: a defer
+    // runs only after the copy
     {
         var arena = env.arena.promote(gpa);
         defer env.arena = arena.state;
@@ -104,15 +113,17 @@ test absolute {
     try std.testing.expectEqualStrings(cwd, try absolute(a, "/elsewhere", cwd));
 }
 
-/// 用户配置的路径，优先于 `zig env` 给出的值；相对路径按当前目录解析
+/// Paths configured by the user, taking precedence over the values reported by `zig env`;
+/// relative paths are resolved against the current directory
 pub const Overrides = struct {
-    /// lib 目录：其下须有 `std/std.zig`
+    /// The lib directory: must contain `std/std.zig`
     lib_dir: ?[]const u8 = null,
-    /// 全局缓存目录：须是已存在的目录
+    /// The global cache directory: must be an existing directory
     global_cache_dir: ?[]const u8 = null,
 };
 
-/// `withOverrides` 没有采用的覆盖：路径不存在或不符合要求
+/// Overrides not applied by `withOverrides`: the path does not exist or does not meet the
+/// requirements
 pub const Rejected = struct {
     lib_dir: bool = false,
     global_cache_dir: bool = false,
@@ -120,8 +131,11 @@ pub const Rejected = struct {
 
 pub const OverrideError = Allocator.Error || Io.Cancelable || Environ.CreateMapError;
 
-/// 以 `overrides` 覆盖 `base`（`zig env` 的结果）中的路径，返回新的环境（不引用 `base` 的内存）。不能采用的覆盖记入
-/// `rejected`，保留 `base` 的值。有采用的覆盖时，运行 zig 的子进程的环境变量为当前进程的 `environ` 加上覆盖的路径
+/// Overrides the paths in `base` (the result of `zig env`) with `overrides` and returns a new
+/// environment (not referencing the memory of `base`). Overrides that cannot be applied are
+/// recorded in `rejected`, keeping the values of `base`. When any override is applied, the
+/// environment variables of the child processes running zig are the current process's `environ`
+/// plus the overriding paths.
 pub fn withOverrides(
     base: *const ZigEnv,
     gpa: Allocator,
@@ -171,14 +185,16 @@ pub fn withOverrides(
     return env;
 }
 
-/// 两个环境给出的路径（zig 可执行文件、lib 目录、标准库目录、全局缓存目录）相同
+/// Whether the two environments give the same paths (zig executable, lib directory, standard
+/// library directory, global cache directory)
 pub fn samePaths(a: *const ZigEnv, b: *const ZigEnv) bool {
     return std.mem.eql(u8, a.zig_exe, b.zig_exe) and std.mem.eql(u8, a.lib_dir, b.lib_dir) and
         std.mem.eql(u8, a.std_dir, b.std_dir) and std.mem.eql(u8, a.global_cache_dir, b.global_cache_dir);
 }
 
-/// 配置中的文件路径（如 `zig.builtin_path`）转为规范化的绝对路径（调用方释放），相对路径按当前目录解析。
-/// 不存在或（跟随符号链接后）不是文件时为 null
+/// Converts a file path from the configuration (such as `zig.builtin_path`) to a normalized
+/// absolute path (freed by the caller), resolving relative paths against the current directory.
+/// Null when it does not exist or (after following symbolic links) is not a file.
 pub fn resolveFile(gpa: Allocator, io: Io, path: []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
     const resolved = try resolveOverride(gpa, io, path) orelse return null;
     if (try isKind(io, resolved, .file)) return resolved;
@@ -186,7 +202,8 @@ pub fn resolveFile(gpa: Allocator, io: Io, path: []const u8) (Allocator.Error ||
     return null;
 }
 
-/// 配置的路径转为规范化的绝对路径（相对路径按当前目录）；取不到当前目录时为 null
+/// Converts a configured path to a normalized absolute path (relative paths against the current
+/// directory); null when the current directory cannot be obtained
 fn resolveOverride(a: Allocator, io: Io, path: []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
     if (std.fs.path.isAbsolute(path)) return try std.fs.path.resolveAlloc(a, &.{path});
     const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", a) catch |err| switch (err) {
@@ -198,7 +215,7 @@ fn resolveOverride(a: Allocator, io: Io, path: []const u8) (Allocator.Error || I
     return try std.fs.path.resolveAlloc(a, &.{ cwd, path });
 }
 
-/// `path` 存在且（跟随符号链接后）是 `kind` 类型的文件
+/// Whether `path` exists and (after following symbolic links) is a file of kind `kind`
 fn isKind(io: Io, path: []const u8, kind: Io.File.Kind) Io.Cancelable!bool {
     const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -230,14 +247,17 @@ test withOverrides {
     defer base.deinit(gpa);
     var rejected: Rejected = .{};
 
-    // 没有覆盖：与 `zig env` 的结果相同，子进程继承当前进程的环境变量
+    // No overrides: the same as the result of `zig env`; child processes inherit the environment
+    // variables of the current process
     var same = try base.withOverrides(gpa, io, .empty, .{}, &rejected);
     defer same.deinit(gpa);
     try std.testing.expectEqualStrings(base.std_dir, same.std_dir);
     try std.testing.expectEqualStrings(base.global_cache_dir, same.global_cache_dir);
     try std.testing.expect(same.childEnviron() == null and !rejected.lib_dir and !rejected.global_cache_dir);
 
-    // 有效的覆盖：替换路径并经环境变量告诉 zig。相对路径按当前目录解析，末尾的分隔符被去掉
+    // Valid overrides: the paths are replaced, and zig is told through environment variables.
+    // Relative paths are resolved against the current directory, and trailing separators are
+    // removed.
     const relative = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "lib" ++ std.fs.path.sep_str });
     var both = try base.withOverrides(gpa, io, .empty, .{ .lib_dir = relative, .global_cache_dir = cache }, &rejected);
     defer both.deinit(gpa);
@@ -250,7 +270,8 @@ test withOverrides {
     try std.testing.expectEqualStrings(lib, both.childEnviron().?.get("ZIG_LIB_DIR").?);
     try std.testing.expectEqualStrings(cache, both.childEnviron().?.get("ZIG_GLOBAL_CACHE_DIR").?);
 
-    // 不存在的路径、没有标准库的目录、不是目录的缓存：不采用，保留 `zig env` 的值
+    // A nonexistent path, a directory without the standard library, a cache that is not a
+    // directory: not applied, keeping the values of `zig env`
     var invalid = try base.withOverrides(gpa, io, .empty, .{ .lib_dir = cache, .global_cache_dir = missing }, &rejected);
     defer invalid.deinit(gpa);
     try std.testing.expect(rejected.lib_dir and rejected.global_cache_dir);
@@ -259,7 +280,7 @@ test withOverrides {
     try std.testing.expectEqualStrings(base.global_cache_dir, invalid.global_cache_dir);
     try std.testing.expect(invalid.childEnviron() == null);
 
-    // 只采用有效的一项
+    // Only the valid one is applied
     var partial = try base.withOverrides(gpa, io, .empty, .{ .lib_dir = lib, .global_cache_dir = std_file }, &rejected);
     defer partial.deinit(gpa);
     try std.testing.expect(!rejected.lib_dir and rejected.global_cache_dir);
@@ -269,7 +290,7 @@ test withOverrides {
     try std.testing.expect(partial.childEnviron().?.get("ZIG_GLOBAL_CACHE_DIR") == null);
 }
 
-/// 解析 `zig env` 的 ZON 输出
+/// Parses the ZON output of `zig env`
 pub fn parse(gpa: Allocator, text: []const u8) error{ OutOfMemory, ParseZon }!ZigEnv {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -320,10 +341,13 @@ test parse {
 }
 
 test fromOutput {
-    // 防止返回的环境带着转换路径之前的 arena 状态：分配器不能原地扩大时，绝对路径所在的内存块在释放时泄漏
+    // Prevents the returned env from carrying the arena state from before the paths were
+    // converted: when the allocator cannot grow in place, the chunk holding the absolute paths
+    // leaks when freed
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
     const gpa = failing.allocator();
-    // 足够长的当前目录使绝对路径放不进 arena 已有的内存块
+    // A current directory long enough that the absolute paths do not fit in the arena's
+    // existing chunk
     const root = if (builtin.os.tag == .windows) "C:\\" else "/";
     const cwd = try std.testing.allocator.alloc(u8, root.len + 8192);
     defer std.testing.allocator.free(cwd);
@@ -344,6 +368,6 @@ test "query local zig (skipped when zig is not in PATH)" {
     };
     defer env.deinit(std.testing.allocator);
     try std.testing.expect(env.std_dir.len > 0);
-    // 本仓库的 CI 与开发环境都使用与编译时相同的 zig
+    // This repository's CI and development environments both run the same zig as at compile time
     try std.testing.expect(env.matchesBuiltin());
 }

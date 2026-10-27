@@ -1,9 +1,10 @@
-//! 路径与 URI 的性质测试，两种驱动方式共用同一组性质：
+//! Property tests for paths and URIs; two drivers share the same set of properties:
 //!
-//! - 固定种子的伪随机循环：每次 `zig build test` 都在所有平台上运行；
-//! - `std.testing.fuzz`：`zig build test --fuzz=<次数>` 时由覆盖率引导的模糊测试驱动。
+//! - A pseudo-random loop with a fixed seed: runs on every platform in every `zig build test`;
+//! - `std.testing.fuzz`: driven by coverage-guided fuzzing with `zig build test --fuzz=<count>`.
 //!
-//! 两种路径风格在任何平台上都会测试，Windows 规则不必等到 Windows 机器上才暴露问题。
+//! Both path styles are tested on every platform, so problems with the Windows rules do not
+//! have to wait for a Windows machine to surface.
 
 const std = @import("std");
 const testing = std.testing;
@@ -12,18 +13,19 @@ const Style = uri.Style;
 const Vfs = @import("Vfs.zig");
 const Entropy = @import("../util/Entropy.zig");
 
-/// 文件名中的字符：普通字符、URI 需要编码的特殊字符、多字节 UTF-8
+/// Characters in file names: ordinary characters, special characters that URIs must encode,
+/// and multi-byte UTF-8
 const name_pieces = [_][]const u8{
     "a", "Z",   "0",   "_",    "-", ".", " ", "%", "#", "?", "+", "&", "=", "@", "!", "~", ",",
     ";", "'",   "(",   ")",    "[", "]", "{", "}", "$",
-    "中",
+    "€",
     "é",
     "😀",
     ":", "%20", "%3A", "file",
 };
 
 fn genComponent(e: *Entropy, out: *std.ArrayList(u8), comptime style: Style) !void {
-    // 偶尔生成 `.`、`..`、空组件，交给规范化处理
+    // Occasionally generate `.`, `..`, and empty components, left for normalization to handle
     switch (e.below(10)) {
         0 => return out.appendSlice(testing.allocator, "."),
         1 => return out.appendSlice(testing.allocator, ".."),
@@ -33,19 +35,20 @@ fn genComponent(e: *Entropy, out: *std.ArrayList(u8), comptime style: Style) !vo
     const n = 1 + e.below(6);
     for (0..n) |_| {
         const piece = e.pick([]const u8, &name_pieces);
-        // Windows 的 `:` 只出现在盘符中（NTFS 备用数据流不在考虑范围内）
+        // On Windows, `:` appears only in drive letters (NTFS alternate data streams are
+        // out of scope)
         if (style == .windows and std.mem.eql(u8, piece, ":")) continue;
         try out.appendSlice(testing.allocator, piece);
     }
 }
 
-/// 生成一个（未必规范的）绝对路径
+/// Generates an absolute path (not necessarily normalized)
 fn genPath(e: *Entropy, out: *std.ArrayList(u8), comptime style: Style) !void {
     const a = testing.allocator;
     switch (style) {
         .posix => try out.append(a, '/'),
         .windows => if (e.below(4) == 0) {
-            // UNC：\\server\share\
+            // UNC: \\server\share\
             try out.appendSlice(a, if (e.below(2) == 0) "\\\\" else "//");
             try out.appendSlice(a, e.pick([]const u8, &.{ "server", "srv-1", "host.local" }));
             try out.append(a, '\\');
@@ -62,14 +65,15 @@ fn genPath(e: *Entropy, out: *std.ArrayList(u8), comptime style: Style) !void {
         if (i != 0) {
             const sep: u8 = if (style == .windows and e.below(2) == 0) '/' else std.fs.path.sep_posix;
             try out.append(a, if (style == .windows and sep == '/') '/' else if (style == .windows) '\\' else '/');
-            if (e.below(8) == 0) try out.append(a, if (style == .windows) '\\' else '/'); // 重复分隔符
+            if (e.below(8) == 0) try out.append(a, if (style == .windows) '\\' else '/'); // duplicate separator
         }
         try genComponent(e, out, style);
     }
-    if (e.below(6) == 0) try out.append(a, if (style == .windows) '\\' else '/'); // 末尾分隔符
+    if (e.below(6) == 0) try out.append(a, if (style == .windows) '\\' else '/'); // trailing separator
 }
 
-/// 性质：规范化幂等；URI 往返；生成的 URI 只含合法字符
+/// Properties: normalization is idempotent; URIs round-trip; generated URIs contain
+/// only valid characters
 fn checkPathProperties(comptime style: Style, e: *Entropy) !void {
     const a = testing.allocator;
     var raw: std.ArrayList(u8) = .empty;
@@ -108,7 +112,8 @@ fn expectEqualPaths(expected: []const u8, actual: []const u8, raw: []const u8) !
     return error.TestUnexpectedResult;
 }
 
-/// 性质：任意输入作为 URI 解析都不会崩溃；成功时结果不含 NUL，且再转换一次保持稳定
+/// Property: parsing any input as a URI never crashes; on success the result contains no NUL,
+/// and converting it again is stable
 fn checkArbitraryUri(comptime style: Style, input: []const u8) !void {
     const a = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
@@ -133,8 +138,10 @@ fn checkArbitraryUri(comptime style: Style, input: []const u8) !void {
     try expectEqualPaths(path, path2, buf.items);
 }
 
-/// 性质：大小写不敏感模式下，只差 ASCII 大小写的路径是同一个文件，对外保留第一次的写法；
-/// 敏感模式下，当且仅当规范化后完全相同才是同一个文件
+/// Properties: in case-insensitive mode, paths that differ only in ASCII case are the same file,
+/// and the spelling seen first is kept externally;
+/// in case-sensitive mode, paths are the same file if and only if they are identical after
+/// normalization
 fn checkCaseProperties(comptime style: Style, e: *Entropy) !void {
     const a = testing.allocator;
     var raw: std.ArrayList(u8) = .empty;

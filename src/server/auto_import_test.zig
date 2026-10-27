@@ -1,4 +1,5 @@
-//! 自动导入补全的协议编辑须能直接应用，并在协商的位置编码下解析到目标声明。
+//! The protocol edits of auto-import completions must apply directly and resolve to the target
+//! declaration under the negotiated position encoding.
 
 const std = @import("std");
 const testing = std.testing;
@@ -10,7 +11,7 @@ const types = za.lsp.types;
 const Empty = struct {};
 
 const source =
-    \\// 许可说明
+    \\// License notice
     \\//! 😀
     \\pub fn main() void {
     \\    const @"😀" = 0; _ = @"😀"; const value: Widgxx = .{ .size = 1 };
@@ -26,7 +27,9 @@ fn position(text: []const u8, needle: []const u8, delta: u32, encoding: offsets.
     return lines.position(at + delta, encoding);
 }
 
-/// 第一次在可以自动导入的名字处补全时开始为自动导入建索引：这时还没有自动导入，结果标记为不完整。等索引建完
+/// The first completion at a name that can be auto-imported starts building the auto-import index:
+/// there are no auto-imports yet, so the result is marked incomplete. Then waits until the index is
+/// built.
 fn startAutoImport(h: *Harness, uri: []const u8, at: types.Position) !void {
     const first = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
     try testing.expect(first.object.get("result").?.object.get("isIncomplete").?.bool);
@@ -46,7 +49,7 @@ fn importedWidget(response: std.json.Value) ?std.json.Value {
     return null;
 }
 
-/// `zig-analyzer/status` 中各自动导入 query 的 key 总数
+/// Total number of keys of the auto-import queries in `zig-analyzer/status`
 fn importQueryKeys(response: std.json.Value) i64 {
     var keys: i64 = 0;
     for (response.object.get("result").?.object.get("queries").?.array.items) |q| {
@@ -114,7 +117,7 @@ test "auto-import edits replace the whole identifier and resolve after applicati
         try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
         _ = try h.request("zig-analyzer/waitIdle", {});
         const params = .{ .textDocument = .{ .uri = uri }, .position = try position(source, "Widgxx", 4, encoding) };
-        // 补全之前不建自动导入的索引
+        // The auto-import index is not built before completion
         try testing.expect(importedWidget(try h.request("textDocument/completion", params)) == null);
         _ = try h.request("zig-analyzer/waitIdle", {});
         const response = try h.request("textDocument/completion", params);
@@ -122,7 +125,7 @@ test "auto-import edits replace the whole identifier and resolve after applicati
         const edited = try applyCompletion(a, source, item, encoding);
         try testing.expect(std.mem.indexOf(u8, edited, "Widgxx") == null);
         try testing.expect(std.mem.indexOf(u8, edited, "const value: Widget =") != null);
-        try testing.expect(std.mem.startsWith(u8, edited, "// 许可说明\n//! 😀\nconst Widget = @import(\"lib\").Widget;"));
+        try testing.expect(std.mem.startsWith(u8, edited, "// License notice\n//! 😀\nconst Widget = @import(\"lib\").Widget;"));
         try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text = edited }} });
         _ = try h.request("zig-analyzer/waitIdle", {});
         const target = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = try position(edited, ".size", 2, encoding) });
@@ -152,7 +155,8 @@ test "auto-import edits replace the whole identifier and resolve after applicati
 }
 
 test "auto-import indexing restarts when an earlier pass did not finish" {
-    // 一轮索引没有建完（出错、任务没能启动）之后，补全请求重新开始建索引，不会一直不提供自动导入
+    // After an indexing pass fails to finish (an error, or the task could not start), a completion
+    // request starts indexing again, so auto-imports are not withheld forever
     const files = [_]fixture.File{
         .{ .path = "build.zig", .text = fixture.basic[0].text },
         .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
@@ -294,13 +298,15 @@ test "auto-import items resolve to the signature, docs and where the target is d
     const resolved = (try h.request("completionItem/resolve", item)).object.get("result").?;
     try testing.expectEqualStrings("const Widget = struct", resolved.object.get("detail").?.string);
     try testing.expectEqualStrings("A widget.\n\nDefined in `lib/lib.zig:2`", resolved.object.get("documentation").?.object.get("value").?.string);
-    // 原有的编辑保持不变
+    // The existing edits stay unchanged
     try testing.expect(resolved.object.get("additionalTextEdits") != null);
     _ = try h.request("shutdown", {});
 }
 
 test "completion does not run auto-import indexing inside its read transaction" {
-    // 不能另起任务时任务就地执行：补全持有读事务，索引在其中就地执行时，编辑的写事务与之互相等待
+    // A task that cannot be spawned runs in place: completion holds a read transaction, and if
+    // indexing ran in place inside it, an edit's write transaction and the indexing would wait for
+    // each other
     const prev_level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = prev_level;
@@ -315,7 +321,8 @@ test "completion does not run auto-import indexing inside its read transaction" 
     const text = "pub fn main() void {\n    _ = st;\n}\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // 服务器空闲时修改：补全请求与它要启动的任务都不能另起，只能就地执行
+    // Changed while the server is idle: neither the completion request nor the task it starts can
+    // be spawned, so both can only run in place
     threaded.concurrent_limit = .nothing;
     errdefer threaded.concurrent_limit = .unlimited;
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(text, "st;", 2, .utf16) });
@@ -325,7 +332,8 @@ test "completion does not run auto-import indexing inside its read transaction" 
         h.server.busy_mutex.lockUncancelable(testing.io);
         defer h.server.busy_mutex.unlock(testing.io);
         const n = h.server.busy;
-        // 计数泄漏时 deinit 中的 waitIdle 永远等待：先归零，让失败的测试正常结束
+        // If the count leaks, waitIdle in deinit waits forever: reset it to zero first so the
+        // failing test ends normally
         h.server.busy = 0;
         break :blk n;
     };
@@ -371,7 +379,7 @@ test "auto-import module and file candidates resolve through completionItem/reso
     const resolved = (try h.request("completionItem/resolve", item)).object.get("result").?;
     try testing.expectEqualStrings("@import(\"Util.zig\")", resolved.object.get("detail").?.string);
     try testing.expectEqualStrings("Utilities.\n\nFile `Util.zig`", resolved.object.get("documentation").?.object.get("value").?.string);
-    // 不是本服务器给出的 data：原样返回，不报错
+    // `data` not produced by this server: returned as is, without an error
     var data: std.json.ObjectMap = .empty;
     try data.put(a, "from", .{ .integer = 999999 });
     const malformed = types.CompletionItem{ .label = "Util", .data = .{ .object = data } };
@@ -593,7 +601,8 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, "_ = Alph", 8, .utf16);
     const params = .{ .textDocument = .{ .uri = uri }, .position = at };
-    // 默认开启：第一次在可以导入的名字处补全时开始建索引，建完后提供
+    // On by default: the index starts building on the first completion at a name that can be
+    // imported, and candidates are offered once it is built
     try startAutoImport(&h, uri, at);
     const default = try h.request("textDocument/completion", params);
     for ([_][]const u8{ "Alpha1", "Alpha2", "Alpha3" }) |name| {
@@ -602,7 +611,7 @@ test "auto-import is on by default, can be turned off, and its limit is configur
         } else return error.MissingCandidate;
     }
 
-    // 关闭：不提供，也不要求客户端重新请求
+    // Off: nothing is offered, and the client is not asked to request again
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
         .completion = .{ .auto_import = false },
         .diagnostics = .{ .compiler = false, .inactive_code = false },
@@ -613,7 +622,7 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     try testing.expectEqual(0, importCount(off));
     try testing.expect(!isIncomplete(off));
 
-    // 重新开启时沿用已建的索引
+    // Turning it back on reuses the index already built
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
         .completion = .{ .auto_import = true, .max_auto_imports = 1 },
         .diagnostics = .{ .compiler = false, .inactive_code = false },
@@ -624,7 +633,7 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     try testing.expectEqual(1, importCount(limited));
     try testing.expect(isIncomplete(limited));
 
-    // 0 为不限
+    // 0 means no limit
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
         .completion = .{ .auto_import = true, .max_auto_imports = 0 },
         .diagnostics = .{ .compiler = false, .inactive_code = false },
@@ -632,7 +641,7 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const unlimited = try h.request("textDocument/completion", params);
-    // lib.zig 的三个，以及标准库中匹配 `Alph` 的公开声明
+    // The three in lib.zig, plus public declarations in the standard library that match `Alph`
     try testing.expect(importCount(unlimited) >= 3);
     for ([_][]const u8{ "Alpha1", "Alpha2", "Alpha3" }) |name| {
         for (completionItems(unlimited)) |item| {

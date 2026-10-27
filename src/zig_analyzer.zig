@@ -1,7 +1,7 @@
 pub const version = "0.0.0-dev";
 
 pub const db = @import("db/engine.zig");
-/// 查询统计的文本报告
+/// Text report of query statistics
 pub const db_report = @import("db/report.zig");
 pub const Server = @import("server/Server.zig");
 pub const base = struct {
@@ -48,7 +48,7 @@ pub const project = struct {
     pub const builtin = @import("project/builtin.zig");
     pub const configuration = @import("project/configuration.zig");
     pub const exports = @import("project/exports.zig");
-    /// 仅供测试：在临时目录中创建示例项目
+    /// Test-only: creates example projects in a temporary directory
     pub const fixture = @import("project/fixture.zig");
 };
 pub const diagnostics = struct {
@@ -91,7 +91,7 @@ pub const util = struct {
     pub const SharedAllocator = @import("util/SharedAllocator.zig");
     pub const panic_context = @import("util/panic_context.zig");
     pub const assert = @import("util/assert.zig");
-    /// 仅供测试：posix 写法的路径转为本机路径
+    /// Test-only: converts posix-style paths to native paths
     pub const test_path = @import("util/test_path.zig");
 };
 pub const lsp = struct {

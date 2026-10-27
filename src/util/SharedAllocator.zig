@@ -1,11 +1,17 @@
-//! 跨线程共享空闲链表的通用分配器，基于 `std.heap.SmpAllocator` 的大小档设计。
+//! General-purpose allocator whose free lists are shared across threads, based on the size-class
+//! design of `std.heap.SmpAllocator`.
 //!
-//! `SmpAllocator` 按线程槽位各有一套空闲链表，释放的块挂到释放线程所在槽位的链表上，只有在同一槽位上分配
-//! 同一大小档时才复用。服务器的缓存值在工作线程上分配、在清扫与写事务所在的线程上释放，释放的块积压在
-//! 少数槽位中，分配方取不到，只能映射新的块；小块所在的内存不归还系统，常驻内存随会话持续增长。
+//! `SmpAllocator` keeps a set of free lists per thread slot: a freed block goes onto the list of
+//! the freeing thread's slot and is reused only by allocations of the same size class on the same
+//! slot. The server's cached values are allocated on worker threads and freed on the threads that
+//! run sweeps and write transactions, so freed blocks pile up in a few slots out of reach of the
+//! allocating threads, which have to map new blocks; the memory holding small blocks is not
+//! returned to the system, so resident memory keeps growing over a session.
 //!
-//! 这里各大小档只有一条空闲链表，由一把锁保护，任何线程释放的块都能被任何线程复用。锁拿不到时休眠（futex），
-//! 不空转。大于 `slab_len` 的分配直接映射，释放时归还系统。
+//! Here each size class has a single free list protected by one lock, so a block freed by any
+//! thread can be reused by any thread. A thread that cannot get the lock sleeps (futex) instead of
+//! spinning. Allocations larger than `slab_len` are mapped directly, and returned to the system
+//! when they are freed.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -17,14 +23,15 @@ const Mutex = std.Io.Mutex;
 const Threaded = std.Io.Threaded;
 
 const slab_len: usize = @max(std.heap.page_size_max, 64 * 1024);
-/// 空闲链表的指针存放在块中，最小的档是一个指针大小
+/// The free-list pointer is stored in the block, so the smallest class is one pointer in size
 const min_class = math.log2(@sizeOf(usize));
 const size_class_count = math.log2(slab_len) - min_class;
 
 var mutex: Mutex = .init;
-/// 各档下一次从当前 slab 切出的地址；落在 slab 边界上时映射新的 slab
+/// Per class, the address of the next slot to carve from the current slab; a new slab is mapped
+/// when it falls on a slab boundary
 var next_addrs: [size_class_count]usize = @splat(0);
-/// 各档空闲链表的表头
+/// Head of the free list of each class
 var frees: [size_class_count]usize = @splat(0);
 
 pub const allocator: Allocator = .{ .ptr = undefined, .vtable = &vtable };
@@ -57,7 +64,8 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
         next_addrs[class] = next + slot_size;
         return @ptrFromInt(next);
     }
-    // slab 按 slab_len 对齐：上面按取余判断是否切到了 slab 末尾
+    // Slabs are aligned to slab_len: the remainder check above tells whether carving has reached
+    // the end of the slab
     const slab = PageAllocator.map(slab_len, .fromByteUnits(slab_len)) orelse return null;
     next_addrs[class] = @intFromPtr(slab) + slot_size;
     return slab;

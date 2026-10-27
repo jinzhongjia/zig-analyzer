@@ -757,7 +757,8 @@ test "semantic viewport inference does not grow with unrelated generic owners" {
 
 test "semantic tokens search no call sites where the class cannot depend on the instance" {
     const seed = @import("../ide_db/seed.zig");
-    // 类型参数、对泛型函数的引用与对已知方法的访问在任何实例下分类相同
+    // Type parameters, references to generic functions, and accesses to known methods
+    // have the same class in every instance
     const text =
         \\const Box = struct {
         \\    pub fn put(self: Box, _: anytype) void {
@@ -1009,7 +1010,8 @@ test "semantic tokens classify the bottom of a deep field access chain" {
     const a = testing.allocator;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
-    // 字段访问链每段深一层：链底部的 `s` 在语法树中 1500 多层深
+    // Each segment of the field access chain adds one level: the `s` at the bottom of the chain
+    // is over 1500 levels deep in the syntax tree
     try text.appendSlice(a, "const S = struct { n: *const S, v: u32 };\nconst s: S = undefined;\nconst z = s");
     for (0..1500) |_| try text.appendSlice(a, ".n");
     try text.appendSlice(a, ".v;\n");
@@ -1031,7 +1033,7 @@ fn isSyntactic(ty: u32, mods: u32) bool {
     };
 }
 
-/// 去掉全量结果中的语法类 token 后按相对位置重新编码
+/// Removes syntactic tokens from the full result and re-encodes the rest with relative positions
 fn withoutSyntactic(w: *World, full: []const u32) ![]const u32 {
     var out: std.ArrayList(u32) = .empty;
     var position: types.Position = .{ .line = 0, .character = 0 };
@@ -1098,7 +1100,7 @@ test "semantic partial tokens are the full tokens without syntactic classes in f
     const partial = try tokensWith(&w, file, text, .utf16, null, .{ .partial = true });
     try testing.expectEqualSlices(u32, try withoutSyntactic(&w, full), partial);
 
-    // 全量结果含各种语法类 token，partial 去掉了它们
+    // The full result contains all kinds of syntactic tokens; partial removes them
     try check(full, text, .utf16, &.{
         .{ .needle = "//!", .ty = .comment, .mods = M.documentation },
         .{ .needle = "// line", .ty = .comment },
@@ -1181,7 +1183,7 @@ test "semantic global var modifier marks container level var declarations and re
         .{ .needle = "handler:", .ty = .function, .mods = M.declaration | G },
         .{ .needle = "handler()", .ty = .function, .mods = G },
         .{ .needle = "total", .ty = .variable, .mods = G },
-        // 常量、字段与局部变量不带 `global`
+        // Constants, fields, and local variables do not get `global`
         .{ .needle = "limit =", .ty = .variable, .mods = M.declaration | M.readonly },
         .{ .needle = "limit;", .ty = .variable, .mods = M.readonly },
         .{ .needle = "callback:", .ty = .property, .mods = M.declaration },

@@ -1,4 +1,4 @@
-//! JSON-RPC 2.0 消息的解析与构造。
+//! Parsing and construction of JSON-RPC 2.0 messages.
 
 const std = @import("std");
 const json = std.json;
@@ -36,8 +36,9 @@ pub const Message = union(enum) {
 
 pub const ParseError = error{ InvalidMessage, OutOfMemory };
 
-/// 解析消息外层结构；`params` / `result` 保留为 `json.Value`，由处理函数按方法解析为具体类型。
-/// 所有内存分配在 `arena` 上。
+/// Parses the outer structure of a message; `params` / `result` are kept as `json.Value` and
+/// parsed into concrete types per method by the handlers.
+/// All memory is allocated in `arena`.
 pub fn parse(arena: Allocator, body: []const u8) ParseError!Message {
     const value = json.parseFromSliceLeaky(json.Value, arena, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -67,7 +68,7 @@ pub fn parse(arena: Allocator, body: []const u8) ParseError!Message {
     return .{ .response = .{ .id = id, .result = obj.get("result") orelse .null, .@"error" = err } };
 }
 
-/// 把 `params` 解析为方法对应的参数类型。
+/// Parses `params` into the parameter type of the method.
 pub fn parseParams(comptime T: type, arena: Allocator, params: json.Value) json.ParseFromValueError!T {
     if (T == void) return {};
     return json.parseFromValueLeaky(T, arena, params, .{ .ignore_unknown_fields = true });
@@ -117,7 +118,7 @@ pub fn errorResponse(gpa: Allocator, id: ?Id, code: i32, message: []const u8) Al
     return error.OutOfMemory;
 }
 
-/// 服务器发往客户端的请求
+/// A request from the server to the client
 pub fn request(gpa: Allocator, id: Id, method: []const u8, params: anytype) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -160,7 +161,7 @@ pub fn notification(gpa: Allocator, method: []const u8, params: anytype) Allocat
     return error.OutOfMemory;
 }
 
-/// JSON-RPC 与 LSP 定义的错误码
+/// Error codes defined by JSON-RPC and LSP
 pub const error_codes = struct {
     pub const parse_error = @backingInt(types.ErrorCodes.ParseError);
     pub const invalid_request = @backingInt(types.ErrorCodes.InvalidRequest);

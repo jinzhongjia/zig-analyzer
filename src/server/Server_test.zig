@@ -33,12 +33,13 @@ const Session = struct {
         s.arena.deinit();
     }
 
-    /// 按顺序解析服务器输出的全部响应（不含服务器主动发出的通知）
+    /// Parses all responses in the server's output in order (excluding notifications the server
+    /// sends on its own)
     fn messages(s: *Session) ![]std.json.Value {
         return s.collect(.responses);
     }
 
-    /// 服务器主动发出的通知（如 publishDiagnostics）
+    /// Notifications the server sends on its own (such as publishDiagnostics)
     fn notifications(s: *Session) ![]std.json.Value {
         return s.collect(.notifications);
     }
@@ -62,8 +63,9 @@ fn errorCode(msg: std.json.Value) i64 {
 
 test "full lifecycle: initialize, document sync, read requests, shutdown" {
     var s: Session = undefined;
-    // zig 指向不存在的路径：后台启动（zig env、加载 std）确定地失败，不与 status 的文件数与 revision 竞争。
-    // 失败时的警告是预期的，不写到 stderr
+    // zig points to a nonexistent path: the background startup (zig env, loading std) fails
+    // deterministically and does not race with the file count and revision in status.
+    // The warnings on failure are expected and are not written to stderr
     const prev_level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = prev_level;
@@ -104,13 +106,13 @@ test "full lifecycle: initialize, document sync, read requests, shutdown" {
     try testing.expectEqual(3, msgs[2].object.get("id").?.integer);
     try testing.expect(msgs[2].object.get("result").? == .null);
 
-    // 增量变更已应用
+    // The incremental change has been applied
     const id = (try s.server.vfs.lookup(try za.base.uri.toPath(s.arena.allocator(), file_uri))).?;
     var ctx = s.server.db.beginRead(testing.allocator);
     defer ctx.end();
     try testing.expectEqualStrings("const a = 42;\n", (try ctx.get(FileText, id)).?);
 
-    // 合法代码：最后一次推送的诊断为空
+    // Valid code: the last pushed diagnostics are empty
     const notes = try s.notifications();
     try testing.expect(notes.len >= 1);
     const last = notes[notes.len - 1].object;
@@ -120,7 +122,8 @@ test "full lifecycle: initialize, document sync, read requests, shutdown" {
 
 test "duplicate initialized is ignored, including after shutdown" {
     var s: Session = undefined;
-    // 使用真实的 zig 查询环境：重复的 initialized 不应再次启动加载
+    // Uses the real zig to query the environment: a duplicate initialized should not start
+    // loading again
     try s.run(frame(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"initializationOptions":{"zig":{"path":"zig"}}}}
     ) ++ frame(
@@ -139,7 +142,7 @@ test "duplicate initialized is ignored, including after shutdown" {
 }
 
 test "push live diagnostics, clear on close" {
-    // 打开时的 live 诊断（shutdown 等待发布完成）
+    // Live diagnostics on open (shutdown waits for publishing to finish)
     {
         var s: Session = undefined;
         try s.run(frame(
@@ -166,7 +169,8 @@ test "push live diagnostics, clear on close" {
         try testing.expectEqual(1, start.get("line").?.integer);
         try testing.expectEqual(8, start.get("character").?.integer);
     }
-    // 关闭后清空：打开时的发布可能与关闭的发布并发，只断言最后一次结果
+    // Cleared after close: the publish on open may run concurrently with the publish on close, so
+    // only the last result is asserted
     {
         var s: Session = undefined;
         try s.run(frame(
@@ -191,7 +195,8 @@ test "push live diagnostics, clear on close" {
             const params = n.object.get("params").?.object;
             try testing.expectEqualStrings(file_uri, params.get("uri").?.string);
         }
-        // 打开与关闭的发布可能合并；有发布时最后一次必须是空列表
+        // The publishes on open and close may be merged; if there are any, the last one must be
+        // an empty list
         if (notes.len != 0) {
             const last = notes[notes.len - 1].object.get("params").?.object;
             try testing.expectEqual(0, last.get("diagnostics").?.array.items.len);
@@ -201,7 +206,7 @@ test "push live diagnostics, clear on close" {
 
 test "close: non-file documents clear diagnostics on the client URI" {
     const untitled = "untitled:Untitled-1";
-    // 打开时对客户端 URI 发布诊断
+    // On open, diagnostics are published for the client URI
     {
         var s: Session = undefined;
         try s.run(frame(
@@ -222,7 +227,7 @@ test "close: non-file documents clear diagnostics on the client URI" {
         try testing.expectEqualStrings(untitled, params.get("uri").?.string);
         try testing.expectEqual(1, params.get("diagnostics").?.array.items.len);
     }
-    // 关闭后对客户端 URI 发送空列表，而不是内部的虚拟路径
+    // After close, an empty list is sent for the client URI, not for the internal virtual path
     {
         var s: Session = undefined;
         try s.run(frame(
@@ -246,7 +251,8 @@ test "close: non-file documents clear diagnostics on the client URI" {
             const params = n.object.get("params").?.object;
             try testing.expectEqualStrings(untitled, params.get("uri").?.string);
         }
-        // 打开与关闭的发布可能合并；有发布时最后一次必须是空列表
+        // The publishes on open and close may be merged; if there are any, the last one must be
+        // an empty list
         if (notes.len != 0) {
             const params = notes[notes.len - 1].object.get("params").?.object;
             try testing.expectEqual(0, params.get("diagnostics").?.array.items.len);
@@ -339,7 +345,7 @@ test "inspection requests for a standalone file: file status, syntax tree, modul
     var by_id: [7]?std.json.ObjectMap = @splat(null);
     for (msgs) |m| by_id[@intCast(m.object.get("id").?.integer)] = m.object;
 
-    // 没有工作区、不属于任何项目的独立文件
+    // A standalone file without a workspace that belongs to no project
     const status = by_id[2].?.get("result").?.object;
     try testing.expectEqualStrings("other", status.get("origin").?.string);
     try testing.expectEqualStrings("detached", status.get("context").?.string);
@@ -357,7 +363,7 @@ test "inspection requests for a standalone file: file status, syntax tree, modul
 
 test "files under a build.zig outside the workspace belong to a project that is not loaded" {
     const Harness = @import("test_harness.zig").Harness;
-    // `zig build test` 中找不到 zig：启动阶段的警告不写到 stderr
+    // zig cannot be found under `zig build test`: startup warnings are not written to stderr
     const prev_level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = prev_level;
@@ -379,10 +385,12 @@ test "files under a build.zig outside the workspace belong to a project that is 
     try h.notify("initialized", Empty{});
     const cases = [_]struct { []const []const u8, []const u8 }{
         .{ &.{ "proj", "src", "main.zig" }, "unloaded_project" },
-        // 临时目录在本仓库的 .zig-cache 中：查找所属的项目时不越过它
+        // The temporary directory is in this repository's .zig-cache: the search for the owning
+        // project does not go past it
         .{ &.{"scratch.zig"}, "detached" },
-        // 只有 Build.zig（如标准库的 `std/Build.zig`）：大小写不敏感的文件系统上按路径访问 build.zig 同样成功，
-        // 防止把这样的目录当作项目
+        // Only Build.zig (like `std/Build.zig` in the standard library): on a case-insensitive
+        // file system, accessing build.zig by path succeeds as well; this guards against treating
+        // such a directory as a project
         .{ &.{ "capital", "main.zig" }, "detached" },
     };
     for (cases) |c| {
@@ -410,7 +418,7 @@ test "responses for deeply nested code stay within the JSON nesting limit" {
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
-    // 嵌套 150 层的匿名结构体，以及 500 层括号
+    // Anonymous structs nested 150 levels deep, and 500 levels of parentheses
     try text.appendSlice(testing.allocator, "const S = struct {\n");
     for (0..150) |_| try text.appendSlice(testing.allocator, "a: struct {\n");
     for (0..150) |_| try text.appendSlice(testing.allocator, "},\n");
@@ -429,7 +437,8 @@ test "responses for deeply nested code stay within the JSON nesting limit" {
     try h.notify("initialized", Empty{});
     const document_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "deep.zig" }));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = document_uri, .languageId = "zig", .version = 1, .text = text.items } });
-    // 等启动完成：查询 zig 环境之后更新模块图的写事务会取消进行中的请求（回复 ContentModified）
+    // Wait for startup to finish: the write transaction that updates the module graph after the
+    // zig environment query cancels in-flight requests (answered with ContentModified)
     _ = try h.request("zig-analyzer/waitIdle", {});
     const symbols = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = document_uri } });
     try testing.expect(symbols.object.get("result").? == .array);
@@ -456,7 +465,7 @@ test "requests before initialize return ServerNotInitialized, unknown methods re
         \\{"jsonrpc":"2.0","method":"exit"}
     ));
     defer s.deinit();
-    // 未收到 shutdown 就退出
+    // Exits without having received shutdown
     try testing.expectEqual(1, s.exit_code);
 
     const msgs = try s.messages();
@@ -505,7 +514,8 @@ test "malformed params return InvalidParams" {
 
 test "read requests run on their own threads: a blocked read does not stall the main loop" {
     const Harness = @import("test_harness.zig").Harness;
-    // 线程池没有空位：`async` 会在调用方同步执行，zig env 因此可能失败，失败时的警告不写到 stderr
+    // No free slot in the thread pool: `async` runs synchronously on the caller, so zig env may
+    // fail; the warnings on failure are not written to stderr
     const prev_level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = prev_level;
@@ -519,18 +529,18 @@ test "read requests run on their own threads: a blocked read does not stall the 
     try h.notify("initialized", Empty{});
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    // 持有写锁：读请求等在读事务的开始处
+    // Hold the write lock: the read request waits at the start of its read transaction
     h.server.db.beginWrite();
     var writing = true;
     defer if (writing) h.server.db.endWrite();
     const blocked = try h.send("zig-analyzer/status", {});
     try h.notify("$/cancelRequest", .{ .id = blocked });
-    // 主循环仍在处理消息
+    // The main loop is still processing messages
     try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
 
     h.server.db.endWrite();
     writing = false;
-    // 取消在读请求阻塞期间送达
+    // The cancellation arrives while the read request is blocked
     try testing.expectEqual(-32800, errorCode(try h.response(blocked)));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
@@ -545,7 +555,7 @@ test "shutdown does not deadlock with waitIdle while a configuration request is 
     _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{ .configuration = true } } });
     h.hold_requests = true;
     try h.notify("initialized", Empty{});
-    // 等到配置请求发出，暂不回复
+    // Wait until the configuration request is sent, and do not answer it yet
     var config_id: ?std.json.Value = null;
     while (config_id == null) {
         const msg = try h.next();
@@ -556,13 +566,14 @@ test "shutdown does not deadlock with waitIdle while a configuration request is 
     _ = try h.request("shutdown", {});
     _ = try h.response(wait);
     h.hold_requests = false;
-    // 关闭后补发的配置响应被忽略
+    // A configuration response sent belatedly after shutdown is ignored
     try h.write(.{ .jsonrpc = "2.0", .id = config_id.?, .result = &[_]std.json.Value{.null} });
     try h.notify("exit", {});
 }
 
 test "input closing while a configuration request is unanswered ends the main loop" {
-    // 客户端没有回复配置请求就退出时，主循环一直等待这个回复，进程不退出
+    // When the client exits without answering the configuration request, the main loop keeps
+    // waiting for that answer and the process does not exit
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};
     var h: Harness = undefined;
@@ -576,7 +587,8 @@ test "input closing while a configuration request is unanswered ends the main lo
         if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
     }
     h.input.close();
-    // 主循环返回后输出随之关闭；仍在等待时这里超时出错（不调用 finish，免得等待卡住的线程）
+    // Once the main loop returns, the output is closed with it; if it is still waiting, this
+    // times out with an error (finish is not called, to avoid waiting on a stuck thread)
     while (true) _ = h.next() catch |err| switch (err) {
         error.EndOfStream => break,
         else => return err,
@@ -591,7 +603,7 @@ test "live diagnostics are debounced per file and AstGen runs outside the read t
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    // 防抖取得较长，使连续的编辑必然落在同一窗口内
+    // The debounce is long so that consecutive edits always fall within the same window
     const options = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
         \\{"diagnostics": {"debounce_ms": 300}}
     , .{});
@@ -608,12 +620,12 @@ test "live diagnostics are debounced per file and AstGen runs outside the read t
     }
     _ = try h.request("zig-analyzer/waitIdle", {});
     const published = try h.notifications("textDocument/publishDiagnostics");
-    // 五次编辑只发布一次，按最后的文本
+    // Five edits publish only once, for the final text
     try testing.expectEqual(before + 1, published.len);
     const diags = published[published.len - 1].object.get("params").?.object.get("diagnostics").?.array.items;
     try testing.expectEqual(1, diags.len);
     try testing.expectEqualStrings("expected expression, found ';'", diags[0].object.get("message").?.string);
-    // AstCheck 取用了在读事务之外算好的结果
+    // AstCheck used the results computed outside the read transaction
     try testing.expect(h.server.live_prepared.hits >= 2);
     try testing.expectEqual(0, h.server.live_prepared.entries.items.len);
 
@@ -743,7 +755,8 @@ test "inlay hint settings apply to requests and refresh the client when they cha
     try testing.expectEqualStrings(": u32 n:", try labels(&h));
 
     const before = refreshes(&h);
-    // 只改 field_types：推送的配置替换整份配置，其余项与初始化时相同
+    // Only field_types changes: the pushed configuration replaces the whole configuration, and
+    // the other settings are the same as at initialization
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{ .types = false, .field_types = false, .exclude_single_argument = false } } } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(refreshes(&h) > before);
@@ -753,7 +766,8 @@ test "inlay hint settings apply to requests and refresh the client when they cha
 }
 
 test "cache settings from initialization and later configuration limit the retained syntax trees" {
-    // 防止只在推送配置时设置缓存容量，初始化时的配置不生效
+    // Guards against the cache capacity being set only when configuration is pushed, while the
+    // configuration at initialization has no effect
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;
     try h.start();
@@ -763,7 +777,8 @@ test "cache settings from initialization and later configuration limit the retai
     for (uris) |uri| try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const x: u32 = 1;\n" } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const trees = struct {
-        /// 逐个请求各文件的 document symbol（读取解析结果），之后保留着的解析结果个数
+        /// Number of parse results still retained after requesting the document symbols of each
+        /// file in turn (which reads the parse results)
         fn retained(hh: *Harness) !i64 {
             for (uris) |uri| _ = try hh.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
             const status = try hh.request("zig-analyzer/status", {});
@@ -817,11 +832,12 @@ test "organize imports is offered with the cursor in an import block or when req
             return out.items;
         }
     }.at;
-    // 菜单（没有指定种类）：光标在 import 块中才提供
+    // Menu (no kind specified): offered only when the cursor is in an import block
     try testing.expectEqual(1, (try actions(&h, 1, null)).len);
     try testing.expectEqual(0, (try actions(&h, 4, null)).len);
     try testing.expectEqual(0, (try actions(&h, 1, &.{"quickfix"})).len);
-    // 明确要求（快捷键、保存时整理）：不看光标位置；`source` 包含 `source.organizeImports`
+    // Explicitly requested (a shortcut, organize on save): the cursor position does not matter;
+    // `source` includes `source.organizeImports`
     const requested = try actions(&h, 4, &.{"source"});
     try testing.expectEqual(1, requested.len);
     const edits = requested[0].object.get("edit").?.object.get("changes").?.object.get(uri).?.array.items;
@@ -863,7 +879,7 @@ test "workspace symbol returns at most workspace_symbol.limit best matches, all 
             return std.mem.join(hh.arena.allocator(), " ", out.items);
         }
     }.of;
-    // 保留匹配最好的：完全相同、前缀，然后是子序列
+    // The best matches are kept: exact matches, prefixes, then subsequences
     try testing.expectEqualStrings("alpha alphabet", try names(&h));
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .workspace_symbol = .{ .limit = 0 } } } });
     _ = try h.request("zig-analyzer/waitIdle", {});

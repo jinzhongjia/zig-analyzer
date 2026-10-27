@@ -1,6 +1,7 @@
-//! CST 中 token 与节点的种类。
+//! Kinds of tokens and nodes in the CST.
 //!
-//! token 种类与 `std.zig.Token.Tag` 一一对应（同名），另加 trivia（空白、普通注释）。
+//! Token kinds correspond one-to-one to `std.zig.Token.Tag` (same names), plus trivia
+//! (whitespace, plain comments).
 
 const std = @import("std");
 const Tag = std.zig.Token.Tag;
@@ -10,7 +11,7 @@ pub const SyntaxKind = blk: {
     const extra_tokens = [_][:0]const u8{
         "whitespace",
         "line_comment",
-        // 无法归类的字节（如 BOM），作为 trivia 保留以保证无损
+        // Bytes that cannot be classified (such as a BOM), kept as trivia to stay lossless
         "unknown",
     };
     const nodes = node_kinds;
@@ -23,7 +24,7 @@ pub const SyntaxKind = blk: {
     break :blk @Enum(u16, .exhaustive, &names, &values);
 };
 
-/// 第一个节点种类的值；小于它的都是 token。
+/// Value of the first node kind; everything below it is a token.
 pub const first_node: u16 = @typeInfo(Tag).@"enum".field_names.len + 3;
 
 pub fn isToken(kind: SyntaxKind) bool {
@@ -38,16 +39,16 @@ pub fn fromTokenTag(tag: Tag) SyntaxKind {
     return @fromBackingInt(@as(u16, @backingInt(tag)));
 }
 
-/// 对应的 `std.zig.Token.Tag`；trivia 与节点种类返回 null。
+/// The corresponding `std.zig.Token.Tag`; null for trivia and node kinds.
 pub fn toTokenTag(kind: SyntaxKind) ?Tag {
     const v = @backingInt(kind);
     if (v >= @typeInfo(Tag).@"enum".field_names.len) return null;
     return @fromBackingInt(@as(std.meta.BackingInt(Tag), @intCast(v)));
 }
 
-/// CST 节点种类。命名尽量对应 Zig 语法（langref Grammar）中的规则。
+/// CST node kinds. Names follow the rules of the Zig grammar (langref Grammar) where possible.
 const node_kinds = [_][:0]const u8{
-    // ── 顶层 / 容器 ──
+    // ── Top level / containers ──
     "source_file",
     "test_decl",
     "comptime_decl",
@@ -62,7 +63,7 @@ const node_kinds = [_][:0]const u8{
     "linksection_clause",
     "callconv_clause",
 
-    // ── 语句 ──
+    // ── Statements ──
     "block",
     "label",
     "expr_stmt",
@@ -74,7 +75,7 @@ const node_kinds = [_][:0]const u8{
     "assign_expr",
     "destructure",
 
-    // ── 控制流 ──
+    // ── Control flow ──
     "if_expr",
     "while_expr",
     "for_expr",
@@ -95,7 +96,7 @@ const node_kinds = [_][:0]const u8{
     "nosuspend_expr",
     "resume_expr",
 
-    // ── 表达式 ──
+    // ── Expressions ──
     "binary_expr",
     "prefix_expr",
     "paren_expr",
@@ -118,7 +119,7 @@ const node_kinds = [_][:0]const u8{
     "anyframe_type",
     "anyframe_literal",
 
-    // ── 类型表达式 ──
+    // ── Type expressions ──
     "optional_type",
     "error_union_type",
     "ptr_type",
@@ -128,13 +129,13 @@ const node_kinds = [_][:0]const u8{
     "error_set_decl",
     "container_decl",
 
-    // ── 汇编 ──
+    // ── Assembly ──
     "asm_expr",
     "asm_output",
     "asm_input",
     "asm_clobbers",
 
-    // 解析失败时包裹无法归类的 token
+    // Wraps tokens that cannot be classified when parsing fails
     "error_node",
 };
 

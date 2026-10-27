@@ -1,4 +1,4 @@
-//! signature help：光标所在调用的函数签名与当前参数。
+//! signature help: the function signature and current parameter of the call at the cursor.
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
@@ -11,7 +11,7 @@ const database = @import("../database.zig");
 
 pub const Signature = struct {
     label: []const u8,
-    /// 参数的显示文本（label 中的子串）
+    /// Display text of the parameters (substrings of label)
     params: []const []const u8,
     active: u32,
     doc: ?[]const u8,
@@ -35,7 +35,8 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
         };
     }
 
-    // 只有普通调用需要推导被调用者；泛型函数体内取调用点的实例。
+    // Only ordinary calls need the callee inferred; inside a generic function body, a call-site
+    // instance is used.
     const a = try context.atSeeded(r, file, offset, true) orelse return null;
     const b = a.body;
     const call = for (b.exprs, b.expr_ranges) |e, range| {
@@ -50,13 +51,14 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
     const proto = (ast.cast(ast.FnDecl, node) orelse return null).proto() orelse return null;
     var label: std.Io.Writer.Allocating = .init(r.arena);
     proto.writeSignature(&label.writer) catch return error.OutOfMemory;
-    // 与 label 中的参数相同（见 `ast.FnProto.writeParams`）
+    // Same as the parameters in label (see `ast.FnProto.writeParams`)
     const texts = try r.arena.alloc([]const u8, params.len);
     for (params, texts) |p, *t| t.* = try ast.collapsedAlloc(r.arena, p.syntax);
     return .{ .label = label.written(), .params = texts, .active = active + @as(u32, @intFromBool(target.bound)), .doc = try context.doc(r, target.def) };
 }
 
-/// CST 的参数列表直接包含分隔逗号，嵌套表达式、注释和字符串中的逗号不参与计数。
+/// The CST argument list directly contains the separating commas; commas in nested expressions,
+/// comments, and strings are not counted.
 fn argumentIndex(call: ast.SyntaxNode, offset: u32) u32 {
     const list = call.childNode(.arg_list) orelse return 0;
     var active: u32 = 0;
@@ -68,7 +70,8 @@ fn argumentIndex(call: ast.SyntaxNode, offset: u32) u32 {
     return active;
 }
 
-/// 在覆盖光标的路径上选择最内层调用，未完成的列表在文件末尾仍然有效。
+/// Selects the innermost call on the path covering the cursor; an unfinished list at the end
+/// of the file is still valid.
 fn enclosingCall(node: ast.SyntaxNode, offset: u32, text: []const u8) ?ast.SyntaxNode {
     if (offset < node.offset) return null;
     if (offset > node.range().end and !onlyTrivia(text[node.range().end..offset])) return null;
@@ -90,7 +93,8 @@ fn enclosingCall(node: ast.SyntaxNode, offset: u32, text: []const u8) ?ast.Synta
     return best;
 }
 
-/// 未闭合调用末尾的空白和行注释可能位于调用节点之外，仍属于正在编辑的参数位置。
+/// Whitespace and line comments at the end of an unclosed call may lie outside the call node but
+/// still belong to the argument position being edited.
 fn onlyTrivia(text: []const u8) bool {
     var i: usize = 0;
     while (i < text.len) {

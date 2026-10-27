@@ -1,37 +1,37 @@
-# zig-analyzer 协作约定
+# zig-analyzer collaboration conventions
 
-## Git / PR 规则（必须遵守）
+## Git / PR rules (mandatory)
 
-- commit 的 author email 必须使用 `mail@nvimer.org`。
-- 任何 commit message 都不允许携带 LLM co-author 信息（如 `Co-authored-by: ...`、`Generated with ...`）。
-- 按代码修改内容拆分为多个 commit 提交，不要把无关改动合并到一个 commit。
-- 有 PR 时，需要监听 CI 状态，确保所有 CI 执行都通过。
-- 用户要求处理 PR 的 comment 时，使用 loop 持续监听 PR 的 comment，直到所有 comment 处理完成。
+- Commits must use the author email `mail@nvimer.org`.
+- No commit message may carry LLM co-author information (such as `Co-authored-by: ...` or `Generated with ...`).
+- Split the work into multiple commits by the content of the code changes; do not combine unrelated changes in one commit.
+- When there is a PR, watch its CI status and make sure every CI run passes.
+- When the user asks to handle the comments on a PR, keep watching the PR comments in a loop until all of them are handled.
 
-## 代码语言
+## Language
 
-- 只有注释使用中文。
-- 日志、错误消息、panic / compileError、发给客户端的文案（进度、showMessage、错误响应）、工具输出、build step 描述、测试名一律使用英文。
+- Everything in the repository is written in English: code, comments, logs, error messages, panic / compileError messages, text sent to the client (progress, showMessage, error responses), tool output, build step descriptions, test names, and documentation (`README.md`, `docs/`).
+- Exception: non-ASCII text used deliberately as test data (such as the multi-byte characters that check UTF-8 / UTF-16 position conversion).
 
-## 注释
+## Comments
 
-- 注释只描述代码当前的行为、约束与原因，不写阶段性信息：不出现里程碑（M1、v1）、设计文档的章节号（§x.y）、「后续阶段 / 以后再做」、「此前 / 原来是…，现在改为…」之类的演进过程与阶段成果。
-- 修复历史、阶段成果、测量数据写在 commit message 或 PR 描述里，不写进注释。`docs/design.md` 的性能现状只保留最新数据，不记录历次变化。
-- 测试中的回归用例可以用一句话说明它防止的错误行为。
+- Comments describe only the current behavior of the code, its constraints, and the reasons behind them, never stage information: no milestones (M1, v1), no section numbers of the design document (§x.y), and no history or interim results such as "in a later stage / to do later" or "previously / it used to be ..., now it is ...".
+- Fix history, interim results, and measurements belong in the commit message or PR description, not in comments. The performance status in `docs/design.md` keeps only the latest data and does not record how it changed over time.
+- A regression test case may state in one sentence the wrong behavior it prevents.
 
-## 文档（`docs/`）
+## Documentation (`docs/`)
 
-- `docs/design.md`：主要设计文档，只保留设计目标、性能目标与现状、设计要点、验收方式。内容随代码更新，保持与当前实现一致；不写里程碑、开发日志与修复记录。
-- `docs/plan-*.md`：规划文档，一项工作一份，记录多步计划与进度。工作完成后删除对应的规划文档，其中仍然有效的结论（设计决策、性能数据）合并进 `docs/design.md`。
-- 外部问题的记录（如 `docs/neovim-semantic-tokens-race.md`）：编辑器客户端、工具链等外部实现的缺陷，一个问题一份，写现象、原因、本项目的规避与代价、复现方法与上游状态；与 `docs/design.md` 分开，不合并进去。
+- `docs/design.md`: the main design document. It contains only the design goals, the performance targets and current status, the key design points, and how acceptance is verified. It is updated along with the code and kept consistent with the current implementation; no milestones, development logs, or fix records.
+- `docs/plan-*.md`: planning documents, one per piece of work, recording a multi-step plan and its progress. When the work is done, delete its planning document and merge the conclusions that still hold (design decisions, performance data) into `docs/design.md`.
+- Records of external issues (such as `docs/neovim-semantic-tokens-race.md`): defects in external implementations such as editor clients and toolchains, one document per issue, describing the symptoms, the cause, the workaround in this project and its cost, how to reproduce it, and the upstream status. Keep them separate from `docs/design.md`; do not merge them into it.
 
-## 目标
+## Goals
 
-- 准确性是首要目标：结果（诊断、跳转、引用、重命名、着色、hover 等）必须正确完整，不能为了性能截断、近似或静默放弃。
-- 性能是次要目标：在保证准确性的前提下优化，不过度追求性能；只去掉证明不改变结果的计算。
-- 在 zig 源代码库可以流畅使用 zig-analyzer 进行代码分析。
+- Accuracy is the primary goal: results (diagnostics, goto, references, rename, highlighting, hover, etc.) must be correct and complete; never truncate, approximate, or silently give up for the sake of performance.
+- Performance is the secondary goal: optimize only while preserving accuracy, without chasing performance excessively; only remove computation that is proven not to change the results.
+- zig-analyzer runs smoothly for code analysis on the Zig source tree.
 
-## 禁止
+## Prohibited
 
-禁止为了提升性能而牺牲功能的准确性！
-编程不会触发的极端边界 case 不用考虑！
+Never sacrifice the accuracy of a feature to improve performance!
+Do not bother with extreme edge cases that real code never triggers!

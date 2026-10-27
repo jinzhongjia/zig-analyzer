@@ -1,6 +1,8 @@
-//! 调用点种子：泛型函数体内没有具体实例时（抽象参数、未知），取一个调用点的实例
-//! 推导，hover 注明所依据的调用点。先按源码顺序找同一文件，再经由文件索引找其他文件，取第一个
-//! 能求出具体实例的调用，结果确定、可复现。
+//! Call-site seeding: when a generic function body has no concrete instance (abstract parameters,
+//! unknown), infer it under the instance from one call site, and hover notes the call site it is
+//! based on. The same file is searched first in source order, then other files via the file index;
+//! the first call that yields a concrete instance is taken, so the result is deterministic and
+//! reproducible.
 
 const std = @import("std");
 const engine = @import("../db/engine.zig");
@@ -21,19 +23,20 @@ const search = @import("search.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 
 pub const Seed = struct {
-    /// 成员 `item` 在调用点实例下的推导结果
+    /// Inference result of member `item` under the call-site instance
     res: *const infer.Result,
-    /// 所用的实例
+    /// The instance used
     inst: ?Index,
-    /// 调用表达式的位置；`iteration` 不为 null 时为循环的位置
+    /// Position of the call expression; the position of the loop when `iteration` is not null
     file: FileId,
     offset: u32,
-    /// 按遍历类型列表的循环的这次迭代（从 0 开始）推导
+    /// Inferred for this iteration (0-based) of a loop over a list of types
     iteration: ?u32 = null,
 };
 
-/// 成员 `item`（位于某个泛型函数内）以第一个调用点的实例推导的结果：先找同一文件，再按文件顺序找
-/// 项目中其他能引用到该函数的文件
+/// Result of inferring member `item` (inside some generic function) under the instance of the first
+/// call site: the same file is searched first, then the other files of the project that can
+/// reference the function, in file order
 pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
     const owner = try r.ownerKey(file, item);
@@ -41,10 +44,11 @@ pub fn find(r: *Resolver, file: FileId, item: u32) resolve.Error!?Seed {
     return present(r, owner, found);
 }
 
-/// 光标处须能求出具体类型的部分：表达式或局部绑定
+/// The part at the cursor that must resolve to a concrete type: an expression or a local binding
 pub const Subject = union(enum) { expr: Body.ExprId, binding: Body.BindingId };
 
-/// 一次成员分析共享调用点候选与迭代推导；每个位置在调用点和循环迭代的组合中选择。
+/// One member analysis shares call-site candidates and per-iteration inference; each position
+/// chooses among the combinations of call sites and loop iterations.
 pub const Refiner = struct {
     r: *Resolver,
     owner: hir.OwnerKey,
@@ -56,7 +60,8 @@ pub const Refiner = struct {
     stage_ends: [3]usize = @splat(0),
     loop_regions: ?[]const LoopRegion = null,
 
-    /// 按迭代推导的区域：`for` 循环体，或 `inline` switch 分支（`prong` 为分支下标）的分支体
+    /// Region inferred per iteration: a `for` loop body, or the body of an `inline` switch prong
+    /// (`prong` is the prong index)
     const LoopRegion = struct { expr: Body.ExprId, prong: ?u32 = null, range: Body.Range };
 
     const Variant = struct {
@@ -83,13 +88,15 @@ pub const Refiner = struct {
         var fallback: ?Seed = null;
         if (try f.tryVariant(&f.abstract, rel, subject, &fallback)) |s| return s;
         var checked: usize = 0;
-        // 每个位置独立经过相同层级；之前的位置预热了更深的候选也不改变选择顺序。
+        // Each position goes through the same stages independently; deeper candidates warmed up by
+        // earlier positions do not change the selection order.
         for (0..3) |stage| {
             if (f.loaded <= stage) {
                 switch (stage) {
                     0 => if (try f.r.ctx.get(Query, .{ .owner = f.owner, .depth = max_depth })) |found| try f.add(found),
                     1 => for (try f.r.ctx.get(Instances, .{ .owner = f.owner, .depth = max_depth })) |found| try f.add(found),
-                    // 全部实例：只在某些实例中执行的分支（`switch (@typeInfo(T))` 的各分支）由它们细化
+                    // All instances: branches that run only in some instances (the prongs of
+                    // `switch (@typeInfo(T))`) are refined by them
                     2 => for (try allFound(f.r, f.owner)) |found| try f.add(found),
                     else => unreachable,
                 }
@@ -143,7 +150,8 @@ pub const Refiner = struct {
             break :blk inferred;
         };
         if (fits(ip, f.body, res, rel, subject) and candidate.origin != null) return f.presented(candidate);
-        // 只选择包含此位置的最内层异构循环；同一循环的其他捕获由 Infer 一并细化。
+        // Pick only the innermost heterogeneous loop containing this position; Infer refines the
+        // other captures of the same loop along with it.
         var best: ?LoopResults = null;
         var best_len: u32 = std.math.maxInt(u32);
         for (try f.regions()) |region| {
@@ -197,8 +205,9 @@ pub const Refiner = struct {
     }
 };
 
-/// `inline` switch 分支（`sw` 的第 `pi` 个）按取值推导的次数：操作数不是 union 与错误集、捕获在推导中没有值
-/// 时为分支项展开后的取值个数（见 `infer.inlineProngValues`）
+/// Number of per-value inferences for an `inline` switch prong (the `pi`-th of `sw`): when the
+/// operand is neither a union nor an error set and the capture has no value in the inference, the
+/// number of values after expanding the prong items (see `infer.inlineProngValues`)
 fn prongIterations(ip: *InternPool, body: *const Body, res: *const infer.Result, sw: @FieldType(Body.Expr, "switch"), pi: u32) resolve.Error!?u32 {
     const prong = sw.prongs[pi];
     if (!prong.is_inline or prong.capture.len == 0 or res.exprs.len != body.exprs.len) return null;
@@ -215,10 +224,11 @@ fn prongIterations(ip: *InternPool, body: *const Body, res: *const infer.Result,
     return if (n > 0) n else null;
 }
 
-/// 循环 `l` 的第 `k` 个循环变量需要按迭代推导时的迭代次数：遍历 comptime 已知的类型列表
-/// （`inline for`，或 comptime 中的 `for`；循环变量在推导中是抽象的类型），遍历 comptime 已知的值列表
-/// （循环变量有类型但没有值），或遍历各项类型不同的元组（`inline for (.{ &posix, &windows }) |cases|`；
-/// 循环变量的类型求不出）
+/// Number of iterations when the `k`-th loop variable of loop `l` needs per-iteration inference:
+/// iterating a comptime-known list of types (`inline for`, or `for` in comptime; the loop variable
+/// is an abstract type in the inference), a comptime-known list of values (the loop variable has a
+/// type but no value), or a tuple whose items have different types
+/// (`inline for (.{ &posix, &windows }) |cases|`; the loop variable's type cannot be resolved)
 fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) resolve.Error!?u32 {
     if (k >= l.inputs.len or k >= l.capture.len) return null;
     const ip = r.ctx.db.env.ip;
@@ -228,7 +238,8 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
     const binding = res.bindings[@backingInt(cap)];
     const by_value = if (binding.val) |v| ip.key(v) == .opaque_param else binding.ty != .unknown and list.val != null;
     if (by_value) {
-        // 以元素个数为界：值为 `undefined` 的元素也有值（`undefined`），只看元素有没有值时取不到头
+        // Bounded by the element count: an element whose value is `undefined` still has a value
+        // (`undefined`), so checking only whether elements have values would never find the end
         const count = try eval.elemCount(r, list) orelse return null;
         var n: u32 = 0;
         while (n < count and try eval.elemValue(r, list, n) != null) n += 1;
@@ -240,9 +251,10 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
     return @intCast(tt.types.len);
 }
 
-/// 成员 `i`（位于 `in`）中每次迭代的循环变量类型不同的循环（见 `iterations`）与 `inline` switch 分支（见
-/// `prongIterations`）内提到 `names` 的调用：实参求不出具体的实例；按各次迭代推导（实例 `inst` 下的结果为
-/// `res`）再找。`all` 不为 null 时收集
+/// Calls mentioning `names` inside loops of member `i` (in `in`) whose loop variable type differs
+/// per iteration (see `iterations`) and inside `inline` switch prongs (see `prongIterations`): the
+/// arguments do not resolve to a concrete instance, so each iteration is inferred (the result
+/// under instance `inst` is `res`) and searched again. Collects when `all` is not null.
 fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     const ip = r.ctx.db.env.ip;
@@ -276,7 +288,7 @@ fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const 
     return null;
 }
 
-/// `e` 的范围内引用了 `names` 中的名字（名字或成员名）
+/// The range of `e` references a name in `names` (as a name or a member name)
 fn mentionsWithin(body: *const Body, e: Body.ExprId, names: []const []const u8) bool {
     const range = body.range(e);
     for (body.exprs, body.expr_ranges) |x, rg| {
@@ -291,20 +303,24 @@ fn mentionsWithin(body: *const Body, e: Body.ExprId, names: []const []const u8) 
     return false;
 }
 
-/// 实例的推导结果 `res` 中，`rel` 处的代码会执行，且 `subject` 有具体的类型。没有转换为枚举的枚举字面量
-/// （`switch (Q.kind)` 的 `.input =>`，类型仍为 `@Type(.enum_literal)`）还不知道指向哪个成员，不算
+/// In the instance's inference result `res`, the code at `rel` executes and `subject` has a
+/// concrete type. An enum literal not yet coerced to an enum (`.input =>` in `switch (Q.kind)`,
+/// whose type is still `@Type(.enum_literal)`) does not know yet which member it refers to, so it
+/// does not count.
 fn fits(ip: *InternPool, body: *const Body, res: *const infer.Result, rel: u32, subject: ?Subject) bool {
     if (inactiveAt(body, res, rel)) return false;
     const tv = switch (subject orelse return true) {
         .expr => |e| if (@backingInt(e) < res.exprs.len) res.exprs[@backingInt(e)] else return false,
         .binding => |b| if (@backingInt(b) < res.bindings.len) res.bindings[@backingInt(b)] else return false,
     };
-    // 类型为 noreturn：这个实例或这次迭代执行不到此处之后（如 `const T = switch (x) { .none => continue, ... }`）
+    // Type is noreturn: this instance or iteration never gets past this point
+    // (e.g. `const T = switch (x) { .none => continue, ... }`)
     return !wanted(ip, tv) and tv.ty != .enum_literal_type and tv.ty != .noreturn_type;
 }
 
-/// 相对位置 `rel` 落在推导结果的非活动分支中。分支的末尾也算在内：补全的位置常在刚输入的 `a.` 之后，
-/// 即分支的末尾
+/// The relative position `rel` falls in an inactive branch of the inference result. The end of the
+/// branch counts too: the completion position is often right after a just-typed `a.`, i.e. at the
+/// end of the branch.
 fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
     for (res.inactive) |e| {
         const rg = body.range(e);
@@ -314,7 +330,7 @@ fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
     return false;
 }
 
-/// 表达式 `e` 整个位于推导结果 `res` 的非活动代码中
+/// Expression `e` lies entirely in inactive code of inference result `res`
 fn withinInactive(body: *const Body, res: *const infer.Result, e: Body.ExprId) bool {
     const er = body.range(e);
     for (res.inactive) |x| {
@@ -325,7 +341,8 @@ fn withinInactive(body: *const Body, res: *const infer.Result, e: Body.ExprId) b
     return false;
 }
 
-/// 调用点只保留稳定的成员和表达式身份；当前位置在向 IDE 返回结果时求出。
+/// A call site keeps only the stable member and expression identities; the current position is
+/// resolved when results are returned to the IDE.
 pub const Found = struct { inst: ?Index, owner: hir.OwnerKey, expr: Body.ExprId };
 
 fn present(r: *Resolver, target: hir.OwnerKey, found: Found) resolve.Error!?Seed {
@@ -344,16 +361,21 @@ fn present(r: *Resolver, target: hir.OwnerKey, found: Found) resolve.Error!?Seed
     };
 }
 
-/// 经由泛型调用者传递的最大层数：z2d 的 `toRGBA` 由泛型的 `hue` 调用，`hue` 又由泛型的 `run` 分派；
-/// websocket.zig 的 `_handleClientData` 经 `handleClientData`、`NonBlockingBase` 的方法、`NonBlocking` 的字段、
-/// `listen`、`listenInNewThread`（`Thread.spawn` 传入）才到具体的 `Server(TestHandler)`
+/// Maximum number of levels passed through generic callers: z2d's `toRGBA` is called by the generic
+/// `hue`, which in turn is dispatched by the generic `run`; websocket.zig's `_handleClientData`
+/// goes through `handleClientData`, a method of `NonBlockingBase`, a field of `NonBlocking`,
+/// `listen`, and `listenInNewThread` (passed to `Thread.spawn`) before reaching the concrete
+/// `Server(TestHandler)`
 pub const max_depth = 16;
 
-/// 调用点的查找按成员与层数缓存：补全、inlay hints 等频繁的请求不必每次重新查找。先严格查找，没有结果时放宽
-/// （见 `callIn`）。
-/// 层数为 d 的查找为位于泛型函数内的调用者取实例时使用层数 d - 1 的查找（0 层只看实参本身具体的调用点）。
-/// 层数严格递减，不会成环：互相调用的泛型函数（http.zig 的 `execute` 与 `init`）若以同一个 key 递归，
-/// 环中的结果不写入 memo，每次请求都重新计算且层层放大
+/// Call-site lookups are cached per member and depth: frequent requests such as completion and
+/// inlay hints need not search again every time. The lookup is strict first and is relaxed when it
+/// finds nothing (see `callIn`).
+/// A lookup at depth d uses the lookup at depth d - 1 to get instances for callers located inside
+/// generic functions (depth 0 only looks at call sites whose arguments are concrete by themselves).
+/// The depth strictly decreases, so no cycles form: if mutually calling generic functions
+/// (`execute` and `init` in http.zig) recursed with the same key, results within the cycle would
+/// not be written to the memo, and every request would recompute them, amplified at every level.
 pub const Query = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { owner: hir.OwnerKey, depth: u8 };
@@ -371,12 +393,16 @@ pub const Query = struct {
     }
 };
 
-/// `Instances` 保留的实例个数：第一个实例不适用时依次尝试，调用点很多时只取前几个
+/// Number of instances kept by `Instances`: they are tried in turn when the first does not apply;
+/// with many call sites only the first few are taken
 pub const max_seeds = 32;
 
-/// 成员在各调用点的前 `max_seeds` 个不同实例（按查找顺序，去重）：第一个实例不适用时（光标处的代码不执行、
-/// 表达式求不出类型、调用位于该实例不执行的分支中）依次尝试。调用者自身位于泛型函数内时取调用者的实例（层数
-/// 少一层）。与 `Query` 一样，严格查找没有结果时放宽。需要覆盖全部实例时用 `AllInstances`
+/// The first `max_seeds` distinct instances of the member across call sites (in lookup order,
+/// deduplicated): tried in turn when the first instance does not apply (the code at the cursor does
+/// not execute, the expression's type cannot be resolved, the call is in a branch the instance does
+/// not execute). When the caller itself is inside a generic function, the caller's instances are
+/// used (one level less). Like `Query`, relaxes when the strict lookup finds nothing. Use
+/// `AllInstances` when all instances must be covered.
 pub const Instances = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { owner: hir.OwnerKey, depth: u8 };
@@ -410,8 +436,9 @@ pub const Instances = struct {
     }
 };
 
-/// 成员 `item`（位于某个泛型函数内）在项目中的全部具体实例（见 `AllInstances`）。用于需要覆盖所有实例的场合
-/// （引用查找与重命名）：`complete` 为 false 时可能还有其他实例
+/// All concrete instances in the project of member `item` (inside some generic function; see
+/// `AllInstances`). Used where every instance must be covered (find references and rename): when
+/// `complete` is false there may be other instances.
 pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error!struct { insts: []const Index, complete: bool } {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return .{ .insts = &.{}, .complete = true };
     const root = try genericRoot(r, file, item) orelse return .{ .insts = &.{}, .complete = true };
@@ -421,11 +448,14 @@ pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error!struct 
     return .{ .insts = insts, .complete = all.complete };
 }
 
-/// 泛型函数（`root`）的调用者，按顺序：各调用者在泛型函数之外推导时直接给出的实例；位于其他泛型函数中的调用者
-/// 另记下那个函数（`from`），闭包按它的每个实例推导（见 `CallsIn`）。最后是类型流给出的实例（`flow_start` 起）。
-/// 只取决于目标函数、`strict` 与 `target`，各个目标的闭包共享。`target` 不为 null 时（目标函数位于不导入
-/// `target` 的文件中，见 `Closure.importers`）只取能传入通向 `target` 的实参的调用者：导入了 `target` 的文件中的
-/// 调用者与泛型函数中的调用者
+/// Callers of the generic function (`root`), in order: the instances each caller gives directly
+/// when inferred outside generic functions; callers inside other generic functions also record
+/// that function (`from`), and the closure infers them under each of its instances (see
+/// `CallsIn`). Last come the instances given by type flow (starting at `flow_start`).
+/// Depends only on the target function, `strict` and `target`, so it is shared by the closures of
+/// all targets. When `target` is not null (the target function is in a file that does not import
+/// `target`; see `Closure.importers`), only callers that can pass arguments leading to `target`
+/// are taken: callers in files that import `target`, and callers in generic functions.
 pub const RootCallers = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { root: hir.OwnerKey, strict: bool, target: ?FileId = null };
@@ -456,8 +486,9 @@ pub const RootCallers = struct {
             const f = if (fi == 0) key.root.file else files[fi - 1];
             if (fi != 0 and (f == key.root.file or !try containsAny(&r, f, candidates.names))) continue;
             for (try ctx.get(Callers, .{ .root = key.root, .in = f })) |i| {
-                // 不导入目标所在文件的文件中，泛型函数之外的代码不能指名目标的类型，不会调用目标；同样也不能传入
-                // 通向 `target` 的实参
+                // In a file that does not import the target's file, code outside generic functions
+                // cannot name the target's types, so it does not call the target; likewise it
+                // cannot pass arguments leading to `target`
                 const outside = (f != key.root.file and !importers.contains(f)) or
                     (key.target != null and !target_importers.contains(f));
                 if (outside and try genericRoot(&r, f, i) == null) continue;
@@ -495,8 +526,8 @@ pub const RootCallers = struct {
     }
 };
 
-/// 调用者 `owner` 在实例 `inst` 下对泛型函数 `target` 的调用给出的实例（含循环中按各次迭代推导的调用）。
-/// 各个目标的闭包共享
+/// Instances given by the calls of caller `owner` to generic function `target` under instance
+/// `inst` (including calls in loops inferred per iteration). Shared by the closures of all targets.
 pub const CallsIn = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { target: hir.OwnerKey, owner: hir.OwnerKey, inst: Index, strict: bool };
@@ -534,7 +565,8 @@ pub const CallsIn = struct {
     }
 };
 
-/// 成员 `owner` 的全部实例的调用点（见 `AllInstances`），实例按成员规范化
+/// Call sites of all instances of member `owner` (see `AllInstances`), with the instances
+/// normalized for the member
 pub fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
     const tree = try r.itemTree(owner.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
@@ -550,17 +582,24 @@ pub fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
     return out;
 }
 
-/// 闭包中实例的实参嵌套深度上限：能通过编译的代码实例化的集合是有限的，实参类型随递归越嵌越深（`grow(?T)`）
-/// 是实例化无限增长，超过时截断
+/// Limit on the argument nesting depth of instances in the closure: code that compiles instantiates
+/// a finite set, while argument types nesting ever deeper with recursion (`grow(?T)`) mean the
+/// instantiation grows without bound; it is truncated beyond the limit
 const max_closure_depth = 64;
-/// 闭包中实例的总数上限：实参不变深、个数无限增长（comptime 整数随递归增大）同样只出现在不能编译的代码中。
-/// 带大量测试的项目（每个测试类型经数十层泛型函数传播）的实例数可达数万，上限须远高于它
+/// Limit on the total number of instances in the closure: arguments that do not get deeper but
+/// grow without bound in number (comptime integers increasing with recursion) likewise only occur
+/// in code that does not compile. Projects with many tests (each test type propagating through
+/// dozens of levels of generic functions) can reach tens of thousands of instances, so the limit
+/// must be far above that.
 const max_closure = 1 << 18;
-/// 闭包中类型流的层数上限（见 `typeFlow`；进入过的实例不再进入，层数只用于实例化无限增长的代码）
+/// Depth limit of type flow in the closure (see `typeFlow`; an instance already entered is not
+/// entered again, so the depth only matters for code whose instantiation grows without bound)
 const max_closure_flow_depth = 64;
 
-/// 泛型函数（key）在项目中的全部具体实例，按发现的顺序：从泛型函数之外的调用（以及类型流、std 中的分派处）出发，
-/// 沿泛型调用者的每个实例中对它的调用求闭包，直到不再出现新的实例。实例化无限增长而截断时 `complete` 为 false
+/// All concrete instances in the project of the generic function (key), in discovery order:
+/// starting from calls outside generic functions (plus type flow and dispatch sites in std), the
+/// closure is taken along the calls to it in each instance of its generic callers until no new
+/// instances appear. `complete` is false when truncated because instantiation grows without bound.
 pub const AllInstances = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -594,18 +633,22 @@ pub const AllInstances = struct {
     }
 };
 
-/// `AllInstances` 的计算：参与的泛型函数（目标及其泛型调用者，逐层向上）各自的实例集合，以工作队列传播到不动点
+/// Computation of `AllInstances`: the instance sets of each participating generic function (the
+/// target and its generic callers, level by level upward), propagated with a work queue to a
+/// fixpoint
 const Closure = struct {
     r: *Resolver,
-    /// 能经由 `@import` 链到达目标所在文件的文件：其中的泛型函数的实例都参与传播；其余文件中的泛型函数不能
-    /// 指名目标的类型，只有实例实参通向这些文件中定义的类型时（见 `reaches`）才可能调用目标
+    /// Files that can reach the target's file via `@import` chains: instances of generic functions
+    /// in them all take part in propagation; generic functions in other files cannot name the
+    /// target's types and can only call the target when instance arguments lead to types defined
+    /// in these files (see `reaches`)
     importers: std.AutoHashMapUnmanaged(FileId, void) = .empty,
     target_file: FileId = undefined,
     reach_memo: std.AutoHashMapUnmanaged(Index, bool) = .empty,
     roots: std.ArrayList(Root) = .empty,
-    /// 待扫描（求调用者）的泛型函数
+    /// Generic functions waiting to be scanned (for their callers)
     unscanned: std.ArrayList(usize) = .empty,
-    /// 新发现、还未传播的实例：泛型函数与 `found` 下标
+    /// Newly found instances not yet propagated: the generic function and the `found` index
     queue: std.ArrayList(struct { root: usize, index: usize }) = .empty,
     total: usize = 0,
     complete: bool = true,
@@ -615,21 +658,27 @@ const Closure = struct {
         file: FileId,
         item: u32,
         found: Collector,
-        /// 位于泛型函数 `from` 中的调用者（`in` 中的成员 `i`）：`from` 的每个实例下推导调用者，找对本函数的调用
+        /// Callers inside generic function `from` (member `i` in `in`): the caller is inferred
+        /// under each instance of `from` to find the calls to this function
         callers: std.ArrayList(Edge) = .empty,
-        /// 本函数的实例下需要推导的调用者：泛型函数 `to` 的 `callers` 下标
+        /// Callers to infer under this function's instances: indices into the `callers` of generic
+        /// function `to`
         outs: std.ArrayList(struct { to: usize, edge: usize }) = .empty,
         scanned: bool = false,
         dispatch_tried: bool = false,
-        /// 位于不导入目标所在文件的文件中：只保留实参通向目标的实例
+        /// In a file that does not import the target's file: keep only instances whose arguments
+        /// lead to the target
         filtered: bool,
-        /// 找到过实例（含被过滤的）：没有时才取分派处、放宽严格查找，与不过滤时相同
+        /// Some instance was found (including filtered ones): dispatch sites and the relaxed
+        /// lookup are used only when none was, the same as without filtering
         seen: bool = false,
     };
     const Edge = struct { in: FileId, i: u32, from: usize };
 
-    /// 类型或值 `x` 能否通向 `importers` 中定义的类型：容器定义在其中，或是实参通向它们的实例；指针、数组、
-    /// 元组、函数类型等看其组成部分。求不出的值、抽象参数与未列出的种类按能通向
+    /// Whether type or value `x` can lead to types defined in `importers`: containers defined in
+    /// them, or instances whose arguments lead to them; pointers, arrays, tuples, function types
+    /// and the like are judged by their components. Unresolvable values, abstract parameters and
+    /// kinds not listed count as leading there.
     fn reaches(c: *Closure, x: Index) resolve.Error!bool {
         if (x == .runtime) return false;
         if (x == .unknown) return true;
@@ -679,7 +728,7 @@ const Closure = struct {
         return false;
     }
 
-    /// 泛型函数 `key` 在 `roots` 中的下标，首次出现时加入（待扫描）
+    /// Index of generic function `key` in `roots`, added (pending scan) on first appearance
     fn root(c: *Closure, key: hir.OwnerKey) resolve.Error!?usize {
         for (c.roots.items, 0..) |x, k| if (std.meta.eql(x.key, key)) return k;
         const r = c.r;
@@ -701,7 +750,8 @@ const Closure = struct {
                     for (c.roots.items[p.root].outs.items) |o| try c.propagate(o.to, o.edge, p.index);
                 } else break;
             }
-            // 不动点：没有实例的函数先取 std 中的分派处，仍然没有的放宽严格查找（见 `callIn`）
+            // Fixpoint: functions without instances first take dispatch sites in std; those still
+            // without any relax the strict lookup (see `callIn`)
             var progressed = false;
             for (0..c.roots.items.len) |g| {
                 const st = &c.roots.items[g];
@@ -724,8 +774,9 @@ const Closure = struct {
         }
     }
 
-    /// 泛型函数 `g` 的调用者（见 `RootCallers`）：直接给出的实例加入，位于其他泛型函数中的登记为依赖于那个函数
-    /// 的实例，并以那个函数已有的实例推导
+    /// Callers of generic function `g` (see `RootCallers`): directly given instances are added;
+    /// callers inside other generic functions are registered as depending on that function's
+    /// instances and are inferred under the instances it already has
     fn scan(c: *Closure, g: usize) resolve.Error!void {
         const r = c.r;
         if (c.roots.items[g].scanned) return;
@@ -748,7 +799,7 @@ const Closure = struct {
         for (rc.found[rc.flow_start..]) |found| try c.add(g, found);
     }
 
-    /// 放宽之后重新扫描：已登记的泛型调用者会重新登记，先清除
+    /// Rescan after relaxing: registered generic callers get registered again, so clear them first
     fn rescan(c: *Closure, g: usize) resolve.Error!void {
         c.roots.items[g].scanned = false;
         for (c.roots.items[g].callers.items) |e| {
@@ -762,7 +813,8 @@ const Closure = struct {
         try c.scan(g);
     }
 
-    /// 泛型调用者 `g.callers[edge]` 在其所在函数的第 `k` 个实例下对 `g` 的调用（见 `CallsIn`）
+    /// Calls to `g` by generic caller `g.callers[edge]` under the `k`-th instance of its enclosing
+    /// function (see `CallsIn`)
     fn propagate(c: *Closure, g: usize, edge: usize, k: usize) resolve.Error!void {
         const r = c.r;
         const e = c.roots.items[g].callers.items[edge];
@@ -788,7 +840,8 @@ const Closure = struct {
         try c.queueFrom(g, before);
     }
 
-    /// `g` 从 `before` 起新加入的实例排队传播；总数超过上限时不再传播
+    /// Queues the instances newly added to `g` from `before` on for propagation; once the total
+    /// exceeds the limit, they are no longer propagated
     fn queueFrom(c: *Closure, g: usize, before: usize) resolve.Error!void {
         const now = c.roots.items[g].found.found.items.len;
         for (before..now) |k| {
@@ -802,7 +855,8 @@ const Closure = struct {
     }
 };
 
-/// 类型或值 `x` 的嵌套深度（实例的实参、指针与可选的子类型、聚合的元素等逐层）超过 `limit`
+/// The nesting depth of type or value `x` (level by level through instance arguments, pointer and
+/// optional child types, aggregate elements, etc.) exceeds `limit`
 fn depthExceeds(ip: *InternPool, x: Index, limit: u32) bool {
     if (limit == 0) return true;
     const sub = limit - 1;
@@ -831,11 +885,11 @@ fn anyExceeds(ip: *InternPool, xs: []const Index, limit: u32) bool {
     return false;
 }
 
-/// 收集的实例：按实例去重，至多 `limit` 个
+/// Collected instances: deduplicated by instance, at most `limit` of them
 const Collector = struct {
     found: std.ArrayList(Found) = .empty,
     limit: usize,
-    /// 见 `callIn`
+    /// See `callIn`
     strict: bool = true,
 
     fn full(c: *const Collector) bool {
@@ -866,12 +920,13 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.
             try collectIn(r, f, i, key.file, item, root_key, candidates.names, depth, out);
         }
     }
-    // 类型流的层数不受收集层数限制：它只进入实参含有目标容器的实例，不会成倍增长
+    // The type flow depth is not bounded by the collection depth: it only enters instances whose
+    // arguments contain the target container, so it does not grow multiplicatively
     _ = try typeFlow(r, key.file, item, root, files, max_depth, out, out.strict, null);
     if (out.found.items.len == 0) if (try dispatched(r, key.file, item, root)) |found| try out.add(r.arena, found);
 }
 
-/// 同 `findIn`，收集全部实例
+/// Like `findIn`, but collects all instances
 fn collectIn(r: *Resolver, in: FileId, i: u32, file: FileId, item: u32, root_key: hir.OwnerKey, names: []const []const u8, depth: u8, out: *Collector) resolve.Error!void {
     const owner = try r.ownerKey(in, i);
     const body = try r.ctx.get(hir.ItemBody, owner);
@@ -888,7 +943,7 @@ fn collectIn(r: *Resolver, in: FileId, i: u32, file: FileId, item: u32, root_key
     }
 }
 
-/// 成员 `key` 的第一个能求出具体实例的调用点。`strict` 见 `callIn`。
+/// The first call site of member `key` that yields a concrete instance. See `callIn` for `strict`.
 fn search_(r: *Resolver, key: hir.OwnerKey, depth: u8, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
@@ -909,10 +964,13 @@ fn search_(r: *Resolver, key: hir.OwnerKey, depth: u8, strict: bool) resolve.Err
     return dispatched(r, key.file, item, root);
 }
 
-/// 目标所在的容器作为 comptime 类型实参传入泛型函数，再经类型参数调用目标（`ctx.get(hir.ItemBody, k)` →
-/// `get` → … → `execute` 中的 `Q.compute(ctx, key)`）。分派处所在的文件不必 import 目标所在的文件，按导入链
-/// 找不到：从实参中传入这个容器类型的调用出发，逐层进入实参中仍含有它的泛型调用，直到调用目标处。
-/// `all` 不为 null 时收集全部这样找到的实例，返回 null
+/// The target's container is passed to a generic function as a comptime type argument, and the
+/// target is then called through the type parameter (`ctx.get(hir.ItemBody, k)` → `get` → ... →
+/// `Q.compute(ctx, key)` in `execute`). The file of the dispatch site need not import the target's
+/// file, so following import chains does not find it: starting from calls that pass this
+/// container type in their arguments, generic calls whose arguments still contain it are entered
+/// level by level until the target is called.
+/// When `all` is not null, collects all instances found this way and returns null.
 fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const FileId, depth: u8, all: ?*Collector, strict: bool, cut: ?*bool) resolve.Error!?Found {
     const tree = try r.itemTree(file);
     const container = tree.items[root].container;
@@ -939,7 +997,8 @@ fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const Fil
     return null;
 }
 
-/// `typeFlow` 的一次查找：已进入过的实例不再进入（互相调用的泛型函数）
+/// One `typeFlow` search: instances already entered are not entered again (mutually calling
+/// generic functions)
 const Flow = struct {
     r: *Resolver,
     target: Index,
@@ -948,7 +1007,7 @@ const Flow = struct {
     root_key: hir.OwnerKey,
     all: ?*Collector,
     strict: bool,
-    /// 不为 null 时，层数用完而不再进入时置为 true
+    /// When not null, set to true when the depth is used up and entering stops
     cut: ?*bool,
     visited: std.ArrayList(Index) = .empty,
 
@@ -957,7 +1016,8 @@ const Flow = struct {
         return c.full();
     }
 
-    /// 推导结果 `res` 中实参含有目标容器类型的泛型调用：在被调函数的该实例中找对目标的调用
+    /// Generic calls in inference result `res` whose arguments contain the target container type:
+    /// the calls to the target are searched for in that instance of the callee
     fn from(fl: *Flow, body: *const Body, res: *const infer.Result, depth: u8) resolve.Error!?Found {
         if (depth == 0) {
             if (fl.cut) |c| c.* = true;
@@ -996,15 +1056,18 @@ const Flow = struct {
     }
 };
 
-/// 标准库中按方法名分派到实参的方法的函数：`printValue` 对 `{f}` 等调用 `value.format(w)`、
-/// `value.formatNumber(w, ...)`。泛型方法（如 `format(self, writer: anytype)`）在项目中没有调用点时，
-/// 以这些分派处的调用求实例
+/// Functions in the standard library that dispatch by method name to methods of their arguments:
+/// for `{f}` and the like, `printValue` calls `value.format(w)` and `value.formatNumber(w, ...)`.
+/// When a generic method (such as `format(self, writer: anytype)`) has no call site in the
+/// project, its instances are computed from the calls at these dispatch sites.
 const dispatchers = [_]struct { path: []const []const u8, func: []const u8 }{
     .{ .path = &.{ "Io", "Writer" }, .func = "printValue" },
 };
 
-/// 泛型方法 `root`（成员 `item` 位于其中）在标准库分派处的实例：分派函数中对 anytype 参数调用同名方法，
-/// 接收者为方法所在的容器（不在泛型函数内），其余实参取分派处推导的类型
+/// Instance of generic method `root` (which contains member `item`) at a standard library
+/// dispatch site: the dispatch function calls the method of the same name on an anytype
+/// parameter; the receiver is the method's container (not inside a generic function), and the
+/// other arguments take the types inferred at the dispatch site
 fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?Found {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(file);
@@ -1047,7 +1110,7 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?F
                 else => continue,
             };
             if (!std.mem.eql(u8, fa.field orelse continue, name)) continue;
-            // 接收者是分派函数的 anytype 参数
+            // The receiver is an anytype parameter of the dispatch function
             const n = switch (body.expr(fa.lhs)) {
                 .name_ref => |x| x,
                 else => continue,
@@ -1069,9 +1132,12 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?F
     return null;
 }
 
-/// 泛型函数 `root` 的调用点查找在文件 `in` 中要推导的调用者（成员下标，按顺序）：提到函数名或别名、且不能静态
-/// 排除（见 `mentionsOnlyOthers`）的成员，不含函数自身及其体内的成员。与层数、严格与否、是否收集全部实例无关：
-/// 各层的 `Query` 与 `Instances` 共享，不必每次重新扫描文件。按文件缓存：找到调用点即停止的查找不扫描其余文件
+/// Callers in file `in` that the call-site lookup of generic function `root` must infer (member
+/// indices, in order): members that mention the function name or an alias and cannot be excluded
+/// statically (see `mentionsOnlyOthers`), excluding the function itself and members inside its
+/// body. Independent of depth, strictness, and whether all instances are collected: shared by the
+/// `Query` and `Instances` of every depth, so files need not be rescanned each time. Cached per
+/// file: a lookup that stops once a call site is found does not scan the remaining files.
 pub const Callers = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = struct { root: hir.OwnerKey, in: FileId };
@@ -1089,7 +1155,7 @@ pub const Callers = struct {
         var out: std.ArrayList(u32) = .empty;
         const tree = try r.itemTree(key.in);
         for (tree.items, 0..) |_, i| {
-            // 泛型函数自身体内的调用（递归）也是抽象的
+            // Calls inside the generic function's own body (recursion) are abstract too
             if (key.in == file and try enclosedBy(&r, file, @intCast(i), root)) continue;
             if (!try mayMentionAny(&r, key.in, @intCast(i), names)) continue;
             const body = try ctx.get(hir.ItemBody, try r.ownerKey(key.in, @intCast(i)));
@@ -1108,7 +1174,8 @@ pub const Callers = struct {
     }
 };
 
-/// 各层种子查找共享与目标函数有关的导入候选和别名闭包，不缓存任何展示位置。
+/// Seed lookups at all depths share the import candidates and alias closure related to the
+/// target function; no presentation positions are cached.
 pub const Candidates = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -1116,11 +1183,13 @@ pub const Candidates = struct {
 
     pub const Data = struct {
         arena: std.heap.ArenaAllocator,
-        /// 能经由 `@import` 链到达目标所在文件的项目文件：第一个实例与前几个实例的查找按它们的顺序，先找到的
-        /// 实例在前
+        /// Project files that can reach the target's file via `@import` chains: lookups of the
+        /// first instance and of the first few instances follow their order, so instances found
+        /// earlier come first
         files: []const FileId,
-        /// `files` 之后是项目中的其余文件（见 `search.candidateFiles`）：全部实例的闭包不遗漏泛型代码中经
-        /// `anytype` 的值或 comptime 类型参数的调用
+        /// `files` followed by the remaining files of the project (see `search.candidateFiles`):
+        /// the closure of all instances does not miss calls in generic code through `anytype`
+        /// values or comptime type parameters
         all_files: []const FileId,
         names: []const []const u8,
     };
@@ -1168,8 +1237,9 @@ pub const Candidates = struct {
     }
 };
 
-/// 调用泛型函数 `root` 可能使用的名字：函数名，以及 `files` 中指向它的容器级别名
-/// （`const biggest = lib.max;`，含别名的别名）。只检查文件索引中出现这些名字的文件
+/// Names that calls to generic function `root` may use: the function name, plus container-level
+/// aliases to it in `files` (`const biggest = lib.max;`, including aliases of aliases). Only files
+/// whose file index contains these names are checked.
 fn callNames(r: *Resolver, file: FileId, root: u32, files: []const FileId) resolve.Error![]const []const u8 {
     const target: resolve.Def = .{ .item = .{ .file = file, .item = root } };
     var names: std.ArrayList([]const u8) = .empty;
@@ -1207,7 +1277,7 @@ fn containsAny(r: *Resolver, f: FileId, names: []const []const u8) resolve.Error
     return false;
 }
 
-/// 先用成员摘要粗筛，避免为不相关的成员生成 Body
+/// Coarse filtering by the member summary first, to avoid building a Body for unrelated members
 fn mayMentionAny(r: *Resolver, f: FileId, item: u32, names: []const []const u8) resolve.Error!bool {
     for (names) |n| if (try r.mayMention(f, item, n)) return true;
     return false;
@@ -1218,9 +1288,13 @@ fn mentionsAny(body: *const Body, names: []const []const u8) bool {
     return false;
 }
 
-/// 成员 `i`（位于 `in`）提到 `names` 的每一处都不经推导就能确定指向 `root_key` 之外的函数声明：它不调用
-/// `root_key`，不必推导（推导提到常见名字的成员，如 `print`、`init`，是调用点查找的主要开销）。
-/// 求不出、指向别名或字段（其值可能是目标）、枚举字面量（decl literal 可能调用目标）、初始化的字段名时为 false
+/// Every place where member `i` (in `in`) mentions `names` can be determined without inference to
+/// refer to a function declaration other than `root_key`: the member does not call `root_key` and
+/// need not be inferred (inferring members that mention common names such as `print` and `init`
+/// is the main cost of call-site lookup).
+/// False when a mention cannot be resolved, refers to an alias or a field (whose value may be the
+/// target), is an enum literal (a decl literal may call the target), or is a field name in an
+/// initializer.
 fn mentionsOnlyOthers(r: *Resolver, in: FileId, i: u32, body: *const Body, names: []const []const u8, root_key: hir.OwnerKey) resolve.Error!bool {
     for (body.exprs, 0..) |e, ei| {
         switch (e) {
@@ -1244,8 +1318,10 @@ fn mentionsOnlyOthers(r: *Resolver, in: FileId, i: u32, body: *const Body, names
     return true;
 }
 
-/// 不经推导就能确定的 `e`（名字或成员访问）指向的声明：名字按词法作用域解析；成员访问的左侧是命名空间，或是
-/// 类型已知的值（见 `staticValueType`），在类型的命名空间中查找成员。求不出时为 null
+/// The declaration that `e` (a name or member access) refers to, determined without inference:
+/// names are resolved by lexical scope; for a member access whose left side is a namespace, or a
+/// value of known type (see `staticValueType`), the member is looked up in the type's namespace.
+/// Null when it cannot be resolved.
 fn staticRef(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.ExprId) resolve.Error!?resolve.Def {
     switch (body.expr(e)) {
         .name_ref => |n| return r.resolveName(in, i, body, body.expr_scopes[@backingInt(e)], n),
@@ -1260,8 +1336,10 @@ fn staticRef(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.ExprId
     }
 }
 
-/// 不经推导函数体就能确定的值 `e` 的类型（单项指针取指向的类型）：全局声明的值取声明的类型，当前成员的参数取
-/// 签名中的类型。求不出、是类型或抽象时为 null
+/// The type of value `e` determined without inferring the function body (a single-item pointer
+/// yields its pointee type): a global declaration's value takes the declaration's type, and a
+/// parameter of the current member takes the type in the signature. Null when it cannot be
+/// resolved, or is a type or abstract.
 fn staticValueType(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.ExprId) resolve.Error!?Index {
     switch (body.expr(e)) {
         .name_ref, .field_access => {},
@@ -1292,22 +1370,26 @@ fn staticValueType(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.
     return if (ty == .unknown) null else ty;
 }
 
-/// 调用者 `i`（位于 `in`，见 `Callers`）中第一个能求出具体实例的对泛型函数 `root_key` 的调用
+/// The first call to generic function `root_key` in caller `i` (in `in`; see `Callers`) that
+/// yields a concrete instance
 fn findIn(r: *Resolver, in: FileId, i: u32, file: FileId, item: u32, root_key: hir.OwnerKey, names: []const []const u8, depth: u8, strict: bool) resolve.Error!?Found {
     const owner = try r.ownerKey(in, i);
     const body = try r.ctx.get(hir.ItemBody, owner);
     const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
     if (try callIn(r, in, i, body, res, file, item, root_key, null, strict)) |s| return s;
     if (try loopCall(r, in, i, owner, body, res, null, names, file, item, root_key, null, strict)) |s| return s;
-    // 调用者自身位于泛型函数内（如按枚举分派到各个泛型实现的 `run(op, dst: anytype, ...)`）：
-    // 实参是抽象的，改用调用者的调用点实例推导后再找；调用者的实例取自少一层的查找
+    // The caller itself is inside a generic function (such as `run(op, dst: anytype, ...)`, which
+    // dispatches by enum to the generic implementations): the arguments are abstract, so infer the
+    // caller under its call-site instance and search again; the caller's instance comes from the
+    // lookup one level shallower
     if (depth == 0 or try genericRoot(r, in, i) == null) return null;
     if (!mayCall(r.ctx.db.env.ip, body, res, root_key)) return null;
     const outer = try r.ctx.get(Query, .{ .owner = owner, .depth = depth - 1 }) orelse return null;
     const seeded = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = outer.inst });
     if (try callIn(r, in, i, body, seeded, file, item, root_key, null, strict)) |s| return s;
     if (try loopCall(r, in, i, owner, body, seeded, outer.inst, names, file, item, root_key, null, strict)) |s| return s;
-    // 第一个实例下没有有效的调用（如调用位于该实例不执行的 `switch (Q.kind)` 分支中）：依次尝试调用者的其他实例
+    // No valid call under the first instance (e.g. the call is in a `switch (Q.kind)` prong that
+    // the instance does not execute): try the caller's other instances in turn
     for (try r.ctx.get(Instances, .{ .owner = owner, .depth = depth - 1 })) |other| {
         if (other.inst == outer.inst) continue;
         const res3 = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = other.inst });
@@ -1317,9 +1399,11 @@ fn findIn(r: *Resolver, in: FileId, i: u32, file: FileId, item: u32, root_key: h
     return null;
 }
 
-/// 成员 `i`（位于 `in`）按推导结果 `res` 中第一个能求出具体实例的对 `root_key` 的调用。函数作为值与实参元组
-/// 一起传入另一个调用（`Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a, b })`）也算作以元组元素调用。
-/// `all` 不为 null 时把全部调用的实例（去重）加入其中，返回 null
+/// The first call to `root_key` in member `i` (in `in`) that yields a concrete instance according
+/// to inference result `res`. A function passed as a value together with an argument tuple into
+/// another call (`Thread.spawn(.{}, f, .{ a, b })`, `@call(.auto, f, .{ a, b })`) also counts as
+/// a call with the tuple elements.
+/// When `all` is not null, adds the instances of all calls (deduplicated) to it and returns null.
 fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer.Result, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs, 0..) |e, ei| {
@@ -1327,13 +1411,15 @@ fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer
             .call, .builtin_call => {},
             else => continue,
         }
-        // `strict` 时调用者在该实例下不编译的代码中的调用（如 `switch (Q.kind)` 的其他分支）不产生实例；
-        // 严格查找什么都找不到时（调用都位于项目中任何实例都不编译的分支中）才放宽，以便仍有实例可用
+        // When `strict`, calls in code the caller does not compile under this instance (such as
+        // the other prongs of `switch (Q.kind)`) produce no instances; the lookup is relaxed only
+        // when the strict one finds nothing at all (all calls are in branches that no instance in
+        // the project compiles), so that some instance is still available
         if (strict and withinInactive(body, res, @fromBackingInt(@as(u32, @intCast(ei))))) continue;
         const site: Site = .{ .r = r, .in = in, .i = i, .body = body, .res = res, .expr = @intCast(ei), .file = file, .item = item, .root_key = root_key, .all = all };
         switch (e) {
             .call => |c| {
-                // 方法调用：接收者是第一个实参
+                // Method call: the receiver is the first argument
                 const receiver: ?TypedValue = switch (body.expr(c.callee)) {
                     .field_access => |fa| if (!res.exprs[@backingInt(fa.lhs)].isType()) res.exprs[@backingInt(fa.lhs)] else null,
                     else => null,
@@ -1348,9 +1434,12 @@ fn callIn(r: *Resolver, in: FileId, i: u32, body: *const Body, res: *const infer
     return null;
 }
 
-/// 推导结果 `res` 中是否可能有对 `root_key` 的调用：被调表达式，或随元组一起传入的函数实参（见 `Site.passed`）
-/// 的值不是已知的其他函数或其他值。抽象推导中已经求出的值在调用者的各个实例下相同（未知的条件不选分支），
-/// 全部排除时取调用者的实例也找不到调用，不必再查找调用者的调用点
+/// Whether inference result `res` may contain a call to `root_key`: the value of a callee
+/// expression, or of a function argument passed along with a tuple (see `Site.passed`), is not a
+/// known other function or other value. Values already resolved in the abstract inference are the
+/// same under every instance of the caller (unknown conditions select no branch), so when all of
+/// them are excluded, the caller's instances would not find a call either, and the caller's call
+/// sites need not be searched.
 fn mayCall(ip: *InternPool, body: *const Body, res: *const infer.Result, root_key: hir.OwnerKey) bool {
     if (res.exprs.len != body.exprs.len) return true;
     for (body.exprs) |e| switch (e) {
@@ -1361,7 +1450,7 @@ fn mayCall(ip: *InternPool, body: *const Body, res: *const infer.Result, root_ke
     return false;
 }
 
-/// 同 `Site.passed`：后面紧跟匿名元组字面量的实参
+/// Like `Site.passed`: an argument immediately followed by an anonymous tuple literal
 fn mayPass(ip: *InternPool, body: *const Body, res: *const infer.Result, args: []const Body.ExprId, root_key: hir.OwnerKey) bool {
     if (args.len < 2) return false;
     for (args[0 .. args.len - 1], args[1..]) |f_e, tuple_e| {
@@ -1377,7 +1466,8 @@ fn mayPass(ip: *InternPool, body: *const Body, res: *const infer.Result, args: [
     return false;
 }
 
-/// 值 `tv` 在某个实例下可能是函数 `root_key`：值未知或含抽象部分，或者就是它
+/// Value `tv` may be function `root_key` under some instance: the value is unknown or contains
+/// abstract parts, or is that function itself
 fn mayBe(ip: *InternPool, tv: TypedValue, root_key: hir.OwnerKey) bool {
     const v = tv.val orelse return true;
     if (!value.isConcrete(ip, v)) return true;
@@ -1387,7 +1477,7 @@ fn mayBe(ip: *InternPool, tv: TypedValue, root_key: hir.OwnerKey) bool {
     };
 }
 
-/// `callIn` 中的一个调用表达式
+/// A call expression in `callIn`
 const Site = struct {
     r: *Resolver,
     in: FileId,
@@ -1400,7 +1490,8 @@ const Site = struct {
     root_key: hir.OwnerKey,
     all: ?*Collector,
 
-    /// 实参中的函数值后面紧跟着匿名元组字面量：以元组元素调用该函数
+    /// A function value in the arguments immediately followed by an anonymous tuple literal: the
+    /// function is called with the tuple elements
     fn passed(s: Site, args: []const Body.ExprId) resolve.Error!?Found {
         if (args.len < 2) return null;
         for (args[0 .. args.len - 1], args[1..]) |f_e, tuple_e| {
@@ -1418,7 +1509,8 @@ const Site = struct {
         return null;
     }
 
-    /// 以 `callee`（及接收者）和实参 `args` 调用：callee 为 `root_key` 且实例具体时返回调用点
+    /// A call with `callee` (and the receiver) and arguments `args`: returns the call site when
+    /// callee is `root_key` and the instance is concrete
     fn instance(s: Site, callee: TypedValue, receiver: ?TypedValue, args: []const Body.ExprId) resolve.Error!?Found {
         const r = s.r;
         const inst = (try calleeInstance(r, s.res, callee, receiver, args, s.root_key) orelse return null).inst;
@@ -1432,8 +1524,10 @@ const Site = struct {
     }
 };
 
-/// 调用的被调泛型函数与具体实例：callee 是泛型函数的值、由实参（及接收者）求出的实例具体时。`only` 不为 null
-/// 时只看对它的调用（求实例之前先比较被调函数）
+/// The called generic function and concrete instance of a call: when callee is the value of a
+/// generic function and the instance computed from the arguments (and receiver) is concrete. When
+/// `only` is not null, only calls to it are considered (the callee is compared before computing
+/// the instance).
 const Called = struct { file: FileId, decl: @import("../syntax/ItemTree.zig").AstId, inst: Index };
 
 fn calleeInstance(r: *Resolver, res: *const infer.Result, callee: TypedValue, receiver: ?TypedValue, args: []const Body.ExprId, only: ?hir.OwnerKey) resolve.Error!?Called {
@@ -1456,7 +1550,8 @@ fn calleeInstance(r: *Resolver, res: *const infer.Result, callee: TypedValue, re
     return .{ .file = fv.file, .decl = fv.decl, .inst = inst };
 }
 
-/// 包含成员 `item` 的最内层泛型函数（成员自身，或经由体内定义的容器的外层函数）
+/// The innermost generic function containing member `item` (the member itself, or an enclosing
+/// function via a container defined in its body)
 pub fn genericRoot(r: *Resolver, file: FileId, item: u32) resolve.Error!?u32 {
     const tree = try r.itemTree(file);
     var cur: ?u32 = item;
@@ -1466,7 +1561,8 @@ pub fn genericRoot(r: *Resolver, file: FileId, item: u32) resolve.Error!?u32 {
     return null;
 }
 
-/// 有 comptime（含隐式的）或 anytype 参数，或返回 comptime-only 类型的函数
+/// A function with comptime (including implicit) or anytype parameters, or one that returns a
+/// comptime-only type
 fn isGeneric(r: *Resolver, file: FileId, item: u32) resolve.Error!bool {
     const owner = try r.ownerKey(file, item);
     const body = try r.ctx.get(hir.ItemBody, owner);
@@ -1492,7 +1588,8 @@ fn enclosedBy(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!bo
     return false;
 }
 
-/// 类型中含抽象参数或未知部分：值得以调用点的实例重新推导
+/// The type contains abstract parameters or unknown parts: worth re-inferring under a call-site
+/// instance
 pub fn wanted(ip: *InternPool, tv: TypedValue) bool {
     if (tv.ty == .unknown or !value.isConcrete(ip, tv.ty)) return true;
     if (tv.ty == .type_type) return tv.val == null or !value.isConcrete(ip, tv.val.?);

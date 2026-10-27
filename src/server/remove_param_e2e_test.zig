@@ -1,5 +1,7 @@
-//! 端到端：删除未使用的参数（`codeAction/resolve` 中查找调用处、跨文件删除实参、公开函数的确认注解、不能删除时
-//! 的原因、不支持 resolve 的客户端当场算出编辑，应用之后项目照常编译）。
+//! End-to-end: removing an unused parameter (finding call sites in `codeAction/resolve`, removing
+//! arguments across files, the confirmation annotation for public functions, the reason when a
+//! parameter cannot be removed, computing the edit at once for clients without resolve support,
+//! and the project still building after the edits are applied).
 
 const std = @import("std");
 const testing = std.testing;
@@ -19,7 +21,7 @@ fn position(text: []const u8, needle: []const u8) struct { line: u32, character:
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// 文件最后一次发布的编译器诊断（来源为 zig）的个数
+/// Number of compiler diagnostics (whose source is zig) last published for the file
 fn compilerErrors(h: *Harness, name: []const u8) !usize {
     var last: ?[]const std.json.Value = null;
     for (try h.notifications("textDocument/publishDiagnostics")) |m| {
@@ -43,13 +45,14 @@ fn codeActions(h: *Harness, uri: []const u8, text: []const u8, needle: []const u
     return resp.object.get("result").?.array.items;
 }
 
-/// 标题以 `prefix` 开头的代码操作
+/// The code action whose title starts with `prefix`
 fn actionWithTitle(actions: []const std.json.Value, prefix: []const u8) ?std.json.Value {
     for (actions) |x| if (std.mem.startsWith(u8, x.object.get("title").?.string, prefix)) return x;
     return null;
 }
 
-/// 对 `texts`（URI → 文本）应用 WorkspaceEdit（`changes` 或 `documentChanges`），返回改动了的 URI 数
+/// Applies a WorkspaceEdit (`changes` or `documentChanges`) to `texts` (URI → text) and returns
+/// the number of URIs changed
 fn applyEdit(h: *Harness, texts: *std.StringArrayHashMapUnmanaged([]const u8), edit: std.json.Value) !usize {
     const a = h.arena.allocator();
     const Doc = struct { uri: []const u8, edits: []const std.json.Value };
@@ -96,7 +99,7 @@ fn offsetOf(text: []const u8, pos: std.json.Value) usize {
     return i + @as(usize, @intCast(pos.object.get("character").?.integer));
 }
 
-/// 把 `texts` 中的文本发给服务器（编辑器应用了编辑）
+/// Sends the texts in `texts` to the server (the editor has applied the edits)
 fn sync(h: *Harness, texts: *const std.StringArrayHashMapUnmanaged([]const u8), version: i64) !void {
     for (texts.keys(), texts.values()) |u, text| {
         try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = u, .version = version }, .contentChanges = &.{.{ .text = text }} });
@@ -167,7 +170,8 @@ test "remove parameter: resolve, calls in other files, refusals and the project 
     try texts.put(a, lib_uri, lib_text);
     try texts.put(a, main_uri, main_text);
 
-    // 作为函数指针使用的函数：拒绝，说明原因；丢弃仍是首选的修复
+    // A function used as a function pointer: refused with the reason; discarding is still the
+    // preferred fix
     {
         const actions = try codeActions(&h, lib_uri, lib_text, "b: u32) u32 {");
         try testing.expect(actionWithTitle(actions, "discard `b`").?.object.get("isPreferred").?.bool);
@@ -181,10 +185,11 @@ test "remove parameter: resolve, calls in other files, refusals and the project 
         try testing.expectEqual(1, try applyEdit(&h, &texts, actionWithTitle(actions, "discard `b`").?.object.get("edit").?));
         try sync(&h, &texts, 2);
     }
-    // 公开的函数：删除其他文件中调用处的实参，编辑带上要求确认的注解
+    // A public function: the arguments at call sites in other files are removed, and the edit
+    // carries an annotation that needs confirmation
     {
         const fix = actionWithTitle(try codeActions(&h, lib_uri, texts.get(lib_uri).?, "factor"), "remove parameter `factor`").?;
-        // 选择之后才查找调用处
+        // Call sites are looked up only after the action is selected
         try testing.expectEqual(null, fix.object.get("edit"));
         const resp = try h.request("codeAction/resolve", fix);
         const edit = resp.object.get("result").?.object.get("edit").?;
@@ -194,7 +199,8 @@ test "remove parameter: resolve, calls in other files, refusals and the project 
         try testing.expectEqual(2, try applyEdit(&h, &texts, edit));
         try sync(&h, &texts, 3);
     }
-    // 方法：`x.f()` 形式的调用中接收者不是实参；不公开的函数只改所在的文件
+    // A method: in calls of the form `x.f()` the receiver is not an argument; for a function that
+    // is not public, only its own file is edited
     {
         const fix = actionWithTitle(try codeActions(&h, lib_uri, texts.get(lib_uri).?, "note"), "remove parameter `note`").?;
         const resp = try h.request("codeAction/resolve", fix);
@@ -235,7 +241,7 @@ test "remove parameter: resolve, calls in other files, refusals and the project 
         \\
     , texts.get(main_uri).?);
 
-    // 保存修改后的文件：项目照常编译
+    // Save the modified files: the project still builds
     for ([_][]const u8{ "src/lib.zig", "src/main.zig" }, [_][]const u8{ lib_uri, main_uri }) |path, u| {
         const text = texts.get(u).?;
         try project.tmp.dir.writeFile(testing.io, .{ .sub_path = path, .data = text });
@@ -288,7 +294,7 @@ test "remove parameter: clients without resolve support get the edit at once" {
     try testing.expectEqual(1, try applyEdit(&h, &texts, fix.object.get("edit").?));
     try testing.expect(std.mem.indexOf(u8, texts.get(uri).?, "fn area(w: u32, h: u32) u32 {") != null);
     try testing.expect(std.mem.indexOf(u8, texts.get(uri).?, "_ = area(2, 3);") != null);
-    // 不能删除，客户端也不支持 `disabled`：不提供
+    // Cannot be removed, and the client does not support `disabled` either: not offered
     try testing.expectEqual(null, actionWithTitle(try codeActions(&h, uri, single_text, "skip"), "remove parameter"));
     try testing.expect(actionWithTitle(try codeActions(&h, uri, single_text, "skip"), "discard `skip`") != null);
     _ = try h.request("shutdown", {});

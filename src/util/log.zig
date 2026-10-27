@@ -1,5 +1,6 @@
-//! 日志：按运行时的级别过滤后写到 stderr（客户端的输出面板），配置了文件时同时追加到文件。
-//! 由可执行文件的 `std_options.logFn` 接入（见 main.zig）；级别与文件随配置 `log.level`、`log.file` 变化。
+//! Logging: filters by the runtime level and writes to stderr (the client's output panel), also
+//! appending to a file when one is configured. Hooked in via the executable's `std_options.logFn`
+//! (see main.zig); the level and the file change with the `log.level` and `log.file` settings.
 
 const std = @import("std");
 const Io = std.Io;
@@ -7,14 +8,15 @@ const Io = std.Io;
 var level: std.atomic.Value(u8) = .init(@backingInt(std.log.Level.info));
 var mutex: Io.Mutex = .init;
 var file: ?Io.File = null;
-/// 文件中下一次写入的位置（追加）
+/// Offset of the next write in the file (appending)
 var file_offset: u64 = 0;
 
 pub fn setLevel(l: std.log.Level) void {
     level.store(@backingInt(l), .monotonic);
 }
 
-/// 日志追加到 `path`（null 为不写文件）。打不开时返回错误，原来的文件保持不变
+/// Appends the log to `path` (null for no file). Returns an error when it cannot be opened, leaving
+/// the current file unchanged.
 pub fn setFile(path: ?[]const u8) !void {
     const io = std.Options.debug_io;
     const opened: ?Io.File = if (path) |p| try Io.Dir.cwd().createFile(io, p, .{ .truncate = false }) else null;
@@ -28,7 +30,8 @@ pub fn setFile(path: ?[]const u8) !void {
 
 pub fn logFn(comptime l: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     if (@backingInt(l) > level.load(.monotonic)) return;
-    // 测试中直接调用时不写 stderr（测试的 stderr 输出会被构建系统视为异常）
+    // When called directly in tests, does not write to stderr (the build system treats stderr
+    // output from tests as an error)
     if (!@import("builtin").is_test) std.log.defaultLog(l, scope, format, args);
     const io = std.Options.debug_io;
     const prev = io.swapCancelProtection(.blocked);
@@ -36,7 +39,7 @@ pub fn logFn(comptime l: std.log.Level, comptime scope: @EnumLiteral(), comptime
     mutex.lockUncancelable(io);
     defer mutex.unlock(io);
     const f = file orelse return;
-    // 时间（Unix 毫秒）、级别、作用域、消息；过长的消息截断
+    // Time (Unix milliseconds), level, scope, message; overlong messages are truncated
     var buf: [16 * 1024]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     const now_ms = @divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms);
@@ -50,10 +53,12 @@ pub fn logFn(comptime l: std.log.Level, comptime scope: @EnumLiteral(), comptime
     file_offset += text.len + 1;
 }
 
-/// panic 时写出消息、当前线程的上下文（见 `panic_context`）与调用栈：上下文写到 stderr，三者都追加到日志文件。
-/// 调用栈随后由默认的 panic 处理写到 stderr。panic 可能发生在持有日志锁时，拿不到锁就只写 stderr
+/// On panic, writes the message, the current thread's context (see `panic_context`), and the stack
+/// trace: the context goes to stderr, and all three are appended to the log file. The stack trace
+/// is then written to stderr by the default panic handler. A panic can happen while the log lock is
+/// held; when the lock cannot be taken, only stderr is written.
 pub fn writePanic(msg: []const u8, first_address: ?usize) void {
-    // 写日志的过程中再次 panic：不再重复，交给默认的 panic 处理
+    // Panicking again while writing the log: do not repeat, leave it to the default panic handler
     if (writing_panic) return;
     writing_panic = true;
     const io = std.Options.debug_io;
@@ -64,7 +69,7 @@ pub fn writePanic(msg: []const u8, first_address: ?usize) void {
     w.writeAll("context (outermost first):\n") catch {};
     const entries_start = w.end;
     panic_context.dump(&w) catch {};
-    // 没有上下文的线程（如主循环在两条消息之间）不写这一节
+    // Threads without context (such as the main loop between two messages) omit this section
     if (w.end == entries_start) w.end = context_start;
     const context = buf[context_start..w.end];
     if (!@import("builtin").is_test) std.Io.File.stderr().writeStreamingAll(io, context) catch {};

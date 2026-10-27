@@ -1,4 +1,4 @@
-//! hover：光标处名字的签名、类型与文档。
+//! hover: signature, type, and documentation of the name at the cursor.
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
@@ -45,11 +45,12 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
 
     var def: ?Def = null;
     var tv: TypedValue = .unknown;
-    // tv 来自哪个绑定或表达式（以调用点的实例重新推导时取同一位置）
+    // The binding or expression tv comes from (the same position is used when re-inferring with a
+    // call-site instance)
     var binding_id: ?Body.BindingId = null;
     var expr_id: ?Body.ExprId = null;
     if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
-        // decltest：名字指向它引用的声明，而不是 test 自身
+        // decltest: the name refers to the declaration it references, not to the test itself
         if (a.node.kind() == .test_decl and name.kind == .identifier) {
             def = try r.resolveContainerName(file, a.item, try ast.identNameAlloc(r.arena, name.text));
             if (def) |d| tv = try queries.defType(r, d, null, null);
@@ -83,15 +84,16 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
             .error_value => |name| return errorValue(r, file, tok, e, name),
             else => return null,
         }
-        // 直接引用的声明以其声明类型显示（表达式可能经过了结果类型转换）；
-        // 成员访问保留表达式的类型（泛型实例中的成员类型由实例决定）
+        // A directly referenced declaration is shown with its declared type (the expression may
+        // have gone through a result type conversion); a member access keeps the type of the
+        // expression (the member type in a generic instance is determined by the instance)
         if (b.expr(e) == .name_ref) if (def) |d| switch (d) {
             .item => |it| tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(it.file, it.item) }),
             else => {},
         };
     }
 
-    // 泛型函数体内没有具体实例：以调用点的实例推导
+    // A generic function body has no concrete instance: infer with a call-site instance
     var seeded_from: ?seed.Seed = null;
     if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) {
         const subject: seed.Subject = if (binding_id) |id| .{ .binding = id } else .{ .expr = expr_id.? };
@@ -127,7 +129,8 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
 }
 
-/// `error.Foo`：错误名与期望的错误集；当前文件中有它的声明时附上文档
+/// `error.Foo`: the error name and the expected error set, plus its documentation when the
+/// current file declares it
 fn errorValue(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId, name: []const u8) resolve.Error!?Info {
     if (name.len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(r.arena);

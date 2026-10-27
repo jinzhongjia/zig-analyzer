@@ -14,7 +14,7 @@ test "Params / Result types of all messages instantiate JSON parse and stringify
     inline for (types.notifications) |n| try instantiate(n.Params, a);
 }
 
-/// `void` / `?void` 表示无参数或结果恒为 null，由 JSON-RPC 层处理
+/// `void` / `?void` mean no params or a result that is always null; handled by the JSON-RPC layer
 fn instantiate(comptime T: type, a: std.mem.Allocator) !void {
     if (T == void or T == ?void) return;
     _ = json.parseFromValueLeaky(T, a, .null, .{}) catch {};
@@ -53,7 +53,7 @@ test "stringify: integer enums as numbers, string literals and unions" {
         \\{"kind":"create","uri":"file:///a"}
     , try json.Stringify.valueAlloc(a, create, opts));
 
-    // CreateFile | RenameFile | DeleteFile 等按 kind 字面量区分
+    // CreateFile | RenameFile | DeleteFile etc. are distinguished by the kind literal
     const Change = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child).pointer.child;
     const change = try json.parseFromSliceLeaky(Change, a,
         \\{"kind":"rename","oldUri":"file:///a","newUri":"file:///b"}

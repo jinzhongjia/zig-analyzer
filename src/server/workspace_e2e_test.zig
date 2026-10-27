@@ -1,4 +1,5 @@
-//! 端到端：磁盘上的外部改动、工作区文件夹的增减、未保存的文档（`untitled:`）、项目的启动、重启与停止。
+//! End-to-end: external changes on disk, adding and removing workspace folders, unsaved documents
+//! (`untitled:`), and starting, restarting and stopping projects.
 
 const std = @import("std");
 const testing = std.testing;
@@ -28,7 +29,7 @@ fn open(h: *Harness, uri: []const u8, text: []const u8) !void {
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
 }
 
-/// `uri` 最后一次发布的诊断文案
+/// Message texts of the last diagnostics published for `uri`
 fn lastDiagnostics(h: *Harness, uri: []const u8) !?[]const []const u8 {
     var last: ?[]const []const u8 = null;
     for (try h.notifications("textDocument/publishDiagnostics")) |m| {
@@ -62,7 +63,7 @@ test "external changes on disk are picked up through didChangeWatchedFiles" {
     try open(&h, main_uri, main_text);
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    // 动态注册了文件监听
+    // File watching was registered dynamically
     var registered = false;
     for (h.received.items) |m| {
         const method = m.object.get("method") orelse continue;
@@ -74,19 +75,19 @@ test "external changes on disk are picked up through didChangeWatchedFiles" {
     try testing.expect(registered);
     try testing.expectEqualStrings("hello", try completionLabels(&h, main_uri, main_text, "    lib."));
 
-    // 编辑器之外改写 lib.zig
+    // Rewrite lib.zig outside the editor
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn goodbye() void {}\n" });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("goodbye", try completionLabels(&h, main_uri, main_text, "    lib."));
 
-    // 删除
+    // Delete
     try std.Io.Dir.cwd().deleteFile(testing.io, lib_path);
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 3 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("", try completionLabels(&h, main_uri, main_text, "    lib."));
 
-    // 打开的文件以缓冲区为准
+    // For open files the buffer is authoritative
     const other_text = "const other = @import(\"other.zig\");\ntest {\n    other.\n}\n";
     const other_path = try project.path(a, "other.zig");
     const other_uri = try za.base.uri.fromPath(a, other_path);
@@ -125,26 +126,26 @@ test "without file watching from the client, the server watches files on disk" {
     defer h.finish();
     const a = h.arena.allocator();
     const root_uri = try za.base.uri.fromPath(a, project.root);
-    // 客户端不能动态注册文件监听
+    // The client cannot register file watching dynamically
     _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
     try h.notify("initialized", Empty{});
     const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
     try open(&h, main_uri, main_text);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("hello", try completionLabels(&h, main_uri, main_text, "    lib."));
-    // sub/deep.zig 还不存在（所在的目录也不存在）
+    // sub/deep.zig does not exist yet (nor does its directory)
     try testing.expectEqualStrings("", try completionLabels(&h, main_uri, main_text, "    deep."));
 
-    // 编辑器之外改写未打开的 lib.zig，没有任何通知
+    // Rewrite the unopened lib.zig outside the editor, without any notification
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.zig"), .data = "pub fn goodbye() void {}\n" });
     try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "goodbye" });
 
-    // 新建目录与其中被 import 的文件
+    // Create a directory and an imported file in it
     try project.tmp.dir.createDirPath(testing.io, "sub");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "sub/deep.zig"), .data = "pub fn found() void {}\n" });
     try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    deep.", .want = "found" });
 
-    // 编辑器之外新建 build.zig：启动项目；删除：停止项目
+    // Create build.zig outside the editor: the project starts; delete it: the project stops
     const build_path = try project.path(a, "build.zig");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
     try waitWatched(&h, Projects{ .n = 1 });
@@ -155,14 +156,15 @@ test "without file watching from the client, the server watches files on disk" {
     try h.notify("exit", {});
 }
 
-/// 服务器已处理的外部改动的批数
+/// Number of batches of external changes the server has handled
 fn watchBatches(h: *Harness) u64 {
     h.server.watch_mutex.lockUncancelable(testing.io);
     defer h.server.watch_mutex.unlock(testing.io);
     return h.server.watch_batches;
 }
 
-/// 等服务器处理外部改动，直到 `cond.done(h)`：服务器每处理完一批（并空闲）检查一次。10 秒内没有新的一批时失败
+/// Waits for the server to handle external changes until `cond.done(h)`: checks once each time the
+/// server finishes a batch (and is idle). Fails when no new batch arrives within 10 seconds.
 fn waitWatched(h: *Harness, cond: anytype) !void {
     var batches = watchBatches(h);
     for (0..50) |_| {
@@ -179,7 +181,7 @@ fn waitWatched(h: *Harness, cond: anytype) !void {
     return error.ChangeNotNoticed;
 }
 
-/// `waitWatched` 的条件：`after` 之后的补全列表为 `want`
+/// Condition for `waitWatched`: the completion list after `after` is `want`
 const Labels = struct {
     uri: []const u8,
     text: []const u8,
@@ -191,7 +193,7 @@ const Labels = struct {
     }
 };
 
-/// `waitWatched` 的条件：项目列表中有 `n` 个项目
+/// Condition for `waitWatched`: the project list has `n` projects
 const Projects = struct {
     n: usize,
 
@@ -202,7 +204,8 @@ const Projects = struct {
     }
 };
 
-/// 等服务器在第 `after` 批之后又处理完一批外部改动，60 秒内没有时失败
+/// Waits for the server to finish another batch of external changes after batch `after`; fails if
+/// none arrives within 60 seconds
 fn waitBatchAfter(h: *Harness, after: u64) !void {
     const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(60));
     h.server.watch_mutex.lockUncancelable(testing.io);
@@ -212,9 +215,11 @@ fn waitBatchAfter(h: *Harness, after: u64) !void {
     }
 }
 
-/// 发出 waitIdle 并读取消息直到它的响应，`seconds` 秒内没有空闲时失败：一直有构建时 waitIdle 不会返回，
-/// 而不断到来的通知又使单条消息的读取不会超时。失败前先 shutdown 停止各项目，挂起的 waitIdle 随之返回，
-/// 服务器才能在测试结束时退出（退出前要等进行中的请求完成）
+/// Sends waitIdle and reads messages until its response; fails if the server is not idle within
+/// `seconds` seconds: while builds keep running waitIdle does not return, and the constant stream
+/// of notifications keeps the read of any single message from timing out. Before failing, sends
+/// shutdown to stop the projects, so the pending waitIdle returns and the server can exit at the
+/// end of the test (before exiting it waits for in-flight requests to finish).
 fn waitIdleWithin(h: *Harness, seconds: i64) !void {
     const id = try h.send("zig-analyzer/waitIdle", {});
     const start = std.Io.Clock.awake.now(testing.io);
@@ -232,18 +237,20 @@ fn waitIdleWithin(h: *Harness, seconds: i64) !void {
     }
 }
 
-/// 完成并替换了结果的编译次数（项目构建与单文件编译）。构建期间又有改动时，那一轮的结果被丢弃、立即重新构建，不计入
+/// Number of compiles that finished and replaced their results (project builds and single-file
+/// compiles). When something changes during a build, that round's result is discarded and a rebuild
+/// starts immediately; it is not counted.
 fn compiles(h: *Harness) u64 {
     return h.server.compile_generation.load(.monotonic);
 }
 
-/// 服务器的写事务次数
+/// Number of write transactions of the server
 fn writeCount(h: *Harness) !i64 {
     const status = try h.request("zig-analyzer/status", {});
     return status.object.get("result").?.object.get("writes").?.integer;
 }
 
-/// 为 `uri` 发布诊断的次数
+/// Number of times diagnostics were published for `uri`
 fn publishCount(h: *Harness, uri: []const u8) !usize {
     var n: usize = 0;
     for (try h.notifications("textDocument/publishDiagnostics")) |m| {
@@ -272,15 +279,17 @@ test "rewriting files on disk without changing their content is not a change" {
     try testing.expect(builds > 0);
     try testing.expect(published > 0);
 
-    // 原样重写（构建步骤写出的生成代码）：已知的文本没有变，不写入。服务器不知道上一次构建是否读到过磁盘上的
-    // 这份内容，重新构建一次
+    // Rewrite with the same content (generated code written by a build step): the known text is
+    // unchanged, so nothing is written. The server does not know whether the last build read this
+    // content on disk, so it rebuilds once.
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = fixture.basic[2].text });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqual(builds + 1, compiles(&h));
     try testing.expectEqual(writes, try writeCount(&h));
 
-    // 再次原样重写，以及先删除、再新建的原子保存：不写入、不重新构建、不重新发布
+    // Rewrite with the same content again, plus an atomic save that deletes the file and then
+    // creates it again: no write, no rebuild, no republish
     const rebuilt = compiles(&h);
     const republished = try publishCount(&h, lib_uri);
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = fixture.basic[2].text });
@@ -291,7 +300,8 @@ test "rewriting files on disk without changing their content is not a change" {
     try testing.expectEqual(writes, try writeCount(&h));
     try testing.expectEqual(republished, try publishCount(&h, lib_uri));
 
-    // 内容真正改变：写入、重新构建，lib.zig 的编译器诊断随之清除
+    // The content really changes: written and rebuilt, and the compiler diagnostics of lib.zig are
+    // cleared along with it
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn hello() void {}\n" });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
@@ -312,7 +322,7 @@ test "a build step that rewrites a source file with the same content does not re
         \\        .root_source_file = b.path("tools/gen.zig"),
         \\        .target = b.graph.host,
         \\    }) });
-        \\    // 没有声明输出的运行步骤每次构建都运行：原样重写源码树中的 src/gen.zig
+        \\    // A run step with no declared outputs runs on every build: it rewrites src/gen.zig in the source tree verbatim
         \\    const run = b.addRunArtifact(gen);
         \\    run.addDirectoryArg(b.path("src"));
         \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{
@@ -348,17 +358,21 @@ test "a build step that rewrites a source file with the same content does not re
     defer h.finish();
     const a = h.arena.allocator();
     const root_uri = try za.base.uri.fromPath(a, project.root);
-    // 客户端不能动态注册文件监听：由服务器监听，生成步骤的写入会被发现
+    // The client cannot register file watching dynamically: the server watches, so writes by the
+    // generate step are noticed
     _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
     try h.notify("initialized", Empty{});
     const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     try open(&h, main_uri, "const gen = @import(\"gen.zig\");\npub fn main() void {\n    _ = gen.value;\n}\n");
-    // 把重写当作改动会再次构建、再次重写，一直不能空闲（首次构建时监听已就绪就会如此）
+    // Treating the rewrite as a change would build again and rewrite again, never becoming idle
+    // (which happens if watching is already ready at the first build)
     try waitIdleWithin(&h, 120);
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    // 保存触发一次构建：生成步骤原样重写 src/gen.zig。服务器第一次发现时不知道上一次构建是否读到过这份内容，
-    // 可能再构建一次（启动时已经发现过则不会），此后发现时不再构建
+    // A save triggers one build: the generate step rewrites src/gen.zig with the same content. The
+    // first time the server notices it, it does not know whether the last build read this content,
+    // so it may build once more (not if it already noticed it during startup); later notices no
+    // longer trigger a build.
     for (0..2) |round| {
         const builds = compiles(&h);
         const batches = watchBatches(&h);
@@ -391,7 +405,7 @@ test "workspace folders: added folders start a project, removed ones clear its d
     try h.notify("initialized", Empty{});
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    // 加入带 build.zig 的文件夹：构建并发布编译器诊断（main.zig 未打开）
+    // Add a folder with build.zig: builds and publishes compiler diagnostics (main.zig is not open)
     try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &.{.{ .uri = second_uri, .name = "second" }}, .removed = &[_]Empty{} } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const main_uri = try za.base.uri.fromPath(a, try second.path(a, "src/main.zig"));
@@ -399,7 +413,7 @@ test "workspace folders: added folders start a project, removed ones clear its d
     try testing.expectEqual(1, before.len);
     try testing.expect(std.mem.indexOf(u8, before[0], "expected type 'u32'") != null);
 
-    // 移除：项目停止，诊断清除
+    // Remove it: the project stops and the diagnostics are cleared
     try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &.{.{ .uri = second_uri, .name = "second" }} } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqual(0, (try lastDiagnostics(&h, main_uri)).?.len);
@@ -446,8 +460,9 @@ test "removed workspace folder: open files belong to a project that is not loade
     const before = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
     try testing.expect(std.mem.indexOf(u8, before[0], "expected type 'u32'") != null);
 
-    // 移除根目录：目录中仍有 build.zig，打开的文件属于没有加载的项目。项目的编译器诊断被清除，文件不单独编译，
-    // 只有提示
+    // Remove the root directory: the directory still contains build.zig, so the open file belongs
+    // to a project that is not loaded. The project's compiler diagnostics are cleared, the file is
+    // not compiled on its own, and only a hint remains.
     try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &.{.{ .uri = root_uri, .name = "p" }} } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const after = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
@@ -519,7 +534,7 @@ test "completion of @import paths lists modules, files and directories" {
         var labels: std.ArrayList([]const u8) = .empty;
         for (resp.object.get("result").?.array.items) |item| {
             try labels.append(a, item.object.get("label").?.string);
-            // 替换范围从字符串内容的开头起
+            // The replacement range starts at the beginning of the string content
             const start = item.object.get("textEdit").?.object.get("range").?.object.get("start").?.object;
             try testing.expectEqual(c[2], start.get("character").?.integer);
         }
@@ -535,7 +550,8 @@ test "completion of @import paths lists modules, files and directories" {
 }
 
 test "live diagnostics in a library whose default step compiles nothing" {
-    // 只有 addModule 与 addTest：默认的 install step 为空，编译集合改用构建图中所有的编译 step
+    // Only addModule and addTest: the default install step is empty, so the compile set uses all
+    // compile steps in the build graph instead
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
@@ -569,7 +585,8 @@ test "live diagnostics in a library whose default step compiles nothing" {
 }
 
 test "files reachable only from non-default steps resolve module imports" {
-    // 默认的 install 只编译 app；t.zig 只在 test step 的模块中，经由它 import 了模块 lib
+    // The default install compiles only app; t.zig is only in the test step's module, through which
+    // it imports module lib
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
@@ -607,7 +624,8 @@ test "files reachable only from non-default steps resolve module imports" {
 }
 
 test "files of a package that only exports modules resolve module imports" {
-    // 构建图中没有 compile step：lib 只由使用方编译，模块归属来自导出的模块
+    // No compile step in the build graph: lib is compiled only by its users, and module membership
+    // comes from the exported modules
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
@@ -639,7 +657,7 @@ test "files of a package that only exports modules resolve module imports" {
 test "a project whose background task cannot be started does not leave the server busy" {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
-    // 不允许并发任务：项目的后台任务启动失败
+    // Concurrent tasks are not allowed: the project's background task fails to start
     var threaded: std.Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .nothing });
     defer threaded.deinit();
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -652,12 +670,13 @@ test "a project whose background task cannot be started does not leave the serve
 
     try testing.expectError(error.ConcurrencyUnavailable, Workspace.start(&server, project.root, 0));
     const busy = server.busy;
-    // 计数泄漏时 deinit 中的 waitIdle 永远等待：先归零，让失败的测试正常结束
+    // If the count leaks, waitIdle in deinit waits forever: reset it to zero first so the failing
+    // test ends normally
     server.busy = 0;
     try testing.expectEqual(0, busy);
 }
 
-/// 等到某个进度报告的文案包含 `needle`
+/// Waits until the message of some progress report contains `needle`
 fn waitProgress(h: *Harness, needle: []const u8) !void {
     while (true) {
         const msg = try h.next();
@@ -669,7 +688,7 @@ fn waitProgress(h: *Harness, needle: []const u8) !void {
     }
 }
 
-/// 等到服务器发来 `method` 请求（由 `Harness.next` 回复）
+/// Waits until the server sends a `method` request (answered by `Harness.next`)
 fn waitRequest(h: *Harness, method: []const u8) !void {
     while (true) {
         const msg = try h.next();
@@ -679,7 +698,7 @@ fn waitRequest(h: *Harness, method: []const u8) !void {
     }
 }
 
-/// 项目当前的 maker 所在的进程组
+/// Process group of the project's current maker
 fn makerGroup(h: *Harness) std.posix.pid_t {
     h.server.workspaces_mutex.lockUncancelable(testing.io);
     defer h.server.workspaces_mutex.unlock(testing.io);
@@ -699,7 +718,8 @@ test "shutdown during a build ends zig build and its child processes without wai
     const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
     _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .window = .{ .workDoneProgress = true } } });
     try h.notify("initialized", Empty{});
-    // 构建进行到 60 秒的 sleep：maker 要等构建结束才读取下一条消息
+    // The build reaches the 60-second sleep: the maker reads the next message only after the build
+    // ends
     try waitProgress(&h, "run sleep");
     const pgid = makerGroup(&h);
 
@@ -711,7 +731,7 @@ test "shutdown during a build ends zig build and its child processes without wai
     try h.notify("exit", {});
 }
 
-/// 项目当前的 maker 的进程号
+/// Process id of the project's current maker
 fn makerPid(h: *Harness) std.posix.pid_t {
     h.server.workspaces_mutex.lockUncancelable(testing.io);
     defer h.server.workspaces_mutex.unlock(testing.io);
@@ -721,7 +741,8 @@ fn makerPid(h: *Harness) std.posix.pid_t {
     return ws.client.?.child.id.?;
 }
 
-/// 第 `from` 条诊断通知之后，`uri` 至少发布过一次诊断，且每次都含有 `needle`
+/// After the `from`-th diagnostics notification, diagnostics were published for `uri` at least
+/// once, and each publish contains `needle`
 fn expectEveryPublishContains(h: *Harness, from: usize, uri: []const u8, needle: []const u8) !void {
     var count: usize = 0;
     for ((try h.notifications("textDocument/publishDiagnostics"))[from..]) |m| {
@@ -739,7 +760,8 @@ fn expectEveryPublishContains(h: *Harness, from: usize, uri: []const u8, needle:
     try testing.expect(count >= 1);
 }
 
-/// 被替换的实例在其后台任务结束后释放：存活的实例数在几秒内回到 `expected`
+/// Replaced instances are freed after their background tasks end: the number of live instances
+/// returns to `expected` within a few seconds
 fn expectLiveWorkspaces(h: *Harness, expected: usize) !void {
     for (0..100) |_| {
         if (h.server.live_workspaces.load(.monotonic) == expected) return;
@@ -765,14 +787,17 @@ test "restarting a project keeps the previous compiler diagnostics until the new
     try testing.expectEqual(1, before.len);
     try testing.expect(std.mem.indexOf(u8, before[0], "expected type 'u32'") != null);
 
-    // 保存 build.zig：以新实例重启。新实例首次构建完成前，打开的文件不能失去编译器诊断
+    // Save build.zig: restart with a new instance. Until the new instance's first build finishes,
+    // open files must not lose their compiler diagnostics.
     var from = (try h.notifications("textDocument/publishDiagnostics")).len;
     const build_uri = try za.base.uri.fromPath(a, try project.path(a, "build.zig"));
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try expectEveryPublishContains(&h, from, main_uri, "expected type 'u32'");
 
-    // maker 崩溃：自动重启，同样保留。新实例申请了进度 token 之后再等待空闲（此前服务器可能还没发现崩溃）
+    // The maker crashes: restarts automatically, and the diagnostics are kept as well. Waits for
+    // idle only after the new instance has requested a progress token (before that, the server may
+    // not have noticed the crash yet).
     if (@import("builtin").os.tag != .windows) {
         from = (try h.notifications("textDocument/publishDiagnostics")).len;
         try std.posix.kill(makerPid(&h), .KILL);
@@ -781,7 +806,7 @@ test "restarting a project keeps the previous compiler diagnostics until the new
         try expectEveryPublishContains(&h, from, main_uri, "expected type 'u32'");
     }
 
-    // 被替换的实例都已释放
+    // All replaced instances have been freed
     try expectLiveWorkspaces(&h, 1);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
@@ -801,7 +826,8 @@ test "restarting a project during a build stops the old build system first" {
     try waitProgress(&h, "run sleep");
     const old = makerGroup(&h);
 
-    // 构建进行中保存 build.zig：旧的构建立即结束，不与新实例的构建同时进行
+    // Save build.zig during a build: the old build ends immediately and does not run alongside the
+    // new instance's build
     const build_uri = try za.base.uri.fromPath(a, try project.path(a, "build.zig"));
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
     try fixture.expectGroupGone(old);
@@ -810,21 +836,22 @@ test "restarting a project during a build stops the old build system first" {
     try h.notify("exit", {});
 }
 
-/// `uri` 最后一次发布的诊断中是否有含 `needle` 的
+/// Whether the last diagnostics published for `uri` include one containing `needle`
 fn lastHas(h: *Harness, uri: []const u8, needle: []const u8) !bool {
     const diags = (try lastDiagnostics(h, uri)) orelse return false;
     for (diags) |d| if (std.mem.indexOf(u8, d, needle) != null) return true;
     return false;
 }
 
-/// 项目列表中唯一的实例
+/// The only instance in the project list
 fn visibleInstance(h: *Harness) *Workspace {
     h.server.workspaces_mutex.lockUncancelable(testing.io);
     defer h.server.workspaces_mutex.unlock(testing.io);
     return h.server.workspaces.items[0];
 }
 
-/// 跳转结果所在的文件名（没有结果时为 "null"；请求被写事务打断、回复 ContentModified 时为 "error"）
+/// File name of the goto result ("null" without a result; "error" when the request is interrupted
+/// by a write transaction and answered with ContentModified)
 fn gotoFile(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
     const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
     const result = resp.object.get("result") orelse return "error";
@@ -835,7 +862,7 @@ fn gotoFile(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) 
 
 test "fixing a build.zig that failed to compile: named modules resolve once the build graph is read, before the build ends" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    // 构建中运行 60 秒的外部命令：构建在测试期间不会结束
+    // The build runs an external command for 60 seconds: the build does not end during the test
     const fixed =
         \\const std = @import("std");
         \\pub fn build(b: *std.Build) void {
@@ -875,14 +902,15 @@ test "fixing a build.zig that failed to compile: named modules resolve once the 
     try testing.expect(try lastHas(&h, build_uri, "hots"));
     try testing.expectEqualStrings("null", try gotoFile(&h, main_uri, main_text, "geo.na"));
 
-    // 修好并保存：旧实例没有构建图可沿用，新实例读入构建图后立即替换它，不等构建结束
+    // Fix and save: the old instance has no build graph to keep using, so the new instance replaces
+    // it as soon as it has read the build graph, without waiting for the build to end
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = fixed });
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
     for (0..400) |_| {
         if (std.mem.eql(u8, try gotoFile(&h, main_uri, main_text, "geo.na"), "geo.zig")) break;
         try testing.io.sleep(.fromMilliseconds(100), .awake);
     } else return error.TestUnexpectedResult;
-    // build.zig 的编译错误随旧实例清除
+    // The compile errors of build.zig are cleared along with the old instance
     for (0..100) |_| {
         if (!try lastHas(&h, build_uri, "hots")) break;
         _ = try h.request("zig-analyzer/status", {});
@@ -896,7 +924,8 @@ test "abandoning a restart clears the previous compiler diagnostics and keeps th
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
-    // 包装用户的 zig：存在 hang 文件时 `zig build` 什么也不发送。`zig env` 报告包装脚本自身为 zig
+    // Wrap the user's zig: while the hang file exists, `zig build` sends nothing. `zig env` reports
+    // the wrapper script itself as zig.
     const zig = project.env.zig_exe;
     const script = try std.fmt.allocPrint(testing.allocator,
         \\#!/bin/sh
@@ -923,7 +952,8 @@ test "abandoning a restart clears the previous compiler diagnostics and keeps th
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
 
-    // 保存 build.zig：新实例一直得不到结果，随后被放弃（如 maker 反复崩溃）
+    // Save build.zig: the new instance never gets a result and is then abandoned (as when the maker
+    // keeps crashing)
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "hang", .data = "" });
     const build_uri = try za.base.uri.fromPath(a, try project.path(a, "build.zig"));
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
@@ -940,13 +970,14 @@ test "abandoning a restart clears the previous compiler diagnostics and keeps th
     h.server.abandon(pending);
     pending.release();
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // 旧的编译器诊断不再更新：不再显示；旧实例的构建图继续用于模块归属
+    // The old compiler diagnostics are no longer updated: they are no longer shown; the old
+    // instance's build graph is still used for module membership
     try testing.expect(!try lastHas(&h, main_uri, "expected type 'u32'"));
     try testing.expect(visibleInstance(&h) == ws);
     try testing.expect(ws.successor == null);
     try testing.expect(ws.inModuleGraph());
 
-    // 再次保存 build.zig：重新开始
+    // Save build.zig again: starts over
     try project.tmp.dir.deleteFile(testing.io, "hang");
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
     _ = try h.request("zig-analyzer/waitIdle", {});
@@ -968,7 +999,7 @@ test "a restart or build requested through a replaced instance applies to the pr
     const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     try open(&h, main_uri, fixture.basic[1].text);
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // 调用方持有的列表快照中的实例
+    // An instance from a snapshot of the list held by a caller
     const stale = visibleInstance(&h);
     stale.acquire();
     defer stale.release();
@@ -978,13 +1009,14 @@ test "a restart or build requested through a replaced instance applies to the pr
     const current = visibleInstance(&h);
     try testing.expect(current != stale);
 
-    // 构建请求转给当前的实例：重新发布有编译器诊断的文件
+    // The build request is forwarded to the current instance: files with compiler diagnostics are
+    // republished
     const before = (try h.notifications("textDocument/publishDiagnostics")).len;
     h.server.requestBuild(stale);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect((try h.notifications("textDocument/publishDiagnostics")).len > before);
 
-    // 重启当前的实例
+    // Restart the current instance
     h.server.restartWorkspace(stale, 0);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(visibleInstance(&h) != current);
@@ -1000,7 +1032,8 @@ test "a new instance handles build events only after the server has placed it" {
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    // 没有工作区文件夹：项目由测试启动。不运行编译器，配置完成后不再有构建
+    // No workspace folders: the test starts the project. The compiler is not run, so there are no
+    // builds after configuration is done.
     const options = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"diagnostics\": {\"compiler\": false}}", .{});
     _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = options });
     try h.notify("initialized", Empty{});
@@ -1010,7 +1043,8 @@ test "a new instance handles build events only after the server has placed it" {
     _ = try h.request("zig-analyzer/waitIdle", {});
 
     const ws = try Workspace.start(&h.server, project.root, 0);
-    // 加入列表之前不处理事件：maker 早已发来构建图
+    // No events are handled before the instance is added to the list: by then the maker has long
+    // since sent the build graph
     var handled = false;
     for (0..30) |_| {
         ws.mutex.lockUncancelable(testing.io);
@@ -1026,14 +1060,15 @@ test "a new instance handles build events only after the server has placed it" {
         ws.placed.set(testing.io);
     }
     try testing.expect(!handled);
-    // 加入列表后读入的构建图进入模块图
+    // Once added to the list, the build graph it reads goes into the module graph
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("lib.zig", try gotoFile(&h, main_uri, fixture.basic[1].text, "lib.hel"));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
 
-/// 只用命名模块 geo 的源文件；没有 build.zig 时按单文件编译，找不到这个模块
+/// Source file that uses only the named module geo; without build.zig it is compiled as a single
+/// file and the module is not found
 const named_module_main = "const geo = @import(\"geo\");\npub fn main() void {\n    const x: u32 = geo.name;\n    _ = x;\n}\n";
 const named_module_build =
     \\const std = @import("std");
@@ -1098,7 +1133,8 @@ test "creating or deleting build.zig in a workspace folder starts or stops its p
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try testing.expect(try lastHas(&h, main_uri, "no module named 'geo'"));
 
-    // 编辑器之外新建 build.zig（如 zig init）：启动项目，命名模块得以解析
+    // Create build.zig outside the editor (as zig init does): the project starts and the named
+    // module resolves
     const build_path = try project.path(a, "build.zig");
     const build_uri = try za.base.uri.fromPath(a, build_path);
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
@@ -1108,14 +1144,14 @@ test "creating or deleting build.zig in a workspace folder starts or stops its p
     try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
     try testing.expect(!try lastHas(&h, main_uri, "no module named"));
 
-    // 删除：项目停止，打开的文件改按单文件编译
+    // Delete it: the project stops and the open file is compiled as a single file again
     try std.Io.Dir.cwd().deleteFile(testing.io, build_path);
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = build_uri, .type = 3 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqual(0, h.server.workspaces.items.len);
     try testing.expect(try lastHas(&h, main_uri, "no module named 'geo'"));
 
-    // 在编辑器中新建并保存 build.zig（没有文件监听）：同样启动项目
+    // Create and save build.zig in the editor (no file watching): the project starts as well
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = named_module_build });
     try open(&h, build_uri, named_module_build);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
@@ -1123,7 +1159,8 @@ test "creating or deleting build.zig in a workspace folder starts or stops its p
     try testing.expectEqual(1, h.server.workspaces.items.len);
     try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
 
-    // 关闭构建系统集成期间删除 build.zig（没有事件），再打开：按磁盘重新检查，不启动项目
+    // Delete build.zig while build system integration is off (no event), then turn it back on:
+    // rechecked against the disk, and no project starts
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .build = .{ .enable = false } } } });
     try std.Io.Dir.cwd().deleteFile(testing.io, build_path);
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .build = .{ .enable = true } } } });
@@ -1134,7 +1171,7 @@ test "creating or deleting build.zig in a workspace folder starts or stops its p
     try h.notify("exit", {});
 }
 
-/// `uri` 中 `line:character` 处的 hover 文本
+/// Hover text at `line:character` in `uri`
 fn hoverText(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const u8 {
     const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
     const result = resp.object.get("result") orelse return "";
@@ -1142,7 +1179,7 @@ fn hoverText(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const u
     return result.object.get("contents").?.object.get("value").?.string;
 }
 
-/// `waitWatched` 的条件：hover 文本中含有 `want`
+/// Condition for `waitWatched`: the hover text contains `want`
 const Hover = struct {
     uri: []const u8,
     line: u32,
@@ -1181,7 +1218,8 @@ test "files read by @embedFile are watched on disk by the server, or registered 
         const path = try project.path(a, "greeting.txt");
         try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "hello" });
         if (client_watches) {
-            // 客户端按文件名注册了它（由后台任务在驻留后发出）
+            // The client registered it by file name (sent by a background task after the file is
+            // interned)
             var registered = false;
             while (!registered) {
                 for (h.received.items) |m| {

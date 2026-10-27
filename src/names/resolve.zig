@@ -1,6 +1,7 @@
-//! 名字解析：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、
-//! `@This()` 与别名链求出命名空间后查找成员。不做类型推导：经由函数调用、变量类型得到的
-//! 命名空间（如 `std.ArrayList(u8)`、`var x: S` 的 `x.`）由 sema 处理。
+//! Name resolution: local scopes → the chain of lexically enclosing containers; for `a.b.c`, the
+//! namespace is evaluated along `@import`, container definitions, `@This()` and alias chains, and
+//! then the member is looked up. No type inference: namespaces obtained through function calls or
+//! variable types (such as `std.ArrayList(u8)`, or `x.` for `var x: S`) are handled by sema.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,17 +17,17 @@ const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const Body = @import("../hir/Body.zig");
 
-/// 名字解析的结果
+/// Result of name resolution
 pub const Def = union(enum) {
-    /// 容器成员（`ItemTree.items` 下标）
+    /// Container member (index into `ItemTree.items`)
     item: struct { file: FileId, item: u32 },
-    /// 局部绑定：参数、局部变量、捕获（`item` 为所在 BodyOwner）
+    /// Local binding: parameter, local variable or capture (`item` is the enclosing BodyOwner)
     local: struct { file: FileId, item: u32, binding: Body.BindingId },
-    /// `@import` 的目标文件
+    /// Target file of an `@import`
     file: FileId,
 };
 
-/// 可以做成员访问的命名空间：文件中的一个容器（0 为文件本身）
+/// A namespace that supports member access: a container in a file (0 is the file itself)
 pub const Namespace = struct {
     file: FileId,
     container: u32,
@@ -34,7 +35,8 @@ pub const Namespace = struct {
 
 pub const Error = error{ Canceled, OutOfMemory };
 
-/// 别名链的最大长度，防止 `const a = b; const b = a;` 这类环。与 rust-analyzer 名字解析中 glob 导入的递归上限相同
+/// Maximum length of an alias chain, guarding against cycles such as `const a = b; const b = a;`.
+/// Same as the recursion limit for glob imports in rust-analyzer's name resolution.
 const max_depth = 100;
 
 pub const Resolver = struct {
@@ -45,7 +47,7 @@ pub const Resolver = struct {
         return r.ctx.db.env.vfs;
     }
 
-    /// `.zon` 文件：`@import` 得到其中的值，不是命名空间
+    /// `.zon` files: `@import` of one yields the value in it, not a namespace
     pub fn isZon(r: *Resolver, file: FileId) bool {
         return std.mem.endsWith(u8, r.vfs().path(file), ".zon");
     }
@@ -62,25 +64,26 @@ pub const Resolver = struct {
         return r.ctx.get(hir.ItemBody, try r.ownerKey(file, item));
     }
 
-    /// 成员节点（当前语法树中）
+    /// Member node (in the current syntax tree)
     pub fn itemNode(r: *Resolver, file: FileId, item: u32) Error!?SyntaxNode {
         const tree = try r.itemTree(file);
         return (try r.ctx.get(syntax.FileAstIdMap, file)).get(tree.items[item].ast_id);
     }
 
-    /// 成员在文件中的起始位置：只需要位置时用它，不依赖解析结果（可能已被淘汰）
+    /// Start offset of a member in the file: use this when only the position is needed, since it
+    /// does not depend on the parse result (which may have been evicted)
     pub fn itemOffset(r: *Resolver, file: FileId, item: u32) Error!?u32 {
         return (try r.ctx.get(syntax.ItemSummaries, file)).items[item].offset;
     }
 
-    /// 容器在文件中的起始位置（同 `itemOffset`，不依赖解析结果）
+    /// Start offset of a container in the file (like `itemOffset`, independent of the parse result)
     pub fn containerOffset(r: *Resolver, ns: Namespace) Error!?u32 {
         const s = try r.ctx.get(syntax.ItemSummaries, ns.file);
         if (ns.container >= s.container_offsets.len) return null;
         return s.container_offsets[ns.container];
     }
 
-    /// 成员 `item` 体内、相对其起始位置 `rel` 处定义的容器
+    /// Container defined in the body of member `item`, at offset `rel` from the member's start
     pub fn containerAt(r: *Resolver, file: FileId, item: u32, rel: u32) Error!?Namespace {
         const tree = try r.itemTree(file);
         const rels = try r.ctx.get(syntax.ContainerRels, file);
@@ -91,13 +94,14 @@ pub const Resolver = struct {
         return null;
     }
 
-    /// 体内定义的容器 `ns` 相对于其外层成员起始位置的位置
+    /// Offset of container `ns`, defined in a body, relative to the start of its enclosing member
     pub fn containerRel(r: *Resolver, ns: Namespace) Error!?u32 {
         const rels = try r.ctx.get(syntax.ContainerRels, ns.file);
         return if (ns.container < rels.len) rels[ns.container] else null;
     }
 
-    /// 成员是否可能提到名字 `name`（有假阳性）：在生成 Body 之前粗筛
+    /// Whether the member may mention name `name` (with false positives): a coarse filter before
+    /// building the Body
     pub fn mayMention(r: *Resolver, file: FileId, item: u32, name: []const u8) Error!bool {
         const names = try r.ctx.get(syntax.ItemNames, file);
         return (syntax.ItemSummary{ .offset = null, .names = names[item] }).mayMention(name);
@@ -108,22 +112,24 @@ pub const Resolver = struct {
         return (try r.ctx.get(syntax.FileAstIdMap, ns.file)).get(tree.containers[ns.container].ast_id);
     }
 
-    // ── 名字查找 ─────────────────────────────────────────────────────
+    // ── Name lookup ──────────────────────────────────────────────────
 
-    /// 在 BodyOwner `item` 的 `scope` 处解析名字
+    /// Resolves a name at `scope` of BodyOwner `item`
     pub fn resolveName(r: *Resolver, file: FileId, item: u32, b: *const Body, scope: Body.ScopeId, name: []const u8) Error!?Def {
         if (b.lookup(scope, name)) |binding| return .{ .local = .{ .file = file, .item = item, .binding = binding } };
         return r.resolveContainerName(file, item, name);
     }
 
-    /// 容器级的名字：成员声明，以及容器定义在成员体内时该成员在容器位置可见的局部名字。
-    /// 用于没有 Body 局部作用域的位置（如 decltest `test helper` 的名字）
+    /// Container-level names: member declarations and, when the container is defined in a member's
+    /// body, the local names of that member visible at the container's position.
+    /// Used at positions without a Body local scope (such as the name in a decltest `test helper`).
     pub fn resolveContainerName(r: *Resolver, file: FileId, item: u32, name: []const u8) Error!?Def {
         const tree = try r.itemTree(file);
         var container = tree.items[item].container;
         while (true) {
             if (lookupDecl(tree, container, name)) |m| return .{ .item = .{ .file = file, .item = m } };
-            // 容器定义在某个成员的体内：继续查该成员在容器位置可见的局部名字
+            // The container is defined in a member's body: continue with the local names of that
+            // member visible at the container's position
             const parent = tree.containers[container].parent_item orelse return null;
             if (try r.localAtContainer(file, parent, container, name)) |def| return def;
             container = tree.items[parent].container;
@@ -137,7 +143,8 @@ pub const Resolver = struct {
         return .{ .local = .{ .file = file, .item = parent, .binding = binding } };
     }
 
-    /// 容器中可按名字直接引用的成员（声明；字段不是作用域中的名字）
+    /// Members of a container that can be referenced directly by name (declarations; fields are not
+    /// names in scope)
     pub fn lookupDecl(tree: *const ItemTree, container: u32, name: []const u8) ?u32 {
         for (tree.containerMembers(container)) |m| {
             const it = tree.items[m];
@@ -149,7 +156,7 @@ pub const Resolver = struct {
         return null;
     }
 
-    /// `ns.name`：声明；枚举还包括其成员（`E.a`）
+    /// `ns.name`: declarations, and for enums also their fields (`E.a`)
     pub fn memberDef(r: *Resolver, ns: Namespace, name: []const u8) Error!?Def {
         const tree = try r.itemTree(ns.file);
         if (ns.container >= tree.containers.len) return null;
@@ -163,7 +170,8 @@ pub const Resolver = struct {
         return null;
     }
 
-    /// `const f = a.b.c;` 这类别名最终指向的定义；不是别名时为 `def` 本身
+    /// The definition an alias like `const f = a.b.c;` ultimately points to; `def` itself when it
+    /// is not an alias
     pub fn aliasTarget(r: *Resolver, def: Def) Error!Def {
         var cur = def;
         for (0..max_depth) |_| {
@@ -183,9 +191,10 @@ pub const Resolver = struct {
         return cur;
     }
 
-    // ── 命名空间求值 ─────────────────────────────────────────────────
+    // ── Namespace evaluation ─────────────────────────────────────────
 
-    /// 定义指向的命名空间（`const x = @import(...)`、`const S = struct {...}`、别名等）
+    /// The namespace a definition points to (`const x = @import(...)`, `const S = struct {...}`,
+    /// aliases, etc.)
     pub fn namespaceOf(r: *Resolver, def: Def) Error!?Namespace {
         return r.namespaceOfDepth(def, 0);
     }
@@ -212,7 +221,7 @@ pub const Resolver = struct {
         }
     }
 
-    /// 表达式求值得到的命名空间
+    /// The namespace an expression evaluates to
     pub fn evalNamespace(r: *Resolver, file: FileId, item: u32, b: *const Body, e: Body.ExprId) Error!?Namespace {
         return r.evalDepth(file, item, b, e, 0);
     }
@@ -248,17 +257,17 @@ pub const Resolver = struct {
 
     // ── import ───────────────────────────────────────────────────────
 
-    /// `@import(args)` 的目标文件
+    /// Target file of `@import(args)`
     pub fn importTarget(r: *Resolver, file: FileId, b: *const Body, args: []const Body.ExprId) Error!?FileId {
         return r.resolveImport(file, r.importName(b, args) orelse return null);
     }
 
-    /// `@import(args)` 的全部目标（见 `resolveImportTargets`）
+    /// All targets of `@import(args)` (see `resolveImportTargets`)
     pub fn importTargets(r: *Resolver, file: FileId, b: *const Body, args: []const Body.ExprId) Error![]const FileId {
         return r.resolveImportTargets(file, r.importName(b, args) orelse return &.{});
     }
 
-    /// `@import(args)` 的实参字符串
+    /// The argument string of `@import(args)`
     fn importName(r: *Resolver, b: *const Body, args: []const Body.ExprId) ?[]const u8 {
         if (args.len != 1) return null;
         const raw = switch (b.expr(args[0])) {
@@ -273,22 +282,26 @@ pub const Resolver = struct {
             const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
             return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, name }));
         }
-        // 经由文件的 import 表：只依赖与本文件相关的部分（见 `FileImports`）
+        // Through the file's import table: depends only on the part relevant to this file
+        // (see `FileImports`)
         if ((try r.ctx.get(ModuleGraph.FileImports, file)).get(name)) |target| return target;
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return null;
         return graph.importTarget(file, name);
     }
 
-    /// `file` 所在目录中的相对路径 `path` 对应的文件（`@embedFile`）；绝对路径为 null（编译器不接受）
+    /// The file at relative path `path` in the directory of `file` (`@embedFile`); null for
+    /// absolute paths (the compiler rejects them)
     pub fn relativeFile(r: *Resolver, file: FileId, path: []const u8) Error!?FileId {
         if (std.fs.path.isAbsolute(path)) return null;
         const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
         return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, path }));
     }
 
-    /// 文件中 `@import(name)` 的全部目标：文件所属的多个模块以 `name` import 不同的模块时有多个，按模块的
-    /// 优先级排列，第一个即 `resolveImport` 的结果；相对路径至多一个。直接读取模块图、不经 `FileImports`
-    /// 截断其他变化，供跳转等请求使用，推导中不要使用
+    /// All targets of `@import(name)` in a file: there are several when the modules the file
+    /// belongs to import different modules as `name`, ordered by module priority, the first one
+    /// being the result of `resolveImport`; a relative path has at most one. Reads the module graph
+    /// directly, without `FileImports` cutting off other changes; meant for requests such as goto,
+    /// and must not be used in inference.
     pub fn resolveImportTargets(r: *Resolver, file: FileId, name: []const u8) Error![]const FileId {
         if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
             const target = try r.resolveImport(file, name) orelse return &.{};
@@ -298,9 +311,10 @@ pub const Resolver = struct {
         return graph.importTargets(r.arena, file, name);
     }
 
-    // ── 位置 ─────────────────────────────────────────────────────────
+    // ── Positions ────────────────────────────────────────────────────
 
-    /// 包含 `offset` 的最内层成员（`inclusive_end`：光标位于成员末尾时也算在内）
+    /// The innermost member containing `offset` (`inclusive_end`: a cursor at the end of the member
+    /// also counts)
     pub fn ownerAt(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) Error!?u32 {
         const tree = try r.itemTree(file);
         const map = try r.ctx.get(syntax.FileAstIdMap, file);
@@ -318,13 +332,14 @@ pub const Resolver = struct {
         return best;
     }
 
-    /// 成员所在的容器是否允许只写名字的字段（枚举、联合；决定字段名字的位置）
+    /// Whether the member's container allows fields written as just a name (enums, unions; this
+    /// determines where a field's name is)
     pub fn inEnum(r: *Resolver, file: FileId, item: u32) Error!bool {
         const tree = try r.itemTree(file);
         return ItemTree.bareFieldNames(tree.containers[tree.items[item].container].kind);
     }
 
-    /// 定义所在的文件与名字位置（文件为开头）
+    /// The file and name position of a definition (the start of the file for a file)
     pub fn location(r: *Resolver, def: Def) Error!?struct { file: FileId, start: u32, end: u32 } {
         switch (def) {
             .file => |f| return .{ .file = f, .start = 0, .end = 0 },
@@ -342,7 +357,7 @@ pub const Resolver = struct {
     }
 };
 
-/// 字符串字面量的值；不是合法的单行字符串时返回 null
+/// Value of a string literal; null when it is not a valid single-line string
 fn stringValue(arena: Allocator, raw: []const u8) ?[]const u8 {
     if (raw.len < 2 or raw[0] != '"') return null;
     return std.zig.string_literal.parseAlloc(arena, raw) catch null;

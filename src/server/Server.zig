@@ -1,8 +1,10 @@
-//! LSP 服务器：主循环、消息调度、读写分离与取消。
+//! LSP server: main loop, message dispatch, read/write separation, and cancellation.
 //!
-//! - 写消息（文档同步等通知）在主循环中串行执行：`beginWrite` 取消进行中的读查询后修改 input。
-//! - 读请求在 `group` 中并发执行，各自持有一个读事务；被写事务打断时回复 `ContentModified`，
-//!   被 `$/cancelRequest` 取消时回复 `RequestCancelled`。
+//! - Write messages (notifications such as document sync) run serially on the main loop:
+//!   `beginWrite` cancels in-flight read queries, then modifies inputs.
+//! - Read requests run concurrently in `group`, each holding a read transaction; a request
+//!   interrupted by a write transaction is answered with `ContentModified`, and one canceled by
+//!   `$/cancelRequest` with `RequestCancelled`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -50,176 +52,218 @@ env: database.Env,
 out: *transport.Writer,
 state: State = .uninitialized,
 encoding: offsets.Encoding = .utf16,
-/// 并发执行中的读请求。只有主循环向其中提交任务，因此主循环可以安全地 await 它。
+/// Read requests running concurrently. Only the main loop submits tasks to it, so the main loop
+/// can safely await it.
 group: Io.Group = .init,
 pending_mutex: Io.Mutex = .init,
 pending: std.ArrayList(*Pending) = .empty,
 
-/// 后台任务：项目的构建系统协议读取、诊断发布。多个线程都会向其中提交任务，
-/// 而 `Io.Group` 不允许在 await 期间提交，因此只在退出时（所有项目停止后）cancel 一次；
-/// 平时用 `busy` 计数判断是否空闲。
+/// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
+/// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
+/// is canceled only once, on exit (after all projects have stopped); at other times the `busy`
+/// count tells whether it is idle.
 bg_group: Io.Group = .init,
-/// 诊断发布队列：固定数量的 worker 依次取出，避免按文件线性的任务与读事务
+/// Diagnostic publish queue: a fixed number of workers take jobs from it in turn, so the number of
+/// tasks and read transactions does not grow linearly with the number of files
 publish_queue_mutex: Io.Mutex = .init,
 publish_queue: std.ArrayList(PublishJob) = .empty,
 publish_workers: usize = 0,
-/// 排队中或正在发布的文件（受 publish_queue_mutex 保护），见 `publishFiles`
+/// Files queued or being published (protected by publish_queue_mutex); see `publishFiles`
 publish_files: std.AutoHashMapUnmanaged(Vfs.FileId, PublishState) = .empty,
 busy_mutex: Io.Mutex = .init,
 busy_cond: Io.Condition = .init,
 busy: usize = 0,
 
-/// 工作区根目录（绝对路径）：initialize 时给出，之后随 `workspace/didChangeWorkspaceFolders` 增减
+/// Workspace root directories (absolute paths): given at initialize, then added and removed by
+/// `workspace/didChangeWorkspaceFolders`
 roots: std.ArrayList([]u8) = .empty,
-/// 与 `roots` 一一对应：根目录下是否有 build.zig（加入时同步检查，避免项目加载完成前误判；build.zig 新建或删除时
-/// 更新，见 `refreshRoot`）
+/// Parallel to `roots`: whether the root directory has a build.zig (checked synchronously when
+/// the root is added, to avoid a wrong answer before the project finishes loading; updated when
+/// build.zig is created or deleted, see `refreshRoot`)
 root_has_build: std.ArrayList(bool) = .empty,
-/// 保护 `roots` 与 `root_has_build`
+/// Protects `roots` and `root_has_build`
 roots_mutex: Io.Mutex = .init,
 
 single_mutex: Io.Mutex = .init,
-/// 单文件模式（独立的 .zig 文件，见 `FileContext.detached`）的编译结果，按编译的根文件组织。结果中也有被根文件
-/// import 的文件中的错误
+/// Compile results of single-file mode (standalone .zig files, see `FileContext.detached`), keyed
+/// by the compiled root file. The results also include errors in files imported by the root file.
 single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
-/// 已取出的编译结果序号（项目的构建与单文件编译共用，见 `nextCompileGeneration`）
+/// Sequence number of the last compile result taken (shared by project builds and single-file
+/// compiles; see `nextCompileGeneration`)
 compile_generation: std.atomic.Value(u64) = .init(0),
-/// 进程的环境变量：启动的 zig 子进程在其上覆盖 zig 路径（见 `ZigEnv.withOverrides`）
+/// Environment variables of the process: zig child processes are started with the zig path
+/// overrides applied on top of them (see `ZigEnv.withOverrides`)
 environ: std.process.Environ = .empty,
 env_mutex: Io.Mutex = .init,
-/// 生效的 zig 环境：探测结果叠加配置中的路径覆盖（见 `applyZigPaths`）。启动后在后台查询；查询完成前为 null
+/// The effective zig environment: the detected one with the path overrides from the
+/// configuration applied (see `applyZigPaths`). Queried in the background after startup; null
+/// until the query completes
 zig_env: ?*const ZigEnv = null,
-/// `zig env` 探测到的环境；查询完成前为 null
+/// The environment detected by `zig env`; null until the query completes
 detected_env: ?*const ZigEnv = null,
-/// 创建过的全部环境：被替换的环境可能仍被进行中的任务、运行中的项目使用，到 deinit 才释放
+/// All environments created so far: a replaced environment may still be in use by in-flight
+/// tasks and running projects, so it is freed only in deinit
 envs: std.ArrayList(*ZigEnv) = .empty,
-/// 串行化 zig 路径的应用（启动与配置变化）
+/// Serializes applying the zig paths (at startup and on configuration changes)
 zig_paths_mutex: Io.Mutex = .init,
-/// 启动阶段已经结束：zig 环境就绪，带 build.zig 的根目录已经启动项目。此前不按单文件编译（结束时补上），
-/// 项目开始加载之前还不能推迟属于项目的文件的编译（见 `projectsLoading`）
+/// Startup has finished: the zig environment is ready, and projects have been started for root
+/// directories with a build.zig. Before that, nothing is compiled in single-file mode (caught up
+/// when startup finishes): until projects start loading, compiling files that belong to a
+/// project cannot be deferred yet (see `projectsLoading`).
 startup_done: std.atomic.Value(bool) = .init(false),
-/// 不属于任何项目的文件使用的 builtin.zig（本机目标、Debug）；受 env_mutex 保护
+/// builtin.zig for files that belong to no project (native target, Debug); protected by env_mutex
 default_builtin: ?[]u8 = null,
 warned: bool = false,
 workspaces_mutex: Io.Mutex = .init,
-/// 各项目当前可见的实例（各持有一个引用）。在锁外使用其中的实例前先 `acquire`
+/// Currently visible instance of each project (one reference held on each). Before an instance is
+/// used outside the lock, `acquire` it first.
 workspaces: std.ArrayList(*Workspace) = .empty,
-/// 已开始停止所有项目（shutdown / exit / deinit）：此后不再重启项目
+/// Stopping all projects has begun (shutdown / exit / deinit): projects are not restarted anymore
 shutting_down: bool = false,
-/// 尚未释放的 Workspace 实例数（统计与测试用）
+/// Number of Workspace instances not yet freed (for statistics and tests)
 live_workspaces: std.atomic.Value(usize) = .init(0),
 
 progress: Progress = .{},
 
-/// 串行化模块图的更新，避免较旧的快照覆盖较新的
+/// Serializes module graph updates so that an older snapshot does not overwrite a newer one
 graph_mutex: Io.Mutex = .init,
-/// 后台索引的代数：模块图每次更新加一
+/// Generation of background indexing: incremented on every module graph update
 index_generation: std.atomic.Value(u64) = .init(0),
-/// 配置 `sema.callsite_seeding`（经 `Env` 供 IDE 层读取）
+/// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
 callsite_seeding: std.atomic.Value(bool) = .init(true),
-/// 统计分配器（可执行文件设置，用于 `zig-analyzer/status` 的 `heap_bytes`）
+/// Counting allocator (set by the executable; used for `heap_bytes` in `zig-analyzer/status`)
 heap: ?*const za.util.mem.Counting = null,
-/// 慢请求日志的阈值（毫秒，0 为关闭），来自配置 `log.slow_request_ms`
+/// Slow request log threshold (ms, 0 disables it), from the config option `log.slow_request_ms`
 slow_request_ms: std.atomic.Value(u32) = .init(100),
-/// InternPool 超过这么多 MB 时整代回收类型信息（0 为不回收），来自配置 `sema.max_intern_pool_mb`
+/// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
+/// generation (0 disables reclaiming); from the config option `sema.max_intern_pool_mb`
 max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
-/// 是否有线程正在整代回收（同时只进行一次）
+/// Whether a thread is performing whole-generation reclamation (only one at a time)
 sema_resetting: std.atomic.Value(bool) = .init(false),
-/// 编辑触发的诊断发布的防抖（毫秒），来自配置 `diagnostics.debounce_ms`
+/// Debounce (ms) of diagnostic publishing triggered by edits, from the config option
+/// `diagnostics.debounce_ms`
 debounce_ms: std.atomic.Value(u32) = .init(50),
-/// 编辑触发的待发布文件（见 `publishDebounced`）
+/// Files pending publication due to edits (see `publishDebounced`)
 edits_mutex: Io.Mutex = .init,
 edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
-/// 诊断发布在读事务之外预先算好的 live 诊断（经 `Env` 供 `AstCheck` 取用）
+/// Live diagnostics that diagnostic publishing precomputes outside the read transaction (picked up
+/// by `AstCheck` through `Env`)
 live_prepared: live.Prepared = undefined,
-/// 是否有索引任务在运行（同时只运行一个）
+/// Whether an indexing task is running (only one runs at a time)
 indexing: std.atomic.Value(bool) = .init(false),
-/// 在可以自动导入的名字处补全过：此后才为自动导入建索引。不补全的会话（浏览、跳转）不为它展开标准库的公开导出闭包
+/// Completion has run at a name that can be auto-imported: only after that is the auto-import
+/// index built. Sessions without completion (browsing, goto) do not expand the public export
+/// closure of the standard library for it.
 imports_wanted: std.atomic.Value(bool) = .init(false),
-/// 最近一轮建完自动导入索引时模块图的构成（见 `importsBasis`；尚未建完为 `imports_pending`）。补全时与它不同
-/// 则不提供自动导入，标记为不完整，客户端随输入重新请求：以免在请求中同步为新的模块展开标准库、项目的公开导出
-/// 闭包。模块图只增减了文件（如构建中产生的生成文件）时不变，新文件的索引在补全时按需建立
+/// Composition of the module graph when the auto-import index was last completed (see
+/// `importsBasis`; `imports_pending` until it has been completed). When it differs at completion
+/// time, auto-import is not offered and the result is marked incomplete, so the client requests
+/// again as the user types: this avoids expanding the public export closures of the standard
+/// library and the projects for new modules synchronously inside a request. It does not change
+/// when the module graph only gains or loses files (such as generated files produced by a build);
+/// new files are indexed on demand during completion.
 imports_basis: std.atomic.Value(u64) = .init(imports_pending),
-/// 已建立索引的文件：索引进行中时 workspace symbol 只在这些文件（与打开的文档）中查找
+/// Indexed files: while indexing is in progress, workspace symbol searches only these files (and
+/// open documents)
 indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 indexed_mutex: Io.Mutex = .init,
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
-// ── 拉取配置（只在主循环中访问）──
-/// 客户端支持 `workspace/configuration`
+// ── Pulled configuration (accessed only on the main loop) ──
+/// The client supports `workspace/configuration`
 pull_config: bool = false,
-/// 客户端支持动态注册 `workspace/didChangeConfiguration`（注册后客户端在配置变化时通知，内容由服务器拉取）
+/// The client supports dynamically registering `workspace/didChangeConfiguration` (once
+/// registered, the client sends a notification when the configuration changes, and the server
+/// pulls the contents)
 register_config: bool = false,
-/// 客户端支持动态注册 `workspace/didChangeWatchedFiles`（监听磁盘上的外部改动）
+/// The client supports dynamically registering `workspace/didChangeWatchedFiles` (watching
+/// external changes on disk)
 register_watch: bool = false,
-/// 客户端支持 `workspace/inlayHint/refresh`（inlay hints 的配置变化后请客户端重新请求）
+/// The client supports `workspace/inlayHint/refresh` (after the inlay hints settings change, the
+/// client is asked to request them again)
 inlay_refresh: bool = false,
-/// 客户端支持 `codeAction/resolve` 延后计算 `edit`（且原样带回 `data`）：命名的修复在用户选择之后才查找引用
+/// The client supports deferring `edit` to `codeAction/resolve` (and sends `data` back unchanged):
+/// naming fixes look up references only after the user has chosen them
 code_action_resolve: bool = false,
-/// 客户端支持代码操作的 `disabled`（显示为不可用并说明原因）
+/// The client supports `disabled` on code actions (shown as unavailable, with the reason)
 code_action_disabled: bool = false,
-/// 客户端支持 `documentChanges` 中带变更注解的编辑：公开名字的改名要求用户确认
+/// The client supports edits with change annotations in `documentChanges`: renaming a public name
+/// requires confirmation from the user
 change_annotations: bool = false,
-/// 客户端支持工作区语义令牌刷新；同一时间最多等待一个刷新响应。
+/// The client supports the workspace semantic tokens refresh; at most one refresh response is
+/// awaited at a time.
 semantic_refresh: bool = false,
 semantic_refresh_mutex: Io.Mutex = .init,
 semantic_refresh_pending: bool = false,
 semantic_refresh_dirty: bool = false,
 semantic_cache: SemanticCache = .{},
-/// 已发出的拉取请求数；只采纳最近一次请求的响应
+/// Number of configuration requests sent; only the response to the most recent one is used
 config_requests: u32 = 0,
-/// 尚未收到响应的拉取请求数：等待期间计为忙碌（waitIdle 会等待配置生效）
+/// Number of configuration requests not yet answered: counted as busy while waiting (waitIdle
+/// waits for the configuration to take effect)
 config_outstanding: u32 = 0,
-/// 首次拉取的响应到达前推迟项目启动（启动要用 zig.path 与构建参数）
+/// Project startup is postponed until the response to the first pull arrives (startup needs
+/// zig.path and the build arguments)
 startup_pending: bool = false,
-/// `initialized` 已处理：LSP 规定只发送一次，重复的忽略
+/// `initialized` has been handled: LSP specifies that it is sent only once; duplicates are ignored
 initialized_received: bool = false,
-/// 监视客户端进程（`initialize` 的 `processId`）的后台任务
+/// Background task watching the client process (`processId` of `initialize`)
 parent_watch: ?Io.Future(void) = null,
-/// `parent_watch` 等待的客户端进程
+/// Client process that `parent_watch` waits on
 parent_process: ?*client_process.Watch = null,
-/// 项目已启动：此后修改 zig.path 需要重启服务器
+/// Projects have been started: changing zig.path after this requires restarting the server
 started: bool = false,
 
-/// 串行化修改服务器状态的消息处理：主循环处理每条消息时持有，服务器发现的外部改动也在它之下处理（见 `watch.zig`）
+/// Serializes message handling that modifies server state: held by the main loop while it
+/// handles each message; external changes discovered by the server are also handled under it
+/// (see `watch.zig`)
 write_mutex: Io.Mutex = .init,
-/// 未打开的已知文件在外部改动中读到、并已据此重新构建的磁盘内容（哈希；null 为不存在），见
-/// `didChangeWatchedFiles`。打开文档时清除：打开期间保存的内容不经过外部改动。只在 write_mutex 下访问
+/// Disk contents of known files that are not open, read during external changes and already used
+/// as the basis of a rebuild (hash; null if the file does not exist); see `didChangeWatchedFiles`.
+/// Cleared when the document is opened: contents saved while it is open do not come through
+/// external changes. Accessed only under write_mutex.
 watched_built: std.AutoHashMapUnmanaged(Vfs.FileId, ?u64) = .empty,
-/// 服务器发现外部改动的后台任务（`startProjects` 时创建）
+/// Background task for server-side discovery of external changes (created by `startProjects`)
 watcher: ?*watch.Watcher = null,
-/// 原生文件监听不可用时，轮询的最短间隔（毫秒）
+/// Minimum polling interval (ms) when native file watching is unavailable
 poll_interval_ms: std.atomic.Value(u32) = .init(1000),
-/// 服务器发现的外部改动已处理的批数，测试据此等待（受 `watch_mutex` 保护，变化时广播 `watch_cond`）
+/// Number of processed batches of external changes discovered by the server; tests wait on it
+/// (protected by `watch_mutex`; `watch_cond` is broadcast when it changes)
 watch_batches: u64 = 0,
 watch_mutex: Io.Mutex = .init,
 watch_cond: Io.Condition = .init,
 docs_mutex: Io.Mutex = .init,
-/// 已打开的文档：客户端使用的 URI（发布诊断时原样使用）
+/// Open documents: the URI used by the client (used verbatim when publishing diagnostics)
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
-/// 客户端最近一次使用的 URI：文档关闭后仍用于发布诊断（清除旧诊断、编译器重新发布），
-/// 避免按内部路径重新编码 URI。虚拟文档清除后即删除
+/// URI most recently used by the client: still used to publish diagnostics after the document is
+/// closed (clearing old diagnostics, republishing compiler diagnostics), so that the URI is not
+/// re-encoded from the internal path. For a virtual document, the entry is deleted once its
+/// diagnostics are cleared.
 last_uris: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
-/// 当前显示着非空诊断的文件（需要时发布空列表清除）
+/// Files currently showing non-empty diagnostics (cleared by publishing an empty list when needed)
 published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
-/// 诊断计算的序号：每次计算在读取编译结果、文本等状态之前取一个（见 `sendDiagnostics`）
+/// Sequence number of diagnostic computations: each computation takes one before reading state
+/// such as compile results and text (see `sendDiagnostics`)
 publish_seq: std.atomic.Value(u64) = .init(0),
 publish_mutex: Io.Mutex = .init,
-/// 文件 → 已发送的诊断的序号（受 publish_mutex 保护）
+/// File → sequence number of the diagnostics sent (protected by publish_mutex)
 sent_seq: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
 
 pub const State = enum { uninitialized, running, shutdown };
 
 const SingleFile = struct {
     result: ?*compiler.BuildResult = null,
-    /// FileId → `result` 中的条目（根文件自身与被它 import 的文件）
+    /// FileId → entry in `result` (the root file itself and the files it imports)
     files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty,
-    /// 得到 `result` 的那次编译读取的、根文件所在目录下的文件（含被它 import 的）：其中任何一个变化都需要重新编译
+    /// Files under the root file's directory read by the compile that produced `result`
+    /// (including the files it imports): a change to any of them requires recompiling
     inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
-    /// `result` 存入时取的编译结果序号：越大越新
+    /// Compile result sequence number taken when `result` was stored: larger is newer
     generation: u64 = 0,
     running: bool = false,
     rerun: bool = false,
-    /// 编译被推迟（有项目尚在首次加载）：加载结束后补上（见 `reconcileSingle`）
+    /// The compile was deferred (a project is still loading for the first time): it runs after
+    /// loading finishes (see `reconcileSingle`)
     pending: bool = false,
 
     fn clearResult(sf: *SingleFile, gpa: Allocator) void {
@@ -241,17 +285,20 @@ pub const HandlerError = error{
     Canceled,
     OutOfMemory,
     InvalidParams,
-    /// 重命名的目标不在工作区内（标准库、依赖包）
+    /// The rename target is outside the workspace (standard library, dependency packages)
     RenameOutsideWorkspace,
-    /// 新名字不是合法的标识符
+    /// The new name is not a valid identifier
     InvalidIdentifier,
-    /// 泛型函数体内的引用在一些实例下指向其他定义：重命名会破坏这些实例
+    /// A reference inside a generic function body refers to another definition in some instances:
+    /// renaming would break those instances
     RenameAmbiguous,
-    /// 泛型函数体内的引用要按实例判断，而实例不完整（实例化无限增长）：无法确认全部引用
+    /// References inside a generic function body must be decided per instance, but the instances
+    /// are incomplete (instantiation grows without bound): not all references can be confirmed
     RenameIncomplete,
 };
 
-/// 原地初始化：查询引擎持有指向 `server.env` 的指针，因此 Server 不能在初始化后移动。
+/// Initializes in place: the query engine holds a pointer to `server.env`, so the Server must not
+/// be moved after initialization.
 pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) Allocator.Error!void {
     server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .ip = try .init(gpa, io), .env = undefined, .out = out };
     server.live_prepared = .{ .gpa = gpa };
@@ -261,7 +308,7 @@ pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) All
 
 pub fn deinit(server: *Server) void {
     if (server.parent_watch) |*f| {
-        // 等待退出通知时不响应取消：先让它返回
+        // Waiting for the process exit notification ignores cancellation: make it return first
         server.parent_process.?.stop();
         f.cancel(server.io);
         server.parent_process.?.destroy(server.gpa);
@@ -274,7 +321,7 @@ pub fn deinit(server: *Server) void {
         server.vfs.listener.store(null, .release);
         w.destroy();
     }
-    // 后台任务都已结束，只剩列表持有的引用
+    // All background tasks have finished; only the references held by the list remain
     server.publish_queue.deinit(server.gpa);
     server.publish_files.deinit(server.gpa);
     for (server.workspaces.items) |ws| ws.release();
@@ -311,14 +358,17 @@ pub fn deinit(server: *Server) void {
     server.* = undefined;
 }
 
-/// 运行主循环直到收到 `exit` 或输入结束，返回进程退出码。返回前停止各项目的构建系统进程，等待已调度的
-/// 后台任务（诊断发布等）收尾。输入结束而未收到 `exit` 时客户端已经退出：不再等待它对服务器请求的回复。
+/// Runs the main loop until `exit` is received or the input ends, and returns the process exit
+/// code. Before returning, stops the build system processes of all projects and waits for the
+/// scheduled background tasks (diagnostic publishing, etc.) to finish. If the input ends without
+/// an `exit`, the client has already exited: its replies to server requests are no longer awaited.
 pub fn run(server: *Server, reader: *Io.Reader) !u8 {
     var exited = false;
     while (true) {
         const arena = try server.gpa.create(std.heap.ArenaAllocator);
         arena.* = .init(server.gpa);
-        // 消息体分配在 arena 上：解析出的字符串可能直接引用它，需与请求同生命周期
+        // The message body is allocated in the arena: parsed strings may point into it directly,
+        // so it must live as long as the request
         const body = transport.readMessage(reader, arena.allocator()) catch |err| {
             server.destroyArena(arena);
             switch (err) {
@@ -341,14 +391,16 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
     return if (server.state == .shutdown) 0 else 1;
 }
 
-/// 不再等待客户端对配置请求的回复（关闭时，或客户端已经退出）
+/// Stops waiting for the client's replies to configuration requests (on shutdown, or when the
+/// client has already exited)
 fn abandonConfigRequests(server: *Server) void {
     server.startup_pending = false;
     while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
 }
 
-/// 每隔这么久检查一次客户端进程是否还在
-/// 监视客户端进程：它退出后服务器随之退出（见 `client_process.zig`）。在主循环中创建监视，之后的停止不会丢失
+/// How often to check whether the client process is still running
+/// Watches the client process: the server exits when it exits (see `client_process.zig`). The
+/// watch is created on the main loop, so a later stop is not lost.
 fn watchParent(server: *Server, pid: i32) void {
     if (pid <= 0 or server.parent_watch != null) return;
     const w = client_process.Watch.create(server.gpa, server.io, pid) catch
@@ -369,7 +421,7 @@ fn parentWatcher(server: *Server, w: *client_process.Watch) void {
 
 const Flow = enum { @"continue", exit };
 
-/// 处理一条消息；`arena` 的所有权转交给本函数。
+/// Processes one message; ownership of `arena` passes to this function.
 fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []const u8) !Flow {
     const a = arena.allocator();
     const message = jsonrpc.parse(a, body) catch |err| {
@@ -408,7 +460,7 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
     return .@"continue";
 }
 
-/// panic 上下文中的消息：种类、方法，以及参数中的文档
+/// Message in the panic context: kind, method, and the document in the params
 fn messageContext(pc: *panic_context.Text, kind: []const u8, method: []const u8, params: json.Value) void {
     const document_uri: ?[]const u8 = blk: {
         if (params != .object) break :blk null;
@@ -420,7 +472,8 @@ fn messageContext(pc: *panic_context.Text, kind: []const u8, method: []const u8,
     if (document_uri) |u| pc.enter("{s} {s} {s}", .{ kind, method, u }) else pc.enter("{s} {s}", .{ kind, method });
 }
 
-/// panic 上下文中的读请求：方法，以及参数中的文档与位置（行列从 1 开始）
+/// Read request in the panic context: method, and the document and position in the params
+/// (lines and columns start at 1)
 fn requestContext(pc: *panic_context.Text, comptime method: []const u8, params: anytype) void {
     const P = @TypeOf(params);
     if (@typeInfo(P) != .@"struct" or !@hasField(P, "textDocument")) return pc.enter("request {s}", .{method});
@@ -434,16 +487,17 @@ fn requestContext(pc: *panic_context.Text, comptime method: []const u8, params: 
     pc.enter("request {s} {s}", .{ method, doc });
 }
 
-// ── 请求 ─────────────────────────────────────────────────────────────
+// ── Requests ─────────────────────────────────────────────────────────
 
 const Mode = enum {
-    /// 在主循环中同步执行（改变服务器状态的请求）
+    /// Runs synchronously on the main loop (requests that change server state)
     sync,
-    /// 在独立线程中持有读事务并发执行
+    /// Runs concurrently on a separate thread, holding a read transaction
     read,
-    /// 在独立任务中执行，不持有读事务（会长时间等待的请求，不能阻塞主循环）
+    /// Runs in a separate task without a read transaction (requests that may wait for a long time
+    /// and must not block the main loop)
     background,
-    /// 同 `read`，处理函数通过 Resolver 做名字解析与类型查询
+    /// Like `read`, but the handler does name resolution and type queries through a Resolver
     semantic,
 };
 
@@ -482,7 +536,8 @@ const request_handlers = .{
 
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
     const a = arena.allocator();
-    // 字符串 ID 引用 arena 中的内存：错误响应须在释放 arena 之前序列化，因此错误出口都用 defer 释放
+    // A string ID points into the arena: error responses must be serialized before the arena is
+    // freed, so all error exits free it with defer
     inline for (request_handlers) |h| {
         if (std.mem.eql(u8, method, h[0])) {
             const is_initialize = comptime std.mem.eql(u8, h[0], "initialize");
@@ -516,8 +571,11 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                         return err;
                     };
                     const Task = if (h[1] == .read) ReadTask(func, h[0]) else SemanticTask(func, h[0]);
-                    // semantic 必须在独立线程中执行：`async` 在线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务
-                    // 也占名额）时会在主循环中同步执行，而后台请求会等待需要主循环处理的消息（如配置拉取的响应），导致死锁
+                    // semantic must run on a separate thread: when the thread count reaches the
+                    // limit (CPU core count - 1; long-blocking project tasks also take slots),
+                    // `async` runs synchronously on the main loop, while background requests wait
+                    // for messages that the main loop must process (such as configuration pull
+                    // responses), causing a deadlock
                     spawn(server.io, &server.group, Task.run, .{ server, arena, pending, params });
                 },
                 .background => server.group.concurrent(server.io, BackgroundTask(func).run, .{ server, arena, id, params }) catch {
@@ -532,7 +590,8 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
     server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
 }
 
-/// 登记进行中的请求（可被 `$/cancelRequest` 取消）；Pending 分配在请求的 arena 中
+/// Registers an in-flight request (can be canceled by `$/cancelRequest`); the Pending is allocated
+/// in the request's arena
 fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
     const pending = try a.create(Pending);
     pending.* = .{ .id = id };
@@ -542,14 +601,16 @@ fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
     return pending;
 }
 
-/// 在独立线程中执行任务。不用 `async`：线程数达到上限（CPU 核数 - 1，长期阻塞的项目任务也占名额）时
-/// 它在调用方同步执行，主循环中执行期间收不到 `$/cancelRequest`，后续请求排队。`concurrent` 默认
-/// 没有数量上限，只在无法创建线程时失败，这时退回 `async`
+/// Runs the task on a separate thread. Does not use `async`: when the thread count reaches the
+/// limit (CPU core count - 1; long-blocking project tasks also take slots), `async` runs the task
+/// synchronously in the caller, and while it runs on the main loop, `$/cancelRequest` cannot be
+/// received and later requests queue up. `concurrent` has no count limit by default and
+/// fails only when a thread cannot be created, in which case this falls back to `async`.
 fn spawn(io: Io, group: *Io.Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
     group.concurrent(io, function, args) catch group.async(io, function, args);
 }
 
-/// 处理函数最后一个参数即请求参数类型
+/// Type of the handler's last parameter, which is the request params type
 fn LastParam(comptime F: type) type {
     const param_types = @typeInfo(F).@"fn".param_types;
     return param_types[param_types.len - 1].?;
@@ -573,7 +634,8 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             defer {
                 server.removePending(pending);
                 server.destroyArena(arena);
-                // 读事务已结束：有 query 超出缓存容量且没有其他读事务时淘汰
+                // The read transaction has ended: evict if a query exceeds its cache capacity and
+                // no other read transaction is active
                 if (server.db.wantsSweep()) _ = server.db.trySweep();
                 server.maybeResetSema();
             }
@@ -594,14 +656,15 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             const result = func(server, &ctx, a, params) catch |err| {
                 return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             };
-            // 处理函数可能以回退值吞掉了 `Canceled`（如类型渲染中的 `catch null`），结果不完整
+            // The handler may have swallowed `Canceled` with a fallback value (such as
+            // `catch null` in type rendering), and then the result is incomplete
             ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             server.sendResponse(pending.id, result);
         }
     };
 }
 
-/// 同 ReadTask，处理函数拿到的是 Resolver
+/// Like ReadTask, but the handler gets a Resolver
 fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
@@ -609,7 +672,8 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             defer {
                 server.removePending(pending);
                 server.destroyArena(arena);
-                // 读事务已结束：有 query 超出缓存容量且没有其他读事务时淘汰
+                // The read transaction has ended: evict if a query exceeds its cache capacity and
+                // no other read transaction is active
                 if (server.db.wantsSweep()) _ = server.db.trySweep();
                 server.maybeResetSema();
             }
@@ -630,7 +694,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             const result = func(server, &r, a, params) catch |err| {
                 return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             };
-            // 同 ReadTask：吞掉 `Canceled` 的处理函数结果不完整
+            // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
             ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
             if (comptime isOutcome(@TypeOf(result))) switch (result) {
                 .ok => |v| server.sendResponse(pending.id, v),
@@ -640,7 +704,8 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     };
 }
 
-/// 处理函数的结果：成功，或失败的原因（以 `request_failed` 回复，客户端把原因显示给用户）
+/// Result of a handler: success, or the reason for the failure (answered with `request_failed`;
+/// the client shows the reason to the user)
 fn Outcome(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -652,13 +717,15 @@ fn isOutcome(comptime T: type) bool {
     return @typeInfo(T) == .@"union" and @hasField(T, "ok") and @hasField(T, "failed");
 }
 
-// ── 慢请求日志 ─────────────────────────────────────────────────────
+// ── Slow request log ───────────────────────────────────────────────
 
-/// 请求耗时超过 `log.slow_request_ms` 时记录：按 query 汇总的自身耗时与调用树中的耗时路径。
-/// 在读事务结束前调用（描述 key 时读取 ItemTree）
+/// Logs requests that take longer than `log.slow_request_ms`: self time summed per query, and the
+/// slow paths in the call tree. Called before the read transaction ends (describing a key reads
+/// the ItemTree).
 fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timestamp, trace: *const za.db.Trace) void {
-    // 测试中请求耗时随机器负载波动，warn 会写到 stderr，让构建输出出现误导性的 `failed command`；
-    // 报告内容由直接调用 writeSlowReport 的测试覆盖
+    // In tests, request times vary with machine load, and warn writes to stderr, which makes the
+    // build output show a misleading `failed command`; the report contents are covered by tests
+    // that call writeSlowReport directly
     if (@import("builtin").is_test) return;
     const threshold = server.slow_request_ms.load(.monotonic);
     if (threshold == 0) return;
@@ -666,18 +733,19 @@ fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timest
     if (ns < @as(u64, threshold) * std.time.ns_per_ms) return;
     var out: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer out.deinit();
-    // 调用树只展开耗时达到总耗时 2%（至少 1 ms）的节点
+    // The call tree only expands nodes taking at least 2% of the total time (at least 1 ms)
     server.writeSlowReport(&out.writer, ctx, trace, @max(std.time.ns_per_ms, ns / 50)) catch return;
     log.warn("slow request {s}: {d:.1} ms, {d} queries executed\n{s}", .{ method, za.db_report.ms(ns), trace.events.items.len, out.written() });
 }
 
-/// 慢请求报告中调用树的最大行数
+/// Maximum number of call tree lines in a slow request report
 const slow_tree_lines = 40;
 
-/// 慢请求报告：按 query 汇总的自身耗时，与调用树中耗时不少于 `min_ns` 的节点
+/// Slow request report: self time summed per query, and call tree nodes taking at least `min_ns`
 pub fn writeSlowReport(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, trace: *const za.db.Trace, min_ns: u64) !void {
     const events = trace.events.items;
-    // 自身耗时：先序事件中，每个事件的子事件是其后深度更大的连续事件
+    // Self time: among the events in pre-order, an event's children are the consecutive events
+    // after it with a greater depth
     var self_by_query: [Db.query_types.len]u64 = @splat(0);
     var count_by_query: [Db.query_types.len]u32 = @splat(0);
     for (events, 0..) |e, i| {
@@ -730,7 +798,8 @@ fn queryName(qi: usize) []const u8 {
     unreachable;
 }
 
-/// key 的可读形式：文件取文件名，成员取「文件名:成员名」，其余字段原样输出
+/// Readable form of a key: a file is shown as its file name, a member as "file name:member name",
+/// and other fields are written as is
 fn describeKey(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, qi: usize, index: u32) !void {
     inline for (Db.query_types, 0..) |Q, i| if (i == qi) {
         if (Q.Key == void) return;
@@ -763,11 +832,14 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
     }
 }
 
-/// 与目标相关的值运算参数（指针位宽、向量与标量类型的布局规则）：取各模块的 builtin 中一致的部分，
-/// 不一致的为未知（与之相关的值为未知）；没有项目模块时取默认 builtin（本机）
+/// Target-dependent parameters of value operations (pointer bit width, layout rules of vector and
+/// scalar types): taken from the parts the builtins of all modules agree on; parts that disagree
+/// are unknown (values depending on them are unknown); without project modules, the default
+/// builtin (native) is used
 fn targetAbi(server: *Server, modules: []const ModuleGraph.Module, default_builtin: ?Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
     var result: za.sema.InternPool.Target = .{};
-    // 参数相同的模块共用同一份 builtin，重复合并同一目标不改变结果：每份只读取、解析一次
+    // Modules with the same parameters share the same builtin, and merging the same target again
+    // does not change the result: each one is read and parsed only once
     var seen: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     defer seen.deinit(server.gpa);
     for (modules) |m| {
@@ -799,10 +871,10 @@ fn builtinTarget(server: *Server, file: Vfs.FileId) za.sema.InternPool.Target {
     };
 }
 
-/// 汇总各项目的构建图与编译集合，更新模块图 input
+/// Combines the build graphs and compile sets of all projects and updates the module graph input
 pub fn updateModuleGraph(server: *Server) void {
     server.updateModuleGraphInner() catch |err| return log.err("failed to update module graph: {t}", .{err});
-    // 须在写事务结束之后：索引任务可能就地执行
+    // Must come after the write transaction ends: the indexing task may run inline
     server.scheduleIndexing();
 }
 
@@ -834,10 +906,11 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     var graph_owned = true;
     errdefer if (graph_owned) server.gpa.destroy(graph);
     graph.* = try b.finish(std_root, default_builtin);
-    // `finish` 把 builder 的 arena 转移给了 graph
+    // `finish` has moved the builder's arena into graph
     builder_owned = false;
-    // 模块图与目标都没有变化时不开写事务：每次构建结束都会走到这里，而写事务会取消进行中的计算与请求
-    // （请求以 ContentModified 失败）
+    // Do not open a write transaction when neither the module graph nor the target has changed:
+    // every build that finishes gets here, and a write transaction cancels in-flight computations
+    // and requests (the requests fail with ContentModified)
     const unchanged = server.moduleGraphUnchanged(graph, t) catch |err| {
         var unused: ModuleGraph.Input.Value = graph;
         ModuleGraph.Input.deinit(&unused, server.gpa);
@@ -850,10 +923,11 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         graph_owned = false;
         return;
     }
-    // 持有 graph_mutex 开写事务是安全的：没有读事务会等待它
+    // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it
     server.db.beginWrite();
     defer server.db.endWrite();
-    // `set` 只在 key 尚未驻留时分配：先确保两个 key，之后两次 set 不会失败，也不会留下部分更新
+    // `set` allocates only when the key is not interned yet: ensure both keys first, so that
+    // the two set calls afterwards cannot fail and cannot leave a partial update either
     try server.db.ensureInput(ModuleGraph.Input, {});
     try server.db.ensureInput(za.sema.queries.TargetAbi, {});
     server.db.set(ModuleGraph.Input, {}, graph, .medium) catch unreachable;
@@ -862,14 +936,15 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     server.ip.setTarget(t);
 }
 
-/// 当前的模块图与目标已与 `graph`、`t` 相同。在持有 graph_mutex 时调用：模块图只在这里写入，比较之后
-/// 不会被其他人改变
+/// The current module graph and target already equal `graph` and `t`. Called with graph_mutex
+/// held: the module graph is written only here, so nobody else can change it after the
+/// comparison.
 fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target) Allocator.Error!bool {
     var ctx = server.db.beginRead(server.gpa);
     defer ctx.end();
     const current = ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // 另有写事务在等待：按有变化处理
+        // Another write transaction is waiting: treat it as changed
         error.Canceled => return false,
     };
     const target = ctx.get(za.sema.queries.TargetAbi, {}) catch |err| switch (err) {
@@ -881,21 +956,25 @@ fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.I
 
 const index_progress_delay_ms = 200;
 
-/// 自动导入是否仍然开启：索引任务在每批之前复查，关闭后不再继续建索引
+/// Whether auto-import is still enabled: the indexing task checks again before each batch and
+/// stops indexing once it is disabled
 fn autoImportEnabled(server: *Server) bool {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return server.config.completion_auto_import;
 }
 
-/// 每批索引的文件数：每批一个读事务，编辑（写事务）最多等一批
+/// Number of files per indexing batch: one read transaction per batch, so an edit (write
+/// transaction) waits for at most one batch
 const index_batch = 8;
 
-/// 后台为项目文件建立索引（文件索引、ItemTree 与成员摘要）：引用查找、workspace symbol 与调用点种子
-/// 只需读取索引，不必在请求中解析全部文件。解析结果随后按 LRU 淘汰，索引保留。
+/// Indexes project files in the background (file index, ItemTree, and member summaries): reference
+/// search, workspace symbol, and call-site seeding only need to read the indexes, without parsing
+/// every file in a request. The parse results are later evicted by LRU, while the indexes stay.
 ///
-/// 同时只运行一个任务：模块图在项目加载与构建期间会多次更新，运行中的任务不中断，做完一遍后
-/// 发现模块图变了就再做一遍（已建立的索引直接命中缓存）
+/// Only one task runs at a time: the module graph is updated many times while projects load and
+/// build; a running task is not interrupted, and when it finds after a pass that the module graph
+/// has changed, it does another pass (indexes already built hit the cache directly).
 fn scheduleIndexing(server: *Server) void {
     _ = server.index_generation.fetchAdd(1, .monotonic);
     if (server.indexing.swap(true, .acq_rel)) return;
@@ -903,8 +982,10 @@ fn scheduleIndexing(server: *Server) void {
     spawn(server.io, &server.bg_group, indexTask, .{server});
 }
 
-/// 同 `scheduleIndexing`，供持有读事务的请求调用：索引任务可能就地执行，其中的读事务遇到等待中的写事务时，
-/// 与仍持有读锁的调用者互相等待。由另一个任务调度；任务启动不了时不建，留给之后的请求
+/// Like `scheduleIndexing`, for requests that hold a read transaction: the indexing task may run
+/// inline, and when its read transaction runs into a waiting write transaction, it and the caller
+/// still holding the read lock wait for each other. Scheduling is done by another task; if that
+/// task cannot start, no index is built and it is left to later requests.
 fn scheduleIndexingFromRead(server: *Server) void {
     server.busyBegin();
     server.bg_group.concurrent(server.io, scheduleIndexingTask, .{server}) catch server.busyEnd();
@@ -925,7 +1006,7 @@ fn indexTask(server: *Server) Io.Cancelable!void {
         };
         if (server.index_generation.load(.monotonic) != generation) continue;
         server.indexing.store(false, .release);
-        // 释放标志后又有更新，且没有其他任务接手：继续
+        // Updated again after the flag was released, and no other task took over: continue
         if (server.index_generation.load(.monotonic) == generation) {
             server.requestSemanticRefresh();
             return;
@@ -946,7 +1027,7 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
-        // 被编辑打断：重试，不放弃这一轮
+        // Interrupted by an edit: retry instead of abandoning this round
         basis = importsBasis(ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
             error.Canceled => continue,
             error.OutOfMemory => return,
@@ -956,14 +1037,18 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
             error.OutOfMemory => return,
         };
     };
-    // 两步：先为项目文件建普通索引（工作区符号），建完即可用；再建自动导入的索引（标准库与各模块的公开闭包、
-    // 项目文件的 `FileLinks`），期间补全照常提供，只是不含自动导入
+    // Two steps: first the regular index of project files (workspace symbols), usable as soon as
+    // it is built; then the auto-import index (public closures of the standard library and of each
+    // module, `FileLinks` of project files), during which completion works as usual, only without
+    // auto-import
     if (!try server.indexBatches(files, "Indexing", false)) return;
     if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
-    // 预热失败（内存不足）时不标记索引可用：下一次补全重试，而不是在请求中同步展开闭包
+    // When warming up fails (out of memory), the index is not marked usable: the next completion
+    // retries, instead of the closures being expanded synchronously in a request
     if (!server.indexImportRoots()) return;
     if (!try server.indexBatches(files, "Indexing for auto-import", true)) return;
-    // 补全要用的项目级结果也在标记可用之前求出，不留给第一次补全
+    // The project-level results completion needs are also computed before the index is marked
+    // usable, rather than being left to the first completion
     while (true) {
         if (server.isShuttingDown() or !server.autoImportEnabled()) return;
         var ctx = server.db.beginRead(arena_state.allocator());
@@ -977,10 +1062,12 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     if (server.autoImportEnabled()) server.imports_basis.store(basis, .release);
 }
 
-/// 逐批为 `files` 建索引（`auto_import` 时为自动导入的索引，否则为工作区符号的索引），超过一定时间显示进度。
-/// 建完返回 true；正在关闭、自动导入已关闭或内存不足时返回 false
+/// Indexes `files` batch by batch (the auto-import index with `auto_import`, otherwise the
+/// workspace symbol index), showing progress once it takes longer than a certain time. Returns
+/// true when finished; false when shutting down, when auto-import has been disabled, or when out
+/// of memory.
 fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, auto_import: bool) Io.Cancelable!bool {
-    // 大多数文件已有索引时一遍很快：超过一定时间才显示进度
+    // A pass is quick when most files are already indexed: progress is shown only after a while
     const t0 = Io.Clock.awake.now(server.io);
     var progress: ?*Progress.Progress = null;
     var progress_started = false;
@@ -996,7 +1083,7 @@ fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, a
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
             indexFiles(&ctx, files[done..end], auto_import) catch |err| switch (err) {
-                // 被编辑打断：重试这一批
+                // Interrupted by an edit: retry this batch
                 error.Canceled => continue,
                 error.OutOfMemory => {
                     log.err("out of memory while indexing", .{});
@@ -1021,10 +1108,11 @@ fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, a
     return true;
 }
 
-/// 尚未建完自动导入索引（见 `imports_basis`）
+/// The auto-import index has not been fully built yet (see `imports_basis`)
 const imports_pending = std.math.maxInt(u64);
 
-/// 模块图中决定自动导入索引的构成：标准库、默认的 builtin 与各模块的根、builtin 和 import，不含文件
+/// The composition of the module graph that determines the auto-import index: the standard
+/// library, the default builtin, and each module's root, builtin, and imports, but not files
 fn importsBasis(graph: ?*const ModuleGraph) u64 {
     const g = graph orelse return 0;
     var h: std.hash.Wyhash = .init(0);
@@ -1048,14 +1136,17 @@ fn hashFile(h: *std.hash.Wyhash, file: ?Vfs.FileId) void {
     h.update(std.mem.asBytes(&id));
 }
 
-/// 工作区符号的索引；`auto_import` 时为自动导入的声明索引（只为 Zig 源文件）
+/// Workspace symbol index; with `auto_import`, the declaration index for auto-import (only for
+/// Zig source files)
 fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.Error!void {
     for (files) |f| {
         if (auto_import) {
             if (!za.ide_db.imports.isZigSource(ctx.db.env.vfs.path(f))) continue;
             _ = try ctx.get(za.ide_db.imports.FileLinks, f);
-            // `TestOnlyFiles` 读取各文件的 `ImportSites`：在这里随批求出，批间淘汰解析树。否则它在一个读事务中
-            // 解析全部项目文件，解析树在事务结束前都不能淘汰（Zig 编译器源码上约 700 MB）
+            // `TestOnlyFiles` reads the `ImportSites` of each file: compute them here batch by
+            // batch, evicting parse trees between batches. Otherwise it parses all project
+            // files in one read transaction, and none of the parse trees can be evicted before the
+            // transaction ends (about 700 MB on the Zig compiler source).
             _ = try ctx.get(za.ide_db.imports.ImportSites, f);
             continue;
         }
@@ -1065,10 +1156,13 @@ fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.
     }
 }
 
-/// 公开导出索引跨补全请求复用，在后台为标准库、各模块的 `builtin` 与命名模块建好，不在补全请求中展开。
-/// 闭包涉及的文件按批建索引，批与批之间淘汰解析树等中间结果：一个读事务中展开整个标准库的闭包时，它们在
-/// 事务结束前都不能淘汰。返回 false 表示这一轮没有建完（配置已关闭、正在关闭或内存不足），调用方不得把索引
-/// 标记为可用。
+/// The public export index is reused across completion requests and is built in the background
+/// for the standard library, the `builtin` of each module, and named modules, not expanded in
+/// completion requests. The files in the closures are indexed in batches, with parse trees and
+/// other intermediate results evicted between batches: when one read transaction expands the
+/// closure of the whole standard library, none of them can be evicted before the transaction
+/// ends. Returns false when this round did not finish (the option was disabled, the server is
+/// shutting down, or out of memory), in which case the caller must not mark the index usable.
 fn indexImportRoots(server: *Server) bool {
     return server.warmImportRoots() catch |err| {
         log.err("failed to index import roots: {t}", .{err});
@@ -1076,13 +1170,15 @@ fn indexImportRoots(server: *Server) bool {
     };
 }
 
-/// 需要预热公开闭包的根：标准库、默认 builtin、各模块的 builtin 与被 import 的模块根
+/// Roots whose public closures need to be warmed up: the standard library, the default builtin,
+/// the builtin of each module, and the roots of imported modules
 fn appendImportRoots(graph: ?*const ModuleGraph, roots: *std.ArrayList(Vfs.FileId), gpa: Allocator) Allocator.Error!void {
     const g = graph orelse return;
     if (g.std_root) |file| try roots.append(gpa, file);
     if (g.default_builtin) |file| try roots.append(gpa, file);
     for (g.modules) |module| {
-        // 每个模块的 `@import("builtin")` 指向自己的生成文件，补全会无条件查询这个命名空间
+        // Each module's `@import("builtin")` refers to its own generated file, and completion
+        // queries this namespace unconditionally
         if (module.builtin) |file| try roots.append(gpa, file);
         for (module.imports) |imp| if (g.modules[imp.module].root) |file| try roots.append(gpa, file);
     }
@@ -1107,7 +1203,7 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
         var roots: std.ArrayList(Vfs.FileId) = .empty;
         defer roots.deinit(server.gpa);
         try appendImportRoots(graph, &roots, server.gpa);
-        // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON）
+        // A module's root can be a data file (such as JSON added by `addAnonymousImport`)
         for (roots.items) |file| {
             if (!imports.isZigSource(server.vfs.path(file))) continue;
             if (!(try seen.getOrPut(server.gpa, file)).found_existing) try files.append(server.gpa, file);
@@ -1136,14 +1232,14 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
             }
         }
         if (server.db.wantsSweep()) _ = server.db.trySweep();
-        // 被编辑打断：重试这一批
+        // Interrupted by an edit: retry this batch
         if (canceled) continue;
         for (found.items) |file| {
             if (!(try seen.getOrPut(server.gpa, file)).found_existing) try files.append(server.gpa, file);
         }
         done = end;
     }
-    // 各文件的索引都已建好，展开闭包只是查找与复制
+    // Every file's index has been built; expanding the closures is only lookups and copying
     while (!server.isShuttingDown()) {
         if (!server.autoImportEnabled()) return false;
         _ = scratch.reset(.retain_capacity);
@@ -1191,8 +1287,9 @@ fn openDocumentCount(server: *Server) usize {
     return server.open_docs.count();
 }
 
-/// 编辑只在防抖完成后刷新其他文档；索引只在稳定的一轮结束后刷新。
-/// 等待客户端响应期间发生的变化合并为下一次刷新，不在任何读事务或状态锁内发送。
+/// Edits refresh other documents only after the debounce completes; indexing refreshes only
+/// after a stable round ends. Changes made while waiting for the client's response are merged
+/// into the next refresh, which is not sent inside any read transaction or state lock.
 fn requestSemanticRefresh(server: *Server) void {
     if (!server.semantic_refresh or server.isShuttingDown() or server.openDocumentCount() == 0) return;
     server.semantic_refresh_mutex.lockUncancelable(server.io);
@@ -1210,8 +1307,10 @@ fn requestSemanticRefresh(server: *Server) void {
         return log.err("out of memory while building semantic tokens refresh", .{});
     };
     server.send(bytes);
-    // 写出 refresh 之后再作废：此后发出的结果都排在 refresh 之后到达客户端。先作废的话，两者之间发出的结果
-    // 可能先于 refresh 到达，成为客户端刷新后 delta 请求的基线。
+    // Retire the baselines only after the refresh is written out: every result sent afterwards
+    // reaches the client after the refresh. If they were retired first, a result sent in between
+    // could arrive before the refresh and become the baseline for the delta request the client
+    // makes after refreshing.
     server.semantic_cache.retireBaselines(server.io);
 }
 
@@ -1224,11 +1323,11 @@ fn semanticRefreshFinished(server: *Server) void {
     if (dirty) server.requestSemanticRefresh();
 }
 
-// ── 通知 ─────────────────────────────────────────────────────────────
+// ── Notifications ────────────────────────────────────────────────────
 
 fn processNotification(server: *Server, arena: Allocator, method: []const u8, params_value: json.Value) !Flow {
     if (std.mem.eql(u8, method, "exit")) return .exit;
-    // 初始化前与 shutdown 之后除 exit 外的通知一律丢弃
+    // Before initialization and after shutdown, all notifications except exit are dropped
     if (server.state == .uninitialized or server.state == .shutdown) return .@"continue";
 
     const handlers = .{
@@ -1268,8 +1367,10 @@ fn fileIdFromUri(server: *Server, arena: Allocator, document_uri: []const u8) !?
     return try server.vfs.intern(path);
 }
 
-/// 文档的路径：file URI 为其路径；`untitled:` 等非 file URI 的文档映射到虚拟目录下按 URI 命名的
-/// 路径（不与真实文件冲突，磁盘上不存在，因此不交给编译器；其余功能按单文件处理）
+/// Path of a document: the path of a file URI; a document with a non-file URI such as `untitled:`
+/// maps to a path named after the URI under a virtual directory (it does not clash with real
+/// files and does not exist on disk, so it is not passed to the compiler; other features treat it
+/// as a single file)
 fn documentPath(arena: Allocator, document_uri: []const u8) Allocator.Error!?[]const u8 {
     const path = uri.toPath(arena, document_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1283,7 +1384,7 @@ fn documentPath(arena: Allocator, document_uri: []const u8) Allocator.Error!?[]c
     return path;
 }
 
-/// 非 file URI 文档的虚拟目录
+/// Virtual directory for documents with non-file URIs
 const virtual_root = if (@import("builtin").os.tag == .windows) "C:\\.zig-analyzer-virtual" else "/.zig-analyzer-virtual";
 
 pub fn isVirtual(path: []const u8) bool {
@@ -1324,7 +1425,8 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         server.db.beginWrite();
         defer server.db.endWrite();
         try server.db.set(FileText, id, owned, .low);
-        // 开启新会话前先等旧读请求退出，不能继承关闭期间或旧会话的增量基线。
+        // Before a new session starts, wait for old read requests to exit; it must not inherit
+        // delta baselines from the period while the document was closed or from the old session.
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
     server.publishFiles(&.{id}, false);
@@ -1347,12 +1449,13 @@ fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocum
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
     defer {
-        // 即使读取磁盘或替换文本失败，也先等旧读请求退出，防止关闭后重新写入快照。
+        // Even if reading from disk or replacing the text fails, still wait for old read requests
+        // to exit first, which prevents a snapshot from being written again after closing.
         server.db.beginWrite();
         defer server.db.endWrite();
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
-    // 关闭后以磁盘内容为准
+    // After closing, the disk contents are authoritative
     const disk = server.vfs.readFromDisk(id, arena) catch |err| switch (err) {
         error.FileTooBig => null,
         else => |e| return e,
@@ -1364,17 +1467,21 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
     server.requestSemanticRefresh();
-    // 单文件模式的根文件在打开期间从磁盘删除时（外部改动的通知不处理打开的文件），关闭时丢弃它的编译结果，
-    // 被它 import 的文件一并重新发布
+    // When a single-file mode root file was deleted from disk while open (notifications of
+    // external changes skip open files), drop its compile results on close and republish the files
+    // it imports as well
     if (disk == null and server.dropSingle(id)) return;
-    // 关闭后不再需要的结果立即释放，避免长会话中随打开过的文件线性增长
+    // Results that are no longer needed after closing are freed immediately, so they do not grow
+    // linearly with the files opened over a long session
     server.releaseSingleIfUnused(id);
-    // 关闭后按磁盘内容重新发布（编译集合中的文件仍可能有编译器诊断）
+    // After closing, republish from the disk contents (files in the compile set may still have
+    // compiler diagnostics)
     server.publishFiles(&.{id}, true);
 }
 
-/// 关闭文档后释放不再需要保留的单文件结果：没有在编译，且结果中没有诊断（诊断会在关闭后继续发布）。
-/// 关闭后重新打开或保存时按需重新编译
+/// After a document is closed, frees its single-file results if they no longer need to be kept:
+/// no compile is running, and the results contain no diagnostics (diagnostics continue to be
+/// published after closing). When the file is reopened or saved later, it is recompiled on demand.
 fn releaseSingleIfUnused(server: *Server, file: Vfs.FileId) void {
     {
         server.single_mutex.lockUncancelable(server.io);
@@ -1395,47 +1502,52 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const base = std.fs.path.basename(path);
     const is_build_file = isProjectFile(base);
 
-    // 根目录下新建的 build.zig：启动项目
+    // A build.zig newly created in a root directory: start the project
     if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
         if (try server.refreshRoot(dir)) return;
     };
 
-    // 包含该文件的各个项目都重新构建（共用的模块、标准库）
+    // Rebuild every project that contains the file (shared modules, the standard library)
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
         if (!ws.owns(id)) continue;
         if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id)) {
-            // 非 watch 模式下 maker 不会自动重新配置：重启
+            // Outside watch mode, the maker does not reconfigure automatically: restart
             server.restartWorkspace(ws, 0);
         } else {
             server.requestBuild(ws);
         }
     }
-    // 单文件模式：文件自身是独立文件时编译它，上一次编译读取过它或在其中报告过错误的根文件同样重新编译
+    // Single-file mode: compile the file itself if it is a standalone file; root files whose last
+    // compile read it or reported errors in it are recompiled as well
     server.recompileSingle(&.{id}, &.{id});
 }
 
-/// 项目根目录中变化时需要重启项目的文件
+/// Files in a project root directory whose changes require restarting the project
 fn isProjectFile(base: []const u8) bool {
     return std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon") or std.mem.eql(u8, base, Config.project_file);
 }
 
-/// 磁盘上的外部改动（编辑器之外：git checkout、代码生成等）。打开的文件以缓冲区为准；其余已知的文件
-/// 按磁盘内容更新（删除的置为不存在），内容与已知的相同时不写入、不重新发布。工作区根目录的 build.zig / build.zig.zon /
-/// zig-analyzer.zon 或项目的构建脚本变化时重启该项目，根目录下新建或删除 build.zig 时启动或停止项目，其他文件变化时
-/// 项目重新构建、单文件重新编译；磁盘内容与上一次据此重新构建时的相同时不重新构建
+/// External changes on disk (outside the editor: git checkout, code generation, etc.). For open
+/// files the buffer is authoritative; other known files are updated from the disk contents
+/// (deleted ones become nonexistent), without writing or republishing when the contents equal
+/// the known ones. A change to build.zig / build.zig.zon / zig-analyzer.zon in a workspace root
+/// directory or to a project's build script restarts that project; creating or deleting
+/// build.zig in a root directory starts or stops the project; changes to other files rebuild
+/// projects and recompile single files; nothing is rebuilt when the disk contents equal those the
+/// last rebuild was based on.
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
         text: ?[]u8,
         durability: database.Durability,
-        /// 磁盘内容的哈希，null 为不存在
+        /// Hash of the disk contents; null if the file does not exist
         disk: ?u64,
-        /// 与已知的文本不同：写入、重新发布
+        /// Differs from the known text: write it and republish
         edited: bool = true,
-        /// 与 `watched_built` 记录的不同：重新构建
+        /// Differs from what `watched_built` recorded: rebuild
         rebuild: bool = true,
     };
     var changes: std.ArrayList(Change) = .empty;
@@ -1443,9 +1555,11 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     const rules = try server.originRules(arena);
     var build_files: std.ArrayList([]const u8) = .empty;
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
-    // 变化的已知文件（含打开的文件：maker 读取磁盘）
+    // Known files that changed (including open files: the maker reads the disk)
     var known: std.ArrayList(Vfs.FileId) = .empty;
-    // 同一个文件在一批中多次变化时以最后一次为准：原子保存先删除、再新建，内容不变时两次合起来不是改动
+    // When a file changes several times in one batch, the last change wins: an atomic save first
+    // deletes and then recreates the file, and with unchanged contents the two together are not a
+    // change
     var events: std.StringArrayHashMapUnmanaged(types.FileChangeType) = .empty;
     for (params.changes) |event| {
         const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
@@ -1459,7 +1573,8 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         const base = std.fs.path.basename(path);
         const dir = std.fs.path.dirname(path) orelse "";
         if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, dir);
-        // 从未接触过的文件与分析无关（新建的文件被 import 时再加载）；项目文件无从比较内容，按变化处理
+        // Files never seen before do not matter for analysis (a new file is loaded when it is
+        // imported); project files have no contents to compare against and count as changed
         const file = try server.vfs.lookup(path) orelse {
             if (isProjectFile(base)) try build_files.append(arena, dir);
             continue;
@@ -1490,9 +1605,12 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             return err;
         };
     }
-    // 构建步骤每次都原样重写源码树中的文件（如生成代码）时，写事务会取消进行中的计算与请求，重新构建又会再次重写，
-    // 形成循环。是否重新构建不能按已知的文本判断：构建读取磁盘，而已知的文本也可能来自打开、关闭文档或首次加载时
-    // 的读取，构建不一定读到过
+    // When a build step rewrites a file in the source tree with identical contents every time
+    // (such as generated code), the write transaction cancels in-flight computations and
+    // requests, and the rebuild rewrites the file again, forming a loop. Whether to rebuild cannot
+    // be decided from the known text: the build reads the disk, while the known text may also come
+    // from reads when documents were opened or closed or at the first load, which the build has
+    // not necessarily seen.
     if (changes.items.len != 0) {
         var ctx = server.db.beginRead(arena);
         defer ctx.end();
@@ -1527,14 +1645,15 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         };
     }
 
-    // 根目录下新建或删除了 build.zig：启动或停止项目，刚启动的项目不必重启
+    // A build.zig was created or deleted in a root directory: start or stop the project; projects
+    // that were just started need not be restarted
     var refreshed: std.ArrayList([]const u8) = .empty;
     for (build_zig_dirs.items) |dir| if (try server.refreshRoot(dir)) try refreshed.append(arena, dir);
 
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
-        // 非 watch 模式下 maker 不会自动重新配置：重启
+        // Outside watch mode, the maker does not reconfigure automatically: restart
         const reconfigure = for (build_files.items) |dir| {
             if (std.mem.eql(u8, dir, ws.root)) break true;
         } else for (known.items) |file| {
@@ -1557,23 +1676,25 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         server.requestSemanticRefresh();
     }
     if (rebuilt.items.len == 0) return;
-    // 单文件模式：打开的文件 import 的文件可能变了
+    // Single-file mode: files imported by open files may have changed
     server.docs_mutex.lockUncancelable(server.io);
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
     server.docs_mutex.unlock(server.io);
     server.recompileSingle(open, rebuilt.items);
-    // 记录不了时下一次照常重新构建
+    // If it cannot be recorded, the next change rebuilds as usual
     for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
 }
 
-/// 文件已知的文本与 `text` 相同（都不存在也算）；读取失败时按不同处理
+/// The file's known text is the same as `text` (including both being absent); a failed read counts
+/// as different
 fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
     const current = ctx.get(FileText, file) catch return false;
     const known = current orelse return text == null;
     return std.mem.eql(u8, known, text orelse return false);
 }
 
-/// 服务器发现的外部改动：与客户端的 `workspace/didChangeWatchedFiles` 通知同样处理，与主循环的消息处理串行
+/// External changes discovered by the server: handled the same way as the client's
+/// `workspace/didChangeWatchedFiles` notification, serialized with main loop message handling
 pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent) void {
     defer {
         server.watch_mutex.lockUncancelable(server.io);
@@ -1584,15 +1705,18 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     server.write_mutex.lockUncancelable(server.io);
     defer server.write_mutex.unlock(server.io);
     if (server.state != .running or server.isShuttingDown()) return;
-    // 处理期间计为忙碌：重启项目时旧的新实例先结束、新实例随后才计为忙碌，监听任务自身又不计为忙碌，
-    // 中间不能让等待空闲的一方（waitIdle、shutdown）返回
+    // Count as busy during processing: when a project restarts, the old instance finishes before
+    // the new instance counts as busy, and the watch task itself does not count as busy; whoever
+    // waits for idle (waitIdle, shutdown) must not be allowed to return in between
     server.busyBegin();
     defer server.busyEnd();
     server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
 }
 
-/// 服务器发现外部改动时关注的文件（另有各根目录的项目文件）：驻留过的文件（`.zig` / `.zon` 与 `@embedFile` 的
-/// 文件），不是虚拟文档，不在依赖库中。zig 环境未知时还分不出依赖库，都不关注
+/// Files watched when the server discovers external changes (besides the project files of each
+/// root directory): files interned in the Vfs (`.zig` / `.zon` and `@embedFile` files) that are
+/// not virtual documents and not in dependency libraries. While the zig environment is unknown,
+/// dependency libraries cannot be told apart yet, so nothing is watched.
 pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
     if (rules.zig_lib == null) return false;
     return switch (origin.classify(&server.vfs, rules, path, false)) {
@@ -1601,7 +1725,7 @@ pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
     };
 }
 
-/// `path` 是打开的文档
+/// `path` is an open document
 pub fn isOpen(server: *Server, path: []const u8) bool {
     const file = (server.vfs.lookup(path) catch return false) orelse return false;
     server.docs_mutex.lockUncancelable(server.io);
@@ -1609,12 +1733,12 @@ pub fn isOpen(server: *Server, path: []const u8) bool {
     return server.open_docs.contains(file);
 }
 
-/// 关注的文件或监听方式可能变化：让监听任务重新计算
+/// The watched files or the watch method may have changed: tells the watch task to recompute
 fn resyncWatcher(server: *Server) void {
     if (server.watcher) |w| w.requestResync();
 }
 
-/// 是否由服务器发现外部改动（见 `Config.Watcher`）
+/// Whether the server discovers external changes itself (see `Config.Watcher`)
 pub fn watchesFiles(server: *Server) bool {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
@@ -1625,8 +1749,10 @@ pub fn watchesFiles(server: *Server) bool {
     };
 }
 
-/// 文件来源的分类依据（见 `origin.classify`），复制到 `arena` 中：zig 环境、工作区根目录，以及各项目的本地缓存与
-/// 依赖包（在项目读入构建图之后才知道）。依次在 roots_mutex 与 workspaces_mutex 期间读取，不能在写事务中调用
+/// Rules for classifying file origins (see `origin.classify`), copied into `arena`: the zig
+/// environment, the workspace root directories, and each project's local cache and dependency
+/// packages (known only after the project has read its build graph). Read while holding
+/// roots_mutex and then workspaces_mutex; must not be called inside a write transaction.
 pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rules {
     var rules: origin.Rules = .{};
     if (server.zigEnv()) |env| {
@@ -1643,7 +1769,7 @@ pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rul
     var local_caches: std.ArrayList([]const u8) = .empty;
     var packages: std.ArrayList([]const u8) = .empty;
     {
-        // 先 workspaces_mutex 后 ws.mutex
+        // workspaces_mutex first, then ws.mutex
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
         for (server.workspaces.items) |ws| try ws.libraryDirs(arena, &local_caches, &packages);
@@ -1653,7 +1779,8 @@ pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rul
     return rules;
 }
 
-/// 文件属于某个项目的模块图（编译集合，或者可由其余的编译 step 到达）
+/// The file belongs to some project's module graph (its compile set, or reachable from the
+/// other compile steps)
 fn inProject(server: *Server, file: Vfs.FileId) bool {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
@@ -1661,12 +1788,12 @@ fn inProject(server: *Server, file: Vfs.FileId) bool {
     return false;
 }
 
-/// 文件的来源（见 `origin.classify`）
+/// Origin of the file (see `origin.classify`)
 pub fn fileOrigin(server: *Server, file: Vfs.FileId) origin.Origin {
     return server.originOf(file, server.inProject(file));
 }
 
-/// 内存不足、取不到分类依据时按其余文件处理
+/// Treats the file as `.other` when out of memory leaves the classification rules unavailable
 fn originOf(server: *Server, file: Vfs.FileId, in_project: bool) origin.Origin {
     var arena: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena.deinit();
@@ -1675,7 +1802,8 @@ fn originOf(server: *Server, file: Vfs.FileId, in_project: bool) origin.Origin {
 }
 
 fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChangeConfigurationParams) !void {
-    // 只通知「配置已变化」而不带内容的客户端（如 VS Code）：向客户端拉取
+    // Clients that only notify "the configuration has changed" without contents (such as VS Code):
+    // pull the configuration from the client
     if (params.settings == .null) {
         if (server.pull_config) server.requestConfig();
         return;
@@ -1687,7 +1815,7 @@ fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChange
     try server.applyConfig(fresh);
 }
 
-/// 替换当前配置；构建相关配置变化时重启各项目
+/// Replaces the current configuration; restarts the projects when build-related settings change
 fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     var new = fresh;
     server.reportConfigWarnings("zig-analyzer settings", &new);
@@ -1719,7 +1847,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (watcher_changed) server.resyncWatcher();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
-    // 尚未启动时由启动阶段按当前配置应用
+    // Before startup, the startup phase applies them with the current configuration
     if (zig_paths_changed and server.started) {
         server.busyBegin();
         spawn(server.io, &server.bg_group, reloadZigPathsTask, .{server});
@@ -1730,7 +1858,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (imports_enabled and server.imports_wanted.load(.acquire)) server.scheduleIndexing();
     if (build_changed) {
         if (!new.build_enable) {
-            // 关闭构建系统集成：停止各项目，其文件改按单文件处理
+            // Build system integration turned off: stop the projects; their files are handled
+            // in single-file mode instead
             server.stopProjects();
         } else if (!build_was_enabled) {
             if (server.zigEnv() != null) server.startProjectsForRoots();
@@ -1740,21 +1869,22 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
             if (list.len != 0) log.info("build settings changed, restarting projects", .{});
             for (list) |ws| server.restartWorkspace(ws, 0);
         }
-        // 文件的编译上下文可能变化，编译器诊断可能重新开启
+        // Files' compile contexts may have changed, and compiler diagnostics may be re-enabled
         server.reconcileSingle();
     }
 }
 
-/// 构建系统集成与编译器诊断是否开启
+/// Whether build system integration and compiler diagnostics are enabled
 fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return .{ .build = server.config.build_enable, .compiler = server.config.compiler_diagnostics };
 }
 
-/// 停止全部项目，清除其发布过的编译器诊断，模块图随之更新
+/// Stops all projects and clears the compiler diagnostics they published; the module graph is
+/// updated accordingly
 fn stopProjects(server: *Server) void {
-    // 从列表中取出（连同列表持有的引用）
+    // Take them out of the list (together with the references the list holds)
     const list = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -1774,11 +1904,12 @@ fn stopProjects(server: *Server) void {
     server.updateModuleGraph();
     server.publishFiles(stale.items, true);
     server.publishOpenFiles();
-    // 打开的文件改按单文件编译
+    // Open files are compiled in single-file mode instead
     server.reconcileSingle();
 }
 
-/// 为有 build.zig 的根目录启动项目（按磁盘重新检查：加入根目录之后 build.zig 可能被新建或删除）
+/// Starts projects for the root directories that have a build.zig (rechecked on disk: build.zig
+/// may have been created or deleted after the root directory was added)
 fn startProjectsForRoots(server: *Server) void {
     var roots: std.ArrayList([]u8) = .empty;
     defer {
@@ -1803,9 +1934,11 @@ fn startProjectsForRoots(server: *Server) void {
     }
 }
 
-/// 目录 `dir` 下有名为 build.zig 的文件。名字须完全相同：大小写不敏感的文件系统（macOS 与 Windows 的默认）上，
-/// 按路径访问 build.zig 对 Build.zig 同样成功，标准库目录（有 `std/Build.zig`）因此会被当作项目，`zig build` 再以
-/// Build.zig 为构建脚本，编译失败的错误落在标准库的文件上
+/// Directory `dir` contains a file named build.zig. The name must match exactly: on
+/// case-insensitive file systems (the default on macOS and Windows), accessing build.zig by path
+/// also succeeds for Build.zig, so the standard library directory (which has `std/Build.zig`)
+/// would be treated as a project, and `zig build` would then use Build.zig as the build script,
+/// with the errors of the failed compile landing in standard library files.
 fn hasBuildZig(server: *Server, dir: []const u8) Allocator.Error!bool {
     const path = try std.fs.path.join(server.gpa, &.{ dir, "build.zig" });
     defer server.gpa.free(path);
@@ -1819,7 +1952,8 @@ fn hasBuildZig(server: *Server, dir: []const u8) Allocator.Error!bool {
     return false;
 }
 
-/// 记录根目录 `root` 下是否有 build.zig；返回记录是否因此改变（`root` 不是根目录时为 false）
+/// Records whether root directory `root` has a build.zig; returns whether the record changed
+/// (false when `root` is not a root directory)
 fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
@@ -1831,9 +1965,11 @@ fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
     return false;
 }
 
-/// 目录 `dir` 下的 build.zig 可能被新建或删除：按磁盘重新检查。`dir` 是根目录且有变化时，新出现则启动项目；
-/// 消失则停止项目，其中的文件不再属于项目（改为独立文件；祖先目录还有 build.zig 时属于未加载的项目）。返回是否
-/// 有变化
+/// The build.zig in directory `dir` may have been created or deleted: rechecks it on disk. When
+/// `dir` is a root directory and something changed, starts the project if build.zig appeared;
+/// if it disappeared, stops the project, and its files no longer belong to a project (they
+/// become standalone files, or belong to an unloaded project when an ancestor directory still
+/// has a build.zig). Returns whether anything changed.
 fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     const has_build = try server.hasBuildZig(dir);
     if (!server.setRootHasBuild(dir, has_build)) return false;
@@ -1845,13 +1981,15 @@ fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
         server.removeProject(dir);
         server.updateModuleGraph();
     }
-    // 打开的文件：单文件模式的结果不再适用，或改按单文件编译
+    // Open files: single-file mode results no longer apply, or they switch to single-file mode
     server.publishOpenFiles();
     server.reconcileSingle();
     return true;
 }
 
-/// 清除单文件模式的编译器诊断（关闭编译器诊断时）。没有在编译的根文件不再记录，重新开启时按打开的文件重新编译
+/// Clears the compiler diagnostics of single-file mode (when compiler diagnostics are disabled).
+/// Root files not being compiled are no longer recorded; when re-enabled, the open files are
+/// recompiled.
 fn clearSingleFileResults(server: *Server) void {
     var files: std.ArrayList(Vfs.FileId) = .empty;
     defer files.deinit(server.gpa);
@@ -1873,7 +2011,7 @@ fn clearSingleFileResults(server: *Server) void {
     server.publishFiles(files.items, true);
 }
 
-/// 日志级别、慢请求阈值；`reopen_file` 时按配置重新打开日志文件
+/// Log level and slow request threshold; with `reopen_file`, reopens the log file as configured
 fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void {
     za.util.log.setLevel(config.log_level);
     server.slow_request_ms.store(config.slow_request_ms, .monotonic);
@@ -1887,7 +2025,8 @@ fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void 
     };
 }
 
-/// 缓存容量：`cache.queries` 中设置的优先；语法树（`ParseFile` 与 `FileAstIdMap`）的个数默认取 `cache.capacity`
+/// Cache capacity: settings in `cache.queries` take precedence; the number of syntax trees
+/// (`ParseFile` and `FileAstIdMap`) defaults to `cache.capacity`
 fn applyCacheLimits(server: *Server, config: *const Config) void {
     inline for (@typeInfo(Config.CacheQueries).@"struct".field_names) |name| {
         const limit = @field(config.cache_queries, name);
@@ -1898,7 +2037,7 @@ fn applyCacheLimits(server: *Server, config: *const Config) void {
     }
 }
 
-/// `Db` 中名为 `name` 的 query
+/// The query named `name` in `Db`
 fn QueryNamed(comptime name: []const u8) type {
     var found: ?type = null;
     for (Db.query_types) |Q| if (std.mem.endsWith(u8, @typeName(Q), "." ++ name)) {
@@ -1915,7 +2054,8 @@ fn eqlOptionalStr(a: ?[]const u8, b: ?[]const u8) bool {
 
 const config_request_prefix = "zig-analyzer/configuration/";
 
-/// 向客户端拉取 `zig-analyzer` 配置节；响应由 `handleConfigResponse` 处理
+/// Pulls the `zig-analyzer` configuration section from the client; the response is handled by
+/// `handleConfigResponse`
 fn requestConfig(server: *Server) void {
     var buf: [64]u8 = undefined;
     const id = std.fmt.bufPrint(&buf, config_request_prefix ++ "{d}", .{server.config_requests}) catch unreachable;
@@ -1927,20 +2067,21 @@ fn requestConfig(server: *Server) void {
 
 fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value, failed: bool) Allocator.Error!void {
     const n = std.fmt.parseInt(u32, id[config_request_prefix.len..], 10) catch return;
-    // shutdown 时已不再等待
+    // Shutdown has already stopped waiting for it
     if (server.config_outstanding == 0) return;
     defer {
         server.config_outstanding -= 1;
         server.busyEnd();
     }
-    // 之后又发出了新的请求：等待最新的响应
+    // A newer request has been sent since: wait for the latest response
     if (n + 1 != server.config_requests) return;
     defer if (server.startup_pending) {
         server.startup_pending = false;
         server.startProjects();
     };
     if (failed) return log.info("client failed to provide configuration", .{});
-    // 结果与请求的 items 一一对应；该节未设置时为 null，即全部使用默认值
+    // The result corresponds one-to-one to the requested items; it is null when the section is not
+    // set, meaning all defaults are used
     const section: json.Value = if (result == .array and result.array.items.len == 1) result.array.items[0] else .null;
     const fresh: Config = if (section == .null) .{} else Config.parse(server.gpa, section) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1949,7 +2090,7 @@ fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value, fai
     try server.applyConfig(fresh);
 }
 
-/// 当前配置的副本（调用方释放）
+/// A copy of the current configuration (freed by the caller)
 pub fn configSnapshot(server: *Server) Allocator.Error!Config {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
@@ -1962,7 +2103,8 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
     var registrations: std.ArrayList(types.Registration) = .empty;
     if (server.register_config) try registrations.append(arena, .{ .id = "zig-analyzer/didChangeConfiguration", .method = "workspace/didChangeConfiguration" });
     if (server.register_watch) {
-        // 编辑器之外的改动（git checkout、代码生成等）：源文件、build.zig.zon 与项目配置文件
+        // Changes made outside the editor (git checkout, code generation, etc.): source files,
+        // build.zig.zon and project configuration files
         const options = try std.json.parseFromSliceLeaky(std.json.Value, arena,
             \\{"watchers": [{"globPattern": "**/*.zig"}, {"globPattern": "**/*.zon"}]}
         , .{});
@@ -1972,7 +2114,7 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
         server.sendRequest(.{ .string = "zig-analyzer/register" }, "client/registerCapability", types.RegistrationParams{ .registrations = registrations.items });
     }
     if (server.pull_config) {
-        // 拉取到配置后再启动项目
+        // Start projects once the configuration has been pulled
         server.startup_pending = true;
         server.requestConfig();
     } else {
@@ -1987,7 +2129,9 @@ fn startProjects(server: *Server) void {
         server.busyEnd();
         log.err("failed to start project loading task: {t}", .{err});
     };
-    // 在主循环中创建，之后的唤醒与停止不会丢失。一直运行到服务器关闭，不计为忙碌；不能退回在主循环中同步执行
+    // Created on the main loop so that later wakeups and stops are not
+    // lost. Runs until the server shuts down and does not count as busy;
+    // must not fall back to running synchronously on the main loop.
     const w = watch.Watcher.create(server) catch return log.err("out of memory while starting to watch files on disk", .{});
     server.watcher = w;
     server.vfs.listener.store(&w.listener, .release);
@@ -1999,24 +2143,28 @@ fn startProjects(server: *Server) void {
     };
 }
 
-// ── 项目与后台任务 ───────────────────────────────────────────────────
+// ── Projects and background tasks ────────────────────────────────────
 
-/// 用户 zig 与编译时的版本不同时的提示（用户的版本、编译时的版本、编译时的版本、用户的版本）。构建图文件没有版本号、
-/// 按结构体逐字节读取，格式不符时会越界，所以带 build.zig 的项目不加载（见 `startWorkspace`）：除了编译器诊断，
-/// 命名模块的 import 也无法解析，跳转、hover、补全随之受影响
+/// Message shown when the user's zig differs from the version zig-analyzer was built with
+/// (arguments: the user's version, the build-time version, the build-time version, the user's
+/// version). The build graph file has no version number and is read byte for byte into structs, so
+/// a mismatched format causes out-of-bounds reads; projects with build.zig are therefore not loaded
+/// (see `startWorkspace`): besides compiler diagnostics, imports of named modules cannot be
+/// resolved either, which affects goto, hover and completion.
 const version_mismatch_message = "zig {s} differs from zig {s} that zig-analyzer was built with. " ++
     "Projects with build.zig are not loaded: they get no compiler diagnostics, and imports of named modules " ++
     "(dependencies, build options) are not resolved. Live diagnostics use zig ast-check. " ++
     "Use zig {s}, or a zig-analyzer built for zig {s}.";
 
-/// 查询 zig 环境，并为每个带 build.zig 的工作区启动构建系统协议
+/// Queries the zig environment and starts the build
+/// system protocol for each workspace with a build.zig
 fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
-        // `zig build test` 有意找不到 zig（见 `ZigEnv.query`）；warn 会写到 stderr，让构建输出出现误导性的
-        // `failed command`
+        // `zig build test` deliberately cannot find zig (see `ZigEnv.query`); warn writes to
+        // stderr, which would make the build output show a misleading `failed command`
         if (!(@import("builtin").is_test and err == error.ZigNotFound))
             log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
         return;
@@ -2025,7 +2173,8 @@ fn startup(server: *Server) Io.Cancelable!void {
     {
         server.env_mutex.lockUncancelable(server.io);
         defer server.env_mutex.unlock(server.io);
-        // 已有环境（不应发生：`initialized` 只处理一次）：保留旧值
+        // An environment already exists (should not happen: `initialized` is handled only once):
+        // keep the old value
         if (server.detected_env != null) return;
         server.detected_env = detected;
     }
@@ -2033,7 +2182,8 @@ fn startup(server: *Server) Io.Cancelable!void {
     _ = try server.applyZigPaths();
     const env = server.zigEnv() orelse return;
     if (!env.matchesBuiltin()) {
-        // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check
+        // The in-process AstGen may not match the user's zig: live diagnostics use the user's
+        // zig ast-check instead
         const built = @import("builtin").zig_version_string;
         const message = std.fmt.allocPrint(server.gpa, version_mismatch_message, .{ env.version, built, built, env.version }) catch null;
         defer if (message) |m| server.gpa.free(m);
@@ -2045,12 +2195,13 @@ fn startup(server: *Server) Io.Cancelable!void {
     }
     server.updateModuleGraph();
     if (server.buildFlags().build) server.startProjectsForRoots();
-    // 启动前已打开的独立文件：zig 环境就绪、项目开始加载之后补一次编译
+    // Detached files opened before startup: compile them now that the zig environment is ready and
+    // projects have started loading
     server.startup_done.store(true, .release);
     server.reconcileSingle();
 }
 
-/// 取得 `env` 的所有权，返回它在服务器中的副本（到 deinit 才释放）
+/// Takes ownership of `env` and returns the server's copy of it (freed only in deinit)
 pub fn ownEnv(server: *Server, env: ZigEnv) Allocator.Error!*const ZigEnv {
     var owned = env;
     errdefer owned.deinit(server.gpa);
@@ -2063,17 +2214,20 @@ pub fn ownEnv(server: *Server, env: ZigEnv) Allocator.Error!*const ZigEnv {
     return ptr;
 }
 
-/// `applyZigPaths` 改变了什么
+/// What `applyZigPaths` changed
 const ZigPathsChange = struct {
-    /// 生效的 zig 环境（lib 目录、标准库目录、全局缓存目录）
+    /// The effective zig environment (lib, standard library, and global cache directories)
     env: bool = false,
-    /// 默认的 builtin.zig
+    /// The default builtin.zig
     builtin: bool = false,
 };
 
-/// 把配置中的路径覆盖（`zig.lib_path`、`zig.global_cache_path`、`zig.builtin_path`）应用到探测到的环境上，得出生效的
-/// zig 环境与默认的 builtin.zig（不属于任何项目的文件使用；项目中的模块使用按构建参数生成的）。不能采用的覆盖
-/// 提示用户并回退到探测结果。探测到环境之前什么也不做：启动阶段探测之后会调用
+/// Applies the path overrides from the configuration (`zig.lib_path`, `zig.global_cache_path`,
+/// `zig.builtin_path`) to the detected environment, producing the effective zig environment and
+/// the default builtin.zig (used by files outside any project; modules in projects use the one
+/// generated from the build arguments). Overrides that cannot be used are reported to the user,
+/// falling back to the detected values. Does nothing before the environment is detected: the
+/// startup phase calls it after detection.
 fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
     const gpa = server.gpa;
     const io = server.io;
@@ -2124,8 +2278,9 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
             if (file) |f| break :blk f;
             appendNote(&notes, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{path});
         }
-        // 按 `zig test` 的设置生成：test 块中依赖 `builtin.is_test` 的 `std.testing.allocator` 等可以推导
-        // （与有 test step 的模块一致，见 configuration.zig）
+        // Generated with the settings of `zig test`, so that `std.testing.allocator` and the
+        // like, which depend on `builtin.is_test`, can be inferred in test blocks (consistent with
+        // modules that have a test step; see configuration.zig)
         break :blk za.project.builtin.generate(gpa, io, env, &.{"test"}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => null,
@@ -2141,7 +2296,8 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
         server.zig_env = env;
         if (!eqlOptionalStr(server.default_builtin, default_builtin)) {
             change.builtin = true;
-            // 默认的 builtin.zig 只在持有锁时读取（见 `updateModuleGraphInner`）：换下的路径可以在锁外释放
+            // The default builtin.zig is read only while holding the lock (see
+            // `updateModuleGraphInner`): the replaced path can be freed outside the lock
             unused_builtin = server.default_builtin;
             server.default_builtin = default_builtin;
         }
@@ -2151,14 +2307,17 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
     return change;
 }
 
-/// 在 `w` 中追加一条配置问题的说明，合并为一条提示（同 `reportConfigWarnings`）
+/// Appends a note about a configuration problem to `w`; the notes are merged into a single
+/// message (as in `reportConfigWarnings`)
 fn appendNote(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
     w.writeAll(if (w.end == 0) "zig-analyzer settings: " else "; ") catch {};
     w.print(fmt, args) catch {};
 }
 
-/// 配置中 zig 路径的覆盖变化后重新应用：标准库与默认的 builtin.zig 随模块图重新加载；生效的环境变化时各项目
-/// 重启，独立文件重新编译，运行 zig 时都使用新的路径
+/// Reapplies the zig path overrides after they change in the configuration: the standard library
+/// and the default builtin.zig are reloaded with the module graph; when the effective environment
+/// changes, projects are restarted and detached files are recompiled, all running zig with the
+/// new paths
 fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     const change = try server.applyZigPaths();
@@ -2178,37 +2337,47 @@ fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
             roots.appendSlice(server.gpa, server.single.keys()) catch {};
         }
         server.recompileSingle(roots.items, &.{});
-        // 标准库与全局缓存中的文件不必监听（见 `watchable`）：随生效的目录变化
+        // Files in the standard library and the global cache are not watched (see `watchable`):
+        // the set changes with the effective directories
         server.resyncWatcher();
     }
-    // 文件的来源（标准库、全局缓存中的依赖包）与推导结果可能变化
+    // The origins of files (the standard library, dependency packages in the global cache) and
+    // inference results may change
     server.publishOpenFiles();
     server.reconcileSingle();
 }
 
-// ── 单文件模式 ───────────────────────────────────────────────────────
+// ── Single-file mode ─────────────────────────────────────────────────
 
-/// 文件的编译上下文：决定它能否作为单文件模式的根编译，以及单文件编译的结果是否用于它的诊断。
-/// 依次判断：依赖库、项目的模块图、带 build.zig 的根目录、祖先目录中没有加载的项目；以上都不是的 .zig 文件
-/// 才是独立文件
+/// Compile context of a file: decides whether it can be compiled as a root in single-file mode, and
+/// whether single-file compile results are used for its diagnostics. Checked in order: dependency
+/// library, a project's module graph, a root directory with build.zig, an unloaded project in an
+/// ancestor directory; only a .zig file that is none of these is a detached file.
 const FileContext = enum {
-    /// 不参与编译：虚拟文档，以及不属于任何项目的非 .zig 文件
+    /// Not compiled: virtual documents, and non-.zig files that belong to no project
     none,
-    /// 依赖库（见 `origin.Origin.isLibrary`）中的文件：只作为依赖参与编译，不作为根。真实的编译入口在其中
-    /// 报告的错误照常发布
+    /// A file in a dependency library (see `origin.Origin.isLibrary`):
+    /// compiled only as a dependency, never as a root. Errors reported
+    /// in it by the real compile entry points are published as usual.
     library,
-    /// 在某个项目的模块图中（编译集合，或者可由其余的编译 step 到达）：编译器诊断来自项目的构建
+    /// In some project's module graph (the compile set, or reachable from the other compile steps):
+    /// compiler diagnostics come from the project's build
     project,
-    /// 带 build.zig 的根目录下、不在模块图中的文件：由项目处理，不单独编译
+    /// A file under a root directory with build.zig that is not in the module graph: handled by the
+    /// project, not compiled on its own
     project_dir,
-    /// 祖先目录有 build.zig、那个项目却没有加载的 .zig 文件（如工作区外另一个项目中的文件）：按名字的 import
-    /// 只有那个项目的构建能解析，不单独编译；打开时提示把项目加入工作区（见 `appendUnloadedProjectHint`）
+    /// A .zig file with a build.zig in an ancestor directory whose project is not loaded (e.g. a
+    /// file in another project outside the workspace): only that project's build can resolve its
+    /// imports by name, so it is not compiled on its own; when it is open, a hint suggests adding
+    /// the project to the workspace (see `appendUnloadedProjectHint`)
     unloaded_project,
-    /// 独立的 .zig 文件：作为根单独编译
+    /// A detached .zig file: compiled on its own as a root
     detached,
 
-    /// 单文件编译的结果是否用于这类文件：项目中的文件被独立文件按相对路径 import 时处在另一个模块中，
-    /// 按名字的 import 与项目中不同，只采用项目的构建结果
+    /// Whether single-file compile results are used for files of this context:
+    /// a project file imported by relative path from a detached file is in a
+    /// different module there, where imports by name resolve differently than
+    /// in the project, so only the project's build results are used
     fn usesSingle(context: FileContext) bool {
         return switch (context) {
             .none, .library, .detached => true,
@@ -2239,8 +2408,9 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     return .detached;
 }
 
-/// 文件所属项目的目录：所在目录及其祖先中第一个有 build.zig 的。遇到 `.zig-cache`、`zig-pkg` 时停止：其中的
-/// 文件（缓存、获取的依赖包）不是外层项目的源码
+/// Directory of the project a file belongs to: the first of its directory and that directory's
+/// ancestors that has a build.zig. Stops at `.zig-cache` and `zig-pkg`: the files in them (caches,
+/// fetched dependency packages) are not source code of the enclosing project.
 fn projectDirOf(server: *Server, path: []const u8) ?[]const u8 {
     var dir = std.fs.path.dirname(path);
     while (dir) |d| : (dir = std.fs.path.dirname(d)) {
@@ -2251,7 +2421,8 @@ fn projectDirOf(server: *Server, path: []const u8) ?[]const u8 {
     return null;
 }
 
-/// 有项目尚在首次加载（见 `Workspace.load_done`）：还不知道哪些根目录外的文件属于项目
+/// Some project is still loading for the first time (see `Workspace.load_done`): it is not yet
+/// known which files outside the root directories belong to projects
 fn projectsLoading(server: *Server) bool {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
@@ -2259,17 +2430,20 @@ fn projectsLoading(server: *Server) bool {
     return false;
 }
 
-/// 在后台用 `zig build-obj -fno-emit-bin` 编译独立文件；编译期间再次请求时，结束后重新编译
+/// Compiles a detached file in the background with `zig build-obj -fno-emit-bin`; when requested
+/// again during a compile, recompiles after that compile finishes
 fn compileSingle(server: *Server, file: Vfs.FileId) void {
-    if (!server.startup_done.load(.acquire)) return; // 启动结束时会补编译
+    if (!server.startup_done.load(.acquire)) return; // compiled when startup finishes
     if (server.fileContext(file) != .detached) return;
     if (!server.buildFlags().compiler) return;
-    // 编译器读取磁盘：不在磁盘上的文件（尚未保存的新文件、已被删除的文件）不编译，丢弃它上一次的编译结果
+    // The compiler reads from disk: a file that is not on disk (a new file not saved yet, a deleted
+    // file) is not compiled, and its previous compile result is dropped
     Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch {
         _ = server.dropSingle(file);
         return;
     };
-    // 项目首次加载期间文件可能随后归入项目：加载结束时补编译，不在错误的上下文中编译（见 `reconcileSingle`）
+    // While projects are loading for the first time, the file may turn out to belong to a project:
+    // compile it when loading finishes rather than in the wrong context (see `reconcileSingle`)
     const deferred = server.projectsLoading();
     {
         server.single_mutex.lockUncancelable(server.io);
@@ -2288,14 +2462,19 @@ fn compileSingle(server: *Server, file: Vfs.FileId) void {
         gop.value_ptr.running = true;
     }
     server.busyBegin();
-    // 编译耗时数秒，尽量不在主循环中同步执行（否则期间无法处理进度 token 的响应等消息）
+    // A compile takes seconds; avoid running it synchronously on the main loop where possible
+    // (otherwise messages such as responses to progress tokens cannot be handled meanwhile)
     spawn(server.io, &server.bg_group, singleFileTask, .{ server, file });
 }
 
-/// 按文件当前的编译上下文收敛单文件模式，在上下文可能变化之后调用（zig 环境就绪，项目加载结束、编译集合变化、
-/// 新实例替换旧实例，项目与根目录的增删，构建集成与编译器诊断的开关）：不再是独立文件的根丢弃编译结果；
-/// 推迟了的编译，以及打开的、没有编译过的独立文件补上编译。单文件结果是否用于某个文件取决于该文件的上下文
-/// （见 `FileContext.usesSingle`），结果中的文件随之重新发布
+/// Reconciles single-file mode with the current compile context of each file; called after the
+/// contexts may have changed (the zig environment became ready, a project finished loading, a
+/// compile set changed, a new instance replaced an old one, projects or root directories were added
+/// or removed, build integration or compiler diagnostics were toggled): roots that are no longer
+/// detached files drop their compile results; deferred compiles are run, and open detached files
+/// that have never been compiled are compiled. Whether single-file results are used for a file
+/// depends on that file's context (see `FileContext.usesSingle`), so the files in the results are
+/// republished accordingly.
 pub fn reconcileSingle(server: *Server) void {
     if (server.isShuttingDown()) return;
     const gpa = server.gpa;
@@ -2311,7 +2490,8 @@ pub fn reconcileSingle(server: *Server) void {
         roots.appendSlice(gpa, server.single.keys()) catch return;
         for (server.single.values()) |*sf| for (sf.files.keys()) |f| affected.put(gpa, f, {}) catch return;
     }
-    // 上下文在锁外判断：要获取项目与根目录的锁
+    // The context is determined outside the lock: that
+    // needs the locks of projects and root directories
     for (roots.items) |root| {
         const detached = server.fileContext(root) == .detached;
         server.single_mutex.lockUncancelable(server.io);
@@ -2324,7 +2504,7 @@ pub fn reconcileSingle(server: *Server) void {
         affected.put(gpa, root, {}) catch {};
         for (sf.files.keys()) |f| affected.put(gpa, f, {}) catch {};
         if (sf.running) {
-            // 编译结束时按上下文丢弃（见 `singleFileTask`）
+            // Dropped according to the context when the compile finishes (see `singleFileTask`)
             sf.rerun = true;
         } else {
             sf.clearResult(gpa);
@@ -2346,21 +2526,24 @@ pub fn reconcileSingle(server: *Server) void {
         for (open) |file| if (!server.single.contains(file)) compile.append(gpa, file) catch {};
     }
     for (compile.items) |file| server.compileSingle(file);
-    // 未加载的项目中的文件：提示推迟到了启动阶段结束、项目加载结束（见 `appendUnloadedProjectHint`），上下文也
-    // 可能刚变为这一种
+    // Files in unloaded projects: the hint was deferred until startup finished
+    // and projects finished loading (see `appendUnloadedProjectHint`), and the
+    // context may also have just changed to this one
     var unloaded: std.ArrayList(Vfs.FileId) = .empty;
     defer unloaded.deinit(gpa);
     for (open) |file| if (server.fileContext(file) == .unloaded_project) unloaded.append(gpa, file) catch {};
     server.publishFiles(unloaded.items, false);
 }
 
-/// 编译结果的序号：项目的构建与单文件编译存入结果时各取一个，越大越新
+/// Sequence number of a compile result: project builds and single-file compiles each take one when
+/// storing a result; larger is newer
 pub fn nextCompileGeneration(server: *Server) u64 {
     return server.compile_generation.fetchAdd(1, .monotonic) + 1;
 }
 
-/// 丢弃已不在磁盘上的根文件 `file` 的编译结果，并重新发布其中有错误的文件（被它 import 的文件上的错误也随之
-/// 清除）。返回是否丢弃了结果（`file` 已随之重新发布）
+/// Drops the compile result of the root file `file`, which is no longer on disk, and republishes
+/// the files that have errors in that result (errors in files it imports are cleared too). Returns
+/// whether a result was dropped (`file` has then been republished as well).
 fn dropSingle(server: *Server, file: Vfs.FileId) bool {
     var affected: std.ArrayList(Vfs.FileId) = .empty;
     defer affected.deinit(server.gpa);
@@ -2368,7 +2551,8 @@ fn dropSingle(server: *Server, file: Vfs.FileId) bool {
         server.single_mutex.lockUncancelable(server.io);
         defer server.single_mutex.unlock(server.io);
         const sf = server.single.getPtr(file) orelse return false;
-        // 正在进行的编译可能在删除之前就读取了文件：结束后重新编译（文件已不在磁盘上，得到空结果）
+        // An ongoing compile may have read the file before it was deleted: recompile when it
+        // finishes (the file is no longer on disk, so the result is empty)
         if (sf.running) sf.rerun = true;
         if (sf.result == null) return false;
         affected.append(server.gpa, file) catch {};
@@ -2391,11 +2575,13 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     var errors: usize = 0;
     defer server.progress.end(server, progress, if (errors == 0) "Done" else "Has errors");
     while (true) {
-        // 每次编译时取：zig 路径的配置变化后重新编译用新的环境
+        // Taken for every compile: after the zig path configuration changes, recompiles use the new
+        // environment
         const env = server.zigEnv().?;
         var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
         const result: ?*compiler.BuildResult = blk: {
-            // 文件已从磁盘删除（编译期间被删除时由 `dropSingle` 要求重新编译）：没有结果
+            // The file has been deleted from disk (if deleted during a compile, `dropSingle`
+            // requests a recompile): no result
             Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
             var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env, path) catch |err| {
                 log.warn("{s}: single-file compile failed: {t}", .{ path, err });
@@ -2414,8 +2600,9 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             const id = server.vfs.intern(p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
-        // 编译期间文件可能不再是独立文件（所属项目加载完成、所在根目录新建了 build.zig 等），
-        // 编译器诊断也可能已被关闭：都不采用这次的结果
+        // During the compile, the file may have stopped being a detached file (its project finished
+        // loading, a build.zig was created in its root directory, etc.), or compiler diagnostics
+        // may have been turned off: in either case this result is not used
         const detached = server.fileContext(file) == .detached and server.buildFlags().compiler;
         server.single_mutex.lockUncancelable(server.io);
         const sf = server.single.getPtr(file).?;
@@ -2427,7 +2614,8 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             if (result) |r| r.release(server.gpa);
             continue;
         }
-        // 受影响的文件：根文件自身，以及上一次与本次结果中有错误的文件（被 import 的文件也在其中）
+        // Affected files: the root file itself, and the files with errors in the previous and the
+        // current result (imported files included)
         var affected: std.ArrayList(Vfs.FileId) = .empty;
         defer affected.deinit(server.gpa);
         affected.append(server.gpa, file) catch {};
@@ -2441,7 +2629,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             sf.generation = server.nextCompileGeneration();
             sf.running = false;
         } else {
-            // 不采用这次的结果，也不再记录这个根文件
+            // Discard this result and stop tracking this root file
             files.deinit(server.gpa);
             inputs.deinit(server.gpa);
             if (result) |r| r.release(server.gpa);
@@ -2453,8 +2641,9 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     }
 }
 
-/// 重新编译单文件模式的根文件：`roots`，以及上一次编译读取过 `changed` 中的文件或在其中报告过错误的根文件
-/// （例如 import 了被保存的文件）。每个根文件只编译一次
+/// Recompiles single-file mode roots: `roots`, plus the roots whose last
+/// compile read a file in `changed` or reported errors in one (e.g. a
+/// root that imports the saved file). Each root is compiled only once.
 fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const Vfs.FileId) void {
     var list: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     defer list.deinit(server.gpa);
@@ -2477,9 +2666,12 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
     return Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
 }
 
-/// 为根目录启动项目；同一根目录已有项目时不重复启动（启动阶段与工作区文件夹的变化可能同时进行）。
-/// 用户 zig 与编译时的版本不同时不启动：构建图的格式由标准库定义，读不了。这样的项目只有 live 诊断（zig ast-check），
-/// 不按单文件编译（使用命名模块的文件会报出找不到模块）
+/// Starts the project for a root directory; does nothing if the root directory already has a
+/// project (startup and workspace folder changes may happen concurrently). Does not start when the
+/// user's zig differs from the version zig-analyzer was built with: the build graph format is
+/// defined by the standard library and cannot be read. Such projects get only live diagnostics
+/// (zig ast-check) and are not compiled in single-file mode (files that use named modules would
+/// report missing modules).
 fn startWorkspace(server: *Server, root: []const u8) void {
     if (server.isShuttingDown() or !server.buildFlags().build) return;
     if (server.zigEnv()) |env| if (!env.matchesBuiltin()) return;
@@ -2494,7 +2686,8 @@ fn startWorkspace(server: *Server, root: []const u8) void {
     };
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    // 列表接管 `start` 返回的引用。期间同一根目录已启动了项目，或列表无法增长：新实例作废
+    // The list takes over the reference returned by `start`. If a project was started for the same
+    // root directory meanwhile, or the list cannot grow, the new instance is discarded.
     const added = server.visibleFor(root) == null and
         (if (server.workspaces.append(server.gpa, ws)) |_| true else |_| false);
     if (!added) ws.stop();
@@ -2502,7 +2695,8 @@ fn startWorkspace(server: *Server, root: []const u8) void {
     if (!added) ws.release();
 }
 
-/// 加入工作区根目录（`uri` 为目录的 URI）。zig 环境已就绪时立即启动项目，否则由启动阶段启动
+/// Adds a workspace root directory (`uri` is the URI of the directory). Starts its project
+/// immediately if the zig environment is ready; otherwise startup starts it.
 fn addRoot(server: *Server, root_uri: []const u8) !void {
     const path = uri.toPath(server.gpa, root_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2525,7 +2719,8 @@ fn addRoot(server: *Server, root_uri: []const u8) !void {
     if (has_build and server.zigEnv() != null) server.startWorkspace(normalized);
 }
 
-/// 移除工作区根目录：停止其项目，清除其发布过的编译器诊断
+/// Removes a workspace root directory: stops its project
+/// and clears the compiler diagnostics it published
 fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     const path = uri.toPath(arena, root_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -2544,13 +2739,14 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     server.removeProject(normalized);
 }
 
-/// 停止根目录 `root` 的项目，清除其发布过的编译器诊断（模块图由调用方更新）
+/// Stops the project of root directory `root` and clears the compiler diagnostics it published
+/// (the caller updates the module graph)
 fn removeProject(server: *Server, root: []const u8) void {
     var removed: ?*Workspace = null;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        // 连同列表持有的引用一起取出
+        // Take it out together with the reference held by the list
         for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, root)) {
             removed = server.workspaces.orderedRemove(i);
             break;
@@ -2566,29 +2762,34 @@ fn removeProject(server: *Server, root: []const u8) void {
     server.publishFiles(stale, true);
 }
 
-/// 工作区文件夹的增减
+/// Workspace folders added or removed
 fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.DidChangeWorkspaceFoldersParams) !void {
     for (params.event.removed) |f| try server.removeRoot(arena, f.uri);
     for (params.event.added) |f| try server.addRoot(f.uri);
     server.updateModuleGraph();
-    // 打开的文件可能进出项目目录与未加载的项目（提示随之出现或消失）
+    // Open files may move into or out of project directories and unloaded projects (the hint
+    // appears or disappears accordingly)
     server.publishOpenFiles();
     server.reconcileSingle();
     server.resyncWatcher();
 }
 
-/// 重启 `ws` 所在的项目（按根目录找到项目当前的实例：调用方持有的列表快照可能已过时）。`crash_restarts` 为
-/// maker 连续崩溃后自动重启的次数（正常重启为 0）。
+/// Restarts the project of `ws` (finding the project's current instance by root directory: the
+/// caller's snapshot of the list may be stale). `crash_restarts` is the number of automatic
+/// restarts after consecutive maker crashes (0 for a normal restart).
 ///
-/// 先结束旧的 maker（不与新实例同时构建），再启动新实例。新实例在首次构建完成（或配置失败；旧实例没有模型时
-/// 为配置完成）前不可见（见 `promote`）：其间列表中仍是旧实例，其模型、编译集合与编译器诊断继续生效，构建请求
-/// 转给新实例（见 `requestBuild`）
+/// The old maker is stopped first (so that it does not build at the same time as the new instance),
+/// then the new instance is started. The new instance stays invisible (see `promote`) until its
+/// first build finishes (or configuration fails; or, when the old instance has no model, until
+/// configuration finishes): meanwhile the list still holds the old instance, whose model, compile
+/// set and compiler diagnostics stay in effect, and build requests are forwarded to the new
+/// instance (see `requestBuild`).
 pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
     ws.stop();
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        // 所在项目已被移除
+        // The project has been removed
         const visible = server.visibleFor(ws.root) orelse return;
         visible.stop();
         if (visible.successor) |pending| pending.stop();
@@ -2600,14 +2801,16 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
     };
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    // 启动新实例期间服务器开始关闭，或所在项目已被移除：新实例作废
+    // The server began shutting down while the new instance was starting, or the project has been
+    // removed: discard the new instance
     const visible = (if (server.shutting_down) null else server.visibleFor(ws.root)) orelse {
         fresh.stop();
         fresh.placed.set(server.io);
         fresh.release();
         return;
     };
-    // 此前（或并发的重启）产生、尚未替换旧实例的新实例同样作废
+    // A new instance created earlier (or by a concurrent restart) that has not yet replaced the old
+    // instance is discarded too
     if (visible.successor) |pending| {
         pending.stop();
         pending.release();
@@ -2616,13 +2819,19 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
     fresh.placed.set(server.io);
 }
 
-/// 新实例替换旧实例的时机。`built`：首次构建完成（或配置失败、读不了构建图、不需要构建），总是替换。
-/// `configured`：读入构建图并算出编译集合，只在旧实例不参与模块图（配置失败、读不了构建图、配置前 maker 崩溃）
-/// 时替换：旧实例没有可沿用的模块，不必等整次构建结束才能解析命名模块
+/// When a new instance replaces the old one. `built`: the first build finished (or configuration
+/// failed, the build graph could not be read, or no build is needed); always replaces.
+/// `configured`: the build graph was read and the compile set computed; replaces
+/// only when the old instance does not take part in the module graph (configuration
+/// failed, the build graph could not be read, or the maker crashed before
+/// configuring): the old instance has no modules to keep using, so there is no need
+/// to wait for the whole build to finish before named modules can be resolved.
 pub const PromoteStage = enum { configured, built };
 
-/// 重启产生的新实例 `ws` 到了 `stage`：替换列表中的旧实例。返回被替换的实例（连同列表持有的引用，
-/// 调用方释放）；`ws` 不是等待替换的新实例或时机未到时返回 null
+/// The new instance `ws` created by a restart has reached `stage`: replaces the
+/// old instance in the list. Returns the replaced instance (together with the
+/// reference the list held, which the caller releases); returns null when `ws`
+/// is not a new instance waiting to replace one, or when it is not yet time.
 pub fn promote(server: *Server, ws: *Workspace, stage: PromoteStage) ?*Workspace {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
@@ -2630,7 +2839,7 @@ pub fn promote(server: *Server, ws: *Workspace, stage: PromoteStage) ?*Workspace
     for (server.workspaces.items) |*w| if (w.*.successor == ws) {
         const old = w.*;
         if (stage == .configured and old.inModuleGraph()) return null;
-        // 列表接管 `successor` 持有的引用
+        // The list takes over the reference held by `successor`
         old.successor = null;
         w.* = ws;
         return old;
@@ -2638,8 +2847,10 @@ pub fn promote(server: *Server, ws: *Workspace, stage: PromoteStage) ?*Workspace
     return null;
 }
 
-/// 重启产生的新实例 `ws` 不再继续（maker 反复崩溃、协议版本不符）：不再等它替换旧实例。旧实例的模型与
-/// 编译集合继续用于模块归属；其编译器诊断不再更新，予以清除
+/// The new instance `ws` created by a restart will not proceed (the maker keeps crashing, or the
+/// protocol version does not match): stops waiting for it to replace the old instance. The old
+/// instance's model and compile set continue to determine which modules files belong to; its
+/// compiler diagnostics will no longer be updated, so they are cleared.
 pub fn abandon(server: *Server, ws: *Workspace) void {
     const old = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
@@ -2652,19 +2863,19 @@ pub fn abandon(server: *Server, ws: *Workspace) void {
         return;
     };
     defer old.release();
-    // `successor` 持有的引用（调用方另持有一个）
+    // The reference held by `successor` (the caller holds another one)
     ws.release();
     old.clearResult();
 }
 
-/// `ws` 是否是列表中（可见）的实例
+/// Whether `ws` is the (visible) instance in the list
 pub fn isVisible(server: *Server, ws: *Workspace) bool {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     return std.mem.indexOfScalar(*Workspace, server.workspaces.items, ws) != null;
 }
 
-/// 停止列表中的实例 `ws` 以及尚未替换它的新实例
+/// Stops the instance `ws` in the list, and the new instance that has not yet replaced it
 fn stopProject(server: *Server, ws: *Workspace) void {
     ws.stop();
     server.workspaces_mutex.lockUncancelable(server.io);
@@ -2672,12 +2883,14 @@ fn stopProject(server: *Server, ws: *Workspace) void {
     if (ws.successor) |s| s.stop();
 }
 
-/// 请求构建 `ws` 所在的项目（按根目录找到项目当前的实例：调用方持有的列表快照可能已过时）：重启期间转给新实例
+/// Requests a build of the project of `ws` (finding the project's
+/// current instance by root directory: the caller's snapshot of the list
+/// may be stale); during a restart, the request goes to the new instance
 pub fn requestBuild(server: *Server, ws: *Workspace) void {
     const target = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        // 所在项目已被移除
+        // The project has been removed
         const visible = server.visibleFor(ws.root) orelse return;
         const t = visible.successor orelse visible;
         t.acquire();
@@ -2687,13 +2900,14 @@ pub fn requestBuild(server: *Server, ws: *Workspace) void {
     target.requestBuild();
 }
 
-/// 根目录 `root` 的项目在列表中的实例；调用方持有 `workspaces_mutex`
+/// The instance in the list for the project of root
+/// directory `root`; the caller holds `workspaces_mutex`
 fn visibleFor(server: *Server, root: []const u8) ?*Workspace {
     for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return w;
     return null;
 }
 
-/// 列表中各实例的快照（各持有一个引用，用 `releaseList` 释放）
+/// Snapshot of the instances in the list (each with a reference held; release with `releaseList`)
 fn workspaceList(server: *Server, a: Allocator) Allocator.Error![]*Workspace {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
@@ -2733,8 +2947,10 @@ pub fn zigEnv(server: *Server) ?*const ZigEnv {
     return server.zig_env;
 }
 
-/// 配置中未知的项与类型错误的项：合并为一条提示
-/// 合并提示配置中的问题；`source` 为配置的来源（客户端的配置或项目配置文件的路径）
+/// Unknown entries and entries of the wrong type in the configuration: combined into one warning.
+/// Shows the problems in the configuration as one combined warning;
+/// `source` is where the configuration comes from (the client's
+/// configuration or the path of a project configuration file).
 pub fn reportConfigWarnings(server: *Server, source: []const u8, config: *const Config) void {
     if (config.warnings.len == 0) return;
     var buf: [2048]u8 = undefined;
@@ -2745,7 +2961,7 @@ pub fn reportConfigWarnings(server: *Server, source: []const u8, config: *const 
 }
 
 pub fn showWarning(server: *Server, message: []const u8) void {
-    // 已经提示给用户：日志只作记录
+    // Already shown to the user: the log is only a record
     log.info("shown to the user: {s}", .{message});
     server.sendNotification("window/showMessage", types.ShowMessageParams{ .type = .Warning, .message = message });
 }
@@ -2771,7 +2987,8 @@ pub fn busyEnd(server: *Server) void {
     if (server.busy == 0) server.busy_cond.broadcast(server.io);
 }
 
-/// 等待所有后台任务（构建、编译集合计算、诊断发布）完成
+/// Waits for all background tasks (builds, compile
+/// set computation, diagnostics publishing) to finish
 fn waitIdle(server: *Server) void {
     server.busy_mutex.lockUncancelable(server.io);
     defer server.busy_mutex.unlock(server.io);
@@ -2782,26 +2999,33 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
     server.waitIdle();
 }
 
-// ── 诊断发布 ───────────────────────────────────────────────────
+// ── Publishing diagnostics ─────────────────────────────────────
 
-/// 每批发布的并发上限：大批量变更（watcher、构建错误）不能按文件数生成任务与读事务
+/// Concurrency limit for publishing each batch: large batches of changes (watcher, build errors)
+/// must not create a task and a read transaction per file
 pub const max_publish_workers = 8;
 
-/// `tracked` 时文件的状态记在 `publish_files` 中，`clear` 在开始时从那里取；记不下状态（分配失败）时不合并
+/// When `tracked`, the file's state is recorded in `publish_files`,
+/// and `clear` is taken from there when the job starts; when the state
+/// cannot be recorded (allocation failure), requests are not coalesced
 const PublishJob = struct { file: Vfs.FileId, clear: bool = false, tracked: bool = true };
 
 const PublishState = struct {
-    /// 在队列中，尚未开始
+    /// In the queue, not started yet
     queued: bool = true,
-    /// 开始计算之后又有了发布请求：完成后再发布一次
+    /// Another publish request arrived after computation started: publish once more after finishing
     again: bool = false,
-    /// 下一次发布即使没有诊断也发送（合并的请求取并集）
+    /// The next publish is sent even when there are no
+    /// diagnostics (the union over coalesced requests)
     clear: bool,
 };
 
-/// 在后台重新计算并发布这些文件的诊断。`clear` 为 true 时即使没有诊断也发布（用于清除旧诊断）。
-/// 同一文件已在排队时合并，正在计算时在完成后再发布一次：每次状态变化（如构建结束）都会请求发布打开的文件，
-/// 并发计算同一文件只是重复的工作，而完成后的那一次读到的是最新的状态。任务数不超过 `max_publish_workers`
+/// Recomputes and publishes the diagnostics of these files in the background. When `clear` is true,
+/// publishes even when there are no diagnostics (to clear old ones). A request for a file that is
+/// already queued is coalesced; for a file being computed, it is published once more after
+/// completion: every state change (such as a build finishing) requests publishing for the open
+/// files, computing the same file concurrently is just duplicate work, and the run after completion
+/// reads the latest state. The number of tasks does not exceed `max_publish_workers`.
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
     if (files.len == 0) return;
     var spawn_count: usize = 0;
@@ -2847,7 +3071,8 @@ fn publishWorker(server: *Server) Io.Cancelable!void {
             server.publish_queue_mutex.lockUncancelable(server.io);
             defer server.publish_queue_mutex.unlock(server.io);
             if (server.publish_queue.items.len == 0) {
-                // 与入队用同一把锁：退出前先减计数，避免入队方看到 worker 仍在而不再补任务
+                // Under the same lock as enqueuing: decrement the count before exiting, so that an
+                // enqueuer does not see the worker still present and skip spawning a new task
                 server.publish_workers -= 1;
                 counted = false;
                 return;
@@ -2867,7 +3092,8 @@ fn publishWorker(server: *Server) Io.Cancelable!void {
     }
 }
 
-/// 一次发布完成：计算期间又有请求时重新排队（由仍在运行的 worker 处理）
+/// A publish finished: requeues the file if requests arrived during the computation (handled by a
+/// worker that is still running)
 fn publishDone(server: *Server, file: Vfs.FileId) void {
     server.publish_queue_mutex.lockUncancelable(server.io);
     defer server.publish_queue_mutex.unlock(server.io);
@@ -2894,11 +3120,13 @@ pub fn publishOpenFiles(server: *Server) void {
     server.publishFiles(files, false);
 }
 
-/// 文件的编辑代数，与是否已有等待中的发布任务
+/// Edit generation of a file, and whether a publish task is already waiting
 const Edit = struct { generation: u64 = 0, scheduled: bool = false };
 
-/// 编辑触发的发布：同一文件最多一个等待中的任务，`diagnostics.debounce_ms` 内没有新的编辑时才计算。
-/// 逐字输入时不为每次按键计算诊断（AstGen 与非活动代码的推导），也不堆积被写事务反复打断的任务
+/// Publishing triggered by edits: at most one waiting task per file, which computes only when there
+/// has been no new edit for `diagnostics.debounce_ms`. While typing, diagnostics (AstGen and
+/// inference of inactive code) are not computed for every keystroke, and tasks repeatedly
+/// interrupted by write transactions do not pile up.
 fn publishDebounced(server: *Server, file: Vfs.FileId) void {
     {
         server.edits_mutex.lockUncancelable(server.io);
@@ -2909,7 +3137,8 @@ fn publishDebounced(server: *Server, file: Vfs.FileId) void {
         if (gop.value_ptr.scheduled) return;
         gop.value_ptr.scheduled = true;
     }
-    // 在锁外提交：退回 `async` 时任务在这里同步执行，会再获取 `edits_mutex`
+    // Spawned outside the lock: when falling back to `async`, the task runs synchronously here and
+    // acquires `edits_mutex` again
     server.busyBegin();
     spawn(server.io, &server.bg_group, debounceTask, .{ server, file });
 }
@@ -2942,7 +3171,8 @@ fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
     return if (server.edits.get(file)) |e| e.generation else 0;
 }
 
-/// InternPool 超过 `sema.max_intern_pool_mb` 时整代回收（见 `resetSema`）。在读事务之外的空闲处调用
+/// Reclaims the whole generation when the InternPool exceeds `sema.max_intern_pool_mb`
+/// (see `resetSema`). Called at idle points outside read transactions.
 fn maybeResetSema(server: *Server) void {
     const limit = server.max_intern_pool_mb.load(.monotonic);
     if (limit == 0) return;
@@ -2952,11 +3182,13 @@ fn maybeResetSema(server: *Server) void {
     server.resetSema();
 }
 
-/// 类型信息相关 query 的 key 总数超过此值时同样整代回收：key 与依赖边不随淘汰释放，长时间会话中
-/// 随访问过的成员与实例持续增长（Zig 编译器源码 40 轮约 25 万个，连同依赖边数十 MB）
+/// When the total number of keys of the type-information queries exceeds this value, the whole
+/// generation is reclaimed as well: keys and dependency edges are not freed by eviction and keep
+/// growing in long sessions with the members and instances visited (about 250,000 after 40 rounds
+/// over the Zig compiler source, tens of MB including the dependency edges)
 const sema_reset_keys = 200_000;
 
-/// 整代回收所清空的 query
+/// Queries cleared by a whole-generation reclaim
 const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
@@ -2965,16 +3197,18 @@ fn semaKeys(server: *Server) usize {
     return n;
 }
 
-/// 同 `semaKeys`；调用者持有写事务
+/// Same as `semaKeys`; the caller holds a write transaction
 fn semaKeysLocked(server: *Server) usize {
     var n: usize = 0;
     inline for (sema_queries) |Q| n += server.db.keyCountLocked(Q);
     return n;
 }
 
-/// 整代回收类型信息：清空 InternPool 中非预置的项，以及 key 或值引用它们的 query（其余 query 中依赖
-/// 它们的 memo 一并丢弃）。InternPool 与这些 query 的 key、依赖边只增不减，长时间会话中随访问过的
-/// 泛型实例持续增长；回收后再请求时按需重新推导
+/// Reclaims type information as a whole generation: clears the non-predefined items in the
+/// InternPool and the queries whose keys or values refer to them (memos of other queries that
+/// depend on them are dropped too). The InternPool and the keys and dependency edges of these
+/// queries never shrink and keep growing in long sessions with the generic instances visited; after
+/// the reclaim, later requests infer again on demand.
 pub fn resetSema(server: *Server) void {
     const before = server.ip.bytes();
     server.db.beginWrite();
@@ -2985,21 +3219,24 @@ pub fn resetSema(server: *Server) void {
     log.info("reclaimed type information ({d} MB in the intern pool, {d} keys)", .{ before / (1024 * 1024), keys });
 }
 
-/// `generation`：编辑触发的发布所针对的编辑代数。被打断时若已有更新的编辑就放弃，由那次编辑触发的发布接替
+/// `generation`: the edit generation that an edit-triggered publish is for. When interrupted, it
+/// gives up if a newer edit exists; the publish triggered by that edit takes over.
 fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) void {
     var pc: panic_context.Text = .{};
     pc.enter("publish diagnostics {s}", .{server.vfs.path(file)});
     defer pc.leave();
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
-    // 虚拟文档没有磁盘文件：关闭并清除诊断之后不再为内部路径发布
+    // Virtual documents have no file on disk: after one is closed and its diagnostics cleared,
+    // nothing more is published for its internal path
     if (isVirtual(server.vfs.path(file))) {
         server.docs_mutex.lockUncancelable(server.io);
         const wanted = server.open_docs.contains(file) or server.last_uris.contains(file);
         server.docs_mutex.unlock(server.io);
         if (!wanted) return;
     }
-    // 被写事务取消时重试：构建结果触发的发布不能因无关的编辑而丢失
+    // Retry when canceled by a write transaction: a publish triggered by a build result must not be
+    // lost because of an unrelated edit
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
         if (generation) |g| if (server.editGeneration(file) != g) return;
@@ -3007,13 +3244,15 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
         var ctx = server.db.beginRead(arena);
-        // 准备之后又有了编辑：重新在锁外准备，不在读事务中做 AstGen（逐字输入时 AstGen 可能慢于按键）
+        // Another edit came in after preparing: prepare again outside the lock instead of running
+        // AstGen inside the read transaction (while typing, AstGen may be slower than keystrokes)
         const ready = server.liveReady(&ctx, file) catch false;
         if (!ready) {
             ctx.end();
             continue;
         }
-        // 在读取编译结果等状态之前取序号（见 `sendDiagnostics`）
+        // Take the sequence number before reading state
+        // such as compile results (see `sendDiagnostics`)
         const seq = server.publish_seq.fetchAdd(1, .acq_rel);
         const params = server.computeDiagnostics(&ctx, arena, file) catch |err| {
             ctx.end();
@@ -3022,7 +3261,7 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
                 error.OutOfMemory => return log.err("out of memory while computing diagnostics", .{}),
             }
         };
-        // 计算中吞掉了 `Canceled` 时结果不完整：同样重试
+        // If the computation swallowed `Canceled`, the result is incomplete: retry as well
         const canceled = if (ctx.checkCanceled()) |_| false else |_| true;
         ctx.end();
         if (canceled) continue;
@@ -3031,8 +3270,10 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
     }
 }
 
-/// 在读事务之外对文件的当前文本做 AstGen（见 `live.Prepared`）：AstGen 不检查取消，在读事务中进行时
-/// 写事务要等它结束。只读取文本时短暂持有读事务。任何失败都只是退回在 query 中计算
+/// Runs AstGen on the file's current text outside any read transaction (see `live.Prepared`):
+/// AstGen does not check for cancellation, so if it ran inside a read transaction, write
+/// transactions would have to wait for it to finish. A read transaction is held briefly, only to
+/// read the text. Any failure just falls back to computing in the query.
 fn prepareLive(server: *Server, file: Vfs.FileId) void {
     if (!server.liveEligible(file)) return;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
@@ -3054,7 +3295,8 @@ fn prepareLive(server: *Server, file: Vfs.FileId) void {
     server.live_prepared.put(server.io, file, text, mode, backend, result) catch {};
 }
 
-/// 当前文本的 live 诊断已在读事务之外准备过（或不需要准备）
+/// The live diagnostics of the current text have already been prepared outside a read transaction
+/// (or need no preparation)
 fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
     if (!server.liveEligible(file)) return true;
     const backend = try ctx.get(live.LiveBackend, {});
@@ -3062,10 +3304,15 @@ fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
     return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file)), backend));
 }
 
-/// 发送 `seq` 号计算的诊断，已发送过序号更大的结果时丢弃。同一文件的多个发布任务并发计算，先开始的可能后算完。
-/// 状态每次变化之后都会发起新的发布：它在变化之后取号，序号大于变化之前取号的所有计算，读到的是变化之后的状态。
-/// 所以只发送序号不小于已发送序号的结果时，最后发出的结果读到的是最后一次变化之后的状态。比较与写出都在
-/// publish_mutex 内，写出的先后与比较的结果一致；序列化在锁外进行
+/// Sends the diagnostics computed with sequence number `seq`, dropping them if a result
+/// with a larger number has already been sent. Several publish tasks for the same file
+/// compute concurrently, and one that started earlier may finish later. Every state
+/// change is followed by a new publish: it takes its number after the change, which is
+/// larger than those of all computations that took theirs before the change, and it
+/// reads the state after the change. So when only results whose number is no smaller
+/// than the one already sent are sent, the last result sent has read the state after
+/// the last change. Comparing and writing both happen inside publish_mutex, so the
+/// order of writes matches the comparisons; serialization happens outside the lock.
 fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, seq: u64) void {
     const bytes = jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", params) catch return log.err("out of memory while building notification", .{});
     var sent = false;
@@ -3081,7 +3328,8 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
         defer server.docs_mutex.unlock(server.io);
         const was_published = server.published.contains(file);
         if (params.diagnostics.len == 0) {
-            // 从未显示过诊断的文件不必发送空列表（已打开的文件除外，客户端可能仍显示着旧结果）
+            // A file that never had diagnostics shown needs no empty list (except open files: the
+            // client may still be showing old results)
             if (!was_published and !clear and !server.open_docs.contains(file)) return;
             _ = server.published.swapRemove(file);
         } else {
@@ -3090,7 +3338,7 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
     }
     sent = true;
     server.send(bytes);
-    // 虚拟文档的清除已发出：之后不再需要它的 URI
+    // The clearing for the virtual document has been sent: its URI is no longer needed
     if (isVirtual(server.vfs.path(file))) {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
@@ -3110,7 +3358,8 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
     const a = try server.vfs.intern(native("/a.zig"));
     const b = try server.vfs.intern(native("/b.zig"));
     const stale: types.Diagnostic = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 1 } }, .message = .{ .string = "stale" } };
-    // 第 2 次计算先算完并发送；第 1 次计算基于更旧的状态，后算完时丢弃。其他文件不受影响
+    // The 2nd computation finishes first and is sent; the 1st is based on older state and is
+    // dropped when it finishes later. Other files are not affected.
     server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, 2);
     server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 1);
     server.sendDiagnostics(b, .{ .uri = "file:///b.zig", .diagnostics = &.{stale} }, true, 0);
@@ -3185,12 +3434,14 @@ test "publishFiles: requests for a file being published coalesce into one more r
         try server.db.set(FileText, file, try gpa.dupe(u8, "fn f() void {\n    var x = 1;\n}\n"), .low);
     }
     const before = server.publish_seq.load(.monotonic);
-    // 写事务期间发布任务停在读事务之前：之后的请求都在第一次发布排队或计算时到达
+    // During the write transaction, publish tasks stop before their read transactions: all later
+    // requests arrive while the first publish is queued or computing
     server.db.beginWrite();
     for (0..10) |_| server.publishFiles(&.{file}, true);
     server.db.endWrite();
     server.waitIdle();
-    // 排队中的请求合并，计算开始之后的请求在完成后合为一次
+    // Queued requests are coalesced, and requests that arrive after computation starts are combined
+    // into one run after it finishes
     const computed = server.publish_seq.load(.monotonic) - before;
     try std.testing.expect(computed >= 1 and computed <= 2);
     try std.testing.expectEqual(0, server.publish_files.count());
@@ -3205,7 +3456,8 @@ test "importsBasis ignores the files of the module graph but follows modules and
         .{ .root = lib, .imports = &.{} },
     };
     const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .files = &.{.{ .file = main, .module = 0, .root_module = 0 }} };
-    // 构建中产生了生成文件：只多了文件，自动导入的索引仍然可用
+    // A build produced generated files: only files were
+    // added, so the auto-import index remains usable
     var more_files = base;
     more_files.files = &.{ .{ .file = main, .module = 0, .root_module = 0 }, .{ .file = lib, .module = 1, .root_module = 0 } };
     try std.testing.expectEqual(importsBasis(&base), importsBasis(&more_files));
@@ -3244,7 +3496,7 @@ test "appendImportRoots warms std, module builtins and imported module roots" {
     try appendImportRoots(&graph, &roots, std.testing.allocator);
     for ([_]Vfs.FileId{ std_root, default_builtin, module_builtin, lib }) |expected|
         try std.testing.expect(std.mem.indexOfScalar(Vfs.FileId, roots.items, expected) != null);
-    // 没有被任何模块 import 的根不必预热
+    // A root that no module imports does not need warming up
     try std.testing.expect(std.mem.indexOfScalar(Vfs.FileId, roots.items, main) == null);
 }
 
@@ -3260,7 +3512,7 @@ test "updateModuleGraph keeps the old inputs when an allocation fails" {
         server.deinit();
     }
 
-    // 首次更新：任何失败点都不应留下部分写入的 input
+    // First update: no failure point may leave a partially written input
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         try std.testing.expect(fail_index < 10_000);
@@ -3289,7 +3541,8 @@ test "updateModuleGraph keeps the old inputs when an allocation fails" {
     server.db.endWrite();
     try std.testing.expect(old_graph != null);
 
-    // 之后的更新失败时保留旧图与 TargetAbi。换一个默认的 builtin.zig，使新图与旧图不同而走到写入
+    // When a later update fails, the old graph and TargetAbi are kept. Switch to another default
+    // builtin.zig so that the new graph differs from the old one and the write is reached.
     server.default_builtin = try failing.allocator().dupe(u8, "/zig-analyzer-test/builtin.zig");
     fail_index = 0;
     while (true) : (fail_index += 1) {
@@ -3327,7 +3580,8 @@ test "updateModuleGraph takes no write transaction when nothing changed" {
     defer server.deinit();
     try server.updateModuleGraphInner();
     const writes = server.db.writes.load(.monotonic);
-    // 每次构建结束都会更新模块图：没有变化时开写事务会取消进行中的计算与请求
+    // The module graph is updated after every build: opening a write transaction when nothing
+    // changed would cancel in-flight computations and requests
     try server.updateModuleGraphInner();
     try std.testing.expectEqual(writes, server.db.writes.load(.monotonic));
     server.default_builtin = try std.testing.allocator.dupe(u8, "/zig-analyzer-test/builtin.zig");
@@ -3335,9 +3589,10 @@ test "updateModuleGraph takes no write transaction when nothing changed" {
     try std.testing.expectEqual(writes + 1, server.db.writes.load(.monotonic));
 }
 
-/// 是否发布文件的 live 诊断：不属于任何项目，或所属的项目中有一个认为需要（见 `Workspace.liveEligible`）
+/// Whether to publish live diagnostics for the file: it belongs to no project, or one of the
+/// projects it belongs to wants them (see `Workspace.liveEligible`)
 fn liveEligible(server: *Server, file: Vfs.FileId) bool {
-    // 在持有 workspaces_mutex 期间使用各项目（先 workspaces_mutex 后 ws.mutex）
+    // Use the projects while holding workspaces_mutex (workspaces_mutex first, then ws.mutex)
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     var owned = false;
@@ -3359,9 +3614,11 @@ fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![
 const OtherFiles = struct {
     server: *Server,
     ctx: *Db.Ctx,
-    /// 编译器诊断的附注所在文件在那次编译时的文本（附注的区间以它为准），按附注中的路径
+    /// Text, at the time of that compile, of the files that compiler diagnostic notes point into
+    /// (note ranges refer to it), keyed by the path in the note
     texts: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// 取用的编译结果，各持有一份引用（`release` 时释放）：诊断算完之前不会因被新的结果替换而释放
+    /// Compile results in use, each with a reference held (released by `release`): they are not
+    /// freed by being replaced with newer results before the diagnostics are computed
     builds: std.ArrayList(*compiler.BuildResult) = .empty,
 
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
@@ -3373,8 +3630,9 @@ const OtherFiles = struct {
         return .{ .uri = u, .text = text, .base_text = self.texts.get(path) };
     }
 
-    /// 取用编译结果 `build` 中的 `fr`（在持有 `build` 所在的锁时调用），并记下其附注所在文件在这次编译时的文本
-    /// （同一路径只取最先记下的）
+    /// Takes `fr` from the compile result `build` (called while holding the lock that protects
+    /// `build`), and records the text, at the time of this compile, of the files its notes point
+    /// into (for the same path, only the first recorded text is kept)
     fn use(self: *OtherFiles, arena: Allocator, fr: *const compiler.FileResult, build: *compiler.BuildResult) Allocator.Error!*const compiler.FileResult {
         try self.builds.ensureUnusedCapacity(arena, 1);
         self.builds.appendAssumeCapacity(build.retain());
@@ -3392,9 +3650,12 @@ const OtherFiles = struct {
     }
 };
 
-/// `file` 的编译器诊断：包含它的各个项目最近一次构建的结果，单文件编译的结果按文件的上下文决定是否采用
-/// （见 `FileContext.usesSingle`）；有多个时按 `compiler.combine` 合并，以最新一次编译读取的文本为准。
-/// 各个结果在其所在的锁内取得引用，记入 `other`（附注所在文件的文本也记入），合并时不持有锁
+/// Compiler diagnostics of `file`: the results of the latest build of each project
+/// that contains it; whether single-file compile results are used depends on the
+/// file's context (see `FileContext.usesSingle`). Multiple results are merged with
+/// `compiler.combine`, taking the text read by the newest compile as authoritative.
+/// A reference to each result is taken under its lock and recorded in `other` (along
+/// with the text of the files the notes point into); no lock is held while merging.
 fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
     const Found = struct {
         generation: u64,
@@ -3447,11 +3708,13 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     const document_uri = try server.uriFor(arena, file);
     const text = try ctx.get(FileText, file);
 
-    // live 诊断：文件已加载，且（不属于任何项目，或编译集合尚未算出，或在编译集合中）
+    // Live diagnostics: the file is loaded, and (it belongs to no project, or the compile set has
+    // not been computed yet, or it is in the compile set)
     var live_result: ?*live.Result = null;
     if (text != null and server.liveEligible(file)) live_result = try ctx.get(live.AstCheck, file);
 
-    // 编译器诊断：被 import 的文件中的错误由编译它的项目或根文件报告
+    // Compiler diagnostics: errors in an imported file are
+    // reported by the project or root file that compiles it
     var other: OtherFiles = .{ .server = server, .ctx = ctx };
     defer other.release();
     const fr = try server.compilerResult(arena, file, &other);
@@ -3476,9 +3739,11 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     return .{ .uri = document_uri, .diagnostics = diags };
 }
 
-/// 打开的、属于没有加载的项目的文件（见 `FileContext.unloaded_project`）：提示把项目目录加入工作区。同
-/// rust-analyzer 对不属于任何 crate 的文件，是只标出文件开头几个字符的 Hint。启动阶段结束之前与项目首次加载
-/// 期间不提示：文件可能随后出现在项目的模块图中（以路径加入的模块）
+/// An open file that belongs to a project that is not loaded (see `FileContext.unloaded_project`):
+/// a hint to add the project directory to the workspace. Like rust-analyzer's hint for files that
+/// belong to no crate, it is a Hint marking only the first few characters of the file. No hint
+/// before startup finishes or while projects are loading for the first time: the file may later
+/// show up in a project's module graph (modules added by path).
 fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     const path = server.vfs.path(file);
     if (!server.isOpen(path) or !server.startup_done.load(.acquire) or server.projectsLoading()) return diags;
@@ -3502,7 +3767,7 @@ fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId
     return out;
 }
 
-/// 只为打开的文件显示非活动代码：需要推导文件中的全部成员
+/// Inactive code is shown only for open files: it requires inferring all members of the file
 fn wantsInactiveCode(server: *Server, file: Vfs.FileId) bool {
     {
         server.config_mutex.lockUncancelable(server.io);
@@ -3514,7 +3779,8 @@ fn wantsInactiveCode(server: *Server, file: Vfs.FileId) bool {
     return server.open_docs.contains(file);
 }
 
-/// 当前构建配置下不编译的代码（comptime 已知不执行的分支）：带 `Unnecessary` 标记的提示，编辑器以淡色显示
+/// Code that is not compiled under the current build configuration (branches known at comptime not
+/// to execute): hints tagged `Unnecessary`, which editors show faded
 fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     var r: Resolver = .{ .ctx = ctx, .arena = arena };
     const ranges = try za.ide.inactive.ranges(&r, file);
@@ -3524,8 +3790,9 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     @memcpy(out[0..diags.len], diags);
     var n = diags.len;
     for (ranges) |x| {
-        // builtin 按 zig test 生成，推导可能把诊断那次编译实际执行的分支标为非活动：与编译器诊断
-        // 重叠时不发布提示，避免同一处代码同时是错误与非活动
+        // builtin is generated as for zig test, so inference may mark as inactive a branch that the
+        // compile behind the diagnostics actually executes: no hint is published where it overlaps
+        // a compiler diagnostic, so that the same code is not both an error and inactive
         if (conflictsWithCompilerError(diags, text, server.encoding, x)) continue;
         out[n] = .{
             .range = lines.range(x.start, x.end, server.encoding),
@@ -3550,7 +3817,8 @@ fn conflictsWithCompilerError(diags: []const types.Diagnostic, text: []const u8,
     return false;
 }
 
-/// 一个文件的命名检查配置：客户端的配置，以包含文件的项目的 `zig-analyzer.zon` 中出现的项覆盖
+/// Naming check settings for one file: the client's configuration, overridden by the entries
+/// present in the `zig-analyzer.zon` of the project containing the file
 const NamingSettings = struct {
     ignore: []const []const u8,
     rules: Config.NamingRules,
@@ -3565,8 +3833,9 @@ const NamingSettings = struct {
     }
 };
 
-/// 文件是否做命名检查及其配置：开启了检查的、打开的用户代码（见 `origin.Origin.user`），不在 `naming.exclude` 中，
-/// 也不是生成的代码（见 `naming.isGenerated`）
+/// Whether the file gets naming checks, and their settings: open user code
+/// (see `origin.Origin.user`) with the check enabled, not in `naming.exclude`, and not generated
+/// code (see `naming.isGenerated`)
 fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     {
         server.docs_mutex.lockUncancelable(server.io);
@@ -3586,12 +3855,13 @@ fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const 
         exclude = try dupeStrings(arena, server.config.naming_exclude);
         rules = server.config.naming_rules;
     }
-    // `naming.exclude` 的路径相对工作区根目录，来自 `zig-analyzer.zon` 时相对项目根目录
+    // `naming.exclude` paths are relative to the workspace root directory, or to the project root
+    // directory when they come from `zig-analyzer.zon`
     var base = try server.rootOf(arena, path);
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        // 嵌套的项目取最内层的
+        // For nested projects, take the innermost one
         var best: ?*Workspace = null;
         for (server.workspaces.items) |ws| {
             if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
@@ -3631,7 +3901,8 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
     return out;
 }
 
-/// 包含 `path` 的工作区根目录（嵌套时取最内层的），复制到 `arena` 中
+/// The workspace root directory containing `path`
+/// (the innermost one when nested), copied into `arena`
 fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
@@ -3642,7 +3913,8 @@ fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?
     return if (best) |b| try arena.dupe(u8, b) else null;
 }
 
-/// 不符合命名约定的名字（见 `naming`）：低强度的提示，code 为 `naming.<规则>`，附官方规则的链接
+/// Names that violate the naming conventions (see `naming`): low-severity hints with code
+/// `naming.<rule>` and a link to the official rules
 fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, text: []const u8, settings: NamingSettings, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     var r: Resolver = .{ .ctx = ctx, .arena = arena };
     const found = try ide.naming.findings(&r, file, null);
@@ -3664,22 +3936,24 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
     return out.items;
 }
 
-// ── 请求处理函数 ──────────────────────────────────────────────────────
+// ── Request handlers ──────────────────────────────────────────────────
 
-/// 读请求中把 URI 换成已知文件；未打开或不存在的文件返回 null
+/// Maps a URI in a read request to a known file; returns
+/// null for files that are not open or do not exist
 fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
     const path = try documentPath(arena, document_uri) orelse return null;
     return try server.vfs.lookup(path);
 }
 
-/// 请求中的区间换算为字节偏移；起止颠倒的区间按交换后处理
+/// Converts a range in a request to byte offsets; a range
+/// whose start and end are reversed is treated as swapped
 fn rangeOffsets(server: *const Server, text: []const u8, range: types.Range) struct { u32, u32 } {
     const a: u32 = @intCast(offsets.positionToOffset(text, range.start, server.encoding));
     const b: u32 = @intCast(offsets.positionToOffset(text, range.end, server.encoding));
     return .{ @min(a, b), @max(a, b) };
 }
 
-/// 文件文本与行索引
+/// File text and line index
 fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineIndex {
     const text = try ctx.get(FileText, file) orelse "";
     return offsets.LineIndex.init(arena, text);
@@ -3742,7 +4016,9 @@ fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: V
         break :blk server.open_docs.contains(file);
     };
     try ctx.checkCanceled();
-    // 读事务保证关闭时会先等本请求退出；未打开的文档只返回数据，不保存可跨会话复用的快照。
+    // The read transaction guarantees that closing the document first waits for this request to
+    // exit; for a document that is not open, only the data is returned, and no snapshot reusable
+    // across sessions of the document is saved.
     if (!is_open) return .{ .SemanticTokens = .{ .data = data } };
     return try server.semantic_cache.update(server.io, server.gpa, arena, file, data, previous_id);
 }
@@ -3754,7 +4030,8 @@ fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: 
 }
 
 fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
-    // 优先 UTF-8（与内部字节偏移一致），否则回落到协议默认的 UTF-16
+    // Prefer UTF-8 (matches the internal byte offsets);
+    // otherwise fall back to the protocol default UTF-16
     if (params.capabilities.general) |general| {
         if (general.positionEncodings) |encodings| {
             for (encodings) |e| {
@@ -3793,7 +4070,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
     log.info("initialized, position encoding {t}", .{server.encoding});
     if (params.processId) |pid| server.watchParent(pid);
 
-    // 工作区根目录：优先 workspaceFolders，其次 rootUri / rootPath
+    // Workspace root directories: workspaceFolders first, then rootUri / rootPath
     var root_uris: std.ArrayList([]const u8) = .empty;
     defer root_uris.deinit(server.gpa);
     if (params.workspaceFolders) |folders| for (folders) |f| try root_uris.append(server.gpa, f.uri);
@@ -3839,10 +4116,12 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
 }
 
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
-    // 先解除依赖主循环的等待：客户端一直没有回复配置请求时不再等待。之后主循环阻塞在 await 上，
-    // 处理不了补发的响应，进行中的 `waitIdle` 请求只能靠这里结束
+    // First release the waits that depend on the main loop: if the client never answered a
+    // configuration request, stop waiting for it. After this the main loop blocks on await and
+    // cannot handle a late response, so an in-flight `waitIdle` request can only end through this.
     server.abandonConfigRequests();
-    // 停止各项目的构建系统进程；等待进行中的请求完成，再等后台任务（诊断发布等）收尾
+    // Stop the build system processes of all projects; wait for in-flight requests to complete,
+    // then for background tasks (diagnostics publishing, etc.) to wind down
     server.stopWorkspaces();
     server.group.await(server.io) catch {};
     server.waitIdle();
@@ -3853,15 +4132,16 @@ const StatusResult = struct {
     revision: u64,
     files: usize,
     deep_verifications: u64,
-    /// 写事务的次数（见 `db.Stats.writes`）
+    /// Number of write transactions (see `db.Stats.writes`)
     writes: u64,
-    /// 进程的常驻内存峰值（KB；不支持的平台为 0）
+    /// Peak resident memory of the process (KB; 0 on unsupported platforms)
     max_rss_kb: u64,
-    /// InternPool 中的类型与值的个数
+    /// Number of types and values in the InternPool
     intern_pool_items: usize,
-    /// InternPool 占用的字节数
+    /// Bytes used by the InternPool
     intern_pool_bytes: usize,
-    /// 经由服务器分配器分配、尚未释放的字节数（可执行文件以 `mem.Counting` 包装分配器时；否则为 0）
+    /// Bytes allocated through the server's allocator and not yet freed (when the executable wraps
+    /// the allocator with `mem.Counting`; 0 otherwise)
     heap_bytes: usize,
     queries: []const struct {
         name: []const u8,
@@ -3873,12 +4153,12 @@ const StatusResult = struct {
         max_ms: f64,
         memos: usize,
         keys: usize,
-        /// 保留着的值占用的字节数（声明了 `bytes` 的 query；否则为 0）
+        /// Bytes used by retained values (for queries that declare `bytes`; 0 otherwise)
         bytes: usize,
         deps: usize,
         incomplete: u64,
     },
-    /// 结果不完整的原因（环、栈深度）的累计次数
+    /// Cumulative counts of incomplete results by cause (cycles, stack depth)
     incomplete_causes: struct { cycle: u64, stack: u64 },
 };
 
@@ -3906,7 +4186,7 @@ fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types
     return .{ .Definition = .{ .Location = try server.targetLocation(r, arena, t) } };
 }
 
-/// 按 `find` 求光标处的全部跳转目标
+/// All goto targets at the cursor, computed with `find`
 fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) ![]const types.Location {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return &.{};
     const targets = try find(r, at.file, at.offset);
@@ -3926,8 +4206,11 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     const text = try r.ctx.get(FileText, file) orelse return null;
     const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
     const auto_import = server.autoImportEnabled();
-    // 自动导入的索引为当前模块图建完之前不提供，标记为不完整：客户端随输入重新请求，届时再提供。第一次在可以
-    // 导入的名字处补全时开始建索引；之后仍未建完而没有索引在进行时（上一轮出错、任务没能启动）重新开始
+    // Auto-imports are not offered until the index has been built for the current module graph, and
+    // the result is marked incomplete: the client requests again as the user types, and they are
+    // offered then. Indexing starts the first time completion happens where a name could be
+    // imported; later, if the index is still not built and no indexing is in progress (the previous
+    // round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const max_auto_imports, const import_options = blk: {
@@ -3989,8 +4272,9 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     return .{ .array_of_CompletionItem = out };
 }
 
-/// 补全项的 `data`：在哪个文件中补全（`from`）、所指的文件与其中声明的 `AstId`（编辑后仍能找到同一个声明）。
-/// 选中时客户端带着它请求 `completionItem/resolve`
+/// `data` of a completion item: the file where completion happens (`from`), the target file, and
+/// the `AstId` of the declaration in it (which still finds the same declaration after edits). When
+/// the item is selected, the client sends it with a `completionItem/resolve` request.
 fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.ide_db.imports.Target) !std.json.Value {
     var obj: std.json.ObjectMap = .empty;
     try obj.put(arena, "from", .{ .integer = from.index() });
@@ -4004,8 +4288,9 @@ fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.i
     return .{ .object = obj };
 }
 
-/// 补全项被选中：补上签名（`detail`）、文档注释与定义的位置（`documentation`）。`data` 不是本服务器给出的，
-/// 或所指的声明已经不在时原样返回
+/// A completion item was selected: fills in the signature (`detail`), the doc comment and the
+/// definition's location (`documentation`). Returns the item unchanged if `data` did not come from
+/// this server or the declaration it refers to no longer exists.
 fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
     var item = params;
     const data = switch (params.data orelse return item) {
@@ -4025,14 +4310,14 @@ fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.
     return item;
 }
 
-/// `data` 中名为 `key` 的文件；不是本次会话中的文件时为 null
+/// The file named by `key` in `data`; null if it is not a file of the current session
 fn dataFile(server: *Server, data: std.json.ObjectMap, key: []const u8) ?Vfs.FileId {
     const v = data.get(key) orelse return null;
     if (v != .integer or v.integer < 0 or v.integer >= server.vfs.count()) return null;
     return @fromBackingInt(@as(u32, @intCast(v.integer)));
 }
 
-/// 请求中的文件、内容与位置
+/// The file, text and position of a request
 fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { file: Vfs.FileId, text: []const u8, offset: u32 } {
     const file = try server.lookupFile(arena, document_uri) orelse return null;
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
@@ -4099,7 +4384,8 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     return out;
 }
 
-/// 引用查找与 workspace symbol 的范围：模块图中的项目文件（不含标准库）与打开的文档
+/// Scope of find references and workspace symbol: project files in the module graph (excluding the
+/// standard library) and open documents
 fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     for (try za.ide_db.search.projectFiles(r)) |f| try set.put(r.arena, f, {});
@@ -4109,9 +4395,11 @@ fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return set.keys();
 }
 
-/// workspace symbol 的范围：默认不含依赖库中的文件，由 `workspace_symbol.dependencies` 开启。索引进行中时
-/// 只取已建立索引的文件与打开的文档，不在请求中解析其余文件（LSP 的 workspace/symbol 没有 isIncomplete：客户端随
-/// 输入重新请求，结果随索引的进展补全）
+/// Scope of workspace symbol: excludes files in dependency libraries by default;
+/// `workspace_symbol.dependencies` includes them. While indexing is in progress, only indexed files
+/// and open documents are used, and the remaining files are not parsed during the request (LSP's
+/// workspace/symbol has no isIncomplete: the client requests again as the user types, and the
+/// results fill in as indexing progresses).
 fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     var scope = try server.searchScope(r);
     const dependencies = blk: {
@@ -4135,8 +4423,9 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return out.items;
 }
 
-/// 光标处的定义及其全部引用
-/// `ambiguous`、`incomplete` 不为 null 时记录第一处有歧义、实例不完整的引用（见 `search.Options`）
+/// The definition at the cursor and all its references.
+/// When `ambiguous` and `incomplete` are not null, they record the first ambiguous reference and
+/// the first reference with incomplete instances, respectively (see `search.Options`).
 fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference, incomplete: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
@@ -4145,7 +4434,7 @@ fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: [
     return .{ .def = def, .refs = refs };
 }
 
-/// 引用位置转为 LSP 区间（按文件缓存行索引）
+/// Converts reference positions to LSP ranges (caching the line index per file)
 const RangeMapper = struct {
     server: *Server,
     r: *Resolver,
@@ -4180,7 +4469,8 @@ fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return out;
 }
 
-/// 可以重命名的定义：用户自己的代码（见 `origin.Origin.user`）与未保存的文档
+/// Definitions that can be renamed: the user's own code
+/// (see `origin.Origin.user`) and unsaved documents
 fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
     const file = switch (def) {
@@ -4190,7 +4480,7 @@ fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
     };
     const rules = try server.originRules(r.arena);
     return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
-        // 未保存的文档（`untitled:` 等）只存在于编辑器中
+        // Unsaved documents (`untitled:` etc.) exist only in the editor
         .virtual, .user => true,
         .zig_lib, .generated, .package, .other => false,
     };
@@ -4215,7 +4505,7 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
     var incomplete: ?za.ide_db.search.Reference = null;
     const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous, &incomplete) orelse return null;
     if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
-    // 不返回只改了一部分的结果
+    // Do not return a partially renamed result
     if (ambiguous != null) return error.RenameAmbiguous;
     if (incomplete != null) return error.RenameIncomplete;
     const is_field = switch (found.def) {
@@ -4226,8 +4516,9 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
     return try server.renameEdit(r, arena, found.refs, new_name, null);
 }
 
-/// 把引用（按文件与位置排列，含声明处）改为 `new_text` 的编辑。`confirm` 不为 null 时编辑带上以它为标签、要求
-/// 用户确认的注解（见 `workspaceEdit`）
+/// Edits that change the references (sorted by file and position, including the declaration) to
+/// `new_text`. When `confirm` is not null, the edits carry an annotation with it as the label
+/// that requires user confirmation (see `workspaceEdit`).
 fn renameEdit(server: *Server, r: *Resolver, arena: Allocator, refs: []const za.ide_db.search.Reference, new_text: []const u8, confirm: ?[]const u8) !types.WorkspaceEdit {
     var files: std.ArrayList(ide.rename.FileEdits) = .empty;
     var i: usize = 0;
@@ -4246,15 +4537,16 @@ fn renameEdit(server: *Server, r: *Resolver, arena: Allocator, refs: []const za.
     } else null);
 }
 
-/// 要求用户确认的变更注解
+/// A change annotation that requires user confirmation
 const Confirmation = struct {
     id: []const u8,
     label: []const u8,
     description: []const u8,
 };
 
-/// 各文件的编辑（按文件排列，文件中按位置排列）。`confirm` 不为 null 且客户端支持变更注解时，编辑带上要求用户
-/// 确认的注解，客户端应用之前先让用户确认
+/// Edits of each file (sorted by file, and by position within a file). When `confirm` is not
+/// null and the client supports change annotations, the edits carry an annotation requiring user
+/// confirmation, and the client asks the user to confirm before applying them.
 fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []const ide.rename.FileEdits, confirm: ?Confirmation) !types.WorkspaceEdit {
     const annotated = confirm != null and server.change_annotations;
     const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child).pointer.child;
@@ -4284,12 +4576,15 @@ fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []const
     return .{ .documentChanges = documents.items, .changeAnnotations = annotations };
 }
 
-/// 新名字的源码写法：`@"..."` 校验后原样使用；其余按需用 `@"..."` 包裹：关键字、含特殊字符的名字、`_`，
-/// 以及原生类型与值的名字（`u8`、`true`；声明与局部变量不能与它们同名）。`is_field` 时原生名字原样使用：
-/// 字段的声明与 `.` 之后的访问都可以用它们（如 `std.json.Value` 的 `null`、`bool`）
+/// Source text of a new name: `@"..."` is validated and used as is; anything else is wrapped in
+/// `@"..."` when needed: keywords, names with special characters, `_`, and names of primitive types
+/// and values (`u8`, `true`; declarations and locals cannot share these names). With `is_field`,
+/// primitive names are used as is: field declarations and accesses after `.` can both use them
+/// (e.g. `null` and `bool` of `std.json.Value`).
 fn identifierText(arena: Allocator, name: []const u8, is_field: bool) HandlerError![]const u8 {
     if (std.mem.startsWith(u8, name, "@\"")) {
-        // 整个名字须是一个标识符 token，引号中的转义合法、不为空且不含 NUL
+        // The whole name must be a single identifier token, and the quoted part must have valid
+        // escapes, be non-empty, and contain no NUL
         var tokenizer: std.zig.Tokenizer = .init(try arena.dupeSentinel(u8, name, 0));
         const token = tokenizer.next();
         if (token.tag != .identifier or token.loc.end != name.len) return error.InvalidIdentifier;
@@ -4311,18 +4606,20 @@ test "rename: source text of the new name" {
     try std.testing.expectEqualStrings("greet", try identifierText(a, "greet", false));
     try std.testing.expectEqualStrings("@\"fn\"", try identifierText(a, "fn", false));
     try std.testing.expectEqualStrings("@\"a b\"", try identifierText(a, "a b", false));
-    // 原生类型与值的名字、`_`：原样写入时声明与原生名字同名，编译错误
+    // Names of primitive types and values, and `_`: written as is, the declaration would have the
+    // same name as a primitive, which is a compile error
     try std.testing.expectEqualStrings("@\"u8\"", try identifierText(a, "u8", false));
     try std.testing.expectEqualStrings("@\"true\"", try identifierText(a, "true", false));
     try std.testing.expectEqualStrings("@\"_\"", try identifierText(a, "_", false));
-    // 字段可以与原生名字同名；`_` 在枚举中表示非穷尽，仍要加引号
+    // Fields may share a name with a primitive; `_` marks
+    // an enum as non-exhaustive, so it is still quoted
     try std.testing.expectEqualStrings("bool", try identifierText(a, "bool", true));
     try std.testing.expectEqualStrings("@\"_\"", try identifierText(a, "_", true));
     try std.testing.expectEqualStrings("@\"x\\\"y\"", try identifierText(a, "@\"x\\\"y\"", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\"b\"", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\"", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "", false));
-    // 编译器拒绝含 NUL 的标识符
+    // The compiler rejects identifiers containing NUL
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "a\x00b", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\\x00b\"", false));
     try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\\u{0}\"", false));
@@ -4347,8 +4644,9 @@ fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: type
     return .{ .array_of_WorkspaceSymbol = out };
 }
 
-/// 客户端要求的代码操作种类（`context.only`）包含 `kind`：种类按 `.` 分层，`source` 包含 `source.organizeImports`。
-/// 没有要求时任何种类都可以
+/// The code action kinds requested by the client (`context.only`)
+/// include `kind`: kinds are hierarchical by `.`, so `source` includes
+/// `source.organizeImports`. Any kind qualifies when none is requested.
 fn wantsKind(only: ?[]const []const u8, kind: []const u8) bool {
     const list = only orelse return true;
     for (list) |k| {
@@ -4371,7 +4669,8 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     var actions: std.ArrayList(ide.code_actions.Action) = .empty;
     if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or wantsKind(only, types.CodeActionKind.RefactorRewrite))
         try actions.appendSlice(arena, try ide.code_actions.codeActions(r, file, start, end));
-    // 明确要求整理 import 时不看光标位置（快捷键、保存时整理）
+    // When organize imports is requested explicitly (a keybinding,
+    // organizing on save), the cursor position is ignored
     if (wantsKind(only, types.CodeActionKind.SourceOrganizeImports)) {
         if (try ide.code_actions.organizeImports(r, file, start, end, import_options, only != null)) |a| try actions.append(arena, a);
     }
@@ -4391,7 +4690,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
         var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
         try changes.map.put(arena, doc_uri, edits);
-        // 关联客户端传来的同一条诊断，使修复显示在诊断上
+        // Link the same diagnostic sent by the client, so that the fix shows up on the diagnostic
         const diagnostics: ?[]const types.Diagnostic = if (a.diagnostic) |d| blk: {
             const range = lines.range(d.start, d.end, server.encoding);
             for (params.context.diagnostics) |cd| {
@@ -4423,38 +4722,40 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     return out.items;
 }
 
-/// 在 `textDocument/codeAction` 与 `codeAction/resolve` 之间保存的数据（`CodeAction.data`），用于选择之后才算出
-/// 编辑的修复
+/// Data kept between `textDocument/codeAction` and `codeAction/resolve` (`CodeAction.data`) for
+/// fixes whose edits are computed only after they are selected
 const ResolveData = struct {
-    /// 命名修复
+    /// Naming fix
     naming: ?struct {
         uri: []const u8,
-        /// 名字的起点
+        /// Start of the name
         line: u32,
         character: u32,
         name: []const u8,
         new_name: []const u8,
     } = null,
-    /// 删除未使用的参数
+    /// Removing an unused parameter
     remove_param: ?struct {
         uri: []const u8,
-        /// 参数名的起点
+        /// Start of the parameter name
         line: u32,
         character: u32,
         name: []const u8,
     } = null,
 };
 
-/// 不符合命名约定的名字的改名修复，只在用户选择后应用（不标为 preferred）。客户端支持 `codeAction/resolve` 时
-/// 只给出标题与 `data`，选择之后才查找引用、检查冲突；否则当场算出编辑。不能安全改名时，客户端支持 `disabled`
-/// 则带上原因，否则不提供
+/// Rename fix for a name that violates the naming conventions, applied only when the user picks it
+/// (not marked preferred). If the client supports `codeAction/resolve`, only the title and `data`
+/// are given, and references are searched and conflicts checked only after it is picked; otherwise
+/// the edit is computed right away. If the name cannot be renamed safely, the action carries the
+/// reason when the client supports `disabled`, and is not offered otherwise.
 fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, f: ide.naming.Located, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
     const what = if (f.def == .item and f.public) (if (f.rule == .field) "field " else "public ") else "";
     var action: types.CodeAction = .{
         .title = try std.fmt.allocPrint(arena, "rename {s}`{s}` to `{s}`", .{ what, f.name, f.suggestion }),
         .kind = types.CodeActionKind.QuickFix,
     };
-    // 关联客户端传来的同一条提示
+    // Link the same hint sent by the client
     for (client_diagnostics) |d| {
         const c = d.code orelse continue;
         if (c == .string and std.mem.eql(u8, c.string, f.rule.code()) and std.meta.eql(d.range, range)) {
@@ -4462,7 +4763,7 @@ fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []cons
             break;
         }
     }
-    // 声明处的冲突不必查找引用
+    // A conflict at the declaration needs no reference search
     if (try ide.rename.declarationConflict(r, f.def, f.suggestion)) |p| {
         if (!server.code_action_disabled) return null;
         action.disabled = .{ .reason = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
@@ -4489,7 +4790,8 @@ fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []cons
     return action;
 }
 
-/// 补上命名修复与删除参数的编辑；其他代码操作在 `textDocument/codeAction` 中已经完整，原样返回
+/// Fills in the edits of naming fixes and parameter removals; other code actions are already
+/// complete from `textDocument/codeAction` and are returned unchanged
 fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeAction) HandlerError!Outcome(types.CodeAction) {
     const value = params.data orelse return .{ .ok = params };
     const data = std.json.parseFromValueLeaky(ResolveData, arena, value, .{ .ignore_unknown_fields = true }) catch return .{ .ok = params };
@@ -4497,7 +4799,7 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
     if (data.naming) |d| {
         const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
             return .{ .failed = "cannot rename: the document is no longer available" };
-        // 两次请求之间文档可能已经改变：按位置重新找到这个名字
+        // The document may have changed between the two requests: find the name again by its position
         const found = for (try ide.naming.findings(r, at.file, .{ .start = at.offset, .end = at.offset })) |f| {
             if (f.start == at.offset and std.mem.eql(u8, f.name, d.name) and std.mem.eql(u8, f.suggestion, d.new_name)) break f;
         } else return .{ .failed = "cannot rename: the name has changed since the fix was offered" };
@@ -4519,8 +4821,10 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return .{ .ok = action };
 }
 
-/// 把不符合命名约定的名字改为建议的写法。只返回完整而安全的编辑：引用有无法确认之处（歧义、类型未知的成员访问、
-/// 有语法错误的文件），新名字与已有的名字冲突，或者名字以字符串出现（反射）时都不改
+/// Renames a name that violates the naming conventions to the suggested spelling. Returns only
+/// complete and safe edits: nothing is renamed when some reference cannot be confirmed (ambiguity,
+/// member access on an unknown type, a file with syntax errors), the new name conflicts with an
+/// existing one, or the name appears in a string (reflection).
 fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
     const def = f.def;
     const def_file = switch (def) {
@@ -4547,7 +4851,8 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
     if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
     if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
     if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
-    // 只有容器的成员能以字符串引用；不是 pub 的声明只能在所在的文件中访问
+    // Only container members can be referenced by strings; a
+    // non-pub declaration is accessible only in its own file
     if (def == .item) {
         const files = if (f.public) try za.ide_db.search.importers(r, def_file, scope) else try arena.dupe(Vfs.FileId, &.{def_file});
         if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
@@ -4557,7 +4862,8 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
         .local, .file => false,
     };
     const new_text = try identifierText(arena, f.suggestion, is_field);
-    // 遮蔽与重名只会出现在声明所在的文件中，这个文件中漏改的引用也会报出：以改名后的文本做 AstGen 确认
+    // Shadowing and name clashes can only occur in the file of the declaration, and missed
+    // references in that file are reported too: confirm by running AstGen on the renamed text
     var edits: std.ArrayList(ide.rename.Edit) = .empty;
     for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = new_text });
     if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
@@ -4565,12 +4871,14 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
     return .{ .ok = try server.renameEdit(r, arena, refs, new_text, confirm) };
 }
 
-/// 不能改名的说明：「cannot rename `a` to `b`: 原因 (文件:行:列)」，位置为 null 时只有文件
+/// Explanation of why a name cannot be renamed:
+/// "cannot rename `a` to `b`: reason (file:line:column)"; only the file when the position is null
 fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
     return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ f.name, f.suggestion }), file, offset, reason);
 }
 
-/// 不能应用修复的说明：「<prefix>: 原因 (文件:行:列)」，位置为 null 时只有文件
+/// Why a fix cannot be applied: "<prefix>: reason (file:line:column)"; only the file when the
+/// position is null
 fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
     const path = server.vfs.path(file);
     const shown = if (try server.rootOf(arena, path)) |root| std.mem.trimStart(u8, path[root.len..], "/\\") else path;
@@ -4580,16 +4888,19 @@ fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u
     return std.fmt.allocPrint(arena, "{s}: {s} ({s}:{d}:{d})", .{ prefix, reason, shown, pos.line + 1, pos.character + 1 });
 }
 
-/// 删除未使用的参数并删除各调用处对应的实参，只在用户选择后应用（不标为 preferred）。要查找整个工作区中的调用：
-/// 客户端支持 `codeAction/resolve` 时只给出标题与 `data`，选择之后才算出编辑；否则当场算出。不能删除时，客户端
-/// 支持 `disabled` 则带上原因，否则不提供
+/// Removes an unused parameter together with the matching argument at each call site, applied
+/// only when the user selects it (not marked preferred). Calls in the whole workspace have to be
+/// found: when the client supports `codeAction/resolve`, only the title and `data` are given, and
+/// the edits are computed after selection; otherwise they are computed right away. When the
+/// parameter cannot be removed, the reason is attached if the client supports `disabled`;
+/// otherwise the action is not offered.
 fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, t: ide.remove_param.Target, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
     if (!try server.renamable(r, .{ .item = .{ .file = t.file, .item = t.item } })) return null;
     var action: types.CodeAction = .{
         .title = try std.fmt.allocPrint(arena, "remove parameter `{s}`", .{t.name}),
         .kind = types.CodeActionKind.QuickFix,
     };
-    // 关联客户端传来的同一条诊断（同一位置还可能有命名提示）
+    // Attach the same diagnostic sent by the client (a naming hint may share the position)
     for (client_diagnostics) |d| {
         if (std.meta.eql(d.range, range) and d.message == .string and std.mem.eql(u8, d.message.string, ide.remove_param.unused_message)) {
             action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
@@ -4616,8 +4927,9 @@ fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: [
     return action;
 }
 
-/// 删除参数 `t` 与各调用处的实参（见 `ide.remove_param.edits`）。函数是 pub 时编辑要求用户确认：工作区之外的调用
-/// 不会更新
+/// Removes the parameter `t` and the arguments at each call site (see `ide.remove_param.edits`).
+/// When the function is pub, the edits require user confirmation: calls outside the workspace
+/// are not updated.
 fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
     switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
@@ -4633,27 +4945,29 @@ fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remov
     }
 }
 
-/// 以文档为参数的检查请求
+/// Parameters of inspection requests that take a document
 const DocumentParams = struct { textDocument: types.TextDocumentIdentifier };
 
 const FileStatusResult = struct {
     path: []const u8,
-    /// 文件的来源（见 `origin.Origin`）
+    /// Origin of the file (see `origin.Origin`)
     origin: origin.Origin,
-    /// 编译上下文（见 `FileContext`）
+    /// Compile context (see `FileContext`)
     context: FileContext,
     open: bool,
-    /// 文件在模块图中所属的模块（以根文件表示，标准库为 `std`，尚未得知路径的生成文件为空串），按优先级排列；
-    /// 不在模块图中时为空
+    /// Modules the file belongs to in the module graph (given as root files; `std` for the standard
+    /// library, an empty string for a generated file whose path is not known yet), in priority
+    /// order; empty when the file is not in the module graph
     modules: []const []const u8,
-    /// 包含它的项目的根目录及其最近一次构建
+    /// Root directories of the projects containing it, and their latest builds
     projects: []const struct { root: []const u8, last_build: ?Workspace.LastBuild },
-    /// 读过它（或在其中报告了错误）的单文件编译的根文件
+    /// Root files of the single-file compiles that read it (or reported errors in it)
     single_file_roots: []const []const u8,
 };
 
-/// 文件被当作什么处理：来源、编译上下文、所属的模块与项目、相关的单文件编译。用户报告诊断或名字解析的问题时
-/// 据此判断
+/// How the file is treated: origin, compile context, the modules and
+/// projects it belongs to, the related single-file compiles. Used to
+/// diagnose problems that users report with diagnostics or name resolution.
 fn fileStatus(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?FileStatusResult {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const open = blk: {
@@ -4698,7 +5012,8 @@ fn moduleName(server: *Server, g: *const ModuleGraph, module: u32) []const u8 {
     return server.vfs.path(root);
 }
 
-/// 文档的语法树：缩进的节点与 token（不含 trivia），之后是语法错误。用于判断解析与错误恢复的问题
+/// Syntax tree of the document: indented nodes and tokens (without trivia), followed by the syntax
+/// errors. Used to diagnose problems with parsing and error recovery.
 fn syntaxTree(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?[]const u8 {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const parse = try ctx.get(syntax_q.ParseFile, file);
@@ -4709,21 +5024,22 @@ fn syntaxTree(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentP
 }
 
 const ModuleGraphResult = struct {
-    /// 标准库的根文件
+    /// Root file of the standard library
     std_root: ?[]const u8,
     modules: []const struct {
-        /// 根文件；尚未得知路径的生成文件为 null
+        /// Root file; null for a generated file whose path is not known yet
         root: ?[]const u8,
-        /// 按模块参数生成的 builtin.zig
+        /// builtin.zig generated from the module's parameters
         builtin: ?[]const u8,
         imports: []const struct { name: []const u8, module: u32 },
-        /// 属于它的文件数（含同时属于其他模块的）
+        /// Number of files belonging to it (including those that also belong to other modules)
         files: usize,
     },
 };
 
-/// 模块图（由各项目的构建图汇总，见 `updateModuleGraph`）：各模块的根文件、builtin、import 与文件数。用于判断
-/// import 与名字解析的问题
+/// The module graph (aggregated from the build graphs of all projects, see `updateModuleGraph`):
+/// each module's root file, builtin, imports and file count. Used to diagnose problems with imports
+/// and name resolution.
 fn moduleGraph(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) HandlerError!ModuleGraphResult {
     const g = try ctx.get(ModuleGraph.Input, {}) orelse return .{ .std_root = null, .modules = &.{} };
     const Item = @typeInfo(@FieldType(ModuleGraphResult, "modules")).pointer.child;
@@ -4731,7 +5047,8 @@ fn moduleGraph(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) Handler
     const out = try arena.alloc(Item, g.modules.len);
     for (g.modules, out) |m, *o| {
         const imports = try arena.alloc(Import, m.imports.len);
-        // 响应在读事务结束后才序列化：模块图可能已被替换，名字复制出来
+        // The response is serialized only after the read transaction ends, when the module graph
+        // may have been replaced: copy the names out
         for (m.imports, imports) |imp, *x| x.* = .{ .name = try arena.dupe(u8, imp.name), .module = imp.module };
         o.* = .{
             .root = if (m.root) |r| server.vfs.path(r) else null,
@@ -4740,7 +5057,7 @@ fn moduleGraph(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) Handler
             .files = 0,
         };
     }
-    // 标准库文件（`std_module`）不计入
+    // Standard library files (`std_module`) are not counted
     for (g.files) |e| {
         if (e.module < out.len) out[e.module].files += 1;
         for (e.others) |m| if (m < out.len) {
@@ -4750,7 +5067,8 @@ fn moduleGraph(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) Handler
     return .{ .std_root = if (g.std_root) |r| server.vfs.path(r) else null, .modules = out };
 }
 
-/// 重启全部项目（同保存 build.zig）：构建图或编译结果需要手动刷新时使用
+/// Restarts all projects (same as saving build.zig): used when the build graph or compile results
+/// need a manual refresh
 fn reloadWorkspace(server: *Server, arena: Allocator, _: void) HandlerError!void {
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
@@ -4796,7 +5114,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
     };
 }
 
-/// 进程的常驻内存峰值（KB）
+/// Peak resident memory of the process (KB)
 fn maxRssKb() u64 {
     const builtin_os = @import("builtin").os.tag;
     if (builtin_os == .windows) {
@@ -4808,11 +5126,11 @@ fn maxRssKb() u64 {
     if (builtin_os == .wasi) return 0;
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const rss: u64 = @intCast(@max(0, usage.maxrss));
-    // macOS 以字节为单位，Linux 以 KB 为单位
+    // macOS reports bytes, Linux reports KB
     return if (builtin_os == .macos) rss / 1024 else rss;
 }
 
-// ── 发送 ─────────────────────────────────────────────────────────────
+// ── Sending ──────────────────────────────────────────────────────────
 
 fn send(server: *Server, bytes: []u8) void {
     defer server.gpa.free(bytes);
