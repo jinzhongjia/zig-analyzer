@@ -1,5 +1,7 @@
-//! 文件的来源：Zig 安装目录、生成文件、获取的依赖包、用户代码。编译上下文中的依赖库、durability、
-//! 重命名、服务端监听与 workspace symbol 的范围都由这一份分类得出（分类依据见 `Server.originRules`）。
+//! Origin of a file: the Zig installation, generated files, fetched dependency packages, or user
+//! code. Libraries in the compile context, durability, and the scopes of rename, server-side
+//! watching, and workspace symbol are all derived from this one classification (for the rules it
+//! is based on, see `Server.originRules`).
 
 const std = @import("std");
 const Vfs = @import("../base/Vfs.zig");
@@ -7,21 +9,23 @@ const Durability = @import("../db/engine.zig").Durability;
 const isVirtual = @import("Server.zig").isVirtual;
 
 pub const Origin = enum {
-    /// 不在磁盘上的文档（`untitled:` 等）
+    /// Documents not on disk (`untitled:`, etc.)
     virtual,
-    /// 工作区根目录外的 Zig 安装目录：标准库、`lib/compiler` 等
+    /// The Zig installation outside the workspace roots: the standard library, `lib/compiler`, etc.
     zig_lib,
-    /// 生成文件：全局缓存与各项目 maker 使用的本地缓存
+    /// Generated files: the global cache and the local caches used by each project's maker
     generated,
-    /// 获取的依赖包
+    /// Fetched dependency packages
     package,
-    /// 用户代码：工作区根目录下（不含其中的 `.zig-cache`、`zig-pkg`），或在根目录外但属于某个项目的模块
-    /// （以路径加入的模块、`--fork` 指定的包）
+    /// User code: under a workspace root (excluding `.zig-cache` and `zig-pkg` in it), or outside
+    /// the roots but in a module of some project (modules added by path, packages specified with
+    /// `--fork`)
     user,
-    /// 其余文件：根目录外、不属于任何项目，或位于根目录下的 `.zig-cache`、`zig-pkg` 中
+    /// Other files: outside the roots and not in any project, or in `.zig-cache` or `zig-pkg` under
+    /// a root
     other,
 
-    /// 依赖库：内容不由用户编辑
+    /// Library: the contents are not edited by the user
     pub fn isLibrary(o: Origin) bool {
         return switch (o) {
             .zig_lib, .generated, .package => true,
@@ -29,7 +33,9 @@ pub const Origin = enum {
         };
     }
 
-    /// 文件内容的变化频率：Zig 安装目录与获取的依赖包（按哈希寻址）不变，生成文件随构建更新，其余经常变化
+    /// How often the file contents change: the Zig installation and fetched dependency packages
+    /// (addressed by hash) do not change, generated files are updated with builds, and everything
+    /// else changes often
     pub fn durability(o: Origin) Durability {
         return switch (o) {
             .zig_lib, .package => .high,
@@ -39,22 +45,24 @@ pub const Origin = enum {
     }
 };
 
-/// 分类的依据。字符串由创建者持有
+/// Rules for the classification. The strings are owned by the creator.
 pub const Rules = struct {
-    /// `zig env` 的 lib_dir 与 global_cache_dir；zig 环境未知时为 null
+    /// lib_dir and global_cache_dir from `zig env`; null when the zig environment is unknown
     zig_lib: ?[]const u8 = null,
     global_cache: ?[]const u8 = null,
-    /// 工作区根目录
+    /// Workspace root directories
     roots: []const []const u8 = &.{},
-    /// 各项目 maker 使用的本地缓存目录（它包含构建根目录时无法区分生成文件与项目文件，不在其中）
+    /// Local cache directories used by each project's maker (one that contains the build root is
+    /// left out, since generated files could not be told apart from project files)
     local_caches: []const []const u8 = &.{},
-    /// 各项目获取的依赖包的根目录
+    /// Root directories of the dependency packages fetched by each project
     packages: []const []const u8 = &.{},
 };
 
-/// `path` 的来源；`in_project` 为文件属于某个项目的模块图，只影响根目录外的文件。依次判断：依赖包、生成文件
-/// （在根目录下也是）、根目录下的用户代码、Zig 安装目录（在根目录下时是 Zig 自身的开发者在编辑它，属于用户代码）、
-/// 项目的模块
+/// Origin of `path`; `in_project` means the file is in some project's module graph, and only
+/// affects files outside the roots. Checked in order: dependency packages, generated files (even
+/// under a root), user code under a root, the Zig installation (under a root, it is being edited
+/// by developers of Zig itself, so it is user code), project modules.
 pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: bool) Origin {
     if (isVirtual(path)) return .virtual;
     for (rules.packages) |p| if (vfs.isUnder(path, p)) return .package;
@@ -66,7 +74,8 @@ pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: boo
         in_root = true;
         const rest = path[root.len..];
         const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
-        // maker 默认的本地缓存与包目录：改用别处（`--cache-dir`、`--pkg-dir`）时这里是过时的副本
+        // The default local cache and package directories of maker: when others are used
+        // instead (`--cache-dir`, `--pkg-dir`), the ones here are stale copies
         if (std.mem.startsWith(u8, sub, ".zig-cache") or std.mem.startsWith(u8, sub, "zig-pkg")) continue;
         return .user;
     }
@@ -97,11 +106,11 @@ test classify {
         .{ native("/ws/zig-pkg/foo-1.0.0-hash/src/root.zig"), true, .package },
         .{ native("/pkgs/bar-hash/src/root.zig"), true, .package },
         .{ native("/ws/src/main.zig"), true, .user },
-        // 根目录下不在模块图中的文件也是用户代码
+        // Files under a root that are not in the module graph are user code too
         .{ native("/ws/scripts/gen.zig"), false, .user },
-        // 改用别处的包目录后留在根目录下的旧副本
+        // Stale copy left under the root after switching to a package directory elsewhere
         .{ native("/ws/zig-pkg/stale-hash/src/root.zig"), true, .other },
-        // 根目录外、以路径加入项目的模块
+        // Module outside the root, added to the project by path
         .{ native("/libs/shared/src/root.zig"), true, .user },
         .{ native("/tmp/scratch.zig"), false, .other },
     };
@@ -111,10 +120,10 @@ test classify {
             return err;
         };
     }
-    // Zig 安装目录位于工作区根目录下：在开发 Zig 自身
+    // The Zig installation is under a workspace root: Zig itself is being developed
     const in_root: Rules = .{ .zig_lib = native("/ws/lib"), .roots = &.{native("/ws")} };
     try testing.expectEqual(.user, classify(&vfs, in_root, native("/ws/lib/std/std.zig"), true));
-    // zig 环境未知：只按根目录与项目分类
+    // Unknown zig environment: classified only by roots and projects
     try testing.expectEqual(.other, classify(&vfs, .{}, native("/zig/lib/std/std.zig"), false));
 }
 

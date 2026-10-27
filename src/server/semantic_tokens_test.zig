@@ -211,7 +211,8 @@ test "semantic refresh retires delta baselines issued before it" {
     try h.start();
     defer h.finish();
     _ = try initialize(&h, "utf-16", true);
-    // 不自动回复 refresh：期间的变化合并为一次，由下面的回复触发，之后不再有刷新
+    // Refresh requests are not answered automatically: changes in the meantime are merged into one
+    // refresh, triggered by the reply below, and no more refreshes follow
     h.hold_requests = true;
     const source = "const value = 1;\nfn read() u32 { return value; }\n";
     try open(&h, document, source);
@@ -224,7 +225,8 @@ test "semantic refresh retires delta baselines issued before it" {
     try h.write(.{ .jsonrpc = "2.0", .id = "zig-analyzer/semanticTokensRefresh", .result = null });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqual(2, refreshCount(&h));
-    // 客户端刷新后可能先处理 range 结果并替换它保存的 token，所以刷新前的结果不再作为基线
+    // After a refresh the client may handle a range result first and replace the tokens it stores,
+    // so results from before the refresh no longer serve as baselines
     const retired = (try delta(&h, document, before.resultId.?)).SemanticTokens;
     try testing.expectEqualSlices(u32, before.data, retired.data);
     const unchanged = (try delta(&h, document, retired.resultId.?)).SemanticTokensDelta;
@@ -394,7 +396,7 @@ test "watched dependency changes refresh a sole open consumer and change its sem
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = dep_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqual(before_refresh + 1, refreshCount(&h));
-    // 刷新之前的结果不再作为基线，返回全量
+    // A result from before the refresh no longer serves as a baseline: the full tokens are returned
     const after = (try delta(&h, main_document, before.resultId.?)).SemanticTokens;
     try testing.expectEqual(before.data.len, after.data.len);
     var class_changes: usize = 0;
@@ -499,7 +501,8 @@ test "semantic token settings apply to full delta and range requests and refresh
     };
     const fresh = try full(&h, document);
     try testing.expectEqualSlices(u32, fresh.data, current);
-    // 回到 full：首个 token 是注释，`var` 关键字之后是带 `global` 的声明
+    // Back to the full mode: the first token is the comment, and the `var` keyword is followed by a
+    // declaration with `global`
     try testing.expectEqualSlices(u32, &.{ 0, 0, 10, @backingInt(T.comment), 0 }, fresh.data[0..5]);
     try testing.expectEqualSlices(u32, &.{ 1, 0, 3, @backingInt(T.keyword), 0, 0, 4, 7, variable, M.declaration | M.global }, fresh.data[5..15]);
     const marked = try decode(types.SemanticTokens, &h, try h.request("textDocument/semanticTokens/range", .{

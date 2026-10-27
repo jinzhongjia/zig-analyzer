@@ -1,5 +1,6 @@
-//! 交互式测试工具：Server 在独立线程中运行，测试通过内存管道逐条收发消息，
-//! 可以等待响应、读取服务器发来的请求并当场回复。
+//! Interactive test harness: the Server runs on its own thread, and tests send and receive
+//! messages one at a time through in-memory pipes; they can wait for responses, and read requests
+//! from the server and answer them on the spot.
 
 const std = @import("std");
 const Io = std.Io;
@@ -9,14 +10,16 @@ const Server = @import("Server.zig");
 const za = @import("../zig_analyzer.zig");
 const transport = za.lsp.transport;
 
-/// 线程安全的内存管道：一端通过 `Io.Writer` 写入，另一端通过 `Io.Reader` 阻塞读取
+/// Thread-safe in-memory pipe: one end writes through `Io.Writer`, and the other end does
+/// blocking reads through `Io.Reader`
 pub const Pipe = struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     data: std.ArrayList(u8) = .empty,
     read_pos: usize = 0,
     closed: bool = false,
-    /// 读端缓冲（按行读取消息头需要缓冲）；地址稳定后由 `Harness.start` 接到 `reader` 上
+    /// Buffer of the read end (reading message headers line by line needs a buffer); attached to
+    /// `reader` by `Harness.start` once its address is stable
     read_buf: [64 * 1024]u8 = undefined,
 
     reader: Io.Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
@@ -66,7 +69,7 @@ pub const Pipe = struct {
         return n;
     }
 
-    /// 读取一条完整的 LSP 消息（阻塞，超时返回错误）
+    /// Reads one complete LSP message (blocking; returns an error on timeout)
     fn readMessage(p: *Pipe, arena: Allocator, timeout_ms: i64) !std.json.Value {
         const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(timeout_ms) });
         p.mutex.lockUncancelable(testing.io);
@@ -100,21 +103,24 @@ pub const Harness = struct {
     exit_code: u8 = 255,
     arena: std.heap.ArenaAllocator = undefined,
     next_id: i64 = 1,
-    /// 收到的全部服务器消息（通知、服务器请求、响应），按到达顺序
+    /// All server messages received (notifications, server requests, responses), in arrival order
     received: std.ArrayList(std.json.Value) = .empty,
-    /// 为 true 时以错误回复服务器发来的请求
+    /// When true, requests sent by the server are answered with an error
     reject_requests: bool = false,
-    /// 为 true 时不回复服务器发来的请求（模拟迟迟不回复的客户端）
+    /// When true, requests sent by the server are not answered (simulating a client that
+    /// delays its replies)
     hold_requests: bool = false,
-    /// 回复 `workspace/configuration` 的 `zig-analyzer` 配置节（null 表示未设置）
+    /// The `zig-analyzer` configuration section in replies to `workspace/configuration`
+    /// (null means not set)
     configuration: std.json.Value = .null,
 
-    /// `h` 必须位于稳定的地址（Server 持有指向其内部的指针）
+    /// `h` must be at a stable address (the Server holds pointers into it)
     pub fn start(h: *Harness) !void {
         return h.startIo(testing.io);
     }
 
-    /// 同 `start`，服务器使用指定的 Io（如限制线程数的 `Io.Threaded`）
+    /// Like `start`, but the server uses the given Io (such as an `Io.Threaded` that limits the
+    /// number of threads)
     pub fn startIo(h: *Harness, io: Io) !void {
         h.* = .{};
         h.arena = .init(testing.allocator);
@@ -130,7 +136,7 @@ pub const Harness = struct {
         h.output.close();
     }
 
-    /// 关闭输入并等待服务器线程结束
+    /// Closes the input and waits for the server thread to finish
     pub fn finish(h: *Harness) void {
         h.input.close();
         h.thread.join();
@@ -157,12 +163,13 @@ pub const Harness = struct {
         }
     }
 
-    /// 发送请求并等待其响应（期间到达的其他消息记入 `received`）
+    /// Sends a request and waits for its response (other messages that arrive meanwhile are
+    /// recorded in `received`)
     pub fn request(h: *Harness, method: []const u8, params: anytype) !std.json.Value {
         return h.response(try h.send(method, params));
     }
 
-    /// 只发送请求，返回其 id（之后用 `response` 等待）
+    /// Only sends a request and returns its id (wait for it later with `response`)
     pub fn send(h: *Harness, method: []const u8, params: anytype) !i64 {
         const id = h.next_id;
         h.next_id += 1;
@@ -174,7 +181,7 @@ pub const Harness = struct {
         return id;
     }
 
-    /// 等待指定 id 的响应；已经收到的在 `received` 中查找
+    /// Waits for the response with the given id; one already received is looked up in `received`
     pub fn response(h: *Harness, id: i64) !std.json.Value {
         for (h.received.items) |msg| {
             if (msg.object.get("method") == null) if (msg.object.get("id")) |i| if (i == .integer and i.integer == id) return msg;
@@ -185,13 +192,14 @@ pub const Harness = struct {
         }
     }
 
-    /// 读取下一条服务器消息；服务器请求由 `on_request` 处理（默认回复成功）
+    /// Reads the next server message; server requests are handled by `on_request` (answered with
+    /// success by default)
     pub fn next(h: *Harness) !std.json.Value {
         const msg = try h.output.readMessage(h.arena.allocator(), 120_000);
         try h.received.append(h.arena.allocator(), msg);
         if (msg.object.get("method") != null) if (msg.object.get("id")) |id| {
             if (h.hold_requests) {
-                // 不回复
+                // Do not reply
             } else if (h.reject_requests) {
                 try h.write(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = -32603, .message = "rejected" } });
             } else if (std.mem.eql(u8, msg.object.get("method").?.string, "workspace/configuration")) {
@@ -203,7 +211,7 @@ pub const Harness = struct {
         return msg;
     }
 
-    /// 已收到的、指定方法的通知
+    /// Notifications of the given method received so far
     pub fn notifications(h: *Harness, method: []const u8) ![]std.json.Value {
         var out: std.ArrayList(std.json.Value) = .empty;
         for (h.received.items) |m| {
@@ -214,7 +222,8 @@ pub const Harness = struct {
         return out.items;
     }
 
-    /// 每个文件（URI 的最后一段）最后一次发布的诊断：「行:列 来源: 文案」
+    /// Diagnostics last published for each file (the last segment of the URI):
+    /// "line:column source: message"
     pub fn diagnostics(h: *Harness) !std.StringArrayHashMapUnmanaged([]const []const u8) {
         const a = h.arena.allocator();
         var result: std.StringArrayHashMapUnmanaged([]const []const u8) = .empty;

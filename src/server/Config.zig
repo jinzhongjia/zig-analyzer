@@ -1,7 +1,8 @@
-//! 用户配置：来自客户端，即 `initialize` 的 `initializationOptions` 与
-//! `workspace/didChangeConfiguration` 推送（或经 `workspace/configuration` 拉取）的 settings。
+//! User configuration from the client: the settings in the `initializationOptions` of `initialize`
+//! and those pushed with `workspace/didChangeConfiguration` (or pulled with
+//! `workspace/configuration`).
 //!
-//! JSON 结构如下；也接受外面再包一层 `"zig-analyzer"`：
+//! The JSON structure is as follows; an extra outer `"zig-analyzer"` wrapper is also accepted:
 //!
 //!     { "zig": { "path": "/usr/local/bin/zig", "lib_path": "/usr/local/lib/zig", "builtin_path": "/tmp/builtin.zig",
 //!                "global_cache_path": "/home/me/.cache/zig" },
@@ -20,10 +21,14 @@
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
-//! 逐项解析：未知的项与类型错误的项只产生警告（`warnings`），类型错误的项取默认值，其余项照常生效。
+//! Settings are parsed one by one: unknown settings and settings whose value has the wrong type
+//! only produce warnings (`warnings`); a setting whose value has the wrong type takes its default
+//! value, and the other settings still apply.
 //!
-//! 项目根目录的 `zig-analyzer.zon` 可以设置与项目相关的项（`project_settings`），供团队共享；其中出现的项优先于
-//! 客户端的配置（`overlayProject`）。结构相同，写成 ZON（可以有注释），枚举值写成枚举字面量：
+//! `zig-analyzer.zon` in the project root directory can set the project-related settings
+//! (`project_settings`) to be shared by the team; the settings that appear in it take precedence
+//! over the client's configuration (`overlayProject`). It has the same structure, written in ZON
+//! (comments are allowed), with enum values written as enum literals:
 //!
 //!     .{
 //!         .build = .{ .args = .{"-Dtarget=aarch64-linux"} },
@@ -39,118 +44,146 @@ const syntax_queries = @import("../syntax/queries.zig");
 const Config = @This();
 
 arena: std.heap.ArenaAllocator.State = .{},
-/// zig 可执行文件；null 时从 PATH 查找
+/// The zig executable; when null, it is looked up in PATH
 zig_path: ?[]const u8 = null,
-/// zig 的 lib 目录（其下有 `std/std.zig`），标准库从这里解析，运行 zig 时同样使用；null 时用 `zig env` 给出的
+/// The zig lib directory (containing `std/std.zig`): the standard library is resolved from it, and
+/// zig is run with it too; when null, the one reported by `zig env` is used
 zig_lib_path: ?[]const u8 = null,
-/// 不属于任何项目的文件（单文件模式等）的 `@import("builtin")`；null 时按 `zig test` 的设置生成。
-/// 项目中的模块总是用按构建参数生成的
+/// `@import("builtin")` for files outside any project (single-file mode and so on); when null, it
+/// is generated with the settings of `zig test`. Modules in projects always use the one generated
+/// from the build arguments
 zig_builtin_path: ?[]const u8 = null,
-/// zig 的全局缓存目录（依赖包、生成的 builtin.zig 等），运行 zig 时同样使用；null 时用 `zig env` 给出的
+/// The zig global cache directory (dependency packages, generated builtin.zig files and so on),
+/// also used when running zig; when null, the one reported by `zig env` is used
 zig_global_cache_path: ?[]const u8 = null,
-/// 是否通过构建系统协议获取项目模型；关闭时所有文件按单文件处理
+/// Whether to obtain the project model through the build system protocol; when disabled, all
+/// files are handled in single-file mode
 build_enable: bool = true,
-/// 传给 `zig build` 的额外参数（如 `-Dtarget=...`）
+/// Extra arguments passed to `zig build` (such as `-Dtarget=...`)
 build_args: []const []const u8 = &.{},
-/// 用于诊断的 step（`diagnostics.step`，与 `diagnostics.steps` 合并）
+/// Step used for diagnostics (`diagnostics.step`, merged with `diagnostics.steps`)
 diagnostics_step: ?[]const u8 = null,
-/// 用于诊断的 step 列表；为空时用 `check`，没有则用默认 step
+/// Steps used for diagnostics; when empty, `check` is used, or the default step if there is none
 diagnostics_steps: []const []const u8 = &.{},
-/// 是否运行编译器得到诊断；关闭时只有 live 诊断（语法与 AstGen）
+/// Whether to run the compiler to get diagnostics; when disabled, there are only live
+/// diagnostics (syntax and AstGen)
 compiler_diagnostics: bool = true,
-/// 编辑后等待这么多毫秒没有新的编辑才计算 live 诊断；0 为不等待
+/// After an edit, live diagnostics are computed only once this many milliseconds pass without a
+/// new edit; 0 means no waiting
 debounce_ms: u32 = 50,
-/// 是否把当前构建配置下不编译的代码（comptime 已知不执行的分支）显示为非活动代码
+/// Whether to show code that is not compiled under the current build configuration (branches
+/// known at comptime not to execute) as inactive code
 inactive_code: bool = false,
-/// inlay hints：推导出的类型
+/// inlay hints: inferred types
 inlay_types: bool = true,
-/// inlay hints：初始化表达式中字段名之后的字段类型
+/// inlay hints: field types after the field names in initializer expressions
 inlay_field_types: bool = true,
-/// inlay hints：类型中有按内容显示的匿名容器（`struct { a: u32 }`）时也显示类型提示
+/// inlay hints: also show type hints when the type contains an anonymous container displayed by
+/// its contents (`struct { a: u32 }`)
 inlay_anonymous_containers: bool = false,
-/// inlay hints：实参对应的形参名
+/// inlay hints: the parameter name for each argument
 inlay_parameters: bool = true,
-/// inlay hints：内置函数调用的参数名（`inlay_parameters` 关闭时同样不显示）
+/// inlay hints: parameter names in builtin function calls (likewise not shown when
+/// `inlay_parameters` is disabled)
 inlay_builtin_parameters: bool = true,
-/// 只有一个实参的调用（含内置函数）不显示形参名
+/// Calls with only one argument (including builtin calls) show no parameter names
 inlay_exclude_single_argument: bool = true,
-/// 实参去掉 `&`、`.*`、`.?`、`try` 后与形参同名（或是以形参名结尾的字段访问）时不显示形参名
+/// The parameter name is not shown when the argument, with `&`, `.*`, `.?` and `try` removed, has
+/// the same name as the parameter (or is a field access ending in the parameter name)
 hide_redundant_param_names: bool = true,
-/// inlay hints：类型提示的字符数上限，超出时列表（字段、实参等）的其余项显示为 `…`；0 为不限
+/// inlay hints: maximum number of characters in a type hint; beyond it, the remaining items of a
+/// list (fields, arguments, ...) are shown as `…`; 0 means no limit
 inlay_max_length: u32 = 25,
-/// 语义着色发出哪些 token
+/// Which tokens semantic highlighting emits
 semantic_tokens_mode: SemanticTokensMode = .full,
-/// 语义着色：容器级 `var` 的声明与引用带 `global` modifier
+/// Semantic highlighting: declarations of and references to container-level `var`s carry the
+/// `global` modifier
 semantic_tokens_global_var: bool = false,
-/// import 块中派生声明（`const Allocator = std.mem.Allocator;`）的位置：整理 import 与自动导入都按它
+/// Placement of derived declarations (`const Allocator = std.mem.Allocator;`) in the import
+/// block: both organize imports and auto-import follow it
 imports_derived: ImportOptions.Derived = .with_import,
-/// import 块的组内排序：按引用的路径或声明名
+/// Sorting within groups of the import block: by the imported path or the declaration name
 imports_sort: ImportOptions.Sort = .path,
-/// 普通名字补全中提供可达声明与模块的自动导入，以及按整条路径匹配的可见命名空间的成员
+/// Offer, in plain name completion, auto-imports of reachable declarations and modules, as well as
+/// members of visible namespaces matched by their full path
 completion_auto_import: bool = true,
-/// 一次补全至多提供的自动导入候选（保留排序最好的，其余由客户端随输入重新请求得到）；0 为不限
+/// Maximum number of auto-import candidates offered by one completion (the best-ranked ones are
+/// kept; the client gets the rest by requesting again as the user types); 0 means no limit
 completion_max_auto_imports: u32 = 128,
-/// 泛型函数体内没有具体类型时以调用点的实例推导（hover、补全、inlay hints 等）
+/// Inside a generic function body without concrete types, infer from the instances at call sites
+/// (hover, completion, inlay hints, ...)
 callsite_seeding: bool = true,
-/// InternPool 超过这么多 MB 时整代回收类型信息（之后按需重新推导）；0 为不回收
+/// When the InternPool exceeds this many MB, type information is reclaimed as a whole generation
+/// (then inferred again on demand); 0 means never reclaim
 max_intern_pool_mb: u32 = 64,
-/// 保留的语法树个数（`ParseFile` 与 `FileAstIdMap`，被淘汰的按需重新解析）；0 为不限
+/// Number of syntax trees retained (`ParseFile` and `FileAstIdMap`; evicted ones are reparsed on
+/// demand); 0 means no limit
 cache_capacity: u32 = syntax_queries.parse_lru,
-/// 按 query 设置的缓存容量，优先于 `cache_capacity`
+/// Per-query cache capacities, taking precedence over `cache_capacity`
 cache_queries: CacheQueries = .{},
-/// workspace symbol 是否也列出依赖库（获取的依赖包、生成文件、打开的标准库文件）中的符号
+/// Whether workspace symbol also lists symbols in dependencies (fetched dependency packages,
+/// generated files, open standard library files)
 workspace_symbol_dependencies: bool = false,
-/// workspace symbol 至多返回的符号数（保留匹配最好的）；0 为不限。随输入重新查询的客户端不需要一次拿到全部，
-/// 只查询一次、在客户端过滤的需要调高或设为 0
+/// Maximum number of symbols workspace symbol returns (the best matches are kept); 0 means no
+/// limit. Clients that query again as the user types do not need everything at once; clients
+/// that query only once and filter on the client side need to raise it or set it to 0.
 workspace_symbol_limit: u32 = 256,
-/// 命名检查（Zig 风格指南的 Names 一节）：是否为打开的文件提示不符合命名约定的名字，并提供改名的修复
+/// Naming check (the Names section of the Zig style guide): whether to report names in open files
+/// that do not follow the naming conventions, and offer a rename fix
 naming_enable: bool = false,
-/// 命名检查跳过的名字；`*` 匹配任意字符序列（`SDL_*`）
+/// Names the naming check skips; `*` matches any sequence of characters (`SDL_*`)
 naming_ignore: []const []const u8 = &.{},
-/// 命名检查跳过的文件：相对工作区根目录（`zig-analyzer.zon` 中为相对项目根目录）、以 `/` 分隔的路径；
-/// `*` 匹配任意字符序列（含 `/`）
+/// Files the naming check skips: `/`-separated paths relative to the workspace root directory
+/// (relative to the project root directory in `zig-analyzer.zon`); `*` matches any sequence of
+/// characters (including `/`)
 naming_exclude: []const []const u8 = &.{},
-/// 命名检查的各条规则是否启用
+/// Whether each rule of the naming check is enabled
 naming_rules: NamingRules = .{},
-/// 磁盘上的外部改动由谁发现（见 `Watcher`）
+/// Who detects external changes on disk (see `Watcher`)
 files_watcher: Watcher = .auto,
-/// 日志级别（err / warn / info / debug）
+/// Log level (err / warn / info / debug)
 log_level: std.log.Level = .info,
-/// 日志同时追加到这个文件；null 为只写 stderr
+/// Log messages are also appended to this file; null means stderr only
 log_file: ?[]const u8 = null,
-/// 请求超过这么多毫秒时记录查询耗时（慢请求日志）；0 为关闭
+/// When a request takes longer than this many milliseconds, log the time spent in queries (slow
+/// request log); 0 disables it
 slow_request_ms: u32 = 100,
-/// 解析时发现的问题（未知的项、类型错误的项），用于提示用户
+/// Problems found while parsing (unknown settings, settings whose value has the wrong type), used
+/// to notify the user
 warnings: []const []const u8 = &.{},
-/// 配置中出现（且类型正确）的项，下标对应 `settings`
+/// Settings present in the configuration (and of the right type), indexed like `settings`
 present: std.StaticBitSet(settings.len) = .empty,
 
-/// 外部改动的来源。客户端支持时总会向它注册文件监听（`workspace/didChangeWatchedFiles`）
+/// Source of external changes. When the client supports it, file watchers are always registered
+/// with it (`workspace/didChangeWatchedFiles`).
 pub const Watcher = enum {
-    /// 客户端不支持动态注册文件监听时由服务器监听
+    /// Watched by the server when the client does not support dynamic file watcher registration
     auto,
-    /// 只用客户端的通知
+    /// Only the client's notifications
     client,
-    /// 总是由服务器监听（客户端的通知仍然处理）
+    /// Always watched by the server (the client's notifications are still handled)
     server,
 };
 
-/// 语义着色发出的 token
+/// Tokens emitted by semantic highlighting
 pub const SemanticTokensMode = enum {
-    /// 全部 token
+    /// All tokens
     full,
-    /// 只发需要名字解析与类型推导才能确定分类的 token；关键字、注释、字面量、运算符、标签与内建名留给编辑器的语法高亮
+    /// Only tokens whose classification requires name resolution and type inference; keywords,
+    /// comments, literals, operators, labels and builtin names are left to the editor's syntax
+    /// highlighting
     partial,
 };
 
-/// 一个 query 的缓存容量：保留的值的个数与 MB 数，null 为默认值，0 为不限。超出时淘汰最久未使用的值，之后按需重算，
-/// 结果不变
+/// Cache capacity of one query: the number of values retained and the number of MB; null means
+/// the default, 0 means no limit. When exceeded, the least recently used values are evicted and
+/// recomputed on demand later, with the same results.
 pub const CacheLimit = struct {
     count: ?u32 = null,
     mb: ?u32 = null,
 };
 
-/// 可以设置缓存容量的 query，字段名即 query 名
+/// Queries whose cache capacity can be set; the field names are the query names
 pub const CacheQueries = struct {
     ParseFile: CacheLimit = .{},
     FileAstIdMap: CacheLimit = .{},
@@ -160,26 +193,26 @@ pub const CacheQueries = struct {
     Exports: CacheLimit = .{},
 };
 
-/// 命名检查的规则，与诊断的 code `naming.<规则>` 一一对应
+/// Rules of the naming check, matching the diagnostic codes `naming.<rule>` one to one
 pub const NamingRules = struct {
-    /// 类型与类型别名：TitleCase
+    /// Types and type aliases: TitleCase
     type: bool = true,
-    /// 返回 `type` 的可调用对象：TitleCase
+    /// Callables that return `type`: TitleCase
     type_function: bool = true,
-    /// 其他可调用对象（函数、函数别名、函数指针）：camelCase
+    /// Other callables (functions, function aliases, function pointers): camelCase
     function: bool = true,
-    /// 命名空间（没有顶层字段的文件）：snake_case
+    /// Namespaces (files without top-level fields): snake_case
     namespace: bool = true,
-    /// 其他值：snake_case
+    /// Other values: snake_case
     value: bool = true,
-    /// 字段与枚举成员（写法按字段的类型）
+    /// Fields and enum members (the style depends on the field's type)
     field: bool = true,
 };
 
-/// 项目配置文件的文件名（位于项目根目录）
+/// File name of the project configuration file (in the project root directory)
 pub const project_file = "zig-analyzer.zon";
 
-/// 配置项：「分组.名字」与对应的字段
+/// A setting: `section.key` and the corresponding field
 const Setting = struct { section: []const u8, key: []const u8, field: []const u8 };
 
 const settings = [_]Setting{
@@ -224,7 +257,7 @@ const settings = [_]Setting{
     .{ .section = "log", .key = "slow_request_ms", .field = "slow_request_ms" },
 };
 
-/// 可以在项目配置文件中设置的项
+/// Settings that can be set in the project configuration file
 const project_settings = [_][]const u8{
     "build_args",      "diagnostics_step", "diagnostics_steps", "compiler_diagnostics",
     "naming_enable",   "naming_ignore",    "naming_exclude",    "naming_rules",
@@ -242,7 +275,8 @@ pub fn deinit(c: *Config, gpa: Allocator) void {
     c.* = undefined;
 }
 
-/// 解析配置。只有根不是对象时返回 `error.InvalidConfig`；其余问题记入 `warnings`
+/// Parses the configuration. Returns `error.InvalidConfig` only when the root is not an object;
+/// other problems are recorded in `warnings`.
 pub fn parse(gpa: Allocator, value: json.Value) error{ OutOfMemory, InvalidConfig }!Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -290,8 +324,10 @@ fn isSection(name: []const u8) bool {
     return false;
 }
 
-/// 解析项目配置文件（ZON）的内容。不能在项目中设置的项记入 `warnings` 并忽略；语法错误、类型错误或未知的项使整个
-/// 文件被忽略，第一处错误（含位置）记入 `warnings`
+/// Parses the contents of the project configuration file (ZON). Settings that cannot be set in a
+/// project are recorded in `warnings` and ignored; a syntax error, a type error or an unknown
+/// setting causes the whole file to be ignored, and the first error (with its location) is
+/// recorded in `warnings`.
 pub fn parseProject(gpa: Allocator, text: []const u8) Allocator.Error!Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -303,10 +339,12 @@ pub fn parseProject(gpa: Allocator, text: []const u8) Allocator.Error!Config {
     return c;
 }
 
-/// 项目配置文件的结构：分组与项同 `settings`，各项可选（没有写出时为 null）。
-/// 整个文件一次解析：`std.zon.parse.fromZoir` 不使用 `node` 选项，总是从根开始，不能逐项解析
+/// Structure of the project configuration file: the sections and settings are the same as in
+/// `settings`, and every setting is optional (null when not written).
+/// The whole file is parsed at once: `std.zon.parse.fromZoir` does not use the `node` option and
+/// always starts from the root, so settings cannot be parsed one by one.
 const ProjectFile = blk: {
-    // 每个分组都遍历一遍全部配置项
+    // Each section goes through all the settings once
     @setEvalBranchQuota(4000);
     const Attrs = std.lang.Type.Struct.FieldAttributes;
     var names: []const []const u8 = &.{};
@@ -322,7 +360,9 @@ const ProjectFile = blk: {
         var key_types: []const type = &.{};
         var key_attrs: []const Attrs = &.{};
         for (settings) |s| if (std.mem.eql(u8, s.section, name)) {
-            // 本身可选的项（`zig.path` 等）不再包一层：ZON 不支持嵌套的可选类型，写成 null 等同于没写
+            // Settings that are optional themselves (`zig.path`, ...) are not wrapped in another
+            // optional: ZON does not support nested optional types, and writing null is the same
+            // as omitting the setting
             const T = @FieldType(Config, s.field);
             const V = if (@typeInfo(T) == .optional) T else ?T;
             keys = keys ++ .{s.key};
@@ -335,7 +375,8 @@ const ProjectFile = blk: {
     break :blk @Struct(.auto, null, names, &types, &attrs);
 };
 
-/// `parseProject` 的主体：设置写入 `c`，问题记入 `warnings`，都分配在 `a` 中
+/// Body of `parseProject`: the settings are written into `c` and problems are recorded in
+/// `warnings`, all allocated in `a`
 fn readProject(gpa: Allocator, a: Allocator, text: []const u8, c: *Config, warnings: *std.ArrayList([]const u8)) Allocator.Error!void {
     var diag: std.zon.parse.Diagnostics = undefined;
     const file = std.zon.parse.fromSlice(ProjectFile, .{
@@ -361,7 +402,8 @@ fn readProject(gpa: Allocator, a: Allocator, text: []const u8, c: *Config, warni
     };
 }
 
-/// 以项目配置中出现的项覆盖（`project` 由 `parseProject` 得到）
+/// Overrides with the settings that appear in the project configuration (`project` comes from
+/// `parseProject`)
 pub fn overlayProject(c: *Config, gpa: Allocator, project: *const Config) Allocator.Error!void {
     var arena = c.arena.promote(gpa);
     defer c.arena = arena.state;
@@ -386,13 +428,13 @@ fn dupeValue(a: Allocator, v: anytype) Allocator.Error!@TypeOf(v) {
     };
 }
 
-/// 字段 `field` 对应的项是否出现在配置中（且类型正确）
+/// Whether the setting for field `field` is present in the configuration (and of the right type)
 pub fn isSet(c: *const Config, comptime field: []const u8) bool {
     inline for (settings, 0..) |s, si| if (comptime std.mem.eql(u8, s.field, field)) return c.present.isSet(si);
     @compileError("no setting for field " ++ field);
 }
 
-/// 深拷贝（不含 `warnings`）
+/// Deep copy (without `warnings`)
 pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -404,7 +446,8 @@ pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
     return out;
 }
 
-/// 用于诊断的 step：`diagnostics.steps` 与 `diagnostics.step` 合并；为空时由项目决定（`check` 或默认 step）
+/// Steps used for diagnostics: `diagnostics.steps` merged with `diagnostics.step`; when empty,
+/// the project decides (`check` or the default step)
 pub fn diagnosticsSteps(c: *const Config, a: Allocator) Allocator.Error![]const []const u8 {
     if (c.diagnostics_step == null) return c.diagnostics_steps;
     for (c.diagnostics_steps) |s| if (std.mem.eql(u8, s, c.diagnostics_step.?)) return c.diagnostics_steps;
@@ -414,12 +457,13 @@ pub fn diagnosticsSteps(c: *const Config, a: Allocator) Allocator.Error![]const 
     return out;
 }
 
-/// import 块的排列规则（整理 import、自动导入）
+/// Layout rules of the import block (organize imports, auto-import)
 pub fn importOptions(c: *const Config) ImportOptions {
     return .{ .derived = c.imports_derived, .sort = c.imports_sort };
 }
 
-/// 影响构建系统协议进程的配置是否相同（不同时需要重启项目）
+/// Whether the settings that affect the build system protocol process are the same (when they
+/// differ, the project needs to be restarted)
 pub fn sameBuild(a: *const Config, b: *const Config) bool {
     if (a.build_enable != b.build_enable or a.compiler_diagnostics != b.compiler_diagnostics) return false;
     if (!eqlOptional(a.diagnostics_step, b.diagnostics_step)) return false;
@@ -430,13 +474,14 @@ pub fn sameZig(a: *const Config, b: *const Config) bool {
     return eqlOptional(a.zig_path, b.zig_path);
 }
 
-/// 覆盖 zig 环境的路径（lib 目录、默认 builtin、全局缓存目录）是否相同（不同时重新加载标准库与 builtin）
+/// Whether the paths overriding the zig environment (lib directory, default builtin, global cache
+/// directory) are the same (when they differ, the standard library and builtin are reloaded)
 pub fn sameZigPaths(a: *const Config, b: *const Config) bool {
     return eqlOptional(a.zig_lib_path, b.zig_lib_path) and eqlOptional(a.zig_builtin_path, b.zig_builtin_path) and
         eqlOptional(a.zig_global_cache_path, b.zig_global_cache_path);
 }
 
-/// 命名检查的配置是否相同（不同时重新发布打开的文件）
+/// Whether the naming check settings are the same (when they differ, open files are republished)
 pub fn sameNaming(a: *const Config, b: *const Config) bool {
     return a.naming_enable == b.naming_enable and std.meta.eql(a.naming_rules, b.naming_rules) and
         eqlList(a.naming_ignore, b.naming_ignore) and eqlList(a.naming_exclude, b.naming_exclude);
@@ -516,7 +561,7 @@ test "parse: nested fields, optional wrapper" {
     try testing.expect(cache.cache_queries.Infer.count.? == 32768 and cache.cache_queries.Infer.mb.? == 96);
     try testing.expect(cache.cache_queries.ParseFile.count == null and cache.cache_queries.ParseFile.mb.? == 0 and cache.cache_queries.ItemBody.count == null);
     try testing.expectEqual(0, cache.warnings.len);
-    // 不能设置容量的 query：整项取默认值并警告
+    // A query whose capacity cannot be set: the whole setting uses the default, with a warning
     var unknown_query = try parseText(
         \\{"cache": {"queries": {"Infer": {"count": 1}, "LocalValue": {"count": 1}}}}
     );
@@ -548,7 +593,7 @@ test "parse: zig path overrides" {
     defer empty.deinit(testing.allocator);
     try testing.expect(empty.zig_lib_path == null and empty.zig_builtin_path == null and empty.zig_global_cache_path == null);
 
-    // 本机 zig 安装的位置，不能由项目共享
+    // Locations of the local zig installation, which cannot be shared through the project
     var project = try parseProject(testing.allocator,
         \\.{ .zig = .{ .lib_path = "/z/lib" }, .build = .{ .args = .{"-Da"} } }
     );
@@ -563,7 +608,8 @@ test "parse: unknown and invalid settings are reported, the rest still applies" 
         \\{"build": {"args": "-Da=1", "enable": false}, "sema": {"callsite_seeding": false, "fuel": 1}, "colors": {}, "log": 3}
     );
     defer c.deinit(testing.allocator);
-    // 类型错误的项取默认值，同组的其他项照常生效
+    // A setting whose value has the wrong type takes its default value; the other settings in the
+    // same section still apply
     try testing.expectEqual(0, c.build_args.len);
     try testing.expect(!c.build_enable and !c.callsite_seeding);
     try testing.expectEqual(4, c.warnings.len);
@@ -599,18 +645,18 @@ test "project file: only project settings apply and override the client" {
     try client.overlayProject(testing.allocator, &project);
     try testing.expectEqualStrings("-Dtarget=wasm32-freestanding", client.build_args[0]);
     try testing.expect(!client.compiler_diagnostics and client.build_enable);
-    // 项目中没有的项保留客户端的值
+    // Settings absent from the project keep the client's values
     try testing.expectEqualStrings("check", client.diagnostics_steps[0]);
     try testing.expectEqual(.debug, client.log_level);
-    // import 的排列是团队共享的风格，可以写在项目配置中
+    // The import layout is a style shared by the team and can be set in the project configuration
     try testing.expect(client.imports_derived == .separate and client.imports_sort == .name);
 }
 
 test "project file: an error ignores the whole file and is reported with its location" {
     const cases = [_]struct { text: []const u8, prefix: []const u8 }{
-        // 语法错误
+        // Syntax error
         .{ .text = ".{\n    .build = .{ .args = ,\n}", .prefix = "2:" },
-        // 类型错误、未知的项
+        // Type errors, unknown settings
         .{ .text = ".{\n    .naming = .{ .enable = true },\n    .build = .{ .args = true },\n}", .prefix = "3:25: " },
         .{ .text = ".{ .naming = .{ .rules = .{ .constants = false } } }", .prefix = "1:30: " },
         .{ .text = ".{ .colors = .{} }", .prefix = "1:5: " },
@@ -631,7 +677,9 @@ test "project file: an error ignores the whole file and is reported with its loc
 }
 
 test "project file: the parsed config owns the memory of its warnings" {
-    // 防止返回的配置带着加入警告之前的 arena 状态：分配器不能原地扩大时，警告所在的内存块在释放时泄漏
+    // Guards against the returned configuration carrying the arena state from before the
+    // warnings were added: when the allocator cannot grow in place, the memory block holding the
+    // warnings leaks when the configuration is freed
     var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     const gpa = failing.allocator();
     var project = try parseProject(gpa,
@@ -656,7 +704,7 @@ test "naming settings: client and project file" {
     try testing.expectEqualStrings("SDL_*", client.naming_ignore[0]);
     try testing.expect(!client.sameNaming(&empty));
 
-    // 未知的规则：整项取默认值
+    // Unknown rule: the whole setting takes its default value
     var unknown = try parseText(
         \\{"naming": {"rules": {"constants": false}}}
     );
@@ -664,7 +712,7 @@ test "naming settings: client and project file" {
     try testing.expectEqualStrings("invalid value for `naming.rules`, using the default", unknown.warnings[0]);
     try testing.expect(unknown.naming_rules.value);
 
-    // 项目中的命名约定覆盖客户端的
+    // The naming conventions in the project override the client's
     var project = try parseProject(testing.allocator,
         \\.{ .naming = .{ .exclude = .{"src/c/*"}, .rules = .{ .value = false } } }
     );

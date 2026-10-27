@@ -1,8 +1,11 @@
-//! 工作进度（LSP work done progress）：项目加载、构建、单文件编译。
+//! Work progress (LSP work done progress): project loading, builds, single-file compiles.
 //!
-//! 服务器主动发进度前必须先用 `window/workDoneProgress/create` 向客户端申请 token 并收到成功响应。
-//! 为不阻塞构建，`begin` 发出申请后立即返回；响应到达时再补发 begin（及最近一次 report）。
-//! 若响应到达前进度已结束，则不再发送；客户端回复错误则放弃该 token（不再发送，`end` 时释放）。
+//! Before sending progress on its own initiative, the server must request a token from the client
+//! with `window/workDoneProgress/create` and receive a successful response.
+//! To avoid blocking builds, `begin` returns right after sending the request; begin (and the
+//! latest report) is sent once the response arrives.
+//! If the progress has ended before the response arrives, nothing is sent; if the client replies
+//! with an error, the token is abandoned (nothing more is sent; it is freed at `end`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -14,10 +17,11 @@ const log = std.log.scoped(.progress);
 const Registry = @This();
 
 mutex: Io.Mutex = .init,
-/// 客户端在 initialize 中声明支持 `window.workDoneProgress`
+/// The client declared support for `window.workDoneProgress` in initialize
 enabled: bool = false,
 next_id: u32 = 0,
-/// 尚未结束或尚未收到 create 响应的进度（键为 token 序号，同时也是 create 请求的 id）
+/// Progress that has not ended or has not received its create response yet (keyed by the token
+/// number, which is also the id of the create request)
 active: std.AutoArrayHashMapUnmanaged(u32, *Progress) = .empty,
 
 pub const Progress = struct {
@@ -44,8 +48,9 @@ fn free(gpa: Allocator, p: *Progress) void {
     gpa.destroy(p);
 }
 
-/// 回收已结束、但客户端从未回复 create 的条目。持有者已经调用 `end`，不会再使用指针；
-/// 未结束的条目留着，避免悬空指针。调用者持有 `mutex`
+/// Reclaims entries that have ended but whose create the client never answered. Their holders
+/// have already called `end` and will not use the pointers again; entries that have not ended
+/// are kept, to avoid dangling pointers. The caller holds `mutex`.
 fn pruneLocked(reg: *Registry, gpa: Allocator) void {
     var i: usize = 0;
     while (i < reg.active.count()) {
@@ -62,11 +67,13 @@ fn tokenBuf(buf: *[32]u8, id: u32) []const u8 {
     return std.fmt.bufPrint(buf, "zig-analyzer/{d}", .{id}) catch unreachable;
 }
 
-/// 同时存在的进度上限：客户端不回复 create 时，已结束的条目会在下一次 begin 时回收；
-/// 全部未结束（调用方仍持有指针）时不再新建，避免无界增长
+/// Maximum number of progress entries at the same time: when the client does not answer create,
+/// ended entries are reclaimed at the next begin; when none has ended (the callers still hold the
+/// pointers), no new ones are created, to avoid unbounded growth
 const max_active = 64;
 
-/// 开始一个进度；客户端不支持时返回 null（其余函数接受 null 并忽略）
+/// Begins a progress; returns null when the client does not support progress (the other
+/// functions accept null and ignore it)
 pub fn begin(reg: *Registry, server: *Server, title: []const u8, percentage: bool) ?*Progress {
     const gpa = server.gpa;
     reg.mutex.lockUncancelable(server.io);
@@ -123,12 +130,13 @@ pub fn end(reg: *Registry, server: *Server, progress: ?*Progress, message: ?[]co
             _ = reg.active.swapRemove(p.id);
             free(server.gpa, p);
         },
-        // 等 create 响应到达后再释放
+        // Freed once the create response arrives
         .creating => {},
     }
 }
 
-/// 处理客户端对 create 请求的响应；不是进度相关的响应时返回 false
+/// Handles the client's response to a create request; returns false for a response unrelated to
+/// progress
 pub fn handleResponse(reg: *Registry, server: *Server, id: i64, ok: bool) bool {
     reg.mutex.lockUncancelable(server.io);
     defer reg.mutex.unlock(server.io);
@@ -136,13 +144,13 @@ pub fn handleResponse(reg: *Registry, server: *Server, id: i64, ok: bool) bool {
     const p = reg.active.get(@intCast(id)) orelse return false;
     if (p.state != .creating) return true;
     if (p.ended) {
-        // 已经结束（构建很快）：不再发送
+        // Already ended (the build was fast): send nothing
         _ = reg.active.swapRemove(p.id);
         free(server.gpa, p);
         return true;
     }
     if (!ok) {
-        // 被拒绝：持有者仍在使用该指针，等 `end` 时再释放
+        // Rejected: the holder is still using the pointer; free it at `end`
         log.info("client rejected progress token", .{});
         p.state = .failed;
         return true;
@@ -162,7 +170,7 @@ test "pruneLocked drops ended entries but keeps the ones still in use" {
         p.* = .{ .id = @intCast(i), .title = try gpa.dupe(u8, "done"), .state = .creating, .ended = true };
         try reg.active.put(gpa, p.id, p);
     }
-    // 仍被调用方持有的进度
+    // Progress still held by a caller
     const live = try gpa.create(Progress);
     live.* = .{ .id = max_active + 100, .title = try gpa.dupe(u8, "live") };
     try reg.active.put(gpa, live.id, live);

@@ -1,15 +1,20 @@
-//! 一个带 build.zig 的项目：管理构建系统协议进程、项目模型、编译集合与编译器诊断。
+//! A project with a build.zig: manages the build system protocol process, the project model, the
+//! compile set, and compiler diagnostics.
 //!
-//! 线程模型：每个 Workspace 有一个专用的后台任务阻塞读取 BSP 事件并处理；LSP 主循环只通过
-//! `requestBuild` / `stop` 与之交互。
+//! Threading model: each Workspace has a dedicated background task that blocks reading BSP events
+//! and handles them; the LSP main loop interacts with it only through `requestBuild` / `stop`.
 //!
-//! 生命周期：maker 崩溃、build.zig 或构建配置变化时以新实例重启项目。新实例在首次构建完成（或配置失败）前
-//! 不可见，其间旧实例的模型、编译集合与编译器诊断继续生效；旧实例没有模型时，新实例配置完成即替换它
-//! （见 `Server.restartWorkspace`、`Server.promote`）。
-//! 实例按引用计数回收：服务器的项目列表、后台任务与临时使用实例的调用方各持有一个引用。
+//! Lifecycle: when maker crashes, or build.zig or the build configuration changes, the project is
+//! restarted as a new instance. The new instance is invisible until its first build completes (or
+//! configuration fails); meanwhile the old instance's model, compile set, and compiler diagnostics
+//! remain in effect. If the old instance has no model, the new instance replaces it as soon as it
+//! is configured (see `Server.restartWorkspace`, `Server.promote`).
+//! Instances are reclaimed by reference counting: the server's project list, the background task,
+//! and callers that use an instance temporarily each hold one reference.
 //!
-//! 锁顺序：持有 `mutex` 时绝不开启查询引擎的写事务。诊断发布任务会在读事务中获取 `mutex`，
-//! 而写事务要等所有读事务结束，交叉持有会死锁。
+//! Lock order: never begin a write transaction of the query engine while holding `mutex`. The
+//! diagnostics publishing task acquires `mutex` inside a read transaction, and a write transaction
+//! waits for all read transactions to finish, so acquiring them in opposite orders deadlocks.
 
 const std = @import("std");
 const Io = std.Io;
@@ -42,87 +47,110 @@ const Workspace = @This();
 
 server: *Server,
 gpa: Allocator,
-/// 构建根目录（绝对路径，规范化）
+/// Build root directory (absolute path, normalized)
 root: []const u8,
-/// 启动时生效的 zig 环境（由服务器持有到退出）：maker 与读取构建图、生成 builtin.zig 都用它，与 maker 所用的
-/// lib 目录、全局缓存目录一致；zig 路径的配置变化时整个实例被重启替换
+/// The zig environment in effect at startup (held by the server until exit): the maker, reading
+/// the build graph, and generating builtin.zig all use it, matching the lib directory and global
+/// cache directory the maker uses; when the zig path configuration changes, the whole instance is
+/// restarted and replaced
 env: *const ZigEnv,
-/// 启动时的配置副本（构建参数、诊断 step）；配置变化时整个实例被重启替换
+/// Copy of the configuration at startup (build arguments, diagnostics steps); a configuration
+/// change restarts and replaces the whole instance
 config: Server.Config,
-/// 项目根目录的 `zig-analyzer.zon`（只含其中出现的项，见 `Config.parseProject`）；没有时为 null。启动后不变，
-/// 文件变化时整个实例被重启替换
+/// `zig-analyzer.zon` in the project root (only the items that appear in it, see
+/// `Config.parseProject`); null when there is none. Unchanged after startup; a change of the file
+/// restarts and replaces the whole instance.
 project: ?Server.Config = null,
-/// 本实例是 maker 连续崩溃后自动重启的第几次（0 表示正常启动）
+/// This instance is the Nth automatic restart after consecutive maker crashes (0: normal start)
 crash_restarts: u8 = 0,
-/// 引用计数，归零时释放（见 `acquire` / `release`）
+/// Reference count; the instance is freed when it drops to zero (see `acquire` / `release`)
 refs: std.atomic.Value(u32) = .init(0),
-/// 重启产生、尚未替换本实例的新实例（持有一个引用）；受 `Server.workspaces_mutex` 保护
+/// New instance created by a restart that has not replaced this one yet (holds a reference);
+/// protected by `Server.workspaces_mutex`
 successor: ?*Workspace = null,
-/// 调用方已确定本实例的位置：加入项目列表、挂到旧实例上或作废（见 `Server.startWorkspace`、`Server.restartWorkspace`）。
-/// 后台任务在此之后才处理事件，`Server.isVisible` 与 `Server.promote` 才能据位置判断
+/// The caller has decided where this instance goes: added to the project list, attached to an old
+/// instance, or discarded (see `Server.startWorkspace`, `Server.restartWorkspace`).
+/// Only after this does the background task handle events, and only then can `Server.isVisible`
+/// and `Server.promote` decide based on the placement.
 placed: Io.Event = .unset,
 
 mutex: Io.Mutex = .init,
-// ── 以下字段受 mutex 保护 ──
+// ── The following fields are protected by mutex ──
 client: ?*bsp.Client = null,
 model: ?ProjectModel = null,
 compile_set: ?CompileSet.Result = null,
-/// 诊断 step 之外的编译 step 可达的文件（只用于模块归属，见 `recomputeCompileSet`）；与编译集合相同时为 null
+/// Files reachable from compile steps other than the diagnostics steps (used only to determine
+/// which modules files belong to, see `recomputeCompileSet`); null when it equals the compile set
 resolve_set: ?CompileSet.Result = null,
-/// 构建脚本（见 `CompileSet.buildScripts`）：后台任务开始时按文件的当前文本计算（打开的文件以缓冲区为准，
-/// 其余从磁盘读入），构建图读取失败时同样有效
+/// Build scripts (see `CompileSet.buildScripts`): computed when the background task starts, from
+/// the current text of the files (open files use their buffers, the rest are read from disk);
+/// valid even when reading the build graph fails
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
-/// 最近一次构建的编译器诊断
+/// Compiler diagnostics of the most recent build
 result: ?*compiler.BuildResult = null,
-/// `result` 存入时取的编译结果序号（见 `Server.nextCompileGeneration`）：越大越新
+/// Compile result sequence number taken when `result` was stored (see
+/// `Server.nextCompileGeneration`): larger means newer
 result_generation: u64 = 0,
-/// `result` 存入的时刻（Unix 毫秒）
+/// Time when `result` was stored (Unix milliseconds)
 result_at_ms: i64 = 0,
-/// FileId → `result` 中的条目
+/// FileId → entry in `result`
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
 building: bool = false,
-/// 至少完成过一次构建（用于判断崩溃是否「连续」）
+/// At least one build has completed (used to decide whether crashes are "consecutive")
 built: bool = false,
-/// 首次加载已经结束：读入了构建图并算出编译集合，或者加载失败、实例已经结束。此前还不知道项目包含哪些
-/// 根目录外的文件，单文件模式推迟编译（见 `Server.projectsLoading`）
+/// The first load has finished: the build graph was read and the compile set computed, or loading
+/// failed or the instance has ended. Before that, it is not yet known which files outside the root
+/// directory belong to the project, so single-file mode defers compiling (see
+/// `Server.projectsLoading`).
 load_done: bool = false,
-/// 构建期间又收到构建请求：本轮结果作废，结束后立即重建
+/// Another build request arrived during the build: the result of this round is discarded, and the
+/// project is rebuilt as soon as the round finishes
 rebuild: bool = false,
-/// 构建过程中得知了新的生成文件路径、但编译集合尚未重算（节流，见 `generated_recompute_interval_ms`）
+/// New generated file paths became known during the build, but the compile set has not been
+/// recomputed yet (throttled, see `generated_recompute_interval_ms`)
 generated_dirty: bool = false,
-/// 上一次因生成文件重算编译集合结束的时间与耗时（见 `generatedRecomputeDue`）
+/// End time and duration of the last compile set recompute triggered by generated files (see
+/// `generatedRecomputeDue`)
 generated_recomputed_at: ?Io.Timestamp = null,
 generated_recompute_ns: u64 = 0,
 stopping: bool = false,
-/// 项目加载进度（启动到首次编译集合算出）
+/// Project loading progress (from startup until the first compile set is computed)
 loading: ?*Progress = null,
-/// 当前构建的进度与已完成的 step 数
+/// Progress of the current build and the number of completed steps
 build_progress: ?*Progress = null,
 build_total: u32 = 0,
 build_done: u32 = 0,
-/// 诊断 step 及其传递依赖：只有这些 step 的错误作为编译器诊断发布
-/// （构建请求中额外的生成文件产出 step 不影响诊断，与直接运行 `zig build <step>` 一致）
+/// Diagnostics steps and their transitive dependencies: only errors from these steps are
+/// published as compiler diagnostics (the extra steps in the build request that produce generated
+/// files do not affect diagnostics, consistent with running `zig build <step>` directly)
 diag_steps: std.DynamicBitSetUnmanaged = .{},
 
-// ── 以下字段只由后台任务访问 ──
+// ── The following fields are accessed only by the background task ──
 bundles: std.ArrayList(ErrorBundle) = .empty,
-/// 已尝试从磁盘加载的文件（不存在的文件也记录，避免反复尝试）
+/// Files whose loading from disk has already been attempted (nonexistent files are recorded too,
+/// to avoid repeated attempts)
 loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
 
-/// 构建过程中因生成文件的路径而重算编译集合：距上一次重算结束至少 `generated_recompute_interval_ms`，且不少于
-/// 上一次重算耗时的 `generated_recompute_cost_factor` 倍。大项目一次重算可达数秒（Zig 编译器的构建图有四千多个
-/// 编译 step，算出它们可达的文件约 1 秒），间隔固定时读取构建事件的任务一直在重算：maker 的事件积压、构建变慢，
-/// 模块图在整个构建中每秒更新一次，后台索引不停
+/// Recomputing the compile set during a build because of generated file paths: at least
+/// `generated_recompute_interval_ms` after the previous recompute ended, and no less than
+/// `generated_recompute_cost_factor` times the duration of the previous recompute. In a large
+/// project one recompute can take seconds (the Zig compiler's build graph has over four thousand
+/// compile steps, and computing the files reachable from them takes about 1 second); with a fixed
+/// interval, the task reading build events would be recomputing all the time: maker's events pile
+/// up, the build slows down, the module graph is updated every second throughout the build, and
+/// background indexing never stops.
 const generated_recompute_interval_ms = 1000;
 const generated_recompute_cost_factor = 4;
 
-/// 启动 maker 并在后台读取事件。返回的实例带有一个属于调用方的引用；调用方确定实例的位置后设置 `placed`
+/// Starts maker and reads its events in the background. The returned instance carries one
+/// reference owned by the caller; the caller sets `placed` once it has decided where the instance
+/// goes.
 pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
     const gpa = server.gpa;
     const env = server.zigEnv() orelse return error.ZigNotFound;
     const ws = try gpa.create(Workspace);
     errdefer gpa.destroy(ws);
-    // 一个引用属于后台任务，一个属于调用方
+    // One reference belongs to the background task, one to the caller
     ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .env = env, .config = undefined, .crash_restarts = crash_restarts, .refs = .init(2) };
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
@@ -135,7 +163,8 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     errdefer server.progress.end(server, ws.loading, null);
     ws.client = try bsp.Client.start(gpa, server.io, env, root, ws.config.build_args);
     errdefer ws.client.?.deinit();
-    // 在启动后台任务之前计为忙碌：任务可能先于这里运行到结束时的 busyEnd
+    // Counted as busy before the background task starts: the task may reach its final busyEnd
+    // before execution gets here
     server.busyBegin();
     errdefer server.busyEnd();
     try server.bg_group.concurrent(server.io, run, .{ws});
@@ -147,13 +176,15 @@ pub fn acquire(ws: *Workspace) void {
     _ = ws.refs.fetchAdd(1, .monotonic);
 }
 
-/// 放弃一个引用；最后一个引用放弃时释放实例（此时后台任务已经结束）
+/// Drops a reference; dropping the last one frees the instance (the background task has ended by
+/// then)
 pub fn release(ws: *Workspace) void {
     if (ws.refs.fetchSub(1, .acq_rel) == 1) ws.destroy();
 }
 
-/// 读取项目根目录的 `zig-analyzer.zon`；文件不存在时为 null。其中的问题提示给用户，有问题的项（语法错误时为整个
-/// 文件）被忽略
+/// Reads `zig-analyzer.zon` in the project root; null when the file does not exist. Problems in it
+/// are reported to the user, and the problematic items (the whole file on a syntax error) are
+/// ignored.
 fn loadProjectConfig(server: *Server, root: []const u8) Allocator.Error!?Server.Config {
     const gpa = server.gpa;
     const path = try std.fs.path.join(gpa, &.{ root, Server.Config.project_file });
@@ -172,7 +203,8 @@ fn loadProjectConfig(server: *Server, root: []const u8) Allocator.Error!?Server.
     return project;
 }
 
-/// 停止：立即结束 maker 及其子进程（进行中的构建不再继续），后台任务随即读到输入结束，收尾并回收进程
+/// Stops: immediately terminates maker and its child processes (an in-progress build does not
+/// continue); the background task then reads end of input, wraps up, and reaps the process
 pub fn stop(ws: *Workspace) void {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -180,7 +212,7 @@ pub fn stop(ws: *Workspace) void {
     if (ws.client) |c| c.terminate();
 }
 
-/// maker 连续崩溃时自动重启的次数上限
+/// Maximum number of automatic restarts after consecutive maker crashes
 const max_crash_restarts = 3;
 
 fn destroy(ws: *Workspace) void {
@@ -203,7 +235,8 @@ fn destroy(ws: *Workspace) void {
     gpa.destroy(ws);
 }
 
-/// 保存文件后请求构建；构建进行中时标记为结束后重建
+/// Requests a build after a file is saved; while a build is in progress, marks it to be rebuilt
+/// once it finishes
 pub fn requestBuild(ws: *Workspace) void {
     const io = ws.server.io;
     {
@@ -232,11 +265,13 @@ pub fn requestBuild(ws: *Workspace) void {
             return;
         }
     }
-    // 不运行编译器且没有要产出的生成文件：不构建，按空结果完成一次（清除重启前发布的编译器诊断）
+    // The compiler is not run and there are no generated files to produce: do not build, but
+    // finish once with an empty result (clears compiler diagnostics published before a restart)
     ws.finishBuild() catch {};
 }
 
-/// 构建进度的标题：诊断 step 的名字；不运行编译器诊断时只构建生成文件
+/// Title of the build progress: the names of the diagnostics steps; without compiler diagnostics
+/// only generated files are built
 fn buildTitle(model: *const ProjectModel, with_diagnostics: bool) []const u8 {
     if (!with_diagnostics) return "zig build (generated files)";
     const S = struct {
@@ -248,7 +283,7 @@ fn buildTitle(model: *const ProjectModel, with_diagnostics: bool) []const u8 {
     return w.buffered();
 }
 
-/// 发送构建请求并重置进度计数；调用方持有 mutex
+/// Sends a build request and resets the progress counters; the caller holds mutex
 fn sendBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) !void {
     var closure = try model.dependencyClosure(ws.gpa, steps);
     defer closure.deinit(ws.gpa);
@@ -257,7 +292,7 @@ fn sendBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, st
     try client.buildSteps(steps);
 }
 
-/// 文件是否属于本项目：在编译集合中，或位于构建根目录下
+/// Whether the file belongs to this project: it is in the compile set or under the build root
 pub fn owns(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -265,7 +300,8 @@ pub fn owns(ws: *Workspace, file: FileId) bool {
     return ws.server.vfs.isUnder(ws.server.vfs.path(file), ws.root);
 }
 
-/// 文件是否在本项目的模块图中：在编译集合中，或者可由其余的编译 step 到达
+/// Whether the file is in this project's module graph: it is in the compile set, or reachable
+/// from the other compile steps
 pub fn contains(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -274,8 +310,10 @@ pub fn contains(ws: *Workspace, file: FileId) bool {
     return false;
 }
 
-/// 本项目的依赖库目录（见 `origin.Rules`）：maker 使用的本地缓存目录（生成文件所在处，不一定是
-/// `<构建根>/.zig-cache`；它包含构建根目录时无法区分生成文件与项目文件，不算在内）与获取的依赖包，复制到 `arena` 中
+/// Library directories of this project (see `origin.Rules`): the local cache directory used by
+/// maker (where generated files live, not necessarily `<build root>/.zig-cache`; it is left out
+/// when it contains the build root, since generated files cannot be told apart from project files
+/// then) and the fetched dependency packages, copied into `arena`
 pub fn libraryDirs(ws: *Workspace, arena: Allocator, local_caches: *std.ArrayList([]const u8), packages: *std.ArrayList([]const u8)) Allocator.Error!void {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -285,14 +323,15 @@ pub fn libraryDirs(ws: *Workspace, arena: Allocator, local_caches: *std.ArrayLis
     for (model.package_roots) |p| try packages.append(arena, try arena.dupe(u8, p));
 }
 
-/// 首次加载尚未结束（见 `load_done`）
+/// The first load has not finished yet (see `load_done`)
 pub fn isLoading(ws: *Workspace) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return !ws.load_done;
 }
 
-/// 首次加载结束：此前推迟的单文件编译按文件此时的上下文进行
+/// Ends the first load: single-file compiles deferred until now proceed with the files' context
+/// at this point
 fn finishLoading(ws: *Workspace) void {
     {
         ws.mutex.lockUncancelable(ws.server.io);
@@ -303,36 +342,40 @@ fn finishLoading(ws: *Workspace) void {
     ws.server.reconcileSingle();
 }
 
-/// 是否发布 live 诊断：编译集合尚未算出时发布；算出后只对集合中的文件与构建脚本发布（与编译器一致）
+/// Whether to publish live diagnostics: yes before the compile set is computed; afterwards only
+/// for files in the set and build scripts (matches the compiler)
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     if (ws.build_scripts.contains(file)) return true;
     const set = &(ws.compile_set orelse return true);
-    // 构建图中没有任何编译：集合为空时按尚未算出处理，不让所有文件都失去 live 诊断
+    // The build graph compiles nothing: treat an empty set as not yet computed, so that not every
+    // file loses live diagnostics
     if (set.files.count() == 0) return true;
     return set.contains(file);
 }
 
-/// 是否参与模块图：已有模型与编译集合（见 `Server.updateModuleGraph`）
+/// Whether this project takes part in the module graph: it has a model and a compile set (see
+/// `Server.updateModuleGraph`)
 pub fn inModuleGraph(ws: *Workspace) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return ws.model != null and ws.compile_set != null;
 }
 
-/// 文件是否是本项目的构建脚本：变化后需要重新配置
+/// Whether the file is a build script of this project: a change requires reconfiguring
 pub fn isBuildScript(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return ws.build_scripts.contains(file);
 }
 
-// ── 后台任务 ─────────────────────────────────────────────────────────
+// ── Background task ──────────────────────────────────────────────────
 
 fn run(ws: *Workspace) Io.Cancelable!void {
     var started = true;
-    // build.zig 编译失败后 maker 会退出，属于预期情况（保存 build.zig 时会重启）
+    // maker exits when build.zig fails to compile, which is expected (it is restarted when
+    // build.zig is saved)
     var config_failed = false;
     const client = ws.client.?;
     ws.placed.waitUncancelable(ws.server.io);
@@ -340,11 +383,12 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     while (true) {
         var event = client.next() catch |err| {
             if (err == error.Canceled or ws.server.isShuttingDown()) {
-                // 服务器退出：读取任务被取消，不是 maker 的问题
+                // Server shutting down: the reading task was canceled, not a maker problem
             } else if (config_failed) {
                 log.info("{s}: build.zig failed to compile, build system exited; will restart when build.zig is saved", .{ws.root});
             } else if (!ws.isStopping()) {
-                // maker 崩溃（如 0.17 的 maker 在收到新的构建请求时存在竞态，核数少时容易触发）：自动重启
+                // maker crashed (e.g. the 0.17 maker has a race when it receives a new build
+                // request, easily triggered with few cores): restart automatically
                 ws.mutex.lockUncancelable(ws.server.io);
                 const next = if (ws.built) 1 else ws.crash_restarts + 1;
                 ws.mutex.unlock(ws.server.io);
@@ -354,8 +398,10 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                     ws.server.abandon(ws);
                 } else {
                     log.info("{s}: build system exited unexpectedly ({t}, {?t}), restarting", .{ ws.root, err, client.readError() });
-                    // 重启期间计为忙碌：崩溃时本实例可能并不忙碌，新实例计为忙碌之前 waitIdle（如 shutdown）
-                    // 不应返回，否则新实例的进度可能在 shutdown 之后才结束
+                    // Count as busy during the restart: this instance may not be busy when it
+                    // crashes, and waitIdle (e.g. in shutdown) must not return before the new
+                    // instance counts as busy, otherwise the new instance's progress may end only
+                    // after shutdown
                     ws.server.busyBegin();
                     ws.server.restartWorkspace(ws, next);
                     ws.server.busyEnd();
@@ -368,7 +414,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
         ws.handle(&event) catch |err| switch (err) {
             error.OutOfMemory => log.err("{s}: out of memory while handling build event", .{ws.root}),
         };
-        // 首个构建图处理完（或构建图加载失败）后，启动阶段结束。推迟的单文件编译在计为空闲之前开始
+        // Startup ends once the first build graph is handled (or loading the build graph fails).
+        // Deferred single-file compiles start before counting as idle.
         if (started and (event == .configuration or event == .configuration_failed)) {
             started = false;
             ws.finishLoading();
@@ -386,7 +433,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.loading = null;
     ws.mutex.unlock(ws.server.io);
     ws.finishLoading();
-    // 进度结束后才计为空闲：waitIdle（如 shutdown）返回前客户端已收到 end
+    // Count as idle only after the progress ends: by the time waitIdle (e.g. in shutdown)
+    // returns, the client has received the end
     if (started) ws.server.busyEnd();
     if (was_building) ws.server.busyEnd();
     if (c) |cl| cl.deinit();
@@ -404,8 +452,9 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     var pc: panic_context.Text = .{};
     pc.enter("project {s}: build event {t}", .{ ws.root, event.* });
     defer pc.leave();
-    // 已停止的实例（被重启替换、项目被移除、服务器关闭）不再处理 maker 结束前发出的事件：其结果不会被采用。
-    // 进度与忙碌计数在后台任务结束时收尾
+    // A stopped instance (replaced by a restart, project removed, server shutting down) no longer
+    // handles events maker sent before exiting: their results would not be used.
+    // Progress and the busy count are wrapped up when the background task ends.
     if (ws.isStopping()) return;
     switch (event.*) {
         .handshake => |h| if (h.version != bsp.protocol_version) {
@@ -414,12 +463,14 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             ws.server.abandon(ws);
         },
         .configuration => |path| {
-            // 用户 zig 与编译时的版本不同时不启动项目（见 `Server.startWorkspace`），构建图的格式一致
+            // The project is not started when the user's zig differs from the version used at
+            // compile time (see `Server.startWorkspace`), so the build graph format matches
             ws.reportLoading("Reading build graph");
             var model = configuration.load(ws.gpa, io, ws.root, path, ws.env) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    // 没有模型就不能构建：结束加载与 maker，按没有编译结果完成（清除此前的编译器诊断）
+                    // Cannot build without a model: end loading and stop maker, and finish with no
+                    // compile result (clears earlier compiler diagnostics)
                     var buf: [512]u8 = undefined;
                     ws.server.showWarning(std.fmt.bufPrint(&buf, "cannot read the build graph of {s} ({t}): compiler diagnostics are unavailable until build.zig is saved", .{ ws.root, err }) catch
                         "cannot read the build graph: compiler diagnostics are unavailable until build.zig is saved");
@@ -446,21 +497,24 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 ws.model = model;
                 ws.diag_steps.deinit(ws.gpa);
                 ws.diag_steps = .{};
-                // 不运行编译器诊断时没有诊断 step：构建中的错误不发布
+                // Without compiler diagnostics there are no diagnostics steps: errors in the
+                // build are not published
                 ws.diag_steps = if (ws.config.compiler_diagnostics)
                     try ws.model.?.dependencyClosure(ws.gpa, ws.model.?.diagnostics_steps)
                 else
                     try .initEmpty(ws.gpa, ws.model.?.steps.len);
             }
             try ws.recomputeCompileSet();
-            // 旧实例没有可沿用的模型时不必等整次构建结束
+            // If the old instance has no model worth keeping, there is no need to wait for the
+            // whole build to finish
             ws.promote(.configured);
             ws.endLoading("Done");
             ws.requestBuild();
         },
         .configuration_failed => |*eb| {
-            // build.zig 本身有错：作为一次构建结果发布。build.zig.zon 有误、依赖包获取失败时 maker 只把错误写到
-            // 它的 stderr，发来的错误为空：提示用户
+            // build.zig itself has errors: publish them as a build result. When build.zig.zon is
+            // wrong or fetching a dependency package fails, maker only writes the errors to its
+            // stderr and the errors it sends are empty: notify the user
             if (eb.errorMessageCount() == 0) {
                 var buf: [512]u8 = undefined;
                 ws.server.showWarning(std.fmt.bufPrint(&buf, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root}) catch
@@ -493,9 +547,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     if (try m.setGeneratedPath(ws.gpa, g.file, path)) roots_changed = true;
                 };
             }
-            // 生成的模块根文件路径刚刚得知（或变化）：不必等整个构建结束就更新编译集合，但要节流。
-            // 大项目的构建图有上千个以生成文件为根的模块（如各测试变体的 build_options），逐个重算会使
-            // 模块图更新上千次，每次都触发打开文件的诊断重新发布与其中的推导重算
+            // The path of a generated module root file just became known (or changed): update the
+            // compile set without waiting for the whole build to finish, but throttled. The build
+            // graph of a large project has over a thousand modules rooted at generated files (e.g.
+            // the build_options of each test variant); recomputing for each one would update the
+            // module graph over a thousand times, each time republishing diagnostics of open files
+            // and recomputing the inference in them.
             if (roots_changed) ws.generated_dirty = true;
             if (ws.generated_dirty) {
                 const now = Io.Clock.awake.now(io);
@@ -515,7 +572,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             ws.rebuild = false;
             ws.mutex.unlock(io);
             if (rebuild) {
-                // 构建期间文件又被保存：结果可能与磁盘不一致，丢弃并重建
+                // Files were saved again during the build: the result may not match the disk;
+                // discard it and rebuild
                 ws.clearBundles();
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
@@ -544,8 +602,9 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             const again = ws.rebuild;
             ws.rebuild = false;
             ws.mutex.unlock(io);
-            // 发布结果期间又有文件被保存：`requestBuild` 当时只记下了 `rebuild`，在这里开始下一轮。
-            // 先发起新构建再结束本轮的 busy，等待空闲的一方不会在两轮之间返回
+            // More files were saved while the result was being published: `requestBuild` only
+            // recorded `rebuild` then, so the next round starts here. Start the new build before
+            // ending this round's busy, so a waiter for idle does not return between the rounds.
             if (again) ws.requestBuild();
             ws.server.busyEnd();
         },
@@ -553,7 +612,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     }
 }
 
-/// 构建中是否该因生成文件重算编译集合：`last` 为上一次重算结束的时间，`last_ns` 为它的耗时
+/// Whether the compile set should be recomputed during a build because of generated files:
+/// `last` is when the previous recompute ended, `last_ns` is how long it took
 fn generatedRecomputeDue(last: ?Io.Timestamp, last_ns: u64, now: Io.Timestamp) bool {
     const end = last orelse return true;
     const wait = @max(generated_recompute_interval_ms * std.time.ns_per_ms, generated_recompute_cost_factor * last_ns);
@@ -568,15 +628,17 @@ test "generated-file recomputes wait at least a second and in proportion to the 
         }
     }.ms;
     try std.testing.expect(generatedRecomputeDue(null, 0, after(0)));
-    // 重算很快：按最短间隔
+    // Fast recompute: the minimum interval applies
     try std.testing.expect(!generatedRecomputeDue(end, std.time.ns_per_ms, after(999)));
     try std.testing.expect(generatedRecomputeDue(end, std.time.ns_per_ms, after(1000)));
-    // 一次重算 1.2 秒：等到它的 4 倍，读取构建事件的任务不会一直在重算
+    // A recompute takes 1.2 seconds: wait 4 times as long, so the task reading build events is
+    // not recomputing all the time
     try std.testing.expect(!generatedRecomputeDue(end, 1200 * std.time.ns_per_ms, after(4799)));
     try std.testing.expect(generatedRecomputeDue(end, 1200 * std.time.ns_per_ms, after(4800)));
 }
 
-/// 构建图中没有 compile step（只导出模块的库）：并入项目导出的模块，项目中的文件按它们得到模块归属
+/// The build graph has no compile step (a library that only exports modules): merge in the
+/// modules the project exports, so files in the project are assigned to modules through them
 fn loadExports(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     ws.reportLoading("Reading exported modules");
     var exported = try exports.load(ws.gpa, ws.server.io, ws.env, ws.root, ws.config.build_args) orelse return;
@@ -584,12 +646,13 @@ fn loadExports(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     try model.appendExports(ws.gpa, &exported);
 }
 
-/// 为每个模块生成 builtin.zig（相同参数只生成一次）
+/// Generates builtin.zig for each module (only once for identical arguments)
 fn generateBuiltins(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     const env = ws.env;
     const io = ws.server.io;
     ws.reportLoading("Generating builtin.zig");
-    // 参数相同的模块共用一份；不同的参数并行生成（每份要启动一次编译器，命中参数记录时不启动）
+    // Modules with identical arguments share one copy; different arguments are generated in
+    // parallel (each copy launches the compiler once, unless the argument record has a hit)
     var unique: std.StringArrayHashMapUnmanaged(?[]u8) = .empty;
     defer {
         for (unique.keys(), unique.values()) |k, v| {
@@ -649,7 +712,8 @@ fn clearBundles(ws: *Workspace) void {
     ws.bundles.clearRetainingCapacity();
 }
 
-/// 把本轮收集的错误转换为诊断，替换上一轮结果，并重新发布受影响的文件
+/// Converts the errors collected in this round into diagnostics, replaces the previous round's
+/// result, and republishes the affected files
 fn finishBuild(ws: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
     const build_zig = try std.fs.path.join(ws.gpa, &.{ ws.root, "build.zig" });
@@ -663,7 +727,7 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         try files.put(ws.gpa, try ws.server.vfs.intern(path), fr);
     }
 
-    // 受影响的文件：上一轮与本轮有编译器诊断的文件
+    // Affected files: files with compiler diagnostics in the previous round or this one
     var affected: std.ArrayList(FileId) = .empty;
     defer affected.deinit(ws.gpa);
     {
@@ -679,13 +743,16 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
         ws.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
         ws.result_files = files;
     }
-    // 重启产生的新实例：首个结果连同模型与编译集合一起替换旧实例
+    // For a new instance created by a restart, the first result replaces the old instance along
+    // with the model and the compile set
     ws.promote(.built);
     ws.server.publishFiles(affected.items, true);
 }
 
-/// 重启产生的新实例到了 `stage`：替换旧实例（见 `Server.promote`），更新模块图，重新发布打开的文件与旧实例
-/// 发布过编译器诊断的文件，单文件模式按新的模块图收敛
+/// A new instance created by a restart has reached `stage`: replaces the old instance (see
+/// `Server.promote`), updates the module graph, republishes open files and the files the old
+/// instance published compiler diagnostics for, and lets single-file mode converge to the new
+/// module graph
 fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     const old = ws.server.promote(ws, stage) orelse return;
     defer old.release();
@@ -699,10 +766,11 @@ fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     ws.server.reconcileSingle();
 }
 
-/// 最近一次构建的结果：存入的时刻（Unix 毫秒）、有编译器诊断的文件数与诊断数
+/// Result of the most recent build: when it was stored (Unix milliseconds), the number of files
+/// with compiler diagnostics, and the number of diagnostics
 pub const LastBuild = struct { at_ms: i64, files: usize, diagnostics: usize };
 
-/// 还没有结果时为 null
+/// null when there is no result yet
 pub fn lastBuild(ws: *Workspace) ?LastBuild {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -712,7 +780,7 @@ pub fn lastBuild(ws: *Workspace) ?LastBuild {
     return .{ .at_ms = ws.result_at_ms, .files = r.files.count(), .diagnostics = diagnostics };
 }
 
-/// 清除编译器诊断，重新发布发布过诊断的文件
+/// Clears compiler diagnostics and republishes the files that had diagnostics published
 pub fn clearResult(ws: *Workspace) void {
     ws.mutex.lockUncancelable(ws.server.io);
     const stale = ws.gpa.dupe(FileId, ws.result_files.keys()) catch &.{};
@@ -729,7 +797,7 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
     return Io.Dir.cwd().readFileAlloc(ws.server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
 }
 
-// ── 编译集合与文件加载 ────────────────────────────────────────────────
+// ── Compile set and file loading ──────────────────────────────────────
 
 const Resolver = struct {
     ws: *Workspace,
@@ -750,7 +818,8 @@ const Resolver = struct {
     }
 };
 
-/// 计算编译集合；遇到未加载的文件时从磁盘加载后重算，直到没有缺失
+/// Computes the compile set; on encountering files that are not loaded, loads them from disk and
+/// recomputes, until nothing is missing
 pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     const io = ws.server.io;
     var steps: []u32 = &.{};
@@ -763,14 +832,16 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
         const model = &(ws.model orelse return);
         steps = try model.compileStepsOf(ws.gpa, model.diagnostics_steps);
         for (model.steps, 0..) |st, i| if (st.kind == .compile) try all.append(ws.gpa, @intCast(i));
-        // 诊断 step 不编译任何东西（如只有 addModule 与 addTest、默认的 install 为空的库）：改用构建图中
-        // 所有的编译 step，否则编译集合为空，项目中的文件都得不到 live 诊断
+        // The diagnostics steps compile nothing (e.g. a library with only addModule and addTest,
+        // whose default install is empty): use all compile steps of the build graph instead,
+        // otherwise the compile set is empty and no file in the project gets live diagnostics
         if (steps.len == 0) {
             ws.gpa.free(steps);
             steps = try ws.gpa.dupe(u32, all.items);
         }
-        // 文件归属先到达它的 compile step：本机目标的排在前面，同时编译到多个目标的文件（如一份代码
-        // 既编译为 wasm 库也编译为本机示例）按本机目标分析
+        // A file belongs to the compile step that reaches it first: native-target steps come first,
+        // so files compiled for multiple targets (e.g. code compiled both as a wasm library and as
+        // a native example) are analyzed for the native target
         const Native = struct {
             fn lt(m: *const ProjectModel, a: u32, b: u32) bool {
                 return isNativeStep(m, a) and !isNativeStep(m, b);
@@ -785,7 +856,8 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
 
     var result = try ws.computeSet(steps) orelse return;
     errdefer result.deinit(ws.gpa);
-    // 其余编译 step（测试、示例等）可达的文件：只用于模块归属与 import 的解析，不发布 live 诊断
+    // Files reachable from the other compile steps (tests, examples, etc.): used only to determine
+    // which modules files belong to and to resolve imports; no live diagnostics are published
     const extra: ?CompileSet.Result = if (all.items.len > steps.len) try ws.computeSet(all.items) else null;
     ws.mutex.lockUncancelable(io);
     if (ws.compile_set) |*old| old.deinit(ws.gpa);
@@ -793,15 +865,16 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     if (ws.resolve_set) |*old| old.deinit(ws.gpa);
     ws.resolve_set = extra;
     ws.mutex.unlock(io);
-    // 编译集合变化会影响模块归属、已打开文件的 live 诊断与文件是否按单文件编译。尚未替换旧实例的新实例不影响
-    // （替换时一并更新）
+    // A change of the compile set affects which modules files belong to, live diagnostics of open
+    // files, and whether files are compiled in single-file mode. A new instance that has not
+    // replaced the old one yet has no effect (everything is updated when it replaces it).
     if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
     ws.server.reconcileSingle();
 }
 
-/// 计算构建脚本；缺少的文件读入后重算
+/// Computes the build scripts; missing files are read in and the computation repeated
 fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
@@ -812,7 +885,7 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
             defer ctx.end();
             break :blk CompileSet.buildScripts(ws.gpa, ws.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                // 被编辑打断：重试
+                // Interrupted by an edit: retry
                 error.Canceled => continue,
             };
         };
@@ -830,7 +903,8 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
     log.warn("{s}: build script computation did not converge", .{ws.root});
 }
 
-/// 从这些编译 step 的根模块沿 import 可达的文件；缺少的文件读入后重算。不收敛时返回 null
+/// Files reachable through imports from the root modules of these compile steps; missing files
+/// are read in and the computation repeated. Returns null when it does not converge.
 fn computeSet(ws: *Workspace, steps: []const u32) Allocator.Error!?CompileSet.Result {
     const io = ws.server.io;
     var rounds: usize = 0;
@@ -841,12 +915,12 @@ fn computeSet(ws: *Workspace, steps: []const u32) Allocator.Error!?CompileSet.Re
             var ctx = ws.server.db.beginRead(arena.allocator());
             defer ctx.end();
             ws.mutex.lockUncancelable(io);
-            // model 只在本任务中替换，可安全地在锁外使用其指针
+            // model is replaced only in this task, so its pointer is safe to use outside the lock
             const model = &ws.model.?;
             ws.mutex.unlock(io);
             break :blk CompileSet.compute(ws.gpa, model, steps, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                // 被编辑打断：重试
+                // Interrupted by an edit: retry
                 error.Canceled => continue,
             };
         };
@@ -880,7 +954,7 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
     db.beginWrite();
     defer db.endWrite();
     for (batch.items) |l| {
-        // 期间被客户端打开的文件以缓冲区为准
+        // Files the client opened in the meantime: their buffers take precedence
         if (db.peek(FileText, l.file) != null) {
             if (l.text) |t| ws.gpa.free(t);
             continue;

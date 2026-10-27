@@ -1,5 +1,7 @@
-//! 端到端：命名检查的提示（开关、例外、项目配置、编辑后的更新）与改名修复（`codeAction/resolve`、冲突与无法确认的
-//! 引用、公开名字的确认注解，应用之后项目照常编译）。
+//! End-to-end: naming check hints (on/off switch, exceptions, project configuration, updates after
+//! edits) and rename fixes (`codeAction/resolve`, conflicts and references that cannot be
+//! confirmed, the confirmation annotation for public names, and the project still building after
+//! they are applied).
 
 const std = @import("std");
 const testing = std.testing;
@@ -19,7 +21,7 @@ fn position(text: []const u8, needle: []const u8) struct { line: u32, character:
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// 文件（URI 的最后一段）最后一次发布的命名提示：「行:列 code 文案」
+/// Naming hints last published for a file (last segment of the URI): "line:column code message"
 fn namingHints(h: *Harness, name: []const u8) ![]const u8 {
     const a = h.arena.allocator();
     var last: ?[]const std.json.Value = null;
@@ -38,7 +40,7 @@ fn namingHints(h: *Harness, name: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// 文件最后一次发布的编译器诊断（来源为 zig）的个数
+/// Number of compiler diagnostics (source zig) last published for a file
 fn compilerErrors(h: *Harness, name: []const u8) !usize {
     var last: ?[]const std.json.Value = null;
     for (try h.notifications("textDocument/publishDiagnostics")) |m| {
@@ -62,13 +64,14 @@ fn codeActions(h: *Harness, uri: []const u8, text: []const u8, needle: []const u
     return resp.object.get("result").?.array.items;
 }
 
-/// 标题以 `prefix` 开头的代码操作
+/// Code action whose title starts with `prefix`
 fn actionWithTitle(actions: []const std.json.Value, prefix: []const u8) ?std.json.Value {
     for (actions) |x| if (std.mem.startsWith(u8, x.object.get("title").?.string, prefix)) return x;
     return null;
 }
 
-/// 对 `texts`（URI → 文本）应用 WorkspaceEdit（`changes` 或 `documentChanges`），返回改动了的 URI 数
+/// Applies a WorkspaceEdit (`changes` or `documentChanges`) to `texts` (URI -> text) and returns
+/// the number of URIs changed
 fn applyEdit(h: *Harness, texts: *std.StringArrayHashMapUnmanaged([]const u8), edit: std.json.Value) !usize {
     const a = h.arena.allocator();
     const Doc = struct { uri: []const u8, edits: []const std.json.Value };
@@ -148,7 +151,7 @@ test "naming hints are opt-in and follow settings and edits" {
     const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = sample } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // 默认不检查，也没有修复
+    // Off by default, and no fixes either
     try testing.expectEqualStrings("", try namingHints(&h, "main.zig"));
     try testing.expectEqual(null, actionWithTitle(try codeActions(&h, uri, sample, "localValue ="), "rename"));
 
@@ -161,7 +164,7 @@ test "naming hints are opt-in and follow settings and edits" {
         \\6:10 naming.value `localValue` should be snake_case: `local_value`
         \\
     , try namingHints(&h, "main.zig"));
-    // 低强度的提示，附官方规则的链接
+    // Low-severity hints with a link to the official rules
     for ((try h.notifications("textDocument/publishDiagnostics"))[0..]) |m| {
         for (m.object.get("params").?.object.get("diagnostics").?.array.items) |d| {
             try testing.expectEqual(4, d.object.get("severity").?.integer);
@@ -169,7 +172,7 @@ test "naming hints are opt-in and follow settings and edits" {
         }
     }
 
-    // 客户端不支持 `codeAction/resolve`：当场算出编辑
+    // The client does not support `codeAction/resolve`: the edit is computed on the spot
     {
         const actions = try codeActions(&h, uri, sample, "localValue =");
         const fix = actionWithTitle(actions, "rename `localValue` to `local_value`").?;
@@ -180,7 +183,7 @@ test "naming hints are opt-in and follow settings and edits" {
         try testing.expect(std.mem.indexOf(u8, texts.get(uri).?, "const local_value = MakePacket();\n    const marker: Empty = .{};\n    _ = local_value;") != null);
     }
 
-    // 名字与规则的例外
+    // Exceptions for names and rules
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h, "{" ++ base_settings ++
         \\, "naming": {"enable": true, "ignore": ["Make*"], "rules": {"value": false}}}
     ) });
@@ -191,7 +194,7 @@ test "naming hints are opt-in and follow settings and edits" {
         \\
     , try namingHints(&h, "main.zig"));
 
-    // 编辑之后更新
+    // Updated after edits
     const edited = try std.mem.replaceOwned(u8, a, sample, "packet_type", "PacketType");
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text = edited }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
@@ -200,7 +203,7 @@ test "naming hints are opt-in and follow settings and edits" {
         \\
     , try namingHints(&h, "main.zig"));
 
-    // 关闭
+    // Turn it off
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h, "{" ++ base_settings ++ "}") });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("", try namingHints(&h, "main.zig"));
@@ -244,7 +247,7 @@ test "naming fixes: resolve, conflicts, public names and the project still build
         .{ .path = "src/main.zig", .text = main_text },
         .{ .path = "src/lib.zig", .text = lib_text },
         .{ .path = "src/gen.zig", .text = gen_text },
-        // 项目约定：开启检查，排除一个文件
+        // Project convention: enable checking and exclude one file
         .{ .path = "zig-analyzer.zon", .text =
         \\.{ .naming = .{ .enable = true, .exclude = .{"src/gen.zig"} } }
         },
@@ -279,14 +282,15 @@ test "naming fixes: resolve, conflicts, public names and the project still build
     , try namingHints(&h, "lib.zig"));
     try testing.expectEqualStrings("", try namingHints(&h, "gen.zig"));
 
-    // 新名字已有同名的声明：不提供编辑，说明原因
+    // A declaration with the new name already exists: no edit is offered, and the reason is given
     {
         const fix = actionWithTitle(try codeActions(&h, lib_uri, lib_text, "MakeThing() void"), "rename public `MakeThing`").?;
         try testing.expectEqual(null, fix.object.get("edit"));
         const reason = fix.object.get("disabled").?.object.get("reason").?.string;
         try testing.expectEqualStrings("cannot rename `MakeThing` to `makeThing`: `makeThing` is already declared in the same container (src/lib.zig:6:4)", reason);
     }
-    // 类型未知的访问可能是引用：拒绝，不返回只改了一部分的编辑
+    // An access whose type is unknown may be a reference: refused, rather than returning a partial
+    // edit
     {
         const fix = actionWithTitle(try codeActions(&h, lib_uri, lib_text, "FieldName: u32"), "rename field `FieldName` to `field_name`").?;
         const resp = try h.request("codeAction/resolve", fix);
@@ -297,10 +301,11 @@ test "naming fixes: resolve, conflicts, public names and the project still build
     var texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     try texts.put(a, lib_uri, lib_text);
     try texts.put(a, main_uri, main_text);
-    // 公开的函数：跨文件改名，编辑带上要求确认的注解
+    // Public function: renamed across files, and the edit carries an annotation that requires
+    // confirmation
     {
         const fix = actionWithTitle(try codeActions(&h, lib_uri, lib_text, "MakePacket"), "rename public `MakePacket` to `makePacket`").?;
-        // 选择之后才计算编辑
+        // The edit is computed only after the action is chosen
         try testing.expectEqual(null, fix.object.get("edit"));
         const resp = try h.request("codeAction/resolve", fix);
         const edit = resp.object.get("result").?.object.get("edit").?;
@@ -308,7 +313,7 @@ test "naming fixes: resolve, conflicts, public names and the project still build
         try testing.expect(annotation.get("needsConfirmation").?.bool);
         try testing.expectEqual(2, try applyEdit(&h, &texts, edit));
     }
-    // 不公开的类型：只在所在文件中改名
+    // Non-public type: renamed only in its own file
     {
         const fix = actionWithTitle(try codeActions(&h, lib_uri, lib_text, "packet_type"), "rename `packet_type` to `PacketType`").?;
         const resp = try h.request("codeAction/resolve", fix);
@@ -322,7 +327,8 @@ test "naming fixes: resolve, conflicts, public names and the project still build
     , texts.get(lib_uri).?[0..74]);
     try testing.expectEqualStrings("    const packet = lib.makePacket();", texts.get(main_uri).?[std.mem.indexOf(u8, texts.get(main_uri).?, "    const").?..][0..36]);
 
-    // 保存改名后的文件：项目照常编译，剩下的提示随之更新
+    // Save the renamed files: the project still builds, and the remaining hints are updated
+    // accordingly
     for ([_][]const u8{ "src/lib.zig", "src/main.zig" }, [_][]const u8{ lib_uri, main_uri }) |path, u| {
         const text = texts.get(u).?;
         try project.tmp.dir.writeFile(testing.io, .{ .sub_path = path, .data = text });

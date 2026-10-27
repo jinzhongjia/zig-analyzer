@@ -1,4 +1,5 @@
-//! 端到端：goto definition 与补全（跨模块、进入标准库、单文件模式下按需加载标准库）。
+//! End-to-end: goto definition and completion (across modules, into the standard library, and
+//! loading the standard library on demand in single-file mode).
 
 const std = @import("std");
 const testing = std.testing;
@@ -32,13 +33,13 @@ fn position(text: []const u8, needle: []const u8) struct { line: u32, character:
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// definition 的结果：「文件名:行」
+/// Result of definition: "file:line"
 fn gotoAt(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
     return gotoWith(h, "textDocument/definition", uri, text, needle);
 }
 
-/// 跳转结果：单个 Location 为「文件名:行」；Location 数组为「[文件名:行 文件名:行 …]」，单元素的数组与单个
-/// Location 因此可以区分
+/// Goto result: a single Location is "file:line"; an array of Locations is
+/// "[file:line file:line ...]", so a one-element array can be told apart from a single Location
 fn gotoWith(h: *Harness, comptime method: []const u8, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
     const resp = try h.request(method, .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
     const result = resp.object.get("result").?;
@@ -69,7 +70,7 @@ fn contains(list: []const []const u8, s: []const u8) bool {
     return false;
 }
 
-/// 标准库中 `pub const Allocator = ...` 所在的行
+/// Line of `pub const Allocator = ...` in the standard library
 fn stdAllocatorLine(h: *Harness) !i64 {
     const env = h.server.zigEnv().?;
     const path = try std.fs.path.join(h.arena.allocator(), &.{ env.std_dir, "mem.zig" });
@@ -96,7 +97,7 @@ test "goto definition and completion across modules and into std" {
     try testing.expectEqualStrings(expected, try gotoAt(&h, uri, main_text, "Allocator;"));
     try testing.expectEqualStrings("main.zig:4", try gotoAt(&h, uri, main_text, "A;"));
 
-    // `std.mem.` 之后：标准库 mem 的 pub 声明
+    // After `std.mem.`: the pub declarations of the standard library's mem
     const p = position(main_text, "std.mem.\n");
     const labels = try completionLabels(&h, uri, p.line, p.character + @as(u32, "std.mem.".len));
     try testing.expect(contains(labels, "Allocator"));
@@ -323,7 +324,8 @@ const inactive_main =
     \\
 ;
 
-/// exe 与 test 各自创建模块、共用根文件：两者的 dep 指向不同的包，test 的模块另有 helper
+/// exe and test each create a module with a shared root file: their dep points to different
+/// packages, and the test's module also has helper
 const shared_root_build =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
@@ -380,15 +382,16 @@ test "a root file shared by modules with different imports resolves the imports 
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = shared_root_main } });
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    // 只有 test 的模块 import 的名字
+    // Names imported only by the test's module
     try testing.expectEqualStrings("b.zig:0", try gotoAt(&h, uri, shared_root_main, "\"helper\""));
     try testing.expectEqualStrings("b.zig:1", try gotoAt(&h, uri, shared_root_main, "fromB"));
     try testing.expectEqualStrings("```zig\nconst w: Widget\n```", try hoverText(&h, uri, shared_root_main, "w ="));
-    // 两个模块都 import 的名字：成员取诊断 step（默认的 install，即 exe）的模块中的，import 本身列出两个模块的目标
+    // A name imported by both modules: members come from the module of the diagnostics step (the
+    // default install, i.e. exe), and the import itself lists the targets in both modules
     try testing.expectEqualStrings("a.zig:0", try gotoAt(&h, uri, shared_root_main, "fromA"));
     try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoAt(&h, uri, shared_root_main, "\"dep\""));
     try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "\"dep\""));
-    // 别名的使用处停在声明处
+    // A use of the alias stops at the declaration
     try testing.expectEqualStrings("main.zig:0", try gotoAt(&h, uri, shared_root_main, "dep.fromA"));
     try testing.expectEqualStrings("main.zig:0", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "dep.fromA"));
     _ = try h.request("shutdown", {});
@@ -458,7 +461,7 @@ const sizes_main =
     \\
 ;
 
-/// 打开 `files` 组成的项目中的 main.zig，返回 `size`、`max` 与 `vec` 的 hover
+/// Opens main.zig in the project made of `files` and returns the hovers of `size`, `max` and `vec`
 fn sizesHover(files: []const fixture.File, build_args: ?[]const u8) !struct { size: []const u8, max: []const u8, vec: []const u8 } {
     var project = try fixture.Project.create(files);
     defer project.deinit();
@@ -498,11 +501,13 @@ test "pointer width follows the project's target" {
     defer testing.allocator.free(wasm.vec);
     try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", wasm.size);
     try testing.expectEqualStrings("```zig\nconst max: comptime_int = 4294967295\n```", wasm.max);
-    // wasm32 默认使用 LLVM 后端：向量按字节数对齐
+    // wasm32 uses the LLVM backend by default: vectors are aligned to their byte size
     try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", wasm.vec);
 
-    // 同时有 x86_64（自研后端）与 wasm32（LLVM）两个目标：指针位宽与向量的规则都不一致，与大小相关的值
-    // 为未知（不给出可能错误的值）。不用宿主目标：x86_64-windows 的 Debug 默认也用 LLVM，向量的规则与 wasm32 相同
+    // Two targets at once, x86_64 (self-hosted backend) and wasm32 (LLVM): both the pointer width
+    // and the vector rules differ, so size-related values are unknown (no possibly wrong value is
+    // given). The host target is not used: x86_64-windows also uses LLVM by default in Debug, with
+    // the same vector rules as wasm32.
     const mixed = try sizesHover(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
@@ -530,7 +535,7 @@ test "pointer width follows the project's target" {
     try testing.expectEqualStrings("```zig\nconst max: comptime_int\n```", mixed.max);
     try testing.expectEqualStrings("```zig\nconst vec: comptime_int\n```", mixed.vec);
 
-    // 单文件模式：本机
+    // Single-file mode: the native target
     const single = try sizesHover(&.{.{ .path = "main.zig", .text = sizes_main }}, null);
     defer testing.allocator.free(single.size);
     defer testing.allocator.free(single.max);
@@ -541,7 +546,8 @@ test "pointer width follows the project's target" {
 }
 
 test "results depending on pointer width are recomputed when the target changes" {
-    // 不 import 任何文件：结果只经由 TargetAbi 依赖目标（不依赖模块图）
+    // Imports no file: the result depends on the target only through TargetAbi (not on the module
+    // graph)
     const text =
         \\pub fn main() void {
         \\    const size = @sizeOf(usize);
@@ -569,7 +575,7 @@ test "results depending on pointer width are recomputed when the target changes"
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", try hoverText(&h, uri, text, "size ="));
 
-    // 去掉 -Dtarget：项目重启，目标变为本机
+    // Drop -Dtarget: the project restarts and the target becomes native
     const host = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(), "{}", .{});
     try h.notify("workspace/didChangeConfiguration", .{ .settings = host });
     _ = try h.request("zig-analyzer/waitIdle", {});
@@ -580,7 +586,8 @@ test "results depending on pointer width are recomputed when the target changes"
 }
 
 test "type layouts follow the project's target and are recomputed when it changes" {
-    // 期望值为 zig 0.17.0 的结果。两个目标的指针位宽与向量的规则相同，整数的最大对齐不同（4 与 16）
+    // The expected values are the results of zig 0.17.0. The two targets share the pointer width
+    // and vector rules but differ in the maximum integer alignment (4 and 16).
     const text =
         \\pub fn main() void {
         \\    const align_u64 = @alignOf(u64);

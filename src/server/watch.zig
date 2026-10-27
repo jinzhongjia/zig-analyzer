@@ -1,17 +1,25 @@
-//! 服务器发现磁盘上的外部改动（git checkout、代码生成、其他编辑器）：客户端不能动态注册文件监听时（Linux 上的
-//! Neovim 默认如此），或配置 `files.watcher` 为 `server` 时。
+//! The server detects external changes on disk (git checkout, code generation, other editors):
+//! when the client cannot register file watchers dynamically (the default for Neovim on Linux), or
+//! when `files.watcher` is configured as `server`.
 //!
-//! 关注的文件：驻留过的 `.zig` / `.zon` 文件（分析会按需从磁盘读取被 import 的任意文件），以及各工作区根目录的
-//! `build.zig`、`build.zig.zon`、`zig-analyzer.zon`；不含不会改变的依赖库（见 `Server.watchable`）。变化按
-//! `workspace/didChangeWatchedFiles` 的通知处理，与客户端的通知走同一条路径；打开的文档以缓冲区为准，编辑器中的保存由
-//! `didSave` 处理，跳过。
+//! Files of interest: interned `.zig` / `.zon` files (analysis reads any imported file from disk
+//! on demand), plus `build.zig`, `build.zig.zon`, and `zig-analyzer.zon` in each workspace root;
+//! libraries, which never change, are excluded (see `Server.watchable`). Changes are handled as
+//! `workspace/didChangeWatchedFiles` notifications, along the same path as the client's
+//! notifications; open documents are skipped, since their buffers take precedence and saves in the
+//! editor are handled by `didSave`.
 //!
-//! 监听这些文件所在的目录，使用操作系统的原生通知：Linux 用 inotify，macOS 用 FSEvents，Windows 用目录变化通知。
-//! 目录尚不存在时监听最近一级存在的祖先目录，它出现后改为监听它自己，其中已经存在的关注文件按新建处理。驻留了新文件、
-//! 根目录增减、目录新建或删除、通知丢失时重新计算要监听的目录。
+//! The directories containing these files are watched with the operating system's native
+//! notifications: inotify on Linux, FSEvents on macOS, directory change notifications on Windows.
+//! A directory that does not exist yet is watched through its nearest existing ancestor; once it
+//! appears, it is watched itself, and files of interest already in it are treated as created. The
+//! directories to watch are recomputed when new files are interned, roots are added or removed,
+//! directories are created or deleted, or notifications are lost.
 //!
-//! 轮询（定期检查大小与修改时间）只作为最后的退路：原生通知不可用（其他平台、初始化失败），或个别目录超出监听数量
-//! 上限时，只对这些目录中的文件轮询。
+//! Polling (periodically checking size and modification time) is only the last resort: when
+//! native notifications are unavailable (other platforms, initialization failure), or some
+//! directories exceed the limit on the number of watches, only the files in those directories are
+//! polled.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,31 +35,33 @@ const Config = @import("Config.zig");
 
 const log = std.log.scoped(.watch);
 
-/// 收到通知后再等这么久没有新的通知才处理：一次 git checkout 改动的大量文件合为一批
+/// After a notification, wait until no new notification has arrived for this long before handling:
+/// the many files changed by one git checkout are merged into one batch
 const debounce_ms = 50;
-/// 持续有通知时最多推迟这么久
+/// Maximum delay while notifications keep arriving
 const max_debounce_ms = 500;
-/// 轮询时两次检查之间的等待至少是一次检查耗时的这么多倍：文件很多时拉长间隔，轮询占用的时间不超过约 5%
+/// When polling, the wait between two checks is at least this many times the duration of one
+/// check: with many files the interval grows, so polling takes no more than about 5% of the time
 const min_idle_factor = 20;
 
-/// 原生通知报告的一项变化
+/// One change reported by native notifications
 const Event = struct {
-    /// 绝对路径；`overflow` 时为空表示所有文件
+    /// Absolute path; for `overflow`, empty means all files
     path: []const u8,
     kind: Kind,
 
     const Kind = enum {
-        /// 文件内容可能变了
+        /// The file contents may have changed
         changed,
-        /// 新建或移入了这个名字（可能是目录）
+        /// This name was created or moved in (may be a directory)
         created,
-        /// 删除或移出了这个名字（可能是目录）
+        /// This name was deleted or moved out (may be a directory)
         removed,
-        /// 新建或移入了目录
+        /// A directory was created or moved in
         dir_created,
-        /// 监听的目录自身或其中的子目录被删除、移走
+        /// The watched directory itself or a subdirectory in it was deleted or moved away
         dir_gone,
-        /// 通知丢失（队列溢出等）：`path` 下的文件都可能变了
+        /// Notifications were lost (queue overflow, etc.): any file under `path` may have changed
         overflow,
     };
 };
@@ -61,30 +71,34 @@ pub const Watcher = struct {
     gpa: Allocator,
     backend: Backend,
     listener: Vfs.Listener,
-    /// 需要重新计算关注的文件与监听的目录（驻留了新文件、根目录增减）
+    /// The files of interest and the watched directories need to be recomputed (new files were
+    /// interned, roots were added or removed)
     resync_requested: std.atomic.Value(bool) = .init(true),
     stopping: std.atomic.Value(bool) = .init(false),
 
-    // ── 以下字段只由后台任务访问 ──
-    /// 正在监听（服务器负责发现外部改动）
+    // ── The following fields are accessed only by the background task ──
+    /// Watching is active (the server is responsible for detecting external changes)
     active: bool = false,
-    /// `files` 与 `missing` 所在的 arena；重新计算时整体替换
+    /// Arena holding `files` and `missing`; replaced as a whole on recomputation
     state_arena: std.heap.ArenaAllocator,
-    /// 关注的文件：身份键（大小写不敏感时统一为小写）→ 路径
+    /// Files of interest: identity key (lowercased when case-insensitive) → path
     files: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
-    /// 关注的文件所在、还不存在的目录：身份键 → 路径（监听的是它们最近一级存在的祖先）
+    /// Directories of files of interest that do not exist yet: identity key → path (their nearest
+    /// existing ancestors are watched instead)
     missing: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
-    /// 所在目录无法监听、改为轮询的文件（路径在 `state_arena` 中）
+    /// Files polled because their directory cannot be watched (paths are in `state_arena`)
     fallback: std.ArrayList([]const u8) = .empty,
     poller: Poller,
-    /// 由客户端发现外部改动时，已按文件名补充注册的其他文件（`registerClientGlobs`）；键由 `gpa` 分配
+    /// Other files additionally registered by file name when the client detects external changes
+    /// (`registerClientGlobs`); keys are allocated by `gpa`
     client_names: std.StringHashMapUnmanaged(void) = .empty,
     client_registrations: u32 = 0,
-    /// 上一次轮询的耗时（见 `min_idle_factor`）
+    /// Duration of the last poll (see `min_idle_factor`)
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
 
-    /// 在主循环中创建：之后的 `wake` / `stop` 不会丢失。原生通知不可用时退回轮询
+    /// Created on the main loop, so later `wake` / `stop` calls are not lost. Falls back to polling
+    /// when native notifications are unavailable.
     pub fn create(server: *Server) Allocator.Error!*Watcher {
         const gpa = server.gpa;
         const w = try gpa.create(Watcher);
@@ -104,7 +118,7 @@ pub const Watcher = struct {
         return w;
     }
 
-    /// 后台任务结束后调用
+    /// Called after the background task ends
     pub fn destroy(w: *Watcher) void {
         var names = w.client_names.keyIterator();
         while (names.next()) |k| w.gpa.free(k.*);
@@ -118,13 +132,14 @@ pub const Watcher = struct {
         w.gpa.destroy(w);
     }
 
-    /// 关注的文件可能变化（根目录增减）、监听方式可能变化（配置）：在后台任务中重新计算
+    /// The files of interest may have changed (roots added or removed), or how files are watched
+    /// may have changed (configuration): recompute in the background task
     pub fn requestResync(w: *Watcher) void {
         w.resync_requested.store(true, .release);
         w.backend.wake();
     }
 
-    /// 让后台任务结束（服务器关闭）
+    /// Makes the background task end (server shutdown)
     pub fn stop(w: *Watcher) void {
         w.stopping.store(true, .release);
         w.backend.wake();
@@ -132,17 +147,19 @@ pub const Watcher = struct {
 
     fn onNewPath(ctx: *anyopaque) void {
         const w: *Watcher = @ptrCast(@alignCast(ctx));
-        // 只在由否变是时唤醒：项目加载时会连续驻留成千上万个文件
+        // Wake only when the flag goes from false to true: loading a project interns thousands of
+        // files in a row
         if (!w.resync_requested.swap(true, .acq_rel)) w.backend.wake();
     }
 
-    /// 后台任务：服务器关闭时结束
+    /// Background task: ends when the server shuts down
     pub fn run(w: *Watcher) Io.Cancelable!void {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
             if (!w.server.watchesFiles()) {
                 w.deactivate();
-                // 先清除再检查：检查期间驻留的新文件会再次唤醒（见 `onNewPath`）
+                // Clear first, then check: new files interned during the check wake the task
+                // again (see `onNewPath`)
                 w.resync_requested.store(false, .release);
                 if (w.server.register_watch) w.registerClientGlobs() catch |err| switch (err) {
                     error.OutOfMemory => log.err("out of memory while registering file watchers", .{}),
@@ -160,9 +177,11 @@ pub const Watcher = struct {
         }
     }
 
-    /// 由客户端发现外部改动时，初始注册的 glob 只有 `.zig` 与 `.zon`：驻留过的其他文件（`@embedFile` 的文件）按
-    /// 文件名补充注册（`**/<文件名>`；同名的其他文件的通知因没有驻留而被忽略）。文件名含有 glob 的特殊字符时
-    /// 无法写成 glob，不注册
+    /// When the client detects external changes, the initially registered globs cover only
+    /// `.zig` and `.zon`: other interned files (files used by `@embedFile`) are additionally
+    /// registered by file name (`**/<file name>`; notifications for other files with the same
+    /// name are ignored, since those are not interned). A file name containing glob special
+    /// characters cannot be written as a glob and is not registered.
     fn registerClientGlobs(w: *Watcher) Allocator.Error!void {
         const server = w.server;
         var arena: std.heap.ArenaAllocator = .init(w.gpa);
@@ -190,7 +209,8 @@ pub const Watcher = struct {
         server.sendRequest(.{ .string = id }, "client/registerCapability", types.RegistrationParams{ .registrations = &.{.{ .id = id, .method = "workspace/didChangeWatchedFiles", .registerOptions = options }} });
     }
 
-    /// 一轮：（必要时）重新计算监听的目录，等待通知或轮询的时刻，处理这一批变化
+    /// One round: recompute the watched directories (if needed), wait for notifications or the
+    /// time to poll, and handle this batch of changes
     fn step(w: *Watcher) Allocator.Error!void {
         const io = w.server.io;
         var batch_arena: std.heap.ArenaAllocator = .init(w.gpa);
@@ -198,7 +218,8 @@ pub const Watcher = struct {
         const a = batch_arena.allocator();
         var pending: Pending = .{};
 
-        // 先清除请求再计算：计算期间新到的请求会再次唤醒
+        // Clear the request before computing: a request arriving during the computation wakes
+        // the task again
         const requested = w.resync_requested.swap(false, .acq_rel);
         if (!w.active or requested) {
             try w.resync(a, &pending);
@@ -206,7 +227,7 @@ pub const Watcher = struct {
             if (pending.paths.count() != 0) return w.apply(a, &pending);
         }
 
-        // 等待通知；有需要轮询的文件时最多等到下一次轮询
+        // Wait for notifications; when some files need polling, wait at most until the next poll
         const timeout_ns: ?u64 = if (w.next_poll) |at| blk: {
             const left = Io.Clock.awake.now(io).durationTo(at).nanoseconds;
             break :blk if (left <= 0) 0 else @intCast(left);
@@ -217,7 +238,7 @@ pub const Watcher = struct {
         var events: std.ArrayList(Event) = .empty;
         try w.backend.drain(a, &events);
         if (events.items.len != 0) {
-            // 合并一阵连续的通知
+            // Merge a burst of consecutive notifications
             const deadline = Io.Clock.awake.now(io).addDuration(.fromMilliseconds(max_debounce_ms));
             while (Io.Clock.awake.now(io).durationTo(deadline).nanoseconds > 0) {
                 const before = events.items.len;
@@ -236,13 +257,15 @@ pub const Watcher = struct {
             w.schedulePoll();
         };
 
-        // 先补上新出现的目录的监听，再读取文件的状态：之后的改动都会有通知
+        // First add watches for newly appeared directories, then read the state of the files:
+        // every later change will be notified
         const requested_now = w.resync_requested.swap(false, .acq_rel);
         if (dirs_changed or requested_now) try w.resync(a, &pending);
         if (pending.paths.count() != 0) try w.apply(a, &pending);
     }
 
-    /// 停止监听，丢弃状态：重新开始时以那时的磁盘状态为准，期间的变化不补报
+    /// Stops watching and discards the state: when watching starts again, the disk state at that
+    /// time is taken as is, and changes in between are not reported afterwards
     fn deactivate(w: *Watcher) void {
         if (!w.active) return;
         w.active = false;
@@ -257,13 +280,15 @@ pub const Watcher = struct {
         w.next_poll = null;
     }
 
-    /// 身份键：与 Vfs 的文件身份一致，大小写不敏感时统一为小写
+    /// Identity key: consistent with Vfs file identity; lowercased when case-insensitive
     fn key(w: *const Watcher, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
         if (w.server.vfs.case == .sensitive) return path;
         return std.ascii.allocLowerString(a, path);
     }
 
-    /// 重新计算关注的文件与监听的目录。此前不存在、现在出现了的目录中已经存在的关注文件记入 `pending`
+    /// Recomputes the files of interest and the watched directories. Files of interest that
+    /// already exist in directories that did not exist before but have appeared now are recorded
+    /// in `pending`.
     fn resync(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         const gpa = w.gpa;
@@ -289,12 +314,12 @@ pub const Watcher = struct {
             };
         }
 
-        // 每个文件所在的目录：存在时监听它，否则监听最近一级存在的祖先
+        // Each file's directory: watch it if it exists, otherwise its nearest existing ancestor
         var dirs: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         defer dirs.deinit(gpa);
         var missing: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         errdefer missing.deinit(gpa);
-        // 文件 → 监听的目录（`dirs` 的下标）
+        // File → watched directory (index into `dirs`)
         const targets = try a.alloc(u32, files.count());
         for (files.values(), targets) |path, *target| {
             const dir = std.fs.path.dirname(path) orelse path;
@@ -325,7 +350,8 @@ pub const Watcher = struct {
             if (failed_set.contains(dirs.keys()[target])) try fallback.append(gpa, path);
         };
 
-        // 此前不存在、现在出现了的目录：其中已经存在的关注文件在监听开始前就已新建
+        // Directories that did not exist before but have appeared now: files of interest already in
+        // them were created before watching started
         if (w.active) {
             var appeared: std.StringHashMapUnmanaged(void) = .empty;
             defer appeared.deinit(gpa);
@@ -359,9 +385,11 @@ pub const Watcher = struct {
         w.next_poll = Io.Clock.awake.now(w.server.io).addDuration(.{ .nanoseconds = wait_ns });
     }
 
-    /// 把通知对应到关注的文件，记入 `pending`；返回目录是否有变化（需要重新计算监听的目录）
+    /// Maps notifications to files of interest and records them in `pending`; returns whether
+    /// directories changed (the watched directories need to be recomputed)
     fn handle(w: *Watcher, a: Allocator, events: []const Event, pending: *Pending) Allocator.Error!bool {
-        // 目录的变化：其下关注的文件都可能变了。空路径表示所有文件
+        // Directory changes: any file of interest under them may have changed. An empty path
+        // means all files.
         var dirs: std.StringHashMapUnmanaged(void) = .empty;
         var all = false;
         for (events) |ev| switch (ev.kind) {
@@ -370,7 +398,8 @@ pub const Watcher = struct {
                 if (w.files.get(k)) |path| {
                     try pending.add(a, path, if (ev.kind == .created) .created else .changed);
                 } else if (ev.kind == .created and w.leadsToMissing(k)) {
-                    // 不知道是不是目录（Windows 的通知不区分）：通往不存在的目录的路径出现了
+                    // Not known whether it is a directory (Windows notifications do not tell):
+                    // a path leading to a nonexistent directory has appeared
                     try dirs.put(a, k, {});
                 }
             },
@@ -386,13 +415,14 @@ pub const Watcher = struct {
         return true;
     }
 
-    /// `k`（身份键）是某个不存在的目录自身或它的祖先
+    /// `k` (an identity key) is a nonexistent directory itself or one of its ancestors
     fn leadsToMissing(w: *const Watcher, k: []const u8) bool {
         for (w.missing.keys()) |m| if (w.server.vfs.isUnder(m, k)) return true;
         return false;
     }
 
-    /// 按文件此时的状态生成变化事件并交给服务器处理。打开的文档以缓冲区为准，跳过
+    /// Generates change events from the current state of the files and hands them to the server.
+    /// Open documents are skipped, since their buffers take precedence.
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         var events: std.ArrayList(types.FileEvent) = .empty;
@@ -407,8 +437,9 @@ pub const Watcher = struct {
     }
 };
 
-/// 一批待处理的变化：路径 → 是否新建。路径复制到这一批的 arena 中：处理之前可能重新计算关注的文件，
-/// 释放它们原来所在的 arena
+/// A batch of pending changes: path → whether it was created. Paths are copied into this batch's
+/// arena: the files of interest may be recomputed before handling, which frees the arena they were
+/// originally in.
 const Pending = struct {
     paths: std.StringArrayHashMapUnmanaged(Hint) = .empty,
 
@@ -428,7 +459,7 @@ const Pending = struct {
     }
 };
 
-/// `k` 是 `dirs` 中某个目录自身或在其下
+/// `k` is one of the directories in `dirs` or is under one
 fn underAny(k: []const u8, dirs: *const std.StringHashMapUnmanaged(void)) bool {
     var cur: ?[]const u8 = k;
     while (cur) |c| : (cur = std.fs.path.dirname(c)) {
@@ -442,7 +473,7 @@ fn isDir(io: Io, path: []const u8) bool {
     return st.kind == .directory;
 }
 
-/// `dir` 最近一级存在的祖先目录（根目录总是存在）
+/// The nearest existing ancestor directory of `dir` (the root directory always exists)
 fn ancestor(io: Io, dir: []const u8) []const u8 {
     var cur = dir;
     while (std.fs.path.dirname(cur)) |parent| : (cur = parent) {
@@ -451,7 +482,7 @@ fn ancestor(io: Io, dir: []const u8) []const u8 {
     return cur;
 }
 
-/// 文件在磁盘上的状态；不存在时为 null
+/// State of a file on disk; null when it does not exist
 const Stamp = struct {
     size: u64,
     mtime: i96,
@@ -463,10 +494,11 @@ fn stat(io: Io, path: []const u8) ?Stamp {
     return .{ .size = st.size, .mtime = st.mtime.nanoseconds };
 }
 
-/// 轮询：检查一组文件的大小与修改时间。第一次检查到一个文件时只记下它的状态，之后的变化才算
+/// Polling: checks the size and modification time of a set of files. The first check of a file
+/// only records its state; only later changes count.
 const Poller = struct {
     gpa: Allocator,
-    /// 路径（属于 `gpa`）→ 上一次检查时的状态
+    /// Path (owned by `gpa`) → state at the last check
     seen: std.StringArrayHashMapUnmanaged(?Stamp) = .empty,
 
     fn deinit(p: *Poller) void {
@@ -479,7 +511,7 @@ const Poller = struct {
         p.seen.clearRetainingCapacity();
     }
 
-    /// 检查 `paths`，变化记入 `pending`；不在 `paths` 中的文件不再记录
+    /// Checks `paths` and records changes in `pending`; files not in `paths` are no longer tracked
     fn poll(p: *Poller, io: Io, a: Allocator, paths: []const []const u8, pending: *Pending) Allocator.Error!void {
         var current: std.StringArrayHashMapUnmanaged(?Stamp) = .empty;
         for (paths) |path| try current.put(a, path, stat(io, path));
@@ -509,7 +541,7 @@ const Poller = struct {
     }
 };
 
-// ── 监听方式 ──────────────────────────────────────────────────────────
+// ── Watch backends ────────────────────────────────────────────────────
 
 const Backend = union(enum) {
     native: *Native,
@@ -521,28 +553,29 @@ const Backend = union(enum) {
         }
     }
 
-    /// 唤醒等待中的后台任务；任何线程都可以调用
+    /// Wakes the waiting background task; may be called from any thread
     fn wake(b: Backend) void {
         switch (b) {
             inline else => |x| x.wake(),
         }
     }
 
-    /// 监听的目录改为 `dirs`（绝对路径）；无法监听的目录追加到 `failed`（取自 `dirs`）。只在后台任务中调用
+    /// Changes the watched directories to `dirs` (absolute paths); directories that cannot be
+    /// watched are appended to `failed` (taken from `dirs`). Called only in the background task.
     fn setDirs(b: Backend, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
         switch (b) {
             inline else => |x| try x.setDirs(gpa, dirs, failed),
         }
     }
 
-    /// 等到有通知、被唤醒或超时（null 为不超时）
+    /// Waits until there are notifications, a wake-up, or a timeout (null means no timeout)
     fn wait(b: Backend, timeout_ns: ?u64) void {
         switch (b) {
             inline else => |x| x.wait(timeout_ns),
         }
     }
 
-    /// 取出已经到达的通知（不等待），路径分配在 `a` 中
+    /// Takes out notifications that have arrived (without waiting); paths are allocated in `a`
     fn drain(b: Backend, a: Allocator, out: *std.ArrayList(Event)) Allocator.Error!void {
         switch (b) {
             inline else => |x| try x.drain(a, out),
@@ -578,7 +611,8 @@ const Unsupported = struct {
     }
 };
 
-/// 没有原生通知：所有目录都无法监听（文件全部轮询），只提供唤醒
+/// No native notifications: no directory can be watched (all files are polled); only waking
+/// up is provided
 const Fallback = struct {
     io: Io,
     mutex: Io.Mutex = .init,
@@ -621,7 +655,7 @@ const Fallback = struct {
     fn drain(_: *Fallback, _: Allocator, _: *std.ArrayList(Event)) Allocator.Error!void {}
 };
 
-/// Linux：inotify 监听各个目录（不递归），eventfd 用于唤醒
+/// Linux: inotify watches individual directories (non-recursively); eventfd is used for waking up
 const Inotify = struct {
     const linux = std.os.linux;
     const IN = linux.IN;
@@ -629,10 +663,10 @@ const Inotify = struct {
     gpa: Allocator,
     fd: linux.fd_t,
     wake_fd: linux.fd_t,
-    /// 监听描述符 → 目录路径（属于 `gpa`，与 `by_path` 的键共用）
+    /// Watch descriptor → directory path (owned by `gpa`, shared with the keys of `by_path`)
     by_wd: std.AutoArrayHashMapUnmanaged(i32, [:0]u8) = .empty,
     by_path: std.StringArrayHashMapUnmanaged(i32) = .empty,
-    /// 已经提示过达到了监听数量上限
+    /// Already warned that the limit on the number of watches was reached
     warned: bool = false,
     buf: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined,
 
@@ -684,7 +718,8 @@ const Inotify = struct {
             const z = try gpa.dupeSentinel(u8, d, 0);
             const rc = linux.inotify_add_watch(n.fd, z, mask);
             const err = linux.errno(rc);
-            // 同一个目录的另一种写法（经由符号链接）：一个监听只能对应一个路径
+            // Another spelling of the same directory (via a symbolic link): one watch can map to
+            // only one path
             const duplicate = err == .SUCCESS and n.by_wd.contains(@intCast(rc));
             if (err != .SUCCESS or duplicate) {
                 gpa.free(z);
@@ -701,7 +736,7 @@ const Inotify = struct {
         }
     }
 
-    /// 不再记录监听 `wd`（已被移除）
+    /// Stops tracking watch `wd` (already removed)
     fn forget(n: *Inotify, wd: i32) void {
         const kv = n.by_wd.fetchSwapRemove(wd) orelse return;
         _ = n.by_path.swapRemove(kv.value);
@@ -749,7 +784,8 @@ const Inotify = struct {
                 .changed;
             return out.append(a, .{ .path = try std.fs.path.join(a, &.{ dir, name }), .kind = kind });
         }
-        // 监听的目录自身被删除、移走（之后的通知随 inode 而来，路径已不对）或所在的文件系统被卸载
+        // The watched directory itself was deleted or moved away (later notifications follow the
+        // inode, so the path is no longer right), or its file system was unmounted
         if (ev.mask & (IN.DELETE_SELF | IN.MOVE_SELF | IN.IGNORED | IN.UNMOUNT) == 0) return;
         try out.append(a, .{ .path = try a.dupe(u8, dir), .kind = .dir_gone });
         if (ev.mask & IN.IGNORED == 0) _ = linux.inotify_rm_watch(n.fd, ev.wd);
@@ -757,8 +793,10 @@ const Inotify = struct {
     }
 };
 
-/// macOS：FSEvents（递归监听，由系统服务管理）。动态加载 CoreServices，不依赖 SDK；回调在自建的串行队列上执行，
-/// 收到的变化在这个队列上暂存，后台任务经 `dispatch_sync` 取走
+/// macOS: FSEvents (recursive watching, managed by a system service). CoreServices is loaded
+/// dynamically, with no dependency on the SDK; callbacks run on a serial queue created by this
+/// backend, the received changes are buffered on that queue, and the background task takes them
+/// via `dispatch_sync`.
 const FsEvents = struct {
     const dispatch = std.c.dispatch;
 
@@ -771,16 +809,18 @@ const FsEvents = struct {
     stream: ?FSEventStreamRef = null,
     cf_paths: []?CFStringRef = &.{},
     cf_array: ?CFArrayRef = null,
-    /// 当前的监听根（属于 `gpa`）
+    /// Current watch roots (owned by `gpa`)
     roots: std.ArrayList([:0]u8) = .empty,
-    /// 监听根的真实路径与写法不同时：FSEvents 报告真实路径，换回写法
+    /// Watch roots whose real path differs from the written path: FSEvents reports real paths,
+    /// which are mapped back to the written form
     aliases: std.ArrayList(Alias) = .empty,
-    /// 回调收到、尚未取走的变化（只在 `queue` 上访问；路径属于 `gpa`）
+    /// Changes received by the callback and not yet taken (accessed only on `queue`; paths are
+    /// owned by `gpa`)
     queued: std.ArrayList(Event) = .empty,
 
     const Alias = struct { real: []u8, written: []const u8 };
 
-    /// FSEvents 对监听路径的个数有未公开的上限（据称 4096）
+    /// FSEvents has an undocumented limit on the number of watched paths (reportedly 4096)
     const max_roots = 2048;
 
     const Symbols = struct {
@@ -889,7 +929,7 @@ const FsEvents = struct {
     }
 
     fn setDirs(f: *FsEvents, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
-        // 嵌套的目录只保留最外层：监听是递归的
+        // Of nested directories, keep only the outermost: watching is recursive
         const sorted = try gpa.dupe([]const u8, dirs);
         defer gpa.free(sorted);
         std.mem.sort([]const u8, sorted, {}, struct {
@@ -903,7 +943,8 @@ const FsEvents = struct {
             if (roots.items.len != 0 and under(d, roots.items[roots.items.len - 1])) continue;
             try roots.append(gpa, d);
         }
-        // 目录太多时监听整个文件系统：代价大，但仍是原生通知
+        // With too many directories, watch the whole file system: expensive, but still native
+        // notifications
         if (roots.items.len > max_roots) {
             roots.clearRetainingCapacity();
             try roots.append(gpa, "/");
@@ -1029,7 +1070,7 @@ const FsEvents = struct {
         for (take.taken.items) |e| try out.append(a, .{ .path = try f.written(a, e.path), .kind = e.kind });
     }
 
-    /// 真实路径换回监听根的写法
+    /// Maps a real path back to the written form of its watch root
     fn written(f: *const FsEvents, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
         for (f.aliases.items) |al| if (under(path, al.real)) {
             return std.mem.concat(a, u8, &.{ al.written, path[al.real.len..] });
@@ -1038,15 +1079,16 @@ const FsEvents = struct {
     }
 };
 
-/// Windows：各个目录的变化通知（不递归）。通知完成时以 APC 回调到发起它的线程（后台任务），在可警报的等待中执行；
-/// 唤醒用一个事件对象
+/// Windows: change notifications for individual directories (non-recursive). A completed
+/// notification is delivered as an APC to the thread that issued it (the background task) and
+/// runs during an alertable wait; an event object is used for waking up.
 const DirNotify = struct {
     const windows = std.os.windows;
 
     gpa: Allocator,
     wake_event: windows.HANDLE,
     dirs: std.StringArrayHashMapUnmanaged(*Directory) = .empty,
-    /// 通知已完成、等待处理的目录（APC 中加入）
+    /// Directories whose notification has completed and awaits handling (added in the APC)
     ready: std.DoublyLinkedList = .{},
 
     const Directory = struct {
@@ -1054,7 +1096,7 @@ const DirNotify = struct {
         handle: windows.HANDLE,
         state: enum { idle, listening, ready } = .idle,
         iosb: windows.IO_STATUS_BLOCK = undefined,
-        /// 网络上的目录一次通知至多 64 KB
+        /// A single notification for a directory on the network is at most 64 KB
         buffer: [64 * 1024]u8 align(@alignOf(windows.FILE.NOTIFY.INFORMATION)) = undefined,
         ready_node: std.DoublyLinkedList.Node = .{},
     };
@@ -1177,7 +1219,7 @@ const DirNotify = struct {
         dir.state = .ready;
     }
 
-    /// 取消进行中的通知，等它的 APC 执行完后关闭
+    /// Cancels the in-progress notification and closes the directory after its APC has run
     fn close(d: *DirNotify, dir: *Directory) void {
         if (dir.state == .listening) {
             var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
@@ -1201,10 +1243,11 @@ const DirNotify = struct {
                         try out.append(a, .{ .path = try a.dupe(u8, dir.path), .kind = .overflow });
                     } else try parse(a, dir, out);
                 },
-                // 变化太多，缓冲区装不下
+                // Too many changes to fit in the buffer
                 .NOTIFY_ENUM_DIR => try out.append(a, .{ .path = try a.dupe(u8, dir.path), .kind = .overflow }),
                 .CANCELLED => continue,
-                // 目录被删除等：不再监听，重新计算时按那时的情况处理
+                // The directory was deleted, etc.: stop watching it; recomputation handles it
+                // based on the state at that time
                 else => {
                     try out.append(a, .{ .path = try a.dupe(u8, dir.path), .kind = .dir_gone });
                     try gone.append(a, dir);
@@ -1229,8 +1272,8 @@ const DirNotify = struct {
             const info: *windows.FILE.NOTIFY.INFORMATION = @ptrCast(@alignCast(&dir.buffer[offset]));
             const name = name_buf[0..std.unicode.wtf16LeToWtf8(&name_buf, info.fileName())];
             const kind: Event.Kind = switch (info.Action) {
-                1, 5 => .created, // 新建、改名后的新名字
-                2, 4 => .removed, // 删除、改名前的旧名字
+                1, 5 => .created, // created, or the new name after a rename
+                2, 4 => .removed, // deleted, or the old name before a rename
                 else => .changed,
             };
             try out.append(a, .{ .path = try std.fs.path.join(a, &.{ dir.path, name }), .kind = kind });
@@ -1269,7 +1312,8 @@ test "poller: changes, creation and deletion after the first check" {
     try testing.expectEqual(Pending.Hint.created, pending.paths.get(b_path).?);
 }
 
-// 防止待处理的变化借用关注文件的路径：同一批中重新计算关注的文件时，它们所在的 arena 被释放
+// Prevents pending changes from borrowing the paths of files of interest: when the files of
+// interest are recomputed within the same batch, the arena holding those paths is freed
 test "pending changes keep their own copies of the paths" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1294,7 +1338,7 @@ test "under any: a path is under one of the directories, or is one of them" {
     try testing.expect(!underAny(native("/p/a.zig"), &dirs));
 }
 
-/// 等到 `paths` 中的每个路径都被报告过（10 秒内）
+/// Waits until every path in `paths` has been reported (within 10 seconds)
 fn expectReported(n: *Native, a: Allocator, paths: []const []const u8) !void {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var events: std.ArrayList(Event) = .empty;
@@ -1331,15 +1375,16 @@ test "native watching reports changes, creation and removal in watched directori
     const a_path = try std.fs.path.join(a, &.{ dir, "a.zig" });
     const b_path = try std.fs.path.join(a, &.{ dir, "b.zig" });
 
-    // 改写 a.zig、新建 b.zig：两者都报告（FSEvents 会合并同一文件的多项变化，种类只作提示，由处理时的状态决定）
+    // Rewrite a.zig and create b.zig: both are reported (FSEvents merges multiple changes of the
+    // same file, so the kind is only a hint; the state at handling time decides)
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "aa" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = "b" });
     try expectReported(n, a, &.{ a_path, b_path });
-    // 删除 a.zig
+    // Delete a.zig
     try tmp.dir.deleteFile(testing.io, "a.zig");
     try expectReported(n, a, &.{a_path});
 
-    // 唤醒：不带通知也返回
+    // Wake: returns even without notifications
     n.wake();
     n.wait(null);
     var events: std.ArrayList(Event) = .empty;
