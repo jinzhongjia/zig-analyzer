@@ -878,6 +878,9 @@ pub fn main(init: std.process.Init) !u8 {
             .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
             .workspace = .{ .configuration = true },
             .window = .{ .workDoneProgress = true },
+            // Like common editors, completion uses snippets (turn them off with
+            // `BENCH_CONFIG='{"completion":{"snippets":false}}'`)
+            .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true } } },
         },
     });
     const encoding = init_resp.object.get("result").?.object.get("capabilities").?.object.get("positionEncoding");

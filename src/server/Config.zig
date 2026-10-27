@@ -13,7 +13,7 @@
 //!                        "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "imports": { "derived": "with_import", "sort": "path" },
-//!       "completion": { "auto_import": true, "max_auto_imports": 128 },
+//!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "argument_placeholders": true },
 //!       "sema": { "callsite_seeding": true },
 //!       "cache": { "capacity": 64, "queries": { "Infer": { "count": 16384, "mb": 48 } } },
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
@@ -110,6 +110,12 @@ completion_auto_import: bool = true,
 /// Maximum number of auto-import candidates offered by one completion (the best-ranked ones are
 /// kept; the client gets the rest by requesting again as the user types); 0 means no limit
 completion_max_auto_imports: u32 = 128,
+/// When the client supports snippets: function completions insert calls (not when parentheses
+/// already follow the cursor), and common snippets are offered where statements and declarations
+/// start
+completion_snippets: bool = true,
+/// Call snippets insert a placeholder for each argument; when off, only the parentheses
+completion_argument_placeholders: bool = true,
 /// Inside a generic function body without concrete types, infer from the instances at call sites
 /// (hover, completion, inlay hints, ...)
 callsite_seeding: bool = true,
@@ -241,6 +247,8 @@ const settings = [_]Setting{
     .{ .section = "imports", .key = "sort", .field = "imports_sort" },
     .{ .section = "completion", .key = "auto_import", .field = "completion_auto_import" },
     .{ .section = "completion", .key = "max_auto_imports", .field = "completion_max_auto_imports" },
+    .{ .section = "completion", .key = "snippets", .field = "completion_snippets" },
+    .{ .section = "completion", .key = "argument_placeholders", .field = "completion_argument_placeholders" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "cache", .key = "capacity", .field = "cache_capacity" },
@@ -551,6 +559,14 @@ test "parse: nested fields, optional wrapper" {
     defer partial.deinit(testing.allocator);
     try testing.expect(partial.semantic_tokens_mode == .partial and partial.semantic_tokens_global_var);
     try testing.expectEqual(0, partial.warnings.len);
+
+    try testing.expect(empty.completion_snippets and empty.completion_argument_placeholders);
+    var no_snippets = try parseText(
+        \\{"completion": {"snippets": false, "argument_placeholders": false}}
+    );
+    defer no_snippets.deinit(testing.allocator);
+    try testing.expect(!no_snippets.completion_snippets and !no_snippets.completion_argument_placeholders and no_snippets.completion_auto_import);
+    try testing.expectEqual(0, no_snippets.warnings.len);
 
     try testing.expect(empty.cache_capacity == 64 and empty.cache_queries.Infer.count == null and empty.cache_queries.Infer.mb == null);
     var cache = try parseText(

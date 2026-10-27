@@ -190,6 +190,8 @@ code_action_disabled: bool = false,
 /// The client supports edits with change annotations in `documentChanges`: renaming a public name
 /// requires confirmation from the user
 change_annotations: bool = false,
+/// The client supports snippets in completion items (`completionItem.snippetSupport`)
+snippet_support: bool = false,
 /// The client supports the workspace semantic tokens refresh; at most one refresh response is
 /// awaited at a time.
 semantic_refresh: bool = false,
@@ -4055,6 +4057,9 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             if (std.mem.eql(u8, p, "edit")) server.code_action_resolve = ca.dataSupport orelse false;
         };
     };
+    if (params.capabilities.textDocument) |td| if (td.completion) |c| if (c.completionItem) |ci| {
+        server.snippet_support = ci.snippetSupport orelse false;
+    };
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -4214,16 +4219,19 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports, const import_options = blk: {
+    const max_auto_imports, const import_options, const snippets, const placeholders = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
-        break :blk .{ server.config.completion_max_auto_imports, server.config.importOptions() };
+        const c = &server.config;
+        break :blk .{ c.completion_max_auto_imports, c.importOptions(), c.completion_snippets, c.completion_argument_placeholders };
     };
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
         .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
         .imports = import_options,
+        .snippets = server.snippet_support and snippets,
+        .argument_placeholders = placeholders,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
@@ -4260,7 +4268,8 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
         if (it.replace) |range| {
-            o.textEdit = .{ .TextEdit = .{ .range = try ranges.get(arena, range.start, range.end), .newText = it.label } };
+            o.textEdit = .{ .TextEdit = .{ .range = try ranges.get(arena, range.start, range.end), .newText = it.snippet orelse it.label } };
+            if (it.snippet != null) o.insertTextFormat = .Snippet;
         }
         if (it.import_edit) |edit| {
             const edits = try arena.alloc(types.TextEdit, 1);

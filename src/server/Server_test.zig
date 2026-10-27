@@ -709,6 +709,63 @@ test "function completions carry no signature in the list and resolve to the sig
     try h.notify("exit", {});
 }
 
+/// Initializes with `capabilities` and `options`, then completes at `_ = ad|;`: `add` inserts the
+/// snippet `snippet`; when null, no completion item is a snippet
+fn expectAddCompletion(capabilities: anytype, options: anytype, snippet: ?[]const u8) !void {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = capabilities, .initializationOptions = options });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:snippets.zig";
+    const text =
+        \\fn add(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+        \\pub fn main() void {
+        \\    _ = ad;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const resp = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 4, .character = 10 } });
+    const result = resp.object.get("result").?;
+    const items = if (result == .array) result.array.items else result.object.get("items").?.array.items;
+    const item = for (items) |it| {
+        if (std.mem.eql(u8, it.object.get("label").?.string, "add")) break it;
+    } else return error.MissingCompletion;
+    if (snippet) |expected| {
+        try testing.expectEqual(2, item.object.get("insertTextFormat").?.integer);
+        const edit = item.object.get("textEdit").?.object;
+        try testing.expectEqualStrings(expected, edit.get("newText").?.string);
+        const range = edit.get("range").?.object;
+        try testing.expectEqual(8, range.get("start").?.object.get("character").?.integer);
+        try testing.expectEqual(10, range.get("end").?.object.get("character").?.integer);
+    } else for (items) |it| {
+        try testing.expect(it.object.get("insertTextFormat") == null);
+        try testing.expect(it.object.get("kind").?.integer != 15);
+        if (it.object.get("textEdit")) |edit| {
+            try testing.expectEqualStrings(it.object.get("label").?.string, edit.object.get("newText").?.string);
+        }
+    }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "function completions insert calls with placeholders only for clients that support snippets" {
+    const Empty = struct {};
+    const snippet_client = .{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true } } } };
+    try expectAddCompletion(snippet_client, Empty{}, "add(${1:a}, ${2:b})");
+    try expectAddCompletion(Empty{}, Empty{}, null);
+    try expectAddCompletion(.{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = false } } } }, Empty{}, null);
+    try expectAddCompletion(snippet_client, .{ .completion = .{ .snippets = false } }, null);
+    try expectAddCompletion(snippet_client, .{ .completion = .{ .argument_placeholders = false } }, "add($1)");
+}
+
 test "inlay hint settings apply to requests and refresh the client when they change" {
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;
