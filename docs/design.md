@@ -423,6 +423,7 @@ The benchmark starts the server as a child process and talks to it the way an ed
 | `BENCH_SAVE=1` | Save → compiler diagnostics, compared one by one with `zig build` | Identical |
 | `BENCH_SESSION=<rounds>` | Memory over a long session (`imp MB` is the value for the auto-import index) | Stable, within budget |
 | `BENCH_TYPE_COMPLETE=<n>` | Completion while typing: insert a character in a name expression → complete → undo, also reporting the number of auto-import candidates and the changes in index queries (auto-import is on by default; disable it with `BENCH_CONFIG='{"completion":{"auto_import":false}}'` to compare the cost) | Timing includes the edit and the completion |
+| `BENCH_TYPE_WORDS=<line>:<word>,<word>...` | Types each word character by character in a new statement after line `<line>`, requesting completion after each character; waits for background work to finish before each keystroke, so the timing covers only that edit and completion; also reports the number of candidates and how many of them are member paths of local values | Timing includes the edit and the completion |
 | `BENCH_QUICK=1` | Skips the edit-related phases; used for batch validation | — |
 
 In addition, `textDocument/formatting` is cross-checked against `zig fmt` (identical character for character).
