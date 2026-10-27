@@ -1,4 +1,4 @@
-//! 注册全部 query 的数据库类型。
+//! Database type that registers all queries.
 
 const std = @import("std");
 
@@ -23,13 +23,15 @@ pub const ide = struct {
 const Vfs = @import("base/Vfs.zig");
 const InternPool = @import("sema/InternPool.zig");
 
-/// query 可访问的只读环境（`ctx.db.env`）
+/// Read-only environment accessible to queries (`ctx.db.env`)
 pub const Env = struct {
     vfs: *Vfs,
     ip: *InternPool,
-    /// 配置 `sema.callsite_seeding`：泛型函数体内是否以调用点的实例推导（只在 IDE 层读取，不影响 query 结果）
+    /// Config option `sema.callsite_seeding`: whether generic function bodies are inferred with the
+    /// instances from call sites (read only in the IDE layer; does not affect query results)
     callsite_seeding: *const std.atomic.Value(bool) = &always_on,
-    /// 在读事务之外预先算好的 live 诊断（见 `live.Prepared`）；null 时总在 query 中计算
+    /// Live diagnostics precomputed outside the read transaction (see `live.Prepared`); when null,
+    /// they are always computed in the query
     live_prepared: ?*live.Prepared = null,
 };
 
