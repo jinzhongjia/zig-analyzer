@@ -374,6 +374,266 @@ test "name completion ranks scope names before namespace members, each by how we
     try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+/// Labels of the candidates besides the names in scope (member paths of local values) given by name
+/// completion without auto-import, sorted and joined by spaces
+fn localMemberPaths(source: []const u8) ![]u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
+        if (it.weight == 0) try labels.append(w.arena.allocator(), it.label);
+    }
+    std.mem.sort([]const u8, labels.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
+test "name completion offers fields and callable methods of local values two levels deep" {
+    const types =
+        \\const Inner = struct {
+        \\    depth: u32,
+        \\    pub fn get(self: *const Inner) u32 { return self.depth; }
+        \\    pub fn bump(self: *Inner) void { self.depth += 1; }
+        \\};
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    ptr: *Inner,
+        \\    opt: ?Inner,
+        \\    res: anyerror!Inner,
+        \\    pub fn copy(self: Outer) Inner { return self.inner; }
+        \\    pub fn view(self: *Outer) *Inner { return self.ptr; }
+        \\    pub fn maybe(self: Outer) ?Inner { return self.opt; }
+        \\    pub fn fallible(self: Outer) anyerror!Inner { return self.res; }
+        \\    pub fn pick(self: Outer, n: u32) Inner { _ = n; return self.inner; }
+        \\    pub fn make() Outer { return undefined; }
+        \\};
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Fields and the results of methods that take only self and return a container or a
+        // single-item pointer expand to a second level; `?T` and `E!T` values and methods with
+        // parameters do not
+        .{ "fn run(o: Outer) void { _ = o; _ = depth<|>; }", "o.copy().depth o.inner.depth o.ptr.depth" },
+        // Methods receiving `*T` are offered only when the path can be modified (a local var, or
+        // through a mutable pointer); a value returned by a method is a temporary that cannot be
+        // modified
+        .{ "fn run(o: Outer) void { _ = o; _ = bump<|>; }", "o.ptr.bump" },
+        .{ "fn run() void { var o: Outer = undefined; _ = &o; _ = bump<|>; }", "o.inner.bump o.ptr.bump o.view().bump" },
+        .{ "fn run(o: *Outer) void { _ = o; _ = bump<|>; }", "o.inner.bump o.ptr.bump o.view().bump" },
+        .{ "fn run(o: *const Outer) void { _ = o; _ = bump<|>; }", "o.ptr.bump" },
+        .{ "fn run(o: Outer) void { _ = o; _ = get<|>; }", "o.copy().get o.inner.get o.ptr.get" },
+        // Methods with parameters are offered at the first level; a function whose first parameter
+        // is not the enclosing container is not a method
+        .{ "fn run(o: Outer) void { _ = o; _ = pick<|>; }", "o.pick" },
+        .{ "fn run(o: Outer) void { _ = o; _ = make<|>; }", "" },
+        // Pointers to pointers are not expanded
+        .{ "fn run(o: **Outer) void { _ = o; _ = depth<|>; }", "" },
+        // Local values that are types or whose types cannot be computed are not expanded
+        .{ "fn run() void { const T = Outer; const u = missing(); _ = .{ T, u }; _ = make<|>; }", "" },
+        // Slices, arrays, and tuples
+        .{ "fn run(s: []const u8, a: [4]u8, t: struct { u8, bool }) void { _ = .{ s, a, t }; _ = len<|>; }", "a.len s.len t.len" },
+        .{ "fn run(s: []const u8) void { _ = s; _ = ptr<|>; }", "s.ptr" },
+        // Inside a generic function body, types are inferred from the call-site instance
+        .{ "fn generic(comptime T: type, v: T) void { _ = v; _ = depth<|>; }\nfn caller() void { generic(Inner, .{ .depth = 1 }); }", "v.depth" },
+        // Functions in a container cannot access the runtime values of the enclosing function
+        .{ "fn outer(o: Outer) void { _ = o; const S = struct { fn f() void { _ = depth<|>; } }; _ = S; }", "" },
+        // Shadowed local values are not expanded
+        .{ "fn run(o: Outer) void { _ = o; { const o: u32 = 1; _ = o; _ = depth<|>; } }", "" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ types, c[0] });
+        defer testing.allocator.free(source);
+        const got = try localMemberPaths(source);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "name completion offers only pub methods of local values whose type is in another file" {
+    const got = try localMemberPaths(
+        \\//- /p/main.zig module:app
+        \\const other = @import("other.zig");
+        \\fn run(o: other.Thing) void {
+        \\    _ = o;
+        \\    _ = val<|>;
+        \\}
+        \\//- /p/other.zig in:app
+        \\pub const Thing = struct {
+        \\    value: u32,
+        \\    pub fn valid(self: Thing) bool { return self.validate(); }
+        \\    fn validate(self: Thing) bool { return self.value != 0; }
+        \\};
+    );
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("o.valid o.value", got);
+}
+
+test "local member paths carry kinds, types, filters and the replaced range" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Point = struct {
+        \\    x: i32,
+        \\    inner: struct { @"type": u8 },
+        \\    /// Scales the point.
+        \\    pub fn scale(self: Point, k: i32) Point { return .{ .x = self.x * k, .inner = self.inner }; }
+        \\};
+        \\fn run(point: Point) void {
+        \\    _ = point;
+        \\    _ = pt<|>;
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    const find = struct {
+        fn find(all: []const completion.Item, label: []const u8) !completion.Item {
+            for (all) |it| if (std.mem.eql(u8, it.label, label)) return it;
+            std.debug.print("missing `{s}`\n", .{label});
+            return error.MissingCompletion;
+        }
+    }.find;
+    const x = try find(items, "point.x");
+    try testing.expectEqual(.field, x.kind);
+    try testing.expectEqualStrings("i32", x.detail.?);
+    // When the name does not start with the input, the whole path is the filter
+    try testing.expectEqualStrings("point.x", x.filter.?);
+    try testing.expectEqual(@as(u32, at.offset - 2), x.replace.?.start);
+    // A name that is a primitive type needs no escaping inside a path
+    const t = try find(items, "point.inner.type");
+    try testing.expectEqualStrings("u8", t.detail.?);
+    const scale = try find(items, "point.scale");
+    try testing.expectEqual(.method, scale.kind);
+    try testing.expectEqualStrings("Scales the point.", scale.doc.?);
+    const desc = try completion.describe(&r, at.file, scale.target.?);
+    try testing.expectEqualStrings("pub fn scale(self: Point, k: i32) Point", desc.detail);
+}
+
+test "local member paths filter by the member name when it starts with the input" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Point = struct { scale: u32 };
+        \\fn run(point: Point) void {
+        \\    _ = point;
+        \\    _ = Sca<|>;
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
+        if (std.mem.eql(u8, it.label, "point.scale")) break try testing.expectEqualStrings("scale", it.filter.?);
+    } else return error.MissingCompletion;
+}
+
+test "local member paths rank below scope names and above namespace members, deeper paths lower" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\const Box = struct { mem: u32, inner: struct { mem: u32 } };
+        \\fn run(box: Box) void {
+        \\    const memory = 2;
+        \\    _ = .{ memory, box };
+        \\    _ = mem<|>;
+        \\}
+        \\//- /zig/std/std.zig std
+        \\pub const mem = struct { pub fn eql() void {} };
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{})).items;
+    const rankOf = struct {
+        fn rankOf(all: []const completion.Item, label: []const u8) ![]const u8 {
+            for (all) |it| if (std.mem.eql(u8, it.label, label)) return it.sort.?;
+            std.debug.print("missing `{s}`\n", .{label});
+            return error.MissingCompletion;
+        }
+    }.rankOf;
+    // Among equal matches, local names rank above member paths of local values, which rank above
+    // candidates accessed through a namespace; deeper paths rank lower
+    const order = [_][2][]const u8{ .{ "memory", "box.mem" }, .{ "box.mem", "std.mem" }, .{ "box.mem", "box.inner.mem" } };
+    for (order) |pair| {
+        testing.expect(std.mem.lessThan(u8, try rankOf(items, pair[0]), try rankOf(items, pair[1]))) catch |err| {
+            std.debug.print("`{s}` should rank before `{s}`\n", .{ pair[0], pair[1] });
+            return err;
+        };
+    }
+}
+
+test "local member paths and auto-import candidates share the candidate limit" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig",
+        \\const Stamp = struct { stamp: u32, start: u32 };
+        \\fn run(stamp_box: Stamp) void {
+        \\    _ = stamp_box;
+        \\    _ = st<|>;
+        \\}
+    );
+    const std_file = (try w.add("/lib/std/std.zig", "pub const standard = u32;\npub const static_value = 1;\n")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const scored = struct {
+        /// Labels of the candidates besides the names in scope, from the highest score down
+        fn scored(rr: *resolve.Resolver, file: FileId, offset: u32, limit: usize, incomplete: *bool) ![]const []const u8 {
+            const result = try completion.complete(rr, file, offset, .{ .max_auto_imports = limit });
+            incomplete.* = result.is_incomplete;
+            const items = try rr.arena.dupe(completion.Item, result.items);
+            std.mem.sort(completion.Item, items, {}, struct {
+                fn less(_: void, a: completion.Item, b: completion.Item) bool {
+                    return std.mem.lessThan(u8, a.sort.?, b.sort.?);
+                }
+            }.less);
+            var labels: std.ArrayList([]const u8) = .empty;
+            for (items) |it| if (it.weight == 0) try labels.append(rr.arena, it.label);
+            return labels.items;
+        }
+    }.scored;
+    var incomplete = false;
+    const all = try scored(&r, added.file, added.cursor, std.math.maxInt(usize), &incomplete);
+    try testing.expect(!incomplete);
+    var members: usize = 0;
+    for (all) |label| {
+        if (std.mem.startsWith(u8, label, "stamp_box.")) members += 1;
+    }
+    try testing.expect(members > 0 and members < all.len);
+    // Over the limit, the highest-scoring candidates are kept, without a separate limit per source
+    for (1..all.len + 1) |limit| {
+        const kept = try scored(&r, added.file, added.cursor, limit, &incomplete);
+        try testing.expectEqual(limit < all.len, incomplete);
+        try testing.expectEqual(limit, kept.len);
+        for (kept, all[0..limit]) |a, b| try testing.expectEqualStrings(b, a);
+    }
+}
+
 test "completion item kinds follow what each symbol is" {
     var w: World = undefined;
     try w.init();

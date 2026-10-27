@@ -36,7 +36,8 @@ pub const Options = struct {
     /// Even when auto-import is not offered, determine whether the cursor is at a name that can be
     /// auto-imported (`Result.import_position`)
     detect_import_position: bool = false,
-    /// Maximum number of auto-import candidates offered (the best-ranked ones are kept);
+    /// Maximum number of candidates besides the names in scope (member paths of local values and
+    /// auto-import candidates) offered in total (the highest-scoring ones are kept);
     /// `maxInt(usize)` for no limit
     max_auto_imports: usize = 128,
     /// A new import added by auto-import is placed where it belongs in an organized import block
@@ -81,7 +82,8 @@ pub const Item = struct {
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
-    const base = try completeVisible(r, file, offset, &owner);
+    var names: NameContext = .{};
+    const base = try completeVisible(r, file, offset, &owner, &names);
     // Auto-import only in Zig source files: inserting an import declaration into a `.zon` or
     // similar file would break it
     if (!imports.isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = base };
@@ -92,10 +94,15 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
     var result: Result = .{ .items = &.{}, .import_position = options.auto_import or options.detect_import_position };
+    const limit = options.max_auto_imports;
+    const paths = try localMembers(r, file, names.roots.items, name, limit);
+    var extra: std.ArrayList(Item) = .empty;
+    try extra.appendSlice(r.arena, paths.items);
+    result.is_incomplete = paths.incomplete;
     if (options.auto_import) {
-        const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports, options.imports);
-        result.is_incomplete = extra.is_incomplete;
-        for (extra.items) |candidate| {
+        const found = try imports.complete(r, file, offset, owner, name.prefix, limit, options.imports);
+        result.is_incomplete = result.is_incomplete or found.is_incomplete;
+        for (found.items) |candidate| {
             // The core (`imports.complete`) has already rendered the path segment by segment;
             // the whole qualified expression must not be escaped as an identifier again.
             const filter = try completionFilter(r.arena, name, candidate.filter);
@@ -113,7 +120,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
                 break;
             };
             if (duplicate) continue;
-            try items.append(r.arena, .{
+            try extra.append(r.arena, .{
                 .label = candidate.label,
                 .kind = switch (candidate.kind) {
                     .function => .function,
@@ -136,27 +143,33 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
             });
         }
     }
+    if (extra.items.len > limit) {
+        std.mem.sort(Item, extra.items, {}, higherScore);
+        extra.shrinkRetainingCapacity(limit);
+        result.is_incomplete = true;
+    }
+    try items.appendSlice(r.arena, extra.items);
     try rank(r.arena, items.items, name.prefix);
     result.items = items.items;
     return result;
 }
 
 /// Order of name completion (`Item.sort`): the score of a name in scope is its match score (see
-/// `fuzzy`) multiplied by its source weight (`Item.weight`), and an auto-import candidate takes
-/// its own score (see `imports.Candidate.score`); from high to low, keeping the collection order
-/// among equal scores. Names in scope that do not match the input score 0, sort last, and are
-/// filtered by the client.
+/// `fuzzy`) multiplied by its source weight (`Item.weight`), and member paths of local values and
+/// auto-import candidates take their own scores (see `localMembers` and `imports.Candidate.score`);
+/// from high to low, keeping the collection order among equal scores. Names in scope that do not
+/// match the input score 0, sort last, and are filtered by the client.
 fn rank(arena: Allocator, items: []Item, prefix: []const u8) Allocator.Error!void {
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
     for (items) |*it| if (it.weight != 0) {
         it.score = ((try matcher.score(it.label)) orelse 0) * it.weight;
     };
-    std.mem.sort(Item, items, {}, struct {
-        fn higher(_: void, a: Item, b: Item) bool {
-            return a.score > b.score;
-        }
-    }.higher);
+    std.mem.sort(Item, items, {}, higherScore);
     for (items, 0..) |*it, i| it.sort = try std.fmt.allocPrint(arena, "{d:0>5}", .{i});
+}
+
+fn higherScore(_: void, a: Item, b: Item) bool {
+    return a.score > b.score;
 }
 
 pub const Description = struct {
@@ -216,8 +229,9 @@ fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
     return if (out.items.len == 0) null else out.items;
 }
 
-/// `cursor_owner` records the member found at the cursor, which auto-import reuses
-fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error![]const Item {
+/// `cursor_owner` records the member found at the cursor, which auto-import reuses; in name
+/// completion, `names` records the roots of the member paths of local values
+fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner, names: *NameContext) resolve.Error![]const Item {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return &.{};
@@ -296,7 +310,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     // The kinds of local names come from the inference result of the member at the cursor
     // (inside a generic function body, from a call-site instance)
     const types: BindingTypes = if (try context.atSeeded(r, file, offset, true)) |a| .{ .at = a } else .none;
-    try locals(&out, r.ctx.db.env.ip, b, scope, null, types);
+    try locals(&out, r.ctx.db.env.ip, b, scope, null, types, &names.roots);
 
     const tree = try r.itemTree(file);
     var container = tree.items[item].container;
@@ -312,7 +326,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
         const parent_res = try r.ctx.get(database.sema.Infer, .{ .owner = try r.ownerKey(file, parent), .mode = .full });
-        try locals(&out, r.ctx.db.env.ip, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res });
+        try locals(&out, r.ctx.db.env.ip, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res }, &names.roots);
         container = tree.items[parent].container;
     }
     return out.items.items;
@@ -470,19 +484,36 @@ const BindingTypes = union(enum) {
 };
 
 /// When `weight` is null, the weight follows the kind of the binding; otherwise every name gets
-/// `weight` (names in an enclosing function)
-fn locals(out: *Collector, ip: *InternPool, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes) Allocator.Error!void {
+/// `weight` (names in an enclosing function). Local values that are not shadowed are recorded in
+/// `roots` (see `rootOf`)
+fn locals(out: *Collector, ip: *InternPool, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes, roots: *std.ArrayList(Root)) Allocator.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
         for (b.scope(id).bindings) |bid| {
             const binding = b.binding(bid);
+            const tv = types.of(bid);
+            if (!out.seen.contains(binding.name)) if (rootOf(binding, tv, weight != null)) |root| try roots.append(out.arena, root);
             try out.add(.{
                 .label = binding.name,
-                .kind = kindOf(symbol_kind.ofBinding(ip, binding, types.of(bid))),
+                .kind = kindOf(symbol_kind.ofBinding(ip, binding, tv)),
                 .weight = weight orelse if (binding.kind == .param) param_weight else local_weight,
             });
         }
     }
+}
+
+/// A local value as the root of member paths: not when its value is a type or its type cannot be
+/// computed; in an enclosing function (`outer`), only comptime-known values are, since functions in
+/// a container cannot access the runtime values of the enclosing function
+fn rootOf(binding: Body.Binding, tv: TypedValue, outer: bool) ?Root {
+    // A bare `_` introduces no name
+    if (binding.range.end - binding.range.start == 1 and std.mem.eql(u8, binding.name, "_")) return null;
+    if (tv.ty == .unknown or tv.isType()) return null;
+    if (outer) {
+        const known = if (tv.val) |v| v != .unknown and v != .runtime else false;
+        if (binding.kind == .local_var or !(known or (binding.kind == .param and binding.is_comptime))) return null;
+    }
+    return .{ .name = binding.name, .ty = tv.ty, .mutable = binding.kind == .local_var };
 }
 
 fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, container: u32, private: bool, weight: f32) resolve.Error!void {
@@ -661,6 +692,280 @@ fn fnTarget(r: *Resolver, tv: TypedValue) resolve.Error!?imports.Target {
     };
     const def = try context.defOfKey(r, .{ .file = f.file, .item = f.decl }) orelse return null;
     return .{ .decl = .{ .file = def.item.file, .item = def.item.item } };
+}
+
+/// Weight of the member paths of local values, also multiplied by the depth factor of the path (see
+/// `imports.segmentFactor`): below the names in scope (at least `min_container_weight`) and above
+/// the candidates accessed through a namespace (`imports.visible_weight` times the depth factor)
+const local_member_weight = 0.9;
+
+/// Root of the member paths of local values (see `localMembers`): a local value that is visible at
+/// the cursor and not shadowed
+const Root = struct {
+    name: []const u8,
+    ty: Index,
+    /// A local var: values accessed through it can be modified
+    mutable: bool,
+};
+
+/// What `completeVisible` computes in name completion and `complete` reuses
+const NameContext = struct {
+    /// From the innermost outward
+    roots: std.ArrayList(Root) = .empty,
+};
+
+/// The value a member path refers to: its type, and whether it can be modified (methods that
+/// receive `*T` require that it can)
+const Place = struct {
+    ty: Index,
+    mutable: bool,
+
+    /// A single-item pointer is dereferenced once automatically; whether the value it points to can
+    /// be modified depends on the pointer
+    fn deref(p: Place, ip: *InternPool) Place {
+        return switch (ip.key(p.ty)) {
+            .ptr_type => |ptr| if (ptr.size == .one) .{ .ty = ptr.child, .mutable = !ptr.is_const } else p,
+            else => p,
+        };
+    }
+};
+
+/// A member of a value; the types of container fields and the signatures of methods are computed
+/// only when used
+const Member = struct {
+    name: []const u8,
+    doc: ?[]const u8 = null,
+    what: union(enum) {
+        /// A field whose type is known: `len` / `ptr` of slices and arrays, and the fields of
+        /// tuples, anonymous structs, and reified types
+        typed: Index,
+        /// A field of a container
+        field: Decl,
+        /// A function in a container, or a const whose value may be a function (`Decl.alias`)
+        method: Decl,
+    },
+
+    /// A member of a container; `inst` is the instance of the container
+    const Decl = struct { file: FileId, item: u32, ast_id: ItemTree.AstId, inst: ?Index, alias: bool = false };
+};
+
+/// A matched member path: `root.leaf`, or `root.mid.leaf` / `root.mid().leaf` through a middle
+/// segment
+const MemberPath = struct {
+    score: f32,
+    /// The name starts with the input in the same case: preferred among equal scores
+    case_exact: bool,
+    root: []const u8,
+    mid: ?Step,
+    /// The value holding the leaf (dereferenced)
+    holder: Place,
+    leaf: Member,
+
+    const Step = struct { name: []const u8, call: bool };
+
+    fn higher(_: void, a: MemberPath, b: MemberPath) bool {
+        if (a.score != b.score) return a.score > b.score;
+        return a.case_exact and !b.case_exact;
+    }
+};
+
+const LocalMembers = struct { items: []const Item, incomplete: bool };
+
+/// Member paths of local values: fields and methods that can be called there (`a.b`), as well as
+/// members of fields and of the results of methods that take only self (`a.b.c`, `a.b().c`). The
+/// whole path is fuzzy-matched against the input, whether or not the leading segments match; the
+/// score is the match score multiplied by `local_member_weight` and the depth factor. Items are
+/// built from the highest score down (checking that methods can be called there) until `limit` of
+/// them are built; the rest are not built (`incomplete`)
+fn localMembers(r: *Resolver, file: FileId, roots: []const Root, name: ImportPrefix, limit: usize) resolve.Error!LocalMembers {
+    if (roots.len == 0) return .{ .items = &.{}, .incomplete = false };
+    const ip = r.ctx.db.env.ip;
+    var search: MemberSearch = .{ .r = r, .file = file, .prefix = name.prefix, .matcher = try .init(r.arena, name.prefix) };
+    for (roots) |root| {
+        const holder = (Place{ .ty = root.ty, .mutable = root.mutable }).deref(ip);
+        for (try search.membersOf(holder.ty)) |m| {
+            try search.consider(root.name, null, holder, m);
+            const next = try search.through(m, holder) orelse continue;
+            const step: MemberPath.Step = .{ .name = m.name, .call = m.what == .method };
+            for (try search.membersOf(next.ty)) |leaf| try search.consider(root.name, step, next, leaf);
+        }
+    }
+    std.mem.sort(MemberPath, search.found.items, {}, MemberPath.higher);
+    var items: std.ArrayList(Item) = .empty;
+    for (search.found.items) |p| {
+        if (items.items.len >= limit) return .{ .items = items.items, .incomplete = true };
+        if (try search.construct(p, name)) |item| try items.append(r.arena, item);
+    }
+    return .{ .items = items.items, .incomplete = false };
+}
+
+const MemberSearch = struct {
+    r: *Resolver,
+    file: FileId,
+    prefix: []const u8,
+    matcher: fuzzy.Matcher,
+    found: std.ArrayList(MemberPath) = .empty,
+    /// Members recorded by type: values of the same type appear through several paths
+    members: std.AutoHashMapUnmanaged(Index, []const Member) = .empty,
+
+    fn consider(s: *MemberSearch, root: []const u8, mid: ?MemberPath.Step, holder: Place, leaf: Member) Allocator.Error!void {
+        const match = if (mid) |m|
+            try s.matcher.scoreJoined(&.{ root, ".", m.name, ".", leaf.name })
+        else
+            try s.matcher.scoreJoined(&.{ root, ".", leaf.name });
+        const score = match orelse return;
+        try s.found.append(s.r.arena, .{
+            .score = score * local_member_weight * imports.segmentFactor(if (mid == null) 2 else 3),
+            .case_exact = std.mem.startsWith(u8, leaf.name, s.prefix),
+            .root = root,
+            .mid = mid,
+            .holder = holder,
+            .leaf = leaf,
+        });
+    }
+
+    /// Members of a value (dereferenced): fields, and the functions and consts in this file or pub
+    /// (whether a const is a function is known only when the item is built). Values that are not
+    /// containers, tuples, slices, or arrays have no members (`?T`, `E!T`, single-item pointers to
+    /// pointers, many-item pointers, and so on)
+    fn membersOf(s: *MemberSearch, t: Index) resolve.Error![]const Member {
+        if (s.members.get(t)) |known| return known;
+        const r = s.r;
+        const ip = r.ctx.db.env.ip;
+        var out: std.ArrayList(Member) = .empty;
+        switch (ip.key(t)) {
+            .ptr_type => |p| if (p.size == .slice) {
+                try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
+                const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
+                try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
+            },
+            .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
+            .tuple_type, .anon_struct_type, .reified_type => {
+                for (try eval.fieldNames(r, t)) |f| try out.append(r.arena, .{ .name = f.name, .what = .{ .typed = f.ty } });
+                if (ip.key(t) == .tuple_type) try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
+            },
+            .container_type => |c| if (try queries.namespaceOfType(r, t)) |ns| {
+                const tree = try r.itemTree(ns.file);
+                const fields = c.kind != .@"enum" and c.kind != .@"opaque";
+                for (tree.containerMembers(ns.container)) |m| {
+                    const it = tree.items[m];
+                    const name = it.name orelse continue;
+                    const decl: Member.Decl = .{ .file = ns.file, .item = m, .ast_id = it.ast_id, .inst = c.inst, .alias = it.kind == .@"const" };
+                    switch (it.kind) {
+                        .field => if (fields) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .field = decl } }),
+                        .@"fn", .@"const" => if (ns.file == s.file or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .method = decl } }),
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+        try s.members.put(r.arena, t, out.items);
+        return out.items;
+    }
+
+    /// The value (dereferenced) reached through the first-level member `m`, whose members form the
+    /// second level: the value of a field, or the result of a method that takes only self and
+    /// returns a container or a single-item pointer (when a pointer is returned, whether the value
+    /// can be modified depends on the pointer; a returned value is a temporary that cannot be
+    /// modified)
+    fn through(s: *MemberSearch, m: Member, holder: Place) resolve.Error!?Place {
+        const r = s.r;
+        const ip = r.ctx.db.env.ip;
+        switch (m.what) {
+            .typed => |t| return (Place{ .ty = t, .mutable = holder.mutable }).deref(ip),
+            .field => |f| return (Place{ .ty = (try declType(r, f)).ty, .mutable = holder.mutable }).deref(ip),
+            .method => |f| {
+                if (f.alias or !try onlySelf(r, f.file, f.item)) return null;
+                const sig = switch (ip.key((try declType(r, f)).ty)) {
+                    .fn_type => |sig| sig,
+                    else => return null,
+                };
+                if (sig.params.len != 1 or sig.varargs or !receives(ip, sig.params[0], holder)) return null;
+                return switch (ip.key(sig.ret)) {
+                    .ptr_type => |p| if (p.size == .one) .{ .ty = p.child, .mutable = !p.is_const } else null,
+                    .container_type, .tuple_type, .anon_struct_type, .reified_type => .{ .ty = sig.ret, .mutable = false },
+                    else => null,
+                };
+            },
+        }
+    }
+
+    /// The completion item: a method must be callable on the value holding the leaf; a field
+    /// carries its type
+    fn construct(s: *MemberSearch, p: MemberPath, name: ImportPrefix) resolve.Error!?Item {
+        const r = s.r;
+        const ip = r.ctx.db.env.ip;
+        var item: Item = .{ .label = "", .kind = .field, .doc = p.leaf.doc, .replace = name.range, .score = p.score };
+        switch (p.leaf.what) {
+            .typed => |t| item.detail = if (t != .unknown) try render.typeAlloc(r, t) else null,
+            .field => |f| {
+                const t = (try declType(r, f)).ty;
+                item.detail = if (t != .unknown) try render.typeAlloc(r, t) else null;
+            },
+            .method => |f| {
+                const tv = try declType(r, f);
+                const sig = switch (ip.key(tv.ty)) {
+                    .fn_type => |sig| sig,
+                    else => return null,
+                };
+                if (sig.params.len == 0 or !receives(ip, sig.params[0], p.holder)) return null;
+                item.kind = .method;
+                item.target = if (f.alias) try fnTarget(r, tv) else .{ .decl = .{ .file = f.file, .item = f.item } };
+            },
+        }
+        var label: std.Io.Writer.Allocating = .init(r.arena);
+        const w = &label.writer;
+        w.print("{f}", .{std.zig.fmtId(p.root)}) catch return error.OutOfMemory;
+        if (p.mid) |m| w.print(".{f}{s}", .{ std.zig.fmtIdP(m.name), if (m.call) "()" else "" }) catch return error.OutOfMemory;
+        w.print(".{f}", .{std.zig.fmtIdP(p.leaf.name)}) catch return error.OutOfMemory;
+        item.label = label.written();
+        // The same as for auto-import candidates (see `imports.Builder.filterOf`)
+        const filter = if (std.ascii.startsWithIgnoreCase(p.leaf.name, name.prefix)) p.leaf.name else item.label;
+        item.filter = try completionFilter(r.arena, name, filter);
+        return item;
+    }
+};
+
+fn declType(r: *Resolver, d: Member.Decl) resolve.Error!TypedValue {
+    return r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = d.ast_id }, .inst = d.inst });
+}
+
+/// Whether the first parameter of a method can receive the value at `holder`: the parameter is the
+/// enclosing container, a `*const` pointer to it, or a `*T` pointer to it when the value can be
+/// modified
+fn receives(ip: *InternPool, param: Index, holder: Place) bool {
+    if (sameContainer(ip, param, holder.ty)) return true;
+    return switch (ip.key(param)) {
+        .ptr_type => |p| p.size == .one and sameContainer(ip, p.child, holder.ty) and (p.is_const or holder.mutable),
+        else => false,
+    };
+}
+
+/// The same container definition: method signatures are inferred in the instance of their
+/// container
+fn sameContainer(ip: *InternPool, a: Index, b: Index) bool {
+    const x = switch (ip.key(a)) {
+        .container_type => |c| c,
+        else => return false,
+    };
+    const y = switch (ip.key(b)) {
+        .container_type => |c| c,
+        else => return false,
+    };
+    return x.file == y.file and x.ast_id == y.ast_id;
+}
+
+/// The function declaration has exactly one parameter: a method that takes only self (judged by
+/// syntax, so that the signatures of the other methods need not be computed)
+fn onlySelf(r: *Resolver, file: FileId, item: u32) resolve.Error!bool {
+    if ((try r.itemTree(file)).items[item].kind != .@"fn") return false;
+    const node = try r.itemNode(file, item) orelse return false;
+    const proto = (ast.cast(ast.FnDecl, node) orelse return false).proto() orelse return false;
+    var params = proto.params();
+    var n: usize = 0;
+    while (params.next()) |_| n += 1;
+    return n == 1;
 }
 
 fn isIdentChar(c: u8) bool {
