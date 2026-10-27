@@ -17,7 +17,7 @@ const main_text =
     \\
 ;
 
-/// 构造一个带位置的错误包
+/// Builds an error with a location in the error bundle
 fn addError(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: []const u8, msg: []const u8) !void {
     const start: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
     try wip.addRootErrorMessage(.{
@@ -47,7 +47,7 @@ fn buildResult() !*compiler.BuildResult {
     defer wip.deinit();
     try addError(&wip, "src/main.zig", main_text, "unused", "unused local variable");
     try addError(&wip, "src/main.zig", main_text, "\"s\"", "expected type 'u32', found '*const [1:0]u8'");
-    // 重复报告（另一个 compile step）与没有位置的错误
+    // A duplicate report (from another compile step) and an error without a location
     try addError(&wip, "src/main.zig", main_text, "unused", "unused local variable");
     try wip.addRootErrorMessage(.{ .msg = try wip.addString("undefined symbol: foo") });
     var eb = try wip.toOwnedBundle("");
@@ -61,8 +61,8 @@ test "collect: path resolution, dedup, errors without location, AstGen flag" {
     defer r.release(testing.allocator);
     const main = r.files.get(native("/proj/src/main.zig")).?;
     try testing.expectEqual(2, main.items.len);
-    try testing.expect(main.items[0].is_astgen); // unused local variable 也是 ast-check 错误
-    try testing.expect(!main.items[1].is_astgen); // 类型错误来自 Sema
+    try testing.expect(main.items[0].is_astgen); // unused local variable is also an ast-check error
+    try testing.expect(!main.items[1].is_astgen); // the type error comes from Sema
     const build_zig = r.files.get(native("/proj/build.zig")).?;
     try testing.expectEqualStrings("undefined symbol: foo", build_zig.items[0].message);
 }
@@ -70,7 +70,7 @@ test "collect: path resolution, dedup, errors without location, AstGen flag" {
 test "a build result stays valid while a reader holds a reference after the owner released it" {
     const r = try buildResult();
     const reader = r.retain();
-    // 持有者的结果被新的结果替换
+    // The owner's result is replaced by a new one
     r.release(testing.allocator);
     const main = reader.files.get(native("/proj/src/main.zig")).?;
     try testing.expectEqual(2, main.items.len);
@@ -120,14 +120,15 @@ test "merge: live diagnostics plus remapped Sema errors with unsaved edits" {
     defer r.release(testing.allocator);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
 
-    // 在文件开头插入一行：Sema 错误整体下移一行；AstGen 错误改由 live 提供
+    // Insert a line at the start of the file: the Sema error moves down one line; the AstGen error
+    // now comes from live
     const edited = try std.mem.concat(arena.allocator(), u8, &.{ "// 新注释\n", main_text });
     const msgs = try mergeMessages(arena.allocator(), edited, true, result);
     try testing.expectEqual(2, msgs.len);
     try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs[0]);
     try testing.expectEqualStrings("zig@3:19: expected type 'u32', found '*const [1:0]u8'", msgs[1]);
 
-    // 修改 Sema 错误所在的行：该错误隐藏，等保存后的构建结果
+    // Modify the line of the Sema error: the error is hidden until the build result after a save
     const touched = try std.mem.replaceOwned(u8, arena.allocator(), main_text, "\"s\"", "\"t\"");
     const msgs2 = try mergeMessages(arena.allocator(), touched, true, result);
     try testing.expectEqual(1, msgs2.len);
@@ -152,7 +153,8 @@ test "merge: non-adjacent edits only hide their own lines" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // 顶部与底部各插入一行：中间两处未修改的错误都应保留
+    // Insert one line at the top and one at the bottom: both unmodified errors in between should be
+    // kept
     const edited = try std.mem.concat(a, u8, &.{ "// top\n", text, "// bottom\n" });
     const msgs = try mergeMessages(a, edited, false, &result);
     try testing.expectEqual(2, msgs.len);
@@ -199,7 +201,7 @@ test "merge: notes in another file are remapped by that file's edits" {
     });
     try testing.expectEqual(1, diags.len);
     const related = diags[0].relatedInformation.?[0];
-    // 附注文件顶部插入一行：附注整体下移一行
+    // A line is inserted at the top of the note's file: the note moves down one line
     try testing.expectEqual(2, related.location.range.start.line);
     try testing.expectEqual(4, related.location.range.start.character);
 }
@@ -209,18 +211,20 @@ test "merge: malformed compiler spans do not overflow when remapped" {
     defer arena.deinit();
     const a = arena.allocator();
     const sema_start: u32 = @intCast(std.mem.indexOf(u8, main_text, "\"s\"").?);
-    // 防止平移时溢出而 panic：接近 u32 上限的区间后移、终点在起点之前的区间前移后不在 u32 范围内，丢弃
+    // Guards against a panic from overflow during shifting: a range near the u32 limit shifted
+    // later, and a range that ends before its start shifted earlier, fall outside the u32 range
+    // and are dropped
     const result: compiler.FileResult = .{ .base_text = main_text, .items = &.{
         .{ .start = sema_start, .end = sema_start + 3, .message = "sema error", .is_astgen = false, .notes = &.{} },
         .{ .start = std.math.maxInt(u32) - 1, .end = std.math.maxInt(u32), .message = "past the end", .is_astgen = false, .notes = &.{} },
         .{ .start = 30, .end = 1, .message = "end before start", .is_astgen = false, .notes = &.{} },
     } };
-    // 在开头插入：区间后移
+    // Insert at the start: ranges shift later
     const msgs = try mergeMessages(a, try std.mem.concat(a, u8, &.{ "// x\n", main_text }), false, &result);
     try testing.expectEqual(2, msgs.len);
     try testing.expectEqualStrings("zig@3:19: sema error", msgs[0]);
     try testing.expect(std.mem.endsWith(u8, msgs[1], "end before start"));
-    // 删去开头：区间前移
+    // Delete the start: ranges shift earlier
     const msgs2 = try mergeMessages(a, main_text[4..], false, &result);
     try testing.expectEqual(2, msgs2.len);
     try testing.expectEqualStrings("zig@2:19: sema error", msgs2[0]);
@@ -249,7 +253,7 @@ const Files = struct {
     }
 };
 
-/// 源位置：`needle` 在 `text` 中的区间
+/// Source location: the range of `needle` in `text`
 fn location(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: []const u8, reference_trace_len: u32) !ErrorBundle.SourceLocationIndex {
     const start: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
     return wip.addSourceLocation(.{
@@ -263,12 +267,13 @@ fn location(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: [
     });
 }
 
-/// 带附注与引用链的错误包：第一条错误的引用链有一个有位置的引用、一个隐藏计数，第二条只剩隐藏标记，
-/// 还有 compile log 的输出
+/// An error bundle with notes and reference traces: the reference trace of the first error has
+/// one reference with a location and a hidden count, the second has only the hidden marker left;
+/// there is also compile log output
 fn traceBundle() !ErrorBundle {
     var wip: ErrorBundle.Wip = try .init(testing.allocator);
     defer wip.deinit();
-    // 引用链紧跟在错误的源位置之后
+    // The reference trace immediately follows the error's source location
     const ref_loc = try location(&wip, "src/caller.zig", caller_text, "m.main()", 0);
     const note_loc = try location(&wip, "src/main.zig", main_text, "x", 0);
     const err_loc = try location(&wip, "src/main.zig", main_text, "\"s\"", 2);
@@ -293,7 +298,7 @@ test "collect: reference trace and compile log output are kept" {
     const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
     defer r.release(gpa);
 
-    // 附注指向的文件没有错误也保留构建时文本
+    // The build-time text is kept for a file that notes point to even if it has no errors
     try testing.expectEqualStrings(caller_text, r.texts.get(native("/proj/src/caller.zig")).?);
     try testing.expectEqualStrings(main_text, r.texts.get(native("/proj/src/main.zig")).?);
 
@@ -306,7 +311,8 @@ test "collect: reference trace and compile log output are kept" {
     try testing.expectEqualStrings(native("/proj/src/caller.zig"), notes[1].path);
     try testing.expectEqual(std.mem.indexOf(u8, caller_text, "m.main()").?, notes[1].start);
     try testing.expectEqualStrings("referenced by: f", notes[1].message);
-    // 隐藏计数没有位置：放在错误的起点，文案与 zig build 的输出相同
+    // The hidden count has no location: it is placed at the start of the error, with the same
+    // message as the output of zig build
     try testing.expectEqualStrings(native("/proj/src/main.zig"), notes[2].path);
     try testing.expectEqual(err_start, notes[2].start);
     try testing.expectEqual(err_start, notes[2].end);
@@ -316,7 +322,7 @@ test "collect: reference trace and compile log output are kept" {
     try testing.expectEqualStrings("found compile log statement", items[2].message);
     try testing.expectEqualStrings("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")", items[2].compile_log);
 
-    // 发布时附注与引用链都成为 relatedInformation
+    // When published, both the notes and the reference trace become relatedInformation
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var ctx: u8 = 0;
@@ -338,7 +344,7 @@ test "collect: reference trace and compile log output are kept" {
     try testing.expectEqualStrings("referenced by: f", related[1].message);
     try testing.expectEqual(2, related[2].location.range.start.line);
     try testing.expectEqual(19, related[2].location.range.start.character);
-    // compile log 的输出接在文案之后
+    // The compile log output is appended to the message
     try testing.expectEqualStrings(
         \\found compile log statement
         \\
@@ -348,7 +354,8 @@ test "collect: reference trace and compile log output are kept" {
     , diags[2].message.string);
 }
 
-/// `eb` 通过校验时转换并发布（按构建时的文本与有修改的文本各发布一次），返回是否通过校验
+/// Converts and publishes `eb` if it passes validation (once for the build-time text and once for
+/// a modified text); returns whether it passed validation
 fn collectIfValid(eb: ErrorBundle) !bool {
     if (!error_bundle.isValid(eb)) return false;
     const gpa = testing.allocator;
@@ -359,7 +366,7 @@ fn collectIfValid(eb: ErrorBundle) !bool {
     defer arena.deinit();
     const a = arena.allocator();
     for (r.files.keys(), r.files.values()) |path, *fr| {
-        // 结果中的路径会驻留到 Vfs，必须是绝对路径
+        // Paths in the result are interned into the Vfs and must be absolute paths
         try testing.expect(std.fs.path.isAbsolute(path));
         for (fr.items) |item| for (item.notes) |n| try testing.expect(std.fs.path.isAbsolute(n.path));
         for ([_][]const u8{ fr.base_text, try std.mem.concat(a, u8, &.{ "// x\n", fr.base_text }) }) |text| {
@@ -379,7 +386,8 @@ fn collectIfValid(eb: ErrorBundle) !bool {
 }
 
 test "collect: every mutation of an error bundle that passes validation can be converted" {
-    // 防止越界读取：对通过校验的错误包运行真正的 collect 与 merge，它们读取了校验没有覆盖的内容时在这里 panic
+    // Guards against out-of-bounds reads: runs the real collect and merge on error bundles that
+    // pass validation, so they panic here if they read anything the validation does not cover
     const gpa = testing.allocator;
     var eb = try traceBundle();
     defer eb.deinit(gpa);
@@ -413,8 +421,9 @@ test "collect: paths that do not resolve to absolute paths count as missing loca
     const gpa = testing.allocator;
     var wip: ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
-    // 格式不符的错误包中路径下标可能指向任意字符串。在 Windows 上它们是另一驱动器的相对路径，解析后不是
-    // 绝对路径；防止把它们作为文件驻留（`Vfs.intern` 要求绝对路径，否则 panic）
+    // In a malformed error bundle, path indices may point to arbitrary strings. On Windows these
+    // are paths relative to another drive and do not resolve to absolute paths; guards against
+    // interning them as files (`Vfs.intern` requires absolute paths and panics otherwise).
     const ref_loc = try location(&wip, "D:caller.zig", caller_text, "m.main()", 0);
     const note_loc = try location(&wip, "::", main_text, "x", 0);
     const err_loc = try location(&wip, "x: u32 = 1;", main_text, "\"s\"", 1);
@@ -437,7 +446,8 @@ test "collect: paths that do not resolve to absolute paths count as missing loca
     for (item.notes) |n| try testing.expect(std.fs.path.isAbsolute(n.path));
     try testing.expectEqualStrings("referenced by: f", item.notes[1].message);
     if (@import("builtin").os.tag == .windows) {
-        // 按没有位置处理：错误挂在 build.zig 的开头，附注与引用链放在错误的起点
+        // Treated as having no location: the error is attached to the start of build.zig, and the
+        // notes and reference trace are placed at the start of the error
         try testing.expectEqualStrings(native("/proj/build.zig"), path);
         try testing.expectEqual(0, item.start);
         try testing.expectEqual(0, item.end);
@@ -463,7 +473,8 @@ test "collect: spans that end before they start become empty" {
     var dummy: u8 = 0;
     const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
     defer r.release(gpa);
-    // 防止发布终点在起点之前的 Range：改为起点处的空区间
+    // Guards against publishing a Range that ends before it starts: it becomes an empty range at
+    // the start
     const item = r.files.get(native("/proj/src/main.zig")).?.items[0];
     try testing.expectEqual(30, item.start);
     try testing.expectEqual(30, item.end);
@@ -481,10 +492,11 @@ test "combine: results of several compilations of the same file" {
     const unused = newest.items[0];
     const sema = newest.items[1];
 
-    // 同一文本：重复的错误只保留一条
+    // Same text: duplicate errors are kept only once
     const extra: compiler.Item = .{ .start = 0, .end = 3, .message = "another error", .is_astgen = false, .notes = &.{} };
     const same: compiler.FileResult = .{ .base_text = main_text, .items = &.{ sema, extra } };
-    // 较旧的文本（`= 1` 当时是 `= 100`）：非 AstGen 错误平移到最新的文本上，AstGen 错误与落在修改区域内的丢弃
+    // An older text (`= 1` was `= 100` then): non-AstGen errors are shifted onto the newest text;
+    // AstGen errors and errors inside the modified region are dropped
     const old_text = try std.mem.replaceOwned(u8, a, main_text, "= 1;", "= 100;");
     const edited: u32 = @intCast(std.mem.indexOf(u8, old_text, "100").?);
     const old: compiler.FileResult = .{ .base_text = old_text, .items = &.{
@@ -503,7 +515,8 @@ test "combine: results of several compilations of the same file" {
     try testing.expectEqual(sema.end, c.items[3].end);
 }
 
-/// 只有一条错误（"unused local variable"）的错误包，compile log 的输出为 `log_text`
+/// An error bundle with a single error ("unused local variable") and `log_text` as the compile log
+/// output
 fn unusedWithLog(log_text: []const u8) !ErrorBundle {
     var wip: ErrorBundle.Wip = try .init(testing.allocator);
     defer wip.deinit();
@@ -513,8 +526,8 @@ fn unusedWithLog(log_text: []const u8) !ErrorBundle {
 
 test "compile log: kept apart from the message for dedup and the AstGen flag" {
     const gpa = testing.allocator;
-    // 几个 compile step 报告同一个 AstGen 错误，其中一些带有 compile log 的输出（没有
-    // "found compile log statement" 时附在第一条错误上）
+    // Several compile steps report the same AstGen error, some with compile log output (attached to
+    // the first error when there is no "found compile log statement")
     var plain = try unusedWithLog("");
     defer plain.deinit(gpa);
     var log1 = try unusedWithLog("@as(comptime_int, 1)\n");
@@ -525,7 +538,9 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     const r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
     defer r.release(gpa);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
-    // 防止同一错误因带有 compile log 而显示多次、不再被识别为 AstGen 错误：只保留一条，各个 step 的输出并到这一条上
+    // Guards against the same error showing up several times, and no longer being recognized as an
+    // AstGen error, because it carries a compile log: only one is kept, and the output of every
+    // step is merged into it
     try testing.expectEqual(1, result.items.len);
     const item = result.items[0];
     try testing.expect(item.is_astgen);
@@ -535,7 +550,8 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    // 多次编译的结果合并时同样只保留一条，输出并到保留的那条上
+    // Combining the results of several compilations also keeps only one, with the output merged
+    // into the kept one
     var without_log = item;
     without_log.compile_log = "";
     const other: compiler.FileResult = .{ .base_text = main_text, .items = &.{without_log} };
@@ -543,11 +559,11 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     try testing.expectEqual(1, c.items.len);
     try testing.expectEqualStrings(item.compile_log, c.items[0].compile_log);
 
-    // 文本与构建时一致：输出接在文案之后
+    // The text matches the build: the output is appended to the message
     const msgs = try mergeMessages(a, main_text, true, result);
     try testing.expectEqual(1, msgs.len);
     try testing.expectEqualStrings("zig@1:8: unused local variable\n\nCompile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs[0]);
-    // 有未保存修改：AstGen 错误只由 live 提供，不与编译器的那条重复
+    // Unsaved changes: the AstGen error comes only from live and does not duplicate the compiler's
     const edited = try std.mem.concat(a, u8, &.{ "// 新注释\n", main_text });
     const msgs2 = try mergeMessages(a, edited, true, result);
     try testing.expectEqual(1, msgs2.len);
