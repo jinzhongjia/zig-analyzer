@@ -25,6 +25,7 @@ const imports = @import("../ide_db/imports.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const ast = @import("../syntax/ast.zig");
 const isTrivia = @import("../syntax/kind.zig").isTrivia;
+const fuzzy = @import("../ide_db/fuzzy.zig");
 
 pub const Options = struct {
     auto_import: bool = true,
@@ -55,7 +56,11 @@ pub const Item = struct {
     replace: ?Range = null,
     filter: ?[]const u8 = null,
     qualifier: ?[]const u8 = null,
+    /// 名字补全时为排名（见 `rank`）
     sort: ?[]const u8 = null,
+    /// 作用域中的名字的来源权重（见 `rank`）；不是作用域中的名字时为 0
+    weight: f32 = 0,
+    score: f32 = 0,
     import_edit: ?imports.Edit = null,
     /// 所指的定义，被选中时据此给出签名与文档（见 `describe`）：自动导入的候选与函数
     target: ?imports.Target = null,
@@ -67,54 +72,72 @@ pub const Item = struct {
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
     const base = try completeVisible(r, file, offset, &owner);
-    if (!options.auto_import and !options.detect_import_position) return .{ .items = base };
     // 只在 Zig 源文件中自动导入：向 `.zon` 等文件插入 import 声明会破坏它
     if (!imports.isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = base };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset == 0 or offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = try importPrefix(r.arena, root, text, offset) orelse return .{ .items = base };
-    if (!options.auto_import) return .{ .items = base, .import_position = true };
-    const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports, options.imports);
-    if (extra.items.len == 0) return .{ .items = base, .is_incomplete = extra.is_incomplete, .import_position = true };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    for (extra.items) |candidate| {
-        // 核心已经逐段渲染了路径，不能把整个限定表达式再次当作标识符转义。
-        const filter = try completionFilter(r.arena, name, candidate.filter);
-        var duplicate = false;
-        for (items.items[0..base.len]) |*visible| if (std.mem.eql(u8, visible.label, candidate.label)) {
-            // 只合并可见绑定；不同来源的同名自动导入项必须继续作为独立选择。
-            if (candidate.import_edit == null) {
-                visible.replace = name.range;
-                visible.filter = filter;
-                visible.qualifier = candidate.qualifier;
-                visible.sort = candidate.sort;
-                visible.target = candidate.target;
-            }
-            duplicate = true;
-            break;
-        };
-        if (duplicate) continue;
-        try items.append(r.arena, .{
-            .label = candidate.label,
-            .kind = switch (candidate.kind) {
-                .function => .function,
-                .constant => .constant,
-                .variable => .variable,
-                .module => .module,
-                .file => .file,
-            },
-            .doc = candidate.doc,
-            .replace = name.range,
-            .filter = filter,
-            .qualifier = candidate.qualifier,
-            .sort = candidate.sort,
-            .import_edit = candidate.import_edit,
-            .target = candidate.target,
-        });
+    var result: Result = .{ .items = &.{}, .import_position = options.auto_import or options.detect_import_position };
+    if (options.auto_import) {
+        const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports, options.imports);
+        result.is_incomplete = extra.is_incomplete;
+        for (extra.items) |candidate| {
+            // 核心已经逐段渲染了路径，不能把整个限定表达式再次当作标识符转义。
+            const filter = try completionFilter(r.arena, name, candidate.filter);
+            var duplicate = false;
+            for (items.items[0..base.len]) |*visible| if (std.mem.eql(u8, visible.label, candidate.label)) {
+                // 只合并可见绑定；不同来源的同名自动导入项必须继续作为独立选择。
+                if (candidate.import_edit == null) {
+                    visible.replace = name.range;
+                    visible.filter = filter;
+                    visible.qualifier = candidate.qualifier;
+                    visible.target = candidate.target;
+                }
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            try items.append(r.arena, .{
+                .label = candidate.label,
+                .kind = switch (candidate.kind) {
+                    .function => .function,
+                    .constant => .constant,
+                    .variable => .variable,
+                    .module => .module,
+                    .file => .file,
+                },
+                .doc = candidate.doc,
+                .replace = name.range,
+                .filter = filter,
+                .qualifier = candidate.qualifier,
+                .score = candidate.score,
+                .import_edit = candidate.import_edit,
+                .target = candidate.target,
+            });
+        }
     }
-    return .{ .items = items.items, .is_incomplete = extra.is_incomplete, .import_position = true };
+    try rank(r.arena, items.items, name.prefix);
+    result.items = items.items;
+    return result;
+}
+
+/// 名字补全的排序（`Item.sort`）：作用域中的名字的分数为匹配分（见 `fuzzy`）乘以来源的权重（`Item.weight`），
+/// 自动导入的候选取其分数（见 `imports.Candidate.score`）；从高到低，同分时保持收集的顺序。作用域中不匹配输入的
+/// 名字分数为 0，排在最后，由客户端过滤
+fn rank(arena: Allocator, items: []Item, prefix: []const u8) Allocator.Error!void {
+    var matcher: fuzzy.Matcher = try .init(arena, prefix);
+    for (items) |*it| if (it.weight != 0) {
+        it.score = ((try matcher.score(it.label)) orelse 0) * it.weight;
+    };
+    std.mem.sort(Item, items, {}, struct {
+        fn higher(_: void, a: Item, b: Item) bool {
+            return a.score > b.score;
+        }
+    }.higher);
+    for (items, 0..) |*it, i| it.sort = try std.fmt.allocPrint(arena, "{d:0>5}", .{i});
 }
 
 pub const Description = struct {
@@ -245,18 +268,21 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         .name_ref => b.expr_scopes[@backingInt(e)],
         else => b.scopeAt(rel),
     } else b.scopeAt(rel) else b.scopeAt(rel);
-    try locals(&out, b, scope);
+    try locals(&out, b, scope, null);
 
     const tree = try r.itemTree(file);
     var container = tree.items[item].container;
-    while (true) {
-        try decls(&out, file, tree, container, true);
+    var level: f32 = 0;
+    while (true) : (level += 1) {
+        // 内层容器的成员优先于外层的
+        const weight = @max(min_container_weight, container_weight - container_step * level);
+        try decls(&out, file, tree, container, true, weight);
         const parent = tree.containers[container].parent_item orelse break;
         // 体内定义的容器：外层成员在容器位置可见的局部名字
         const owner = try r.itemNode(file, parent) orelse break;
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
-        try locals(&out, pb, pb.scopeAt(c_node.offset - owner.offset));
+        try locals(&out, pb, pb.scopeAt(c_node.offset - owner.offset), weight);
         container = tree.items[parent].container;
     }
     return out.items.items;
@@ -336,6 +362,8 @@ fn isBareEnumOrUnionMember(arena: Allocator, root: SyntaxNode, offset: u32) Allo
 /// 客户端从替换范围起点过滤；保留用户输入的引号和转义拼写，而不是只返回解码后的名字。
 fn completionFilter(arena: Allocator, name: ImportPrefix, target: []const u8) Allocator.Error![]const u8 {
     const raw = name.escaped_prefix orelse return target;
+    // 按路径匹配上的候选按路径过滤（见 `imports.Builder.filterOf`）
+    if (!std.ascii.startsWithIgnoreCase(target, name.prefix)) return target;
     const closed = name.closed;
     return std.fmt.allocPrint(arena, "{s}{f}{s}", .{
         raw, std.zig.fmtString(target[name.prefix.len..]), if (closed) "" else "\"",
@@ -376,7 +404,16 @@ const Collector = struct {
     }
 };
 
-fn locals(out: *Collector, b: *const Body, from: Body.ScopeId) Allocator.Error!void {
+/// 作用域中的名字的来源权重（见 `rank`）：局部名字、参数、所在容器的成员依次靠后，外层容器的成员每层再少
+/// `container_step`；都高于经由命名空间访问的自动导入候选（`imports.visible_weight`）
+const local_weight = 1.0;
+const param_weight = 0.98;
+const container_weight = 0.94;
+const container_step = 0.02;
+const min_container_weight = 0.86;
+
+/// `weight` 为 null 时按绑定的种类取权重，否则都取 `weight`（外层函数中的名字）
+fn locals(out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32) Allocator.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
         for (b.scope(id).bindings) |bid| {
@@ -385,12 +422,12 @@ fn locals(out: *Collector, b: *const Body, from: Body.ScopeId) Allocator.Error!v
                 .param => .param,
                 .local_const, .local_var => .local,
                 .capture => .capture,
-            } });
+            }, .weight = weight orelse if (binding.kind == .param) param_weight else local_weight });
         }
     }
 }
 
-fn decls(out: *Collector, file: FileId, tree: *const ItemTree, container: u32, private: bool) Allocator.Error!void {
+fn decls(out: *Collector, file: FileId, tree: *const ItemTree, container: u32, private: bool, weight: f32) Allocator.Error!void {
     const is_enum = tree.containers[container].kind == .@"enum";
     for (tree.containerMembers(container)) |m| {
         const it = tree.items[m];
@@ -404,7 +441,7 @@ fn decls(out: *Collector, file: FileId, tree: *const ItemTree, container: u32, p
             .@"test", .@"comptime" => continue,
         };
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
-        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") .{ .decl = .{ .file = file, .item = m } } else null });
+        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") .{ .decl = .{ .file = file, .item = m } } else null, .weight = weight });
     }
 }
 
@@ -699,7 +736,7 @@ fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.Fiel
 fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolve.Error!void {
     const tree = try r.itemTree(ns.file);
     if (ns.container >= tree.containers.len) return;
-    try decls(out, ns.file, tree, ns.container, same_file);
+    try decls(out, ns.file, tree, ns.container, same_file, 0);
     const kind = tree.containers[ns.container].kind;
     // 同一文件中的枚举成员（其他文件的由 `decls` 给出）；带标签的 union 在类型上访问字段得到字段的标签
     // （`Value.null_val`），可以转换为 union

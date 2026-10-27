@@ -336,6 +336,38 @@ test "hover and signature help drop comments from multi-line function prototypes
     try testing.expectEqualStrings("b: u32", s.params[1]);
 }
 
+test "name completion ranks scope names before namespace members, each by how well it matches" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\const memo = 1;
+        \\fn run(mem_param: u32) void {
+        \\    const memory = 2;
+        \\    _ = .{ memory, mem_param };
+        \\    _ = mem<|>;
+        \\}
+        \\//- /zig/std/std.zig std
+        \\pub const mem = struct { pub fn eql() void {} };
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = try w.arena.allocator().dupe(completion.Item, (try completion.complete(&r, at.file, at.offset, .{})).items);
+    std.mem.sort(completion.Item, items, {}, struct {
+        fn less(_: void, a: completion.Item, b: completion.Item) bool {
+            return std.mem.lessThan(u8, a.sort.?, b.sort.?);
+        }
+    }.less);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    // 局部名字、参数、容器的成员、经由 `std` 的成员依次靠后；不匹配的作用域名字排在最后，由客户端过滤
+    try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
 test "selected function completions resolve to the signature as written in the source" {
     const text =
         \\const Point = struct {

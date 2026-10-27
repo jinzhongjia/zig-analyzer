@@ -471,8 +471,10 @@ test "auto imports reuse direct type scalar function and value aliases by canoni
     };
     inline for (cases) |case| {
         const result = try run(&w, at.file, at.offset, case[0], 128);
-        try testing.expectEqual(@as(usize, 1), result.items.len);
-        const alias = find(result, case[1]).?;
+        // 复用的别名排在最前；按路径匹配上的其他成员（如 `Root.EdgeWidget.EdgeChild`）排在后面，都不新增 import
+        const alias = result.items[0];
+        try testing.expectEqualStrings(case[1], alias.label);
+        for (result.items) |item| try testing.expect(item.import_edit == null);
         try testing.expectEqualStrings(case[2], alias.filter);
         try testing.expectEqualStrings("", alias.qualifier);
         try testing.expect(alias.import_edit == null);
@@ -881,4 +883,62 @@ test "files used only by tests are imported only from test code" {
     const in_test = at.offset + @as(u32, "missing; }\ntest { _ = @import(\"main_test.zig\"); check(.{}); _ = missing2".len);
     try testing.expect(find(try run(&w, at.file, in_test, "Fixt", 128), "Fixture") != null);
     try testing.expect(find(try run(&w, at.file, in_test, "harn", 128), "harness") != null);
+}
+
+test "auto imports match whole paths of shallow exports and only names deeper" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\fn main() void { _ = <|>missing; }
+        \\//- /zig/std/std.zig std
+        \\pub const mem = struct {
+        \\    pub fn eql() void {}
+        \\    pub const Allocator = struct {};
+        \\};
+        \\pub const os = struct {
+        \\    pub const linux = struct {
+        \\        pub const syscalls = struct { pub fn read() void {} };
+        \\    };
+        \\};
+    );
+    const at = f.cursor.?;
+    // 命名空间的名字匹配时也给出它的成员（经由可见的 `std`，不新增 import）；名字以输入开头的按名字过滤，其余按路径
+    const mem = try run(&w, at.file, at.offset, "mem", 128);
+    try testing.expectEqualStrings("std.mem", mem.items[0].label);
+    try testing.expectEqualStrings("mem", mem.items[0].filter);
+    const eql = find(mem, "std.mem.eql").?;
+    try testing.expectEqualStrings("std.mem.eql", eql.filter);
+    try testing.expect(eql.import_edit == null);
+    // 跨段的模糊匹配
+    try testing.expect(find(try run(&w, at.file, at.offset, "memeql", 128), "std.mem.eql") != null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "oslin", 128), "std.os.linux") != null);
+    // 超过两段的只按名字的前缀匹配
+    try testing.expect(find(try run(&w, at.file, at.offset, "linsys", 128), "std.os.linux.syscalls") == null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "sys", 128), "std.os.linux.syscalls") != null);
+    try testing.expect(find(try run(&w, at.file, at.offset, "read", 128), "std.os.linux.syscalls.read") != null);
+    // 截断时保留分数最高的
+    const one = try run(&w, at.file, at.offset, "mem", 1);
+    try testing.expectEqual(@as(usize, 1), one.items.len);
+    try testing.expectEqualStrings("std.mem", one.items[0].label);
+    try testing.expect(one.is_incomplete);
+}
+
+test "auto imports match whole paths of modules that are not imported yet" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\fn main() void { _ = <|>missing; }
+        \\//- /zig/std/std.zig std
+        \\pub const mem = struct { pub fn eql() void {} };
+    );
+    const at = f.cursor.?;
+    const eql = editContaining(try run(&w, at.file, at.offset, "memeql", 128), "eql") orelse return error.MissingPathImport;
+    try testing.expectEqualStrings("eql", eql.label);
+    try testing.expectEqualStrings("std.mem.eql", eql.filter);
+    try testing.expectEqualStrings("const eql = @import(\"std\").mem.eql;\n", eql.import_edit.?.text);
 }
