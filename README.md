@@ -81,4 +81,4 @@ A `zig-analyzer.zon` in the project root shares project settings (build argument
 
 ## Documentation
 
-[`docs/design.md`](docs/design.md) (in Chinese) covers the architecture, performance targets and current measurements, and how correctness is verified.
+[`docs/design.md`](docs/design.md) covers the architecture, performance targets and current measurements, and how correctness is verified.
