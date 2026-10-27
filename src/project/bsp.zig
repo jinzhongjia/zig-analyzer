@@ -1,8 +1,11 @@
-//! 构建系统协议（BSP，`zig build --listen=-`）客户端。
+//! Build system protocol (BSP, `zig build --listen=-`) client.
 //!
-//! 消息格式由 `std.zig.Server` / `std.zig.Client` 定义：8 字节头部（tag、body 长度，小端）+ body。
-//! 使用非 watch 模式：每次需要构建时发送一次 `bsp_build_steps`，maker 构建完成后等待下一次请求。
-//! （0.17 的 maker 在 watch 期间收到新请求会 panic，且 watch 模式下无法改变要构建的 step。）
+//! The message format is defined by `std.zig.Server` / `std.zig.Client`: an 8-byte header (tag,
+//! body length, little-endian) + body.
+//! Non-watch mode is used: `bsp_build_steps` is sent once each time a build is needed, and the
+//! maker waits for the next request after the build finishes.
+//! (The 0.17 maker panics when it receives a new request while watching, and the steps to build
+//! cannot be changed in watch mode.)
 
 const std = @import("std");
 const Watchdog = @import("../util/watchdog.zig").Watchdog;
@@ -23,14 +26,14 @@ pub const protocol_version = std.zig.Server.build_system_version;
 pub const StepCompleted = struct {
     step: u32,
     status: ServerMessage.BuildStepCompleted.Status,
-    /// 该 step 的错误（compile step 的编译错误等）
+    /// Errors of the step (compile errors of a compile step, etc.)
     errors: ErrorBundle,
-    /// 该 step 产出的生成文件路径
+    /// Paths of the generated files the step produced
     generated: []GeneratedFile = &.{},
 };
 
 pub const GeneratedFile = struct {
-    /// 构建图中的生成文件编号
+    /// Index of the generated file in the build graph
     file: u32,
     prefix: ServerMessage.PathPrefix,
     sub_path: []u8,
@@ -38,9 +41,9 @@ pub const GeneratedFile = struct {
 
 pub const Event = union(enum) {
     handshake: ServerMessage.Handshake,
-    /// 构建图文件路径（相对于 maker 的 cwd，即构建根目录）
+    /// Path of the build graph file (relative to the maker's cwd, i.e. the build root)
     configuration: []u8,
-    /// build.zig 本身编译失败
+    /// build.zig itself failed to compile
     configuration_failed: ErrorBundle,
     build_started,
     step_started: u32,
@@ -63,7 +66,7 @@ pub const Event = union(enum) {
 
 pub const DecodeError = error{ InvalidMessage, OutOfMemory };
 
-/// 解码一条服务端消息；与 BSP 无关的消息返回 null。
+/// Decodes one server message; returns null for messages unrelated to BSP.
 pub fn decode(gpa: Allocator, tag: ServerMessage.Tag, body: []const u8) DecodeError!?Event {
     var r: Io.Reader = .fixed(body);
     switch (tag) {
@@ -93,15 +96,18 @@ pub fn decode(gpa: Allocator, tag: ServerMessage.Tag, body: []const u8) DecodeEr
     }
 }
 
-/// 以 `ServerMessage.ErrorBundle` 头部开始的消息体中的错误包（见 `readErrorBundle`）
+/// The error bundle in a message body that starts with a `ServerMessage.ErrorBundle` header
+/// (see `readErrorBundle`)
 fn allocErrorBundle(gpa: Allocator, body: []const u8) DecodeError!ErrorBundle {
     var r: Io.Reader = .fixed(body);
     const hdr = r.takeStruct(ServerMessage.ErrorBundle, .little) catch return error.InvalidMessage;
     return readErrorBundle(gpa, &r, hdr);
 }
 
-/// 按头部给出的长度从消息体的读取器 `r` 中读取错误包；`extra` 为空时返回空的错误包。长度超出剩余的字节时
-/// （如格式与 zig-analyzer 编译时的标准库不符，长度是任意值）在分配之前返回 `error.InvalidMessage`
+/// Reads an error bundle from the message body reader `r` using the lengths given in the header;
+/// returns an empty error bundle when `extra` is empty. When the lengths exceed the remaining
+/// bytes (e.g. the format does not match the standard library zig-analyzer was compiled with, so
+/// the lengths are arbitrary values), returns `error.InvalidMessage` before allocating
 fn readErrorBundle(gpa: Allocator, r: *Io.Reader, hdr: ServerMessage.ErrorBundle) DecodeError!ErrorBundle {
     if (@as(u64, hdr.extra_len) * @sizeOf(u32) + hdr.string_bytes_len > r.bufferedLen()) return error.InvalidMessage;
     const extra = try gpa.alloc(u32, hdr.extra_len);
@@ -118,8 +124,9 @@ fn readErrorBundle(gpa: Allocator, r: *Io.Reader, hdr: ServerMessage.ErrorBundle
     return .{ .string_bytes = strings, .extra = extra };
 }
 
-/// 子进程回传的错误包：不合法时（如格式与 zig-analyzer 编译时的标准库不符）释放、记录日志并改用空的错误包，
-/// 消息的其余部分照常使用
+/// An error bundle sent back by a child process: when it is invalid (e.g. the format does not
+/// match the standard library zig-analyzer was compiled with), it is freed, logged, and replaced
+/// by an empty error bundle; the rest of the message is used as usual
 fn checked(gpa: Allocator, eb: ErrorBundle, comptime source: []const u8, args: anytype) ErrorBundle {
     if (error_bundle.isValid(eb)) return eb;
     log.warn("discarding malformed error bundle from " ++ source, args);
@@ -128,7 +135,8 @@ fn checked(gpa: Allocator, eb: ErrorBundle, comptime source: []const u8, args: a
     return .empty;
 }
 
-/// 生成文件列表：先是 `count` 个 `GeneratedFile` 头部，然后依次是每个文件的前缀字节与子路径
+/// List of generated files: first `count` `GeneratedFile` headers, then the prefix byte and
+/// sub path of each file in turn
 fn decodeGenerated(gpa: Allocator, r: *Io.Reader, count: u32) DecodeError![]GeneratedFile {
     const headers = try gpa.alloc(ServerMessage.GeneratedFile, count);
     defer gpa.free(headers);
@@ -156,7 +164,7 @@ fn freeGenerated(gpa: Allocator, files: []GeneratedFile) void {
     gpa.free(files);
 }
 
-/// 编码 `bsp_build_steps` 请求（非 watch 模式）
+/// Encodes a `bsp_build_steps` request (non-watch mode)
 pub fn encodeBuildSteps(w: *Io.Writer, steps: []const u32) Io.Writer.Error!void {
     try w.writeStruct(ClientMessage.Header{
         .tag = .bsp_build_steps,
@@ -166,9 +174,11 @@ pub fn encodeBuildSteps(w: *Io.Writer, steps: []const u32) Io.Writer.Error!void 
     try w.writeSliceEndian(u32, steps, .little);
 }
 
-/// 一个 `zig build --listen=-` 子进程。maker 及其启动的编译器等子进程放在一起：POSIX 上是同一个进程组，
-/// Windows 上是同一个 Job Object。停止时结束整组，不等 maker 跑完当前的构建（非 watch 模式的 maker 构建
-/// 期间不读取输入，收到的 exit 要等构建结束才处理）。
+/// A `zig build --listen=-` child process. The maker and the child processes it starts (compilers,
+/// etc.) are kept together: in the same process group on POSIX, in the same Job Object on Windows.
+/// Stopping ends the whole group without waiting for the maker to finish the current build (a
+/// non-watch maker does not read its input while building, so an exit it receives is handled only
+/// after the build finishes).
 pub const Client = struct {
     gpa: Allocator,
     io: Io,
@@ -182,7 +192,8 @@ pub const Client = struct {
 
     pub const StartError = std.process.SpawnError || Allocator.Error;
 
-    /// 在 `build_root` 下用 `env` 的 zig 启动 maker。`extra_args` 透传给 `zig build`（如 `-Dtarget=...`）。
+    /// Starts the maker in `build_root` with the zig of `env`. `extra_args` is passed through to
+    /// `zig build` (e.g. `-Dtarget=...`).
     pub fn start(gpa: Allocator, io: Io, env: *const ZigEnv, build_root: []const u8, extra_args: []const []const u8) StartError!*Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
@@ -210,8 +221,9 @@ pub const Client = struct {
         return c;
     }
 
-    /// 阻塞读取下一个 BSP 事件；maker 退出时返回 `error.EndOfStream`，读取任务被取消时返回
-    /// `error.Canceled`，其他读取错误为 `error.ReadFailed`（具体原因见 `readError`）。
+    /// Blocks reading the next BSP event; returns `error.EndOfStream` when the maker exits,
+    /// `error.Canceled` when the reading task is canceled, and `error.ReadFailed` for other read
+    /// errors (see `readError` for the cause).
     pub fn next(c: *Client) (DecodeError || error{ EndOfStream, ReadFailed, Canceled })!Event {
         const r = &c.reader.interface;
         while (true) {
@@ -234,7 +246,7 @@ pub const Client = struct {
         return error.ReadFailed;
     }
 
-    /// `next` 返回 `error.ReadFailed` 时的底层错误
+    /// The underlying error when `next` returns `error.ReadFailed`
     pub fn readError(c: *Client) ?anyerror {
         return if (c.reader.err) |e| e else null;
     }
@@ -246,13 +258,16 @@ pub const Client = struct {
         try c.writer.interface.flush();
     }
 
-    /// 立即结束 maker 及其全部子进程，不等待、不回收（不关闭管道，不与阻塞在 `next` 中的读取竞争）。
-    /// 读取方随后得到 `error.EndOfStream`，再调用 `deinit` 回收进程与资源
+    /// Immediately ends the maker and all its child processes, without waiting or reaping (it does
+    /// not close the pipes and does not race with a read blocked in `next`).
+    /// The reader then gets `error.EndOfStream` and calls `deinit` to reap the processes and free
+    /// the resources
     pub fn terminate(c: *Client) void {
         c.group.terminate(&c.child);
     }
 
-    /// 结束 maker 及其全部子进程（若仍在运行）并释放。调用时不能有其他任务在 `next` 中读取。
+    /// Ends the maker and all its child processes (if still running) and frees the client.
+    /// No other task may be reading in `next` when this is called.
     pub fn deinit(c: *Client) void {
         c.terminate();
         c.child.kill(c.io);
@@ -261,14 +276,18 @@ pub const Client = struct {
     }
 };
 
-/// maker 及其子进程的整体。
+/// The maker and its child processes as a whole.
 ///
-/// POSIX：maker 加入看门狗进程（`sh`）为组长的进程组。看门狗阻塞读取一个只有服务器持有写端的管道，
-/// 读到输入结束时向整个进程组发 SIGKILL：服务器以任何方式退出（包括被 SIGKILL、崩溃）时，操作系统
-/// 关闭写端，maker 与编译器随之结束。看门狗无法启动时 maker 自成一组，只有服务器主动停止时才结束整组。
+/// POSIX: the maker joins the process group whose leader is a watchdog process (`sh`). The
+/// watchdog blocks reading a pipe whose write end only the server holds, and on end of input
+/// sends SIGKILL to the whole process group: however the server exits (including being SIGKILLed
+/// or crashing), the operating system closes the write end, and the maker and the compilers end
+/// with it. When the watchdog cannot be started, the maker forms its own group, and the whole
+/// group is ended only when the server stops it explicitly.
 ///
-/// Windows：maker 以挂起状态启动，放入设置了 KILL_ON_JOB_CLOSE 的 Job Object 后再恢复运行，之后启动的
-/// 子进程都在其中；服务器退出时句柄随之关闭，Job 中的进程全部结束。
+/// Windows: the maker is started suspended, put into a Job Object with KILL_ON_JOB_CLOSE set,
+/// and then resumed; the child processes it starts afterwards are all in the job. When the
+/// server exits, the handle is closed with it and all processes in the job end.
 const Group = switch (native_os) {
     .windows => struct {
         job: ?std.os.windows.HANDLE,
@@ -297,7 +316,8 @@ const Group = switch (native_os) {
             return g.job != null;
         }
 
-        /// 放入 Job 后恢复运行；放不进去时只能单独结束 maker
+        /// Puts the maker into the job, then resumes it; if it cannot be put in, only the maker
+        /// itself can be ended
         fn adopt(g: *@This(), child: *std.process.Child) void {
             const job = g.job orelse return;
             if (win32.AssignProcessToJobObject(job, child.id.?) == 0) {
@@ -324,7 +344,8 @@ const Group = switch (native_os) {
     },
     else => struct {
         watchdog: ?std.process.Child,
-        /// 进程组号：看门狗的 pid；没有看门狗时为 maker 的 pid（启动后得知）
+        /// Process group ID: the watchdog's pid; without a watchdog, the maker's pid (known
+        /// after it starts)
         pgid: std.posix.pid_t = 0,
 
         fn create(io: Io) @This() {
@@ -341,7 +362,7 @@ const Group = switch (native_os) {
             return .{ .watchdog = watchdog, .pgid = watchdog.id.? };
         }
 
-        /// 加入看门狗的进程组，没有看门狗时自成一组
+        /// Joins the watchdog's process group; without a watchdog, forms its own group
         fn spawnPgid(g: *const @This()) ?std.posix.pid_t {
             return g.pgid;
         }
@@ -355,11 +376,13 @@ const Group = switch (native_os) {
         }
 
         fn terminate(g: *@This(), _: *std.process.Child) void {
-            // 组长（看门狗或 maker）在 `deinit` 中才回收，组号在此之前不会被复用。0 表示调用者自己的进程组
+            // The group leader (the watchdog or the maker) is reaped only in `deinit`, so the
+            // group ID cannot be reused before then. 0 means the caller's own process group
             if (g.pgid > 0) std.posix.kill(-g.pgid, .KILL) catch {};
         }
 
-        /// 回收看门狗。maker 已结束时组中可能还有它的子进程：先结束整组
+        /// Reaps the watchdog. When the maker has ended, its child processes may still be in the
+        /// group: the whole group is ended first
         fn destroy(g: *@This(), io: Io) void {
             if (g.watchdog) |*w| {
                 std.posix.kill(-g.pgid, .KILL) catch {};
@@ -408,10 +431,12 @@ const win32 = struct {
 };
 
 pub const SingleFileResult = struct {
-    /// 错误包（没有错误时为空）。错误中的相对路径相对于文件所在目录
+    /// Error bundle (empty when there are no errors). Relative paths in the errors are relative
+    /// to the directory of the file
     errors: ErrorBundle,
-    /// 编译读取的、位于文件所在目录之下的文件（绝对路径，含 import 了但不存在的文件）：其中任何一个变化
-    /// 都可能改变编译结果。标准库等其他位置的文件不在其中
+    /// Files read by the compilation that are under the file's directory (absolute paths,
+    /// including files that are imported but do not exist): a change to any of them may change
+    /// the compile result. Files elsewhere, such as in the standard library, are not included
     inputs: []const []const u8,
 
     pub fn deinit(r: *SingleFileResult, gpa: Allocator) void {
@@ -422,7 +447,8 @@ pub const SingleFileResult = struct {
     }
 };
 
-/// 单文件模式（没有 build.zig）：用 `env` 的 zig 运行 `zig build-obj -fno-emit-bin --listen=- <file>`，请求一次编译
+/// Single-file mode (no build.zig): runs `zig build-obj -fno-emit-bin --listen=- <file>` with the
+/// zig of `env` and requests one compilation
 pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
     var child = try std.process.spawn(io, .{
@@ -452,7 +478,7 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: 
     return result;
 }
 
-/// 读取编译器的消息，直到这次编译结束（`error_bundle` 或 `emit_digest`）
+/// Reads compiler messages until this compilation finishes (`error_bundle` or `emit_digest`)
 fn receiveSingleFile(gpa: Allocator, r: *Io.Reader, file_path: []const u8) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
     var inputs: std.ArrayList([]const u8) = .empty;
@@ -468,14 +494,18 @@ fn receiveSingleFile(gpa: Allocator, r: *Io.Reader, file_path: []const u8) !Sing
             .error_bundle => checked(gpa, try allocErrorBundle(gpa, body), "zig build-obj {s}", .{file_path}),
             .emit_digest => .empty,
             .file_system_inputs => {
-                // 以 0 分隔的路径，第一个字节是路径前缀（`PathPrefix` 加一）。单独编译时 cwd 与构建根目录都是
-                // 文件所在目录（命中缓存时用后者）；只保留这两种前缀的，不保留标准库与缓存中的
+                // Paths separated by 0, each starting with a path prefix byte (`PathPrefix` plus
+                // one). When a file is compiled on its own, both cwd and the build root are the
+                // file's directory (the latter is used on a cache hit); only paths with these two
+                // prefixes are kept, not those in the standard library or caches
                 var it = std.mem.splitScalar(u8, body, 0);
                 while (it.next()) |prefixed| {
                     if (prefixed.len < 2) continue;
                     const prefix = std.enums.fromInt(ServerMessage.PathPrefix, prefixed[0] -% 1) orelse continue;
                     if (prefix != .cwd and prefix != .build_root) continue;
-                    // 格式不符时路径可能是任意字符串：解析后不是绝对路径的（见 `Vfs.resolve`）不能驻留，跳过
+                    // When the format does not match, a path may be an arbitrary string: one that
+                    // does not resolve to an absolute path (see `Vfs.resolve`) cannot be interned
+                    // and is skipped
                     const p = try Vfs.resolve(.native, gpa, dir, prefixed[1..]) orelse continue;
                     errdefer gpa.free(p);
                     try inputs.append(gpa, p);
@@ -494,7 +524,7 @@ const native = @import("../util/test_path.zig").native;
 
 test "decode step completed message and error bundle" {
     const gpa = testing.allocator;
-    // 用标准库构造一个错误包
+    // Build an error bundle with the standard library
     var wip: ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
     try wip.addRootErrorMessage(.{ .msg = try wip.addString("boom") });
@@ -532,12 +562,12 @@ test "decode step completed message and error bundle" {
     try testing.expectEqual(.build_root, sc.generated[1].prefix);
     try testing.expectEqualStrings("gen", sc.generated[1].sub_path);
 
-    // 数据被截断时报错且不泄漏
+    // Truncated data is reported as an error without leaking
     w.end -= 4;
     try testing.expectError(error.InvalidMessage, decode(gpa, .bsp_step_completed, w.buffered()));
 }
 
-/// 只有一条消息的错误包，消息的字符串下标越界
+/// An error bundle with a single message whose string index is out of bounds
 fn malformedBundle(gpa: Allocator) !ErrorBundle {
     var wip: ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
@@ -558,7 +588,7 @@ fn writeBundle(w: *Io.Writer, eb: ErrorBundle) Io.Writer.Error!void {
 
 test "decode: a malformed error bundle is discarded, the rest of the message is kept" {
     const gpa = testing.allocator;
-    // 丢弃时的警告是预期的，不写到 stderr
+    // The warning on discarding is expected; do not write it to stderr
     const prev_level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = prev_level;
@@ -596,7 +626,8 @@ test "decode: a malformed error bundle is discarded, the rest of the message is 
 }
 
 test "decode: error bundle lengths beyond the message are rejected before allocating" {
-    // 曾按头部的长度先分配再读取：格式不符时长度是任意值，一次分配可达 16 GiB
+    // Memory used to be allocated by the lengths in the header before reading: when the
+    // format does not match, the lengths are arbitrary, and a single allocation could reach 16 GiB
     var small: [4096]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&small);
     const gpa = fba.allocator();
@@ -668,11 +699,13 @@ test "single-file mode: compile one file, get its errors and the files it read" 
     const msg = eb.getErrorMessage(eb.getMessages()[0]);
     try testing.expectEqualStrings("unused local variable", eb.nullTerminatedString(msg.msg));
     try testing.expectEqualStrings("one.zig", eb.nullTerminatedString(eb.getSourceLocation(msg.src_loc).src_path));
-    // 编译读取的文件：根文件自身在其中，标准库与缓存中的文件不在其中
+    // Files read by the compilation: the root file itself is included, files in the standard
+    // library and caches are not
     try testing.expectEqual(1, result.inputs.len);
     try testing.expectEqualStrings(path, result.inputs[0]);
 
-    // 没有错误的编译：第二次命中缓存，读取的文件（包括被 import 的）仍然完整
+    // A compilation without errors: the second run hits the cache, and the files read (including
+    // imported ones) are still complete
     const ok = try project.path(gpa, "ok.zig");
     defer gpa.free(ok);
     const dep = try project.path(gpa, "dep.zig");
@@ -688,7 +721,7 @@ test "single-file mode: compile one file, get its errors and the files it read" 
 
 test "single-file mode: a malformed error bundle is discarded, the files read are kept" {
     const gpa = testing.allocator;
-    // 丢弃时的警告是预期的，不写到 stderr
+    // The warning on discarding is expected; do not write it to stderr
     const prev_level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = prev_level;
@@ -721,8 +754,9 @@ test "single-file mode: a malformed error bundle is discarded, the files read ar
 test "single-file mode: files read that do not resolve to absolute paths are skipped" {
     const gpa = testing.allocator;
     const file = native("/proj/one.zig");
-    // 格式不符时路径可能是任意字符串。在 Windows 上 `D:x.zig` 与 `::` 是另一驱动器的相对路径，解析后不是绝对
-    // 路径；防止把它们交给 `Vfs.intern`（要求绝对路径，否则 panic）
+    // When the format does not match, a path may be an arbitrary string. On Windows, `D:x.zig`
+    // and `::` are relative paths on another drive and do not resolve to absolute paths; they
+    // must not be passed to `Vfs.intern` (which requires absolute paths and panics otherwise)
     var inputs_buf: [64]u8 = undefined;
     var inputs: Io.Writer = .fixed(&inputs_buf);
     for ([_][]const u8{ "one.zig", "D:x.zig", "::" }) |p| {

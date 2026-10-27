@@ -1,8 +1,11 @@
-//! 校验子进程回传的 `std.zig.ErrorBundle`。
+//! Validates the `std.zig.ErrorBundle` sent back by child processes.
 //!
-//! ErrorBundle 的格式没有版本号：用户 zig 与 zig-analyzer 编译时的版本不同时，单文件编译读取的就是另一个
-//! 版本的编译器产出的数据。标准库的读取函数（`getErrorMessage`、`getNotes`、`nullTerminatedString` 等）与
-//! `diagnostics/compiler.zig` 按布局读取引用链时都不检查下标，格式不符时会越界读取，因此使用前先校验。
+//! The ErrorBundle format has no version number: when the user's zig and the zig that
+//! zig-analyzer was compiled with are different versions, a single-file compile reads data
+//! produced by a different version of the compiler. Neither the standard library's read
+//! functions (`getErrorMessage`, `getNotes`, `nullTerminatedString`, etc.) nor
+//! `diagnostics/compiler.zig`, which reads reference traces by layout, check indices, so a
+//! mismatched format causes out-of-bounds reads; the bundle is therefore validated before use.
 
 const std = @import("std");
 const ErrorBundle = std.zig.ErrorBundle;
@@ -12,23 +15,35 @@ const message_words = fieldCount(ErrorBundle.ErrorMessage);
 const location_words = fieldCount(ErrorBundle.SourceLocation);
 const trace_words = fieldCount(ErrorBundle.ReferenceTrace);
 
-/// 附注与引用链中的位置的最大嵌套深度，使校验的递归有界：自引用与环都会超出它。
-/// 编译器产出的附注只有一层，引用链中的位置不再带引用链
+/// Maximum nesting depth of notes and of locations in reference traces, which bounds the
+/// recursion of the validation: self-references and cycles both exceed it.
+/// Notes produced by the compiler are only one level deep, and locations in reference traces do
+/// not carry reference traces of their own
 const max_depth = 32;
 
-/// 读取总量的上限是 `extra.len` 的倍数。标准库构造的错误包中各结构互不重叠、只被引用一次，读取总量不超过
-/// `extra.len`；共用结构的错误包也能通过，而大量指向同一结构的引用（读取量随嵌套层数指数增长）被拒绝
+/// The limit on the total amount read, as a multiple of `extra.len`. In an error bundle built by
+/// the standard library, structures do not overlap and are each referenced only once, so the
+/// total read does not exceed `extra.len`; error bundles that share structures still pass, while
+/// many references to the same structure (the amount read grows exponentially with nesting
+/// depth) are rejected
 const max_reads_per_word = 4;
 
-/// `eb` 中本项目与它调用的标准库函数会读取的内容是否都在范围内：
-/// - 消息列表、各条消息与逐层的附注、源位置与其后的引用链都在 `extra` 内；
-/// - 消息、路径、源码行、引用名与 compile log 的下标都指向 `string_bytes` 中以 0 结尾的字符串；
-/// - 引用链中没有位置的项（隐藏标记）的 `decl_name` 是隐藏的引用数而不是字符串，与引用链长度相加后不超出 u32。
+/// Whether everything in `eb` that this project and the standard library functions it calls read
+/// is in bounds:
+/// - The message list, each message and its notes at every level, and each source location with
+///   the reference trace that follows it are within `extra`;
+/// - The indices of messages, paths, source lines, reference names, and the compile log all
+///   point to 0-terminated strings in `string_bytes`;
+/// - For reference trace entries without a location (hidden markers), `decl_name` is the number
+///   of hidden references rather than a string, and adding the reference trace length to it does
+///   not overflow u32.
 ///
-/// 行列、span 与 `count` 等数值不检查，使用方要能处理任意值。空的错误包（`extra` 为空）合法。
+/// Numeric values such as line/column, span, and `count` are not checked; consumers must cope
+/// with arbitrary values. An empty error bundle (empty `extra`) is valid.
 pub fn isValid(eb: ErrorBundle) bool {
     if (eb.extra.len == 0) return true;
-    // 下标都是 u32：标准库与 `diagnostics/compiler.zig` 用 u32 计算结构之后的位置
+    // Indices are all u32: the standard library and `diagnostics/compiler.zig` compute the
+    // position after a structure in u32
     if (eb.extra.len > std.math.maxInt(u32)) return false;
     var v: Validator = .{
         .eb = eb,
@@ -37,7 +52,7 @@ pub fn isValid(eb: ErrorBundle) bool {
     };
     if (!v.take(0, list_words)) return false;
     const list = eb.getErrorMessageList();
-    // `getCompileLogOutput` 在没有输出（下标为 0）时同样读取这个字符串
+    // `getCompileLogOutput` reads this string even when there is no output (index 0)
     if (!v.string(list.compile_log_text)) return false;
     if (!v.take(list.start, list.len)) return false;
     for (eb.getMessages()) |mi| if (!v.message(@backingInt(mi), 0)) return false;
@@ -46,12 +61,13 @@ pub fn isValid(eb: ErrorBundle) bool {
 
 const Validator = struct {
     eb: ErrorBundle,
-    /// `string_bytes` 中最后一个 0 的位置：字符串下标不超过它时，从下标往后一定能读到终止符
+    /// Position of the last 0 in `string_bytes`: for a string index not beyond it, reading
+    /// forward from the index is guaranteed to reach a terminator
     last_nul: ?usize,
-    /// 还能读取的 `extra` 字数
+    /// Number of `extra` words that may still be read
     budget: u64,
 
-    /// 读取 `extra[index..][0..len]`：要在范围内，且不超出读取总量
+    /// Reads `extra[index..][0..len]`: must be in bounds and within the total read limit
     fn take(v: *Validator, index: u64, len: u64) bool {
         if (index + len > v.eb.extra.len or len > v.budget) return false;
         v.budget -= len;
@@ -63,7 +79,8 @@ const Validator = struct {
         return index <= last;
     }
 
-    /// 消息与它的附注。附注也是消息，标准库渲染时逐层递归
+    /// A message and its notes. Notes are messages too; the standard library recurses through
+    /// them level by level when rendering
     fn message(v: *Validator, index: u32, depth: u32) bool {
         if (depth > max_depth or !v.take(index, message_words)) return false;
         const mi: ErrorBundle.MessageIndex = @fromBackingInt(index);
@@ -75,7 +92,7 @@ const Validator = struct {
         return true;
     }
 
-    /// 源位置与其后的引用链
+    /// A source location and the reference trace that follows it
     fn location(v: *Validator, index: u32, depth: u32) bool {
         if (depth > max_depth or !v.take(index, location_words)) return false;
         const loc = v.eb.getSourceLocation(@fromBackingInt(index));
@@ -83,7 +100,7 @@ const Validator = struct {
         if (loc.source_line != 0 and !v.string(loc.source_line)) return false;
         const first = @as(u64, index) + location_words;
         if (!v.take(first, @as(u64, loc.reference_trace_len) * trace_words)) return false;
-        // 每项按字段顺序存放 `decl_name` 与 `src_loc`
+        // Each entry stores `decl_name` and `src_loc` in field order
         for (0..loc.reference_trace_len) |k| {
             const at: usize = @intCast(first + k * trace_words);
             const decl_name = v.eb.extra[at];
@@ -91,7 +108,9 @@ const Validator = struct {
             if (ref_loc != @backingInt(ErrorBundle.SourceLocationIndex.none)) {
                 if (!v.string(decl_name) or !v.location(ref_loc, depth + 1)) return false;
             } else if (decl_name != 0) {
-                // 隐藏标记：渲染为 `-freference-trace=<隐藏数 + 引用链长度 - 1>`，按 u32 先加后减
+                // Hidden marker: rendered as
+                // `-freference-trace=<hidden count + reference trace length - 1>`, computed in u32
+                // by adding first and then subtracting
                 if (@as(u64, decl_name) + loc.reference_trace_len > std.math.maxInt(u32)) return false;
             }
         }
@@ -105,13 +124,15 @@ fn fieldCount(comptime T: type) comptime_int {
 
 const testing = std.testing;
 
-/// 用标准库构造的合法错误包，以及其中各结构在 `extra` 中的下标
+/// A valid error bundle built with the standard library, and the indices in `extra` of the
+/// structures in it
 const Fixture = struct {
     eb: ErrorBundle,
-    /// 带附注、源码行与引用链（一个有位置的引用、一个隐藏计数）的消息
+    /// Message with a note, a source line, and a reference trace (one reference with a location,
+    /// one hidden count)
     root: u32,
     err_loc: u32,
-    /// 没有位置的消息，它的附注还带有附注
+    /// Message without a location whose note has a note of its own
     chain: u32,
     nested: u32,
 
@@ -140,7 +161,8 @@ const Fixture = struct {
             .reference_trace_len = 2,
         });
         try wip.addReferenceTrace(.{ .decl_name = try wip.addString("f"), .src_loc = ref_loc });
-        // 隐藏计数大于 `string_bytes` 的长度：误当作字符串下标时校验失败
+        // The hidden count exceeds the length of `string_bytes`: validation fails if it is
+        // mistaken for a string index
         try wip.addReferenceTrace(.{ .decl_name = 100000, .src_loc = .none });
         try wip.addRootErrorMessageWithNotes(
             .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .count = 2, .src_loc = err_loc, .notes_len = 1 },
@@ -151,7 +173,7 @@ const Fixture = struct {
         try wip.addReferenceTrace(.{ .decl_name = 0, .src_loc = .none });
         try wip.addRootErrorMessage(.{ .msg = try wip.addString("unused local variable"), .src_loc = unused_loc });
 
-        // 附注的附注
+        // A note of a note
         try wip.addRootErrorMessage(.{ .msg = try wip.addString("undefined symbol: foo"), .notes_len = 1 });
         const chain_notes = try wip.reserveNotes(1);
         const nested = try wip.addErrorMessage(.{ .msg = try wip.addString("referenced here"), .notes_len = 1 });
@@ -176,7 +198,8 @@ const Fixture = struct {
     }
 };
 
-/// 按标准库读取函数与 `diagnostics/compiler.zig` 的方式读取全部内容：越界时 panic
+/// Reads all contents the way the standard library's read functions and
+/// `diagnostics/compiler.zig` do: panics when out of bounds
 fn readAll(eb: ErrorBundle) void {
     if (eb.extra.len == 0) return;
     std.mem.doNotOptimizeAway(eb.getCompileLogOutput().len);
@@ -213,7 +236,7 @@ test "valid error bundle: notes, source lines, reference traces and compile log"
     try testing.expect(isValid(f.eb));
     try testing.expect(isValid(.empty));
     readAll(f.eb);
-    // 夹具遵循标准库的约定：标准库能渲染它
+    // The fixture follows the standard library's conventions: the standard library can render it
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try f.eb.renderToWriter(.{}, &w);
@@ -261,19 +284,20 @@ test "malformed error bundles are rejected" {
         }
     }
 
-    // 最后一个字符串（compile log）没有终止符
+    // The last string (compile log) has no terminator
     const strings = try gpa.dupe(u8, eb.string_bytes);
     defer gpa.free(strings);
     strings[strings.len - 1] = 'x';
     try testing.expect(!isValid(.{ .string_bytes = strings, .extra = eb.extra }));
-    // 没有字符串、消息列表不完整
+    // No strings; incomplete message list
     try testing.expect(!isValid(.{ .string_bytes = &.{}, .extra = eb.extra }));
     try testing.expect(!isValid(.{ .string_bytes = eb.string_bytes, .extra = eb.extra[0..2] }));
 }
 
 test "nested and shared references are bounded" {
     const gpa = testing.allocator;
-    // 每条消息的两个附注都指向上一层的消息：逐层展开时读取量是 2^levels
+    // Both notes of each message point to the message of the previous level: when expanded level
+    // by level, the amount read is 2^levels
     for ([_]u32{ 2, 30 }, [_]bool{ true, false }) |levels, expected| {
         var extra: std.ArrayList(u32) = .empty;
         defer extra.deinit(gpa);

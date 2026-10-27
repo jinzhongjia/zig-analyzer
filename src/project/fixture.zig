@@ -1,5 +1,7 @@
-//! 集成测试用的示例项目：在临时目录中写出文件，真实运行 `zig build --listen=-`。只在 `zig build test-all`
-//! 与 `test-stress` 中运行；PATH 中没有 zig 或版本与编译时不同时跳过（CI 与开发环境都满足）。
+//! Sample projects for integration tests: files are written to a temporary directory and
+//! `zig build --listen=-` is actually run. Runs only in `zig build test-all` and `test-stress`;
+//! skipped when there is no zig in PATH or its version differs from the one used at compile time
+//! (both CI and the development environment satisfy this).
 
 const std = @import("std");
 const testing = std.testing;
@@ -10,7 +12,7 @@ pub const File = struct { path: []const u8, text: []const u8 };
 
 pub const Project = struct {
     tmp: testing.TmpDir,
-    /// 绝对路径
+    /// Absolute path
     root: [:0]u8,
     env: ZigEnv,
 
@@ -43,7 +45,7 @@ pub const Project = struct {
     }
 };
 
-/// 带一个 AstGen 错误、一个 Sema 错误、两个模块、一个 check step 的示例项目
+/// Sample project with one AstGen error, one Sema error, two modules, and a check step
 pub const basic = [_]File{
     .{ .path = "build.zig", .text =
     \\const std = @import("std");
@@ -95,9 +97,11 @@ pub const basic = [_]File{
     },
 };
 
-/// 构建中运行 60 秒外部命令（POSIX 的 `sleep`，由 maker 启动）的示例项目：诊断 step 为 check。
-/// sleep 在 exe 编译完成后才开始，是 check 之前最后开始的 step：客户端晚于它激活进度 token 时，补发的 begin
-/// 带有的也是 "run sleep"（激活前只保留最近一次报告）
+/// Sample project whose build runs a 60-second external command (POSIX `sleep`, started by the
+/// maker); the diagnostics step is check.
+/// sleep starts only after the exe is compiled and is the last step to start before check: when
+/// the client activates the progress token later than that, the deferred begin also carries
+/// "run sleep" (only the latest report is kept before activation)
 pub const slow = [_]File{
     .{ .path = "build.zig", .text =
     \\const std = @import("std");
@@ -116,12 +120,14 @@ pub const slow = [_]File{
     .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
 };
 
-/// 进程组 `pgid` 中的进程（被结束后由 init 回收）在几秒内全部消失
+/// All processes in process group `pgid` (reaped by init after being ended) are gone within a
+/// few seconds
 pub fn expectGroupGone(pgid: std.posix.pid_t) !void {
     for (0..100) |_| {
         std.posix.kill(-pgid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
-            // macOS：组里只剩尚未回收的僵尸进程时返回 EPERM，继续等待回收
+            // macOS: returns EPERM when only zombie processes not yet reaped remain in the group;
+            // keep waiting for them to be reaped
             error.PermissionDenied => {},
             else => return err,
         };
