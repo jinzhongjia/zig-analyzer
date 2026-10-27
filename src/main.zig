@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
     // 请求在工作线程上执行；无法创建工作线程时在调用方的线程（可能是主线程）上执行，主线程仍按默认的栈上限
     server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = worker_stack_budget };
     server.heap = &counting;
+    server.environ = init.minimal.environ;
     defer server.deinit();
     return server.run(&stdin.interface);
 }

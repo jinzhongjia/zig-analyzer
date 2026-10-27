@@ -1590,3 +1590,164 @@ test "project zig-analyzer.zon: build settings apply, a change on disk restarts 
     try expectDiagnostics(diags, "t.zig", &.{"1:18 zig: expected type 'u8'"});
     try shutdown(&h);
 }
+
+/// 设置转为 JSON（路径中的字符按 JSON 转义）
+fn settingsValue(h: *Harness, settings: anytype) !std.json.Value {
+    return jsonValue(h, try std.json.Stringify.valueAlloc(h.arena.allocator(), settings, .{}));
+}
+
+/// 模块图中标准库的根文件
+fn stdRoot(h: *Harness) ![]const u8 {
+    return (try h.request("zig-analyzer/moduleGraph", {})).object.get("result").?.object.get("std_root").?.string;
+}
+
+/// 在 `text` 中 `needle` 的开头处 goto definition，返回目标文件的路径
+fn definitionPath(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
+    const offset = std.mem.indexOf(u8, text, needle).?;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = .{
+        .line = std.mem.count(u8, text[0..offset], "\n"),
+        .character = offset - line_start,
+    } });
+    const result = resp.object.get("result").?;
+    if (result != .object) return error.TestUnexpectedResult;
+    return za.base.uri.toPath(h.arena.allocator(), result.object.get("uri").?.string);
+}
+
+/// 包装脚本记下的 zig 命令（`zig env` 除外）：每行为「子命令 ZIG_LIB_DIR」
+fn zigCalls(h: *Harness, path: []const u8) ![]const []const u8 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, h.arena.allocator(), .limited(1024 * 1024));
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or std.mem.startsWith(u8, line, "env ")) continue;
+        try out.append(h.arena.allocator(), line);
+    }
+    return out.items;
+}
+
+fn hasLine(lines: []const []const u8, line: []const u8) bool {
+    for (lines) |l| if (std.mem.eql(u8, l, line)) return true;
+    return false;
+}
+
+const lib_path_main =
+    \\const std = @import("std");
+    \\pub fn main() void {
+    \\    const x: u32 = "s";
+    \\    _ = x;
+    \\    _ = std.mem.Allocator;
+    \\}
+    \\
+;
+
+test "settings: zig.lib_path: std resolves under it and zig runs with it, removing it reloads std, restarts the project and recompiles standalone files" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = simple_build },
+        .{ .path = "main.zig", .text = lib_path_main },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // 工作区之外：指向用户 zig 的 lib 目录的另一个路径，以及按单文件编译的独立文件
+    var other = testing.tmpDir(.{});
+    defer other.cleanup();
+    try other.dir.symLink(testing.io, project.env.lib_dir, "zig-lib", .{ .is_directory = true });
+    try other.dir.writeFile(testing.io, .{ .sub_path = "solo.zig", .data = lib_path_main });
+    const other_root = try other.dir.realPathFileAlloc(testing.io, ".", a);
+    const lib = try std.fs.path.join(a, &.{ other_root, "zig-lib" });
+    // 包装用户 zig 的脚本 zigw：记下每条命令的子命令与 ZIG_LIB_DIR；`zig env` 报告脚本自身为 zig，其余命令照常执行
+    const zig = project.env.zig_exe;
+    const calls = try project.path(a, "zig-calls");
+    const zigw = try project.path(a, "zigw");
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\echo "$1 $ZIG_LIB_DIR" >> "{s}"
+        \\case "$1" in
+        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}"|' ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ calls, zig, zigw, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+
+    try initializeWith(&h, project.root, false, try settingsValue(&h, .{ .zig = .{ .path = zigw, .lib_path = lib } }));
+    const main_uri = try open(&h, try project.path(a, "main.zig"), lib_path_main);
+    _ = try open(&h, try std.fs.path.join(a, &.{ other_root, "solo.zig" }), lib_path_main);
+    try waitIdle(&h);
+    const lib_std = try std.fs.path.join(a, &.{ lib, "std" });
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ lib_std, "std.zig" }), try stdRoot(&h));
+    const lib_mem = try std.fs.path.join(a, &.{ lib_std, "mem.zig" });
+    try testing.expectEqualStrings(lib_mem, try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = try za.base.uri.fromPath(a, lib_mem) } })).object.get("result").?.object;
+    try testing.expectEqualStrings("zig_lib", status.get("origin").?.string);
+    var diags = try h.diagnostics();
+    try expectDiagnostics(diags, "main.zig", &.{"2:19 zig: expected type 'u32'"});
+    try expectDiagnostics(diags, "solo.zig", &.{"2:19 zig: expected type 'u32'"});
+    // 项目的构建、单文件编译等 zig 子进程都使用覆盖的 lib 目录（缓存中没有默认 builtin.zig 的记录时，生成它的
+    // 命令先于构建运行）
+    const before = try zigCalls(&h, calls);
+    try testing.expect(hasLine(before, try std.fmt.allocPrint(a, "build {s}", .{lib})));
+    try testing.expect(hasLine(before, try std.fmt.allocPrint(a, "build-obj {s}", .{lib})));
+    for (before) |line| try testing.expect(std.mem.endsWith(u8, line, lib));
+
+    // 去掉覆盖：标准库重新加载，项目按 `zig env` 给出的 lib 目录重启，独立文件重新编译
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .zig = .{ .path = zigw } } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "mem.zig" }), try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
+    const after = (try zigCalls(&h, calls))[before.len..];
+    try testing.expect(hasLine(after, "build ") and hasLine(after, "build-obj "));
+    for (after) |line| try testing.expect(std.mem.endsWith(u8, line, " "));
+    diags = try h.diagnostics();
+    try expectDiagnostics(diags, "main.zig", &.{"2:19 zig: expected type 'u32'"});
+    try expectDiagnostics(diags, "solo.zig", &.{"2:19 zig: expected type 'u32'"});
+    try shutdown(&h);
+}
+
+const builtin_main = "const builtin = @import(\"builtin\");\npub const mode = builtin.mode;\n";
+
+test "settings: invalid zig paths fall back to zig env with a message, zig.builtin_path applies to standalone files" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "one.zig", .text = builtin_main },
+        .{ .path = "target/builtin.zig", .text = "pub const mode = .ReleaseFast;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // 没有 std/std.zig 的 lib 目录，不存在的缓存目录与 builtin.zig
+    const missing = try project.path(a, "missing");
+    try initializeWith(&h, project.root, false, try settingsValue(&h, .{ .zig = .{
+        .lib_path = project.root,
+        .global_cache_path = missing,
+        .builtin_path = missing,
+    } }));
+    const uri = try open(&h, try project.path(a, "one.zig"), builtin_main);
+    try waitIdle(&h);
+    const messages = try shownMessages(&h);
+    try testing.expect(anyContains(messages, try std.fmt.allocPrint(a, "zig.lib_path {s} does not contain std/std.zig, using {s}", .{ project.root, project.env.lib_dir })));
+    try testing.expect(anyContains(messages, try std.fmt.allocPrint(a, "zig.global_cache_path {s} is not an existing directory, using {s}", .{ missing, project.env.global_cache_dir })));
+    try testing.expect(anyContains(messages, try std.fmt.allocPrint(a, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{missing})));
+    // 服务器给出的路径是规范化的（Windows 上分隔符为 `\`、盘符大写），预期的路径同样规范化后比较
+    try testing.expectEqualStrings(try std.fs.path.resolveAlloc(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
+    try testing.expectEqualStrings(project.env.global_cache_dir, h.server.zigEnv().?.global_cache_dir);
+    const generated = try definitionPath(&h, uri, builtin_main, "mode;");
+    try testing.expect(std.mem.startsWith(u8, generated, try std.fs.path.resolveAlloc(a, &.{project.env.global_cache_dir})));
+
+    // 改为存在的 builtin.zig：不属于项目的文件改用它
+    const custom = try std.fs.path.resolveAlloc(a, &.{ project.root, "target", "builtin.zig" });
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .zig = .{ .builtin_path = custom } } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(custom, try definitionPath(&h, uri, builtin_main, "mode;"));
+    // 去掉覆盖：回到生成的 builtin.zig
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = Empty{} });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(generated, try definitionPath(&h, uri, builtin_main, "mode;"));
+    try testing.expectEqual(messages.len, (try shownMessages(&h)).len);
+    try shutdown(&h);
+}

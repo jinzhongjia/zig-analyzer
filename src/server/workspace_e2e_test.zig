@@ -648,7 +648,7 @@ test "a project whose background task cannot be started does not leave the serve
     var server: Server = undefined;
     try server.init(threaded.io(), testing.allocator, &writer);
     defer server.deinit();
-    server.zig_env = try za.project.ZigEnv.query(testing.allocator, testing.io, project.env.zig_exe);
+    server.zig_env = try server.ownEnv(try za.project.ZigEnv.query(testing.allocator, testing.io, project.env.zig_exe));
 
     try testing.expectError(error.ConcurrencyUnavailable, Workspace.start(&server, project.root, 0));
     const busy = server.busy;

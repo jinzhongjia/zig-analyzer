@@ -44,6 +44,9 @@ server: *Server,
 gpa: Allocator,
 /// 构建根目录（绝对路径，规范化）
 root: []const u8,
+/// 启动时生效的 zig 环境（由服务器持有到退出）：maker 与读取构建图、生成 builtin.zig 都用它，与 maker 所用的
+/// lib 目录、全局缓存目录一致；zig 路径的配置变化时整个实例被重启替换
+env: *const ZigEnv,
 /// 启动时的配置副本（构建参数、诊断 step）；配置变化时整个实例被重启替换
 config: Server.Config,
 /// 项目根目录的 `zig-analyzer.zon`（只含其中出现的项，见 `Config.parseProject`）；没有时为 null。启动后不变，
@@ -120,7 +123,7 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     const ws = try gpa.create(Workspace);
     errdefer gpa.destroy(ws);
     // 一个引用属于后台任务，一个属于调用方
-    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .config = undefined, .crash_restarts = crash_restarts, .refs = .init(2) };
+    ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .env = env, .config = undefined, .crash_restarts = crash_restarts, .refs = .init(2) };
     errdefer gpa.free(ws.root);
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
@@ -412,9 +415,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         },
         .configuration => |path| {
             // 用户 zig 与编译时的版本不同时不启动项目（见 `Server.startWorkspace`），构建图的格式一致
-            const env = ws.server.zigEnv().?;
             ws.reportLoading("Reading build graph");
-            var model = configuration.load(ws.gpa, io, ws.root, path, env) catch |err| switch (err) {
+            var model = configuration.load(ws.gpa, io, ws.root, path, ws.env) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     // 没有模型就不能构建：结束加载与 maker，按没有编译结果完成（清除此前的编译器诊断）
@@ -486,7 +488,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     sc.errors = .empty;
                 }
                 if (ws.model) |*m| for (sc.generated) |g| {
-                    const path = try configuration.generatedPath(ws.gpa, m, ws.server.zigEnv().?, g.prefix, g.sub_path);
+                    const path = try configuration.generatedPath(ws.gpa, m, ws.env, g.prefix, g.sub_path);
                     defer ws.gpa.free(path);
                     if (try m.setGeneratedPath(ws.gpa, g.file, path)) roots_changed = true;
                 };
@@ -577,14 +579,14 @@ test "generated-file recomputes wait at least a second and in proportion to the 
 /// 构建图中没有 compile step（只导出模块的库）：并入项目导出的模块，项目中的文件按它们得到模块归属
 fn loadExports(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     ws.reportLoading("Reading exported modules");
-    var exported = try exports.load(ws.gpa, ws.server.io, ws.server.zigEnv().?, ws.root, ws.config.build_args) orelse return;
+    var exported = try exports.load(ws.gpa, ws.server.io, ws.env, ws.root, ws.config.build_args) orelse return;
     defer exported.deinit(ws.gpa);
     try model.appendExports(ws.gpa, &exported);
 }
 
 /// 为每个模块生成 builtin.zig（相同参数只生成一次）
 fn generateBuiltins(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
-    const env = ws.server.zigEnv().?;
+    const env = ws.env;
     const io = ws.server.io;
     ws.reportLoading("Generating builtin.zig");
     // 参数相同的模块共用一份；不同的参数并行生成（每份要启动一次编译器，命中参数记录时不启动）
