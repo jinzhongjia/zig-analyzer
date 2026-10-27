@@ -19,6 +19,7 @@ const infer = @import("../sema/infer.zig");
 const queries = @import("../sema/queries.zig");
 const context = @import("context.zig");
 const seed = @import("../ide_db/seed.zig");
+const symbol_kind = @import("../ide_db/symbol_kind.zig");
 const OwnerKey = database.hir.OwnerKey;
 
 pub const TokenType = enum(u32) {
@@ -91,6 +92,22 @@ pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc:
 const Class = struct { type: TokenType, mods: u32 = 0 };
 const BindingKey = struct { owner: OwnerKey, binding: Body.BindingId };
 const BindingDecl = struct { key: BindingKey, end: u32, class: Class, can_be_unused: bool };
+
+fn tokenType(kind: symbol_kind.Kind) TokenType {
+    return switch (kind) {
+        .namespace => .namespace,
+        .@"struct" => .@"struct",
+        .@"enum" => .@"enum",
+        .type => .type,
+        .function => .function,
+        .method => .method,
+        .variable => .variable,
+        .field => .property,
+        .enum_member => .enumMember,
+        .parameter => .parameter,
+        .type_parameter => .typeParameter,
+    };
+}
 
 /// 声明分类为变量或类型的成员在引用处按该处的具体类型细化（`itemClassAt`）；其他分类与类型无关
 fn dependsOnType(c: Class) bool {
@@ -191,16 +208,10 @@ const Builder = struct {
         if (b.classes.get(key)) |c| return c;
         try b.indexFile(key.file);
         const index = b.items.get(key) orelse return .{ .type = .variable };
-        const itree = try b.r.itemTree(key.file);
-        const item = itree.items[index];
-        const c: Class = switch (item.kind) {
-            .@"fn" => .{ .type = try b.functionType(key, itree.containers[item.container]) },
-            .field => .{ .type = if (itree.containers[item.container].kind == .@"enum") .enumMember else .property },
-            .@"const" => b.valueClass(try b.r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable, Modifier.readonly),
-            // ItemTree 的成员都在容器级
-            .@"var" => b.valueClass(try b.r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable, if (b.options.global_var) Modifier.global else 0),
-            else => .{ .type = .variable },
-        };
+        const symbol = try symbol_kind.ofDecl(b.r, key.file, index);
+        // ItemTree 的成员都在容器级
+        const global = b.options.global_var and (try b.r.itemTree(key.file)).items[index].kind == .@"var";
+        const c: Class = .{ .type = tokenType(symbol.kind), .mods = (if (symbol.readonly) Modifier.readonly else 0) | (if (global) Modifier.global else 0) };
         try b.classes.put(b.r.arena, key, c);
         return c;
     }
@@ -234,55 +245,15 @@ const Builder = struct {
         return seed.wanted(b.r.ctx.db.env.ip, abstract) and dependsOnType(try b.itemClass(key));
     }
 
-    fn functionType(b: *Builder, key: OwnerKey, container: ItemTree.Container) resolve.Error!TokenType {
-        if (container.kind == .file) return .function;
-        const ip = b.r.ctx.db.env.ip;
-        const tv = try b.r.ctx.get(database.sema.DeclType, .{ .owner = key });
-        const signature = switch (ip.key(tv.ty)) {
-            .fn_type => |f| f,
-            else => return .function,
-        };
-        if (signature.params.len == 0) return .function;
-        const receiver = switch (ip.key(signature.params[0])) {
-            .ptr_type => |p| if (p.size == .one) p.child else return .function,
-            else => signature.params[0],
-        };
-        return switch (ip.key(receiver)) {
-            .container_type => |c| if (c.file == key.file and c.ast_id == container.ast_id) .method else .function,
-            else => .function,
-        };
-    }
-
+    /// 不是类型也不是函数的值为 `fallback`（见 `symbol_kind.ofValue`）
     fn valueClass(b: *Builder, tv: InternPool.TypedValue, fallback: TokenType, mods: u32) Class {
-        const ip = b.r.ctx.db.env.ip;
-        const token_type: TokenType = if (tv.isType()) blk: {
-            const ty = tv.asType() orelse break :blk .type;
-            break :blk switch (ip.key(ty)) {
-                .container_type => |c| switch (c.kind) {
-                    .file => .namespace,
-                    .@"struct" => .@"struct",
-                    .@"enum" => .@"enum",
-                    .@"union", .@"opaque" => .type,
-                },
-                .reified_type => |c| switch (c.kind) {
-                    .@"struct" => .@"struct",
-                    .@"enum" => .@"enum",
-                    .@"union" => .type,
-                },
-                .union_tag_type => .@"enum",
-                else => .type,
-            };
-        } else switch (ip.key(tv.ty)) {
-            .fn_type => .function,
-            .ptr_type => |p| if (ip.key(p.child) == .fn_type) .function else fallback,
-            else => fallback,
-        };
-        return .{ .type = token_type, .mods = mods };
+        const kind = symbol_kind.ofValue(b.r.ctx.db.env.ip, tv, .variable);
+        return .{ .type = if (kind == .variable) fallback else tokenType(kind), .mods = mods };
     }
 
     fn bindingClass(b: *Builder, binding: Body.Binding, tv: InternPool.TypedValue) Class {
-        if (binding.kind == .param) return .{ .type = if (tv.isType()) .typeParameter else .parameter, .mods = Modifier.readonly };
-        return b.valueClass(tv, .variable, if (binding.kind == .local_var) 0 else Modifier.readonly);
+        const symbol = symbol_kind.ofBinding(b.r.ctx.db.env.ip, binding, tv);
+        return .{ .type = tokenType(symbol.kind), .mods = if (symbol.readonly) Modifier.readonly else 0 };
     }
 
     fn defClass(b: *Builder, def: resolve.Def, tv: InternPool.TypedValue, owner: OwnerKey, body: *const Body, res: *const infer.Result) resolve.Error!Class {

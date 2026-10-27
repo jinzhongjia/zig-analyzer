@@ -78,6 +78,7 @@ pub const ide_db = struct {
     pub const seed = @import("ide_db/seed.zig");
     pub const imports = @import("ide_db/imports.zig");
     pub const fuzzy = @import("ide_db/fuzzy.zig");
+    pub const symbol_kind = @import("ide_db/symbol_kind.zig");
     pub const organize_imports = @import("ide_db/organize_imports.zig");
 };
 pub const util = struct {
