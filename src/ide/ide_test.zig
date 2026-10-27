@@ -309,6 +309,33 @@ test "signature help and parameter hints through aliases" {
     try testing.expectEqualStrings("a: b: a: b: a: b: ", out.items);
 }
 
+test "hover and signature help drop comments from multi-line function prototypes" {
+    // 防止参数的文档注释与行尾注释折叠进签名，使其后的参数看起来成了注释
+    const text =
+        \\fn add(
+        \\    /// the first
+        \\    a: u32,
+        \\    b: u32, // the second
+        \\) callconv(.c) u32 { return a + b; }
+        \\fn run() void {
+        \\    _ = add(1, 2);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "add(1, 2)").?)) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nfn add(a: u32, b: u32) callconv(.c) u32\n```", info.text);
+    const s = try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, "2);").?)) orelse return error.NoSignature;
+    try testing.expectEqualStrings("fn add(a: u32, b: u32) callconv(.c) u32", s.label);
+    try testing.expectEqualStrings("b: u32", s.params[1]);
+}
+
 test "goto declaration of reified fields named by comptime parsed strings" {
     // 字段名从帮助文本中解析出来（zig-clap 的用法）：跳到帮助文本中的参数名
     const text =

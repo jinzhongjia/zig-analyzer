@@ -11,7 +11,7 @@ const database = @import("../database.zig");
 
 pub const Signature = struct {
     label: []const u8,
-    /// 参数的源码（label 中的子串）
+    /// 参数的显示文本（label 中的子串）
     params: []const []const u8,
     active: u32,
     doc: ?[]const u8,
@@ -48,10 +48,12 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
     const it = target.def.item;
     const node = try r.itemNode(it.file, it.item) orelse return null;
     const proto = (ast.cast(ast.FnDecl, node) orelse return null).proto() orelse return null;
-    const label = try context.collapsedText(r, it.file, proto.syntax);
+    var label: std.Io.Writer.Allocating = .init(r.arena);
+    proto.writeSignature(&label.writer) catch return error.OutOfMemory;
+    // 与 label 中的参数相同（见 `ast.FnProto.writeParams`）
     const texts = try r.arena.alloc([]const u8, params.len);
-    for (params, texts) |p, *t| t.* = try context.collapsedText(r, it.file, p.syntax);
-    return .{ .label = label, .params = texts, .active = active + @as(u32, @intFromBool(target.bound)), .doc = try context.doc(r, target.def) };
+    for (params, texts) |p, *t| t.* = try ast.collapsedAlloc(r.arena, p.syntax);
+    return .{ .label = label.written(), .params = texts, .active = active + @as(u32, @intFromBool(target.bound)), .doc = try context.doc(r, target.def) };
 }
 
 /// CST 的参数列表直接包含分隔逗号，嵌套表达式、注释和字符串中的逗号不参与计数。

@@ -227,6 +227,44 @@ pub const FnProto = struct {
         }
         return out;
     }
+
+    /// 签名的显示：`fn name(a: T, b: U) callconv(.c) R`，由 `writeParams` 与 `writeReturnType` 组成
+    pub fn writeSignature(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("fn");
+        if (n.name()) |t| try w.print(" {s}", .{t.text});
+        try n.writeParams(w);
+        if (n.returnType() == null) return;
+        try w.writeByte(' ');
+        try n.writeReturnType(w);
+    }
+
+    /// 参数列表与其后的子句：`(a: T, b: U) callconv(.c)`。各部分见 `writeCollapsed`，参数以 `, ` 分隔
+    /// （多行参数列表末尾的逗号不显示）
+    pub fn writeParams(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeByte('(');
+        var it = n.params();
+        var first = true;
+        while (it.next()) |p| : (first = false) {
+            if (!first) try w.writeAll(", ");
+            try writeCollapsed(p, w);
+        }
+        try w.writeByte(')');
+        var children = n.syntax.children();
+        while (children.nextNode()) |c| switch (c.kind()) {
+            .align_clause, .addrspace_clause, .linksection_clause, .callconv_clause => {
+                try w.writeByte(' ');
+                try writeCollapsed(c, w);
+            },
+            else => {},
+        };
+    }
+
+    /// 返回类型（推导的错误集带 `!`），见 `writeCollapsed`；缺失时不输出
+    pub fn writeReturnType(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ret = n.returnType() orelse return;
+        if (n.inferredErrorSet()) try w.writeByte('!');
+        try writeCollapsed(ret, w);
+    }
 };
 
 pub const Param = struct {
@@ -717,6 +755,39 @@ pub fn childNodes(n: SyntaxNode) Nodes {
     return nodes(n);
 }
 
+/// 节点的显示文本（签名的各部分）：源码去掉注释与文档注释，token 之间的空白与注释折叠为单个空格
+pub fn writeCollapsed(n: SyntaxNode, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var c: Collapser = .{ .w = w };
+    try c.walk(n);
+}
+
+pub fn collapsedAlloc(a: std.mem.Allocator, n: SyntaxNode) std.mem.Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    writeCollapsed(n, &out.writer) catch return error.OutOfMemory;
+    return out.written();
+}
+
+const Collapser = struct {
+    w: *std.Io.Writer,
+    started: bool = false,
+    space: bool = false,
+
+    fn walk(c: *Collapser, n: SyntaxNode) std.Io.Writer.Error!void {
+        var it = n.children();
+        while (it.next()) |e| switch (e) {
+            .node => |inner| try c.walk(inner),
+            .token => |t| if (kind_mod.isTrivia(t.kind) or t.kind == .doc_comment) {
+                c.space = c.started;
+            } else {
+                if (c.space) try c.w.writeByte(' ');
+                try c.w.writeAll(t.text);
+                c.started = true;
+                c.space = false;
+            },
+        };
+    }
+};
+
 const testing = std.testing;
 const Parse = @import("Parse.zig");
 
@@ -762,6 +833,45 @@ test "declarations and fn proto" {
     const tuple = cast(ContainerField, fields.next().?).?;
     try testing.expect(tuple.name() == null);
     try testing.expectEqual(.name_ref, tuple.typeExpr().?.kind());
+}
+
+test "fn signature display drops comments and collapses whitespace" {
+    const p = try parseFirst(testing.allocator,
+        \\fn lazy(
+        \\    /// The build struct
+        \\    b: *Build, // the builder
+        \\    comptime T: type,
+        \\    x:anytype,
+        \\) align(4) callconv(.c) error{ A,
+        \\    B }!?[]const u8 {}
+        \\fn g(fmt: [*:0]const u8, ...) !void {}
+        \\fn h() E!T {}
+        \\fn s(m: []const u8) @TypeOf("a  b") {}
+        \\fn missing(a: u32)
+    );
+    defer p.destroy();
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "fn lazy(b: *Build, comptime T: type, x:anytype) align(4) callconv(.c) error{ A, B }!?[]const u8", "(b: *Build, comptime T: type, x:anytype) align(4) callconv(.c)", "error{ A, B }!?[]const u8" },
+        .{ "fn g(fmt: [*:0]const u8, ...) !void", "(fmt: [*:0]const u8, ...)", "!void" },
+        .{ "fn h() E!T", "()", "E!T" },
+        // 字符串内的空白保持原样
+        .{ "fn s(m: []const u8) @TypeOf(\"a  b\")", "(m: []const u8)", "@TypeOf(\"a  b\")" },
+        .{ "fn missing(a: u32)", "(a: u32)", "" },
+    };
+    var members = nodes(p.rootNode());
+    for (cases) |c| {
+        const proto = cast(FnDecl, members.next().?).?.proto().?;
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try proto.writeSignature(&out.writer);
+        try testing.expectEqualStrings(c[0], out.written());
+        out.clearRetainingCapacity();
+        try proto.writeParams(&out.writer);
+        try testing.expectEqualStrings(c[1], out.written());
+        out.clearRetainingCapacity();
+        try proto.writeReturnType(&out.writer);
+        try testing.expectEqualStrings(c[2], out.written());
+    }
 }
 
 test "control flow" {

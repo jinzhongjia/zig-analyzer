@@ -119,25 +119,7 @@ pub fn doc(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
     };
 }
 
-/// 节点源码，空白折叠为单个空格（用于签名显示）
-pub fn collapsedText(r: *Resolver, file: FileId, node: SyntaxNode) resolve.Error![]const u8 {
-    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
-    const range = node.range();
-    var out: std.ArrayList(u8) = .empty;
-    var space = false;
-    for (text[range.start..range.end]) |c| {
-        if (std.ascii.isWhitespace(c)) {
-            space = out.items.len != 0;
-            continue;
-        }
-        if (space) try out.append(r.arena, ' ');
-        space = false;
-        try out.append(r.arena, c);
-    }
-    return out.items;
-}
-
-/// 定义的签名：函数为原型源码，其他为 `const name: T = v` 形式
+/// 定义的签名：函数为原型（见 `ast.FnProto.writeSignature`），其他为 `const name: T = v` 形式
 pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u8 {
     const ip = r.ctx.db.env.ip;
     switch (def) {
@@ -146,8 +128,10 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
             const item = tree.items[it.item];
             const node = try r.itemNode(it.file, it.item) orelse return render.typeAlloc(r, tv.ty);
             if (item.kind == .@"fn") if (ast.cast(ast.FnDecl, node)) |f| if (f.proto()) |p| {
-                const proto = try collapsedText(r, it.file, p.syntax);
-                return if (item.flags.is_pub) std.fmt.allocPrint(r.arena, "pub {s}", .{proto}) else proto;
+                var out: std.Io.Writer.Allocating = .init(r.arena);
+                if (item.flags.is_pub) out.writer.writeAll("pub ") catch return error.OutOfMemory;
+                p.writeSignature(&out.writer) catch return error.OutOfMemory;
+                return out.written();
             };
             const keyword = switch (item.kind) {
                 .@"const" => "const ",
