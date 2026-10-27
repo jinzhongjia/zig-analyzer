@@ -3,21 +3,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
-const pinned_version = "0.17.0";
+const official = @import("zig_source.zig");
+const pinned_version = official.pinned_version;
+const Metadata = official.Metadata;
+const checkHash = official.checkHash;
+const validateMetadata = official.validateMetadata;
 const documented_count = 124;
 const compiler_only = [_][]const u8{ "@Frame", "@frame", "@disableInstrumentation", "@disableIntrinsics" };
-
-const Metadata = struct {
-    version: []const u8,
-    source_archive: []const u8,
-    source_archive_sha256: []const u8,
-    langref_path: []const u8,
-    langref_sha256: []const u8,
-    builtin_registry_path: []const u8,
-    builtin_registry_sha256: []const u8,
-    documentation_url: []const u8,
-    license: []const u8,
-};
 
 fn invalid(comptime fmt: []const u8, args: anytype) error{InvalidOfficialSource} {
     // Tests construct invalid input on purpose; printing to stderr would put a misleading
@@ -32,24 +24,6 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
-}
-
-fn checkHash(bytes: []const u8, expected: []const u8, name: []const u8) !void {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const actual = std.fmt.bytesToHex(digest, .lower);
-    if (!eql(&actual, expected)) return invalid("{s} SHA-256 mismatch: expected {s}, got {s}", .{ name, expected, actual });
-}
-
-fn validateMetadata(a: Allocator, metadata: Metadata, compiler_version: []const u8) !void {
-    if (!eql(metadata.version, pinned_version) or !eql(metadata.version, compiler_version))
-        return invalid("version mismatch: generator {s}, official inputs {s}, compiler {s}", .{ pinned_version, metadata.version, compiler_version });
-    const archive = try std.fmt.allocPrint(a, "https://ziglang.org/download/{s}/zig-{s}.tar.xz", .{ metadata.version, metadata.version });
-    const docs = try std.fmt.allocPrint(a, "https://ziglang.org/documentation/{s}/", .{metadata.version});
-    if (!eql(metadata.source_archive, archive) or !eql(metadata.documentation_url, docs) or
-        !eql(metadata.langref_path, "doc/langref.html.in") or !eql(metadata.builtin_registry_path, "lib/std/zig/BuiltinFn.zig") or
-        !eql(metadata.license, "MIT") or metadata.source_archive_sha256.len != 64)
-        return invalid("unexpected official source provenance for Zig {s}", .{metadata.version});
 }
 
 fn sectionUrl(a: Allocator, base: []const u8, title: []const u8) ![]const u8 {
