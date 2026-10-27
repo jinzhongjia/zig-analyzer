@@ -942,3 +942,51 @@ test "auto imports match whole paths of modules that are not imported yet" {
     try testing.expectEqualStrings("std.mem.eql", eql.filter);
     try testing.expectEqualStrings("const eql = @import(\"std\").mem.eql;\n", eql.import_edit.?.text);
 }
+
+test "auto import candidates are classified like the declarations they import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\fn main() void { _ = <|>missing; }
+        \\//- /p/Lib.zig in:app
+        \\pub const WidgetStruct = struct {};
+        \\pub const WidgetEnum = enum { a };
+        \\pub const WidgetIndex = u32;
+        \\pub const widget_limit = 3;
+        \\pub var widget_count: u32 = 0;
+        \\pub fn widgetMake() void {}
+        \\pub const widgets = @import("widgets.zig");
+        \\//- /p/widgets.zig in:app
+        \\pub const Part = struct {};
+    );
+    const at = f.cursor.?;
+    const result = try run(&w, at.file, at.offset, "widget", 128);
+    const cases = [_]struct { []const u8, @FieldType(imports.Candidate, "kind") }{
+        .{ "WidgetStruct", .@"struct" },
+        .{ "WidgetEnum", .@"enum" },
+        .{ "WidgetIndex", .type },
+        .{ "widget_limit", .constant },
+        .{ "widgetMake", .function },
+        // 运行期存储经由命名空间访问
+        .{ "Lib.widget_count", .variable },
+    };
+    for (cases) |c| {
+        const item = find(result, c[0]) orelse {
+            std.debug.print("missing `{s}`\n", .{c[0]});
+            return error.MissingCandidate;
+        };
+        testing.expectEqual(c[1], item.kind) catch |err| {
+            std.debug.print("kind of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // 同名的两个候选：`Lib.zig` 中指向文件的声明为命名空间，文件本身为文件
+    var kinds: [2]?@FieldType(imports.Candidate, "kind") = .{ null, null };
+    for (result.items) |item| if (std.mem.eql(u8, item.label, "widgets")) {
+        kinds[@intFromBool(std.mem.indexOf(u8, item.qualifier, "Lib") != null)] = item.kind;
+    };
+    try testing.expectEqual(.file, kinds[0].?);
+    try testing.expectEqual(.namespace, kinds[1].?);
+}

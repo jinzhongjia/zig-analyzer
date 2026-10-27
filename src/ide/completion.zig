@@ -12,6 +12,8 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const context = @import("context.zig");
+const infer = @import("../sema/infer.zig");
+const symbol_kind = @import("../ide_db/symbol_kind.zig");
 const queries = @import("../sema/queries.zig");
 const render = @import("../sema/render.zig");
 const eval = @import("../sema/eval.zig");
@@ -65,7 +67,7 @@ pub const Item = struct {
     /// 所指的定义，被选中时据此给出签名与文档（见 `describe`）：自动导入的候选与函数
     target: ?imports.Target = null,
 
-    pub const Kind = enum { param, local, capture, function, constant, variable, field, enum_member, error_name, builtin, module, file, folder, label };
+    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label };
     pub const Range = struct { start: u32, end: u32 };
 };
 
@@ -106,6 +108,10 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
                     .function => .function,
                     .constant => .constant,
                     .variable => .variable,
+                    .namespace => .namespace,
+                    .@"struct" => .@"struct",
+                    .@"enum" => .@"enum",
+                    .type => .type,
                     .module => .module,
                     .file => .file,
                 },
@@ -268,7 +274,9 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         .name_ref => b.expr_scopes[@backingInt(e)],
         else => b.scopeAt(rel),
     } else b.scopeAt(rel) else b.scopeAt(rel);
-    try locals(&out, b, scope, null);
+    // 局部名字的种类取光标所在成员的推导结果（泛型函数体内以调用点的实例）
+    const types: BindingTypes = if (try context.atSeeded(r, file, offset, true)) |a| .{ .at = a } else .none;
+    try locals(&out, r.ctx.db.env.ip, b, scope, null, types);
 
     const tree = try r.itemTree(file);
     var container = tree.items[item].container;
@@ -276,13 +284,14 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     while (true) : (level += 1) {
         // 内层容器的成员优先于外层的
         const weight = @max(min_container_weight, container_weight - container_step * level);
-        try decls(&out, file, tree, container, true, weight);
+        try decls(r, &out, file, tree, container, true, weight);
         const parent = tree.containers[container].parent_item orelse break;
         // 体内定义的容器：外层成员在容器位置可见的局部名字
         const owner = try r.itemNode(file, parent) orelse break;
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
-        try locals(&out, pb, pb.scopeAt(c_node.offset - owner.offset), weight);
+        const parent_res = try r.ctx.get(database.sema.Infer, .{ .owner = try r.ownerKey(file, parent), .mode = .full });
+        try locals(&out, r.ctx.db.env.ip, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res });
         container = tree.items[parent].container;
     }
     return out.items.items;
@@ -412,37 +421,68 @@ const container_weight = 0.94;
 const container_step = 0.02;
 const min_container_weight = 0.86;
 
+/// 绑定的类型：光标所在的成员取 `At`，外层函数取它的推导结果
+const BindingTypes = union(enum) {
+    none,
+    at: context.At,
+    res: *const infer.Result,
+
+    fn of(t: BindingTypes, id: Body.BindingId) TypedValue {
+        return switch (t) {
+            .none => .unknown,
+            .at => |a| a.bindingType(id),
+            .res => |res| if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown,
+        };
+    }
+};
+
 /// `weight` 为 null 时按绑定的种类取权重，否则都取 `weight`（外层函数中的名字）
-fn locals(out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32) Allocator.Error!void {
+fn locals(out: *Collector, ip: *InternPool, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes) Allocator.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
         for (b.scope(id).bindings) |bid| {
             const binding = b.binding(bid);
-            try out.add(.{ .label = binding.name, .kind = switch (binding.kind) {
-                .param => .param,
-                .local_const, .local_var => .local,
-                .capture => .capture,
-            }, .weight = weight orelse if (binding.kind == .param) param_weight else local_weight });
+            try out.add(.{
+                .label = binding.name,
+                .kind = kindOf(symbol_kind.ofBinding(ip, binding, types.of(bid))),
+                .weight = weight orelse if (binding.kind == .param) param_weight else local_weight,
+            });
         }
     }
 }
 
-fn decls(out: *Collector, file: FileId, tree: *const ItemTree, container: u32, private: bool, weight: f32) Allocator.Error!void {
+fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, container: u32, private: bool, weight: f32) resolve.Error!void {
     const is_enum = tree.containers[container].kind == .@"enum";
     for (tree.containerMembers(container)) |m| {
         const it = tree.items[m];
         const name = it.name orelse continue;
-        const kind: Item.Kind = switch (it.kind) {
-            .@"fn" => .function,
-            .@"const" => .constant,
-            .@"var" => .variable,
+        switch (it.kind) {
+            .@"fn", .@"const", .@"var" => {},
             // 字段不是作用域中的名字；枚举成员可以通过类型访问
-            .field => if (is_enum and !private) .enum_member else continue,
+            .field => if (!is_enum or private) continue,
             .@"test", .@"comptime" => continue,
-        };
+        }
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
+        const kind = kindOf(try symbol_kind.ofDecl(r, file, m));
         try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") .{ .decl = .{ .file = file, .item = m } } else null, .weight = weight });
     }
+}
+
+/// 补全项的种类：不可修改的变量为常量
+fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
+    return switch (symbol.kind) {
+        .namespace => .namespace,
+        .@"struct" => .@"struct",
+        .@"enum" => .@"enum",
+        .type => .type,
+        .function => .function,
+        .method => .method,
+        .variable => if (symbol.readonly) .constant else .variable,
+        .field => .field,
+        .enum_member => .enum_member,
+        .parameter => .param,
+        .type_parameter => .type_param,
+    };
 }
 
 /// 按类型列出成员：值为类型时列出声明；实例（含单指针）列出字段与方法；切片与数组有 len
@@ -502,7 +542,7 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
                 const fty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(r.ctx.db.env.ip, t) })).ty;
                 try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
             },
-            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = .function, .doc = it.doc, .target = .{ .decl = .{ .file = ns.file, .item = m } } }),
+            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = .{ .decl = .{ .file = ns.file, .item = m } } }),
             // 函数的别名（`pub const isPowerPC = isPowerpc;`）同样可以作为方法调用，选中时给出所指函数的签名
             .@"const" => if (same_file or it.flags.is_pub) {
                 const ctv = try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) });
@@ -550,7 +590,7 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resol
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
                 if (!producesType(ip, decl_ty, t, it.kind == .@"fn")) continue;
                 const is_fn = it.kind == .@"fn";
-                try out.add(.{ .label = name, .kind = if (is_fn) .function else .constant, .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
+                try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
             },
             else => {},
         }
@@ -736,7 +776,7 @@ fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.Fiel
 fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolve.Error!void {
     const tree = try r.itemTree(ns.file);
     if (ns.container >= tree.containers.len) return;
-    try decls(out, ns.file, tree, ns.container, same_file, 0);
+    try decls(r, out, ns.file, tree, ns.container, same_file, 0);
     const kind = tree.containers[ns.container].kind;
     // 同一文件中的枚举成员（其他文件的由 `decls` 给出）；带标签的 union 在类型上访问字段得到字段的标签
     // （`Value.null_val`），可以转换为 union

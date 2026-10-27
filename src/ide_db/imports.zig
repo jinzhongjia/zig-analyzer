@@ -21,11 +21,13 @@ const deepEql = @import("../util/deep_eql.zig").deepEql;
 const mem = @import("../util/mem.zig");
 const organize_imports = @import("organize_imports.zig");
 const fuzzy = @import("fuzzy.zig");
+const symbol_kind = @import("symbol_kind.zig");
 
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 pub const Candidate = struct {
     label: []const u8,
-    kind: enum { function, constant, variable, module, file },
+    /// 声明的种类见 `symbol_kind`；`module`、`file` 为新增 import 的模块与文件本身
+    kind: enum { function, constant, variable, namespace, @"struct", @"enum", type, module, file },
     filter: []const u8,
     qualifier: []const u8,
     /// 匹配分（见 `fuzzy`）乘以来源的权重与路径的深度系数，越大越靠前
@@ -72,6 +74,8 @@ pub const Decl = struct {
     /// `Eval` 求值
     local: ?u32,
     doc: ?[]const u8,
+    /// 按语法能确定的种类（const 与 var），补全的候选据此显示种类，不必为它求声明的类型
+    form: symbol_kind.Form = .unknown,
 };
 
 /// 经由公开成员（包括指向同文件私有容器的公开别名）从文件根可达的声明：`decl` 为 `DeclIndex.decls` 的下标
@@ -322,6 +326,7 @@ const DeclBuilder = struct {
                 .path = try b.pathOf(item),
                 .local = try b.localNamespace(item),
                 .doc = if (it.doc) |d| try b.a.dupe(u8, d) else null,
+                .form = if (it.kind == .@"fn") .unknown else if (try b.r.itemNode(b.file, item)) |node| symbol_kind.declForm(node) else .unknown,
             });
         }
         std.mem.sort(Decl, list.items, {}, nameLess(Decl));
@@ -1226,20 +1231,22 @@ const Builder = struct {
         switch (p.what) {
             .member => |m| {
                 if (try b.visible(m.name) != null) return;
-                try b.add(.{ .label = try joinPath(b.r.arena, p.parts[0], p.parts[1]), .kind = candidateKind(m.kind), .filter = try b.filterOf(m.name, p.parts), .qualifier = p.parts[0], .score = p.score, .doc = m.doc, .target = .{ .decl = m.decl } });
+                try b.add(.{ .label = try joinPath(b.r.arena, p.parts[0], p.parts[1]), .kind = try b.declKind(m.decl), .filter = try b.filterOf(m.name, p.parts), .qualifier = p.parts[0], .score = p.score, .doc = m.doc, .target = .{ .decl = m.decl } });
             },
-            .reuse => |u| try b.add(.{ .label = try renderName(b.r.arena, u.alias.name), .kind = candidateKind(u.kind), .filter = try b.filterOf(u.name, p.parts), .qualifier = "", .score = p.score, .doc = u.doc, .target = .{ .decl = .{ .file = b.file, .item = u.alias.item } } }),
+            .reuse => |u| try b.add(.{ .label = try renderName(b.r.arena, u.alias.name), .kind = try b.declKind(.{ .file = b.file, .item = u.alias.item }), .filter = try b.filterOf(u.name, p.parts), .qualifier = "", .score = p.score, .doc = u.doc, .target = .{ .decl = .{ .file = b.file, .item = u.alias.item } } }),
             .chain => |c| {
                 if (try b.visible(c.decl.name) != null) return;
                 const root_def = try b.visible(c.root) orelse return;
                 const expected = findRoot(b.current, c.root) orelse return;
                 if (!deepEql(root_def, resolve.Def{ .item = .{ .file = b.file, .item = expected.item } })) return;
-                try b.add(.{ .label = try b.r.arena.dupe(u8, c.decl.path), .kind = candidateKind(c.decl.kind), .filter = try b.filterOf(c.decl.name, p.parts), .qualifier = try renderName(b.r.arena, c.root), .score = p.score, .doc = c.decl.doc, .target = .{ .decl = .{ .file = b.file, .item = c.decl.item } } });
+                try b.add(.{ .label = try b.r.arena.dupe(u8, c.decl.path), .kind = try b.declKind(.{ .file = b.file, .item = c.decl.item }), .filter = try b.filterOf(c.decl.name, p.parts), .qualifier = try renderName(b.r.arena, c.root), .score = p.score, .doc = c.decl.doc, .target = .{ .decl = .{ .file = b.file, .item = c.decl.item } } });
             },
             .module => |m| try b.importCandidate(m.name, m.kind, false, m.spec, "", null, p, .{ .file = m.target }),
             .import => |i| {
                 if (try b.visible(i.name) != null) return;
-                try b.importCandidate(i.name, candidateKind(i.kind), i.is_extern, i.spec, i.path, i.doc, p, i.target);
+                // 运行期存储（容器级 var、extern const）不能复制到新的 comptime 常量中
+                const storage = i.kind == .@"var" or (i.is_extern and i.kind == .@"const");
+                try b.importCandidate(i.name, try b.declKind(i.target.decl), storage, i.spec, i.path, i.doc, p, i.target);
             },
         }
     }
@@ -1249,14 +1256,56 @@ const Builder = struct {
         }
         try b.items.append(b.r.arena, candidate);
     }
-    fn importCandidate(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), is_extern: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, p: Found, target: Target) resolve.Error!void {
+    /// 构造的候选的种类（见 `symbol_kind`）。先取建索引时已求出、常驻的结果：函数、按语法能确定种类的声明
+    /// （`Decl.form`）、值为命名空间的 const 以及指向它们的别名，不必为所在的文件解析、求声明的类型；其余求声明的类型
+    fn declKind(b: *Builder, decl: Declaration) resolve.Error!@FieldType(Candidate, "kind") {
+        const key = try b.r.ownerKey(decl.file, decl.item);
+        if (try b.indexedKind(decl, key)) |kind| return kind;
+        const target = try b.r.ctx.get(DeclTarget, key);
+        if (!deepEql(target, decl)) if (try b.indexedKind(target, try b.r.ownerKey(target.file, target.item))) |kind| return kind;
+        const symbol = try symbol_kind.ofDecl(b.r, decl.file, decl.item);
+        return switch (symbol.kind) {
+            .namespace => .namespace,
+            .@"struct" => .@"struct",
+            .@"enum" => .@"enum",
+            .type => .type,
+            .function, .method => .function,
+            .variable, .field, .enum_member, .parameter, .type_parameter => if (symbol.readonly) .constant else .variable,
+        };
+    }
+    /// 函数（自动导入不提供方法，见 `DeclBuilder.isMethod`）、按语法能确定种类的 const / var 与值为 Zig 文件或容器的
+    /// const 的种类
+    fn indexedKind(b: *Builder, decl: Declaration, key: hir.OwnerKey) resolve.Error!?@FieldType(Candidate, "kind") {
+        const item_kind = (try b.r.itemTree(decl.file)).items[decl.item].kind;
+        switch (item_kind) {
+            .@"fn" => return .function,
+            .@"const", .@"var" => {},
+            else => return null,
+        }
+        if ((try b.r.ctx.get(FileDecls, decl.file)).byItem(decl.item)) |d| switch (d.form) {
+            .value => return if (item_kind == .@"var") .variable else .constant,
+            .type => return .type,
+            .function => return .function,
+            .unknown => {},
+        };
+        if (item_kind != .@"const") return null;
+        const ns = try b.r.ctx.get(DeclNamespace, key) orelse return null;
+        if (!isZigSource(b.r.ctx.db.env.vfs.path(ns.file))) return null;
+        return switch ((try b.r.itemTree(ns.file)).containers[ns.container].kind) {
+            .file => .namespace,
+            .@"struct" => .@"struct",
+            .@"enum" => .@"enum",
+            .@"union", .@"opaque" => .type,
+        };
+    }
+    fn importCandidate(b: *Builder, name: []const u8, kind: @FieldType(Candidate, "kind"), storage: bool, spec: []const u8, path: []const u8, doc: ?[]const u8, p: Found, target: Target) resolve.Error!void {
         const a = b.r.arena;
         const qualifier = if (path.len == 0) spec else try std.fmt.allocPrint(a, "{s}:{s}", .{ spec, path });
         var binding = name;
         var binding_path = path;
         var direct = false;
-        // 运行期存储不能复制到 comptime 常量；extern const 仍保留只读补全类别。
-        const label = if (kind == .variable or (is_extern and kind == .constant) or try b.bindingConflict(name)) blk: {
+        // 运行期存储经由命名空间访问；extern const 仍保留只读补全类别。
+        const label = if (storage or try b.bindingConflict(name)) blk: {
             const base = std.fs.path.basename(spec);
             const namespace = if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else base;
             if (try b.bindingConflict(namespace) or try b.visible(namespace) != null) {
@@ -1396,13 +1445,6 @@ fn localRelative(index: *const DeclIndex, ns: Namespace, decl: Decl) ?[]const u8
     if (prefix.len == 0) return decl.path;
     if (decl.path.len <= prefix.len or !std.mem.startsWith(u8, decl.path, prefix) or decl.path[prefix.len] != '.') return null;
     return decl.path[prefix.len + 1 ..];
-}
-fn candidateKind(kind: ItemTree.Item.Kind) @FieldType(Candidate, "kind") {
-    return switch (kind) {
-        .@"fn" => .function,
-        .@"var" => .variable,
-        else => .constant,
-    };
 }
 fn renderName(a: Allocator, name: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(a, "{f}", .{std.zig.fmtId(name)});

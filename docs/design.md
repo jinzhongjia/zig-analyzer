@@ -77,11 +77,13 @@ Cubyz、strand、flow、element-0 的首次 10 行 range 为 0.31～2.89 ms；�
 | Cubyz（`src/graphics.zig`） | 3.5 ms | 5.1 ms | 1.6 s | 275 MB |
 | flow（`src/tui/mainview.zig`） | 4.9 ms | 7.0 ms | 1.3 s | 411 MB |
 | zig-analyzer（`src/sema/infer.zig`） | 4.3 ms | 6.7 ms | 0.7 s | 188 MB |
-| Zig 编译器（`src/Sema.zig`，3.5 万行） | 27 ms | 49 ms | 2.9 s | 680 MB |
+| Zig 编译器（`src/Sema.zig`，3.5 万行） | 27 ms | 57 ms | 2.9 s | 680 MB |
 
-`Sema.zig` 上同样输入、不开启自动导入时补全 p50 9.8 ms、p95 24.6 ms，常驻内存约 510 MB；多出的部分主要是按键后为当前文件重算的 `FileIndex`、`ItemSummaries`（`Resolver` 解析命名模块的 import、求容器位置时依赖它们）与 `ImportSites`。在文件头增删一行 `@import` 后紧接着补全，Cubyz、flow、zig-analyzer 上 p50 6～7 ms、最慢 17 ms，`Sema.zig` 上 p50 37 ms、最慢 70 ms，主要是编辑落在文件头部后的重新解析；其中 `TestOnlyFiles` 的重算不到 1 ms。
+`Sema.zig` 上同样输入、不开启自动导入时补全 p50 12.5 ms、p95 30.7 ms，常驻内存约 510 MB；多出的部分主要是按键后为当前文件重算的 `FileIndex`、`ItemSummaries`（`Resolver` 解析命名模块的 import、求容器位置时依赖它们）与 `ImportSites`。在文件头增删一行 `@import` 后紧接着补全，Cubyz、flow、zig-analyzer 上 p50 6～7 ms、最慢 17 ms，`Sema.zig` 上 p50 37 ms、最慢 70 ms，主要是编辑落在文件头部后的重新解析；其中 `TestOnlyFiles` 的重算不到 1 ms。
 
 按整条路径输入时（`memeql`、`fmtalloc`、`heaparena`、`ArrayHashMap`、`debugassert`，同样逐字输入三遍），`Sema.zig` 上补全 p50 24 ms、p95 44 ms：每次补全对可见命名空间与模块的根之下两段以内的全部导出做模糊匹配并打分。
+
+补全项的种类在候选第一次出现时可能要求声明的类型：自动导入的候选中要求值的声明（如 `std.Target.x86.all_features = blk: {...}`）第一次出现的那次按键最慢约 0.2 s，之后命中缓存；`Sema.zig` 打开后第一次名字补全约 70 ms（为作用域中的成员求声明的类型），之后约 2 ms；`.` 之后补全的第一轮最慢 19 ms。
 
 命名检查（开启时，ReleaseSafe）：Zig 编译器的 `src/Sema.zig` 上编辑 → 诊断 p50 170 ms（关闭时 169 ms），每次编辑只重算被编辑的
 成员，不读取其他文件；codeAction p50 3.8 ms，局部名字的修复（resolve，含改名后对整个文件的 AstGen）68 ms。ZLS、zigimg、Cubyz
@@ -242,7 +244,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 | 功能 | 依据 |
 |---|---|
 | folding / selection range / document symbol | 纯语法 |
-| semantic tokens | CST 分类 + 每个成员的名字解析与类型推导；引用与声明共用类型、绑定和成员信息，无法解析的代码保留语法分类 |
+| semantic tokens | CST 分类 + 每个成员的名字解析与类型推导；引用与声明共用类型、绑定和成员信息，无法解析的代码保留语法分类；声明的种类与补全项的种类共用 `ide_db/symbol_kind.zig` |
 | formatting | `std.zig.Ast.render`，与 `zig fmt` 逐字一致；嵌套深的文本在专用线程上格式化（栈按估计的深度取，至多 8 GiB），估计深度超过 147456（32 位平台 36864）时拒绝。上限按常见的嵌套形式标定：`zig fmt`（主线程栈 46 MiB）能格式化到 36864 层（连续的前缀运算符能更深），64 位平台上是它的 4 倍 |
 | goto definition / declaration / type definition、hover、completion、signature help、inlay hints | 推导结果 + 名字解析 |
 | 内置函数的补全、hover、参数提示 | 同版本 Zig 官方语言参考生成的静态签名、参数和 Markdown 说明；hover 同时保留推导结果 |
@@ -261,6 +263,8 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 128 个编译器登记项中，124 个有官方文档；其余 4 个明确说明来源缺口，不编造签名，也不提供虚假的参数提示。
 
 补全项被选中时（`completionItem/resolve`）给出签名与文档：函数（作用域中的函数、成员与方法、decl literal，以及经实例访问的函数别名所指的函数）与自动导入的候选在 `data` 中记下所指的声明，`detail` 为签名，`documentation` 为文档注释与定义的位置（格式见下面的自动导入）。函数的签名与 hover、signature help 相同（`ast.FnProto.writeSignature`），按源码显示：去掉注释与参数的文档注释，空白折叠为单个空格，多行参数列表末尾的逗号不显示；泛型实例的方法不代入推导出的类型。补全列表中不带签名，签名只在选中时计算。作用域与成员补全中的常量、变量只有文档注释。
+
+补全项的种类（`CompletionItemKind`）与语义着色共用 `ide_db/symbol_kind.zig` 的分类，由声明的种类与推导出的类型决定：值为类型的按类型分为命名空间（Module，文件）、结构体（Struct）、枚举（Enum）与其他类型（Class：union、opaque、标量等）；值为函数（或函数指针）的为 Function；容器（不是文件）中第一个参数是所在容器或指向它的单指针的函数为 Method；值为类型的参数（`comptime T: type`）为 TypeParameter；不可修改的变量（const 声明、局部常量、捕获）为 Constant，其余为 Variable。类型求不出时按声明的种类，不按名字猜。局部名字的类型取光标所在成员的推导结果，泛型函数体内以调用点的实例推导。自动导入的候选先取建索引时记下、常驻的结果，不必为所在的文件解析、求声明的类型：函数（自动导入不提供方法）、按语法能确定种类的 const / var（`Decl.form`：字面量、取负与取反、`orelse` / `catch` / `||` 以外的二元运算、初始化表达式、原始类型名与类型语法、错误集的合并、类型标注，由测试保证与按类型分类的结果相同）、值为 Zig 文件或容器的 const，以及指向它们的别名；其余（函数调用、按目标选择的 `switch`、块等）在构造候选时求声明的类型，有缓存。
 
 名字补全的排序：输入名字时，每个候选的分数为匹配分乘以来源的权重，服务器按分数从高到低给出 `sortText`（排名），同分时保持收集的顺序。匹配分由 `ide_db/fuzzy.zig` 求出，移植自 gopls 的 `internal/fuzzy`（许可见 `tools/gopls/LICENSE`），不限制输入与候选的长度：输入的字符按顺序、不区分大小写地出现在候选（整条路径）中；词首、连续、候选最后一段中、大小写与输入一致的匹配加分，跳过第一段或最后一段的开头、在词中开始匹配扣分；第一个字符匹配在词中时须从这里起连续匹配输入的前三个字符，词中有两处以上不足三个字符的片段时不算匹配；归一化到 (0, 1]。输入全为小写时打分不区分大小写，同分时名字的大小写与输入一致的优先。来源的权重：局部名字 1.0、参数 0.98、所在容器的成员 0.94（外层容器每层少 0.02，至少 0.86）、经由可见名字访问的自动导入候选 0.85（命名空间别名的成员、复用的直接别名、同文件的私有链）、需要新增 import 的 0.75；自动导入候选的路径每多一段再乘以少 0.05 的系数（至少 0.5）。作用域中的名字不在服务器过滤，不匹配的分数为 0，排在最后，由客户端过滤。
 

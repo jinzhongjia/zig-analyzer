@@ -368,6 +368,114 @@ test "name completion ranks scope names before namespace members, each by how we
     try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
+test "completion item kinds follow what each symbol is" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\const Point = struct {
+        \\    x: i32,
+        \\    pub fn len(self: Point) u32 { _ = self; return 0; }
+        \\    pub fn origin() Point { return .{ .x = 0 }; }
+        \\};
+        \\const Color = enum { red, green };
+        \\const Shape = union { circle: u32 };
+        \\const Index = u32;
+        \\const limit = 10;
+        \\var counter: u32 = 0;
+        \\const run_alias = run;
+        \\fn run(comptime T: type, p: Point) void {
+        \\    const local = 1;
+        \\    var mutable: u32 = 0;
+        \\    const Local = struct {};
+        \\    _ = .{ T, local, &mutable, Local, p.x, p.len(), Point.origin };
+        \\    _ = zz<|>;
+        \\}
+        \\//- /zig/std/std.zig std
+        \\pub const mem = struct {};
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const text = try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, at.file)).text);
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    const cases = [_]struct { []const u8, completion.Item.Kind }{
+        .{ "std", .namespace },
+        .{ "Point", .@"struct" },
+        .{ "Color", .@"enum" },
+        .{ "Shape", .type },
+        .{ "Index", .type },
+        .{ "limit", .constant },
+        .{ "counter", .variable },
+        .{ "run", .function },
+        .{ "run_alias", .function },
+        .{ "T", .type_param },
+        .{ "p", .param },
+        .{ "local", .constant },
+        .{ "mutable", .variable },
+        .{ "Local", .@"struct" },
+    };
+    for (cases) |c| {
+        const item = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[0])) break it;
+        } else return error.MissingCompletion;
+        testing.expectEqual(c[1], item.kind) catch |err| {
+            std.debug.print("kind of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // 成员：字段、方法（第一个参数是所在容器）与普通函数
+    const member_at: u32 = @intCast(std.mem.indexOf(u8, text, "p.x").? + 2);
+    const members = (try completion.complete(&r, at.file, member_at, .{ .auto_import = false })).items;
+    for ([_]struct { []const u8, completion.Item.Kind }{ .{ "x", .field }, .{ "len", .method } }) |c| {
+        const item = for (members) |it| {
+            if (std.mem.eql(u8, it.label, c[0])) break it;
+        } else return error.MissingCompletion;
+        try testing.expectEqual(c[1], item.kind);
+    }
+    const type_at: u32 = @intCast(std.mem.indexOf(u8, text, "Point.origin").? + 6);
+    for ((try completion.complete(&r, at.file, type_at, .{ .auto_import = false })).items) |it| {
+        if (std.mem.eql(u8, it.label, "origin")) break try testing.expectEqual(.function, it.kind);
+    } else return error.MissingCompletion;
+}
+
+test "completion item kinds in generic bodies follow a call site and fall back when the type is unknown" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Point = struct { x: i32 };
+        \\const broken = missing_name;
+        \\fn make(comptime T: type) void {
+        \\    const Alias = T;
+        \\    _ = Alias;
+        \\    _ = zz<|>;
+        \\}
+        \\fn caller() void {
+        \\    make(Point);
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    // `Alias` 以调用点 `make(Point)` 的实例推导为结构体；`broken` 的类型求不出，按声明为常量
+    for ([_]struct { []const u8, completion.Item.Kind }{ .{ "Alias", .@"struct" }, .{ "T", .type_param }, .{ "broken", .constant } }) |c| {
+        const item = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[0])) break it;
+        } else return error.MissingCompletion;
+        testing.expectEqual(c[1], item.kind) catch |err| {
+            std.debug.print("kind of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "selected function completions resolve to the signature as written in the source" {
     const text =
         \\const Point = struct {
