@@ -28,6 +28,9 @@
 //!   projects in bulk)
 //! - `BENCH_TYPE_WORDS=<line>:<word>,<word>...`: type each word character by character in a new
 //!   statement after line `line`, requesting completion after each character (see `typeWords`)
+//! - `BENCH_TYPE_STMT=<statement>`: the statement `BENCH_TYPE_WORDS` inserts, with `|` marking
+//!   where to type (default `_ = |;`); e.g. `const probe: Air.Inst.Ref = |;` types where there is
+//!   an expected type
 //! - `BENCH_COMPLETE=<n>`: completion recall: for each member access `a.b` in the source,
 //!   complete after the `.`; the list must contain `b`
 //! - `BENCH_REFS=<n>`: check find references and rename for n declarations (same name, no false
@@ -266,14 +269,15 @@ fn completionItems(response: std.json.Value) []const std.json.Value {
     };
 }
 
-/// Typing words (BENCH_TYPE_WORDS=<line>:<word>,<word>...): inserts a statement `_ = ;` after line
-/// `line` and types each word character by character before the `;`, requesting completion right
-/// after each character, then deletes the word. Waits for background work to finish before each
-/// keystroke, so the timing covers only that keystroke's edit and completion. Reports the latency of
-/// the first keystroke (which includes building the index and the inference for the first time)
-/// and of the later ones, and for each completion the number of candidates and how many of them are
-/// member paths of local values (fields and methods whose labels contain `.`)
-fn typeWords(c: *Client, uri: []const u8, text: []const u8, spec: []const u8, version: *i64) !void {
+/// Typing words (BENCH_TYPE_WORDS=<line>:<word>,<word>...): inserts the statement `template` after
+/// line `line` (`|` marks where to type) and types each word character by character at the `|`,
+/// requesting completion right after each character, then deletes the word. Waits for background
+/// work to finish before each keystroke, so the timing covers only that keystroke's edit and
+/// completion. Reports the latency of the first keystroke (which includes building the index and
+/// the inference for the first time) and of the later ones, and for each completion the number of
+/// candidates and how many of them are member paths of local values (fields and methods whose
+/// labels contain `.`)
+fn typeWords(c: *Client, uri: []const u8, text: []const u8, spec: []const u8, template: []const u8, version: *i64) !void {
     const a = c.arena.allocator();
     const io = c.io;
     const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return error.BadTypeWordsSpec;
@@ -283,12 +287,14 @@ fn typeWords(c: *Client, uri: []const u8, text: []const u8, spec: []const u8, ve
     const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
     const at = positionOf(text, line_end);
     const doc = .{ .uri = uri };
-    const statement = "\n    _ = ;";
+    const marker = std.mem.indexOfScalar(u8, template, '|') orelse return error.BadTypeStatement;
+    const indent = "\n    ";
+    const statement = try std.mem.concat(a, u8, &.{ indent, template[0..marker], template[marker + 1 ..] });
     try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = statement }} });
     version.* += 1;
     _ = try c.request("zig-analyzer/waitIdle", {});
-    const start: Position = .{ .line = at.line + 1, .character = statement.len - 2 };
-    std.debug.print("  type words after line {d}: `{s}`\n", .{ line, lineText(text, line - 1) });
+    const start: Position = .{ .line = at.line + 1, .character = @intCast(indent.len - 1 + marker) };
+    std.debug.print("  type words after line {d}: `{s}`, in `{s}`\n", .{ line, lineText(text, line - 1), template });
     var times: std.ArrayList(f64) = .empty;
     var first: ?f64 = null;
     var items_total: usize = 0;
@@ -317,7 +323,7 @@ fn typeWords(c: *Client, uri: []const u8, text: []const u8, spec: []const u8, ve
             items_total += items.len;
             paths_total += paths;
             paths_max = @max(paths_max, paths);
-            if (verbose) std.debug.print("    `{s}` {d:.1}ms {d} items, {d} member paths\n", .{ word[0 .. i + 1], t, items.len, paths });
+            if (verbose) std.debug.print("    `{s}` {d:.1}ms {d} items, {d} member paths, first `{s}`\n", .{ word[0 .. i + 1], t, items.len, paths, firstRanked(items) });
         }
         const end: Position = .{ .line = start.line, .character = start.character + @as(u32, @intCast(word.len)) };
         try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = start, .end = end }, .text = "" }} });
@@ -327,9 +333,19 @@ fn typeWords(c: *Client, uri: []const u8, text: []const u8, spec: []const u8, ve
     std.debug.print("  type words   first keystroke {d:.1}ms\n", .{first orelse 0});
     Stats.print("type words", times.items);
     std.debug.print("  type words   {d} keystrokes: {d:.0} items on average, member paths {d:.0} on average, at most {d}\n", .{ keys, @as(f64, @floatFromInt(items_total)) / @as(f64, @floatFromInt(keys)), @as(f64, @floatFromInt(paths_total)) / @as(f64, @floatFromInt(keys)), paths_max });
-    const after: Position = .{ .line = at.line + 1, .character = statement.len - 1 };
+    const after: Position = .{ .line = at.line + 1, .character = @intCast(statement.len - 1) };
     try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = at, .end = after }, .text = "" }} });
     version.* += 1;
+}
+
+/// The label of the top-ranked completion item (the smallest `sortText`)
+fn firstRanked(items: []const json.Value) []const u8 {
+    var best: ?json.Value = null;
+    for (items) |it| {
+        const sort = (it.object.get("sortText") orelse continue).string;
+        if (best == null or std.mem.lessThan(u8, sort, best.?.object.get("sortText").?.string)) best = it;
+    }
+    return if (best) |b| b.object.get("label").?.string else "";
 }
 
 const Stats = struct {
@@ -1031,7 +1047,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         var version: i64 = 2;
-        if (init.environ_map.get("BENCH_TYPE_WORDS")) |spec| try typeWords(&c, uri, text, spec, &version);
+        if (init.environ_map.get("BENCH_TYPE_WORDS")) |spec| try typeWords(&c, uri, text, spec, init.environ_map.get("BENCH_TYPE_STMT") orelse "_ = |;", &version);
 
         // Edit → live diagnostics: add a syntax error at the end of the file, then undo it
         // (BENCH_QUICK skips the edit-related phases)
