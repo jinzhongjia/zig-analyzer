@@ -4086,42 +4086,60 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
     return try server.renameEdit(r, arena, found.refs, new_name, null);
 }
 
-/// 把引用（按文件与位置排列，含声明处）改为 `new_text` 的编辑。`confirm` 不为 null 且客户端支持变更注解时，
-/// 编辑带上要求用户确认的注解（`confirm` 为其标签），客户端应用之前先让用户确认
+/// 把引用（按文件与位置排列，含声明处）改为 `new_text` 的编辑。`confirm` 不为 null 时编辑带上以它为标签、要求
+/// 用户确认的注解（见 `workspaceEdit`）
 fn renameEdit(server: *Server, r: *Resolver, arena: Allocator, refs: []const za.ide_db.search.Reference, new_text: []const u8, confirm: ?[]const u8) !types.WorkspaceEdit {
-    const annotated = confirm != null and server.change_annotations;
-    const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child).pointer.child;
-    const DocumentEdit = @typeInfo(@FieldType(types.TextDocumentEdit, "edits")).pointer.child;
-    const annotation_id = "zig-analyzer.rename-public";
-    var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
-    var documents: std.ArrayList(DocumentChange) = .empty;
-    var m: RangeMapper = .{ .server = server, .r = r };
+    var files: std.ArrayList(ide.rename.FileEdits) = .empty;
     var i: usize = 0;
     while (i < refs.len) {
         const file = refs[i].file;
-        const file_uri = try server.uriFor(arena, file);
+        var edits: std.ArrayList(ide.rename.Edit) = .empty;
+        while (i < refs.len and refs[i].file == file) : (i += 1) {
+            try edits.append(arena, .{ .start = refs[i].start, .end = refs[i].end, .text = new_text });
+        }
+        try files.append(arena, .{ .file = file, .edits = edits.items });
+    }
+    return server.workspaceEdit(r, arena, files.items, if (confirm) |label| .{
+        .id = "zig-analyzer.rename-public",
+        .label = label,
+        .description = "code outside this workspace that uses the name is not updated",
+    } else null);
+}
+
+/// 要求用户确认的变更注解
+const Confirmation = struct {
+    id: []const u8,
+    label: []const u8,
+    description: []const u8,
+};
+
+/// 各文件的编辑（按文件排列，文件中按位置排列）。`confirm` 不为 null 且客户端支持变更注解时，编辑带上要求用户
+/// 确认的注解，客户端应用之前先让用户确认
+fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []const ide.rename.FileEdits, confirm: ?Confirmation) !types.WorkspaceEdit {
+    const annotated = confirm != null and server.change_annotations;
+    const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child).pointer.child;
+    const DocumentEdit = @typeInfo(@FieldType(types.TextDocumentEdit, "edits")).pointer.child;
+    var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+    var documents: std.ArrayList(DocumentChange) = .empty;
+    var m: RangeMapper = .{ .server = server, .r = r };
+    for (files) |fe| {
+        const file_uri = try server.uriFor(arena, fe.file);
         if (annotated) {
-            var edits: std.ArrayList(DocumentEdit) = .empty;
-            while (i < refs.len and refs[i].file == file) : (i += 1) {
-                const ref = refs[i];
-                try edits.append(arena, .{ .AnnotatedTextEdit = .{ .range = try m.range(file, ref.start, ref.end), .newText = new_text, .annotationId = annotation_id } });
-            }
-            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = null }, .edits = edits.items } });
+            const edits = try arena.alloc(DocumentEdit, fe.edits.len);
+            for (fe.edits, edits) |e, *o| o.* = .{ .AnnotatedTextEdit = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text, .annotationId = confirm.?.id } };
+            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = null }, .edits = edits } });
         } else {
-            var edits: std.ArrayList(types.TextEdit) = .empty;
-            while (i < refs.len and refs[i].file == file) : (i += 1) {
-                const ref = refs[i];
-                try edits.append(arena, .{ .range = try m.range(file, ref.start, ref.end), .newText = new_text });
-            }
-            try changes.map.put(arena, file_uri, edits.items);
+            const edits = try arena.alloc(types.TextEdit, fe.edits.len);
+            for (fe.edits, edits) |e, *o| o.* = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text };
+            try changes.map.put(arena, file_uri, edits);
         }
     }
     if (!annotated) return .{ .changes = changes };
     var annotations: std.json.ArrayHashMap(types.ChangeAnnotation) = .{};
-    try annotations.map.put(arena, annotation_id, .{
-        .label = confirm.?,
+    try annotations.map.put(arena, confirm.?.id, .{
+        .label = confirm.?.label,
         .needsConfirmation = true,
-        .description = "code outside this workspace that uses the name is not updated",
+        .description = confirm.?.description,
     });
     return .{ .documentChanges = documents.items, .changeAnnotations = annotations };
 }
@@ -4249,6 +4267,12 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             .edit = .{ .changes = changes },
         } });
     }
+    if (wantsKind(only, types.CodeActionKind.QuickFix)) {
+        for (try ide.remove_param.targets(r, file, start, end)) |t| {
+            const range = lines.range(t.start, t.end, server.encoding);
+            if (try server.removeParamAction(r, arena, doc_uri, range, t, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
+        }
+    }
     if (wantsKind(only, types.CodeActionKind.QuickFix)) if (try server.namingFor(arena, file, text)) |settings| {
         for (try ide.naming.findings(r, file, .{ .start = start, .end = end })) |f| {
             if (!settings.allows(f)) continue;
@@ -4259,16 +4283,26 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     return out.items;
 }
 
-/// 命名修复在 `textDocument/codeAction` 与 `codeAction/resolve` 之间保存的数据（`CodeAction.data`）
-const NamingData = struct {
-    naming: struct {
+/// 在 `textDocument/codeAction` 与 `codeAction/resolve` 之间保存的数据（`CodeAction.data`），用于选择之后才算出
+/// 编辑的修复
+const ResolveData = struct {
+    /// 命名修复
+    naming: ?struct {
         uri: []const u8,
         /// 名字的起点
         line: u32,
         character: u32,
         name: []const u8,
         new_name: []const u8,
-    },
+    } = null,
+    /// 删除未使用的参数
+    remove_param: ?struct {
+        uri: []const u8,
+        /// 参数名的起点
+        line: u32,
+        character: u32,
+        name: []const u8,
+    } = null,
 };
 
 /// 不符合命名约定的名字的改名修复，只在用户选择后应用（不标为 preferred）。客户端支持 `codeAction/resolve` 时
@@ -4315,21 +4349,32 @@ fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []cons
     return action;
 }
 
-/// 补上命名修复的编辑；其他代码操作在 `textDocument/codeAction` 中已经完整，原样返回
+/// 补上命名修复与删除参数的编辑；其他代码操作在 `textDocument/codeAction` 中已经完整，原样返回
 fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeAction) HandlerError!Outcome(types.CodeAction) {
     const value = params.data orelse return .{ .ok = params };
-    const data = std.json.parseFromValueLeaky(NamingData, arena, value, .{ .ignore_unknown_fields = true }) catch return .{ .ok = params };
-    const d = data.naming;
-    const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
-        return .{ .failed = "cannot rename: the document is no longer available" };
-    // 两次请求之间文档可能已经改变：按位置重新找到这个名字
-    const found = for (try ide.naming.findings(r, at.file, .{ .start = at.offset, .end = at.offset })) |f| {
-        if (f.start == at.offset and std.mem.eql(u8, f.name, d.name) and std.mem.eql(u8, f.suggestion, d.new_name)) break f;
-    } else return .{ .failed = "cannot rename: the name has changed since the fix was offered" };
+    const data = std.json.parseFromValueLeaky(ResolveData, arena, value, .{ .ignore_unknown_fields = true }) catch return .{ .ok = params };
     var action = params;
-    switch (try server.namingEdit(r, arena, found)) {
-        .ok => |edit| action.edit = edit,
-        .failed => |reason| return .{ .failed = reason },
+    if (data.naming) |d| {
+        const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
+            return .{ .failed = "cannot rename: the document is no longer available" };
+        // 两次请求之间文档可能已经改变：按位置重新找到这个名字
+        const found = for (try ide.naming.findings(r, at.file, .{ .start = at.offset, .end = at.offset })) |f| {
+            if (f.start == at.offset and std.mem.eql(u8, f.name, d.name) and std.mem.eql(u8, f.suggestion, d.new_name)) break f;
+        } else return .{ .failed = "cannot rename: the name has changed since the fix was offered" };
+        switch (try server.namingEdit(r, arena, found)) {
+            .ok => |edit| action.edit = edit,
+            .failed => |reason| return .{ .failed = reason },
+        }
+    } else if (data.remove_param) |d| {
+        const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
+            return .{ .failed = "cannot remove parameter: the document is no longer available" };
+        const found = for (try ide.remove_param.targets(r, at.file, at.offset, at.offset)) |t| {
+            if (t.start == at.offset and std.mem.eql(u8, t.name, d.name)) break t;
+        } else return .{ .failed = "cannot remove parameter: the parameter has changed since the fix was offered" };
+        switch (try server.removeParamEdit(r, arena, found)) {
+            .ok => |edit| action.edit = edit,
+            .failed => |reason| return .{ .failed = reason },
+        }
     }
     return .{ .ok = action };
 }
@@ -4382,12 +4427,70 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
 
 /// 不能改名的说明：「cannot rename `a` to `b`: 原因 (文件:行:列)」，位置为 null 时只有文件
 fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
+    return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ f.name, f.suggestion }), file, offset, reason);
+}
+
+/// 不能应用修复的说明：「<prefix>: 原因 (文件:行:列)」，位置为 null 时只有文件
+fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
     const path = server.vfs.path(file);
     const shown = if (try server.rootOf(arena, path)) |root| std.mem.trimStart(u8, path[root.len..], "/\\") else path;
-    const at = offset orelse return std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s} ({s})", .{ f.name, f.suggestion, reason, shown });
+    const at = offset orelse return std.fmt.allocPrint(arena, "{s}: {s} ({s})", .{ prefix, reason, shown });
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const pos = (try offsets.LineIndex.init(arena, text)).position(at, server.encoding);
-    return std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s} ({s}:{d}:{d})", .{ f.name, f.suggestion, reason, shown, pos.line + 1, pos.character + 1 });
+    return std.fmt.allocPrint(arena, "{s}: {s} ({s}:{d}:{d})", .{ prefix, reason, shown, pos.line + 1, pos.character + 1 });
+}
+
+/// 删除未使用的参数并删除各调用处对应的实参，只在用户选择后应用（不标为 preferred）。要查找整个工作区中的调用：
+/// 客户端支持 `codeAction/resolve` 时只给出标题与 `data`，选择之后才算出编辑；否则当场算出。不能删除时，客户端
+/// 支持 `disabled` 则带上原因，否则不提供
+fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, t: ide.remove_param.Target, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
+    if (!try server.renamable(r, .{ .item = .{ .file = t.file, .item = t.item } })) return null;
+    var action: types.CodeAction = .{
+        .title = try std.fmt.allocPrint(arena, "remove parameter `{s}`", .{t.name}),
+        .kind = types.CodeActionKind.QuickFix,
+    };
+    // 关联客户端传来的同一条诊断（同一位置还可能有命名提示）
+    for (client_diagnostics) |d| {
+        if (std.meta.eql(d.range, range) and d.message == .string and std.mem.eql(u8, d.message.string, ide.remove_param.unused_message)) {
+            action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
+            break;
+        }
+    }
+    if (server.code_action_resolve) {
+        const inner: std.json.ObjectMap = try .init(arena, &.{ "uri", "line", "character", "name" }, &.{
+            .{ .string = doc_uri },
+            .{ .integer = range.start.line },
+            .{ .integer = range.start.character },
+            .{ .string = t.name },
+        });
+        action.data = .{ .object = try .init(arena, &.{"remove_param"}, &.{.{ .object = inner }}) };
+        return action;
+    }
+    switch (try server.removeParamEdit(r, arena, t)) {
+        .ok => |edit| action.edit = edit,
+        .failed => |reason| {
+            if (!server.code_action_disabled) return null;
+            action.disabled = .{ .reason = reason };
+        },
+    }
+    return action;
+}
+
+/// 删除参数 `t` 与各调用处的实参（见 `ide.remove_param.edits`）。函数是 pub 时编辑要求用户确认：工作区之外的调用
+/// 不会更新
+fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
+    const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
+    switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
+        .ok => |files| return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
+            .id = "zig-analyzer.remove-param-public",
+            .label = try std.fmt.allocPrint(arena, "Remove parameter `{s}` of public `{s}`", .{ t.name, fn_name }),
+            .description = "code outside this workspace that calls the function is not updated",
+        } else null) },
+        .failed => |p| {
+            const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
+            return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
+        },
+    }
 }
 
 /// 以文档为参数的检查请求
@@ -4625,6 +4728,7 @@ test {
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
     _ = @import("naming_e2e_test.zig");
+    _ = @import("remove_param_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
     _ = @import("auto_import_test.zig");
 }
