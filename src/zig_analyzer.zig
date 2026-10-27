@@ -72,6 +72,7 @@ pub const ide = struct {
     pub const code_actions = @import("ide/code_actions.zig");
     pub const naming = @import("ide/naming.zig");
     pub const rename = @import("ide/rename.zig");
+    pub const remove_param = @import("ide/remove_param.zig");
 };
 pub const ide_db = struct {
     pub const search = @import("ide_db/search.zig");
