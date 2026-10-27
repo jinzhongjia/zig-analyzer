@@ -1089,6 +1089,149 @@ test "member completion of reified, tuple and anonymous struct types" {
     }
 }
 
+/// `text` 中 `needle` 的最后一个 `.` 之后的位置上补全，各项标签以空格连接
+fn memberLabels(w: *World, r: *resolve.Resolver, file: FileId, text: []const u8, needle: []const u8) ![]const u8 {
+    const at: u32 = @intCast(std.mem.indexOf(u8, text, needle).? + std.mem.lastIndexOfScalar(u8, needle, '.').? + 1);
+    const items = (try completion.complete(r, file, at, .{ .auto_import = false })).items;
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    return std.mem.join(w.arena.allocator(), " ", labels.items);
+}
+
+test "imported zon files are values with member completion and hover" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/position.zon",
+        \\.{
+        \\    .x = 1,
+        \\    .y = 2,
+        \\    .name = "origin",
+        \\    .tags = .{ .a, .b },
+        \\    .inner = .{ .z = 1.5, .on = true },
+        \\}
+        \\
+    );
+    const text =
+        \\const pos = @import("position.zon");
+        \\fn run() void {
+        \\    _ = .{ pos.x, @import("position.zon").y, pos.inner.z, pos.tags.len, pos.name };
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const completions = [_]struct { []const u8, []const u8 }{
+        .{ "pos.x", "x y name tags inner" },
+        .{ "@import(\"position.zon\").y", "x y name tags inner" },
+        .{ "inner.z", "z on" },
+        .{ "tags.len", "@\"0\" @\"1\" len" },
+    };
+    for (completions) |c| {
+        testing.expectEqualStrings(c[1], try memberLabels(&w, &r, file, text, c[0])) catch |err| {
+            std.debug.print("completion after `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    const hovers = [_]struct { []const u8, []const u8 }{
+        .{ "pos =", "const pos = .{ .x = 1, .y = 2, .name = \"origin\", .tags = .{ .a, .b }, .inner = .{ .z = 1.5, .on = true } }" },
+        .{ "x, @", "comptime_int = 1" },
+        .{ "y, pos", "comptime_int = 2" },
+        .{ "z, pos", "comptime_float = 1.5" },
+        .{ "name }", "*const [6:0]u8 = \"origin\"" },
+    };
+    for (hovers) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;
+        testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "zon imports with a result type take the result type" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/cfg.zon", ".{ .port = 8080, .host = \"localhost\" }");
+    _ = try w.add("/p/n.zon", "5");
+    _ = try w.add("/p/level.zon", ".debug");
+    const text =
+        \\const Cfg = struct { port: u16, host: []const u8, verbose: bool = false };
+        \\const Level = enum { debug, info };
+        \\const cfg: Cfg = @import("cfg.zon");
+        \\const n: u32 = @import("n.zon");
+        \\const level: Level = @import("level.zon");
+        \\fn portOf(comptime c: Cfg) u16 {
+        \\    return c.port;
+        \\}
+        \\const port = portOf(@import("cfg.zon"));
+        \\fn run() void {
+        \\    _ = cfg.port;
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    try testing.expectEqualStrings("port host verbose", try memberLabels(&w, &r, file, text, "cfg.port"));
+    const hovers = [_]struct { []const u8, []const u8 }{
+        .{ "cfg:", "const cfg: Cfg" },
+        // 标量的值与按结果类型解析的结果相同
+        .{ "n:", "const n: u32 = 5" },
+        .{ "level:", "const level: Level = .debug" },
+        // 实参按 `Cfg` 解析，不是匿名结构体的值：值求不出
+        .{ "port =", "const port: u16" },
+    };
+    for (hovers) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;
+        testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "zon import values follow edits to the zon file" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/data.zon", ".{ .a = 1 }");
+    _ = try w.add("/p/lib.zig", "pub const answer = 42;");
+    const text =
+        \\const data = @import("data.zon");
+        \\const lib = @import("lib.zig");
+        \\fn run() void {
+        \\    _ = .{ data.a, lib.answer };
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    const steps = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .a = 1 }", "a" },
+        .{ ".{ .a = 1, .b = .{ 2, 3 } }", "a b" },
+        // 有错误（语法错误、重复的字段名）时没有值，不猜测
+        .{ ".{ .a = 1, .b = ", "" },
+        .{ ".{ .a = 1, .a = 2 }", "" },
+        .{ ".{ .c = 3 }", "c" },
+    };
+    for (steps) |step| {
+        _ = try w.add("/p/data.zon", step[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        testing.expectEqualStrings(step[1], try memberLabels(&w, &r, file, text, "data.a")) catch |err| {
+            std.debug.print("data.zon: `{s}`\n", .{step[0]});
+            return err;
+        };
+        // `.zig` 文件仍是命名空间
+        try testing.expectEqualStrings("answer", try memberLabels(&w, &r, file, text, "lib.answer"));
+    }
+}
+
 test "hover in generic bodies is inferred from a call site" {
     const text =
         \\fn List(comptime T: type) type {

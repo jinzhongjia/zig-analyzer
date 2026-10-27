@@ -28,6 +28,7 @@ const deepEql = @import("../util/deep_eql.zig").deepEql;
 const queries = @import("queries.zig");
 const value = @import("value.zig");
 const eval = @import("eval.zig");
+const zon = @import("zon.zig");
 const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 
 pub const Error = resolve.Error;
@@ -1264,7 +1265,10 @@ const Inferrer = struct {
         if (eq(u8, name, "@import")) {
             for (args) |a| _ = try inf.infer(a, null);
             const target = try inf.r.importTarget(inf.file, inf.body, args) orelse return .unknown;
-            return TypedValue.ofType(try queries.containerType(inf.r, .{ .file = target, .container = 0 }, null));
+            const tv = try queries.importValue(inf.r, target);
+            // 有结果类型时编译器按结果类型解析 ZON：标量以外的值只取结果类型（见 `zon.isScalar`）
+            if (inf.r.isZon(target)) if (expected) |want| if (want != .unknown and want != tv.ty and !zon.isScalar(tv.ty)) return .{ .ty = want };
+            return tv;
         }
         if (eq(u8, name, "@This")) {
             const tree = try inf.r.itemTree(inf.file);

@@ -45,6 +45,11 @@ pub const Resolver = struct {
         return r.ctx.db.env.vfs;
     }
 
+    /// `.zon` 文件：`@import` 得到其中的值，不是命名空间
+    pub fn isZon(r: *Resolver, file: FileId) bool {
+        return std.mem.endsWith(u8, r.vfs().path(file), ".zon");
+    }
+
     pub fn itemTree(r: *Resolver, file: FileId) Error!*const ItemTree {
         return r.ctx.get(syntax.FileItemTree, file);
     }
@@ -188,7 +193,7 @@ pub const Resolver = struct {
     fn namespaceOfDepth(r: *Resolver, def: Def, depth: u32) Error!?Namespace {
         if (depth > max_depth) return null;
         switch (def) {
-            .file => |f| return .{ .file = f, .container = 0 },
+            .file => |f| return if (r.isZon(f)) null else .{ .file = f, .container = 0 },
             .item => |it| {
                 const tree = try r.itemTree(it.file);
                 switch (tree.items[it.item].kind) {

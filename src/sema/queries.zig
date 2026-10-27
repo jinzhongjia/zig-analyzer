@@ -11,6 +11,7 @@ const Index = InternPool.Index;
 const TypedValue = InternPool.TypedValue;
 const infer = @import("infer.zig");
 const eval = @import("eval.zig");
+const zon = @import("zon.zig");
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const Namespace = resolve.Namespace;
@@ -343,6 +344,29 @@ pub const CallEval = struct {
     }
 };
 
+/// `.zon` 文件没有结果类型时的值（见 `zon.lower`）
+pub const ZonValue = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = TypedValue;
+
+    pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
+        // 解析与转换都逐层递归
+        if (ctx.stackExhausted()) {
+            ctx.exhausted();
+            return .unknown;
+        }
+        const source = try ctx.get(database.syntax.SourceText, file);
+        return zon.lower(ctx.db.gpa, ctx.db.env.ip, source.text);
+    }
+};
+
+/// `@import` 的值：`.zon` 文件为其中的值（见 `ZonValue`），`.zig` 文件为文件容器类型
+pub fn importValue(r: *Resolver, target: FileId) resolve.Error!TypedValue {
+    if (r.isZon(target)) return r.ctx.get(ZonValue, target);
+    return TypedValue.ofType(try containerType(r, .{ .file = target, .container = 0 }, null));
+}
+
 /// 推导进行中的局部绑定（同一 owner 内直接读取，避免循环）
 pub const LocalKey = struct {
     owner: hir.OwnerKey,
@@ -392,7 +416,7 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
             if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
             return r.ctx.get(LocalValue, .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) });
         },
-        .file => |f| return TypedValue.ofType(try containerType(r, .{ .file = f, .container = 0 }, null)),
+        .file => |f| return importValue(r, f),
     }
 }
 

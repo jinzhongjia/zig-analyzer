@@ -2957,7 +2957,7 @@ fn maybeResetSema(server: *Server) void {
 const sema_reset_keys = 200_000;
 
 /// 整代回收所清空的 query
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;
