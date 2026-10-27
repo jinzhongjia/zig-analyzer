@@ -105,7 +105,7 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     try testing.expect(diags.get("unrelated.zig") == null);
 
     // 2. Unsaved edit: the Sema error moves down with the inserted line
-    const edited = try std.mem.concat(a, u8, &.{ "// 新的一行\n", main_text });
+    const edited = try std.mem.concat(a, u8, &.{ "// a new line\n", main_text });
     defer a.free(edited);
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = edited }} });
     try waitIdle(&h);
@@ -115,7 +115,7 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     // 3. Fix the error, write it to disk and save: after the rebuild, the diagnostics of main.zig
     //    are cleared. The compiler can now go on to analyze lib.hello() and reports one more Sema
     //    error in lib.zig (the same result as running zig build check directly).
-    const fixed = try std.mem.replaceOwned(u8, a, edited, "const x: u32 = \"不是数字\";", "const x: u32 = 1;");
+    const fixed = try std.mem.replaceOwned(u8, a, edited, "const x: u32 = \"not a number\";", "const x: u32 = 1;");
     defer a.free(fixed);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/main.zig", .data = fixed });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 3 }, .contentChanges = &.{.{ .text = fixed }} });
@@ -188,7 +188,7 @@ test "compiler diagnostics: a save while the finished build is being published s
         if (std.mem.eql(u8, kind, "begin") and std.mem.startsWith(u8, value.get("title").?.string, "zig build")) build_token = token;
         if (std.mem.eql(u8, kind, "end") and build_token != null and std.mem.eql(u8, token, build_token.?)) break;
     }
-    const fixed = try std.mem.replaceOwned(u8, a, main_text, "const x: u32 = \"不是数字\";", "const x: u32 = 1;");
+    const fixed = try std.mem.replaceOwned(u8, a, main_text, "const x: u32 = \"not a number\";", "const x: u32 = 1;");
     defer a.free(fixed);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "src/main.zig", .data = fixed });
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
@@ -1604,7 +1604,7 @@ test "settings: build.enable can be switched off and on at runtime" {
 test "project zig-analyzer.zon: build settings apply, a change on disk restarts the project" {
     var project = try fixture.Project.create(settings_project ++ [_]fixture.File{
         .{ .path = "zig-analyzer.zon", .text =
-        \\// 项目的构建参数
+        \\// Build settings of the project
         \\.{
         \\    .build = .{ .args = .{"-Dbad=true"} },
         \\    .log = .{ .level = .err },

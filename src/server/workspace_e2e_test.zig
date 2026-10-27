@@ -322,7 +322,7 @@ test "a build step that rewrites a source file with the same content does not re
         \\        .root_source_file = b.path("tools/gen.zig"),
         \\        .target = b.graph.host,
         \\    }) });
-        \\    // 没有声明输出的运行步骤每次构建都运行：原样重写源码树中的 src/gen.zig
+        \\    // A run step with no declared outputs runs on every build: it rewrites src/gen.zig in the source tree verbatim
         \\    const run = b.addRunArtifact(gen);
         \\    run.addDirectoryArg(b.path("src"));
         \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{

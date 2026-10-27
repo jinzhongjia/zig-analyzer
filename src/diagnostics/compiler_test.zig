@@ -122,7 +122,7 @@ test "merge: live diagnostics plus remapped Sema errors with unsaved edits" {
 
     // Insert a line at the start of the file: the Sema error moves down one line; the AstGen error
     // now comes from live
-    const edited = try std.mem.concat(arena.allocator(), u8, &.{ "// 新注释\n", main_text });
+    const edited = try std.mem.concat(arena.allocator(), u8, &.{ "// new comment\n", main_text });
     const msgs = try mergeMessages(arena.allocator(), edited, true, result);
     try testing.expectEqual(2, msgs.len);
     try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs[0]);
@@ -564,7 +564,7 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     try testing.expectEqual(1, msgs.len);
     try testing.expectEqualStrings("zig@1:8: unused local variable\n\nCompile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs[0]);
     // Unsaved changes: the AstGen error comes only from live and does not duplicate the compiler's
-    const edited = try std.mem.concat(a, u8, &.{ "// 新注释\n", main_text });
+    const edited = try std.mem.concat(a, u8, &.{ "// new comment\n", main_text });
     const msgs2 = try mergeMessages(a, edited, true, result);
     try testing.expectEqual(1, msgs2.len);
     try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs2[0]);

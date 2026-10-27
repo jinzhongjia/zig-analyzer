@@ -68,7 +68,7 @@ pub const basic = [_]File{
     .{ .path = "src/main.zig", .text =
     \\const lib = @import("lib");
     \\pub fn main() void {
-    \\    const x: u32 = "不是数字";
+    \\    const x: u32 = "not a number";
     \\    _ = x;
     \\    lib.hello();
     \\}

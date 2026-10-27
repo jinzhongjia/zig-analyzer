@@ -630,7 +630,7 @@ test "project file: only project settings apply and override the client" {
     );
     defer client.deinit(testing.allocator);
     var project = try parseProject(testing.allocator,
-        \\// 注释
+        \\// comment
         \\.{
         \\    .build = .{ .args = .{"-Dtarget=wasm32-freestanding"}, .enable = false },
         \\    .diagnostics = .{ .compiler = false },
@@ -671,7 +671,7 @@ test "project file: an error ignores the whole file and is reported with its loc
         try testing.expect(!c.isSet("naming_enable") and !c.isSet("build_args"));
     }
 
-    var empty = try parseProject(testing.allocator, "// 只有注释\n.{}");
+    var empty = try parseProject(testing.allocator, "// only a comment\n.{}");
     defer empty.deinit(testing.allocator);
     try testing.expectEqual(0, empty.warnings.len);
 }

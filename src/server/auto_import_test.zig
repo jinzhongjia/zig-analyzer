@@ -11,7 +11,7 @@ const types = za.lsp.types;
 const Empty = struct {};
 
 const source =
-    \\// 许可说明
+    \\// License notice
     \\//! 😀
     \\pub fn main() void {
     \\    const @"😀" = 0; _ = @"😀"; const value: Widgxx = .{ .size = 1 };
@@ -125,7 +125,7 @@ test "auto-import edits replace the whole identifier and resolve after applicati
         const edited = try applyCompletion(a, source, item, encoding);
         try testing.expect(std.mem.indexOf(u8, edited, "Widgxx") == null);
         try testing.expect(std.mem.indexOf(u8, edited, "const value: Widget =") != null);
-        try testing.expect(std.mem.startsWith(u8, edited, "// 许可说明\n//! 😀\nconst Widget = @import(\"lib\").Widget;"));
+        try testing.expect(std.mem.startsWith(u8, edited, "// License notice\n//! 😀\nconst Widget = @import(\"lib\").Widget;"));
         try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text = edited }} });
         _ = try h.request("zig-analyzer/waitIdle", {});
         const target = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = try position(edited, ".size", 2, encoding) });

@@ -16,13 +16,13 @@ const seed = database.ide_db.seed;
 const search = @import("../ide_db/search.zig");
 
 const src =
-    \\/// 平面上的点
+    \\/// A point in the plane
     \\const Point = struct {
     \\    x: i32,
     \\    y: i32 = 0,
     \\    pub const origin: Point = .{ .x = 0 };
     \\    pub fn init(x: i32, y: i32) Point { return .{ .x = x, .y = y }; }
-    \\    /// 到原点的距离
+    \\    /// Distance to the origin
     \\    pub fn dist(self: Point, scale: u32) u32 { _ = .{ self, scale }; return 0; }
     \\};
     \\fn add(a: u32, b: u32) u32 { return a + b; }
@@ -60,8 +60,8 @@ test "hover shows signature, type and doc" {
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, usize, []const u8 }{
         .{ "d = p", 0, "```zig\nconst d: u32\n```" },
-        .{ "dist(3)", 0, "```zig\npub fn dist(self: Point, scale: u32) u32\n```\n\n到原点的距离" },
-        .{ "Point", 0, "```zig\nconst Point = struct\n```\n\n平面上的点" },
+        .{ "dist(3)", 0, "```zig\npub fn dist(self: Point, scale: u32) u32\n```\n\nDistance to the origin" },
+        .{ "Point", 0, "```zig\nconst Point = struct\n```\n\nA point in the plane" },
         .{ "x, buf", 0, "```zig\nx: i32\n```" },
         .{ "ptr: *Point", 0, "```zig\nptr: *Point\n```" },
         .{ "init(1", 0, "```zig\npub fn init(x: i32, y: i32) Point\n```" },
@@ -227,7 +227,7 @@ test "signature help and inlay hints" {
     // Method call: self is skipped
     const m = try signature_help.signatureHelp(&r, file, offsetOf("3);", 0)) orelse return error.NoSignature;
     try testing.expectEqual(1, m.active);
-    try testing.expectEqualStrings("到原点的距离", m.doc.?);
+    try testing.expectEqualStrings("Distance to the origin", m.doc.?);
 
     const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(src.len), .{});
     var out: std.ArrayList(u8) = .empty;
@@ -488,7 +488,7 @@ test "selected function completions resolve to the signature as written in the s
         \\const Point = struct {
         \\    x: i32,
         \\    pub fn init(x: i32, y: i32) Point { return .{ .x = x + y }; }
-        \\    /// 到原点的距离
+        \\    /// Distance to the origin
         \\    pub fn dist(self: Point, scale: u32) u32 { _ = .{ self, scale }; return 0; }
         \\    pub const length = dist;
         \\};
@@ -555,7 +555,7 @@ test "selected function completions resolve to the signature as written in the s
         };
         // The list does not include signatures
         try testing.expect(item.detail == null);
-        if (std.mem.eql(u8, c[1], "dist")) try testing.expect(std.mem.startsWith(u8, description.doc, "到原点的距离\n\n"));
+        if (std.mem.eql(u8, c[1], "dist")) try testing.expect(std.mem.startsWith(u8, description.doc, "Distance to the origin\n\n"));
     }
 }
 
