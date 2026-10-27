@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    name: 测试 (${{ matrix.os }})
+    name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -26,19 +26,19 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: 全部测试（Debug）
+      - name: All tests (Debug)
         run: zig build test-all --summary all
-      - name: 全部测试（ReleaseSafe）
+      - name: All tests (ReleaseSafe)
         run: zig build test-all -Doptimize=ReleaseSafe --summary all
-      - name: 构建可执行文件
+      - name: Build the executable
         run: zig build -Doptimize=ReleaseSafe
-      - name: 编译检查（含基准工具）
+      - name: Compile check (including benchmark tools)
         run: zig build check -Doptimize=ReleaseSafe
-      - name: 语料对拍（Zig 标准库 + 本仓库源码）
+      - name: Corpus cross-check (Zig standard library + this repository's sources)
         run: zig build corpus -Doptimize=ReleaseSafe -- src tools
 
   lint:
-    name: 格式与生成代码
+    name: Formatting and generated code
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -48,13 +48,13 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         run: zig fmt --check src tools build.zig
-      - name: 生成代码与提交一致
+      - name: Generated code matches the committed files
         run: |
           zig build gen
           git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig
 
   fuzz:
-    name: 覆盖率引导模糊测试
+    name: Coverage-guided fuzzing
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
