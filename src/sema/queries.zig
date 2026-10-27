@@ -11,6 +11,7 @@ const Index = InternPool.Index;
 const TypedValue = InternPool.TypedValue;
 const infer = @import("infer.zig");
 const eval = @import("eval.zig");
+const zon = @import("zon.zig");
 const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const Namespace = resolve.Namespace;
@@ -340,6 +341,23 @@ pub const CallEval = struct {
 
     pub fn cycleFallback(_: Key) Value {
         return .unknown;
+    }
+};
+
+/// `.zon` 文件没有结果类型时的值（见 `zon.lower`）
+pub const ZonValue = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = TypedValue;
+
+    pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
+        // 解析与转换都逐层递归
+        if (ctx.stackExhausted()) {
+            ctx.exhausted();
+            return .unknown;
+        }
+        const source = try ctx.get(database.syntax.SourceText, file);
+        return zon.lower(ctx.db.gpa, ctx.db.env.ip, source.text);
     }
 };
 
