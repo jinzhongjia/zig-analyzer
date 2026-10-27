@@ -130,7 +130,7 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     var title_buf: [256]u8 = undefined;
     ws.loading = server.progress.begin(server, std.fmt.bufPrint(&title_buf, "Loading project {s}", .{std.fs.path.basename(root)}) catch "Loading project", false);
     errdefer server.progress.end(server, ws.loading, null);
-    ws.client = try bsp.Client.start(gpa, server.io, env.zig_exe, root, ws.config.build_args);
+    ws.client = try bsp.Client.start(gpa, server.io, env, root, ws.config.build_args);
     errdefer ws.client.?.deinit();
     // 在启动后台任务之前计为忙碌：任务可能先于这里运行到结束时的 busyEnd
     server.busyBegin();

@@ -14,6 +14,7 @@ const ServerMessage = std.zig.Server.Message;
 const ClientMessage = std.zig.Client.Message;
 const error_bundle = @import("error_bundle.zig");
 const Vfs = @import("../base/Vfs.zig");
+const ZigEnv = @import("ZigEnv.zig");
 
 const log = std.log.scoped(.bsp);
 
@@ -181,11 +182,11 @@ pub const Client = struct {
 
     pub const StartError = std.process.SpawnError || Allocator.Error;
 
-    /// 在 `build_root` 下启动 maker。`extra_args` 透传给 `zig build`（如 `-Dtarget=...`）。
-    pub fn start(gpa: Allocator, io: Io, zig_exe: []const u8, build_root: []const u8, extra_args: []const []const u8) StartError!*Client {
+    /// 在 `build_root` 下用 `env` 的 zig 启动 maker。`extra_args` 透传给 `zig build`（如 `-Dtarget=...`）。
+    pub fn start(gpa: Allocator, io: Io, env: *const ZigEnv, build_root: []const u8, extra_args: []const []const u8) StartError!*Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{ zig_exe, "build", "--listen=-" });
+        try argv.appendSlice(gpa, &.{ env.zig_exe, "build", "--listen=-" });
         try argv.appendSlice(gpa, extra_args);
 
         const c = try gpa.create(Client);
@@ -195,6 +196,7 @@ pub const Client = struct {
         var child = try std.process.spawn(io, .{
             .argv = argv.items,
             .cwd = .{ .path = build_root },
+            .environ_map = env.childEnviron(),
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
@@ -420,12 +422,13 @@ pub const SingleFileResult = struct {
     }
 };
 
-/// 单文件模式（没有 build.zig）：运行 `zig build-obj -fno-emit-bin --listen=- <file>`，请求一次编译
-pub fn compileSingleFile(gpa: Allocator, io: Io, zig_exe: []const u8, file_path: []const u8) !SingleFileResult {
+/// 单文件模式（没有 build.zig）：用 `env` 的 zig 运行 `zig build-obj -fno-emit-bin --listen=- <file>`，请求一次编译
+pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
     var child = try std.process.spawn(io, .{
-        .argv = &.{ zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path) },
+        .argv = &.{ env.zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path) },
         .cwd = .{ .path = dir },
+        .environ_map = env.childEnviron(),
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -658,7 +661,7 @@ test "single-file mode: compile one file, get its errors and the files it read" 
     const gpa = testing.allocator;
     const path = try project.path(gpa, "one.zig");
     defer gpa.free(path);
-    var result = try compileSingleFile(gpa, testing.io, project.env.zig_exe, path);
+    var result = try compileSingleFile(gpa, testing.io, &project.env, path);
     defer result.deinit(gpa);
     const eb = result.errors;
     try testing.expectEqual(1, eb.errorMessageCount());
@@ -675,7 +678,7 @@ test "single-file mode: compile one file, get its errors and the files it read" 
     const dep = try project.path(gpa, "dep.zig");
     defer gpa.free(dep);
     for (0..2) |_| {
-        var r = try compileSingleFile(gpa, testing.io, project.env.zig_exe, ok);
+        var r = try compileSingleFile(gpa, testing.io, &project.env, ok);
         defer r.deinit(gpa);
         try testing.expectEqual(0, r.errors.errorMessageCount());
         try testing.expectEqual(2, r.inputs.len);

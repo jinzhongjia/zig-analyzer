@@ -2261,7 +2261,7 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         const result: ?*compiler.BuildResult = blk: {
             // 文件已从磁盘删除（编译期间被删除时由 `dropSingle` 要求重新编译）：没有结果
             Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
-            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
+            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env, path) catch |err| {
                 log.warn("{s}: single-file compile failed: {t}", .{ path, err });
                 break :blk null;
             };
