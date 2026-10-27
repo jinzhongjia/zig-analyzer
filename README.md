@@ -30,6 +30,7 @@ The lib and global cache directories come from `zig env`; `zig.lib_path` and `zi
 - **Refactoring**: rename (with prepare); code actions:
   - discard an unused name, or remove a pointless discard;
   - remove an unused function parameter together with the matching argument at every call in the workspace, refusing with the reason when some use of the function cannot be updated;
+  - remove an unused capture (`if (x) |v|` → `if (x != null)`, `catch |err|` → `catch`), or rename it to `_` where it cannot be removed;
   - change a local `var` that is never mutated to `const`;
   - add missing switch prongs;
   - add missing struct fields;
