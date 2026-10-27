@@ -3,10 +3,10 @@ const db = @import("engine.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-// 依赖图：
+// Dependency graph:
 //   Number(k) ─┬→ Tens(k) → Plus(k)
-//              └→ Text(k) (字符串 input，验证带指针的 Value)
-//   Stable(k)：high durability input → OnlyStable(k)
+//              └→ Text(k) (string input, tests a Value with pointers)
+//   Stable(k): high durability input → OnlyStable(k)
 
 const Number = struct {
     pub const kind: db.Kind = .input;
@@ -98,7 +98,7 @@ const StablePlus = struct {
     }
 };
 
-// 环：CycleA(k) = CycleB(k) + 1，CycleB(k) = CycleA(k)
+// Cycle: CycleA(k) = CycleB(k) + 1, CycleB(k) = CycleA(k)
 const CycleA = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -120,7 +120,7 @@ const CycleB = struct {
     }
 };
 
-/// 递归链：Depth(k) = Depth(k - 1) + 1
+/// Recursive chain: Depth(k) = Depth(k - 1) + 1
 const Depth = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -134,7 +134,8 @@ const Depth = struct {
     }
 };
 
-/// 可达集（位集）：Reach(k) = {k} ∪ 各后继的 Reach。图 0 → 1，1 → 0、2，2 → 2，3 → 0
+/// Reachable set (bit set): Reach(k) = {k} ∪ the Reach of each successor.
+/// Graph: 0 → 1; 1 → 0, 2; 2 → 2; 3 → 0.
 const Reach = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -154,8 +155,9 @@ const Reach = struct {
     }
 };
 
-/// 由 input 描述的图上的可达集：Graph(k) = Label(k) ∪ 各后继的 Graph，后继由 Succ(k) 的位给出。
-/// 编号为奇数的后继经由非 fixpoint 的 GraphVia 读取，环可以穿过不同的 query
+/// Reachable set on a graph described by inputs: Graph(k) = Label(k) ∪ the Graph of each successor,
+/// with the successors given by the bits of Succ(k). Odd-numbered successors are read through
+/// GraphVia, which is not a fixpoint query, so cycles can pass through different queries.
 const Succ = struct {
     pub const kind: db.Kind = .input;
     pub const Key = u32;
@@ -204,9 +206,10 @@ const GraphVia = struct {
     }
 };
 
-/// 逐层读取的链或环：Layer(k) = Label(k) ∪ Label(k + 1000) ∪ 下一层。`len` 为 0 时下一层是 k - 1（到 0 为止），
-/// 否则是 (k + 1) % len。结果不完整或在环中时，读完下一层后把本帧记下的依赖数记入
-/// `layer_max_deps`
+/// A chain or cycle read layer by layer: Layer(k) = Label(k) ∪ Label(k + 1000) ∪ the next layer.
+/// When `len` is 0, the next layer is k - 1 (down to 0), otherwise (k + 1) % len. When the result
+/// is incomplete or in a cycle, after reading the next layer, the number of dependencies this frame
+/// has recorded is noted in `layer_max_deps`.
 const Layer = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = struct { k: u32, len: u32 = 0 };
@@ -232,7 +235,8 @@ const Layer = struct {
 };
 var layer_max_deps: usize = 0;
 
-/// 链接环：Lasso(k) = Label(k) ∪ 下一个。k > 10 时下一个是 k - 1，环 10 → 9 → … → 0 → 10
+/// A chain leading into a cycle: Lasso(k) = Label(k) ∪ the next one. For k > 10 the next one is
+/// k - 1, and the cycle is 10 → 9 → ... → 0 → 10.
 const Lasso = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -249,7 +253,7 @@ const Lasso = struct {
     }
 };
 
-/// 读到 Number 后一直等待，直到被取消
+/// After reading Number, waits until canceled
 const Spin = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -266,7 +270,8 @@ const Spin = struct {
 };
 var spin_started: std.atomic.Value(bool) = .init(false);
 
-/// 计算途中出现写事务，并以回退值吞掉内层读取的 `Canceled`
+/// A write transaction arrives mid-computation, and the `Canceled` of the inner read is swallowed
+/// with a fallback value
 const Swallow = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -278,7 +283,7 @@ const Swallow = struct {
 };
 var swallow_cancel = false;
 
-/// 带 LRU 容量的 query：值含指针（淘汰时须释放）
+/// A query with an LRU capacity: the value contains pointers (must be freed on eviction)
 const Cached = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -295,7 +300,7 @@ const Cached = struct {
     }
 };
 
-/// 按字节数淘汰的 query：个数上限很大，字节数上限只容得下一个值
+/// A query evicted by bytes: the count limit is large, while the byte limit fits only one value
 const Sized = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -348,9 +353,9 @@ test "keyCount outside and inside a transaction agree" {
     defer d.deinit();
     try setNumber(&d, Number, 1, 5, .low);
     try setNumber(&d, Number, 2, 6, .low);
-    // 事务之外：取共享锁
+    // Outside of a transaction: takes the shared lock
     try testing.expectEqual(2, d.keyCount(Number));
-    // 写事务内：调用者已持有独占锁
+    // Inside a write transaction: the caller already holds the exclusive lock
     d.beginWrite();
     defer d.endWrite();
     try testing.expectEqual(2, d.keyCountLocked(Number));
@@ -379,13 +384,13 @@ test "early cutoff: upstream not recomputed when intermediate result is unchange
     try setNumber(&d, Number, 1, 42, .low);
     try testing.expectEqual(5, try read(&d, Plus, 1));
 
-    // 42 → 47：Tens 仍为 4
+    // 42 → 47: Tens is still 4
     try setNumber(&d, Number, 1, 47, .low);
     try testing.expectEqual(5, try read(&d, Plus, 1));
     try testing.expectEqual(2, executions(&d, Tens));
     try testing.expectEqual(1, executions(&d, Plus));
 
-    // 47 → 51：Tens 变为 5，Plus 必须重算
+    // 47 → 51: Tens becomes 5, so Plus must be recomputed
     try setNumber(&d, Number, 1, 51, .low);
     try testing.expectEqual(6, try read(&d, Plus, 1));
     try testing.expectEqual(3, executions(&d, Tens));
@@ -399,7 +404,7 @@ test "setting the same input value does not bump revision" {
     const rev = d.revision;
     try setNumber(&d, Number, 1, 42, .low);
     try testing.expectEqual(rev, d.revision);
-    // 值没有变化的写事务仍会取消读查询，计入写事务次数
+    // A write transaction that changes no value still cancels read queries and counts as a write
     var buf: [Db.query_types.len]db.QueryStats = undefined;
     try testing.expectEqual(2, d.stats(&buf).writes);
 }
@@ -426,7 +431,7 @@ test "durability: skip dependency check of high-durability memos when low inputs
     try testing.expectEqual(before, d.deep_verifications.load(.monotonic));
     try testing.expectEqual(1, executions(&d, OnlyStable));
 
-    // 高 durability 输入变化后必须重算
+    // Must be recomputed after a high-durability input changes
     try setNumber(&d, Stable, 1, 50, .high);
     try testing.expectEqual(100, try read(&d, OnlyStable, 1));
     try testing.expectEqual(2, executions(&d, OnlyStable));
@@ -448,11 +453,12 @@ test "durability: memo verified through an early cutoff takes the lowered durabi
     defer d.deinit();
     try setNumber(&d, Stable, 1, 21, .high);
     try testing.expectEqual(3, try read(&d, StablePlus, 1));
-    // 降为 low：StableTens 重算出相同的值，StablePlus 只被验证
+    // Lowered to low: StableTens recomputes the same value, and StablePlus is only verified
     try setNumber(&d, Stable, 1, 29, .low);
     try testing.expectEqual(3, try read(&d, StablePlus, 1));
     try testing.expectEqual(1, executions(&d, StablePlus));
-    // StablePlus 仍按 high 跳过依赖检查时，这里得到的是旧值 3
+    // If StablePlus still skipped the dependency check based on high durability, this would read
+    // the old value 3
     try setNumber(&d, Stable, 1, 35, .low);
     try testing.expectEqual(4, try read(&d, StablePlus, 1));
 }
@@ -471,7 +477,7 @@ test "Value with pointers: keep old value when equal, deferred free when changed
     try testing.expectEqualStrings("ABC", first);
     ctx.end();
 
-    // 内容相同的新字符串：input 不变，Upper 不重算
+    // A new string with the same content: the input is unchanged and Upper is not recomputed
     d.beginWrite();
     try d.set(Text, 1, try gpa.dupe(u8, "abc"), .low);
     d.endWrite();
@@ -489,7 +495,8 @@ test "Value with pointers: keep old value when equal, deferred free when changed
 }
 
 test "out of memory while committing a memo keeps the old memo intact and leaks nothing" {
-    // 依次让重算 Upper 过程中的第 i 次分配失败：旧 memo 的依赖与值不能被提前移交，新值不能泄漏
+    // Make the i-th allocation while recomputing Upper fail, for each i in turn: the old memo's
+    // dependencies and value must not be handed over early, and the new value must not leak
     var i: usize = 0;
     while (true) : (i += 1) {
         var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
@@ -510,7 +517,8 @@ test "out of memory while committing a memo keeps the old memo intact and leaks 
         failing.fail_index = std.math.maxInt(usize);
 
         try testing.expectEqualStrings("XYZ", try read(&d, Upper, 1));
-        // 写事务释放垃圾列表：旧的依赖与值各只释放一次
+        // The write transaction frees the garbage list: the old dependencies and value are each
+        // freed only once
         d.beginWrite();
         try d.set(Text, 1, try gpa.dupe(u8, "q"), .low);
         d.endWrite();
@@ -522,7 +530,7 @@ test "out of memory while committing a memo keeps the old memo intact and leaks 
 test "cycle: uses cycleFallback without writing memo" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
-    // CycleA → CycleB → CycleA(fallback = -100)，CycleB = -100，CycleA = -99
+    // CycleA → CycleB → CycleA(fallback = -100), CycleB = -100, CycleA = -99
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(2, executions(&d, CycleA));
@@ -531,25 +539,30 @@ test "cycle: uses cycleFallback without writing memo" {
 test "fixpoint: the cycle head is complete and memoized" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
-    // 3 → 0 ⇄ 1 → 2 ↺：环中对入口的读取取空集，入口 0 与 2 算一遍即得完整结果
+    // 3 → 0 ⇄ 1 → 2 ↺: reads of the cycle head from within the cycle get the empty set, and
+    // computing the cycle heads 0 and 2 once gives the complete result
     try testing.expectEqual(0b1111, try read(&d, Reach, 3));
     const before = executions(&d, Reach);
     try testing.expectEqual(0b0111, try read(&d, Reach, 0));
     try testing.expectEqual(0b0100, try read(&d, Reach, 2));
     try testing.expectEqual(before, executions(&d, Reach));
-    // 1 在 0 的环内，读到的是 0 的回退值，不写入 memo：单独读取时重算
+    // 1 is in the cycle of 0 and read the fallback value of 0, so it is not written to a memo:
+    // reading it on its own recomputes it
     try testing.expectEqual(0b0111, try read(&d, Reach, 1));
     try testing.expectEqual(before + 1, executions(&d, Reach));
 }
 
 test "fixpoint: an older memo of a cycle member does not hide changes seen by the cycle head" {
-    // 防止环的入口把环内成员记为依赖：成员的旧 memo 重算出相同的值（early cutoff）时，入口被误判为未变
+    // Guards against the cycle head recording members of its cycle as dependencies: when a member's
+    // old memo is recomputed to the same value (early cutoff), the cycle head would be wrongly
+    // judged unchanged
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Label, 0, 0b1, .low);
     try setNumber(&d, Label, 2, 0b10, .low);
     try testing.expectEqual(0b10, try read(&d, Graph, 2));
-    // 0 ⇄ 2：入口 0 计算时 2 在环中算出 0b100，2 的 memo 仍是之前的 0b10
+    // 0 ⇄ 2: while the cycle head 0 is computed, 2 computes 0b100 within the cycle, but the memo of
+    // 2 is still the earlier 0b10
     {
         d.beginWrite();
         defer d.endWrite();
@@ -558,7 +571,8 @@ test "fixpoint: an older memo of a cycle member does not hide changes seen by th
         try d.set(Label, 2, 0b100, .low);
     }
     try testing.expectEqual(0b101, try read(&d, Graph, 0));
-    // 2 重算出与旧 memo 相同的值（early cutoff）时，入口仍须看到变化
+    // When 2 is recomputed to the same value as its old memo (early cutoff), the cycle head must
+    // still see the change
     {
         d.beginWrite();
         defer d.endWrite();
@@ -568,7 +582,7 @@ test "fixpoint: an older memo of a cycle member does not hide changes seen by th
     try testing.expectEqual(0b11, try read(&d, Graph, 0));
 }
 
-/// 环 k → k + 1（mod n），`dense` 时还有 k → k + 2；Label(k) = {k}
+/// Cycle k → k + 1 (mod n), plus k → k + 2 when `dense`; Label(k) = {k}
 fn setRing(d: *Db, n: u32, dense: bool) !void {
     d.beginWrite();
     defer d.endWrite();
@@ -585,8 +599,9 @@ fn graphExecutions(d: *Db) u64 {
 }
 
 test "fixpoint: an unrelated change does not recompute a cycle whose members are memoized" {
-    // 防止环的入口与单独读取过的成员的 memo 互相依赖：之后每次验证都沿 memo 环递归到栈上限，
-    // 重算次数随环的规模指数增长
+    // Guards against the cycle head and the memos of separately read members depending on each
+    // other: every later verification would then recurse around the memo cycle up to the stack
+    // limit, and the number of recomputations would grow exponentially with the size of the cycle
     for ([_]struct { n: u32, dense: bool }{ .{ .n = 16, .dense = false }, .{ .n = 8, .dense = true } }) |c| {
         var d: Db = .init(testing.io, testing.allocator, {});
         defer d.deinit();
@@ -599,11 +614,12 @@ test "fixpoint: an unrelated change does not recompute a cycle whose members are
             const deep = d.deep_verifications.load(.monotonic);
             for (0..c.n) |k| try testing.expectEqual(all, try read(&d, Graph, @intCast(k)));
             try testing.expectEqual(execs, graphExecutions(&d));
-            // 每个 memo 只验证一次
+            // Each memo is verified only once
             try testing.expect(d.deep_verifications.load(.monotonic) - deep <= 2 * c.n);
         }
     }
-    // 只读入口：验证不会逐个重算成员并写入 memo
+    // Reading only the cycle head: verification does not recompute the members one by one and write
+    // them to memos
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setRing(&d, 12, false);
@@ -617,8 +633,10 @@ test "fixpoint: an unrelated change does not recompute a cycle whose members are
 }
 
 test "fixpoint: an edit inside a cycle recomputes it at the cost of a first computation" {
-    // 防止环中反复验证、重算成员的旧 memo（重算的结果在环中，不写入 memo）：成员都单独读取过时，
-    // 改其中一个成员，读入口要重算的次数随环的规模指数增长
+    // Guards against repeatedly verifying and recomputing the old memos of members within a cycle
+    // (the recomputed results are in the cycle and are not written to memos): when all members have
+    // been read separately and one of them is changed, the number of recomputations needed to read
+    // the cycle head would grow exponentially with the size of the cycle
     for ([_]struct { n: u32, dense: bool }{ .{ .n = 16, .dense = false }, .{ .n = 8, .dense = true } }) |c| {
         var d: Db = .init(testing.io, testing.allocator, {});
         defer d.deinit();
@@ -639,7 +657,8 @@ test "fixpoint: an edit inside a cycle recomputes it at the cost of a first comp
     }
 }
 
-/// Graph(start) 的期望值：从 start 可达的结点（含自身）的 Label 之并
+/// Expected value of Graph(start): the union of the Labels of the nodes reachable from start
+/// (including itself)
 fn expectedGraph(succ: []const u32, label: []const u32, start: u32) u32 {
     var seen: u32 = @as(u32, 1) << @intCast(start);
     var grew = true;
@@ -660,7 +679,7 @@ fn expectedGraph(succ: []const u32, label: []const u32, start: u32) u32 {
 
 const Mark = enum { new, open, done };
 
-/// Graph 与 GraphVia 的 memo 沿依赖不成环
+/// The memos of Graph and GraphVia form no cycle along their dependencies
 fn expectAcyclicMemos(d: *Db) !void {
     var marks: [2][32]Mark = @splat(@splat(.new));
     inline for (.{ Graph, GraphVia }) |Q| {
@@ -708,7 +727,8 @@ test "fixpoint: values stay correct under random edits to a graph with cycles" {
                 const k = rand.uintLessThan(u32, n);
                 switch (rand.uintLessThan(u8, 4)) {
                     0, 1 => {
-                        // 删边的概率高于加边，图保持稀疏：稠密的环中各路径都要算一遍
+                        // Removing an edge is more likely than adding one, which keeps the graph
+                        // sparse: in a dense cycle every path has to be computed once
                         const bit = @as(u32, 1) << rand.uintLessThan(u5, @intCast(n));
                         if (succ[k] & bit != 0 or rand.uintLessThan(u8, 3) == 0) succ[k] ^= bit;
                         try d.set(Succ, k, succ[k], .low);
@@ -720,7 +740,7 @@ test "fixpoint: values stay correct under random edits to a graph with cycles" {
                     else => try d.set(Number, 99, rand.int(i64), .low),
                 }
             }
-            // 按随机顺序读取，有时在同一个读事务中读取多个
+            // Read in random order, sometimes several in the same read transaction
             var ctx = d.beginRead(testing.allocator);
             defer ctx.end();
             for (0..rand.uintLessThan(u32, 2 * n)) |_| {
@@ -738,7 +758,9 @@ test "fixpoint: values stay correct under random edits to a graph with cycles" {
 }
 
 test "fixpoint: dependencies of cycle members are handed straight to the cycle head" {
-    // 防止环中每一层都把上面各层的依赖逐个并入自己的依赖表：大环的计算代价随规模按立方增长
+    // Guards against every level of a cycle merging the dependencies of all the levels above it
+    // into its own dependency table one by one: the cost of computing a large cycle would grow
+    // cubically with its size
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     const n = 200;
@@ -750,7 +772,8 @@ test "fixpoint: dependencies of cycle members are handed straight to the cycle h
     layer_max_deps = 0;
     try testing.expectEqual(0x7fff_ffff, try read(&d, Layer, .{ .k = 0, .len = n }));
     try testing.expectEqual(2, layer_max_deps);
-    // 入口的 memo 直接依赖各成员读到的 input，包括离入口最远的成员
+    // The memo of the cycle head depends directly on the inputs read by each member, including the
+    // member farthest from the cycle head
     const entry = d.tables[comptime Db.queryIndex(Layer)].keys.getIndex(.{ .k = 0, .len = n }).?;
     try testing.expectEqual(2 * n, memoDeps(&d, Layer, @intCast(entry)).len);
     try setNumber(&d, Label, 1000 + n - 1, 1 << 31, .low);
@@ -760,29 +783,33 @@ test "fixpoint: dependencies of cycle members are handed straight to the cycle h
 test "stack limit: deep recursion stops with the fallback and is not memoized" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
-    // 远超栈上限的递归链不会溢出，最深处以回退值代替
+    // A recursive chain far beyond the stack limit does not overflow; the deepest part is replaced
+    // by the fallback value
     try testing.expect(try read(&d, Depth, 2_000_000) < 0);
-    // 结果取决于求值时的栈深度，不写入 memo：再次读取会重算
+    // The result depends on the stack depth during evaluation, so it is not written to a memo:
+    // reading again recomputes it
     const before = executions(&d, Depth);
     try testing.expect(try read(&d, Depth, 2_000_000) < 0);
     try testing.expect(executions(&d, Depth) > before);
-    // 从浅处开始的计算不受影响
+    // A computation starting from a shallow point is unaffected
     try testing.expectEqual(100, try read(&d, Depth, 100));
 }
 
 test "stack limit: unwinding an incomplete deep recursion does not collect dependencies" {
-    // 防止结果不完整（栈深度上限）时各层把上面各层的依赖逐个并入自己的依赖表：这些帧都不写入
-    // memo，合并却使代价随深度按立方增长
+    // Guards against each level merging the dependencies of all the levels above it into its own
+    // dependency table one by one when the result is incomplete (stack depth limit): none of these
+    // frames are written to memos, but the merging makes the cost grow cubically with depth
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     layer_max_deps = 0;
-    // 远超栈上限的链
+    // A chain far beyond the stack limit
     try testing.expectEqual(std.math.maxInt(u32), try read(&d, Layer, .{ .k = 100_000 }));
     try testing.expectEqual(2, layer_max_deps);
 }
 
 test "stack limit: each top-level read in a transaction gets its own deepenings" {
-    // 防止同一读事务中前面的读取用完分段计算的次数，后面需要分段的读取被截断
+    // Guards against earlier reads in the same read transaction using up the segmented
+    // computations, so that later reads that need segmenting get truncated
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     var ctx = d.beginRead(testing.allocator);
@@ -795,7 +822,8 @@ test "stack limit: threads other than the configured main thread use the worker 
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     d.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = 48 * 1024 * 1024 };
-    // 主线程按默认上限分段，算不完；栈更大的线程能算完
+    // The main thread computes in segments under the default limit and cannot finish; a thread with
+    // a larger stack can
     try testing.expect(try read(&d, Depth, 100_000) < 0);
     const Worker = struct {
         fn run(dd: *Db, out: *?db.Error!i64) void {
@@ -816,9 +844,9 @@ test "cycles entered deep in the stack are detected at the right frame" {
         defer d.endWrite();
         for (0..201) |k| try d.set(Label, @intCast(k), @as(u32, 1) << @intCast(k % 32), .low);
     }
-    // 环的入口 10 在栈上第 190 帧
+    // The cycle head 10 is frame 190 on the stack
     try testing.expectEqual(0xffff_ffff, try read(&d, Lasso, 200));
-    // 入口之上的帧不在环中，写入了 memo
+    // The frames calling into the cycle head are not in the cycle and were written to memos
     const before = executions(&d, Lasso);
     try testing.expectEqual(0xfff, try read(&d, Lasso, 11));
     try testing.expectEqual(before, executions(&d, Lasso));
@@ -860,15 +888,16 @@ test "cancellation: write interrupts in-flight read" {
     const thread = try std.Thread.spawn(.{}, Reader.run, .{ &d, &result });
     while (!spin_started.load(.acquire)) std.atomic.spinLoopHint();
 
-    // beginWrite 会等到读者退出后才返回
+    // beginWrite returns only after the reader exits
     try setNumber(&d, Number, 1, 1, .low);
     thread.join();
     try testing.expectError(error.Canceled, result.?);
 }
 
 test "cancellation: a writer taking the lock keeps the request of the writer queued behind it" {
-    // 防止先拿到锁的写事务清掉排队中的写事务的登记：排在两者之间拿到共享锁的读事务不会被取消，
-    // 排队的写事务要等它完整执行
+    // Guards against the writer that gets the lock first clearing the registration of a queued
+    // writer: a read transaction that gets the shared lock between the two would not be canceled,
+    // and the queued writer would have to wait for it to run to completion
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     const Writer = struct {
@@ -883,7 +912,8 @@ test "cancellation: a writer taking the lock keeps the request of the writer que
     var order: std.atomic.Value(u32) = .init(0);
     var seen: [2]u32 = undefined;
     const writer: Writer = .{ .order = &order, .seen = &seen };
-    // 读事务进行中，两个写事务都在等待。启动线程失败时先结束读事务，已启动的写事务才能结束
+    // A read transaction is in progress and both write transactions are waiting. If spawning a
+    // thread fails, end the read transaction first so that the writers already started can finish.
     var ctx = d.beginRead(testing.allocator);
     const first = std.Thread.spawn(.{}, Writer.run, .{ writer, &d }) catch |err| {
         ctx.end();
@@ -898,7 +928,7 @@ test "cancellation: a writer taking the lock keeps the request of the writer que
     ctx.end();
     first.join();
     second.join();
-    // 先拿到锁的写事务看到另一个仍在登记中
+    // The writer that got the lock first sees the other one still registered
     try testing.expectEqual([2]u32{ 1, 0 }, seen);
     try testing.expectEqual(0, d.pending_write.load(.acquire));
 }
@@ -917,7 +947,8 @@ test "cancellation: result of a compute that swallowed Canceled is not memoized"
     d.pending_write.store(0, .release);
     swallow_cancel = false;
 
-    // 被吞掉的取消没有留下回退值 -1：再次读取重新计算出正确结果
+    // The swallowed cancellation left no fallback value -1 behind: reading again recomputes the
+    // correct result
     const before = executions(&d, Swallow);
     try testing.expectEqual(7, try read(&d, Swallow, 1));
     try testing.expectEqual(before + 1, executions(&d, Swallow));
@@ -936,14 +967,15 @@ test "resetQueries: cleared keys and dependent memos are recomputed" {
     var buf: [Db.query_types.len]db.QueryStats = undefined;
     const stats = d.stats(&buf);
     try testing.expectEqual(0, stats.queries[comptime Db.queryIndex(Tens)].keys);
-    // Plus 依赖 Tens：memo 被丢弃，重新读取时两者都重算
+    // Plus depends on Tens: its memo is discarded, and reading again recomputes both
     try testing.expectEqual(0, stats.queries[comptime Db.queryIndex(Plus)].memos);
     const tens = executions(&d, Tens);
     const plus = executions(&d, Plus);
     try testing.expectEqual(3, try read(&d, Plus, 1));
     try testing.expectEqual(tens + 1, executions(&d, Tens));
     try testing.expectEqual(plus + 1, executions(&d, Plus));
-    // 与它们无关的 memo 保留（high durability 的依赖也重新验证，但不重算）
+    // Memos unrelated to them are kept (high-durability dependencies are re-verified too, but not
+    // recomputed)
     const only = executions(&d, OnlyStable);
     _ = try read(&d, OnlyStable, 1);
     try testing.expectEqual(only, executions(&d, OnlyStable));
@@ -962,12 +994,12 @@ test "lru_bytes: values are evicted by size, oldest first" {
     try testing.expect(d.trySweep());
     var buf: [Db.query_types.len]db.QueryStats = undefined;
     const q = d.stats(&buf).queries[comptime Db.queryIndex(Sized)];
-    // 3 × 6 字节超过 10：淘汰到不超过 7.5 字节，只留下最近使用的一个
+    // 3 × 6 bytes exceeds 10: evict to at most 7.5 bytes, keeping only the most recently used one
     try testing.expectEqual(1, q.memos);
     const before = executions(&d, Sized);
     try testing.expectEqualStrings("abcdef", try read(&d, Sized, 3));
     try testing.expectEqual(before, executions(&d, Sized));
-    // 被淘汰的值按需恢复
+    // Evicted values are restored on demand
     try testing.expectEqualStrings("abcdef", try read(&d, Sized, 1));
     try testing.expectEqual(before + 1, executions(&d, Sized));
 }
@@ -981,12 +1013,12 @@ test "lru: capacities set at runtime apply at the next sweep, 0 is unlimited" {
         for (1..4) |k| try d.set(Text, @intCast(k), try testing.allocator.dupe(u8, "abcdef"), .low);
     }
     const live = &d.tables[comptime Db.queryIndex(Sized)].live;
-    // 字节数不限：默认 10 字节只容得下一个值，现在 3 个都保留
+    // Unlimited bytes: the default of 10 bytes fits only one value; now all 3 are kept
     d.setLru(Sized, null, 0);
     for (1..4) |k| _ = try read(&d, Sized, @intCast(k));
     try testing.expect(d.trySweep());
     try testing.expectEqual(3, live.*);
-    // 调低个数：清扫时淘汰到 3/4，留下最近使用的
+    // Lower the count: the sweep evicts down to 3/4, keeping the most recently used
     d.setLru(Sized, 2, 0);
     try testing.expect(d.wantsSweep());
     try testing.expect(d.trySweep());
@@ -1027,25 +1059,27 @@ test "lru: evicted values are restored without invalidating dependents" {
     for (1..5) |k| try setText(&d, @intCast(k), "abc");
     for (1..5) |k| try testing.expectEqual(3, try read(&d, CachedLen, @intCast(k)));
     try testing.expect(d.wantsSweep());
-    // 容量 2：淘汰到 1 个，最久未使用的 1、2、3 被淘汰
+    // Capacity 2: evict down to 1; the least recently used 1, 2, 3 are evicted
     try testing.expect(d.trySweep());
     try testing.expect(!d.wantsSweep());
     try testing.expectEqual(1, d.tables[comptime Db.queryIndex(Cached)].live);
 
-    // 无关的输入变化：验证 CachedLen(1) 只需要 Cached(1) 的 changed_at，不恢复其值
+    // An unrelated input change: verifying CachedLen(1) only needs the changed_at of Cached(1) and
+    // does not restore its value
     try setText(&d, 4, "abcd");
     try testing.expectEqual(3, try read(&d, CachedLen, 1));
     try testing.expectEqual(4, executions(&d, Cached));
     try testing.expectEqual(4, executions(&d, CachedLen));
 
-    // 直接读取被淘汰的值：重算恢复，沿用原 changed_at，下游不重算
+    // Reading an evicted value directly: it is recomputed to restore it and keeps its original
+    // changed_at, so nothing downstream is recomputed
     try testing.expectEqualStrings("abc", try read(&d, Cached, 1));
     try testing.expectEqual(5, executions(&d, Cached));
     try setText(&d, 3, "x");
     try testing.expectEqual(3, try read(&d, CachedLen, 1));
     try testing.expectEqual(4, executions(&d, CachedLen));
 
-    // 依赖变化：照常重算
+    // A dependency changes: recompute as usual
     try setText(&d, 1, "abcdef");
     try testing.expectEqual(6, try read(&d, CachedLen, 1));
     try testing.expectEqual(5, executions(&d, CachedLen));
@@ -1065,7 +1099,8 @@ test "stats: executions, hits, cutoffs and timing; trace records the call tree" 
         try testing.expectEqual(5, try ctx.get(Plus, 1));
         try testing.expectEqual(5, try ctx.get(Plus, 1));
     }
-    // 先序：Plus 在前（深度 0），Tens 在其中（深度 1）；第二次读取是命中，不再执行
+    // Preorder: Plus first (depth 0), Tens inside it (depth 1); the second read is a hit and does
+    // not execute again
     try testing.expectEqual(2, trace.events.items.len);
     try testing.expectEqual(Db.queryIndex(Plus), trace.events.items[0].query);
     try testing.expectEqual(0, trace.events.items[0].depth);
@@ -1074,7 +1109,7 @@ test "stats: executions, hits, cutoffs and timing; trace records the call tree" 
     try testing.expect(trace.events.items[0].ns >= trace.events.items[1].ns);
     try testing.expectEqual(1, d.keyAt(Plus, trace.events.items[0].key));
 
-    // 42 → 47：Tens 重算但结果不变（cutoff），Plus 不重算
+    // 42 → 47: Tens is recomputed but its result is unchanged (cutoff), and Plus is not recomputed
     try setNumber(&d, Number, 1, 47, .low);
     try testing.expectEqual(5, try read(&d, Plus, 1));
     var stats: [Db.query_types.len]db.QueryStats = undefined;
