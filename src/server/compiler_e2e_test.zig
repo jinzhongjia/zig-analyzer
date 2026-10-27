@@ -360,7 +360,7 @@ test "columns are UTF-16 when multi-byte characters precede the error" {
         .{ .path = "build.zig", .text = simple_build },
         .{ .path = "main.zig", .text =
         \\pub fn main() void {
-        \\    const s = "中文😀"; const x: u32 = s;
+        \\    const s = "€€😀"; const x: u32 = s;
         \\    _ = x;
         \\}
         \\
@@ -371,7 +371,7 @@ test "columns are UTF-16 when multi-byte characters precede the error" {
     try h.start();
     defer h.finish();
     const diags = try runProject(&h, &project);
-    // `s` is at byte column 43 and UTF-16 column 37 (each of the two CJK characters is 3 bytes and
+    // `s` is at byte column 43 and UTF-16 column 37 (each of the two euro signs is 3 bytes and
     // 1 code unit, the emoji is 4 bytes and 2 code units)
     try expectDiagnostics(diags, "main.zig", &.{"1:37 zig: expected type 'u32'"});
 }

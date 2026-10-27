@@ -157,7 +157,7 @@ test "posix" {
     try expectToPath(.posix, "file:///home/u/my%20project/a%2Bb.zig", "/home/u/my project/a+b.zig");
     try expectToPath(.posix, "file://localhost/tmp/x.zig", "/tmp/x.zig");
     try expectToPath(.posix, "FILE:///tmp/x.zig?query#frag", "/tmp/x.zig");
-    try expectToPath(.posix, "file:///tmp/%E4%B8%AD.zig", "/tmp/中.zig");
+    try expectToPath(.posix, "file:///tmp/%E2%82%AC.zig", "/tmp/€.zig");
     try testing.expectError(error.InvalidUri, toPathStyle(.posix, testing.allocator, "file://server/share/x"));
 }
 

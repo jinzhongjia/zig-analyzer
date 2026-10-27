@@ -11,7 +11,7 @@
 ## Language
 
 - Everything in the repository is written in English: code, comments, logs, error messages, panic / compileError messages, text sent to the client (progress, showMessage, error responses), tool output, build step descriptions, test names, and documentation (`README.md`, `docs/`).
-- Exception: non-ASCII text used deliberately as test data (such as the Chinese strings that check UTF-8 / UTF-16 position conversion).
+- Exception: non-ASCII text used deliberately as test data (such as the multi-byte characters that check UTF-8 / UTF-16 position conversion).
 
 ## Comments
 

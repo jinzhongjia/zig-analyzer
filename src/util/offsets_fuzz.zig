@@ -11,7 +11,7 @@ const offsets = @import("offsets.zig");
 const types = @import("../lsp/types.zig");
 const Entropy = @import("Entropy.zig");
 
-const pieces = [_][]const u8{ "a", "Z", " ", "\n", "\r\n", "\r", "\t", "é", "中", "😀", "\xff", "\xe4\xb8", "\x00" };
+const pieces = [_][]const u8{ "a", "Z", " ", "\n", "\r\n", "\r", "\t", "é", "€", "😀", "\xff", "\xe2\x82", "\x00" };
 
 fn genText(e: *Entropy, out: *std.ArrayList(u8)) !void {
     const n = e.below(48);

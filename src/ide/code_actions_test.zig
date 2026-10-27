@@ -419,7 +419,7 @@ test "string conversion preserves bytes and surrounding syntax" {
         .{ "\"abc\"", "abc" },
         .{ "\"a\\nb\"", "a\nb" },
         .{ "\"\\n\\na\\n\\n\"", "\n\na\n\n" },
-        .{ "\"\\\"\\\\\\x41\\u{4e2d}  \"", "\"\\A中  " },
+        .{ "\"\\\"\\\\\\x41\\u{20ac}  \"", "\"\\A€  " },
     };
     const contexts = .{
         .{ "const text = ", ";" },

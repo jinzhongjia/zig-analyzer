@@ -514,7 +514,7 @@ test "subprocess backend matches in-process (skipped when zig is not in PATH)" {
         .{ .text = "const a = 1;\nconst a = 2;\n", .mode = .zig },
         .{ .text = "const = ;\n", .mode = .zig },
         .{ .text = "pub fn main() void {}\n", .mode = .zig },
-        .{ .text = "fn f() void {\n    const s = \"中文\"; var x = s;\n}\n", .mode = .zig },
+        .{ .text = "fn f() void {\n    const s = \"€€\"; var x = s;\n}\n", .mode = .zig },
         .{ .text = ".{ .a = 1, .a = 2 }\n", .mode = .zon },
     };
     for (samples) |sample| {
