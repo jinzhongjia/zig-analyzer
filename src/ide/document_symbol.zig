@@ -35,16 +35,19 @@ const Builder = struct {
     fn container(b: *Builder, index: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
         const kind = b.items.containers[index].kind;
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
+        var fields: u32 = 0;
         for (b.items.containerMembers(index)) |i| {
             const item = b.items.items[i];
             if (item.kind == .@"comptime") continue;
+            const field_index = fields;
+            if (item.kind == .field) fields += 1;
             const node = b.map.get(item.ast_id) orelse continue;
             const name_tok = ast.memberName(node, ItemTree.bareFieldNames(kind));
             const children = if (level < max_levels) try b.childrenOf(i, level + 1) else &.{};
             const r = node.range();
             const sel = if (name_tok) |t| t.range() else r;
             try out.append(b.arena, .{
-                .name = displayName(item),
+                .name = try displayName(b.arena, item, field_index),
                 .kind = symbolKind(b.items, i, kind),
                 .range = b.lines.range(r.start, r.end, b.enc),
                 .selectionRange = b.lines.range(sel.start, sel.end, b.enc),
@@ -65,8 +68,11 @@ const Builder = struct {
     }
 };
 
-fn displayName(item: ItemTree.Item) []const u8 {
-    const name = item.name orelse return "test";
+/// Members without a name: a tuple field is shown as its index (`field_index` is its position
+/// among the container's fields, the same as the name in `t.@"0"`); the others are unnamed
+/// `test {}`
+fn displayName(arena: Allocator, item: ItemTree.Item, field_index: u32) Allocator.Error![]const u8 {
+    const name = item.name orelse return if (item.kind == .field) std.fmt.allocPrint(arena, "{d}", .{field_index}) else "test";
     if (item.kind == .@"test" and name.len >= 2 and name[0] == '"') return name[1 .. name.len - 1];
     return name;
 }
@@ -150,4 +156,29 @@ test "document symbols stop at the nesting limit" {
     var levels: usize = 0;
     while (syms.len > 0) : (syms = syms[0].children orelse &.{}) levels += 1;
     try testing.expectEqual(max_levels, levels);
+}
+
+test "tuple fields are named by their index" {
+    const text =
+        \\const T = struct { u32, u8 };
+        \\const P = struct { x: u32, y: u32 };
+        \\test {}
+    ;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parse = try Parse.create(a, text);
+    var items = try ItemTree.build(a, parse.rootNode());
+    var map = try ItemTree.AstIdMap.build(a, &items, parse.rootNode());
+    const lines = try offsets.LineIndex.init(a, text);
+
+    const syms = try documentSymbols(a, &items, &map, lines, .utf16);
+    try testing.expectEqual(3, syms.len);
+    const tuple = syms[0].children.?;
+    try testing.expectEqualStrings("0", tuple[0].name);
+    try testing.expectEqualStrings("1", tuple[1].name);
+    try testing.expectEqual(types.SymbolKind.Field, tuple[1].kind);
+    try testing.expectEqualStrings("y", syms[1].children.?[1].name);
+    // An unnamed test is still shown as `test`
+    try testing.expectEqualStrings("test", syms[2].name);
 }
