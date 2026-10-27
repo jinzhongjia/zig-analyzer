@@ -1,10 +1,13 @@
-//! 在标准库上运行类型推导：每个成员做完整推导（检验不崩溃），统计类型已知的比例与耗时。
+//! Runs type inference over the standard library: full inference for every member (checking that
+//! nothing crashes), reporting the share of known types and the time taken.
 //!
-//! 用法：zig build sema-corpus [-- <std 目录>]
+//! Usage: zig build sema-corpus [-- <std dir>]
 //!
-//! 标准库的全部文件都归入 std 模块：`@import("std")` 可解析，`builtin` 为本机目标、Debug、`zig test`
-//! 的 builtin.zig（需要 PATH 中的 zig），`root` 不可解析。
-//! 每个文件之后与服务器一样按需淘汰缓存，结果须与不淘汰时相同。
+//! All standard library files belong to the std module: `@import("std")` resolves; `builtin` is
+//! the builtin.zig for the native target, Debug, `zig test` (needs zig in PATH); `root` does not
+//! resolve.
+//! After each file, caches are evicted on demand as in the server; results must be the same as
+//! without eviction.
 
 const std = @import("std");
 const za = @import("zig_analyzer");
@@ -48,7 +51,7 @@ pub fn main(init: std.process.Init) !u8 {
     var db: database.Db = .init(io, gpa, &env);
     defer db.deinit();
 
-    // 收集文件，全部归入 std 模块
+    // Collect the files; all of them belong to the std module
     var files: std.ArrayList(FileId) = .empty;
     defer files.deinit(gpa);
     {
@@ -66,7 +69,7 @@ pub fn main(init: std.process.Init) !u8 {
     const std_root_path = try std.fs.path.join(gpa, &.{ std_dir, "std.zig" });
     defer gpa.free(std_root_path);
     const std_root = try vfs.intern(std_root_path);
-    // `@import("builtin")`：本机目标、Debug、`zig test`（需要 PATH 中的 zig）
+    // `@import("builtin")`: native target, Debug, `zig test` (needs zig in PATH)
     const default_builtin: ?FileId = blk: {
         var zig_env = za.project.ZigEnv.query(gpa, io, null) catch break :blk null;
         defer zig_env.deinit(gpa);
@@ -91,14 +94,15 @@ pub fn main(init: std.process.Init) !u8 {
         try db.set(ModuleGraph.Input, {}, g, .high);
     }
 
-    // 查找引用（冷缓存）：标准库中常用的声明
+    // Find references (cold cache): commonly used declarations of the standard library
     const ref_targets = [_][2][]const u8{ .{ "mem.zig", "Allocator" }, .{ "mem.zig", "eql" }, .{ "std.zig", "ArrayList" } };
     for (ref_targets) |target| {
         const path = try std.fs.path.join(gpa, &.{ std_dir, target[0] });
         defer gpa.free(path);
         try findRefs(gpa, io, &db, files.items, try vfs.intern(path), target[1]);
     }
-    // 淘汰解析结果后再查一次（函数体仍在缓存中）：不应重新解析
+    // Search again after evicting the parse results (function bodies are still cached): files must
+    // not be parsed again
     {
         _ = db.trySweep();
         const before = db.executions(database.syntax.ParseFile);
@@ -113,9 +117,11 @@ pub fn main(init: std.process.Init) !u8 {
     var locals: Counts = .{};
     var decls: Counts = .{};
     var exprs: Counts = .{};
-    // 未知表达式的分布：非活动代码、泛型函数、泛型函数返回的容器的成员（如 `ArrayList(T)` 的方法）、其他
+    // Distribution of unknown expressions: inactive code, generic functions, members of containers
+    // returned by generic functions (e.g. methods of `ArrayList(T)`), other
     var unknown: struct { inactive: usize = 0, generic: usize = 0, generic_member: usize = 0, other: usize = 0 } = .{};
-    // 泛型代码中的未知表达式以同一文件中的调用点实例推导后得到类型的个数（编辑器中的 hover、补全等使用它）
+    // Number of unknown expressions in generic code that get a type when inferred with the instance
+    // from a call site in the same file (used by hover, completion, etc. in editors)
     var seeded: usize = 0;
     var members: usize = 0;
     var sweeps: usize = 0;
@@ -128,7 +134,8 @@ pub fn main(init: std.process.Init) !u8 {
             defer ctx.end();
             const tree = try ctx.get(database.syntax.FileItemTree, file);
             var r: za.names.resolve.Resolver = .{ .ctx = &ctx, .arena = scratch.allocator() };
-            // 文件中的非活动代码（含定义在不执行的分支中的容器的成员）
+            // Inactive code in the file (including members of containers defined in branches that
+            // are not executed)
             const inactive_ranges = try za.ide.inactive.ranges(&r, file);
             for (tree.items, 0..) |item, item_index| {
                 const owner: database.hir.OwnerKey = .{ .file = file, .item = item.ast_id };
@@ -148,7 +155,8 @@ pub fn main(init: std.process.Init) !u8 {
                 var seed_looked = false;
                 for (body.exprs, res.exprs, 0..) |e, tv, ei| {
                     switch (e) {
-                        // 只统计有值的表达式（不含语句级的控制流与类型表达式）；`_ = x;` 的 `_` 是丢弃，不是值
+                        // Count only expressions that have a value (not statement-level control
+                        // flow or type expressions); the `_` in `_ = x;` is a discard, not a value
                         .name_ref => |n| if (std.mem.eql(u8, n, "_")) continue,
                         .field_access, .call, .builtin_call, .literal, .index, .slice, .deref, .unwrap_optional, .prefix, .binary, .@"catch", .init => {},
                         else => continue,
@@ -172,13 +180,15 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
         }
-        // 与服务器相同：读事务结束后按需淘汰（同时检验淘汰后恢复的结果与从未淘汰时一致）
+        // As in the server: evict on demand after the read transaction ends (which also checks that
+        // results restored after eviction match those that were never evicted)
         if (db.wantsSweep()) {
             _ = db.trySweep();
             sweeps += 1;
         }
     }
-    // 再次查找引用：期间大部分解析结果已被淘汰，引用查找不应因此重新解析
+    // Find references again: most parse results have been evicted in the meantime, and find
+    // references must not reparse because of that
     const parses_before = db.executions(database.syntax.ParseFile);
     for (ref_targets) |target| {
         const path = try std.fs.path.join(gpa, &.{ std_dir, target[0] });
@@ -196,7 +206,7 @@ pub fn main(init: std.process.Init) !u8 {
         \\  of those in generic code, known when inferred from a call site in the same file: {d}
         \\
     , .{ files.items.len, members, secs, sweeps, decls.known, decls.total, decls.pct(), locals.known, locals.total, locals.pct(), exprs.known, exprs.total, exprs.pct(), unknown.inactive, unknown.generic, unknown.generic_member, unknown.other, seeded });
-    // 各 query 的耗时：按自身耗时排序，定位推导中最耗时的部分
+    // Time of each query, sorted by self time, to locate the most expensive parts of inference
     {
         var stats: [database.Db.query_types.len]za.db.QueryStats = undefined;
         _ = db.stats(&stats);
@@ -210,7 +220,8 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-/// 泛型函数：有 comptime（含隐式的 `T: type`）或 anytype 参数，或返回 `type`
+/// Generic function: has a comptime (including an implicit `T: type`) or anytype parameter, or
+/// returns `type`
 fn isGenericFn(item: za.syntax.ItemTree.Item, body: *const za.hir.Body) bool {
     if (item.kind != .@"fn") return false;
     for (body.params) |p| {
@@ -227,7 +238,7 @@ fn isTypeName(body: *const za.hir.Body, e: za.hir.Body.ExprId) bool {
     };
 }
 
-/// 成员位于某个泛型函数返回（或定义）的容器中
+/// The member is in a container returned (or defined) by a generic function
 fn inGenericFn(ctx: *database.Db.Ctx, file: FileId, tree: *const za.syntax.ItemTree, item: za.syntax.ItemTree.Item) !bool {
     var parent = tree.containers[item.container].parent_item;
     while (parent) |pi| {
@@ -238,7 +249,7 @@ fn inGenericFn(ctx: *database.Db.Ctx, file: FileId, tree: *const za.syntax.ItemT
     return false;
 }
 
-/// 统计 `file` 顶层声明 `name` 的引用数与耗时
+/// Counts the references to the top-level declaration `name` of `file` and the time taken
 fn findRefs(gpa: std.mem.Allocator, io: std.Io, db: *database.Db, files: []const FileId, file: FileId, name: []const u8) !void {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();

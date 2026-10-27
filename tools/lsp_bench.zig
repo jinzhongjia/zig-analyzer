@@ -1,25 +1,38 @@
-//! LSP 基准（docs/design.md 的性能目标）：以子进程启动 zig-analyzer，经标准输入输出按真实编辑器的方式交互，
-//! 测量冷启动各阶段、热状态下 hover / goto / completion 的延迟分布、编辑到诊断的延迟与常驻内存。
+//! LSP benchmark (the performance goals in docs/design.md): starts zig-analyzer as a child
+//! process and talks to it over stdin/stdout the way a real editor does, measuring the phases of
+//! a cold start, the latency distribution of hover / goto / completion in a warm state, the
+//! latency from an edit to diagnostics, and resident memory.
 //!
-//! 用法：zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <文件（相对项目根）>...
+//! Usage: zig build bench -Doptimize=ReleaseSafe -- <project root> <file (relative to the root)>...
 //!
-//! 请求位置在文件中按标识符均匀取样（每个文件最多 `samples` 处），补全取 `.` 之后的位置。
+//! Request positions are sampled evenly over the identifiers of a file (at most `samples` per
+//! file); completion uses the position after a `.`.
 //!
-//! 环境变量：
-//! - `BENCH_CONFIG`：回复 `workspace/configuration` 的配置（JSON），如 `{"build":{"args":["-Dno-bin"]}}`
-//! - `BENCH_SAVE=1`：测量保存 → 构建完成（会改写项目中的文件，结束时恢复）
-//! - `BENCH_HOVER=行:列`：打印该处的 hover 结果
-//! - `BENCH_VERBOSE=1`：打印首轮中较慢的请求、其内存变化与各 query 的执行次数
-//! - `BENCH_CHECK=<n>`：校验跳转的正确性：对文件中的标识符请求 declaration，目标处的标识符应与请求处相同；
-//!   同时打印前 n 个未解析的标识符
-//! - `BENCH_TYPE_COMPLETE=<n>`：在 n 个名字表达式中各插入一个字符、立即请求补全再撤销；计时包含编辑与补全，
-//!   并报告自动导入候选数与索引 query 的变化（自动导入默认开启，以 `BENCH_CONFIG='{"completion":{"auto_import":false}}'`
-//!   关闭，与开启时比较开销）
-//! - `BENCH_QUICK=1`：跳过编辑、连续输入与保存的各阶段（批量校验大量项目时使用）
-//! - `BENCH_COMPLETE=<n>`：补全的召回：源码中的成员访问 `a.b` 在 `.` 之后补全，列表中应有 `b`
-//! - `BENCH_REFS=<n>`：校验 n 个声明的查找引用与重命名（同名、无误报、本文件无漏报、rename 与引用一致；
-//!   泛型函数体中在其他实例下指向同名声明的引用单独计数）
-//! - `BENCH_SESSION=<轮数>`：长时间会话，观察内存的增长
+//! Environment variables:
+//! - `BENCH_CONFIG`: the configuration (JSON) to answer `workspace/configuration` with, e.g.
+//!   `{"build":{"args":["-Dno-bin"]}}`
+//! - `BENCH_SAVE=1`: measure save → build finished (rewrites files in the project and restores
+//!   them at the end)
+//! - `BENCH_HOVER=line:col`: print the hover result at that position
+//! - `BENCH_VERBOSE=1`: print the slow requests of the first pass, their memory change, and the
+//!   execution count of each query
+//! - `BENCH_CHECK=<n>`: check goto correctness: request declaration for the identifiers in the
+//!   file; the identifier at the target must be the same as at the request position; also print
+//!   the first n unresolved identifiers
+//! - `BENCH_TYPE_COMPLETE=<n>`: in each of n name expressions, insert a character, immediately
+//!   request completion, then undo; the timing includes the edit and the completion, and the
+//!   number of auto-import candidates and the changes in index queries are reported (auto-import
+//!   is on by default; disable it with `BENCH_CONFIG='{"completion":{"auto_import":false}}'` to
+//!   compare the cost with it on)
+//! - `BENCH_QUICK=1`: skip the edit, continuous typing, and save phases (used when checking many
+//!   projects in bulk)
+//! - `BENCH_COMPLETE=<n>`: completion recall: for each member access `a.b` in the source,
+//!   complete after the `.`; the list must contain `b`
+//! - `BENCH_REFS=<n>`: check find references and rename for n declarations (same name, no false
+//!   positives, nothing missed in this file, rename consistent with references; references in a
+//!   generic function body that point to a same-named declaration under another instance are
+//!   counted separately)
+//! - `BENCH_SESSION=<rounds>`: a long session, to watch memory growth
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,7 +42,8 @@ const za = @import("zig_analyzer");
 const transport = za.lsp.transport;
 
 const samples = 200;
-/// 打印首轮中耗时超过 20ms 的请求及其内存变化（BENCH_VERBOSE=1）
+/// Prints the requests of the first pass that take more than 20ms, with their memory change
+/// (BENCH_VERBOSE=1)
 var verbose = false;
 
 fn lineText(text: []const u8, line: u32) []const u8 {
@@ -50,17 +64,17 @@ const Client = struct {
     next_id: i64 = 1,
     arena: std.heap.ArenaAllocator,
     start: Io.Timestamp = undefined,
-    /// 回复 `workspace/configuration` 的配置（BENCH_CONFIG，JSON）
+    /// Configuration to answer `workspace/configuration` with (BENCH_CONFIG, JSON)
     config: json.Value = .null,
-    /// 已结束的构建进度数（标题以 `zig build` 开头的进度）
+    /// Number of build progress operations that have ended (title starting with `zig build`)
     builds_done: usize = 0,
     build_tokens: std.ArrayList([]const u8) = .empty,
-    /// 最近一次构建结束时的消息（如 `1 error(s)`）
+    /// Message at the end of the most recent build (e.g. `1 error(s)`)
     build_message: []const u8 = "",
-    /// 各文件最近一次发布的错误诊断个数（按 uri）
+    /// Number of error diagnostics last published for each file (by uri)
     errors: std.StringHashMapUnmanaged(usize) = .empty,
     last_counts: []const QueryCount = &.{},
-    /// 跳转校验中打印的未解析样例数（BENCH_CHECK 的值）
+    /// Number of unresolved samples printed by the goto check (the value of BENCH_CHECK)
     unresolved_samples: usize = 0,
 
     fn send(c: *Client, value: anytype) !void {
@@ -72,7 +86,8 @@ const Client = struct {
         try w.flush();
     }
 
-    /// 上一个阶段以来各 query 的执行次数与累计耗时的增量（BENCH_VERBOSE）
+    /// Increase in the execution count and total time of each query since the previous phase
+    /// (BENCH_VERBOSE)
     fn phase(c: *Client, name: []const u8) !void {
         const now = try queryCounts(c);
         const st, _ = try c.request("zig-analyzer/status", {});
@@ -91,7 +106,8 @@ const Client = struct {
         try c.send(.{ .jsonrpc = "2.0", .method = method, .params = params });
     }
 
-    /// 读取下一条消息；服务器发来的请求当场回复（配置为空，其余为 null）
+    /// Reads the next message; requests from the server are answered right away (an empty
+    /// configuration, null for everything else)
     fn next(c: *Client) !json.Value {
         while (true) {
             const body = try transport.readMessage(&c.reader.interface, c.arena.allocator());
@@ -109,7 +125,7 @@ const Client = struct {
                 if (!entry.found_existing) entry.key_ptr.* = try c.arena.allocator().dupe(u8, uri);
                 entry.value_ptr.* = errors;
             }
-            // 进度事件：打印时间线
+            // Progress events: print a timeline
             if (std.mem.eql(u8, method.string, "$/progress")) {
                 const v = msg.object.get("params").?.object.get("value").?.object;
                 const kind = v.get("kind").?.string;
@@ -133,7 +149,7 @@ const Client = struct {
         }
     }
 
-    /// 发送请求并等待其响应，返回响应与耗时（毫秒）
+    /// Sends a request and waits for its response; returns the response and the elapsed time (ms)
     fn request(c: *Client, method: []const u8, params: anytype) !struct { json.Value, f64 } {
         const id = c.next_id;
         c.next_id += 1;
@@ -151,7 +167,8 @@ const Client = struct {
         }
     }
 
-    /// 等待 `uri` 的错误诊断个数满足 `pred`，返回耗时（提示等其他级别不计，如非活动代码）
+    /// Waits until the number of error diagnostics of `uri` satisfies `pred`; returns the elapsed
+    /// time (other severities, such as the hints for inactive code, do not count)
     fn waitDiagnostics(c: *Client, uri: []const u8, t0: Io.Timestamp, comptime pred: fn (usize, usize) bool, base: usize) !f64 {
         while (true) {
             const msg = try c.next();
@@ -163,8 +180,10 @@ const Client = struct {
         }
     }
 
-    /// `uri` 当前的错误诊断个数：先等后台工作结束，使之是当前文本的结果。
-    /// 标准库等文件本身可能带有错误，编辑的计时以此为基准
+    /// Current number of error diagnostics of `uri`: waits for background work to finish first, so
+    /// that the count is the result for the current text.
+    /// Files such as the standard library may contain errors themselves; edit timings use this as
+    /// the baseline
     fn baseErrors(c: *Client, uri: []const u8) !usize {
         _ = try c.request("zig-analyzer/waitIdle", {});
         return c.errors.get(uri) orelse 0;
@@ -182,7 +201,7 @@ fn positionOf(text: []const u8, offset: usize) Position {
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// 按标识符均匀取样的位置；`after_dot` 时取 `a.b` 中 `.` 之后的位置
+/// Positions sampled evenly over identifiers; with `after_dot`, the position after `.` in `a.b`
 fn samplePositions(a: Allocator, text: [:0]const u8, after_dot: bool) ![]Position {
     var all: std.ArrayList(usize) = .empty;
     var tokenizer: std.zig.Tokenizer = .init(text);
@@ -201,8 +220,10 @@ fn samplePositions(a: Allocator, text: [:0]const u8, after_dot: bool) ![]Positio
     return out;
 }
 
-/// 逐字输入补全的取样：identifier 且前一个 token 不是 `.`，长度至少 3。返回插入位置（名字第二个字节）
-/// 与请求补全的位置（名字第三个字节），编辑与补全都落在同一个名字表达式内。
+/// Samples for completion while typing: an identifier of length at least 3 whose previous
+/// token is not `.`. Returns the insert position (the second byte of the name) and the position
+/// to request completion at (the third byte of the name), so the edit and the completion both
+/// fall within the same name expression.
 const TypingPosition = struct { edit: Position, complete: Position };
 
 fn typingPositions(a: Allocator, text: [:0]const u8) ![]TypingPosition {
@@ -223,7 +244,8 @@ fn typingPositions(a: Allocator, text: [:0]const u8) ![]TypingPosition {
     return all.items;
 }
 
-/// 补全响应中是否有自动导入项：带附加编辑或限定名（`labelDetails`）的项。函数项也带 data，不能据此判断
+/// Whether a completion response has auto-import items: items with additional edits or a qualified
+/// name (`labelDetails`). Function items also carry data, so data cannot be used to decide
 fn hasAutoImport(response: std.json.Value) bool {
     const result = response.object.get("result") orelse return false;
     const items = switch (result) {
@@ -253,7 +275,7 @@ const Stats = struct {
 
 const QueryCount = struct { name: []const u8, n: i64, ms: f64 = 0 };
 
-/// 各查询的累计执行次数（zig-analyzer/status）
+/// Cumulative execution count of each query (zig-analyzer/status)
 fn queryCounts(c: *Client) ![]QueryCount {
     const resp, _ = try c.request("zig-analyzer/status", {});
     const qs = resp.object.get("result").?.object.get("queries").?.array.items;
@@ -269,7 +291,7 @@ fn queryCounts(c: *Client) ![]QueryCount {
     return out;
 }
 
-/// 服务器整个运行期间各 query 的耗时（zig-analyzer/status），按自身耗时排序
+/// Time spent in each query over the whole server run (zig-analyzer/status), sorted by self time
 fn printQueryTable(c: *Client) !void {
     const resp, _ = try c.request("zig-analyzer/status", {});
     const qs = resp.object.get("result").?.object.get("queries").?.array.items;
@@ -305,7 +327,8 @@ fn printQueryTable(c: *Client) !void {
 }
 
 fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
-    // Windows 上 Child.Id 是进程 HANDLE，且没有 ps：直接读进程的工作集
+    // On Windows, Child.Id is a process HANDLE and there is no ps: read the working set of the
+    // process directly
     if (@import("builtin").os.tag == .windows) {
         const w = std.os.windows;
         var c: w.PROCESS.VM_COUNTERS = undefined;
@@ -321,7 +344,8 @@ fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     return @as(f64, @floatFromInt(kb)) / 1024;
 }
 
-/// 位置（行、UTF-16 列；样例文件都是 ASCII 时等于字节列）对应的字节偏移
+/// Byte offset of a position (line and UTF-16 column; equal to the byte column when the sample
+/// files are all ASCII)
 fn offsetOf(text: []const u8, p: Position) ?usize {
     var line: u32 = 0;
     var start: usize = 0;
@@ -329,7 +353,7 @@ fn offsetOf(text: []const u8, p: Position) ?usize {
     return if (start + p.character <= text.len) start + p.character else null;
 }
 
-/// 偏移处的标识符（含 `@"..."` 形式）
+/// Identifier at an offset (including the `@"..."` form)
 fn identAt(text: []const u8, offset: usize) []const u8 {
     if (std.mem.startsWith(u8, text[offset..], "@\"")) {
         const end = std.mem.indexOfScalarPos(u8, text, offset + 2, '"') orelse return "";
@@ -340,20 +364,21 @@ fn identAt(text: []const u8, offset: usize) []const u8 {
     return text[offset..end];
 }
 
-/// 跳转的正确性（BENCH_CHECK=1）：对文件中的每个标识符（最多 `limit` 个，均匀取样）请求
-/// `textDocument/declaration`，目标位置的标识符应与请求处的相同（declaration 不追别名链）
+/// Goto correctness (BENCH_CHECK=1): requests `textDocument/declaration` for each identifier in
+/// the file (at most `limit`, sampled evenly); the identifier at the target must be the same as
+/// at the request position (declaration does not follow alias chains)
 fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const u8) !void {
     const a = c.arena.allocator();
     const limit = 3000;
     var offsets: std.ArrayList(usize) = .empty;
-    // 每个标识符之前的两个 token，用于给未解析的标识符分类
+    // The two tokens before each identifier, used to classify unresolved identifiers
     var befores: std.ArrayList([2]std.zig.Token.Tag) = .empty;
     var tokenizer: std.zig.Tokenizer = .init(text);
     var prev: [2]std.zig.Token.Tag = .{ .invalid, .invalid };
     while (true) {
         const t = tokenizer.next();
         if (t.tag == .eof) break;
-        // `[*c]` 中的 `c` 是指针语法的一部分，不是名字
+        // The `c` in `[*c]` is part of the pointer syntax, not a name
         const c_ptr = prev[0] == .l_bracket and prev[1] == .asterisk and std.mem.eql(u8, text[t.loc.start..t.loc.end], "c");
         if (t.tag == .identifier and !c_ptr and !std.mem.eql(u8, text[t.loc.start..t.loc.end], "_")) {
             try offsets.append(a, t.loc.start);
@@ -366,11 +391,13 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     var texts: std.StringHashMapUnmanaged([]const u8) = .empty;
     var resolved: usize = 0;
     var mismatched: usize = 0;
-    // 构造的类型（`@Struct` 等）的成员名追不到源码中的来源时跳到构造调用：成员在那里生成，不算跳错
+    // When a member name of a constructed type (`@Struct` etc.) cannot be traced to its origin in
+    // the source, goto lands on the construction call: the member is created there, so it does not
+    // count as a wrong jump
     var at_construction: usize = 0;
     var samples_shown: usize = 0;
     var unresolved_shown: usize = 0;
-    // BENCH_CHECK=<n>：打印前 n 个未解析的标识符
+    // BENCH_CHECK=<n>: print the first n unresolved identifiers
     const unresolved_limit = c.unresolved_samples;
     for (0..n) |i| {
         const off = offsets.items[i * offsets.items.len / n];
@@ -423,26 +450,28 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}, at construction {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched, at_construction });
     std.debug.print("  declaration  unresolved by kind:", .{});
     for (kinds, 0..) |k, i| std.debug.print(" {t} {d}", .{ @as(UnresolvedKind, @fromBackingInt(@intCast(i))), k });
-    // 内置类型与值、len / ptr、error.X 本来就没有声明位置，不计入分母
+    // Built-in types and values, len / ptr, and error.X have no declaration position to begin with,
+    // so they are excluded from the denominator
     const no_decl = kinds[@backingInt(UnresolvedKind.primitive)] + kinds[@backingInt(UnresolvedKind.len_ptr)] + kinds[@backingInt(UnresolvedKind.error_name)];
     std.debug.print("; resolved excluding identifiers without a declaration {d:.1}%\n", .{@as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n - no_decl, 1)))});
 }
 
-/// 未解析的标识符的种类（由其之前的 token 判断）
+/// Kind of an unresolved identifier (determined from the tokens before it)
 const UnresolvedKind = enum {
-    /// 内置类型与值（`u8`、`bool`、`true`、`null`、`undefined`）：没有声明位置
+    /// Built-in types and values (`u8`, `bool`, `true`, `null`, `undefined`):
+    /// no declaration position
     primitive,
-    /// 切片、数组的 `len` 与 `ptr`：没有声明位置
+    /// `len` and `ptr` of slices and arrays: no declaration position
     len_ptr,
-    /// `error.Foo`：没有声明位置
+    /// `error.Foo`: no declaration position
     error_name,
-    /// 没有左侧的 `.name`：枚举字面量、decl literal、初始化中的字段名
+    /// `.name` without a left-hand side: enum literals, decl literals, field names in initializers
     dot_literal,
     /// `a.name`
     member,
-    /// 标签（`break :blk`）
+    /// Labels (`break :blk`)
     label,
-    /// 名字引用（局部、容器级、模块名）
+    /// Name references (locals, container-level names, module names)
     name,
 };
 
@@ -473,9 +502,12 @@ fn containsLoc(list: []const Loc, l: Loc) bool {
     return false;
 }
 
-/// 查找引用与重命名的正确性（BENCH_REFS=<n>）：文件中均匀选 n 个声明（`const` / `var` / `fn` 之后的名字），
-/// 1. 引用处的标识符与声明同名；2. 从每个引用处 declaration 回到该声明（无误报）；3. 本文件中 declaration
-/// 指向该声明的同名标识符都在引用中（无漏报）；4. rename 的编辑与引用的位置相同
+/// Correctness of find references and rename (BENCH_REFS=<n>): picks n declarations evenly from the
+/// file (the names after `const` / `var` / `fn`): 1. the identifier at each reference has the same
+/// name as the declaration; 2. declaration from each reference leads back to that declaration (no
+/// false positives); 3. every same-named identifier in this file whose declaration points to that
+/// declaration is among the references (nothing missed); 4. the edits of rename are at the same
+/// positions as the references
 fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const u8, count: usize) !void {
     const a = c.arena.allocator();
     var decls: std.ArrayList(usize) = .empty;
@@ -504,7 +536,8 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         const name = identAt(text, off);
         const decl_pos = positionOf(text, off);
         const decl_loc: Loc = .{ .uri = uri, .line = decl_pos.line, .character = decl_pos.character };
-        // 只取声明处（`[]const T` 中的 T 等不是声明）：declaration 指向自身
+        // Take only declaration sites (the T in `[]const T` and the like are not declarations):
+        // declaration points to the name itself
         {
             const self, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = uri }, .position = decl_pos });
             const target = if (self.object.get("result")) |r| switch (r) {
@@ -522,8 +555,10 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         var refs: std.ArrayList(Loc) = .empty;
         for (result.array.items) |v| try refs.append(a, locOf(v));
         total_refs += refs.items.len;
-        // 泛型函数体中的引用在不同实例下指向不同的声明时，rename 返回错误；这样的引用处 declaration 只取
-        // 一个实例，可能指向另一个同名声明（计为 other instance，不是误报）
+        // When a reference in a generic function body points to different declarations under
+        // different instances, rename returns an error; declaration at such a reference takes only
+        // one instance and may point to another declaration with the same name (counted as other
+        // instance, not a false positive)
         const ren, _ = try c.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = decl_pos, .newName = "zz_renamed" });
         const ambiguous = ren.object.get("error") != null;
         for (refs.items) |l| {
@@ -538,7 +573,8 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
                 bad_name += 1;
                 continue;
             }
-            // 引用所在的文件须先打开才能请求（其他文件按需打开再关闭）
+            // The file containing a reference must be opened before requesting (other files are
+            // opened on demand and closed afterwards)
             const other = !std.mem.eql(u8, l.uri, uri);
             if (other) try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = l.uri, .languageId = "zig", .version = 1, .text = t } });
             const back, _ = try c.request("textDocument/declaration", .{ .textDocument = .{ .uri = l.uri }, .position = .{ .line = l.line, .character = l.character } });
@@ -569,7 +605,7 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
                 }
             }
         }
-        // 本文件中同名、declaration 指向该声明的标识符
+        // Identifiers in this file with the same name whose declaration points to that declaration
         var tk: std.zig.Tokenizer = .init(text);
         while (true) {
             const t = tk.next();
@@ -592,7 +628,7 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
                 }
             }
         }
-        // rename 的编辑与引用的位置相同
+        // The edits of rename are at the same positions as the references
         if (ren.object.get("result")) |r| if (r == .object) {
             var edits: std.ArrayList(Loc) = .empty;
             if (r.object.get("changes")) |changes| {
@@ -625,8 +661,9 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
     std.debug.print("  references   checked {d} declarations, {d} references: wrong name {d}, false positives {d}, missing in this file {d}, rename mismatches {d}, other instances {d}\n", .{ checked, total_refs, bad_name, false_pos, missing, rename_mismatch, other_instance });
 }
 
-/// 补全的召回（BENCH_COMPLETE=<n>）：源码中的成员访问 `a.b`（`.` 之前是标识符、`)` 或 `]`），在 `.` 之后
-/// 请求补全，列表中应有 `b`。均匀取样 n 处，输出召回率与未补全的样例
+/// Completion recall (BENCH_COMPLETE=<n>): for each member access `a.b` in the source (with an
+/// identifier, `)`, or `]` before the `.`), requests completion after the `.`; the list must
+/// contain `b`. Samples n sites evenly and prints the recall and the samples that were missed
 fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const u8, count: usize) !void {
     const a = c.arena.allocator();
     var sites: std.ArrayList(usize) = .empty;
@@ -659,7 +696,7 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         if (items.len == 0) empty += 1;
         const hit = for (items) |it| {
             const label = it.object.get("label").?.string;
-            // `@"struct"` 形式的标签按其中的名字比较
+            // Labels of the form `@"struct"` are compared by the name inside
             const bare = if (std.mem.startsWith(u8, label, "@\"") and label.len > 3) label[2 .. label.len - 1] else label;
             if (std.mem.eql(u8, bare, name)) break true;
         } else false;
@@ -677,8 +714,10 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
     std.debug.print("  completion   checked {d} member accesses: offered {d} ({d:.1}%), empty lists {d}\n", .{ n, found, @as(f64, @floatFromInt(found)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), empty });
 }
 
-/// 长时间会话（BENCH_SESSION=<轮数>）：每轮在项目的 25 个文件（逐轮向后轮换）中打开、hover、成员与名字补全、
-/// 编辑并关闭，结束后打印堆、InternPool 与主要 query 的内存，观察长时间运行时内存的增长
+/// Long session (BENCH_SESSION=<rounds>): each round opens 25 files of the project (rotating
+/// forward each round), runs hover, member and name completion, and edits, then closes them;
+/// afterwards prints the memory of the heap, the InternPool, and the main queries, to watch memory
+/// growth over a long run
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     const a = c.arena.allocator();
     const io = c.io;
@@ -713,7 +752,8 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             while (i < idents.len) : (i += step) _ = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i] });
             const dots = try samplePositions(a, text, true);
             if (dots.len > 0) _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
-            // 名字输入了两个字符时的补全：自动导入的索引（第一次在名字处补全后才建）也计入会话的内存
+            // Completion after two characters of a name are typed: the auto-import index (built
+            // only after the first completion at a name) also counts toward the session's memory
             if (idents.len > 0) {
                 const at = idents[idents.len / 3];
                 _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = .{ .line = at.line, .character = at.character + 2 } });
@@ -762,7 +802,8 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s,
         });
         if (round + 1 == rounds) {
-            // 最后一轮：按字节数列出各 query，其余为未归属（引擎的表、依赖、Vfs 等）
+            // Last round: list the queries by bytes; the rest is unattributed (engine tables,
+            // dependencies, Vfs, ...)
             const Row = struct { name: []const u8, bytes: i64, memos: i64, keys: i64 };
             var rows: std.ArrayList(Row) = .empty;
             var attributed: i64 = o.get("intern_pool_bytes").?.integer;
@@ -784,7 +825,8 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     }
 }
 
-/// 文件后半段第一个函数体中的语句（缩进至少 8 个空格、以 `;` 结尾）的行尾偏移
+/// Line-end offset of the first function body statement (indented by at least 8 spaces, ending
+/// with `;`) in the second half of the file
 fn bodyLine(text: []const u8) ?usize {
     var start = std.mem.indexOfScalarPos(u8, text, text.len / 2, '\n') orelse return null;
     while (start < text.len) {
@@ -828,7 +870,8 @@ pub fn main(init: std.process.Init) !u8 {
     const a = c.arena.allocator();
     if (init.environ_map.get("BENCH_CONFIG")) |cfg| c.config = try json.parseFromSliceLeaky(json.Value, a, cfg, .{});
     const root_uri = try za.base.uri.fromPath(a, root);
-    // 样例位置与校验中的列号都是字节偏移：位置须按 UTF-8 计数，否则含多字节字符的行上错位
+    // Sample positions and the columns in the checks are byte offsets: positions must be counted in
+    // UTF-8, otherwise they are off on lines with multibyte characters
     const init_resp, _ = try c.request("initialize", .{
         .rootUri = root_uri,
         .capabilities = .{
@@ -865,7 +908,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  memory after idle {d:.0} MB\n", .{mb});
         _, const first_after = try c.request("textDocument/hover", .{ .textDocument = doc, .position = first[0] });
         std.debug.print("  first hover after idle {d:.1}ms\n", .{first_after});
-        // BENCH_HOVER=行:列：打印该处的 hover 结果与耗时
+        // BENCH_HOVER=line:col: print the hover result at that position and its time
         if (init.environ_map.get("BENCH_HOVER")) |spec| {
             var it = std.mem.splitScalar(u8, spec, ':');
             const line = try std.fmt.parseInt(u32, it.next().?, 10);
@@ -875,7 +918,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  memory {d:.0} MB\n", .{mb});
         }
 
-        // 热状态：同一批位置先预热一轮，再计时
+        // Warm state: warm up the same positions with one pass first, then time them
         const idents = try samplePositions(a, text, false);
         const dots = try samplePositions(a, text, true);
         inline for (.{ "textDocument/hover", "textDocument/definition", "textDocument/completion" }) |method| {
@@ -915,7 +958,8 @@ pub fn main(init: std.process.Init) !u8 {
             try checkDeclarations(&c, uri, text, rel);
         }
 
-        // 编辑 → live 诊断：在文件末尾加入语法错误，再撤销（BENCH_QUICK 时跳过编辑相关的各阶段）
+        // Edit → live diagnostics: add a syntax error at the end of the file, then undo it
+        // (BENCH_QUICK skips the edit-related phases)
         if (init.environ_map.get("BENCH_QUICK") == null) {
             const end = positionOf(text, text.len);
             var edit_times: [10]f64 = undefined;
@@ -936,8 +980,10 @@ pub fn main(init: std.process.Init) !u8 {
             Stats.print("edit→diag", &edit_times);
             Stats.print("undo→clear", &clear_times);
 
-            // 连续输入：在文件末尾的注释中每 30ms 输入一个字符，每次按键后立即 hover。编辑的写事务要等
-            // 进行中的读事务（诊断计算）退出，这里的延迟包含这段等待
+            // Continuous typing: type a character every 30ms into a comment at the end of the file
+            // and hover right after each keystroke. The write transaction of an edit waits for the
+            // in-flight read transactions (diagnostics computation) to exit; the latency here
+            // includes that wait
             {
                 try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "//" }} });
                 version += 1;
@@ -956,8 +1002,10 @@ pub fn main(init: std.process.Init) !u8 {
                 version += 1;
             }
 
-            // 函数体中的编辑（实际编辑的常见位置，走块级增量重解析）：文件后半段第一个缩进至少 8 个空格、
-            // 以 `;` 结尾的语句，在行尾加入语法错误再撤销；再在行尾的注释中连续输入并 hover
+            // Edits in a function body (a common place for real edits; uses block-level incremental
+            // reparse): take the first statement in the second half of the file that is indented by
+            // at least 8 spaces and ends with `;`, add a syntax error at the end of its line and
+            // undo it; then type continuously into a comment at the end of the line and hover
             if (bodyLine(text)) |line_end| {
                 const body_base = try c.baseErrors(uri);
                 if (verbose) try c.phase("end-of-file edits");
@@ -998,8 +1046,10 @@ pub fn main(init: std.process.Init) !u8 {
                 try c.phase("in-body edits (incl. background work until idle)");
             }
 
-            // 逐字输入补全（BENCH_TYPE_COMPLETE=<次数>）：在名字表达式中插入一个字符、立即请求补全，
-            // 再撤销。计时包含编辑与补全；同时报告自动导入候选的出现次数与索引 query 的变化
+            // Typing completion (BENCH_TYPE_COMPLETE=<count>): insert a character into a name
+            // expression, request completion immediately, then undo. The timing includes the edit
+            // and the completion; also reports how often auto-import candidates appear and the
+            // changes in the index queries
             if (init.environ_map.get("BENCH_TYPE_COMPLETE")) |v| {
                 const wanted = std.fmt.parseInt(usize, v, 10) catch 40;
                 const names = try typingPositions(a, text);
@@ -1032,14 +1082,17 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
 
-            // 保存 → 编译器诊断（BENCH_SAVE=1）：在磁盘文件末尾写入一个语义错误（AstGen 不报，只有编译器报），
-            // 保存后等诊断出现，再恢复原文件并等诊断清除。会改写项目中的文件，结束时恢复
+            // Save → compiler diagnostics (BENCH_SAVE=1): write a semantic error at the end of the
+            // file on disk (not reported by AstGen, only by the compiler), wait for the diagnostic
+            // to appear after saving, then restore the original file and wait for the diagnostic to
+            // clear. Rewrites a file in the project and restores it at the end
             if (init.environ_map.get("BENCH_SAVE") != null) {
                 const bad = try std.mem.concat(a, u8, &.{ text, "\ncomptime {\n    _ = @as(u8, 300);\n}\n" });
                 var save_times: [5]f64 = undefined;
                 var restore_times: [5]f64 = undefined;
                 defer Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
-                // 计时到本次保存触发的构建结束（诊断随之发布）
+                // Timed until the build triggered by this save finishes (the diagnostics are
+                // published with it)
                 for (&save_times, &restore_times) |*ts, *tr| {
                     for ([_][]const u8{ bad, text }, [_]*f64{ ts, tr }) |content, out| {
                         _ = try c.request("zig-analyzer/waitIdle", {});

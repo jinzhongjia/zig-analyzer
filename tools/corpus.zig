@@ -1,13 +1,17 @@
-//! 语料对拍：在一批 Zig 源码上校验自研 CST 解析器。
+//! Corpus cross-check: validates the project's own CST parser on a set of Zig sources.
 //!
-//! 用法：zig build corpus -- <目录或文件>...
+//! Usage: zig build corpus -- <dir or file>...
 //!
-//! 校验项：
-//! 1. 无损：语法树文本拼接等于原文
-//! 2. 无误报：`std.zig.Ast` 无错误的文件，CST 也必须无错误
-//! 3. 结构一致：容器顶层成员的（种类, 名字）序列与 `std.zig.Ast` 一致
-//! 4. 健壮性：在多个位置截断文件后解析不崩溃且仍然无损
-//! 5. HIR：每个成员都能降级，表达式位置在成员内，名字引用逐一对应源码的标识符（含 asm 输出目标）。
+//! Checks:
+//! 1. Lossless: the concatenated text of the syntax tree equals the source
+//! 2. No false errors: a file without `std.zig.Ast` errors must have no CST errors either
+//! 3. Same structure: the (kind, name) sequence of the top-level members of each container
+//!    matches `std.zig.Ast`
+//! 4. Robustness: parsing a file truncated at several positions does not crash and is still
+//!    lossless
+//! 5. HIR: every member can be lowered, expression positions lie within the member, and name
+//!    references correspond one-to-one to the identifiers in the source (including asm output
+//!    targets).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,7 +23,7 @@ const Stats = struct {
     files: usize = 0,
     bytes: usize = 0,
     std_errors: usize = 0,
-    /// 嵌套过深、跳过与官方解析器对拍的文件
+    /// Files nested too deeply, skipped in the cross-check against the official parser
     std_skipped: usize = 0,
     lossless_failures: usize = 0,
     false_errors: usize = 0,
@@ -30,7 +34,7 @@ const Stats = struct {
     reparse_mismatches: usize = 0,
     reparse_full_ns: u64 = 0,
     reparse_inc_ns: u64 = 0,
-    /// 只统计走了局部重解析的编辑
+    /// Counts only edits that took the local reparse path
     local_inc_ns: u64 = 0,
     local_full_ns: u64 = 0,
     items: usize = 0,
@@ -44,7 +48,7 @@ const Stats = struct {
 };
 
 const max_reports = 20;
-/// 设置环境变量 CORPUS_DEBUG 时打印结构差异详情
+/// Prints details of structure differences when the environment variable CORPUS_DEBUG is set
 var debug = false;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -127,13 +131,13 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     stats.parse_ns += @intCast(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     defer parse.destroy();
 
-    // 1. 无损
+    // 1. Lossless
     if (!try isLossless(gpa, parse.rootNode(), source)) {
         stats.lossless_failures += 1;
         report(stats, "[lossless failure] {s}", .{path});
     }
 
-    // ItemTree 与 AstIdMap：每个成员都能映射回对应种类的节点
+    // ItemTree and AstIdMap: every member maps back to a node of the matching kind
     {
         const t1 = std.Io.Clock.awake.now(io);
         var items = try syntax.ItemTree.build(gpa, parse.rootNode());
@@ -160,7 +164,8 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
 
         for (items.items) |item| {
             const node = map.get(item.ast_id) orelse continue;
-            // enum 成员与 union 中只写名字的字段：名字不是表达式（同 `ItemBody`）
+            // Enum members and union fields written as just a name: the name is not an
+            // expression (as in `ItemBody`)
             const container_kind = items.containers[item.container].kind;
             const field_is_name = item.kind == .field and (container_kind == .@"enum" or container_kind == .@"union") and
                 (syntax.ast.ContainerField{ .syntax = node }).name() == null;
@@ -199,7 +204,8 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
         }
     }
 
-    // 2. 与 std.zig.Ast 对比（嵌套过深的文件跳过：官方解析器会耗尽栈）
+    // 2. Compare with std.zig.Ast (files nested too deeply are skipped: the official parser
+    //    would run out of stack)
     const source_z = try gpa.dupeSentinel(u8, source, 0);
     defer gpa.free(source_z);
     if (try syntax.nesting.estimate(gpa, source_z, syntax.nesting.inline_depth) > syntax.nesting.inline_depth) {
@@ -216,7 +222,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
                 const loc = lineCol(source, e.offset);
                 report(stats, "[false error] {s}:{d}:{d}: {s} ({d} total)", .{ path, loc.line, loc.col, e.message, parse.errors.len });
             }
-            // 3. 顶层结构
+            // 3. Top-level structure
             if (!try sameStructure(gpa, &ast, parse.rootNode(), source)) {
                 stats.structure_mismatches += 1;
                 report(stats, "[structure mismatch] {s}", .{path});
@@ -224,10 +230,11 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
         }
     }
 
-    // 5. 增量重解析：在随机位置做随机编辑（单次编辑与连续编辑链），结果必须与全量解析一致
+    // 5. Incremental reparse: random edits at random positions (single edits and chains of
+    //    consecutive edits); the result must match a full parse
     try checkReparse(gpa, io, path, source, stats);
 
-    // 4. 截断
+    // 4. Truncation
     const cuts = 8;
     for (1..cuts) |i| {
         const end = source.len * i / cuts;
@@ -259,7 +266,7 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
 
     const edits = 12;
     for (0..edits) |_| {
-        // 随机编辑：删除 0~8 字节并插入一个片段
+        // Random edit: delete 0-8 bytes and insert a snippet
         const at = rand.uintLessThan(usize, text.items.len + 1);
         const del = @min(rand.uintLessThan(usize, 9), text.items.len - at);
         const ins = if (rand.boolean()) snippets[rand.uintLessThan(usize, snippets.len)] else "";
@@ -289,7 +296,8 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
     }
 }
 
-/// 收集 HIR 中应存在的源码引用；嵌套容器的成员由各自的 owner 检查。
+/// Collects the source references that must appear in the HIR; members of nested containers
+/// are checked by their own owners.
 fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references: *std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken)) !void {
     switch (node.kind()) {
         .name_ref => {
@@ -302,7 +310,8 @@ fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references:
             return;
         },
         .asm_output => if (node.childToken(.arrow) == null) {
-            // 输出的局部变量是直接 token，不是 name_ref 子节点；寄存器标签不算引用。
+            // The output local variable is a direct token, not a name_ref child node; register
+            // labels are not references.
             var children = node.children();
             var operand = false;
             while (children.next()) |child| if (child == .token) {
@@ -343,7 +352,8 @@ fn lineCol(source: []const u8, offset: u32) struct { line: usize, col: usize } {
 
 const Member = struct { kind: []const u8, name: []const u8 };
 
-/// 逐个容器比较成员序列。容器以其关键字（struct/enum/...）的偏移标识，文件根用偏移 maxInt。
+/// Compares the member sequences container by container. A container is identified by the
+/// offset of its keyword (struct/enum/...); the file root uses offset maxInt.
 fn sameStructure(gpa: Allocator, ast: *const std.zig.Ast, root: SyntaxNode, source: []const u8) !bool {
     _ = source;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -425,7 +435,7 @@ fn collectCst(arena: Allocator, container: SyntaxNode, key: u32, out: *std.AutoA
     try collectNested(arena, container, out);
 }
 
-/// 在子树中查找 container_decl（跳过 `node` 本身）
+/// Finds container_decl nodes in the subtree (skipping `node` itself)
 fn collectNested(arena: Allocator, node: SyntaxNode, out: *std.AutoArrayHashMapUnmanaged(u32, []const Member)) Allocator.Error!void {
     var it = node.children();
     while (it.nextNode()) |c| {
