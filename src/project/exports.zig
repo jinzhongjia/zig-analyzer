@@ -64,7 +64,7 @@ pub fn load(gpa: Allocator, io: Io, env: *const ZigEnv, root: []const u8, build_
     defer args_arena.deinit();
     const args = try probeArgs(args_arena.allocator(), root, build_args);
 
-    const client = bsp.Client.start(gpa, io, env.zig_exe, probe_root, args) catch |err| switch (err) {
+    const client = bsp.Client.start(gpa, io, env, probe_root, args) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             log.info("{s}: cannot start zig build to probe exported modules: {t}", .{ root, err });

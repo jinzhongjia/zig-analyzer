@@ -9,7 +9,7 @@ test "build system protocol: read build graph and get compile errors" {
     defer project.deinit();
     const gpa = testing.allocator;
 
-    const client = try bsp.Client.start(gpa, testing.io, project.env.zig_exe, project.root, &.{});
+    const client = try bsp.Client.start(gpa, testing.io, &project.env, project.root, &.{});
     defer client.deinit();
 
     var model: ?@import("../base/ProjectModel.zig") = null;
@@ -91,7 +91,7 @@ test "build system protocol: zig build and the processes it started end when the
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const client = try bsp.Client.start(gpa, io, project.env.zig_exe, project.root, &.{});
+    const client = try bsp.Client.start(gpa, io, &project.env, project.root, &.{});
     var deinited = false;
     defer if (!deinited) client.deinit();
     const pgid = client.group.pgid;

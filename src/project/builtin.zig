@@ -38,6 +38,7 @@ pub fn generate(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []cons
 
     const result = std.process.run(gpa, io, .{
         .argv = argv.items,
+        .environ_map = env.childEnviron(),
         .stdout_limit = .limited(4 * 1024 * 1024),
         .stderr_limit = .limited(64 * 1024),
         .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } },

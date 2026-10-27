@@ -83,9 +83,17 @@ single_mutex: Io.Mutex = .init,
 single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
 /// 已取出的编译结果序号（项目的构建与单文件编译共用，见 `nextCompileGeneration`）
 compile_generation: std.atomic.Value(u64) = .init(0),
+/// 进程的环境变量：启动的 zig 子进程在其上覆盖 zig 路径（见 `ZigEnv.withOverrides`）
+environ: std.process.Environ = .empty,
 env_mutex: Io.Mutex = .init,
-/// 启动后在后台查询；查询完成前为 null
-zig_env: ?ZigEnv = null,
+/// 生效的 zig 环境：探测结果叠加配置中的路径覆盖（见 `applyZigPaths`）。启动后在后台查询；查询完成前为 null
+zig_env: ?*const ZigEnv = null,
+/// `zig env` 探测到的环境；查询完成前为 null
+detected_env: ?*const ZigEnv = null,
+/// 创建过的全部环境：被替换的环境可能仍被进行中的任务、运行中的项目使用，到 deinit 才释放
+envs: std.ArrayList(*ZigEnv) = .empty,
+/// 串行化 zig 路径的应用（启动与配置变化）
+zig_paths_mutex: Io.Mutex = .init,
 /// 启动阶段已经结束：zig 环境就绪，带 build.zig 的根目录已经启动项目。此前不按单文件编译（结束时补上），
 /// 项目开始加载之前还不能推迟属于项目的文件的编译（见 `projectsLoading`）
 startup_done: std.atomic.Value(bool) = .init(false),
@@ -280,7 +288,11 @@ pub fn deinit(server: *Server) void {
     server.root_has_build.deinit(server.gpa);
     for (server.single.values()) |*sf| sf.clearResult(server.gpa);
     server.single.deinit(server.gpa);
-    if (server.zig_env) |*env| env.deinit(server.gpa);
+    for (server.envs.items) |env| {
+        env.deinit(server.gpa);
+        server.gpa.destroy(env);
+    }
+    server.envs.deinit(server.gpa);
     if (server.default_builtin) |p| server.gpa.free(p);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
@@ -1681,6 +1693,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.reportConfigWarnings("zig-analyzer settings", &new);
     server.config_mutex.lockUncancelable(server.io);
     const zig_changed = !server.config.sameZig(&new);
+    const zig_paths_changed = !server.config.sameZigPaths(&new);
     const build_changed = !server.config.sameBuild(&new);
     const semantic_changed = server.config.callsite_seeding != new.callsite_seeding or server.config.semantic_tokens_mode != new.semantic_tokens_mode or
         server.config.semantic_tokens_global_var != new.semantic_tokens_global_var;
@@ -1706,6 +1719,11 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (watcher_changed) server.resyncWatcher();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
+    // 尚未启动时由启动阶段按当前配置应用
+    if (zig_paths_changed and server.started) {
+        server.busyBegin();
+        spawn(server.io, &server.bg_group, reloadZigPathsTask, .{server});
+    }
     if (compiler_disabled) server.clearSingleFileResults();
     if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
     if (semantic_changed) server.requestSemanticRefresh();
@@ -1996,43 +2014,24 @@ fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
-    const env = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
+    const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
         // `zig build test` 有意找不到 zig（见 `ZigEnv.query`）；warn 会写到 stderr，让构建输出出现误导性的
         // `failed command`
         if (!(@import("builtin").is_test and err == error.ZigNotFound))
             log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
         return;
     };
+    const detected = server.ownEnv(queried) catch return log.err("out of memory while storing the zig environment", .{});
     {
-        var fresh = true;
         server.env_mutex.lockUncancelable(server.io);
         defer server.env_mutex.unlock(server.io);
-        if (server.zig_env == null) {
-            server.zig_env = env;
-        } else fresh = false;
-        if (!fresh) {
-            // 已有环境（不应发生：`initialized` 只处理一次）：保留旧值，释放这次查询的结果
-            var stale = env;
-            stale.deinit(server.gpa);
-            return;
-        }
+        // 已有环境（不应发生：`initialized` 只处理一次）：保留旧值
+        if (server.detected_env != null) return;
+        server.detected_env = detected;
     }
-    log.info("zig {s} ({s})", .{ env.version, env.zig_exe });
-    // 默认的 builtin.zig（单文件模式）：按 `zig test` 的设置，test 块中依赖 `builtin.is_test` 的
-    // `std.testing.allocator` 等可以推导（与有 test step 的模块一致，见 configuration.zig）
-    const default_builtin = za.project.builtin.generate(server.gpa, server.io, &env, &.{"test"}) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        error.OutOfMemory => null,
-    };
-    if (default_builtin) |path| {
-        var keep = true;
-        {
-            server.env_mutex.lockUncancelable(server.io);
-            defer server.env_mutex.unlock(server.io);
-            if (server.default_builtin == null) server.default_builtin = path else keep = false;
-        }
-        if (!keep) server.gpa.free(path);
-    }
+    log.info("zig {s} ({s})", .{ detected.version, detected.zig_exe });
+    _ = try server.applyZigPaths();
+    const env = server.zigEnv() orelse return;
     if (!env.matchesBuiltin()) {
         // 进程内 AstGen 与用户 zig 不一定一致：live 诊断改用用户的 zig ast-check
         const built = @import("builtin").zig_version_string;
@@ -2048,6 +2047,142 @@ fn startup(server: *Server) Io.Cancelable!void {
     if (server.buildFlags().build) server.startProjectsForRoots();
     // 启动前已打开的独立文件：zig 环境就绪、项目开始加载之后补一次编译
     server.startup_done.store(true, .release);
+    server.reconcileSingle();
+}
+
+/// 取得 `env` 的所有权，返回它在服务器中的副本（到 deinit 才释放）
+pub fn ownEnv(server: *Server, env: ZigEnv) Allocator.Error!*const ZigEnv {
+    var owned = env;
+    errdefer owned.deinit(server.gpa);
+    const ptr = try server.gpa.create(ZigEnv);
+    errdefer server.gpa.destroy(ptr);
+    server.env_mutex.lockUncancelable(server.io);
+    defer server.env_mutex.unlock(server.io);
+    try server.envs.append(server.gpa, ptr);
+    ptr.* = owned;
+    return ptr;
+}
+
+/// `applyZigPaths` 改变了什么
+const ZigPathsChange = struct {
+    /// 生效的 zig 环境（lib 目录、标准库目录、全局缓存目录）
+    env: bool = false,
+    /// 默认的 builtin.zig
+    builtin: bool = false,
+};
+
+/// 把配置中的路径覆盖（`zig.lib_path`、`zig.global_cache_path`、`zig.builtin_path`）应用到探测到的环境上，得出生效的
+/// zig 环境与默认的 builtin.zig（不属于任何项目的文件使用；项目中的模块使用按构建参数生成的）。不能采用的覆盖
+/// 提示用户并回退到探测结果。探测到环境之前什么也不做：启动阶段探测之后会调用
+fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
+    const gpa = server.gpa;
+    const io = server.io;
+    server.zig_paths_mutex.lockUncancelable(io);
+    defer server.zig_paths_mutex.unlock(io);
+    const detected, const current = blk: {
+        server.env_mutex.lockUncancelable(io);
+        defer server.env_mutex.unlock(io);
+        break :blk .{ server.detected_env orelse return .{}, server.zig_env };
+    };
+    var config = server.configSnapshot() catch Config{};
+    defer config.deinit(gpa);
+    var buf: [2048]u8 = undefined;
+    var notes: std.Io.Writer = .fixed(&buf);
+
+    const base = current orelse detected;
+    var rejected: ZigEnv.Rejected = .{};
+    const env: *const ZigEnv = env: {
+        const fresh = detected.withOverrides(gpa, io, server.environ, .{
+            .lib_dir = config.zig_lib_path,
+            .global_cache_dir = config.zig_global_cache_path,
+        }, &rejected) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory, error.Unexpected => {
+                log.err("failed to apply the zig path settings: {t}", .{err});
+                break :env base;
+            },
+        };
+        if (fresh.samePaths(base)) {
+            var unused = fresh;
+            unused.deinit(gpa);
+            break :env base;
+        }
+        break :env server.ownEnv(fresh) catch {
+            log.err("out of memory while applying the zig path settings", .{});
+            break :env base;
+        };
+    };
+    if (rejected.lib_dir) appendNote(&notes, "zig.lib_path {s} does not contain std/std.zig, using {s}", .{ config.zig_lib_path.?, detected.lib_dir });
+    if (rejected.global_cache_dir) appendNote(&notes, "zig.global_cache_path {s} is not an existing directory, using {s}", .{ config.zig_global_cache_path.?, detected.global_cache_dir });
+
+    const default_builtin: ?[]u8 = blk: {
+        if (config.zig_builtin_path) |path| {
+            const file = ZigEnv.resolveFile(gpa, io, path) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.OutOfMemory => null,
+            };
+            if (file) |f| break :blk f;
+            appendNote(&notes, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{path});
+        }
+        // 按 `zig test` 的设置生成：test 块中依赖 `builtin.is_test` 的 `std.testing.allocator` 等可以推导
+        // （与有 test step 的模块一致，见 configuration.zig）
+        break :blk za.project.builtin.generate(gpa, io, env, &.{"test"}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => null,
+        };
+    };
+
+    var change: ZigPathsChange = .{};
+    var unused_builtin: ?[]u8 = default_builtin;
+    {
+        server.env_mutex.lockUncancelable(io);
+        defer server.env_mutex.unlock(io);
+        change.env = server.zig_env != env;
+        server.zig_env = env;
+        if (!eqlOptionalStr(server.default_builtin, default_builtin)) {
+            change.builtin = true;
+            // 默认的 builtin.zig 只在持有锁时读取（见 `updateModuleGraphInner`）：换下的路径可以在锁外释放
+            unused_builtin = server.default_builtin;
+            server.default_builtin = default_builtin;
+        }
+    }
+    if (unused_builtin) |p| gpa.free(p);
+    if (notes.end != 0) server.showWarning(notes.buffered());
+    return change;
+}
+
+/// 在 `w` 中追加一条配置问题的说明，合并为一条提示（同 `reportConfigWarnings`）
+fn appendNote(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
+    w.writeAll(if (w.end == 0) "zig-analyzer settings: " else "; ") catch {};
+    w.print(fmt, args) catch {};
+}
+
+/// 配置中 zig 路径的覆盖变化后重新应用：标准库与默认的 builtin.zig 随模块图重新加载；生效的环境变化时各项目
+/// 重启，独立文件重新编译，运行 zig 时都使用新的路径
+fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    const change = try server.applyZigPaths();
+    if (!change.env and !change.builtin) return;
+    log.info("zig paths changed, reloading the standard library and builtin.zig", .{});
+    server.updateModuleGraph();
+    if (change.env) {
+        const list = server.workspaceList(server.gpa) catch return;
+        defer server.releaseList(server.gpa, list);
+        if (list.len != 0) log.info("zig paths changed, restarting projects", .{});
+        for (list) |ws| server.restartWorkspace(ws, 0);
+        var roots: std.ArrayList(Vfs.FileId) = .empty;
+        defer roots.deinit(server.gpa);
+        {
+            server.single_mutex.lockUncancelable(server.io);
+            defer server.single_mutex.unlock(server.io);
+            roots.appendSlice(server.gpa, server.single.keys()) catch {};
+        }
+        server.recompileSingle(roots.items, &.{});
+        // 标准库与全局缓存中的文件不必监听（见 `watchable`）：随生效的目录变化
+        server.resyncWatcher();
+    }
+    // 文件的来源（标准库、全局缓存中的依赖包）与推导结果可能变化
+    server.publishOpenFiles();
     server.reconcileSingle();
 }
 
@@ -2246,7 +2381,6 @@ fn dropSingle(server: *Server, file: Vfs.FileId) bool {
 
 fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     defer server.busyEnd();
-    const env = server.zigEnv().?;
     const path = server.vfs.path(file);
     var pc: panic_context.Text = .{};
     pc.enter("single-file compile {s}", .{path});
@@ -2257,11 +2391,13 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     var errors: usize = 0;
     defer server.progress.end(server, progress, if (errors == 0) "Done" else "Has errors");
     while (true) {
+        // 每次编译时取：zig 路径的配置变化后重新编译用新的环境
+        const env = server.zigEnv().?;
         var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
         const result: ?*compiler.BuildResult = blk: {
             // 文件已从磁盘删除（编译期间被删除时由 `dropSingle` 要求重新编译）：没有结果
             Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
-            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env.zig_exe, path) catch |err| {
+            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env, path) catch |err| {
                 log.warn("{s}: single-file compile failed: {t}", .{ path, err });
                 break :blk null;
             };
@@ -2594,7 +2730,7 @@ pub fn isShuttingDown(server: *Server) bool {
 pub fn zigEnv(server: *Server) ?*const ZigEnv {
     server.env_mutex.lockUncancelable(server.io);
     defer server.env_mutex.unlock(server.io);
-    return if (server.zig_env) |*e| e else null;
+    return server.zig_env;
 }
 
 /// 配置中未知的项与类型错误的项：合并为一条提示

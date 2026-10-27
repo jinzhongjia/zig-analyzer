@@ -1,4 +1,5 @@
-//! 定位 zig 可执行文件并读取 `zig env`：标准库路径、全局缓存目录与版本。
+//! 定位 zig 可执行文件并读取 `zig env`：标准库路径、全局缓存目录与版本。lib 目录与全局缓存目录可以由配置覆盖
+//! （`withOverrides`）。
 //!
 //! 版本检查决定两件事：
 //! - 进程内 AstGen 只有在用户 zig 与 zig-analyzer 编译时的标准库版本完全相同时才与编译器一致；
@@ -8,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const Environ = std.process.Environ;
 
 const ZigEnv = @This();
 
@@ -17,11 +19,20 @@ lib_dir: []const u8,
 std_dir: []const u8,
 global_cache_dir: []const u8,
 version: []const u8,
+/// 运行 zig（`zig build`、`zig build-obj` 等）的子进程的环境变量；null 时继承当前进程的。lib 目录或全局缓存目录
+/// 被覆盖时经 `ZIG_LIB_DIR`、`ZIG_GLOBAL_CACHE_DIR` 告诉 zig：`zig build` 没有指定全局缓存目录的参数
+environ_map: ?Environ.Map = null,
 
 pub fn deinit(env: *ZigEnv, gpa: Allocator) void {
+    if (env.environ_map) |*m| m.deinit();
     var arena = env.arena.promote(gpa);
     arena.deinit();
     env.* = undefined;
+}
+
+/// 运行 zig 时传给 `std.process.spawn` / `run` 的 `environ_map`
+pub fn childEnviron(env: *const ZigEnv) ?*const Environ.Map {
+    return if (env.environ_map) |*m| m else null;
 }
 
 /// 用户 zig 与 zig-analyzer 编译时所用 zig 的版本完全相同（含预发布与构建号）
@@ -91,6 +102,171 @@ test absolute {
     try std.testing.expect(std.fs.path.isAbsolute(rel));
     try std.testing.expect(std.mem.endsWith(u8, rel, ".zig-cache"));
     try std.testing.expectEqualStrings(cwd, try absolute(a, "/elsewhere", cwd));
+}
+
+/// 用户配置的路径，优先于 `zig env` 给出的值；相对路径按当前目录解析
+pub const Overrides = struct {
+    /// lib 目录：其下须有 `std/std.zig`
+    lib_dir: ?[]const u8 = null,
+    /// 全局缓存目录：须是已存在的目录
+    global_cache_dir: ?[]const u8 = null,
+};
+
+/// `withOverrides` 没有采用的覆盖：路径不存在或不符合要求
+pub const Rejected = struct {
+    lib_dir: bool = false,
+    global_cache_dir: bool = false,
+};
+
+pub const OverrideError = Allocator.Error || Io.Cancelable || Environ.CreateMapError;
+
+/// 以 `overrides` 覆盖 `base`（`zig env` 的结果）中的路径，返回新的环境（不引用 `base` 的内存）。不能采用的覆盖记入
+/// `rejected`，保留 `base` 的值。有采用的覆盖时，运行 zig 的子进程的环境变量为当前进程的 `environ` 加上覆盖的路径
+pub fn withOverrides(
+    base: *const ZigEnv,
+    gpa: Allocator,
+    io: Io,
+    environ: Environ,
+    overrides: Overrides,
+    rejected: *Rejected,
+) OverrideError!ZigEnv {
+    rejected.* = .{};
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var env: ZigEnv = .{
+        .arena = undefined,
+        .zig_exe = try a.dupe(u8, base.zig_exe),
+        .lib_dir = try a.dupe(u8, base.lib_dir),
+        .std_dir = try a.dupe(u8, base.std_dir),
+        .global_cache_dir = try a.dupe(u8, base.global_cache_dir),
+        .version = try a.dupe(u8, base.version),
+    };
+    var lib_dir: ?[]const u8 = null;
+    if (overrides.lib_dir) |path| {
+        const dir = try resolveOverride(a, io, path);
+        const root = if (dir) |d| try std.fs.path.join(a, &.{ d, "std", "std.zig" }) else null;
+        if (root != null and try isKind(io, root.?, .file)) {
+            env.lib_dir = dir.?;
+            env.std_dir = std.fs.path.dirname(root.?).?;
+            lib_dir = dir.?;
+        } else rejected.lib_dir = true;
+    }
+    var cache_dir: ?[]const u8 = null;
+    if (overrides.global_cache_dir) |path| {
+        const dir = try resolveOverride(a, io, path);
+        if (dir != null and try isKind(io, dir.?, .directory)) {
+            env.global_cache_dir = dir.?;
+            cache_dir = dir.?;
+        } else rejected.global_cache_dir = true;
+    }
+    if (lib_dir != null or cache_dir != null) {
+        var map = try environ.createMap(gpa);
+        errdefer map.deinit();
+        if (lib_dir) |d| try map.put("ZIG_LIB_DIR", d);
+        if (cache_dir) |d| try map.put("ZIG_GLOBAL_CACHE_DIR", d);
+        env.environ_map = map;
+    }
+    env.arena = arena.state;
+    return env;
+}
+
+/// 两个环境给出的路径（zig 可执行文件、lib 目录、标准库目录、全局缓存目录）相同
+pub fn samePaths(a: *const ZigEnv, b: *const ZigEnv) bool {
+    return std.mem.eql(u8, a.zig_exe, b.zig_exe) and std.mem.eql(u8, a.lib_dir, b.lib_dir) and
+        std.mem.eql(u8, a.std_dir, b.std_dir) and std.mem.eql(u8, a.global_cache_dir, b.global_cache_dir);
+}
+
+/// 配置中的文件路径（如 `zig.builtin_path`）转为规范化的绝对路径（调用方释放），相对路径按当前目录解析。
+/// 不存在或（跟随符号链接后）不是文件时为 null
+pub fn resolveFile(gpa: Allocator, io: Io, path: []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
+    const resolved = try resolveOverride(gpa, io, path) orelse return null;
+    if (try isKind(io, resolved, .file)) return resolved;
+    gpa.free(resolved);
+    return null;
+}
+
+/// 配置的路径转为规范化的绝对路径（相对路径按当前目录）；取不到当前目录时为 null
+fn resolveOverride(a: Allocator, io: Io, path: []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
+    if (std.fs.path.isAbsolute(path)) return try std.fs.path.resolveAlloc(a, &.{path});
+    const cwd = Io.Dir.cwd().realPathFileAlloc(io, ".", a) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return null,
+    };
+    defer a.free(cwd);
+    return try std.fs.path.resolveAlloc(a, &.{ cwd, path });
+}
+
+/// `path` 存在且（跟随符号链接后）是 `kind` 类型的文件
+fn isKind(io: Io, path: []const u8, kind: Io.File.Kind) Io.Cancelable!bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return false,
+    };
+    return stat.kind == kind;
+}
+
+test withOverrides {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib/std");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/std/std.zig", .data = "" });
+    try tmp.dir.createDirPath(io, "cache");
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const lib = try std.fs.path.join(a, &.{ root, "lib" });
+    const cache = try std.fs.path.join(a, &.{ root, "cache" });
+    const missing = try std.fs.path.join(a, &.{ root, "missing" });
+    const std_file = try std.fs.path.join(a, &.{ lib, "std", "std.zig" });
+
+    var base = try parse(gpa,
+        \\.{ .zig_exe = "/opt/zig/zig", .lib_dir = "/opt/zig/lib", .std_dir = "/opt/zig/lib/std", .global_cache_dir = "/home/u/.cache/zig", .version = "0.17.0" }
+    );
+    defer base.deinit(gpa);
+    var rejected: Rejected = .{};
+
+    // 没有覆盖：与 `zig env` 的结果相同，子进程继承当前进程的环境变量
+    var same = try base.withOverrides(gpa, io, .empty, .{}, &rejected);
+    defer same.deinit(gpa);
+    try std.testing.expectEqualStrings(base.std_dir, same.std_dir);
+    try std.testing.expectEqualStrings(base.global_cache_dir, same.global_cache_dir);
+    try std.testing.expect(same.childEnviron() == null and !rejected.lib_dir and !rejected.global_cache_dir);
+
+    // 有效的覆盖：替换路径并经环境变量告诉 zig。相对路径按当前目录解析，末尾的分隔符被去掉
+    const relative = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path, "lib" ++ std.fs.path.sep_str });
+    var both = try base.withOverrides(gpa, io, .empty, .{ .lib_dir = relative, .global_cache_dir = cache }, &rejected);
+    defer both.deinit(gpa);
+    try std.testing.expect(!rejected.lib_dir and !rejected.global_cache_dir);
+    try std.testing.expectEqualStrings(lib, both.lib_dir);
+    try std.testing.expectEqualStrings(std.fs.path.dirname(std_file).?, both.std_dir);
+    try std.testing.expectEqualStrings(cache, both.global_cache_dir);
+    try std.testing.expectEqualStrings(base.zig_exe, both.zig_exe);
+    try std.testing.expectEqualStrings(base.version, both.version);
+    try std.testing.expectEqualStrings(lib, both.childEnviron().?.get("ZIG_LIB_DIR").?);
+    try std.testing.expectEqualStrings(cache, both.childEnviron().?.get("ZIG_GLOBAL_CACHE_DIR").?);
+
+    // 不存在的路径、没有标准库的目录、不是目录的缓存：不采用，保留 `zig env` 的值
+    var invalid = try base.withOverrides(gpa, io, .empty, .{ .lib_dir = cache, .global_cache_dir = missing }, &rejected);
+    defer invalid.deinit(gpa);
+    try std.testing.expect(rejected.lib_dir and rejected.global_cache_dir);
+    try std.testing.expectEqualStrings(base.lib_dir, invalid.lib_dir);
+    try std.testing.expectEqualStrings(base.std_dir, invalid.std_dir);
+    try std.testing.expectEqualStrings(base.global_cache_dir, invalid.global_cache_dir);
+    try std.testing.expect(invalid.childEnviron() == null);
+
+    // 只采用有效的一项
+    var partial = try base.withOverrides(gpa, io, .empty, .{ .lib_dir = lib, .global_cache_dir = std_file }, &rejected);
+    defer partial.deinit(gpa);
+    try std.testing.expect(!rejected.lib_dir and rejected.global_cache_dir);
+    try std.testing.expectEqualStrings(lib, partial.lib_dir);
+    try std.testing.expectEqualStrings(base.global_cache_dir, partial.global_cache_dir);
+    try std.testing.expectEqualStrings(lib, partial.childEnviron().?.get("ZIG_LIB_DIR").?);
+    try std.testing.expect(partial.childEnviron().?.get("ZIG_GLOBAL_CACHE_DIR") == null);
 }
 
 /// 解析 `zig env` 的 ZON 输出

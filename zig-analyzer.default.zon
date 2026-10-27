@@ -12,10 +12,25 @@
 // Omitted options keep their defaults. An error in this file (syntax, a wrong type, an unknown
 // option) is shown with its location, and the whole file is ignored.
 .{
-    // Path to the `zig` executable (editor only):
-    //   .zig = .{ .path = "/usr/local/bin/zig" },
-    // Default: looked up in PATH. It must be the Zig version zig-analyzer was built with (0.17.0);
-    // otherwise projects with build.zig are not loaded.
+    // The Zig installation (editor only):
+    //   .zig = .{
+    //       // Path to the `zig` executable. Default: looked up in PATH. It must be the Zig version
+    //       // zig-analyzer was built with (0.17.0); otherwise projects with build.zig are not
+    //       // loaded. Takes effect after restarting zig-analyzer.
+    //       .path = "/usr/local/bin/zig",
+    //       // The paths below override what `zig env` reports. A path that is missing or invalid
+    //       // is reported, and the detected one is used instead. Relative paths are resolved
+    //       // against the working directory of zig-analyzer. A change reloads the standard
+    //       // library, and restarts the projects when the lib or cache directory changes.
+    //       // Lib directory, which must contain `std/std.zig`: the standard library is read from
+    //       // it, and zig runs with ZIG_LIB_DIR set to it.
+    //       .lib_path = "/usr/local/lib/zig",
+    //       // Existing global cache directory: zig runs with ZIG_GLOBAL_CACHE_DIR set to it.
+    //       .global_cache_path = "/home/me/.cache/zig",
+    //       // `@import("builtin")` of files outside any project. Default: generated for the
+    //       // native target. Modules of a project always use the one of their build settings.
+    //       .builtin_path = "/home/me/builtin.zig",
+    //   },
 
     .build = .{
         // Load projects through the build system protocol (`zig build --listen=-`); false handles

@@ -3,7 +3,8 @@
 //!
 //! JSON 结构如下；也接受外面再包一层 `"zig-analyzer"`：
 //!
-//!     { "zig": { "path": "/usr/local/bin/zig" },
+//!     { "zig": { "path": "/usr/local/bin/zig", "lib_path": "/usr/local/lib/zig", "builtin_path": "/tmp/builtin.zig",
+//!                "global_cache_path": "/home/me/.cache/zig" },
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": false, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
@@ -40,6 +41,13 @@ const Config = @This();
 arena: std.heap.ArenaAllocator.State = .{},
 /// zig 可执行文件；null 时从 PATH 查找
 zig_path: ?[]const u8 = null,
+/// zig 的 lib 目录（其下有 `std/std.zig`），标准库从这里解析，运行 zig 时同样使用；null 时用 `zig env` 给出的
+zig_lib_path: ?[]const u8 = null,
+/// 不属于任何项目的文件（单文件模式等）的 `@import("builtin")`；null 时按 `zig test` 的设置生成。
+/// 项目中的模块总是用按构建参数生成的
+zig_builtin_path: ?[]const u8 = null,
+/// zig 的全局缓存目录（依赖包、生成的 builtin.zig 等），运行 zig 时同样使用；null 时用 `zig env` 给出的
+zig_global_cache_path: ?[]const u8 = null,
 /// 是否通过构建系统协议获取项目模型；关闭时所有文件按单文件处理
 build_enable: bool = true,
 /// 传给 `zig build` 的额外参数（如 `-Dtarget=...`）
@@ -176,6 +184,9 @@ const Setting = struct { section: []const u8, key: []const u8, field: []const u8
 
 const settings = [_]Setting{
     .{ .section = "zig", .key = "path", .field = "zig_path" },
+    .{ .section = "zig", .key = "lib_path", .field = "zig_lib_path" },
+    .{ .section = "zig", .key = "builtin_path", .field = "zig_builtin_path" },
+    .{ .section = "zig", .key = "global_cache_path", .field = "zig_global_cache_path" },
     .{ .section = "build", .key = "enable", .field = "build_enable" },
     .{ .section = "build", .key = "args", .field = "build_args" },
     .{ .section = "diagnostics", .key = "step", .field = "diagnostics_step" },
@@ -419,6 +430,12 @@ pub fn sameZig(a: *const Config, b: *const Config) bool {
     return eqlOptional(a.zig_path, b.zig_path);
 }
 
+/// 覆盖 zig 环境的路径（lib 目录、默认 builtin、全局缓存目录）是否相同（不同时重新加载标准库与 builtin）
+pub fn sameZigPaths(a: *const Config, b: *const Config) bool {
+    return eqlOptional(a.zig_lib_path, b.zig_lib_path) and eqlOptional(a.zig_builtin_path, b.zig_builtin_path) and
+        eqlOptional(a.zig_global_cache_path, b.zig_global_cache_path);
+}
+
 /// 命名检查的配置是否相同（不同时重新发布打开的文件）
 pub fn sameNaming(a: *const Config, b: *const Config) bool {
     return a.naming_enable == b.naming_enable and std.meta.eql(a.naming_rules, b.naming_rules) and
@@ -506,6 +523,39 @@ test "parse: nested fields, optional wrapper" {
     defer unknown_query.deinit(testing.allocator);
     try testing.expect(unknown_query.cache_queries.Infer.count == null);
     try testing.expectEqual(1, unknown_query.warnings.len);
+}
+
+test "parse: zig path overrides" {
+    var c = try parseText(
+        \\{"zig": {"lib_path": "/z/lib", "builtin_path": "/z/builtin.zig", "global_cache_path": "/z/cache"}}
+    );
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(0, c.warnings.len);
+    try testing.expectEqualStrings("/z/lib", c.zig_lib_path.?);
+    try testing.expectEqualStrings("/z/builtin.zig", c.zig_builtin_path.?);
+    try testing.expectEqualStrings("/z/cache", c.zig_global_cache_path.?);
+
+    var copy = try c.clone(testing.allocator);
+    defer copy.deinit(testing.allocator);
+    try testing.expect(c.sameZigPaths(&copy) and c.sameZig(&copy));
+
+    var fewer = try parseText(
+        \\{"zig": {"lib_path": "/z/lib", "builtin_path": "/z/builtin.zig"}}
+    );
+    defer fewer.deinit(testing.allocator);
+    try testing.expect(!c.sameZigPaths(&fewer) and c.sameZig(&fewer));
+    var empty = try parseText("{}");
+    defer empty.deinit(testing.allocator);
+    try testing.expect(empty.zig_lib_path == null and empty.zig_builtin_path == null and empty.zig_global_cache_path == null);
+
+    // 本机 zig 安装的位置，不能由项目共享
+    var project = try parseProject(testing.allocator,
+        \\.{ .zig = .{ .lib_path = "/z/lib" }, .build = .{ .args = .{"-Da"} } }
+    );
+    defer project.deinit(testing.allocator);
+    try testing.expectEqual(1, project.warnings.len);
+    try testing.expectEqualStrings("`zig.lib_path` cannot be set in zig-analyzer.zon", project.warnings[0]);
+    try testing.expect(!project.isSet("zig_lib_path") and project.isSet("build_args"));
 }
 
 test "parse: unknown and invalid settings are reported, the rest still applies" {
