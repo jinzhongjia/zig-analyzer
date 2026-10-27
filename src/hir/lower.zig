@@ -1,4 +1,4 @@
-//! CST → HIR 降级，同时计算局部作用域。
+//! CST → HIR lowering, which also computes local scopes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,9 +16,10 @@ const Range = Body.Range;
 
 const Error = Allocator.Error;
 
-/// 降级一个容器成员（fn_decl / var_decl / container_field / test_decl / comptime_decl）。
-/// `field_is_name`：成员是 enum 成员或 union 中只写名字的字段（`red`、`red = 1`、`union(enum) { b }`），
-/// 类型表达式的位置是它的名字，不是表达式
+/// Lowers a container member (fn_decl / var_decl / container_field / test_decl / comptime_decl).
+/// `field_is_name`: the member is an enum member or a union field written as just a name
+/// (`red`, `red = 1`, `union(enum) { b }`); the type expression position holds its name,
+/// not an expression
 pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -34,12 +35,15 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
         .fn_decl => {
             const decl = ast.cast(ast.FnDecl, member).?;
             if (decl.proto()) |proto| {
-                // 每个参数的类型在之前参数的作用域中求值：`fn f(comptime T: type, x: T)`
+                // The type of each parameter is evaluated in the scope of the preceding
+                // parameters: `fn f(comptime T: type, x: T)`
                 var it = proto.params();
                 while (it.next()) |p| {
                     const param = ast.cast(ast.Param, p).?;
                     const ty = try l.optExpr(param.typeExpr());
-                    // 无名参数（extern 函数的 `fn f(*const u32) void`）以空名绑定，保证参数按位置对应；`...` 不绑定
+                    // An unnamed parameter (`fn f(*const u32) void` of an extern function) is
+                    // bound with an empty name so that parameters still correspond by position;
+                    // `...` is not bound
                     const name = param.name() orelse if (ty != null) SyntaxToken{ .kind = .identifier, .text = "", .offset = p.offset } else continue;
                     const b = try l.bind(name, .param, .{ .ty = ty, .is_comptime = param.isComptime() });
                     try params.append(l.a, b);
@@ -92,16 +96,16 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
 
 const Lowerer = struct {
     gpa: Allocator,
-    /// Body 的 arena：名字与各种切片
+    /// Arena of the Body: names and the various slices
     a: Allocator,
-    /// owner 节点起点
+    /// Start of the owner node
     base: u32,
     exprs: std.ArrayList(Expr) = .empty,
     ranges: std.ArrayList(Range) = .empty,
     expr_scopes: std.ArrayList(ScopeId) = .empty,
     bindings: std.ArrayList(Body.Binding) = .empty,
     scopes: std.ArrayList(Body.Scope) = .empty,
-    /// Body 的 arena 中分配
+    /// Allocated in the arena of the Body
     clause_list: std.ArrayList(Body.Clause) = .empty,
     scope: ScopeId = .root,
 
@@ -134,7 +138,8 @@ const Lowerer = struct {
         return l.a.dupe(u8, s);
     }
 
-    /// 字面量的原文；多行字符串由各行的 token 以换行符连接（见 `Body.Expr.literal`）
+    /// Source text of a literal; for a multiline string literal, the tokens of its lines joined
+    /// with newlines (see `Body.Expr.literal`)
     fn literal(l: *Lowerer, n: SyntaxNode) Error![]const u8 {
         const first = n.firstToken() orelse return "";
         if (first.kind != .multiline_string_literal_line) return l.str(first.text);
@@ -150,7 +155,7 @@ const Lowerer = struct {
         return text.items;
     }
 
-    /// token 的文本；`@"name"` 形式的标识符取去掉引号并解码的名字
+    /// Text of a token; for a `@"name"` identifier, the decoded name without the quotes
     fn tokenText(l: *Lowerer, t: ?SyntaxToken) Error!?[]const u8 {
         return if (t) |tok| try l.ident(tok.text) else null;
     }
@@ -159,7 +164,7 @@ const Lowerer = struct {
         return l.str(try ast.identNameAlloc(l.a, text));
     }
 
-    /// 新建当前作用域的子作用域并进入
+    /// Creates a child scope of the current scope and enters it
     fn pushScope(l: *Lowerer, bindings: []const BindingId) Error!ScopeId {
         return l.pushScopeLabeled(bindings, null);
     }
@@ -186,7 +191,7 @@ const Lowerer = struct {
         return id;
     }
 
-    /// 捕获 `|a, *b|` 的绑定
+    /// Bindings of a capture `|a, *b|`
     fn captures(l: *Lowerer, payload: ?ast.Payload) Error![]const BindingId {
         const p = payload orelse return &.{};
         var out: std.ArrayList(BindingId) = .empty;
@@ -210,7 +215,8 @@ const Lowerer = struct {
         return out.items;
     }
 
-    /// align / addrspace / linksection / callconv 子句中的表达式；返回 align 子句中的表达式
+    /// Expressions in align / addrspace / linksection / callconv clauses; returns the expression in
+    /// the align clause
     fn clauses(l: *Lowerer, n: SyntaxNode) Error!?ExprId {
         var align_expr: ?ExprId = null;
         var it = n.children();
@@ -224,7 +230,8 @@ const Lowerer = struct {
         return align_expr;
     }
 
-    /// 一个子句：本身降级为 `.other`，其中的表达式记录到 `clauses`；返回其中的第一个表达式
+    /// One clause: the clause itself is lowered to `.other` and its expressions are recorded in
+    /// `clauses`; returns the first of them
     fn clause(l: *Lowerer, c: SyntaxNode) Error!?ExprId {
         const id = try l.expr(c);
         const children = switch (l.exprs.items[@backingInt(id)]) {
@@ -245,9 +252,10 @@ const Lowerer = struct {
     fn expr(l: *Lowerer, n: SyntaxNode) Error!ExprId {
         const r = l.nodeRange(n);
         const e: Expr = switch (n.kind()) {
-            // 括号与语句形式的分支不单独成节点
+            // Parentheses and branches in statement form do not get a node of their own
             .paren_expr, .expr_stmt => return l.exprOrMissing(firstChild(n)),
-            // 恢复出的引用位置可能只有 invalid token；缺失名字保持未知，不进入名字解析。
+            // A recovered reference position may hold only an invalid token; a missing name stays
+            // unknown and does not enter name resolution.
             .name_ref => if ((ast.NameRef{ .syntax = n }).name()) |name| .{ .name_ref = try l.ident(name.text) } else .missing,
             .literal => .{ .literal = try l.literal(n) },
             .field_access => blk: {
@@ -338,7 +346,7 @@ const Lowerer = struct {
                 break :blk .{ .@"break" = .{ .label = try l.tokenText(b.label()), .value = try l.optExpr(b.value()) } };
             },
             .continue_expr => blk: {
-                // 与 break 的子结构相同：可选标签与可选的值
+                // Same substructure as break: an optional label and an optional value
                 const c = ast.BreakExpr{ .syntax = n };
                 break :blk .{ .@"continue" = .{ .label = try l.tokenText(c.label()), .value = try l.optExpr(c.value()) } };
             },
@@ -367,7 +375,8 @@ const Lowerer = struct {
                 break :blk .{ .error_set = names.items };
             },
             .asm_output => blk: {
-                // 输出目标是直接 token，不是子表达式；保留它的真实范围和当前作用域。
+                // The output target is a direct token, not a subexpression; keep its actual range
+                // and the current scope.
                 if (n.childToken(.arrow) == null) {
                     var children = n.children();
                     var in_operand = false;
@@ -389,7 +398,7 @@ const Lowerer = struct {
 
     fn block(l: *Lowerer, n: SyntaxNode) Error!ExprId {
         const blk = ast.Block{ .syntax = n };
-        // 先占位，标签作用域需要块的 ExprId
+        // Add a placeholder first: the label scope needs the ExprId of the block
         const id = try l.add(.missing, l.nodeRange(n));
         const saved = l.scope;
         defer l.scope = saved;
@@ -406,7 +415,8 @@ const Lowerer = struct {
         return id;
     }
 
-    /// 降级一条块级语句；声明会把当前作用域推进到包含新绑定的子作用域
+    /// Lowers one block-level statement; a declaration advances the current scope to a child scope
+    /// that contains the new binding
     fn stmt(l: *Lowerer, n: SyntaxNode) Error!@FieldType(Body.Stmt, "kind") {
         switch (n.kind()) {
             .var_decl => return .{ .local = try l.localDecl(n) },
@@ -421,7 +431,7 @@ const Lowerer = struct {
                 return .{ .@"errdefer" = .{ .capture = if (caps.len != 0) caps[0] else null, .body = try l.exprOrMissing(it.next()) } };
             },
             .comptime_stmt => {
-                // `comptime var x = ...;` 或 `comptime { ... }` / `comptime expr;`
+                // `comptime var x = ...;` or `comptime { ... }` / `comptime expr;`
                 const inner = firstChild(n) orelse return .{ .expr = try l.add(.missing, .none) };
                 if (inner.kind() == .var_decl) {
                     const b = try l.localDecl(inner);
@@ -457,7 +467,8 @@ const Lowerer = struct {
         const ty = try l.optExpr(v.typeExpr());
         _ = try l.clauses(n);
         const init = try l.optExpr(v.initExpr());
-        // 缺名字时用空名占位，保证语句仍有绑定
+        // When the name is missing, an empty name serves as a placeholder so that the statement
+        // still has a binding
         const name = v.name() orelse SyntaxToken{ .kind = .identifier, .text = "", .offset = n.offset };
         const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = ty, .init = init });
         _ = try l.pushScope(&.{b});
@@ -587,7 +598,7 @@ fn firstChild(n: SyntaxNode) ?SyntaxNode {
     return it.nextNode();
 }
 
-/// 赋值运算符：第一个子节点之后的第一个非 trivia token
+/// Assignment operator: the first non-trivia token after the first child node
 fn opAfterFirstNode(n: SyntaxNode) SyntaxKind {
     var it = n.children();
     var seen = false;
@@ -648,7 +659,7 @@ test "params, locals and captures are scoped" {
     try testing.expectEqual(.param, b.binding(b.params[1]).kind);
 
     const cases = [_]struct { at: []const u8, names: []const u8 }{
-        // 参数类型：只看得到之前的参数
+        // Parameter type: only the preceding parameters are visible
         .{ .at = "T) !T", .names = "T " },
         .{ .at = "x;", .names = "x T " },
         .{ .at = "v;", .names = "v a x T " },
@@ -682,10 +693,10 @@ test "expressions keep structure and ranges" {
     try testing.expectEqualStrings("eql", callee.field.?);
     try testing.expectEqualStrings("mem", b.expr(callee.lhs).field_access.field.?);
     try testing.expectEqual(.unwrap_optional, std.meta.activeTag(b.expr(call.args[1])));
-    // `foo.` 字段缺失
+    // `foo.`: the field is missing
     const incomplete = b.expr(root.binary.rhs).field_access;
     try testing.expect(incomplete.field == null);
-    // 位置相对 owner 起点
+    // Positions are relative to the start of the owner
     const r_eql = b.range(call.callee);
     try testing.expectEqualStrings("std.mem.eql", text[r_eql.start..r_eql.end]);
     try testing.expectEqual(call.callee, b.exprAt(offsetOf(text, ".eql") + 1).?);
@@ -705,7 +716,7 @@ test "labels, switch captures and nested containers" {
     defer r.parse.destroy();
     defer r.body.deinit(testing.allocator);
     const b = &r.body;
-    // 标签作用域
+    // Label scope
     var s: ?ScopeId = b.scopeAt(offsetOf(text, "break"));
     var found_label = false;
     while (s) |id| : (s = b.scope(id).parent) {
@@ -717,7 +728,7 @@ test "labels, switch captures and nested containers" {
     const names = try visibleNames(b, offsetOf(text, "break"));
     defer testing.allocator.free(names);
     try testing.expectEqualStrings("p ", names);
-    // 体内容器只是占位，不展开其成员
+    // A container in the body is only a placeholder; its members are not expanded
     var containers: usize = 0;
     for (b.exprs) |e| if (e == .container) {
         containers += 1;

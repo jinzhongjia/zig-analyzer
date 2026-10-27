@@ -1,10 +1,13 @@
-//! HIR：BodyOwner（函数、const/var、字段、test、comptime 块）中表达式的容错中间表示。
+//! HIR: an error-tolerant intermediate representation of the expressions in a BodyOwner
+//! (function, const/var, field, test, comptime block).
 //!
-//! 由 CST 降级而来（`lower.zig`），语法缺失处为 `.missing`。位置都相对于 owner 节点的起点，
-//! owner 之前的编辑不改变 Body 的内容。体内定义的容器只记录为 `.container`，其成员属于 ItemTree。
+//! Lowered from the CST (`lower.zig`); missing syntax becomes `.missing`. All positions are
+//! relative to the start of the owner node, so edits before the owner do not change the contents
+//! of the Body. Containers defined in the body are recorded only as `.container`; their members
+//! belong to the ItemTree.
 //!
-//! 作用域在降级时一并算出：每个表达式记录其求值时所在的作用域，作用域链上是可见的
-//! 参数、局部变量、捕获与标签。
+//! Scopes are computed during lowering: each expression records the scope it is evaluated in,
+//! and the scope chain holds the visible parameters, local variables, captures, and labels.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -15,29 +18,31 @@ const Body = @This();
 
 arena: std.heap.ArenaAllocator.State,
 exprs: []const Expr,
-/// 与 `exprs` 一一对应
+/// Parallel to `exprs`
 expr_ranges: []const Range,
-/// 与 `exprs` 一一对应：表达式求值时所在的作用域
+/// Parallel to `exprs`: the scope each expression is evaluated in
 expr_scopes: []const ScopeId,
 bindings: []const Binding,
 scopes: []const Scope,
-/// 函数参数（按顺序）
+/// Function parameters (in order)
 params: []const BindingId,
-/// owner 的主体：函数体、变量初始化、字段默认值、test / comptime 块
+/// Main part of the owner: function body, variable initializer, field default value,
+/// test / comptime block
 value: ?ExprId,
-/// 变量与字段的类型标注、函数的返回类型
+/// Type annotation of a variable or field; return type of a function
 type_expr: ?ExprId,
-/// 变量与字段的 `align(...)` 中的表达式
+/// Expression in the `align(...)` of a variable or field
 align_expr: ?ExprId,
-/// 函数原型、变量与字段、局部变量、指针类型的 `align` / `addrspace` / `linksection` / `callconv` 子句中的
-/// 表达式（子句不属于表达式树，推导时按子句的结果类型单独推导）
+/// Expressions in the `align` / `addrspace` / `linksection` / `callconv` clauses of function
+/// prototypes, variables and fields, local variables, and pointer types (the clauses are not part
+/// of the expression tree; they are inferred separately, against the result type of the clause)
 clauses: []const Clause,
 
 pub const ExprId = enum(u32) { _ };
 pub const BindingId = enum(u32) { _ };
 pub const ScopeId = enum(u32) { root = 0, _ };
 
-/// 相对 owner 起点的字节区间
+/// Byte range relative to the start of the owner
 pub const Range = struct {
     start: u32,
     end: u32,
@@ -50,16 +55,17 @@ pub const Range = struct {
 };
 
 pub const Expr = union(enum) {
-    /// 语法缺失
+    /// Missing syntax
     missing,
     name_ref: []const u8,
-    /// `foo.` 尚未写完时 `field` 为 null
+    /// `field` is null while `foo.` is not finished yet
     field_access: struct { lhs: ExprId, field: ?[]const u8 },
     enum_literal: []const u8,
     error_value: []const u8,
-    /// 数字、字符串、字符字面量：原文。多行字符串为各行的 token（`\\` 开头，不含换行符）以 `\n` 连接
+    /// Number, string, and character literals: the source text. For a multiline string literal,
+    /// the tokens of its lines (starting with `\\`, without the newline) joined with `\n`
     literal: []const u8,
-    /// `name` 含 `@`
+    /// `name` includes the `@`
     builtin_call: struct { name: []const u8, args: []const ExprId },
     call: struct { callee: ExprId, args: []const ExprId },
     block: Block,
@@ -68,7 +74,7 @@ pub const Expr = union(enum) {
     @"switch": struct { operand: ExprId, prongs: []const Prong },
     @"catch": struct { lhs: ExprId, capture: ?BindingId, rhs: ExprId },
     binary: struct { op: SyntaxKind, lhs: ExprId, rhs: ExprId },
-    /// 含 `try`、`&`、`-`、`!`、`~`
+    /// Includes `try`, `&`, `-`, `!`, `~`
     prefix: struct { op: SyntaxKind, operand: ExprId },
     assign: struct { op: SyntaxKind, lhs: ExprId, rhs: ExprId },
     index: struct { lhs: ExprId, index: ExprId },
@@ -77,14 +83,15 @@ pub const Expr = union(enum) {
     unwrap_optional: ExprId,
     /// `T{ ... }` / `.{ ... }`
     init: struct { ty: ?ExprId, fields: []const FieldInit },
-    /// 体内定义的容器（内容见 ItemTree），按位置对应。`arg` 为 `enum(u8)` 的整数类型、
-    /// `union(E)` 的标签类型、`packed struct(u32)` 的 backing 整数
+    /// Container defined in the body (see the ItemTree for its contents), matched by position.
+    /// `arg` is the integer type of `enum(u8)`, the tag type of `union(E)`, or the backing integer
+    /// of `packed struct(u32)`
     container: struct { arg: ?ExprId },
-    /// 函数类型 `fn (A, B) R`
+    /// Function type `fn (A, B) R`
     fn_type: struct { params: []const ExprId, ret: ?ExprId },
     @"return": ?ExprId,
     @"break": struct { label: ?[]const u8, value: ?ExprId },
-    /// labeled switch 的 `continue :l value` 带值
+    /// `continue :l value` of a labeled switch carries a value
     @"continue": struct { label: ?[]const u8, value: ?ExprId },
     @"comptime": ExprId,
     @"unreachable",
@@ -93,7 +100,8 @@ pub const Expr = union(enum) {
     ptr_type: struct { size: PtrSize, is_const: bool, child: ExprId, sentinel: ?ExprId = null },
     array_type: struct { len: ExprId, child: ExprId, sentinel: ?ExprId = null },
     error_set: []const []const u8,
-    /// 其他结构（asm、nosuspend、语法错误节点等）：只保留子表达式，使其中的名字仍可解析
+    /// Other constructs (asm, nosuspend, syntax error nodes, ...): only the subexpressions are
+    /// kept, so that the names in them can still be resolved
     other: []const ExprId,
 };
 
@@ -103,30 +111,30 @@ pub const Clause = struct {
     kind: Kind,
     expr: ExprId,
 
-    /// `bit_range` 为位指针 `align(a:b:c)` 中对齐之后的两项
+    /// `bit_range` is for the two items after the alignment in the `align(a:b:c)` of a bit pointer
     pub const Kind = enum { @"align", bit_range, @"addrspace", @"linksection", @"callconv" };
 };
 
 pub const Block = struct {
     label: ?[]const u8,
     stmts: []const Stmt,
-    /// 块内第一条语句所在的作用域
+    /// Scope of the first statement in the block
     scope: ScopeId,
 };
 
 pub const Stmt = struct {
     kind: union(enum) {
         expr: ExprId,
-        /// 局部变量声明
+        /// Local variable declaration
         local: BindingId,
         @"defer": ExprId,
         @"errdefer": struct { capture: ?BindingId, body: ExprId },
         /// `a, const b = expr;`
         destructure: struct { targets: []const DestructureTarget, value: ExprId },
     },
-    /// 语句结束位置（相对 owner）
+    /// End of the statement (relative to the owner)
     end: u32,
-    /// 本语句之后的语句所在的作用域
+    /// Scope of the statements after this one
     scope_after: ScopeId,
 };
 
@@ -135,10 +143,10 @@ pub const DestructureTarget = union(enum) { binding: BindingId, expr: ExprId };
 pub const Loop = struct {
     kind: enum { @"while", @"for" },
     label: ?[]const u8,
-    /// while 的条件；for 的各个输入
+    /// Condition of a while; inputs of a for
     inputs: []const ExprId,
     capture: []const BindingId,
-    /// while 的 `: (cont)`
+    /// The `: (cont)` of a while
     cont: ?ExprId,
     body: ExprId,
     else_capture: []const BindingId,
@@ -149,32 +157,32 @@ pub const Loop = struct {
 pub const Prong = struct {
     items: []const ExprId,
     is_else: bool,
-    /// `inline` 分支：每个分支项单独实例化，捕获 comptime 已知
+    /// `inline` prong: each item is instantiated separately, and the capture is comptime-known
     is_inline: bool = false,
     capture: []const BindingId,
     body: ExprId,
 };
 
 pub const FieldInit = struct {
-    /// 元组形式 `.{ a, b }` 没有字段名
+    /// The tuple form `.{ a, b }` has no field names
     name: ?[]const u8,
     value: ExprId,
-    /// 字段名 token 的位置（引用查找与重命名用）
+    /// Position of the field name token (for find references and rename)
     name_range: Range = .none,
 };
 
 pub const Binding = struct {
     name: []const u8,
     kind: Kind,
-    /// 名字 token 的位置
+    /// Position of the name token
     range: Range,
-    /// 类型标注（参数类型、`const x: T`）
+    /// Type annotation (parameter type, `const x: T`)
     ty: ?ExprId = null,
-    /// 局部变量的初始化表达式
+    /// Initializer of a local variable
     init: ?ExprId = null,
     /// `|*x|`
     is_ptr: bool = false,
-    /// `comptime` 参数，或 `comptime var` 局部变量
+    /// `comptime` parameter, or `comptime var` local variable
     is_comptime: bool = false,
 
     pub const Kind = enum { param, local_const, local_var, capture };
@@ -183,7 +191,7 @@ pub const Binding = struct {
 pub const Scope = struct {
     parent: ?ScopeId,
     bindings: []const BindingId,
-    /// 带标签的块或循环
+    /// Labeled block or loop
     label: ?struct { name: []const u8, expr: ExprId } = null,
 };
 
@@ -193,7 +201,8 @@ pub fn deinit(b: *Body, gpa: Allocator) void {
     b.* = undefined;
 }
 
-/// 结构相等（不比较 arena）：Body 内容不变时下游 query 不必重算
+/// Structural equality (the arena is not compared): when the contents of a Body are unchanged,
+/// downstream queries need not be recomputed
 pub fn eql(a: *const Body, b: *const Body) bool {
     inline for (@typeInfo(Body).@"struct".field_names) |name| {
         if (comptime std.mem.eql(u8, name, "arena")) continue;
@@ -210,13 +219,15 @@ pub fn range(b: *const Body, id: ExprId) Range {
     return b.expr_ranges[@backingInt(id)];
 }
 
-/// name_ref 的区间是原始 token；带引号或转义的标识符比解码后的名字更长。
+/// The range of a name_ref is the raw token; a quoted or escaped identifier is longer than the
+/// decoded name.
 pub fn nameRefIsEscaped(b: *const Body, id: ExprId) bool {
     const span = b.range(id);
     return span.end - span.start > b.expr(id).name_ref.len;
 }
 
-/// 不带引号的原始类型 / 原始值名字：语言内建，不解析到同名声明（`@"u32"` 可以同名）
+/// Unquoted primitive type / primitive value name: built into the language, never resolved to a
+/// declaration with the same name (`@"u32"` can be the name of a declaration)
 pub fn nameRefIsBuiltin(b: *const Body, id: ExprId) bool {
     if (b.nameRefIsEscaped(id)) return false;
     const name = b.expr(id).name_ref;
@@ -233,7 +244,7 @@ pub fn scope(b: *const Body, id: ScopeId) Scope {
     return b.scopes[@backingInt(id)];
 }
 
-/// 包含 `offset`（相对 owner）的最小表达式
+/// Smallest expression containing `offset` (relative to the owner)
 pub fn exprAt(b: *const Body, offset: u32) ?ExprId {
     var best: ?ExprId = null;
     var best_len: u32 = std.math.maxInt(u32);
@@ -247,12 +258,12 @@ pub fn exprAt(b: *const Body, offset: u32) ?ExprId {
     return best;
 }
 
-/// `offset` 处可见局部名字所在的作用域
+/// Scope holding the local names visible at `offset`
 pub fn scopeAt(b: *const Body, offset: u32) ScopeId {
     const e = b.exprAt(offset) orelse return .root;
     switch (b.expr(e)) {
         .block => |blk| {
-            // 块内：取 offset 之前最后一条语句之后的作用域
+            // Inside a block: take the scope after the last statement before offset
             var s = blk.scope;
             for (blk.stmts) |stmt| {
                 if (stmt.end > offset) break;
@@ -264,7 +275,7 @@ pub fn scopeAt(b: *const Body, offset: u32) ScopeId {
     }
 }
 
-/// 沿作用域链查找名字
+/// Looks up a name along the scope chain
 pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
     var s: ?ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
@@ -273,7 +284,8 @@ pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
         while (i > 0) {
             i -= 1;
             const candidate = b.binding(bindings[i]);
-            // 裸 `_` 不引入名字，转义后的 `@"_"` 仍是可引用的绑定。
+            // A bare `_` introduces no name, while the escaped `@"_"` is still a binding that
+            // can be referenced.
             if (candidate.range.end - candidate.range.start == 1 and std.mem.eql(u8, candidate.name, "_")) continue;
             if (std.mem.eql(u8, candidate.name, name)) return bindings[i];
         }
@@ -285,7 +297,8 @@ test {
     _ = @import("lower.zig");
 }
 
-/// 字符串字面量（`literal` 的原文，含多行字符串）的值；不是字符串或转义无效时为 null
+/// Value of a string literal (the source text of a `literal`, multiline string literals
+/// included); null when it is not a string or has an invalid escape
 pub fn stringLiteralValue(gpa: Allocator, text: []const u8) Allocator.Error!?[]u8 {
     if (text.len == 0) return null;
     switch (text[0]) {
@@ -293,7 +306,8 @@ pub fn stringLiteralValue(gpa: Allocator, text: []const u8) Allocator.Error!?[]u
             error.OutOfMemory => error.OutOfMemory,
             else => null,
         },
-        // 与编译器一致：各行去掉 `\\` 后以换行符连接，最后一行之后没有换行符
+        // Matches the compiler: the lines are joined with newlines after removing `\\`, with no
+        // newline after the last line
         '\\' => {
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(gpa);
@@ -310,8 +324,10 @@ pub fn stringLiteralValue(gpa: Allocator, text: []const u8) Allocator.Error!?[]u
     }
 }
 
-/// 字符串字面量的源码（含引号；多行字符串含各行的 `\\` 与行间缩进）中，解码后的内容第 `decoded` 个字节
-/// 所在的位置；`decoded` 为内容长度时为内容结束处
+/// Offset of byte `decoded` of the decoded contents within the source of a string literal
+/// (including the quotes; for a multiline string literal, the `\\` of each line and the
+/// indentation between lines); when `decoded` is the length of the contents, the offset where
+/// the contents end
 pub fn literalSourceOffset(src: []const u8, decoded: usize) ?usize {
     if (src.len == 0) return null;
     var d: usize = 0;
