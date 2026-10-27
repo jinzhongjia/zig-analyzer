@@ -1,4 +1,5 @@
-//! textDocument/selectionRange：从光标处的 token 逐层向外扩展到包含它的语法节点。
+//! textDocument/selectionRange: expands level by level from the token at the cursor outward to the
+//! syntax nodes containing it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -7,8 +8,9 @@ const offsets = @import("../util/offsets.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const isTrivia = @import("../syntax/kind.zig").isTrivia;
 
-/// 每个位置至多返回的层数，保留最内层的。`parent` 链每层在 JSON 中嵌套一层，而 `std.json.Stringify`
-/// 在带安全检查的构建中嵌套超过 256 层时 panic
+/// Maximum number of levels returned per position, keeping the innermost ones. Each level of
+/// the `parent` chain nests one level deeper in JSON, and `std.json.Stringify` panics when
+/// nesting exceeds 256 levels in builds with safety checks
 pub const max_levels = 200;
 
 pub fn selectionRanges(
@@ -23,7 +25,7 @@ pub fn selectionRanges(
         const offset: u32 = @intCast(offsets.positionToOffset(lines.text, pos, enc));
         const path = try root.coveringPath(arena, offset);
 
-        // 由外向内构建，parent 指向外层
+        // Built from the outside in; parent points to the outer level
         var chain: std.ArrayList(*types.SelectionRange) = .empty;
         var last: ?[2]u32 = null;
         for (path) |node| {
@@ -60,7 +62,7 @@ test selectionRanges {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    // 光标在 `bar` 上
+    // The cursor is on `bar`
     const result = try selectionRanges(arena.allocator(), parse.rootNode(), lines, .utf8, &.{.{ .line = 0, .character = 15 }});
     var texts: std.ArrayList([]const u8) = .empty;
     var cur: ?*const types.SelectionRange = &result[0];

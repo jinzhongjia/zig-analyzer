@@ -1,8 +1,12 @@
-//! 改名的安全检查（引用的查找见 `search.findReferences`）：新名字与已有的名字冲突，以及以字符串引用名字的反射用法。
+//! Safety checks for renaming (for finding references, see `search.findReferences`): conflicts
+//! of the new name with existing names, and reflection that refers to names by string.
 //!
-//! Zig 不允许局部名字遮蔽外层的局部名字与声明，同一容器的成员（声明与字段）也不能重名：这些改名后 AstGen 会报错，
-//! `declarationConflict` 预先查出，`verifyAstGen` 以改名后的文本确认。容器中的声明却可以与外层容器的声明同名
-//! （内层的优先），改名后不报错，名字悄悄指向了另一个声明，由 `resolutionConflict` 检查。
+//! Zig does not allow a local name to shadow outer local names or declarations, and members of
+//! one container (declarations and fields) cannot share a name either: such renames make AstGen
+//! report errors, which `declarationConflict` detects in advance and `verifyAstGen` confirms on
+//! the renamed text. A declaration in a container, however, may share its name with a declaration
+//! of an outer container (the inner one takes precedence); such a rename causes no error, but the
+//! name silently refers to another declaration, which `resolutionConflict` checks.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,25 +20,27 @@ const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 
-/// 不能改名的原因
+/// Reason a rename is not possible
 pub const Problem = struct {
     file: FileId,
-    /// 问题所在的位置（字节偏移）
+    /// Location of the problem (byte offset)
     offset: u32,
     message: []const u8,
 };
 
-/// 替换 `[start, end)` 的文本
+/// Replacement of the text in `[start, end)`
 pub const Edit = struct { start: u32, end: u32, text: []const u8 };
 
-/// 一个文件中的编辑，按位置排列、互不重叠
+/// Edits in one file, sorted by position and non-overlapping
 pub const FileEdits = struct { file: FileId, edits: []const Edit };
 
-/// AstGen 报出的错误：位置（字节偏移）与文案
+/// An error reported by AstGen: position (byte offset) and message text
 pub const AstGenError = struct { start: u32, message: []const u8 };
 
-/// 声明处的冲突（改名为 `new` 后 AstGen 会报错）：同一容器中已有名为 `new` 的成员；局部名字与它处可见的名字
-/// 同名（遮蔽外层），或与它作用域内更深处的局部名字同名（被遮蔽）；函数体内的容器的声明与函数中可见的局部名字同名
+/// Conflicts at the declaration (AstGen reports an error after renaming to `new`): the same
+/// container already has a member named `new`; a local name matches a name visible where it is
+/// declared (shadowing an outer one) or a local name deeper within its scope (being shadowed); a
+/// declaration in a container inside a function body matches a local name visible in the function
 pub fn declarationConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error!?Problem {
     switch (def) {
         .file => return null,
@@ -49,7 +55,7 @@ pub fn declarationConflict(r: *Resolver, def: Def, new: []const u8) resolve.Erro
                 const name = tree.items[m].name orelse continue;
                 if (std.mem.eql(u8, name, new)) return try problemAt(r, .{ .item = .{ .file = it.file, .item = m } }, "`{s}` is already declared in the same container", new);
             }
-            // 字段不是作用域中的名字
+            // Fields are not names in a scope
             if (tree.items[it.item].kind == .field) return null;
             if (try r.resolveContainerName(it.file, it.item, new)) |d| if (d == .local) {
                 return try problemAt(r, d, "the new name `{s}` would shadow this local", new);
@@ -75,9 +81,12 @@ pub fn declarationConflict(r: *Resolver, def: Def, new: []const u8) resolve.Erro
     }
 }
 
-/// 容器中的声明改名为 `new` 后，容器以内的名字引用改变了指向（AstGen 不报错）：
-/// - 对它的引用处已经能看到更近的 `new`（容器以内的声明或局部名字）：改名后引用被那个名字截获
-/// - 容器以内原本指向容器以外的 `new`：改名后指向它
+/// After a declaration in a container is renamed to `new`, name references inside the container
+/// change their target (AstGen reports no error):
+/// - A reference to it already sees a closer `new` (a declaration or local name inside the
+///   container): after the rename, the reference is captured by that name
+/// - A reference inside the container that used to refer to a `new` outside the container: after
+///   the rename, it refers to the renamed declaration
 pub fn resolutionConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error!?Problem {
     const it = switch (def) {
         .item => |it| it,
@@ -124,15 +133,16 @@ pub fn resolutionConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error
     return null;
 }
 
-/// 名字以字符串字面量出现的第一处：反射（`@field(x, "name")`、`@hasDecl(T, "name")`）与序列化以字符串引用名字，
-/// 改名无法更新这些字符串
+/// First occurrence of the name as a string literal: reflection (`@field(x, "name")`,
+/// `@hasDecl(T, "name")`) and serialization refer to names by string, and renaming cannot update
+/// these strings
 pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) resolve.Error!?Problem {
     const quoted = try std.fmt.allocPrint(r.arena, "\"{s}\"", .{name});
     for (files) |f| {
         const text = (try r.ctx.get(database.syntax.SourceText, f)).text;
         var from: usize = 0;
         while (std.mem.indexOfPos(u8, text, from, quoted)) |pos| : (from = pos + 1) {
-            // 跳过注释中的与 `@"name"` 形式的标识符
+            // Skip occurrences in comments and identifiers of the form `@"name"`
             const root = (try r.ctx.get(database.syntax.ParseFile, f)).rootNode();
             const tok = root.tokenAtOffset(@intCast(pos)) orelse continue;
             if (tok.kind != .string_literal or tok.offset != pos or tok.text.len != quoted.len) continue;
@@ -146,11 +156,14 @@ pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) re
     return null;
 }
 
-/// 文件应用 `edits`（按位置排列、互不重叠）之后，比之前多出的第一个 AstGen 错误：重名、遮蔽，以及文件中漏改的
-/// 引用（引用不到声明）都会报出。位置换算回改名之前的文本
+/// First AstGen error that appears after applying `edits` (sorted by position, non-overlapping)
+/// to the file and was not there before: duplicate names, shadowing, and references in the file
+/// missed by the rename (which no longer resolve to the declaration) are all reported. The
+/// position is mapped back to the text before the rename
 pub fn verifyAstGen(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!?Problem {
     const errors = try astGenErrors(r, file, edits);
-    // 按文案对应，改名前已有的错误不算。不比较个数：新的错误可能使 AstGen 不再报出原有的错误
+    // Errors are matched by message text; errors that existed before the rename do not count.
+    // Counts are not compared: a new error may keep AstGen from reporting an existing one
     var known: std.StringHashMapUnmanaged(u32) = .empty;
     for (errors.before) |d| {
         const gop = try known.getOrPut(r.arena, d.message);
@@ -166,7 +179,8 @@ pub fn verifyAstGen(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
     return null;
 }
 
-/// 文件应用 `edits`（按位置排列、互不重叠）之前与之后的 AstGen 错误。之后的错误的位置换算回应用之前的文本
+/// AstGen errors of the file before and after applying `edits` (sorted by position,
+/// non-overlapping). Positions of the errors after are mapped back to the text before applying.
 pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!struct { before: []const AstGenError, after: []const AstGenError } {
     const ctx = r.ctx;
     const gpa = ctx.db.gpa;
@@ -181,7 +195,8 @@ pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
     try edited.appendSlice(r.arena, text[pos..]);
     const backend = try ctx.get(live.LiveBackend, {});
     const mode = live.modeOf(ctx.db.env.vfs.path(file));
-    // 当前文本的结果：打开的文件已由诊断发布算出（`AstCheck` 读取的是 `FileText`）
+    // Result for the current text: for open files it has already been computed when publishing
+    // diagnostics (`AstCheck` reads `FileText`)
     var own_before: ?*live.Result = null;
     defer if (own_before) |b| b.destroy(gpa);
     const before = if (try ctx.get(database.inputs.FileText, file) != null) try ctx.get(live.AstCheck, file) else blk: {
@@ -197,7 +212,8 @@ pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
     return .{ .before = out_before, .after = out_after };
 }
 
-/// 应用 `edits` 之后的位置换算回之前的文本；位于替换的文本中时取被替换区间的起点
+/// Maps a position after applying `edits` back to the text before; a position inside replacement
+/// text maps to the start of the replaced range
 fn mapBack(edits: []const Edit, offset: u32) u32 {
     var delta: i64 = 0;
     for (edits) |e| {
@@ -214,7 +230,7 @@ fn problemAt(r: *Resolver, def: Def, comptime fmt: []const u8, new: []const u8) 
     return .{ .file = loc.file, .offset = loc.start, .message = try std.fmt.allocPrint(r.arena, fmt, .{new}) };
 }
 
-/// 绑定所在的作用域
+/// Scope that contains the binding
 fn scopeOf(b: *const Body, id: Body.BindingId) ?Body.ScopeId {
     for (b.scopes, 0..) |s, i| {
         if (std.mem.indexOfScalar(Body.BindingId, s.bindings, id) != null) return @fromBackingInt(@as(u32, @intCast(i)));
@@ -222,7 +238,7 @@ fn scopeOf(b: *const Body, id: Body.BindingId) ?Body.ScopeId {
     return null;
 }
 
-/// 作用域 `s` 是 `ancestor` 或在它之内
+/// Whether scope `s` is `ancestor` or lies within it
 fn within(b: *const Body, s: Body.ScopeId, ancestor: Body.ScopeId) bool {
     var cur: ?Body.ScopeId = s;
     while (cur) |c| : (cur = b.scope(c).parent) {
@@ -231,7 +247,8 @@ fn within(b: *const Body, s: Body.ScopeId, ancestor: Body.ScopeId) bool {
     return false;
 }
 
-/// 成员 `item` 在容器 `container` 之内（直接的成员，或体内定义的容器的成员）
+/// Whether member `item` is inside container `container` (a direct member, or a member of a
+/// container defined within its body)
 fn inside(tree: *const ItemTree, item: u32, container: u32) bool {
     var c = tree.items[item].container;
     while (true) {
@@ -241,7 +258,8 @@ fn inside(tree: *const ItemTree, item: u32, container: u32) bool {
     }
 }
 
-/// 定义在文件 `file` 的容器 `container` 之内：容器（及其体内容器）的成员，或其中成员的局部名字
+/// Whether the definition is inside container `container` of file `file`: a member of the
+/// container (or of containers within it), or a local name of such a member
 fn definedInside(r: *Resolver, d: Def, file: FileId, container: u32) resolve.Error!bool {
     const tree = try r.itemTree(file);
     return switch (d) {

@@ -9,7 +9,8 @@ const World = @import("../names/resolve_test.zig").World;
 
 const Check = enum { declaration, resolution };
 
-/// 把 `<|>` 处的定义改名为 `new` 时的问题：「行:列 文案」（行列从 1 起）；没有问题时为 "ok"
+/// Problem with renaming the definition at `<|>` to `new`: "line:column message" (lines and
+/// columns start at 1); "ok" when there is no problem
 fn problemOf(text: []const u8, new: []const u8, comptime check: Check) ![]const u8 {
     var w: World = undefined;
     try w.init();
@@ -41,14 +42,14 @@ fn expectProblem(text: []const u8, new: []const u8, comptime check: Check, expec
 }
 
 test "rename: conflicts at the declaration" {
-    // 同一容器中的字段与声明不能重名
+    // A field and a declaration in the same container cannot share a name
     try expectProblem(
         \\const S = struct {
         \\    fooBar: u32,
         \\    fn <|>other() void {}
         \\};
     , "fooBar", .declaration, "2:5 `fooBar` is already declared in the same container");
-    // 局部名字不能遮蔽外层的局部名字与声明
+    // A local name cannot shadow outer local names or declarations
     try expectProblem(
         \\fn f() void {
         \\    const a = 1;
@@ -66,14 +67,15 @@ test "rename: conflicts at the declaration" {
         \\    _ = x;
         \\}
     , "top", .declaration, "1:7 the new name `top` would shadow this declaration");
-    // 作用域内更深处的同名局部名字会遮蔽改名后的名字
+    // A same-named local name deeper within the scope would shadow the renamed name
     try expectProblem(
         \\fn f(<|>p: u32) void {
         \\    const q = p;
         \\    _ = q;
         \\}
     , "q", .declaration, "2:11 this `q` would shadow the renamed name");
-    // 函数体内的容器的声明不能遮蔽函数中可见的局部名字
+    // A declaration in a container inside a function body cannot shadow local names visible
+    // in the function
     try expectProblem(
         \\fn f() type {
         \\    const v = 1;
@@ -82,7 +84,7 @@ test "rename: conflicts at the declaration" {
         \\    };
         \\}
     , "v", .declaration, "2:11 the new name `v` would shadow this local");
-    // 不同分支中的同名局部名字互不可见
+    // Same-named local names in different branches cannot see each other
     try expectProblem(
         \\fn f(c: bool) void {
         \\    if (c) {
@@ -97,7 +99,8 @@ test "rename: conflicts at the declaration" {
 }
 
 test "rename: references that would change their target" {
-    // 容器中的声明可以与外层的同名：改名后容器中原本指向外层 `x` 的引用会指向它
+    // A declaration in a container may share its name with an outer one: after the rename,
+    // references in the container that used to refer to the outer `x` would refer to it
     try expectProblem(
         \\const x = 1;
         \\const S = struct {
@@ -107,7 +110,8 @@ test "rename: references that would change their target" {
         \\    }
         \\};
     , "x", .resolution, "5:16 this `x` refers to another declaration, which the renamed declaration would shadow");
-    // 对它的引用处有更近的同名声明：改名后引用被截获
+    // A reference to it sees a closer declaration with the same name: after the rename, the
+    // reference is captured
     try expectProblem(
         \\const S = struct {
         \\    const <|>old = 1;
@@ -119,7 +123,7 @@ test "rename: references that would change their target" {
         \\    };
         \\};
     , "new", .resolution, "6:20 this reference would refer to another `new` declared closer to it");
-    // 外层的同名声明在容器中没有被引用
+    // The outer declaration with the same name is not referenced in the container
     try expectProblem(
         \\const x = 1;
         \\const S = struct {
@@ -156,11 +160,12 @@ test "rename: names referenced by string literals" {
     const got = try format(text, p);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("6:22 `fooBar` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
-    // 注释中的与 `@"..."` 形式的标识符不算
+    // Occurrences in comments and identifiers of the form `@"..."` do not count
     try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "other"));
 }
 
-/// 把 `<|>` 处的定义的全部引用改为 `new` 之后 AstGen 多出的错误；`skip_uses` 时只改声明处（模拟漏改的引用）
+/// Extra AstGen error after renaming all references of the definition at `<|>` to `new`; with
+/// `skip_uses`, only the declaration is renamed (simulating references missed by the rename)
 fn verify(text: []const u8, new: []const u8, skip_uses: bool) ![]const u8 {
     var w: World = undefined;
     try w.init();
@@ -195,9 +200,9 @@ test "rename: AstGen confirms the renamed text" {
         \\    return a + b;
         \\}
     ;
-    // 已有的错误（未使用的局部常量）不算
+    // Existing errors (the unused local constant) do not count
     try expectVerify(text, "c", false, "ok");
     try expectVerify(text, "a", false, "4:11 redeclaration of local constant 'a'");
-    // 漏改的引用引用不到声明
+    // A reference missed by the rename no longer resolves to the declaration
     try expectVerify(text, "c", true, "5:16 use of undeclared identifier 'b'");
 }

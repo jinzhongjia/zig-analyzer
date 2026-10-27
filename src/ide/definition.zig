@@ -1,7 +1,10 @@
-//! goto definition / declaration / type definition：名字、成员访问、初始化中的字段名、标签、`@import` 字符串。
+//! Goto definition / declaration / type definition: names, member access, field names in
+//! initializers, labels, and `@import` strings.
 //!
-//! declaration 跳到名字直接解析到的声明；definition 再沿容器级的别名（`const A = std.mem.Allocator;`）
-//! 追到最终的定义；type definition 跳到光标处符号的类型（剥去指针、optional、数组、错误联合）的定义。
+//! Declaration jumps to the declaration that a name resolves to directly; definition additionally
+//! follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition; type
+//! definition jumps to the definition of the type of the symbol at the cursor (with pointers,
+//! optionals, arrays, and error unions stripped).
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -43,14 +46,16 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
     return selfTarget(r, file, offset);
 }
 
-/// definition 的全部目标：光标在 `@import("name")` 上、文件所属的多个模块以 `name` import 不同的模块时为
-/// 这些模块的根文件（按模块的优先级）；其余情况为 `definition` 的结果。第一个即 `definition` 的结果
+/// All targets of definition: when the cursor is on `@import("name")` and the modules the file
+/// belongs to import different modules as `name`, the root files of those modules (in module
+/// priority order); otherwise the result of `definition`. The first one is the result of
+/// `definition`.
 pub fn definitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
     return single(r, try definition(r, file, offset));
 }
 
-/// declaration 的全部目标：同 `definitionTargets`，其余情况为 `declaration` 的结果
+/// All targets of declaration: like `definitionTargets`, but otherwise the result of `declaration`
 pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
     return single(r, try declaration(r, file, offset));
@@ -60,8 +65,9 @@ fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
     return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
 }
 
-/// 光标在 `@import(...)` 或其字符串上时 import 的全部目标（文件开头）。这类 token 不是名字，
-/// `definition` / `declaration` 对它们只经 `defAt` 取 import 的第一个目标
+/// All targets of the import (start of each file) when the cursor is on `@import(...)` or its
+/// string. These tokens are not names; for them, `definition` / `declaration` take only the first
+/// target of the import, via `defAt`.
 fn importTargetsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]const Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind == .identifier) return null;
@@ -76,8 +82,10 @@ fn importTargetsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]con
     return targets;
 }
 
-/// 本身就是声明处、但不是成员或局部绑定的名字：错误集 `error{ Foo }` 中的 `Foo`，没有结果类型的
-/// 匿名初始化 `.{ .x = 1 }` 中的字段名（定义了匿名结构体的字段）。与在声明的名字上跳转一样返回自身
+/// Names that are themselves declaration sites but are not members or local bindings: `Foo` in the
+/// error set `error{ Foo }`, and field names in an anonymous initializer `.{ .x = 1 }` without a
+/// result type (they define the fields of an anonymous struct). As when jumping from the name of a
+/// declaration, returns the name itself.
 fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -98,7 +106,7 @@ fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     if (x.ty != null) return null;
     for (x.fields) |fi| {
         if (fi.name == null or rel < fi.name_range.start or rel >= fi.name_range.end) continue;
-        // 有结果类型（字段解析不出时）不是声明处
+        // With a result type (when the field cannot be resolved), it is not a declaration site
         const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
         if (a.literalExpected(e) != null) return null;
         return span;
@@ -106,9 +114,10 @@ fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return null;
 }
 
-/// 构造的类型（`@Struct`、`@Enum`、`@Union`）的成员：字段访问 `x.name`、经类型访问的 `E.name` 与枚举字面量 `.name`。
-/// 名字是 comptime 求出的字符串，跳到它在源码中的来源：字符串字面量（如 zig-clap 的帮助文本），或 `@typeInfo(X)`
-/// 给出的 X 的同名成员
+/// Members of constructed types (`@Struct`, `@Enum`, `@Union`): field access `x.name`, `E.name`
+/// accessed via the type, and enum literals `.name`. The name is a string computed at comptime;
+/// jumps to its origin in the source: a string literal (such as the help text of zig-clap), or the
+/// member of the same name in X given by `@typeInfo(X)`.
 fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -139,7 +148,8 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
             break :blk .{ fa.field orelse return null, ty };
         },
         .enum_literal => |n| blk: {
-            // 结果类型为 `?E`、`E!T` 时取 E；传给 anytype 形参的字面量取被调函数中转换成的类型
+            // When the result type is `?E` or `E!T`, take E; for a literal passed to an anytype
+            // parameter, take the type the callee converts it to
             var ty = a.exprType(e).ty;
             if (ty == .enum_literal_type) ty = a.literalExpected(e) orelse return null;
             while (true) switch (ip.key(ty)) {
@@ -153,19 +163,21 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     };
     const rt = switch (ip.key(t)) {
         .reified_type => |x| x,
-        // `union(enum)` 的标签枚举：成员是 union 的字段
+        // Tag enum of a `union(enum)`: its members are the fields of the union
         .union_tag_type => |u| switch (ip.key(u)) {
             .reified_type => |x| x,
             else => return null,
         },
         else => return null,
     };
-    // 经类型访问的只有枚举成员（结构体与 union 的类型上只有声明）
+    // Only enum members are accessible via the type (struct and union types have only declarations)
     if (via_type and rt.kind != .@"enum") return null;
     for (rt.names) |n| {
         if (std.mem.eql(u8, n, name)) break;
     } else return null;
-    // 名字的字符串字面量先在使用处找，再到构造类型的成员（含其中的局部常量，如 `blk: { const extra = .{...}; ... }`）所在的文件中找
+    // Look for the string literal of the name first at the use site, then in the file of the member
+    // that constructs the type (including its local constants, such as
+    // `blk: { const extra = .{...}; ... }`)
     if (try literalOrigin(r, file, .{ .item = item, .body = b, .at = a }, rt, name)) |found| return found;
     const owner = try ownerLocal(r, rt);
     if (rt.file != file or owner == null or owner.?.item != item) if (try literalOrigin(r, rt.file, owner, rt, name)) |found| return found;
@@ -176,7 +188,8 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     return constructionSite(r, rt);
 }
 
-/// 名字的来源追不到具体字符时（如由单个字节 `@as(*const [1]u8, &c)` 构成的名字）：成员定义在构造类型的调用处
+/// When the origin of the name cannot be traced to specific characters (such as a name made of a
+/// single byte `@as(*const [1]u8, &c)`): the member is defined at the call that constructs the type
 fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target {
     const tree = try r.itemTree(rt.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
@@ -189,10 +202,15 @@ fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target 
     return .{ .file = rt.file, .start = node.offset + range.start, .end = node.offset + range.end };
 }
 
-/// 名字来自构造类型所在实例 `inst` 的实参（如 zig-clap 的 `clap.parse(clap.Help, &args.params, ...)` 传入、在
-/// 另一个文件中解析帮助文本得到的参数表）时的来源：在 `inst` 的调用处取对应的实参表达式。实参是外层泛型函数的
-/// 形参时，到外层函数中实参值与之相同的实例的调用处继续找；否则以跟踪字面量来源的方式求这个实参（实参指向
-/// 声明时求这个声明）。走过的实例记在 `visited` 中，不再重复：结果只取决于实例，互相调用的泛型函数也不会成环
+/// Origin of a name that comes from an argument of the instance `inst` in which the type is
+/// constructed (such as the parameter table passed in by zig-clap's
+/// `clap.parse(clap.Help, &args.params, ...)` and obtained by parsing help text in another file):
+/// takes the corresponding argument expression at the call sites of `inst`. When the argument is a
+/// parameter of an outer generic function, continues at the call sites of the instances of the
+/// outer function whose argument value is the same; otherwise evaluates the argument while tracking
+/// literal origins (when the argument refers to a declaration, evaluates that declaration). Visited
+/// instances are recorded in `visited` and not repeated: the result depends only on the instance,
+/// and generic functions that call each other do not cycle either.
 fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.AutoHashMapUnmanaged(Index, void)) resolve.Error!?Target {
     if ((try visited.getOrPut(r.arena, inst)).found_existing) return null;
     const ip = r.ctx.db.env.ip;
@@ -215,12 +233,13 @@ fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.Aut
                 .call => |c| c.args,
                 else => continue,
             };
-            // 方法调用：接收者是第一个形参
+            // Method call: the receiver is the first parameter
             const skip = fn_body.params.len -| args.len;
             if (k < skip or k - skip >= args.len) continue;
             const arg_e = stripAddress(body, args[k - skip]);
             if (try paramOf(r, site.owner.file, site_item, body, arg_e)) |p| {
-                // 外层泛型函数的形参：外层函数中实参值与这里相同的实例
+                // Parameter of an outer generic function: the instances of the outer function
+                // whose argument value is the same as here
                 const outer_key = try r.ownerKey(p.file, p.item);
                 for (try seed.allFound(r, outer_key)) |outer| {
                     const outer_inst = outer.inst orelse continue;
@@ -234,7 +253,7 @@ fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.Aut
                 continue;
             }
             const origin = if (try declOf(r, site.owner.file, site_item, body, arg_e)) |d| blk: {
-                // 指向声明：重新求这个声明
+                // Refers to a declaration: evaluate that declaration again
                 const decl_body = try r.body(d.file, d.item);
                 const value = decl_body.value orelse continue;
                 break :blk try eval.stringOrigin(r, d.file, d.item, decl_body, value, path.items);
@@ -245,7 +264,7 @@ fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.Aut
     return null;
 }
 
-/// 去掉取地址与括号、`comptime`：`&args.params` → `args.params`
+/// Strips address-of, parentheses, and `comptime`: `&args.params` → `args.params`
 fn stripAddress(body: *const Body, e: Body.ExprId) Body.ExprId {
     var cur = e;
     while (true) switch (body.expr(cur)) {
@@ -257,7 +276,9 @@ fn stripAddress(body: *const Body, e: Body.ExprId) Body.ExprId {
     };
 }
 
-/// `e` 是函数的形参（含外层函数的形参，如类型构造函数返回的容器中引用的 `params`）时，该函数与形参的下标
+/// When `e` is a parameter of a function (including parameters of outer functions, such as
+/// `params` referenced in the container returned by a type constructor), that function and the
+/// index of the parameter
 fn paramOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.ExprId) resolve.Error!?struct { file: FileId, item: u32, index: u32 } {
     const n = switch (body.expr(e)) {
         .name_ref => |x| x,
@@ -272,7 +293,7 @@ fn paramOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.Exp
     return .{ .file = l.file, .item = l.item, .index = @intCast(index) };
 }
 
-/// `e`（名字或成员访问）指向的声明
+/// The declaration that `e` (a name or member access) refers to
 fn declOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.ExprId) resolve.Error!?@FieldType(resolve.Def, "item") {
     const def: ?resolve.Def = switch (body.expr(e)) {
         .name_ref => |n| try r.resolveName(file, item, body, body.expr_scopes[@backingInt(e)], n),
@@ -293,7 +314,8 @@ fn itemOf(r: *Resolver, key: database.hir.OwnerKey) resolve.Error!?u32 {
     return null;
 }
 
-/// 构造类型的成员（`rt.owner`）：其中的局部绑定也是名字来源的候选
+/// The member that constructs the type (`rt.owner`): its local bindings are also candidates for
+/// the origin of a name
 fn ownerLocal(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Local {
     const tree = try r.itemTree(rt.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
@@ -305,17 +327,21 @@ fn ownerLocal(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Local {
     return .{ .item = item, .body = at.body, .at = at, .inst = rt.inst };
 }
 
-/// 局部绑定也是候选的成员：使用处所在的成员，或构造类型的成员（在其实例 `inst` 下求值）
+/// A member whose local bindings are also candidates: the member containing the use site, or the
+/// member that constructs the type (evaluated under its instance `inst`)
 const Local = struct { item: u32, body: *const Body, at: context.At, inst: ?Index = null };
 
-/// 名字 `name` 在文件 `file` 中的字符串字面量来源。候选是初始化表达式含有该字面量（或经由含有它的常量）的常量，
-/// 以及 `local` 中的局部绑定：求出它们的值并在其中找到这个字符串，再以跟踪字面量来源的方式重新求值
+/// The string literal origin of the name `name` in the file `file`. Candidates are the constants
+/// whose initializer contains the literal (directly or via a constant containing it), and the local
+/// bindings in `local`: their values are computed and the string is found in them, then they are
+/// evaluated again while tracking literal origins.
 fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
     const ip = r.ctx.db.env.ip;
     const Candidate = struct { item: u32, body: *const Body, expr: Body.ExprId, value: Index };
     var cands: std.ArrayList(Candidate) = .empty;
     const tree = try r.itemTree(file);
-    // 初始化表达式中直接含有该名字的字符串字面量的常量（名字），以及经由它们的常量
+    // Constants (names) whose initializer directly contains a string literal of the name, and
+    // the constants that contain it through them
     var holders: std.ArrayList([]const u8) = .empty;
     for (tree.items, 0..) |it, i| {
         if (it.kind != .@"const" and it.kind != .@"var") continue;
@@ -334,7 +360,8 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
     if (local) |l| for (l.body.bindings, 0..) |binding, bi| {
         const init = binding.init orelse continue;
         if (!literalWithin(l.body, init, name) and !nameRefWithin(l.body, init, holders.items)) continue;
-        // 推导不为字符串生成值（如块中的 `const extra = [_][]const u8{"a"};`）：求不出时按 comptime 求值
+        // Inference produces no values for strings (such as `const extra = [_][]const u8{"a"};`
+        // in a block): when there is none, evaluate it at comptime
         const v = l.at.bindingType(@fromBackingInt(@intCast(bi))).val orelse
             (try eval.exprValue(r, file, l.item, l.body, init, l.inst, l.at.res.bindings, null, eval.bodyQuota(r, l.body, l.at.res.exprs))).val orelse continue;
         try cands.append(r.arena, .{ .item = l.item, .body = l.body, .expr = init, .value = v });
@@ -343,7 +370,8 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
     var chosen: ?struct { cand: Candidate, path: []const u32 } = null;
     var found: u32 = 0;
     var shared: u32 = 0;
-    // 值相同的候选（`const nodes = node_kinds;`）是同一个来源，只计一次，取先出现的
+    // Candidates with the same value (`const nodes = node_kinds;`) are the same origin: counted
+    // once, taking the one that appears first
     var seen: std.ArrayList(Index) = .empty;
     for (cands.items) |c| {
         if (std.mem.indexOfScalar(Index, seen.items, c.value) != null) continue;
@@ -354,7 +382,8 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
         found += 1;
         const share = if (rt.inst) |inst| sharesValue(ip, inst, chain.items) else false;
         if (share) shared += 1;
-        // 与实例实参共有值的候选优先；都没有时只有唯一的候选才取
+        // Candidates that share a value with the instance arguments take precedence; when none
+        // does, a candidate is taken only if it is the only one
         if (share or (shared == 0 and chosen == null)) chosen = .{ .cand = c, .path = path.items };
     }
     const pick = chosen orelse return null;
@@ -364,7 +393,7 @@ fn literalOrigin(r: *Resolver, file: FileId, local: ?Local, rt: InternPool.Reifi
     return originTarget(r, origin, name);
 }
 
-/// 字符串来源 `origin` 对应源码中的字面量区间
+/// The range of the literal in the source that corresponds to the string origin `origin`
 fn originTarget(r: *Resolver, origin: eval.StringOrigin, name: []const u8) resolve.Error!?Target {
     const lit_node = try r.itemNode(origin.file, origin.item) orelse return null;
     const lit_body = try r.body(origin.file, origin.item);
@@ -377,8 +406,9 @@ fn originTarget(r: *Resolver, origin: eval.StringOrigin, name: []const u8) resol
     return .{ .file = origin.file, .start = lit_start + @as(u32, @intCast(start)), .end = lit_start + @as(u32, @intCast(end)) };
 }
 
-/// 名字切片直接写在构造调用中（`@Enum(..., &.{"fast", "slow"}, ...)`）时的来源：
-/// 求出构造的第 3 个实参（名字切片），在其中找到 `name`，再沿字符串来源跟踪到字面量
+/// Origin when the name slice is written directly in the construction call
+/// (`@Enum(..., &.{"fast", "slow"}, ...)`): evaluates the 3rd argument of the construction (the
+/// name slice), finds `name` in it, then follows the string origin to the literal
 fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
     const local = (try ownerLocal(r, rt)) orelse return null;
     const e: Body.ExprId = @fromBackingInt(rt.expr);
@@ -398,8 +428,10 @@ fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) re
     return originTarget(r, origin, name);
 }
 
-/// 构造类型的成员名来自 `@typeInfo(X)`（如 `@typeInfo(Tag).@"enum".field_names`）时，X 中的同名成员：
-/// 在构造所在的成员中找 `@typeInfo` 的实参，取第一个有这个成员的类型
+/// When the member names of a constructed type come from `@typeInfo(X)` (such as
+/// `@typeInfo(Tag).@"enum".field_names`), the member of the same name in X: finds the arguments of
+/// `@typeInfo` in the member where the construction happens, and takes the first type that has
+/// this member
 fn typeInfoOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
     const tree = try r.itemTree(rt.file);
     const owner_item: u32 = for (tree.items, 0..) |it, i| {
@@ -422,7 +454,7 @@ fn typeInfoOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolv
     return null;
 }
 
-/// `e` 的范围内有内容含有 `name` 的字符串字面量
+/// The range of `e` contains a string literal whose content contains `name`
 fn literalWithin(b: *const Body, e: Body.ExprId, name: []const u8) bool {
     const range = b.range(e);
     for (b.exprs, 0..) |x, i| switch (x) {
@@ -436,7 +468,7 @@ fn literalWithin(b: *const Body, e: Body.ExprId, name: []const u8) bool {
     return false;
 }
 
-/// `e` 的范围内引用了 `names` 中的名字
+/// The range of `e` references a name in `names`
 fn nameRefWithin(b: *const Body, e: Body.ExprId, names: []const []const u8) bool {
     const range = b.range(e);
     for (b.exprs, 0..) |x, i| switch (x) {
@@ -450,7 +482,8 @@ fn nameRefWithin(b: *const Body, e: Body.ExprId, names: []const []const u8) bool
     return false;
 }
 
-/// 实例 `inst`（及其所在的实例）的实参中含有 `values` 中的某个值
+/// The arguments of the instance `inst` (and of the instances enclosing it) contain one of the
+/// values in `values`
 fn sharesValue(ip: *InternPool, inst: Index, values: []const Index) bool {
     if (values.len == 0) return false;
     var budget: u32 = 4096;
@@ -478,7 +511,8 @@ fn containsValue(ip: *InternPool, v: Index, values: []const Index, budget: *u32,
     return false;
 }
 
-/// 具名错误集的成员：`Error.Foo` 跳到声明 `const Error = error{ Foo, ... }` 中的 `Foo`（声明是别名时沿别名查找）
+/// Members of named error sets: `Error.Foo` jumps to `Foo` in the declaration
+/// `const Error = error{ Foo, ... }` (following the alias when the declaration is an alias)
 fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -512,13 +546,16 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
     return null;
 }
 
-/// `error.Foo` 中的 `Foo` 在错误集声明中的位置与文档
+/// Position and documentation of the `Foo` of `error.Foo` in an error set declaration
 pub const ErrorDecl = struct { target: Target, doc: ?[]const u8 };
 
-/// `error.Foo`：错误名不必先声明，同名的错误也可以出现在多个错误集中。在 `error{ ... }` 声明中查找：成员与
-/// 期望的错误集完全相同的优先，其次是期望错误集的一部分（`A || B` 中的 `A`），再次是任何含这个名字的。
-/// 先查当前文件；`imports` 时再查沿 import 可达的文件（以文件索引按名字筛选），直到找到不会被取代的：有期望的
-/// 错误集时为完全相同的；没有时各声明同样符合，取第一个
+/// `error.Foo`: error names need not be declared first, and errors with the same name may appear in
+/// several error sets. Searches `error{ ... }` declarations: one whose members are exactly the
+/// expected error set is preferred, then one that is part of the expected error set (`A` in
+/// `A || B`), then any that contains the name. Searches the current file first; with `imports`,
+/// then the files reachable through imports (filtered by name with the file index), until one that
+/// cannot be superseded is found: an exact match when there is an expected error set; without one,
+/// all declarations match equally well and the first is taken.
 pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) resolve.Error!?ErrorDecl {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -548,7 +585,7 @@ pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) re
     return if (best) |c| c.decl else null;
 }
 
-/// `error.X` 的期望错误集（错误联合取其错误集）的成员
+/// Members of the expected error set of `error.X` (for an error union, its error set)
 pub fn expectedErrorNames(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?[]const []const u8 {
     const set = try expectedErrorSet(r, file, offset, e) orelse return null;
     return queries.errorSetMembers(r, set);
@@ -569,7 +606,9 @@ const ErrorCandidate = struct {
     decl: ErrorDecl,
 };
 
-/// 文件中含名为 `name` 的错误的 `error{ ... }` 声明，比 `best` 更符合期望的错误集时替换它（同样符合时取先出现的）
+/// The `error{ ... }` declarations in the file that contain an error named `name`: one that
+/// matches the expected error set better than `best` replaces it (on a tie, the one that appears
+/// first is taken)
 fn findErrorDecl(r: *Resolver, file: FileId, name: []const u8, expected: ?[]const []const u8, best: *?ErrorCandidate) resolve.Error!void {
     const sets = try r.ctx.get(ErrorSets.Query, file);
     for (sets.sets) |set| {
@@ -594,7 +633,8 @@ fn findErrorDecl(r: *Resolver, file: FileId, name: []const u8, expected: ?[]cons
 
 const ErrorNameRange = struct { start: u32, end: u32 };
 
-/// 节点中 `error{ ... }` 里名为 `name` 的错误的位置；名字按解码后的形式比较，区间为 token 自身
+/// Location of the error named `name` inside an `error{ ... }` in the node; names are compared in
+/// decoded form, and the range is the token itself
 fn findErrorName(a: std.mem.Allocator, node: ast.SyntaxNode, name: []const u8, depth: u32) resolve.Error!?ErrorNameRange {
     if (depth > 16) return null;
     var it = node.children();
@@ -606,7 +646,8 @@ fn findErrorName(a: std.mem.Allocator, node: ast.SyntaxNode, name: []const u8, d
     return null;
 }
 
-/// 标签：`break :l` / `continue :l` 中的 `l` 跳到带标签的块或循环的标签处，标签自身返回自身
+/// Labels: `l` in `break :l` / `continue :l` jumps to the label of the labeled block or loop; a
+/// label itself returns itself
 fn labelTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -617,7 +658,7 @@ fn labelTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const e = b.exprAt(rel) orelse return null;
     const name = tok.text;
     const self_target: Target = .{ .file = file, .start = tok.offset, .end = tok.offset + @as(u32, @intCast(name.len)) };
-    // 标签自身（块或循环的范围从标签开始）
+    // The label itself (the range of a block or loop starts at the label)
     switch (b.expr(e)) {
         .block => |blk| if (blk.label) |l| if (b.range(e).start == rel and std.mem.eql(u8, l, name)) return self_target,
         .loop => |lp| if (lp.label) |l| if (b.range(e).start == rel and std.mem.eql(u8, l, name)) return self_target,
@@ -628,7 +669,7 @@ fn labelTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
         .@"continue" => |x| x.label,
         else => null,
     } orelse return null;
-    // 光标在标签上，而不在 break 的值中
+    // The cursor is on the label, not in the value of the break
     const prev = (try r.ctx.get(database.syntax.ParseFile, file)).source[tok.offset - 1];
     if (!std.mem.eql(u8, label, name) or prev != ':') return null;
     var scope: ?Body.ScopeId = b.expr_scopes[@backingInt(e)];
@@ -646,8 +687,9 @@ fn target(r: *Resolver, def: Def) resolve.Error!?Target {
     return .{ .file = loc.file, .start = loc.start, .end = loc.end };
 }
 
-/// 光标处符号的类型的定义：声明与局部变量取其类型，表达式取推导出的类型；值本身是类型时取该类型。
-/// 指针、optional、数组、切片、错误联合取其元素 / 载荷类型
+/// Definition of the type of the symbol at the cursor: declarations and local variables take their
+/// type, expressions take the inferred type; when the value itself is a type, that type is taken.
+/// Pointers, optionals, arrays, slices, and error unions take their element / payload type.
 pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
@@ -670,10 +712,11 @@ pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
         else => break,
     };
     const ns = try queries.namespaceOfType(r, t) orelse return null;
-    // 文件即容器：跳到文件开头
+    // The file is the container: jump to the start of the file
     if (ns.container == 0) return .{ .file = ns.file, .start = 0, .end = 0 };
     const tree = try r.itemTree(ns.file);
-    // `const S = struct {...}`：跳到声明的名字；其他（如泛型函数返回的容器）跳到容器本身
+    // `const S = struct {...}`: jump to the name of the declaration; otherwise (such as a
+    // container returned by a generic function) jump to the container itself
     if (tree.containers[ns.container].parent_item) |p| if (tree.items[p].kind == .@"const") {
         if (try r.containerRel(ns)) |rel_c| if ((try r.body(ns.file, p)).value) |v| if ((try r.body(ns.file, p)).range(v).start == rel_c) {
             return target(r, .{ .item = .{ .file = ns.file, .item = p } });
@@ -683,7 +726,8 @@ pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
     return .{ .file = ns.file, .start = start, .end = start };
 }
 
-/// 光标处 token：优先取可跳转的 token，光标紧跟在标识符之后时取它
+/// The token at the cursor: a token that can be jumped from is preferred; when the cursor
+/// immediately follows an identifier, that identifier is taken
 pub fn tokenAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?SyntaxToken {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     if (root.tokenAtOffset(offset)) |t| if (isTarget(t)) return t;
@@ -699,16 +743,17 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
     const tok = try tokenAt(r, file, offset) orelse return null;
     const item = try r.ownerAt(file, tok.offset, false) orelse return null;
     const node = try r.itemNode(file, item) orelse return null;
-    // 成员自身的名字
+    // The name of the member itself
     if (ast.memberName(node, try r.inEnum(file, item))) |name| if (name.offset == tok.offset) {
-        // decltest：`test helper` 的标识符是对 helper 的引用，不是 test 自身的名字
+        // decltest: the identifier in `test helper` is a reference to helper, not the name of the
+        // test itself
         if (node.kind() == .test_decl and name.kind == .identifier) return r.resolveContainerName(file, item, try ast.identNameAlloc(r.arena, name.text));
         return .{ .item = .{ .file = file, .item = item } };
     };
 
     const b = try r.body(file, item);
     const rel = tok.offset - node.offset;
-    // 局部绑定自身的名字
+    // The name of the local binding itself
     for (b.bindings, 0..) |binding, i| {
         if (binding.range.start == rel) return .{ .local = .{ .file = file, .item = item, .binding = @fromBackingInt(@as(u32, @intCast(i))) } };
     }
@@ -719,23 +764,24 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
             return r.resolveName(file, item, b, b.expr_scopes[@backingInt(e)], name);
         },
         .field_access => |fa| {
-            // 光标在字段名上（不在左侧表达式内）
+            // The cursor is on the field name (not inside the left-hand expression)
             if (rel < b.range(fa.lhs).end) return null;
             if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
                 if (try r.memberDef(ns, fa.field orelse return null)) |def| return def;
             }
-            // 经由类型：字段、方法
+            // Via the type: fields, methods
             return memberViaTypes(r, file, tok.offset, e);
         },
-        // decl literal（`.init(...)`、`.empty`）
+        // Decl literal (`.init(...)`, `.empty`)
         .enum_literal => return memberViaTypes(r, file, tok.offset, e),
-        // 初始化中的字段名（`.{ .x = 1 }`、`S{ .x = 1 }`）：推导时按结果类型解析
+        // Field names in initializers (`.{ .x = 1 }`, `S{ .x = 1 }`): resolved by the result type
+        // during inference
         .init => |x| for (x.fields, 0..) |fi, k| {
             if (fi.name == null or rel < fi.name_range.start or rel >= fi.name_range.end) continue;
             const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
             return context.defOfKey(r, a.fieldRef(e, @intCast(k)) orelse return null);
         } else return null,
-        // `@import` 与它的字符串
+        // `@import` and its string
         .builtin_call, .literal => {
             const call = importCall(b, e) orelse return null;
             return .{ .file = try r.importTarget(file, b, call.args) orelse return null };
@@ -744,7 +790,7 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
     }
 }
 
-/// `e` 为 `@import(...)` 调用或它的实参时的调用
+/// The call, when `e` is an `@import(...)` call or its argument
 fn importCall(b: *const Body, e: Body.ExprId) ?@FieldType(Body.Expr, "builtin_call") {
     const call = switch (b.expr(e)) {
         .builtin_call => |call| call,
@@ -758,7 +804,7 @@ fn importCall(b: *const Body, e: Body.ExprId) ?@FieldType(Body.Expr, "builtin_ca
 }
 
 fn memberViaTypes(r: *Resolver, file: FileId, offset: u32, e: Body.ExprId) resolve.Error!?Def {
-    // 泛型函数体内取调用点的实例
+    // Inside the body of a generic function, use the instance from a call site
     const a = try context.atSeeded(r, file, offset, false) orelse return null;
     const key = a.member(e) orelse return null;
     return context.defOfKey(r, key);

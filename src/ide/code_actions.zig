@@ -1,12 +1,17 @@
-//! textDocument/codeAction 的快速修复：
-//! - 未使用的局部名字（AstGen 的 `unused ...` 诊断）：插入 `_ = name;`
-//! - 未使用的函数参数：另可删除参数与各调用处的实参（跨文件，见 `remove_param.zig`）
-//! - 多余的丢弃（`pointless discard of ...`）：删除 `_ = name;`
-//! - 从未修改的局部变量（`local variable is never mutated`）：`var` 改为 `const`
-//! - switch 缺少的枚举 / 联合分支：补上 `.name => {},`
-//! - 结构体初始化缺少的字段（没有默认值的）：补上 `.name = undefined`
+//! Quick fixes for textDocument/codeAction:
+//! - Unused local names (AstGen's `unused ...` diagnostics): insert `_ = name;`
+//! - Unused function parameters: alternatively, remove the parameter and the argument at each
+//!   call site (across files; see `remove_param.zig`)
+//! - Pointless discards (`pointless discard of ...`): delete `_ = name;`
+//! - Local variables that are never mutated (`local variable is never mutated`): change `var` to
+//!   `const`
+//! - Enum / union prongs missing from a switch: add `.name => {},`
+//! - Fields missing from a struct initializer (those without a default value): add
+//!   `.name = undefined`
 //!
-//! 重构：选中的表达式提取为局部常量，普通字符串与多行字符串无损互转。源码操作：整理 import（见 `ide_db/organize_imports.zig`）。
+//! Refactors: extract the selected expression into a local constant, and convert losslessly
+//! between ordinary and multiline string literals. Source actions: organize imports (see
+//! `ide_db/organize_imports.zig`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,13 +36,14 @@ pub const Action = struct {
     title: []const u8,
     kind: Kind = .quickfix,
     edits: []const Edit,
-    /// 所修复的诊断（`live.AstCheck` 的位置）；没有对应诊断时为 null
+    /// The diagnostic being fixed (position from `live.AstCheck`); null when there is no
+    /// corresponding diagnostic
     diagnostic: ?struct { start: u32, end: u32 } = null,
 
     pub const Kind = enum { quickfix, refactor_extract, refactor_rewrite, source_organize_imports };
 };
 
-/// `[start, end]` 区间内可用的快速修复
+/// Quick fixes available in the range `[start, end]`
 pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Error![]const Action {
     var out: std.ArrayList(Action) = .empty;
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
@@ -70,8 +76,9 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
     return out.items;
 }
 
-/// 整理文件中的全部 import 块（`source.organizeImports`）。客户端明确要求这一类时（`requested`）总是提供，否则只在
-/// `[start, end]` 与某个块相交时提供；已经整理好时不提供
+/// Organizes all import blocks in the file (`source.organizeImports`). Always offered when the
+/// client explicitly requests this kind (`requested`); otherwise offered only when `[start, end]`
+/// intersects a block. Not offered when the imports are already organized.
 pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: organize_imports.Options, requested: bool) resolve.Error!?Action {
     const parse = try r.ctx.get(database.syntax.ParseFile, file);
     const result = try organize_imports.organize(r.arena, parse, opts);
@@ -87,8 +94,9 @@ pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: o
     return .{ .title = "Organize imports", .kind = .source_organize_imports, .edits = edits };
 }
 
-/// 只替换完整的字符串字面量；多行形式按 token 解码，避免把源码缩进或 CRLF 计入字符串值。排版与 `zig fmt` 一致
-/// （见 `zigFmtEdit`）
+/// Replaces only complete string literals; the multiline form is decoded token by token, so that
+/// source indentation and CRLF are not counted in the string value. The layout matches `zig fmt`
+/// (see `zigFmtEdit`).
 fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -129,7 +137,8 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
         try std.fmt.allocPrint(r.arena, "\"{f}\"", .{std.zig.fmtString(bytes.items)})
     else blk: {
         const value = try Body.stringLiteralValue(r.arena, first.text) orelse return null;
-        // 多行字符串不支持转义，控制字节（包括 TAB、CR）与非法 UTF-8 不能原样写入源码。
+        // Multiline string literals do not support escapes; control bytes (including TAB and CR)
+        // and invalid UTF-8 cannot be written into the source verbatim.
         if (!std.unicode.utf8ValidateSlice(value)) return null;
         for (value) |c| if (c != '\n' and std.ascii.isControl(c)) return null;
         const indent = lineIndent(text, first.offset);
@@ -138,7 +147,7 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
         const newline: []const u8 = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
         var out: std.ArrayList(u8) = .empty;
         if (!own_line) {
-            // 字面量换到下一行：不留行尾空白
+            // The literal moves to the next line: leave no trailing whitespace
             while (edit_start > line_start and (text[edit_start - 1] == ' ' or text[edit_start - 1] == '\t')) edit_start -= 1;
             try out.appendSlice(r.arena, newline);
             try out.appendSlice(r.arena, indent);
@@ -156,7 +165,8 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
             try out.appendSlice(r.arena, "\\\\");
             try out.appendSlice(r.arena, line);
         }
-        // 后续分号、逗号或表达式必须位于新行，否则会成为字符串内容。
+        // A following semicolon, comma, or expression must be on a new line; otherwise it would
+        // become part of the string content.
         try out.appendSlice(r.arena, newline);
         try out.appendSlice(r.arena, indent);
         break :blk out.items;
@@ -169,9 +179,13 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
     };
 }
 
-/// `raw` 替换之后按 `zig fmt` 排版：文件原本已按 `zig fmt` 格式化时，改为格式化替换后的全文、与原文的差异（按整行，
-/// 只有替换附近的行，如多行字符串之后的 `;` 移到行首、元素改为每行一个的初始化列表、转换回普通字符串后合并的行）。
-/// 文件没有格式化（格式化会改动无关的代码）、有语法错误或嵌套过深时保留 `raw`
+/// Lays out the result of the `raw` replacement as `zig fmt` does: when the file was already
+/// formatted with `zig fmt`, returns instead the difference between the formatted full text after
+/// the replacement and the original (in whole lines, covering only the lines near the replacement,
+/// such as a `;` after a multiline string literal moved to the start of a line, an initializer list
+/// changed to one element per line, or lines merged after converting back to an ordinary string
+/// literal). Keeps `raw` when the file is not formatted (formatting would change unrelated code),
+/// has syntax errors, or is nested too deeply.
 fn zigFmtEdit(r: *Resolver, file: FileId, text: []const u8, raw: Edit) resolve.Error!Edit {
     const a = r.arena;
     const mode: format.Mode = if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) .zon else .zig;
@@ -183,8 +197,10 @@ fn zigFmtEdit(r: *Resolver, file: FileId, text: []const u8, raw: Edit) resolve.E
     return .{ .start = @intCast(d.start), .end = @intCast(d.old_end), .text = after[d.start..d.new_end] };
 }
 
-/// 选中的表达式（两端空白不计）提取为所在语句之前的局部常量，原处替换为它的名字。
-/// 赋值的左侧、取地址的操作数与控制流表达式不提取（提取后语义改变或不合法）
+/// Extracts the selected expression (ignoring surrounding whitespace) into a local constant before
+/// the statement containing it, and replaces the original with its name.
+/// The left-hand side of an assignment, the operand of address-of, and control flow expressions
+/// are not extracted (extracting them would change the semantics or be invalid).
 fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -213,7 +229,7 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         else => {},
     };
 
-    // 所在语句：块的直接子节点
+    // The enclosing statement: a direct child of a block
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const path = try root.coveringPath(r.arena, start);
     var stmt: ?ast.SyntaxNode = null;
@@ -221,7 +237,8 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         if (path[i - 1].kind() == .block and n.range().end >= end) stmt = n;
     }
     const s = stmt orelse return null;
-    // defer 等语句中的表达式不在语句处求值（或在 comptime 求值）
+    // Expressions in statements such as defer are not evaluated at the statement (or are
+    // evaluated at comptime)
     switch (s.kind()) {
         .defer_stmt, .errdefer_stmt, .comptime_stmt, .suspend_stmt, .nosuspend_stmt => return null,
         else => {},
@@ -230,14 +247,17 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
     if (res.exprs.len != b.exprs.len) return null;
     const purity: Purity = .{ .r = r, .file = file, .item = item, .body = b, .res = res };
     if (s.offset < base or !try hoistable(purity, e, s.offset - base, s.range().end - base)) return null;
-    // 类型取决于结果位置的表达式（`@intCast(x)` 等）：提取后显式标注原处的类型，标注不出时不提取
+    // Expressions whose type depends on the result location (such as `@intCast(x)`): the extracted
+    // constant is annotated explicitly with the type at the original position; when the type cannot
+    // be written out, nothing is extracted
     const annotation: []const u8 = if (needsResultType(b, e)) blk: {
         const ty = res.exprs[@backingInt(e)].ty;
         if (!isPlainType(r.ctx.db.env.ip, ty)) return null;
         break :blk try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, ty)});
     } else "";
 
-    // 名字：Zig 不允许遮蔽，选一个在此处不可见、本成员中也没有绑定的名字
+    // Name: Zig does not allow shadowing, so pick a name that is not visible here and not bound
+    // anywhere in this member
     var buf: [16]u8 = undefined;
     const name = for (0..100) |n| {
         const candidate = if (n == 0) "value" else std.fmt.bufPrint(&buf, "value{d}", .{n}) catch unreachable;
@@ -256,10 +276,13 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
     };
 }
 
-/// `e` 提取到所在语句（相对 owner 的 `[stmt_start, stmt_end)`）之前后，求值的条件、次数与顺序不变：
-/// - `e` 不在有条件或重复求值的位置（`and` / `or` / `orelse` / `catch` 的右侧、`if` / `switch` 的分支、
-///   循环的条件与循环体等）
-/// - 语句中先于 `e` 求值的部分与 `e` 交换顺序不改变结果：两者之一是纯的（见 `Purity`）
+/// After `e` is extracted to before its statement (`[stmt_start, stmt_end)` relative to the
+/// owner), the conditions, number, and order of evaluations stay the same:
+/// - `e` is not in a position that is evaluated conditionally or repeatedly (the right-hand side of
+///   `and` / `or` / `orelse` / `catch`, the branches of `if` / `switch`, loop conditions and loop
+///   bodies, etc.)
+/// - Swapping `e` with the parts of the statement evaluated before it does not change the result:
+///   one of the two is pure (see `Purity`)
 fn hoistable(p: Purity, e: Body.ExprId, stmt_start: u32, stmt_end: u32) resolve.Error!bool {
     const b = p.body;
     const target = b.range(e);
@@ -273,7 +296,8 @@ fn hoistable(p: Purity, e: Body.ExprId, stmt_start: u32, stmt_end: u32) resolve.
     for (b.exprs, b.expr_ranges, 0..) |x, range, i| {
         if (i == @backingInt(e) or range.start < stmt_start or range.end > stmt_end) continue;
         if (!(range.start <= target.start and target.end <= range.end)) {
-            // 先于 `e` 求值的部分有副作用（或读取可变的状态、可能提前退出），而 `e` 也不是纯的
+            // A part evaluated before `e` has side effects (or reads mutable state, or may exit
+            // early), and `e` is not pure either
             if (!e_pure and range.end <= target.start and try p.impure(@intCast(i))) return false;
             continue;
         }
@@ -290,7 +314,7 @@ fn hoistable(p: Purity, e: Body.ExprId, stmt_start: u32, stmt_end: u32) resolve.
             },
             .loop => |l| {
                 if (in(b, l.body, target) or in(b, l.@"else", target) or in(b, l.cont, target)) return false;
-                // while 的条件每轮都会求值
+                // The condition of a while loop is evaluated on every iteration
                 if (l.kind == .@"while") for (l.inputs) |it| if (in(b, it, target)) return false;
             },
             .block, .@"comptime", .container, .other => return false,
@@ -300,8 +324,10 @@ fn hoistable(p: Purity, e: Body.ExprId, stmt_start: u32, stmt_end: u32) resolve.
     return true;
 }
 
-/// 表达式的纯度：纯的表达式没有副作用、不会提前退出，读取的也只有不可变的值（字面量、常量、参数、
-/// 值捕获），与其他表达式交换求值顺序不改变结果（溢出等运行时检查失败的先后除外）
+/// Purity of expressions: a pure expression has no side effects, does not exit early, and reads
+/// only immutable values (literals, constants, parameters, value captures), so swapping its
+/// evaluation order with other expressions does not change the result (except for which runtime
+/// check, such as an overflow check, fails first)
 const Purity = struct {
     r: *Resolver,
     file: FileId,
@@ -309,7 +335,7 @@ const Purity = struct {
     body: *const Body,
     res: queries.Infer.Value,
 
-    /// 区间 `range` 内的表达式都不是 `impure` 的
+    /// None of the expressions in the range `range` is `impure`
     fn pure(p: Purity, range: Body.Range) resolve.Error!bool {
         for (p.body.expr_ranges, 0..) |x, i| {
             if (x.start >= range.start and x.end <= range.end and try p.impure(@intCast(i))) return false;
@@ -317,7 +343,8 @@ const Purity = struct {
         return true;
     }
 
-    /// 表达式自身（不含子表达式）有副作用、可能提前退出或读取可变的状态
+    /// The expression itself (excluding subexpressions) has side effects, may exit early, or reads
+    /// mutable state
     fn impure(p: Purity, i: u32) resolve.Error!bool {
         const b = p.body;
         const id: Body.ExprId = @fromBackingInt(i);
@@ -328,7 +355,7 @@ const Purity = struct {
                 if (std.mem.eql(u8, c.name, n)) break false;
             } else true,
             .name_ref => |name| try p.mutableName(id, name),
-            // 经由指针（含自动解引用）读取：所指向的内容可能被修改
+            // Reading via a pointer (including automatic dereference): the pointee may be modified
             .field_access => |fa| p.viaPointer(fa.lhs) or try p.isVar(p.res.members[i]),
             .index => |x| p.viaPointer(x.lhs),
             else => false,
@@ -362,7 +389,7 @@ const Purity = struct {
     }
 };
 
-/// 没有副作用的内建函数
+/// Builtins without side effects
 pub const pure_builtins = [_][]const u8{
     "@as",              "@sizeOf",          "@alignOf",   "@bitSizeOf",  "@TypeOf",       "@typeInfo",        "@typeName",
     "@This",            "@min",             "@max",       "@abs",        "@intFromEnum",  "@intFromBool",     "@tagName",
@@ -374,13 +401,14 @@ pub const pure_builtins = [_][]const u8{
     "@mulWithOverflow", "@shlWithOverflow", "@Vector",    "@Type",       "@embedFile",    "@src",
 };
 
-/// 类型由结果位置决定的转换（与 `Infer` 的 `casts` 一致）
+/// Casts whose type is determined by the result location (consistent with `casts` in `Infer`)
 const result_typed_builtins = [_][]const u8{
     "@intCast", "@truncate",  "@floatCast",     "@floatFromInt", "@intFromFloat",   "@enumFromInt", "@bitCast",
     "@ptrCast", "@alignCast", "@addrSpaceCast", "@ptrFromInt",   "@fieldParentPtr", "@errorCast",   "@splat",
 };
 
-/// 表达式的类型（或合法性）取决于结果位置：单独作为 `const` 的初始值时须标注类型
+/// The type (or validity) of the expression depends on its result location: used alone as the
+/// initial value of a `const`, it needs a type annotation
 fn needsResultType(b: *const Body, e: Body.ExprId) bool {
     return switch (b.expr(e)) {
         .builtin_call => |c| for (result_typed_builtins) |n| {
@@ -400,7 +428,7 @@ fn needsResultType(b: *const Body, e: Body.ExprId) bool {
     };
 }
 
-/// 只由内建类型组成、在任何作用域都能原样写出的类型
+/// A type made up only of built-in types, which can be written out as is in any scope
 fn isPlainType(ip: *InternPool, t: Index) bool {
     return switch (ip.key(t)) {
         .int_type => true,
@@ -415,7 +443,8 @@ fn isPlainType(ip: *InternPool, t: Index) bool {
     };
 }
 
-/// 在名字 `offset` 处的局部绑定之后（局部变量的语句之后、参数或捕获所在块的开头）插入 `_ = name;`
+/// Inserts `_ = name;` after the local binding whose name is at `offset` (after the statement of a
+/// local variable, or at the start of the block that a parameter or capture belongs to)
 fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Edit {
     const def = try definition.defAt(r, file, offset) orelse return null;
     const l = switch (def) {
@@ -437,9 +466,11 @@ fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Er
     }
 }
 
-/// 名字在 `offset` 处、从未修改的局部 `var` 改为 `const`，只替换关键字。`comptime var` 整体改为 `const`，
-/// 初始化表达式包上 `comptime`：`comptime const` 不合法，初始化仍须在编译期求值；已经是 `comptime` 表达式时不再包。
-/// 带 `comptime` 的解构中的变量不提供（`comptime` 作用于整条语句）
+/// Changes the never-mutated local `var` whose name is at `offset` to `const`, replacing only the
+/// keyword. `comptime var` as a whole becomes `const`, and the initializer is wrapped in
+/// `comptime`: `comptime const` is invalid, and the initializer must still be evaluated at compile
+/// time; it is not wrapped again when it is already a `comptime` expression. Not offered for
+/// variables in a destructuring with `comptime` (`comptime` applies to the whole statement).
 fn useConst(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?[]const Edit {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const path = try root.coveringPath(r.arena, offset);
@@ -465,7 +496,7 @@ fn useConst(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.E
     return try r.arena.dupe(Edit, &.{.{ .start = keyword.offset, .end = keyword.range().end, .text = "const" }});
 }
 
-/// 名字 token 的长度（含 `@"..."`）
+/// Length of the name token (including `@"..."`)
 fn tokenLen(text: []const u8, offset: u32) u32 {
     if (std.mem.startsWith(u8, text[offset..], "@\"")) {
         const close = std.mem.indexOfScalarPos(u8, text, offset + 2, '"') orelse return 0;
@@ -476,7 +507,7 @@ fn tokenLen(text: []const u8, offset: u32) u32 {
     return i - offset;
 }
 
-/// 在块表达式 `e` 的 `{` 之后插入一行
+/// Inserts a line after the `{` of the block expression `e`
 fn blockStart(r: *Resolver, text: []const u8, base: u32, b: *const Body, e: Body.ExprId, line: []const u8) resolve.Error!?Edit {
     if (b.expr(e) != .block) return null;
     const range = b.range(e);
@@ -496,7 +527,7 @@ fn localStmt(b: *const Body, id: Body.BindingId) ?Body.Stmt {
     return null;
 }
 
-/// 捕获所在的主体表达式
+/// The body expression that the capture belongs to
 fn captureBody(b: *const Body, id: Body.BindingId) ?Body.ExprId {
     const has = struct {
         fn f(list: []const Body.BindingId, x: Body.BindingId) bool {
@@ -523,7 +554,8 @@ fn captureBody(b: *const Body, id: Body.BindingId) ?Body.ExprId {
     return null;
 }
 
-/// 删除 `offset` 处的 `_ = name;` 所在行（该行只有这一条语句时删整行）
+/// Deletes the line of the `_ = name;` at `offset` (the whole line, when the line holds only this
+/// statement)
 fn removeDiscard(text: []const u8, offset: u32) ?Edit {
     const line_start: u32 = @intCast(if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0);
     const line_end: u32 = @intCast(std.mem.indexOfScalarPos(u8, text, offset, '\n') orelse text.len);
@@ -532,7 +564,7 @@ fn removeDiscard(text: []const u8, offset: u32) ?Edit {
     return .{ .start = line_start, .end = @min(line_end + 1, @as(u32, @intCast(text.len))), .text = "" };
 }
 
-/// 包含 `offset` 的最内层某种表达式
+/// The innermost expression of a given kind that contains `offset`
 fn innermost(r: *Resolver, file: FileId, offset: u32, comptime tag: std.meta.Tag(Body.Expr)) resolve.Error!?struct { item: u32, base: u32, body: *const Body, expr: Body.ExprId } {
     const item = try r.ownerAt(file, offset, true) orelse return null;
     const node = try r.itemNode(file, item) orelse return null;
@@ -559,7 +591,7 @@ fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
         if (p.is_else) return null;
         for (p.items) |i| switch (at.body.expr(i)) {
             .enum_literal => |n| try covered.put(r.arena, ast.identName(n), {}),
-            // 非穷尽枚举的 `_`
+            // `_` of a non-exhaustive enum
             .name_ref => |n| if (std.mem.eql(u8, n, "_")) return null,
             else => {},
         };
@@ -621,8 +653,9 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
     return .{ .title = "add missing struct fields", .edits = try r.arena.dupe(Edit, &.{edit}) };
 }
 
-/// 在 `[start, end)`（以 `}` 结尾）的 `}` 之前追加条目：多行时每条一行并带结尾逗号，
-/// 单行时以 `, ` 分隔（不加结尾逗号，否则 zig fmt 会展开成多行）
+/// Appends entries before the `}` of `[start, end)` (which ends with `}`): when multiline, one
+/// entry per line with a trailing comma; on a single line, separated by `, ` (without a trailing
+/// comma, otherwise zig fmt would expand it into multiple lines)
 fn appendBeforeClose(a: Allocator, text: []const u8, start: u32, end: u32, items: []const []const u8, multiline: bool) Allocator.Error!?Edit {
     if (end == 0 or end > text.len or text[end - 1] != '}') return null;
     const close = end - 1;
@@ -642,7 +675,7 @@ fn appendBeforeClose(a: Allocator, text: []const u8, start: u32, end: u32, items
     return .{ .start = p, .end = close, .text = out.items };
 }
 
-/// `offset` 所在行的缩进
+/// Indentation of the line containing `offset`
 fn lineIndent(text: []const u8, offset: u32) []const u8 {
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
     var i = line_start;

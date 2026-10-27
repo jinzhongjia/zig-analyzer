@@ -1,4 +1,4 @@
-//! 依赖类型推导的 IDE 功能测试（内存项目）。
+//! IDE feature tests that depend on type inference (in-memory projects).
 
 const std = @import("std");
 const testing = std.testing;
@@ -82,13 +82,13 @@ test "member completion and goto definition through types" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    // `ptr.` 之后（经由指针）：字段与方法
+    // After `ptr.` (through a pointer): fields and methods
     const items = (try completion.complete(&r, file, offsetOf("ptr.x", 0) + 4, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("x y init dist", try std.mem.join(w.arena.allocator(), " ", labels.items));
     try testing.expectEqualStrings("i32", items[0].detail.?);
-    // 切片
+    // Slices
     const slice_items = (try completion.complete(&r, file, offsetOf("buf.len", 0) + 4, .{ .auto_import = false })).items;
     try testing.expectEqualStrings("len", slice_items[0].label);
 
@@ -165,11 +165,12 @@ test "definition of bare primitive names skips escaped declarations" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
 
-    // 裸 `u32` 是原始类型，不能解析到同名的转义参数
+    // A bare `u32` is the primitive type and must not resolve to the escaped parameter of the same
+    // name
     const bare = std.mem.indexOf(u8, text, "local: u32").? + "local: ".len;
     try testing.expectEqual(null, try definition.definition(&r, file, @intCast(bare)));
 
-    // 转义引用仍解析到参数
+    // An escaped reference still resolves to the parameter
     const quoted = std.mem.indexOf(u8, text, "= @\"u32\"").? + 4;
     const t = (try definition.definition(&r, file, @intCast(quoted))) orelse return error.NoTarget;
     try testing.expectEqual(file, t.file);
@@ -223,7 +224,7 @@ test "signature help and inlay hints" {
     try testing.expectEqualStrings("fn add(a: u32, b: u32) u32", s.label);
     try testing.expectEqual(1, s.active);
     try testing.expectEqualStrings("b: u32", s.params[1]);
-    // 方法调用：跳过 self
+    // Method call: self is skipped
     const m = try signature_help.signatureHelp(&r, file, offsetOf("3);", 0)) orelse return error.NoSignature;
     try testing.expectEqual(1, m.active);
     try testing.expectEqualStrings("到原点的距离", m.doc.?);
@@ -234,7 +235,9 @@ test "signature help and inlay hints" {
         try out.appendSlice(w.arena.allocator(), h.label);
         try out.append(w.arena.allocator(), ' ');
     }
-    // 初始化表达式的字段类型；局部变量类型；调用处参数名（实参与参数同名、只有一个实参的 `p.dist(3)` 省略）
+    // Field types of initializers; types of local variables; parameter names at call sites (omitted
+    // when the argument has the same name as the parameter, and for `p.dist(3)`, which has only one
+    // argument)
     try testing.expectEqualStrings(": i32 : i32 : i32 x: y: : u32 : u32 a: b: ", out.items);
 }
 
@@ -260,7 +263,7 @@ test "calls through function fields are not method calls" {
             return @intCast(std.mem.indexOf(u8, text, needle).?);
         }
     }.of;
-    // 字段中的函数不绑定接收者：第一个实参对应 a
+    // A function in a field does not bind a receiver: the first argument corresponds to a
     const sig = (try signature_help.signatureHelp(&r, file, at("3, 4"))).?;
     try testing.expectEqualStrings("fn add(a: i32, b: i32) i32", sig.label);
     try testing.expectEqual(0, sig.active);
@@ -274,7 +277,8 @@ test "calls through function fields are not method calls" {
 }
 
 test "signature help and parameter hints through aliases" {
-    // 经由别名调用（`const assert = std.debug.assert;`）时不跟随别名：没有签名帮助与参数名提示
+    // Calls through an alias (`const assert = std.debug.assert;`): if the alias is not followed,
+    // there is no signature help and there are no parameter name hints
     const text =
         \\fn add(a: u32, b: u32) u32 { return a + b; }
         \\const plus = add;
@@ -310,7 +314,8 @@ test "signature help and parameter hints through aliases" {
 }
 
 test "hover and signature help drop comments from multi-line function prototypes" {
-    // 防止参数的文档注释与行尾注释折叠进签名，使其后的参数看起来成了注释
+    // Prevents doc comments and trailing comments of parameters from being folded into the
+    // signature, which makes the parameters after them look like comments
     const text =
         \\fn add(
         \\    /// the first
@@ -364,7 +369,8 @@ test "name completion ranks scope names before namespace members, each by how we
     }.less);
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
-    // 局部名字、参数、容器的成员、经由 `std` 的成员依次靠后；不匹配的作用域名字排在最后，由客户端过滤
+    // Local names, parameters, container members and members through `std` come in that order;
+    // names in scope that do not match sort last and are filtered by the client
     try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
@@ -427,7 +433,7 @@ test "completion item kinds follow what each symbol is" {
             return err;
         };
     }
-    // 成员：字段、方法（第一个参数是所在容器）与普通函数
+    // Members: fields, methods (the first parameter is the enclosing container) and plain functions
     const member_at: u32 = @intCast(std.mem.indexOf(u8, text, "p.x").? + 2);
     const members = (try completion.complete(&r, at.file, member_at, .{ .auto_import = false })).items;
     for ([_]struct { []const u8, completion.Item.Kind }{ .{ "x", .field }, .{ "len", .method } }) |c| {
@@ -464,7 +470,8 @@ test "completion item kinds in generic bodies follow a call site and fall back w
     var r = resolver(&w, &ctx);
     const at = f.cursor.?;
     const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
-    // `Alias` 以调用点 `make(Point)` 的实例推导为结构体；`broken` 的类型求不出，按声明为常量
+    // `Alias` is inferred as a struct from the instance at the call site `make(Point)`; the type
+    // of `broken` cannot be inferred, so it is a constant by its declaration
     for ([_]struct { []const u8, completion.Item.Kind }{ .{ "Alias", .@"struct" }, .{ "T", .type_param }, .{ "broken", .constant } }) |c| {
         const item = for (items) |it| {
             if (std.mem.eql(u8, it.label, c[0])) break it;
@@ -516,15 +523,18 @@ test "selected function completions resolve to the signature as written in the s
         }
     }.of;
     const cases = [_]struct { u32, []const u8, ?[]const u8 }{
-        // 方法，以及指向它的别名（给出所指函数的签名）；字段没有
+        // Methods, and aliases pointing to them (giving the signature of the function they point
+        // to); fields have none
         .{ at("p.dist", 2), "dist", "pub fn dist(self: Point, scale: u32) u32" },
         .{ at("p.dist", 2), "length", "pub fn dist(self: Point, scale: u32) u32" },
         .{ at("p.dist", 2), "x", null },
-        // 泛型实例的方法：按源码，不代入推导出的类型
+        // Methods of generic instances: as written in the source, without substituting inferred
+        // types
         .{ at("list.append", 5), "append", "pub fn append(self: *Self, item: T) !void" },
         // decl literal
         .{ at(".init(1", 1), "init", "pub fn init(x: i32, y: i32) Point" },
-        // 作用域中的名字；多行参数列表去掉注释与末尾的逗号；常量没有
+        // Names in scope; multi-line parameter lists drop comments and the trailing comma;
+        // constants have none
         .{ at("add(1, 2)", 3), "add", "fn add(a: u32, b: u32) callconv(.c) u32" },
         .{ at("add(1, 2)", 3), "List", "fn List(comptime T: type) type" },
         .{ at("add(1, 2)", 3), "Point", null },
@@ -543,14 +553,15 @@ test "selected function completions resolve to the signature as written in the s
             std.debug.print("completion `{s}`\n", .{c[1]});
             return err;
         };
-        // 列表中不带签名
+        // The list does not include signatures
         try testing.expect(item.detail == null);
         if (std.mem.eql(u8, c[1], "dist")) try testing.expect(std.mem.startsWith(u8, description.doc, "到原点的距离\n\n"));
     }
 }
 
 test "goto declaration of reified fields named by comptime parsed strings" {
-    // 字段名从帮助文本中解析出来（zig-clap 的用法）：跳到帮助文本中的参数名
+    // Field names parsed out of help text (as zig-clap does): goes to the parameter name in the
+    // help text
     const text =
         \\const Param = struct { long: ?[]const u8 = null };
         \\fn count(str: []const u8) usize {
@@ -597,7 +608,7 @@ test "goto declaration of reified fields named by comptime parsed strings" {
         \\}
         \\
     ;
-    // `@Struct` 的字段属性类型来自 std.builtin
+    // The type of the field attributes of `@Struct` comes from std.builtin
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     var w: World = undefined;
@@ -611,11 +622,11 @@ test "goto declaration of reified fields named by comptime parsed strings" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        // 多行字符串的第二行
+        // Second line of a multi-line string
         .{ "beta, b.", "beta Second" },
-        // 经由另一个常量的普通字符串
+        // A plain string through another constant
         .{ "count, c.", "count Number" },
-        // 局部常量
+        // Local constant
         .{ "gamma };", "gamma Local" },
     };
     for (cases, 0..) |c, i| {
@@ -634,7 +645,8 @@ test "goto declaration of reified fields named by comptime parsed strings" {
 }
 
 test "goto declaration of enum literals passed to anytype parameters that the callee converts" {
-    // `testing.expectEqual(.x, actual)` 中的字面量由被调函数经 `@TypeOf(expected, actual)` 转换：曾没有跳转目标
+    // Literals in `testing.expectEqual(.x, actual)` are converted by the callee through
+    // `@TypeOf(expected, actual)`: they used to have no goto target
     const text =
         \\const Color = enum { red, green };
         \\const names = [_][:0]const u8{ "fast", "slow" };
@@ -665,9 +677,9 @@ test "goto declaration of enum literals passed to anytype parameters that the ca
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "green, c", "green }" },
-        // 构造的枚举：名字的字符串字面量
+        // Reified enum: the string literal of the name
         .{ "slow, m", "slow\" }" },
-        // peer type 为 optional
+        // The peer type is optional
         .{ "red, @as", "red, green" },
     };
     for (cases, 0..) |c, i| {
@@ -684,7 +696,9 @@ test "goto declaration of enum literals passed to anytype parameters that the ca
 }
 
 test "goto declaration of switch prong literals on a member of a loop's type" {
-    // 合并推导中光标处的字面量类型为 `@Type(.enum_literal)`：曾被当作已有类型而不按迭代推导，没有跳转目标
+    // In merged inference the type of the literal at the cursor is `@Type(.enum_literal)`: it used
+    // to be treated as an already known type instead of being inferred per iteration, and had no
+    // goto target
     const text =
         \\const Kind = enum { input, derived };
         \\const A = struct {
@@ -730,7 +744,8 @@ test "goto declaration of switch prong literals on a member of a loop's type" {
 }
 
 test "goto declaration of enum literals in branches whose result is the peer type" {
-    // 没有结果类型的 `if` / `switch`：分支按 peer type 转换，`.invalid` 是 Kind 的成员；曾没有跳转目标
+    // `if` / `switch` without a result type: the branches are converted by peer type, and
+    // `.invalid` is a member of Kind; it used to have no goto target
     const text =
         \\const Kind = enum { invalid, name, none };
         \\const Tok = struct { kind: Kind };
@@ -769,7 +784,8 @@ test "goto declaration of enum literals in branches whose result is the peer typ
 }
 
 test "completion through a switch whose other prong is an empty tuple literal" {
-    // `else => &.{}` 与切片做 peer type resolution 得到切片：曾求不出，补全为空
+    // Peer type resolution of `else => &.{}` with a slice gives a slice: it used to fail, leaving
+    // completion empty
     const labels = try completionLabels(
         \\const Item = struct { label: []const u8, kind: u8 };
         \\fn f(list: []const Item, n: u8) usize {
@@ -787,7 +803,8 @@ test "completion through a switch whose other prong is an empty tuple literal" {
 }
 
 test "goto declaration of a reified field whose name is not traceable to a literal goes to the construction" {
-    // 名字由单个字节构成（zig-clap 的短参数名）：追不到字面量中的字符，曾没有跳转目标
+    // The name consists of a single byte (zig-clap's short parameter names): it cannot be traced to
+    // characters in a literal, and used to have no goto target
     const text =
         \\const Names = struct {
         \\    short: ?u8 = null,
@@ -828,7 +845,8 @@ test "goto declaration of a reified field whose name is not traceable to a liter
 }
 
 test "goto declaration of a reified field named by a byte copied from a string literal" {
-    // 短参数名由帮助文本中的一个字节拷贝而成（zig-clap 的 `-h`）：曾追不到字面量，跳到构造调用
+    // The short parameter name is copied from one byte of the help text (zig-clap's `-h`): it used
+    // to be untraceable to the literal, so goto went to the construction call
     const text =
         \\const Names = struct {
         \\    short: ?u8 = null,
@@ -878,8 +896,9 @@ test "goto declaration of a reified field named by a byte copied from a string l
 }
 
 test "goto declaration of a reified field whose name comes from an argument in another file" {
-    // 帮助文本在第三个文件中、经两层泛型函数传入（zig-clap 的 `clap.parse(..., &args.params, ...)`）：曾只在使用处与
-    // 构造处的文件中找字面量，跳到构造调用
+    // The help text is in a third file and passed through two levels of generic functions
+    // (zig-clap's `clap.parse(..., &args.params, ...)`): literals used to be searched only in the
+    // files of the use and of the construction, so goto went to the construction call
     const lib =
         \\pub const Param = struct { long: []const u8 };
         \\pub fn parse(comptime str: []const u8) [1]Param {
@@ -967,7 +986,7 @@ test "goto declaration of a shorthand member of an inline reified enum" {
 }
 
 test "goto declaration of reified enum members named by string literals or @typeInfo" {
-    // `@Enum` 构造的枚举（如 SyntaxKind）的成员曾没有跳转目标
+    // Members of enums reified by `@Enum` (such as SyntaxKind) used to have no goto target
     const kind_text =
         \\const Base = enum { alpha, beta };
         \\const extra = [_][:0]const u8{ "gamma", "delta" };
@@ -1005,13 +1024,14 @@ test "goto declaration of reified enum members named by string literals or @type
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        // 构造类型所在文件中的字符串字面量（经由值相同的局部别名 `more`）
+        // String literal in the file of the reified type (through the local alias `more` with the
+        // same value)
         .{ "gamma or", "gamma\", \"delta" },
-        // 构造所在成员中的局部常量；结果类型为 optional
+        // Local constant in the member containing the construction; the result type is optional
         .{ "epsilon }", "epsilon\"}" },
-        // `@typeInfo(Base)` 给出的成员名：Base 中的成员
+        // Member names given by `@typeInfo(Base)`: members of Base
         .{ "beta or", "beta };" },
-        // 经类型访问
+        // Access through the type
         .{ "delta;", "delta\" };" },
     };
     for (cases, 0..) |c, i| {
@@ -1029,7 +1049,7 @@ test "goto declaration of reified enum members named by string literals or @type
 }
 
 test "hover names a reified type after the constant it initializes" {
-    // 不在函数中构造的类型曾按内容显示为匿名的 `enum { ... }`
+    // Types reified outside functions used to be shown by content as an anonymous `enum { ... }`
     const text =
         \\const Kind = blk: {
         \\    break :blk @Enum(u8, .exhaustive, &.{ "alpha", "beta" }, &.{ 0, 1 });
@@ -1072,9 +1092,9 @@ test "member completion of reified, tuple and anonymous struct types" {
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "F.alpha", "alpha beta" },
-        // 元组字段不是合法标识符，以引号形式插入
+        // Tuple fields are not valid identifiers and are inserted in quoted form
         .{ "t.len", "@\"0\" @\"1\" len" },
-        // 与原生类型同名的字段可以直接访问
+        // Fields with the same name as a primitive type can be accessed directly
         .{ "a.name", "name type" },
     };
     for (cases) |c| {
@@ -1089,7 +1109,8 @@ test "member completion of reified, tuple and anonymous struct types" {
     }
 }
 
-/// `text` 中 `needle` 的最后一个 `.` 之后的位置上补全，各项标签以空格连接
+/// Completes at the position after the last `.` of `needle` in `text`; the labels of the items
+/// are joined with spaces
 fn memberLabels(w: *World, r: *resolve.Resolver, file: FileId, text: []const u8, needle: []const u8) ![]const u8 {
     const at: u32 = @intCast(std.mem.indexOf(u8, text, needle).? + std.mem.lastIndexOfScalar(u8, needle, '.').? + 1);
     const items = (try completion.complete(r, file, at, .{ .auto_import = false })).items;
@@ -1180,10 +1201,11 @@ test "zon imports with a result type take the result type" {
     try testing.expectEqualStrings("port host verbose", try memberLabels(&w, &r, file, text, "cfg.port"));
     const hovers = [_]struct { []const u8, []const u8 }{
         .{ "cfg:", "const cfg: Cfg" },
-        // 标量的值与按结果类型解析的结果相同
+        // The value of a scalar is the same as the result of parsing according to the result type
         .{ "n:", "const n: u32 = 5" },
         .{ "level:", "const level: Level = .debug" },
-        // 实参按 `Cfg` 解析，不是匿名结构体的值：值求不出
+        // The argument is parsed as `Cfg`, not as the value of an anonymous struct: the value
+        // cannot be evaluated
         .{ "port =", "const port: u16" },
     };
     for (hovers) |c| {
@@ -1213,7 +1235,7 @@ test "zon import values follow edits to the zon file" {
     const steps = [_]struct { []const u8, []const u8 }{
         .{ ".{ .a = 1 }", "a" },
         .{ ".{ .a = 1, .b = .{ 2, 3 } }", "a b" },
-        // 有错误（语法错误、重复的字段名）时没有值，不猜测
+        // No value when there are errors (syntax errors, duplicate field names); no guessing
         .{ ".{ .a = 1, .b = ", "" },
         .{ ".{ .a = 1, .a = 2 }", "" },
         .{ ".{ .c = 3 }", "c" },
@@ -1227,7 +1249,7 @@ test "zon import values follow edits to the zon file" {
             std.debug.print("data.zon: `{s}`\n", .{step[0]});
             return err;
         };
-        // `.zig` 文件仍是命名空间
+        // `.zig` files are still namespaces
         try testing.expectEqualStrings("answer", try memberLabels(&w, &r, file, text, "lib.answer"));
     }
 }
@@ -1272,7 +1294,8 @@ test "hover in generic bodies is inferred from a call site" {
 }
 
 test "goto declaration through comptime anytype parameters" {
-    // `comptime H: anytype` 的实例记录实参值：类型实参的成员可以解析，原先只记录了实参的类型 `type`
+    // Instances of `comptime H: anytype` record the argument value: members of type arguments can
+    // be resolved (previously only the argument's type, `type`, was recorded)
     const text =
         \\const Md = struct {
         \\    pub const digest_length = 16;
@@ -1298,7 +1321,7 @@ test "goto declaration through comptime anytype parameters" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        // 签名中的参数类型
+        // Parameter types in the signature
         .{ "digest_length * 2", "digest_length = 16" },
         .{ "digest_length]u8 = undefined", "digest_length = 16" },
         .{ "hash(&h)", "hash(out" },
@@ -1314,7 +1337,8 @@ test "goto declaration through comptime anytype parameters" {
 }
 
 test "goto declaration in format methods called only by std.Io.Writer.printValue" {
-    // `format(self, writer: anytype)` 只由 `{f}` 经 printValue 的 `value.format(w)` 调用：writer 为 `*std.Io.Writer`
+    // `format(self, writer: anytype)` is called only by `{f}` through printValue's
+    // `value.format(w)`: writer is `*std.Io.Writer`
     const text =
         \\const Fig = struct {
         \\    rows: u8,
@@ -1342,7 +1366,7 @@ test "goto declaration in format methods called only by std.Io.Writer.printValue
 }
 
 test "hover in generic functions passed as a value with an argument tuple" {
-    // `Thread.spawn(.{}, f, .{ a, b })`、`@call(.auto, f, .{ a })`：以元组元素调用
+    // `Thread.spawn(.{}, f, .{ a, b })`, `@call(.auto, f, .{ a })`: called with the tuple elements
     const text =
         \\fn spawn(f: anytype, args: anytype) void {
         \\    _ = .{ f, args };
@@ -1407,7 +1431,8 @@ test "hover in generic bodies called only from other generic functions" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    // `over` 只在泛型的 `run` 中调用：经由 `run` 的调用点实例得到具体类型
+    // `over` is called only in the generic `run`: the concrete type comes through the call-site
+    // instance of `run`
     const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:8", info.text);
 }
@@ -1440,7 +1465,7 @@ test "hover in generic bodies through two levels of generic callers" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    // `leaf` ← 泛型的 `mid` ← 泛型的 `run` ← 具体的调用
+    // `leaf` <- generic `mid` <- generic `run` <- concrete call
     const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:7", info.text);
 }
@@ -1457,7 +1482,7 @@ test "hover in generic bodies is inferred from a call site in another file" {
     try w.init();
     defer w.deinit();
     const lib = (try w.add("/p/lib.zig", lib_text)).file;
-    // 不导入 lib.zig 的文件即使有同名调用也不参与
+    // Files that do not import lib.zig do not take part, even if they have calls of the same name
     const other = (try w.add("/p/a.zig", "fn max(comptime T: type, a: T, b: T) T { return a; }\nfn f() void { _ = max(u8, 1, 2); }\n")).file;
     const main = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\nfn run() void {\n    _ = lib.max(i64, 1, 2);\n}\n")).file;
     try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
@@ -1484,7 +1509,7 @@ test "hover in generic bodies: call sites through aliases" {
     try w.init();
     defer w.deinit();
     const lib = (try w.add("/p/lib.zig", lib_text)).file;
-    // 别名的别名：main.zig 中只出现 `top`，没有 `max`
+    // Alias of an alias: only `top` appears in main.zig, not `max`
     const alias = (try w.add("/p/alias.zig", "const lib = @import(\"lib.zig\");\npub const biggest = lib.max;\npub const top = biggest;\n")).file;
     const main = (try w.add("/p/main.zig", "const alias = @import(\"alias.zig\");\nfn run() void {\n    _ = alias.top(u16, 1, 2);\n}\n")).file;
     try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
@@ -1540,13 +1565,14 @@ test "completion after `.` lists members of the expected type" {
         .{ "const c: ?E = .<|>;", "red green default parse" },
         .{ "const s: S = .<|>;", "empty init" },
         .{ "const u: U = .<|>;", "num none" },
-        // 结果类型去掉 error union 与 optional
+        // The result type drops the error union and optional
         .{ "fn f() !E { return .<|>; }", "red green default parse" },
         .{ "fn f() error{X}!?U { return .<|>; }", "num none" },
-        // 带标签的 union 在类型上访问字段得到标签；不带标签的没有
+        // For a tagged union, accessing fields on the type gives the tags; untagged unions have
+        // none
         .{ "const t = U.<|>;", "num none" },
         .{ "const t = V.<|>;", "k" },
-        // 没有期望类型
+        // No expected type
         .{ "const c = .<|>;", "" },
     };
     for (cases, 0..) |c, i| {
@@ -1596,14 +1622,15 @@ test "branches excluded by comptime conditions are inactive" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const ranges = try inactive.ranges(&r, file);
-    // 运行时的条件与取决于抽象参数的条件不是非活动代码
+    // Runtime conditions and conditions that depend on abstract parameters are not inactive code
     try testing.expectEqual(2, ranges.len);
     try testing.expectEqualStrings("{\n        return x + 1;\n    }", text[ranges[0].start..ranges[0].end]);
     try testing.expectEqualStrings("x * 2", text[ranges[1].start..ranges[1].end]);
 }
 
 test "switch prongs on a comptime-known tagged union are inactive unless they match" {
-    // 操作数是带标签的 union 时曾选不出执行的分支，其余分支都不判为非活动
+    // When the operand is a tagged union, the executed prong used to be unknown, and none of the
+    // other prongs were judged inactive
     const text =
         \\const U = union(enum) { x: u32, y: void };
         \\const u: U = .{ .x = 1 };
@@ -1627,7 +1654,8 @@ test "switch prongs on a comptime-known tagged union are inactive unless they ma
     try testing.expectEqualStrings("return 0", text[ranges[0].start..ranges[0].end]);
 }
 
-/// 使用本机 zig 的真实标准库（PATH 中没有 zig 时跳过）：`@typeInfo` 需要 `std.builtin.Type`
+/// Uses the real standard library of the local zig (skipped when PATH has no zig): `@typeInfo`
+/// needs `std.builtin.Type`
 fn useRealStd(w: *World) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
@@ -1660,7 +1688,8 @@ test "switch prongs on @typeInfo of a concrete type are inactive unless they mat
 }
 
 test "conditions on members of abstract parameters are not inactive" {
-    // 防止没有实例时把 `@hasDecl` / `@hasField` 求值为 false：有调用点的泛型代码中实际执行的分支显示为非活动
+    // Prevents evaluating `@hasDecl` / `@hasField` to false when there is no instance: in generic
+    // code with call sites, the branches actually executed would be shown as inactive
     const text =
         \\fn hasInner(comptime T: type) bool {
         \\    return @hasDecl(T, "Inner");
@@ -1704,8 +1733,9 @@ test "conditions on members of abstract parameters are not inactive" {
 }
 
 test "conditions on the root of a file outside every module are not inactive" {
-    // 防止为不属于任何模块的文件猜测根文件（如取文件自身）：它可能由另一个文件以相对路径 import，
-    // 也可能由 `zig test` 编译（根文件是测试运行器）
+    // Prevents guessing a root file (such as the file itself) for a file that belongs to no module:
+    // it may be imported by another file through a relative path, or compiled by `zig test` (where
+    // the root file is the test runner)
     const text =
         \\const root = @import("root");
         \\pub fn check() void {
@@ -1755,7 +1785,7 @@ test "completion, goto, signature help and inlay hints in generic bodies use a c
         }
     }.f;
 
-    // `p.` 之后：调用点实例中 `p` 为 Point
+    // After `p.`: `p` is Point in the call-site instance
     const items = (try completion.complete(&r, file, at("p.x") + 2, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
@@ -1768,7 +1798,8 @@ test "completion, goto, signature help and inlay hints in generic bodies use a c
     try testing.expectEqualStrings("fn scale(self: Point, k: i32) i32", s.label);
     try testing.expectEqual(1, s.active);
 
-    // 抽象的结果中未知的局部变量：类型取自调用点的实例，并说明所依据的调用
+    // Unknown local variables in the abstract result: the type is taken from the call-site
+    // instance, and the call it is based on is stated
     const hints = try inlay_hints.inlayHints(&r, file, at("const v"), at("_ = v"), .{});
     var found = false;
     for (hints) |h| if (h.kind == .type) {
@@ -1785,24 +1816,26 @@ test "completion: builtins, labels, init fields and import names" {
         \\
     ;
     const cases = [_]struct { []const u8, []const u8 }{
-        // 标签：内层在前
+        // Labels: inner first
         .{ "fn f() void { outer: while (true) { inner: { break :<|> } } }", "inner outer" },
         .{ "fn f() void { outer: while (true) { continue :ou<|>; } }", "outer" },
-        // 初始化中未赋值的字段
+        // Fields not yet assigned in the initializer
         .{ "const s: S = .{ .x = 1, .<|> };", "y z" },
         .{ "const s = S{ .<|> };", "x y z" },
         .{ "const s: ?S = .{ .y = 2, .<|> };", "x z" },
-        // import：模块名（没有项目时只有固定的三个）
+        // import: module names (only the fixed three without a project)
         .{ "const a = @import(\"<|>\");", "std builtin root" },
-        // 注释与字符串中不补全（曾列出作用域中的全部名字）
+        // No completion in comments and strings (it used to list every name in scope)
         .{ "fn f() void {\n    const p: S = .{ .x = 1 };\n    // p.<|>\n    _ = p;\n}", "" },
         .{ "fn f() void {\n    _ = \"p.<|>\";\n}", "" },
         .{ "fn f() void {\n    _ = \"p.<|>\n}", "" },
         .{ "/// a @<|>\nconst T = 1;", "" },
-        // 错误名：期望类型的错误集成员，没有期望类型时为本文件中出现的错误名
+        // Error names: members of the expected type's error set; without an expected type, the
+        // error names that appear in this file
         .{ "const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.<|>;\n}", "Bad Worse" },
         .{ "const E = error{ Worse, Bad };\nfn g() void {\n    const e = error.<|>;\n    _ = e;\n}\nfn h() !void {\n    return error.Other;\n}", "Worse Bad Other" },
-        // 未写完的 `error.` 接上了下一行的名字（`error._`），这个名字不列出
+        // An unfinished `error.` joins with the name on the next line (`error._`); that name is not
+        // listed
         .{ "const E = error{ Worse, Bad };\nfn g() void {\n    const e = error.<|>\n    _ = e;\n}", "Worse Bad" },
     };
     for (cases, 0..) |c, i| {
@@ -1823,7 +1856,7 @@ test "completion: builtins, labels, init fields and import names" {
         };
     }
 
-    // 内置函数：替换范围从 `@` 开始，到名字末尾
+    // Builtin functions: the replacement range starts at `@` and ends at the end of the name
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -1841,7 +1874,7 @@ test "completion: builtins, labels, init fields and import names" {
 }
 
 test "goto and hover on error values: the expected error set picks the declaration" {
-    // `error.Foo` 曾既不能跳转也没有 hover
+    // `error.Foo` used to have neither goto nor hover
     const lib_text =
         \\pub const LibError = error{ Missing, Busy };
         \\
@@ -1883,17 +1916,17 @@ test "goto and hover on error values: the expected error set picks the declarati
             return @intCast(std.mem.indexOf(u8, text, needle).?);
         }
     }.of;
-    // 期望的错误集 E 中的 Foo，而不是 Other 中的
+    // Foo in the expected error set E, not the one in Other
     const foo = (try definition.definition(&r, file, at("Foo;") + 1)).?;
     try testing.expectEqual(file, foo.file);
     try testing.expectEqual(at("Foo,\n    Bar"), foo.start);
-    // 没有期望类型：含这个名字的错误集
+    // No expected type: the error set containing this name
     const baz = (try definition.definition(&r, file, at("Baz;") + 1)).?;
     try testing.expectEqual(at("Baz }"), baz.start);
-    // 合并的错误集：其中含这个名字的部分
+    // Merged error set: the part of it that contains this name
     const bar = (try definition.definition(&r, file, at("Bar;") + 1)).?;
     try testing.expectEqual(at("Bar,\n};"), bar.start);
-    // 其他文件中声明的错误集
+    // Error set declared in another file
     const missing = (try definition.definition(&r, file, at("Missing;") + 1)).?;
     try testing.expectEqual(lib, missing.file);
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, lib_text, "Missing").?)), missing.start);
@@ -1933,10 +1966,10 @@ test "goto and hover on quoted error names" {
         }
     }.of;
     const cases = [_]struct { []const u8, u32, []const u8 }{
-        // `error.X` 按解码后的名字查找
+        // `error.X` is looked up by the decoded name
         .{ "error.Escaped", "error.".len, "@\"\\x45scaped\"" },
         .{ "error.@\"\\x45scaped\"", "error.".len, "@\"\\x45scaped\"" },
-        // `E.X` 的 token 原文带引号，区间覆盖 token 自身
+        // The token of `E.X` is quoted in the source, and the range covers the token itself
         .{ "E.Quoted", "E.".len, "@\"Quoted\"" },
         .{ "E.Escaped", "E.".len, "@\"\\x45scaped\"" },
         .{ "E.@\"a b\"", "E.".len, "@\"a b\"" },
@@ -1950,13 +1983,14 @@ test "goto and hover on quoted error names" {
         try testing.expectEqual(decl_at, t.start);
         try testing.expectEqual(decl_at + @as(u32, @intCast(c[2].len)), t.end);
     }
-    // hover 带上转义名字对应的文档
+    // hover includes the docs for the escaped name
     const info = (try hover.hover(&r, file, at("error.Escaped") + @as(u32, "error.".len))).?;
     try testing.expect(std.mem.endsWith(u8, info.text, "escaped doc"));
 }
 
 test "goto on an error value without an expected error set stops at the first declaration" {
-    // 没有期望的错误集时各声明同样符合，结果总是第一个；曾在找到后仍为 import 闭包中的全部文件建索引
+    // Without an expected error set, all declarations match equally and the result is always the
+    // first; it used to keep indexing every file in the import closure after finding it
     const text =
         \\const a = @import("a.zig");
         \\fn g() void {
@@ -2019,14 +2053,15 @@ test "goto declaration, definition through aliases and type definition" {
     var r = resolver(&w, &ctx);
     const Fn = *const fn (*resolve.Resolver, @import("../base/Vfs.zig").FileId, u32) resolve.Error!?definition.Target;
     const cases = [_]struct { Fn, []const u8, []const u8 }{
-        // definition 沿别名追到 Point，declaration 停在 P
+        // definition follows the alias to Point; declaration stops at P
         .{ definition.definition, "P = undefined", "Point = struct" },
         .{ definition.declaration, "P = undefined", "P = Point" },
-        // type definition：剥去 optional 与指针；经别名的类型标注；类型名本身
+        // type definition: strips optional and pointers; type annotations through aliases; the type
+        // name itself
         .{ definition.typeDefinition, "p = make", "Point = struct" },
         .{ definition.typeDefinition, "q: P", "Point = struct" },
         .{ definition.typeDefinition, "Point {", "Point = struct" },
-        // 泛型函数返回的容器：跳到容器本身
+        // Container returned by a generic function: goes to the container itself
         .{ definition.typeDefinition, "l: List", "struct { item" },
     };
     for (cases, 0..) |c, i| {
@@ -2195,7 +2230,9 @@ test "inlay hint options" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { inlay_hints.Options, []const u8 }{
-        // 默认：局部变量与字段的类型；形参名，与实参同名的 `a`、`dest` 与单参数调用 `one(v)` 不提示
+        // Default: types of local variables and fields; parameter names, with no hints for `a` and
+        // `dest`, which have the same names as the arguments, or for the single-argument call
+        // `one(v)`
         .{ .{}, ": u32 b: : u32 source:" },
         .{ .{ .types = false }, "b: : u32 source:" },
         .{ .{ .field_types = false }, ": u32 b: source:" },
@@ -2215,7 +2252,8 @@ test "inlay hint options" {
     }
 }
 
-/// 把提示插到源码中对应的位置：参数名提示后带一个空格，与编辑器中显示的一样
+/// Inserts the hints at their positions in the source: a parameter name hint is followed by a
+/// space, as shown in the editor
 fn inlaid(w: *World, file: FileId, text: []const u8, opts: inlay_hints.Options) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -2261,8 +2299,10 @@ test "inlay hints: field types in initializers that have a result type" {
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    // 字段类型取自初始化表达式的结果类型（写出的类型、形参、标注、外层字段、去掉 error union 与 optional 的返回类型），
-    // 泛型容器取实例中的类型；没有结果类型的匿名初始化不提示
+    // Field types come from the result type of the initializer (the written type, a parameter, an
+    // annotation, an enclosing field, the return type without error union and optional), and for
+    // generic containers from the instance; anonymous initializers without a result type get no
+    // hints
     try testing.expectEqualStrings(
         \\const Point = struct { x: i32, y: i32 = 0 };
         \\const Wrap = struct { p: Point };
@@ -2310,7 +2350,9 @@ test "hover shows tuples whose fields are all comptime by value and does not tru
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    // inlay hints 的类型至多约 `max_length` 个字符（默认 25）：写下一个字段之前已经写满时，其余的显示为 `…`；0 为不限
+    // Types in inlay hints are at most about `max_length` characters (25 by default): when the
+    // limit is already reached before the next field is written, the rest is shown as `…`; 0 means
+    // no limit
     const hinted = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false });
     try testing.expect(std.mem.indexOf(u8, hinted, "const many: struct { u8, u8, u8, u8, … } =") != null);
     const unlimited = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false, .max_length = 0 });
@@ -2320,16 +2362,17 @@ test "hover shows tuples whose fields are all comptime by value and does not tru
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        // 类型完全由值决定：只显示值
+        // The type is fully determined by the value: only the value is shown
         .{ "qs =", "const qs = .{ A, B }" },
         .{ "point =", "const point = .{ .x = 1, .y = true }" },
-        // hover 不截断：长的值、超过 64 字节的字符串、超过 16 个字段的元组都完整显示
+        // hover does not truncate: long values, strings over 64 bytes and tuples with more than 16
+        // fields are all shown in full
         .{ "long =", "const long = .{ Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name }" },
         .{ "msg =", "const msg: *const [72:0]u8 = \"a message that is longer than sixty-four bytes, all of it shown in hover\"" },
         .{ "many =", "const many: struct { u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8 }" },
-        // 嵌套的匿名容器同样展开，只有自引用显示为 `{...}`
+        // Nested anonymous containers are expanded too; only self-references are shown as `{...}`
         .{ "in =", "const in: struct { deep: struct { z: u8 }, next: ?*const struct {...} }" },
-        // `@typeName` 是完整的名字（与编译器相同，315 字节）
+        // `@typeName` is the full name (as in the compiler, 315 bytes)
         .{ "name_len =", "const name_len: usize = 315" },
     };
     for (cases) |c| {
@@ -2371,8 +2414,10 @@ test "anonymous containers are shown by content, and their type hints only when 
             return annotated[std.mem.indexOf(u8, annotated, "fn f(").?..];
         }
     }.of;
-    // 字段、变量的类型标注中的容器没有名字，按内容显示（其中再有的显示为 `{...}`）；值是容器或 `if` 选出的容器、
-    // `return` 的容器、局部常量的容器以成员命名
+    // Containers in the type annotations of fields and variables have no name and are shown by
+    // content (containers that recur inside them are shown as `{...}`); containers that are a
+    // member's value or are picked by `if`, containers in `return` and containers of local
+    // constants are named after the member
     try testing.expectEqualStrings(
         \\fn f(s: S) void {
         \\    const k: Kind = .{ .compile: struct { root: u32 } = .{ .root: u32 = 1 } };
@@ -2387,7 +2432,7 @@ test "anonymous containers are shown by content, and their type hints only when 
         \\}
         \\
     , body(try inlaid(&w, file, text, .{ .anonymous_containers = true, .parameters = false })));
-    // 默认不显示类型中有匿名容器的提示
+    // By default, hints whose types contain anonymous containers are not shown
     try testing.expectEqualStrings(
         \\fn f(s: S) void {
         \\    const k: Kind = .{ .compile = .{ .root: u32 = 1 } };
@@ -2402,7 +2447,7 @@ test "anonymous containers are shown by content, and their type hints only when 
         \\}
         \\
     , body(try inlaid(&w, file, text, .{ .parameters = false })));
-    // hover 不受 inlay hints 的配置影响
+    // hover is not affected by the inlay hints configuration
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
@@ -2425,7 +2470,8 @@ test "inlay hints: builtin parameter names" {
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    // 去掉 `comptime` / `noalias` 前缀取参数名；`@divExact`、`@as` 不提示；同名的 `ptr` 与单参数调用不提示
+    // Parameter names drop the `comptime` / `noalias` prefix; no hints for `@divExact` and `@as`;
+    // no hints for `ptr`, which has the same name, or for single-argument calls
     try testing.expectEqualStrings(
         \\fn f(buf: []u8, data: []const u8, ptr: *u32, x: u64) void {
         \\    @memcpy(dest: buf, source: data);
@@ -2436,7 +2482,7 @@ test "inlay hints: builtin parameter names" {
         \\}
         \\
     , try inlaid(&w, file, text, .{}));
-    // 单参数的内置函数只由 exclude_single_argument 决定
+    // Single-argument builtins are governed only by exclude_single_argument
     try testing.expectEqualStrings(
         \\fn f(buf: []u8, data: []const u8, ptr: *u32, x: u64) void {
         \\    @memcpy(dest: buf, source: data);
@@ -2480,7 +2526,9 @@ test "inlay hints: calls with a single argument, including method calls" {
             return annotated[std.mem.indexOf(u8, annotated, "fn f(").?..];
         }
     }.of;
-    // 按写出的实参个数：方法调用去掉接收者后只剩一个实参也不提示，经类型调用的 `S.set(s, 3)` 有两个实参
+    // By the number of arguments as written: a method call left with one argument after dropping
+    // the receiver gets no hint either, while `S.set(s, 3)`, called through the type, has two
+    // arguments
     try testing.expectEqualStrings(
         \\fn f(s: *S) void {
         \\    one(1);
@@ -2523,7 +2571,8 @@ test "inlay hints: redundant parameter names look through address-of, deref, unw
     try w.init();
     defer w.deinit();
     const file = (try w.add("/p/main.zig", text)).file;
-    // 可以多层；`+`、`-%`、`orelse` 得到新的值，照常提示
+    // Several levels can be looked through; `+`, `-%` and `orelse` produce new values and get hints
+    // as usual
     try testing.expectEqualStrings(
         \\const S = struct { buf: u32, len: ?u32 };
         \\fn take(buf: *const u32, len: u32) void {
@@ -2564,7 +2613,7 @@ test "callsite seeding can be switched off" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "bigger =").?)) orelse return error.NoHover;
-    // 不以调用点的实例推导：显示抽象的类型，没有「inferred from」
+    // Not inferred from a call-site instance: shows the abstract type, without "inferred from"
     try testing.expectEqualStrings("```zig\nconst bigger: T\n```", info.text);
 }
 
@@ -2590,7 +2639,8 @@ test "member completion on values lists function aliases as methods" {
     const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
-    // 函数的别名 `isARM` 可作为方法调用；值常量 `count` 不列出
+    // The function alias `isARM` can be called as a method; the value constant `count` is not
+    // listed
     try testing.expectEqualStrings("x86 arm isArm isARM", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
@@ -2621,12 +2671,13 @@ test "completion in a branch inactive for the first call site uses a call site w
     const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
-    // 第一个调用点（Rgb）下该分支不生效：取第二个调用点（Rgba）
+    // The branch is not active for the first call site (Rgb): the second call site (Rgba) is used
     try testing.expectEqualStrings("r a", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
 test "completion in a switch prong on @typeInfo uses a call site where the prong is taken" {
-    // 第一个调用点（结构体）下 `.pointer` 分支不执行，曾仍以它的实例补全出结构体的字段
+    // For the first call site (a struct), the `.pointer` prong is not executed; completion used to
+    // still use its instance, listing the struct's fields
     const text =
         \\const Top = struct { name: []const u8 };
         \\fn measure(a: anytype) usize {
@@ -2657,7 +2708,7 @@ test "completion in a switch prong on @typeInfo uses a call site where the prong
     try testing.expectEqualStrings("len ptr", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
-/// 在 `text` 的 `<|>` 处补全，返回以空格连接的标签
+/// Completes at `<|>` in `text` and returns the labels joined by spaces
 fn completionLabels(text: []const u8) ![]const u8 {
     var w: World = undefined;
     try w.init();
@@ -2674,7 +2725,8 @@ fn completionLabels(text: []const u8) ![]const u8 {
 }
 
 test "callsite seeding skips calls in branches the caller instance does not compile" {
-    // 第一个实例（Input）下 `ensure` 的调用位于不执行的分支中：曾仍以它推导出 Input 的实例，补全出 Input 才有的字段
+    // For the first instance (Input), the call to `ensure` is in a branch that is not executed: an
+    // Input instance used to still be inferred from it, completing fields that only Input has
     const labels = try completionLabels(
         \\const Input = struct {
         \\    pub const kind = .input;
@@ -2711,7 +2763,8 @@ test "callsite seeding skips calls in branches the caller instance does not comp
 }
 
 test "callsite seeding falls back to calls in branches no instance of the caller compiles" {
-    // 唯一的调用位于调用者每个实例都不编译的分支中：曾因跳过这样的调用而没有实例，补全为空
+    // The only call is in a branch that no instance of the caller compiles: skipping such calls
+    // used to leave no instance, so completion was empty
     const labels = try completionLabels(
         \\const Point = struct { x: u32, y: u32 };
         \\fn read(p: anytype) u32 {
@@ -2731,7 +2784,8 @@ test "callsite seeding falls back to calls in branches no instance of the caller
 }
 
 test "callsite seeding picks an instance in which the expression at the cursor has a type" {
-    // 第一个调用点（Input）下 `Q.Memo` 不存在，`m` 的类型未知：曾补全为空
+    // For the first call site (Input), `Q.Memo` does not exist and the type of `m` is unknown:
+    // completion used to be empty
     const labels = try completionLabels(
         \\const Input = struct {};
         \\const Derived = struct {
@@ -2752,7 +2806,8 @@ test "callsite seeding picks an instance in which the expression at the cursor h
 }
 
 test "callsite seeding skips instances for which a guard before the cursor fires" {
-    // `if (!@hasDecl(Q, "fallback")) unreachable;` 在第一个调用点（A）下被选中，其后的代码不编译：曾仍以 A 补全
+    // `if (!@hasDecl(Q, "fallback")) unreachable;` is taken for the first call site (A), so the
+    // code after it is not compiled: completion used to still use A
     const labels = try completionLabels(
         \\const A = struct {};
         \\const B = struct {
@@ -2796,7 +2851,7 @@ test "code after a statement that comptime makes noreturn is inactive" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const ranges = try inactive.ranges(&r, file);
-    // 运行时的条件之后的代码不是非活动代码
+    // Code after a runtime condition is not inactive code
     try testing.expectEqual(1, ranges.len);
     try testing.expectEqualStrings("const y = x + 2;\n    return y;", text[ranges[0].start..ranges[0].end]);
 }
@@ -2820,14 +2875,14 @@ test "the right side of a comptime short-circuited and / or is inactive" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const ranges = try inactive.ranges(&r, file);
-    // 左侧是运行时的值时右侧照常编译
+    // When the left side is a runtime value, the right side is compiled as usual
     try testing.expectEqual(1, ranges.len);
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "x;").?)), ranges[0].start);
 }
 
 test "callsite seeding uses the caller instance with the matching comptime type argument" {
-    // `A.step` 与 `B.step` 都经 `run` 中的 `Impl.step(ctx)` 调用；`run` 先以 B 调用，
-    // A.step 内仍应使用 A 的实例
+    // `A.step` and `B.step` are both called through `Impl.step(ctx)` in `run`; `run` is called with
+    // B first, but inside A.step, A's instance must still be used
     const labels = try completionLabels(
         \\const CA = struct { a_field: u32 };
         \\const CB = struct { b_field: u32 };
@@ -2903,7 +2958,8 @@ test "via a comptime type parameter dispatch uses the real caller instance" {
 }
 
 test "via a comptime type parameter dispatch without a real instance stays abstract" {
-    // `caller(A, ..)` 不存在：编译器不会生成 `A.name` 的实例，不能借用 `caller(B, ..)` 的实例
+    // `caller(A, ..)` does not exist: the compiler does not generate an instance of `A.name`, so
+    // the instance of `caller(B, ..)` must not be borrowed
     const text =
         \\const Foo = struct {
         \\    fn hello(_: Foo) void {}
@@ -2946,7 +3002,9 @@ test "via a comptime type parameter dispatch without a real instance stays abstr
 }
 
 test "callsite seeding follows a container type passed as a comptime argument to the call that dispatches to it" {
-    // 分派处（engine.zig 的 `Q.compute(ctx)`）所在的文件不 import 目标所在的文件：曾按导入链找不到调用点，`ctx` 的类型未知
+    // The file of the dispatch site (`Q.compute(ctx)` in engine.zig) does not import the file of
+    // the target: following the import chain used to find no call site, and the type of `ctx` was
+    // unknown
     const queries_text =
         \\pub const Item = struct {
         \\    pub fn compute(ctx: anytype) u32 {
@@ -2997,7 +3055,8 @@ test "callsite seeding follows a container type passed as a comptime argument to
 }
 
 test "inside an inline for over a list of types, features use one iteration" {
-    // 循环变量在推导中是抽象的（每次迭代的类型不同）：曾补全为空、hover 求不出类型
+    // The loop variable is abstract in inference (its type differs in each iteration): completion
+    // used to be empty and hover could not compute the type
     const text =
         \\const A = struct {
         \\    pub fn name() u32 {
@@ -3037,7 +3096,8 @@ test "inside an inline for over a list of types, features use one iteration" {
 }
 
 test "callsite seeding uses an iteration of an inline for over types that the call is in" {
-    // 调用位于遍历类型列表的 `inline for` 中，实参是抽象的循环变量：曾求不出 `get` 的实例
+    // The call is inside an `inline for` over a list of types, and the argument is the abstract
+    // loop variable: the instance of `get` used to be unresolvable
     const labels = try completionLabels(
         \\const A = struct { x: u32 };
         \\fn get(comptime T: type) void {
@@ -3053,7 +3113,7 @@ test "callsite seeding uses an iteration of an inline for over types that the ca
     try testing.expectEqualStrings("x", labels);
 }
 
-/// `inline for (.{ E0, E1, ..., A }) |T|`，只有 `A`（第 `empty + 1` 次迭代）有 `run`
+/// `inline for (.{ E0, E1, ..., A }) |T|`, where only `A` (iteration `empty + 1`) has `run`
 fn manyTypesLoop(comptime empty: usize) []const u8 {
     @setEvalBranchQuota(100_000);
     var list: []const u8 = "";
@@ -3077,7 +3137,8 @@ fn manyTypesLoop(comptime empty: usize) []const u8 {
 }
 
 test "features inside an inline for over types use iterations past the first 64" {
-    // 曾只尝试前 64 次迭代：位于其后的 `A` 求不出
+    // Only the first 64 iterations used to be tried: `A`, which comes after them, could not be
+    // resolved
     const text = comptime manyTypesLoop(80);
     var w: World = undefined;
     try w.init();
@@ -3115,7 +3176,9 @@ test "an inline for over a list that is a parameter of the enclosing generic fun
 }
 
 test "an iteration of a loop over types also gives the other captures of the loop their values" {
-    // 曾只给类型的循环变量取值：下标 `i` 没有值，`tables[i]` 的元素求不出；其中嵌套的普通循环不影响选取
+    // Only the loop variable holding a type used to get a value: the index `i` had no value, so the
+    // element `tables[i]` could not be resolved; the plain loop nested inside does not affect the
+    // choice
     const labels = try completionLabels(
         \\const A = struct {};
         \\const B = struct {};
@@ -3135,7 +3198,8 @@ test "an iteration of a loop over types also gives the other captures of the loo
 }
 
 test "callsite seeding uses an iteration of a comptime for over types" {
-    // comptime 块中遍历类型列表的普通 `for`（不是 `inline for`）同样按迭代推导
+    // A plain `for` (not `inline for`) over a list of types in a comptime block is also inferred
+    // per iteration
     const labels = try completionLabels(
         \\const A = struct {
         \\    pub const id = 1;
@@ -3153,7 +3217,8 @@ test "callsite seeding uses an iteration of a comptime for over types" {
 }
 
 test "inside an inline for over a tuple whose items have different types, features use one iteration" {
-    // 各项的类型不同（长度不同的数组、字符串），合并推导时循环变量的类型求不出：曾补全为空
+    // The items have different types (arrays of different lengths, strings), so merged inference
+    // cannot compute the type of the loop variable: completion used to be empty
     const by_array = try completionLabels(
         \\const Case = struct { base: u32, expected: ?u32 };
         \\const short = [_]Case{.{ .base = 1, .expected = null }};
@@ -3169,7 +3234,7 @@ test "inside an inline for over a tuple whose items have different types, featur
     );
     defer testing.allocator.free(by_array);
     try testing.expectEqualStrings("base expected", by_array);
-    // 元组的值在运行时才知道，各项的类型 comptime 已知
+    // The tuple's values are known only at runtime, while the types of its items are comptime-known
     const by_name = try completionLabels(
         \\const Flag = enum {
         \\    on,
@@ -3193,7 +3258,8 @@ test "inside an inline for over a tuple whose items have different types, featur
 }
 
 test "callsite seeding tries every instance for a branch only rare instances compile" {
-    // 只有第 10 个实例有 `extra`，调用者又在泛型函数中：曾只尝试调用者的前 8 个实例，补全为空
+    // Only the 10th instance has `extra`, and the caller is itself in a generic function: only the
+    // caller's first 8 instances used to be tried, leaving completion empty
     const labels = try completionLabels(
         \\const A0 = struct {
         \\    pub const id = 0;
@@ -3254,7 +3320,8 @@ test "callsite seeding tries every instance for a branch only rare instances com
 }
 
 test "an inline switch prong over several tags captures the payload of the operand's tag" {
-    // 各项的载荷类型不同（`std.lang.Type.Struct` 与 `Union`），曾按 peer 求不出捕获的类型
+    // The items of the prong have different payload types (`std.lang.Type.Struct` and `Union`), and
+    // resolving them by peer type used to give no type for the capture
     const text =
         \\const S = struct { a: u32, b: u8 };
         \\fn count(comptime T: type) usize {
@@ -3285,7 +3352,8 @@ test "an inline switch prong over several tags captures the payload of the opera
 }
 
 test "completion through single pointers to arrays, tuples and slices" {
-    // 单指针解引用后曾直接查找命名空间：指向数组或元组时补全为空（如字符串常量的 `.len`）
+    // After dereferencing a single pointer, the namespace used to be looked up directly: completion
+    // was empty for pointers to arrays or tuples (such as `.len` of a string constant)
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "fn f() void {\n    const prefix = \"file://\";\n    _ = prefix.<|>;\n}\n", "len" },
         .{ "fn f() void {\n    const t = .{ 1, 2 };\n    const p = &t;\n    _ = p.<|>;\n}\n", "@\"0\" @\"1\" len" },
@@ -3329,12 +3397,13 @@ test "goto declaration on names that declare themselves: error set members and a
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, usize, []const u8 }{
-        // 错误集的成员与匿名初始化的字段名：本身就是声明处
+        // Members of error sets and field names of anonymous initializers: they are their own
+        // declarations
         .{ "Timeout", 0, "Timeout" },
         .{ "Closed", 0, "Closed" },
         .{ ".verbose", 1, "verbose" },
         .{ ".second", 1, "second" },
-        // 有结果类型：跳到字段的声明
+        // With a result type: goes to the field's declaration
         .{ ".x = 0", 1, "x: i32" },
     };
     for (cases, 0..) |c, i| {
@@ -3480,17 +3549,17 @@ test "goto declaration of members that exist only in other target branches" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        // 别名 `system.SO` 与嵌套的 switch
+        // The alias `system.SO` and nested switches
         .{ "REUSEPORT_LB;", "REUSEPORT_LB = 0x10000" },
-        // 当前配置下 EVFILT 为 void
+        // EVFILT is void under the current configuration
         .{ "READ;", "READ = -1" },
-        // 字段的类型、局部变量的 `init()`、调用结果
+        // Field types, `init()` of a local variable, call results
         .{ "handle;\n    var", "handle: u32" },
         .{ "handle;\n    _ = platform", "handle: u32" },
         .{ "handle;\n    _ = t", "handle: u32" },
-        // 当前配置下存在的成员
+        // Members that exist under the current configuration
         .{ "fd;\n}", "fd: u32" },
-        // 函数返回类型按目标选择，字段的类型再按目标选择
+        // The function's return type is selected by target, and the field's type again by target
         .{ "CCTS_OFLOW = true", "CCTS_OFLOW: bool = false" },
     };
     for (cases, 0..) |c, i| {
@@ -3561,7 +3630,8 @@ test "recursive chosen and negative seeds survive prefix edits without executing
 }
 
 test "seed search skips callers whose calls resolve to other functions of the same name" {
-    // `format` 提到 print，但调用的是 Writer.print：任何实例下都调用不到目标，不查找它自己的调用点
+    // `format` mentions print but calls Writer.print: it cannot call the target in any instance, so
+    // its own call sites are not searched for
     const text =
         \\pub fn print(comptime fmt: []const u8, args: anytype) void {
         \\    _ = fmt;
@@ -3591,11 +3661,12 @@ test "seed search skips callers whose calls resolve to other functions of the sa
     const file = (try w.add("/p/main.zig", text)).file;
     const chosen = (try seedFor(&w, file, "print")).?;
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "print(\"{}\", .{").?)), chosen.offset);
-    // 只有目标自身的查找：`seedFor` 依次请求 Query、Instances 与 allInstances
+    // Only the target's own search: `seedFor` requests Query, Instances and allInstances in turn
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Query));
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Instances));
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.AllInstances));
-    // 改为调用目标后不再跳过：以 `format` 的调用点实例找到它对目标的调用
+    // Once it calls the target it is no longer skipped: its call to the target is found through the
+    // call-site instance of `format`
     const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "w.print(\"{}\");", "print(\"{}\", .{T});");
     _ = try w.add("/p/main.zig", calling);
     const moved = (try seedFor(&w, file, "print")).?;
@@ -3603,8 +3674,10 @@ test "seed search skips callers whose calls resolve to other functions of the sa
 }
 
 test "callers whose mentions resolve to other functions without inference are skipped" {
-    // 经命名空间、全局声明的类型、参数的类型就能确定调用的是其他 print 的成员不推导；局部值求不出，别名与调用目标的
-    // 成员照常推导，按原顺序选出调用点
+    // Members that can be shown to call another print from a namespace, the type of a global
+    // declaration or the type of a parameter are not inferred; local values cannot be resolved that
+    // way, so members using them are inferred as usual, as are aliases and members that call the
+    // target, and the call site is chosen in the original order
     const text =
         \\pub fn print(comptime fmt: []const u8, args: anytype) void {
         \\    _ = fmt;
@@ -3651,10 +3724,11 @@ test "callers whose mentions resolve to other functions without inference are sk
     const chosen = (try seedFor(&w, file, "print")).?;
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "alias(\"{}\"").?)), chosen.offset);
     try expectCallers(&w, file, "print", &.{ "useLocal", "alias", "useAlias", "main" });
-    // `seedFor` 依次请求各层的 Query 与 Instances：调用者列表只计算一次
+    // `seedFor` requests Query and Instances of each level in turn: the caller list is computed
+    // only once
     try testing.expectEqual(@as(u64, 1), w.db.executions(seed.Callers));
 
-    // 改为调用目标后不再跳过，排在前面的调用点被选中
+    // Once it calls the target it is no longer skipped, and the earlier call site is chosen
     const calling = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "ns.print(\"{}\");", "print(\"{}\", .{@as(u32, 1)});");
     _ = try w.add("/p/main.zig", calling);
     const moved = (try seedFor(&w, file, "print")).?;
@@ -3662,7 +3736,8 @@ test "callers whose mentions resolve to other functions without inference are sk
     try expectCallers(&w, file, "print", &.{ "useNamespace", "useLocal", "alias", "useAlias", "main" });
 }
 
-/// `file` 中名为 `name` 的泛型函数在 `file` 中的调用者（`seed.Callers`）依次为 `expected`
+/// The callers (`seed.Callers`) in `file` of the generic function named `name` in `file` are
+/// `expected`, in order
 fn expectCallers(w: *World, file: FileId, name: []const u8, expected: []const []const u8) !void {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -4008,7 +4083,8 @@ test "auto import does not leak into non-name contexts" {
         const baseline = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false });
         const result = try completion.complete(&r, added.file, added.cursor, .{});
         try testing.expect(!result.is_incomplete);
-        // 这些上下文不提供自动导入，普通补全的结果不因此丢失或被改写
+        // These contexts offer no auto-imports, and the results of plain completion are not lost or
+        // rewritten because of it
         try testing.expectEqual(baseline.items.len, result.items.len);
         for (result.items) |item| {
             try testing.expect(item.import_edit == null);
@@ -4041,7 +4117,8 @@ test "auto import does not rewrite bare enum or union member declarations" {
             try testing.expect(item.filter == null);
         }
     }
-    // struct 的元组字段没有冒号，但类型表达式是真正的名字引用，仍应自动导入
+    // Tuple fields of a struct have no colon, but the type expression is a real name reference and
+    // should still be auto-imported
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -4063,7 +4140,8 @@ test "auto import does not rewrite bare enum or union member declarations" {
 }
 
 test "auto import is not offered outside zig source files" {
-    // 向 `.zon` 文件插入 import 声明会破坏它；也不为它开始建自动导入的索引
+    // Inserting an import declaration into a `.zon` file would break it; no auto-import indexing is
+    // started for it either
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -4138,9 +4216,10 @@ test "selected auto-import candidates describe the signature, docs and where the
     const cases = [_]struct { prefix: []const u8, label: []const u8, detail: []const u8, doc: []const u8 }{
         .{ .prefix = "LineIn", .label = "LineIndex", .detail = "const LineIndex = struct", .doc = "Offsets of line starts.\n\nDefined in `util/lines.zig:4`" },
         .{ .prefix = "lineO", .label = "lineOf", .detail = "pub fn lineOf(offset: u32) u32", .doc = "Defined in `util/lines.zig:5`" },
-        // 文件本身：import 表达式与文件开头的 `//!` 文档
+        // The file itself: the import expression and the `//!` docs at the start of the file
         .{ .prefix = "lines", .label = "lines", .detail = "@import(\"util/lines.zig\")", .doc = "Line utilities.\n\nFile `util/lines.zig`" },
-        // 标准库按 `std/` 下的路径；其他模块按当前文件 import 它的名字
+        // The standard library by its path under `std/`; other modules by the name the current file
+        // imports them under
         .{ .prefix = "eq", .label = "eql", .detail = "pub fn eql() bool", .doc = "Defined in `std/mem.zig:1`" },
         .{ .prefix = "Head", .label = "Header", .detail = "const Header = struct", .doc = "Defined in `wire/root.zig:1`" },
     };
@@ -4403,7 +4482,7 @@ test "visible completion precedes auto-import candidates" {
     try testing.expect(visible_at.? < auto_at.?);
 }
 
-/// `file` 中名为 `name` 的成员的全部实例（`seed.allInstances`）
+/// All instances (`seed.allInstances`) of the member named `name` in `file`
 fn allInstancesOf(w: *World, file: FileId, name: []const u8) !struct { count: usize, complete: bool } {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -4417,7 +4496,8 @@ fn allInstancesOf(w: *World, file: FileId, name: []const u8) !struct { count: us
 }
 
 test "all instances follow generic callers to a fixpoint without depth or count limits" {
-    // 防止按层数或个数截断：7 层泛型调用者之后的具体调用、互相递归的泛型函数、70 个不同的实例都要找到
+    // Prevents truncation by depth or count: concrete calls after 7 levels of generic callers,
+    // mutually recursive generic functions and 70 distinct instances must all be found
     var text: std.ArrayList(u8) = .empty;
     try text.appendSlice(testing.allocator,
         \\fn leaf(x: anytype) void {
@@ -4460,7 +4540,8 @@ test "all instances follow generic callers to a fixpoint without depth or count 
 }
 
 test "all instances of unboundedly growing instantiations are reported incomplete" {
-    // 防止截断的实例被当作全部：`grow(T)` 调用 `other(?T)`，`other(T)` 又调用 `grow(T)`，实例无限增长
+    // Prevents truncated instances from being taken as all of them: `grow(T)` calls `other(?T)` and
+    // `other(T)` calls `grow(T)` again, so the instances grow without bound
     const text =
         \\fn grow(comptime T: type) void {
         \\    other(?T);
@@ -4482,8 +4563,9 @@ test "all instances of unboundedly growing instantiations are reported incomplet
 }
 
 test "all instances include anytype calls in files that do not import the method" {
-    // 防止只在导入了方法所在文件的文件中找调用者：`c.zig` 不导入 `a.zig`，经 anytype 的值（指向 `S` 的指针，
-    // 类型流只认实参类型恰为 `S` 的实例）调用其泛型方法
+    // Prevents looking for callers only in files that import the method's file: `c.zig` does not
+    // import `a.zig` and calls its generic method through an anytype value (a pointer to `S`; the
+    // type flow only recognizes instances whose argument type is exactly `S`)
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -4501,7 +4583,8 @@ test "all instances include anytype calls in files that do not import the method
 }
 
 test "callsite seeding uses an iteration of a loop over a comptime list of values" {
-    // 循环变量有类型但没有值（遍历的是 comptime 已知的值列表）：曾求不出 `PT` 的实例
+    // The loop variable has a type but no value (the loop is over a comptime-known list of values):
+    // the instance of `PT` used to be unresolvable
     const labels = try completionLabels(
         \\const Help = struct {
         \\    v: []const u8,
@@ -4532,7 +4615,9 @@ test "callsite seeding uses an iteration of a loop over a comptime list of value
 }
 
 test "a field name sliced from a comptime string in an inline for over pointers resolves @field" {
-    // 指针捕获在按迭代推导时曾没有值，comptime 已知的切片、解引用与取地址也曾没有值：`@field` 求不出字段
+    // Pointer captures used to have no value in per-iteration inference, and neither did
+    // comptime-known slices, dereferences and address-of expressions: `@field` could not resolve
+    // the field
     const labels = try completionLabels(
         \\const Names = struct {
         \\    long: []const u8,
@@ -4564,7 +4649,8 @@ test "a field name sliced from a comptime string in an inline for over pointers 
 }
 
 test "an iteration that leaves the loop before a declaration is not used for it" {
-    // 第 1 次迭代在 `.none => continue` 处离开循环：曾取这次迭代，`F` 显示为 noreturn
+    // The first iteration leaves the loop at `.none => continue`: that iteration used to be taken,
+    // and `F` was shown as noreturn
     const text =
         \\const P = struct { kind: enum { none, one }, T: type };
         \\fn Make(comptime ps: []const P) type {
@@ -4594,7 +4680,8 @@ test "an iteration that leaves the loop before a declaration is not used for it"
 }
 
 test "try on a call whose error set depends on an abstract parameter gives the payload type" {
-    // 错误集 `B.Error` 求不出时整个 `Error!Event` 曾为 unknown，`try` 的结果没有类型
+    // When the error set `B.Error` could not be resolved, the whole `Error!Event` used to be
+    // unknown, and the result of `try` had no type
     const labels = try completionLabels(
         \\const Event = struct { kind: u8 };
         \\fn Cursor(comptime B: type) type {
@@ -4618,7 +4705,8 @@ test "try on a call whose error set depends on an abstract parameter gives the p
 }
 
 test "@hasField on anonymous struct types decides branches in generic bodies" {
-    // 匿名结构体的 `@hasField` 曾求不出：分支不判为非活动，选了 `opt` 没有 `other` 的实例，补全为空
+    // `@hasField` on anonymous structs used to be unresolvable: the branch was not judged inactive,
+    // the instance in which `opt` has no `other` was chosen, and completion was empty
     const labels = try completionLabels(
         \\const A = struct {
         \\    pub const opts = .{};
@@ -4643,7 +4731,8 @@ test "@hasField on anonymous struct types decides branches in generic bodies" {
 }
 
 test "callsite seeding uses each value of an inline switch prong" {
-    // `inline 0...1 => |index|` 的捕获每个取值单独实例化：曾按未知推导，`read(T, names[index])` 求不出实例
+    // The capture of `inline 0...1 => |index|` is instantiated separately for each value: it used
+    // to be inferred as unknown, so the instance of `read(T, names[index])` could not be resolved
     const labels = try completionLabels(
         \\const S = struct {
         \\    a: struct { x: u8 },
@@ -4669,7 +4758,8 @@ test "callsite seeding uses each value of an inline switch prong" {
 }
 
 test "dereferencing a C pointer gives its child type" {
-    // translate-c 生成的 `[*c]T` 解引用曾为 unknown：`face.*.glyph.*.bitmap` 之后的成员都求不出
+    // Dereferencing the `[*c]T` generated by translate-c used to give unknown: none of the members
+    // after `face.*.glyph.*.bitmap` could be resolved
     const labels = try completionLabels(
         \\const Bitmap = extern struct { width: c_uint, rows: c_uint };
         \\const GlyphRec = extern struct { bitmap: Bitmap };
@@ -4686,7 +4776,8 @@ test "dereferencing a C pointer gives its child type" {
 }
 
 test "types defined inside an inline for take the loop variable of each iteration" {
-    // 循环体内定义的结构体的字段类型依赖循环变量：类型不区分迭代时字段类型求不出，`@hasField` 也求不出
+    // The field types of a struct defined in the loop body depend on the loop variable: if types do
+    // not distinguish iterations, the field types cannot be resolved, and neither can `@hasField`
     const labels = try completionLabels(
         \\const A = struct { a_field: u8 };
         \\const B = struct { b_field: u8 };
@@ -4710,7 +4801,8 @@ test "types defined inside an inline for take the loop variable of each iteratio
 }
 
 test "an iteration of an inline for sees comptime vars as the earlier iterations left them" {
-    // 第 n 次迭代中 `comptime var` 取前 n 次迭代修改后的值：曾没有值，`items[i]` 求不出
+    // In iteration n, a `comptime var` has the value as modified by the first n iterations: it used
+    // to have no value, so `items[i]` could not be resolved
     const labels = try completionLabels(
         \\const A = struct { a_field: u8 };
         \\const B = struct { b_field: u8 };
@@ -4749,7 +4841,9 @@ test "comptime vars follow assignments in straight-line code" {
 }
 
 test "an inline for over an undefined array in a generic body counts its elements" {
-    // 抽象实例中数组的值为 `undefined`，每个元素也是 `undefined`：曾按「元素有没有值」数迭代次数，数不到头而溢出
+    // In an abstract instance the array's value is `undefined`, and so is each element: iterations
+    // used to be counted by whether elements have a value, so the count never reached the end and
+    // overflowed
     const labels = try completionLabels(
         \\const S = struct { a_field: u8 };
         \\fn f(comptime T: type) void {

@@ -1,6 +1,7 @@
-//! workspace/symbol：在项目文件的 ItemTree 中按名字模糊匹配声明。
+//! workspace/symbol: fuzzy-matches declarations by name in the ItemTrees of the project files.
 //!
-//! 匹配规则：查询串（忽略大小写）是名字的子序列。完全相同优先，其次前缀，再次子序列；同级按名字长度。
+//! Matching rule: the query string (ignoring case) is a subsequence of the name. Exact matches
+//! come first, then prefixes, then subsequences; ties are broken by name length.
 
 const std = @import("std");
 const types = @import("../lsp/types.zig");
@@ -14,7 +15,7 @@ const document_symbol = @import("document_symbol.zig");
 pub const Symbol = struct {
     name: []const u8,
     kind: types.SymbolKind,
-    /// 所在容器的名字（文件顶层为 null）
+    /// Name of the enclosing container (null at the top level of a file)
     container: ?[]const u8,
     file: FileId,
     start: u32,
@@ -22,13 +23,14 @@ pub const Symbol = struct {
     rank: u8,
 };
 
-/// 至多返回 `limit` 个（按匹配等级排序后最好的）。名字的位置取自 `ItemSummaries`（不淘汰）：项目文件多于解析结果的
-/// 缓存容量时，重复的查询不必重新解析各文件
+/// Returns at most `limit` symbols (the best ones after sorting by match rank). Name positions
+/// come from `ItemSummaries` (never evicted): when there are more project files than the parse
+/// result cache holds, repeated queries do not need to reparse every file
 pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usize) resolve.Error![]const Symbol {
     var out: std.ArrayList(Symbol) = .empty;
     for (files) |file| {
         const tree = try r.itemTree(file);
-        // 有成员匹配时才取：没有匹配的文件不必计算摘要
+        // Fetched only when a member matches: files without matches need not compute summaries
         var summaries: ?*const syntax.ItemSummaries.Summaries = null;
         for (tree.items, 0..) |item, i| {
             switch (item.kind) {
@@ -63,7 +65,7 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
     return out.items[0..@min(out.items.len, limit)];
 }
 
-/// 匹配等级：0 完全相同，1 前缀，2 子序列；不匹配为 null（均忽略大小写）
+/// Match rank: 0 exact, 1 prefix, 2 subsequence; null when there is no match (all ignoring case)
 fn match(raw_name: []const u8, query: []const u8) ?u8 {
     const name = ast.identName(raw_name);
     if (std.ascii.eqlIgnoreCase(name, query)) return 0;
@@ -87,7 +89,7 @@ test match {
 const testing = std.testing;
 const World = @import("../names/resolve_test.zig").World;
 
-/// 结果：「名字(容器):范围内的文本」以空格连接
+/// The results as "name(container):text in range", joined by spaces
 fn describe(w: *World, file: FileId, text: []const u8, query: []const u8) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -121,7 +123,8 @@ test "search returns the name token of each matching declaration" {
     try testing.expectEqualStrings("", try describe(&w, file, text, "zzz"));
 }
 
-// 防止每次查询都为匹配的成员取语法树节点：文件数多于解析结果的缓存容量时，重复查询会重新解析大部分文件
+// Guards against fetching syntax tree nodes for matching members on every query: when there are
+// more files than the parse result cache holds, repeated queries would reparse most files
 test "repeated searches do not reparse files evicted from the parse cache" {
     const n = syntax.parse_lru + 16;
     var w: World = undefined;
@@ -145,7 +148,7 @@ test "repeated searches do not reparse files evicted from the parse cache" {
     const parses = w.db.executions(syntax.ParseFile);
     try testing.expectEqual(3 * n, try Run.run(&w, &files));
     try testing.expectEqual(parses, w.db.executions(syntax.ParseFile));
-    // 编辑一个文件后：只重新解析这一个
+    // After editing one file, only that file is reparsed
     _ = try w.add("/p/f0.zig", "pub fn alpha() void {\n    _ = 1;\n}\npub const Abc = struct { a: u32 };\n");
     try testing.expectEqual(3 * n, try Run.run(&w, &files));
     try testing.expectEqual(parses + 1, w.db.executions(syntax.ParseFile));

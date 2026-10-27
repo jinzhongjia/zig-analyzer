@@ -6,9 +6,10 @@ const World = @import("../names/resolve_test.zig").World;
 const FileId = @import("../base/Vfs.zig").FileId;
 const remove_param = @import("remove_param.zig");
 
-/// 删除 `<|>`（参数名上）处的未使用参数：返回编辑后的文本（fixture 有多个文件时为改动的各个文件，每个以
-/// `//- <路径>` 开始），不能删除时为「<路径>:<行>:<列> <原因>」，不提供删除时为 "no target"。
-/// 不以 `//- ` 开始的文本是单个文件 `/p/main.zig`
+/// Removes the unused parameter at `<|>` (on the parameter name): returns the edited text (when
+/// the fixture has several files, the changed files, each starting with `//- <path>`),
+/// `<path>:<line>:<column> <reason>` when the parameter cannot be removed, or "no target" when no
+/// removal is offered. Text that does not start with `//- ` is the single file `/p/main.zig`.
 fn remove(text: []const u8) ![]const u8 {
     var w: World = undefined;
     try w.init();
@@ -49,7 +50,7 @@ fn remove(text: []const u8) ![]const u8 {
                 }
                 try out.appendSlice(testing.allocator, src[pos..]);
             }
-            // fixture 中每个文件以换行结束
+            // Each file in the fixture ends with a newline
             if (std.mem.endsWith(u8, out.items, "\n")) out.items.len -= 1;
         },
     }
@@ -126,7 +127,7 @@ test "remove parameter: plain function" {
         \\    (f)();
         \\}
     );
-    // 没有调用处
+    // No call sites
     try expectRemove(
         \\pub fn f(a: u32, <|>b: u32) u32 {
         \\    return a;
@@ -136,7 +137,7 @@ test "remove parameter: plain function" {
         \\    return a;
         \\}
     );
-    // 递归调用、字段默认值与容器级声明中的调用
+    // Recursive calls, and calls in field default values and container-level declarations
     try expectRemove(
         \\fn f(n: u32, <|>b: u32) u32 {
         \\    if (n == 0) return 0;
@@ -180,7 +181,7 @@ test "remove parameter: methods" {
         \\    return s.get() + S.get(s) + p.get();
         \\}
     );
-    // 文件作为容器，`@This()` 的别名
+    // A file as the container, and an alias of `@This()`
     try expectRemove(
         \\const Self = @This();
         \\x: u32,
@@ -200,7 +201,7 @@ test "remove parameter: methods" {
         \\    return s.get(2) + Self.get(&s, 4) + @This().get(&s, 6);
         \\}
     );
-    // 第一个参数不是接收者时可以删除
+    // The first parameter can be removed when it is not a receiver
     try expectRemove(
         \\const S = struct {
         \\    fn f(<|>a: u32, b: u32) u32 {
@@ -220,7 +221,7 @@ test "remove parameter: methods" {
         \\    return S.f(2);
         \\}
     );
-    // 泛型容器的方法
+    // A method of a generic container
     try expectRemove(
         \\fn List(comptime T: type) type {
         \\    return struct {
@@ -248,7 +249,7 @@ test "remove parameter: methods" {
         \\    return l.get(0) + m.get(1);
         \\}
     );
-    // 声明字面量
+    // Decl literal
     try expectRemove(
         \\const S = struct {
         \\    x: u32,
@@ -272,7 +273,7 @@ test "remove parameter: methods" {
         \\    return s;
         \\}
     );
-    // 泛型函数中的方法调用：按调用点的实例确认是方法调用
+    // A method call in a generic function: the call-site instances confirm it is a method call
     try expectRemove(
         \\const S = struct {
         \\    fn get(self: S, <|>i: u32) void {
@@ -394,7 +395,7 @@ test "remove parameter: multi-line lists" {
         \\    );
         \\}
     );
-    // 删除唯一的一项后括号之间为空
+    // Removing the only item leaves the parentheses empty
     try expectRemove(
         \\fn f(
         \\    <|>a: u32,
@@ -466,7 +467,8 @@ test "remove parameter: multiline string arguments" {
         \\    return f(1, 2);
         \\}
     );
-    // 多行字符串之后的逗号须另起一行：删除它之前的一项时保留换行
+    // The comma after a multiline string literal must go on a new line: removing the item before
+    // the string keeps the line break
     try expectRemove(
         \\fn f(<|>a: u32, b: []const u8) []const u8 {
         \\    return b;
@@ -531,7 +533,7 @@ test "remove parameter: calls in other files" {
 }
 
 test "remove parameter: test names and comptime cascades" {
-    // decltest 的名字不是调用
+    // The name of a decltest is not a call
     try expectRemove(
         \\fn f(a: u32, <|>b: u32) u32 {
         \\    return a;
@@ -547,7 +549,7 @@ test "remove parameter: test names and comptime cascades" {
         \\    _ = f(1);
         \\}
     );
-    // 删除 `x` 后 `T` 不再被使用：仍然可以删除（之后再删除 `T`）
+    // Removing `x` leaves `T` unused: the removal is still possible (`T` can be removed next)
     try expectRemove(
         \\fn f(comptime T: type, <|>x: T) void {}
         \\fn g() void {
@@ -637,7 +639,7 @@ test "remove parameter: arguments with side effects" {
         \\    });
         \\}
     , "/p/main.zig:5:17 removing the argument here would drop its side effects");
-    // 没有副作用的内建函数
+    // Builtins without side effects
     try expectRemove(
         \\fn f(a: u32, <|>b: u32) u32 {
         \\    return a;
@@ -667,7 +669,7 @@ test "remove parameter: new errors at call sites" {
         \\    return f(1, y);
         \\}
     , "/p/main.zig:5:11 the edit would cause an error here: unused local constant");
-    // 调用者的参数只传给了删除的实参
+    // A parameter of the caller is passed only as the removed argument
     try expectRemove(
         \\//- /p/main.zig module:main deps:lib
         \\const lib = @import("lib");

@@ -1,16 +1,21 @@
-//! 命名约定：按 Zig 0.17.0 风格指南的 Names 一节，由声明实际表示的东西决定名字的写法，不按 `fn` / `const` /
-//! `var` 关键字分类：
-//! - 类型与类型别名：TitleCase
-//! - 返回 `type` 的可调用对象（函数及其别名）：TitleCase
-//! - 其他可调用对象（函数、函数别名、函数指针）：camelCase
-//! - 命名空间（没有顶层字段的文件）：snake_case
-//! - 其他值：snake_case
+//! Naming conventions: following the Names section of the Zig 0.17.0 style guide, the style of a
+//! name is determined by what the declaration actually represents, not by the `fn` / `const` /
+//! `var` keyword:
+//! - Types and type aliases: TitleCase
+//! - Callables that return `type` (functions and their aliases): TitleCase
+//! - Other callables (functions, function aliases, function pointers): camelCase
+//! - Namespaces (files without top-level fields): snake_case
+//! - Other values: snake_case
 //!
-//! 字段与枚举成员按字段的类型同样分类。只在能可靠判断时给出结论，以下情况跳过：类型未知或取决于泛型实例
-//! （抽象的类型参数）、没有字段的结构体（是命名空间还是要实例化的零大小类型取决于意图）、持有类型的字段与可选的
-//! 函数指针（惯例不一）、extern / export 声明与 extern 容器（名字沿用外部 ABI）、以同名重新导出的别名
-//! （`const X = c.X;`）、分词不明确的名字（见 `split`）。
-//! 只用抽象实例的推导结果，不以调用点的某个实例的结论代替源码的规则。
+//! Fields and enum members are classified the same way, by the type of the field. A verdict is
+//! given only when it can be determined reliably; the following are skipped: types that are
+//! unknown or depend on the generic instance (abstract type parameters), structs without fields
+//! (whether one is a namespace or a zero-sized type to be instantiated depends on intent), fields
+//! holding types and optional function pointers (conventions vary), extern / export declarations
+//! and extern containers (names follow the external ABI), aliases re-exported under the same name
+//! (`const X = c.X;`), and names whose word split is ambiguous (see `split`).
+//! Only inference results of the abstract instance are used; the conclusion for one particular
+//! instance at a call site does not stand in for the rule on the source.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -31,7 +36,7 @@ const TypedValue = InternPool.TypedValue;
 const queries = @import("../sema/queries.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
-/// 规则说明的链接（诊断的 `codeDescription`）
+/// Link to the description of the rules (the `codeDescription` of diagnostics)
 pub const guide_url = "https://ziglang.org/documentation/0.17.0/#Names";
 
 pub const Style = enum {
@@ -48,19 +53,20 @@ pub const Style = enum {
     }
 };
 
-/// 违反的规则：对应配置 `naming.rules` 的各项，诊断的 code 为 `naming.<规则>`
+/// The violated rule: corresponds to the entries of the `naming.rules` configuration; the
+/// diagnostic code is `naming.<rule>`
 pub const Rule = enum {
-    /// 类型与类型别名
+    /// Types and type aliases
     type,
-    /// 返回 `type` 的可调用对象
+    /// Callables that return `type`
     type_function,
-    /// 其他可调用对象
+    /// Other callables
     function,
-    /// 命名空间
+    /// Namespaces
     namespace,
-    /// 其他值
+    /// Other values
     value,
-    /// 容器的字段与枚举成员（写法按字段的类型）
+    /// Fields of containers and enum members (style by the type of the field)
     field,
 
     pub fn code(rule: Rule) []const u8 {
@@ -69,7 +75,7 @@ pub const Rule = enum {
         };
     }
 
-    /// 非字段的规则要求的写法
+    /// The style that a non-field rule requires
     fn style(rule: Rule) Style {
         return switch (rule) {
             .type, .type_function => .title_case,
@@ -79,9 +85,9 @@ pub const Rule = enum {
     }
 };
 
-// ── 分词与写法 ───────────────────────────────────────────────────────
+// ── Word splitting and styles ────────────────────────────────────────
 
-/// 名字按 `style` 的写法；分词不明确时为 null（见 `split`）
+/// The name written in `style`; null when the word split is ambiguous (see `split`)
 pub fn convert(a: Allocator, name: []const u8, style: Style) Allocator.Error!?[]const u8 {
     const words = try split(a, name) orelse return null;
     var out: std.ArrayList(u8) = .empty;
@@ -97,14 +103,20 @@ pub fn convert(a: Allocator, name: []const u8, style: Style) Allocator.Error!?[]
     return out.items;
 }
 
-/// 名字分成单词：以 `_` 分隔，其间大写字母开始新的单词，数字归入前一个单词（`readU32Be` 为 `read`、`U32`、`Be`）；
-/// 连续的大写字母是一个单词（缩写也按普通单词处理），其中最后一个后面跟着小写字母时归入下一个单词
-/// （`XMLParser` 为 `XML`、`Parser`）。以下情况分词不明确或可能是有意的写法，返回 null：
-/// - 没有小写字母（`ENOENT`、`MAX_SIZE`、`T`）：常见于沿用外部的既有惯例
-/// - 以 `_` 开头或结尾，或含连续的 `_`
-/// - 从连续的大写字母中分出的单词不到五个字母：缩写在哪里结束无法判断（`URLs`、`HSLuv`、`CIELChuv`、`XYZAtoLMS`）
-/// - 数字之后的大写字母后面没有小写字母（`Vec3D`：是单位还是新的单词无法判断）
-/// - 不以字母开头，或含字母、数字与 `_` 以外的字符（只能以 `@"..."` 写出的名字）
+/// Splits a name into words: separated by `_`; within the parts, an uppercase letter starts a new
+/// word, and digits belong to the preceding word (`readU32Be` is `read`, `U32`, `Be`); a run of
+/// uppercase letters is one word (acronyms are treated as ordinary words), except that its last
+/// letter joins the next word when followed by a lowercase letter (`XMLParser` is `XML`,
+/// `Parser`). Returns null when the split is ambiguous or the spelling may be intentional:
+/// - No lowercase letters (`ENOENT`, `MAX_SIZE`, `T`): common when following an existing external
+///   convention
+/// - Starts or ends with `_`, or contains consecutive `_`
+/// - A word split off from a run of uppercase letters has fewer than five letters: where the
+///   acronym ends cannot be determined (`URLs`, `HSLuv`, `CIELChuv`, `XYZAtoLMS`)
+/// - An uppercase letter after a digit is not followed by a lowercase letter (`Vec3D`: whether it
+///   is a unit or a new word cannot be determined)
+/// - Does not start with a letter, or contains characters other than letters, digits, and `_`
+///   (names that can only be written as `@"..."`)
 fn split(a: Allocator, name: []const u8) Allocator.Error!?[]const []const u8 {
     if (name.len == 0 or !std.ascii.isAlphabetic(name[0])) return null;
     var has_lower = false;
@@ -137,18 +149,20 @@ fn split(a: Allocator, name: []const u8) Allocator.Error!?[]const []const u8 {
     return words.items;
 }
 
-// ── 分类 ─────────────────────────────────────────────────────────────
+// ── Classification ───────────────────────────────────────────────────
 
-/// 一个名字不符合的规则与应有的写法
+/// The rule a name violates and the style it should have
 pub const Finding = struct {
-    /// 成员体内的局部绑定；null 为成员自身的名字
+    /// A local binding in the body of the member; null for the name of the member itself
     binding: ?Body.BindingId,
     rule: Rule,
     style: Style,
 };
 
-/// 成员自身与其体内的局部绑定（参数、局部常量与变量、捕获）中不符合命名约定的名字。只取决于源码与推导结果，
-/// 与配置无关；不保存位置，只移动源码时不重算
+/// Names that violate the naming conventions among the member itself and the local bindings in its
+/// body (parameters, local constants and variables, captures). Depends only on the source and
+/// inference results, not on configuration; positions are not stored, so it is not recomputed
+/// when the source merely moves.
 pub const Query = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -189,7 +203,7 @@ const Collector = struct {
             if (it.ast_id == key.item) break i;
         } else return;
         const item = tree.items[index];
-        // 外部符号：名字与参数名都沿用外部的写法
+        // External symbols: both the name and the parameter names follow the external spelling
         if (item.flags.is_extern or item.flags.is_export) return;
         const ip = r.ctx.db.env.ip;
         const body = try r.ctx.get(hir.ItemBody, key);
@@ -205,7 +219,8 @@ const Collector = struct {
                     try c.check(name, null, .field, .snake_case);
                 } else {
                     const ty = (try r.ctx.get(sema.DeclType, .{ .owner = key })).ty;
-                    // 持有类型的字段：标准库中写作 snake_case（`StructField.type`），惯例不一
+                    // Fields holding types: written in snake_case in the standard library
+                    // (`StructField.type`); conventions vary
                     if (ty != .type_type) if (valueCategory(ip, ty)) |rule| try c.check(name, null, .field, rule.style());
                 }
             },
@@ -216,7 +231,7 @@ const Collector = struct {
         if (res.bindings.len != body.bindings.len) return;
         for (body.bindings, res.bindings, 0..) |binding, tv, i| {
             if (binding.range.end <= binding.range.start) continue;
-            // 裸 `_` 不引入名字
+            // A bare `_` introduces no name
             if (binding.range.end - binding.range.start == 1 and std.mem.eql(u8, binding.name, "_")) continue;
             if (reexports(body, binding.init, binding.name)) continue;
             const rule = try category(r, tv) orelse continue;
@@ -231,8 +246,10 @@ const Collector = struct {
     }
 };
 
-/// 初始化表达式是对同名成员的访问（`const SDL_Window = c.SDL_Window;`）：名字由被引用的声明决定，常见于沿用
-/// C 等外部名字的绑定，被引用的声明不符合约定时在那里提示
+/// The initializer accesses a member of the same name (`const SDL_Window = c.SDL_Window;`): the
+/// name is determined by the referenced declaration, which is common for bindings that keep
+/// external names such as C names; when the referenced declaration violates the conventions, it
+/// is reported there
 fn reexports(body: *const Body, init: ?Body.ExprId, name: []const u8) bool {
     const e = init orelse return false;
     return switch (body.expr(e)) {
@@ -241,14 +258,15 @@ fn reexports(body: *const Body, init: ?Body.ExprId, name: []const u8) bool {
     };
 }
 
-/// 声明或局部绑定的值（类型与 comptime 值）对应的规则（不含 `field`）；无法可靠判断时为 null
+/// The rule (other than `field`) for the value of a declaration or local binding (types and
+/// comptime values); null when it cannot be determined reliably
 fn category(r: *Resolver, tv: TypedValue) resolve.Error!?Rule {
     if (tv.ty == .unknown) return null;
     if (tv.isType()) return typeCategory(r, tv.val orelse return null);
     return valueCategory(r.ctx.db.env.ip, tv.ty);
 }
 
-/// 值为类型 `t` 的名字：类型，或者命名空间
+/// A name whose value is the type `t`: a type, or a namespace
 fn typeCategory(r: *Resolver, t: Index) resolve.Error!?Rule {
     const ip = r.ctx.db.env.ip;
     const c = switch (ip.key(t)) {
@@ -258,33 +276,35 @@ fn typeCategory(r: *Resolver, t: Index) resolve.Error!?Rule {
     };
     const ns = try queries.namespaceOfType(r, t) orelse return null;
     const tree = try r.itemTree(ns.file);
-    // 外部 ABI 的布局：名字通常沿用外部的写法
+    // External ABI layout: names usually follow the external spelling
     if (tree.containers[ns.container].layout == .@"extern") return null;
     var fields: usize = 0;
     for (tree.containerMembers(ns.container)) |m| {
         if (tree.items[m].kind == .field) fields += 1;
     }
     return switch (c.kind) {
-        // 文件：有顶层字段的是类型，否则是命名空间
+        // Files: a type when there are top-level fields, otherwise a namespace
         .file => if (fields > 0) .type else .namespace,
-        // 没有字段的结构体是命名空间还是要实例化的零大小类型，取决于意图
+        // Whether a struct without fields is a namespace or a zero-sized type to be instantiated
+        // depends on intent
         .@"struct" => if (fields > 0) .type else null,
         .@"enum", .@"union", .@"opaque" => .type,
     };
 }
 
-/// 类型为 `ty` 的值（不是类型）：可调用对象，或者普通的值
+/// A value (not a type) of type `ty`: a callable, or an ordinary value
 fn valueCategory(ip: *InternPool, ty: Index) ?Rule {
     return switch (ip.key(ty)) {
         .unknown, .opaque_param => null,
         .fn_type => |f| callable(ip, f.ret),
         .ptr_type => |p| switch (ip.key(p.child)) {
             .fn_type => |f| if (p.size == .one) callable(ip, f.ret) else .value,
-            // 指向抽象类型的指针：在一些实例中可能是函数指针
+            // Pointer to an abstract type: it may be a function pointer in some instances
             .unknown, .opaque_param => null,
             else => .value,
         },
-        // 可选的函数指针不能直接调用，标准库中两种写法都有
+        // Optional function pointers cannot be called directly; the standard library uses both
+        // styles
         .optional_type => |child| switch (ip.key(child)) {
             .unknown, .opaque_param, .fn_type => null,
             .ptr_type => |p| switch (ip.key(p.child)) {
@@ -297,41 +317,42 @@ fn valueCategory(ip: *InternPool, ty: Index) ?Rule {
     };
 }
 
-/// 返回类型为 `ret` 的可调用对象
+/// A callable whose return type is `ret`
 fn callable(ip: *InternPool, ret: Index) ?Rule {
     if (ret == .type_type) return .type_function;
     return switch (ip.key(ret)) {
         .unknown => null,
-        // `!type`：去掉错误之后是类型，惯例不一
+        // `!type`: a type once the error is removed; conventions vary
         .error_union_type => |e| if (e.payload == .type_type or e.payload == .unknown) null else .function,
         else => .function,
     };
 }
 
-// ── 文件中的结果 ─────────────────────────────────────────────────────
+// ── Results in a file ────────────────────────────────────────────────
 
-/// 文件中一个不符合命名约定的名字
+/// A name in a file that violates the naming conventions
 pub const Located = struct {
-    /// 名字 token 的区间（字节偏移）
+    /// Range of the name token (byte offsets)
     start: u32,
     end: u32,
     name: []const u8,
     rule: Rule,
     style: Style,
-    /// 按应有的写法改写的名字（未转义）
+    /// The name rewritten in the style it should have (unescaped)
     suggestion: []const u8,
     def: Def,
-    /// 函数声明（提示的措辞）
+    /// Function declaration (for the wording of the message)
     is_fn: bool,
-    /// `pub` 声明与字段：可能被工作区之外的代码使用
+    /// `pub` declarations and fields: may be used by code outside the workspace
     public: bool,
 };
 
-/// 字节区间（两端都含）
+/// Byte range (both ends inclusive)
 pub const Span = struct { start: u32, end: u32 };
 
-/// 文件中不符合命名约定的名字，按位置排列；`span` 不为 null 时只取与它相交的。以 `@"..."` 写出的名字跳过：
-/// 转义多半是有意的写法
+/// Names in the file that violate the naming conventions, ordered by position; when `span` is not
+/// null, only those intersecting it. Names written as `@"..."` are skipped: the escaping is most
+/// likely intentional.
 pub fn findings(r: *Resolver, file: FileId, span: ?Span) resolve.Error![]const Located {
     const tree = try r.itemTree(file);
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
@@ -382,7 +403,7 @@ pub fn findings(r: *Resolver, file: FileId, span: ?Span) resolve.Error![]const L
     return out.items;
 }
 
-/// 提示的文案
+/// The message text
 pub fn message(a: Allocator, f: Located) Allocator.Error![]const u8 {
     return switch (f.rule) {
         .type => std.fmt.allocPrint(a, "`{s}` is a type and should be TitleCase: `{s}`", .{ f.name, f.suggestion }),
@@ -397,13 +418,15 @@ pub fn message(a: Allocator, f: Located) Allocator.Error![]const u8 {
     };
 }
 
-// ── 配置的匹配 ───────────────────────────────────────────────────────
+// ── Configuration matching ───────────────────────────────────────────
 
-/// `pattern` 中的 `*` 匹配任意字符序列（含 `/`），其余字符按原样匹配
+/// `*` in `pattern` matches any sequence of characters (including `/`); other characters match
+/// literally
 pub fn globMatch(pattern: []const u8, s: []const u8) bool {
     var p: usize = 0;
     var i: usize = 0;
-    // 最近一个 `*` 之后的位置与它当时对应的 `s` 中的位置：失配时让 `*` 多匹配一个字符
+    // The position after the most recent `*` and the position in `s` it corresponded to: on a
+    // mismatch, `*` is made to match one more character
     var star: ?usize = null;
     var star_i: usize = 0;
     while (i < s.len) {
@@ -424,8 +447,9 @@ pub fn globMatch(pattern: []const u8, s: []const u8) bool {
     return p == pattern.len;
 }
 
-/// 文件开头的注释标明它是生成的代码（`DO NOT EDIT`、`@generated`、`Code generated by` 等）：名字由生成器决定，
-/// 不检查。只看开头连续的注释行
+/// The comments at the start of the file mark it as generated code (`DO NOT EDIT`, `@generated`,
+/// `Code generated by`, etc.): names are determined by the generator and are not checked. Only the
+/// consecutive comment lines at the start are examined.
 pub fn isGenerated(text: []const u8) bool {
     const markers = [_][]const u8{
         "do not edit",            "@generated",              "code generated", "auto-generated",

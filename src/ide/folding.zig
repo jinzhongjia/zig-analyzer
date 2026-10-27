@@ -1,4 +1,5 @@
-//! textDocument/foldingRange：代码块、容器、参数与初始化列表、连续注释、多行字符串。
+//! textDocument/foldingRange: blocks, containers, argument, parameter and initializer lists,
+//! consecutive comments, and multiline string literals.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,7 +20,7 @@ const Builder = struct {
     arena: Allocator,
     lines: offsets.LineIndex,
     out: std.ArrayList(types.FoldingRange) = .empty,
-    /// 当前连续注释 / 多行字符串的起止行
+    /// Start and end lines of the current run of comments / multiline string literal lines
     run: ?struct { kind: Run, start: u32, end: u32 } = null,
 
     const Run = enum { comment, string };
@@ -30,7 +31,8 @@ const Builder = struct {
     }
 
     fn visit(b: *Builder, node: SyntaxNode) Allocator.Error!void {
-        // 括号类结构：从开括号所在行折叠到闭括号的前一行，使闭括号保持可见
+        // Bracketed constructs: fold from the line of the opening bracket to the line before the
+        // closing bracket, so that the closing bracket stays visible
         const open_close: ?[2]SyntaxKind = switch (node.kind()) {
             .block, .container_decl, .init_list, .switch_expr, .error_set_decl => .{ .l_brace, .r_brace },
             .arg_list, .param_list, .asm_expr => .{ .l_paren, .r_paren },
@@ -111,9 +113,9 @@ test foldingRanges {
     var found: [4]bool = @splat(false);
     for (ranges) |r| {
         if (r.startLine == 0 and r.endLine == 1) found[0] = std.mem.eql(u8, r.kind.?, "comment");
-        if (r.startLine == 2 and r.endLine == 3) found[1] = true; // 参数列表
-        if (r.startLine == 4 and r.endLine == 8) found[2] = true; // 函数体
-        if (r.startLine == 6 and r.endLine == 7) found[3] = true; // 多行字符串
+        if (r.startLine == 2 and r.endLine == 3) found[1] = true; // parameter list
+        if (r.startLine == 4 and r.endLine == 8) found[2] = true; // function body
+        if (r.startLine == 6 and r.endLine == 7) found[3] = true; // multiline string literal
     }
     try testing.expectEqual([4]bool{ true, true, true, true }, found);
 }
