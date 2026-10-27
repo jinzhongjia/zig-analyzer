@@ -4158,6 +4158,328 @@ test "auto import is not offered outside zig source files" {
     try testing.expect(!detected.import_position);
 }
 
+/// The snippet inserted by the item named `label` at the cursor: `-` when it has no snippet,
+/// `missing` when there is no such item
+fn snippetOf(w: *World, file: FileId, offset: u32, label: []const u8, options: completion.Options) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    for ((try completion.complete(&r, file, offset, options)).items) |it| {
+        if (std.mem.eql(u8, it.label, label)) return w.arena.allocator().dupe(u8, it.snippet orelse "-");
+    }
+    return "missing";
+}
+
+const call_snippet_decls =
+    \\const S = struct {
+    \\    v: u8,
+    \\    pub fn init(a: u8) S {
+    \\        return .{ .v = a };
+    \\    }
+    \\    pub fn get(self: S, index: usize, comptime T: type, value: anytype) T {
+    \\        _ = .{ self, index, value };
+    \\        return undefined;
+    \\    }
+    \\    pub fn reset(self: *S) void {
+    \\        self.v = 0;
+    \\    }
+    \\};
+    \\fn add(a: u32, b: u32) u32 {
+    \\    return a + b;
+    \\}
+    \\fn noArgs() void {}
+    \\fn discard(_: u8, label: []const u8) void {
+    \\    _ = label;
+    \\}
+    \\extern fn printf(format: [*:0]const u8, ...) c_int;
+    \\const alias = add;
+    \\fn apply(f: *const fn (u32, u32) u32, x: u32) u32 {
+    \\    return f(x, x);
+    \\}
+    \\const Handler = struct { cb: *const fn () void, n: u32 };
+    \\
+;
+
+test "completion: function and builtin calls insert argument placeholders with snippets" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "fn t() void {\n    ad<|>\n}", "add", "add(${1:a}, ${2:b})" },
+        .{ "fn t() void {\n    const x = <|>\n}", "add", "add(${1:a}, ${2:b})" },
+        .{ "fn t() void {\n    noA<|>\n}", "noArgs", "noArgs()" },
+        // A parameter named `_` uses its type as the placeholder; a varargs function ends with a
+        // stop before the `)`
+        .{ "fn t() void {\n    dis<|>\n}", "discard", "discard(${1:u8}, ${2:label})" },
+        .{ "fn t() void {\n    pri<|>\n}", "printf", "printf(${1:format}$2)" },
+        // Methods of a value skip the receiver, and comptime and anytype parameters still get
+        // placeholders; calls through the type do not skip the receiver
+        .{ "fn t(s: S) void {\n    s.ge<|>\n}", "get", "get(${1:index}, ${2:T}, ${3:value})" },
+        .{ "fn t(s: *S) void {\n    s.<|>\n}", "reset", "reset()" },
+        .{ "fn t() void {\n    S.ge<|>\n}", "get", "get(${1:self}, ${2:index}, ${3:T}, ${4:value})" },
+        // decl literal
+        .{ "fn t() void {\n    const s: S = .in<|>\n}", "init", "init(${1:a})" },
+        // Function aliases
+        .{ "fn t() void {\n    ali<|>\n}", "alias", "alias(${1:a}, ${2:b})" },
+        .{ "fn t() void {\n    const f = add;\n    f<|>\n}", "f", "f(${1:a}, ${2:b})" },
+        // Parentheses already follow the cursor
+        .{ "fn t() void {\n    ad<|>(1, 2);\n}", "add", "-" },
+        .{ "fn t() void {\n    a<|>dd(1, 2);\n}", "add", "-" },
+        .{ "fn t(s: S) void {\n    s.g<|>et(1, u8, 2);\n}", "get", "-" },
+        // Positions that expect a function value insert only the name
+        .{ "fn t() void {\n    _ = apply(ad<|>, 1);\n}", "add", "-" },
+        .{ "fn t() void {\n    _ = apply(<|>);\n}", "add", "-" },
+        .{ "fn t() void {\n    _ = apply(add, ad<|>);\n}", "add", "add(${1:a}, ${2:b})" },
+        .{ "fn t() void {\n    _ = &ad<|>;\n}", "add", "-" },
+        .{ "fn t() void {\n    @call(.auto, ad<|>, .{ 1, 2 });\n}", "add", "-" },
+        .{ "fn t() void {\n    const f: *const fn (u32, u32) u32 = ad<|>;\n}", "add", "-" },
+        .{ "fn t() void {\n    const f: *const fn (u32, u32) u32 = <|>\n}", "add", "-" },
+        .{ "fn t() void {\n    const h: Handler = .{ .cb = noA<|>, .n = 1 };\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const h: Handler = .{ .cb = <|> };\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const h: Handler = .{ .cb = noArgs, .n = ad<|> };\n}", "add", "add(${1:a}, ${2:b})" },
+        .{ "fn t() void {\n    var g: ?*const fn () void = null;\n    g = noA<|>;\n}", "noArgs", "-" },
+        .{ "fn t() *const fn () void {\n    return noA<|>;\n}", "noArgs", "-" },
+        .{ "const cb: *const fn () void = noA<|>;", "noArgs", "-" },
+        // Builtins
+        .{ "fn t() void {\n    _ = @Thi<|>;\n}", "@This", "@This()" },
+        .{ "fn t() void {\n    _ = @a<|>s;\n}", "@as", "@as(${1:T}, ${2:expression})" },
+        .{ "fn t() void {\n    _ = @TypeO<|>;\n}", "@TypeOf", "@TypeOf($1)" },
+        .{ "fn t() void {\n    _ = @a<|>s(u8, 1);\n}", "@as", "-" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ call_snippet_decls, c[0], "\n" });
+        const added = try w.add("/p/main.zig", text);
+        const got = try snippetOf(&w, added.file, added.cursor, c[1], .{ .auto_import = false, .snippets = true });
+        testing.expectEqualStrings(c[2], got) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
+test "completion: call snippets without argument placeholders, and nothing changes without snippets" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "fn t() void {\n    ad<|>\n}", "add", "add($1)" },
+        .{ "fn t() void {\n    noA<|>\n}", "noArgs", "noArgs()" },
+        .{ "fn t(s: S) void {\n    s.ge<|>\n}", "get", "get($1)" },
+        .{ "fn t(s: *S) void {\n    s.<|>\n}", "reset", "reset()" },
+        .{ "fn t() void {\n    _ = @Thi<|>;\n}", "@This", "@This()" },
+        .{ "fn t() void {\n    _ = @a<|>s;\n}", "@as", "@as($1)" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ call_snippet_decls, c[0], "\n" });
+        const added = try w.add("/p/main.zig", text);
+        const got = try snippetOf(&w, added.file, added.cursor, c[1], .{ .auto_import = false, .snippets = true, .argument_placeholders = false });
+        testing.expectEqualStrings(c[2], got) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+        // Without snippets no item has a snippet; with snippets the other items are unchanged
+        // (apart from the added snippet items)
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const plain = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
+        const with = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false, .snippets = true })).items;
+        var rest: std.ArrayList(completion.Item) = .empty;
+        for (with) |s| if (s.kind != .snippet) try rest.append(w.arena.allocator(), s);
+        try testing.expectEqual(plain.len, rest.items.len);
+        for (plain, rest.items) |p, s| {
+            try testing.expect(p.snippet == null and p.kind != .snippet);
+            try testing.expectEqualStrings(p.label, s.label);
+            if (s.snippet == null) try testing.expectEqual(p.replace, s.replace);
+        }
+    }
+}
+
+test "completion: auto-import candidates for functions insert a call along with the import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const fixture = try w.fixture(
+        \\//- /p/main.zig module:root
+        \\fn t() void {
+        \\    help<|>
+        \\}
+        \\//- /p/util.zig in:root
+        \\pub fn helper(n: u32) void {
+        \\    _ = n;
+        \\}
+    );
+    const cursor = fixture.cursor.?;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const result = try completion.complete(&r, cursor.file, cursor.offset, .{ .snippets = true });
+    const candidate = for (result.items) |item| {
+        if (item.import_edit != null and std.mem.endsWith(u8, item.label, "helper")) break item;
+    } else return error.MissingAutoImport;
+    const expected = try std.fmt.allocPrint(w.arena.allocator(), "{s}(${{1:n}})", .{candidate.label});
+    try testing.expectEqualStrings(expected, candidate.snippet.?);
+    try testing.expectEqual(cursor.offset - "help".len, candidate.replace.?.start);
+    try testing.expectEqual(cursor.offset, candidate.replace.?.end);
+    try testing.expect(candidate.sort != null);
+}
+
+test "completion: call snippets follow edits to the called function" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = try w.add("/p/main.zig", "const b = @import(\"b.zig\");\nfn t() void {\n    b.<|>\n}\n");
+    const steps = [_]struct { []const u8, []const u8 }{
+        .{ "pub fn add(a: u32, b: u32) u32 {\n    return a + b;\n}\n", "add(${1:a}, ${2:b})" },
+        // The name and position of the function stay the same; only the parameters change
+        .{ "pub fn add(x: u32, y: u32, z: u32) u32 {\n    return x + y + z;\n}\n", "add(${1:x}, ${2:y}, ${3:z})" },
+        .{ "pub fn add(x: u32, _: u8, ...) callconv(.c) u32 {\n    return x;\n}\n", "add(${1:x}, ${2:u8}$3)" },
+        .{ "pub fn add() u32 {\n    return 0;\n}\n", "add()" },
+    };
+    for (steps) |step| {
+        _ = try w.add("/p/b.zig", step[0]);
+        try testing.expectEqualStrings(step[1], try snippetOf(&w, main.file, main.cursor, "add", .{ .auto_import = false, .snippets = true }));
+    }
+}
+
+/// Labels of the snippet items (`.snippet`) at the cursor, joined with `, `
+fn snippetLabels(w: *World, file: FileId, offset: u32) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, file, offset, .{ .auto_import = false, .snippets = true })).items) |it| {
+        if (it.kind == .snippet) try labels.append(w.arena.allocator(), it.label);
+    }
+    return std.mem.join(w.arena.allocator(), ", ", labels.items);
+}
+
+/// A standard library with only `process.Init` and `Io.Writer`
+const snippet_std_root =
+    \\pub const process = struct {
+    \\    pub const Init = struct {};
+    \\};
+    \\pub const Io = struct {
+    \\    pub const Writer = struct {
+    \\        pub const Error = error{WriteFailed};
+    \\    };
+    \\};
+    \\
+;
+
+/// A project with `text` as the root file of module app and `std_root` as the root file of the
+/// standard library
+fn snippetFixture(w: *World, text: []const u8, std_root: []const u8) !World.Fixture {
+    return w.fixture(try std.mem.concat(w.arena.allocator(), u8, &.{ "//- /p/main.zig module:app\n", text, "\n//- /zig/std/std.zig std\n", std_root }));
+}
+
+test "completion: statement and declaration snippets follow the syntax position" {
+    const statements = "if, if else, for, fori, while, switch";
+    const logging = ", print, log err, log warn, log info, log debug";
+    const declarations = "fn, pub fn, test, struct, enum, union, union tagged, error set, import";
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Start of a statement in a block; snippets that use `std` only when `std` is the standard
+        // library
+        .{ "fn t() void {\n    <|>\n}", statements },
+        // Snippets that match the input come first
+        .{ "fn t() void {\n    wh<|>\n}", "while, if, if else, for, fori, switch" },
+        .{ "const std = @import(\"std\");\nfn t() void {\n    const a = 1;\n    _ = a;\n    <|>\n}", statements ++ logging },
+        .{ "const std = struct {};\nfn t() void {\n    <|>\n}", statements },
+        .{ "fn t() void {\n    if (true) {}\n    <|>\n}", statements },
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        else => {},\n    }\n    <|>\n}", statements },
+        .{ "test \"a\" {\n    <|>\n}", statements },
+        // None inside expressions
+        .{ "fn t() void {\n    const a = <|>\n}", "" },
+        .{ "fn t() void {\n    _ = .{ 1, <|> };\n}", "" },
+        .{ "fn t() void {\n    t(<|>);\n}", "" },
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        <|>\n    }\n}", "" },
+        .{ "fn t() void {\n    defer <|>\n}", "" },
+        // Start of a container member
+        .{ "<|>", declarations ++ ", std, builtin, main" },
+        .{ "const a = 1;\nfo<|>", declarations ++ ", std, builtin, main" },
+        .{ "pub <|>", "fn, struct, enum, union, union tagged, error set, import, main" },
+        .{ "/// doc\n<|>", "fn, pub fn, struct, enum, union, union tagged, error set, import, std, builtin, main" },
+        .{ "const std = @import(\"std\");\npub fn main() void {}\n<|>", declarations ++ ", builtin" },
+        .{ "const S = struct {\n    a: u8,\n    <|>\n};", declarations ++ ", std, builtin" },
+        .{ "const std = @import(\"std\");\nconst S = struct {\n    a: u8,\n    <|>\n};", declarations ++ ", builtin, format" },
+        .{ "const std = @import(\"std\");\nconst S = opaque {\n    <|>\n};", declarations ++ ", builtin" },
+        .{ "fn t() void {\n    const S = struct {\n        <|>\n    };\n    _ = S;\n}", declarations ++ ", std, builtin" },
+        // No declarations between fields
+        .{ "const S = struct {\n    a: u8,\n    <|>\n    b: u8,\n};", "" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const fixture = try snippetFixture(&w, c[0], snippet_std_root);
+        const cursor = fixture.cursor.?;
+        testing.expectEqualStrings(c[1], try snippetLabels(&w, cursor.file, cursor.offset)) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
+test "completion: snippets insert declarations that fit the position and the standard library" {
+    const cases = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
+        .{ "<|>", snippet_std_root, "main", "pub fn main() !void {$0}" },
+        .{ "<|>", snippet_std_root, "std", "const std = @import(\"std\");" },
+        .{ "<|>", snippet_std_root, "fn", "fn ${1:name}($2) ${3:!void} {$0}" },
+        .{ "<|>", snippet_std_root, "test", "test \"$1\" {$0}" },
+        // `main` takes `std.process.Init` when the standard library has it; `pub` is not inserted
+        // again when already written
+        .{ "const std = @import(\"std\");\n<|>", snippet_std_root, "main", "pub fn main(init: std.process.Init) !void {$0}" },
+        .{ "const std = @import(\"std\");\n<|>", "", "main", "pub fn main() !void {$0}" },
+        .{ "const std = @import(\"std\");\npub <|>", snippet_std_root, "main", "fn main(init: std.process.Init) !void {$0}" },
+        .{ "pub <|>", snippet_std_root, "struct", "const ${1:Name} = struct {$0};" },
+        .{ "const std = @import(\"std\");\nconst S = struct {\n    <|>\n};", snippet_std_root, "format", "pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {$0}" },
+        .{ "const std = @import(\"std\");\nconst S = struct {\n    <|>\n};", "", "format", "missing" },
+        .{ "const std = @import(\"std\");\nfn t() void {\n    <|>\n}", snippet_std_root, "print", "std.debug.print(\"$1\", .{$0});" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "for", "for ($1) |${2:value}| {$0}" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const fixture = try snippetFixture(&w, c[0], c[1]);
+        const cursor = fixture.cursor.?;
+        testing.expectEqualStrings(c[3], try snippetOf(&w, cursor.file, cursor.offset, c[2], .{ .auto_import = false, .snippets = true })) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+
+    // The replace range is the whole word at the cursor (keywords included), and the detail shows
+    // the inserted text
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn t() void {\n    wh<|>ile\n}\n");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false, .snippets = true })).items;
+    const item = for (items) |it| {
+        if (it.kind == .snippet and std.mem.eql(u8, it.label, "for")) break it;
+    } else return error.MissingSnippet;
+    try testing.expectEqual(added.cursor - 2, item.replace.?.start);
+    try testing.expectEqual(added.cursor + 3, item.replace.?.end);
+    try testing.expectEqualStrings("for (…) |value| {}", item.detail.?);
+}
+
+test "completion: no snippets outside zig source files" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/build.zig.zon", ".{\n    .value = <|>\n}");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ((try completion.complete(&r, added.file, added.cursor, .{ .snippets = true })).items) |it| {
+        try testing.expect(it.snippet == null and it.kind != .snippet);
+    }
+}
+
 test "auto import preserves rendered qualified paths and metadata" {
     var w: World = undefined;
     try w.init();

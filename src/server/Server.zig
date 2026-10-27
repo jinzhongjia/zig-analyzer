@@ -4250,6 +4250,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
                 .file => .File,
                 .folder => .Folder,
                 .label => .Reference,
+                .snippet => .Snippet,
             },
             .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
             .detail = it.detail,

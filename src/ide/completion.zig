@@ -4,6 +4,8 @@
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
 //! the declarations of enclosing containers).
 //! No completion in comments and strings (other than `@import("`).
+//! With snippets, functions and builtins complete as calls (see `addCallSnippets`), and common
+//! snippets are also offered where a statement or a declaration starts (see `addKeywordSnippets`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,10 +28,14 @@ const database = @import("../database.zig");
 const ModuleGraph = @import("../names/ModuleGraph.zig");
 const builtins = @import("builtins.zig");
 const imports = @import("../ide_db/imports.zig");
-const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
+const tree_mod = @import("../syntax/tree.zig");
+const SyntaxNode = tree_mod.SyntaxNode;
+const SyntaxToken = tree_mod.SyntaxToken;
 const ast = @import("../syntax/ast.zig");
 const isTrivia = @import("../syntax/kind.zig").isTrivia;
 const fuzzy = @import("../ide_db/fuzzy.zig");
+const engine = @import("../db/engine.zig");
+const mem = @import("../util/mem.zig");
 
 pub const Options = struct {
     auto_import: bool = true,
@@ -42,6 +48,11 @@ pub const Options = struct {
     /// A new import added by auto-import is placed where it belongs in an organized import block
     /// (configuration `imports.*`)
     imports: @import("../ide_db/organize_imports.zig").Options = .{},
+    /// Use snippets (the client supports them and they are enabled): functions complete as calls,
+    /// and common snippets are offered where a statement or a declaration starts
+    snippets: bool = false,
+    /// Call snippets insert a placeholder for each argument; otherwise only the parentheses
+    argument_placeholders: bool = true,
 };
 
 pub const Result = struct {
@@ -59,9 +70,9 @@ pub const Item = struct {
     doc: ?[]const u8 = null,
     /// Type
     detail: ?[]const u8 = null,
-    /// Range to replace (byte offsets in the file; the inserted text is `label`); when null, the
-    /// client determines it by word. Needed for characters that are not part of a word, such as `@`
-    /// and the `/` in paths.
+    /// Range to replace (byte offsets in the file; the inserted text is `label`, or `snippet` when
+    /// there is one); when null, the client determines it by word. Needed for characters that are
+    /// not part of a word, such as `@` and the `/` in paths.
     replace: ?Range = null,
     filter: ?[]const u8 = null,
     qualifier: ?[]const u8 = null,
@@ -72,42 +83,47 @@ pub const Item = struct {
     score: f32 = 0,
     import_edit: ?imports.Edit = null,
     /// The definition referred to, from which the signature and documentation are given when the
-    /// item is selected (see `describe`): for auto-import candidates and functions
+    /// item is selected (see `describe`): for auto-import candidates and functions (for an alias of
+    /// a function, the function it refers to)
     target: ?imports.Target = null,
+    /// LSP snippet inserted instead of `label`; `replace` is not null when there is one
+    snippet: ?[]const u8 = null,
 
-    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label };
+    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, snippet };
     pub const Range = struct { start: u32, end: u32 };
 };
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
-    const base = try completeVisible(r, file, offset, &owner);
-    // Auto-import only in Zig source files: inserting an import declaration into a `.zon` or
-    // similar file would break it
+    const visible = try completeVisible(r, file, offset, &owner);
+    const base = visible.items;
+    // Auto-import and snippets only in Zig source files: inserting an import declaration or code
+    // into a `.zon` or similar file would break it
     if (!imports.isZigSource(r.ctx.db.env.vfs.path(file))) return .{ .items = base };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
-    if (offset == 0 or offset > text.len) return .{ .items = base };
+    if (offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
-    const name = try importPrefix(r.arena, root, text, offset) orelse return .{ .items = base };
+    const name = if (offset == 0) null else try importPrefix(r.arena, root, text, offset);
+    if (name == null and !options.snippets) return .{ .items = base };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    var result: Result = .{ .items = &.{}, .import_position = options.auto_import or options.detect_import_position };
-    if (options.auto_import) {
-        const extra = try imports.complete(r, file, offset, owner, name.prefix, options.max_auto_imports, options.imports);
+    var result: Result = .{ .items = &.{}, .import_position = name != null and (options.auto_import or options.detect_import_position) };
+    if (name) |n| if (options.auto_import) {
+        const extra = try imports.complete(r, file, offset, owner, n.prefix, options.max_auto_imports, options.imports);
         result.is_incomplete = extra.is_incomplete;
         for (extra.items) |candidate| {
             // The core (`imports.complete`) has already rendered the path segment by segment;
             // the whole qualified expression must not be escaped as an identifier again.
-            const filter = try completionFilter(r.arena, name, candidate.filter);
+            const filter = try completionFilter(r.arena, n, candidate.filter);
             var duplicate = false;
-            for (items.items[0..base.len]) |*visible| if (std.mem.eql(u8, visible.label, candidate.label)) {
+            for (items.items[0..base.len]) |*visible_item| if (std.mem.eql(u8, visible_item.label, candidate.label)) {
                 // Only visible bindings are merged; auto-import items with the same name from
                 // different sources must remain separate choices.
                 if (candidate.import_edit == null) {
-                    visible.replace = name.range;
-                    visible.filter = filter;
-                    visible.qualifier = candidate.qualifier;
-                    visible.target = candidate.target;
+                    visible_item.replace = n.range;
+                    visible_item.filter = filter;
+                    visible_item.qualifier = candidate.qualifier;
+                    visible_item.target = candidate.target;
                 }
                 duplicate = true;
                 break;
@@ -127,7 +143,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
                     .file => .file,
                 },
                 .doc = candidate.doc,
-                .replace = name.range,
+                .replace = n.range,
                 .filter = filter,
                 .qualifier = candidate.qualifier,
                 .score = candidate.score,
@@ -135,8 +151,16 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
                 .target = candidate.target,
             });
         }
+    };
+    if (options.snippets) {
+        const pos: ?Position = switch (visible.context) {
+            .none, .scope => try positionOf(r.arena, root, text, offset),
+            else => null,
+        };
+        try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
+        if (pos) |p| try addKeywordSnippets(r, file, text, offset, visible, p, &items);
     }
-    try rank(r.arena, items.items, name.prefix);
+    if (name) |n| try rank(r.arena, items.items, n.prefix);
     result.items = items.items;
     return result;
 }
@@ -216,37 +240,70 @@ fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
     return if (out.items.len == 0) null else out.items;
 }
 
+/// The completion items at the cursor and the context of the cursor
+const Visible = struct {
+    items: []const Item = &.{},
+    context: Context = .none,
+    /// `.member`: the left-hand side is a value (not a type or namespace), which is the first
+    /// argument when a function in it is called
+    bound: bool = false,
+    /// `.scope`: the member and the scope at the cursor
+    item: u32 = 0,
+    scope: Body.ScopeId = .root,
+    /// Inference result of the member at the cursor (when computed)
+    at: ?context.At = null,
+
+    const Context = enum {
+        /// Not in any member
+        none,
+        /// In a comment or string, or past the end of the text
+        ignored,
+        builtin,
+        import_path,
+        label,
+        /// After `lhs.`
+        member,
+        error_name,
+        /// After `.` (enum literals, decl literals)
+        enum_literal,
+        /// Field name in an initializer
+        init_field,
+        /// Names in scope
+        scope,
+    };
+};
+
 /// `cursor_owner` records the member found at the cursor, which auto-import reuses
-fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error![]const Item {
+fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
-    if (offset > text.len) return &.{};
+    if (offset > text.len) return .{ .context = .ignored };
 
     const literal = try commentOrString(r, file, offset);
-    if (literal == .comment) return &.{};
+    if (literal == .comment) return .{ .context = .ignored };
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
     if (literal == .none) if (builtinStart(text, offset)) |start| {
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
-        return out.items.items;
+        return .{ .items = out.items.items, .context = .builtin };
     };
     if (importString(text, offset)) |start| {
         try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = offset });
-        return out.items.items;
+        return .{ .items = out.items.items, .context = .import_path };
     }
-    if (literal == .string) return &.{};
+    if (literal == .string) return .{ .context = .ignored };
 
     cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) };
-    const item = cursor_owner.known orelse return &.{};
-    const node = try r.itemNode(file, item) orelse return &.{};
+    const item = cursor_owner.known orelse return .{};
+    const node = try r.itemNode(file, item) orelse return .{};
     const b = try r.body(file, item);
     const rel = offset - node.offset;
 
     if (labelStart(text, offset) != null) {
         var s: ?Body.ScopeId = b.scopeAt(rel);
         while (s) |id| : (s = b.scope(id).parent) if (b.scope(id).label) |l| try out.add(.{ .label = l.name, .kind = .label });
-        return out.items.items;
+        return .{ .items = out.items.items, .context = .label };
     }
 
     // `lhs.` / `lhs.na`: the character before the cursor is inside a field access, and not
@@ -256,13 +313,14 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             out.member_mode = true;
             if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
                 try members(r, &out, ns, ns.file == file);
-                return out.items.items;
+                return .{ .items = out.items.items, .context = .member };
             }
             // Via the type: fields and methods of the instance (inside the body of a generic
             // function, use the instance from a call site)
-            const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
-            try typedMembers(r, &out, a.exprType(fa.lhs), file);
-            return out.items.items;
+            const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .member };
+            const tv = a.exprType(fa.lhs);
+            try typedMembers(r, &out, tv, file);
+            return .{ .items = out.items.items, .context = .member, .bound = !tv.isType(), .at = a };
         },
         else => {},
     };
@@ -270,22 +328,22 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .error_value) {
         out.member_mode = true;
         try errorNames(r, &out, file, offset, item, e);
-        return out.items.items;
+        return .{ .items = out.items.items, .context = .error_name };
     };
 
     // `.` / `.na` (enum literals, decl literals): list members by the expected type; in an
     // initializer (`.{ .x = 1, .| }`), list the fields not yet assigned
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
         out.member_mode = true;
-        const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
+        const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .enum_literal };
         if (initOf(b, e)) |init| {
             const x = b.expr(init).init;
-            const ty = if (x.ty == null) a.literalExpected(init) orelse return &.{} else a.exprType(init).ty;
+            const ty = if (x.ty == null) a.literalExpected(init) orelse return .{ .context = .init_field } else a.exprType(init).ty;
             try initFields(r, &out, ty, x.fields);
-            return out.items.items;
+            return .{ .items = out.items.items, .context = .init_field };
         }
-        try expectedMembers(r, &out, a.literalExpected(e) orelse return &.{}, file);
-        return out.items.items;
+        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, file);
+        return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
 
     // Names in scope: when the cursor immediately follows a name, use the scope of that name
@@ -295,8 +353,9 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     } else b.scopeAt(rel) else b.scopeAt(rel);
     // The kinds of local names come from the inference result of the member at the cursor
     // (inside a generic function body, from a call-site instance)
-    const types: BindingTypes = if (try context.atSeeded(r, file, offset, true)) |a| .{ .at = a } else .none;
-    try locals(&out, r.ctx.db.env.ip, b, scope, null, types);
+    const at = try context.atSeeded(r, file, offset, true);
+    const types: BindingTypes = if (at) |a| .{ .at = a } else .none;
+    try locals(r, &out, b, scope, null, types);
 
     const tree = try r.itemTree(file);
     var container = tree.items[item].container;
@@ -312,10 +371,10 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
         const parent_res = try r.ctx.get(database.sema.Infer, .{ .owner = try r.ownerKey(file, parent), .mode = .full });
-        try locals(&out, r.ctx.db.env.ip, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res });
+        try locals(r, &out, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res });
         container = tree.items[parent].container;
     }
-    return out.items.items;
+    return .{ .items = out.items.items, .context = .scope, .item = item, .scope = scope, .at = at };
 }
 
 const ImportPrefix = struct {
@@ -471,15 +530,18 @@ const BindingTypes = union(enum) {
 
 /// When `weight` is null, the weight follows the kind of the binding; otherwise every name gets
 /// `weight` (names in an enclosing function)
-fn locals(out: *Collector, ip: *InternPool, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes) Allocator.Error!void {
+fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes) resolve.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
         for (b.scope(id).bindings) |bid| {
             const binding = b.binding(bid);
+            const tv = types.of(bid);
+            const kind = kindOf(symbol_kind.ofBinding(r.ctx.db.env.ip, binding, tv));
             try out.add(.{
                 .label = binding.name,
-                .kind = kindOf(symbol_kind.ofBinding(ip, binding, types.of(bid))),
+                .kind = kind,
                 .weight = weight orelse if (binding.kind == .param) param_weight else local_weight,
+                .target = if (kind == .function) try fnTarget(r, tv) else null,
             });
         }
     }
@@ -498,7 +560,14 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
         }
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
         const kind = kindOf(try symbol_kind.ofDecl(r, file, m));
-        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = if (it.kind == .@"fn") .{ .decl = .{ .file = file, .item = m } } else null, .weight = weight });
+        const target: ?imports.Target = switch (it.kind) {
+            .@"fn" => .{ .decl = .{ .file = file, .item = m } },
+            // An alias of a function: the function it refers to (the type of the declaration has
+            // already been computed for the kind)
+            .@"const" => if (kind == .function) try fnTarget(r, try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = file, .item = it.ast_id } })) else null,
+            else => null,
+        };
+        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = target, .weight = weight });
     }
 }
 
@@ -834,4 +903,664 @@ fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolv
         const it = tree.items[m];
         if (it.kind == .field) if (it.name) |name| try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc });
     }
+}
+
+// ── snippet ──────────────────────────────────────────────────────────
+
+/// Source weight of snippets (see `rank`): below names in scope and auto-import candidates
+/// accessed through an existing namespace (`imports.visible_weight`), above candidates that need a
+/// new import (`imports.import_weight`)
+const snippet_weight = 0.8;
+
+/// Syntactic position of the word at the cursor
+const Position = struct {
+    /// Range of the word: the identifier characters before and after the cursor
+    start: u32,
+    end: u32,
+    /// The last token before the word (skipping comments)
+    prev: ?SyntaxToken,
+    /// The word immediately follows `pub`
+    after_pub: bool = false,
+    /// A doc comment precedes the word (or the `pub` it follows)
+    doc: bool = false,
+    kind: Kind = .other,
+    /// For `.statement`, the enclosing block; for `.member`, the enclosing container
+    /// (`container_decl` or the file)
+    node: ?SyntaxNode = null,
+
+    const Kind = enum {
+        /// Start of a statement in a block
+        statement,
+        /// Start of a container member
+        member,
+        other,
+    };
+};
+
+fn positionOf(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u32) Allocator.Error!Position {
+    var start = offset;
+    while (start > 0 and isIdentChar(text[start - 1])) start -= 1;
+    var pos: Position = .{ .start = start, .end = identEnd(text, offset), .prev = tokenBefore(root, start) };
+    var before = pos.prev;
+    var gap_end = start;
+    if (before) |p| if (p.kind == .keyword_pub) {
+        pos.after_pub = true;
+        gap_end = p.offset;
+        before = tokenBefore(root, p.offset);
+    };
+    const gap_start = if (before) |p| p.range().end else 0;
+    pos.doc = hasDocComment(text[gap_start..gap_end]);
+    const node = try scopeAfter(arena, root, before) orelse return pos;
+    pos.node = node;
+    pos.kind = switch (node.kind()) {
+        .block => .statement,
+        .source_file, .container_decl => .member,
+        else => .other,
+    };
+    return pos;
+}
+
+/// The last token before `offset`, skipping whitespace and comments (including doc comments)
+fn tokenBefore(root: SyntaxNode, offset: u32) ?SyntaxToken {
+    var at = offset;
+    while (at > 0) {
+        const t = root.tokenAtOffset(at - 1) orelse return null;
+        switch (t.kind) {
+            .doc_comment, .container_doc_comment => {},
+            else => if (!isTrivia(t.kind)) return t,
+        }
+        at = t.offset;
+    }
+    return null;
+}
+
+/// The text contains a `///` doc comment (`////` is a normal comment)
+fn hasDocComment(gap: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, gap, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trimStart(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "///") and !std.mem.startsWith(u8, t, "////")) return true;
+    }
+    return false;
+}
+
+/// The block or container of a statement or member that starts after `prev`: `prev` is the `{` of
+/// a block or container, the `;` or `}` that ends a statement or member, or the `,` that ends a
+/// field; without `prev`, the file. Null at other positions
+fn scopeAfter(arena: Allocator, root: SyntaxNode, prev: ?SyntaxToken) Allocator.Error!?SyntaxNode {
+    const p = prev orelse return root;
+    switch (p.kind) {
+        .l_brace, .semicolon, .comma, .r_brace => {},
+        else => return null,
+    }
+    const path = try root.coveringPath(arena, p.offset);
+    var i = path.len - 1;
+    switch (p.kind) {
+        .l_brace => return path[i],
+        // Statements that end with a block (`if`, `while`, `switch`, etc.) need no semicolon
+        .r_brace => switch (path[i].kind()) {
+            .block, .switch_expr => {},
+            else => return null,
+        },
+        else => {},
+    }
+    // Outside the statement or member that ends at `prev`
+    const end = p.range().end;
+    while (i > 0 and path[i].range().end == end) i -= 1;
+    const node = path[i];
+    if (p.kind == .comma and node.kind() != .container_decl and node.kind() != .source_file) return null;
+    return node;
+}
+
+/// Functions complete as calls (`f(${1:a}, ${2:b})`), skipping the receiver parameter for members
+/// of a value (method calls); builtins complete as calls too. Only the name is inserted when `(`
+/// already follows the cursor or the position expects a function value (see `expectsFnValue`).
+/// When completing in scope, declaration names and names at the start of a container member do not
+/// complete as calls
+fn addCallSnippets(r: *Resolver, file: FileId, text: []const u8, root: SyntaxNode, offset: u32, visible: Visible, pos: ?Position, items: []Item, placeholders: bool) resolve.Error!void {
+    const word: ?Item.Range = switch (visible.context) {
+        // Builtin items already have a replace range
+        .builtin => null,
+        .member, .enum_literal => callWord(root, text, offset, visible.context) orelse return,
+        .scope => blk: {
+            const p = pos orelse return;
+            if (p.kind == .member or p.after_pub) return;
+            if (p.prev) |prev| switch (prev.kind) {
+                .keyword_const, .keyword_var, .keyword_fn, .keyword_test => return,
+                else => {},
+            };
+            break :blk callWord(root, text, offset, .scope) orelse return;
+        },
+        else => return,
+    };
+    const bound = visible.context == .member and visible.bound;
+    var fn_value: ?bool = null;
+    for (items) |*it| {
+        const range = it.replace orelse word orelse continue;
+        if (range.end < text.len and text[range.end] == '(') continue;
+        it.snippet = switch (it.kind) {
+            .builtin => try builtinSnippet(r.arena, builtins.get(it.label) orelse continue, placeholders),
+            .function, .method => blk: {
+                const w = word orelse continue;
+                const def = try calledFn(r, it.target) orelse continue;
+                if (fn_value == null) fn_value = try expectsFnValue(r, file, root, offset, visible, w);
+                if (fn_value.?) continue;
+                break :blk try callSnippet(r, def, it.label, bound, placeholders);
+            },
+            else => continue,
+        };
+        it.replace = range;
+    }
+}
+
+/// Range replaced by a call: from the name before the cursor (from the cursor when there is none)
+/// to the end of the identifier characters after it. Null when the word before the cursor is a
+/// keyword or a number, or, when completing in scope, not a name in an expression (a declaration
+/// name, a capture name, etc.)
+fn callWord(root: SyntaxNode, text: []const u8, offset: u32, ctx: Visible.Context) ?Item.Range {
+    if (offset > 0) if (root.tokenAtOffset(offset - 1)) |t| if (t.kind == .identifier) {
+        if (ctx == .scope and tokenParent(root, offset - 1) != .name_ref) return null;
+        return .{ .start = t.offset, .end = t.range().end };
+    };
+    if (offset > 0 and isIdentChar(text[offset - 1])) return null;
+    return .{ .start = offset, .end = identEnd(text, offset) };
+}
+
+/// The function declaration an item refers to: the function, or the function an alias refers to
+fn calledFn(r: *Resolver, target: ?imports.Target) resolve.Error!?resolve.Def {
+    const d = switch (target orelse return null) {
+        .decl => |d| d,
+        .file => return null,
+    };
+    const it = (try r.itemTree(d.file)).items[d.item];
+    switch (it.kind) {
+        .@"fn" => return .{ .item = .{ .file = d.file, .item = d.item } },
+        .@"const" => {
+            const t = try fnTarget(r, try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = it.ast_id } })) orelse return null;
+            return .{ .item = .{ .file = t.decl.file, .item = t.decl.item } };
+        },
+        else => return null,
+    }
+}
+
+/// Snippet calling `def`: the placeholders of the parameters come from `CallParams`; when `bound`,
+/// the first parameter (the receiver) is skipped. Without placeholders the cursor stops inside the
+/// parentheses; with varargs `...` the last stop is before the `)`, where the remaining arguments
+/// can follow
+fn callSnippet(r: *Resolver, def: resolve.Def, label: []const u8, bound: bool, placeholders: bool) resolve.Error![]const u8 {
+    const d = def.item;
+    const params = try r.ctx.get(CallParams, .{ .file = d.file, .item = (try r.itemTree(d.file)).items[d.item].ast_id });
+    var out: std.ArrayList(u8) = .empty;
+    try appendEscaped(r.arena, &out, label);
+    try out.append(r.arena, '(');
+    var n: u32 = 0;
+    var rest = false;
+    // Varargs `...` come after `names`
+    const total = params.names.len + @intFromBool(params.varargs);
+    for (@min(@intFromBool(bound), total)..total) |i| {
+        if (!placeholders or i == params.names.len) {
+            rest = true;
+            break;
+        }
+        if (n > 0) try out.appendSlice(r.arena, ", ");
+        n += 1;
+        try out.print(r.arena, "${{{d}:", .{n});
+        try appendEscaped(r.arena, &out, params.names[i]);
+        try out.append(r.arena, '}');
+    }
+    if (rest) try out.print(r.arena, "${d}", .{n + 1});
+    try out.append(r.arena, ')');
+    return out.items;
+}
+
+/// Placeholders of the parameters of a function declaration in call snippets. The value is small
+/// and never evicted: the functions listed by completion are spread across many files, which then
+/// need not be parsed again after their parse results are evicted
+pub const CallParams = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = database.hir.OwnerKey;
+    pub const Value = struct {
+        arena: std.heap.ArenaAllocator.State,
+        /// Placeholders of the parameters before varargs `...`: the parameter name, or the type
+        /// when the parameter has no name or is `_`
+        names: []const []const u8,
+        /// The last parameter is varargs `...`
+        varargs: bool,
+    };
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        var arena: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var names: std.ArrayList([]const u8) = .empty;
+        var varargs = false;
+        const node = (try ctx.get(database.syntax.FileAstIdMap, key.file)).get(key.item);
+        if (node) |n| if (ast.cast(ast.FnDecl, n)) |f| if (f.proto()) |proto| {
+            var params = proto.params();
+            while (params.next()) |p| {
+                const param = ast.cast(ast.Param, p).?;
+                if (param.syntax.childToken(.ellipsis3) != null) {
+                    varargs = true;
+                    break;
+                }
+                try names.append(a, try placeholder(a, param));
+            }
+        };
+        return .{ .arena = arena.state, .names = names.items, .varargs = varargs };
+    }
+
+    fn placeholder(a: Allocator, p: ast.Param) Allocator.Error![]const u8 {
+        if (p.name()) |t| if (!std.mem.eql(u8, t.text, "_")) return a.dupe(u8, t.text);
+        if (p.typeExpr()) |t| return ast.collapsedAlloc(a, t);
+        return "anytype";
+    }
+
+    pub fn eql(x: Value, y: Value) bool {
+        if (x.varargs != y.varargs or x.names.len != y.names.len) return false;
+        for (x.names, y.names) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+        return true;
+    }
+
+    pub fn bytes(v: Value) usize {
+        return mem.arenaBytes(v.arena);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        var arena = v.arena.promote(gpa);
+        arena.deinit();
+    }
+};
+
+/// Snippet calling a builtin: the placeholders are the names of the documented parameters (without
+/// `comptime`, `noalias` and the types); varargs as in `callSnippet`. For a builtin without
+/// documented parameters, the parameter count of the compiler decides whether arguments are needed
+fn builtinSnippet(arena: Allocator, entry: *const builtins.Entry, placeholders: bool) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try appendEscaped(arena, &out, entry.name);
+    try out.append(arena, '(');
+    var n: u32 = 0;
+    var rest = false;
+    for (entry.parameters) |raw| {
+        var param = std.mem.trim(u8, raw, " \t\r\n");
+        if (!placeholders or std.mem.eql(u8, param, "...")) {
+            rest = true;
+            break;
+        }
+        for ([_][]const u8{ "comptime ", "noalias " }) |prefix| {
+            if (std.mem.startsWith(u8, param, prefix)) param = param[prefix.len..];
+        }
+        if (std.mem.indexOfScalar(u8, param, ':')) |colon| param = std.mem.trimEnd(u8, param[0..colon], " ");
+        if (n > 0) try out.appendSlice(arena, ", ");
+        n += 1;
+        try out.print(arena, "${{{d}:", .{n});
+        try appendEscaped(arena, &out, param);
+        try out.append(arena, '}');
+    }
+    if (rest or (n == 0 and (entry.compiler_param_count orelse 1) > 0)) try out.print(arena, "${d}", .{n + 1});
+    try out.append(arena, ')');
+    return out.items;
+}
+
+/// Text inserted verbatim in a snippet: escapes `$`, `}` and `\`
+fn appendEscaped(arena: Allocator, out: *std.ArrayList(u8), text: []const u8) Allocator.Error!void {
+    for (text) |c| {
+        if (c == '$' or c == '}' or c == '\\') try out.append(arena, '\\');
+        try out.append(arena, c);
+    }
+}
+
+/// Position of a name in an expression
+const Slot = union(enum) {
+    none,
+    /// `&f`, the callee of `@call`
+    fn_value,
+    /// Argument `index` of the call `call`
+    arg: struct { call: Body.ExprId, index: u32 },
+    /// Value of field `index` in the initializer `init`
+    field: struct { init: Body.ExprId, index: u32 },
+    /// Right-hand side of an assignment (`=`); the payload is the left-hand side
+    assign: Body.ExprId,
+    /// Initializer of a local variable
+    local: Body.BindingId,
+    /// Value of a member: the initializer of a variable, the default value of a field
+    value,
+    @"return",
+};
+
+/// The position of the name at the cursor expects a function value: `&f`, the callee of `@call`,
+/// and arguments, fields, assignments, variables and return values whose type is a function or a
+/// function pointer (including inside optionals and error unions)
+fn expectsFnValue(r: *Resolver, file: FileId, root: SyntaxNode, offset: u32, visible: Visible, word: Item.Range) resolve.Error!bool {
+    const a = visible.at orelse try context.atSeeded(r, file, offset, true) orelse return false;
+    const slot: Slot = switch (visible.context) {
+        .member => exprSlot(a.body, a.rel, .field_access),
+        .scope => if (word.start < offset) exprSlot(a.body, a.rel, .name_ref) else try emptySlot(r.arena, root, a, offset),
+        else => return false,
+    };
+    return slotIsFn(r, a, slot);
+}
+
+/// Position of the expression containing the character before the cursor, which must be a `tag`
+fn exprSlot(b: *const Body, rel: u32, tag: std.meta.Tag(Body.Expr)) Slot {
+    if (rel == 0) return .none;
+    const e = b.exprAt(rel - 1) orelse return .none;
+    return if (std.meta.activeTag(b.expr(e)) == tag) slotOf(b, e) else .none;
+}
+
+fn slotOf(b: *const Body, e: Body.ExprId) Slot {
+    for (b.exprs, 0..) |x, i| {
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        switch (x) {
+            .prefix => |p| if (p.operand == e and p.op == .ampersand) return .fn_value,
+            .builtin_call => |c| if (std.mem.eql(u8, c.name, "@call") and c.args.len > 1 and c.args[1] == e) return .fn_value,
+            .call => |c| for (c.args, 0..) |arg, j| {
+                if (arg == e) return .{ .arg = .{ .call = id, .index = @intCast(j) } };
+            },
+            .init => |init| for (init.fields, 0..) |f, j| {
+                if (f.value == e) return if (f.name != null) .{ .field = .{ .init = id, .index = @intCast(j) } } else .none;
+            },
+            .assign => |x_| if (x_.rhs == e and x_.op == .equal) return .{ .assign = x_.lhs },
+            .@"return" => |v| if (v) |value| if (value == e) return .@"return",
+            else => {},
+        }
+    }
+    for (b.bindings, 0..) |binding, i| if (binding.init) |init| if (init == e) return .{ .local = @fromBackingInt(@as(u32, @intCast(i))) };
+    if (b.value) |value| if (value == e) return .value;
+    return .none;
+}
+
+/// Position at the cursor when no name precedes it: the expression is missing and has no position
+/// in the Body, so the position follows from the token before the cursor
+fn emptySlot(arena: Allocator, root: SyntaxNode, a: context.At, offset: u32) Allocator.Error!Slot {
+    const b = a.body;
+    const p = tokenBefore(root, offset) orelse return .none;
+    if (p.offset < a.node.offset) return .none;
+    const rel = p.offset - a.node.offset;
+    if (b.exprAt(rel)) |e| switch (b.expr(e)) {
+        .call => |c| if (p.kind == .l_paren or p.kind == .comma) return .{ .arg = .{ .call = e, .index = argsBefore(b, c.args, rel) } },
+        .builtin_call => |c| if (p.kind == .comma and std.mem.eql(u8, c.name, "@call") and argsBefore(b, c.args, rel) == 1) return .fn_value,
+        .prefix => |x| if (p.kind == .ampersand and x.op == .ampersand) return .fn_value,
+        .@"return" => if (p.kind == .keyword_return) return .@"return",
+        .init => |init| if (p.kind == .equal) {
+            // The last field name before the `=`
+            var index: ?usize = null;
+            for (init.fields, 0..) |f, j| {
+                if (f.name != null and f.name_range.end <= rel) index = j;
+            }
+            if (index) |j| return .{ .field = .{ .init = e, .index = @intCast(j) } };
+        },
+        .assign => |x| if (p.kind == .equal and x.op == .equal) return .{ .assign = x.lhs },
+        else => {},
+    };
+    if (p.kind != .equal) return .none;
+    // Variables and fields whose initializer is not written yet (`const f: T = `)
+    const path = try root.coveringPath(arena, p.offset);
+    const decl = path[path.len - 1];
+    if (decl.offset == a.node.offset) return switch (decl.kind()) {
+        .var_decl, .container_field => .value,
+        else => .none,
+    };
+    if (decl.kind() != .var_decl) return .none;
+    const name = (ast.VarDecl{ .syntax = decl }).name() orelse return .none;
+    for (b.bindings, 0..) |binding, i| {
+        if (binding.kind != .param and binding.range.start == name.offset - a.node.offset) return .{ .local = @fromBackingInt(@as(u32, @intCast(i))) };
+    }
+    return .none;
+}
+
+/// Number of arguments that end before `rel` (missing arguments have no position and are not
+/// counted)
+fn argsBefore(b: *const Body, args: []const Body.ExprId, rel: u32) u32 {
+    var n: u32 = 0;
+    for (args) |arg| {
+        const range = b.range(arg);
+        if (range.end > range.start and range.end <= rel) n += 1;
+    }
+    return n;
+}
+
+fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
+    const b = a.body;
+    switch (slot) {
+        .none => return false,
+        .fn_value => return true,
+        .arg => |arg| {
+            const c = try context.callee(r, a, b.expr(arg.call).call.callee) orelse return false;
+            return paramIsFn(r, c.def, arg.index + @intFromBool(c.bound));
+        },
+        .field => |f| {
+            const key = a.fieldRef(f.init, f.index) orelse return false;
+            if (isFnType(a.ip, (try r.ctx.get(queries.DeclType, .{ .owner = key })).ty)) return true;
+            const def = try context.defOfKey(r, key) orelse return false;
+            const fb = try r.body(def.item.file, def.item.item);
+            return if (fb.type_expr) |t| isFnTypeExpr(fb, t) else false;
+        },
+        .assign => |lhs| return isFnType(a.ip, a.exprType(lhs).ty),
+        .local => |id| return typeExprIsFn(a, b.binding(id).ty),
+        .value, .@"return" => return typeExprIsFn(a, b.type_expr),
+    }
+}
+
+/// The type of parameter `index` of the function `def` is a function or a function pointer
+fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
+    const d = switch (def) {
+        .item => |d| d,
+        else => return false,
+    };
+    const it = (try r.itemTree(d.file)).items[d.item];
+    if (it.kind != .@"fn") return false;
+    const fb = try r.body(d.file, d.item);
+    if (index < fb.params.len) if (fb.binding(fb.params[index]).ty) |t| if (isFnTypeExpr(fb, t)) return true;
+    const ip = r.ctx.db.env.ip;
+    return switch (ip.key((try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = it.ast_id } })).ty)) {
+        .fn_type => |f| index < f.params.len and isFnType(ip, f.params[index]),
+        else => false,
+    };
+}
+
+/// The type annotation is a function or a function pointer: by syntax, or by the computed type (for
+/// aliases)
+fn typeExprIsFn(a: context.At, t: ?Body.ExprId) bool {
+    const e = t orelse return false;
+    if (isFnTypeExpr(a.body, e)) return true;
+    return if (a.exprType(e).asType()) |ty| isFnType(a.ip, ty) else false;
+}
+
+/// Function types, single pointers to functions, and optionals and error unions of them
+fn isFnTypeExpr(b: *const Body, e: Body.ExprId) bool {
+    var cur = e;
+    while (true) cur = switch (b.expr(cur)) {
+        .optional_type => |child| child,
+        .error_union_type => |eu| eu.payload,
+        .ptr_type => |p| if (p.size == .one) p.child else return false,
+        .fn_type => return true,
+        else => return false,
+    };
+}
+
+/// Like `isFnTypeExpr`, for a computed type
+fn isFnType(ip: *InternPool, t: Index) bool {
+    var cur = t;
+    while (true) cur = switch (ip.key(cur)) {
+        .optional_type => |child| child,
+        .error_union_type => |eu| eu.payload,
+        .ptr_type => |p| if (p.size == .one) p.child else return false,
+        .fn_type => return true,
+        else => return false,
+    };
+}
+
+const Snippet = struct {
+    label: []const u8,
+    text: []const u8,
+    /// Cannot follow `pub`
+    no_pub: bool = false,
+    /// Cannot have a doc comment
+    no_doc: bool = false,
+};
+
+/// Snippets at the start of a statement
+const statement_snippets = [_]Snippet{
+    .{ .label = "if", .text = "if ($1) {$0}" },
+    .{ .label = "if else", .text = "if ($1) {$2} else {$0}" },
+    .{ .label = "for", .text = "for ($1) |${2:value}| {$0}" },
+    .{ .label = "fori", .text = "for ($1, 0..) |${2:value}, ${3:i}| {$0}" },
+    .{ .label = "while", .text = "while ($1) {$0}" },
+    .{ .label = "switch", .text = "switch ($1) {$0}" },
+};
+
+/// Snippets at the start of a statement when `std` is the standard library
+const std_statement_snippets = [_]Snippet{
+    .{ .label = "print", .text = "std.debug.print(\"$1\", .{$0});" },
+    .{ .label = "log err", .text = "std.log.err(\"$1\", .{$0});" },
+    .{ .label = "log warn", .text = "std.log.warn(\"$1\", .{$0});" },
+    .{ .label = "log info", .text = "std.log.info(\"$1\", .{$0});" },
+    .{ .label = "log debug", .text = "std.log.debug(\"$1\", .{$0});" },
+};
+
+/// Snippets at the start of a container member
+const member_snippets = [_]Snippet{
+    .{ .label = "fn", .text = "fn ${1:name}($2) ${3:!void} {$0}" },
+    .{ .label = "pub fn", .text = "pub fn ${1:name}($2) ${3:!void} {$0}", .no_pub = true },
+    .{ .label = "test", .text = "test \"$1\" {$0}", .no_pub = true, .no_doc = true },
+    .{ .label = "struct", .text = "const ${1:Name} = struct {$0};" },
+    .{ .label = "enum", .text = "const ${1:Name} = enum {$0};" },
+    .{ .label = "union", .text = "const ${1:Name} = union {$0};" },
+    .{ .label = "union tagged", .text = "const ${1:Name} = union(${2:enum}) {$0};" },
+    .{ .label = "error set", .text = "const ${1:Error} = error{$0};" },
+    .{ .label = "import", .text = "const $1 = @import(\"$2\");" },
+};
+
+/// Common snippets at the start of a statement or a container member: control flow, printing and
+/// logging; declarations of functions, types, tests and imports, and the `main` and `format`
+/// functions. Snippets that use `std` are offered only when `std` is the standard library; the
+/// `std` and `builtin` imports, `main` and `format` only when not declared yet
+fn addKeywordSnippets(r: *Resolver, file: FileId, text: []const u8, offset: u32, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
+    switch (visible.context) {
+        .none, .scope => {},
+        else => return,
+    }
+    // Inside a number literal
+    if (pos.start < offset and std.ascii.isDigit(text[pos.start])) return;
+    const range: Item.Range = .{ .start = pos.start, .end = pos.end };
+    switch (pos.kind) {
+        .statement => {
+            if (visible.context != .scope or pos.after_pub or pos.doc) return;
+            for (statement_snippets) |s| try addSnippet(r.arena, items, s.label, s.text, range);
+            const b = try r.body(file, visible.item);
+            if (try isStd(r, file, try r.resolveName(file, visible.item, b, visible.scope, "std"))) {
+                for (std_statement_snippets) |s| try addSnippet(r.arena, items, s.label, s.text, range);
+            }
+        },
+        .member => {
+            const node = pos.node.?;
+            if (betweenFields(node, pos.start, pos.end)) return;
+            const container = try containerIndex(r, file, node) orelse return;
+            for (member_snippets) |s| {
+                if ((pos.after_pub and s.no_pub) or (pos.doc and s.no_doc)) continue;
+                try addSnippet(r.arena, items, s.label, s.text, range);
+            }
+            const std_def = try r.resolveInContainer(file, container, "std");
+            if (!pos.after_pub) {
+                if (std_def == null) try addSnippet(r.arena, items, "std", "const std = @import(\"std\");", range);
+                if (try r.resolveInContainer(file, container, "builtin") == null) try addSnippet(r.arena, items, "builtin", "const builtin = @import(\"builtin\");", range);
+            }
+            const is_std = try isStd(r, file, std_def);
+            const tree = try r.itemTree(file);
+            // Drop the leading `pub ` when `pub` is already written
+            const skip: usize = if (pos.after_pub) "pub ".len else 0;
+            if (container == 0 and Resolver.lookupDecl(tree, 0, "main") == null) {
+                const main = if (is_std and try stdHas(r, file, &.{ "process", "Init" }))
+                    "pub fn main(init: std.process.Init) !void {$0}"
+                else
+                    "pub fn main() !void {$0}";
+                try addSnippet(r.arena, items, "main", main[skip..], range);
+            }
+            if (container != 0 and is_std and tree.containers[container].kind != .@"opaque" and
+                Resolver.lookupDecl(tree, container, "format") == null and try stdHas(r, file, &.{ "Io", "Writer" }))
+            {
+                const format = "pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {$0}";
+                try addSnippet(r.arena, items, "format", format[skip..], range);
+            }
+        },
+        .other => {},
+    }
+}
+
+fn addSnippet(arena: Allocator, items: *std.ArrayList(Item), label: []const u8, snippet: []const u8, range: Item.Range) Allocator.Error!void {
+    try items.append(arena, .{ .label = label, .kind = .snippet, .detail = try preview(arena, snippet), .replace = range, .snippet = snippet, .weight = snippet_weight });
+}
+
+/// How a snippet looks once inserted: placeholders take their default text, empty placeholders
+/// show as `…`, and the final position `$0` is dropped
+fn preview(arena: Allocator, snippet: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < snippet.len) {
+        const c = snippet[i];
+        if (c == '\\' and i + 1 < snippet.len) {
+            try out.append(arena, snippet[i + 1]);
+            i += 2;
+        } else if (c == '$' and i + 1 < snippet.len and std.ascii.isDigit(snippet[i + 1])) {
+            var j = i + 1;
+            while (j < snippet.len and std.ascii.isDigit(snippet[j])) j += 1;
+            if (!std.mem.eql(u8, snippet[i + 1 .. j], "0")) try out.appendSlice(arena, "…");
+            i = j;
+        } else if (c == '$' and i + 1 < snippet.len and snippet[i + 1] == '{') {
+            i += 2;
+            while (i < snippet.len and std.ascii.isDigit(snippet[i])) i += 1;
+            if (i < snippet.len and snippet[i] == ':') i += 1;
+            while (i < snippet.len and snippet[i] != '}') : (i += 1) {
+                if (snippet[i] == '\\' and i + 1 < snippet.len) i += 1;
+                try out.append(arena, snippet[i]);
+            }
+            i += 1;
+        } else {
+            try out.append(arena, c);
+            i += 1;
+        }
+    }
+    return out.items;
+}
+
+/// `def` is the standard library (`@import("std")`)
+fn isStd(r: *Resolver, file: FileId, def: ?resolve.Def) resolve.Error!bool {
+    const d = def orelse return false;
+    const std_file = try r.resolveImport(file, "std") orelse return false;
+    const ns = try r.namespaceOf(d) orelse return false;
+    return ns.file == std_file and ns.container == 0;
+}
+
+/// The standard library declares `path` (such as `process.Init`)
+fn stdHas(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!bool {
+    var ns: Namespace = .{ .file = try r.resolveImport(file, "std") orelse return false, .container = 0 };
+    for (path, 0..) |name, i| {
+        const def = try r.memberDef(ns, name) orelse return false;
+        if (i + 1 < path.len) ns = try r.namespaceOf(def) orelse return false;
+    }
+    return true;
+}
+
+/// The container has fields both before and after the range `start..end`: declarations cannot be
+/// placed between fields
+fn betweenFields(container: SyntaxNode, start: u32, end: u32) bool {
+    var before = false;
+    var after = false;
+    var it = container.children();
+    while (it.nextNode()) |c| {
+        if (c.kind() != .container_field) continue;
+        if (c.range().end <= start) before = true;
+        if (c.range().start >= end) after = true;
+    }
+    return before and after;
+}
+
+/// Index of the container node in the ItemTree
+fn containerIndex(r: *Resolver, file: FileId, node: SyntaxNode) resolve.Error!?u32 {
+    if (node.kind() == .source_file) return 0;
+    const n = (try r.itemTree(file)).containers.len;
+    for (1..n) |i| {
+        if (try r.containerOffset(.{ .file = file, .container = @intCast(i) })) |o| if (o == node.offset) return @intCast(i);
+    }
+    return null;
 }
