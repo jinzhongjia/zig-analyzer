@@ -4204,7 +4204,8 @@ fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.defini
 fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = try r.ctx.get(FileText, file) orelse return null;
-    const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
+    const line = offsets.Line.init(text, params.position.line);
+    const offset: u32 = @intCast(if (line) |l| l.offset(params.position.character, server.encoding) else text.len);
     const auto_import = server.autoImportEnabled();
     // Auto-imports are not offered until the index has been built for the current module graph, and
     // the result is marked incomplete: the client requests again as the user types, and they are
@@ -4230,7 +4231,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         if (first or !server.indexing.load(.acquire)) server.scheduleIndexingFromRead();
     }
     const out = try arena.alloc(types.CompletionItem, result.items.len);
-    var lines: ?offsets.LineIndex = null;
+    var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding };
     for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
@@ -4258,19 +4259,50 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
         if (it.replace) |range| {
-            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
-            o.textEdit = .{ .TextEdit = .{ .range = lines.?.range(range.start, range.end, server.encoding), .newText = it.label } };
+            o.textEdit = .{ .TextEdit = .{ .range = try ranges.get(arena, range.start, range.end), .newText = it.label } };
         }
         if (it.import_edit) |edit| {
-            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
             const edits = try arena.alloc(types.TextEdit, 1);
-            edits[0] = .{ .range = lines.?.range(edit.start, edit.end, server.encoding), .newText = edit.text };
+            edits[0] = .{ .range = try ranges.get(arena, edit.start, edit.end), .newText = edit.text };
             o.additionalTextEdits = edits;
         }
     }
     if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
     return .{ .array_of_CompletionItem = out };
 }
+
+/// Converts the ranges of completion items to LSP ranges. Replaced ranges are almost always in the
+/// line of the cursor and are converted within that line, without building a line table for the
+/// whole file (on large files, building the line table is slower than the completion itself); only
+/// other ranges (added imports, ranges spanning lines) build the line table
+const CompletionRanges = struct {
+    text: []const u8,
+    /// The line of the cursor
+    line: ?offsets.Line,
+    encoding: offsets.Encoding,
+    lines: ?offsets.LineIndex = null,
+    /// The range converted last: items mostly replace the same range
+    last: ?struct { start: u32, end: u32, range: types.Range } = null,
+
+    fn get(c: *CompletionRanges, arena: Allocator, start: u32, end: u32) Allocator.Error!types.Range {
+        if (c.last) |l| if (l.start == start and l.end == end) return l.range;
+        const range = c.inLine(start, end) orelse blk: {
+            if (c.lines == null) c.lines = try offsets.LineIndex.init(arena, c.text);
+            break :blk c.lines.?.range(start, end, c.encoding);
+        };
+        c.last = .{ .start = start, .end = end, .range = range };
+        return range;
+    }
+
+    /// The range when both ends are in the line of the cursor
+    fn inLine(c: *const CompletionRanges, start: u32, end: u32) ?types.Range {
+        const line = c.line orelse return null;
+        return .{
+            .start = line.position(start, c.encoding) orelse return null,
+            .end = line.position(end, c.encoding) orelse return null,
+        };
+    }
+};
 
 /// `data` of a completion item: the file where completion happens (`from`), the target file, and
 /// the `AstId` of the declaration in it (which still finds the same declaration after edits). When

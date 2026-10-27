@@ -1,6 +1,7 @@
 //! Property tests for position conversion (fixed-seed random input + coverage-guided fuzzing):
 //!
-//! 1. `LineIndex.position` agrees with `offsetToPosition`, which scans character by character;
+//! 1. `LineIndex.position` and `Line.position` agree with `offsetToPosition`, which scans character
+//!    by character;
 //! 2. position → offset → position round-trips are stable, and offsets never land in the middle of
 //!    a multi-byte character or `\r\n`;
 //! 3. incremental changes give the same result as "splicing the text directly".
@@ -36,6 +37,10 @@ fn checkAll(input: []const u8) !void {
             const back = offsets.positionToOffset(text.items, pos, enc);
             try testing.expect(back <= off);
             try testing.expectEqual(pos, li.position(back, enc));
+            // Line-local conversion: agrees with the line table for offsets in the content of the line,
+            // and gives nothing for offsets in the line break
+            const line = offsets.Line.init(text.items, pos.line).?;
+            if (line.position(off, enc)) |p| try testing.expectEqual(pos, p) else try testing.expect(off > line.end);
         }
     }
 
