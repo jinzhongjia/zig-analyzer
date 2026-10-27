@@ -19,6 +19,14 @@ const tree = @import("tree.zig");
 
 const Parse = @This();
 
+/// Whether source text is treated as Zig or as ZON
+pub const Mode = enum { zig, zon };
+
+/// `.zon` files are treated as ZON, all others as Zig
+pub fn modeOf(path: []const u8) Mode {
+    return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
+}
+
 arena: std.heap.ArenaAllocator,
 gpa: Allocator,
 source: [:0]const u8,

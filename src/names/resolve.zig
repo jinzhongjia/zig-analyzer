@@ -13,6 +13,7 @@ const ModuleGraph = @import("ModuleGraph.zig");
 const Vfs = @import("../base/Vfs.zig");
 const FileId = Vfs.FileId;
 const ItemTree = @import("../syntax/ItemTree.zig");
+const Parse = @import("../syntax/Parse.zig");
 const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const Body = @import("../hir/Body.zig");
@@ -49,7 +50,7 @@ pub const Resolver = struct {
 
     /// `.zon` files: `@import` of one yields the value in it, not a namespace
     pub fn isZon(r: *Resolver, file: FileId) bool {
-        return std.mem.endsWith(u8, r.vfs().path(file), ".zon");
+        return Parse.modeOf(r.vfs().path(file)) == .zon;
     }
 
     pub fn itemTree(r: *Resolver, file: FileId) Error!*const ItemTree {

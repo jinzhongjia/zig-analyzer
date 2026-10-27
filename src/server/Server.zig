@@ -3962,7 +3962,7 @@ fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineInde
 fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!types.ResultType("textDocument/formatting") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(ctx, arena, file);
-    const mode: ide.format.Mode = if (std.mem.endsWith(u8, server.vfs.path(file), ".zon")) .zon else .zig;
+    const mode = za.syntax.Parse.modeOf(server.vfs.path(file));
     return ide.format.format(arena, lines, mode, server.encoding);
 }
 
