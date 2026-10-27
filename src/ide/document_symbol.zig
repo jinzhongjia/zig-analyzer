@@ -1,4 +1,5 @@
-//! textDocument/documentSymbol: builds the document outline from the ItemTree.
+//! textDocument/documentSymbol: builds the document outline from the ItemTree; for a ZON file,
+//! lists the field tree of the root expression.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -67,6 +68,48 @@ const Builder = struct {
         return out.items;
     }
 };
+
+/// The outline of a ZON file: the field tree of the initializer lists in the root expression. Named
+/// fields are listed by name and tuple elements by index (the same as the name in `t.@"0"`); the
+/// fields of a value that is an initializer list are child symbols
+pub fn zonSymbols(arena: Allocator, root: SyntaxNode, lines: offsets.LineIndex, enc: offsets.Encoding) Allocator.Error![]const types.DocumentSymbol {
+    const value = ItemTree.zonRoot(root) orelse return &.{};
+    return zonFields(arena, value, lines, enc, 1);
+}
+
+/// The fields of `value` when it is an initializer list (at level `level`)
+fn zonFields(arena: Allocator, value: SyntaxNode, lines: offsets.LineIndex, enc: offsets.Encoding, level: u32) Allocator.Error![]const types.DocumentSymbol {
+    if (value.kind() != .init_expr) return &.{};
+    var out: std.ArrayList(types.DocumentSymbol) = .empty;
+    var index: u32 = 0;
+    var it = (ast.InitExpr{ .syntax = value }).items();
+    while (it.next()) |n| {
+        if (n.kind() == .error_node) continue;
+        var name: []const u8 = undefined;
+        var sel = n.range();
+        var field_value: ?SyntaxNode = n;
+        if (n.kind() == .field_init) {
+            const field: ast.FieldInit = .{ .syntax = n };
+            const tok = field.name() orelse continue;
+            name = try ast.identNameAlloc(arena, tok.text);
+            sel = tok.range();
+            field_value = field.value();
+        } else {
+            name = try std.fmt.allocPrint(arena, "{d}", .{index});
+            index += 1;
+        }
+        const children = if (level < max_levels) if (field_value) |v| try zonFields(arena, v, lines, enc, level + 1) else &.{} else &.{};
+        const r = n.range();
+        try out.append(arena, .{
+            .name = name,
+            .kind = .Field,
+            .range = lines.range(r.start, r.end, enc),
+            .selectionRange = lines.range(sel.start, sel.end, enc),
+            .children = if (children.len == 0) null else children,
+        });
+    }
+    return out.items;
+}
 
 /// Members without a name: a tuple field is shown as its index (`field_index` is its position
 /// among the container's fields, the same as the name in `t.@"0"`); the others are unnamed
@@ -182,4 +225,77 @@ test "tuple fields are named by their index" {
     try testing.expectEqualStrings("y", syms[1].children.?[1].name);
     // An unnamed test is still shown as `test`
     try testing.expectEqualStrings("test", syms[2].name);
+}
+
+fn writeOutline(w: *std.Io.Writer, syms: []const types.DocumentSymbol, depth: usize) !void {
+    for (syms) |s| {
+        try w.splatByteAll(' ', depth * 2);
+        try w.print("{s}\n", .{s.name});
+        try writeOutline(w, s.children orelse &.{}, depth + 1);
+    }
+}
+
+test "zon files list the field tree" {
+    const text =
+        \\.{
+        \\    .name = .demo,
+        \\    .@"min-version" = "0.1.0",
+        \\    .dependencies = .{
+        \\        .foo = .{
+        \\            .url = "https://example.com/foo.tar.gz",
+        \\            .hash = "...",
+        \\        },
+        \\    },
+        \\    .paths = .{ "build.zig", .{ .x = 1 } },
+        \\}
+    ;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parse = try Parse.create(a, text, .zon);
+    const lines = try offsets.LineIndex.init(a, text);
+
+    const syms = try zonSymbols(a, parse.rootNode(), lines, .utf16);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try writeOutline(&out.writer, syms, 0);
+    try testing.expectEqualStrings(
+        \\name
+        \\min-version
+        \\dependencies
+        \\  foo
+        \\    url
+        \\    hash
+        \\paths
+        \\  0
+        \\  1
+        \\    x
+        \\
+    , out.written());
+    try testing.expectEqual(types.SymbolKind.Field, syms[0].kind);
+    // The selectionRange of a field is its name and its range includes the value; both are the
+    // element itself for a tuple element
+    try testing.expectEqual(types.Position{ .line = 1, .character = 5 }, syms[0].selectionRange.start);
+    try testing.expectEqual(types.Position{ .line = 1, .character = 17 }, syms[0].range.end);
+    const elem = syms[3].children.?[0];
+    try testing.expectEqual(types.Position{ .line = 9, .character = 16 }, elem.selectionRange.start);
+    try testing.expectEqual(types.Position{ .line = 9, .character = 27 }, elem.range.end);
+
+    // No symbols when the root is not an initializer list
+    const scalar = try Parse.create(a, "1", .zon);
+    try testing.expectEqual(0, (try zonSymbols(a, scalar.rootNode(), try offsets.LineIndex.init(a, "1"), .utf16)).len);
+}
+
+test "zon document symbols stop at the nesting limit" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    for (0..150) |_| try text.appendSlice(a, ".{ .a = ");
+    try text.appendSlice(a, "1");
+    for (0..150) |_| try text.appendSlice(a, " }");
+    const parse = try Parse.create(a, text.items, .zon);
+    var syms = try zonSymbols(a, parse.rootNode(), try offsets.LineIndex.init(a, text.items), .utf16);
+    var levels: usize = 0;
+    while (syms.len > 0) : (syms = syms[0].children orelse &.{}) levels += 1;
+    try testing.expectEqual(max_levels, levels);
 }

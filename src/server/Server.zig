@@ -3968,6 +3968,11 @@ fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.Doc
 
 fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    if (parse.mode == .zon) {
+        const lines = try fileLines(ctx, arena, file);
+        return .{ .array_of_DocumentSymbol = try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding) };
+    }
     const items = try ctx.get(syntax_q.FileItemTree, file);
     const map = try ctx.get(syntax_q.FileAstIdMap, file);
     const lines = try fileLines(ctx, arena, file);
