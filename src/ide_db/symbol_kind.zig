@@ -1,8 +1,11 @@
-//! 符号的种类：语义着色与补全共用（着色映射为 token 类型，补全映射为 `CompletionItemKind`）。
+//! Symbol kinds, shared by semantic highlighting and completion (highlighting maps them to token
+//! types, completion to `CompletionItemKind`).
 //!
-//! 由声明的种类与推导出的类型决定：值为类型的按类型分为命名空间（文件）、结构体、枚举与其他类型（union、opaque、
-//! 标量等）；值为函数（或函数指针）的为函数；容器（不是文件）中第一个参数是所在容器或指向它的单指针的函数为方法。
-//! 类型求不出时按声明的种类（变量）。
+//! Determined by the kind of the declaration and the inferred type: a value that is a type is
+//! classified by that type as a namespace (file), struct, enum or other type (union, opaque,
+//! scalars, ...); a value that is a function (or function pointer) is a function; a function in a
+//! container (not a file) whose first parameter is that container or a single-item pointer to it
+//! is a method. When the type cannot be inferred, the kind follows the declaration (variable).
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
@@ -18,11 +21,11 @@ pub const Kind = enum { namespace, @"struct", @"enum", type, function, method, v
 
 pub const Symbol = struct {
     kind: Kind,
-    /// 不可修改：`const` 声明、局部常量、参数与捕获
+    /// Cannot be modified: `const` declarations, local constants, parameters and captures
     readonly: bool = false,
 };
 
-/// `file` 中的成员 `item`（ItemTree 的下标）
+/// The member `item` (an ItemTree index) of `file`
 pub fn ofDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!Symbol {
     const tree = try r.itemTree(file);
     const it = tree.items[item];
@@ -37,7 +40,7 @@ pub fn ofDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!Symbol {
     };
 }
 
-/// 函数 `key` 所在的容器为 `container`
+/// `container` is the container that the function `key` is in
 pub fn functionKind(r: *Resolver, key: database.hir.OwnerKey, container: ItemTree.Container) resolve.Error!Kind {
     if (container.kind == .file) return .function;
     const ip = r.ctx.db.env.ip;
@@ -57,7 +60,7 @@ pub fn functionKind(r: *Resolver, key: database.hir.OwnerKey, container: ItemTre
     };
 }
 
-/// 值 `tv` 的种类：不是类型也不是函数时为 `fallback`
+/// Kind of the value `tv`; `fallback` when it is neither a type nor a function
 pub fn ofValue(ip: *InternPool, tv: InternPool.TypedValue, fallback: Kind) Kind {
     if (tv.isType()) {
         const ty = tv.asType() orelse return .type;
@@ -84,31 +87,35 @@ pub fn ofValue(ip: *InternPool, tv: InternPool.TypedValue, fallback: Kind) Kind 
     };
 }
 
-/// 局部绑定（类型为 `tv`）：值为类型的参数为类型参数
+/// A local binding (of type `tv`): a parameter whose value is a type is a type parameter
 pub fn ofBinding(ip: *InternPool, binding: Body.Binding, tv: InternPool.TypedValue) Symbol {
     if (binding.kind == .param) return .{ .kind = if (tv.isType()) .type_parameter else .parameter, .readonly = true };
     return .{ .kind = ofValue(ip, tv, .variable), .readonly = binding.kind != .local_var };
 }
 
-/// 只看声明的语法就能确定的种类，与按推导出的类型分类（`ofDecl`）的结果相同。求声明的类型要解析所在的文件、对
-/// 初始化表达式求值，自动导入的候选来自许多文件，建索引时按语法记下能确定的种类
+/// A kind determined by the syntax of the declaration alone, the same as the result of classifying
+/// by the inferred type (`ofDecl`). Inferring the type of a declaration requires parsing its file
+/// and evaluating the initializer expression, and auto-import candidates come from many files, so
+/// the kinds the syntax determines are recorded when the index is built.
 pub const Form = enum {
     unknown,
-    /// 不是类型也不是函数的值
+    /// A value that is neither a type nor a function
     value,
-    /// 类型（`ofValue` 的 `.type`：不是命名空间、结构体或枚举）
+    /// A type (`.type` of `ofValue`: not a namespace, struct or enum)
     type,
-    /// 函数类型的值
+    /// A value of function type
     function,
 };
 
-/// `const` / `var` 声明 `node` 的种类：
-/// - 类型标注为 `type` 以外的原始类型、`?T`、`[]T`、`[N]T`、`E!T` 时为值，为函数类型时为函数；其他标注（如指针、
-///   别名）可能是指向函数的指针，不由语法判断
-/// - 初始化为字面量、`true` / `false` / `null` / `undefined`、枚举字面量、`error.X`、初始化表达式（`.{...}`、
-///   `S{...}`）、取负、取反与 `orelse`、`catch`、`||` 以外的二元运算时为值
-/// - 初始化为原始类型名、类型语法（`?T`、`*T`、`[]T`、`[N]T`、`E!T`、`error{...}`、`fn (...) R`、`anyframe`）或错误集的
-///   合并（`A || B`）时为类型
+/// Kind of the `const` / `var` declaration `node`:
+/// - A value when the type annotation is a primitive type other than `type`, `?T`, `[]T`, `[N]T`
+///   or `E!T`, and a function when it is a function type; other annotations (such as pointers or
+///   aliases) may be pointers to functions and are not decided by the syntax
+/// - A value when initialized with a literal, `true` / `false` / `null` / `undefined`, an enum
+///   literal, `error.X`, an init expression (`.{...}`, `S{...}`), a negation, a logical or bitwise
+///   not, or a binary operation other than `orelse`, `catch` and `||`
+/// - A type when initialized with a primitive type name, type syntax (`?T`, `*T`, `[]T`, `[N]T`,
+///   `E!T`, `error{...}`, `fn (...) R`, `anyframe`) or a merge of error sets (`A || B`)
 pub fn declForm(node: ast.SyntaxNode) Form {
     const decl = ast.cast(ast.VarDecl, node) orelse return .unknown;
     if (decl.typeExpr()) |annotation| switch (annotation.kind()) {
@@ -130,7 +137,7 @@ pub fn declForm(node: ast.SyntaxNode) Form {
             .none => .unknown,
         },
         .optional_type, .ptr_type, .slice_type, .array_type, .error_union_type, .error_set_decl, .fn_proto, .anyframe_type => .type,
-        // `||` 只用于合并错误集；`orelse` 与 `catch` 的结果可以是类型
+        // `||` is used only to merge error sets; the result of `orelse` and `catch` can be a type
         .binary_expr => if (init.childToken(.pipe_pipe) != null)
             .type
         else if (init.childToken(.keyword_orelse) != null or init.childToken(.keyword_catch) != null)
@@ -141,7 +148,8 @@ pub fn declForm(node: ast.SyntaxNode) Form {
     };
 }
 
-/// 名字引用是否为原始的值（`true` 等）、`type`、其他原始类型名；`@"u32"` 不是原始名字
+/// Whether the name reference is a primitive value (`true` and so on), `type`, or another
+/// primitive type name; `@"u32"` is not a primitive name
 fn primitive(name_ref: ast.SyntaxNode) enum { none, value, type_keyword, type_name } {
     const token = (ast.NameRef{ .syntax = name_ref }).name() orelse return .none;
     const name = token.text;
@@ -197,7 +205,7 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
         const item: u32 = @intCast(index);
         const form = declForm((try r.itemNode(file, item)).?);
         const symbol = try ofDecl(&r, file, item);
-        // 容器与别名要求值，不由语法判断
+        // Containers and aliases need evaluation and are not decided by the syntax
         const expected: Form = if (std.mem.eql(u8, it.name.?, "S") or std.mem.eql(u8, it.name.?, "x") or std.mem.eql(u8, it.name.?, "w")) .unknown else switch (symbol.kind) {
             .type => .type,
             .function => .function,

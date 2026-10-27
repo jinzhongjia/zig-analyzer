@@ -1,31 +1,39 @@
-//! 补全的模糊匹配，移植自 gopls：golang/tools `5dd9c3348317` 的 `gopls/internal/fuzzy/matcher.go` 与 `input.go`
-//! （Copyright 2019 The Go Authors；版权及许可见 tools/gopls/LICENSE）。不限制输入与候选的长度：gopls 截断到 63 与
-//! 127 字节，截断会改变长名字能否匹配。
+//! Fuzzy matching for completion, ported from gopls: `gopls/internal/fuzzy/matcher.go` and
+//! `input.go` of golang/tools `5dd9c3348317` (Copyright 2019 The Go Authors; see
+//! tools/gopls/LICENSE for the copyright and license). The lengths of the input and the candidate
+//! are not limited: gopls truncates them to 63 and 127 bytes, and truncation changes whether long
+//! names can match.
 //!
-//! 输入的字符按顺序、不区分大小写地出现在候选中。词首（大写字母、非字母数字之后的字母数字）的匹配、连续的匹配、
-//! 候选最后一段（`.` / `:` 分隔）中的匹配、大小写与输入一致（输入全为小写时词首也算）的匹配加分；跳过第一段或
-//! 最后一段的开头、在词中开始匹配扣分。第一个字符匹配在词中时，须从这里起连续匹配输入的前 min(3, 输入长度) 个
-//! 字符；输入中的词首不能匹配候选的词中字符；词中有两处以上不足 3 个字符的片段时不算匹配。分数归一化到 (0, 1]，
-//! 与候选相同（不区分大小写）时为 1。
+//! The characters of the input appear in the candidate in order, case-insensitively. Bonuses go
+//! to matches at word starts (an uppercase letter, or a letter or digit after a non-alphanumeric
+//! character), consecutive matches, matches in the last segment of the candidate (separated by
+//! `.` / `:`), and matches whose case agrees with the input (word starts also count when the
+//! input is all lowercase); penalties go to skipping the start of the first or the last segment
+//! and to starting a match in the middle of a word. When the first character matches in the
+//! middle of a word, the first min(3, input length) characters of the input must match
+//! consecutively from there; a word start in the input cannot match a character in the middle of
+//! a word in the candidate; a match with two or more fragments of fewer than 3 characters in the
+//! middle of words does not count. Scores are normalized to (0, 1], and are 1 when the input
+//! equals the candidate (case-insensitively).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const Role = enum(u8) {
-    /// 不属于词：空白、标点
+    /// Not part of a word: whitespace, punctuation
     none,
-    /// 段的分隔符：`.`、`:`
+    /// Segment separator: `.`, `:`
     sep,
-    /// 词中的小写字母与数字
+    /// Lowercase letters and digits inside a word
     tail,
-    /// 连续大写中不是词首的
+    /// An uppercase letter in a run of uppercase letters that does not start a word
     uc_tail,
     head,
 };
 
 const CharType = enum(u8) { none, punct, lower, upper };
 
-/// 非 ASCII 字节按小写字母；数字按小写字母
+/// Non-ASCII bytes count as lowercase letters; so do digits
 fn charType(c: u8) CharType {
     if (c >= 0x80 or std.ascii.isLower(c) or std.ascii.isDigit(c)) return .lower;
     if (std.ascii.isUpper(c)) return .upper;
@@ -35,7 +43,7 @@ fn charType(c: u8) CharType {
     };
 }
 
-/// 各字节在 `text` 中的角色，写入 `out`（长度与 `text` 相同）
+/// The role of each byte in `text`, written into `out` (the same length as `text`)
 pub fn roles(text: []const u8, out: []Role) void {
     var prev: CharType = .none;
     var prev2: CharType = .none;
@@ -46,7 +54,7 @@ pub fn roles(text: []const u8, out: []Role) void {
             .lower => role = if (prev == .none or prev == .punct) .head else .tail,
             .upper => {
                 role = .head;
-                // 末尾两个大写字母中的后一个：`aBC` 中的 `C`
+                // The second of two uppercase letters at the end: `C` in `aBC`
                 if (prev == .upper and i + 1 == text.len) role = .uc_tail;
             },
             .punct => if (c == '.' or c == ':') {
@@ -54,7 +62,8 @@ pub fn roles(text: []const u8, out: []Role) void {
             },
             .none => {},
         }
-        // 前两个字符都是大写、当前不是小写：前一个不是词首（`ABC`、`AB.` 中的 `B`）
+        // The previous two characters are uppercase and the current one is not lowercase: the
+        // previous one does not start a word (`B` in `ABC` and `AB.`)
         if (curr != .lower and i > 1 and out[i - 1] == .head and prev2 == .upper and (out[i - 2] == .head or out[i - 2] == .uc_tail)) {
             out[i - 1] = .uc_tail;
         }
@@ -68,20 +77,21 @@ const min_score = -10000;
 const consecutive_bonus = 2;
 const max_char_score = 4;
 
-/// 分数表的一格：到这里为止的最好分数，与它由上一行的哪一格（0：上一个字符没有匹配，1：匹配了）得到
+/// A cell of the score table: the best score up to here, and which cell of the previous row it
+/// comes from (0: the previous character did not match, 1: it matched)
 const Entry = struct { val: i32, prev: u1 };
 const Cell = [2]Entry;
 
 pub const Matcher = struct {
     pattern: []const u8,
     lower: []const u8,
-    /// 输入（小写）的前 min(3, 长度) 个字符
+    /// The first min(3, length) characters of the input (lowercased)
     short: []const u8,
     pattern_roles: []const Role,
-    /// 输入中有大写字母：只有大小写一致的匹配加分
+    /// The input contains uppercase letters: only matches in the same case get a bonus
     case_sensitive: bool,
     arena: Allocator,
-    /// 以下按候选复用
+    /// The following are reused across candidates
     text: std.ArrayList(u8) = .empty,
     text_lower: std.ArrayList(u8) = .empty,
     text_roles: std.ArrayList(Role) = .empty,
@@ -101,14 +111,14 @@ pub const Matcher = struct {
         };
     }
 
-    /// 依次拼接 `parts` 后的分数（见 `score`）
+    /// Score of the concatenation of `parts` in order (see `score`)
     pub fn scoreJoined(m: *Matcher, parts: []const []const u8) Allocator.Error!?f32 {
         m.text.clearRetainingCapacity();
         for (parts) |part| try m.text.appendSlice(m.arena, part);
         return m.score(m.text.items);
     }
 
-    /// 不匹配时为 null；空的输入匹配一切，分数为 1
+    /// null when it does not match; an empty input matches everything with a score of 1
     pub fn score(m: *Matcher, text: []const u8) Allocator.Error!?f32 {
         if (m.pattern.len == 0) return 1;
         try m.text_lower.resize(m.arena, text.len);
@@ -150,39 +160,44 @@ pub const Matcher = struct {
         for (1..text.len + 1) |i| {
             const role = text_roles[i - 1];
             if (role == .sep and segments_left > 1) segments_left -= 1;
-            // 跳过第一段或最后一段的开头
+            // Skipping the start of the first or the last segment
             const skip_penalty: i32 = if (i == 1 or i - 1 == last_segment_start) 1 else 0;
             for (0..pattern_len + 1) |j| {
                 const here = m.cell(i, j);
                 here[1] = .{ .val = min_score, .prev = 0 };
-                // 这个字符不匹配
+                // This character does not match
                 const k = m.bestK(i - 1, j);
                 var skip = m.cell(i - 1, j)[k].val;
-                // 最后一个匹配的字符之后的字符不扣分
+                // Characters after the last matched character are not penalized
                 if (j != pattern_len) skip -= skip_penalty;
                 here[0] = .{ .val = skip, .prev = k };
 
                 if (j == 0 or lower[i - 1] != m.lower[j - 1]) continue;
                 const pattern_role = m.pattern_roles[j - 1];
                 if (role == .tail and pattern_role == .head) {
-                    // 输入中的词首不能匹配词中的字符，第一个字符除外：从这里起连续匹配输入的前几个字符时可以
+                    // A word start in the input cannot match a character in the middle of a word,
+                    // except for the first character: it can when the first few characters of the
+                    // input match consecutively from here
                     if (j > 1 or !std.mem.startsWith(u8, lower[i - 1 ..], m.short)) continue;
                 }
 
                 var char_score: i32 = 0;
-                // 在候选的最后一段
+                // In the last segment of the candidate
                 if (segments_left <= 1) char_score += 1;
-                // 大小写一致；输入全为小写（没有分词）时，候选的词首也算
+                // Same case; when the input is all lowercase (no word boundaries), word starts
+                // in the candidate also count
                 if (text[i - 1] == m.pattern[j - 1] or (role == .head and !m.case_sensitive)) char_score += 1;
                 if (role == .tail and pattern_role == .head) char_score -= 1;
-                // 第一个字符匹配在词中
+                // The first character matches in the middle of a word
                 if (j == 1 and role == .tail) char_score -= 4;
 
                 for ([_]u1{ 0, 1 }) |prev_k| {
                     var sc = m.cell(i - 1, j - 1)[prev_k].val + char_score;
-                    // 连续的匹配；匹配在开头或最后一段的开头也算，使前缀的分数归一化后为 1
+                    // Consecutive match; a match at the start or at the start of the last segment
+                    // also counts, so that a prefix normalizes to a score of 1
                     if (prev_k == 1 or i - 1 == 0 or i - 1 == last_segment_start) sc += consecutive_bonus;
-                    // 在段中开始匹配（上一个字符没有匹配）
+                    // Starting a match in the middle of a segment (the previous character
+                    // did not match)
                     if (prev_k == 0 and (role == .tail or role == .uc_tail)) sc -= 3;
                     if (sc > here[1].val) here[1] = .{ .val = sc, .prev = prev_k };
                 }
@@ -191,7 +206,7 @@ pub const Matcher = struct {
         return m.cell(text.len, pattern_len)[m.bestK(text.len, pattern_len)].val;
     }
 
-    /// 最好的匹配在词中有两处以上不足 3 个字符的片段
+    /// The best match has two or more fragments of fewer than 3 characters in the middle of words
     fn poor(m: *Matcher, text_len: usize) bool {
         if (m.pattern.len < 2) return false;
         var i = text_len;
@@ -228,7 +243,7 @@ fn isSubsequence(pattern: []const u8, text: []const u8) bool {
 
 const testing = std.testing;
 
-/// 测试取自 gopls 的 `matcher_test.go` 与 `input_test.go`
+/// The tests are taken from `matcher_test.go` and `input_test.go` of gopls
 fn scoreOf(pattern: []const u8, text: []const u8) !f32 {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -297,7 +312,8 @@ test "fuzzy match rejects short matches in the middle of words" {
         .{ "edt", "foo.Textedit" },
     };
     for (cases) |c| try testing.expectEqual(0, try scoreOf(c[0], c[1]));
-    // 词中开始、分数不为正的匹配（gopls 中只用于高亮）同样不算
+    // A match that starts in the middle of a word with a non-positive score (used only for
+    // highlighting in gopls) does not count either
     try testing.expectEqual(0, try scoreOf("ex", "foo.Textedit"));
     for ([_][2][]const u8{ .{ "extdit", "foo.Textedit" }, .{ "edit", "foo.Textedit" } }) |c| {
         try testing.expect(try scoreOf(c[0], c[1]) > 0);

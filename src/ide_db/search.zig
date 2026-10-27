@@ -1,10 +1,15 @@
-//! 引用查找：按名字粗筛候选文件，再逐处精确解析确认。
+//! Find references: coarsely filter candidate files by name, then confirm each occurrence by
+//! precise resolution.
 //!
-//! 候选文件：能经由 `@import` 链到达定义所在文件的文件，以及范围内的其余文件（泛型代码不导入定义所在的文件也能
-//! 经由 `anytype` 的值或 comptime 类型参数访问其成员，见 `candidateFiles`），且文件索引中包含该名字。局部名字只在
-//! 所在成员（及其体内定义的容器成员）中查找。
-//! 只在出现该名字的成员中解析；名字引用用名字解析，字段访问优先用命名空间求值，求不出时
-//! 才读取该成员的类型推导结果。
+//! Candidate files: files that can reach the file containing the definition through an `@import`
+//! chain, plus the remaining files in scope (generic code can access the members of the file
+//! containing the definition without importing it, through an `anytype` value or a comptime type
+//! parameter; see `candidateFiles`), provided that the file index contains the name. A local
+//! name is searched for only in its enclosing member (and the members of containers defined in
+//! its body).
+//! Only members in which the name occurs are resolved; name references use name resolution, and
+//! field accesses prefer namespace evaluation, reading the member's type inference result only
+//! when that fails.
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -26,11 +31,11 @@ pub const Reference = struct {
     file: FileId,
     start: u32,
     end: u32,
-    /// 定义处的名字
+    /// Name at the definition site
     is_decl: bool = false,
 };
 
-/// 定义的名字；没有可引用的名字（文件、test、comptime 块）时为 null
+/// Name of the definition; null when it has no referenceable name (files, test and comptime blocks)
 pub fn defName(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
     switch (def) {
         .item => |it| {
@@ -46,25 +51,29 @@ pub fn defName(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
 }
 
 pub const Options = struct {
-    /// 搜索范围（项目中的文件）；定义所在的文件总在其中
+    /// Search scope (files in the project); always includes the file containing the definition
     scope: []const FileId,
-    /// 只在这个文件中查找（document highlight）
+    /// Search only in this file (document highlight)
     only_file: ?FileId = null,
-    /// 不为 null 时记录第一处有歧义的引用：泛型函数体内的成员访问，在一些调用点实例下指向 `def`，
-    /// 另一些指向其他定义（重命名会破坏其他实例，应拒绝）
+    /// When not null, records the first ambiguous reference: a member access in a generic function
+    /// body that refers to `def` under some call-site instances and to other definitions under
+    /// others (renaming would break the other instances, so it should be refused)
     ambiguous: ?*?Reference = null,
-    /// 不为 null 时记录第一处无法确认的同名成员访问（字段访问、枚举字面量、初始化的字段）：左侧或期望的类型未知
-    /// 或是抽象的，任何调用点实例下也求不出成员，可能是引用
+    /// When not null, records the first member access with the same name that cannot be confirmed
+    /// (field access, enum literal, field in an initializer): the type of the left-hand side or the
+    /// expected type is unknown or abstract, and no call-site instance determines the member
+    /// either, so it may be a reference
     uncertain: ?*?Reference = null,
-    /// 不为 null 时记录第一个有语法错误、又出现了这个名字的文件：错误处的代码不一定降级为 HIR，其中的引用可能
-    /// 找不到
+    /// When not null, records the first file that has syntax errors and also contains this name:
+    /// the code at an error is not necessarily lowered to HIR, so references in it may be missed
     syntax_error: ?*?FileId = null,
-    /// 不为 null 时记录第一处要按调用点实例判断、而实例不完整（实例化无限增长而截断，见 `seed.AllInstances`）的
-    /// 成员访问：其他实例中可能是或不是引用
+    /// When not null, records the first member access that has to be decided per call-site instance
+    /// while the instances are incomplete (truncated because instantiation grows without bound; see
+    /// `seed.AllInstances`): it may or may not be a reference in the other instances
     incomplete: ?*?Reference = null,
 };
 
-/// `def` 的全部引用（含定义处），按文件与位置排序
+/// All references to `def` (including the definition itself), sorted by file and position
 pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Reference {
     const name = try defName(r, def) orelse return &.{};
     var out: std.ArrayList(Reference) = .empty;
@@ -86,7 +95,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
             try noteSyntaxError(r, opts.syntax_error, l.file);
-            // 局部名字：所在成员及其体内定义的容器中的成员
+            // Local name: the enclosing member and the members of containers defined in its body
             const tree = try r.itemTree(l.file);
             for (0..tree.items.len) |i| {
                 if (try sema.enclosedBy(r, l.file, @intCast(i), tree.items[l.item].ast_id)) try finder.item(l.file, @intCast(i));
@@ -112,7 +121,8 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
             return a.start < b.start;
         }
     }.lt);
-    // 定义处也可能作为表达式出现（如同一位置的多种解析路径）：去重
+    // The definition site may also show up as an expression (e.g. several resolution paths at the
+    // same position): deduplicate
     var n: usize = 0;
     for (out.items) |ref| {
         if (n > 0 and out.items[n - 1].file == ref.file and out.items[n - 1].start == ref.start) {
@@ -130,7 +140,7 @@ fn noteSyntaxError(r: *Resolver, slot: ?*?FileId, file: FileId) resolve.Error!vo
     if (s.* == null and (try r.ctx.get(database.syntax.ParseFile, file)).errors.len != 0) s.* = file;
 }
 
-/// 模块图中的项目文件（不含标准库）
+/// Project files in the module graph (excluding the standard library)
 pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
     const graph = try r.ctx.get(database.ModuleGraph.Input, {}) orelse return &.{};
     var out: std.ArrayList(FileId) = .empty;
@@ -138,9 +148,12 @@ pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
     return out.items;
 }
 
-/// 引用 `target` 中的定义的候选文件：能经由 `@import` 链到达 `target` 的文件在前（见 `importers`），之后是
-/// `scope` 中的其余文件。泛型代码不必导入定义所在的文件就能访问其成员：`anytype` 参数的值（`x.foo()`，实例中
-/// `x` 的类型来自 `target`）、comptime 类型参数（`M.foo`）。与 ZLS 在构建系统下搜索模块的全部文件相同
+/// Candidate files that may reference definitions in `target`: files that can reach `target`
+/// through an `@import` chain come first (see `importers`), followed by the remaining files in
+/// `scope`. Generic code can access the members of the file containing a definition without
+/// importing it: through the value of an `anytype` parameter (`x.foo()`, where the type of `x` in
+/// an instance comes from `target`) or a comptime type parameter (`M.foo`). Same as ZLS, which
+/// searches all files of the module when using the build system
 pub fn candidateFiles(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
     var out: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
     for (try importers(r, target, scope)) |f| try out.put(r.arena, f, {});
@@ -148,16 +161,19 @@ pub fn candidateFiles(r: *Resolver, target: FileId, scope: []const FileId) resol
     return out.keys();
 }
 
-/// 在 `scope` 中能经由 `@import` 链到达 `target` 的文件（含 `target` 自身）。`target` 不在 `scope` 中
-/// （标准库、依赖包）时，导入链会经过范围外的文件（项目 → `std.zig` → `mem.zig`）：沿 import 求出从
-/// 范围内的文件可达的全部文件，在其上建立反向边；范围外的其他文件不在结果中
+/// Files in `scope` that can reach `target` through an `@import` chain (including `target`
+/// itself). When `target` is not in `scope` (standard library, dependency packages), the import
+/// chain passes through files outside the scope (project → `std.zig` → `mem.zig`): all files
+/// reachable from the files in scope are collected by following imports, and reverse edges are
+/// built over them; other files outside the scope are not in the result
 pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
-    // 范围内的文件在前（下标小于 `scope_len`），之后追加范围外可达的文件
+    // Files in scope come first (indices below `scope_len`), followed by the reachable files
+    // outside the scope
     var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
     for (scope) |f| try nodes.put(r.arena, f, {});
     const scope_len = nodes.count();
     const in_scope = nodes.contains(target);
-    // 反向边：被导入的文件 → 导入它的文件
+    // Reverse edges: imported file → the files importing it
     var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
     var n: usize = 0;
     while (n < nodes.count()) : (n += 1) {
@@ -187,7 +203,8 @@ pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Er
     return out.items;
 }
 
-/// 项目范围的反向导入闭包在各成员的种子查找之间共享；文件索引与模块配置仍是实际依赖。
+/// The project-wide reverse import closure is shared between the seed lookups of all members;
+/// the file indexes and the module configuration are still the actual dependencies.
 pub const ProjectImporters = struct {
     pub const kind: @import("../db/engine.zig").Kind = .derived;
     pub const Key = FileId;
@@ -212,22 +229,25 @@ pub const ProjectImporters = struct {
 const Finder = struct {
     r: *Resolver,
     def: Def,
-    /// `def` 是字段：初始化表达式中的字段名（`.{ .x = v }`）只能指向字段，不会是其他定义的引用
+    /// `def` is a field: a field name in an initializer (`.{ .x = v }`) can only refer to a field
+    /// and is never a reference to another definition
     is_field: bool,
     name: []const u8,
     out: *std.ArrayList(Reference),
     ambiguous: ?*?Reference,
     uncertain: ?*?Reference,
     incomplete: ?*?Reference,
-    /// 能经由 `@import` 链到达定义所在文件的文件（`.item` 定义）。其余文件中只有泛型函数中的代码可能引用定义
+    /// Files that can reach the file containing the definition through an `@import` chain (`.item`
+    /// definitions). In other files, only code in generic functions may reference the definition
     importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
-    /// 最近一个成员的调用点实例（`instances`）
+    /// Call-site instances of the most recent member (`instances`)
     cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index, complete: bool } = null,
 
-    /// 检查文件 `file` 中的成员 `item`
+    /// Checks member `item` in file `file`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
         const r = f.r;
-        // decltest 的名字不在 Body 中：`test helper` 的标识符是对 helper 的引用
+        // The name of a decltest is not in the Body: the identifier in `test helper` is a
+        // reference to helper
         if (try r.itemNode(file, item_index)) |node| if (node.kind() == .test_decl) if (node.childToken(.identifier)) |t| {
             const name = try ast.identNameAlloc(r.arena, t.text);
             if (std.mem.eql(u8, name, f.name)) {
@@ -239,7 +259,8 @@ const Finder = struct {
         if (!try r.mayMention(file, item_index, f.name)) return;
         const body = try r.body(file, item_index);
         if (!mentions(body, f.name)) return;
-        // 不导入定义所在文件的文件中，泛型函数之外的代码既不能按名字引用定义，也拿不到它所在的类型
+        // In a file that does not import the file containing the definition, code outside generic
+        // functions can neither reference the definition by name nor obtain its containing type
         if (f.def == .item and !f.importing.contains(file) and try seed.genericRoot(r, file, item_index) == null) return;
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
@@ -253,7 +274,8 @@ const Finder = struct {
                 },
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
-                    // 命名空间的声明直接比较；其他成员（带标签 union 的字段标签、其他目标分支中的声明）由推导给出
+                    // Namespace declarations are compared directly; other members (field tags of
+                    // tagged unions, declarations in other targets' branches) come from inference
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
                     const target: Target = if (ns_def) |d| (if (deepEql(d, f.def)) .hit else .miss) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     switch (target) {
@@ -292,9 +314,12 @@ const Finder = struct {
         return x;
     }
 
-    /// 推导结果中记录的成员（字段、方法、decl literal、枚举成员、初始化的字段）是否为 `def`。
-    /// 泛型函数体内抽象推导求不出时检查全部调用点实例：任一实例指向 `def` 即为引用；同时有实例指向
-    /// 其他定义时记为有歧义（`at`）。抽象推导与各实例都求不出成员时为 `unknown`
+    /// Whether the member recorded in the inference result (field, method, decl literal, enum
+    /// member, initializer field) is `def`.
+    /// When abstract inference inside a generic function body cannot determine it, all call-site
+    /// instances are checked: it is a reference if any instance refers to `def`; if other instances
+    /// refer to other definitions as well, it is recorded as ambiguous (`at`). The result
+    /// is `unknown` when neither abstract inference nor any instance determines the member.
     fn refersTo(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, l: Lookup, at: Reference) resolve.Error!Target {
         if (l.member(try f.inferred(res, file, item_index))) |m| {
             const d = try keyDef(f.r, m) orelse return .miss;
@@ -319,8 +344,10 @@ const Finder = struct {
         return if (miss) .miss else .unknown;
     }
 
-    /// 求不出成员的访问：决定成员的类型（字段访问的左侧，枚举字面量与初始化表达式自身）未知或是抽象的时，
-    /// 记为无法确认（具体的类型中没有这个成员时不是引用，如切片的 `len`）
+    /// An access whose member cannot be determined: when the type that determines the member (the
+    /// left-hand side of a field access, the enum literal or initializer expression itself) is
+    /// unknown or abstract, it is recorded as uncertain (when a concrete type has no such member,
+    /// it is not a reference, e.g. `len` of a slice)
     fn noteUncertain(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, e: Body.ExprId, at: Reference) resolve.Error!void {
         const slot = f.uncertain orelse return;
         if (slot.* != null) return;
@@ -340,8 +367,9 @@ const Finder = struct {
         try f.out.append(f.r.arena, .{ .file = file, .start = start, .end = end });
     }
 
-    /// 以表达式末尾的名字（字段名、枚举字面量的名字）为引用位置。直接在源码上回扫，
-    /// 不依赖解析结果（可能已被淘汰）
+    /// Uses the name at the end of the expression (field name, name of an enum literal) as the
+    /// reference position. Scans backward over the source text directly instead of relying on the
+    /// parse result (which may have been evicted).
     fn addLastToken(f: *Finder, file: FileId, end: u32) resolve.Error!void {
         const text = (try f.r.ctx.get(database.syntax.SourceText, file)).text;
         const start = lastNameStart(text, end) orelse return;
@@ -349,10 +377,11 @@ const Finder = struct {
     }
 };
 
-/// 成员访问的目标与所查找的定义的关系
+/// Relation between the target of a member access and the definition being searched for
 const Target = enum { hit, miss, unknown };
 
-/// 推导结果中的成员：表达式 `e` 访问的成员，或初始化表达式 `e` 的第 `field` 个字段
+/// A member in the inference result: the member accessed by expression `e`, or the `field`-th
+/// field of initializer expression `e`
 const Lookup = struct {
     e: Body.ExprId,
     field: ?usize = null,
@@ -367,7 +396,8 @@ const Lookup = struct {
     }
 };
 
-/// Body 中是否出现了名字 `name`（名字引用、字段访问、枚举字面量、初始化字段）
+/// Whether the name `name` occurs in the Body (name reference, field access, enum literal,
+/// initializer field)
 pub fn mentions(body: *const Body, name: []const u8) bool {
     for (body.exprs) |e| switch (e) {
         .name_ref => |n| if (std.mem.eql(u8, n, name)) return true,
@@ -379,11 +409,12 @@ pub fn mentions(body: *const Body, name: []const u8) bool {
     return false;
 }
 
-/// 结束于 `end` 的名字（标识符或 `@"..."`）的起始位置
+/// Start of the name (identifier or `@"..."`) that ends at `end`
 fn lastNameStart(text: []const u8, end: u32) ?u32 {
     if (end == 0 or end > text.len) return null;
     if (text[end - 1] == '"') {
-        // 内部可能有转义的引号：从同一行中每个 `@"` 起按字符串字面量的规则向后扫描，取恰好结束于 `end` 的
+        // There may be escaped quotes inside: scan forward from each `@"` on the same line by the
+        // rules of string literals, and take the one that ends exactly at `end`
         const line_start = if (std.mem.lastIndexOfScalar(u8, text[0 .. end - 1], '\n')) |i| i + 1 else 0;
         var q = end - 1;
         while (q > line_start + 1) {
@@ -397,7 +428,7 @@ fn lastNameStart(text: []const u8, end: u32) ?u32 {
     return if (i == end) null else i;
 }
 
-/// 起始于 `q`（开引号）的字符串字面量的结束位置（闭引号之后）
+/// End (just past the closing quote) of the string literal starting at `q` (the opening quote)
 fn quotedEnd(text: []const u8, q: usize) ?usize {
     var i = q + 1;
     while (i < text.len) : (i += 1) switch (text[i]) {

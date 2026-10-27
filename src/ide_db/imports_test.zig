@@ -85,7 +85,7 @@ test "auto imports reuse deep aliases and never leak dependency internal paths" 
     try testing.expect(index.import_edit == null);
     try testing.expect(find(aliases, "Index") == null);
     const wire = find(try run(&w, at.file, at.offset, "Wire", 128), "WireIndex").?;
-    // 依赖模块与 std 不在同一组：新的组前空一行
+    // A dependency module is not in the same group as std: a blank line before the new group
     try testing.expectEqualStrings("\nconst WireIndex = @import(\"wire\").Exported.WireIndex;\n", wire.import_edit.?.text);
     try testing.expectEqual(@as(usize, 0), (try run(&w, at.file, at.offset, "Unexport", 128)).items.len);
 }
@@ -113,7 +113,8 @@ test "auto imports traverse the full public std export closure and terminate cyc
 }
 
 test "auto imports skip module roots that are not zig source files" {
-    // 模块的根可以是数据文件（如 `addAnonymousImport` 引入的 JSON），不能按 Zig 解析：大文件很慢
+    // The root of a module can be a data file (e.g. JSON added with `addAnonymousImport`), which
+    // must not be parsed as Zig: that is very slow for large files
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -471,7 +472,8 @@ test "auto imports reuse direct type scalar function and value aliases by canoni
     };
     inline for (cases) |case| {
         const result = try run(&w, at.file, at.offset, case[0], 128);
-        // 复用的别名排在最前；按路径匹配上的其他成员（如 `Root.EdgeWidget.EdgeChild`）排在后面，都不新增 import
+        // The reused alias comes first; other members matched by path (such as
+        // `Root.EdgeWidget.EdgeChild`) come after it; none of them adds an import
         const alias = result.items[0];
         try testing.expectEqualStrings(case[1], alias.label);
         for (result.items) |item| try testing.expect(item.import_edit == null);
@@ -600,7 +602,7 @@ test "auto imports match prefixes regardless of case and rank the typed case fir
     const title = try run(&w, at.file, at.offset, "Arr", 128);
     try testing.expectEqualStrings("ArrayList", title.items[0].label);
     try testing.expectEqualStrings("arrayCopy", title.items[1].label);
-    // 截断时保留大小写一致的候选，无论先遇到哪一个
+    // When truncating, keep the candidate whose case matches, regardless of which comes first
     for ([_][2][]const u8{ .{ "arr", "arrayCopy" }, .{ "Arr", "ArrayList" } }) |case| {
         const one = try run(&w, at.file, at.offset, case[0], 1);
         try testing.expectEqual(@as(usize, 1), one.items.len);
@@ -616,7 +618,8 @@ test "auto imports keep declarations whose names differ only in case apart" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
-    // 跨文件的精确查找须与索引的顺序一致：按字节比较时找不到排在 `alpha`、`beta`、`gamma` 之后的 `Zone`
+    // Exact lookups across files must follow the order of the index: a bytewise comparison
+    // cannot find `Zone`, which sorts after `alpha`, `beta` and `gamma`
     const f = try w.fixture(
         \\//- /p/main.zig module:app deps:shapes=dep
         \\fn main() void { _ = <|>missing; }
@@ -638,8 +641,10 @@ test "auto imports keep declarations whose names differ only in case apart" {
 }
 
 test "auto import resolves short alias chains independently of earlier long chains" {
-    // 超过 max_depth 的长链不能把同一批声明里较短的链按起点深度截断：A30 距 Root 只有 19 跳，
-    // 从 A0 求值到它时已接近深度上限，必须仍能在自己的起点求值出命名空间。
+    // A long chain exceeding max_depth must not cause shorter chains in the same batch of
+    // declarations to be truncated by the depth counted from the long chain's start: A30 is only
+    // 19 hops away from Root, and evaluating from A0 reaches it close to the depth limit, yet it
+    // must still evaluate to a namespace from its own starting point.
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -850,7 +855,7 @@ test "auto imports follow namespaces chosen by comptime conditions" {
     const chosen = find(try run(&w, at.file, at.offset, "kqueue", 128), "kqueue_create").?;
     try testing.expect(std.mem.indexOf(u8, chosen.import_edit.?.text, "impl.kqueue_create") != null or
         std.mem.indexOf(u8, chosen.import_edit.?.text, "by_tag.kqueue_create") != null);
-    // 没有选中的分支中的声明不可达
+    // Declarations in branches that are not selected are unreachable
     try testing.expect(find(try run(&w, at.file, at.offset, "epoll", 128), "epoll_create") == null);
 }
 
@@ -877,9 +882,9 @@ test "files used only by tests are imported only from test code" {
     try testing.expect(find(try run(&w, at.file, at.offset, "Widg", 128), "lib.Widget") != null);
     try testing.expect(find(try run(&w, at.file, at.offset, "Fixt", 128), "Fixture") == null);
     try testing.expect(find(try run(&w, at.file, at.offset, "main_t", 128), "main_test") == null);
-    // `harness.zig` 只经由只被 test 用到的 `check` 引用
+    // `harness.zig` is referenced only through `check`, which only tests use
     try testing.expect(find(try run(&w, at.file, at.offset, "harn", 128), "harness") == null);
-    // test 声明中仍然提供
+    // Still offered in test declarations
     const in_test = at.offset + @as(u32, "missing; }\ntest { _ = @import(\"main_test.zig\"); check(.{}); _ = missing2".len);
     try testing.expect(find(try run(&w, at.file, in_test, "Fixt", 128), "Fixture") != null);
     try testing.expect(find(try run(&w, at.file, in_test, "harn", 128), "harness") != null);
@@ -905,21 +910,23 @@ test "auto imports match whole paths of shallow exports and only names deeper" {
         \\};
     );
     const at = f.cursor.?;
-    // 命名空间的名字匹配时也给出它的成员（经由可见的 `std`，不新增 import）；名字以输入开头的按名字过滤，其余按路径
+    // When the name of a namespace matches, its members are offered too (through the visible `std`,
+    // without a new import); those whose names start with the input are filtered by name, the rest
+    // by path
     const mem = try run(&w, at.file, at.offset, "mem", 128);
     try testing.expectEqualStrings("std.mem", mem.items[0].label);
     try testing.expectEqualStrings("mem", mem.items[0].filter);
     const eql = find(mem, "std.mem.eql").?;
     try testing.expectEqualStrings("std.mem.eql", eql.filter);
     try testing.expect(eql.import_edit == null);
-    // 跨段的模糊匹配
+    // Fuzzy matching across segments
     try testing.expect(find(try run(&w, at.file, at.offset, "memeql", 128), "std.mem.eql") != null);
     try testing.expect(find(try run(&w, at.file, at.offset, "oslin", 128), "std.os.linux") != null);
-    // 超过两段的只按名字的前缀匹配
+    // Paths of more than two segments are matched only by name prefix
     try testing.expect(find(try run(&w, at.file, at.offset, "linsys", 128), "std.os.linux.syscalls") == null);
     try testing.expect(find(try run(&w, at.file, at.offset, "sys", 128), "std.os.linux.syscalls") != null);
     try testing.expect(find(try run(&w, at.file, at.offset, "read", 128), "std.os.linux.syscalls.read") != null);
-    // 截断时保留分数最高的
+    // Truncation keeps the highest-scoring ones
     const one = try run(&w, at.file, at.offset, "mem", 1);
     try testing.expectEqual(@as(usize, 1), one.items.len);
     try testing.expectEqualStrings("std.mem", one.items[0].label);
@@ -969,7 +976,7 @@ test "auto import candidates are classified like the declarations they import" {
         .{ "WidgetIndex", .type },
         .{ "widget_limit", .constant },
         .{ "widgetMake", .function },
-        // 运行期存储经由命名空间访问
+        // Runtime storage is accessed through the namespace
         .{ "Lib.widget_count", .variable },
     };
     for (cases) |c| {
@@ -982,7 +989,8 @@ test "auto import candidates are classified like the declarations they import" {
             return err;
         };
     }
-    // 同名的两个候选：`Lib.zig` 中指向文件的声明为命名空间，文件本身为文件
+    // Two candidates with the same name: the declaration in `Lib.zig` that refers to the file is a
+    // namespace, and the file itself is a file
     var kinds: [2]?@FieldType(imports.Candidate, "kind") = .{ null, null };
     for (result.items) |item| if (std.mem.eql(u8, item.label, "widgets")) {
         kinds[@intFromBool(std.mem.indexOf(u8, item.qualifier, "Lib") != null)] = item.kind;

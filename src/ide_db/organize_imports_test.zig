@@ -17,7 +17,7 @@ fn apply(a: std.mem.Allocator, text: []const u8, edits: []const Edit) ![]const u
     return out.items;
 }
 
-/// 整理后的文本；整理的结果再整理一次没有编辑
+/// Text after organizing; organizing the result again produces no edits
 fn organized(a: std.mem.Allocator, text: []const u8, opts: Options) ![]const u8 {
     const parse = try Parse.create(testing.allocator, text);
     defer parse.destroy();
@@ -70,7 +70,7 @@ test "organize imports: groups std builtin root, modules and files, files neares
         \\pub fn main() void {}
         \\
     ;
-    // 数字按数值比较（a2 在 a10 之前），大写字母在小写字母之前
+    // Numbers compare by value (a2 before a10), and uppercase letters come before lowercase ones
     try testing.expectEqualStrings(
         \\//! Docs.
         \\const std = @import("std");
@@ -90,7 +90,7 @@ test "organize imports: groups std builtin root, modules and files, files neares
         \\pub fn main() void {}
         \\
     , try organized(arena.allocator(), text, .{}));
-    // 按声明名：std 组仍按固定顺序
+    // By declaration name: the std group still uses the fixed order
     try testing.expectEqualStrings(
         \\//! Docs.
         \\const std = @import("std");
@@ -128,7 +128,9 @@ test "organize imports: derived declarations follow their import or form the las
         \\const other = @import("other.zig");
         \\
     ;
-    // 派生声明按展开后的路径排在它依赖的声明之后（多层的依次跟随）；依赖的声明在别的块中时在最后一组
+    // Derived declarations follow the declaration they depend on, sorted by expanded path
+    // (multiple levels follow one after another); when the dependency is in another block, they
+    // go in the last group
     try testing.expectEqualStrings(
         \\const std = @import("std");
         \\const assert = std.debug.assert;
@@ -228,7 +230,7 @@ test "organize imports: declarations sharing a line and files with syntax errors
 }
 
 test "version sort orders numbers by value, capitals first and underscores before other characters" {
-    // Rust Style Guide 的 Sorting 一节中的例子（节选）
+    // Examples from the Sorting section of the Rust Style Guide (excerpt)
     const sorted = [_][]const u8{ "_ZYXW", "_abcd", "A2", "ABCD", "Z_YXW", "ZY_XW", "ZYXW", "ZYXW_", "a1", "abcd", "u_zzz", "u8", "u16", "u32", "u128", "ua", "usize", "uz", "v000", "v00", "v0", "v0s", "v00t", "v0u", "v001", "v01", "v1", "v009", "v09", "v9", "v010", "v10", "x64", "x86", "x86_32", "x86_64", "x86_128", "x87", "zyxw" };
     for (sorted[0 .. sorted.len - 1], sorted[1..]) |x, y| {
         testing.expectEqual(std.math.Order.lt, organize_imports.versionOrder(x, y)) catch |err| {
@@ -268,7 +270,7 @@ test "auto import inserts into the organized block at its sorted place, otherwis
         \\fn main() void {}
         \\
     , try inserted(a, text, "mid", "mid.zig", "const mid = @import(\"mid.zig\");"));
-    // 新的组前后空一行
+    // A blank line before and after a new group
     try testing.expectEqualStrings(
         \\const std = @import("std");
         \\
@@ -290,14 +292,14 @@ test "auto import inserts into the organized block at its sorted place, otherwis
         \\fn main() void {}
         \\
     , try inserted(a, text, "zz", "zz.zig", "const zz = @import(\"zz.zig\");"));
-    // 块没有整理好：不顺带重排，插在最后一条 import 之后
+    // The block is not organized: no incidental reordering; insert after the last import
     try testing.expectEqualStrings(
         \\const b = @import("b.zig");
         \\const a = @import("a.zig"); // keep
         \\const c = @import("c.zig");
         \\fn main() void {}
     , try inserted(a, "const b = @import(\"b.zig\");\nconst a = @import(\"a.zig\"); // keep\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"));
-    // 没有 import：文件头的 `//!` 文档之后
+    // No imports: after the `//!` docs at the top of the file
     try testing.expectEqualStrings(
         "//! Docs.\nconst c = @import(\"c.zig\");\nfn main() void {}",
         try inserted(a, "//! Docs.\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
