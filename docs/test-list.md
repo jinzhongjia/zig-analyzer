@@ -1,16 +1,16 @@
-# 批量校验的项目清单
+# Projects used for batch validation
 
-`docs/design.md` §5.3 中批量校验所用的 97 个 Zig 0.17.0 项目。提交为 2026-10-19 克隆时默认分支的最新提交；测量文件为根项目（不含自带 `build.zig` 的子目录、测试与示例）中成员访问最多的文件，只有构建脚本的 C 库为 `build.zig`。
+The 97 Zig 0.17.0 projects used for the batch validation in `docs/design.md` §5.3. The commit is the latest commit of the default branch when the project was cloned on 2026-10-19. The measured file is the file with the most member accesses in the root project (excluding subdirectories with their own `build.zig`, tests, and examples); for C libraries that consist only of a build script, it is `build.zig`.
 
-复现：克隆并检出表中的提交，在项目根目录运行 `zig build --fetch` 取得依赖，再在本仓库中对每个项目运行
+To reproduce: clone each project and check out the commit in the table, run `zig build --fetch` in the project root to fetch the dependencies, and then run the following in this repository for each project:
 
 ```
-BENCH_QUICK=1 BENCH_CHECK=40 BENCH_COMPLETE=40 BENCH_REFS=20 zig build bench -Doptimize=ReleaseSafe -- <项目根目录> <测量文件>
+BENCH_QUICK=1 BENCH_CHECK=40 BENCH_COMPLETE=40 BENCH_REFS=20 zig build bench -Doptimize=ReleaseSafe -- <project root> <measured file>
 ```
 
-kristoff-it/zine 的 `build.zig` 以 `git describe` 求版本号，需要完整的提交历史与 tag，浅克隆时构建配置失败。
+The `build.zig` of kristoff-it/zine computes the version number with `git describe`, which needs the full commit history and tags; with a shallow clone, the build configuration fails.
 
-| 仓库 | 提交 | 测量文件 |
+| Repository | Commit | Measured file |
 |---|---|---|
 | https://codeberg.org/GasInfinity/zitrus | `35cb3ecddb5a` | `src/horizon/Io/Storage.zig` |
 | https://codeberg.org/hgrsd/zopt | `d78b41e94ea1` | `src/Zopt.zig` |
