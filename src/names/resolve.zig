@@ -124,8 +124,14 @@ pub const Resolver = struct {
     /// body, the local names of that member visible at the container's position.
     /// Used at positions without a Body local scope (such as the name in a decltest `test helper`).
     pub fn resolveContainerName(r: *Resolver, file: FileId, item: u32, name: []const u8) Error!?Def {
+        return r.resolveInContainer(file, (try r.itemTree(file)).items[item].container, name);
+    }
+
+    /// Names visible between the members of container `container_index` (such as at the position of
+    /// a member declaration), looked up as in `resolveContainerName`.
+    pub fn resolveInContainer(r: *Resolver, file: FileId, container_index: u32, name: []const u8) Error!?Def {
         const tree = try r.itemTree(file);
-        var container = tree.items[item].container;
+        var container = container_index;
         while (true) {
             if (lookupDecl(tree, container, name)) |m| return .{ .item = .{ .file = file, .item = m } };
             // The container is defined in a member's body: continue with the local names of that
