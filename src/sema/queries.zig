@@ -1,4 +1,4 @@
-//! sema query：声明类型与 Body 的类型推导。
+//! sema queries: declaration types and type inference of Bodies.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,8 +21,10 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const mem = @import("../util/mem.zig");
 
-/// 与目标相关的值运算参数：指针位宽，向量、整数、浮点与 C 类型的布局规则（各模块一致的部分）。值同时存于
-/// InternPool 供值的运算读取，用到值运算的 query 先读本 input 以记录依赖
+/// Target-dependent parameters for value computations: the pointer bit width and the layout rules
+/// for vectors, integers, floats and C types (the parts consistent across modules). The value is
+/// also stored in the InternPool for value computations to read; queries that use value
+/// computations read this input first to record the dependency.
 pub const TargetAbi = struct {
     pub const kind: engine.Kind = .input;
     pub const Key = void;
@@ -33,9 +35,12 @@ pub const TargetAbi = struct {
 pub const InferKey = struct {
     owner: hir.OwnerKey,
     mode: infer.Mode,
-    /// owner 自身或其外层泛型函数的实例（已规范化，见 `normalizeInst`）；null 为非泛型或抽象实例
+    /// Instance of the owner itself or of its enclosing generic function (normalized, see
+    /// `normalizeInst`); null for non-generic code or the abstract instance
     inst: ?Index = null,
-    /// 遍历类型列表的循环的循环变量按某次迭代取值（IDE 功能为循环体选实例时用）；null 时循环变量是抽象的
+    /// The loop variable of a loop over a list of types takes its value from one particular
+    /// iteration (used when IDE features pick an instance for the loop body); when null, the loop
+    /// variable is abstract
     loop: ?infer.LoopSeed = null,
 };
 
@@ -44,15 +49,18 @@ pub const DeclKey = struct {
     inst: ?Index = null,
 };
 
-/// BodyOwner 的类型推导结果。签名模式不读取函数体与初始化表达式，
-/// 只改这些内容时依赖签名的 query 不必重算
+/// Type inference result of a BodyOwner. Signature mode reads neither the function body nor the
+/// initializer expression, so queries that depend on the signature need not be recomputed when
+/// only those change.
 pub const Infer = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = InferKey;
     pub const Value = *const infer.Result;
-    /// 约束长时间会话的内存（泛型实例的结果会不断累积）：被淘汰的结果按需重新推导
+    /// Bounds the memory of long sessions (results for generic instances keep accumulating):
+    /// evicted results are inferred again on demand
     pub const lru = 16 * 1024;
-    /// 值的大小差别很大（长函数的 HIR / 推导结果可达数百 KB），同时按字节数限制
+    /// Values vary greatly in size (the HIR / inference result of a long function can reach
+    /// hundreds of KB), so the cache is limited by byte count as well
     pub const lru_bytes = 48 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
@@ -87,7 +95,8 @@ pub const Infer = struct {
 
 const empty_result: infer.Result = .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{}, .ret = .unknown };
 
-/// 声明的类型；const 的值 comptime 已知时附带值（如 `const S = struct {...}` 的值为类型 S）
+/// Type of a declaration; includes the value when the value of a const is known at comptime
+/// (e.g. the value of `const S = struct {...}` is the type S)
 pub const DeclType = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = DeclKey;
@@ -109,7 +118,8 @@ pub const DeclType = struct {
             .@"fn" => {
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
-                // 绑定的参数（含 anytype 与无名参数）按顺序，`...` 没有绑定、只能在末尾（见 ItemTree 的 `varargs`）
+                // Parameters with bindings (including anytype and unnamed parameters) in order;
+                // `...` has no binding and can only come last (see `varargs` in ItemTree)
                 var params: std.ArrayList(Index) = .empty;
                 for (b.params) |p| try params.append(r.arena, res.bindings[@backingInt(p)].ty);
                 const varargs = tree.items[item].flags.varargs;
@@ -122,7 +132,8 @@ pub const DeclType = struct {
                 const annotation: ?Index = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else null;
                 var value: TypedValue = if (b.value) |v| res.exprs[@backingInt(v)] else .unknown;
                 const is_const = tree.items[item].kind == .@"const";
-                // 容器级常量在 comptime 求值：推导求不出值时由解释器执行初始化表达式
+                // Container-level constants are evaluated at comptime: when inference cannot
+                // compute the value, the interpreter executes the initializer expression
                 if (is_const and value.val == null and b.value != null and !ctx.incomplete()) {
                     const ev = try eval.ownerValue(&r, key, dk.inst, annotation);
                     if (ev.val != null and (value.ty == .unknown or ev.ty == value.ty or annotation != null)) value = ev;
@@ -136,7 +147,8 @@ pub const DeclType = struct {
                     const ty = try containerType(&r, .{ .file = key.file, .container = container }, dk.inst);
                     return .{ .ty = ty, .val = try ip.get(.{ .enum_tag = .{ .ty = ty, .name = tree.items[item].name orelse "" } }) };
                 }
-                // union 中只写名字的字段（`union(enum) { a: u8, b }` 的 `b`）类型为 void
+                // A union field written with just a name (`b` in `union(enum) { a: u8, b }`) has
+                // type void
                 if (b.type_expr == null and tree.containers[container].kind == .@"union") return .{ .ty = .void_type };
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
                 if (res.exprs.len == 0) return .unknown;
@@ -151,8 +163,9 @@ pub const DeclType = struct {
     }
 };
 
-/// 函数在签名推导结果 `sig`（实例 `inst`）中的返回类型。`!T` 的错误集是由函数体推导的错误集，
-/// 签名中只记录标记（不读取函数体），成员由 `ErrorSetOf` 求出
+/// Return type of a function in the signature inference result `sig` (instance `inst`). The error
+/// set of `!T` is the error set inferred from the function body; the signature records only a
+/// marker (without reading the body), and the members are computed by `ErrorSetOf`.
 pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *const infer.Result, inst: ?Index) resolve.Error!Index {
     const t = body.type_expr orelse return .unknown;
     if (@backingInt(t) >= sig.exprs.len) return .unknown;
@@ -163,9 +176,12 @@ pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *co
     return ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
 }
 
-/// 成员中不编译的代码的范围：`Infer` 的 `inactive` 与 `dead_spans`（相对成员起点，按位置排序）。
-/// 非活动代码需要文件中全部成员的推导结果，大文件的 `Infer` 结果超出 LRU 的上限，每次发布都要重算被淘汰的
-/// 部分；这里只保留区间，依赖未变时即使 `Infer` 的值已被淘汰也不必重算
+/// Ranges of code in a member that is not compiled: the `inactive` and `dead_spans` of `Infer`
+/// (relative to the start of the member, sorted by position). Inactive code needs the inference
+/// results of all members of the file, and for a large file the `Infer` results exceed the LRU
+/// limit, so every publish would recompute the evicted part; only the ranges are kept here, so
+/// while the dependencies are unchanged nothing needs recomputing even if the `Infer` values have
+/// been evicted.
 pub const InactiveRanges = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = hir.OwnerKey;
@@ -205,13 +221,17 @@ pub const InactiveRanges = struct {
     }
 };
 
-/// 推导的错误集的成员：函数体中 `return` 的错误与 `try` 传播的错误，含未知部分时为 anyerror。
-/// 递归的函数取最小不动点（与编译器一致；编译器不允许相互递归，这里同样取各函数错误的并集）
+/// Members of an inferred error set: the errors `return`ed in the function body and the errors
+/// propagated by `try`; anyerror when any part is unknown. Recursive functions take the least
+/// fixpoint (matching the compiler; the compiler rejects mutual recursion, for which the union of
+/// the errors of the functions is likewise taken here).
 pub const ErrorSetOf = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = DeclKey;
     pub const Value = Index;
-    /// 函数体只把被调函数的错误并入结果：环中对自身的读取先视为空集，环的入口算一遍即得完整结果
+    /// A function body only merges the errors of its callees into the result: a read of
+    /// itself within a cycle is first treated as the empty set, and one computation at the
+    /// entry of the cycle gives the complete result
     pub const fixpoint = true;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
@@ -230,7 +250,8 @@ pub const ErrorSetOf = struct {
                 .prefix => |p| if (p.op == .keyword_try) res.exprs[@backingInt(p.operand)].ty else continue,
                 else => continue,
             };
-            // comptime 已知不会执行的分支（含 noreturn 语句之后）不并入错误集
+            // Branches known at comptime not to execute (including code after a noreturn
+            // statement) are not merged into the error set
             if (isInactive(body, res, range)) continue;
             if (!try collectErrors(&r, t, &names, e == .prefix)) return .anyerror_type;
         }
@@ -246,8 +267,8 @@ pub const ErrorSetOf = struct {
     }
 };
 
-/// `range` 是否落在 comptime 不活跃的分支或 noreturn 语句之后（见 `Infer.Result.inactive` /
-/// `dead_spans`）
+/// Whether `range` lies in a branch that is inactive at comptime or after a noreturn statement
+/// (see `Infer.Result.inactive` / `dead_spans`)
 fn isInactive(body: *const Body, res: *const infer.Result, range: Body.Range) bool {
     for (res.inactive) |e| {
         const r = body.range(e);
@@ -259,8 +280,9 @@ fn isInactive(body: *const Body, res: *const infer.Result, range: Body.Range) bo
     return false;
 }
 
-/// 类型中可能出现的错误（错误集、error union 的错误集）加入 `names`；含 anyerror 或未知时返回 false。
-/// `required` 时类型必须带有错误（`try` 的操作数）
+/// Adds the errors the type can carry (an error set, the error set of an error union) to `names`;
+/// returns false when anyerror or something unknown is involved. With `required`, the type must
+/// carry errors (the operand of `try`).
 fn collectErrors(r: *Resolver, t: Index, names: *std.ArrayList([]const u8), required: bool) resolve.Error!bool {
     const ip = r.ctx.db.env.ip;
     if (t == .unknown) return false;
@@ -276,12 +298,12 @@ fn collectErrors(r: *Resolver, t: Index, names: *std.ArrayList([]const u8), requ
             return true;
         },
         .simple_type => |s| return s != .anyerror and !required,
-        // `return` 的其他值（载荷）不带错误
+        // Other values of `return` (payloads) carry no errors
         else => return !required,
     }
 }
 
-/// 错误集的成员；anyerror 或无法求出时为 null
+/// Members of an error set; null for anyerror or when they cannot be computed
 pub fn errorSetMembers(r: *Resolver, t: Index) resolve.Error!?[]const []const u8 {
     const ip = r.ctx.db.env.ip;
     switch (ip.key(t)) {
@@ -297,15 +319,16 @@ pub fn errorSetMembers(r: *Resolver, t: Index) resolve.Error!?[]const []const u8
     }
 }
 
-/// 函数的返回类型是否为 `!T`（推导的错误集）
+/// Whether the return type of the function is `!T` (an inferred error set)
 fn inferredErrorSet(r: *Resolver, owner: hir.OwnerKey) resolve.Error!bool {
     const tree = try r.itemTree(owner.file);
     for (tree.items) |it| if (it.ast_id == owner.item) return it.flags.inferred_error_set;
     return false;
 }
 
-/// 类型是否只能在 comptime 存在（见 `eval.computeComptimeOnly`），按类型缓存。递归类型经由指针引用自身
-/// 形成环：环本身不使类型成为 comptime-only，取最小不动点
+/// Whether a type can exist only at comptime (see `eval.computeComptimeOnly`), cached per type.
+/// A recursive type referring to itself through a pointer forms a cycle: the cycle itself does
+/// not make the type comptime-only, so the least fixpoint is taken.
 pub const ComptimeOnly = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Index;
@@ -328,7 +351,8 @@ pub const ComptimeOnly = struct {
     }
 };
 
-/// comptime 调用的结果：由解释器执行函数体，结果按实例与实参缓存
+/// Result of a comptime call: the interpreter executes the function body, and the result is
+/// cached per instance and arguments
 pub const CallEval = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = eval.CallKey;
@@ -344,14 +368,14 @@ pub const CallEval = struct {
     }
 };
 
-/// `.zon` 文件没有结果类型时的值（见 `zon.lower`）
+/// Value of a `.zon` file without a result type (see `zon.lower`)
 pub const ZonValue = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
     pub const Value = TypedValue;
 
     pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
-        // 解析与转换都逐层递归
+        // Both parsing and conversion recurse level by level
         if (ctx.stackExhausted()) {
             ctx.exhausted();
             return .unknown;
@@ -361,29 +385,36 @@ pub const ZonValue = struct {
     }
 };
 
-/// `@import` 的值：`.zon` 文件为其中的值（见 `ZonValue`），`.zig` 文件为文件容器类型
+/// Value of `@import`: for a `.zon` file, the value in it (see `ZonValue`); for a `.zig` file,
+/// the file container type
 pub fn importValue(r: *Resolver, target: FileId) resolve.Error!TypedValue {
     if (r.isZon(target)) return r.ctx.get(ZonValue, target);
     return TypedValue.ofType(try containerType(r, .{ .file = target, .container = 0 }, null));
 }
 
-/// 推导进行中的局部绑定（同一 owner 内直接读取，避免循环）
+/// A local binding of an inference in progress (read directly within the same owner, to avoid
+/// cycles)
 pub const LocalKey = struct {
     owner: hir.OwnerKey,
     target: union(enum) {
         binding: Body.BindingId,
-        /// 在 comptime 上下文中求值的表达式（如体内 `enum(u8)` 的参数）
+        /// An expression evaluated in a comptime context (such as the argument of `enum(u8)`
+        /// in a body)
         expr: Body.ExprId,
     },
     inst: ?Index = null,
 };
 
-/// 成员中一个局部绑定（或一个 comptime 表达式）的类型与值：只推导这一个绑定（参数取实例；
-/// 局部常量 / 变量推导其类型标注与初始化表达式，其中引用的其他局部绑定同样按需查询）。
+/// Type and value of one local binding (or one comptime expression) in a member: infers only this
+/// binding (a parameter is taken from the instance; a local constant / variable infers its type
+/// annotation and initializer expression, and other local bindings referenced there are queried
+/// on demand in the same way).
 ///
-/// 体内定义的容器引用外层函数的局部名字（如 `const T = struct {...}; ... struct { fn f(x: T) }`）时
-/// 经由它，不依赖外层函数的整个函数体：否则外层函数体又引用内层成员时形成环，
-/// 环中的结果不写入 memo，每次读取都要重算
+/// A container defined in a body that refers to local names of the enclosing function (e.g.
+/// `const T = struct {...}; ... struct { fn f(x: T) }`) goes through this query instead of
+/// depending on the whole body of the enclosing function: otherwise a cycle forms when the
+/// enclosing function body in turn refers to the inner member, and since results within a cycle
+/// are not written to the memo, every read would recompute them.
 pub const LocalValue = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = LocalKey;
@@ -405,7 +436,8 @@ pub const LocalScope = struct {
     bindings: []const TypedValue,
 };
 
-/// 名字解析结果的类型。`inst` 为解析发生处的实例上下文
+/// Type of a name resolution result. `inst` is the instance context where the resolution takes
+/// place.
 pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Index) resolve.Error!TypedValue {
     switch (def) {
         .item => |it| {
@@ -420,8 +452,10 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
     }
 }
 
-/// 实例上下文中适用于成员 `item` 的实例：沿实例链找第一个属于 `item` 自身（函数）
-/// 或其外层函数的实例。成员不在任何泛型函数中时为 null，保证同一成员不会因上下文不同而重复推导
+/// The instance in an instance context that applies to member `item`: the first instance along
+/// the instance chain that belongs to `item` itself (a function) or to an enclosing function.
+/// Null when the member is not inside any generic function, which ensures the same member is not
+/// inferred repeatedly for different contexts.
 pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
     const ip = r.ctx.db.env.ip;
     var cur = inst;
@@ -432,8 +466,11 @@ pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolv
     return null;
 }
 
-/// 成员声明（DeclType）适用的实例。函数取包含它的泛型函数的实例，不取它自身的实例：
-/// 函数体内递归引用自身时，函数值不能带上当前调用的实例（否则每层递归都是新的实例，无法识别为环）
+/// The instance that applies to a member declaration (DeclType). A function takes the instance of
+/// the generic function containing it, not its own instance: when a function body refers to
+/// itself recursively, the function value must not carry the instance of the current call
+/// (otherwise every level of recursion would be a new instance, and the cycle could not be
+/// recognized).
 pub fn declInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
     const tree = try r.itemTree(file);
     if (tree.items[item].kind != .@"fn") return normalizeInst(r, file, item, inst);
@@ -441,7 +478,7 @@ pub fn declInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Err
     return normalizeInst(r, file, parent, inst);
 }
 
-/// `item` 是否为 `fn_decl` 本身或位于其内部（经由体内定义的容器）
+/// Whether `item` is `fn_decl` itself or lies inside it (through containers defined in its body)
 pub fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../syntax/ItemTree.zig").AstId) resolve.Error!bool {
     const tree = try r.itemTree(file);
     var cur: ?u32 = item;
@@ -452,7 +489,8 @@ pub fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../sy
     return false;
 }
 
-/// 命名空间（文件中的容器）对应的容器类型；容器定义在泛型函数体内时带上适用的实例
+/// Container type of a namespace (a container in a file); when the container is defined in a
+/// generic function body, it carries the applicable instance
 pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!Index {
     const tree = try r.itemTree(ns.file);
     const c = tree.containers[ns.container];
@@ -467,8 +505,9 @@ pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!In
     }, .inst = container_inst } });
 }
 
-/// 元组声明 `struct { A, B }`：与编译器一致是结构化的元组类型（字段类型相同的声明是同一个类型）。
-/// 有字段名或声明时不是元组声明，为 null
+/// Tuple declaration `struct { A, B }`: matching the compiler, it is a structural tuple type
+/// (declarations with the same field types are the same type). Null when there are field names
+/// or declarations, since it is then not a tuple declaration.
 fn tupleDecl(r: *Resolver, tree: *const ItemTree, ns: Namespace, inst: ?Index) resolve.Error!?Index {
     const members = tree.containerMembers(ns.container);
     if (members.len == 0) return null;
@@ -477,7 +516,7 @@ fn tupleDecl(r: *Resolver, tree: *const ItemTree, ns: Namespace, inst: ?Index) r
     const values = try r.arena.alloc(Index, members.len);
     for (members, types, values) |m, *t, *v| {
         t.* = (try defType(r, .{ .item = .{ .file = ns.file, .item = m } }, null, inst)).ty;
-        // comptime 字段的值属于类型，这里不求值
+        // The values of comptime fields belong to the type and are not evaluated here
         v.* = if (tree.items[m].flags.is_comptime) .unknown else .runtime;
     }
     return try r.ctx.db.env.ip.get(.{ .tuple_type = .{ .types = types, .values = InternPool.fieldValues(values) } });
@@ -493,7 +532,7 @@ pub fn namespaceOfType(r: *Resolver, t: Index) resolve.Error!?Namespace {
     return null;
 }
 
-/// 容器类型所属的实例
+/// The instance a container type belongs to
 pub fn instOfType(ip: *InternPool, t: Index) ?Index {
     return switch (ip.key(t)) {
         .container_type => |c| c.inst,

@@ -1,11 +1,15 @@
-//! comptime 解释器：在 HIR 上解释执行 comptime 求值的函数调用（类型构造函数、
-//! comptime 上下文中的调用）与容器级常量的初始化表达式，值为 InternPool 中的类型与值。
+//! comptime interpreter: interprets on HIR the function calls evaluated at comptime (type
+//! constructors, calls in a comptime context) and the initializer expressions of container-level
+//! constants; values are types and values in the InternPool.
 //!
-//! 解释器内的值可以修改：局部变量、数组与结构体的元素、经由指针写入（指针表示为存储单元 +
-//! 元素路径）。只在离开解释器时（返回值、query 结果）驻留，避免只增不减的 InternPool 中堆积
-//! 中间结果。遇到未知值、运行时才能确定的操作、不支持的语法或 `@compileError` 时放弃求值，
-//! 结果为未知。燃料：每次求值有步数上限，解释器内的嵌套调用有深度上限，经由 query 的调用与
-//! 深层递归受查询引擎的栈深度保护。
+//! Values inside the interpreter are mutable: locals, elements of arrays and structs, and writes
+//! through pointers (a pointer is represented as a storage cell + an element path). Values are
+//! interned only when they leave the interpreter (return values, query results), so intermediate
+//! results do not pile up in the grow-only InternPool. Evaluation gives up on an unknown value, an
+//! operation that can only be determined at runtime, unsupported syntax, or `@compileError`, and
+//! the result is unknown. Fuel: each evaluation has a step limit, nested calls inside the
+//! interpreter have a depth limit, and calls through queries and deep recursion are guarded by
+//! the query engine's stack depth limit.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,36 +34,46 @@ const infer = @import("infer.zig");
 const value = @import("value.zig");
 const zon = @import("zon.zig");
 
-/// 回跳（循环的每次迭代、每次调用）的默认配额，与编译器相同；`@setEvalBranchQuota` 调高。超过配额时编译器报错，
-/// 这里放弃求值
+/// Default quota of backward branches (each loop iteration, each call), same as the compiler;
+/// raised by `@setEvalBranchQuota`. When the quota is exceeded the compiler reports an error;
+/// here evaluation gives up.
 pub const default_branch_quota = 1000;
-/// 求字符串来源时展开声明的嵌套深度上限：互相引用的声明不会结束，超过时只是不跟踪来源
+/// Limit on the nesting depth of declarations expanded when finding the origin of a string:
+/// mutually referencing declarations never terminate; past the limit the origin is just not
+/// tracked
 const max_tracked_decls = 64;
-/// 单次求值的内存上限（字节）：循环中复制大数组、拼接长字符串等超过时放弃。与 rust-analyzer 常量求值的内存上限相同
+/// Memory limit of a single evaluation (bytes): evaluation gives up when it is exceeded, e.g. by
+/// copying large arrays or concatenating long strings in a loop. Same as the memory limit of
+/// rust-analyzer's const evaluation.
 const max_eval_bytes = 1024 * 1024 * 1024;
-/// 求布局时容器按值嵌套的深度上限（按值包含自身的类型非法，不会结束）
+/// Depth limit of containers nested by value when computing layouts (a type that contains itself
+/// by value is invalid and would never terminate)
 const max_layout_depth = 64;
-/// 驻留时值的嵌套深度上限（聚合与指针的层数）。驻留的值按内容唯一表示、没有环，
-/// 自引用的值（如 `n.next = &n`）沿指针展开不会结束
+/// Nesting depth limit of values when interning (levels of aggregates and pointers). Interned
+/// values are uniquely represented by their content and have no cycles, so expanding a
+/// self-referencing value (such as `n.next = &n`) along its pointers would never terminate.
 const max_freeze_depth = 256;
 
 const Error = resolve.Error;
-/// 放弃求值与控制流
+/// Giving up evaluation, and control flow
 const EvalError = Error || error{ Abort, Break, Continue, Return };
 
-/// comptime 调用：被调函数的实例与各参数的值
+/// comptime call: the instance of the callee and the values of the arguments
 pub const CallKey = struct {
-    /// 与类型推导中的实例相同（comptime 参数取值、anytype 取类型、其他为 `runtime`），
-    /// 决定体内定义的容器的身份
+    /// Same as the instance in type inference (comptime parameters take the value, anytype takes
+    /// the type, others are `runtime`); determines the identity of containers defined in the body
     inst: Index,
-    /// 各参数的值：`aggregate`（类型为 unknown），元素与形参一一对应，未知的为 unknown
+    /// Values of the arguments: an `aggregate` (of type unknown) whose elements correspond
+    /// one-to-one to the parameters, with unknown for unknown values
     values: Index,
-    /// 回跳配额：调用处当前的配额。编译器中被调函数与调用者共用回跳计数，这里被调函数重新计数，
-    /// 不会比编译器先放弃
+    /// Backward branch quota: the current quota at the call site. In the compiler the callee shares
+    /// the backward branch count with the caller; here the callee starts counting anew, so it never
+    /// gives up before the compiler does.
     quota: u32 = default_branch_quota,
 };
 
-/// 以实例 `inst` 与实参 `args`（与形参一一对应）执行 comptime 调用，回跳配额为 `quota`
+/// Executes a comptime call with instance `inst` and arguments `args` (one-to-one with the
+/// parameters), with backward branch quota `quota`
 pub fn call(r: *Resolver, inst: Index, args: []const TypedValue, quota: u32) Error!TypedValue {
     const ip = r.ctx.db.env.ip;
     const values = try r.arena.alloc(Index, args.len);
@@ -68,8 +82,11 @@ pub fn call(r: *Resolver, inst: Index, args: []const TypedValue, quota: u32) Err
     return r.ctx.get(queries.CallEval, key);
 }
 
-/// 成员体内 `@setEvalBranchQuota` 设置的最大配额（至少为默认配额）：推导与跳转在成员中直接发起的求值使用它。
-/// 不按出现的位置区分，不会比编译器先放弃。实参求不出时取最大值。`exprs` 为成员的推导结果（可能不完整）
+/// The largest quota set by `@setEvalBranchQuota` in the member's body (at least the default
+/// quota): used by the evaluations that inference and goto start directly in the member. Where
+/// the call appears is not distinguished, so it never gives up before the compiler does. When
+/// an argument cannot be evaluated, the maximum value is taken. `exprs` is the member's
+/// inference result (possibly incomplete).
 pub fn bodyQuota(r: *Resolver, body: *const Body, exprs: []const TypedValue) u32 {
     const ip = r.ctx.db.env.ip;
     var quota: u32 = default_branch_quota;
@@ -93,7 +110,7 @@ pub fn bodyQuota(r: *Resolver, body: *const Body, exprs: []const TypedValue) u32
     return quota;
 }
 
-/// `CallEval` 的计算
+/// Computation of `CallEval`
 pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     _ = try ctx.get(queries.TargetAbi, {});
     var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
@@ -113,7 +130,8 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     return ev.toTyped(result) catch |err| giveUp(err);
 }
 
-/// 成员（容器级常量、字段默认值）主体的 comptime 值。`want` 为类型标注
+/// comptime value of the body of a member (container-level constant, field default value).
+/// `want` is the type annotation.
 pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index) Error!TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -127,8 +145,9 @@ pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index)
     return ev.toTyped(v) catch |err| giveUp(err);
 }
 
-/// 表达式在给定绑定下的 comptime 值：类型推导在 comptime 上下文中求不出值时使用。`quota` 为回跳配额
-/// （见 `bodyQuota`）
+/// comptime value of an expression under the given bindings: used when type inference cannot
+/// evaluate a value in a comptime context. `quota` is the backward branch quota (see
+/// `bodyQuota`).
 pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index, quota: u32) Error!TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -142,17 +161,20 @@ pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Ex
 
 pub const StringOrigin = struct {
     file: FileId,
-    /// 字面量所在成员（`ItemTree.items` 下标）
+    /// Member containing the literal (index into `ItemTree.items`)
     item: u32,
-    /// 字符串字面量
+    /// The string literal
     expr: ExprId,
-    /// 字面量解码后的内容中的偏移
+    /// Offset into the decoded content of the literal
     offset: u32,
 };
 
-/// 表达式 `e` 的 comptime 值中沿 `path`（逐层的元素下标，指针透明）到达的字符串来自哪个字符串字面量。
-/// 跟踪来源重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，调用在本次求值中展开；
-/// 字符串经过复制（如 `++`、逐字节构造）时来源丢失，返回 null
+/// Finds the string literal that the string reached along `path` (element indices level by
+/// level, transparent through pointers) in the comptime value of expression `e` comes from.
+/// Re-evaluates with origin tracking: string literals are placed in separate storage cells,
+/// slices keep referencing them, and calls are expanded within this evaluation; when the string
+/// is copied (e.g. by `++` or by building it byte by byte), the origin is lost and null is
+/// returned.
 pub fn stringOrigin(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, path: []const u32) Error!?StringOrigin {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -167,12 +189,15 @@ pub fn stringOrigin(r: *Resolver, file: FileId, item: u32, body: *const Body, e:
     return origin;
 }
 
-/// 在驻留的值中查找内容为 `needle` 的字符串，`path` 为逐层的元素下标（指针透明，与 `stringOrigin` 一致）；
-/// `chain` 为路径上依次经过的值（不含根与字符串本身）
+/// Searches the interned value for a string whose content is `needle`; `path` holds the element
+/// indices level by level (transparent through pointers, consistent with `stringOrigin`);
+/// `chain` holds the values passed through along the path, in order (excluding the root and the
+/// string itself)
 pub fn findString(ip: *InternPool, a: Allocator, root: Index, needle: []const u8, path: *std.ArrayList(u32), chain: *std.ArrayList(Index)) Allocator.Error!bool {
     var budget: u32 = 4096;
     if (try findStringIn(ip, a, root, needle, path, chain, &budget, 0, false)) return true;
-    // 单个字符的名字也可能由一个字节构成（`@as(*const [1]u8, &c)`）：没有这个字符串时找值为它的 u8
+    // A single-character name may also be made of a single byte (`@as(*const [1]u8, &c)`): when
+    // there is no such string, look for a u8 whose value is that character
     if (needle.len != 1) return false;
     path.clearRetainingCapacity();
     chain.clearRetainingCapacity();
@@ -186,9 +211,10 @@ fn findStringIn(ip: *InternPool, a: Allocator, v: Index, needle: []const u8, pat
     switch (ip.key(v)) {
         .int_value => |x| return byte and x.ty == .u8_type and x.value == needle[0],
         .bytes => |b| switch (ip.key(b.ty)) {
-            // 字符串（数组与指向数组的指针）
+            // Strings (arrays and pointers to arrays)
             .array_type, .ptr_type => return !byte and std.mem.eql(u8, b.bytes, needle),
-            // 元素都是 u8 的结构体等同样以字节表示：逐个元素
+            // Structs etc. whose elements are all u8 are also represented as bytes: check each
+            // element
             else => {
                 if (!byte) return false;
                 const i = std.mem.indexOfScalar(u8, b.bytes, needle[0]) orelse return false;
@@ -209,7 +235,8 @@ fn findStringIn(ip: *InternPool, a: Allocator, v: Index, needle: []const u8, pat
     return false;
 }
 
-/// 值的字段（聚合、union、切片与数组的 `len`）；求不出时为 null
+/// Field of a value (aggregates, unions, `len` of slices and arrays); null when it cannot be
+/// evaluated
 pub fn fieldValue(r: *Resolver, base: TypedValue, name: []const u8) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -220,7 +247,7 @@ pub fn fieldValue(r: *Resolver, base: TypedValue, name: []const u8) Error!?Typed
     return if (tv.val != null) tv else null;
 }
 
-/// 值的第 `i` 个元素；求不出时为 null
+/// Element `i` of a value; null when it cannot be evaluated
 pub fn elemValue(r: *Resolver, base: TypedValue, i: usize) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -231,7 +258,8 @@ pub fn elemValue(r: *Resolver, base: TypedValue, i: usize) Error!?TypedValue {
     return if (tv.val != null) tv else null;
 }
 
-/// 值的元素个数（数组、切片、元组、结构体等，值为 `undefined` 时由类型决定）；求不出时为 null
+/// Number of elements of a value (arrays, slices, tuples, structs, etc.; determined by the type
+/// when the value is `undefined`); null when it cannot be evaluated
 pub fn elemCount(r: *Resolver, base: TypedValue) Error!?usize {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -244,7 +272,8 @@ pub fn elemCount(r: *Resolver, base: TypedValue) Error!?usize {
     };
 }
 
-/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），含容器的布局；求不出时为 null
+/// Size, alignment, and bit width of a type (`@sizeOf` / `@alignOf` / `@bitSizeOf`), including
+/// the layout of containers; null when it cannot be evaluated
 pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
@@ -255,8 +284,9 @@ pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
     };
 }
 
-/// `@backingInt` 的结果类型（与编译器一致）：枚举为标签整数，带标签的 union 为标签枚举的整数，
-/// packed 容器为显式给出的 backing 整数；其他类型或求不出时为 null
+/// Result type of `@backingInt` (matches the compiler): the tag integer for enums, the integer
+/// of the tag enum for tagged unions, the explicitly given backing integer for packed
+/// containers; null for other types or when it cannot be evaluated
 pub fn backingIntType(r: *Resolver, t: Index) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
@@ -267,7 +297,8 @@ pub fn backingIntType(r: *Resolver, t: Index) Error!?Index {
     };
 }
 
-/// 枚举显式给出的标签类型（`enum(u8)` 的 `u8`）；没有时为 null。不读取成员的值
+/// Explicitly given tag type of an enum (the `u8` of `enum(u8)`); null when there is none. Does
+/// not read the values of the members.
 pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
@@ -280,14 +311,16 @@ pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
     return decl.arg;
 }
 
-/// 指向 comptime 常量值 `pointee` 的指针值（与解释器的表示一致：指向数组的指针以元素表示）
+/// Pointer value pointing to the comptime constant value `pointee` (consistent with the
+/// interpreter's representation: a pointer to an array is represented by its elements)
 pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
     return ev.pointerTo(ptr_ty, pointee);
 }
 
-/// union 的标签类型（`union(E)` 为 E，`union(enum)` 为生成的标签枚举）；不是带标签的 union 时为 null
+/// Tag type of a union (E for `union(E)`, the generated tag enum for `union(enum)`); null when
+/// it is not a tagged union
 pub fn unionTag(r: *Resolver, t: Index) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
@@ -299,7 +332,7 @@ pub fn unionTag(r: *Resolver, t: Index) Error!?Index {
     };
 }
 
-/// comptime 已知的字符串的内容；不是时为 null
+/// Content of a comptime-known string; null when it is not one
 pub fn stringValue(r: *Resolver, tv: TypedValue) Error!?[]const u8 {
     const v = tv.val orelse return null;
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
@@ -311,7 +344,7 @@ pub fn stringValue(r: *Resolver, tv: TypedValue) Error!?[]const u8 {
     };
 }
 
-/// 结构体字段的位偏移（`@bitOffsetOf`）；求不出时为 null
+/// Bit offset of a struct field (`@bitOffsetOf`); null when it cannot be evaluated
 pub fn bitOffsetOf(r: *Resolver, t: Index, field: []const u8) Error!?u64 {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
@@ -322,7 +355,8 @@ pub fn bitOffsetOf(r: *Resolver, t: Index, field: []const u8) Error!?u64 {
     };
 }
 
-/// 参数都已知时只做计算的内置函数（数学函数、布局）的值，供推导器使用；不是这类函数或求不出时为 null
+/// Value of a builtin that only computes (math functions, layout) when its arguments are all
+/// known, used by the inferrer; null when it is not such a builtin or cannot be evaluated
 pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -335,19 +369,22 @@ pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Er
     return if (tv.val != null) tv else null;
 }
 
-/// `@embedFile(path)`：`file` 所在目录中的文件的内容，类型与字符串字面量相同（`*const [len:0]u8`）。打开的
-/// 文档以缓冲区为准，否则读取磁盘（见 `SourceText`）。文件不存在时编译器报错，为 null
+/// `@embedFile(path)`: content of the file in the directory of `file`, with the same type as a
+/// string literal (`*const [len:0]u8`). For an open document the buffer is authoritative;
+/// otherwise the file is read from disk (see `SourceText`). When the file does not exist the
+/// compiler reports an error, and the result is null.
 pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue {
     const target = try r.relativeFile(file, path) orelse return null;
     const source = try r.ctx.get(syntax.SourceText, target);
-    // 没有打开、也没能从磁盘读到：文件不存在（空文件读到的是空的内容）
+    // Not open, and could not be read from disk either: the file does not exist (reading an empty
+    // file yields empty content)
     if (!source.owned and try r.ctx.get(database.inputs.FileText, target) == null) return null;
     const ip = r.ctx.db.env.ip;
     const ty = try ip.stringLiteralType(source.text.len);
     return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = source.text } }) };
 }
 
-/// 元组、匿名结构体、构造的类型与源码容器中字段的类型
+/// Type of a field in a tuple, anonymous struct, constructed type, or source container
 pub fn fieldType(r: *Resolver, t: Index, name: []const u8) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
@@ -356,21 +393,22 @@ pub fn fieldType(r: *Resolver, t: Index, name: []const u8) Error!?Index {
     return null;
 }
 
-/// 字段名（按声明顺序）：补全构造的类型、元组与匿名结构体的成员
+/// Field names (in declaration order): for completing the members of constructed types, tuples,
+/// and anonymous structs
 pub fn fieldNames(r: *Resolver, t: Index) Error![]const Field {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
     return try ev.fieldsOf(t) orelse &.{};
 }
 
-/// 构造的枚举（`@Enum`、`union(enum)` 的标签枚举）的成员名
+/// Member names of a constructed enum (`@Enum`, the tag enum of `union(enum)`)
 pub fn enumMemberNames(r: *Resolver, t: Index) Error![]const []const u8 {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
     return try ev.enumNames(t) orelse &.{};
 }
 
-/// 类型上的成员（声明、枚举成员）
+/// Member of a type (declarations, enum members)
 pub fn typeMember(r: *Resolver, t: Index, name: []const u8) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -388,8 +426,10 @@ fn abortToNull(err: EvalError) Error!?TypedValue {
     };
 }
 
-/// 两个值是否相等：`value.eqlValues` 之外，同一位置、不同实例的两个容器按它们捕获的值判断
-/// （Zig 中容器的身份 = 定义位置 + 捕获的值：不捕获实参的容器在不同实例间是同一个类型）
+/// Whether two values are equal: beyond `value.eqlValues`, two containers at the same location
+/// in different instances are compared by the values they capture (in Zig the identity of a
+/// container = definition location + captured values: a container that captures no arguments
+/// is the same type across instances)
 pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     const ip = r.ctx.db.env.ip;
     if (value.eqlValues(ip, a, b)) |eq| return eq;
@@ -421,12 +461,13 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
 
 const Capture = struct { item: u32, binding: Body.BindingId };
 
-/// 容器（含嵌套的容器）的成员引用的外层函数的参数与局部变量
+/// Parameters and locals of the enclosing function that are referenced by the members of the
+/// container (including nested containers)
 fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
     const tree = try r.itemTree(ns.file);
     var out: std.ArrayList(Capture) = .empty;
     for (tree.items, 0..) |_, i| {
-        // 成员是否位于容器内（经由嵌套的容器）
+        // Whether the member lies inside the container (through nested containers)
         var c: u32 = tree.items[i].container;
         const inside = while (true) {
             if (c == ns.container) break true;
@@ -445,7 +486,7 @@ fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
                 .local => |l| l,
                 else => continue,
             };
-            // 成员自身的局部变量不是捕获
+            // The member's own locals are not captures
             if (l.item == i) continue;
             for (out.items) |x| {
                 if (x.item == l.item and x.binding == l.binding) break;
@@ -455,14 +496,16 @@ fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
     return out.items;
 }
 
-/// 只能在 comptime 存在的类型，包括字段为这类类型的结构体与 union（如 `std.builtin.Type`、
-/// `std.meta.fieldInfo` 的结果）：返回它的调用在 comptime 执行
+/// Types that can only exist at comptime, including structs and unions with fields of such
+/// types (e.g. `std.builtin.Type`, the result of `std.meta.fieldInfo`): calls returning them
+/// are executed at comptime
 pub fn isComptimeOnly(r: *Resolver, t: Index) Error!bool {
     return r.ctx.get(queries.ComptimeOnly, t);
 }
 
-/// `ComptimeOnly` 的计算：结构体与 union 的字段（不含 comptime 字段），以及指针（函数指针除外）、数组、可选、
-/// 错误联合、元组中的类型，任一是 comptime-only 即是
+/// Computation of `ComptimeOnly`: the fields of structs and unions (excluding comptime fields)
+/// and the types in pointers (except function pointers), arrays, optionals, error unions, and
+/// tuples; the type is comptime-only if any of them is
 pub fn computeComptimeOnly(r: *Resolver, t: Index) Error!bool {
     const ip = r.ctx.db.env.ip;
     if (value.isComptimeOnly(ip, t)) return true;
@@ -498,7 +541,8 @@ pub fn computeComptimeOnly(r: *Resolver, t: Index) Error!bool {
     }
 }
 
-/// 元组与匿名结构体中值不是 comptime 已知的字段（comptime 字段不使类型成为 comptime-only）
+/// Fields of tuples and anonymous structs whose values are not comptime-known (comptime fields
+/// do not make the type comptime-only)
 fn anyRuntimeFieldComptimeOnly(r: *Resolver, types: []const Index, values: []const Index) Error!bool {
     for (types, 0..) |t, i| {
         const v = InternPool.fieldValue(values, i);
@@ -507,7 +551,7 @@ fn anyRuntimeFieldComptimeOnly(r: *Resolver, types: []const Index, values: []con
     return false;
 }
 
-/// `@typeInfo(t)` 的值；`t` 含未知部分时为 null
+/// Value of `@typeInfo(t)`; null when `t` has unknown parts
 pub fn typeInfo(r: *Resolver, t: Index) Error!?Index {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
@@ -527,13 +571,14 @@ fn giveUp(err: EvalError) Error!TypedValue {
     };
 }
 
-// ── 值 ───────────────────────────────────────────────────────────────
+// ── Values ───────────────────────────────────────────────────────────
 
-/// 解释器中的值
+/// A value in the interpreter
 const Val = struct {
     ty: Index,
-    /// 跟踪来源时，从字符串字面量中取出的字节的来源（`Tracking.bytes` 的下标加一）；0 为没有。占用 `ty` 之后的
-    /// 对齐空隙，不增大 `Val`
+    /// When tracking origins, the origin of a byte taken from a string literal (index into
+    /// `Tracking.bytes` plus one); 0 means none. Occupies the alignment padding after `ty`, so it
+    /// does not enlarge `Val`.
     origin: u32 = 0,
     v: Repr = .unknown,
 
@@ -552,7 +597,7 @@ const Val = struct {
         return .{ .ty = ty, .v = .{ .int = x } };
     }
 
-    /// 是否为驻留的值 `x`（不驻留整数）
+    /// Whether `v` is the interned value `x` (integers are not interned)
     fn is(v: Val, x: Index) bool {
         return v.v == .ip and v.v.ip == x;
     }
@@ -561,13 +606,14 @@ const Val = struct {
 const Repr = union(enum) {
     unknown,
     undef,
-    /// 驻留的值
+    /// An interned value
     ip: Index,
-    /// 整数：运算的中间结果不驻留，`freeze` 交出结果时才驻留，大的编译期循环不会撑大 InternPool
+    /// Integer: intermediate results of arithmetic are not interned; they are interned only when
+    /// `freeze` hands out the result, so large comptime loops do not bloat the InternPool
     int: i128 align(8),
-    /// 解释器内可修改的聚合：数组、向量、元组、结构体（按字段顺序）
+    /// Mutable aggregate inside the interpreter: arrays, vectors, tuples, structs (in field order)
     agg: *Agg,
-    /// 指针：指向存储单元中的某个元素
+    /// Pointer: points to an element inside a storage cell
     ref: Ref,
 };
 
@@ -575,18 +621,20 @@ const Agg = struct { elems: []Val };
 
 const Ref = struct {
     cell: *Val,
-    /// 从存储单元的值逐层取元素的下标
+    /// Element indices taken level by level from the value of the storage cell
     path: []const u32,
-    /// 切片：指向 `path` 处聚合的 `[start, start + len)` 区间（与原数组共享存储）
+    /// Slice: points to the range `[start, start + len)` of the aggregate at `path` (shares
+    /// storage with the original array)
     window: ?Window = null,
 
     const Window = struct { start: u32, len: u32 };
 };
 
-/// 求值中创建的字符串字面量的存储单元及其位置
+/// Storage cells of the string literals created during evaluation, and their locations
 const Tracking = struct {
     literals: std.ArrayList(Literal) = .empty,
-    /// 从字面量中取出的单个字节：`literals` 的下标与字节在字面量内容中的偏移
+    /// Single bytes taken from literals: the index into `literals` and the byte's offset within
+    /// the literal's content
     bytes: std.ArrayList(Byte) = .empty,
 
     const Literal = struct { cell: *Val, file: FileId, item: u32, expr: ExprId };
@@ -597,8 +645,10 @@ comptime {
     std.debug.assert(@sizeOf(Val) == @sizeOf(Index) * 2 + @sizeOf(Repr));
 }
 
-/// `scalarCall` 的结果：键为实例、配额与实参（类型与值）的字节表示；值为 `.unknown` 表示求不出。
-/// 只影响速度：项数达到上限时清空，内存不随调用次数增长，也不计入求值的内存上限
+/// Results of `scalarCall`: the key is the byte representation of the instance, the quota, and
+/// the arguments (types and values); a value of `.unknown` means it could not be evaluated.
+/// Affects only speed: cleared when the number of entries reaches the limit, so memory does not
+/// grow with the number of calls; not counted toward the evaluation's memory limit.
 const CallMemo = struct {
     arena: std.heap.ArenaAllocator,
     map: std.StringHashMapUnmanaged(Val) = .empty,
@@ -620,13 +670,13 @@ const Frame = struct {
     item: u32,
     body: *const Body,
     inst: ?Index,
-    /// 与 `body.bindings` 一一对应
+    /// Corresponds one-to-one with `body.bindings`
     slots: []Val,
     ret_type: ?Index = null,
     labels: std.ArrayList(Label) = .empty,
 };
 
-/// break / continue 的目标
+/// Target of break / continue
 const Label = struct {
     name: ?[]const u8,
     kind: enum { block, loop, @"switch" },
@@ -639,24 +689,25 @@ const Evaluator = struct {
     r: *Resolver,
     ip: *InternPool,
     a: Allocator,
-    /// `a` 的来源：检查求值占用的内存
+    /// Source of `a`: used to check how much memory the evaluation uses
     arena: ?*std.heap.ArenaAllocator = null,
-    /// 求值的表达式个数：每隔一段检查取消与内存
+    /// Number of expressions evaluated: cancellation and memory are checked at intervals
     steps: u32 = 0,
-    /// 回跳的次数与配额（见 `default_branch_quota`）
+    /// Number of backward branches and the quota (see `default_branch_quota`)
     branches: u32 = 0,
     quota: u32 = default_branch_quota,
-    /// `trackedDecl` 展开声明的嵌套深度
+    /// Nesting depth of declarations expanded by `trackedDecl`
     tracked_decls: u32 = 0,
-    /// `freeze` 当前的嵌套深度
+    /// Current nesting depth of `freeze`
     freeze_depth: u32 = 0,
-    /// 跟踪字符串字面量的来源（见 `stringOrigin`）
+    /// Tracking of string literal origins (see `stringOrigin`)
     track: ?*Tracking = null,
-    /// 实参含不驻留整数的调用的结果（见 `scalarCall`），由本次求值中的各层调用共用
+    /// Results of calls whose arguments contain non-interned integers (see `scalarCall`); shared
+    /// by the calls at every level of this evaluation
     calls: ?*CallMemo = null,
-    /// `calls` 由本解释器创建，在 `deinit` 中释放
+    /// `calls` is created by this interpreter and freed in `deinit`
     owns_calls: bool = false,
-    /// break / continue 的目标（`Frame.labels` 下标）与值；return 的值
+    /// Target (index into `Frame.labels`) and value of break / continue; the value of return
     jump_target: usize = 0,
     jump_value: Val = .unknown,
 
@@ -674,14 +725,16 @@ const Evaluator = struct {
             try ctx.checkCanceled();
             if (ev.arena) |arena| if (arena.queryCapacity() > max_eval_bytes) return error.Abort;
         }
-        // 嵌套过深（解释器内展开的递归调用）：结果取决于求值时的栈深度，不写入 memo
+        // Nested too deeply (recursive calls expanded inside the interpreter): the result depends
+        // on the stack depth at evaluation time, so it is not written to the memo
         if (ctx.stackExhausted()) {
             ctx.exhausted();
             return error.Abort;
         }
     }
 
-    /// 回跳（循环的一次迭代、一次调用）：超过配额时放弃，编译器在这里报错
+    /// Backward branch (one loop iteration, one call): gives up when the quota is exceeded; the
+    /// compiler reports an error here
     fn backwardBranch(ev: *Evaluator) EvalError!void {
         ev.branches += 1;
         if (ev.branches > ev.quota) return error.Abort;
@@ -699,7 +752,7 @@ const Evaluator = struct {
         return .{ .file = file, .item = item, .body = body, .inst = inst, .slots = slots };
     }
 
-    // ── 驻留 ─────────────────────────────────────────────────────────
+    // ── Interning ────────────────────────────────────────────────────
 
     fn toTyped(ev: *Evaluator, v: Val) EvalError!TypedValue {
         return .{ .ty = v.ty, .val = try ev.freeze(v) };
@@ -709,7 +762,8 @@ const Evaluator = struct {
         return if (tv.val) |x| Val.of(tv.ty, x) else .{ .ty = tv.ty };
     }
 
-    /// 驻留后的值；值未知时为 null。自引用与嵌套超过 `max_freeze_depth` 的值按未知处理
+    /// Interned value; null when the value is unknown. Self-referencing values and values nested
+    /// deeper than `max_freeze_depth` are treated as unknown.
     fn freeze(ev: *Evaluator, v: Val) EvalError!?Index {
         switch (v.v) {
             .unknown => return null,
@@ -736,7 +790,8 @@ const Evaluator = struct {
         }
     }
 
-    /// 驻留的值；整数在这里驻留。不是驻留值或整数时为 null
+    /// Interned value (integers are interned here); null when it is neither an interned value nor
+    /// an integer
     fn ipOf(ev: *Evaluator, v: Val) Error!?Index {
         return switch (v.v) {
             .ip => |x| x,
@@ -745,7 +800,7 @@ const Evaluator = struct {
         };
     }
 
-    /// 整数值；不是已知的整数时为 null
+    /// Integer value; null when it is not a known integer
     fn intOf(ev: *Evaluator, v: Val) ?i128 {
         return switch (v.v) {
             .int => |x| x,
@@ -754,7 +809,7 @@ const Evaluator = struct {
         };
     }
 
-    /// 浮点值（整数按浮点）；不是已知的数时为 null
+    /// Float value (integers as floats); null when it is not a known number
     fn floatOf(ev: *Evaluator, v: Val) ?f128 {
         return switch (v.v) {
             .int => |x| @floatFromInt(x),
@@ -767,7 +822,8 @@ const Evaluator = struct {
         return value.aggregate(ev.ip, ev.a, ty, elems);
     }
 
-    /// 指针值：指向数组的指针与切片以所指向的元素表示，其他为 `ptr_value`
+    /// Pointer value: pointers to arrays and slices are represented by the pointed-to elements,
+    /// others by `ptr_value`
     fn pointerTo(ev: *Evaluator, ptr_ty: Index, pointee: Index) Error!Index {
         const ip = ev.ip;
         if (ev.isArrayPtr(ptr_ty)) switch (ip.key(pointee)) {
@@ -778,7 +834,7 @@ const Evaluator = struct {
         return ip.get(.{ .ptr_value = .{ .ty = ptr_ty, .pointee = pointee } });
     }
 
-    /// 切片、多项指针，或指向数组 / 元组 / 向量的单项指针
+    /// Slice, many-item pointer, or single-item pointer to an array / tuple / vector
     fn isArrayPtr(ev: *Evaluator, t: Index) bool {
         return switch (ev.ip.key(t)) {
             .ptr_type => |p| p.size != .one or switch (ev.ip.key(p.child)) {
@@ -789,7 +845,7 @@ const Evaluator = struct {
         };
     }
 
-    /// 深复制可修改的聚合（值语义）
+    /// Deep-copies a mutable aggregate (value semantics)
     fn copy(ev: *Evaluator, v: Val) EvalError!Val {
         const agg = switch (v.v) {
             .agg => |x| x,
@@ -801,9 +857,9 @@ const Evaluator = struct {
         return .{ .ty = v.ty, .v = .{ .agg = out } };
     }
 
-    // ── 聚合 ─────────────────────────────────────────────────────────
+    // ── Aggregates ───────────────────────────────────────────────────
 
-    /// 第 `i` 个元素的类型（数组、切片、指向数组的指针、向量、元组、结构体）
+    /// Type of element `i` (arrays, slices, pointers to arrays, vectors, tuples, structs)
     fn elemTypeOf(ev: *Evaluator, t: Index, i: usize) Index {
         const ip = ev.ip;
         return switch (ip.key(t)) {
@@ -821,7 +877,7 @@ const Evaluator = struct {
         };
     }
 
-    /// 由类型决定的元素个数（数组、向量、元组、结构体）
+    /// Number of elements determined by the type (arrays, vectors, tuples, structs)
     fn typeElemCount(ev: *Evaluator, t: Index) Error!?usize {
         return switch (ev.ip.key(t)) {
             .array_type => |a| std.math.cast(usize, a.len),
@@ -835,11 +891,11 @@ const Evaluator = struct {
         };
     }
 
-    /// 元素个数；值未知时取类型决定的个数
+    /// Number of elements; when the value is unknown, the number determined by the type
     fn elemCount(ev: *Evaluator, v: Val) EvalError!?usize {
         switch (v.v) {
             .agg => |agg| return agg.elems.len,
-            // 区间的长度不必取出元素
+            // The length of a range is known without taking out its elements
             .ref => |ref| return if (ref.window) |w| w.len else ev.elemCount(try ev.load(ref)),
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return agg.elems.len,
@@ -859,7 +915,7 @@ const Evaluator = struct {
         };
     }
 
-    /// 第 `i` 个元素；值未知时元素也未知
+    /// Element `i`; unknown when the value is unknown
     fn elemAt(ev: *Evaluator, v: Val, i: usize) EvalError!Val {
         const ty = ev.elemTypeOf(v.ty, i);
         switch (v.v) {
@@ -868,14 +924,16 @@ const Evaluator = struct {
             .int => return error.Abort,
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
             .ref => |ref| {
-                // 区间：下标相对于区间的起点，在所在的聚合中直接取元素
+                // Range: the index is relative to the start of the range; take the element
+                // directly from the containing aggregate
                 const base = try ev.loadPath(ref);
                 const index = if (ref.window) |w| blk: {
                     if (i >= w.len) return error.Abort;
                     break :blk w.start + i;
                 } else i;
                 var elem = try ev.elemAt(base, index);
-                // 跟踪来源时，字面量中的字节记下它的位置：逐字节构造的名字（`&[1]u8{c}`）也能追到字面量
+                // When tracking origins, a byte from a literal records its position, so a name
+                // built byte by byte (`&[1]u8{c}`) can also be traced back to the literal
                 if (ev.track) |t| if (ref.path.len == 0) for (t.literals.items, 0..) |lit, li| {
                     if (lit.cell != ref.cell) continue;
                     try t.bytes.append(ev.a, .{ .literal = @intCast(li), .offset = @intCast(index) });
@@ -886,7 +944,8 @@ const Evaluator = struct {
             },
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
-                // 元素都是 u8 的聚合也以字节表示（如 `struct { short: ?u8 }` 的值）：取元素的声明类型
+                // Aggregates whose elements are all u8 are also represented as bytes (e.g. a
+                // value of `struct { short: ?u8 }`): use the declared type of the element
                 .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
                 .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
                 .union_value => |u| return if (i == 0) Val.of(ty, u.payload) else error.Abort,
@@ -895,8 +954,9 @@ const Evaluator = struct {
         }
     }
 
-    /// 指针所指向的值。区间取出元素组成数组（读取时复制，写入经由 `extend` 落到原存储）；
-    /// 只取元素或长度时用 `elemAt` / `elemCount`，不复制区间
+    /// The value the pointer points to. A range has its elements taken out into an array (copied
+    /// on read; writes reach the original storage through `extend`); to get only an element or the
+    /// length, use `elemAt` / `elemCount`, which do not copy the range.
     fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
         const cur = try ev.loadPath(ref);
         const w = ref.window orelse return cur;
@@ -906,15 +966,17 @@ const Evaluator = struct {
         return ev.makeAgg(array, elems);
     }
 
-    /// 沿 `path` 逐层取元素得到的值；区间所在的聚合（不取出区间）
+    /// Value obtained by taking elements level by level along `path`; for a range, the aggregate
+    /// containing it (without taking out the range)
     fn loadPath(ev: *Evaluator, ref: Ref) EvalError!Val {
         var cur = ref.cell.*;
         for (ref.path) |i| cur = try ev.elemAt(cur, i);
         return cur;
     }
 
-    /// 展开 `n` 个元素的聚合：分配之前检查本次求值的内存上限（`tick` 每隔一段才检查内存，
-    /// 单步展开的大聚合会越过它）
+    /// Expands an aggregate of `n` elements: checks this evaluation's memory limit before
+    /// allocating (`tick` checks memory only at intervals, and a large aggregate expanded in a
+    /// single step would get past it)
     fn allocElems(ev: *Evaluator, n: usize) EvalError![]Val {
         const used = if (ev.arena) |arena| arena.queryCapacity() else 0;
         if (n > (max_eval_bytes - @min(used, max_eval_bytes)) / @sizeOf(Val)) return error.Abort;
@@ -923,7 +985,7 @@ const Evaluator = struct {
 
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
         if (ref.window) |w| {
-            // 逐元素写入：每个元素计一步
+            // Write element by element: each element counts as one step
             for (0..w.len) |i| {
                 try ev.tick();
                 try ev.store(try ev.extend(ref, @intCast(i)), try ev.elemAt(v, i));
@@ -939,7 +1001,7 @@ const Evaluator = struct {
         cell.* = try ev.copy(try ev.coerce(v, if (cell.ty != .unknown) cell.ty else null));
     }
 
-    /// 存储单元中的值展开为可修改的聚合
+    /// Expands the value in a storage cell into a mutable aggregate
     fn mutableAgg(ev: *Evaluator, cell: *Val) EvalError!*Agg {
         if (cell.v == .agg) return cell.v.agg;
         if (cell.v == .ref) return error.Abort;
@@ -951,7 +1013,7 @@ const Evaluator = struct {
         return agg;
     }
 
-    /// 容器类型的字段（按声明顺序）
+    /// Fields of a container type (in declaration order)
     fn fieldsOf(ev: *Evaluator, t: Index) Error!?[]const Field {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -994,7 +1056,7 @@ const Evaluator = struct {
         return null;
     }
 
-    /// 结构体字段的默认值
+    /// Default value of a struct field
     fn fieldDefault(ev: *Evaluator, t: Index, field: Field) EvalError!Val {
         const item = field.item orelse return error.Abort;
         const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
@@ -1007,7 +1069,7 @@ const Evaluator = struct {
         return thaw(try ownerValue(ev.r, owner, inst, field.ty));
     }
 
-    // ── 求值 ─────────────────────────────────────────────────────────
+    // ── Evaluation ───────────────────────────────────────────────────
 
     fn eval(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!Val {
         try ev.tick();
@@ -1015,7 +1077,7 @@ const Evaluator = struct {
         return ev.coerce(raw, want);
     }
 
-    /// 求值得到类型
+    /// Evaluates to a type
     fn evalType(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Index {
         const v = try ev.eval(f, e, null);
         if (v.ty != .type_type) return error.Abort;
@@ -1066,7 +1128,8 @@ const Evaluator = struct {
                     .error_union_type => |eu| eu,
                     else => return error.Abort,
                 };
-                // 载荷可以是解释器内的存储（指向局部数组元素的指针等），与 `try` 一样由 `condition` 区分
+                // The payload may be storage inside the interpreter (a pointer to an element of a
+                // local array, etc.); as with `try`, `condition` tells it apart from an error
                 const taken = try ev.condition(lhs);
                 if (taken.yes) return taken.payload;
                 if (c.capture) |cap| f.slots[@backingInt(cap)] = taken.payload;
@@ -1156,7 +1219,8 @@ const Evaluator = struct {
         return thaw(tv);
     }
 
-    /// 跟踪来源时，值为字符串的全局常量在本次求值中重新求出（字面量的来源才能保留）
+    /// When tracking origins, a global constant whose value is a string is evaluated again within
+    /// this evaluation (only then is the origin of the literal kept)
     fn trackedDecl(ev: *Evaluator, def: resolve.Def, tv: TypedValue) EvalError!?Val {
         const v = tv.val orelse return null;
         if (ev.ip.key(v) != .bytes) return null;
@@ -1178,7 +1242,7 @@ const Evaluator = struct {
     fn followOrigin(ev: *Evaluator, f: *Frame, e: ExprId, path: []const u32) EvalError!?StringOrigin {
         var v = try ev.eval(f, e, null);
         for (path) |i| v = try ev.elemAt(v, i);
-        // 从字面量中取出的单个字节
+        // A single byte taken from a literal
         if (v.origin != 0) {
             const byte = ev.track.?.bytes.items[v.origin - 1];
             const lit = ev.track.?.literals.items[byte.literal];
@@ -1198,7 +1262,8 @@ const Evaluator = struct {
         return null;
     }
 
-    /// 跟踪来源时的字符串字面量：指向独立存储单元的指针，切片保持对它的引用
+    /// String literal when tracking origins: a pointer to a separate storage cell, which slices
+    /// keep referencing
     fn trackedLiteral(ev: *Evaluator, f: *Frame, e: ExprId, text: []const u8) EvalError!Val {
         const v = try ev.literal(text);
         const ptr = switch (ev.ip.key(v.ty)) {
@@ -1239,13 +1304,13 @@ const Evaluator = struct {
         }
     }
 
-    // ── 成员 ─────────────────────────────────────────────────────────
+    // ── Members ──────────────────────────────────────────────────────
 
     fn fieldAccess(ev: *Evaluator, base: Val, name: []const u8) EvalError!Val {
         const ip = ev.ip;
         if (base.ty == .type_type) return ev.typeMember((try ev.ipOf(base)) orelse return error.Abort, name);
         var v = base;
-        // 自动解引用指向非数组的单项指针
+        // Automatically dereference single-item pointers to non-arrays
         switch (ip.key(v.ty)) {
             .ptr_type => |p| if (p.size == .one and !ev.isArrayPtr(v.ty)) {
                 v = try ev.deref(v);
@@ -1256,7 +1321,8 @@ const Evaluator = struct {
             const n = try ev.elemCount(v) orelse return .{ .ty = .usize_type };
             return Val.of(.usize_type, try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = n } }));
         };
-        // 切片的 `ptr`：多项指针，与切片共用表示（用于指针比较，见 `pointerEql`）
+        // `ptr` of a slice: a many-item pointer that shares the slice's representation (used for
+        // pointer comparison; see `pointerEql`)
         if (std.mem.eql(u8, name, "ptr")) switch (ip.key(v.ty)) {
             .ptr_type => |p| if (p.size == .slice) {
                 var q = p;
@@ -1301,7 +1367,7 @@ const Evaluator = struct {
         return .unknown;
     }
 
-    /// 类型上的成员：声明、枚举成员、错误集成员
+    /// Members of a type: declarations, enum members, error set members
     fn typeMember(ev: *Evaluator, t: Index, name: []const u8) EvalError!Val {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -1322,7 +1388,7 @@ const Evaluator = struct {
         return error.Abort;
     }
 
-    /// decl literal：结果类型中的声明 `.name`
+    /// decl literal: the declaration `.name` in the result type
     fn declLiteral(ev: *Evaluator, t: Index, name: []const u8) EvalError!?Val {
         const ip = ev.ip;
         if (ip.key(t) != .container_type) return null;
@@ -1335,7 +1401,7 @@ const Evaluator = struct {
         return thaw(try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, queries.instOfType(ip, t)));
     }
 
-    /// 枚举类型的成员名（按声明顺序，不含非穷尽枚举的 `_`）
+    /// Enum member names (in declaration order, excluding the `_` of non-exhaustive enums)
     fn enumNames(ev: *Evaluator, t: Index) Error!?[]const []const u8 {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -1361,7 +1427,7 @@ const Evaluator = struct {
         }
     }
 
-    /// 枚举成员的整数值（按 `enumNames` 的顺序）
+    /// Integer values of the enum members (in the order of `enumNames`)
     fn enumValues(ev: *Evaluator, t: Index) EvalError![]const i128 {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -1374,7 +1440,7 @@ const Evaluator = struct {
                 for (tree.containerMembers(ns.container)) |m| {
                     const it = tree.items[m];
                     if (it.kind != .field or it.name == null or std.mem.eql(u8, it.name.?, "_")) continue;
-                    // 显式的值 `a = 5`
+                    // Explicit value `a = 5`
                     const owner = try ev.r.ownerKey(ns.file, m);
                     const body = try ev.r.ctx.get(hir.ItemBody, owner);
                     if (body.value != null) {
@@ -1394,7 +1460,7 @@ const Evaluator = struct {
         return out;
     }
 
-    /// 方法：值的类型（经由单项指针）中的函数声明
+    /// Method: a function declaration in the value's type (through a single-item pointer)
     fn method(ev: *Evaluator, lhs: Val, name: []const u8) EvalError!?Val {
         var t = lhs.ty;
         switch (ev.ip.key(t)) {
@@ -1410,7 +1476,7 @@ const Evaluator = struct {
         return thaw(tv);
     }
 
-    // ── 调用 ─────────────────────────────────────────────────────────
+    // ── Calls ────────────────────────────────────────────────────────
 
     fn callExpr(ev: *Evaluator, f: *Frame, callee_e: ExprId, args: []const ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
@@ -1421,7 +1487,8 @@ const Evaluator = struct {
                 const lhs = try ev.eval(f, fa.lhs, null);
                 if (lhs.ty != .type_type) if (try ev.method(lhs, name)) |m| {
                     self = lhs;
-                    // 接收者按第一个参数的类型传递：需要指针时取地址
+                    // The receiver is passed as the type of the first parameter: take its address
+                    // when a pointer is required
                     const fty = ip.key(m.ty).fn_type;
                     if (fty.params.len > 0) switch (ip.key(fty.params[0])) {
                         .ptr_type => |p| if (p.size == .one and ip.key(lhs.ty) != .ptr_type) {
@@ -1453,8 +1520,9 @@ const Evaluator = struct {
         return ev.callFn(callee, fty, vals);
     }
 
-    /// 调用函数值：实参都可驻留时经 `CallEval`（结果缓存），否则（实参含指向解释器内存储的
-    /// 指针，被调函数可能经由它写入）在当前解释器中执行
+    /// Calls a function value: through `CallEval` (results are cached) when all arguments can be
+    /// interned; otherwise (an argument contains a pointer to storage inside the interpreter,
+    /// through which the callee may write) executes it in the current interpreter
     fn callFn(ev: *Evaluator, callee: Val, fty: infer.FnType, args: []const Val) EvalError!Val {
         const ip = ev.ip;
         const fv = switch (ip.key((try ev.ipOf(callee)) orelse return error.Abort)) {
@@ -1463,11 +1531,14 @@ const Evaluator = struct {
         };
         const callee_tv: TypedValue = .{ .ty = callee.ty, .val = try ev.ipOf(callee) };
         const g = try infer.genericCallee(ev.r, ev.a, callee_tv, fty);
-        // 实参驻留后经 query 调用（结果缓存）。传给非 comptime 参数的可修改聚合与指针不驻留：
-        // 被调函数可能经由指针写入，大的中间值也不应留在只增不减的 InternPool 中
+        // Arguments are interned and the call goes through a query (results are cached). Mutable
+        // aggregates and pointers passed to non-comptime parameters are not interned: the callee
+        // may write through the pointers, and large intermediate values should not stay in the
+        // grow-only InternPool either.
         const tvs = try ev.a.alloc(TypedValue, args.len);
         var local = false;
-        // 传给非 comptime 参数的整数不驻留，经 `scalarCall` 执行
+        // Integers passed to non-comptime parameters are not interned; the call is executed
+        // through `scalarCall`
         var scalar = false;
         for (args, tvs, 0..) |a, *tv, i| {
             const comptime_param = if (g) |gg| gg.kind(i) != .runtime else false;
@@ -1488,9 +1559,12 @@ const Evaluator = struct {
         else
             try infer.runtimeInstance(ip, ev.a, fv, args.len);
         try ev.backwardBranch();
-        // 跟踪来源时在本次求值中展开：经 query 调用的结果是驻留的值，字面量的来源会丢失
+        // When tracking origins, expand the call within this evaluation: the result of a call
+        // through a query is an interned value, which loses the origin of literals
         if (!local and ev.track == null) {
-            // 原生栈用去一半之后经 query 调用：很深的递归由查询引擎在栈将尽处中断、从中断处分段计算
+            // Call through a query once half of the native stack is used: the query engine
+            // interrupts very deep recursion when the stack is nearly exhausted and computes it in
+            // segments from where it was interrupted
             if (scalar and ev.r.ctx.stackUsed() < ev.r.ctx.stack_budget / 2) return ev.scalarCall(.{ .file = fv.file, .item = fv.decl }, inst, args);
             for (args, tvs) |a, *tv| if (a.v == .int) {
                 tv.val = try ev.freeze(a);
@@ -1502,8 +1576,10 @@ const Evaluator = struct {
         return ev.runFunction(.{ .file = fv.file, .item = fv.decl }, inst, args);
     }
 
-    /// 实参含不驻留整数、不含解释器内存储的调用：与 `CallEval` 相同，在新的解释器（独立的内存与回跳计数，
-    /// 配额取调用处的配额）中执行，结果缓存在本次求值中。实参不驻留，循环中逐次调用不撑大 InternPool
+    /// A call whose arguments contain non-interned integers but no storage inside the interpreter:
+    /// as with `CallEval`, it runs in a new interpreter (with its own memory and backward branch
+    /// count, and the call site's quota), and the result is cached within this evaluation. The
+    /// arguments are not interned, so repeated calls in a loop do not bloat the InternPool.
     fn scalarCall(ev: *Evaluator, owner: hir.OwnerKey, inst: Index, args: []const Val) EvalError!Val {
         _ = try ev.r.ctx.get(queries.TargetAbi, {});
         const memo = ev.calls orelse blk: {
@@ -1514,7 +1590,8 @@ const Evaluator = struct {
             ev.owns_calls = true;
             break :blk m;
         };
-        // 键在栈上构造，命中时不占用求值的内存（每个实参至多 21 字节）
+        // The key is built on the stack, so a hit uses none of the evaluation's memory (at most
+        // 21 bytes per argument)
         var buf: [512]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         const ka = if (8 + args.len * 21 <= buf.len) fba.allocator() else ev.a;
@@ -1550,7 +1627,8 @@ const Evaluator = struct {
                 error.Abort, error.Break, error.Continue, error.Return => break :blk .unknown,
                 else => |e| return e,
             };
-            // 结果不能引用即将释放的存储：聚合与指针驻留
+            // The result must not reference storage that is about to be freed: intern aggregates
+            // and pointers
             break :blk switch (v.v) {
                 .int, .ip, .undef, .unknown => v,
                 .agg, .ref => thaw(callee.toTyped(v) catch |err| switch (err) {
@@ -1563,7 +1641,7 @@ const Evaluator = struct {
         return if (out.v == .unknown) error.Abort else out;
     }
 
-    /// 在实例 `inst` 中执行函数体
+    /// Executes the function body in instance `inst`
     fn runFunction(ev: *Evaluator, owner: hir.OwnerKey, inst: Index, args: []const Val) EvalError!Val {
         const ip = ev.ip;
         const item = try ev.itemIndex(owner) orelse return error.Abort;
@@ -1573,7 +1651,8 @@ const Evaluator = struct {
         var frame = try ev.newFrame(owner.file, item, body, inst);
         for (body.params, 0..) |p, i| {
             const arg: Val = if (i < args.len) args[i] else .unknown;
-            // anytype 参数的类型为实参类型（实例中记录的也是它；comptime anytype 记录的是实参值）
+            // The type of an anytype parameter is the type of the argument (also what the instance
+            // records; for comptime anytype the instance records the argument's value)
             const binding = body.binding(p);
             const recorded = i < inst_args.len and inst_args[i] != .unknown and inst_args[i] != .runtime;
             const ty: Index = if (binding.ty == null)
@@ -1588,13 +1667,15 @@ const Evaluator = struct {
             error.Return => return ev.coerce(ev.jump_value, frame.ret_type),
             else => |e| return e,
         };
-        // 执行到函数体末尾：返回 void（返回类型为 `E!void` 时转换为 error union）
+        // Execution reached the end of the function body: return void (coerced to an error union
+        // when the return type is `E!void`)
         return ev.coerce(Val.void_val, frame.ret_type);
     }
 
-    // ── 块与控制流 ───────────────────────────────────────────────────
+    // ── Blocks and control flow ──────────────────────────────────────
 
-    /// break / continue 的目标：带标签时为同名的块、循环或 switch，否则为最内层的循环
+    /// Target of break / continue: with a label, the block, loop, or switch of the same name;
+    /// otherwise the innermost loop
     fn labelTarget(f: *Frame, label: ?[]const u8) ?usize {
         var i = f.labels.items.len;
         while (i > 0) {
@@ -1613,7 +1694,8 @@ const Evaluator = struct {
         defer f.labels.shrinkRetainingCapacity(index);
         var defers: std.ArrayList(ExprId) = .empty;
         ev.statements(f, blk.stmts, &defers) catch |err| {
-            // 离开块时执行 defer（break 的值已保存在 jump_value 中）
+            // Run the defers when leaving the block (the value of break is already saved in
+            // jump_value)
             const saved_value = ev.jump_value;
             const saved_target = ev.jump_target;
             try ev.runDefers(f, defers.items);
@@ -1666,7 +1748,8 @@ const Evaluator = struct {
 
     const Condition = struct { yes: bool, payload: Val = .unknown };
 
-    /// if / while 的条件：bool、optional（非 null 时载荷）、error union（成功时载荷，否则错误）
+    /// Condition of if / while: bool, optional (the payload when not null), error union (the
+    /// payload on success, otherwise the error)
     fn condition(ev: *Evaluator, v: Val) EvalError!Condition {
         const ip = ev.ip;
         const x = try ev.ipOf(v);
@@ -1696,8 +1779,10 @@ const Evaluator = struct {
         f.slots[@backingInt(b)] = try ev.copy(v);
     }
 
-    /// `if (opt) |*x|`：x 指向 optional 的载荷。optional 以载荷表示，指针指向 optional 所在的位置
-    /// （读取见 `deref`，写入按存储单元的类型转换回 optional）；条件不是位置时指向载荷的副本
+    /// `if (opt) |*x|`: x points to the payload of the optional. An optional is represented by its
+    /// payload, so the pointer points to where the optional is (for reads see `deref`; writes are
+    /// coerced back to an optional according to the type of the storage cell); when the condition
+    /// is not a place, it points to a copy of the payload.
     fn bindPayloadPtr(ev: *Evaluator, f: *Frame, b: Body.BindingId, cond_e: ExprId, payload: Val) EvalError!void {
         var is_const = false;
         const ref = ev.place(f, cond_e) catch |err| switch (err) {
@@ -1746,7 +1831,7 @@ const Evaluator = struct {
                         },
                         else => blk: {
                             const v = try ev.eval(f, x, null);
-                            // 元素未知：循环体无法执行
+                            // Unknown elements: the loop body cannot be executed
                             if (v.v == .unknown or v.v == .undef) return error.Abort;
                             in.* = .{ .seq = v };
                             break :blk try ev.elemCount(v) orelse return error.Abort;
@@ -1777,7 +1862,8 @@ const Evaluator = struct {
         return Val.void_val;
     }
 
-    /// 执行一次循环体：break 到本循环时返回其值，continue 到本循环时继续
+    /// Executes the loop body once: returns the value of a break to this loop, and continues on a
+    /// continue to this loop
     fn loopBody(ev: *Evaluator, f: *Frame, body: ExprId, index: usize) EvalError!?Val {
         _ = ev.eval(f, body, null) catch |err| switch (err) {
             error.Break => if (ev.jump_target == index) return ev.jump_value else return err,
@@ -1787,13 +1873,13 @@ const Evaluator = struct {
         return null;
     }
 
-    /// 指针捕获 `|*x|`：指向序列第 `i` 个元素的指针
+    /// Pointer capture `|*x|`: a pointer to element `i` of the sequence
     fn elemRef(ev: *Evaluator, seq: Val, i: usize) EvalError!Val {
         const ref = switch (seq.v) {
             .ref => |r| r,
             else => return error.Abort,
         };
-        // 元素的类型取自所在的聚合，不取出区间
+        // The element type comes from the containing aggregate, without taking out the range
         const target = try ev.loadPath(ref);
         const child = ev.elemTypeOf(target.ty, if (ref.window) |w| w.start + i else i);
         const is_const = switch (ev.ip.key(seq.ty)) {
@@ -1805,7 +1891,7 @@ const Evaluator = struct {
 
     fn switchExpr(ev: *Evaluator, f: *Frame, e: ExprId, s: @FieldType(Body.Expr, "switch"), want: ?Index) EvalError!Val {
         const index = f.labels.items.len;
-        // 带标签的 switch：`continue :sw x` 以新的操作数重新分派
+        // Labeled switch: `continue :sw x` dispatches again with a new operand
         const label: ?[]const u8 = for (f.body.scopes) |sc| {
             if (sc.label) |lab| if (lab.expr == e) break lab.name;
         } else null;
@@ -1815,7 +1901,7 @@ const Evaluator = struct {
         var first = true;
         while (true) {
             try ev.tick();
-            // 带标签的 switch 以 `continue :label` 再次分派：回跳
+            // A labeled switch dispatched again by `continue :label`: a backward branch
             if (!first) try ev.backwardBranch();
             first = false;
             const chosen = try ev.chooseProng(f, s.prongs, operand) orelse return error.Abort;
@@ -1834,11 +1920,14 @@ const Evaluator = struct {
     }
 
     fn chooseProng(ev: *Evaluator, f: *Frame, prongs: []const Body.Prong, operand: Val) EvalError!?usize {
-        // 整数操作数不驻留，与分支项按值比较
+        // Integer operands are not interned; they are compared with the prong items by value
         const v: ?Index = if (operand.v == .int) null else try ev.freeze(operand) orelse return error.Abort;
         var else_prong: ?usize = null;
-        // 求不出的分支项：分支项的值互不相同（重复是编译错误），其他分支项与操作数相等时它不可能也相等，
-        // 因此继续查找；都不相等时才无法确定（不能落到 else）。如 `switch (T) { vector.T => .., Scalar => .. }`
+        // Prong items that cannot be evaluated: the values of prong items are all distinct
+        // (duplicates are a compile error), so if another prong item equals the operand, this one
+        // cannot also be equal; therefore keep searching. Only when none is equal is the result
+        // undetermined (it must not fall back to else). For example:
+        // `switch (T) { vector.T => .., Scalar => .. }`.
         var unknown = false;
         for (prongs, 0..) |prong, i| {
             if (prong.is_else) {
@@ -1871,7 +1960,7 @@ const Evaluator = struct {
                 return lo <= x and x <= hi;
             },
             else => {
-                // union 的分支项是标签
+                // The prong items of a union are tags
                 const item_want: ?Index = if (ev.isUnion(operand.ty)) null else operand.ty;
                 const item_v = try ev.eval(f, item, item_want);
                 if (ev.intOf(operand)) |x| if (ev.intOf(item_v)) |y| return x == y;
@@ -1903,7 +1992,7 @@ const Evaluator = struct {
         };
     }
 
-    // ── 运算 ─────────────────────────────────────────────────────────
+    // ── Operations ───────────────────────────────────────────────────
 
     fn binary(ev: *Evaluator, f: *Frame, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
@@ -1925,7 +2014,7 @@ const Evaluator = struct {
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
                 const lhs = try ev.eval(f, lhs_e, null);
-                // 带标签的 union 与标签比较：另一侧不按 union 类型转换
+                // Tagged union compared with a tag: do not coerce the other side to the union type
                 const rhs_want: ?Index = if (lhs.ty == .unknown or lhs.ty == .comptime_int_type or lhs.ty == .enum_literal_type or ev.isUnion(lhs.ty)) null else lhs.ty;
                 const rhs = try ev.eval(f, rhs_e, rhs_want);
                 if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
@@ -1951,12 +2040,14 @@ const Evaluator = struct {
                 return Val.ofType(try ip.errorSet(ev.a, names));
             },
             else => {
-                // 与编译器一致，操作数没有结果类型：`const m: u8 = (0xFF << 4) >> 4` 按 comptime_int 计算，
-                // 结果转换为 u8 时为 255。右侧以左侧的类型作为字面量的期望，与 peer 的结果相同
+                // Matching the compiler, the operands have no result type:
+                // `const m: u8 = (0xFF << 4) >> 4` is computed as comptime_int and gives 255 when
+                // coerced to u8. The right side uses the left side's type as the expected type of
+                // literals, which gives the same result as peer type resolution.
                 const lhs = try ev.eval(f, lhs_e, null);
                 const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
                 const rhs = try ev.eval(f, rhs_e, if (is_shift or lhs.ty == .comptime_int_type) null else lhs.ty);
-                // bool 的位运算
+                // Bitwise operations on bool
                 if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
                     const x = (try ev.condition(lhs)).yes;
                     const y = (try ev.condition(rhs)).yes;
@@ -1982,8 +2073,9 @@ const Evaluator = struct {
         }
     }
 
-    /// comptime 指针是否相等；判断不了时为 null。解释器内的存储单元各自独立；驻留的常量数据以值区分
-    /// （相同的值视为同一块数据，与编译器对相同字面量的去重一致）
+    /// Whether two comptime pointers are equal; null when it cannot be determined. Storage cells
+    /// in the interpreter are all distinct; interned constant data is distinguished by value (equal
+    /// values are the same data, matching the compiler's deduplication of identical literals).
     fn pointerEql(a: Val, b: Val) ?bool {
         switch (a.v) {
             .ref => |x| switch (b.v) {
@@ -2006,7 +2098,7 @@ const Evaluator = struct {
         }
     }
 
-    /// `++`：数组、字符串、元组的拼接
+    /// `++`: concatenation of arrays, strings, and tuples
     fn concat(ev: *Evaluator, lhs: Val, rhs: Val) EvalError!Val {
         const ip = ev.ip;
         if (lhs.v == .unknown or rhs.v == .unknown) return error.Abort;
@@ -2024,26 +2116,27 @@ const Evaluator = struct {
             const ra = ip.key(rt).array_type;
             const sentinel = concatSentinel(la.sentinel, ra.sentinel);
             const array = try ip.get(.{ .array_type = .{ .len = std.math.cast(u64, total) orelse return error.Abort, .child = la.child, .sentinel = sentinel } });
-            // 两侧有一个是指针时结果为指向数组的指针（字符串字面量）
+            // If either side is a pointer, the result is a pointer to an array (a string literal)
             ty = if (ip.key(lhs.ty) == .ptr_type or ip.key(rhs.ty) == .ptr_type) try ip.ptrTo(array, .one, true) else array;
         } else {
             const types = try ev.a.alloc(Index, total);
             for (elems, types) |e, *t| t.* = e.ty;
             ty = try ip.get(.{ .tuple_type = .{ .types = types, .values = try ev.comptimeFieldValues(elems) } });
         }
-        // 中间结果留在解释器内，不驻留
+        // Intermediate results stay inside the interpreter and are not interned
         if (ip.key(ty) == .ptr_type) return ev.pointerToNew(ty, try ev.makeAgg(ip.key(ty).ptr_type.child, elems));
         return ev.makeAgg(ty, elems);
     }
 
-    /// 指向一个新的存储单元（保存 `target`）的指针
+    /// Pointer to a new storage cell (holding `target`)
     fn pointerToNew(ev: *Evaluator, ptr_ty: Index, target: Val) Error!Val {
         const cell = try ev.a.create(Val);
         cell.* = target;
         return .{ .ty = ptr_ty, .v = .{ .ref = .{ .cell = cell, .path = &.{} } } };
     }
 
-    /// 数组类型：指向数组的指针取其所指向的数组；切片按其元素与已知长度视为数组
+    /// Array type: a pointer to an array yields the array it points to; a slice is treated as an
+    /// array of its element type and known length
     fn arrayOf(ev: *Evaluator, t: Index) Index {
         return switch (ev.ip.key(t)) {
             .ptr_type => |p| if (p.size == .one) p.child else t,
@@ -2079,7 +2172,7 @@ const Evaluator = struct {
                 const v = try ev.eval(f, operand_e, null);
                 const c = try ev.condition(v);
                 if (c.yes) return c.payload;
-                // comptime 中返回错误
+                // Return the error at comptime
                 ev.jump_value = c.payload;
                 return error.Return;
             },
@@ -2087,7 +2180,8 @@ const Evaluator = struct {
         }
     }
 
-    /// `&x`：x 是局部变量（或其元素）时指向它，否则指向一个临时的存储单元
+    /// `&x`: points to x when x is a local variable (or an element of one), otherwise to a
+    /// temporary storage cell
     fn addressOf(ev: *Evaluator, f: *Frame, e: ExprId, v: Val) EvalError!Val {
         const ref = ev.place(f, e) catch |err| switch (err) {
             error.Abort => blk: {
@@ -2100,7 +2194,7 @@ const Evaluator = struct {
         return .{ .ty = try ev.ip.ptrTo(v.ty, .one, false), .v = .{ .ref = ref } };
     }
 
-    /// 赋值目标与取地址的位置
+    /// Place of assignment targets and address-of operands
     fn place(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
         switch (f.body.expr(e)) {
             .name_ref => |name| {
@@ -2135,10 +2229,11 @@ const Evaluator = struct {
         }
     }
 
-    /// 位置；值为指向局部存储的指针时取它所指向的位置（自动解引用）
+    /// Place; when its value is a pointer to local storage, the place it points to instead
+    /// (automatic dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
         const ref = try ev.place(f, e);
-        // 区间的值是数组，不是指针
+        // The value of a range is an array, not a pointer
         if (ref.window != null) return ref;
         const v = try ev.load(ref);
         return switch (v.v) {
@@ -2147,7 +2242,7 @@ const Evaluator = struct {
         };
     }
 
-    /// 第 `i` 个元素的位置；区间的下标相对于区间的起点
+    /// Place of element `i`; for a range, the index is relative to the start of the range
     fn extend(ev: *Evaluator, base: Ref, i: u32) EvalError!Ref {
         const index = if (base.window) |w| blk: {
             if (i >= w.len) return error.Abort;
@@ -2174,7 +2269,8 @@ const Evaluator = struct {
         var ref: Ref = undefined;
         var old: Val = undefined;
         switch (f.body.expr(lhs_e)) {
-            // `p.* = x`：经由指针读取旧值，指向 optional 载荷的指针（`if (opt) |*x|`）按载荷类型
+            // `p.* = x`: read the old value through the pointer; a pointer to the payload of an
+            // optional (`if (opt) |*x|`) reads it as the payload type
             .deref => |x| {
                 const p = try ev.eval(f, x, null);
                 ref = switch (p.v) {
@@ -2190,7 +2286,7 @@ const Evaluator = struct {
         }
         const rhs_want: ?Index = if (old.ty != .unknown) old.ty else null;
         if (op == .equal) return ev.store(ref, try ev.eval(f, rhs_e, rhs_want));
-        // 复合赋值 `a += b`
+        // Compound assignment `a += b`
         const bin: SyntaxKind = switch (op) {
             .plus_equal => .plus,
             .minus_equal => .minus,
@@ -2227,8 +2323,9 @@ const Evaluator = struct {
         try ev.store(ref, Val.ofInt(old.ty, r));
     }
 
-    /// 修改切片的 `len`（`list.items.len += 1`）：切片指向解释器内的存储时调整区间的长度，不能超出
-    /// 所在的数组。切片不在解释器内的存储中时返回 false
+    /// Modifies the `len` of a slice (`list.items.len += 1`): when the slice points to storage
+    /// inside the interpreter, adjusts the length of the range, which must not exceed the
+    /// containing array. Returns false when the slice is not in storage inside the interpreter.
     fn assignSliceLen(ev: *Evaluator, f: *Frame, op: SyntaxKind, slice_e: ExprId, rhs_e: ExprId) EvalError!bool {
         const ip = ev.ip;
         const ref = ev.place(f, slice_e) catch |err| switch (err) {
@@ -2265,7 +2362,8 @@ const Evaluator = struct {
         switch (p.v) {
             .ref => |r| {
                 const v = try ev.load(r);
-                // 指向 optional 载荷的指针（`if (opt) |*x|`）：optional 以载荷表示，按载荷类型读取
+                // Pointer to the payload of an optional (`if (opt) |*x|`): an optional is
+                // represented by its payload, so read it as the payload type
                 if (child != .unknown and v.ty != child) switch (ip.key(v.ty)) {
                     .optional_type => |c| if (c == child) return .{ .ty = child, .v = v.v },
                     else => {},
@@ -2274,7 +2372,7 @@ const Evaluator = struct {
             },
             .ip => |x| switch (ip.key(x)) {
                 .ptr_value => |pv| return Val.of(child, pv.pointee),
-                // 指向数组的指针以元素表示：解引用得到数组
+                // Array pointers are represented by their elements; dereferencing yields the array
                 .aggregate => |agg| return Val.of(child, try ip.get(.{ .aggregate = .{ .ty = child, .elems = agg.elems } })),
                 .bytes => |b| return Val.of(child, try ip.get(.{ .bytes = .{ .ty = child, .bytes = b.bytes } })),
                 else => return error.Abort,
@@ -2286,7 +2384,7 @@ const Evaluator = struct {
     fn slice(ev: *Evaluator, f: *Frame, s: @FieldType(Body.Expr, "slice")) EvalError!Val {
         const ip = ev.ip;
         const base = try ev.eval(f, s.lhs, null);
-        // 值未知时不展开元素
+        // Do not expand the elements when the value is unknown
         if (base.v == .unknown) return error.Abort;
         const start = std.math.cast(usize, try ev.evalInt(f, s.start, .usize_type)) orelse return error.Abort;
         const count = try ev.elemCount(base) orelse return error.Abort;
@@ -2297,7 +2395,8 @@ const Evaluator = struct {
             .ptr_type => |p| p.is_const,
             else => true,
         };
-        // 与推导路径一致：显式哨兵优先；切到末尾时保留源数组的哨兵
+        // Consistent with the inference path: an explicit sentinel takes precedence; slicing to
+        // the end keeps the sentinel of the source array
         const src_sentinel: ?Index = switch (ip.key(base.ty)) {
             .array_type => |a| a.sentinel,
             .abstract_array_type => |a| a.sentinel,
@@ -2316,23 +2415,25 @@ const Evaluator = struct {
             break :blk try ev.freeze(v) orelse return error.Abort;
         } else null;
         const sentinel: ?Index = if (explicit) |x| x else if (end == count) src_sentinel else null;
-        // comptime 已知的区间：指向数组的指针
+        // Range known at comptime: a pointer to an array
         const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child, .sentinel = sentinel } });
         const ptr_ty = try ip.ptrTo(array, .one, is_const);
-        // 切片的是局部变量（或经由指针）的存储：引用原存储的区间，写入反映到原数组
+        // Slicing storage of a local variable (or reached through a pointer): reference a range of
+        // the original storage, so writes are reflected in the original array
         if (try ev.sliceTarget(f, s.lhs, base)) |target| {
             const offset = if (target.window) |tw| tw.start else 0;
             var ref = target;
             ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = std.math.cast(u32, end - start) orelse return error.Abort };
             return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
         }
-        // 其他（驻留的常量等）：元素为复制，不驻留
+        // Otherwise (interned constants, etc.): the elements are copies and are not interned
         const elems = try ev.allocElems(end - start);
         for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
         return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
     }
 
-    /// 被切片的存储：指针所指向的存储，或数组局部变量自身；没有可引用的存储时为 null
+    /// Storage being sliced: the storage the pointer points to, or the local array variable itself;
+    /// null when there is no storage to reference
     fn sliceTarget(ev: *Evaluator, f: *Frame, lhs: ExprId, base: Val) EvalError!?Ref {
         switch (base.v) {
             .ref => |r| return r,
@@ -2345,7 +2446,7 @@ const Evaluator = struct {
         };
     }
 
-    // ── 初始化 ───────────────────────────────────────────────────────
+    // ── Initialization ───────────────────────────────────────────────
 
     fn initExpr(ev: *Evaluator, f: *Frame, ty_e: ?ExprId, fields: []const Body.FieldInit, want: ?Index) EvalError!Val {
         const ip = ev.ip;
@@ -2385,7 +2486,7 @@ const Evaluator = struct {
                         if (fl.name != null and std.mem.eql(u8, fl.name.?, d.name)) break try ev.copy(try ev.eval(f, fl.value, d.ty));
                     } else try ev.fieldDefault(target, d);
                 }
-                // 不存在的字段
+                // Fields that do not exist
                 for (fields) |fl| if ((fl.name == null and ip.key(target) != .tuple_type) or (fl.name != null and try ev.fieldIndex(target, fl.name.?) == null)) return error.Abort;
                 return ev.makeAgg(target, elems);
             },
@@ -2393,7 +2494,7 @@ const Evaluator = struct {
         }
     }
 
-    /// 没有结果类型的 `.{ ... }`：元组或匿名结构体
+    /// `.{ ... }` without a result type: a tuple or an anonymous struct
     fn anonInit(ev: *Evaluator, f: *Frame, fields: []const Body.FieldInit) EvalError!Val {
         const ip = ev.ip;
         const elems = try ev.a.alloc(Val, fields.len);
@@ -2412,7 +2513,8 @@ const Evaluator = struct {
         return ev.makeAgg(ty, elems);
     }
 
-    /// 解释器中构造的元组与匿名结构体：值都在 comptime 求出，字段都是 comptime 字段（与编译器一致）
+    /// Tuples and anonymous structs constructed in the interpreter: all values are evaluated at
+    /// comptime and all fields are comptime fields (matching the compiler)
     fn comptimeFieldValues(ev: *Evaluator, elems: []const Val) EvalError![]const Index {
         const values = try ev.a.alloc(Index, elems.len);
         for (elems, values) |e, *v| v.* = ev.freeze(e) catch |err| switch (err) {
@@ -2436,12 +2538,13 @@ const Evaluator = struct {
         };
     }
 
-    // ── 转换 ─────────────────────────────────────────────────────────
+    // ── Coercion ─────────────────────────────────────────────────────
 
-    /// 按结果类型转换
+    /// Coerces to the result type
     fn coerce(ev: *Evaluator, v: Val, want: ?Index) EvalError!Val {
         var out = try ev.coerceValue(v, want);
-        // 字节的来源随类型转换保留（`u8` → `?u8`、`comptime_int` → `u8`）：值不变
+        // The origin of a byte is kept through coercion (`u8` → `?u8`, `comptime_int` → `u8`):
+        // the value is unchanged
         if (v.origin != 0 and out.origin == 0) if (ev.intOf(v)) |a| if (ev.intOf(out)) |b| if (a == b) {
             out.origin = v.origin;
         };
@@ -2471,28 +2574,29 @@ const Evaluator = struct {
                 if (!value.intFits(ip, t, v.v.int)) return error.Abort;
                 return Val.ofInt(t, v.v.int);
             }
-            // 转换到浮点、枚举等：按驻留的值转换
+            // Coercion to floats, enums, etc.: coerce the interned value
             return ev.coerceValue(Val.of(v.ty, (try ev.ipOf(v)).?), want);
         }
         switch (v.v) {
             .ip => |x| switch (ip.key(x)) {
                 .int_value, .enum_literal => {
-                    // 整数越界、不是枚举成员等：编译错误
+                    // Integer out of range, not an enum member, etc.: compile error
                     const cx = try value.coerceValue(ip, x, t) orelse return error.Abort;
                     if (ip.key(cx) == .enum_tag and !try ev.isEnumMember(t, ip.key(cx).enum_tag.name)) return error.Abort;
                     if (ip.key(x) == .enum_literal and cx == x) {
-                        // union 中 void 字段的标签
+                        // Tag of a void field in a union
                         if (ev.isUnion(t)) return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = ip.key(x).enum_literal, .payload = .void_value } }));
                     }
                     return Val.of(t, cx);
                 },
-                // 浮点值转换到浮点 / 整数类型：按目标精度舍入或取整，不能只改类型标签
+                // Float value to a float / integer type: round to the target precision or convert
+                // to an integer; changing only the type tag is not enough
                 .float_value => if (ip.isFloat(t) or ip.isInt(t)) {
                     const cx = try value.coerceValue(ip, x, t) orelse return error.Abort;
                     return Val.of(t, cx);
                 },
                 .union_value => |u| if (value.isEnumType(ip, t)) {
-                    // union 转换为其标签
+                    // A union coerces to its tag
                     return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = u.tag } }));
                 },
                 else => {},
@@ -2500,9 +2604,11 @@ const Evaluator = struct {
             .unknown => return .{ .ty = t },
             else => {},
         }
-        // 指向元组的指针 → 切片：元素逐个转换；元组 / 匿名结构体字面量 → 数组、结构体
+        // Pointer to a tuple → slice: coerce the elements one by one; tuple / anonymous struct
+        // literal → array, struct
         switch (ip.key(t)) {
-            // `*const T` → `*const [1]T`：取出元素，指向只含该元素的常量数组
+            // `*const T` → `*const [1]T`: take out the element and point to a constant array
+            // containing only that element
             .ptr_type => |p| if (p.size == .one and p.is_const and ip.key(p.child) == .array_type and
                 ip.key(p.child).array_type.len == 1 and ip.key(v.ty) == .ptr_type and
                 ip.key(v.ty).ptr_type.size == .one and ip.key(v.ty).ptr_type.child == ip.key(p.child).array_type.child)
@@ -2558,17 +2664,17 @@ const Evaluator = struct {
     fn isEnumMember(ev: *Evaluator, t: Index, name: []const u8) Error!bool {
         const names = try ev.enumNames(t) orelse return true;
         for (names) |n| if (std.mem.eql(u8, n, name)) return true;
-        // 非穷尽枚举没有名字的成员不能用名字引用
+        // Unnamed members of a non-exhaustive enum cannot be referenced by name
         return false;
     }
 
-    // ── 位置 ─────────────────────────────────────────────────────────
+    // ── Positions ────────────────────────────────────────────────────
 
     fn containerAt(ev: *Evaluator, f: *Frame, e: ExprId) Error!?Namespace {
         return ev.r.containerAt(f.file, f.item, f.body.range(e).start);
     }
 
-    // ── 内置函数 ─────────────────────────────────────────────────────
+    // ── Builtin functions ────────────────────────────────────────────
 
     fn builtin(ev: *Evaluator, f: *Frame, e: ExprId, name: []const u8, args: []const ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
@@ -2577,7 +2683,8 @@ const Evaluator = struct {
             const target = try ev.r.importTarget(f.file, f.body, args) orelse return error.Abort;
             const tv = try queries.importValue(ev.r, target);
             if (tv.ty == .unknown) return error.Abort;
-            // 有结果类型时编译器按结果类型解析 ZON：标量以外的值不能由转换得到（见 `zon.isScalar`）
+            // With a result type, the compiler parses ZON according to the result type: values
+            // other than scalars cannot be produced by conversion (see `zon.isScalar`)
             if (ev.r.isZon(target)) if (want) |t| if (t != .unknown and t != tv.ty and !zon.isScalar(tv.ty)) return error.Abort;
             return thaw(tv);
         }
@@ -2591,11 +2698,11 @@ const Evaluator = struct {
             return Val.ofType(try queries.containerType(ev.r, .{ .file = f.file, .container = tree.items[f.item].container }, f.inst));
         }
         if (eq(u8, name, "@compileError") or eq(u8, name, "@panic") or eq(u8, name, "@trap") or eq(u8, name, "@breakpoint")) return error.Abort;
-        // 不影响 comptime 结果的提示
+        // Hints that do not affect the comptime result
         if (eq(u8, name, "@setEvalBranchQuota")) {
             if (args.len != 1) return error.Abort;
             const n = try ev.evalInt(f, args[0], null);
-            // 比当前配额小时不起作用（与编译器相同）
+            // Has no effect when smaller than the current quota (same as the compiler)
             ev.quota = @max(ev.quota, std.math.cast(u32, n) orelse return error.Abort);
             return Val.void_val;
         }
@@ -2609,7 +2716,7 @@ const Evaluator = struct {
             return ev.eval(f, args[1], t);
         }
         const vals = try ev.a.alloc(Val, args.len);
-        // 参数的结果类型
+        // Result types of the arguments
         for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i]));
         if (try ev.pureBuiltin(name, vals)) |v| return v;
         if (eq(u8, name, "@TypeOf")) {
@@ -2648,7 +2755,8 @@ const Evaluator = struct {
         if (eq(u8, name, "@hasDecl") or eq(u8, name, "@hasField")) {
             if (vals.len != 2) return error.Abort;
             const t = try asType(vals[0]);
-            // 没有实例的泛型体中的类型参数：有哪些成员取决于实例（同 `infer.hasMember`）
+            // Type parameter in a generic body without an instance: which members it has depends
+            // on the instance (same as `infer.hasMember`)
             if (ip.key(t) == .opaque_param) return error.Abort;
             const field = try ev.stringOf(vals[1]);
             if (eq(u8, name, "@hasField")) return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
@@ -2697,7 +2805,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@Enum")) {
             if (vals.len != 4) return error.Abort;
             const names = try ev.stringsOf(vals[2]);
-            // 成员的值求不出时按声明顺序编号
+            // When the member values cannot be evaluated, number them in declaration order
             const values = ev.intsOf(vals[3]) catch |err| switch (err) {
                 error.Abort => blk: {
                     const out = try ev.a.alloc(i128, names.len);
@@ -2731,7 +2839,8 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
             if (vals.len != 1) return error.Abort;
-            // 指针类转换不改变值：没有结果类型时（如嵌套的 `@ptrCast(@alignCast(p))`）原样传递
+            // Pointer casts do not change the value: without a result type (e.g. the nested
+            // `@ptrCast(@alignCast(p))`), pass it through unchanged
             const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
             if (want == null and pointer_cast) return vals[0];
             return ev.cast(name, vals[0], want orelse return error.Abort);
@@ -2762,7 +2871,7 @@ const Evaluator = struct {
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[1]) orelse return error.Abort;
-            // 逐元素写入：每个元素计一步
+            // Write element by element: each element counts as one step
             for (0..n) |i| {
                 try ev.tick();
                 try ev.store(try ev.extend(dest, @intCast(i)), try ev.elemAt(vals[1], i));
@@ -2788,7 +2897,7 @@ const Evaluator = struct {
                 .ref => |r| r,
                 else => return error.Abort,
             };
-            // 源与目标可以重叠：先读出全部元素再写入
+            // Source and destination may overlap: read all elements before writing
             const n = try ev.elemCount(vals[1]) orelse return error.Abort;
             const elems = try ev.a.alloc(Val, n);
             for (elems, 0..) |*x, i| {
@@ -2815,7 +2924,8 @@ const Evaluator = struct {
         return error.Abort;
     }
 
-    /// 只做计算的内置函数（数学函数、布局）：参数都已求出，不读取求值的上下文。不是这类函数时为 null
+    /// Builtins that only compute (math functions, layout): the arguments are all evaluated, and
+    /// the evaluation context is not read. Returns null for any other builtin.
     fn pureBuiltin(ev: *Evaluator, name: []const u8, vals: []const Val) EvalError!?Val {
         const ip = ev.ip;
         const eq = std.mem.eql;
@@ -2829,7 +2939,7 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
             if (vals.len != 1) return error.Abort;
-            // 运行时操作数没有可用的名字，由调用方按切片处理
+            // A runtime operand has no usable name; the caller treats it as a slice
             const x = (try ev.freeze(vals[0])) orelse return null;
             const s = switch (ip.key(x)) {
                 .enum_tag => |t| t.name,
@@ -2868,7 +2978,8 @@ const Evaluator = struct {
                 for (vals[1..]) |v| best = value.floatOf(ip, try value.floatBinary(ip, op, ty, best, try ev.floatArg(v))) orelse return error.Abort;
                 return try ev.float(ty, best);
             }
-            // 结果类型为容纳结果的最小整数类型（如 `@min(@as(u8, 3), @as(u16, 5))` 为 u2）
+            // The result type is the smallest integer type that can hold the result (e.g.
+            // `@min(@as(u8, 3), @as(u16, 5))` is u2)
             const ty = try value.minMaxIntType(ip, op == .min, operands) orelse return error.Abort;
             var best = try ev.intArg(vals[0]);
             for (vals[1..]) |v| {
@@ -2885,7 +2996,7 @@ const Evaluator = struct {
             const ty = if (value.intInfo(ip, vals[0].ty)) |info| (if (info.signed) try ip.intType(.unsigned, info.bits) else vals[0].ty) else vals[0].ty;
             return try ev.int(ty, @abs(x));
         }
-        // 浮点的一元数学函数：按参数的浮点类型计算
+        // Unary float math functions: compute in the float type of the argument
         if (name.len > 1) if (std.meta.stringToEnum(value.FloatFn, name[1..])) |op| {
             if (vals.len != 1) return error.Abort;
             return try floatResult(vals[0].ty, try value.floatUnary(ip, op, vals[0].ty, try ev.floatArg(vals[0])));
@@ -2908,7 +3019,8 @@ const Evaluator = struct {
             const ty = value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
             const x = try ev.intArg(vals[0]);
             const y = try ev.intArg(vals[1]);
-            // i128 的最小值除以 -1 溢出（解释器的安全检查会使进程崩溃）
+            // The minimum of i128 divided by -1 overflows (the safety check in the interpreter
+            // would crash the process)
             if (y == 0 or x == std.math.minInt(i128)) return error.Abort;
             const r: i128 = switch (d[1]) {
                 .div_trunc => @divTrunc(x, y),
@@ -2927,7 +3039,8 @@ const Evaluator = struct {
         };
         for (overflow_ops) |o| if (eq(u8, name, o[0])) {
             if (vals.len != 2) return error.Abort;
-            // 结果类型为两侧的 peer（`@shlWithOverflow` 为左侧的类型）
+            // The result type is the peer type of both sides (for `@shlWithOverflow`, the type of
+            // the left side)
             const ty = if (o[1] == .shl) vals[0].ty else value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
             const result, const overflow = value.overflowInt(ip, o[1], ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
             const tuple = try ip.get(.{ .tuple_type = .{ .types = &.{ ty, .u1_type } } });
@@ -2949,7 +3062,7 @@ const Evaluator = struct {
             const info = value.intInfo(ip, vals[0].ty) orelse return error.Abort;
             if (info.bits > 128) return error.Abort;
             const x = try ev.intArg(vals[0]);
-            // 按位宽取二进制补码表示
+            // Take the two's complement representation at the bit width
             const bits: u128 = if (info.bits == 128) @bitCast(x) else @as(u128, @bitCast(x)) & ((@as(u128, 1) << @intCast(info.bits)) - 1);
             const n: u16 = if (eq(u8, name, "@popCount"))
                 @popCount(bits)
@@ -2959,7 +3072,7 @@ const Evaluator = struct {
                 @intCast(@clz(bits) - (128 - info.bits))
             else
                 @ctz(bits);
-            // 结果类型：能容纳位宽的无符号整数
+            // Result type: an unsigned integer that can hold the bit width
             const result_bits: u16 = @intCast(128 - @clz(@as(u128, info.bits)));
             return try ev.int(try ip.intType(.unsigned, result_bits), n);
         }
@@ -2974,8 +3087,9 @@ const Evaluator = struct {
         return ev.floatOf(v) orelse error.Abort;
     }
 
-    /// 内置函数第 `i` 个参数的结果类型（`prev` 为之前的参数）。构造类型的内置函数中按字段给出的参数为
-    /// `*const [n]T`，`&@splat(.{})` 等写法需要它
+    /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments). In
+    /// builtins that construct types, arguments given per field get `*const [n]T`, which forms
+    /// such as `&@splat(.{})` need.
     fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val) EvalError!?Index {
         const eq = std.mem.eql;
         const is_struct = eq(u8, name, "@Struct");
@@ -2993,7 +3107,7 @@ const Evaluator = struct {
         return builtinParamType(name, i);
     }
 
-    /// 内置函数参数的结果类型
+    /// Result type of a builtin parameter
     fn builtinParamType(name: []const u8, i: usize) ?Index {
         const eq = std.mem.eql;
         if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf") or eq(u8, name, "@mulAdd"))) return .type_type;
@@ -3044,7 +3158,7 @@ const Evaluator = struct {
         const x = try ev.freeze(v) orelse return error.Abort;
         const enum_ty: Index, const tag_name: []const u8 = switch (ip.key(x)) {
             .enum_tag => |t| .{ t.ty, t.name },
-            // 带标签的 union：标签的整数
+            // Tagged union: the integer of the tag
             .union_value => |u| .{ try ev.unionTagType(u.ty) orelse return error.Abort, u.tag },
             else => return error.Abort,
         };
@@ -3074,13 +3188,13 @@ const Evaluator = struct {
         return t;
     }
 
-    /// 字符串值：`[:0]const u8`
+    /// String value: `[:0]const u8`
     fn string(ev: *Evaluator, s: []const u8) Error!Val {
         const ty = try ev.stringSliceType();
         return Val.of(ty, try ev.ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
     }
 
-    /// 字符串字面量值：`*const [len:0]u8`
+    /// String literal value: `*const [len:0]u8`
     fn stringLiteral(ev: *Evaluator, s: []const u8) Error!Val {
         const ty = try ev.ip.stringLiteralType(s.len);
         return Val.of(ty, try ev.ip.get(.{ .bytes = .{ .ty = ty, .bytes = s } }));
@@ -3091,7 +3205,7 @@ const Evaluator = struct {
         return ev.ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = zero } });
     }
 
-    /// 字符串的内容
+    /// Content of a string
     fn stringOf(ev: *Evaluator, v: Val) EvalError![]const u8 {
         const x = try ev.freeze(v) orelse return error.Abort;
         return switch (ev.ip.key(x)) {
@@ -3118,7 +3232,7 @@ const Evaluator = struct {
         const out = try ev.a.alloc(Index, n);
         for (out, 0..) |*o, i| {
             const elem = try ev.elemAt(v, i);
-            // `[]const ?type` 中的 optional 载荷
+            // Optional payloads in `[]const ?type`
             o.* = if (try ev.ipOf(elem)) |x| (if (x == .null_value) return error.Abort else x) else return error.Abort;
         }
         return out;
@@ -3149,7 +3263,8 @@ const Evaluator = struct {
         return (try ev.condition(fv)).yes;
     }
 
-    /// 构造的类型：身份含构造位置与构造时的实例
+    /// Constructed type: its identity includes the construction site and the instance in which it
+    /// was constructed
     fn reify(ev: *Evaluator, f: *Frame, e: ExprId, spec: struct {
         kind: InternPool.Reified.Kind,
         layout: InternPool.Reified.Layout = .auto,
@@ -3181,9 +3296,9 @@ const Evaluator = struct {
         } });
     }
 
-    // ── 布局 ─────────────────────────────────────────────────────────
+    // ── Layout ───────────────────────────────────────────────────────
 
-    /// 类型的布局；容器按编译器的布局算法（Sema/type_resolution.zig）
+    /// Type layout; containers follow the compiler's layout algorithm (Sema/type_resolution.zig)
     fn typeLayout(ev: *Evaluator, t: Index, depth: u32) EvalError!?value.Layout {
         const ip = ev.ip;
         if (depth > max_layout_depth) return null;
@@ -3194,16 +3309,16 @@ const Evaluator = struct {
             .container_type, .reified_type, .union_tag_type, .tuple_type, .anon_struct_type => {},
             else => return value.typeLayout(ip, t),
         }
-        // 枚举：标签整数
+        // Enum: its tag integer
         if (value.isEnumType(ip, t)) return value.typeLayout(ip, try ev.enumTagType(t) orelse return null);
         const fields = try ev.layoutFields(t, depth) orelse return null;
         if (ev.isUnion(t)) return ev.unionLayout(t, try ev.containerSyntax(t), fields, depth);
         return (try ev.structLayoutOf(t, fields) orelse return null).layout;
     }
 
-    /// 结构体字段的位偏移；comptime 字段与求不出时为 null
+    /// Bit offset of a struct field; null for comptime fields and when it cannot be evaluated
     fn bitOffsetOf(ev: *Evaluator, t: Index, field: []const u8) EvalError!?u64 {
-        // 只有结构体有字段偏移
+        // Only structs have field offsets
         if (ev.isUnion(t) or value.isEnumType(ev.ip, t)) return null;
         const i = try ev.fieldIndex(t, field) orelse return null;
         const fields = try ev.layoutFields(t, 0) orelse return null;
@@ -3211,7 +3326,9 @@ const Evaluator = struct {
         return sl.bit_offsets[i];
     }
 
-    /// 类型有位表示：数组的位宽要求元素有位表示（错误集与未指定标签类型的枚举虽可求 `@bitSizeOf`，却没有）
+    /// Whether the type has a bit representation: the bit width of an array requires its elements
+    /// to have one (error sets and enums without a specified tag type have none, although
+    /// `@bitSizeOf` can be evaluated on them)
     fn hasBitRepr(ev: *Evaluator, t: Index) EvalError!bool {
         switch (ev.ip.key(t)) {
             .error_set_type, .inferred_error_set => return false,
@@ -3223,7 +3340,8 @@ const Evaluator = struct {
         }
     }
 
-    /// packed 容器可以包含的字段类型：整数、浮点、bool、void、指定了标签类型的枚举与 packed 容器
+    /// Field types a packed container can contain: integers, floats, bool, void, enums with a
+    /// specified tag type, and packed containers
     fn packable(ev: *Evaluator, t: Index) EvalError!bool {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -3237,10 +3355,12 @@ const Evaluator = struct {
         }
     }
 
-    /// 参与布局的字段：comptime 字段不占空间。`alignment` 为显式对齐，未指定时为类型的对齐
+    /// Field taking part in the layout: comptime fields take no space. `alignment` is the explicit
+    /// alignment, or the type's alignment when none is specified.
     const LayoutField = struct { ty: Index, layout: ?value.Layout, alignment: u64 = 0, explicit_align: bool = false, is_comptime: bool = false };
 
-    /// 结构体（含元组、匿名结构体）与 union 各字段的布局；字段的布局或属性求不出时为 null
+    /// Layout of each field of a struct (including tuples and anonymous structs) or union; null
+    /// when the layout or attributes of a field cannot be evaluated
     fn layoutFields(ev: *Evaluator, t: Index, depth: u32) EvalError!?[]const LayoutField {
         switch (ev.ip.key(t)) {
             .container_type => |c| if (c.kind == .@"opaque") return null,
@@ -3263,7 +3383,8 @@ const Evaluator = struct {
 
     const FieldAttrs = struct { is_comptime: bool = false, alignment: ?u64 = null };
 
-    /// 源码中的字段与构造的类型的字段的 comptime 与显式对齐；求不出时放弃
+    /// The comptime flag and explicit alignment of fields in source code and of fields of
+    /// constructed types; gives up when they cannot be evaluated
     fn fieldAttrs(ev: *Evaluator, t: Index, i: usize, fl: Field) EvalError!FieldAttrs {
         if (fl.item) |m| {
             const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
@@ -3275,14 +3396,15 @@ const Evaluator = struct {
                 .is_comptime = i < rt.comptime_fields.len and rt.comptime_fields[i],
                 .alignment = if (i < rt.field_aligns.len and rt.field_aligns[i] != 0) rt.field_aligns[i] else null,
             },
-            // 字面量的字段是否 comptime 求不出时放弃
+            // Give up when it cannot be determined whether a literal's field is comptime
             .tuple_type => |tt| literalFieldAttrs(tt.values, i),
             .anon_struct_type => |a| literalFieldAttrs(a.values, i),
             else => .{},
         };
     }
 
-    /// 源码中字段的显式对齐 `align(N)`（在签名模式的推导结果中）；没有时为 null，求不出时放弃
+    /// Explicit alignment `align(N)` of a field in source code (in the signature-mode inference
+    /// result); null when there is none, and gives up when it cannot be evaluated
     fn explicitAlign(ev: *Evaluator, t: Index, file: FileId, item: u32) EvalError!?u64 {
         const owner = try ev.r.ownerKey(file, item);
         const body = try ev.r.ctx.get(hir.ItemBody, owner);
@@ -3295,15 +3417,17 @@ const Evaluator = struct {
 
     const StructLayout = struct { layout: value.Layout, bit_offsets: []const ?u64 };
 
-    /// 结构体（含元组、匿名结构体）的布局与各字段的位偏移
+    /// Layout and field bit offsets of a struct (including tuples and anonymous structs)
     fn structLayoutOf(ev: *Evaluator, t: Index, fields: []const LayoutField) EvalError!?StructLayout {
         if (ev.ip.key(t) == .tuple_type) return try ev.tupleLayout(fields);
         return ev.structLayout(try ev.containerSyntax(t), fields);
     }
 
-    /// 元组的布局（`Type.structFieldOffset` 与 `abiAlignment` 的元组分支）：按声明顺序，不重排；comptime 字段
-    /// 与零大小的字段不占位置。对齐计入零大小的字段，大小只按有大小的字段的对齐补齐（与编译器一致，
-    /// `struct { u8, [0]u64 }` 的大小为 1、对齐为 8）
+    /// Layout of a tuple (the tuple branches of `Type.structFieldOffset` and `abiAlignment`): in
+    /// declaration order, without reordering; comptime fields and zero-size fields take no space.
+    /// The alignment counts zero-size fields, but the size is padded only to the alignment of the
+    /// fields that have a size (matching the compiler: `struct { u8, [0]u64 }` has size 1 and
+    /// alignment 8).
     fn tupleLayout(ev: *Evaluator, fields: []const LayoutField) Error!?StructLayout {
         const offsets = try ev.a.alloc(?u64, fields.len);
         var end: u64 = 0;
@@ -3327,8 +3451,9 @@ const Evaluator = struct {
         return .{ .layout = .{ .size = value.alignForward(end, size_align) orelse return null, .alignment = alignment, .bits = null }, .bit_offsets = offsets };
     }
 
-    /// 结构体的布局与各字段的位偏移（comptime 字段为 null）。auto 布局按对齐降序重排字段，
-    /// 与编译器同样使用 `sortUnstable`，对齐相同的字段顺序也一致
+    /// Layout of a struct and the bit offset of each field (null for comptime fields). The auto
+    /// layout reorders fields by descending alignment, using `sortUnstable` like the compiler, so
+    /// the order of fields with equal alignment matches as well.
     fn structLayout(ev: *Evaluator, decl: ContainerSyntax, fields: []const LayoutField) EvalError!?StructLayout {
         const offsets = try ev.a.alloc(?u64, fields.len);
         @memset(offsets, null);
@@ -3336,12 +3461,12 @@ const Evaluator = struct {
             var bits: u64 = 0;
             for (fields, offsets) |fl, *o| {
                 const l = fl.layout orelse return null;
-                // packed 的字段不能有显式对齐（编译器报错）
+                // Packed fields cannot have an explicit alignment (the compiler reports an error)
                 if (fl.explicit_align or !try ev.packable(fl.ty)) return null;
                 o.* = bits;
                 bits = std.math.add(u64, bits, l.bits orelse return null) catch return null;
             }
-            // 显式的 backing 整数须与各字段的位宽之和相等
+            // An explicit backing integer must match the sum of the fields' bit widths
             if (decl.arg) |arg| if ((value.intInfo(ev.ip, arg) orelse return null).bits != bits) return null;
             return .{ .layout = value.intLayout(ev.ip, std.math.cast(u16, bits) orelse return null) orelse return null, .bit_offsets = offsets };
         }
@@ -3366,7 +3491,7 @@ const Evaluator = struct {
         return .{ .layout = .{ .size = value.alignForward(end, struct_align) orelse return null, .alignment = struct_align, .bits = null }, .bit_offsets = offsets };
     }
 
-    /// 字段在内存中的顺序：与编译器的比较函数相同，comptime 字段排在最后
+    /// In-memory order of fields: matches the compiler's comparison function; comptime fields last
     const RuntimeOrder = struct {
         const omitted = std.math.maxInt(u32);
 
@@ -3377,7 +3502,8 @@ const Evaluator = struct {
         }
     };
 
-    /// union 的布局：auto 与 extern 为最大的字段（与标签），packed 的各字段位宽相同
+    /// Layout of a union: for auto and extern, the largest field (plus the tag); for packed, all
+    /// fields have the same bit width
     fn unionLayout(ev: *Evaluator, t: Index, decl: ContainerSyntax, fields: []const LayoutField, depth: u32) EvalError!?value.Layout {
         var payload_size: u64 = 0;
         var payload_align: u64 = 1;
@@ -3399,12 +3525,13 @@ const Evaluator = struct {
             .@"extern" => return payload,
             .auto => {},
         }
-        // 只有一个字段时没有标签
+        // No tag when there is only one field
         if (fields.len < 2) return payload;
         const tag: value.Layout = if (try ev.unionTagType(t)) |tag_ty|
             try ev.typeLayout(tag_ty, depth + 1) orelse return null
         else if (try ev.safetyTagged(t) orelse return null)
-            // 隐藏标签与 `union(enum)` 的标签相同：容纳字段序号的最小无符号整数
+            // The hidden tag is the same as that of `union(enum)`: the smallest unsigned integer
+            // that holds the field index
             value.intLayout(ev.ip, @intCast(64 - @clz(@as(u64, fields.len - 1)))) orelse return null
         else
             return payload;
@@ -3415,9 +3542,10 @@ const Evaluator = struct {
 
     const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
 
-    /// 不带标签的 auto union 是否有安全检查用的隐藏标签（与编译器的 `wantSafeTypes` 一致）：所在模块的
-    /// 优化模式为 Debug 或 ReleaseSafe 时有。声明位于函数体（含 test、comptime 块）且其中调用了
-    /// `@setRuntimeSafety` 时取决于调用的位置与参数，为 null
+    /// Whether an untagged auto union has a hidden tag for safety checks (matching the compiler's
+    /// `wantSafeTypes`): it does when the optimize mode of its module is Debug or ReleaseSafe. When
+    /// the declaration is in a function body (including test and comptime blocks) that calls
+    /// `@setRuntimeSafety`, it depends on the call's location and argument, so the result is null.
     fn safetyTagged(ev: *Evaluator, t: Index) EvalError!?bool {
         const file: FileId, const item: ?u32 = switch (ev.ip.key(t)) {
             .container_type => blk: {
@@ -3450,7 +3578,8 @@ const Evaluator = struct {
         return null;
     }
 
-    /// `@Struct` / `@Union` 的字段属性中的显式对齐与 comptime 字段（都取默认值时为空）
+    /// Explicit alignments and comptime fields in the field attributes of `@Struct` / `@Union`
+    /// (empty when all take the default)
     fn reifiedAttrs(ev: *Evaluator, attrs: Val, n: usize, is_union: bool) EvalError!ReifiedAttrs {
         return ev.readAttrs(attrs, n, is_union) catch |err| switch (err) {
             error.Abort => .{ .unknown = true },
@@ -3477,7 +3606,7 @@ const Evaluator = struct {
 
     // ── @typeInfo ────────────────────────────────────────────────────
 
-    /// 标准库中按路径查找的类型（如 `builtin.Type`）
+    /// Type in the standard library looked up by path (e.g. `builtin.Type`)
     fn stdType(ev: *Evaluator, path: []const []const u8) EvalError!Index {
         const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return error.Abort;
         var t = try queries.containerType(ev.r, .{ .file = std_root, .container = 0 }, null);
@@ -3489,7 +3618,7 @@ const Evaluator = struct {
         return asType(try ev.typeMember(t, name));
     }
 
-    /// 类型 `t` 的值：字段按名字给出，其余取默认值
+    /// Value of type `t`: fields given by name, the rest take their default values
     fn structValue(ev: *Evaluator, t: Index, fields: []const struct { []const u8, Index }) EvalError!Index {
         const decl = try ev.fieldsOf(t) orelse return error.Abort;
         const elems = try ev.a.alloc(Index, decl.len);
@@ -3588,14 +3717,14 @@ const Evaluator = struct {
         });
     }
 
-    /// 指向哨兵值的指针（`?*const anyopaque`）
+    /// Pointer to the sentinel value (`?*const anyopaque`)
     fn sentinelPtr(ev: *Evaluator, sentinel: ?Index) Error!Index {
         const s = sentinel orelse return .null_value;
         const ty = try ev.ip.ptrTo(.anyopaque_type, .one, true);
         return ev.ip.get(.{ .ptr_value = .{ .ty = ty, .pointee = s } });
     }
 
-    /// 容器（结构体、枚举、union、opaque、元组）的 `@typeInfo`
+    /// `@typeInfo` of a container (struct, enum, union, opaque, tuple)
     fn containerInfo(ev: *Evaluator, type_ty: Index, t: Index) EvalError!struct { []const u8, Index } {
         const ip = ev.ip;
         const layout_ty = try ev.member(type_ty, "ContainerLayout");
@@ -3651,7 +3780,7 @@ const Evaluator = struct {
         const attrs = try ev.a.alloc(Index, fields.len);
         for (fields, attrs, 0..) |fl, *o, i| {
             const fa = try ev.fieldAttrs(t, i, fl);
-            // 元组与匿名结构体字面量的 comptime 字段：值属于类型
+            // Comptime fields of tuple / anonymous struct literals: the value belongs to the type
             const literal_value: ?Index = switch (ip.key(t)) {
                 .tuple_type => |tt| InternPool.fieldValue(tt.values, i),
                 .anon_struct_type => |a| InternPool.fieldValue(a.values, i),
@@ -3674,18 +3803,19 @@ const Evaluator = struct {
         }) };
     }
 
-    /// 指向值的 `*const anyopaque`（字段的默认值）
+    /// `*const anyopaque` pointing to a value (the default value of a field)
     fn anyopaquePtr(ev: *Evaluator, v: Index) Error!Index {
         const ty = try ev.ip.ptrTo(.anyopaque_type, .one, true);
         return ev.ip.get(.{ .ptr_value = .{ .ty = ty, .pointee = v } });
     }
 
-    /// 字段属性中的 `align`（`?usize`）
+    /// `align` in the field attributes (`?usize`)
     fn alignAttr(ev: *Evaluator, alignment: ?u64) Error!Index {
         return if (alignment) |a| ev.intIndex(.usize_type, a) else .null_value;
     }
 
-    /// 字段默认值的指针；有默认值但求不出时指向未知值
+    /// Pointer to the default value of a field; points to an unknown value when there is a default
+    /// value that cannot be evaluated
     fn defaultPtr(ev: *Evaluator, t: Index, field: Field) EvalError!Index {
         const item = field.item orelse return .null_value;
         const ns = try queries.namespaceOfType(ev.r, t) orelse return .null_value;
@@ -3699,7 +3829,7 @@ const Evaluator = struct {
         return ev.ip.get(.{ .ptr_value = .{ .ty = ty, .pointee = try ev.freeze(v) orelse .unknown } });
     }
 
-    /// 源码容器的 pub 声明名
+    /// Names of the pub declarations of a source container
     fn declNames(ev: *Evaluator, t: Index) Error![]const []const u8 {
         const ns = try queries.namespaceOfType(ev.r, t) orelse return &.{};
         const tree = try ev.r.itemTree(ns.file);
@@ -3716,14 +3846,16 @@ const Evaluator = struct {
 
     const ContainerSyntax = struct { layout: InternPool.Reified.Layout = .auto, auto_enum: bool = false, arg: ?Index = null };
 
-    /// 容器声明的语法信息：布局、`union(enum)`、参数表达式的值
+    /// Syntactic information of a container declaration: layout, `union(enum)`, and the value of
+    /// the argument expression
     fn containerSyntax(ev: *Evaluator, t: Index) EvalError!ContainerSyntax {
         const ip = ev.ip;
         switch (ip.key(t)) {
             .reified_type => |rt| return .{ .layout = rt.layout, .arg = rt.tag },
             .container_type => |c| {
                 const ns = try queries.namespaceOfType(ev.r, t) orelse return .{};
-                // 布局修饰记录在 ItemTree 中（结构不变时不随编辑变化），不读语法树
+                // The layout modifier is recorded in the ItemTree (it does not change with edits
+                // while the structure stays the same); the syntax tree is not read
                 const container = (try ev.r.itemTree(ns.file)).containers[ns.container];
                 var out: ContainerSyntax = .{
                     .layout = switch (container.layout) {
@@ -3740,7 +3872,8 @@ const Evaluator = struct {
         }
     }
 
-    /// `enum(u8)` / `union(E)` / `packed struct(u32)` 的参数（在外层成员的推导结果中）
+    /// Argument of `enum(u8)` / `union(E)` / `packed struct(u32)` (in the inference result of the
+    /// enclosing member)
     fn containerArg(ev: *Evaluator, ns: Namespace, inst: ?Index) Error!?Index {
         const tree = try ev.r.itemTree(ns.file);
         const parent = tree.containers[ns.container].parent_item orelse return null;
@@ -3749,7 +3882,8 @@ const Evaluator = struct {
         for (body.exprs, 0..) |x, i| switch (x) {
             .container => |c| if (body.expr_ranges[i].start == rel) {
                 const arg = c.arg orelse return null;
-                // 只推导参数表达式：外层成员整体的推导可能正在进行（体内的容器），取它会形成环
+                // Infer only the argument expression: inference of the enclosing member as a whole
+                // may be in progress (for a container in a body), and taking it would form a cycle
                 const owner = try ev.r.ownerKey(ns.file, parent);
                 const v = try ev.r.ctx.get(queries.LocalValue, .{ .owner = owner, .target = .{ .expr = arg }, .inst = try queries.normalizeInst(ev.r, ns.file, parent, inst) });
                 return v.asType();
@@ -3763,12 +3897,13 @@ const Evaluator = struct {
         return (try ev.containerSyntax(t)).layout;
     }
 
-    /// 枚举的标签整数类型：显式的 `enum(u8)`，否则为容纳最大值的无符号整数
+    /// Tag integer type of an enum: the explicit one of `enum(u8)`, otherwise the unsigned integer
+    /// that holds the largest value
     fn enumTagType(ev: *Evaluator, t: Index) EvalError!?Index {
         const ip = ev.ip;
         switch (ip.key(t)) {
             .container_type, .reified_type => if ((try ev.containerSyntax(t)).arg) |arg| return arg,
-            // `union(enum(u8))` 的标签枚举
+            // Tag enum of `union(enum(u8))`
             .union_tag_type => |u| if ((try ev.containerSyntax(u)).arg) |arg| return arg,
             else => {},
         }
@@ -3791,7 +3926,8 @@ const Evaluator = struct {
         }
     }
 
-    /// union 的标签类型：`union(E)` 为 E，`union(enum)` 为自动生成的标签枚举，否则为 null
+    /// Tag type of a union: E for `union(E)`, the automatically generated tag enum for
+    /// `union(enum)`, otherwise null
     fn unionTagType(ev: *Evaluator, t: Index) EvalError!?Index {
         const s = try ev.containerSyntax(t);
         if (s.auto_enum) return try ev.ip.get(.{ .union_tag_type = t });
@@ -3806,13 +3942,14 @@ const Evaluator = struct {
             else => return null,
         }
         const decl = try ev.containerSyntax(t);
-        // 未显式给出 backing 整数的 packed 容器：编译器对 `@backingInt` 报错
+        // Packed container without an explicit backing integer: the compiler reports an error for
+        // `@backingInt`
         if (decl.layout == .@"packed") return decl.arg;
         if (ev.isUnion(t)) if (try ev.unionTagType(t)) |tag| return ev.enumTagType(tag);
         return null;
     }
 
-    /// packed 结构体的 backing 整数（`?type` 的值）
+    /// Backing integer of a packed struct (a value of `?type`)
     fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index) EvalError!Index {
         if (layout != .@"packed") return .null_value;
         if ((try ev.containerSyntax(t)).arg) |arg| return arg;
@@ -3836,7 +3973,8 @@ fn compareNumbers(op: SyntaxKind, x: anytype, y: @TypeOf(x)) bool {
     };
 }
 
-/// 浮点运算的结果类型：comptime_float 取另一侧，整数与浮点混合时取浮点类型
+/// Result type of a float operation: comptime_float takes the other side's type; when integers
+/// and floats are mixed, the float type
 fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     if (a == b) return a;
     if (a == .comptime_float_type or a == .comptime_int_type) return if (ip.isFloat(b)) b else null;
@@ -3844,39 +3982,44 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     return null;
 }
 
-/// 元组与匿名结构体字面量的字段是否 comptime；求不出时放弃
+/// Whether a field of a tuple or anonymous struct literal is comptime; gives up when it cannot
+/// be determined
 fn literalFieldAttrs(values: []const Index, i: usize) EvalError!Evaluator.FieldAttrs {
     const v = InternPool.fieldValue(values, i);
     if (v == .unknown) return error.Abort;
     return .{ .is_comptime = v != .runtime };
 }
 
-/// 对齐的值：须为 2 的幂（否则编译器报错），求不出时放弃
+/// Alignment value: must be a power of two (otherwise the compiler reports an error); gives up
+/// when it cannot be evaluated
 fn alignValue(ip: *InternPool, v: ?Index) EvalError!u64 {
     const x = value.intOf(ip, v) orelse return error.Abort;
     if (x <= 0 or x & (x - 1) != 0) return error.Abort;
     return std.math.cast(u64, x) orelse error.Abort;
 }
 
-/// `++` 结果的哨兵（与编译器一致）：两侧都有时须相同，只有一侧有时取该侧
+/// Sentinel of the result of `++` (matching the compiler): when both sides have one, they must
+/// be equal; when only one side has one, that side's sentinel
 pub fn concatSentinel(a: ?Index, b: ?Index) ?Index {
     const x = a orelse return b;
     const y = b orelse return x;
     return if (x == y) x else null;
 }
 
-/// 浮点运算的结果；求不出（不是浮点类型、除数为零等）时放弃
+/// Result of a float operation; gives up when it cannot be evaluated (not a float type, division
+/// by zero, etc.)
 fn floatResult(ty: Index, v: ?Index) EvalError!Val {
     return Val.of(ty, v orelse return error.Abort);
 }
 
-/// 有参数是浮点类型或 comptime_float
+/// Whether any argument is of a float type or comptime_float
 fn anyFloat(ip: *InternPool, vals: []const Val) bool {
     for (vals) |v| if (ip.isFloat(v.ty)) return true;
     return false;
 }
 
-/// 浮点内置函数参数的结果类型：两侧都是 comptime 数值时为 comptime_float
+/// Result type of the arguments of float builtins: comptime_float when both sides are comptime
+/// numbers
 fn floatPeer(ip: *InternPool, a: Index, b: Index) ?Index {
     const comptime_a = a == .comptime_float_type or a == .comptime_int_type;
     const comptime_b = b == .comptime_float_type or b == .comptime_int_type;

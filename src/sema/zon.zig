@@ -1,6 +1,8 @@
-//! `.zon` 文件的值：`@import` 一个 `.zon` 文件得到其中的值。没有结果类型时与编译器一致：结构体字面量为
-//! 匿名结构体、数组字面量为元组，字段都是 comptime 字段；整数与字符为 comptime_int，浮点数为 comptime_float，
-//! 字符串为 `*const [n:0]u8`。类型与值的表示与源码中没有结果类型的同样字面量相同（见 `infer` 的 `anonInit`）
+//! Values of `.zon` files: `@import` of a `.zon` file yields the value in it. Without a result
+//! type, it matches the compiler: struct literals are anonymous structs and array literals are
+//! tuples, with all fields comptime fields; integers and characters are comptime_int, floats are
+//! comptime_float, and strings are `*const [n:0]u8`. Types and values are represented the same
+//! way as the same literals without a result type in source code (see `anonInit` in `infer`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,11 +16,13 @@ const value = @import("value.zig");
 
 const log = std.log.scoped(.zon);
 
-/// 值的嵌套层数上限（与解释器驻留聚合值的上限相同），更深的值按未知处理
+/// Maximum nesting depth of values (the same as the interpreter's limit for interned aggregate
+/// values); deeper values are treated as unknown
 const max_depth = 256;
 
-/// ZON 文本没有结果类型时的值。有语法错误或 ZonGen 报告的错误（如重复的字段名）时未知；`inf`、`nan`
-/// 没有结果类型时编译器报错，含有它们的值同样未知
+/// Value of ZON text without a result type. Unknown when there are syntax errors or errors
+/// reported by ZonGen (such as duplicate field names); without a result type the compiler reports
+/// errors for `inf` and `nan`, so values containing them are unknown too.
 pub fn lower(gpa: Allocator, ip: *InternPool, text: []const u8) Allocator.Error!TypedValue {
     const source = try gpa.dupeSentinel(u8, text, 0);
     defer gpa.free(source);
@@ -30,9 +34,11 @@ pub fn lower(gpa: Allocator, ip: *InternPool, text: []const u8) Allocator.Error!
     return l.node(.root, 0);
 }
 
-/// 有结果类型时编译器按结果类型解析 ZON。没有结果类型时的值是标量（bool、null、整数、浮点数、枚举字面量）
-/// 时，它转换为结果类型的结果与按结果类型解析相同；字符串、元组与结构体按结果类型可以解析为切片、数组、指针
-/// 或带默认值的结构体，不能由转换得到
+/// With a result type, the compiler parses ZON according to the result type. When the value
+/// without a result type is a scalar (bool, null, integer, float, enum literal), converting it to
+/// the result type gives the same result as parsing according to the result type; strings, tuples
+/// and structs can be parsed according to the result type into slices, arrays, pointers or structs
+/// with default values, which conversion cannot produce
 pub fn isScalar(ty: Index) bool {
     return switch (ty) {
         .bool_type, .null_type, .comptime_int_type, .comptime_float_type, .enum_literal_type => true,
@@ -40,7 +46,8 @@ pub fn isScalar(ty: Index) bool {
     };
 }
 
-/// 解析并运行 ZonGen，有错误时为 null。官方解析器逐层递归：同 `live.check`，按嵌套深度选择执行的线程
+/// Parses and runs ZonGen; null when there are errors. The official parser recurses level by
+/// level: as in `live.check`, the thread to run on is chosen by nesting depth
 fn generate(gpa: Allocator, source: [:0]const u8) Allocator.Error!?Zoir {
     const depth = try nesting.estimate(gpa, source, nesting.thread_depth);
     if (depth <= nesting.inline_depth) return generateSource(gpa, source);
@@ -84,7 +91,7 @@ const Lowering = struct {
             .pos_inf, .neg_inf, .nan => return .unknown,
             .int_literal => |int| switch (int) {
                 .small => |x| return l.comptimeInt(x),
-                // 超出 i128 的整数没有值的表示
+                // Integers beyond i128 have no value representation
                 .big => |b| return if (b.toInt(i128)) |x| l.comptimeInt(x) else |_| .{ .ty = .comptime_int_type },
             },
             .char_literal => |c| return l.comptimeInt(c),
@@ -107,7 +114,9 @@ const Lowering = struct {
         return .{ .ty = .comptime_int_type, .val = try l.ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = x } }) };
     }
 
-    /// 元组（`names` 为 null）或匿名结构体。字段都是 comptime 字段，值属于类型；任一字段的类型未知时整个值未知
+    /// A tuple (`names` is null) or an anonymous struct. All fields are comptime fields, with the
+    /// values belonging to the type; when the type of any field is unknown, the whole value is
+    /// unknown
     fn container(l: *Lowering, names: ?[]const Zoir.NullTerminatedString, elems: Zoir.Node.Index.Range, depth: u32) Allocator.Error!TypedValue {
         if (depth >= max_depth) return .unknown;
         const ip = l.ip;
@@ -157,7 +166,7 @@ test "ZON text lowers to the value without a result type" {
 test "ZON text the compiler rejects without a result type has no value" {
     var ip: InternPool = try .init(testing.allocator, testing.io);
     defer ip.deinit();
-    // 语法错误、重复的字段名、没有结果类型的 inf / nan
+    // Syntax errors, duplicate field names, inf / nan without a result type
     for ([_][]const u8{ ".{ .x = 1, ", ".{ .x = 1, .x = 2 }", ".{ .f = inf }", "-inf", "nan" }) |text| {
         try testing.expectEqual(Index.unknown, (try lower(testing.allocator, &ip, text)).ty);
     }

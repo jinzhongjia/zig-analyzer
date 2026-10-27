@@ -1,11 +1,14 @@
-//! comptime 值的语义（类型推导与 comptime 解释器共用）：按类型位宽的整数运算、值与类型的
-//! 相等判断、值的类型转换、comptime-only 类型的判断。
+//! Semantics of comptime values (shared by type inference and the comptime interpreter): integer
+//! arithmetic at the bit width of the type, equality of values and types, coercion of values to
+//! types, and detection of comptime-only types.
 //!
-//! 相等判断返回 `?bool`：抽象参数、未知值，或身份取决于捕获值的泛型实例无法判断时为 null，
-//! 调用方据此不选择任何分支，而不是给出可能错误的结果。
+//! Equality returns `?bool`: it is null when it cannot be decided for abstract parameters, unknown
+//! values, or generic instances whose identity depends on captured values, so the caller selects
+//! no branch instead of giving a possibly wrong result.
 //!
-//! 与目标相关的大小与位宽（usize、指针、整数的对齐、浮点与 C 类型）按目标的参数（`InternPool.Target`）
-//! 计算；参数未知时（各模块的目标不一致）这些值为未知。
+//! Target-dependent sizes and bit widths (usize, pointers, integer alignment, floats and C types)
+//! are computed from the target parameters (`InternPool.Target`); when the parameters are unknown
+//! (the targets of the modules disagree) these values are unknown.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,11 +16,12 @@ const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
 const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 
-// ── 整数 ─────────────────────────────────────────────────────────────
+// ── Integers ─────────────────────────────────────────────────────────
 
 pub const IntInfo = struct { signed: bool, bits: u16 };
 
-/// 定宽整数类型的符号与位宽（usize 与 C 整数类型按目标）；comptime_int 与位宽或符号未知的为 null
+/// Signedness and bit width of a fixed-width integer type (usize and C integer types per the
+/// target); null for comptime_int and when the bit width or signedness is unknown
 pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
     return switch (ip.key(t)) {
         .int_type => |i| .{ .signed = i.signedness == .signed, .bits = i.bits },
@@ -33,12 +37,12 @@ pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
     };
 }
 
-/// 运算的中间结果：两个 i128 的积与移位结果都放得下
+/// Intermediate result of arithmetic: holds both the product of two i128 values and shift results
 const Wide = i256;
 
 const Bounds = struct { min: Wide, max: Wide };
 
-/// 位宽超过 128 时为 null（值以 i128 存储，超出部分不折叠）
+/// Null when the bit width exceeds 128 (values are stored as i128; anything wider is not folded)
 fn bounds(info: IntInfo) ?Bounds {
     if (info.bits > 128) return null;
     if (info.bits == 0) return .{ .min = 0, .max = 0 };
@@ -49,7 +53,7 @@ fn bounds(info: IntInfo) ?Bounds {
     return .{ .min = 0, .max = (@as(Wide, 1) << @intCast(info.bits)) - 1 };
 }
 
-/// 按二进制补码截断到 `info` 的位宽
+/// Truncates to the bit width of `info` in two's complement
 fn truncate(info: IntInfo, v: Wide) Wide {
     if (info.bits == 0) return 0;
     const m = @as(Wide, 1) << @intCast(info.bits);
@@ -60,8 +64,9 @@ fn truncate(info: IntInfo, v: Wide) Wide {
 
 const Overflow = enum { check, wrap, saturate };
 
-/// 运算结果放入类型 `ty`（comptime_int 或定宽整数）。越界时：普通运算为 null（编译器会报错），
-/// 回绕运算截断，饱和运算取边界
+/// Fits an arithmetic result into type `ty` (comptime_int or a fixed-width integer). When it is
+/// out of range: plain operations give null (the compiler reports an error), wrapping operations
+/// truncate, and saturating operations clamp to the bound.
 fn fit(ip: *InternPool, ty: Index, v: Wide, mode: Overflow) ?i128 {
     if (ty == .comptime_int_type) return std.math.cast(i128, v);
     const info = intInfo(ip, ty) orelse return null;
@@ -74,7 +79,8 @@ fn fit(ip: *InternPool, ty: Index, v: Wide, mode: Overflow) ?i128 {
     return std.math.cast(i128, r);
 }
 
-/// 整数二元运算的 comptime 结果（`ty` 为结果类型）；结果不确定或编译器会报错时为 null
+/// Result of a binary integer operation at comptime (`ty` is the result type); null when the
+/// result is not determined or the compiler would report an error
 pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?i128 {
     const x: Wide = a;
     const y: Wide = b;
@@ -88,7 +94,7 @@ pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?
         .asterisk => fit(ip, ty, x * y, .check),
         .asterisk_percent => fit(ip, ty, x * y, .wrap),
         .asterisk_pipe => fit(ip, ty, x * y, .saturate),
-        // 有符号的 `/` 与 `%` 要求使用 @divTrunc 等，只折叠非负操作数
+        // Signed `/` and `%` require @divTrunc etc., so only nonnegative operands are folded
         .slash => if (y <= 0 or x < 0) null else fit(ip, ty, @divTrunc(x, y), .check),
         .percent => if (y <= 0 or x < 0) null else fit(ip, ty, @rem(x, y), .check),
         .ampersand => fit(ip, ty, x & y, .check),
@@ -101,7 +107,8 @@ pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?
     };
 }
 
-/// `<<`：定宽整数移出的位被丢弃（移位量须小于位宽）；`<<|` 饱和
+/// `<<`: bits shifted out of a fixed-width integer are discarded (the shift amount must be less
+/// than the bit width); `<<|` saturates
 fn shl(ip: *InternPool, ty: Index, x: Wide, y: Wide, saturate: bool) ?i128 {
     if (y < 0) return null;
     if (ty == .comptime_int_type) {
@@ -123,7 +130,8 @@ fn shr(ip: *InternPool, ty: Index, x: Wide, y: Wide) ?i128 {
     if (y < 0) return null;
     if (ty == .comptime_int_type) return fit(ip, ty, x >> @intCast(@min(y, 255)), .check);
     const info = intInfo(ip, ty) orelse return null;
-    // 值以 i128 存储，位宽超过 128 的结果无法表示；先返回 null，避免移位量 @intCast 到 u8 溢出
+    // Values are stored as i128, so results wider than 128 bits cannot be represented; return
+    // null early so that the @intCast of the shift amount to u8 cannot overflow
     if (info.bits > 128) return null;
     if (y >= info.bits) return null;
     return fit(ip, ty, x >> @intCast(y), .check);
@@ -131,8 +139,10 @@ fn shr(ip: *InternPool, ty: Index, x: Wide, y: Wide) ?i128 {
 
 pub const OverflowOp = enum { add, sub, mul, shl };
 
-/// 带溢出位的整数运算（`@addWithOverflow` 等）：按 `ty` 回绕的结果与是否溢出。`ty` 须为定宽整数；
-/// 移位量须小于位宽（编译器中右侧的类型为 `Log2Int(T)`）；求不出时为 null
+/// Integer arithmetic with an overflow bit (`@addWithOverflow` etc.): the result wrapped to `ty`
+/// and whether it overflowed. `ty` must be a fixed-width integer; the shift amount must be less
+/// than the bit width (in the compiler the right operand has type `Log2Int(T)`); null when it
+/// cannot be computed.
 pub fn overflowInt(ip: *InternPool, op: OverflowOp, ty: Index, a: i128, b: i128) ?struct { i128, bool } {
     const info = intInfo(ip, ty) orelse return null;
     if (ty == .comptime_int_type or info.bits > 128) return null;
@@ -148,7 +158,8 @@ pub fn overflowInt(ip: *InternPool, op: OverflowOp, ty: Index, a: i128, b: i128)
     return .{ wrapped, fit(ip, ty, r, .check) == null };
 }
 
-/// `@shlExact` / `@shrExact`：左移溢出、右移移出了 1 时编译器报错，为 null
+/// `@shlExact` / `@shrExact`: null when the compiler reports an error, i.e. when a left shift
+/// overflows or a right shift shifts out a 1 bit
 pub fn exactShift(ip: *InternPool, left: bool, ty: Index, a: i128, b: i128) ?i128 {
     if (b < 0) return null;
     const x: Wide = a;
@@ -164,8 +175,9 @@ pub fn exactShift(ip: *InternPool, left: bool, ty: Index, a: i128, b: i128) ?i12
     return fit(ip, ty, x >> n, .check);
 }
 
-/// `@byteSwap`（`bytes`）/ `@bitReverse`：按 `ty` 的位宽取二进制补码表示后交换字节或反转位。
-/// `@byteSwap` 的位宽须为 8 的倍数
+/// `@byteSwap` (`bytes`) / `@bitReverse`: takes the two's complement representation at the bit
+/// width of `ty`, then swaps the bytes or reverses the bits. The bit width for `@byteSwap` must
+/// be a multiple of 8.
 pub fn reverseBits(ip: *InternPool, bytes: bool, ty: Index, a: i128) ?i128 {
     if (ty == .comptime_int_type) return null;
     const info = intInfo(ip, ty) orelse return null;
@@ -188,13 +200,14 @@ pub fn negate(ip: *InternPool, ty: Index, a: i128, wrapping: bool) ?i128 {
     return fit(ip, ty, -@as(Wide, a), if (wrapping) .wrap else .check);
 }
 
-/// `~x`：只对定宽整数有定义
+/// `~x`: defined only for fixed-width integers
 pub fn bitNot(ip: *InternPool, ty: Index, a: i128) ?i128 {
     const info = intInfo(ip, ty) orelse return null;
     return fit(ip, ty, truncate(info, ~@as(Wide, a)), .check);
 }
 
-/// comptime 值自身的类型（值驻留时不带类型的场合，如 comptime 调用的实参）
+/// Type of a comptime value itself (for values interned without a type, such as the arguments of
+/// a comptime call)
 pub fn typeOfValue(ip: *InternPool, v: Index) Index {
     return switch (ip.key(v)) {
         .int_value => |i| i.ty,
@@ -216,8 +229,9 @@ pub fn typeOfValue(ip: *InternPool, v: Index) Index {
     };
 }
 
-/// 两个整数类型的 peer 类型：comptime_int 取另一侧；同符号取较宽者；无符号且较窄时可放入有符号；
-/// 其他组合（编译错误）为 null
+/// Peer type of two integer types: with comptime_int, the other side; with the same signedness,
+/// the wider one; an unsigned type fits into a wider signed one; null for other combinations
+/// (compile errors)
 pub fn peerIntType(ip: *InternPool, a: Index, b: Index) ?Index {
     if (a == b) return a;
     if (a == .comptime_int_type and ip.isInt(b)) return b;
@@ -231,14 +245,16 @@ pub fn peerIntType(ip: *InternPool, a: Index, b: Index) ?Index {
     return null;
 }
 
-/// 值是否在整数类型的范围内（comptime_int 总是）
+/// Whether the value is in the range of the integer type (always true for comptime_int)
 pub fn intFits(ip: *InternPool, ty: Index, v: i128) bool {
     return fit(ip, ty, v, .check) != null;
 }
 
-/// 整数参数的 `@min` / `@max` 的结果类型（与编译器的 `analyzeMinMax` 一致）：各参数的范围（值已知时
-/// 为该值，否则为类型的范围）按 `@min` / `@max` 合并，取容纳结果范围的最小整数类型；参数都是
-/// comptime_int 时为 comptime_int。有参数不是整数或范围求不出时为 null
+/// Result type of `@min` / `@max` with integer operands (matches the compiler's `analyzeMinMax`):
+/// the ranges of the operands (the value when it is known, otherwise the range of the type) are
+/// combined by `@min` / `@max`, and the result is the smallest integer type that holds the
+/// combined range; comptime_int when all operands are comptime_int. Null when an operand is not
+/// an integer or a range cannot be computed.
 pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool.TypedValue) Allocator.Error!?Index {
     var result: Bounds = undefined;
     var all_comptime = true;
@@ -254,18 +270,20 @@ pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool
             .{ .min = @max(result.min, r.min), .max = @max(result.max, r.max) };
     }
     if (all_comptime) return .comptime_int_type;
-    // 与编译器的 `intFittingRange` 相同
+    // Same as the compiler's `intFittingRange`
     const signed = result.min < 0;
     return try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
 }
 
-/// 容纳 `x` 的位宽，`signed` 时含符号位（`x` 为负时 `signed` 为 true）
+/// Bit width needed to hold `x`, including the sign bit when `signed` (`signed` is true when `x`
+/// is negative)
 fn bitsFor(x: Wide, signed: bool) u16 {
     const magnitude: u256 = @intCast(if (x >= 0) x else -(x + 1));
     return @as(u16, @intCast(256 - @clz(magnitude))) + @intFromBool(signed);
 }
 
-/// 有浮点参数的 `@min` / `@max` 的结果类型：位宽最大的浮点类型，只有 comptime 数值时为 comptime_float
+/// Result type of `@min` / `@max` with float operands: the float type with the largest bit width,
+/// or comptime_float when all operands are comptime numbers
 pub fn minMaxFloatType(ip: *InternPool, types: []const Index) ?Index {
     var best: ?Index = null;
     var best_bits: u16 = 0;
@@ -281,7 +299,7 @@ pub fn minMaxFloatType(ip: *InternPool, types: []const Index) ?Index {
     return best orelse .comptime_float_type;
 }
 
-// ── 浮点 ─────────────────────────────────────────────────────────────
+// ── Floating point ───────────────────────────────────────────────────
 
 pub fn floatOf(ip: *InternPool, v: ?Index) ?f128 {
     return switch (ip.key(v orelse return null)) {
@@ -291,7 +309,7 @@ pub fn floatOf(ip: *InternPool, v: ?Index) ?f128 {
     };
 }
 
-/// 按浮点类型的精度舍入；不是浮点类型时为 null
+/// Rounds to the precision of the float type; null when it is not a float type
 fn roundTo(ip: *InternPool, ty: Index, x: f128) ?f128 {
     return switch (ip.key(ty)) {
         .simple_type => |s| switch (s) {
@@ -306,13 +324,14 @@ fn roundTo(ip: *InternPool, ty: Index, x: f128) ?f128 {
     };
 }
 
-/// 浮点类型 `ty` 的值
+/// A value of the float type `ty`
 pub fn floatValue(ip: *InternPool, ty: Index, x: f128) Allocator.Error!?Index {
     const r = roundTo(ip, ty, x) orelse return null;
     return try ip.get(.{ .float_value = .{ .ty = ty, .bits = @bitCast(r) } });
 }
 
-/// 浮点二元运算（`ty` 为结果的浮点类型）；结果不确定时为 null
+/// Binary float operation (`ty` is the float type of the result); null when the result is not
+/// determined
 pub fn binaryFloat(ip: *InternPool, op: SyntaxKind, ty: Index, a: f128, b: f128) Allocator.Error!?Index {
     const r: f128 = switch (op) {
         .plus => a + b,
@@ -324,7 +343,8 @@ pub fn binaryFloat(ip: *InternPool, op: SyntaxKind, ty: Index, a: f128, b: f128)
     return floatValue(ip, ty, r);
 }
 
-/// 浮点类型对应的 Zig 类型（comptime_float 按 f128 计算，与编译器一致）
+/// The Zig type corresponding to a float type (comptime_float is computed as f128, matching the
+/// compiler)
 fn FloatOf(comptime k: InternPool.Simple) type {
     return switch (k) {
         .f16 => f16,
@@ -335,7 +355,8 @@ fn FloatOf(comptime k: InternPool.Simple) type {
     };
 }
 
-/// 浮点类型的位宽（与布局无关）；c_longdouble 按目标，目标未知时为 null
+/// Bit width of a float type (independent of the layout); c_longdouble depends on the target and
+/// is null when the target is unknown
 pub fn floatBits(ip: *InternPool, t: Index) ?u16 {
     return switch (ip.key(t)) {
         .simple_type => |s| switch (s) {
@@ -361,10 +382,11 @@ fn floatKind(ip: *InternPool, ty: Index) ?InternPool.Simple {
     };
 }
 
-/// 浮点的一元内置函数
+/// Unary float builtins
 pub const FloatFn = enum { sqrt, sin, cos, tan, exp, exp2, log, log2, log10, abs, floor, ceil, trunc, round };
 
-/// 浮点一元内置函数（`@sqrt` 等）的值，按类型的精度计算；不是浮点类型时为 null
+/// Value of a unary float builtin (`@sqrt` etc.), computed at the precision of the type; null
+/// when it is not a float type
 pub fn floatUnary(ip: *InternPool, f: FloatFn, ty: Index, x: f128) Allocator.Error!?Index {
     const r: f128 = switch (floatKind(ip, ty) orelse return null) {
         inline .f16, .f32, .f64, .f80, .f128, .comptime_float => |k| unary(FloatOf(k), f, @floatCast(x)),
@@ -392,10 +414,11 @@ fn unary(comptime T: type, f: FloatFn, x: T) T {
     };
 }
 
-/// 浮点的二元内置函数
+/// Binary float builtins
 pub const FloatBinFn = enum { min, max, mod, rem, div_trunc, div_floor, div_ceil, div_exact };
 
-/// 浮点二元内置函数（`@mod`、`@min` 等）的值，按类型的精度计算；除数为零、不能整除等求不出时为 null
+/// Value of a binary float builtin (`@mod`, `@min` etc.), computed at the precision of the type;
+/// null when it cannot be computed (division by zero, inexact division, and so on)
 pub fn floatBinary(ip: *InternPool, f: FloatBinFn, ty: Index, a: f128, b: f128) Allocator.Error!?Index {
     const r: f128 = switch (floatKind(ip, ty) orelse return null) {
         inline .f16, .f32, .f64, .f80, .f128, .comptime_float => |k| binary(FloatOf(k), f, @floatCast(a), @floatCast(b)) orelse return null,
@@ -411,9 +434,11 @@ fn binary(comptime T: type, f: FloatBinFn, a: T, b: T) ?T {
         else => {},
     }
     if (b == 0) return null;
-    // 编译器在 comptime 调用自身的同名内置函数，发行版的编译器经 LLVM 编译，展开为以下形式。按同样的
-    // 展开式计算，结果不随 zig-analyzer 自身的编译后端变化。`@mod` 只按被除数的符号调整，除数为负时
-    // 与数学定义不同（f64 的 7 mod -3 得 1 而不是 -2）
+    // At comptime the compiler calls its own builtin of the same name; a release build of the
+    // compiler is compiled by LLVM, which expands it into the forms below. Computing with the same
+    // expansion keeps the result independent of the backend zig-analyzer itself is compiled with.
+    // `@mod` adjusts only by the sign of the dividend, so with a negative divisor it differs from
+    // the mathematical definition (7 mod -3 in f64 gives 1 rather than -2).
     return switch (f) {
         .mod => if (a < 0) @rem(@rem(a, b) + b, b) else @rem(a, b),
         .rem => @rem(a, b),
@@ -425,7 +450,7 @@ fn binary(comptime T: type, f: FloatBinFn, a: T, b: T) ?T {
     };
 }
 
-/// `@mulAdd(T, a, b, c)`：只舍入一次的 `a * b + c`
+/// `@mulAdd(T, a, b, c)`: `a * b + c` rounded only once
 pub fn floatMulAdd(ip: *InternPool, ty: Index, a: f128, b: f128, c: f128) Allocator.Error!?Index {
     const r: f128 = switch (floatKind(ip, ty) orelse return null) {
         inline .f16, .f32, .f64, .f80, .f128, .comptime_float => |k| @mulAdd(FloatOf(k), @floatCast(a), @floatCast(b), @floatCast(c)),
@@ -441,22 +466,24 @@ pub fn intOf(ip: *InternPool, v: ?Index) ?i128 {
     };
 }
 
-// ── 大小与对齐 ───────────────────────────────────────────────────────
+// ── Size and alignment ───────────────────────────────────────────────
 
 pub const Layout = struct {
     size: u64,
     alignment: u64,
-    /// `@bitSizeOf`；没有位表示的类型（切片、非指针的 optional、error union、非 packed 的容器等）为 null
+    /// `@bitSizeOf`; null for types without a bit representation (slices, optionals of
+    /// non-pointers, error unions, non-packed containers, etc.)
     bits: ?u64,
 };
 
-/// 错误码：按 u16 的整数布局
+/// Error codes: the integer layout of u16
 fn errorLayout(ip: *InternPool) ?Layout {
     return intLayout(ip, 16);
 }
 
-/// 类型的大小、对齐与位宽（`@sizeOf` / `@alignOf` / `@bitSizeOf`），按目标的规则（`InternPool.Target`）。
-/// 只处理不含容器的类型（容器由 `eval.typeLayout` 处理），其余为 null
+/// Size, alignment and bit width of a type (`@sizeOf` / `@alignOf` / `@bitSizeOf`) by the rules
+/// of the target (`InternPool.Target`). Handles only types that contain no containers (containers
+/// are handled by `eval.typeLayout`); null for the rest.
 pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
     const pointer_bits: u64 = ip.pointerBits() orelse 0;
     const ptr_bytes: u64 = pointer_bits / 8;
@@ -466,7 +493,7 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             .bool => .{ .size = 1, .alignment = 1, .bits = 1 },
             .void => .{ .size = 0, .alignment = 1, .bits = 0 },
             .usize, .isize => if (pointer_bits == 0) null else intLayout(ip, @intCast(pointer_bits)),
-            // 表示为 u16
+            // Represented as u16
             .f16 => intLayout(ip, 16),
             .anyerror => errorLayout(ip),
             else => if (scalarAbiOf(ip, s)) |l| .{ .size = l.size, .alignment = l.alignment, .bits = l.bits } else null,
@@ -486,7 +513,8 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
     };
 }
 
-/// C 类型与 f32、f64、f80、f128 的布局（`InternPool.ScalarAbi`）；其余类型与目标未定义时为 null
+/// Layout of C types and f32, f64, f80, f128 (`InternPool.ScalarAbi`); null for other types and
+/// when the target leaves it undefined
 fn scalarAbiOf(ip: *InternPool, s: InternPool.Simple) ?InternPool.ScalarAbi.Scalar {
     const k: InternPool.ScalarAbi.Type = switch (s) {
         .c_char => .c_char,
@@ -504,8 +532,9 @@ fn scalarAbiOf(ip: *InternPool, s: InternPool.Simple) ?InternPool.ScalarAbi.Scal
     return ip.scalarAbi().types.get(k);
 }
 
-/// `@Vector(len, T)`（`Type.abiAlignment` / `abiSize` 的 vector 分支）：规则取决于编译后端与 CPU 特性
-/// （`InternPool.VectorAbi`）。f80、f128 元素是否走软浮点取决于目标的 long double，为 null
+/// `@Vector(len, T)` (the vector branch of `Type.abiAlignment` / `abiSize`): the rules depend on
+/// the compiler backend and CPU features (`InternPool.VectorAbi`). Null for f80 and f128 elements,
+/// since whether they use soft float depends on the target's long double.
 fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
     const abi = ip.vectorAbi();
     if (abi == .unknown) return null;
@@ -525,7 +554,7 @@ fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
         .llvm, .llvm_aarch64 => blk: {
             const bytes = (bits + 7) / 8;
             if (elem_bits == 0) break :blk .{ 1, bytes };
-            // aarch64：不超过栈对齐
+            // aarch64: no larger than the stack alignment
             const capped = if (abi == .llvm_aarch64) @min(bytes, 16) else bytes;
             break :blk .{ std.math.ceilPowerOfTwo(u64, capped) catch return null, bytes };
         },
@@ -546,20 +575,23 @@ fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
     return .{ .size = alignForward(bytes, alignment) orelse return null, .alignment = alignment, .bits = if (hasBitRepr(ip, child)) bits else null };
 }
 
-/// 向上对齐到 `alignment`（2 的幂）；溢出时为 null，源码中的超大类型不应使宿主崩溃
+/// Aligns up to `alignment` (a power of 2); null on overflow, since an oversized type in the
+/// source must not crash the host
 pub fn alignForward(x: u64, alignment: u64) ?u64 {
     const sum = std.math.add(u64, x, alignment - 1) catch return null;
     return sum & ~(alignment - 1);
 }
 
-/// 字节偏移换算为位偏移；溢出时为 null
+/// Converts a byte offset to a bit offset; null on overflow
 pub fn bitsOf(bytes: u64) ?u64 {
     return std.math.mul(u64, bytes, 8) catch null;
 }
 
-/// 定宽整数类型（含 packed 容器的 backing 整数、枚举的标签）的布局（`std.zig.target.intAlignment` /
-/// `intByteSize`）：对齐为不小于字节数的 2 的幂，且不超过目标的最大整数对齐。最大对齐在各模块中不一致、
-/// 且影响该位宽的对齐时为 null
+/// Layout (`std.zig.target.intAlignment` / `intByteSize`) of a fixed-width integer type,
+/// including the backing integer of a packed container and the tag of an enum: the alignment is
+/// the byte size rounded up to a power of 2, but no larger than the target's maximum integer
+/// alignment. Null when the maximum alignment differs between modules and affects the alignment
+/// of this bit width.
 pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     if (bits == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
     if (bits > 128) return null;
@@ -571,8 +603,9 @@ pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = bits };
 }
 
-/// `?T`：非 C 指针（含切片）与错误集以零值表示 null，与载荷同大小；其余在载荷之后加一个标记，
-/// 按载荷的对齐补齐。只有单项与多项指针的 optional 有位表示
+/// `?T`: non-C pointers (including slices) and error sets represent null as zero and have the
+/// size of the payload; the rest add a flag after the payload, padded to the payload's alignment.
+/// Only optionals of single-item and many-item pointers have a bit representation.
 pub fn optionalLayout(ip: *InternPool, child: Index, payload: Layout) ?Layout {
     switch (ip.key(child)) {
         .ptr_type => |p| if (p.size != .c) return .{ .size = payload.size, .alignment = payload.alignment, .bits = if (p.size == .slice) null else payload.bits },
@@ -583,8 +616,9 @@ pub fn optionalLayout(ip: *InternPool, child: Index, payload: Layout) ?Layout {
     return .{ .size = std.math.add(u64, payload.size, payload.alignment) catch return null, .alignment = payload.alignment, .bits = null };
 }
 
-/// 数组（长度含哨兵）。`elem_bit_repr`：元素有位表示时数组才有位宽（错误集与未指定标签类型的枚举
-/// 虽可求 `@bitSizeOf`，却没有位表示）
+/// Arrays (the length includes the sentinel). `elem_bit_repr`: an array has a bit width only
+/// when its elements have a bit representation (error sets and enums without an explicit tag type
+/// have a `@bitSizeOf` but no bit representation).
 pub fn arrayLayout(elem: Layout, a: @FieldType(InternPool.Key, "array_type"), elem_bit_repr: bool) ?Layout {
     const n = std.math.add(u64, a.len, @intFromBool(a.sentinel != null)) catch return null;
     const size = std.math.mul(u64, elem.size, n) catch return null;
@@ -592,7 +626,7 @@ pub fn arrayLayout(elem: Layout, a: @FieldType(InternPool.Key, "array_type"), el
     return .{ .size = size, .alignment = elem.alignment, .bits = bits };
 }
 
-/// `E!T`：错误码与载荷，按两者中较大的对齐补齐
+/// `E!T`: the error code and the payload, padded to the larger of their alignments
 pub fn errorUnionLayout(ip: *InternPool, payload: Layout) ?Layout {
     const err = errorLayout(ip) orelse return null;
     const alignment = @max(err.alignment, payload.alignment);
@@ -600,7 +634,7 @@ pub fn errorUnionLayout(ip: *InternPool, payload: Layout) ?Layout {
     return .{ .size = alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
 }
 
-/// 不含容器的类型是否有位表示（错误集没有）
+/// Whether a type without containers has a bit representation (error sets do not)
 fn hasBitRepr(ip: *InternPool, t: Index) bool {
     return switch (ip.key(t)) {
         .error_set_type, .inferred_error_set => false,
@@ -610,7 +644,7 @@ fn hasBitRepr(ip: *InternPool, t: Index) bool {
     };
 }
 
-// ── 类型分类 ─────────────────────────────────────────────────────────
+// ── Type classification ──────────────────────────────────────────────
 
 pub fn isTypeKey(k: InternPool.Key) bool {
     return switch (k) {
@@ -620,7 +654,7 @@ pub fn isTypeKey(k: InternPool.Key) bool {
     };
 }
 
-/// 枚举类型（源码中的 enum、构造的 enum、union(enum) 的标签枚举）
+/// Enum types (enums in the source, constructed enums, the tag enum of a union(enum))
 pub fn isEnumType(ip: *InternPool, t: Index) bool {
     return switch (ip.key(t)) {
         .container_type => |c| c.kind == .@"enum",
@@ -630,7 +664,8 @@ pub fn isEnumType(ip: *InternPool, t: Index) bool {
     };
 }
 
-/// 只能在 comptime 存在的类型：这类参数即使不写 `comptime` 也是 comptime 参数
+/// Types that can exist only at comptime: a parameter of such a type is a comptime parameter even
+/// without `comptime`
 pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
     return switch (ip.key(t)) {
         .simple_type => |s| switch (s) {
@@ -638,7 +673,8 @@ pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
             else => false,
         },
         .fn_type => true,
-        // 函数指针是运行时的值；指向其他 comptime-only 类型的指针才是
+        // Function pointers are runtime values; only pointers to other comptime-only types are
+        // comptime-only
         .ptr_type => |p| ip.key(p.child) != .fn_type and isComptimeOnly(ip, p.child),
         .array_type => |a| isComptimeOnly(ip, a.child),
         .abstract_array_type => |a| isComptimeOnly(ip, a.child),
@@ -659,7 +695,8 @@ fn anyComptimeOnly(ip: *InternPool, types: []const Index) bool {
     return false;
 }
 
-/// 元组与匿名结构体：comptime 字段（如 `comptime comptime_int = 5`）不使类型成为 comptime-only
+/// Tuples and anonymous structs: comptime fields (such as `comptime comptime_int = 5`) do not
+/// make the type comptime-only
 fn anyRuntimeComptimeOnly(ip: *InternPool, types: []const Index, values: []const Index) bool {
     for (types, 0..) |t, i| {
         const v = InternPool.fieldValue(values, i);
@@ -668,10 +705,11 @@ fn anyRuntimeComptimeOnly(ip: *InternPool, types: []const Index, values: []const
     return false;
 }
 
-// ── 相等 ─────────────────────────────────────────────────────────────
+// ── Equality ─────────────────────────────────────────────────────────
 
-/// 不含未知部分：同一个 Index 一定表示同一个值。抽象参数可以与自身比较（`T == T`），
-/// 未知的 comptime 实参（`List(_)`）不行：不同调用处的 `_` 可能是不同的值
+/// Contains no unknown parts: the same Index always denotes the same value. An abstract
+/// parameter can be compared with itself (`T == T`), but an unknown comptime argument
+/// (`List(_)`) cannot: `_` at different call sites may be different values.
 pub fn isPrecise(ip: *InternPool, v: Index) bool {
     if (v == .unknown) return false;
     return switch (ip.key(v)) {
@@ -708,7 +746,8 @@ fn allPrecise(ip: *InternPool, items: []const Index) bool {
     return true;
 }
 
-/// 不含抽象参数与未知部分的类型：可以脱离定义它的实例使用（如作为调用方的期望类型）
+/// A type without abstract parameters or unknown parts: it can be used outside the instance that
+/// defines it (e.g. as the caller's expected type)
 pub fn isConcrete(ip: *InternPool, t: Index) bool {
     if (t == .unknown) return false;
     return switch (ip.key(t)) {
@@ -741,7 +780,7 @@ fn allConcrete(ip: *InternPool, items: []const Index) bool {
     return true;
 }
 
-/// 三值合取：有 false 为 false，否则有未知为 null
+/// Three-valued conjunction: false if any is false, otherwise null if any is unknown
 fn all(results: []const ?bool) ?bool {
     var unknown = false;
     for (results) |r| {
@@ -754,13 +793,14 @@ fn all(results: []const ?bool) ?bool {
     return if (unknown) null else true;
 }
 
-/// 两个类型是否相同
+/// Whether two types are the same
 pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
     if (a == b) return if (isPrecise(ip, a)) true else null;
     if (a == .unknown or b == .unknown) return null;
     const ka = ip.key(a);
     const kb = ip.key(b);
-    // 抽象的类型（参数、长度未知的数组）与其他类型是否相同取决于实例
+    // Whether an abstract type (a parameter, an array of unknown length) is the same as another
+    // type depends on the instance
     if (ka == .opaque_param or kb == .opaque_param or ka == .unknown or kb == .unknown) return null;
     if (ka == .abstract_array_type or kb == .abstract_array_type) return null;
     if (std.meta.activeTag(ka) != std.meta.activeTag(kb)) return false;
@@ -791,7 +831,8 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
             const r = eqlTypes(ip, f.ret, g.ret) orelse break :blk null;
             break :blk if (!r) false else if (unknown) null else true;
         },
-        // 不同位置定义的容器一定不同；同一位置、不同实例的容器是否相同取决于它捕获的值
+        // Containers defined at different locations always differ; whether containers defined at
+        // the same location in different instances are the same depends on the values they capture
         .container_type => |c| if (c.file != kb.container_type.file or c.ast_id != kb.container_type.ast_id) false else null,
         .tuple_type => |x| all(&.{ eqlTypeLists(ip, x.types, kb.tuple_type.types), eqlFieldValues(ip, x.values, kb.tuple_type.values, x.types.len) }),
         .vector_type => |v| if (v.len != kb.vector_type.len) false else eqlTypes(ip, v.child, kb.vector_type.child),
@@ -800,7 +841,8 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
             if (!eqlNames(x.names, y.names)) break :blk false;
             break :blk all(&.{ eqlTypeLists(ip, x.types, y.types), eqlFieldValues(ip, x.values, y.values, x.types.len) });
         },
-        // 同一位置以相同内容构造的类型相同（构造时的实例只影响显示）
+        // Types constructed at the same location with the same contents are the same (the instance
+        // at construction only affects display)
         .reified_type => |x| blk: {
             const y = kb.reified_type;
             if (x.file != y.file or x.owner != y.owner or x.expr != y.expr or x.kind != y.kind or x.layout != y.layout) break :blk false;
@@ -810,9 +852,10 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
             break :blk all(&.{ tag, eqlTypeLists(ip, x.types, y.types) });
         },
         .union_tag_type => |u| eqlTypes(ip, u, kb.union_tag_type),
-        // 不同函数推导的错误集可能恰好相同
+        // Error sets inferred for different functions may happen to be the same
         .inferred_error_set => null,
-        // 驻留保证了简单类型、整数类型与错误集相同即同一个 Index
+        // Interning guarantees that equal simple types, integer types and error sets are the same
+        // Index
         else => false,
     };
 }
@@ -830,7 +873,8 @@ fn eqlTypeLists(ip: *InternPool, a: []const Index, b: []const Index) ?bool {
     return if (unknown) null else true;
 }
 
-/// 元组与匿名结构体各字段的 comptime 值：运行时字段与 comptime 字段不同，comptime 字段按值比较
+/// Comptime values of the fields of tuples and anonymous structs: a runtime field differs from a
+/// comptime field, and comptime fields are compared by value
 fn eqlFieldValues(ip: *InternPool, a: []const Index, b: []const Index, n: usize) ?bool {
     var unknown = false;
     for (0..n) |i| {
@@ -862,7 +906,8 @@ fn eqlSentinel(ip: *InternPool, a: ?Index, b: ?Index) ?bool {
     return eqlValues(ip, a.?, b.?);
 }
 
-/// 两个 comptime 值是否相等（`==` 的语义；类型按 `eqlTypes`）
+/// Whether two comptime values are equal (the semantics of `==`; types are compared by
+/// `eqlTypes`)
 pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
     if (a == .unknown or b == .unknown) return null;
     const ka = ip.key(a);
@@ -871,7 +916,8 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         if (!isTypeKey(ka) or !isTypeKey(kb)) return null;
         return eqlTypes(ip, a, b);
     }
-    // 非 null 的 optional 值即其载荷：与 null 比较时只要另一侧是已知的非 null 值即不等
+    // A non-null optional value is its payload: compared with null, it is unequal as soon as
+    // the other side is a known non-null value
     if (a == .null_value or b == .null_value) {
         if (a == b) return true;
         const other = if (a == .null_value) kb else ka;
@@ -898,7 +944,7 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         .enum_literal => |n| switch (kb) {
             .enum_literal => |m| std.mem.eql(u8, n, m),
             .enum_tag => |t| std.mem.eql(u8, n, t.name),
-            // 带标签的 union 与标签比较
+            // A tagged union compared with a tag
             .union_value => |u| std.mem.eql(u8, n, u.tag),
             else => null,
         },
@@ -927,7 +973,8 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
     };
 }
 
-/// 聚合值的驻留：元素都是 u8 整数时以字符串（`bytes`）表示，保证同一个值只有一种表示
+/// Interns an aggregate value: when all elements are u8 integers it is represented as a string
+/// (`bytes`), so each value has only one representation
 pub fn aggregate(ip: *InternPool, gpa: Allocator, ty: Index, elems: []const Index) Allocator.Error!Index {
     if (elems.len > 0) bytes: {
         const out = try gpa.alloc(u8, elems.len);
@@ -968,11 +1015,13 @@ fn eqlAggregates(ip: *InternPool, a: Index, b: Index) ?bool {
     return if (unknown) null else true;
 }
 
-// ── 转换 ─────────────────────────────────────────────────────────────
+// ── Conversion ───────────────────────────────────────────────────────
 
-/// comptime 值转换为类型 `to` 的值（结果类型语义）：整数字面量取目标整数类型（越界为 null），
-/// enum literal 取目标枚举的成员，optional 的目标先转换为载荷类型（非 null 的 optional 值即载荷值）。
-/// 不需要或无法转换时原样返回
+/// Coerces a comptime value to a value of type `to` (result type semantics): an integer literal
+/// takes the target integer type (null when out of range), an enum literal becomes the member of
+/// the target enum, and an optional target first coerces to the payload type (a non-null optional
+/// value is the payload value). Returns the value unchanged when no coercion is needed or
+/// possible.
 pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index {
     if (to == .unknown or v == .unknown or v == .undefined_value) return v;
     switch (ip.key(to)) {
@@ -986,7 +1035,8 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
         const x = floatOf(ip, v) orelse return null;
         return floatValue(ip, to, x);
     }
-    // 整数值的浮点（comptime_float 的整数值可以转换为整数类型）
+    // Floats with integer values (an integer-valued comptime_float can coerce to an integer
+    // type)
     if (ip.isInt(to)) switch (ip.key(v)) {
         .float_value => |f| {
             const x: f128 = @bitCast(f.bits);
@@ -1023,7 +1073,8 @@ test "integer folding follows the type's width" {
     try testing.expectEqual(@as(?i128, 2), binaryInt(&ip, .angle_bracket_angle_bracket_left, u8_t, 0x81, 1));
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_left, u8_t, 1, 8));
     try testing.expectEqual(@as(?i128, 1 << 100), binaryInt(&ip, .angle_bracket_angle_bracket_left, .comptime_int_type, 1, 100));
-    // 位宽超过 128 的类型不折叠：移位量超过 255 时不能 @intCast 到 u8
+    // Types wider than 128 bits are not folded: a shift amount above 255 cannot be @intCast
+    // to u8
     const u1000_t = try ip.intType(.unsigned, 1000);
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_right, u1000_t, 5, 300));
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -4, 2));

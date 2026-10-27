@@ -1,4 +1,4 @@
-//! 类型与值的显示（hover、inlay hint、补全详情共用）。
+//! Display of types and values (shared by hover, inlay hints and completion details).
 
 const std = @import("std");
 const Io = std.Io;
@@ -10,25 +10,32 @@ const Resolver = resolve.Resolver;
 const queries = @import("queries.zig");
 const Body = @import("../hir/Body.zig");
 
-/// 容器类型的名字：声明它的成员名（`const Point = struct {...}` → `Point`），文件为文件名。没有名字的容器（字段类型、
-/// 变量的类型标注、实参中的容器）按内容显示：`struct { x: u8 }`。其中再有的没有名字的容器：列出全部内容时同样展开，
-/// 只有自引用（`?*const @This()`）显示为 `struct {...}`；否则一律显示为 `struct {...}`
+/// Names of container types: the name of the member that declares the container
+/// (`const Point = struct {...}` → `Point`), and the file name for a file. Containers without a
+/// name (field types, type annotations of variables, containers in arguments) are displayed by
+/// their contents: `struct { x: u8 }`. Unnamed containers nested further inside them are expanded
+/// the same way when listing the full contents, and only self-references (`?*const @This()`) are
+/// displayed as `struct {...}`; otherwise they are always displayed as `struct {...}`.
 const ContainerNames = struct {
     r: *Resolver,
-    /// 正在按内容显示的外层匿名容器
+    /// The enclosing anonymous containers currently being displayed by their contents
     outer: ?*const Outer = null,
-    /// 显示过按内容显示的匿名容器时置为 true
+    /// Set to true once an anonymous container has been displayed by its contents
     anonymous: ?*bool = null,
 
-    /// 列出全部内容：hover、`@typeName` 与值的显示。否则（inlay hints、补全详情等）其中再有的匿名容器显示为 `struct {...}`
+    /// List the full contents: hover, `@typeName` and the display of values. Otherwise (inlay
+    /// hints, completion details, etc.) nested anonymous containers are displayed as
+    /// `struct {...}`.
     full: bool = false,
-    /// 输出的字符数上限（inlay hints 的 `max_length`），null 为不限。见 `InternPool.truncateList`；输出须写入
-    /// `Io.Writer.Allocating`，已写的内容都在缓冲区中
+    /// Maximum number of characters in the output (`max_length` of inlay hints); null means
+    /// unlimited. See `InternPool.truncateList`; the output must be written to an
+    /// `Io.Writer.Allocating`, which keeps everything written so far in its buffer.
     max_length: ?usize = null,
 
     const Outer = struct { c: InternPool.Container, parent: ?*const Outer };
 
-    /// 输出还能写的字符数（`InternPool.print` 读取），null 为不限
+    /// Number of characters the output can still take (read by `InternPool.print`); null means
+    /// unlimited
     pub fn remaining(n: ContainerNames, w: *Io.Writer) ?usize {
         const max = n.max_length orelse return null;
         const written = w.buffered();
@@ -38,11 +45,11 @@ const ContainerNames = struct {
     pub fn write(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         const found = n.name(c) catch null;
         try w.writeAll(found orelse return n.writeContent(c, w));
-        // 泛型实例：`List(u8)`，只列出 comptime 已知的实参
+        // Generic instance: `List(u8)`, listing only the arguments known at comptime
         try n.writeArgs(n.shownInst(c.inst) orelse return, w);
     }
 
-    /// 匿名容器的内容：布局、种类与字段（枚举只有名字）
+    /// Contents of an anonymous container: layout, kind and fields (only names for enums)
     fn writeContent(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         if (n.anonymous) |seen| seen.* = true;
         const tree = n.r.itemTree(c.file) catch return w.writeAll(@tagName(c.kind));
@@ -68,7 +75,7 @@ const ContainerNames = struct {
             try w.writeAll(if (count == 0) " " else ", ");
             count += 1;
             if (try InternPool.truncateList(n, w)) break;
-            // 元组字段没有名字
+            // Tuple fields have no names
             if (it.name) |field| try w.print("{f}", .{std.zig.fmtId(field)});
             if (c.kind == .@"enum") continue;
             if (it.name != null) try w.writeAll(": ");
@@ -78,7 +85,9 @@ const ContainerNames = struct {
         try w.writeAll(if (count == 0) "}" else " }");
     }
 
-    /// 显示实参的实例：没有实例的成员按迭代推导时的实例（见 `InternPool.Instance.iteration`）显示外层实例
+    /// The instance whose arguments are displayed: for the per-iteration instance (see
+    /// `InternPool.Instance.iteration`) of a member that has no instance, the enclosing instance
+    /// is displayed
     fn shownInst(n: ContainerNames, inst: ?Index) ?Index {
         const i = inst orelse return null;
         const key = n.r.ctx.db.env.ip.key(i).instance;
@@ -86,8 +95,10 @@ const ContainerNames = struct {
         return i;
     }
 
-    /// 内置函数构造的类型：以构造它的函数实例命名（`FieldEnum(S)`）；不在函数中构造、正是某个常量的值时以常量命名
-    /// （`const Kind = blk: { ... break :blk @Enum(...); }` → `Kind`）；否则按内容显示
+    /// Types constructed by builtins: named after the function instance that constructs them
+    /// (`FieldEnum(S)`); when not constructed in a function and exactly the value of a constant,
+    /// named after the constant (`const Kind = blk: { ... break :blk @Enum(...); }` → `Kind`);
+    /// otherwise displayed by their contents
     pub fn writeReified(n: ContainerNames, t: InternPool.Reified, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
         const inst = t.inst orelse {
@@ -103,7 +114,8 @@ const ContainerNames = struct {
         return ip.printReified(t, w, n);
     }
 
-    /// 构造所在的常量，其值就是这个类型（同一处构造）时的名字
+    /// Name of the constant where the type is constructed, when its value is exactly this type
+    /// (constructed at the same place)
     fn constNaming(n: ContainerNames, t: InternPool.Reified) resolve.Error!?[]const u8 {
         const ip = n.r.ctx.db.env.ip;
         const tree = try n.r.itemTree(t.file);
@@ -121,7 +133,7 @@ const ContainerNames = struct {
         return null;
     }
 
-    /// 推导的错误集：显示由函数体求出的成员
+    /// Inferred error sets: displays the members computed from the function body
     pub fn writeInferredErrorSet(n: ContainerNames, t: Index, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
         const names = queries.errorSetMembers(n.r, t) catch null orelse return w.writeAll("anyerror");
@@ -129,7 +141,8 @@ const ContainerNames = struct {
         return ip.print(set, w, n);
     }
 
-    /// 结构体值显示时的字段名；不是结构体（数组、元组等）时为 null
+    /// Field names used when displaying a struct value; null when it is not a struct (arrays,
+    /// tuples, etc.)
     pub fn fieldNames(n: ContainerNames, t: Index) ?[]const []const u8 {
         const ip = n.r.ctx.db.env.ip;
         switch (ip.key(t)) {
@@ -148,7 +161,8 @@ const ContainerNames = struct {
         const ip = n.r.ctx.db.env.ip;
         try w.writeAll("(");
         var first = true;
-        // 非 comptime 参数不属于实例的身份，不显示；未知的 comptime 实参显示为 `_`
+        // Non-comptime parameters are not part of the instance's identity and are not shown;
+        // unknown comptime arguments are shown as `_`
         for (ip.key(inst).instance.args) |arg| {
             if (arg == .runtime) continue;
             if (!first) try w.writeAll(", ");
@@ -159,9 +173,13 @@ const ContainerNames = struct {
         try w.writeAll(")");
     }
 
-    /// 容器是成员的值时以成员命名：`const S = struct {...}` 为 `S`，函数体中按局部常量命名，`return` 的容器以函数命名
-    /// （`List(u8)`）；值是在几个容器中选一个的 `if` / `switch` 时同样命名（编译器在这里命名为 `S__struct_1`，以成员
-    /// 命名更易读）。字段与变量的类型标注、实参、`?struct {...}` 中的容器没有名字，返回 null
+    /// A container that is the value of a member is named after the member:
+    /// `const S = struct {...}` is `S`, in a function body it is named after the local constant,
+    /// and a `return`ed container is named after the function (`List(u8)`); the same naming
+    /// applies when the value is an `if` / `switch` choosing among several containers (the
+    /// compiler names it `S__struct_1` here; naming after the member is more readable).
+    /// Containers in type annotations of fields and variables, in arguments, and in
+    /// `?struct {...}` have no name; returns null.
     fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?[]const u8 {
         if (c.kind == .file) {
             const base = std.fs.path.basename(n.r.ctx.db.env.vfs.path(c.file));
@@ -192,7 +210,8 @@ const ContainerNames = struct {
         return null;
     }
 
-    /// 表达式的结果是否就是位于 `rel` 的容器：容器本身，或 `if` / `switch` 某个分支的结果
+    /// Whether the result of the expression is the container at `rel`: the container itself, or
+    /// the result of a branch of an `if` / `switch`
     fn yields(b: *const Body, e: Body.ExprId, rel: u32) bool {
         return switch (b.expr(e)) {
             .container => b.range(e).start == rel,
@@ -206,7 +225,8 @@ const ContainerNames = struct {
     }
 };
 
-/// 列出全部内容的显示：`@typeName` 的结果，hover 与补全详情中的类型与值
+/// Display listing the full contents: the result of `@typeName`, and types and values in hover
+/// and completion details
 pub fn writeFull(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
     try r.ctx.db.env.ip.print(t, w, ContainerNames{ .r = r, .full = true });
 }
@@ -215,8 +235,9 @@ pub fn typeAlloc(r: *Resolver, t: Index) error{OutOfMemory}![]const u8 {
     return (try typeAllocNoting(r, t, null)).text;
 }
 
-/// 同 `typeAlloc`，输出至多约 `max_length` 个字符（见 `ContainerNames.max_length`），并说明其中是否有按内容显示的
-/// 匿名容器
+/// Like `typeAlloc`, but outputs at most about `max_length` characters (see
+/// `ContainerNames.max_length`) and reports whether it contains anonymous containers displayed
+/// by their contents
 pub fn typeAllocNoting(r: *Resolver, t: Index, max_length: ?usize) error{OutOfMemory}!struct { text: []const u8, anonymous: bool } {
     var out: Io.Writer.Allocating = .init(r.arena);
     var anonymous = false;
@@ -224,7 +245,8 @@ pub fn typeAllocNoting(r: *Resolver, t: Index, max_length: ?usize) error{OutOfMe
     return .{ .text = out.written(), .anonymous = anonymous };
 }
 
-/// 值为类型时显示 `type = T`；comptime 已知的其他值显示 `T = v`。列出全部内容，不截断（hover、补全详情）
+/// Displays `type = T` when the value is a type, and `T = v` for other values known at comptime.
+/// Lists the full contents without truncation (hover, completion details).
 pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     var out: Io.Writer.Allocating = .init(r.arena);
     writeFull(r, tv.ty, &out.writer) catch return error.OutOfMemory;
@@ -232,20 +254,23 @@ pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const 
     return out.written();
 }
 
-/// 声明名之后的部分：`: T = v`；值决定类型时（见 `valueDetermined`）只显示 ` = v`
+/// The part after the declaration name: `: T = v`; only ` = v` when the value determines the
+/// type (see `valueDetermined`)
 pub fn annotationAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     if (valueDetermined(r.ctx.db.env.ip, tv)) return std.fmt.allocPrint(r.arena, " = {s}", .{(try shownValue(r, tv)).?});
     return std.fmt.allocPrint(r.arena, ": {s}", .{try typedValueAlloc(r, tv)});
 }
 
-/// 没有声明时（表达式）的显示：值决定类型时只显示值，否则同 `typedValueAlloc`
+/// Display without a declaration (for an expression): only the value when the value determines
+/// the type, otherwise the same as `typedValueAlloc`
 pub fn exprAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     if (valueDetermined(r.ctx.db.env.ip, tv)) return (try shownValue(r, tv)).?;
     return typedValueAlloc(r, tv);
 }
 
-/// 字段都是 comptime 字段的元组与匿名结构体，值已知时：类型完全由值决定（`.{ A, B }` 的类型是
-/// `struct { comptime type = A, comptime type = B }`），显示值即可
+/// Tuples and anonymous structs whose fields are all comptime fields, when the value is known:
+/// the type is fully determined by the value (the type of `.{ A, B }` is
+/// `struct { comptime type = A, comptime type = B }`), so displaying the value suffices
 fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
     if (tv.val == null) return false;
     const types, const values = switch (ip.key(tv.ty)) {
@@ -260,7 +285,7 @@ fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
     return true;
 }
 
-/// comptime 已知的值（函数与 `simple_value` 不显示）
+/// The value known at comptime (functions and `simple_value` are not displayed)
 fn shownValue(r: *Resolver, tv: TypedValue) error{OutOfMemory}!?[]const u8 {
     const v = tv.val orelse return null;
     switch (r.ctx.db.env.ip.key(v)) {

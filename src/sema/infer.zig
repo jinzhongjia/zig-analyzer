@@ -1,12 +1,17 @@
-//! 表达式类型推导：双向推导，期望类型从参数、返回值、类型标注、字段初始化下推；
-//! 分支汇合处做 peer type resolution 的常用子集。未知部分为 `unknown`，吸收一切且不产生诊断。
+//! Expression type inference: bidirectional, with expected types pushed down from parameters,
+//! return values, type annotations, and field initializers; a common subset of peer type
+//! resolution where branches merge. Unknown parts are `unknown`, which absorbs everything and
+//! produces no diagnostics.
 //!
-//! 类型表达式（`?*const T`、`[]u8`、`struct {...}`）也是表达式，求值得到 `type` 类型的值。
+//! Type expressions (`?*const T`, `[]u8`, `struct {...}`) are expressions too; they evaluate to
+//! values of type `type`.
 //!
-//! comptime 求值：调用带 comptime / anytype 参数或返回 `type` 的函数时创建实例
-//! （InternPool 的 `instance`），在实例中推导函数体：参数绑定到实参值，条件已知的
-//! `if` / `switch` 只走实际执行的分支，整数、布尔与类型相等比较做常量折叠，返回 `type` 的函数
-//! 取实际执行到的 `return` 的值。没有具体实例时 `comptime T: type` 为抽象参数 `T`。
+//! comptime evaluation: calling a function with comptime / anytype parameters or one that returns
+//! `type` creates an instance (an InternPool `instance`), and the function body is inferred in the
+//! instance: parameters are bound to the argument values, `if` / `switch` with a known condition
+//! takes only the branch actually executed, integer, boolean, and type equality comparisons are
+//! constant-folded, and a function returning `type` takes the value of the `return` actually
+//! reached. Without a concrete instance, `comptime T: type` is the abstract parameter `T`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -33,33 +38,39 @@ const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 
 pub const Error = resolve.Error;
 
-/// 一个 BodyOwner 的推导结果
+/// Inference result of one BodyOwner
 pub const Result = struct {
     arena: std.heap.ArenaAllocator.State,
-    /// 与 `Body.exprs` 一一对应
+    /// Parallel to `Body.exprs`
     exprs: []const TypedValue,
-    /// 与 `Body.bindings` 一一对应
+    /// Parallel to `Body.bindings`
     bindings: []const TypedValue,
-    /// 与 `Body.exprs` 一一对应：字段访问解析到的成员（字段或声明）
+    /// Parallel to `Body.exprs`: the member (field or declaration) a field access resolves to
     members: []const ?hir.OwnerKey,
-    /// 函数实际执行到的 `return` 的值（类型构造函数的结果）
+    /// Value of the `return` the function actually reaches (the result of a type constructor)
     ret: TypedValue,
-    /// 初始化表达式中字段名解析到的字段（`.{ .x = 1 }` 的 `x`）
+    /// Fields that field names in initializer expressions resolve to (the `x` in `.{ .x = 1 }`)
     field_refs: []const FieldRef = &.{},
-    /// 有期望类型的枚举字面量（含 decl literal 与还没写名字的 `.`）、错误值（`error.X`）与匿名初始化
-    /// （`.{ ... }`）及其期望类型：补全按它列出成员、错误名与字段
+    /// Enum literals with an expected type (including decl literals and a bare `.` with no name
+    /// written yet), error values (`error.X`), and anonymous initializers (`.{ ... }`), along with
+    /// their expected types: completion uses them to list members, error names, and fields
     literal_expected: []const LiteralExpected = &.{},
-    /// comptime 已知不会执行的 `if` / `switch` 分支，以及左侧已决定结果的 `and` / `or` 的右侧（最外层的）：
-    /// 在当前构建配置下不编译的代码
+    /// `if` / `switch` branches known at comptime not to execute, and the right-hand sides of
+    /// `and` / `or` whose left-hand side already decides the result (the outermost ones): code
+    /// that is not compiled under the current build configuration
     inactive: []const ExprId = &.{},
-    /// 同一块中 noreturn 语句之后的语句（相对 owner 的范围）：同样不编译。如被选中的
-    /// `if (!@hasDecl(T, "x")) @compileError(...);`、comptime 条件下的 `return` 之后的代码
+    /// Statements after a noreturn statement in the same block (ranges relative to the owner): not
+    /// compiled either. Examples are the code after a selected
+    /// `if (!@hasDecl(T, "x")) @compileError(...);` and after a `return` under a comptime
+    /// condition.
     dead_spans: []const Body.Range = &.{},
-    /// 类型为枚举字面量的参数（anytype 收到的 `.x`）在函数体中被转换成的类型，每个参数取第一处：调用处的
-    /// 字面量引用这个类型中的成员（`testing.expectEqual(.x, actual)` 经 `@TypeOf(expected, actual)` 转换为
-    /// actual 的类型）
+    /// The type each parameter of enum literal type (a `.x` received by anytype) is coerced to in
+    /// the function body, taking the first coercion for each parameter: the literal at the call
+    /// site refers to a member of this type (`testing.expectEqual(.x, actual)` coerces it to the
+    /// type of actual through `@TypeOf(expected, actual)`)
     param_coercions: []const ParamCoercion = &.{},
-    /// 按迭代推导（`LoopSeed`）时，这次迭代结束时循环体修改过的外面的 `comptime var` 的值：下一次迭代从它开始
+    /// With per-iteration inference (`LoopSeed`), the values at the end of this iteration of the
+    /// outer `comptime var`s modified by the loop body: the next iteration starts from them
     iteration_vars: []const IterationVar = &.{},
 
     pub const LiteralExpected = struct { expr: ExprId, ty: Index };
@@ -67,9 +78,9 @@ pub const Result = struct {
     pub const ParamCoercion = struct { param: u32, ty: Index };
 
     pub const FieldRef = struct {
-        /// `init` 表达式
+        /// The `init` expression
         init: ExprId,
-        /// 在 `Body.Expr.init.fields` 中的下标
+        /// Index into `Body.Expr.init.fields`
         index: u32,
         member: hir.OwnerKey,
     };
@@ -86,13 +97,15 @@ pub const Result = struct {
 };
 
 pub const Mode = enum {
-    /// 只推导签名：参数类型、返回类型、变量与字段的类型标注
+    /// Infers only the signature: parameter types, the return type, and type annotations of
+    /// variables and fields
     signature,
     full,
 };
 
-/// 按迭代推导：循环（`inline for`、comptime 中的 `for`）的循环变量 `binding` 取列表的第 `index` 个元素，
-/// `inline` switch 分支的捕获 `binding` 取第 `index` 个分支项的值（见 `queries.InferKey.loop`）
+/// Per-iteration inference: the loop variable `binding` of a loop (`inline for`, or `for` at
+/// comptime) takes the `index`-th element of the list, and the capture `binding` of an `inline`
+/// switch prong takes the value of the `index`-th prong item (see `queries.InferKey.loop`)
 pub const LoopSeed = struct { binding: u32, index: u32 };
 
 pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_seed: ?LoopSeed) Error!Result {
@@ -138,7 +151,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars };
 }
 
-/// 只推导成员 `owner` 中的一个局部绑定或 comptime 表达式（见 `queries.LocalValue`）
+/// Infers only one local binding or comptime expression in the member `owner` (see
+/// `queries.LocalValue`)
 pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(queries.LocalKey, "target"), inst: ?Index) Error!TypedValue {
     const gpa = ctx.db.gpa;
     var scratch: std.heap.ArenaAllocator = .init(gpa);
@@ -186,7 +200,7 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
         .param => return inf.bindings[@backingInt(binding)],
         .local_const, .local_var => {
             const init = target.init orelse return .unknown;
-            // 初始化表达式之外的局部绑定按需查询（见 `nameRef`）
+            // Local bindings outside the initializer are queried on demand (see `nameRef`)
             inf.lazy = body.range(init);
             const annotation: ?Index = if (target.ty) |t| (try inf.inferComptime(t, null)).asType() orelse .unknown else null;
             const v = try inf.infer(init, annotation);
@@ -197,7 +211,7 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
             else
                 .{ .ty = v.ty };
         },
-        // 捕获的值取决于控制流：取整个成员的推导结果
+        // A capture's value depends on control flow: take the whole member's inference result
         .capture => {
             const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = split.inst, .loop = split.seed });
             return if (@backingInt(binding) < res.bindings.len) res.bindings[@backingInt(binding)] else .unknown;
@@ -221,49 +235,59 @@ const Inferrer = struct {
     bindings: []TypedValue,
     members: []?hir.OwnerKey,
     scratch: Allocator,
-    /// 函数的返回类型（return 的期望类型）
+    /// Return type of the function (the expected type of return)
     ret_type: ?Index = null,
-    /// 带标签的块与循环：break 的值类型
+    /// Labeled blocks and loops: types of the break values
     labels: std.ArrayList(LabelFrame) = .empty,
-    /// 方法调用：字段访问解析到实例上的函数声明（调用时跳过 self 参数）
+    /// Method calls: field accesses that resolve to a function declaration on an instance
+    /// (the self parameter is skipped in the call)
     bound: std.AutoHashMapUnmanaged(ExprId, void) = .empty,
-    /// 初始化表达式中字段名的引用（见 `Result.field_refs`）
+    /// References from field names in initializer expressions (see `Result.field_refs`)
     field_refs: std.ArrayList(Result.FieldRef) = .empty,
-    /// 正在推导的 init 表达式
+    /// The init expression being inferred
     current_init: ?ExprId = null,
-    /// 只推导一个局部绑定（`runLocal`）时其初始化表达式的范围：范围外的局部绑定没有推导，按需查询
+    /// Range of the initializer expression when inferring only one local binding (`runLocal`):
+    /// local bindings outside the range are not inferred and are queried on demand
     lazy: ?Body.Range = null,
-    /// 见 `Result.literal_expected`
+    /// See `Result.literal_expected`
     literal_expected: std.ArrayList(Result.LiteralExpected) = .empty,
-    /// 见 `Result.inactive`
+    /// See `Result.inactive`
     inactive: std.ArrayList(ExprId) = .empty,
-    /// 见 `Result.dead_spans`
+    /// See `Result.dead_spans`
     dead_spans: std.ArrayList(Body.Range) = .empty,
-    /// 见 `Result.param_coercions`
+    /// See `Result.param_coercions`
     param_coercions: std.ArrayList(Result.ParamCoercion) = .empty,
-    /// 实例上下文（owner 自身或外层泛型函数的实例）
+    /// Instance context (the instance of the owner itself or of an outer generic function)
     inst: ?Index,
-    /// 见 `LoopSeed`
+    /// See `LoopSeed`
     loop_seed: ?LoopSeed = null,
-    /// 大于 0 时位于 comptime 已知不会执行的分支中：其中的 return 不计入结果
+    /// Greater than 0 inside a branch known at comptime not to execute: returns there do not count
+    /// toward the result
     dead: u32 = 0,
-    /// 推导中控制流未定的嵌套层数：条件求不出的 if / switch 分支，不按迭代推导的循环体。`comptime var` 只能在
-    /// comptime 已知的控制流中修改，在这些位置的修改是推导求不出的条件造成的，修改后的值按未知
+    /// Nesting depth of control flow left undetermined by inference: branches of if / switch whose
+    /// condition cannot be evaluated, and loop bodies not inferred per iteration.
+    /// `comptime var` can only be modified under comptime-known control flow, so a modification in
+    /// these places stems from a condition that inference cannot evaluate; the modified value is
+    /// treated as unknown.
     uncertain: u32 = 0,
-    /// `comptime var` 声明处的 `uncertain`（与 `bindings` 一一对应，首次声明时分配）
+    /// `uncertain` at the declaration of each `comptime var` (parallel to `bindings`, allocated on
+    /// the first declaration)
     var_levels: []u32 = &.{},
-    /// 见 `Result.iteration_vars`
+    /// See `Result.iteration_vars`
     iteration_vars: std.ArrayList(Result.IterationVar) = .empty,
-    /// 推导的模式（按迭代推导时取上一次迭代的结果用）
+    /// Inference mode (used to get the previous iteration's result in per-iteration inference)
     mode: Mode = .full,
-    /// 实际执行到的 return 的值
+    /// Values of the returns actually reached
     returns: std.ArrayList(TypedValue) = .empty,
-    /// 大于 0 时位于 comptime 上下文中（类型表达式、数组长度、comptime 实参等）：其中的函数调用由解释器求值
+    /// Greater than 0 inside a comptime context (type expressions, array lengths, comptime
+    /// arguments, etc.): function calls there are evaluated by the interpreter
     comptime_depth: u32 = 0,
-    /// 成员中直接发起的 comptime 求值的回跳配额（见 `eval.bodyQuota`），首次使用时计算
+    /// Backward-branch quota of comptime evaluations started directly in the member (see
+    /// `eval.bodyQuota`), computed on first use
     quota: ?u32 = null,
 
-    /// break 的目标。只记录实际会执行到的 break（不在 comptime 已知不执行的分支中）
+    /// Target of break. Only breaks actually reached are recorded (not those in branches known at
+    /// comptime not to execute).
     const LabelFrame = struct {
         name: ?[]const u8,
         is_loop: bool,
@@ -286,7 +310,7 @@ const Inferrer = struct {
             },
             .@"const", .@"var", .field => {
                 const annotation: ?Index = if (b.type_expr) |t| (try inf.inferComptime(t, null)).asType() else if (kind == .field) try inf.enumValueType() else null;
-                // 对齐属于签名：字段的布局读取它
+                // Alignment belongs to the signature: field layout reads it
                 if (b.align_expr) |e| _ = try inf.inferComptime(e, try inf.clauseType(.@"align"));
                 if (mode == .full) if (b.value) |v| {
                     _ = try inf.infer(v, annotation);
@@ -296,13 +320,13 @@ const Inferrer = struct {
                 _ = try inf.infer(v, null);
             },
         }
-        // 子句不属于表达式树：按子句的结果类型推导
+        // Clauses are not part of the expression tree: infer them with the clause's result type
         if (mode == .full) for (b.clauses) |c| {
             _ = try inf.infer(c.expr, try inf.clauseType(c.kind));
         };
     }
 
-    /// 枚举成员的值（`a = 1`）的结果类型：显式给出的标签类型
+    /// Result type of an enum member's value (`a = 1`): the explicitly given tag type
     fn enumValueType(inf: *Inferrer) Error!?Index {
         const tree = try inf.r.itemTree(inf.file);
         const container = tree.items[inf.item].container;
@@ -311,7 +335,7 @@ const Inferrer = struct {
         return eval.explicitTagType(inf.r, t);
     }
 
-    /// 子句中表达式的结果类型（与编译器一致）
+    /// Result type of the expression in a clause (matches the compiler)
     fn clauseType(inf: *Inferrer, kind: Body.Clause.Kind) Error!?Index {
         const ip = inf.ip;
         return switch (kind) {
@@ -330,14 +354,15 @@ const Inferrer = struct {
         return q;
     }
 
-    /// owner 自身（函数）的实例
-    /// 本成员按迭代推导时（`loop_seed`）的实例，见 `InternPool.Instance.iteration`；不按迭代推导时为 null
+    /// Instance of the owner itself (a function)
+    /// Instance of this member when inferred per iteration (`loop_seed`), see
+    /// `InternPool.Instance.iteration`; null when not inferred per iteration
     fn iterationInstance(inf: *Inferrer) Error!?Index {
         const seed = inf.loop_seed orelse return null;
         return try inf.instanceAt(seed.binding, seed.index);
     }
 
-    /// 本成员的实例在循环变量 `binding` 取第 `index` 次迭代时
+    /// Instance of this member at the `index`-th iteration of the loop variable `binding`
     fn instanceAt(inf: *Inferrer, binding: u32, index: u32) Error!Index {
         if (inf.ownInstance()) |own| {
             var key = own;
@@ -348,8 +373,10 @@ const Inferrer = struct {
         return inf.ip.get(.{ .instance = .{ .file = inf.file, .decl = decl, .args = &.{}, .parent = inf.inst, .iteration = .{ .binding = binding, .index = index, .abstract = true } } });
     }
 
-    /// 本成员中定义在 `e` 处的容器的实例。每次迭代单独分析的循环体（`inline for`、`inline` switch 分支）内的
-    /// 容器，字段类型可以依赖循环变量：按迭代推导时取这次迭代的实例，否则取迭代未确定的实例（类型不具体）
+    /// Instance of the container defined at `e` in this member. Field types of a container inside
+    /// a loop body analyzed separately for each iteration (`inline for`, `inline` switch prong)
+    /// may depend on the loop variable: per-iteration inference uses this iteration's instance;
+    /// otherwise the instance with an undetermined iteration is used (its types are not concrete).
     fn containerInst(inf: *Inferrer, e: ExprId) Error!?Index {
         const at = inf.body.range(e).start;
         if (inf.loop_seed) |seed| if (seedRegion(inf.body, seed.binding)) |rg| if (rg.contains(at)) return try inf.instanceAt(seed.binding, seed.index);
@@ -378,15 +405,17 @@ const Inferrer = struct {
         return if (key.decl == tree.items[inf.item].ast_id) key else null;
     }
 
-    /// 参数的值：实例中 comptime 参数取实参值（按参数类型转换），comptime anytype 参数取实参值，
-    /// anytype 参数取实参的类型；
-    /// 没有具体实参时类型参数（`comptime T: type`，或不写 comptime 的 `T: type`）为抽象参数
+    /// Value of a parameter: in an instance, a comptime parameter takes the argument value
+    /// (coerced to the parameter type), a comptime anytype parameter takes the argument value, and
+    /// an anytype parameter takes the type of the argument;
+    /// without a concrete argument, a type parameter (`comptime T: type`, or `T: type` without
+    /// comptime) is an abstract parameter
     fn paramValue(inf: *Inferrer, p: Body.BindingId, arg: ?Index) Error!TypedValue {
         const binding = inf.body.binding(p);
         const ty_e = binding.ty orelse {
             const a = arg orelse return .unknown;
             if (a == .runtime or a == .unknown) return .unknown;
-            // comptime anytype：实例记录的是实参值；anytype：实参类型
+            // comptime anytype: the instance records the argument value; anytype: the argument type
             if (binding.is_comptime) return .{ .ty = value.typeOfValue(inf.ip, a), .val = a };
             return .{ .ty = a };
         };
@@ -396,12 +425,14 @@ const Inferrer = struct {
         return .{ .ty = ty };
     }
 
-    /// 读取 ItemTree 是 query：即使已缓存，读事务被写事务或客户端取消时也会返回 `error.Canceled`
+    /// Reading the ItemTree is a query: even when it is cached, `error.Canceled` is returned when
+    /// the read transaction is canceled by a write transaction or by the client
     fn body_owner(inf: *Inferrer) Error!ItemTree.AstId {
         return (try inf.r.itemTree(inf.file)).items[inf.item].ast_id;
     }
 
-    /// 实际执行到的 return 的值：都相同时带值，否则为类型的 peer
+    /// Value of the returns actually reached: carries the value when they are all the same;
+    /// otherwise the peer type of their types
     fn returnValue(inf: *Inferrer) Error!TypedValue {
         const rs = inf.returns.items;
         if (rs.len == 0) return .unknown;
@@ -415,8 +446,10 @@ const Inferrer = struct {
         return first;
     }
 
-    /// 条件求不出时的多个 return 都是同一个容器定义的不同实例（自递归的类型函数，如 `Aligned` 中的
-    /// `return Aligned(T, null)` 与 `return struct {...}`）：取本实例中的那个
+    /// When the returns under conditions that cannot be evaluated are all different instances of
+    /// the same container definition (a self-recursive type function, such as
+    /// `return Aligned(T, null)` and `return struct {...}` in `Aligned`), takes the one in this
+    /// instance
     fn selfInstance(inf: *Inferrer, rs: []const TypedValue) ?TypedValue {
         var own: ?TypedValue = null;
         var def: ?InternPool.Container = null;
@@ -433,8 +466,10 @@ const Inferrer = struct {
         return own;
     }
 
-    /// 求不出值的条件是否 comptime 已知（如取决于抽象参数）：comptime 上下文、结果为 comptime-only 类型、
-    /// 容器级的常量与变量的初始化和字段（在 comptime 求值），或条件本身 comptime 已知
+    /// Whether a condition whose value cannot be evaluated is comptime-known (e.g. because it
+    /// depends on an abstract parameter): in a comptime context, with a comptime-only result type,
+    /// in initializers of container-level constants and variables and in fields (evaluated at
+    /// comptime), or when the condition itself is comptime-known
     fn comptimeCond(inf: *Inferrer, cond: ExprId, result: Index) Error!bool {
         if (inf.comptime_depth > 0 or value.isComptimeOnly(inf.ip, result)) return true;
         const kind = (try inf.r.itemTree(inf.file)).items[inf.item].kind;
@@ -442,7 +477,8 @@ const Inferrer = struct {
         return try inf.knownness(cond, 0) == .comptime_known;
     }
 
-    /// comptime 已知的条件：bool 值，或 optional 是否为 null（非 null 的 optional 值即其载荷值）
+    /// A comptime-known condition: a bool value, or whether an optional is null (the value of a
+    /// non-null optional is its payload value)
     fn isCompileError(inf: *Inferrer, e: ExprId) bool {
         return switch (inf.body.expr(e)) {
             .builtin_call => |c| std.mem.eql(u8, c.name, "@compileError"),
@@ -453,7 +489,8 @@ const Inferrer = struct {
     fn condValue(inf: *Inferrer, cond: TypedValue) ?bool {
         const v = cond.val orelse return null;
         switch (inf.ip.key(cond.ty)) {
-            // 非 null 的 optional 与成功的 error union 以载荷值表示，`false` 载荷仍是成功
+            // Non-null optionals and successful error unions are represented by their payload
+            // values; a `false` payload still means success
             .optional_type => return switch (v) {
                 .null_value => false,
                 .unknown, .undefined_value => null,
@@ -475,13 +512,14 @@ const Inferrer = struct {
         return null;
     }
 
-    /// `if` / `switch` 的分支：不会执行的记录为非活动代码（见 `Result.inactive`）
+    /// Branch of an `if` / `switch`: a branch that will not execute is recorded as inactive code
+    /// (see `Result.inactive`)
     fn inferArm(inf: *Inferrer, e: ExprId, expected: ?Index, dead_branch: bool) Error!TypedValue {
         if (dead_branch and inf.dead == 0) try inf.inactive.append(inf.scratch, e);
         return inf.inferBranch(e, expected, dead_branch);
     }
 
-    /// 在 `dead_branch` 为真时以「不会执行」的状态推导
+    /// Infers in the "will not execute" state when `dead_branch` is true
     fn inferBranch(inf: *Inferrer, e: ExprId, expected: ?Index, dead_branch: bool) Error!TypedValue {
         if (dead_branch) inf.dead += 1;
         defer if (dead_branch) {
@@ -498,7 +536,8 @@ const Inferrer = struct {
         const i = @backingInt(e);
         if (inf.done.isSet(i)) return inf.exprs[i];
         inf.done.set(i);
-        // 嵌套过深（深层的表达式或 query 递归）：以未知结束，结果不缓存
+        // Nesting too deep (deep expressions or query recursion): end with unknown without
+        // caching the result
         if (inf.r.ctx.stackExhausted()) {
             inf.r.ctx.exhausted();
             return .unknown;
@@ -506,14 +545,16 @@ const Inferrer = struct {
         const raw = try inf.inferInner(e, expected);
         const tv = try inf.coerce(raw, expected);
         inf.exprs[i] = tv;
-        // 转换为枚举 / union 的枚举字面量（`.red`、`switch` 的 `.a =>`）引用对应的成员
+        // Enum literals coerced to an enum / union (`.red`, `.a =>` in a `switch`) refer to the
+        // corresponding member
         if (inf.members[i] == null and inf.body.expr(e) == .enum_literal) try inf.recordTagMember(e, tv.ty);
         if (raw.ty == .enum_literal_type) if (expected) |want| try inf.noteParamCoercion(e, want);
         return tv;
     }
 
-    /// 没有结果类型的分支结果按 peer type 转换（`if (b.op()) |t| t.kind else .invalid`）：分支中的枚举字面量引用
-    /// peer 类型中的成员，并以它为期望类型
+    /// Branch results without a result type are coerced to the peer type
+    /// (`if (b.op()) |t| t.kind else .invalid`): enum literals in the branches refer to members of
+    /// the peer type and use it as their expected type
     fn peerLiteral(inf: *Inferrer, e: ExprId, ty: Index) Error!void {
         if (ty == .unknown or ty == .enum_literal_type) return;
         if (inf.body.expr(e) != .enum_literal or inf.members[@backingInt(e)] != null) return;
@@ -522,7 +563,8 @@ const Inferrer = struct {
         try inf.recordTagMember(e, ty);
     }
 
-    /// 见 `Result.param_coercions`：`e` 是对本成员参数的引用，以期望类型 `want` 使用
+    /// See `Result.param_coercions`: `e` is a reference to a parameter of this member, used with
+    /// the expected type `want`
     fn noteParamCoercion(inf: *Inferrer, e: ExprId, want: Index) Error!void {
         if (want == .unknown or want == .enum_literal_type) return;
         const b = inf.body;
@@ -541,8 +583,10 @@ const Inferrer = struct {
         try inf.param_coercions.append(inf.scratch, .{ .param = param, .ty = want });
     }
 
-    /// comptime 上下文中的表达式（类型标注、参数与返回类型、数组长度）。推导求不出值时，在最外层
-    /// 交给解释器以当前的绑定求值（如 `fn f(comptime T: type) switch (@typeInfo(T)) {...}`）
+    /// Expression in a comptime context (type annotations, parameter and return types, array
+    /// lengths). When inference cannot determine its value, the outermost one is handed to the
+    /// interpreter to evaluate with the current bindings (e.g.
+    /// `fn f(comptime T: type) switch (@typeInfo(T)) {...}`).
     fn inferComptime(inf: *Inferrer, e: ExprId, expected: ?Index) Error!TypedValue {
         const outermost = inf.comptime_depth == 0;
         inf.comptime_depth += 1;
@@ -551,7 +595,8 @@ const Inferrer = struct {
             break :blk try inf.infer(e, expected);
         };
         if (tv.val != null or inf.dead > 0) return tv;
-        // comptime 实参中的字符串字面量（推导器平时不为字符串生成值）：与解释器一致，值的类型为 `*const [N:0]u8`
+        // String literals in comptime arguments (the inferrer normally produces no values for
+        // strings): matching the interpreter, the type of the value is `*const [N:0]u8`
         switch (inf.body.expr(e)) {
             .literal => |text| if (try Body.stringLiteralValue(inf.scratch, text)) |str| {
                 const ty = try inf.ip.stringLiteralType(str.len);
@@ -573,9 +618,10 @@ const Inferrer = struct {
     }
 
     fn recordTagMember(inf: *Inferrer, e: ExprId, t: Index) Error!void {
-        // 结果类型为 `E!U`、`?U`、`E!?U` 时转换到 U（`fn parse() Error!Value { return .null_val; }`）
+        // When the result type is `E!U`, `?U`, or `E!?U`, coerce to U
+        // (`fn parse() Error!Value { return .null_val; }`)
         const want = inf.destType(t, .eu_opt) orelse return;
-        // `union(enum)` 生成的标签枚举：成员是 union 的字段
+        // Tag enum generated by `union(enum)`: its members are the fields of the union
         const want_union = switch (inf.ip.key(want)) {
             .union_tag_type => |u| u,
             else => want,
@@ -595,8 +641,9 @@ const Inferrer = struct {
         inf.members[@backingInt(e)] = .{ .file = ns.file, .item = tree.items[f].ast_id };
     }
 
-    /// 结果类型转换：字面量类的值在有期望类型时取期望类型（optional 的期望类型先按载荷类型转换），
-    /// `T` 的值转换为 `?T`
+    /// Result type coercion: literal-like values take the expected type when there is one (with an
+    /// optional expected type, they are first coerced to the payload type), and values of `T` are
+    /// coerced to `?T`
     fn coerce(inf: *Inferrer, tv: TypedValue, expected: ?Index) Error!TypedValue {
         const want = expected orelse return tv;
         if (want == .unknown or tv.ty == want) return tv;
@@ -611,7 +658,8 @@ const Inferrer = struct {
                 return .{ .ty = want, .val = val };
             },
             .enum_literal_type => if (tv.val) |v| {
-                // `E!T`：字面量转换为载荷类型 T（再由编译器包装成 error union）
+                // `E!T`: the literal is coerced to the payload type T (and then wrapped into an
+                // error union by the compiler)
                 switch (ip.key(want)) {
                     .error_union_type => |eu| return inf.coerce(tv, eu.payload),
                     else => {},
@@ -662,9 +710,11 @@ const Inferrer = struct {
                 const other: TypedValue = if (x.@"else") |el| try inf.inferArm(el, expected, taken == true) else .{ .ty = .void_type };
                 if (taken == null) inf.uncertain -= 1;
                 if (taken) |t| {
-                    // 选中的分支是 `@compileError`：被使用的声明不可能是编译错误（否则无法编译），使用它的代码
-                    // 只在另一个分支生效的配置中编译。如 `std.testing.allocator = if (builtin.is_test) .. else
-                    // @compileError(..)` 在非测试模块的 test 块中使用：取另一个分支
+                    // The chosen branch is `@compileError`: a declaration that is used cannot be a
+                    // compile error (otherwise compilation would fail), so the code using it is
+                    // compiled only in configurations where the other branch applies. For example,
+                    // `std.testing.allocator = if (builtin.is_test) .. else @compileError(..)`
+                    // used in a test block of a non-test module: take the other branch.
                     if (x.@"else") |el| {
                         const chosen, const rest = if (t) .{ x.then, el } else .{ el, x.then };
                         if (inf.isCompileError(chosen) and !inf.isCompileError(rest)) return if (t) other else then;
@@ -679,14 +729,17 @@ const Inferrer = struct {
             .loop => |l| return inf.loop(l, expected),
             .@"switch" => |s| {
                 const operand = try inf.infer(s.operand, null);
-                // 带标签的 union 按标签匹配：分支项按标签类型推导，转换为 union 本身会失去值，选不出执行的分支
+                // A tagged union is matched by its tag: prong items are inferred with the tag
+                // type, since coercing them to the union itself would lose the value and no
+                // executed prong could be chosen
                 const item_ty = try inf.comparedType(operand.ty);
                 for (s.prongs) |prong| for (prong.items) |item| {
                     _ = try inf.infer(item, item_ty);
                 };
-                // 带标签的 switch：`break :label value` 的值也是结果
+                // Labeled switch: the value of `break :label value` is also a result
                 const label = inf.switchLabel(e, s.operand);
-                // comptime 已知的操作数：只有匹配的分支会执行。`continue :label` 会转到其他分支，有它时不选
+                // comptime-known operand: only the matching prong executes. `continue :label`
+                // jumps to other prongs, so no prong is chosen when it is present.
                 const chosen = if (label != null and inf.continuesTo(label.?)) null else try inf.chooseProng(s.prongs, operand);
                 if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected });
                 var types: std.ArrayList(Index) = .empty;
@@ -705,7 +758,8 @@ const Inferrer = struct {
                 }
                 if (label != null) {
                     const frame = inf.labels.pop().?;
-                    // 选中分支时只记录了它的 break（其他分支按不执行推导）
+                    // When a prong is chosen, only its breaks are recorded (the other prongs are
+                    // inferred as not executing)
                     if (chosen != null) {
                         if (frame.types.items.len == 0) return chosen_tv;
                         var live_types: std.ArrayList(Index) = .empty;
@@ -745,14 +799,15 @@ const Inferrer = struct {
             .index => |x| {
                 const lhs = try inf.infer(x.lhs, null);
                 const i = try inf.infer(x.index, .usize_type);
-                // 元组（含指向元组的指针）：下标 comptime 已知时取字段的类型；comptime 字段的值属于类型
+                // Tuples (including pointers to tuples): with a comptime-known index, take the
+                // field's type; values of comptime fields belong to the type
                 if (tupleOf(ip, lhs.ty)) |tt| if (value.intOf(ip, i.val)) |n| if (std.math.cast(usize, n)) |k| if (k < tt.types.len) {
                     if (lhs.val != null) if (try eval.elemValue(inf.r, lhs, k)) |ev| return .{ .ty = tt.types[k], .val = ev.val };
                     const v = InternPool.fieldValue(tt.values, k);
                     return .{ .ty = tt.types[k], .val = if (v == .runtime or v == .unknown) null else v };
                 };
                 const elem = inf.elementType(lhs.ty);
-                // comptime 已知的聚合与下标：取出元素
+                // comptime-known aggregate and index: extract the element
                 if (lhs.val != null) if (value.intOf(ip, i.val)) |n| if (std.math.cast(usize, n)) |k| if (try eval.elemValue(inf.r, lhs, k)) |ev| {
                     return .{ .ty = if (elem != .unknown) elem else ev.ty, .val = ev.val };
                 };
@@ -762,11 +817,11 @@ const Inferrer = struct {
             .deref => |x| {
                 const p = try inf.infer(x, null);
                 const pt = switch (ip.key(p.ty)) {
-                    // C 指针也可以解引用（translate-c 生成的 `[*c]T`）
+                    // C pointers can be dereferenced too (`[*c]T` generated by translate-c)
                     .ptr_type => |pt| if (pt.size == .one or pt.size == .c) pt else return .unknown,
                     else => return .unknown,
                 };
-                // 指向常量的 comptime 已知指针：由解释器取出所指的值
+                // comptime-known pointer to a constant: the interpreter reads the pointee
                 if (pt.is_const) if (try inf.knownValue(e, p.val, pt.child)) |tv| return tv;
                 return .{ .ty = pt.child };
             },
@@ -776,7 +831,7 @@ const Inferrer = struct {
                     .optional_type => |c| c,
                     else => .unknown,
                 };
-                // 已知的非 null optional 值即载荷值
+                // A known non-null optional value is its payload value
                 return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) o.val else null };
             },
             .init => |x| {
@@ -803,11 +858,11 @@ const Inferrer = struct {
                 return .{ .ty = .noreturn_type };
             },
             .@"break" => |br| {
-                // 先找到目标：break 的值按块的期望类型推导
+                // Find the target first: the break value is inferred with the block's expected type
                 const frame_index = inf.labelFrame(br.label);
                 const want: ?Index = if (frame_index) |fi| inf.labels.items[fi].expected else null;
                 const brk: TypedValue = if (br.value) |v| try inf.infer(v, want) else .{ .ty = .void_type };
-                // 推导期间 labels 可能扩容，按下标重新取
+                // labels may grow during inference, so re-fetch the frame by index
                 if (frame_index) |fi| if (inf.dead == 0) {
                     const frame = &inf.labels.items[fi];
                     try frame.types.append(inf.scratch, brk.ty);
@@ -816,7 +871,8 @@ const Inferrer = struct {
                 return .{ .ty = .noreturn_type };
             },
             .@"continue" => |c| {
-                // labeled switch 的 `continue :l value`：值按 switch 操作数的类型推导
+                // `continue :l value` of a labeled switch: the value is inferred with the type
+                // of the switch operand
                 if (c.value) |v| _ = try inf.infer(v, if (c.label) |l| inf.switchOperandType(e, l) else null);
                 return .{ .ty = .noreturn_type };
             },
@@ -829,7 +885,8 @@ const Inferrer = struct {
             .error_union_type => |eu| {
                 const err = (try inf.infer(eu.err, null)).asType() orelse .unknown;
                 const payload = (try inf.infer(eu.payload, null)).asType() orelse .unknown;
-                // 错误集求不出（抽象参数的 `B.Error`）时保留载荷类型：`try` 的结果仍可确定
+                // When the error set cannot be evaluated (`B.Error` of an abstract parameter),
+                // keep the payload type: the result of `try` can still be determined
                 if (payload == .unknown) return typeUnknown();
                 return TypedValue.ofType(try ip.get(.{ .error_union_type = .{ .err = err, .payload = payload } }));
             },
@@ -847,7 +904,8 @@ const Inferrer = struct {
                     .int_value => |iv| std.math.cast(u64, iv.value) orelse return typeUnknown(),
                     else => return typeUnknown(),
                 } else {
-                    // 长度求不出（如取决于抽象参数）：元素类型已知，长度按源码显示
+                    // The length cannot be evaluated (e.g. it depends on an abstract parameter):
+                    // the element type is known, and the length is shown as in the source
                     if (child == .unknown or (arr.sentinel != null and sentinel == null)) return typeUnknown();
                     var text: std.ArrayList(u8) = .empty;
                     if (!try inf.exprText(arr.len, &text, 0)) return typeUnknown();
@@ -863,7 +921,7 @@ const Inferrer = struct {
         }
     }
 
-    // ── 名字 ─────────────────────────────────────────────────────────
+    // ── Names ────────────────────────────────────────────────────────
 
     fn nameRef(inf: *Inferrer, e: ExprId, name: []const u8) Error!TypedValue {
         const b = inf.body;
@@ -871,7 +929,8 @@ const Inferrer = struct {
         const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .unknown;
         if (inf.lazy) |range| if (def == .local) {
             const l = def.local;
-            // 属于本成员的局部绑定（外层成员的由 defType 经 LocalValue 查询）
+            // A local binding of this member (those of outer members are queried by defType
+            // through LocalValue)
             if (l.file != inf.file or l.item != inf.item) return queries.defType(inf.r, def, null, inf.inst);
             const binding = b.binding(l.binding);
             if (binding.kind != .param and !range.contains(binding.range.start)) {
@@ -909,13 +968,13 @@ const Inferrer = struct {
         }
     }
 
-    // ── 成员访问 ─────────────────────────────────────────────────────
+    // ── Member access ────────────────────────────────────────────────
 
     fn fieldAccess(inf: *Inferrer, e: ExprId, lhs_e: ExprId, field: ?[]const u8) Error!TypedValue {
         const ip = inf.ip;
         const lhs = try inf.infer(lhs_e, null);
         const name = field orelse return .unknown;
-        // 类型上的成员：声明、枚举成员、错误集成员
+        // Members on a type: declarations, enum members, error set members
         if (lhs.asType()) |t| {
             switch (ip.key(t)) {
                 .container_type => {
@@ -928,9 +987,10 @@ const Inferrer = struct {
                     return queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 },
                 .error_set_type => return .{ .ty = t, .val = try ip.get(.{ .error_value = name }) },
-                // 构造的枚举（`@Enum`、union(enum) 的标签枚举）的成员
+                // Members of constructed enums (`@Enum`, the tag enum of a union(enum))
                 .reified_type, .union_tag_type => return try eval.typeMember(inf.r, t, name) orelse .unknown,
-                // 当前配置下的值不是容器（`std.c.EVFILT` 在 linux 上为 void）
+                // The value under the current configuration is not a container (`std.c.EVFILT`
+                // is void on linux)
                 else => return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown,
             }
         }
@@ -938,7 +998,7 @@ const Inferrer = struct {
         if (tv.ty == .unknown and inf.members[@backingInt(e)] == null and lhs.ty != .unknown) {
             if (try inf.otherBranchField(e, lhs_e, lhs.ty, name)) |x| tv = x;
         }
-        // comptime 已知的值（结构体、union、元组、`len`）：取出字段的值
+        // comptime-known values (structs, unions, tuples, `len`): extract the field value
         if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, lhs, name)) |fv| {
             return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
         };
@@ -948,9 +1008,11 @@ const Inferrer = struct {
         return tv;
     }
 
-    /// 左侧是初始化为结构体字面量的容器级常量、但整体的值求不出时（其他字段求不出）：取该字段的初始化
-    /// 表达式的值。如 wasm 目标的 `builtin.cpu = .{ .arch = .wasm32, .features = featureSet(..) }` 中
-    /// `featureSet` 求不出，`builtin.cpu.arch` 仍为 `.wasm32`
+    /// When the left-hand side is a container-level constant initialized with a struct literal but
+    /// its value as a whole cannot be evaluated (because other fields cannot): takes the value of
+    /// the field's initializer expression. For example, `featureSet` cannot be evaluated in the
+    /// wasm target's `builtin.cpu = .{ .arch = .wasm32, .features = featureSet(..) }`, yet
+    /// `builtin.cpu.arch` is still `.wasm32`.
     fn declInitFieldValue(inf: *Inferrer, lhs_e: ExprId, name: []const u8) Error!?TypedValue {
         const owner: hir.OwnerKey = if (inf.members[@backingInt(lhs_e)]) |m| m else switch (inf.body.expr(lhs_e)) {
             .name_ref => |n| blk: {
@@ -978,8 +1040,9 @@ const Inferrer = struct {
         return if (fv.val != null) fv else null;
     }
 
-    /// 带标签的 union 在类型上访问字段（`Value.null_val`）：值为该字段的标签，类型为 union 的标签类型，
-    /// 可以转换为 union（与编译器一致）；引用的成员是 union 的字段
+    /// Field access on the type of a tagged union (`Value.null_val`): the value is the tag of that
+    /// field and the type is the union's tag type, which can be coerced to the union (matches the
+    /// compiler); the referenced member is the union field
     fn unionTagMember(inf: *Inferrer, e: ExprId, t: Index, ns: Namespace, name: []const u8) Error!?TypedValue {
         const tree = try inf.r.itemTree(ns.file);
         if (tree.containers[ns.container].kind != .@"union") return null;
@@ -989,9 +1052,11 @@ const Inferrer = struct {
         return .{ .ty = tag, .val = try inf.ip.get(.{ .enum_tag = .{ .ty = tag, .name = name } }) };
     }
 
-    /// 当前构建配置下不存在的成员，所在的命名空间由声明中的 `if` / `switch` 按目标选择（如 `posix.system`
-    /// 在 linux 上为 `linux`，其他目标为 `std.c` 等）：到其他分支选择的容器中查找。这样的代码只在其他目标上
-    /// 编译，给出那里的定义，而不是未知
+    /// A member that does not exist under the current build configuration, in a namespace chosen
+    /// per target by an `if` / `switch` in a declaration (e.g. `posix.system` is `linux` on linux,
+    /// and `std.c` etc. on other targets): looks it up in the containers chosen by the other
+    /// branches. Such code is compiled only on other targets; the definition there is given
+    /// instead of unknown.
     fn otherBranchMember(inf: *Inferrer, e: ExprId, lhs_e: ExprId, current: Index, name: []const u8) Error!?TypedValue {
         const ip = inf.ip;
         var cands: std.ArrayList(Index) = .empty;
@@ -1008,9 +1073,11 @@ const Inferrer = struct {
         return null;
     }
 
-    /// 实例上当前构建配置下不存在的成员，实例的类型由按目标选择的命名空间给出（`state: platform.State`、
-    /// `var state = platform.State.init()`，platform 按目标选择文件；`var t = try posix.tcgetattr(fd)`，返回类型
-    /// `termios` 按目标选择）：到其他配置下的类型中查找字段与方法
+    /// A member on an instance that does not exist under the current build configuration, when
+    /// the instance's type comes from a namespace chosen per target (`state: platform.State`,
+    /// `var state = platform.State.init()`, where platform selects a file per target;
+    /// `var t = try posix.tcgetattr(fd)`, whose return type `termios` is chosen per target):
+    /// looks up fields and methods in the types under other configurations
     fn otherBranchField(inf: *Inferrer, e: ExprId, lhs_e: ExprId, lhs_ty: Index, name: []const u8) Error!?TypedValue {
         const ip = inf.ip;
         const current = switch (ip.key(lhs_ty)) {
@@ -1034,7 +1101,8 @@ const Inferrer = struct {
         return null;
     }
 
-    /// 实例（值）上的成员：字段与方法，自动解引用单指针
+    /// Members on an instance (value): fields and methods, with single-item pointers dereferenced
+    /// automatically
     fn instanceMember(inf: *Inferrer, e: ExprId, lhs: TypedValue, name: []const u8) Error!TypedValue {
         const ip = inf.ip;
         var t = lhs.ty;
@@ -1052,7 +1120,7 @@ const Inferrer = struct {
                     inf.members[@backingInt(e)] = .{ .file = ns.file, .item = tree.items[f].ast_id };
                     return .{ .ty = (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(ip, t))).ty };
                 }
-                // 方法
+                // Methods
                 const def = try inf.r.memberDef(ns, name) orelse return .unknown;
                 inf.members[@backingInt(e)] = try defKey(inf.r, def);
                 const tv = try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
@@ -1069,11 +1137,11 @@ const Inferrer = struct {
                 if (std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type };
                 if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } }) };
             },
-            // 元组、匿名结构体、构造的结构体与 union
+            // Tuples, anonymous structs, and constructed structs and unions
             .tuple_type, .anon_struct_type, .reified_type => {
                 if (ip.key(t) == .tuple_type and std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type, .val = try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = ip.key(t).tuple_type.types.len } }) };
                 const ty = try eval.fieldType(inf.r, t, name) orelse .unknown;
-                // 字面量的 comptime 字段：值属于类型
+                // comptime fields of literals: the value belongs to the type
                 return .{ .ty = ty, .val = literalFieldValue(ip, t, name) };
             },
             else => {},
@@ -1081,8 +1149,9 @@ const Inferrer = struct {
         return .unknown;
     }
 
-    /// decl literal：结果类型（去掉 error union、optional 与单项指针，与编译器一致）为容器时，`.name` 是该
-    /// 类型的声明 `T.name`（枚举优先取同名成员）
+    /// decl literal: when the result type (with error unions, optionals, and single-item pointers
+    /// stripped, matching the compiler) is a container, `.name` is that type's declaration
+    /// `T.name` (for enums, a member with the same name takes precedence)
     fn declLiteral(inf: *Inferrer, e: ExprId, want: Index, name: []const u8) Error!?TypedValue {
         const ip = inf.ip;
         var t = want;
@@ -1110,7 +1179,7 @@ const Inferrer = struct {
         return try queries.defType(inf.r, def, null, c.inst);
     }
 
-    /// 标准库中按路径查找的类型（如 `builtin.Type`）
+    /// A type in the standard library looked up by path (e.g. `builtin.Type`)
     fn stdType(inf: *Inferrer, path: []const []const u8) Error!?Index {
         var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return null, .container = 0 };
         var t: Index = .unknown;
@@ -1122,14 +1191,14 @@ const Inferrer = struct {
         return t;
     }
 
-    // ── 调用 ─────────────────────────────────────────────────────────
+    // ── Calls ────────────────────────────────────────────────────────
 
     fn call(inf: *Inferrer, callee_e: ExprId, args: []const ExprId, expected: ?Index) Error!TypedValue {
-        // `.init(...)`：decl literal 在结果类型中查找
+        // `.init(...)`: the decl literal is looked up in the result type
         const callee = try inf.infer(callee_e, if (inf.body.expr(callee_e) == .enum_literal) expected else null);
         const f = switch (inf.ip.key(callee.ty)) {
             .fn_type => |f| f,
-            // 函数指针
+            // Function pointers
             .ptr_type => |p| if (p.size == .one and inf.ip.key(p.child) == .fn_type) inf.ip.key(p.child).fn_type else {
                 for (args) |a| _ = try inf.infer(a, null);
                 return .unknown;
@@ -1145,8 +1214,9 @@ const Inferrer = struct {
             if (inf.comptime_depth > 0) if (try inf.comptimeCall(callee, callee_e, args, skip)) |tv| return tv;
             return .{ .ty = f.ret };
         };
-        // 泛型调用：comptime 实参决定实例，先推导；抽象签名中依赖其他参数的参数类型不能作为期望类型。
-        // anytype 实参只需要类型，不是 comptime 上下文
+        // Generic call: comptime arguments determine the instance, so infer them first; parameter
+        // types in the abstract signature that depend on other parameters cannot serve as expected
+        // types. anytype arguments need only their types and are not in a comptime context.
         for (args, 0..) |a, i| switch (g.kind(i + skip)) {
             .comptime_value => _ = try inf.inferComptime(a, inf.concrete(paramType(f, i + skip))),
             .comptime_anytype => _ = try inf.inferComptime(a, null),
@@ -1155,7 +1225,7 @@ const Inferrer = struct {
         };
         const inst = try instanceOf(inf.r, inf.scratch, g, f, try inf.argValues(callee_e, args, skip, g.body.params.len));
         const sig = try inf.r.ctx.get(queries.Infer, .{ .owner = g.owner, .mode = .signature, .inst = inst });
-        // 其余实参按实例中的参数类型推导
+        // The remaining arguments are inferred with the parameter types in the instance
         for (args, 0..) |a, i| if (g.kind(i + skip) == .runtime) {
             _ = try inf.infer(a, instParamType(sig, g.body, i + skip) orelse inf.concrete(paramType(f, i + skip)));
         };
@@ -1164,8 +1234,9 @@ const Inferrer = struct {
         return result;
     }
 
-    /// anytype 形参收到的枚举字面量（`testing.expectEqual(.x, actual)`）：被调函数的实例把参数转换为哪个类型，
-    /// 字面量就引用其中的成员，并以它为期望类型（补全、构造类型的成员）
+    /// Enum literals received by anytype parameters (`testing.expectEqual(.x, actual)`): the
+    /// literal refers to a member of whatever type the callee's instance coerces the parameter to,
+    /// and uses that type as its expected type (for completion and members of constructed types)
     fn literalArgTargets(inf: *Inferrer, g: Generic, inst: Index, args: []const ExprId, skip: usize) Error!void {
         var full: ?*const Result = null;
         for (args, 0..) |a, i| {
@@ -1185,7 +1256,7 @@ const Inferrer = struct {
         }
     }
 
-    /// 与形参一一对应的实参（方法调用的接收者在最前）
+    /// Arguments parallel to the parameters (a method call's receiver comes first)
     fn argValues(inf: *Inferrer, callee_e: ExprId, args: []const ExprId, skip: usize, n: usize) Error![]const TypedValue {
         const out = try inf.scratch.alloc(TypedValue, n);
         for (out, 0..) |*o, i| {
@@ -1197,8 +1268,11 @@ const Inferrer = struct {
         return out;
     }
 
-    /// 实例化调用的结果：返回类型在实例中求值。返回 comptime-only 类型（如 `type`）或位于 comptime
-    /// 上下文中时由解释器执行函数体求出值；解释器放弃时，返回 `type` 的函数取推导中实际执行到的 `return`
+    /// Result of an instantiated call: the return type is evaluated in the instance. When the
+    /// function returns a comptime-only type (such as `type`) or the call is in a comptime
+    /// context, the interpreter executes the function body to compute the value; when the
+    /// interpreter gives up, a function returning `type` takes the value of the `return` actually
+    /// reached during inference.
     fn callResult(inf: *Inferrer, g: Generic, inst: Index, sig: *const Result, args: []const TypedValue) Error!TypedValue {
         const ret = try queries.returnType(inf.r, g.owner, g.body, sig, inst);
         if ((try eval.isComptimeOnly(inf.r, ret) or inf.comptime_depth > 0) and !inf.r.ctx.incomplete()) {
@@ -1212,7 +1286,8 @@ const Inferrer = struct {
         return .{ .ty = ret };
     }
 
-    /// comptime 上下文中调用非泛型函数（如数组长度中的 `double(4)`）：由解释器求值
+    /// A call to a non-generic function in a comptime context (such as `double(4)` in an array
+    /// length): evaluated by the interpreter
     fn comptimeCall(inf: *Inferrer, callee: TypedValue, callee_e: ExprId, args: []const ExprId, skip: usize) Error!?TypedValue {
         const fv = switch (inf.ip.key(callee.val orelse return null)) {
             .fn_value => |v| v,
@@ -1224,13 +1299,13 @@ const Inferrer = struct {
         return if (tv.val != null) tv else null;
     }
 
-    /// 不含抽象参数与未知部分的类型（可以作为调用方的期望类型）
+    /// Type free of abstract parameters and unknown parts (usable as the caller's expected type)
     fn concrete(inf: *Inferrer, t: ?Index) ?Index {
         const ty = t orelse return null;
         return if (value.isConcrete(inf.ip, ty)) ty else null;
     }
 
-    /// switch 的操作数与分支项都 comptime 已知时，会执行的分支
+    /// The prong that executes when both the switch operand and the prong items are comptime-known
     fn chooseProng(inf: *Inferrer, prongs: []const Body.Prong, operand: TypedValue) Error!?usize {
         const v = operand.val orelse return null;
         var else_prong: ?usize = null;
@@ -1247,7 +1322,7 @@ const Inferrer = struct {
         return else_prong;
     }
 
-    /// comptime 已知的比较
+    /// comptime-known comparison
     fn compare(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs: TypedValue) Error!?bool {
         const ip = inf.ip;
         const a = lhs.val orelse return null;
@@ -1266,7 +1341,8 @@ const Inferrer = struct {
             for (args) |a| _ = try inf.infer(a, null);
             const target = try inf.r.importTarget(inf.file, inf.body, args) orelse return .unknown;
             const tv = try queries.importValue(inf.r, target);
-            // 有结果类型时编译器按结果类型解析 ZON：标量以外的值只取结果类型（见 `zon.isScalar`）
+            // With a result type, the compiler parses ZON according to the result type: for values
+            // other than scalars, only the result type is taken (see `zon.isScalar`)
             if (inf.r.isZon(target)) if (expected) |want| if (want != .unknown and want != tv.ty and !zon.isScalar(tv.ty)) return .{ .ty = want };
             return tv;
         }
@@ -1280,7 +1356,8 @@ const Inferrer = struct {
             const path = try inf.stringArg(args[0]) orelse try eval.stringValue(inf.r, arg) orelse return .unknown;
             return try eval.embedFile(inf.r, inf.file, path) orelse .unknown;
         }
-        // 模块名由构建系统决定（见 `std.builtin.SourceLocation.module`），项目模型中没有，只给出类型
+        // The module name is decided by the build system (see `std.builtin.SourceLocation.module`)
+        // and is absent from the project model, so only the type is given
         if (eq(u8, name, "@src")) return .{ .ty = try inf.stdType(&.{ "builtin", "SourceLocation" }) orelse .unknown };
         if (eq(u8, name, "@as")) {
             if (args.len != 2) return .unknown;
@@ -1309,7 +1386,8 @@ const Inferrer = struct {
             if (sign == null or n == null) return typeUnknown();
             return TypedValue.ofType(try ip.intType(sign.?, n.?));
         }
-        // 构造类型的内置函数：由解释器求值（参数都是 comptime 已知的值）
+        // Builtins that construct types: evaluated by the interpreter (their arguments are
+        // all comptime-known values)
         const reifying = [_][]const u8{ "@Pointer", "@Tuple", "@Enum", "@Struct", "@Union", "@Fn", "@Vector", "@EnumLiteral" };
         for (reifying) |n| if (eq(u8, name, n)) {
             for (args) |a| _ = try inf.infer(a, null);
@@ -1319,7 +1397,8 @@ const Inferrer = struct {
         };
         if (eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf")) {
             const t = (if (args.len == 1) (try inf.infer(args[0], null)).asType() else null) orelse return .{ .ty = .comptime_int_type };
-            // 容器的布局读取字段类型的推导结果：当前结果已不完整时不再深入
+            // A container's layout reads the inferred field types: once the current result is
+            // already incomplete, do not go deeper
             const l = value.typeLayout(ip, t) orelse (if (inf.dead > 0 or inf.r.ctx.incomplete()) null else try eval.typeLayout(inf.r, t)) orelse return .{ .ty = .comptime_int_type };
             const n = (if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits) orelse return .{ .ty = .comptime_int_type };
             return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = n } }) };
@@ -1337,7 +1416,8 @@ const Inferrer = struct {
             const b = if (args.len == 1) inf.condValue(inf.get(args[0])) else null;
             return .{ .ty = .u1_type, .val = if (b) |x| try ip.get(.{ .int_value = .{ .ty = .u1_type, .value = @intFromBool(x) } }) else null };
         }
-        // 结果是标准库中定义的类型：只给出类型（不构造值）
+        // The result is a type defined in the standard library: only the type is given (no
+        // value is constructed)
         if (eq(u8, name, "@typeInfo")) {
             for (args) |x| _ = try inf.infer(x, null);
             const ty = (try inf.stdType(&.{ "builtin", "Type" })) orelse .unknown;
@@ -1362,13 +1442,13 @@ const Inferrer = struct {
         }
         if (eq(u8, name, "@field")) {
             if (args.len != 2) return .unknown;
-            // 字段名为字符串字面量或 comptime 已知的字符串
+            // The field name is a string literal or a comptime-known string
             const field_name = try inf.infer(args[1], null);
             return inf.fieldAccess(e, args[0], try inf.stringArg(args[1]) orelse try eval.stringValue(inf.r, field_name));
         }
         if (try inf.typedArgsBuiltin(name, args, expected)) |tv| return tv;
-        // 嵌套的指针转换在编译器中合并为一次转换（`@ptrCast(@alignCast(p))`、`@alignCast(@fieldParentPtr(...))`）：
-        // 内层取外层的结果类型
+        // Nested pointer casts are merged into one cast in the compiler (`@ptrCast(@alignCast(p))`,
+        // `@alignCast(@fieldParentPtr(...))`): the inner cast takes the outer one's result type
         if (isPtrCast(name) and args.len == 1) switch (inf.body.expr(args[0])) {
             .builtin_call => |inner| if (isPtrCast(inner.name) or eq(u8, inner.name, "@fieldParentPtr")) {
                 _ = try inf.infer(args[0], inf.destType(expected, .eu));
@@ -1376,7 +1456,8 @@ const Inferrer = struct {
             else => {},
         };
         for (args) |a| _ = try inf.infer(a, null);
-        // 转换：结果类型由期望类型决定（按编译器的 `resolveDestType` 去掉 error union / optional）
+        // Casts: the result type is determined by the expected type (with error union / optional
+        // stripped as in the compiler's `resolveDestType`)
         const casts = [_]struct { []const u8, DestStrip }{
             .{ "@intCast", .eu_opt },      .{ "@truncate", .eu_opt },    .{ "@floatCast", .eu_opt }, .{ "@floatFromInt", .eu_opt },
             .{ "@intFromFloat", .eu_opt }, .{ "@enumFromInt", .eu_opt }, .{ "@bitCast", .eu_opt },   .{ "@ptrCast", .eu },
@@ -1385,11 +1466,13 @@ const Inferrer = struct {
         };
         for (casts) |c| if (eq(u8, name, c[0])) {
             if (inf.destType(expected, c[1])) |t| return .{ .ty = t };
-            // `@alignCast` / `@addrSpaceCast` 没有结果类型（在编译器中是错误）时取参数的类型
+            // `@alignCast` / `@addrSpaceCast` without a result type (an error in the compiler)
+            // take the type of the argument
             if ((eq(u8, name, "@alignCast") or eq(u8, name, "@addrSpaceCast")) and args.len == 1) return .{ .ty = inf.get(args[0]).ty };
             return .unknown;
         };
-        // 去掉 const / volatile：结果只取决于参数的类型（与编译器一致）
+        // Stripping const / volatile: the result depends only on the argument's type
+        // (matches the compiler)
         if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
             const t = if (args.len == 1) inf.get(args[0]).ty else .unknown;
             return .{ .ty = if (eq(u8, name, "@constCast")) try inf.mutablePtr(t) else t };
@@ -1404,7 +1487,8 @@ const Inferrer = struct {
             if (try inf.pureValue(name, args)) |tv| return tv;
             return .{ .ty = (if (args.len == 1) try inf.bitCountType(inf.get(args[0]).ty) else null) orelse .unknown };
         }
-        // `struct { T, u1 }`：T 为两侧的 peer（`@shlWithOverflow` 为左侧的类型），向量时溢出位也是向量
+        // `struct { T, u1 }`: T is the peer type of both sides (the left-hand side's type for
+        // `@shlWithOverflow`); for vectors, the overflow bit is a vector too
         if (eq(u8, name, "@addWithOverflow") or eq(u8, name, "@subWithOverflow") or eq(u8, name, "@mulWithOverflow") or eq(u8, name, "@shlWithOverflow")) {
             if (args.len != 2) return .unknown;
             if (try inf.pureValue(name, args)) |tv| return tv;
@@ -1417,7 +1501,7 @@ const Inferrer = struct {
             };
             return .{ .ty = try ip.get(.{ .tuple_type = .{ .types = &.{ t, bit } } }) };
         }
-        // `@Vector(n, T)`：n 为 `pred` / `mask` 的长度
+        // `@Vector(n, T)`: n is the length of `pred` / `mask`
         if (eq(u8, name, "@select") or eq(u8, name, "@shuffle")) {
             if (args.len != 4) return .unknown;
             const t = inf.get(args[0]).asType() orelse return .unknown;
@@ -1429,7 +1513,8 @@ const Inferrer = struct {
             const len = std.math.cast(u32, n orelse return .unknown) orelse return .unknown;
             return .{ .ty = try ip.get(.{ .vector_type = .{ .len = len, .child = t } }) };
         }
-        // 错误的整数值：位宽取决于错误数量的上限（编译器默认为 u16）
+        // Integer value of an error: the bit width depends on the maximum number of errors
+        // (u16 by default in the compiler)
         if (eq(u8, name, "@intFromError")) return .{ .ty = try ip.intType(.unsigned, 16) };
         if (eq(u8, name, "@errorReturnTrace")) {
             const trace = try inf.stdType(&.{ "builtin", "StackTrace" }) orelse return .unknown;
@@ -1463,12 +1548,14 @@ const Inferrer = struct {
         for (simple) |s| if (eq(u8, name, s[0])) return .{ .ty = s[1] };
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName") or eq(u8, name, "@typeName")) {
             if (args.len == 1) if (try inf.pureValue(name, args)) |tv| return tv;
-            // `@typeName` 的参数总是类型：名字求不出时没有运行时切片形式
+            // The argument of `@typeName` is always a type: when the name cannot be evaluated,
+            // there is no runtime slice form
             if (eq(u8, name, "@typeName")) return .unknown;
             const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
-        // 结果与第一个参数同类型（除法与取余为两侧的 peer）
+        // The result has the type of the first argument (for division and remainder, the
+        // peer type of both sides)
         const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil" };
         for (same) |n| if (eq(u8, name, n)) {
             if (args.len == 0) return .unknown;
@@ -1476,22 +1563,25 @@ const Inferrer = struct {
             var types: std.ArrayList(Index) = .empty;
             for (args) |a| try types.append(inf.scratch, inf.get(a).ty);
             if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
-                // 与编译器一致：有浮点参数时取位宽最大的浮点类型，整数取容纳结果范围的最小整数类型
+                // Matches the compiler: with float arguments, take the float type with the
+                // largest bit width; for integers, take the smallest integer type that holds the
+                // result range
                 for (types.items) |t| if (ip.isFloat(t)) return .{ .ty = value.minMaxFloatType(ip, types.items) orelse try inf.peer(types.items) };
                 const operands = try inf.scratch.alloc(TypedValue, args.len);
                 for (args, operands) |a, *o| o.* = inf.get(a);
                 return .{ .ty = try value.minMaxIntType(ip, eq(u8, name, "@min"), operands) orelse try inf.peer(types.items) };
             }
-            // 有符号整数的绝对值为同位宽的无符号整数
+            // The absolute value of a signed integer is an unsigned integer of the same bit width
             if (eq(u8, name, "@abs")) if (value.intInfo(ip, types.items[0])) |info| if (info.signed) return .{ .ty = try ip.intType(.unsigned, info.bits) };
-            // 除法与取余：两侧的 peer
+            // Division and remainder: the peer type of both sides
             if (args.len == 2) return .{ .ty = try inf.peer(types.items) };
             return .{ .ty = types.items[0] };
         };
         return .unknown;
     }
 
-    /// 参数有结果类型的内置函数（与编译器一致）：参数按各自的结果类型推导；不是这些内置函数时为 null
+    /// Builtins whose arguments have result types (matches the compiler): the arguments are
+    /// inferred with their respective result types; null for other builtins
     fn typedArgsBuiltin(inf: *Inferrer, name: []const u8, args: []const ExprId, expected: ?Index) Error!?TypedValue {
         const ip = inf.ip;
         const eq = std.mem.eql;
@@ -1506,20 +1596,20 @@ const Inferrer = struct {
             for (args) |a| _ = try inf.infer(a, elem);
             return .{ .ty = dest orelse .unknown };
         }
-        // 参数的结果类型为目标类型的 backing 整数
+        // The argument's result type is the backing integer of the destination type
         if (eq(u8, name, "@fromBackingInt")) {
             const dest = inf.destType(expected, .eu_opt);
             const int_ty: ?Index = if (dest) |d| try eval.backingIntType(inf.r, d) else null;
             for (args) |a| _ = try inf.infer(a, int_ty);
             return .{ .ty = dest orelse .unknown };
         }
-        // 右侧为 `Log2Int(T)`
+        // The right-hand side is `Log2Int(T)`
         if (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact")) {
             const lhs: TypedValue = if (args.len > 0) try inf.infer(args[0], null) else .unknown;
             for (args[@min(args.len, 1)..]) |a| _ = try inf.infer(a, try inf.log2IntType(lhs.ty));
             return try inf.pureValue(name, args) orelse .{ .ty = lhs.ty };
         }
-        // 初始化值的结果类型为字段的类型
+        // The result type of the init value is the field's type
         if (eq(u8, name, "@unionInit")) {
             if (args.len != 3) return null;
             const t = (try inf.infer(args[0], null)).asType();
@@ -1529,14 +1619,14 @@ const Inferrer = struct {
             _ = try inf.infer(args[2], field_ty);
             return .{ .ty = t orelse .unknown };
         }
-        // 填充值的结果类型为元素类型
+        // The result type of the fill value is the element type
         if (eq(u8, name, "@memset")) {
             const dest: TypedValue = if (args.len > 0) try inf.infer(args[0], null) else .unknown;
             const elem = inf.elementType(dest.ty);
             for (args[@min(args.len, 1)..]) |a| _ = try inf.infer(a, if (elem != .unknown) elem else null);
             return .{ .ty = .void_type };
         }
-        // 各参数的结果类型；`elem` 为第一个参数给出的类型
+        // Result types of the arguments; `elem` is the type given by the first argument
         const ArgType = enum { none, elem, u32, atomic_order, atomic_rmw_op, reduce_op, call_modifier, branch_hint, float_mode, prefetch_options, export_options, extern_options };
         const signatures = [_]struct { []const u8, []const ArgType }{
             .{ "@atomicLoad", &.{ .none, .none, .atomic_order } },
@@ -1586,7 +1676,8 @@ const Inferrer = struct {
 
     const DestStrip = enum { eu_opt, eu, opt };
 
-    /// 转换类内置函数的目标类型：期望类型按编译器的 `resolveDestType` 去掉 error union / optional
+    /// Destination type of cast builtins: the expected type, with error union / optional stripped
+    /// as in the compiler's `resolveDestType`
     fn destType(inf: *Inferrer, expected: ?Index, strip: DestStrip) ?Index {
         const ip = inf.ip;
         var t = expected orelse return null;
@@ -1602,7 +1693,7 @@ const Inferrer = struct {
         return t;
     }
 
-    /// 去掉指针（含 optional 指针）的 const
+    /// Strips const from a pointer (including an optional pointer)
     fn mutablePtr(inf: *Inferrer, t: Index) Error!Index {
         const ip = inf.ip;
         switch (ip.key(t)) {
@@ -1617,7 +1708,8 @@ const Inferrer = struct {
         return t;
     }
 
-    /// `@clz` / `@ctz` / `@popCount` 的结果类型：能容纳 0 到位宽的最小无符号整数，向量逐元素
+    /// Result type of `@clz` / `@ctz` / `@popCount`: the smallest unsigned integer that holds 0
+    /// through the bit width, element-wise for vectors
     fn bitCountType(inf: *Inferrer, t: Index) Error!?Index {
         const ip = inf.ip;
         switch (ip.key(t)) {
@@ -1631,7 +1723,7 @@ const Inferrer = struct {
         return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int(u16, info.bits) + 1);
     }
 
-    /// 函数（或函数指针）的返回类型；依赖参数时为 unknown
+    /// Return type of a function (or function pointer); unknown when it depends on the parameters
     fn fnReturnType(inf: *Inferrer, t: Index) Index {
         const ip = inf.ip;
         const f = switch (ip.key(t)) {
@@ -1642,7 +1734,8 @@ const Inferrer = struct {
         return inf.concrete(f.ret) orelse .unknown;
     }
 
-    /// 参数都已知时只做计算的内置函数（数学函数、布局）的值，由解释器计算
+    /// Value of a purely computational builtin (math functions, layout) when all arguments are
+    /// known, computed by the interpreter
     fn pureValue(inf: *Inferrer, name: []const u8, args: []const ExprId) Error!?TypedValue {
         if (inf.dead > 0 or inf.r.ctx.incomplete()) return null;
         const tvs = try inf.scratch.alloc(TypedValue, args.len);
@@ -1653,7 +1746,7 @@ const Inferrer = struct {
         return eval.builtinValue(inf.r, name, tvs);
     }
 
-    /// 字符串字面量实参的内容
+    /// Contents of a string literal argument
     fn stringArg(inf: *Inferrer, e: ExprId) Error!?[]const u8 {
         return switch (inf.body.expr(e)) {
             .literal => |text| if (text.len > 0 and text[0] == '"') std.zig.string_literal.parseAlloc(inf.scratch, text) catch null else null,
@@ -1661,7 +1754,7 @@ const Inferrer = struct {
         };
     }
 
-    // ── 块与控制流 ───────────────────────────────────────────────────
+    // ── Blocks and control flow ──────────────────────────────────────
 
     fn block(inf: *Inferrer, blk: Body.Block, expected: ?Index) Error!TypedValue {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected });
@@ -1678,7 +1771,7 @@ const Inferrer = struct {
         if (dead_rest) inf.dead -= 1;
         var frame = inf.labels.pop().?;
         if (blk.label != null) {
-            // 执行到块尾时值为 void
+            // Reaching the end of the block yields void
             if (last != .noreturn_type and inf.dead == 0) {
                 try frame.types.append(inf.scratch, .void_type);
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
@@ -1696,7 +1789,8 @@ const Inferrer = struct {
                 const binding = inf.body.binding(b);
                 const annotation: ?Index = if (binding.ty) |t| (try inf.inferComptime(t, null)).asType() orelse .unknown else null;
                 const init: TypedValue = if (binding.init) |i| try inf.infer(i, annotation) else .unknown;
-                // `comptime var` 的值随修改跟踪（见 `assignComptimeVar`）
+                // The value of a `comptime var` is tracked through its modifications
+                // (see `assignComptimeVar`)
                 const keeps_value = binding.kind == .local_const or binding.is_comptime;
                 inf.bindings[@backingInt(b)] = if (annotation) |t|
                     .{ .ty = t, .val = if (keeps_value and init.ty == t) init.val else null }
@@ -1737,7 +1831,8 @@ const Inferrer = struct {
         }
     }
 
-    /// 解构 `const a, const b = x;` 的第 `i` 个元素：元组的字段、数组与向量的元素
+    /// The `i`-th element of the destructuring `const a, const b = x;`: a field of a tuple, or an
+    /// element of an array or vector
     fn destructureElem(inf: *Inferrer, v: TypedValue, i: usize) Error!TypedValue {
         const ip = inf.ip;
         const ty: Index = switch (ip.key(v.ty)) {
@@ -1747,7 +1842,7 @@ const Inferrer = struct {
             else => return .unknown,
         };
         if (v.val != null) if (try eval.elemValue(inf.r, v, i)) |ev| return .{ .ty = ty, .val = ev.val };
-        // 元组的 comptime 字段：值属于类型
+        // comptime fields of a tuple: the value belongs to the type
         const x: Index = switch (ip.key(v.ty)) {
             .tuple_type => |tt| InternPool.fieldValue(tt.values, i),
             else => .runtime,
@@ -1764,12 +1859,14 @@ const Inferrer = struct {
                 try inf.bindCaptures(l.else_capture, l.inputs[0], cond, .if_else);
             },
             .@"for" => {
-                // 按某次迭代推导这个循环（见 `LoopSeed`）：各个循环变量都取这次迭代的值
+                // Inferring this loop for one iteration (see `LoopSeed`): every loop variable
+                // takes its value in this iteration
                 iteration = if (inf.loop_seed) |seed|
                     (if (std.mem.indexOfScalar(Body.BindingId, l.capture, @fromBackingInt(seed.binding)) != null) seed.index else null)
                 else
                     null;
-                // 循环体修改外面的 `comptime var` 时，第 n 次迭代开始时它取第 n - 1 次迭代结束时的值
+                // When the loop body modifies an outer `comptime var`, at the start of iteration n
+                // it takes its value at the end of iteration n - 1
                 if (iteration) |n| if (n > 0) if (try inf.assignsOuterComptimeVar(l.body)) {
                     const prev = try inf.r.ctx.get(queries.Infer, .{
                         .owner = .{ .file = inf.file, .item = try inf.body_owner() },
@@ -1782,19 +1879,22 @@ const Inferrer = struct {
                 try inf.bindForCaptures(l, iteration);
             },
         }
-        // 不按迭代推导时循环体执行的次数未定：循环体修改的外面的 `comptime var` 在任一次迭代开始时都是未知的
+        // Without per-iteration inference, the number of times the loop body runs is
+        // undetermined: outer `comptime var`s modified by the loop body are unknown at the
+        // start of any iteration
         if (iteration == null) {
             inf.uncertain += 1;
             try inf.forgetOuterComptimeVars(l.body);
         }
         if (l.cont) |c| _ = try inf.infer(c, null);
-        // break 的值与 else 分支取循环的结果类型
+        // break values and the else branch take the loop's result type
         try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true, .expected = expected });
         _ = try inf.infer(l.body, null);
         var frame = inf.labels.pop().?;
         if (iteration == null) inf.uncertain -= 1;
-        // 循环之后修改过的 `comptime var` 取所有迭代执行后的值，这里只推导了一次迭代：记下这次迭代结束时的值
-        // （下一次迭代从它开始）后置为未知
+        // After the loop, a modified `comptime var` holds its value after all iterations, but only
+        // one iteration is inferred here: record its value at the end of this iteration (the next
+        // iteration starts from it), then set it to unknown
         if (iteration != null) {
             var vars: std.ArrayList(Body.BindingId) = .empty;
             _ = try inf.outerComptimeVars(l.body, &vars);
@@ -1808,7 +1908,8 @@ const Inferrer = struct {
         return .{ .ty = try inf.peer(frame.types.items) };
     }
 
-    /// `for` 循环的循环变量；按第 `iteration` 次迭代推导时取这次迭代的值与类型
+    /// Loop variables of a `for` loop; when inferring the `iteration`-th iteration, they take the
+    /// value and type of that iteration
     fn bindForCaptures(inf: *Inferrer, l: Body.Loop, iteration: ?u32) Error!void {
         const ip = inf.ip;
         for (l.inputs, 0..) |input, i| {
@@ -1836,7 +1937,8 @@ const Inferrer = struct {
                 else if (iteration) |n| blk: {
                     const it_ty = try inf.iterationType(list.ty, elem, n, ptr, is_const);
                     const v = try inf.iterationValue(list, start, n);
-                    // 指针捕获取指向这次迭代的元素的指针；可变列表的元素在运行时会变，不取值
+                    // A pointer capture takes a pointer to this iteration's element; elements of a
+                    // mutable list change at runtime, so no value is taken
                     const val = if (!ptr) v else if (is_const) (if (v) |x| try ip.get(.{ .ptr_value = .{ .ty = it_ty, .pointee = x } }) else null) else null;
                     break :blk .{ .ty = it_ty, .val = val };
                 } else .{ .ty = ty };
@@ -1844,14 +1946,15 @@ const Inferrer = struct {
         }
     }
 
-    /// 名字 `e` 指向本成员的 `comptime var` 时为它的绑定
+    /// The binding when the name `e` refers to a `comptime var` of this member
     fn comptimeVarOf(inf: *Inferrer, e: ExprId) Error!?Body.BindingId {
         const b = inf.body;
         const name = switch (b.expr(e)) {
             .name_ref => |n| n,
             else => return null,
         };
-        // 声明在前：尚未声明过 `comptime var` 时不会指向它
+        // Declarations come first: when no `comptime var` has been declared yet, the name
+        // cannot refer to one
         if (inf.var_levels.len == 0) return null;
         const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return null;
         const l = switch (def) {
@@ -1863,7 +1966,8 @@ const Inferrer = struct {
         return if (binding.kind == .local_var and binding.is_comptime) l.binding else null;
     }
 
-    /// 对 `comptime var` 的赋值：在声明处同样确定的控制流中（见 `uncertain`）按赋值更新它的值，否则值未知
+    /// Assignment to a `comptime var`: under control flow as determined as at its declaration (see
+    /// `uncertain`), the assignment updates its value; otherwise the value becomes unknown
     fn assignComptimeVar(inf: *Inferrer, b: Body.BindingId, op: SyntaxKind, rhs: TypedValue) Error!void {
         if (inf.dead > 0) return;
         const slot = &inf.bindings[@backingInt(b)];
@@ -1902,10 +2006,11 @@ const Inferrer = struct {
         slot.val = (try inf.foldInt(bin, ty, slot.*, rhs)).val;
     }
 
-    /// `e` 范围内对外面声明的 `comptime var` 的赋值
+    /// Assignments within `e` to `comptime var`s declared outside it
     fn outerComptimeVars(inf: *Inferrer, e: ExprId, out: ?*std.ArrayList(Body.BindingId)) Error!bool {
         const b = inf.body;
-        // 成员中没有 `comptime var` 时不必逐个解析赋值的左侧
+        // When the member has no `comptime var`, the left-hand sides of assignments need not be
+        // resolved one by one
         if (inf.var_levels.len == 0) {
             for (b.bindings) |x| {
                 if (x.kind == .local_var and x.is_comptime) break;
@@ -1938,8 +2043,10 @@ const Inferrer = struct {
         for (vars.items) |v| inf.bindings[@backingInt(v)].val = null;
     }
 
-    /// 元素为类型的循环变量（`inline for (.{ f32, f64 }) |T|`）：每次迭代的类型不同，与泛型函数的
-    /// `comptime T: type` 一样按抽象参数推导。按某次迭代推导时（`loop_seed`）取列表中的该元素
+    /// A loop variable whose values are types (`inline for (.{ f32, f64 }) |T|`): the type
+    /// differs in each iteration, so it is inferred as an abstract parameter, like
+    /// `comptime T: type` of a generic function. When inferring one iteration (`loop_seed`), it
+    /// takes that element of the list.
     fn typeCapture(inf: *Inferrer, cap: Body.BindingId, list: TypedValue, iteration: ?u32) Error!TypedValue {
         if (iteration) |n| if (list.val != null) {
             if (try eval.elemValue(inf.r, list, n)) |ev| if (ev.val) |t| return TypedValue.ofType(t);
@@ -1947,8 +2054,9 @@ const Inferrer = struct {
         return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(cap), .name = inf.body.binding(cap).name } }));
     }
 
-    /// `for` 的指针捕获是否为 const：遍历指针（切片、多项指针、指向数组的指针）时取指针本身的
-    /// `is_const`；遍历数组值时取决于被遍历的值是否为 const place
+    /// Whether a pointer capture of `for` is const: when iterating over a pointer (slice,
+    /// many-item pointer, pointer to array), the pointer's own `is_const`; when iterating over an
+    /// array value, whether the iterated value is a const place
     fn forCaptureConst(inf: *Inferrer, input: ExprId, list: Index) Error!bool {
         return switch (inf.ip.key(list)) {
             .ptr_type => |p| p.is_const,
@@ -1957,7 +2065,8 @@ const Inferrer = struct {
         };
     }
 
-    /// 按第 `n` 次迭代推导时非类型的循环变量的类型：各项类型不同的元组（`.{ &posix, &windows }`）取第 `n` 项的类型
+    /// Type of a non-type loop variable when inferring the `n`-th iteration: for a tuple whose
+    /// items have different types (`.{ &posix, &windows }`), the type of the `n`-th item
     fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool, is_const: bool) Error!Index {
         var t = elem;
         if (t == .unknown) if (tupleOf(inf.ip, list)) |tt| if (n < tt.types.len) {
@@ -1966,14 +2075,15 @@ const Inferrer = struct {
         return if (ptr) inf.ip.ptrTo(t, .one, is_const) else t;
     }
 
-    /// 按第 `n` 次迭代推导时非类型的循环变量的值：范围（`start..`）为 `start + n`，列表为第 `n` 个元素
+    /// Value of a non-type loop variable when inferring the `n`-th iteration: `start + n` for a
+    /// range (`start..`), the `n`-th element for a list
     fn iterationValue(inf: *Inferrer, list: TypedValue, start: TypedValue, n: u32) Error!?Index {
         if (value.intOf(inf.ip, start.val)) |s| return try inf.ip.get(.{ .int_value = .{ .ty = .usize_type, .value = s + n } });
         if (list.val == null) return null;
         return if (try eval.elemValue(inf.r, list, n)) |ev| ev.val else null;
     }
 
-    /// `continue :label` 的目标为 labeled switch 时其操作数的类型
+    /// The operand type when the target of `continue :label` is a labeled switch
     fn switchOperandType(inf: *Inferrer, e: ExprId, label: []const u8) ?Index {
         const b = inf.body;
         var s: ?Body.ScopeId = b.expr_scopes[@backingInt(e)];
@@ -1990,9 +2100,12 @@ const Inferrer = struct {
         return null;
     }
 
-    /// `catch` / `orelse` 右侧的期望类型。编译器取整个表达式的结果类型；没有结果类型时两侧做 peer type
-    /// resolution，这里以载荷类型作为右侧字面量（`0`、`.red`）的期望，得到与 peer 相同的结果。`null` 例外：
-    /// 与载荷 peer 得到 optional（`parseInt(u8, s, 10) catch null` 为 `?u8`），不能转换为载荷类型
+    /// Expected type of the right-hand side of `catch` / `orelse`. The compiler uses the result
+    /// type of the whole expression; without a result type, both sides go through peer type
+    /// resolution, and here the payload type serves as the expected type of right-hand side
+    /// literals (`0`, `.red`), which gives the same result as the peer. `null` is the exception:
+    /// its peer with the payload is an optional (`parseInt(u8, s, 10) catch null` is `?u8`), so it
+    /// cannot be coerced to the payload type.
     fn fallbackType(inf: *Inferrer, expected: ?Index, payload: Index, rhs: ExprId) ?Index {
         if (expected) |want| if (want != .unknown) return want;
         if (payload == .unknown) return null;
@@ -2003,7 +2116,8 @@ const Inferrer = struct {
         return payload;
     }
 
-    /// 函数体中有 `continue :label`（带标签的 switch 由它转到其他分支）
+    /// Whether the function body has a `continue :label` (through which a labeled switch jumps to
+    /// another prong)
     fn continuesTo(inf: *Inferrer, label: []const u8) bool {
         for (inf.body.exprs) |x| switch (x) {
             .@"continue" => |c| if (c.label) |l| if (std.mem.eql(u8, l, label)) return true,
@@ -2012,7 +2126,7 @@ const Inferrer = struct {
         return false;
     }
 
-    /// switch 的标签：lowering 在推导操作数之前推入了以这个 switch 为目标的带标签作用域
+    /// Label of a switch: lowering pushes a labeled scope targeting this switch before the operand
     fn switchLabel(inf: *Inferrer, e: ExprId, operand: ExprId) ?[]const u8 {
         const b = inf.body;
         var s: ?Body.ScopeId = b.expr_scopes[@backingInt(operand)];
@@ -2023,7 +2137,7 @@ const Inferrer = struct {
         return null;
     }
 
-    /// break 的目标（`labels` 中的下标）
+    /// Target of a break (an index into `labels`)
     fn labelFrame(inf: *Inferrer, label: ?[]const u8) ?usize {
         var i = inf.labels.items.len;
         while (i > 0) {
@@ -2038,7 +2152,8 @@ const Inferrer = struct {
 
     const CaptureSource = enum { if_then, if_else };
 
-    /// if / while 的捕获：optional 取子类型，error union 取载荷（else 分支取错误集）
+    /// Captures of if / while: the child type of an optional, the payload of an error union (the
+    /// error set in the else branch)
     fn bindCaptures(inf: *Inferrer, caps: []const Body.BindingId, cond_e: ExprId, cond_tv: TypedValue, source: CaptureSource) Error!void {
         if (caps.len == 0) return;
         const ip = inf.ip;
@@ -2050,15 +2165,18 @@ const Inferrer = struct {
         };
         const cap = caps[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
-        // 已知的非 null optional 值即载荷值
+        // A known non-null optional value is its payload value
         const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) cond_tv.val else null;
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
     }
 
-    /// switch 的捕获。带标签的 union：捕获为各分支项对应字段类型的 peer（与编译器一致），`else` 分支与
-    /// 求不出的分支项为 unknown；第二个捕获为标签。`chosen`：操作数 comptime 已知，这是执行的分支，捕获取
-    /// 实际的载荷值；各项的载荷类型没有 peer 时只能是 `inline` 分支（每项单独实例化，如
-    /// `inline .@"struct", .@"union" => |info|`），类型也取实际的载荷类型
+    /// Captures of a switch. For a tagged union, the capture is the peer of the field types of the
+    /// prong items (matching the compiler); it is unknown for the `else` prong and for prong items
+    /// that cannot be evaluated; the second capture is the tag. `chosen`: the operand is
+    /// comptime-known and this is the prong that executes, so the capture takes the actual payload
+    /// value; when the payload types of the items have no peer, the prong can only be an `inline`
+    /// prong (each item is instantiated separately, e.g. `inline .@"struct", .@"union" => |info|`),
+    /// and the type also takes the actual payload type.
     fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, prongs: []const Body.Prong, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
@@ -2092,7 +2210,8 @@ const Inferrer = struct {
         };
         const cap = prong.capture[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
-        // 按 inline 分支的某个取值推导（见 `LoopSeed`）：捕获取这个分支项的值
+        // Inferring for one value of an inline prong (see `LoopSeed`): the capture takes the value
+        // of this prong item
         if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
             if ((try inlineProngValues(ip, inf.body, inf.exprs, prong, operand, seed.index)).value) |v| val = v;
         };
@@ -2103,8 +2222,9 @@ const Inferrer = struct {
         }
     }
 
-    /// 错误集 switch 分支捕获的类型：普通分支为分支项中的错误组成的集合，`else` 为操作数成员去掉
-    /// 其他分支列出的错误；成员求不出（`anyerror`）时为 unknown
+    /// Type of a prong capture in a switch on an error set: for an ordinary prong, the set of the
+    /// errors in its items; for `else`, the operand's members minus the errors listed by other
+    /// prongs; unknown when the members cannot be evaluated (`anyerror`)
     fn errorSetProngType(inf: *Inferrer, prong: Body.Prong, prongs: []const Body.Prong, members: ?[]const []const u8) Error!Index {
         const all = members orelse return .unknown;
         var names: std.ArrayList([]const u8) = .empty;
@@ -2156,7 +2276,7 @@ const Inferrer = struct {
         return inf.peer(types);
     }
 
-    /// union 字段的类型
+    /// Type of a union field
     fn unionFieldType(inf: *Inferrer, t: Index, name: []const u8) Error!?Index {
         if (inf.ip.key(t) != .container_type) return eval.fieldType(inf.r, t, name);
         const ns = try queries.namespaceOfType(inf.r, t) orelse return null;
@@ -2165,9 +2285,10 @@ const Inferrer = struct {
         return (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(inf.ip, t))).ty;
     }
 
-    // ── 运算 ─────────────────────────────────────────────────────────
+    // ── Operations ───────────────────────────────────────────────────
 
-    /// 比较中另一侧的结果类型：带标签的 union 与标签比较，另一侧按标签类型（`u == .none`）
+    /// Result type of the other side of a comparison: a tagged union is compared with a tag, so
+    /// the other side takes the tag type (`u == .none`)
     fn comparedType(inf: *Inferrer, t: Index) Error!?Index {
         if (t == .unknown or t == .comptime_int_type) return null;
         const is_union = switch (inf.ip.key(t)) {
@@ -2188,7 +2309,7 @@ const Inferrer = struct {
                     .optional_type => |c| c,
                     else => .unknown,
                 };
-                // comptime 已知时只有一侧会被求值
+                // When comptime-known, only one side is evaluated
                 const non_null = inf.condValue(lhs);
                 const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, child, rhs_e), non_null == true);
                 if (non_null) |n| return if (n) .{ .ty = child, .val = lhs.val } else rhs;
@@ -2197,16 +2318,18 @@ const Inferrer = struct {
             .keyword_and, .keyword_or => {
                 const is_and = op == .keyword_and;
                 const lhs = inf.condValue(try inf.infer(lhs_e, .bool_type));
-                // 左侧 comptime 已知并决定了结果时右侧不编译（`@hasDecl(T, "x") and T.x`）
+                // When the left-hand side is comptime-known and decides the result, the right-hand
+                // side is not compiled (`@hasDecl(T, "x") and T.x`)
                 const rhs = inf.condValue(try inf.inferArm(rhs_e, .bool_type, if (lhs) |l| l != is_and else false));
-                // 短路：一侧已决定结果
+                // Short-circuit: one side has already decided the result
                 if (lhs) |l| if (l != is_and) return boolValue(l);
                 if (rhs) |r| if (r != is_and) return boolValue(r);
                 if (lhs != null and rhs != null) return boolValue(is_and);
                 return .{ .ty = .bool_type };
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                // 枚举字面量在左侧（`.a == e`）：先推导右侧，字面量按右侧的类型（peer）
+                // An enum literal on the left (`.a == e`): infer the right-hand side first, and the
+                // literal takes the type of the right-hand side (peer)
                 const literal_lhs = inf.body.expr(lhs_e) == .enum_literal and inf.body.expr(rhs_e) != .enum_literal;
                 const lhs, const rhs = if (literal_lhs) blk: {
                     const r = try inf.infer(rhs_e, null);
@@ -2215,7 +2338,7 @@ const Inferrer = struct {
                     const l = try inf.infer(lhs_e, null);
                     break :blk .{ l, try inf.infer(rhs_e, try inf.comparedType(l.ty)) };
                 };
-                // 向量逐元素比较，结果为 bool 的向量
+                // Vectors are compared element-wise; the result is a vector of bool
                 const vec_len: ?u32 = switch (ip.key(lhs.ty)) {
                     .vector_type => |v| v.len,
                     else => switch (ip.key(rhs.ty)) {
@@ -2227,14 +2350,17 @@ const Inferrer = struct {
                 if (try inf.compare(op, lhs, rhs)) |result| return boolValue(result);
                 return .{ .ty = .bool_type };
             },
-            // 与编译器一致：左侧没有结果类型；`<<` / `>>` 的右侧按 `Log2Int(T)` 推导，`<<|` 的右侧没有结果类型
+            // Matches the compiler: the left-hand side has no result type; the right-hand side of
+            // `<<` / `>>` is inferred with `Log2Int(T)` as its result type, and that of `<<|` has
+            // no result type
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .angle_bracket_angle_bracket_left_pipe => {
                 const lhs = try inf.infer(lhs_e, null);
                 const rhs = try inf.infer(rhs_e, if (op == .angle_bracket_angle_bracket_left_pipe) null else try inf.log2IntType(lhs.ty));
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
-            // 指针运算（与编译器一致）：`[*]T ± usize` 仍为原指针类型，两个指针相减为 usize
+            // Pointer arithmetic (matches the compiler): `[*]T ± usize` is still the original
+            // pointer type, and the difference of two pointers is usize
             .plus, .minus => {
                 const lhs = try inf.infer(lhs_e, null);
                 if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e);
@@ -2242,7 +2368,7 @@ const Inferrer = struct {
                 if (isNonSlicePtr(ip, rhs.ty)) return .{ .ty = if (op == .minus) .usize_type else .unknown };
                 return .{ .ty = if (isManyPtr(ip, lhs.ty)) lhs.ty else .unknown };
             },
-            // 错误集合并
+            // Merging error sets
             .pipe_pipe => {
                 const lhs = (try inf.infer(lhs_e, null)).asType() orelse .unknown;
                 const rhs = (try inf.infer(rhs_e, null)).asType() orelse .unknown;
@@ -2255,16 +2381,20 @@ const Inferrer = struct {
         }
     }
 
-    /// 算术与位运算：两侧 peer；两侧都是已知整数时按 peer 类型的位宽折叠。与编译器一致，操作数没有
-    /// 结果类型（`const m: u8 = (0xFF << 4) >> 4` 按 comptime_int 计算得 255，之后才转换为 u8）；
-    /// 右侧以左侧的类型作为字面量的期望，与 peer 的结果相同
+    /// Arithmetic and bitwise operations: the peer of both sides; when both sides are known
+    /// integers, the result is folded with the bit width of the peer type. Matching the compiler,
+    /// the operands have no result type (`const m: u8 = (0xFF << 4) >> 4` is computed as
+    /// comptime_int, giving 255, and only then converted to u8); the right-hand side uses the
+    /// left-hand side's type as the expected type of literals, with the same result as the peer.
     fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
         const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
         return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
     }
 
-    /// `++`（与编译器的 `zirArrayCat` 一致）：元组相接为元组；数组与指向数组的指针相接为数组，元素类型为两侧
-    /// 元素类型的 peer，任一侧是指针时为 `*const [N]T`。两侧的值都已知时由解释器求值
+    /// `++` (matches the compiler's `zirArrayCat`): concatenating tuples gives a tuple;
+    /// concatenating arrays and pointers to arrays gives an array, whose element type is the
+    /// peer of both sides' element types, or `*const [N]T` when either side is a pointer. When
+    /// the values of both sides are known, the interpreter evaluates the result.
     fn concat(inf: *Inferrer, e: ExprId, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
         const ty = try inf.concatType(lhs.ty, rhs.ty);
         if (ty == .unknown) return .unknown;
@@ -2275,7 +2405,8 @@ const Inferrer = struct {
         return .{ .ty = ty };
     }
 
-    /// 操作数的值 `operand` 已知时由解释器求 `e` 的值；求不出或类型不是 `ty` 时为 null
+    /// When the operand value `operand` is known, the interpreter evaluates `e`; null when it
+    /// cannot be evaluated or its type is not `ty`
     fn knownValue(inf: *Inferrer, e: ExprId, operand: ?Index, ty: Index) Error!?TypedValue {
         if (operand == null or inf.dead != 0 or inf.r.ctx.incomplete()) return null;
         const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
@@ -2285,7 +2416,7 @@ const Inferrer = struct {
     fn concatType(inf: *Inferrer, a: Index, b: Index) Error!Index {
         const ip = inf.ip;
         if (ip.key(a) == .tuple_type and ip.key(b) == .tuple_type) {
-            // comptime 字段保持为 comptime 字段
+            // comptime fields stay comptime fields
             const x = ip.key(a).tuple_type;
             const y = ip.key(b).tuple_type;
             const types = try std.mem.concat(inf.scratch, Index, &.{ x.types, y.types });
@@ -2293,21 +2424,23 @@ const Inferrer = struct {
             for (values, 0..) |*v, i| v.* = if (i < x.types.len) InternPool.fieldValue(x.values, i) else InternPool.fieldValue(y.values, i - x.types.len);
             return ip.get(.{ .tuple_type = .{ .types = types, .values = InternPool.fieldValues(values) } });
         }
-        // 元组与数组相接时元组按另一侧的元素类型看作数组
+        // When concatenating a tuple with an array, the tuple is treated as an array with the
+        // element type of the other side
         const x = concatOperand(ip, a, b) orelse return .unknown;
         const y = concatOperand(ip, b, a) orelse return .unknown;
         const elem = try inf.peer(&.{ x.elem, y.elem });
         if (elem == .unknown) return .unknown;
-        // 哨兵先转换为结果的元素类型再比较
+        // Sentinels are converted to the result's element type before being compared
         const xs: ?Index = if (x.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return .unknown else null;
         const ys: ?Index = if (y.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return .unknown else null;
-        // 长度是 u64，无法表示的拼接不产生结果
+        // The length is a u64; a concatenation whose length cannot be represented gives no result
         const len = std.math.add(u64, x.len, y.len) catch return .unknown;
         const array = try ip.get(.{ .array_type = .{ .len = len, .child = elem, .sentinel = eval.concatSentinel(xs, ys) } });
         return if (x.is_ptr or y.is_ptr) ip.ptrTo(array, .one, true) else array;
     }
 
-    /// 整数运算：结果类型为 `ty`，两侧值已知且结果有定义时带值
+    /// Integer operations: the result type is `ty`; it carries a value when the values of both
+    /// sides are known and the result is defined
     fn foldInt(inf: *Inferrer, op: SyntaxKind, ty: Index, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
         const ip = inf.ip;
         if (ip.isFloat(ty)) {
@@ -2326,7 +2459,8 @@ const Inferrer = struct {
         const ip = inf.ip;
         switch (op) {
             .keyword_try => {
-                // 与编译器一致：结果类型只用于 `try .foo(...)` 中 decl literal 的查找
+                // Matches the compiler: the result type is only used for looking up decl literals
+                // in `try .foo(...)`
                 const decl_call = switch (inf.body.expr(operand_e)) {
                     .call => |c| inf.body.expr(c.callee) == .enum_literal,
                     else => false,
@@ -2348,7 +2482,7 @@ const Inferrer = struct {
                 const child_expected: ?Index = if (want) |x| switch (ip.key(x)) {
                     .ptr_type => |p| switch (p.size) {
                         .one => p.child,
-                        // `&.{ a, b }` 转换为切片或多项指针：按 `[2]T` 推导
+                        // `&.{ a, b }` coerced to a slice or many-item pointer: inferred as `[2]T`
                         .slice, .many, .c => switch (inf.body.expr(operand_e)) {
                             .init => |init| if (init.ty == null) try ip.get(.{ .array_type = .{ .len = init.fields.len, .child = p.child, .sentinel = p.sentinel } }) else null,
                             else => null,
@@ -2359,15 +2493,16 @@ const Inferrer = struct {
                 const v = try inf.infer(operand_e, child_expected);
                 const is_const = try inf.isConstPlace(operand_e);
                 const ty = try ip.ptrTo(v.ty, .one, is_const);
-                // 指向 comptime 已知的常量的指针（`parseEx(Id, &params, ...)`、`@field(x, &name)`）comptime 已知：
-                // 值为指向该常量值的指针
+                // A pointer to a comptime-known constant (`parseEx(Id, &params, ...)`,
+                // `@field(x, &name)`) is comptime-known: its value points to the constant's value
                 if (is_const) if (v.val) |pointee| {
                     return .{ .ty = ty, .val = try eval.constPointer(inf.r, ty, pointee) };
                 };
                 return .{ .ty = ty };
             },
             .minus, .minus_percent, .tilde => {
-                // 数字字面量先按 comptime_int 运算，结果再转换为期望类型（`const x: i8 = -128`）
+                // Number literals are computed as comptime_int first, and the result is then
+                // converted to the expected type (`const x: i8 = -128`)
                 const v = try inf.infer(operand_e, if (inf.body.expr(operand_e) == .literal) null else expected);
                 if (op == .minus and ip.isFloat(v.ty)) {
                     const x = value.floatOf(ip, v.val) orelse return .{ .ty = v.ty };
@@ -2386,7 +2521,8 @@ const Inferrer = struct {
 
     fn initExpr(inf: *Inferrer, ty_e: ?ExprId, fields: []const Body.FieldInit, expected: ?Index) Error!TypedValue {
         const ip = inf.ip;
-        // `.{ ... }` 的类型为结果类型去掉 error union 与 optional（与编译器一致）
+        // The type of `.{ ... }` is the result type with error union and optional stripped
+        // (matches the compiler)
         const want = inf.destType(expected, .eu_opt);
         if (ty_e == null and want == null) return inf.anonInit(fields);
         const t: Index = if (ty_e) |te|
@@ -2402,7 +2538,8 @@ const Inferrer = struct {
         return .{ .ty = t };
     }
 
-    /// 没有结果类型的 `.{ ... }`：元组（`struct { A, B }`）或匿名结构体；元素都已知时带值
+    /// `.{ ... }` without a result type: a tuple (`struct { A, B }`) or an anonymous struct;
+    /// it carries a value when all elements are known
     fn anonInit(inf: *Inferrer, fields: []const Body.FieldInit) Error!TypedValue {
         const ip = inf.ip;
         const types = try inf.scratch.alloc(Index, fields.len);
@@ -2415,7 +2552,8 @@ const Inferrer = struct {
             if (tv.val == null) known = false;
         }
         for (types) |t| if (t == .unknown) return .unknown;
-        // comptime 已知的字段是 comptime 字段，值属于类型（与编译器一致）
+        // comptime-known fields are comptime fields, and their values belong to the type
+        // (matches the compiler)
         const values = try inf.scratch.alloc(Index, fields.len);
         for (fields, types, vals, values) |f, t, v, *o| o.* = try inf.literalField(f.value, t, v);
         const field_values = InternPool.fieldValues(values);
@@ -2428,12 +2566,13 @@ const Inferrer = struct {
         return .{ .ty = ty, .val = if (known) try value.aggregate(ip, inf.scratch, ty, vals) else null };
     }
 
-    /// 字面量字段的 comptime 值（见 `InternPool.fieldValue`）：值已知或类型只有一个可能值时为该值，
-    /// 运行时的值为 `runtime`，判断不了时为 `unknown`
+    /// comptime value of a literal field (see `InternPool.fieldValue`): that value when it is
+    /// known or the type has only one possible value, `runtime` for a runtime value, and `unknown`
+    /// when it cannot be determined
     fn literalField(inf: *Inferrer, e: ExprId, ty: Index, val: Index) Error!Index {
         if (val != .unknown) return val;
         if (ty == .void_type) return .void_value;
-        // 字符串字面量（推导器不为字符串生成值）
+        // String literals (the inferrer does not produce values for strings)
         switch (inf.body.expr(e)) {
             .literal => |text| if (try Body.stringLiteralValue(inf.scratch, text)) |str| {
                 return inf.ip.get(.{ .bytes = .{ .ty = ty, .bytes = str } });
@@ -2447,12 +2586,13 @@ const Inferrer = struct {
 
     const Knownness = enum { comptime_known, runtime, uncertain };
 
-    /// 表达式的值是否 comptime 已知，覆盖与编译器判断一致的常见情形，判断不了时为 `uncertain`
+    /// Whether the value of an expression is comptime-known, covering common cases with the same
+    /// judgment as the compiler; `uncertain` when it cannot be determined
     fn knownness(inf: *Inferrer, e: ExprId, depth: u32) Error!Knownness {
         const ip = inf.ip;
         const tv = inf.get(e);
         if (tv.val != null) return .comptime_known;
-        // comptime-only 类型的值一定 comptime 已知
+        // Values of comptime-only types are always comptime-known
         if (tv.ty != .unknown and value.isComptimeOnly(ip, tv.ty)) return .comptime_known;
         if (depth > 8) return .uncertain;
         const b = inf.body;
@@ -2461,7 +2601,8 @@ const Inferrer = struct {
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .uncertain;
                 switch (def) {
                     .local => |l| {
-                        // 外层函数的局部变量（体内容器的成员中引用）：与编译器一致，只能引用 comptime 已知的
+                        // A local of the outer function (referenced in a member of a container in
+                        // the body): matching the compiler, it can only be a comptime-known one
                         if (l.file != inf.file or l.item != inf.item) return .comptime_known;
                         const binding = b.binding(l.binding);
                         return switch (binding.kind) {
@@ -2476,7 +2617,7 @@ const Inferrer = struct {
                 }
             },
             .field_access => |fa| {
-                // 容器的声明
+                // A declaration of a container
                 if (inf.members[@backingInt(e)]) |owner| {
                     const tree = try inf.r.itemTree(owner.file);
                     for (tree.items) |it| if (it.ast_id == owner.item) return declKnownness(it);
@@ -2485,7 +2626,8 @@ const Inferrer = struct {
                 return inf.anyRuntime(&.{fa.lhs}, depth);
             },
             .call => |c| {
-                // 普通函数的调用在运行时执行（返回 comptime-only 类型的调用已在上面处理）
+                // Calls to ordinary functions execute at runtime (calls that return comptime-only
+                // types have been handled above)
                 const fv = switch (ip.key(inf.get(c.callee).val orelse return .uncertain)) {
                     .fn_value => |f| f,
                     else => return .uncertain,
@@ -2502,7 +2644,8 @@ const Inferrer = struct {
             .@"catch" => |x| return inf.anyRuntime(&.{x.lhs}, depth),
             .builtin_call => |c| {
                 if (c.args.len == 0) return .uncertain;
-                // 转换类的内置函数取决于被转换的值（最后一个参数），`@field` 取决于对象
+                // Cast builtins depend on the value being cast (the last argument), and `@field`
+                // on the object
                 const casts = [_][]const u8{ "@as", "@intCast", "@truncate", "@bitCast", "@floatCast", "@floatFromInt", "@intFromFloat", "@ptrCast", "@alignCast", "@constCast", "@volatileCast", "@intFromEnum", "@enumFromInt", "@intFromBool", "@intFromPtr", "@errorCast" };
                 for (casts) |n| if (std.mem.eql(u8, c.name, n)) return inf.anyRuntime(c.args[c.args.len - 1 ..], depth);
                 if (std.mem.eql(u8, c.name, "@field")) return inf.anyRuntime(c.args[0..1], depth);
@@ -2512,14 +2655,15 @@ const Inferrer = struct {
         }
     }
 
-    /// 有一个运行时的值即为运行时
+    /// Runtime if any of the values is runtime
     fn anyRuntime(inf: *Inferrer, es: []const ExprId, depth: u32) Error!Knownness {
         for (es) |x| if (try inf.knownness(x, depth + 1) == .runtime) return .runtime;
         return .uncertain;
     }
 
-    /// 非 comptime 参数：返回 comptime-only 类型的函数在 comptime 调用，参数都 comptime 已知；
-    /// inline 函数的参数取决于调用处
+    /// Non-comptime parameters: a function returning a comptime-only type is called at comptime,
+    /// so its parameters are all comptime-known; parameters of inline functions depend on the
+    /// call site
     fn paramKnownness(inf: *Inferrer) Error!Knownness {
         const it = (try inf.r.itemTree(inf.file)).items[inf.item];
         if (it.kind != .@"fn" or it.flags.is_inline) return .uncertain;
@@ -2528,8 +2672,9 @@ const Inferrer = struct {
         return if (try eval.isComptimeOnly(inf.r, ret)) .comptime_known else .runtime;
     }
 
-    /// 捕获：非 inline 循环的捕获每次迭代不同，在运行时确定；if、catch 与 switch 的捕获取决于来源
-    /// （switch 只看载荷：inline 分支的标签捕获 comptime 已知）
+    /// Captures: a capture of a non-inline loop differs in each iteration and is determined at
+    /// runtime; captures of if, catch and switch depend on their source (switch looks only at the
+    /// payload: the tag capture of an inline prong is comptime-known)
     fn captureKnownness(inf: *Inferrer, binding: Body.BindingId, depth: u32) Error!Knownness {
         for (inf.body.exprs) |x| switch (x) {
             .@"if" => |i| if (contains(i.capture, binding) or contains(i.else_capture, binding)) return inf.anyRuntime(&.{i.cond}, depth),
@@ -2541,7 +2686,8 @@ const Inferrer = struct {
         return .uncertain;
     }
 
-    /// `&x`：局部变量与参数的地址在运行时确定，全局声明的地址 comptime 已知
+    /// `&x`: addresses of local variables and parameters are determined at runtime; addresses of
+    /// global declarations are comptime-known
     fn addressKnownness(inf: *Inferrer, e: ExprId, depth: u32) Error!Knownness {
         const b = inf.body;
         switch (b.expr(e)) {
@@ -2557,7 +2703,8 @@ const Inferrer = struct {
         }
     }
 
-    /// 表达式的源码形式（显示长度未知的数组用）：名字、字段访问、字面量、调用与二元运算；其他形式为 false
+    /// Source form of an expression (used to display arrays of unknown length): names, field
+    /// accesses, literals, calls and binary operations; false for other forms
     fn exprText(inf: *Inferrer, e: ExprId, out: *std.ArrayList(u8), depth: u32) Error!bool {
         if (depth > 8) return false;
         const a = inf.scratch;
@@ -2591,7 +2738,7 @@ const Inferrer = struct {
             .binary => |x| {
                 const tag: std.zig.Token.Tag = @fromBackingInt(@as(@typeInfo(std.zig.Token.Tag).@"enum".tag_type, @intCast(@backingInt(x.op))));
                 const op = tag.lexeme() orelse return false;
-                // 嵌套的运算加上括号（HIR 中不保留括号）
+                // Nested operations get parentheses (HIR does not keep parentheses)
                 for ([_]ExprId{ x.lhs, x.rhs }, 0..) |side, i| {
                     if (i == 1) try out.print(a, " {s} ", .{op});
                     const nested = inf.body.expr(side) == .binary;
@@ -2605,7 +2752,8 @@ const Inferrer = struct {
         return true;
     }
 
-    /// `[_]T{ ... }`：数组长度由元素个数决定。不是这种形式时返回 null
+    /// `[_]T{ ... }`: the array length is determined by the number of elements. Returns null
+    /// when the expression is not in this form.
     fn inferredLenArray(inf: *Inferrer, te: ExprId, n: usize) Error!?Index {
         const arr = switch (inf.body.expr(te)) {
             .array_type => |a| a,
@@ -2630,9 +2778,10 @@ const Inferrer = struct {
         return t;
     }
 
-    // ── 类型工具 ─────────────────────────────────────────────────────
+    // ── Type utilities ───────────────────────────────────────────────
 
-    /// `for` 遍历的元素类型：`elementType`，以及各字段类型相同的元组（`.{ f32, f64 }` 的元素为 `type`）
+    /// Element type iterated by `for`: `elementType`, plus tuples whose fields all have the same
+    /// type (the element of `.{ f32, f64 }` is `type`)
     fn forElement(inf: *Inferrer, t: Index) Index {
         const tt = tupleOf(inf.ip, t) orelse return inf.elementType(t);
         if (tt.types.len == 0) return .unknown;
@@ -2640,7 +2789,7 @@ const Inferrer = struct {
         return tt.types[0];
     }
 
-    /// 数组、向量、切片、多项指针、指向数组的指针的元素类型
+    /// Element type of arrays, vectors, slices, many-item pointers and pointers to arrays
     fn elementType(inf: *Inferrer, t: Index) Index {
         const ip = inf.ip;
         return switch (ip.key(t)) {
@@ -2659,8 +2808,10 @@ const Inferrer = struct {
         };
     }
 
-    /// 切片（与编译器的 `analyzeSlice` 一致）：长度 comptime 已知时为指向数组的指针，否则为切片；多项指针
-    /// 不给结束位置时为指针运算，仍是原指针类型。切到数组或切片的末尾时保留原有的哨兵
+    /// Slicing (matches the compiler's `analyzeSlice`): a pointer to an array when the length is
+    /// comptime-known, a slice otherwise; slicing a many-item pointer without an end is pointer
+    /// arithmetic and keeps the original pointer type. Slicing up to the end of an array or slice
+    /// keeps its original sentinel.
     fn slice(inf: *Inferrer, e: ExprId, lhs_e: ExprId, start_e: ExprId, end_e: ?ExprId, sentinel_e: ?ExprId) Error!TypedValue {
         const ip = inf.ip;
         const lhs = try inf.infer(lhs_e, null);
@@ -2674,7 +2825,7 @@ const Inferrer = struct {
                 .one => switch (ip.key(p.child)) {
                     .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const },
                     .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = p.is_const },
-                    // 指向单个元素的指针按长度为 1 的数组切片
+                    // A pointer to a single element is sliced as an array of length 1
                     else => .{ .elem = p.child, .len = 1, .is_const = p.is_const },
                 },
                 .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const },
@@ -2691,14 +2842,15 @@ const Inferrer = struct {
         if (start_n != null and end_n != null and end_n.? >= start_n.?) {
             const array = try ip.get(.{ .array_type = .{ .len = end_n.? - start_n.?, .child = src.elem, .sentinel = sentinel } });
             const ty = try ip.ptrTo(array, .one, src.is_const);
-            // comptime 已知的常量与区间：由解释器求出切片的值
+            // comptime-known constant and range: the interpreter computes the value of the slice
             if (src.is_const) if (try inf.knownValue(e, lhs.val, ty)) |tv| return tv;
             return .{ .ty = ty };
         }
         return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel } }) };
     }
 
-    /// 移位右侧的结果类型 `Log2Int(T)`（与编译器一致）；不是整数及其向量时为 null
+    /// Result type `Log2Int(T)` of the right-hand side of a shift (matches the compiler); null for
+    /// types other than integers and vectors of integers
     fn log2IntType(inf: *Inferrer, t: Index) Error!?Index {
         const ip = inf.ip;
         if (t == .comptime_int_type) return .comptime_int_type;
@@ -2713,8 +2865,8 @@ const Inferrer = struct {
         return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits));
     }
 
-    /// 赋值右侧的结果类型（与编译器一致）：`<<=` / `>>=` 为 `Log2Int(T)`，`<<|=` 没有结果类型，多项指针的
-    /// `+=` / `-=` 为 usize
+    /// Result type of the right-hand side of an assignment (matches the compiler): `Log2Int(T)`
+    /// for `<<=` / `>>=`, none for `<<|=`, and usize for `+=` / `-=` on many-item pointers
     fn assignRhsType(inf: *Inferrer, op: SyntaxKind, lhs: Index) Error!?Index {
         if (lhs == .unknown) return null;
         return switch (op) {
@@ -2732,21 +2884,22 @@ const Inferrer = struct {
         };
     }
 
-    /// `&x`：x 是 const 声明或 const 局部变量时得到 `*const T`
+    /// `&x`: `*const T` when x is a const declaration or a const local variable
     fn isConstPlace(inf: *Inferrer, e: ExprId) Error!bool {
         const b = inf.body;
         switch (b.expr(e)) {
             .name_ref => |name| {
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
                 return switch (def) {
-                    // 外层函数的局部变量（体内容器的成员中引用）在其所在成员的 Body 中
+                    // A local of the outer function (referenced in a member of a container in
+                    // the body) is in the Body of the member it belongs to
                     .local => |l| (if (l.file == inf.file and l.item == inf.item) b else try inf.r.body(l.file, l.item)).binding(l.binding).kind != .local_var,
                     .item => |it| (try inf.r.itemTree(it.file)).items[it.item].kind == .@"const",
                     .file => true,
                 };
             },
             .field_access => |fa| {
-                // 经由指针访问时取决于指针；否则取决于左侧
+                // Access through a pointer depends on the pointer; otherwise on the left-hand side
                 const lhs = inf.get(fa.lhs);
                 return switch (inf.ip.key(lhs.ty)) {
                     .ptr_type => |p| p.is_const,
@@ -2772,7 +2925,7 @@ const Inferrer = struct {
         };
     }
 
-    /// peer type resolution 的常用子集；无法统一时为 unknown
+    /// A commonly used subset of peer type resolution; unknown when the types cannot be unified
     pub fn peer(inf: *Inferrer, types: []const Index) Error!Index {
         const ip = inf.ip;
         var result: ?Index = null;
@@ -2802,25 +2955,27 @@ const Inferrer = struct {
                 continue;
             }
             if (t == .comptime_float_type and ip.isFloat(cur)) continue;
-            // 枚举字面量与枚举或带标签的 union：取后者
+            // An enum literal with an enum or a tagged union: take the latter
             if (cur == .enum_literal_type and isTagged(ip, t)) {
                 result = t;
                 continue;
             }
             if (t == .enum_literal_type and isTagged(ip, cur)) continue;
-            // 整数之间：同符号取较宽者（位宽相同取前者），无符号且较窄时放入有符号，与编译器一致
+            // Between integers: with the same signedness, take the wider (the former for equal bit
+            // widths); a narrower unsigned one is put into the signed one (matches the compiler)
             if (value.peerIntType(ip, cur, t)) |p| {
                 result = p;
                 continue;
             }
-            // 浮点之间取位宽较大者（c_longdouble 的位宽取决于目标）
+            // Between floats, take the wider one (c_longdouble's bit width depends on the target)
             if (ip.isFloat(cur) and ip.isFloat(t)) {
                 const x = value.floatBits(ip, cur) orelse return .unknown;
                 const y = value.floatBits(ip, t) orelse return .unknown;
                 if (y > x) result = t;
                 continue;
             }
-            // 一侧为 optional：载荷与另一侧的 peer 再包为 optional
+            // One side is an optional: the peer of the payload and the other side is wrapped back
+            // into an optional
             if (ip.key(cur) == .optional_type or ip.key(t) == .optional_type) {
                 const p = try inf.peer(&.{ optionalChild(ip, cur), optionalChild(ip, t) });
                 if (p == .unknown) return .unknown;
@@ -2838,7 +2993,7 @@ const Inferrer = struct {
         return t;
     }
 
-    /// 枚举字面量可以转换到的类型：枚举与 union
+    /// Types an enum literal can coerce to: enums and unions
     fn isTagged(ip: *InternPool, t: Index) bool {
         if (value.isEnumType(ip, t)) return true;
         return switch (ip.key(t)) {
@@ -2860,7 +3015,8 @@ const Inferrer = struct {
 
 pub const FnType = @FieldType(InternPool.Key, "fn_type");
 
-/// 容器的声明的值：var 与 extern 声明在运行时读取，其余（const、函数）comptime 已知
+/// Value of a container's declaration: var and extern declarations are read at runtime, and the
+/// rest (const, functions) are comptime-known
 fn declKnownness(it: ItemTree.Item) Inferrer.Knownness {
     return if (it.kind == .@"var" or it.flags.is_extern) .runtime else .comptime_known;
 }
@@ -2869,9 +3025,11 @@ fn contains(list: []const Body.BindingId, b: Body.BindingId) bool {
     return std.mem.indexOfScalar(Body.BindingId, list, b) != null;
 }
 
-/// `if` / `switch` 各分支（含嵌套的）的结果表达式
-/// 声明 `owner` 在各种构建配置下可能的值（容器类型）：初始化为按 comptime 条件选择的 `if` / `switch` 时取
-/// 各分支，分支或初始化本身是别名（`linux`、`std.c`、`system.SO`）时沿别名查找。用于当前配置下不存在的成员
+/// Result expressions of the branches of `if` / `switch` (including nested ones)
+/// Possible values (container types) of the declaration `owner` across build configurations: when
+/// the initializer is an `if` / `switch` selected by a comptime condition, take each branch; when
+/// a branch or the initializer itself is an alias (`linux`, `std.c`, `system.SO`), follow the
+/// alias. Used for members that do not exist in the current configuration.
 fn alternativeContainers(r: *Resolver, a: Allocator, owner: hir.OwnerKey, out: *std.ArrayList(Index), depth: u32) Error!void {
     if (depth > max_alternative_depth) return;
     const item = try itemOfKey(r, owner) orelse return;
@@ -2884,10 +3042,12 @@ fn alternativeContainers(r: *Resolver, a: Allocator, owner: hir.OwnerKey, out: *
     for (leaves.items) |leaf| try leafAlternatives(r, a, owner.file, item, body, res.exprs, leaf, out, depth);
 }
 
-/// 查找其他配置下的候选时沿别名与推导链的最大层数：互相引用的声明不会结束
+/// Maximum depth along alias and inference chains when looking up candidates in other
+/// configurations: mutually referencing declarations would not terminate
 const max_alternative_depth = 16;
 
-/// 表达式 `e` 在各种构建配置下可能的值（容器类型）：当前的值，以及它引用的声明在其他配置下的值
+/// Possible values (container types) of the expression `e` across build configurations: the
+/// current value, and the values of the declaration it references in other configurations
 fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *const Body, exprs: []const TypedValue, e: ExprId, out: *std.ArrayList(Index), depth: u32) Error!void {
     if (depth > max_alternative_depth) return;
     const ip = r.ctx.db.env.ip;
@@ -2898,7 +3058,7 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
             const key = try defKey(r, def) orelse return;
             try alternativeContainers(r, a, key, out, depth + 1);
         },
-        // `X.Name`：X 的各个可能的容器中的 `Name`
+        // `X.Name`: `Name` in each possible container of X
         .field_access => |fa| {
             const name = fa.field orelse return;
             var bases: std.ArrayList(Index) = .empty;
@@ -2916,10 +3076,10 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
     }
 }
 
-/// owner 中的表达式及其推导结果
+/// Expressions in an owner and their inference results
 const ExprCtx = struct {
     file: FileId,
-    /// `ItemTree.items` 下标
+    /// Index into `ItemTree.items`
     item: u32,
     body: *const Body,
     exprs: []const TypedValue,
@@ -2934,8 +3094,11 @@ fn ownerCtx(r: *Resolver, key: hir.OwnerKey, mode: Mode) Error!?ExprCtx {
     return .{ .file = key.file, .item = item, .body = body, .exprs = res.exprs, .members = res.members };
 }
 
-/// 表达式 `e` 的值在各种构建配置下可能的类型（容器类型）：当前的类型；局部变量与参数的类型标注或初始化；
-/// 全局变量的类型标注或初始化；调用的返回类型（`X.Y.init()` 还取 `X.Y`）；字段访问取左侧各种类型中同名字段的类型
+/// Possible types (container types) of the value of the expression `e` across build
+/// configurations: the current type; the type annotation or initializer of locals and parameters;
+/// the type annotation or initializer of global variables; the return type of calls (`X.Y.init()`
+/// also takes `X.Y`); for field access, the types of the fields with the same name in each
+/// possible type of the left-hand side
 fn valueAlternatives(r: *Resolver, a: Allocator, c: ExprCtx, e: ExprId, out: *std.ArrayList(Index), depth: u32) Error!void {
     if (depth > max_alternative_depth) return;
     const ip = r.ctx.db.env.ip;
@@ -2981,7 +3144,7 @@ fn valueAlternatives(r: *Resolver, a: Allocator, c: ExprCtx, e: ExprId, out: *st
             if (callee_key) |key| if (try ownerCtx(r, key, .signature)) |fc| if (fc.body.type_expr) |ret| {
                 try typeAlternatives(r, a, fc, ret, out);
             };
-            // 返回 `@This()` 的构造函数在其他配置下的类型由 `X.Y` 给出
+            // For a constructor returning `@This()`, `X.Y` gives its type in other configurations
             switch (c.body.expr(call.callee)) {
                 .field_access => |fa| try leafAlternatives(r, a, c.file, c.item, c.body, c.exprs, fa.lhs, out, 0),
                 else => {},
@@ -3003,8 +3166,10 @@ fn valueAlternatives(r: *Resolver, a: Allocator, c: ExprCtx, e: ExprId, out: *st
     }
 }
 
-/// 类型表达式在各种构建配置下可能的容器类型；可选、错误联合与指针取其中的类型。
-/// 类型的别名链与值的推导链分别限制深度：值经过几层变量与调用之后，类型仍可能有多层别名
+/// Possible container types of a type expression across build configurations; for optionals,
+/// error unions and pointers, the type inside is taken. The alias chain of types and the
+/// inference chain of values are depth-limited separately: after a value goes through several
+/// variables and calls, its type may still have several levels of aliases.
 fn typeAlternatives(r: *Resolver, a: Allocator, c: ExprCtx, t: ExprId, out: *std.ArrayList(Index)) Error!void {
     var x = t;
     while (true) switch (c.body.expr(x)) {
@@ -3020,7 +3185,7 @@ fn appendUnique(a: Allocator, out: *std.ArrayList(Index), t: Index) Allocator.Er
     if (std.mem.indexOfScalar(Index, out.items, t) == null) try out.append(a, t);
 }
 
-/// `ItemTree.items` 中 AST id 为 `key.item` 的项的下标
+/// Index of the item in `ItemTree.items` whose AST id is `key.item`
 fn itemOfKey(r: *Resolver, key: hir.OwnerKey) Error!?u32 {
     const tree = try r.itemTree(key.file);
     for (tree.items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
@@ -3039,7 +3204,7 @@ fn branchLeaves(a: Allocator, body: *const Body, e: ExprId, out: *std.ArrayList(
     }
 }
 
-/// 指针转换类内置函数（嵌套时在编译器中合并为一次转换）
+/// Pointer cast builtins (when nested, the compiler merges them into one cast)
 fn isPtrCast(name: []const u8) bool {
     for ([_][]const u8{ "@ptrCast", "@alignCast", "@addrSpaceCast", "@constCast", "@volatileCast" }) |n| {
         if (std.mem.eql(u8, name, n)) return true;
@@ -3054,8 +3219,10 @@ fn optionalChild(ip: *InternPool, t: Index) Index {
     };
 }
 
-/// 两个指针的 peer（与编译器一致）：元素类型须相同；指向数组的单项指针与切片、多项指针统一为后者，长度不同的
-/// 数组指针统一为切片；const 取并集，哨兵只在两侧相同时保留。不能统一时为 null
+/// Peer of two pointers (matches the compiler): the element types must be the same; a single-item
+/// pointer to an array unifies with a slice or many-item pointer into the latter, and array
+/// pointers of different lengths unify into a slice; const if either side is const, and the
+/// sentinel is kept only when both sides have the same one. null when they cannot be unified.
 fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
     const x = switch (ip.key(a)) {
         .ptr_type => |p| p,
@@ -3076,7 +3243,7 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
         else => null,
     } else null;
     const is_const = x.is_const or y.is_const;
-    // 指向非数组的单项指针只与同类型的单项指针统一
+    // A single-item pointer to a non-array only unifies with the same single-item pointer type
     if ((x.size == .one and xa == null) or (y.size == .one and ya == null)) {
         if (x.size != y.size or x.child != y.child) return null;
         return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .one, .is_const = is_const } });
@@ -3098,8 +3265,10 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
     return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel } });
 }
 
-/// 指向元组的单项指针 `p`（`&.{}`、`&.{ a, b }`）的各项都是指针 `other` 的元素类型（或没有项）时，对应的指向
-/// 数组的指针：与切片、指向数组的指针做 peer type resolution 时按数组处理（`else => &.{}`）
+/// The pointer to an array corresponding to the single-item pointer to a tuple `p` (`&.{}`,
+/// `&.{ a, b }`) when all its items have the element type of the pointer `other` (or it has no
+/// items): treated as an array in peer type resolution with slices and pointers to arrays
+/// (`else => &.{}`)
 fn tupleAsArray(ip: *InternPool, p: @FieldType(InternPool.Key, "ptr_type"), other: @FieldType(InternPool.Key, "ptr_type")) Allocator.Error!?Index {
     if (p.size != .one) return null;
     const tt = switch (ip.key(p.child)) {
@@ -3115,7 +3284,7 @@ fn tupleAsArray(ip: *InternPool, p: @FieldType(InternPool.Key, "ptr_type"), othe
     return try ip.ptrTo(arr, .one, p.is_const);
 }
 
-/// 可做指针运算的指针（多项指针与 C 指针）
+/// Pointers that support pointer arithmetic (many-item pointers and C pointers)
 fn isManyPtr(ip: *InternPool, t: Index) bool {
     return switch (ip.key(t)) {
         .ptr_type => |p| p.size == .many or p.size == .c,
@@ -3132,7 +3301,8 @@ fn isNonSlicePtr(ip: *InternPool, t: Index) bool {
 
 const ConcatOperand = struct { elem: Index, len: u64, sentinel: ?Index, is_ptr: bool };
 
-/// `++` 的一侧：数组、指向数组的指针，或另一侧可下标时的元组（元素类型取另一侧的）
+/// One side of `++`: an array, a pointer to an array, or a tuple when the other side is indexable
+/// (taking the element type of the other side)
 fn concatOperand(ip: *InternPool, t: Index, other: Index) ?ConcatOperand {
     switch (ip.key(t)) {
         .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = false },
@@ -3161,7 +3331,7 @@ fn concatOperand(ip: *InternPool, t: Index, other: Index) ?ConcatOperand {
     return null;
 }
 
-/// 元组类型（含指向元组的单项指针）
+/// Tuple types (including single-item pointers to tuples)
 pub fn tupleOf(ip: *InternPool, t: Index) ?InternPool.Tuple {
     return switch (ip.key(t)) {
         .tuple_type => |tt| tt,
@@ -3173,7 +3343,7 @@ pub fn tupleOf(ip: *InternPool, t: Index) ?InternPool.Tuple {
     };
 }
 
-/// 元组与匿名结构体类型中名为 `name` 的 comptime 字段的值
+/// Value of the comptime field named `name` in tuple and anonymous struct types
 fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
     const v = switch (ip.key(t)) {
         .tuple_type => |tt| blk: {
@@ -3189,11 +3359,13 @@ fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
     return if (v == .runtime or v == .unknown) null else v;
 }
 
-/// `comptime_anytype`（`comptime x: anytype`）在实例中记录实参值，参数类型由值给出；`anytype_type` 记录实参类型
+/// `comptime_anytype` (`comptime x: anytype`) records the argument value in the instance, and
+/// the parameter type is given by the value; `anytype_type` records the argument type
 pub const ParamKind = enum { runtime, comptime_value, comptime_anytype, anytype_type };
 
-/// 需要实例化的被调函数：参数中有 comptime（含隐式的 comptime-only 类型参数）或 anytype，
-/// 或返回 comptime-only 类型（如 `type`，此时调用在 comptime 执行，所有实参都参与实例）
+/// A callee that needs instantiation: it has comptime parameters (including implicit ones of
+/// comptime-only types) or anytype parameters, or returns a comptime-only type (e.g. `type`, in
+/// which case the call executes at comptime and all arguments take part in the instance)
 pub const Generic = struct {
     owner: hir.OwnerKey,
     body: *const Body,
@@ -3212,7 +3384,8 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
         else => return null,
     };
     const owner: hir.OwnerKey = .{ .file = fv.file, .item = fv.decl };
-    // 先只看参数的形式：不是泛型的调用（绝大多数）不依赖被调函数的函数体
+    // Look only at the parameter forms first: non-generic calls (the vast majority) do not depend
+    // on the callee's body
     const forms = try r.ctx.get(hir.ParamForms, owner);
     const all_comptime = try eval.isComptimeOnly(r, f.ret);
     const kinds = try scratch.alloc(ParamKind, forms.len);
@@ -3232,9 +3405,10 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
     return .{ .owner = owner, .body = try r.ctx.get(hir.ItemBody, owner), .parent = fv.inst, .kinds = kinds };
 }
 
-/// 调用的实例（`args` 与形参一一对应）。comptime 实参按参数类型转换：参数类型依赖其他参数
-/// （`comptime n: T`）时，先以未转换的实参建立实例求出参数类型，再转换实参，保证 `Box(u8, 3)`
-/// 与 `Box(u8, @as(u8, 3))` 是同一个实例
+/// Instance of a call (`args` is parallel to the parameters). comptime arguments are coerced to
+/// the parameter types: when a parameter type depends on other parameters (`comptime n: T`), an
+/// instance is first built with the uncoerced arguments to evaluate the parameter types, then
+/// the arguments are coerced, so `Box(u8, 3)` and `Box(u8, @as(u8, 3))` are the same instance.
 pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args: []const TypedValue) Error!Index {
     const ip = r.ctx.db.env.ip;
     const inst_args = try scratch.alloc(Index, g.body.params.len);
@@ -3272,9 +3446,11 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
     return inst;
 }
 
-/// 非泛型函数作为 comptime 调用执行时的实例（不区分实参，实参的值另行传入）
-/// 实例用于它所属的成员 `owner` 自身时：带迭代的实例（见 `InternPool.Instance.iteration`）拆成外层实例与
-/// 循环种子；其他实例原样返回
+/// Instance used when a non-generic function is executed as a comptime call (it does not
+/// distinguish arguments; argument values are passed separately)
+/// When the instance is used for the member `owner` it belongs to: an instance with an iteration
+/// (see `InternPool.Instance.iteration`) is split into the outer instance and the loop seed;
+/// other instances are returned as is
 fn splitIteration(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) Error!struct { inst: ?Index, seed: ?LoopSeed } {
     const i = inst orelse return .{ .inst = null, .seed = null };
     const key = ip.key(i).instance;
@@ -3287,7 +3463,7 @@ fn splitIteration(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) Error!stru
     return .{ .inst = try ip.get(.{ .instance = base }), .seed = seed };
 }
 
-/// 循环种子的循环变量所在的区域：`for` 循环体，或 `inline` switch 分支的分支体
+/// Region of a loop seed's loop variable: a `for` loop body or an `inline` switch prong body
 fn seedRegion(body: *const Body, binding: u32) ?Body.Range {
     for (body.exprs) |x| switch (x) {
         .loop => |l| for (l.capture) |c| if (@backingInt(c) == binding) return body.range(l.body),
@@ -3303,7 +3479,7 @@ pub fn runtimeInstance(ip: *InternPool, scratch: Allocator, fv: @FieldType(Inter
     return ip.get(.{ .instance = .{ .file = fv.file, .decl = fv.decl, .args = args, .parent = fv.inst } });
 }
 
-/// 比较两个数
+/// Compares two numbers
 fn order(op: SyntaxKind, x: anytype, y: @TypeOf(x)) ?bool {
     return switch (op) {
         .equal_equal => x == y,
@@ -3316,7 +3492,7 @@ fn order(op: SyntaxKind, x: anytype, y: @TypeOf(x)) ?bool {
     };
 }
 
-/// 不计 noreturn 的分支：各分支的值都相同时为该值
+/// Ignoring noreturn branches: the value when all branches have the same value
 fn sameLiveValue(values: []const TypedValue, ty: Index) ?Index {
     var v: ?Index = null;
     for (values) |x| {
@@ -3330,7 +3506,7 @@ fn sameLiveValue(values: []const TypedValue, ty: Index) ?Index {
     return v;
 }
 
-/// 各个 break 的值都相同（且类型就是汇合后的类型）时的值
+/// The value when all breaks have the same value (and its type is the merged type)
 fn sameValue(values: []const TypedValue, ty: Index) ?Index {
     if (values.len == 0) return null;
     const v = values[0].val orelse return null;
@@ -3342,12 +3518,12 @@ fn boolValue(b: bool) TypedValue {
     return .{ .ty = .bool_type, .val = if (b) .true_value else .false_value };
 }
 
-/// 签名中第 `i` 个参数的类型（未知时为 null）
+/// Type of the `i`-th parameter in the signature (null when unknown)
 fn paramType(f: @FieldType(InternPool.Key, "fn_type"), i: usize) ?Index {
     return if (i < f.params.len and f.params[i] != .unknown) f.params[i] else null;
 }
 
-/// 实例的签名推导结果中第 `i` 个参数的类型
+/// Type of the `i`-th parameter in the signature inference result of an instance
 fn instParamType(sig: *const Result, body: *const Body, i: usize) ?Index {
     if (i >= body.params.len) return null;
     const b = @backingInt(body.params[i]);
@@ -3359,8 +3535,9 @@ fn typeUnknown() TypedValue {
     return .{ .ty = .type_type };
 }
 
-/// `@hasDecl`（只计 pub 声明）/ `@hasField`；元组、匿名结构体与构造的类型没有声明，字段名在类型中；
-/// 其他不是源码中的容器的类型为 null
+/// `@hasDecl` (counting only pub declarations) / `@hasField`; tuples, anonymous structs and
+/// constructed types have no declarations, and their field names are in the type; null for other
+/// types that are not containers in source code
 fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
     switch (r.ctx.db.env.ip.key(t)) {
         .tuple_type => |tt| {
@@ -3379,8 +3556,10 @@ fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
     return tree.items[m].flags.is_pub;
 }
 
-/// `inline` 分支的取值（非 union、非错误集的操作数）：分支项依次展开，区间 `a...b` 逐个整数。`count` 为
-/// 取值个数，`value` 为第 `want` 个；有求不出的分支项或是 `else` 分支时 `count` 为 null
+/// Values of an `inline` prong (for operands that are not unions or error sets): the items are
+/// expanded in order, and a range `a...b` one integer at a time. `count` is the number of values
+/// and `value` is the `want`-th one; `count` is null when an item cannot be evaluated or for an
+/// `else` prong.
 pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const TypedValue, prong: Body.Prong, ty: Index, want: ?u32) Error!struct { count: ?u32, value: ?Index } {
     if (prong.is_else or !prong.is_inline) return .{ .count = null, .value = null };
     const int_ty: Index = if (value.intInfo(ip, ty) != null) ty else .comptime_int_type;
@@ -3417,11 +3596,12 @@ fn hasName(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// 初始化表达式中一项的结果类型与字段名解析到的字段
+/// Result type of one item in an initializer expression, and the field its field name resolves to
 pub const InitField = struct { ty: ?Index = null, member: ?hir.OwnerKey = null };
 
-/// 类型为 `t` 的初始化表达式中第 `index` 项（`name` 为字段名，元组形式为 null）的结果类型与字段；`ns` 为
-/// `t` 的命名空间（`t` 不是容器类型时为 null）
+/// Result type and field of item `index` (`name` is the field name, null in tuple form) in an
+/// initializer expression of type `t`; `ns` is `t`'s namespace (null when `t` is not a
+/// container type)
 pub fn initField(r: *Resolver, t: Index, ns: ?Namespace, index: usize, name: ?[]const u8) Error!InitField {
     const ip = r.ctx.db.env.ip;
     var field: InitField = .{ .ty = switch (ip.key(t)) {
@@ -3438,14 +3618,14 @@ pub fn initField(r: *Resolver, t: Index, ns: ?Namespace, index: usize, name: ?[]
             field.member = .{ .file = space.file, .item = tree.items[fi].ast_id };
         }
     } else switch (ip.key(t)) {
-        // 构造的类型、元组与匿名结构体的字段
+        // Fields of constructed types, tuples and anonymous structs
         .reified_type, .tuple_type, .anon_struct_type => field.ty = try eval.fieldType(r, t, n),
         else => {},
     };
     return field;
 }
 
-/// 容器中的字段（按名字）
+/// A field in a container (by name)
 pub fn fieldItem(tree: *const ItemTree, container: u32, name: []const u8) ?u32 {
     for (tree.containerMembers(container)) |m| {
         const it = tree.items[m];
@@ -3461,11 +3641,11 @@ pub fn defKey(r: *Resolver, def: resolve.Def) Error!?hir.OwnerKey {
     };
 }
 
-/// 原生类型与值的名字
+/// Names of primitive types and values
 pub fn primitive(ip: *InternPool, name: []const u8) Error!?TypedValue {
     const simple = std.meta.stringToEnum(InternPool.Simple, name);
     if (simple) |s| switch (s) {
-        // 这些是类型名但不是可直接书写的标识符
+        // These are type names but not identifiers that can be written directly
         .null, .undefined, .enum_literal => {},
         else => return TypedValue.ofType(try ip.get(.{ .simple_type = s })),
     };
@@ -3473,7 +3653,7 @@ pub fn primitive(ip: *InternPool, name: []const u8) Error!?TypedValue {
     if (std.mem.eql(u8, name, "false")) return .{ .ty = .bool_type, .val = .false_value };
     if (std.mem.eql(u8, name, "null")) return .{ .ty = .null_type, .val = .null_value };
     if (std.mem.eql(u8, name, "undefined")) return .{ .ty = .undefined_type, .val = .undefined_value };
-    // `u8`、`i32`、`u0`
+    // `u8`, `i32`, `u0`
     if (name.len >= 2 and (name[0] == 'u' or name[0] == 'i')) {
         const bits = std.fmt.parseInt(u16, name[1..], 10) catch return null;
         if (name[1] == '0' and name.len > 2) return null;
