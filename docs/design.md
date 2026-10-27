@@ -196,7 +196,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
   - 文件的归属来自各 compile step 的编译集合。一个文件可属于多个模块（如 exe 与 test 各自创建模块、共用根文件），按名字的 import 依次在这些模块的 import 表中查找。
   - 多个模块以同一名字 import 不同目标时，名字解析（成员、hover、补全等）取最优先的模块：诊断 step 在前，其中本机目标在前，其余 compile step 按构建图的顺序（可用 `diagnostics.step` 改变）。不按位置区分，test 块中不会改用 test 模块的同名 import。光标在 `@import` 或它的字符串上时，跳转（definition / declaration）返回全部目标，按同样的优先级排列；别名的使用处仍跳到 `const x = @import(...)` 声明。`@import("root")` 与 `builtin` 按最优先的归属。
   - 不属于任何模块的文件（单文件模式、不在任何编译集合中的文件、项目加载期间的文件）只能 import std 与相对路径，`builtin` 为本机目标、Debug。`@import("root")` 为 `unknown`：文件可能由另一个文件以相对路径 import，也可能由 `zig test` 编译（根文件是测试运行器），标准库又由所有这类文件共用；经 `@hasDecl(root, ...)` 读取的值（`std.options` 等）因此为 `unknown`，不产生非活动代码。
-- **名字解析**：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、`@This()` 与别名链求命名空间。
+- **名字解析**：局部作用域 → 词法外层容器链；`a.b.c` 沿 `@import`、容器定义、`@This()` 与别名链求命名空间。`@import` 的 `.zon` 文件是值（见语义层），不是命名空间。
 - **HIR**：函数体、初始化表达式、comptime / test 块、字段类型与默认值都是 BodyOwner，降级为容错的表达式 IR（不用 ZIR：有语法错误时不生成），同时算出局部作用域；成员源码未变时沿用上一次的 Body。
 
 ### 4.5 语义层（`sema/`）
@@ -206,6 +206,7 @@ lsp/          由 metaModel.json 生成的类型 · JSON-RPC · 传输
 - **推导**：双向推导对应 Zig 的结果类型语义，期望类型从参数、返回值、标注、字段初始化下推；分支汇合做 peer type resolution（含枚举字面量与枚举、`&.{}` 与切片），没有结果类型的分支中的枚举字面量按 peer 类型解析（`if (t) |x| x.kind else .invalid`）；`unknown` 吸收一切。调用处判断是否为泛型调用只读被调函数的参数形式（`ParamForms`），只改被调函数的函数体时调用者不重新推导。
   - anytype 形参收到的枚举字面量在被调函数的实例中被转换成的类型（每个参数取函数体中第一处）记入推导结果，调用处的字面量引用其中的成员：`testing.expectEqual(.x, actual)` 经 `@TypeOf(expected, actual)` 转换为 actual 的类型。
   - switch 的操作数 comptime 已知时，执行的分支的捕获取实际的载荷值；各项的载荷类型没有 peer 时（只能是 `inline .@"struct", .@"union" => |info|` 这样每项单独实例化的分支）类型也取实际的载荷类型。
+- **`.zon` 的值**：`@import` 一个 `.zon` 文件得到其中的值（`ZonValue`，按文件缓存），推导与解释器相同。文本经官方解析器与 ZonGen 处理，有错误时为 `unknown`，不猜测编辑到一半的内容。没有结果类型时与编译器相同：结构体字面量为匿名结构体、数组字面量为元组（字段都是 comptime 字段），整数与字符为 `comptime_int`，浮点数为 `comptime_float`，字符串为 `*const [n:0]u8`；成员补全、hover 与成员访问因此与源码中同样的匿名字面量一致。`inf`、`nan` 需要结果类型，含有它们的值为 `unknown`；值至多嵌套 256 层，更深的为 `unknown`。有结果类型时编译器按结果类型解析：标量（bool、null、整数、浮点数、枚举字面量）转换为结果类型，其余只取结果类型、值为 `unknown`（字符串、元组与结构体可以解析为切片、数组、指针或带默认值的结构体，不能由匿名的值转换得到）。
 - **comptime 解释器**：在 HIR 上执行，支持算术（按位宽回绕 / 饱和 / 溢出检查）、控制流、函数调用、容器构造、`@typeInfo` 与 `@Struct` / `@Enum` 等类型构造 builtin；遇到运行时值、外部函数为 `unknown`。std 的泛型容器、`std.meta` 等因此无需特判。构造类型（`@Struct` / `@Enum` / `@Union`）以构造它的函数实例命名（`FieldEnum(S)`）；不在函数中构造、正是某个常量的值时以常量命名。
   - 跳转到构造类型的成员（字段访问 `x.name`、`E.name`、枚举字面量 `.name`）：名字是 comptime 求出的字符串。来自字符串字面量时（如 zig-clap 解析帮助文本得到的字段名），以跟踪字面量来源的方式重新求值：字符串字面量放在独立的存储单元中，切片保持对它的引用，得到名字在字面量中的位置；候选为初始化表达式含有这个字面量的常量，以及使用处与构造处所在成员的局部绑定。从字符串中取出的单个字节（`@as(*const [1]u8, &str[i])` 构成的短参数名）记下它在字面量中的偏移，名字为单个字符时也按字节匹配。字面量不在构造处可见的常量里、而是作为实参传入（如 `clap.parseParamsComptime(help)` 中 `help` 定义在调用方的另一个文件）时，沿实例的调用处反查实参：实参为外层函数的形参时继续向上追溯外层实例的调用处，实参为常量时取常量的初始化表达式。来自 `@typeInfo(X)` 时（`@typeInfo(Tag).@"enum".field_names`）跳到 X 的同名成员。名字追不到字面量中的字符时（如由字符字面量 `'h'` 构成的短参数名）跳到构造类型的调用（`@Struct(...)` 等）；`tools/lsp_bench.zig` 把这类跳转单独计为 at construction，不算不一致。
   - 内置函数：整数（含带溢出位的运算、精确移位、`@byteSwap` / `@bitReverse`）与浮点运算、`@memcpy` / `@memset` / `@memmove`、`@call`、`@embedFile`（相对所在文件，读取打开的文档或磁盘，文件不存在为 `unknown`）。`@src()` 只给出类型：`module` 字段是构建系统给模块起的名字，项目模型中没有。只在运行时有意义的（原子操作、C 变参、返回地址等）与 `@intFromError`（编号由编译器分配）求不出值。
