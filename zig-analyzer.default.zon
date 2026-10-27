@@ -84,8 +84,9 @@
     // Completion (editor only):
     //   .completion = .{
     //       // In name completion, also offer reachable declarations and modules that are not
-    //       // imported yet, adding the import when one is accepted.
-    //       .auto_import = false,
+    //       // imported yet, adding the import when one is accepted, and members of visible
+    //       // namespaces matched by their whole path (`memeql` -> `std.mem.eql`).
+    //       .auto_import = true,
     //       // At most this many auto-import candidates per completion (the best ranked are kept;
     //       // the list is marked incomplete and refreshed as you type); 0 never limits.
     //       .max_auto_imports = 128,

@@ -11,7 +11,7 @@
 //!                        "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "imports": { "derived": "with_import", "sort": "path" },
-//!       "completion": { "auto_import": false, "max_auto_imports": 128 },
+//!       "completion": { "auto_import": true, "max_auto_imports": 128 },
 //!       "sema": { "callsite_seeding": true },
 //!       "cache": { "capacity": 64, "queries": { "Infer": { "count": 16384, "mb": 48 } } },
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
@@ -78,8 +78,8 @@ semantic_tokens_global_var: bool = false,
 imports_derived: ImportOptions.Derived = .with_import,
 /// import 块的组内排序：按引用的路径或声明名
 imports_sort: ImportOptions.Sort = .path,
-/// 普通名字补全中提供可达声明与模块的自动导入
-completion_auto_import: bool = false,
+/// 普通名字补全中提供可达声明与模块的自动导入，以及按整条路径匹配的可见命名空间的成员
+completion_auto_import: bool = true,
 /// 一次补全至多提供的自动导入候选（保留排序最好的，其余由客户端随输入重新请求得到）；0 为不限
 completion_max_auto_imports: u32 = 128,
 /// 泛型函数体内没有具体类型时以调用点的实例推导（hover、补全、inlay hints 等）

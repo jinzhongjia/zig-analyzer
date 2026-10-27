@@ -566,7 +566,7 @@ fn isIncomplete(response: std.json.Value) bool {
     return result == .object and result.object.get("isIncomplete").?.bool;
 }
 
-test "auto-import is off by default and its limit is configurable" {
+test "auto-import is on by default, can be turned off, and its limit is configurable" {
     const files = [_]fixture.File{
         .{ .path = "build.zig", .text = fixture.basic[0].text },
         .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
@@ -593,18 +593,33 @@ test "auto-import is off by default and its limit is configurable" {
     _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, "_ = Alph", 8, .utf16);
     const params = .{ .textDocument = .{ .uri = uri }, .position = at };
-    // 默认关闭：不提供，也不要求客户端重新请求
+    // 默认开启：第一次在可以导入的名字处补全时开始建索引，建完后提供
+    try startAutoImport(&h, uri, at);
+    const default = try h.request("textDocument/completion", params);
+    for ([_][]const u8{ "Alpha1", "Alpha2", "Alpha3" }) |name| {
+        for (completionItems(default)) |item| {
+            if (std.mem.eql(u8, item.object.get("label").?.string, name)) break;
+        } else return error.MissingCandidate;
+    }
+
+    // 关闭：不提供，也不要求客户端重新请求
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
+        .completion = .{ .auto_import = false },
+        .diagnostics = .{ .compiler = false, .inactive_code = false },
+        .files = .{ .watcher = "client" },
+    } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
     const off = try h.request("textDocument/completion", params);
     try testing.expectEqual(0, importCount(off));
     try testing.expect(!isIncomplete(off));
 
+    // 重新开启时沿用已建的索引
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{
         .completion = .{ .auto_import = true, .max_auto_imports = 1 },
         .diagnostics = .{ .compiler = false, .inactive_code = false },
         .files = .{ .watcher = "client" },
     } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    try startAutoImport(&h, uri, at);
     const limited = try h.request("textDocument/completion", params);
     try testing.expectEqual(1, importCount(limited));
     try testing.expect(isIncomplete(limited));
@@ -617,7 +632,7 @@ test "auto-import is off by default and its limit is configurable" {
     } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const unlimited = try h.request("textDocument/completion", params);
-    // lib.zig 的三个，以及标准库中同样以 `Alph` 开头的公开声明
+    // lib.zig 的三个，以及标准库中匹配 `Alph` 的公开声明
     try testing.expect(importCount(unlimited) >= 3);
     for ([_][]const u8{ "Alpha1", "Alpha2", "Alpha3" }) |name| {
         for (completionItems(unlimited)) |item| {
