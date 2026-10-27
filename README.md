@@ -1,7 +1,5 @@
 # zig-analyzer
 
-English | [简体中文](README.zh-CN.md)
-
 A language server (LSP) for Zig, built on an incremental query engine.
 
 - **Diagnostics match the compiler**: errors come only from Zig itself (in-process AstGen while typing, `zig build` on save), never from guesses.
