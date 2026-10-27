@@ -14,14 +14,14 @@ const test_path = @import("../util/test_path.zig");
 const native = test_path.native;
 const InternPool = @import("../sema/InternPool.zig");
 
-/// 内存中的项目：文件内容直接设置为 input，模块图手工构造
+/// In-memory project: file contents are set directly as inputs; the module graph is built by hand
 pub const World = struct {
     vfs: Vfs,
     ip: InternPool,
     env: database.Env,
     db: Db,
     arena: std.heap.ArenaAllocator,
-    /// `setGraph` 时不属于任何模块的文件使用的 builtin
+    /// builtin used by files that belong to no module when `setGraph` is called
     default_builtin: ?FileId = null,
 
     pub fn init(w: *World) !void {
@@ -40,14 +40,14 @@ pub const World = struct {
         w.arena.deinit();
     }
 
-    /// 添加的文件与去掉 `<|>` 后的光标位置（没有标记时为 0）
+    /// The added file and the cursor position after removing `<|>` (0 without a marker)
     pub const Added = struct { file: FileId, cursor: u32 };
 
     pub fn add(w: *World, comptime path: []const u8, text: []const u8) !Added {
         return w.addNative(native(path), text);
     }
 
-    /// 同 `add`，`path` 已是本机路径
+    /// Like `add`, but `path` is already a native path
     fn addNative(w: *World, path: []const u8, text: []const u8) !Added {
         const file = try w.vfs.intern(path);
         const cursor = std.mem.indexOf(u8, text, "<|>");
@@ -72,12 +72,12 @@ pub const World = struct {
         try w.db.set(ModuleGraph.Input, {}, g, .low);
     }
 
-    /// `fixture` 中的文件与 `<|>` 的位置
+    /// The files in a `fixture` and the position of `<|>`
     pub const Fixture = struct {
-        /// fixture 中写的路径（posix 写法）与对应的文件
+        /// Paths as written in the fixture (posix style) and the corresponding files
         paths: []const []const u8,
         files: []const FileId,
-        /// `<|>` 所在的文件与去掉标记后的位置
+        /// The file containing `<|>` and the position after the marker is removed
         cursor: ?struct { file: FileId, offset: u32 } = null,
 
         pub fn file(f: Fixture, path: []const u8) FileId {
@@ -86,14 +86,19 @@ pub const World = struct {
         }
     };
 
-    /// 多文件、多模块的测试项目（参照 rust-analyzer 的 fixture）。每个文件以一行 `//- <路径> <属性>...` 开始，路径用
-    /// posix 写法。属性决定文件在模块图中的位置，没有属性的文件不在模块图中：
-    /// - `std`：标准库中的文件，其中的 `std.zig` 是标准库的根；
-    /// - `module:<名字>`：作为这个模块的根，紧随其后的 `deps:<名字>[=<模块>],...` 是这个模块的 import（import 的名字
-    ///   与模块名相同时省略 `=<模块>`）；同一行可以有多个 `module:`，即同一个根文件属于多个模块；
-    /// - `in:<模块>`：属于这个模块。
-    /// 模块按声明顺序编号，文件属于多个模块时先写的优先。模块的 `@import("root")` 指向按声明顺序第一个能经由
-    /// import 到达它的、没有被其他模块 import 的模块
+    /// A multi-file, multi-module test project (modeled on rust-analyzer's fixtures). Each file
+    /// starts with a line `//- <path> <attribute>...`, with the path in posix style. The attributes
+    /// determine the file's place in the module graph; files without attributes are not in the
+    /// module graph:
+    /// - `std`: a file in the standard library; the `std.zig` among them is its root;
+    /// - `module:<name>`: the root of this module; the `deps:<name>[=<module>],...` right after it
+    ///   lists the imports of this module (`=<module>` is omitted when the import name equals the
+    ///   module name); a line can have several `module:`s, i.e. the same root file belongs to
+    ///   several modules;
+    /// - `in:<module>`: belongs to this module.
+    /// Modules are numbered in declaration order; for a file in several modules, the one written
+    /// first takes priority. A module's `@import("root")` points to the first module in declaration
+    /// order that can reach it through imports and is not imported by any other module.
     pub fn fixture(w: *World, text: []const u8) !Fixture {
         const a = w.arena.allocator();
         const Block = struct { path: []const u8, attrs: []const u8, body: std.ArrayList(u8) = .empty };
@@ -124,7 +129,7 @@ pub const World = struct {
         out.paths = paths;
         out.files = ids;
 
-        // 模块按声明顺序编号
+        // Modules are numbered in declaration order
         const Decl = struct { name: []const u8, root: FileId, deps: []const u8 = "" };
         var decls: std.ArrayList(Decl) = .empty;
         for (blocks.items, ids) |b, id| {
@@ -156,7 +161,8 @@ pub const World = struct {
             m.* = .{ .root = d.root, .imports = imports.items };
         }
 
-        // 各模块的根模块：从没有被 import 的模块出发按声明顺序遍历，先到达的为准
+        // The root module of each module: traverse from the modules that are not imported, in
+        // declaration order; the first to reach a module wins
         const imported = try a.alloc(bool, modules.len);
         @memset(imported, false);
         for (modules) |m| for (m.imports) |imp| {
@@ -206,7 +212,8 @@ pub const World = struct {
         return out;
     }
 
-    /// 设置与目标相关的值运算参数（同 Server 更新模块图时）
+    /// Sets the target-dependent parameters for value operations (as the Server does when it
+    /// updates the module graph)
     pub fn setTarget(w: *World, t: InternPool.Target) !void {
         w.db.beginWrite();
         defer w.db.endWrite();
@@ -214,7 +221,7 @@ pub const World = struct {
         w.ip.setTarget(t);
     }
 
-    /// goto definition 的结果：「文件名:目标文本」
+    /// Result of goto definition: "file name:target text"
     fn goto(w: *World, file: FileId, offset: u32) ![]const u8 {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
@@ -223,7 +230,8 @@ pub const World = struct {
         return w.targetLabel(&ctx, t);
     }
 
-    /// `definition.definitionTargets` / `declarationTargets` 的结果：各目标的「文件名:目标文本」，以空格连接
+    /// Result of `definition.definitionTargets` / `declarationTargets`: "file name:target text" of
+    /// each target, joined with spaces
     fn gotoAll(w: *World, file: FileId, offset: u32, comptime find: anytype) ![]const u8 {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
@@ -238,7 +246,7 @@ pub const World = struct {
         return std.fmt.allocPrint(w.arena.allocator(), "{s}:{s}", .{ std.fs.path.basename(w.vfs.path(t.file)), text[t.start..t.end] });
     }
 
-    /// 补全标签，按字母排序并以空格连接
+    /// Completion labels, sorted alphabetically and joined with spaces
     fn complete(w: *World, file: FileId, offset: u32) ![]const u8 {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
@@ -278,7 +286,7 @@ test "fixture builds the module graph from file attributes" {
     try testing.expectEqual(3, g.modules[1].imports[0].module);
     try testing.expectEqual(f.file("/p/main.zig"), f.cursor.?.file);
     try testing.expectEqual(std.mem.indexOf(u8, "const dep = @import(\"dep\");", ";").? + 1, f.cursor.?.offset);
-    // 先写的模块优先，被 test 的模块 import 的 b 以它为根
+    // The module written first takes priority; the test module imports b and is its root
     const Expect = struct { path: []const u8, module: u32, root: u32, others: []const u32 = &.{} };
     for ([_]Expect{
         .{ .path = "/p/main.zig", .module = 0, .root = 0, .others = &.{1} },
@@ -294,7 +302,7 @@ test "fixture builds the module graph from file attributes" {
         try testing.expectEqual(e.root, entry.root_module);
         try testing.expectEqualSlices(u32, e.others, entry.others);
     }
-    // 没有属性的文件不在模块图中
+    // Files without attributes are not in the module graph
     for (g.files) |x| try testing.expect(x.file != f.file("/p/notes.zig"));
 }
 
@@ -324,11 +332,11 @@ test "locals, params and container declarations" {
     try testing.expectEqualStrings("main.zig:n", try w.goto(f.file, at(text, "n + limit", 0)));
     try testing.expectEqualStrings("main.zig:limit", try w.goto(f.file, at(text, "limit;", 0) + 1));
     try testing.expectEqualStrings("main.zig:helper", try w.goto(f.file, at(text, "helper();", 0)));
-    // 光标在名字末尾
+    // Cursor at the end of the name
     try testing.expectEqualStrings("main.zig:total", try w.goto(f.file, f.cursor));
-    // 声明自身
+    // The declaration itself
     try testing.expectEqualStrings("main.zig:run", try w.goto(f.file, at(text, "run", 0)));
-    // 原生类型没有定义
+    // Primitive types have no definition
     try testing.expectEqualStrings("null", try w.goto(f.file, at(text, "u32", 0)));
 
     try testing.expectEqualStrings("helper limit n run total", try w.complete(f.file, f.cursor));
@@ -381,10 +389,10 @@ test "imports: relative files, modules, std and root" {
     try testing.expectEqualStrings("mem.zig:Allocator", try w.goto(main.file, at(text, "Allocator;")));
     try testing.expectEqualStrings("Allocator.zig:alloc", try w.goto(main.file, at(text, "alloc;")));
     try testing.expectEqualStrings("main.zig:main", try w.goto(main.file, at(text, "main;")));
-    // import 字符串跳转到文件开头
+    // An import string jumps to the start of the file
     try testing.expectEqualStrings("util.zig:", try w.goto(main.file, at(text, "util.zig") + 1));
     try testing.expectEqualStrings("std.zig:", try w.goto(main.file, at(text, "\"std\"")));
-    // 其他文件只列出 pub 声明
+    // Only pub declarations are listed for other files
     try testing.expectEqualStrings("Allocator eql", try w.complete(main.file, main.cursor));
 }
 
@@ -403,7 +411,8 @@ test "imports of a file in several modules" {
         \\    _ = @import("<|>");
         \\}
     ;
-    // exe 的模块与 test 的模块共用根文件：exe 中 dep → a；test 中 dep → b，另有 helper → b
+    // The exe module and the test module share the root file: in exe, dep → a; in test, dep → b,
+    // plus helper → b
     const f = try w.fixture("//- /p/src/main.zig module:exe deps:dep=a module:test deps:dep=b,helper=b\n" ++ src ++ "\n" ++
         \\//- /p/a.zig module:a
         \\pub fn fromA() u32 {}
@@ -417,10 +426,10 @@ test "imports of a file in several modules" {
             return @intCast(std.mem.indexOf(u8, t, needle).?);
         }
     }.of;
-    // 只有 test 的模块 import 的名字
+    // A name imported only by the test module
     try testing.expectEqualStrings("b.zig:", try w.goto(main.file, at(text, "\"helper\"")));
     try testing.expectEqualStrings("b.zig:fromB", try w.goto(main.file, at(text, "fromB")));
-    // 两个模块都 import 的名字取优先的模块中的
+    // A name imported by both modules resolves to the one in the preferred module
     try testing.expectEqualStrings("a.zig:fromA", try w.goto(main.file, at(text, "fromA")));
     try testing.expectEqualStrings("builtin dep helper root std", try w.complete(main.file, main.cursor));
 }
@@ -444,7 +453,8 @@ test "goto on a module import that differs between the modules of a file lists e
         \\}
     ;
     const main = try w.add("/p/src/main.zig", src);
-    // exe 的模块（0）与 test 的模块（1）共用根文件：cfg 的目标不同，util 的相同
+    // The exe module (0) and the test module (1) share the root file: the targets of cfg differ,
+    // those of util are the same
     try w.setGraph(null, &.{
         .{ .root = main.file, .imports = &.{ .{ .name = "cfg", .module = 2 }, .{ .name = "util", .module = 4 } } },
         .{ .root = main.file, .imports = &.{ .{ .name = "cfg", .module = 3 }, .{ .name = "util", .module = 4 } } },
@@ -462,23 +472,24 @@ test "goto on a module import that differs between the modules of a file lists e
             return @intCast(std.mem.indexOf(u8, src, needle).?);
         }
     }.of;
-    // `@import` 与它的字符串上：每个模块的目标，按模块的优先级
+    // On `@import` and on its string: the target in each module, by module priority
     for ([_]u32{ at("\"cfg\"") + 1, at("@import(\"cfg") + 1 }) |offset| {
         try testing.expectEqualStrings("exe_cfg.zig: test_cfg.zig:", try w.gotoAll(main.file, offset, definition.definitionTargets));
         try testing.expectEqualStrings("exe_cfg.zig: test_cfg.zig:", try w.gotoAll(main.file, offset, definition.declarationTargets));
-        // 单个目标的入口取最优先的模块中的
+        // The single-target entry point takes the target in the highest-priority module
         try testing.expectEqualStrings("exe_cfg.zig:", try w.goto(main.file, offset));
     }
-    // 别名的使用处：definition 不越过 `@import`，与 declaration 一样停在声明处
+    // At a use of the alias: definition does not go past `@import` and, like declaration, stops at
+    // the declaration
     try testing.expectEqualStrings("main.zig:cfg", try w.gotoAll(main.file, at("cfg.mode"), definition.definitionTargets));
     try testing.expectEqualStrings("main.zig:cfg", try w.gotoAll(main.file, at("cfg.mode"), definition.declarationTargets));
-    // 成员按最优先的模块解析
+    // Members are resolved through the highest-priority module
     try testing.expectEqualStrings("exe_cfg.zig:mode", try w.gotoAll(main.file, at("mode;"), definition.definitionTargets));
-    // 各模块目标相同的名字与相对路径只有一个目标
+    // A name whose target is the same in every module, and a relative path, have only one target
     try testing.expectEqualStrings("util.zig:", try w.gotoAll(main.file, at("\"util\""), definition.definitionTargets));
     try testing.expectEqualStrings("local.zig:", try w.gotoAll(main.file, at("\"local.zig\""), definition.definitionTargets));
     try testing.expectEqualStrings("util.zig:helper", try w.gotoAll(main.file, at("helper()"), definition.definitionTargets));
-    // 没有目标
+    // No target
     try testing.expectEqualStrings("", try w.gotoAll(main.file, at("void"), definition.definitionTargets));
 }
 
@@ -504,11 +515,12 @@ test "@This, enums, nested containers and generic functions" {
             return @intCast(std.mem.indexOf(u8, t, needle).?);
         }
     }.of;
-    // 体内容器中引用外层函数的参数
+    // A container inside a body references a parameter of the enclosing function
     try testing.expectEqualStrings("main.zig:T", try w.goto(f.file, at(text, "T,")));
     try testing.expectEqualStrings("main.zig:len", try w.goto(f.file, at(text, "len; _")));
     try testing.expectEqualStrings("main.zig:green", try w.goto(f.file, at(text, "green; ")));
-    // 可见名字：参数、容器成员、外层函数的参数与文件级声明
+    // Visible names: parameters, container members, parameters of the enclosing function, and
+    // file-level declarations
     try testing.expectEqualStrings("Color List Self T first len self", try w.complete(f.file, f.cursor));
 }
 
