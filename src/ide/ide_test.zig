@@ -1254,6 +1254,192 @@ test "zon import values follow edits to the zon file" {
     }
 }
 
+const zon_cfg_decls =
+    \\const Cfg = struct { port: u16, host: []const u8, verbose: bool = false, level: Level = .info, server: Server = .{} };
+    \\const Level = enum { debug, info };
+    \\const Server = struct { threads: u8 = 1, backlog: u32 = 128 };
+;
+
+/// The completion labels at the cursor
+fn completionAt(w: *World, at: World.Added) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| try labels.append(w.arena.allocator(), it.label);
+    return std.mem.join(w.arena.allocator(), " ", labels.items);
+}
+
+/// The completion at the cursor is `expected` both when the same literal (containing `<|>`) is a
+/// `.zon` file imported by `const cfg: Cfg = @import("cfg.zon");` and when it is the value of
+/// `const lit: Cfg = <literal>;` in a `.zig` file
+fn expectZonCompletionLikeZig(literal: []const u8, expected: []const u8) !void {
+    for ([_]bool{ true, false }) |in_zon| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const a = w.arena.allocator();
+        const at = if (in_zon) blk: {
+            _ = try w.fixture(try std.fmt.allocPrint(a, "//- /p/main.zig module:app\n{s}\nconst cfg: Cfg = @import(\"cfg.zon\");", .{zon_cfg_decls}));
+            break :blk try w.add("/p/cfg.zon", literal);
+        } else try w.add("/p/main.zig", try std.fmt.allocPrint(a, "{s}\nconst lit: Cfg = {s};\n", .{ zon_cfg_decls, literal }));
+        testing.expectEqualStrings(expected, try completionAt(&w, at)) catch |err| {
+            std.debug.print("literal `{s}` in {s}\n", .{ literal, if (in_zon) "zon" else "zig" });
+            return err;
+        };
+    }
+}
+
+test "zon files take the result type of their typed imports" {
+    // Field names, enum literals, nested initializer lists: the same results as for the same
+    // literal in a `.zig` file
+    try expectZonCompletionLikeZig(".{ .port = 8080, .<|> }", "host verbose level server");
+    try expectZonCompletionLikeZig(".{ .port = 8080, .level = .<|> }", "debug info");
+    try expectZonCompletionLikeZig(".{ .port = 8080, .server = .{ .threads = 2, .<|> } }", "backlog");
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.fixture("//- /p/main.zig module:app\n" ++ zon_cfg_decls ++ "\nconst cfg: Cfg = @import(\"cfg.zon\");")).file("/p/main.zig");
+    const zon_text =
+        \\.{
+        \\    .port = 8080,
+        \\    .host = "localhost",
+        \\    .level = .debug,
+        \\    .server = .{ .threads = 4 },
+        \\}
+        \\
+    ;
+    const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+    try testing.expectEqualStrings(
+        \\.{
+        \\    .port: u16 = 8080,
+        \\    .host: []const u8 = "localhost",
+        \\    .level: Level = .debug,
+        \\    .server: Server = .{ .threads: u8 = 4 },
+        \\}
+        \\
+    , try inlaid(&w, zon_file, zon_text, .{ .types = false, .parameters = false }));
+
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const main_text = (try ctx.get(database.syntax.SourceText, main)).text;
+    // A field name jumps to the declaration of the field in the result type, an enum literal to
+    // the enum member
+    const jumps = [_]struct { []const u8, []const u8 }{
+        .{ "port", "port:" },
+        .{ "threads", "threads:" },
+        .{ "debug", "debug," },
+    };
+    for (jumps) |j| {
+        const t = try definition.definition(&r, zon_file, @intCast(std.mem.indexOf(u8, zon_text, j[0]).?)) orelse return error.NoDefinition;
+        try testing.expectEqual(main, t.file);
+        try testing.expectEqual(std.mem.indexOf(u8, main_text, j[1]).?, t.start);
+    }
+    // The references of a field include the field name in the `.zon` file
+    const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, main_text, "port:").?)) orelse return error.NoDefinition;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file } });
+    try testing.expectEqual(2, refs.len);
+    try testing.expectEqual(zon_file, refs[1].file);
+    try testing.expectEqual(std.mem.indexOf(u8, zon_text, "port").?, refs[1].start);
+}
+
+test "zon files have no result type unless their typed imports agree" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        // No import site; only an import without a result type
+        .{ "", "" },
+        .{ "const raw = @import(\"cfg.zon\");", "" },
+        // An import site without a result type does not constrain the value
+        .{ "const raw = @import(\"cfg.zon\");\nconst cfg: Cfg = @import(\"cfg.zon\");", "host verbose level server" },
+        // The import sites agree on the type (including an import inside a function); they disagree
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nfn load() Cfg {\n    return @import(\"cfg.zon\");\n}", "host verbose level server" },
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst server: Server = @import(\"cfg.zon\");", "" },
+        // The result type depends on a generic parameter
+        .{ "fn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}", "" },
+        // A branch known at comptime not to execute is not compiled
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\ncomptime {\n    if (false) {\n        const s: Server = @import(\"cfg.zon\");\n        _ = s;\n    }\n}", "host verbose level server" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app\n{s}\n{s}", .{ zon_cfg_decls, c[0] }));
+        const at = try w.add("/p/cfg.zon", ".{ .port = 8080, .<|> }");
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("importer:\n{s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "zon values take pointer and slice result types like the compiler" {
+    // The compiler parses the value of a single-item pointer as the pointee type, and the value of
+    // a slice is an array literal (a `.zig` file needs `&.{ ... }`)
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "const cfg: *const Cfg = @import(\"cfg.zon\");", ".{ .port = 8080, .<|> }", "host verbose level server" },
+        .{ "const cfg: ?*const Cfg = @import(\"cfg.zon\");", ".{ .port = 8080, .level = .<|> }", "debug info" },
+        .{ "const cfgs: []const Cfg = @import(\"cfg.zon\");", ".{ .{ .port = 1 }, .{ .port = 2, .<|> } }", "host verbose level server" },
+        .{ "const cfgs: []const Cfg = @import(\"cfg.zon\");", ".{ .{ .port = 1, .level = .<|> } }", "debug info" },
+        .{ "const Group = struct { servers: []const Server };\nconst g: Group = @import(\"cfg.zon\");", ".{ .servers = .{ .{ .threads = 2, .<|> } } }", "backlog" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app\n{s}\n{s}", .{ zon_cfg_decls, c[0] }));
+        const at = try w.add("/p/cfg.zon", c[1]);
+        testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
+            std.debug.print("importer:\n{s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture("//- /p/main.zig module:app\n" ++ zon_cfg_decls ++ "\nconst Group = struct { servers: []const Server };\nconst g: *const Group = @import(\"cfg.zon\");");
+    const zon_text = ".{ .servers = .{ .{ .threads = 2 } } }";
+    const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+    try testing.expectEqualStrings(".{ .servers: []const Server = .{ .{ .threads: u8 = 2 } } }", try inlaid(&w, zon_file, zon_text, .{ .types = false, .parameters = false }));
+}
+
+test "zon result types follow the importers across files and edits" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\pub const Cfg = struct { port: u16, host: []const u8 = "" };
+        \\const cfg: Cfg = @import("conf/cfg.zon");
+        \\//- /p/other.zig in:app
+        \\const Cfg = @import("main.zig").Cfg;
+        \\const cfg: Cfg = @import("conf/cfg.zon");
+    );
+    var at = try w.add("/p/conf/cfg.zon", ".{ .port = 8080, .<|> }");
+    try testing.expectEqualStrings("host", try completionAt(&w, at));
+    const steps = [_]struct { path: []const u8, text: []const u8, labels: []const u8 }{
+        // Change the type in the importer
+        .{ .path = "main", .text = "pub const Cfg = struct { port: u16, name: []const u8 = \"\", debug: bool = false };\nconst cfg: Cfg = @import(\"conf/cfg.zon\");", .labels = "name debug" },
+        // Change the content of the `.zon` file
+        .{ .path = "zon", .text = ".{ .port = 8080, .name = \"x\", .<|> }", .labels = "debug" },
+        // One import site switches to another type
+        .{ .path = "other", .text = "const cfg: u32 = @import(\"conf/cfg.zon\");", .labels = "" },
+        .{ .path = "other", .text = "const cfg = @import(\"conf/cfg.zon\");", .labels = "debug" },
+    };
+    for (steps) |step| {
+        if (std.mem.eql(u8, step.path, "main")) {
+            _ = try w.add("/p/main.zig", step.text);
+        } else if (std.mem.eql(u8, step.path, "other")) {
+            _ = try w.add("/p/other.zig", step.text);
+        } else at = try w.add("/p/conf/cfg.zon", step.text);
+        testing.expectEqualStrings(step.labels, try completionAt(&w, at)) catch |err| {
+            std.debug.print("after editing {s}: `{s}`\n", .{ step.path, step.text });
+            return err;
+        };
+    }
+}
+
 test "hover in generic bodies is inferred from a call site" {
     const text =
         \\fn List(comptime T: type) type {

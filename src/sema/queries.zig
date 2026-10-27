@@ -387,6 +387,67 @@ pub const ZonValue = struct {
     }
 };
 
+/// The result type of the root expression of a `.zon` file, taken from the `@import` call sites
+/// with a result type in the project files that import it directly (see
+/// `infer.Result.zon_imports`). Import sites without a result type do not constrain the value and
+/// are not counted; when all the other import sites have the same type, free of abstract
+/// parameters and unknown parts, the result is that type, otherwise null (no guessing). Only the
+/// root expression of a `.zon` file reads it
+pub const ZonResultType = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = ?Index;
+
+    pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const graph = try ctx.get(database.ModuleGraph.Input, {}) orelse return null;
+        var result: ?Index = null;
+        for (graph.files) |entry| {
+            // Only Zig source files can `@import` (the root of a module can also be a `.zon` or
+            // another data file)
+            if (entry.module == database.ModuleGraph.std_module or !std.mem.endsWith(u8, ctx.db.env.vfs.path(entry.file), ".zig")) continue;
+            const index = try ctx.get(database.FileIndex.Query, entry.file);
+            const imports = for (index.imports) |spec| {
+                if (try r.resolveImport(entry.file, spec) == file) break true;
+            } else false;
+            if (!imports) continue;
+            for (try importOwners(&r, entry.file, file)) |owner| {
+                const res = try ctx.get(Infer, .{ .owner = owner, .mode = .full });
+                for (res.zon_imports) |site| {
+                    if (site.file != file) continue;
+                    if (!@import("value.zig").isConcrete(ctx.db.env.ip, site.ty)) return null;
+                    if (result) |t| if (t != site.ty) return null;
+                    result = site.ty;
+                }
+            }
+        }
+        return result;
+    }
+
+    /// The members of `importer` that contain an `@import` call importing `target` (deduplicated)
+    fn importOwners(r: *Resolver, importer: FileId, target: FileId) resolve.Error![]const hir.OwnerKey {
+        var owners: std.AutoArrayHashMapUnmanaged(hir.OwnerKey, void) = .empty;
+        var stack: std.ArrayList(ast.SyntaxNode) = .empty;
+        try stack.append(r.arena, (try r.ctx.get(database.syntax.ParseFile, importer)).rootNode());
+        while (stack.pop()) |node| {
+            if (ast.cast(ast.BuiltinCall, node)) |call| if (call.name()) |n| if (std.mem.eql(u8, n.text, "@import")) {
+                var args = call.args();
+                if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
+                    const spec = std.zig.string_literal.parseAlloc(r.arena, t.text) catch continue;
+                    if (try r.resolveImport(importer, spec) == target) {
+                        if (try r.ownerAt(importer, node.offset, false)) |item| try owners.put(r.arena, try r.ownerKey(importer, item), {});
+                    }
+                };
+            };
+            var it = node.children();
+            while (it.nextNode()) |c| try stack.append(r.arena, c);
+        }
+        return owners.keys();
+    }
+};
+
 /// Value of `@import`: for a `.zon` file, the value in it (see `ZonValue`); for a `.zig` file,
 /// the file container type
 pub fn importValue(r: *Resolver, target: FileId) resolve.Error!TypedValue {
