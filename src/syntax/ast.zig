@@ -805,7 +805,7 @@ const testing = std.testing;
 const Parse = @import("Parse.zig");
 
 fn parseFirst(gpa: std.mem.Allocator, text: []const u8) !*Parse {
-    return Parse.create(gpa, text);
+    return Parse.create(gpa, text, .zig);
 }
 
 test "declarations and fn proto" {

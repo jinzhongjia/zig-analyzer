@@ -14,6 +14,7 @@ const Vfs = @import("../base/Vfs.zig");
 const inputs = @import("../base/inputs.zig");
 const mem = @import("../util/mem.zig");
 const nesting = @import("../syntax/nesting.zig");
+const Parse = @import("../syntax/Parse.zig");
 const Watchdog = @import("../util/watchdog.zig").Watchdog;
 
 const log = std.log.scoped(.live);
@@ -47,12 +48,8 @@ pub const Result = struct {
     }
 };
 
-pub const Mode = enum { zig, zon };
-
-/// `.zon` files are treated as ZON
-pub fn modeOf(path: []const u8) Mode {
-    return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
-}
+pub const Mode = Parse.Mode;
+pub const modeOf = Parse.modeOf;
 
 /// Runs parsing and AstGen (or ZonGen) on the text and returns all errors. The thread to run on is
 /// chosen by nesting depth, so deeply nested text does not exhaust the native stack.

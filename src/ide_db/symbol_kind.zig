@@ -36,7 +36,7 @@ pub fn ofDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!Symbol {
         .field => .{ .kind = if (tree.containers[it.container].kind == .@"enum") .enum_member else .field },
         .@"const" => .{ .kind = ofValue(ip, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = true },
         .@"var" => .{ .kind = ofValue(ip, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable) },
-        .@"test", .@"comptime" => .{ .kind = .variable },
+        .@"test", .@"comptime", .zon => .{ .kind = .variable },
     };
 }
 

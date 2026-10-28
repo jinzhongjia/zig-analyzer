@@ -105,7 +105,7 @@ test build {
         \\const std = @import("std");
         \\const lib = @import("lib/a.zig");
         \\fn f(@"x y": u8, z: u8) void { _ = .{ @"x y", z, std.mem }; }
-    );
+    , .zig);
     defer p.destroy();
     var index = try build(std.testing.allocator, p.rootNode());
     defer index.deinit(std.testing.allocator);

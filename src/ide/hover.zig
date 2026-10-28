@@ -1,4 +1,5 @@
-//! hover: signature, type, and documentation of the name at the cursor.
+//! hover: signature, type, and documentation of the name at the cursor; the official documentation
+//! of field names in `build.zig.zon`.
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
@@ -14,6 +15,7 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const seed = @import("../ide_db/seed.zig");
 const builtins = @import("builtins.zig");
+const manifest = @import("manifest.zig");
 
 pub const Info = struct {
     /// markdown
@@ -36,6 +38,7 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
         }
         return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
     }
+    if (try manifest.fieldDoc(r, file, tok)) |doc| return .{ .text = doc, .start = tok.offset, .end = tok.range().end };
     return semanticHover(r, file, offset, tok);
 }
 

@@ -86,7 +86,9 @@ pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc:
         if (start >= end) return &.{};
         b.visible = .{ .start = @intCast(start), .end = @intCast(end) };
     }
-    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const parse = try r.ctx.get(database.syntax.ParseFile, file);
+    b.zon = parse.mode == .zon;
+    const root = parse.rootNode();
     try b.collect(file, root);
     try b.visit(root, false);
     return b.data.items;
@@ -133,6 +135,8 @@ const Builder = struct {
     enc: offsets.Encoding,
     range: ?types.Range,
     options: Options,
+    /// The file is parsed as ZON
+    zon: bool = false,
     visible: ?tree.TextRange = null,
     /// Keyed by the end of the name token, so a field access does not need to walk its left-hand
     /// expression again.
@@ -471,7 +475,7 @@ const Builder = struct {
             .token => |token| {
                 if (!b.intersects(token.range())) continue;
                 const semantic = if (token.kind == .identifier) b.names.get(token.offset + @as(u32, @intCast(token.text.len))) else null;
-                const c = semantic orelse syntaxClass(token, node, child_in_enum) orelse continue;
+                const c = semantic orelse syntaxClass(token, node, child_in_enum, b.zon) orelse continue;
                 if (!(b.options.partial and syntactic(c))) try b.emit(token, c);
             },
         };
@@ -501,7 +505,8 @@ fn before(a: types.Position, b: types.Position) bool {
     return a.line < b.line or (a.line == b.line and a.character < b.character);
 }
 
-fn syntaxClass(token: tree.SyntaxToken, parent: SyntaxNode, in_enum: bool) ?Class {
+/// `zon`: the file is parsed as ZON, where `inf` and `nan` are float literals
+fn syntaxClass(token: tree.SyntaxToken, parent: SyntaxNode, in_enum: bool, zon: bool) ?Class {
     const decl = Modifier.declaration;
     switch (token.kind) {
         .line_comment => return .{ .type = .comment },
@@ -522,7 +527,7 @@ fn syntaxClass(token: tree.SyntaxToken, parent: SyntaxNode, in_enum: bool) ?Clas
                 .error_set_decl => .{ .type = .enumMember, .mods = decl },
                 .label => .{ .type = .label, .mods = decl },
                 .break_label => .{ .type = .label },
-                .name_ref => if (isPrimitiveType(token.text)) .{ .type = .type, .mods = Modifier.defaultLibrary } else if (isPrimitiveValue(token.text)) .{ .type = .keyword, .mods = Modifier.defaultLibrary } else .{ .type = .variable },
+                .name_ref => if (zon and Body.zonFloatValue(token.text) != null) .{ .type = .number } else if (isPrimitiveType(token.text)) .{ .type = .type, .mods = Modifier.defaultLibrary } else if (isPrimitiveValue(token.text)) .{ .type = .keyword, .mods = Modifier.defaultLibrary } else .{ .type = .variable },
                 else => null,
             };
         },

@@ -3,10 +3,16 @@ const testing = std.testing;
 const Parse = @import("Parse.zig");
 const ItemTree = @import("ItemTree.zig");
 
-fn buildTree(source: []const u8) !struct { parse: *Parse, items: ItemTree } {
-    const parse = try Parse.create(testing.allocator, source);
+const Built = struct { parse: *Parse, items: ItemTree };
+
+fn buildTree(source: []const u8) !Built {
+    return buildTreeIn(.zig, source);
+}
+
+fn buildTreeIn(mode: Parse.Mode, source: []const u8) !Built {
+    const parse = try Parse.create(testing.allocator, source, mode);
     errdefer parse.destroy();
-    return .{ .parse = parse, .items = try ItemTree.build(testing.allocator, parse.rootNode()) };
+    return .{ .parse = parse, .items = try ItemTree.build(testing.allocator, parse.rootNode(), mode) };
 }
 
 /// Describes an ItemTree as text for assertions
@@ -29,7 +35,11 @@ fn describe(t: *const ItemTree, w: *std.Io.Writer, container: u32, depth: usize)
 }
 
 fn expectItems(source: []const u8, expected: []const u8) !void {
-    var r = try buildTree(source);
+    return expectItemsIn(.zig, source, expected);
+}
+
+fn expectItemsIn(mode: Parse.Mode, source: []const u8, expected: []const u8) !void {
+    var r = try buildTreeIn(mode, source);
     defer r.parse.destroy();
     defer r.items.deinit(testing.allocator);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -72,10 +82,14 @@ test "collects top-level and nested container members" {
 }
 
 fn treesEqual(a: []const u8, b: []const u8) !bool {
-    var x = try buildTree(a);
+    return treesEqualIn(.zig, a, b);
+}
+
+fn treesEqualIn(mode: Parse.Mode, a: []const u8, b: []const u8) !bool {
+    var x = try buildTreeIn(mode, a);
     defer x.parse.destroy();
     defer x.items.deinit(testing.allocator);
-    var y = try buildTree(b);
+    var y = try buildTreeIn(mode, b);
     defer y.parse.destroy();
     defer y.items.deinit(testing.allocator);
     return x.items.eql(&y.items);
@@ -132,4 +146,34 @@ test "same-name members are distinguished by index" {
     defer r.items.deinit(testing.allocator);
     try testing.expect(r.items.items[0].ast_id != r.items.items[1].ast_id);
     try testing.expect(r.items.items[2].ast_id != r.items.items[3].ast_id);
+}
+
+test "zon root expression is the only item" {
+    try expectItemsIn(.zon,
+        \\.{ .a = 1, .b = .{ .c = struct { x: u8 } } }
+    ,
+        \\zon _
+        \\  <struct>
+        \\    field x
+        \\
+    );
+    // Tokens outside the root expression belong to error nodes, not members
+    try expectItemsIn(.zon, "1 2", "zon _\n");
+    try expectItemsIn(.zon, "// only a comment\n", "");
+}
+
+test "zon AstIdMap maps the root item to the root expression" {
+    var r = try buildTreeIn(.zon, "// c\n.{ .s = struct { x: u8 } }\n");
+    defer r.parse.destroy();
+    defer r.items.deinit(testing.allocator);
+    var map = try ItemTree.AstIdMap.build(testing.allocator, &r.items, r.parse.rootNode());
+    defer map.deinit(testing.allocator);
+    try testing.expectEqual(.init_expr, map.get(r.items.items[0].ast_id).?.kind());
+    try testing.expectEqual(.container_decl, map.get(r.items.containers[1].ast_id).?.kind());
+    try testing.expectEqual(.container_field, map.get(r.items.items[1].ast_id).?.kind());
+}
+
+test "zon ItemTree unchanged by value edits" {
+    try testing.expect(try treesEqualIn(.zon, ".{ .a = 1 }", ".{ .a = 2, .b = .{ \"x\" } }"));
+    try testing.expect(try treesEqualIn(.zon, ".{ .a = 1 }", "1"));
 }

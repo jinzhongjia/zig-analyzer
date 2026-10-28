@@ -251,6 +251,35 @@ test "semantic tokens preserve syntax for unresolved code and classify error mem
     });
 }
 
+test "semantic tokens classify zon inf and nan as numbers" {
+    const text =
+        \\.{
+        \\    .name = .demo,
+        \\    .a = inf,
+        \\    .b = -nan,
+        \\    .c = .{ "s", 1.5 },
+        \\}
+    ;
+    const zig_text = "const a = inf;";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/cfg.zon", text)).file;
+    const zig_file = (try w.add("/p/main.zig", zig_text)).file;
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &.{
+        .{ .needle = "name", .ty = .property },
+        .{ .needle = "demo", .ty = .enumMember },
+        .{ .needle = "inf", .ty = .number },
+        .{ .needle = "nan", .ty = .number },
+        .{ .needle = "\"s\"", .ty = .string },
+        .{ .needle = "1.5", .ty = .number },
+    });
+    // In a Zig file `inf` is a name
+    try check(try tokens(&w, zig_file, zig_text, .utf16, null), zig_text, .utf16, &.{
+        .{ .needle = "inf", .ty = .variable },
+    });
+}
+
 test "semantic token ranges preserve whole unicode tokens and document relative deltas" {
     const text = "const @\"😀a\" = 1;\r\nfn run() void { _ = @\"😀a\"; }\r\n";
     var w: World = undefined;

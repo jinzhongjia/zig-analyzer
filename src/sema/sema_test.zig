@@ -3269,6 +3269,26 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
     }
 }
 
+test "the root expression of a zon file is inferred and inf and nan are floats" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src = ".{ .a = inf, .b = -inf, .c = nan, .d = 1 }";
+    const f = try w.add("/p/cfg.zon", src);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "inf", "comptime_float = inf" },
+        .{ "-inf", "comptime_float = -inf" },
+        .{ "nan", "comptime_float = nan" },
+        .{ "1", "comptime_int = 1" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "@src has the type std.builtin.SourceLocation" {
     try expectStdTypes(
         \\fn f() void {

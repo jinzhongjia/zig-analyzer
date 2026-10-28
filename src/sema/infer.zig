@@ -72,8 +72,13 @@ pub const Result = struct {
     /// With per-iteration inference (`LoopSeed`), the values at the end of this iteration of the
     /// outer `comptime var`s modified by the loop body: the next iteration starts from them
     iteration_vars: []const IterationVar = &.{},
+    /// The target and result type of each reachable `@import` call that has a result type and
+    /// targets a `.zon` file: the root expression of the `.zon` file is inferred with it (see
+    /// `queries.ZonResultType`)
+    zon_imports: []const ZonImport = &.{},
 
     pub const LiteralExpected = struct { expr: ExprId, ty: Index };
+    pub const ZonImport = struct { file: FileId, ty: Index };
     pub const IterationVar = struct { binding: Body.BindingId, val: ?Index };
     pub const ParamCoercion = struct { param: u32, ty: Index };
 
@@ -86,7 +91,7 @@ pub const Result = struct {
     };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -148,7 +153,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const dead_spans = try a.dupe(Body.Range, inf.dead_spans.items);
     const param_coercions = try a.dupe(Result.ParamCoercion, inf.param_coercions.items);
     const iteration_vars = try a.dupe(Result.IterationVar, inf.iteration_vars.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars };
+    const zon_imports = try a.dupe(Result.ZonImport, inf.zon_imports.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports };
 }
 
 /// Infers only one local binding or comptime expression in the member `owner` (see
@@ -257,6 +263,8 @@ const Inferrer = struct {
     dead_spans: std.ArrayList(Body.Range) = .empty,
     /// See `Result.param_coercions`
     param_coercions: std.ArrayList(Result.ParamCoercion) = .empty,
+    /// See `Result.zon_imports`
+    zon_imports: std.ArrayList(Result.ZonImport) = .empty,
     /// Instance context (the instance of the owner itself or of an outer generic function)
     inst: ?Index,
     /// See `LoopSeed`
@@ -277,6 +285,9 @@ const Inferrer = struct {
     iteration_vars: std.ArrayList(Result.IterationVar) = .empty,
     /// Inference mode (used to get the previous iteration's result in per-iteration inference)
     mode: Mode = .full,
+    /// The owner is the root expression of a `.zon` file: values are converted to the result type
+    /// by the rules of ZON (see `zonExpected`)
+    zon: bool = false,
     /// Values of the returns actually reached
     returns: std.ArrayList(TypedValue) = .empty,
     /// Greater than 0 inside a comptime context (type expressions, array lengths, comptime
@@ -318,6 +329,12 @@ const Inferrer = struct {
             },
             .@"test", .@"comptime" => if (mode == .full) if (b.value) |v| {
                 _ = try inf.infer(v, null);
+            },
+            // Inferred with the result type of the import sites, as the compiler parses ZON with
+            // the result type
+            .zon => if (mode == .full) if (b.value) |v| {
+                inf.zon = true;
+                _ = try inf.infer(v, try inf.r.ctx.get(queries.ZonResultType, inf.file));
             },
         }
         // Clauses are not part of the expression tree: infer them with the clause's result type
@@ -542,14 +559,50 @@ const Inferrer = struct {
             inf.r.ctx.exhausted();
             return .unknown;
         }
-        const raw = try inf.inferInner(e, expected);
-        const tv = try inf.coerce(raw, expected);
+        const want = if (inf.zon) try inf.zonExpected(e, expected) else expected;
+        const raw = try inf.inferInner(e, want);
+        const tv = try inf.coerce(raw, want);
         inf.exprs[i] = tv;
         // Enum literals coerced to an enum / union (`.red`, `.a =>` in a `switch`) refer to the
         // corresponding member
         if (inf.members[i] == null and inf.body.expr(e) == .enum_literal) try inf.recordTagMember(e, tv.ty);
-        if (raw.ty == .enum_literal_type) if (expected) |want| try inf.noteParamCoercion(e, want);
-        return tv;
+        if (raw.ty == .enum_literal_type) if (want) |w| try inf.noteParamCoercion(e, w);
+        // A ZON value parsed as the pointee or as an array has the result type (pointer, slice)
+        if (want != expected) inf.exprs[i] = .{ .ty = expected.? };
+        return inf.exprs[i];
+    }
+
+    /// When the compiler parses a ZON value with a result type (`LowerZon`), the value of an
+    /// optional is parsed as the payload type and the value of a single-item pointer as the pointee
+    /// type, and the value of a slice is an array literal (a `[]const u8` may also be a string):
+    /// `.{ a, b }` is inferred as `[2]T`. Returns the type the value is parsed as when it goes
+    /// through a pointer, otherwise `expected` unchanged (each kind of value handles optionals
+    /// itself, as in Zig source)
+    fn zonExpected(inf: *Inferrer, e: ExprId, expected: ?Index) Error!?Index {
+        const ip = inf.ip;
+        const x = expected orelse return null;
+        var t = x;
+        var through_ptr = false;
+        while (true) switch (ip.key(t)) {
+            .optional_type => |c| t = c,
+            .ptr_type => |p| switch (p.size) {
+                .one => {
+                    t = p.child;
+                    through_ptr = true;
+                },
+                .slice => {
+                    const init = switch (inf.body.expr(e)) {
+                        .init => |init| init,
+                        else => break,
+                    };
+                    if (init.ty != null) break;
+                    return try ip.get(.{ .array_type = .{ .len = init.fields.len, .child = p.child, .sentinel = p.sentinel } });
+                },
+                .many, .c => break,
+            },
+            else => break,
+        };
+        return if (through_ptr) t else x;
     }
 
     /// Branch results without a result type are coerced to the peer type
@@ -956,7 +1009,9 @@ const Inferrer = struct {
                 };
                 return .{ .ty = .comptime_int_type, .val = if (code) |v| try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } }) else null };
             },
-            else => switch (std.zig.parseNumberLiteral(text)) {
+            else => if (Body.zonFloatValue(text)) |x| {
+                return .{ .ty = .comptime_float_type, .val = try value.floatValue(ip, .comptime_float_type, x) };
+            } else switch (std.zig.parseNumberLiteral(text)) {
                 .int => |v| return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } }) },
                 .big_int => return .{ .ty = .comptime_int_type },
                 .float => {
@@ -1343,7 +1398,10 @@ const Inferrer = struct {
             const tv = try queries.importValue(inf.r, target);
             // With a result type, the compiler parses ZON according to the result type: for values
             // other than scalars, only the result type is taken (see `zon.isScalar`)
-            if (inf.r.isZon(target)) if (expected) |want| if (want != .unknown and want != tv.ty and !zon.isScalar(tv.ty)) return .{ .ty = want };
+            if (inf.r.isZon(target)) if (expected) |want| {
+                if (inf.dead == 0) try inf.zon_imports.append(inf.scratch, .{ .file = target, .ty = want });
+                if (want != .unknown and want != tv.ty and !zon.isScalar(tv.ty)) return .{ .ty = want };
+            };
             return tv;
         }
         if (eq(u8, name, "@This")) {

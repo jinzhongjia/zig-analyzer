@@ -2,8 +2,9 @@
 //! expected type, and in initializers the fields not yet assigned; after `error.`, lists error
 //! names; after `@`, lists builtins; inside `@import("`, lists modules and files; after `break :` /
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
-//! the declarations of enclosing containers).
-//! No completion in comments and strings (other than `@import("`).
+//! the declarations of enclosing containers). When `build.zig.zon` has no result type, its fields
+//! and paths are listed by the built-in schema (see `manifest.zig`).
+//! No completion in comments and strings (other than `@import("` and the paths of `build.zig.zon`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,6 +26,7 @@ const Index = InternPool.Index;
 const database = @import("../database.zig");
 const ModuleGraph = @import("../names/ModuleGraph.zig");
 const builtins = @import("builtins.zig");
+const manifest = @import("manifest.zig");
 const imports = @import("../ide_db/imports.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const ast = @import("../syntax/ast.zig");
@@ -235,7 +237,10 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = offset });
         return out.items.items;
     }
-    if (literal == .string) return &.{};
+    if (literal == .string) {
+        try manifestPaths(r, &out, file, text, offset);
+        return out.items.items;
+    }
 
     cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) };
     const item = cursor_owner.known orelse return &.{};
@@ -280,7 +285,10 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         const a = try context.atSeeded(r, file, offset, true) orelse return &.{};
         if (initOf(b, e)) |init| {
             const x = b.expr(init).init;
-            const ty = if (x.ty == null) a.literalExpected(init) orelse return &.{} else a.exprType(init).ty;
+            const ty = if (x.ty == null) a.literalExpected(init) orelse {
+                for (try manifest.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
+                return out.items.items;
+            } else a.exprType(init).ty;
             try initFields(r, &out, ty, x.fields);
             return out.items.items;
         }
@@ -494,7 +502,7 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
             .@"fn", .@"const", .@"var" => {},
             // Fields are not names in scope; enum members can be accessed through the type
             .field => if (!is_enum or private) continue,
-            .@"test", .@"comptime" => continue,
+            .@"test", .@"comptime", .zon => continue,
         }
         if (!private and it.kind != .field and !it.flags.is_pub) continue;
         const kind = kindOf(try symbol_kind.ofDecl(r, file, m));
@@ -760,15 +768,46 @@ fn labelStart(text: []const u8, offset: u32) ?u32 {
 /// the file belongs to), and `.zig` / `.zon` files and subdirectories under the relative path.
 /// Completion items are full paths from the start of the string.
 fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range) resolve.Error!void {
-    const slash = std.mem.lastIndexOfScalar(u8, typed, '/');
-    if (slash == null) {
+    if (std.mem.lastIndexOfScalar(u8, typed, '/') == null) {
         for ([_][]const u8{ "std", "builtin", "root" }) |m| try out.add(.{ .label = m, .kind = .module, .replace = range });
         if (try r.ctx.get(ModuleGraph.Input, {})) |graph| {
             for (try graph.importNames(r.arena, file)) |name| try out.add(.{ .label = name, .kind = .module, .replace = range });
         }
     }
+    try listPaths(r, out, file, typed, range, .import);
+}
+
+/// Inside a path string of `build.zig.zon` (the string holding the character before the cursor):
+/// an element of `.paths` lists files and directories, and the `.path` of a dependency lists only
+/// directories. Completion items are full paths from the start of the string
+fn manifestPaths(r: *Resolver, out: *Collector, file: FileId, text: []const u8, offset: u32) resolve.Error!void {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const tok = root.tokenAtOffset(offset - 1) orelse return;
+    const kind = try manifest.pathKind(r, file, tok) orelse return;
+    const start = tok.offset + 1;
+    if (offset < start) return;
+    try listPaths(r, out, file, text[start..offset], .{ .start = start, .end = offset }, switch (kind) {
+        .included => .any,
+        .dependency => .directories,
+    });
+}
+
+const PathFilter = enum {
+    /// `.zig` / `.zon` files and directories; directories end with `/`, so typing continues with a
+    /// path inside them
+    import,
+    /// Any files and directories
+    any,
+    /// Directories only
+    directories,
+};
+
+/// The entries of the directory named by the part of `typed` before its last `/`, relative to the
+/// directory of `file` (excluding entries that start with `.` and `zig-out`). Completion items are
+/// full paths from the start of the string
+fn listPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range, filter: PathFilter) resolve.Error!void {
     const vfs = r.ctx.db.env.vfs;
-    const prefix = if (slash) |s| typed[0 .. s + 1] else "";
+    const prefix = if (std.mem.lastIndexOfScalar(u8, typed, '/')) |s| typed[0 .. s + 1] else "";
     const base = std.fs.path.dirname(vfs.path(file)) orelse return;
     const dir_path = try std.fs.path.join(r.arena, &.{ base, prefix });
     var dir = std.Io.Dir.cwd().openDir(vfs.io, dir_path, .{ .iterate = true }) catch return;
@@ -777,8 +816,13 @@ fn importPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, r
     while (it.next(vfs.io) catch null) |entry| {
         if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.eql(u8, entry.name, "zig-out")) continue;
         switch (entry.kind) {
-            .directory => try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}/", .{ prefix, entry.name }), .kind = .folder, .replace = range }),
-            .file => if (std.mem.endsWith(u8, entry.name, ".zig") or std.mem.endsWith(u8, entry.name, ".zon")) {
+            .directory => {
+                const slash = if (filter == .import) "/" else "";
+                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ prefix, entry.name, slash }), .kind = .folder, .replace = range });
+            },
+            .file => if (filter == .any or (filter == .import and
+                (std.mem.endsWith(u8, entry.name, ".zig") or std.mem.endsWith(u8, entry.name, ".zon"))))
+            {
                 try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}", .{ prefix, entry.name }), .kind = .file, .replace = range });
             },
             else => {},

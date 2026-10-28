@@ -55,7 +55,7 @@ const Parse = @import("../syntax/Parse.zig");
 
 test selectionRanges {
     const text = "const a = foo(bar + 1);";
-    const parse = try Parse.create(testing.allocator, text);
+    const parse = try Parse.create(testing.allocator, text, .zig);
     defer parse.destroy();
     var lines = try offsets.LineIndex.init(testing.allocator, text);
     defer lines.deinit(testing.allocator);
@@ -84,7 +84,7 @@ test "selection ranges keep the innermost levels of a deep path" {
     try text.append(testing.allocator, 'x');
     for (0..500) |_| try text.append(testing.allocator, ')');
     try text.append(testing.allocator, ';');
-    const parse = try Parse.create(testing.allocator, text.items);
+    const parse = try Parse.create(testing.allocator, text.items, .zig);
     defer parse.destroy();
     var lines = try offsets.LineIndex.init(testing.allocator, text.items);
     defer lines.deinit(testing.allocator);
@@ -98,4 +98,42 @@ test "selection ranges keep the innermost levels of a deep path" {
     try testing.expectEqual(max_levels, levels);
     try testing.expectEqual(510, result[0].range.start.character);
     try testing.expectEqual(511, result[0].range.end.character);
+}
+
+test "zon selection ranges match the same text parsed as zig" {
+    const text =
+        \\// a
+        \\.{
+        \\    .name = .demo,
+        \\    .dependencies = .{ .foo = .{ .url = "u", .lazy = true } },
+        \\    .paths = .{ "build.zig", "src" },
+        \\}
+        \\
+    ;
+    var lines = try offsets.LineIndex.init(testing.allocator, text);
+    defer lines.deinit(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Parsed as Zig, the root expression sits in an unnamed field
+    const zig = try Parse.create(testing.allocator, text, .zig);
+    defer zig.destroy();
+    const zon = try Parse.create(testing.allocator, text, .zon);
+    defer zon.destroy();
+
+    const positions = try a.alloc(types.Position, text.len + 1);
+    for (positions, 0..) |*p, offset| p.* = lines.position(offset, .utf8);
+    const expected = try selectionRanges(a, zig.rootNode(), lines, .utf8, positions);
+    const actual = try selectionRanges(a, zon.rootNode(), lines, .utf8, positions);
+    for (expected, actual) |e, z| {
+        var ec: ?*const types.SelectionRange = &e;
+        var zc: ?*const types.SelectionRange = &z;
+        while (ec != null or zc != null) : ({
+            ec = ec.?.parent;
+            zc = zc.?.parent;
+        }) {
+            try testing.expect(ec != null and zc != null);
+            try testing.expectEqual(ec.?.range, zc.?.range);
+        }
+    }
 }

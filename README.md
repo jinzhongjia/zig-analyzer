@@ -38,6 +38,7 @@ The lib and global cache directories come from `zig env`; `zig.lib_path` and `zi
   - convert between string literals and multiline string literals, keeping the bytes;
   - organize imports: sort the top-level `@import` declarations (and declarations derived from them) into std / modules / files groups; auto-import adds new imports in the same order.
 - **Formatting**: identical to `zig fmt`, for `.zig` and `.zon`.
+- **ZON files**: the outline lists the fields; a `.zon` file imported with a result type (`const cfg: Config = @import("cfg.zon");`) gets the same field and enum-literal completion, goto and inlay hints as the same literal in Zig; `build.zig.zon` gets field completion with the official docs on hover, and completion and goto for its paths.
 - **Structure**: folding ranges, selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.0/#Names) section of the Zig style guide, judged by what each declaration actually is (type, function, value), with rename fixes that refuse unsafe renames.
 

@@ -19,10 +19,10 @@ fn apply(a: std.mem.Allocator, text: []const u8, edits: []const Edit) ![]const u
 
 /// Text after organizing; organizing the result again produces no edits
 fn organized(a: std.mem.Allocator, text: []const u8, opts: Options) ![]const u8 {
-    const parse = try Parse.create(testing.allocator, text);
+    const parse = try Parse.create(testing.allocator, text, .zig);
     defer parse.destroy();
     const result = try apply(a, text, (try organize_imports.organize(a, parse, opts)).edits);
-    const again = try Parse.create(testing.allocator, result);
+    const again = try Parse.create(testing.allocator, result, .zig);
     defer again.destroy();
     try testing.expectEqual(0, (try organize_imports.organize(a, again, opts)).edits.len);
     return result;
@@ -43,7 +43,7 @@ test "organize imports: files that are already organized or have nothing to orga
         \\const ast = @import("ast.zig");
         \\
     }) |text| {
-        const parse = try Parse.create(testing.allocator, text);
+        const parse = try Parse.create(testing.allocator, text, .zig);
         defer parse.destroy();
         try testing.expectEqual(0, (try organize_imports.organize(a, parse, .{})).edits.len);
     }
@@ -223,7 +223,7 @@ test "organize imports: declarations sharing a line and files with syntax errors
         "const b = @import(\"b.zig\"); const a = @import(\"a.zig\");\n",
         "const b = @import(\"b.zig\");\nconst a = @import(\"a.zig\");\nfn broken( {}\n",
     }) |text| {
-        const parse = try Parse.create(testing.allocator, text);
+        const parse = try Parse.create(testing.allocator, text, .zig);
         defer parse.destroy();
         try testing.expectEqual(0, (try organize_imports.organize(a, parse, .{})).edits.len);
     }
@@ -241,7 +241,7 @@ test "version sort orders numbers by value, capitals first and underscores befor
 }
 
 fn inserted(a: std.mem.Allocator, text: []const u8, name: []const u8, spec: []const u8, decl: []const u8) ![]const u8 {
-    const parse = try Parse.create(testing.allocator, text);
+    const parse = try Parse.create(testing.allocator, text, .zig);
     defer parse.destroy();
     const ins = try organize_imports.Inserter.init(a, parse, .{});
     return apply(a, text, &.{try ins.edit(a, name, spec, "", decl)});

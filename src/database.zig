@@ -62,6 +62,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.ErrorSetOf,
     sema.InactiveRanges,
     sema.ZonValue,
+    sema.ZonResultType,
     FileIndex.Query,
     ErrorSets.Query,
     ide_db.seed.Query,

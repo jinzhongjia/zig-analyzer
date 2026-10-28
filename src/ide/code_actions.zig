@@ -23,6 +23,7 @@ const Resolver = resolve.Resolver;
 const Def = resolve.Def;
 const Body = @import("../hir/Body.zig");
 const ast = @import("../syntax/ast.zig");
+const Parse = @import("../syntax/Parse.zig");
 const queries = @import("../sema/queries.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const Index = InternPool.Index;
@@ -209,7 +210,7 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
 /// has syntax errors, or is nested too deeply.
 fn zigFmtEdit(r: *Resolver, file: FileId, text: []const u8, raw: Edit) resolve.Error!Edit {
     const a = r.arena;
-    const mode: format.Mode = if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) .zon else .zig;
+    const mode = Parse.modeOf(r.ctx.db.env.vfs.path(file));
     const before = try format.renderText(a, text, mode) orelse return raw;
     if (!std.mem.eql(u8, before, text)) return raw;
     const edited = try std.mem.concat(a, u8, &.{ text[0..raw.start], raw.text, text[raw.end..] });

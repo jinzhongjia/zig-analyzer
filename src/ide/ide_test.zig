@@ -12,6 +12,7 @@ const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const Vfs = @import("../base/Vfs.zig");
 const seed = database.ide_db.seed;
 const search = @import("../ide_db/search.zig");
 
@@ -1252,6 +1253,480 @@ test "zon import values follow edits to the zon file" {
         // `.zig` files are still namespaces
         try testing.expectEqualStrings("answer", try memberLabels(&w, &r, file, text, "lib.answer"));
     }
+}
+
+const zon_cfg_decls =
+    \\const Cfg = struct { port: u16, host: []const u8, verbose: bool = false, level: Level = .info, server: Server = .{} };
+    \\const Level = enum { debug, info };
+    \\const Server = struct { threads: u8 = 1, backlog: u32 = 128 };
+;
+
+/// The completion labels at the cursor
+fn completionAt(w: *World, at: World.Added) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| try labels.append(w.arena.allocator(), it.label);
+    return std.mem.join(w.arena.allocator(), " ", labels.items);
+}
+
+/// The completion at the cursor is `expected` both when the same literal (containing `<|>`) is a
+/// `.zon` file imported by `const cfg: Cfg = @import("cfg.zon");` and when it is the value of
+/// `const lit: Cfg = <literal>;` in a `.zig` file
+fn expectZonCompletionLikeZig(literal: []const u8, expected: []const u8) !void {
+    for ([_]bool{ true, false }) |in_zon| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const a = w.arena.allocator();
+        const at = if (in_zon) blk: {
+            _ = try w.fixture(try std.fmt.allocPrint(a, "//- /p/main.zig module:app\n{s}\nconst cfg: Cfg = @import(\"cfg.zon\");", .{zon_cfg_decls}));
+            break :blk try w.add("/p/cfg.zon", literal);
+        } else try w.add("/p/main.zig", try std.fmt.allocPrint(a, "{s}\nconst lit: Cfg = {s};\n", .{ zon_cfg_decls, literal }));
+        testing.expectEqualStrings(expected, try completionAt(&w, at)) catch |err| {
+            std.debug.print("literal `{s}` in {s}\n", .{ literal, if (in_zon) "zon" else "zig" });
+            return err;
+        };
+    }
+}
+
+test "zon files take the result type of their typed imports" {
+    // Field names, enum literals, nested initializer lists: the same results as for the same
+    // literal in a `.zig` file
+    try expectZonCompletionLikeZig(".{ .port = 8080, .<|> }", "host verbose level server");
+    try expectZonCompletionLikeZig(".{ .port = 8080, .level = .<|> }", "debug info");
+    try expectZonCompletionLikeZig(".{ .port = 8080, .server = .{ .threads = 2, .<|> } }", "backlog");
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.fixture("//- /p/main.zig module:app\n" ++ zon_cfg_decls ++ "\nconst cfg: Cfg = @import(\"cfg.zon\");")).file("/p/main.zig");
+    const zon_text =
+        \\.{
+        \\    .port = 8080,
+        \\    .host = "localhost",
+        \\    .level = .debug,
+        \\    .server = .{ .threads = 4 },
+        \\}
+        \\
+    ;
+    const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+    try testing.expectEqualStrings(
+        \\.{
+        \\    .port: u16 = 8080,
+        \\    .host: []const u8 = "localhost",
+        \\    .level: Level = .debug,
+        \\    .server: Server = .{ .threads: u8 = 4 },
+        \\}
+        \\
+    , try inlaid(&w, zon_file, zon_text, .{ .types = false, .parameters = false }));
+
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const main_text = (try ctx.get(database.syntax.SourceText, main)).text;
+    // A field name jumps to the declaration of the field in the result type, an enum literal to
+    // the enum member
+    const jumps = [_]struct { []const u8, []const u8 }{
+        .{ "port", "port:" },
+        .{ "threads", "threads:" },
+        .{ "debug", "debug," },
+    };
+    for (jumps) |j| {
+        const t = try definition.definition(&r, zon_file, @intCast(std.mem.indexOf(u8, zon_text, j[0]).?)) orelse return error.NoDefinition;
+        try testing.expectEqual(main, t.file);
+        try testing.expectEqual(std.mem.indexOf(u8, main_text, j[1]).?, t.start);
+    }
+    // The references of a field include the field name in the `.zon` file
+    const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, main_text, "port:").?)) orelse return error.NoDefinition;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file } });
+    try testing.expectEqual(2, refs.len);
+    try testing.expectEqual(zon_file, refs[1].file);
+    try testing.expectEqual(std.mem.indexOf(u8, zon_text, "port").?, refs[1].start);
+}
+
+test "references do not look into zon files without a result type" {
+    // Nothing in an untyped `.zon` file refers to a declaration, even where the values cannot be
+    // inferred (`foo` is not a ZON value): such files leave no uncertain references
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main_text = "const Cfg = struct { port: u16 };\nconst raw = @import(\"cfg.zon\");\n";
+    const main = (try w.fixture("//- /p/main.zig module:app\n" ++ main_text)).file("/p/main.zig");
+    const zon_file = (try w.add("/p/cfg.zon", ".{ .port = foo, .other = .{ .port = 1 } }\n")).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, main_text, "port:").?)) orelse return error.NoDefinition;
+    var uncertain: ?search.Reference = null;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file }, .uncertain = &uncertain });
+    try testing.expectEqual(1, refs.len);
+    try testing.expectEqual(null, uncertain);
+}
+
+test "zon files have no result type unless their typed imports agree" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        // No import site; only an import without a result type
+        .{ "", "" },
+        .{ "const raw = @import(\"cfg.zon\");", "" },
+        // An import site without a result type does not constrain the value
+        .{ "const raw = @import(\"cfg.zon\");\nconst cfg: Cfg = @import(\"cfg.zon\");", "host verbose level server" },
+        // The import sites agree on the type (including an import inside a function); they disagree
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nfn load() Cfg {\n    return @import(\"cfg.zon\");\n}", "host verbose level server" },
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst server: Server = @import(\"cfg.zon\");", "" },
+        // Pointers and optionals around the same type parse the value the same way
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst p: *const Cfg = @import(\"cfg.zon\");\nconst o: ?Cfg = @import(\"cfg.zon\");", "host verbose level server" },
+        .{ "const p: *const Cfg = @import(\"cfg.zon\");\nconst s: *const Server = @import(\"cfg.zon\");", "" },
+        // The result type depends on a generic parameter
+        .{ "fn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}", "" },
+        // A branch known at comptime not to execute is not compiled
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\ncomptime {\n    if (false) {\n        const s: Server = @import(\"cfg.zon\");\n        _ = s;\n    }\n}", "host verbose level server" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app\n{s}\n{s}", .{ zon_cfg_decls, c[0] }));
+        const at = try w.add("/p/cfg.zon", ".{ .port = 8080, .<|> }");
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("importer:\n{s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "zon values take pointer and slice result types like the compiler" {
+    // The compiler parses the value of a single-item pointer as the pointee type, and the value of
+    // a slice is an array literal (a `.zig` file needs `&.{ ... }`)
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "const cfg: *const Cfg = @import(\"cfg.zon\");", ".{ .port = 8080, .<|> }", "host verbose level server" },
+        .{ "const cfg: ?*const Cfg = @import(\"cfg.zon\");", ".{ .port = 8080, .level = .<|> }", "debug info" },
+        .{ "const cfgs: []const Cfg = @import(\"cfg.zon\");", ".{ .{ .port = 1 }, .{ .port = 2, .<|> } }", "host verbose level server" },
+        .{ "const cfgs: []const Cfg = @import(\"cfg.zon\");", ".{ .{ .port = 1, .level = .<|> } }", "debug info" },
+        .{ "const Group = struct { servers: []const Server };\nconst g: Group = @import(\"cfg.zon\");", ".{ .servers = .{ .{ .threads = 2, .<|> } } }", "backlog" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app\n{s}\n{s}", .{ zon_cfg_decls, c[0] }));
+        const at = try w.add("/p/cfg.zon", c[1]);
+        testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
+            std.debug.print("importer:\n{s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture("//- /p/main.zig module:app\n" ++ zon_cfg_decls ++ "\nconst Group = struct { servers: []const Server };\nconst g: *const Group = @import(\"cfg.zon\");");
+    const zon_text = ".{ .servers = .{ .{ .threads = 2 } } }";
+    const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+    try testing.expectEqualStrings(".{ .servers: []const Server = .{ .{ .threads: u8 = 2 } } }", try inlaid(&w, zon_file, zon_text, .{ .types = false, .parameters = false }));
+}
+
+test "zon result types follow the importers across files and edits" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\pub const Cfg = struct { port: u16, host: []const u8 = "" };
+        \\const cfg: Cfg = @import("conf/cfg.zon");
+        \\//- /p/other.zig in:app
+        \\const Cfg = @import("main.zig").Cfg;
+        \\const cfg: Cfg = @import("conf/cfg.zon");
+    );
+    var at = try w.add("/p/conf/cfg.zon", ".{ .port = 8080, .<|> }");
+    try testing.expectEqualStrings("host", try completionAt(&w, at));
+    const steps = [_]struct { path: []const u8, text: []const u8, labels: []const u8 }{
+        // Change the type in the importer
+        .{ .path = "main", .text = "pub const Cfg = struct { port: u16, name: []const u8 = \"\", debug: bool = false };\nconst cfg: Cfg = @import(\"conf/cfg.zon\");", .labels = "name debug" },
+        // Change the content of the `.zon` file
+        .{ .path = "zon", .text = ".{ .port = 8080, .name = \"x\", .<|> }", .labels = "debug" },
+        // One import site switches to another type
+        .{ .path = "other", .text = "const cfg: u32 = @import(\"conf/cfg.zon\");", .labels = "" },
+        .{ .path = "other", .text = "const cfg = @import(\"conf/cfg.zon\");", .labels = "debug" },
+    };
+    for (steps) |step| {
+        if (std.mem.eql(u8, step.path, "main")) {
+            _ = try w.add("/p/main.zig", step.text);
+        } else if (std.mem.eql(u8, step.path, "other")) {
+            _ = try w.add("/p/other.zig", step.text);
+        } else at = try w.add("/p/conf/cfg.zon", step.text);
+        testing.expectEqualStrings(step.labels, try completionAt(&w, at)) catch |err| {
+            std.debug.print("after editing {s}: `{s}`\n", .{ step.path, step.text });
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon fields are completed from the schema" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .<|> }", "name fingerprint version minimum_zig_version dependencies paths" },
+        // Fields already given are not listed again
+        .{ ".{ .name = .demo, .version = \"0.1.0\", .<|> }", "fingerprint minimum_zig_version dependencies paths" },
+        // The `url` and `path` of a dependency are mutually exclusive; dependencies can have any
+        // name
+        .{ ".{ .dependencies = .{ .foo = .{ .<|> } } }", "url hash path lazy" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"https://example.com/foo.tar.gz\", .<|> } } }", "hash lazy" },
+        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "hash lazy" },
+        // Dependency names, elements of `.paths`, field values, and objects outside the schema
+        .{ ".{ .dependencies = .{ .<|> } }", "" },
+        .{ ".{ .paths = .{ .<|> } }", "" },
+        .{ ".{ .name = .<|> }", "" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"u\", .extra = .{ .<|> } } } }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.add("/p/build.zig.zon", c[0]);
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = try w.add("/p/build.zig.zon", ".{ .<|> }");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const first = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items[0];
+    try testing.expectEqual(.field, first.kind);
+    try testing.expect(std.mem.startsWith(u8, first.doc.?, "Enum literal. Required."));
+}
+
+test "build.zig.zon uses the schema only without a result type" {
+    const schema = "name fingerprint version minimum_zig_version dependencies paths";
+    const typed = "const M = struct { a: u8, b: u8 };\nconst m: M = @import(\"build.zig.zon\");";
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // Imported without a result type, as build scripts usually do
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\nconst zon = @import(\"build.zig.zon\");", schema },
+        // With a result type, the file is inferred with that type
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n" ++ typed, "a b" },
+        // Import sites are searched in the files of the module graph, which do not include build
+        // scripts
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n//- /p/build.zig\n" ++ typed, schema },
+        // `.zon` files with other names don't use the schema
+        .{ "/p/cfg.zon", "//- /p/main.zig module:app\nconst zon = @import(\"cfg.zon\");", "" },
+        .{ "/p/sub/build.zig.zon.zig", "//- /p/main.zig module:app\n", "" },
+    };
+    inline for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(c[1]);
+        const at = try w.add(c[0], ".{ .<|> }");
+        testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
+            std.debug.print("{s} imported by:\n{s}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon fields have the official documentation" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .name = .demo,
+        \\    .@"version" = "0.1.0",
+        \\    .dependencies = .{
+        \\        .foo = .{ .url = "https://example.com/foo.tar.gz", .hash = "abc", .lazy = true },
+        \\        .paths = .{ .path = "libs/paths" },
+        \\    },
+        \\    .paths = .{ "build.zig", .{ .name = 1 } },
+        \\    .unknown = .{ .url = "u" },
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/build.zig.zon", text)).file;
+    const cfg = (try w.add("/p/cfg.zon", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "name =", "Enum literal. Required." },
+        .{ "@\"version\"", "String. Required." },
+        .{ "dependencies", "Struct." },
+        .{ "url = \"https://", "String.\n\nWhen updating" },
+        .{ "hash", "String.\n\n[multihash]" },
+        .{ "lazy", "Boolean." },
+        // A dependency named `paths` and the `path` in it
+        .{ "path = ", "String.\n\nWhen this is provided" },
+        .{ "paths = .{ \"", "List. Required." },
+        // Dependency names, values, and fields and objects outside the schema
+        .{ "foo", null },
+        .{ "paths = .{ .path", null },
+        .{ "demo", null },
+        .{ "name = 1", null },
+        .{ "unknown", null },
+        .{ "url = \"u\"", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const info = try hover.hover(&r, file, offset);
+        const other = try hover.hover(&r, cfg, offset);
+        const got = if (info) |i| i.text else "";
+        if (c[1]) |want| {
+            testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+            try testing.expectEqual(offset, info.?.start);
+            // `.zon` files with other names have no schema documentation
+            try testing.expectEqual(null, other);
+        } else {
+            // Outside the schema, the same as in other `.zon` files
+            testing.expectEqualStrings(if (other) |o| o.text else "", got) catch |err| {
+                std.debug.print("hover at `{s}`\n", .{c[0]});
+                return err;
+            };
+        }
+    }
+}
+
+/// A build root: `build.zig.zon` and some files and directories (entries starting with `.` and
+/// `zig-out` are not listed)
+const ManifestRoot = struct {
+    tmp: testing.TmpDir,
+    dir: [:0]const u8,
+
+    fn create() !ManifestRoot {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        for ([_][]const u8{ "src/util", "libs/foo", "zig-out/bin", ".zig-cache" }) |d| try tmp.dir.createDirPath(testing.io, d);
+        for ([_][]const u8{ "build.zig", "build.zig.zon", "README.md", ".gitignore", "src/main.zig", "src/util/a.zig", "libs/foo/build.zig.zon" }) |f| {
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = f, .data = "" });
+        }
+        return .{ .tmp = tmp, .dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator) };
+    }
+
+    fn deinit(m: *ManifestRoot) void {
+        testing.allocator.free(m.dir);
+        m.tmp.cleanup();
+    }
+
+    /// Uses `text` as the content of its `build.zig.zon`
+    fn add(m: ManifestRoot, w: *World, text: []const u8) !World.Added {
+        return w.addNative(try std.fs.path.join(w.arena.allocator(), &.{ m.dir, "build.zig.zon" }), text);
+    }
+};
+
+test "build.zig.zon paths are completed relative to the build root" {
+    var root: ManifestRoot = try .create();
+    defer root.deinit();
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Elements of `.paths`: files and directories
+        .{ ".{ .paths = .{ \"<|>\" } }", "README.md build.zig build.zig.zon libs src" },
+        .{ ".{ .paths = .{ \"build.zig\", \"src/<|>\" } }", "src/main.zig src/util" },
+        .{ ".{ .paths = .{ \"src/util/a<|>\" } }", "src/util/a.zig" },
+        // The `.path` of a dependency: directories only
+        .{ ".{ .dependencies = .{ .foo = .{ .path = \"<|>\" } } }", "libs src" },
+        .{ ".{ .dependencies = .{ .foo = .{ .path = \"libs/<|>\" } } }", "libs/foo" },
+        // Unclosed strings
+        .{ ".{\n    .paths = .{ \"build.zig\", \"sr<|>\n    },\n}", "README.md build.zig build.zig.zon libs src" },
+        .{ ".{\n    .dependencies = .{ .foo = .{ .path = \"li<|>\n    } },\n}", "libs src" },
+        // Strings that are not paths
+        .{ ".{ .version = \"<|>\" }", "" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"<|>\" } } }", "" },
+        .{ ".{ .paths = .{ .{ .path = \"<|>\" } } }", "" },
+        .{ ".{ .other = .{ \"<|>\" } }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try root.add(&w, c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        const text = (try ctx.get(database.syntax.SourceText, at.file)).text;
+        for (items) |it| {
+            try labels.append(w.arena.allocator(), it.label);
+            // The replacement range starts at the start of the string content
+            const quote = std.mem.lastIndexOfScalar(u8, text[0..at.cursor], '"').?;
+            try testing.expectEqual(quote + 1, it.replace.?.start);
+            try testing.expectEqual(at.cursor, it.replace.?.end);
+        }
+        std.mem.sort([]const u8, labels.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon paths go to the files they name" {
+    var root: ManifestRoot = try .create();
+    defer root.deinit();
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .version = "build.zig",
+        \\    .dependencies = .{
+        \\        .foo = .{ .path = "libs/foo" },
+        \\        .bar = .{ .path = "build.zig" },
+        \\    },
+        \\    .paths = .{ "build.zig", "src/main.zig", "README.md", "src", "", "missing.zig", "/build.zig" },
+        \\}
+        \\
+    ;
+    const file = (try root.add(&w, text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "\"build.zig\", \"src", "build.zig" },
+        .{ "src/main.zig", "src/main.zig" },
+        .{ "README.md", "README.md" },
+        // The `.path` of a dependency goes to a file as well
+        .{ "build.zig\" }", "build.zig" },
+        // Directories, missing files, absolute paths, and strings that are not paths
+        .{ "\"src\"", null },
+        .{ "\"\"", null },
+        .{ "missing.zig", null },
+        .{ "/build.zig", null },
+        .{ "libs/foo", null },
+        .{ "build.zig\",\n", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).? + 1);
+        const got = try definition.manifestPath(&r, file, offset);
+        if (c[1]) |want| {
+            const path = got orelse {
+                std.debug.print("no path at `{s}`\n", .{c[0]});
+                return error.NoDefinition;
+            };
+            // Normalized: the path in `want` uses `/`, while paths on Windows use `\`
+            const joined = try std.fs.path.join(w.arena.allocator(), &.{ root.dir, want });
+            const expected = switch (w.vfs.style) {
+                inline else => |style| try Vfs.normalize(style, w.arena.allocator(), joined),
+            };
+            try testing.expectEqualStrings(expected.?, path);
+        } else testing.expectEqual(null, got) catch |err| {
+            std.debug.print("path at `{s}`: {s}\n", .{ c[0], got.? });
+            return err;
+        };
+    }
+    // The target is not interned: interned files other than Zig sources are watched, and their
+    // changes rebuild the project
+    try testing.expectEqual(null, try w.vfs.lookup(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, "README.md" })));
 }
 
 test "hover in generic bodies is inferred from a call site" {
