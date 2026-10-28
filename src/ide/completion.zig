@@ -1582,7 +1582,12 @@ fn addKeywordSnippets(r: *Resolver, file: FileId, text: []const u8, offset: u32,
                     "pub fn main() !void {$0}";
                 try addSnippet(r.arena, items, "main", main[skip..], range);
             }
-            if (container != 0 and is_std and tree.containers[container].kind != .@"opaque" and
+            // `format` belongs to types: containers other than the file, and the file when it has
+            // fields (a file used as a struct)
+            const is_type = container != 0 or for (tree.containerMembers(0)) |m| {
+                if (tree.items[m].kind == .field) break true;
+            } else false;
+            if (is_type and is_std and tree.containers[container].kind != .@"opaque" and
                 Resolver.lookupDecl(tree, container, "format") == null and try stdHas(r, file, &.{ "Io", "Writer" }))
             {
                 const format = "pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {$0}";

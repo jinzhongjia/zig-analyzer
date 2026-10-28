@@ -4477,6 +4477,8 @@ test "completion: statement and declaration snippets follow the syntax position"
         .{ "const S = struct {\n    a: u8,\n    <|>\n};", declarations ++ ", std, builtin" },
         .{ "const std = @import(\"std\");\nconst S = struct {\n    a: u8,\n    <|>\n};", declarations ++ ", builtin, format" },
         .{ "const std = @import(\"std\");\nconst S = opaque {\n    <|>\n};", declarations ++ ", builtin" },
+        // A file with fields is a struct and gets `format` as well
+        .{ "const std = @import(\"std\");\na: u8,\n<|>", declarations ++ ", builtin, main, format" },
         .{ "fn t() void {\n    const S = struct {\n        <|>\n    };\n    _ = S;\n}", declarations ++ ", std, builtin" },
         // No declarations between fields
         .{ "const S = struct {\n    a: u8,\n    <|>\n    b: u8,\n};", "" },
