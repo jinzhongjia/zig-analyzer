@@ -1221,6 +1221,8 @@ const Slot = union(enum) {
     arg: struct { call: Body.ExprId, index: u32 },
     /// Value of field `index` in the initializer `init`
     field: struct { init: Body.ExprId, index: u32 },
+    /// Element `index` of the array or tuple initializer `init`
+    elem: struct { init: Body.ExprId, index: u32 },
     /// Right-hand side of an assignment (`=`); the payload is the left-hand side
     assign: Body.ExprId,
     /// Initializer of a local variable
@@ -1231,8 +1233,10 @@ const Slot = union(enum) {
 };
 
 /// The position of the name at the cursor expects a function value: `&f`, the callee of `@call`,
-/// and arguments, fields, assignments, variables and return values whose type is a function or a
-/// function pointer (including inside optionals and error unions)
+/// and arguments, fields, array and tuple elements, assignments, variables and return values whose
+/// type is a function or a function pointer (including inside optionals and error unions). The
+/// branches of `if`, `switch`, `orelse`, `catch` and the value of `break :label` take the position
+/// of the expression they produce
 fn expectsFnValue(r: *Resolver, file: FileId, root: SyntaxNode, offset: u32, visible: Visible, word: Item.Range) resolve.Error!bool {
     const a = visible.at orelse try context.atSeeded(r, file, offset, true) orelse return false;
     const slot: Slot = switch (visible.context) {
@@ -1260,16 +1264,48 @@ fn slotOf(b: *const Body, e: Body.ExprId) Slot {
                 if (arg == e) return .{ .arg = .{ .call = id, .index = @intCast(j) } };
             },
             .init => |init| for (init.fields, 0..) |f, j| {
-                if (f.value == e) return if (f.name != null) .{ .field = .{ .init = id, .index = @intCast(j) } } else .none;
+                if (f.value == e) return if (f.name != null) .{ .field = .{ .init = id, .index = @intCast(j) } } else .{ .elem = .{ .init = id, .index = @intCast(j) } };
             },
             .assign => |x_| if (x_.rhs == e and x_.op == .equal) return .{ .assign = x_.lhs },
             .@"return" => |v| if (v) |value| if (value == e) return .@"return",
+            // A branch value takes the position of the whole expression
+            .@"if" => |x_| if (x_.then == e or x_.@"else" == e) return slotOf(b, id),
+            .@"switch" => |s| for (s.prongs) |prong| {
+                if (prong.body == e) return slotOf(b, id);
+            },
+            .binary => |x_| if (x_.op == .keyword_orelse and x_.rhs == e) return slotOf(b, id),
+            .@"catch" => |c| if (c.rhs == e) return slotOf(b, id),
+            .@"comptime" => |inner| if (inner == e) return slotOf(b, id),
+            .@"break" => |x_| if (x_.value == e) {
+                const block = labeledBlock(b, id, x_.label orelse return .none) orelse return .none;
+                return slotOf(b, block);
+            },
             else => {},
         }
     }
     for (b.bindings, 0..) |binding, i| if (binding.init) |init| if (init == e) return .{ .local = @fromBackingInt(@as(u32, @intCast(i))) };
     if (b.value) |value| if (value == e) return .value;
     return .none;
+}
+
+/// The innermost block labeled `label` that contains the expression `e`
+fn labeledBlock(b: *const Body, e: Body.ExprId, label: []const u8) ?Body.ExprId {
+    const range = b.range(e);
+    var found: ?Body.ExprId = null;
+    for (b.exprs, 0..) |x, i| {
+        const block = switch (x) {
+            .block => |block| block,
+            else => continue,
+        };
+        const l = block.label orelse continue;
+        if (!std.mem.eql(u8, l, label)) continue;
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        const r = b.range(id);
+        if (r.start > range.start or r.end < range.end) continue;
+        if (found) |f| if (b.range(f).start > r.start) continue;
+        found = id;
+    }
+    return found;
 }
 
 /// Position at the cursor when no name precedes it: the expression is missing and has no position
@@ -1284,13 +1320,27 @@ fn emptySlot(arena: Allocator, root: SyntaxNode, a: context.At, offset: u32) All
         .builtin_call => |c| if (p.kind == .comma and std.mem.eql(u8, c.name, "@call") and argsBefore(b, c.args, rel) == 1) return .fn_value,
         .prefix => |x| if (p.kind == .ampersand and x.op == .ampersand) return .fn_value,
         .@"return" => if (p.kind == .keyword_return) return .@"return",
-        .init => |init| if (p.kind == .equal) {
-            // The last field name before the `=`
-            var index: ?usize = null;
-            for (init.fields, 0..) |f, j| {
-                if (f.name != null and f.name_range.end <= rel) index = j;
-            }
-            if (index) |j| return .{ .field = .{ .init = e, .index = @intCast(j) } };
+        .init => |init| switch (p.kind) {
+            .equal => {
+                // The last field name before the `=`
+                var index: ?usize = null;
+                for (init.fields, 0..) |f, j| {
+                    if (f.name != null and f.name_range.end <= rel) index = j;
+                }
+                if (index) |j| return .{ .field = .{ .init = e, .index = @intCast(j) } };
+            },
+            // An element of an array or tuple initializer: the elements before the cursor are
+            // counted (missing elements have no position)
+            .l_brace, .comma => {
+                var index: u32 = 0;
+                for (init.fields) |f| {
+                    if (f.name != null) return .none;
+                    const range = b.range(f.value);
+                    if (range.end > range.start and range.end <= rel) index += 1;
+                }
+                return .{ .elem = .{ .init = e, .index = index } };
+            },
+            else => {},
         },
         .assign => |x| if (p.kind == .equal and x.op == .equal) return .{ .assign = x.lhs },
         else => {},
@@ -1337,6 +1387,19 @@ fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
             const def = try context.defOfKey(r, key) orelse return false;
             const fb = try r.body(def.item.file, def.item.item);
             return if (fb.type_expr) |t| isFnTypeExpr(fb, t) else false;
+        },
+        .elem => |el| {
+            // By syntax (`[_]*const fn () void{ ... }`), or by the computed type of the initializer
+            if (b.expr(el.init).init.ty) |t| switch (b.expr(t)) {
+                .array_type => |arr| if (isFnTypeExpr(b, arr.child)) return true,
+                else => {},
+            };
+            return switch (a.ip.key(a.exprType(el.init).ty)) {
+                .array_type => |arr| isFnType(a.ip, arr.child),
+                .abstract_array_type => |arr| isFnType(a.ip, arr.child),
+                .tuple_type => |tuple| el.index < tuple.types.len and isFnType(a.ip, tuple.types[el.index]),
+                else => false,
+            };
         },
         .assign => |lhs| return isFnType(a.ip, a.exprType(lhs).ty),
         .local => |id| return typeExprIsFn(a, b.binding(id).ty),

@@ -4197,6 +4197,7 @@ const call_snippet_decls =
     \\    return f(x, x);
     \\}
     \\const Handler = struct { cb: *const fn () void, n: u32 };
+    \\const HandlerFn = *const fn () void;
     \\
 ;
 
@@ -4237,6 +4238,21 @@ test "completion: function and builtin calls insert argument placeholders with s
         .{ "fn t() void {\n    var g: ?*const fn () void = null;\n    g = noA<|>;\n}", "noArgs", "-" },
         .{ "fn t() *const fn () void {\n    return noA<|>;\n}", "noArgs", "-" },
         .{ "const cb: *const fn () void = noA<|>;", "noArgs", "-" },
+        // Elements of arrays and tuples of functions, by syntax or by the computed type
+        .{ "fn t() void {\n    const fs = [_]*const fn () void{ noA<|> };\n    _ = fs;\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const fs = [_]HandlerFn{ noArgs, noA<|> };\n    _ = fs;\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const fs = [_]HandlerFn{ noArgs, <|> };\n    _ = fs;\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const fs: [2]HandlerFn = .{ noArgs, noA<|> };\n    _ = fs;\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const fs: struct { HandlerFn, u32 } = .{ noA<|>, 1 };\n    _ = fs;\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const xs = [_]u32{ ad<|> };\n    _ = xs;\n}", "add", "add(${1:a}, ${2:b})" },
+        .{ "fn t() void {\n    const xs: struct { HandlerFn, u32 } = .{ noArgs, ad<|> };\n    _ = xs;\n}", "add", "add(${1:a}, ${2:b})" },
+        // Branches take the position of the expression they produce
+        .{ "fn t(c: bool) void {\n    const h: HandlerFn = if (c) noArgs else noA<|>;\n    _ = h;\n}", "noArgs", "-" },
+        .{ "fn t(o: ?HandlerFn) void {\n    const h: HandlerFn = o orelse noA<|>;\n    _ = h;\n}", "noArgs", "-" },
+        .{ "fn t(e: anyerror!HandlerFn) void {\n    const h: HandlerFn = e catch noA<|>;\n    _ = h;\n}", "noArgs", "-" },
+        .{ "fn t(x: u8) void {\n    const h: HandlerFn = switch (x) {\n        0 => noArgs,\n        else => noA<|>,\n    };\n    _ = h;\n}", "noArgs", "-" },
+        .{ "fn t() void {\n    const h: HandlerFn = blk: {\n        break :blk noA<|>;\n    };\n    _ = h;\n}", "noArgs", "-" },
+        .{ "fn t(c: bool) void {\n    const x: u32 = if (c) 1 else ad<|>;\n    _ = x;\n}", "add", "add(${1:a}, ${2:b})" },
         // Builtins
         .{ "fn t() void {\n    _ = @Thi<|>;\n}", "@This", "@This()" },
         .{ "fn t() void {\n    _ = @a<|>s;\n}", "@as", "@as(${1:T}, ${2:expression})" },
