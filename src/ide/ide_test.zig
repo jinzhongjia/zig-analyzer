@@ -729,6 +729,16 @@ test "name completion ranks candidates fitting the expected type first" {
         .{ "fn run(w: Want) void { if (w == cd<|>) {} }", want_first },
         .{ "fn run(o: Other) void { if (o.w != cd<|>) {} }", want_first },
         .{ "fn run(t: Tagged) void { if (t == cd<|>) {} }", want_first },
+        // `@as(T, e)`; the branches of `if`, `switch`, `orelse`, and `catch`, `break :label`, and
+        // `comptime e` take the expected type of the expression they produce
+        .{ "fn run() void { _ = @as(Want, cd<|>); }", want_first },
+        .{ "fn run(c: bool) void { const x: Want = if (c) .a else cd<|>; _ = x; }", want_first },
+        .{ "fn run(n: u8) void { const x: Want = switch (n) { 0 => .a, else => cd<|> }; _ = x; }", want_first },
+        .{ "fn run(o: ?Want) void { const x: Want = o orelse cd<|>; _ = x; }", want_first },
+        .{ "fn run(e: anyerror!Want) void { const x: Want = e catch cd<|>; _ = x; }", want_first },
+        .{ "fn run() void { const x: Want = blk: { break :blk cd<|>; }; _ = x; }", want_first },
+        .{ "fn run() void { const x: Want = comptime cd<|>; _ = x; }", want_first },
+        .{ "fn run(c: bool) void { const x: Other = if (c) .{} else cd<|>; _ = x; }", other_first },
     });
 }
 

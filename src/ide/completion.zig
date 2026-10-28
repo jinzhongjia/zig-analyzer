@@ -1048,29 +1048,68 @@ fn expectedAt(r: *Resolver, file: FileId, offset: u32, at: ?context.At) resolve.
 /// (including declarations in containers and default values of fields) takes the annotated type;
 /// `return e` takes the return type of the function; `.f = e` in an initializer takes the type of
 /// the field; `lhs = e` takes the type of the left-hand side; a comparison takes the type of the
-/// other side
+/// other side; `@as(T, e)` takes `T`. The branches of `if`, `switch`, `orelse`, and `catch`, the
+/// value of `break :label`, and `comptime e` take the expected type of the expression they produce
 fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index {
     const b = a.body;
-    for (b.exprs, 0..) |x, i| switch (x) {
-        .call => |c| for (c.args, 0..) |arg, n| {
-            if (arg == e) return argType(r, a, c.callee, n);
-        },
-        .init => |init| for (init.fields) |f| {
-            if (f.value == e) return initFieldType(r, a, @fromBackingInt(@as(u32, @intCast(i))), f.name orelse return null);
-        },
-        .@"return" => |v| if (v == e) {
-            if ((try r.itemTree(a.file)).items[a.item].kind != .@"fn") return null;
-            return a.exprType(b.type_expr orelse return null).asType();
-        },
-        .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
-        .binary => |s| if (isComparison(s.op) and (s.lhs == e or s.rhs == e)) {
-            return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty);
-        },
-        else => {},
-    };
+    for (b.exprs, 0..) |x, i| {
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        switch (x) {
+            .call => |c| for (c.args, 0..) |arg, n| {
+                if (arg == e) return argType(r, a, c.callee, n);
+            },
+            .init => |init| for (init.fields) |f| {
+                if (f.value == e) return initFieldType(r, a, id, f.name orelse return null);
+            },
+            .@"return" => |v| if (v == e) {
+                if ((try r.itemTree(a.file)).items[a.item].kind != .@"fn") return null;
+                return a.exprType(b.type_expr orelse return null).asType();
+            },
+            .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
+            .binary => |s| {
+                if (isComparison(s.op) and (s.lhs == e or s.rhs == e)) {
+                    return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty);
+                }
+                if (s.op == .keyword_orelse and s.rhs == e) return expectedOf(r, a, id);
+            },
+            .builtin_call => |c| if (std.mem.eql(u8, c.name, "@as") and c.args.len == 2 and c.args[1] == e) {
+                return a.exprType(c.args[0]).asType();
+            },
+            .@"if" => |s| if (s.then == e or s.@"else" == e) return expectedOf(r, a, id),
+            .@"switch" => |s| for (s.prongs) |prong| {
+                if (prong.body == e) return expectedOf(r, a, id);
+            },
+            .@"catch" => |s| if (s.rhs == e) return expectedOf(r, a, id),
+            .@"comptime" => |inner| if (inner == e) return expectedOf(r, a, id),
+            .@"break" => |s| if (s.value == e) {
+                return expectedOf(r, a, labeledBlock(b, id, s.label orelse return null) orelse return null);
+            },
+            else => {},
+        }
+    }
     for (b.bindings) |binding| if (binding.init == e) return a.exprType(binding.ty orelse return null).asType();
     if (b.value == e) return a.exprType(b.type_expr orelse return null).asType();
     return null;
+}
+
+/// The innermost block labeled `label` that contains the expression `e`
+fn labeledBlock(b: *const Body, e: Body.ExprId, label: []const u8) ?Body.ExprId {
+    const range = b.range(e);
+    var found: ?Body.ExprId = null;
+    for (b.exprs, 0..) |x, i| {
+        const block = switch (x) {
+            .block => |block| block,
+            else => continue,
+        };
+        const l = block.label orelse continue;
+        if (!std.mem.eql(u8, l, label)) continue;
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        const r = b.range(id);
+        if (r.start > range.start or r.end < range.end) continue;
+        if (found) |f| if (b.range(f).start > r.start) continue;
+        found = id;
+    }
+    return found;
 }
 
 /// The expected type of argument `n` of a call: the type of the called function's parameter. A
