@@ -1073,13 +1073,12 @@ fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index 
     return null;
 }
 
-/// The expected type of argument `n` of a call: the type of the called function's parameter.
-/// Calling a function declaration through a value (a method call) skips self, while fields of
-/// function type do not bind a receiver (the same as `infer`)
+/// The expected type of argument `n` of a call: the type of the called function's parameter. A
+/// method call skips self (see `context.callee`); when the member called through a value cannot be
+/// resolved, whether it binds self is unknown and there is no expected type
 fn argType(r: *Resolver, a: context.At, callee: Body.ExprId, n: usize) resolve.Error!?Index {
     const ip = a.ip;
-    const ct = a.exprType(callee).ty;
-    const f = switch (ip.key(ct)) {
+    const f = switch (ip.key(a.exprType(callee).ty)) {
         .fn_type => |f| f,
         .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
             .fn_type => |f| f,
@@ -1087,18 +1086,9 @@ fn argType(r: *Resolver, a: context.At, callee: Body.ExprId, n: usize) resolve.E
         } else return null,
         else => return null,
     };
-    var skip: usize = 0;
-    switch (a.body.expr(callee)) {
-        .field_access => |fa| if (ip.key(ct) == .fn_type and !a.exprType(fa.lhs).isType()) {
-            const def = try context.defOfKey(r, a.member(callee) orelse return null) orelse return null;
-            const it = switch (def) {
-                .item => |it| it,
-                else => return null,
-            };
-            if ((try r.itemTree(it.file)).items[it.item].kind != .field) skip = 1;
-        },
-        else => {},
-    }
+    const target = try context.callee(r, a, callee);
+    if (target == null and a.body.expr(callee) == .field_access) return null;
+    const skip: usize = if (target) |t| @intFromBool(t.bound) else 0;
     return if (n + skip < f.params.len) f.params[n + skip] else null;
 }
 
