@@ -412,6 +412,7 @@ test "name completion offers fields and callable methods of local values two lev
         \\    depth: u32,
         \\    pub fn get(self: *const Inner) u32 { return self.depth; }
         \\    pub fn bump(self: *Inner) void { self.depth += 1; }
+        \\    pub const peek = get;
         \\};
         \\const Outer = struct {
         \\    inner: Inner,
@@ -457,6 +458,16 @@ test "name completion offers fields and callable methods of local values two lev
         .{ "fn outer(o: Outer) void { _ = o; const S = struct { fn f() void { _ = depth<|>; } }; _ = S; }", "" },
         // Shadowed local values are not expanded
         .{ "fn run(o: Outer) void { _ = o; { const o: u32 = 1; _ = o; _ = depth<|>; } }", "" },
+        // A value capture cannot be modified; a pointer capture can be when the pointer is mutable
+        .{ "fn run(xs: []Inner) void { for (xs) |x| { _ = x; _ = bump<|>; } }", "" },
+        .{ "fn run(xs: []Inner) void { for (xs) |*x| { _ = x; _ = bump<|>; } }", "x.bump" },
+        .{ "fn run(xs: []const Inner) void { for (xs) |*x| { _ = x; _ = bump<|>; } }", "" },
+        // An alias of a method is a method too
+        .{ "fn run(o: Outer) void { _ = o; _ = peek<|>; }", "o.copy().peek o.inner.peek o.ptr.peek" },
+        // Fields of unions
+        .{ "const U = union(enum) { in: Inner, n: u8 };\nfn run(u: U) void { _ = u; _ = depth<|>; }", "u.in.depth" },
+        // Comptime parameters of an enclosing function are comptime-known
+        .{ "fn outer(comptime o: Outer) type { return struct { fn f() void { _ = depth<|>; } }; }", "o.copy().depth o.inner.depth o.ptr.depth" },
     };
     for (cases) |c| {
         const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ types, c[0] });
