@@ -3673,7 +3673,7 @@ test "member completion on values lists function aliases as methods" {
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
     // The function alias `isARM` can be called as a method; the value constant `count` is not
     // listed
-    try testing.expectEqualStrings("x86 arm isArm isARM", try std.mem.join(w.arena.allocator(), " ", labels.items));
+    try testing.expectEqualStrings("isArm isARM", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
 test "completion in a branch inactive for the first call site uses a call site where it is active" {
@@ -4286,7 +4286,7 @@ test "inside an inline for over a tuple whose items have different types, featur
         \\
     );
     defer testing.allocator.free(by_name);
-    try testing.expectEqualStrings("on off toBool", by_name);
+    try testing.expectEqualStrings("toBool", by_name);
 }
 
 test "callsite seeding tries every instance for a branch only rare instances compile" {
@@ -4403,6 +4403,37 @@ test "completion through single pointers to arrays, tuples and slices" {
         var labels: std.ArrayList([]const u8) = .empty;
         for (items) |it| try labels.append(w.arena.allocator(), it.label);
         try testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items));
+    }
+}
+
+test "member completion on an enum value lists its functions but not its tags" {
+    // Tags used to be listed after `.` on an enum value, although Zig accesses them only through
+    // the type
+    const color =
+        \\const Color = enum {
+        \\    red,
+        \\    green,
+        \\    pub fn isRed(self: Color) bool { return self == .red; }
+        \\};
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f(color: Color) void { _ = color.<|>; }", "isRed" },
+        .{ "fn f(color: *const Color) void { _ = color.<|>; }", "isRed" },
+        // Tags are accessed through the type
+        .{ "fn f() void { _ = Color.<|>; }", "isRed red green" },
+        // The fields of a union value are its payloads
+        .{ "const U = union(enum) { a: u32, b: bool, pub fn isA(self: U) bool { return self == .a; } };\nfn f(u: U) void { _ = u.<|>; }", "a b isA" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "{s}{s}\n", .{ color, c[0] });
+        defer testing.allocator.free(source);
+        const got = try completionLabels(source);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
     }
 }
 

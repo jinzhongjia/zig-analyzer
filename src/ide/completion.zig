@@ -655,8 +655,8 @@ fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
     };
 }
 
-/// Lists members by type: declarations when the value is a type; fields and methods for
-/// instances (including single pointers); slices and arrays have len
+/// Lists members by type: declarations when the value is a type; for other values (also through a
+/// single pointer), their members (see `valueMembers`), with every function among them
 fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
@@ -676,54 +676,25 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
         const ns = try queries.namespaceOfType(r, t) orelse return;
         return members(r, out, ns, ns.file == from);
     }
-    var t = tv.ty;
     // A single pointer is dereferenced automatically once: len of `*[N]T`, fields and methods of
     // `*S`, len and ptr of `*[]T`
-    switch (ip.key(t)) {
-        .ptr_type => |p| if (p.size == .one) {
-            t = p.child;
+    const t = switch (ip.key(tv.ty)) {
+        .ptr_type => |p| if (p.size == .one) p.child else tv.ty,
+        else => tv.ty,
+    };
+    for (try valueMembers(r, from, t)) |m| switch (m.what) {
+        .typed => |ty| try out.add(.{ .label = m.name, .kind = .field, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null }),
+        .field => |f| {
+            const ty = (try declType(r, f)).ty;
+            try out.add(.{ .label = m.name, .kind = .field, .doc = m.doc, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null });
         },
-        else => {},
-    }
-    switch (ip.key(t)) {
-        .ptr_type => |p| {
-            // Single pointers to pointers and many-item pointers have no members
-            if (p.size == .slice) {
-                try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
-                try out.add(.{ .label = "ptr", .kind = .field });
-            }
-            return;
-        },
-        .array_type => return out.add(.{ .label = "len", .kind = .field, .detail = "usize" }),
-        // Tuples, anonymous structs, constructed structs and unions: fields
-        .tuple_type, .anon_struct_type, .reified_type => {
-            for (try eval.fieldNames(r, t)) |f| try out.add(.{ .label = f.name, .kind = .field, .detail = if (f.ty != .unknown) try render.typeAlloc(r, f.ty) else null });
-            if (ip.key(t) == .tuple_type) try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
-            return;
-        },
-        else => {},
-    }
-    const ns = try queries.namespaceOfType(r, t) orelse return;
-    const tree = try r.itemTree(ns.file);
-    const same_file = ns.file == from;
-    for (tree.containerMembers(ns.container)) |m| {
-        const it = tree.items[m];
-        const name = it.name orelse continue;
-        switch (it.kind) {
-            .field => {
-                const fty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(r.ctx.db.env.ip, t) })).ty;
-                try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
-            },
-            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = .{ .decl = .{ .file = ns.file, .item = m } } }),
-            // Function aliases (`pub const isPowerPC = isPowerpc;`) can also be called as methods;
-            // when selected, they show the signature of the aliased function
-            .@"const" => if (same_file or it.flags.is_pub) {
-                const ctv = try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) });
-                if (ip.key(ctv.ty) == .fn_type) try out.add(.{ .label = name, .kind = .function, .doc = it.doc, .target = try fnTarget(r, ctv) });
-            },
-            else => {},
-        }
-    }
+        // Function aliases (`pub const isPowerPC = isPowerpc;`) can also be called as methods;
+        // when selected, they show the signature of the aliased function
+        .method => |f| if (f.alias) {
+            const ctv = try declType(r, f);
+            if (ip.key(ctv.ty) == .fn_type) try out.add(.{ .label = m.name, .kind = .function, .doc = m.doc, .target = try fnTarget(r, ctv) });
+        } else try out.add(.{ .label = m.name, .kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item)), .doc = m.doc, .target = .{ .decl = .{ .file = f.file, .item = f.item } } }),
+    };
 }
 
 /// After `.`: enum members and union fields of the expected type (`T` for `?T`), and
