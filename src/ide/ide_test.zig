@@ -283,11 +283,16 @@ test "signature help and parameter hints through aliases" {
         \\fn add(a: u32, b: u32) u32 { return a + b; }
         \\const plus = add;
         \\const ns = struct { const sum = plus; };
-        \\fn run(x: u32) void {
+        \\const S = struct {
+        \\    fn addImpl(self: S, a: u32, b: u32) u32 { _ = self; return a + b; }
+        \\    pub const sum = addImpl;
+        \\};
+        \\fn run(x: u32, s: S) void {
         \\    const local = add;
         \\    _ = plus(x, 1);
         \\    _ = ns.sum(x, 2);
         \\    _ = local(x, 3);
+        \\    _ = s.sum(x, 4);
         \\}
         \\
     ;
@@ -304,13 +309,17 @@ test "signature help and parameter hints through aliases" {
         try testing.expectEqualStrings("fn add(a: u32, b: u32) u32", s.label);
         try testing.expectEqual(1, s.active);
     }
+    // An alias of a method, called through a value, binds the receiver like the method itself
+    const s = try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, "4);").?)) orelse return error.NoSignature;
+    try testing.expectEqualStrings("fn addImpl(self: S, a: u32, b: u32) u32", s.label);
+    try testing.expectEqual(2, s.active);
     const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{});
     var out: std.ArrayList(u8) = .empty;
     for (hints) |h| if (h.kind == .parameter) {
         try out.appendSlice(w.arena.allocator(), h.label);
         try out.append(w.arena.allocator(), ' ');
     };
-    try testing.expectEqualStrings("a: b: a: b: a: b: ", out.items);
+    try testing.expectEqualStrings("a: b: a: b: a: b: a: b: ", out.items);
 }
 
 test "hover and signature help drop comments from multi-line function prototypes" {
