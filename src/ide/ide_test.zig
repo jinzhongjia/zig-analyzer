@@ -1356,6 +1356,9 @@ test "zon files have no result type unless their typed imports agree" {
         // The import sites agree on the type (including an import inside a function); they disagree
         .{ "const cfg: Cfg = @import(\"cfg.zon\");\nfn load() Cfg {\n    return @import(\"cfg.zon\");\n}", "host verbose level server" },
         .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst server: Server = @import(\"cfg.zon\");", "" },
+        // Pointers and optionals around the same type parse the value the same way
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst p: *const Cfg = @import(\"cfg.zon\");\nconst o: ?Cfg = @import(\"cfg.zon\");", "host verbose level server" },
+        .{ "const p: *const Cfg = @import(\"cfg.zon\");\nconst s: *const Server = @import(\"cfg.zon\");", "" },
         // The result type depends on a generic parameter
         .{ "fn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}", "" },
         // A branch known at comptime not to execute is not compiled
