@@ -226,15 +226,7 @@ fn fail(file: FileId, offset: ?u32, message: []const u8) Outcome {
 /// can be removed next.
 fn verify(r: *Resolver, t: Target, param_list: TextRange, fe: rename.FileEdits) resolve.Error!?Problem {
     const errors = try rename.astGenErrors(r, fe.file, fe.edits);
-    const matched = try r.arena.alloc(bool, errors.before.len);
-    @memset(matched, false);
-    next: for (errors.after) |a| {
-        for (errors.before, matched) |b, *m| {
-            if (!m.* and b.start == a.start and std.mem.eql(u8, b.message, a.message)) {
-                m.* = true;
-                continue :next;
-            }
-        }
+    for (try rename.newAstGenErrors(r.arena, errors.before, errors.after)) |a| {
         if (fe.file == t.file and std.mem.eql(u8, a.message, unused_message) and param_list.contains(a.start)) continue;
         return .{ .file = fe.file, .offset = a.start, .message = try std.fmt.allocPrint(r.arena, "the edit would cause an error here: {s}", .{a.message}) };
     }
