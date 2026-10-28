@@ -527,7 +527,7 @@ pub fn computeComptimeOnly(r: *Resolver, t: Index) Error!bool {
     if (value.isComptimeOnly(ip, t)) return true;
     switch (ip.key(t)) {
         .container_type => |c| {
-            if (c.kind != .@"struct" and c.kind != .@"union") return false;
+            if (!c.kind.isStruct() and c.kind != .@"union") return false;
             const ns = try queries.namespaceOfType(r, t) orelse return false;
             const tree = try r.itemTree(ns.file);
             for (tree.containerMembers(ns.container)) |m| {

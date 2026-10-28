@@ -3070,6 +3070,23 @@ test "calls returning types with comptime-only fields nested at any depth are ev
     });
 }
 
+test "calls returning a file whose fields are comptime-only are evaluated at comptime" {
+    // Guards against taking a file, which is a struct, as never comptime-only
+    try expectTypes(
+        \\t: type,
+        \\fn make(comptime X: type) @This() {
+        \\    return .{ .t = X };
+        \\}
+        \\fn f() void {
+        \\    const r = make(u16);
+        \\    const deep = r.t;
+        \\    _ = deep;
+        \\}
+    , &.{
+        .{ "deep", "type = u16" },
+    });
+}
+
 test "comptime evaluation: backward branches follow the compiler's quota" {
     // Guards against giving up by the number of expressions or by the fuel of the whole request:
     // the compiler only counts backward branches (loop iterations, calls), `@setEvalBranchQuota`
