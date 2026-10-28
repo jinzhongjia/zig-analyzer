@@ -4314,6 +4314,32 @@ const CompletionRanges = struct {
     }
 };
 
+test "CompletionRanges: ranges in the line of the cursor and elsewhere convert as with the line table" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // CRLF line breaks and characters of 2, 3 and 4 UTF-8 bytes before the word at the cursor
+    const text = "const a = @import(\"a.zig\");\r\nfn f() void {\r\n    _ = \"é€😀\" ++ ad;\r\n}\r\n";
+    const word = std.mem.indexOf(u8, text, "ad;").?;
+    const line_start = std.mem.indexOf(u8, text, "    _").?;
+    const line_end = std.mem.indexOfPos(u8, text, line_start, "\r").?;
+    for ([_]offsets.Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        const lines = try offsets.LineIndex.init(arena, text);
+        var ranges: CompletionRanges = .{ .text = text, .line = offsets.Line.init(text, 2), .encoding = enc };
+        // In the line of the cursor (the word, an empty range at its end, the whole line): no line
+        // table is built
+        for ([_][2]usize{ .{ word, word + 2 }, .{ word + 2, word + 2 }, .{ line_start, line_end } }) |r| {
+            try std.testing.expectEqualDeep(lines.range(r[0], r[1], enc), try ranges.get(arena, @intCast(r[0]), @intCast(r[1])));
+        }
+        try std.testing.expect(ranges.lines == null);
+        // An import added in the first line, and a range spanning lines
+        for ([_][2]usize{ .{ 0, 0 }, .{ line_start - 2, word } }) |r| {
+            try std.testing.expectEqualDeep(lines.range(r[0], r[1], enc), try ranges.get(arena, @intCast(r[0]), @intCast(r[1])));
+        }
+        try std.testing.expect(ranges.lines != null);
+    }
+}
+
 /// `data` of a completion item: the file where completion happens (`from`), the target file, and
 /// the `AstId` of the declaration in it (which still finds the same declaration after edits). When
 /// the item is selected, the client sends it with a `completionItem/resolve` request.
