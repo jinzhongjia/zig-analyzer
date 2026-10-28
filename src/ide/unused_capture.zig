@@ -10,8 +10,9 @@
 //! - An unbounded for counter (`0..`) is removed together with its input (discarding an unbounded
 //!   counter is an error). Removing the input also removes the evaluation of its start, so the
 //!   start may only be a literal, a name, or a field access on a name; when it contains a name,
-//!   AstGen confirms that there are no new errors (a local name used only there is no longer
-//!   used). At least one remaining input must be bounded
+//!   AstGen confirms that there are no new errors, matched by position and message (a name used
+//!   only there is no longer used, which can be another `unused capture`). At least one remaining
+//!   input must be bounded
 //! - Other captures (both captures of an error union `if` / `while`, the other captures of a for)
 //!   are renamed to `_`, a pointer capture together with its `*` (`|*_|` is an error). The payload
 //!   capture of an error union is not removed: without it, the payload type must be void; nor is
@@ -203,7 +204,8 @@ fn forCapture(r: *Resolver, file: FileId, text: []const u8, node: SyntaxNode, ca
     if (start.kind() != .literal) {
         const checked = try arena.alloc(rename.Edit, edits.len);
         for (edits, checked) |e, *c| c.* = .{ .start = e.start, .end = e.end, .text = e.text };
-        if (try rename.verifyAstGen(r, file, checked) != null) return null;
+        const errors = try rename.astGenErrors(r, file, checked);
+        if ((try rename.newAstGenErrors(arena, errors.before, errors.after)).len > 0) return null;
     }
     return .{ .removed = true, .edits = edits };
 }

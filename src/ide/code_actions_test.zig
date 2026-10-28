@@ -792,6 +792,18 @@ test "remove unused captures or rename them to _" {
         \\    return n;
         \\}
         ,
+        // The start is an outer capture used only here: removing the input would leave another
+        // `unused capture`, with the same message as the one fixed
+        \\fn f(xs: []const u32, o: ?usize) u32 {
+        \\    var n: u32 = 0;
+        \\    if (o) |base| {
+        \\        for (xs, base..) |x, <|>i| {
+        \\            n += x;
+        \\        }
+        \\    }
+        \\    return n;
+        \\}
+        ,
     }) |source| {
         for ([_][]const u8{ "remove capture", "rename" }) |title| {
             const got = try apply(source, title);
