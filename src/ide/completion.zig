@@ -364,7 +364,9 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             // function, use the instance from a call site)
             const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .member };
             const tv = a.exprType(fa.lhs);
-            try typedMembers(r, &out, tv, file);
+            // Methods receiving `*T` need a value that can be modified (see `receives`)
+            const mutable = !tv.isType() and !try infer.placeIsConst(r, a.file, a.item, a.body, a, fa.lhs);
+            try typedMembers(r, &out, tv, mutable, file);
             return .{ .items = out.items.items, .context = .member, .bound = !tv.isType(), .at = a };
         },
         else => {},
@@ -656,8 +658,10 @@ fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
 }
 
 /// Lists members by type: declarations when the value is a type; for other values (also through a
-/// single pointer), their members (see `valueMembers`), with every function among them
-fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) resolve.Error!void {
+/// single pointer), their members (see `valueMembers`): the fields, and the functions that can be
+/// called on the value as methods (see `receives`; `mutable` tells whether the value can be
+/// modified)
+fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
         // Constructed enums (`@Enum`, the tag enum of a union(enum)): members
@@ -677,23 +681,24 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
         return members(r, out, ns, ns.file == from);
     }
     // A single pointer is dereferenced automatically once: len of `*[N]T`, fields and methods of
-    // `*S`, len and ptr of `*[]T`
-    const t = switch (ip.key(tv.ty)) {
-        .ptr_type => |p| if (p.size == .one) p.child else tv.ty,
-        else => tv.ty,
-    };
-    for (try valueMembers(r, from, t)) |m| switch (m.what) {
+    // `*S`, len and ptr of `*[]T`; whether the value can be modified then depends on the pointer
+    const holder = (Place{ .ty = tv.ty, .mutable = mutable }).deref(ip);
+    for (try valueMembers(r, from, holder.ty)) |m| switch (m.what) {
         .typed => |ty| try out.add(.{ .label = m.name, .kind = .field, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null }),
         .field => |f| {
             const ty = (try declType(r, f)).ty;
             try out.add(.{ .label = m.name, .kind = .field, .doc = m.doc, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null });
         },
-        // Function aliases (`pub const isPowerPC = isPowerpc;`) can also be called as methods;
-        // when selected, they show the signature of the aliased function
-        .method => |f| if (f.alias) {
-            const ctv = try declType(r, f);
-            if (ip.key(ctv.ty) == .fn_type) try out.add(.{ .label = m.name, .kind = .function, .doc = m.doc, .target = try fnTarget(r, ctv) });
-        } else try out.add(.{ .label = m.name, .kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item)), .doc = m.doc, .target = .{ .decl = .{ .file = f.file, .item = f.item } } }),
+        .method => |f| {
+            const ftv = try declType(r, f);
+            if (!callableOn(ip, ftv.ty, f.alias, holder)) continue;
+            // Function aliases (`pub const isPowerPC = isPowerpc;`) show the signature of the
+            // function they refer to when selected
+            try out.add(if (f.alias)
+                .{ .label = m.name, .kind = .function, .doc = m.doc, .target = try fnTarget(r, ftv) }
+            else
+                .{ .label = m.name, .kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item)), .doc = m.doc, .target = .{ .decl = .{ .file = f.file, .item = f.item } } });
+        },
     };
 }
 
@@ -992,11 +997,7 @@ const MemberSearch = struct {
             },
             .method => |f| {
                 const tv = try declType(r, f);
-                const sig = switch (ip.key(tv.ty)) {
-                    .fn_type => |sig| sig,
-                    else => return null,
-                };
-                if (sig.params.len == 0 or !receives(ip, sig.params[0], p.holder)) return null;
+                if (!callableOn(ip, tv.ty, f.alias, p.holder)) return null;
                 // Classified like the same declaration after `.` (a function in a file is Function)
                 item.kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item));
                 item.bound = true;
@@ -1021,13 +1022,27 @@ fn declType(r: *Resolver, d: Member.Decl) resolve.Error!TypedValue {
     return r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = d.ast_id }, .inst = d.inst });
 }
 
-/// Whether the first parameter of a method can receive the value at `holder`: the parameter is the
-/// enclosing container, a `*const` pointer to it, or a `*T` pointer to it when the value can be
-/// modified
+/// Whether the function or function alias of type `ty` can be called as a method on the value at
+/// `holder` (see `receives`): a function whose signature cannot be computed counts as yes, an alias
+/// only when its value is known to be a function
+fn callableOn(ip: *InternPool, ty: Index, alias: bool, holder: Place) bool {
+    return switch (ip.key(ty)) {
+        .fn_type => |sig| sig.params.len != 0 and receives(ip, sig.params[0], holder),
+        else => !alias and ty == .unknown,
+    };
+}
+
+/// Whether the first parameter of a method can receive the value at `holder` (matches the
+/// compiler): the parameter is the enclosing container `T`, `?T`, `E!T`, or a single-item or C
+/// pointer to it (also `?*T`), and a pointer that is not const needs a value that can be modified;
+/// an `anytype` parameter, whose type is not known before a call, and a parameter whose type cannot
+/// be computed count as yes
 fn receives(ip: *InternPool, param: Index, holder: Place) bool {
-    if (sameContainer(ip, param, holder.ty)) return true;
+    if (param == .unknown or sameContainer(ip, param, holder.ty)) return true;
     return switch (ip.key(param)) {
-        .ptr_type => |p| p.size == .one and sameContainer(ip, p.child, holder.ty) and (p.is_const or holder.mutable),
+        .ptr_type => |p| (p.size == .one or p.size == .c) and sameContainer(ip, p.child, holder.ty) and (p.is_const or holder.mutable),
+        .optional_type => |c| sameContainer(ip, c, holder.ty) or (ip.key(c) == .ptr_type and receives(ip, c, holder)),
+        .error_union_type => |eu| sameContainer(ip, eu.payload, holder.ty),
         else => false,
     };
 }

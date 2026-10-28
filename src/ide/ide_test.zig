@@ -87,7 +87,7 @@ test "member completion and goto definition through types" {
     const items = (try completion.complete(&r, file, offsetOf("ptr.x", 0) + 4, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
     for (items) |it| try labels.append(w.arena.allocator(), it.label);
-    try testing.expectEqualStrings("x y init dist", try std.mem.join(w.arena.allocator(), " ", labels.items));
+    try testing.expectEqualStrings("x y dist", try std.mem.join(w.arena.allocator(), " ", labels.items));
     try testing.expectEqualStrings("i32", items[0].detail.?);
     // Slices
     const slice_items = (try completion.complete(&r, file, offsetOf("buf.len", 0) + 4, .{ .auto_import = false })).items;
@@ -469,6 +469,8 @@ test "name completion offers fields and callable methods of local values two lev
         .{ "const U = union(enum) { in: Inner, n: u8 };\nfn run(u: U) void { _ = u; _ = depth<|>; }", "u.in.depth" },
         // Comptime parameters of an enclosing function are comptime-known
         .{ "fn outer(comptime o: Outer) type { return struct { fn f() void { _ = depth<|>; } }; }", "o.copy().depth o.inner.depth o.ptr.depth" },
+        // Methods receiving an optional of the type
+        .{ "const W = struct { pub fn peekOpt(self: ?W) u32 { _ = self; return 0; } };\nfn run(w: W) void { _ = w; _ = peekOpt<|>; }", "w.peekOpt" },
     };
     for (cases) |c| {
         const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ types, c[0] });
@@ -4427,6 +4429,74 @@ test "member completion on an enum value lists its functions but not its tags" {
     };
     for (cases) |c| {
         const source = try std.fmt.allocPrint(testing.allocator, "{s}{s}\n", .{ color, c[0] });
+        defer testing.allocator.free(source);
+        const got = try completionLabels(source);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "member completion on values lists the functions that can be called on them as methods" {
+    // Every function of the type used to be listed, including those the compiler rejects there:
+    // ones whose first parameter does not take the value (`v.init()`), and ones receiving `*T` on a
+    // value that cannot be modified
+    const types =
+        \\const S = struct {
+        \\    x: u8 = 0,
+        \\    pub fn byVal(self: S) void { _ = self; }
+        \\    pub fn byPtr(self: *S) void { _ = self; }
+        \\    pub fn byConstPtr(self: *const S) void { _ = self; }
+        \\    pub fn byOpt(self: ?S) void { _ = self; }
+        \\    pub fn byOptPtr(self: ?*S) void { _ = self; }
+        \\    pub fn byErr(self: anyerror!S) void { _ = self catch {}; }
+        \\    pub fn byAny(self: anytype) void { _ = self; }
+        \\    pub fn init() S { return .{}; }
+        \\    pub fn other(n: u8) void { _ = n; }
+        \\    pub fn bySlice(self: []S) void { _ = self; }
+        \\    pub const reset = byPtr;
+        \\};
+        \\const Outer = struct { inner: S = .{} };
+        \\fn make() S { return .{}; }
+        \\fn G(comptime T: type) type {
+        \\    return struct {
+        \\        v: T,
+        \\        const Self = @This();
+        \\        pub fn get(self: Self) T { return self.v; }
+        \\        pub fn set(self: *Self, v: T) void { self.v = v; }
+        \\        pub fn of(v: T) Self { return .{ .v = v }; }
+        \\    };
+        \\}
+        \\
+    ;
+    const mutable = "x byVal byPtr byConstPtr byOpt byOptPtr byErr byAny reset";
+    const immutable = "x byVal byConstPtr byOpt byErr byAny";
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f() void { var v: S = .{}; _ = &v; _ = v.<|>; }", mutable },
+        .{ "fn f() void { const v: S = .{}; _ = v.<|>; }", immutable },
+        // Parameters, value captures, and temporaries cannot be modified
+        .{ "fn f(v: S) void { _ = v.<|>; }", immutable },
+        .{ "fn f(xs: []S) void { for (xs) |x| { _ = x.<|>; } }", immutable },
+        .{ "fn f() void { _ = make().<|>; }", immutable },
+        // Through a pointer, it depends on the pointer
+        .{ "fn f(p: *S) void { _ = p.<|>; }", mutable },
+        .{ "fn f(p: *const S) void { _ = p.<|>; }", immutable },
+        .{ "fn f(xs: []S) void { for (xs) |*x| { _ = x.<|>; } }", mutable },
+        .{ "fn f(xs: []S) void { _ = xs[0].<|>; }", mutable },
+        .{ "fn f(xs: []const S) void { _ = xs[0].<|>; }", immutable },
+        // Members and payloads are parts of the value holding them
+        .{ "fn f() void { var o: Outer = .{}; _ = &o; _ = o.inner.<|>; }", mutable },
+        .{ "fn f() void { const o: Outer = .{}; _ = o.inner.<|>; }", immutable },
+        .{ "fn f() void { var o: Outer = .{}; _ = &o; _ = @field(o, \"inner\").<|>; }", mutable },
+        .{ "fn f() void { var o: ?S = null; _ = &o; _ = o.?.<|>; }", mutable },
+        // Methods of an instance of a generic type
+        .{ "fn f() void { const g: G(u8) = .of(1); _ = g.<|>; }", "v get" },
+        .{ "fn f() void { var g: G(u8) = .of(1); _ = &g; _ = g.<|>; }", "v get set" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "{s}{s}\n", .{ types, c[0] });
         defer testing.allocator.free(source);
         const got = try completionLabels(source);
         defer testing.allocator.free(got);
