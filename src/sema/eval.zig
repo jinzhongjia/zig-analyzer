@@ -902,7 +902,7 @@ const Evaluator = struct {
             .anon_struct_type => |s| s.names.len,
             .reified_type => |rt| if (rt.kind == .@"struct") rt.names.len else null,
             .ptr_type => |p| if (p.size == .one) try ev.typeElemCount(p.child) else null,
-            .container_type => |c| if (c.kind == .@"struct" or c.kind == .file) (if (try ev.fieldsOf(t)) |f| f.len else null) else null,
+            .container_type => |c| if (c.kind.isStruct()) (if (try ev.fieldsOf(t)) |f| f.len else null) else null,
             else => null,
         };
     }

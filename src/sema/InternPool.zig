@@ -247,7 +247,18 @@ pub const Container = struct {
     /// (`ArrayList(u8)` and `ArrayList(i32)` are different types)
     inst: ?Index = null,
 
-    pub const Kind = enum { file, @"struct", @"enum", @"union", @"opaque" };
+    pub const Kind = enum {
+        file,
+        @"struct",
+        @"enum",
+        @"union",
+        @"opaque",
+
+        /// A file is a struct: its fields are written at the top level
+        pub fn isStruct(k: Kind) bool {
+            return k == .@"struct" or k == .file;
+        }
+    };
 };
 
 /// A type and (if known at comptime) a value. `ty == .unknown` means unknown.

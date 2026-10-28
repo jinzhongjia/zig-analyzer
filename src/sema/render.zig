@@ -146,7 +146,7 @@ const ContainerNames = struct {
     pub fn fieldNames(n: ContainerNames, t: Index) ?[]const []const u8 {
         const ip = n.r.ctx.db.env.ip;
         switch (ip.key(t)) {
-            .container_type => |c| if (c.kind != .@"struct" and c.kind != .file) return null,
+            .container_type => |c| if (!c.kind.isStruct()) return null,
             .anon_struct_type => |s| return s.names,
             .reified_type => |rt| if (rt.kind != .@"struct") return null,
             else => return null,
