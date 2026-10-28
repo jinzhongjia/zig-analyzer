@@ -18,6 +18,7 @@ pub const ide_db = struct {
 };
 pub const ide = struct {
     pub const naming = @import("ide/naming.zig");
+    pub const completion = @import("ide/completion.zig");
 };
 
 const Vfs = @import("base/Vfs.zig");
@@ -82,4 +83,5 @@ pub const Db = engine.Engine(*const Env, &.{
     ide_db.seed.CallsIn,
     @import("ide_db/search.zig").ProjectImporters,
     ide.naming.Query,
+    ide.completion.CallParams,
 });

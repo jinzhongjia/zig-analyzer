@@ -190,6 +190,8 @@ code_action_disabled: bool = false,
 /// The client supports edits with change annotations in `documentChanges`: renaming a public name
 /// requires confirmation from the user
 change_annotations: bool = false,
+/// The client supports snippets in completion items (`completionItem.snippetSupport`)
+snippet_support: bool = false,
 /// The client supports the workspace semantic tokens refresh; at most one refresh response is
 /// awaited at a time.
 semantic_refresh: bool = false,
@@ -4060,6 +4062,9 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             if (std.mem.eql(u8, p, "edit")) server.code_action_resolve = ca.dataSupport orelse false;
         };
     };
+    if (params.capabilities.textDocument) |td| if (td.completion) |c| if (c.completionItem) |ci| {
+        server.snippet_support = ci.snippetSupport orelse false;
+    };
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -4218,7 +4223,8 @@ fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.defini
 fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = try r.ctx.get(FileText, file) orelse return null;
-    const offset: u32 = @intCast(offsets.positionToOffset(text, params.position, server.encoding));
+    const line = offsets.Line.init(text, params.position.line);
+    const offset: u32 = @intCast(if (line) |l| l.offset(params.position.character, server.encoding) else text.len);
     const auto_import = server.autoImportEnabled();
     // Auto-imports are not offered until the index has been built for the current module graph, and
     // the result is marked incomplete: the client requests again as the user types, and they are
@@ -4227,16 +4233,19 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports, const import_options = blk: {
+    const max_auto_imports, const import_options, const snippets, const placeholders = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
-        break :blk .{ server.config.completion_max_auto_imports, server.config.importOptions() };
+        const c = &server.config;
+        break :blk .{ c.completion_max_auto_imports, c.importOptions(), c.completion_snippets, c.completion_argument_placeholders };
     };
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
         .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
         .imports = import_options,
+        .snippets = server.snippet_support and snippets,
+        .argument_placeholders = placeholders,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
@@ -4244,7 +4253,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         if (first or !server.indexing.load(.acquire)) server.scheduleIndexingFromRead();
     }
     const out = try arena.alloc(types.CompletionItem, result.items.len);
-    var lines: ?offsets.LineIndex = null;
+    var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding };
     for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
@@ -4263,6 +4272,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
                 .file => .File,
                 .folder => .Folder,
                 .label => .Reference,
+                .snippet => .Snippet,
             },
             .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
             .detail = it.detail,
@@ -4272,18 +4282,76 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
         if (it.replace) |range| {
-            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
-            o.textEdit = .{ .TextEdit = .{ .range = lines.?.range(range.start, range.end, server.encoding), .newText = it.label } };
+            o.textEdit = .{ .TextEdit = .{ .range = try ranges.get(arena, range.start, range.end), .newText = it.snippet orelse it.label } };
+            if (it.snippet != null) o.insertTextFormat = .Snippet;
         }
         if (it.import_edit) |edit| {
-            if (lines == null) lines = try offsets.LineIndex.init(arena, text);
             const edits = try arena.alloc(types.TextEdit, 1);
-            edits[0] = .{ .range = lines.?.range(edit.start, edit.end, server.encoding), .newText = edit.text };
+            edits[0] = .{ .range = try ranges.get(arena, edit.start, edit.end), .newText = edit.text };
             o.additionalTextEdits = edits;
         }
     }
     if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
     return .{ .array_of_CompletionItem = out };
+}
+
+/// Converts the ranges of completion items to LSP ranges. Replaced ranges are almost always in the
+/// line of the cursor and are converted within that line, without building a line table for the
+/// whole file (on large files, building the line table is slower than the completion itself); only
+/// other ranges (added imports, ranges spanning lines) build the line table
+const CompletionRanges = struct {
+    text: []const u8,
+    /// The line of the cursor
+    line: ?offsets.Line,
+    encoding: offsets.Encoding,
+    lines: ?offsets.LineIndex = null,
+    /// The range converted last: items mostly replace the same range
+    last: ?struct { start: u32, end: u32, range: types.Range } = null,
+
+    fn get(c: *CompletionRanges, arena: Allocator, start: u32, end: u32) Allocator.Error!types.Range {
+        if (c.last) |l| if (l.start == start and l.end == end) return l.range;
+        const range = c.inLine(start, end) orelse blk: {
+            if (c.lines == null) c.lines = try offsets.LineIndex.init(arena, c.text);
+            break :blk c.lines.?.range(start, end, c.encoding);
+        };
+        c.last = .{ .start = start, .end = end, .range = range };
+        return range;
+    }
+
+    /// The range when both ends are in the line of the cursor
+    fn inLine(c: *const CompletionRanges, start: u32, end: u32) ?types.Range {
+        const line = c.line orelse return null;
+        return .{
+            .start = line.position(start, c.encoding) orelse return null,
+            .end = line.position(end, c.encoding) orelse return null,
+        };
+    }
+};
+
+test "CompletionRanges: ranges in the line of the cursor and elsewhere convert as with the line table" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // CRLF line breaks and characters of 2, 3 and 4 UTF-8 bytes before the word at the cursor
+    const text = "const a = @import(\"a.zig\");\r\nfn f() void {\r\n    _ = \"é€😀\" ++ ad;\r\n}\r\n";
+    const word = std.mem.indexOf(u8, text, "ad;").?;
+    const line_start = std.mem.indexOf(u8, text, "    _").?;
+    const line_end = std.mem.indexOfPos(u8, text, line_start, "\r").?;
+    for ([_]offsets.Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        const lines = try offsets.LineIndex.init(arena, text);
+        var ranges: CompletionRanges = .{ .text = text, .line = offsets.Line.init(text, 2), .encoding = enc };
+        // In the line of the cursor (the word, an empty range at its end, the whole line): no line
+        // table is built
+        for ([_][2]usize{ .{ word, word + 2 }, .{ word + 2, word + 2 }, .{ line_start, line_end } }) |r| {
+            try std.testing.expectEqualDeep(lines.range(r[0], r[1], enc), try ranges.get(arena, @intCast(r[0]), @intCast(r[1])));
+        }
+        try std.testing.expect(ranges.lines == null);
+        // An import added in the first line, and a range spanning lines
+        for ([_][2]usize{ .{ 0, 0 }, .{ line_start - 2, word } }) |r| {
+            try std.testing.expectEqualDeep(lines.range(r[0], r[1], enc), try ranges.get(arena, @intCast(r[0]), @intCast(r[1])));
+        }
+        try std.testing.expect(ranges.lines != null);
+    }
 }
 
 /// `data` of a completion item: the file where completion happens (`from`), the target file, and

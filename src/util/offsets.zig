@@ -28,18 +28,6 @@ pub const Encoding = enum {
     }
 };
 
-/// Byte offset where line `line` starts; returns the end of the text when `line` is out of range.
-fn lineStart(text: []const u8, line: u32) usize {
-    var current: u32 = 0;
-    var i: usize = 0;
-    while (current < line) : (current += 1) {
-        const nl = std.mem.indexOfAnyPos(u8, text, i, "\r\n") orelse return text.len;
-        i = nl + 1;
-        if (text[nl] == '\r' and i < text.len and text[i] == '\n') i += 1;
-    }
-    return i;
-}
-
 fn lineEnd(text: []const u8, start: usize) usize {
     return std.mem.indexOfAnyPos(u8, text, start, "\r\n") orelse text.len;
 }
@@ -57,19 +45,67 @@ fn charWidth(bytes: []const u8, enc: Encoding) struct { len: usize, units: u32 }
     } };
 }
 
-pub fn positionToOffset(text: []const u8, pos: types.Position, enc: Encoding) usize {
-    const start = lineStart(text, pos.line);
-    const end = lineEnd(text, start);
-    var i = start;
-    var units: u32 = 0;
-    while (i < end and units < pos.character) {
+/// Number of code units in `text[from..target]`, where `end` is the end offset of the content of
+/// the line; a `target` in the middle of a multi-byte character is rounded down
+fn countUnits(text: []const u8, from: usize, target: usize, end: usize, enc: Encoding) u32 {
+    const stop = @min(target, end);
+    var i = from;
+    var n: u32 = 0;
+    while (i < stop) {
         const w = charWidth(text[i..end], enc);
-        // When the column falls in the middle of a multi-unit character, round down to its start
-        if (units + w.units > pos.character) break;
-        units += w.units;
+        if (i + w.len > stop) break;
+        n += w.units;
         i += w.len;
     }
-    return i;
+    return n;
+}
+
+/// One line of the text: converts positions and offsets within this line only, without building a
+/// line table for the whole file
+pub const Line = struct {
+    text: []const u8,
+    number: u32,
+    /// Byte offset where the line starts
+    start: usize,
+    /// End offset of the content of the line (excluding the line break)
+    end: usize,
+
+    /// Line `number`; null when the text has fewer lines
+    pub fn init(text: []const u8, number: u32) ?Line {
+        var start: usize = 0;
+        for (0..number) |_| {
+            const nl = std.mem.indexOfAnyPos(u8, text, start, "\r\n") orelse return null;
+            start = nl + 1;
+            if (text[nl] == '\r' and start < text.len and text[start] == '\n') start += 1;
+        }
+        return .{ .text = text, .number = number, .start = start, .end = lineEnd(text, start) };
+    }
+
+    /// Offset of code unit `character` in the line; the end of the line when past it
+    pub fn offset(l: Line, character: u32, enc: Encoding) usize {
+        var i = l.start;
+        var units: u32 = 0;
+        while (i < l.end and units < character) {
+            const w = charWidth(l.text[i..l.end], enc);
+            // When the column falls in the middle of a multi-unit character, round down to its start
+            if (units + w.units > character) break;
+            units += w.units;
+            i += w.len;
+        }
+        return i;
+    }
+
+    /// Position of offset `at` (as `offsetToPosition`); null when `at` is not in the content of the
+    /// line (`start` to `end`, both inclusive)
+    pub fn position(l: Line, at: usize, enc: Encoding) ?types.Position {
+        if (at < l.start or at > l.end) return null;
+        return .{ .line = l.number, .character = countUnits(l.text, l.start, at, l.end, enc) };
+    }
+};
+
+pub fn positionToOffset(text: []const u8, pos: types.Position, enc: Encoding) usize {
+    const line = Line.init(text, pos.line) orelse return text.len;
+    return line.offset(pos.character, enc);
 }
 
 pub fn offsetToPosition(text: []const u8, offset: usize, enc: Encoding) types.Position {
@@ -149,17 +185,7 @@ pub const LineIndex = struct {
     /// Number of code units in line `line` from `from` (a character boundary) to `offset`; an
     /// offset in the middle of a multi-byte character is rounded down
     fn units(li: LineIndex, line: u32, from: usize, offset: usize, enc: Encoding) u32 {
-        const end = li.contentEnd(line);
-        const target = @min(offset, end);
-        var i = from;
-        var n: u32 = 0;
-        while (i < target) {
-            const w = charWidth(li.text[i..end], enc);
-            if (i + w.len > target) break;
-            n += w.units;
-            i += w.len;
-        }
-        return n;
+        return countUnits(li.text, from, offset, li.contentEnd(line), enc);
     }
 
     /// End offset of the content of line `line` (excluding the line break)
@@ -192,6 +218,23 @@ test LineIndex {
                 prev_offset = off;
                 prev = expected;
             }
+        }
+    }
+}
+
+test Line {
+    const text = "x\r\na😀b\nlast\r\r\n😀😀";
+    for ([_]Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        for (0..text.len + 1) |off| {
+            const expected = offsetToPosition(text, off, enc);
+            var number: u32 = 0;
+            while (Line.init(text, number)) |line| : (number += 1) {
+                // Only offsets in the content of a line are converted, not those in its line break
+                if (number == expected.line and off <= line.end) {
+                    try testing.expectEqual(expected, line.position(off, enc).?);
+                } else try testing.expectEqual(null, line.position(off, enc));
+            }
+            try testing.expectEqual(5, number);
         }
     }
 }

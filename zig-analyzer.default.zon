@@ -106,6 +106,16 @@
     //       // auto-import candidates) per completion (the best ranked are kept; the list is marked
     //       // incomplete and refreshed as you type); 0 never limits.
     //       .max_auto_imports = 128,
+    //       // When the editor supports snippets: functions and builtins complete as calls
+    //       // (`add(${1:a}, ${2:b})`; methods called on a value skip the receiver), except where
+    //       // `(` already follows or a function value is expected (`&f`, a function-typed
+    //       // argument); common snippets are offered where a statement (`if`, `for`, `while`,
+    //       // `switch`, `print`, ...) or a declaration (`fn`, `test`, `struct`, `main`, ...)
+    //       // starts.
+    //       .snippets = true,
+    //       // Call snippets get a placeholder for each argument; false inserts only the
+    //       // parentheses, with the cursor between them.
+    //       .argument_placeholders = true,
     //   },
 
     // How top-level imports are arranged, by "Organize imports" (`source.organizeImports`) and when
