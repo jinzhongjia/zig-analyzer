@@ -4702,7 +4702,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             .title = a.title,
             .kind = kind,
             .diagnostics = diagnostics,
-            .isPreferred = if (a.diagnostic != null) true else null,
+            .isPreferred = if (a.diagnostic != null and a.preferred) true else null,
             .edit = .{ .changes = changes },
         } });
     }
@@ -5187,6 +5187,7 @@ test {
     _ = @import("refs_e2e_test.zig");
     _ = @import("naming_e2e_test.zig");
     _ = @import("remove_param_e2e_test.zig");
+    _ = @import("unused_capture_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
     _ = @import("auto_import_test.zig");
 }

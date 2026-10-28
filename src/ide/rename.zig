@@ -212,6 +212,24 @@ pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
     return .{ .before = out_before, .after = out_after };
 }
 
+/// The errors in `after` that were not there before: each error in `before` matches at most one
+/// error in `after` with the same position and message (both from `astGenErrors`)
+pub fn newAstGenErrors(arena: Allocator, before: []const AstGenError, after: []const AstGenError) Allocator.Error![]const AstGenError {
+    const matched = try arena.alloc(bool, before.len);
+    @memset(matched, false);
+    var out: std.ArrayList(AstGenError) = .empty;
+    next: for (after) |a| {
+        for (before, matched) |b, *m| {
+            if (!m.* and b.start == a.start and std.mem.eql(u8, b.message, a.message)) {
+                m.* = true;
+                continue :next;
+            }
+        }
+        try out.append(arena, a);
+    }
+    return out.items;
+}
+
 /// Maps a position after applying `edits` back to the text before; a position inside replacement
 /// text maps to the start of the replaced range
 fn mapBack(edits: []const Edit, offset: u32) u32 {
