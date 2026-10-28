@@ -1149,21 +1149,7 @@ fn initFieldType(r: *Resolver, a: context.At, init_e: Body.ExprId, name: []const
         .error_union_type => |eu| t = eu.payload,
         else => break,
     };
-    switch (ip.key(t)) {
-        .container_type => |c| {
-            if (c.kind == .@"enum" or c.kind == .@"opaque") return null;
-            const ns = try queries.namespaceOfType(r, t) orelse return null;
-            const tree = try r.itemTree(ns.file);
-            for (tree.containerMembers(ns.container)) |m| {
-                const it = tree.items[m];
-                if (it.kind != .field or !std.mem.eql(u8, it.name orelse continue, name)) continue;
-                return (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = c.inst })).ty;
-            }
-            return null;
-        },
-        .tuple_type, .anon_struct_type, .reified_type => return eval.fieldType(r, t, name),
-        else => return null,
-    }
+    return eval.fieldType(r, t, name);
 }
 
 fn isComparison(op: SyntaxKind) bool {
