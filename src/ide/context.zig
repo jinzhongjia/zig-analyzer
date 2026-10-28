@@ -176,10 +176,15 @@ pub fn callee(r: *Resolver, a: At, callee_e: Body.ExprId) resolve.Error!?struct 
         .field_access => |fa| {
             const key = a.member(callee_e) orelse return null;
             const def = try defOfKey(r, key) orelse return null;
-            // It is a method call only when the member is a function declaration and the left-hand
-            // side is a value (not a type): fields of function type do not bind a receiver
+            // It is a method call only when the member is a declaration whose value is a function
+            // (including an alias such as `pub const put = putImpl;`) and the left-hand side is a
+            // value (not a type): fields of function type do not bind a receiver
             const method = switch (def) {
-                .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"fn",
+                .item => |it| switch ((try r.itemTree(it.file)).items[it.item].kind) {
+                    .@"fn" => true,
+                    .@"const" => a.ip.key(a.exprType(callee_e).ty) == .fn_type,
+                    else => false,
+                },
                 else => false,
             };
             return .{ .def = try fnDecl(r, a, callee_e, def), .bound = method and !a.exprType(fa.lhs).isType() };
