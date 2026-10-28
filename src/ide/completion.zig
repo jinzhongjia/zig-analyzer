@@ -1528,7 +1528,7 @@ const std_statement_snippets = [_]Snippet{
 const member_snippets = [_]Snippet{
     .{ .label = "fn", .text = "fn ${1:name}($2) ${3:!void} {$0}" },
     .{ .label = "pub fn", .text = "pub fn ${1:name}($2) ${3:!void} {$0}", .no_pub = true },
-    .{ .label = "test", .text = "test \"$1\" {$0}", .no_pub = true, .no_doc = true },
+    .{ .label = "test", .text = "test \"${1:name}\" {$0}", .no_pub = true, .no_doc = true },
     .{ .label = "struct", .text = "const ${1:Name} = struct {$0};" },
     .{ .label = "enum", .text = "const ${1:Name} = enum {$0};" },
     .{ .label = "union", .text = "const ${1:Name} = union {$0};" },

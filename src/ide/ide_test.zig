@@ -4499,7 +4499,7 @@ test "completion: snippets insert declarations that fit the position and the sta
         .{ "<|>", snippet_std_root, "main", "pub fn main() !void {$0}" },
         .{ "<|>", snippet_std_root, "std", "const std = @import(\"std\");" },
         .{ "<|>", snippet_std_root, "fn", "fn ${1:name}($2) ${3:!void} {$0}" },
-        .{ "<|>", snippet_std_root, "test", "test \"$1\" {$0}" },
+        .{ "<|>", snippet_std_root, "test", "test \"${1:name}\" {$0}" },
         // `main` takes `std.process.Init` when the standard library has it; `pub` is not inserted
         // again when already written
         .{ "const std = @import(\"std\");\n<|>", snippet_std_root, "main", "pub fn main(init: std.process.Init) !void {$0}" },
