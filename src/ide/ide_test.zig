@@ -1503,20 +1503,25 @@ test "build.zig.zon fields are completed from the schema" {
 }
 
 test "build.zig.zon uses the schema only without a result type" {
+    const schema = "name fingerprint version minimum_zig_version dependencies paths";
+    const typed = "const M = struct { a: u8, b: u8 };\nconst m: M = @import(\"build.zig.zon\");";
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
-        // Build scripts usually import it without a result type
-        .{ "/p/build.zig.zon", "const zon = @import(\"build.zig.zon\");", "name fingerprint version minimum_zig_version dependencies paths" },
+        // Imported without a result type, as build scripts usually do
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\nconst zon = @import(\"build.zig.zon\");", schema },
         // With a result type, the file is inferred with that type
-        .{ "/p/build.zig.zon", "const M = struct { a: u8, b: u8 };\nconst m: M = @import(\"build.zig.zon\");", "a b" },
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n" ++ typed, "a b" },
+        // Import sites are searched in the files of the module graph, which do not include build
+        // scripts
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n//- /p/build.zig\n" ++ typed, schema },
         // `.zon` files with other names don't use the schema
-        .{ "/p/cfg.zon", "const zon = @import(\"cfg.zon\");", "" },
-        .{ "/p/sub/build.zig.zon.zig", "", "" },
+        .{ "/p/cfg.zon", "//- /p/main.zig module:app\nconst zon = @import(\"cfg.zon\");", "" },
+        .{ "/p/sub/build.zig.zon.zig", "//- /p/main.zig module:app\n", "" },
     };
     inline for (cases) |c| {
         var w: World = undefined;
         try w.init();
         defer w.deinit();
-        _ = try w.fixture("//- /p/build.zig module:app\n" ++ c[1]);
+        _ = try w.fixture(c[1]);
         const at = try w.add(c[0], ".{ .<|> }");
         testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
             std.debug.print("{s} imported by:\n{s}\n", .{ c[0], c[1] });
