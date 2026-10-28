@@ -677,6 +677,39 @@ test "local member paths and auto-import candidates share the candidate limit" {
     }
 }
 
+test "local member paths are incomplete only when a path left out can be built" {
+    // `abd` needs a mutable receiver and `abmake` is not a method: neither is an item, so a limit
+    // that keeps every other path leaves nothing out
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig",
+        \\const Big = struct {
+        \\    ab1: u8,
+        \\    ab2: u8,
+        \\    pub fn abc(self: Big) void { _ = self; }
+        \\    pub fn abd(self: *Big) void { _ = self; }
+        \\    pub fn abmake() Big { return undefined; }
+        \\};
+        \\fn run(b: Big) void {
+        \\    _ = b;
+        \\    _ = ab<|>;
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { usize, bool }{ .{ 2, true }, .{ 3, false }, .{ 4, false } }) |c| {
+        const result = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false, .max_auto_imports = c[0] });
+        var paths: usize = 0;
+        for (result.items) |it| {
+            if (it.weight == 0) paths += 1;
+        }
+        try testing.expectEqual(@min(c[0], 3), paths);
+        try testing.expectEqual(c[1], result.is_incomplete);
+    }
+}
+
 /// Labels of the candidates that match the input in name completion, in rank order, joined by
 /// spaces
 fn rankedLabels(source: []const u8, auto_import: bool) ![]u8 {

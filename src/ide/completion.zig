@@ -804,7 +804,7 @@ const LocalMembers = struct { items: []const Item, incomplete: bool };
 /// whole path is fuzzy-matched against the input, whether or not the leading segments match; the
 /// score is the match score multiplied by `local_member_weight` and the depth factor. Items are
 /// built from the highest score down (checking that methods can be called there) until `limit` of
-/// them are built; the rest are not built (`incomplete`)
+/// them are built; the list is `incomplete` when another path left out could be built
 fn localMembers(r: *Resolver, file: FileId, roots: []const Root, name: ImportPrefix, limit: usize) resolve.Error!LocalMembers {
     if (roots.len == 0) return .{ .items = &.{}, .incomplete = false };
     const ip = r.ctx.db.env.ip;
@@ -820,8 +820,15 @@ fn localMembers(r: *Resolver, file: FileId, roots: []const Root, name: ImportPre
     }
     std.mem.sort(MemberPath, search.found.items, {}, MemberPath.higher);
     var items: std.ArrayList(Item) = .empty;
-    for (search.found.items) |p| {
-        if (items.items.len >= limit) return .{ .items = items.items, .incomplete = true };
+    for (search.found.items, 0..) |p, i| {
+        if (items.items.len >= limit) {
+            // Incomplete only when a path left out can be built (methods that cannot be called
+            // there are not items)
+            for (search.found.items[i..]) |rest| {
+                if (try search.construct(rest, name) != null) return .{ .items = items.items, .incomplete = true };
+            }
+            break;
+        }
         if (try search.construct(p, name)) |item| try items.append(r.arena, item);
     }
     return .{ .items = items.items, .incomplete = false };
