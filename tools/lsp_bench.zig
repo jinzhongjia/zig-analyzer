@@ -26,6 +26,11 @@
 //!   compare the cost with it on)
 //! - `BENCH_QUICK=1`: skip the edit, continuous typing, and save phases (used when checking many
 //!   projects in bulk)
+//! - `BENCH_TYPE_WORDS=<line>:<word>,<word>...`: type each word character by character in a new
+//!   statement after line `line`, requesting completion after each character (see `typeWords`)
+//! - `BENCH_TYPE_STMT=<statement>`: the statement `BENCH_TYPE_WORDS` inserts, with `|` marking
+//!   where to type (default `_ = |;`); e.g. `const probe: Air.Inst.Ref = |;` types where there is
+//!   an expected type
 //! - `BENCH_COMPLETE=<n>`: completion recall: for each member access `a.b` in the source,
 //!   complete after the `.`; the list must contain `b`
 //! - `BENCH_REFS=<n>`: check find references and rename for n declarations (same name, no false
@@ -247,17 +252,100 @@ fn typingPositions(a: Allocator, text: [:0]const u8) ![]TypingPosition {
 /// Whether a completion response has auto-import items: items with additional edits or a qualified
 /// name (`labelDetails`). Function items also carry data, so data cannot be used to decide
 fn hasAutoImport(response: std.json.Value) bool {
-    const result = response.object.get("result") orelse return false;
-    const items = switch (result) {
-        .array => |array| array.items,
-        .object => |object| if (object.get("items")) |items| items.array.items else &.{},
-        else => return false,
-    };
+    const items = completionItems(response);
     for (items) |item| {
         if (item != .object) continue;
         if (item.object.get("additionalTextEdits") != null or item.object.get("labelDetails") != null) return true;
     }
     return false;
+}
+
+fn completionItems(response: std.json.Value) []const std.json.Value {
+    const result = response.object.get("result") orelse return &.{};
+    return switch (result) {
+        .array => |array| array.items,
+        .object => |object| if (object.get("items")) |items| items.array.items else &.{},
+        else => &.{},
+    };
+}
+
+/// Typing words (BENCH_TYPE_WORDS=<line>:<word>,<word>...): inserts the statement `template` after
+/// line `line` (`|` marks where to type) and types each word character by character at the `|`,
+/// requesting completion right after each character, then deletes the word. Waits for background
+/// work to finish before each keystroke, so the timing covers only that keystroke's edit and
+/// completion. Reports the latency of the first keystroke (which includes building the index and
+/// the inference for the first time) and of the later ones, and for each completion the number of
+/// candidates and how many of them are member paths of local values (fields and methods whose
+/// labels contain `.`)
+fn typeWords(c: *Client, uri: []const u8, text: []const u8, spec: []const u8, template: []const u8, version: *i64) !void {
+    const a = c.arena.allocator();
+    const io = c.io;
+    const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return error.BadTypeWordsSpec;
+    const line = try std.fmt.parseInt(u32, spec[0..colon], 10);
+    var line_start: usize = 0;
+    for (1..line) |_| line_start = (std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse return error.BadTypeWordsSpec) + 1;
+    const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+    const at = positionOf(text, line_end);
+    const doc = .{ .uri = uri };
+    const marker = std.mem.indexOfScalar(u8, template, '|') orelse return error.BadTypeStatement;
+    const indent = "\n    ";
+    const statement = try std.mem.concat(a, u8, &.{ indent, template[0..marker], template[marker + 1 ..] });
+    try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = statement }} });
+    version.* += 1;
+    _ = try c.request("zig-analyzer/waitIdle", {});
+    const start: Position = .{ .line = at.line + 1, .character = @intCast(indent.len - 1 + marker) };
+    std.debug.print("  type words after line {d}: `{s}`, in `{s}`\n", .{ line, lineText(text, line - 1), template });
+    var times: std.ArrayList(f64) = .empty;
+    var first: ?f64 = null;
+    var items_total: usize = 0;
+    var paths_total: usize = 0;
+    var paths_max: usize = 0;
+    var words = std.mem.splitScalar(u8, spec[colon + 1 ..], ',');
+    while (words.next()) |word| {
+        for (word, 0..) |ch, i| {
+            const p: Position = .{ .line = start.line, .character = start.character + @as(u32, @intCast(i)) };
+            // Wait for the background work triggered by the previous keystroke (diagnostics and so
+            // on) to finish, so the timing covers only this edit and completion
+            _ = try c.request("zig-analyzer/waitIdle", {});
+            const t0 = Io.Clock.awake.now(io);
+            try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = p, .end = p }, .text = &[_]u8{ch} }} });
+            version.* += 1;
+            const resp, _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = Position{ .line = p.line, .character = p.character + 1 } });
+            const t = ms(io, t0);
+            if (first == null) first = t else try times.append(a, t);
+            const items = completionItems(resp);
+            var paths: usize = 0;
+            for (items) |it| {
+                const kind = if (it.object.get("kind")) |k| k.integer else 0;
+                // LSP CompletionItemKind: Method = 2, Field = 5
+                if ((kind == 2 or kind == 5) and std.mem.indexOfScalar(u8, it.object.get("label").?.string, '.') != null) paths += 1;
+            }
+            items_total += items.len;
+            paths_total += paths;
+            paths_max = @max(paths_max, paths);
+            if (verbose) std.debug.print("    `{s}` {d:.1}ms {d} items, {d} member paths, first `{s}`\n", .{ word[0 .. i + 1], t, items.len, paths, firstRanked(items) });
+        }
+        const end: Position = .{ .line = start.line, .character = start.character + @as(u32, @intCast(word.len)) };
+        try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = start, .end = end }, .text = "" }} });
+        version.* += 1;
+    }
+    const keys = times.items.len + 1;
+    std.debug.print("  type words   first keystroke {d:.1}ms\n", .{first orelse 0});
+    Stats.print("type words", times.items);
+    std.debug.print("  type words   {d} keystrokes: {d:.0} items on average, member paths {d:.0} on average, at most {d}\n", .{ keys, @as(f64, @floatFromInt(items_total)) / @as(f64, @floatFromInt(keys)), @as(f64, @floatFromInt(paths_total)) / @as(f64, @floatFromInt(keys)), paths_max });
+    const after: Position = .{ .line = at.line + 1, .character = @intCast(statement.len - 1) };
+    try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = at, .end = after }, .text = "" }} });
+    version.* += 1;
+}
+
+/// The label of the top-ranked completion item (the smallest `sortText`)
+fn firstRanked(items: []const json.Value) []const u8 {
+    var best: ?json.Value = null;
+    for (items) |it| {
+        const sort = (it.object.get("sortText") orelse continue).string;
+        if (best == null or std.mem.lessThan(u8, sort, best.?.object.get("sortText").?.string)) best = it;
+    }
+    return if (best) |b| b.object.get("label").?.string else "";
 }
 
 const Stats = struct {
@@ -961,13 +1049,15 @@ pub fn main(init: std.process.Init) !u8 {
             try checkDeclarations(&c, uri, text, rel);
         }
 
+        var version: i64 = 2;
+        if (init.environ_map.get("BENCH_TYPE_WORDS")) |spec| try typeWords(&c, uri, text, spec, init.environ_map.get("BENCH_TYPE_STMT") orelse "_ = |;", &version);
+
         // Edit → live diagnostics: add a syntax error at the end of the file, then undo it
         // (BENCH_QUICK skips the edit-related phases)
         if (init.environ_map.get("BENCH_QUICK") == null) {
             const end = positionOf(text, text.len);
             var edit_times: [10]f64 = undefined;
             var clear_times: [10]f64 = undefined;
-            var version: i64 = 2;
             const base = try c.baseErrors(uri);
             for (&edit_times, &clear_times) |*te, *tc| {
                 var t0 = Io.Clock.awake.now(io);

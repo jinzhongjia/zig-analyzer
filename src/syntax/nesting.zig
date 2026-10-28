@@ -28,9 +28,11 @@ pub const thread_stack_size = 2 * 1024 * 1024 * 1024 * scale;
 /// Stack of the dedicated thread for nesting depth `depth` (at most `limit`, i.e. `thread_depth`
 /// or `format_depth`): proportional to `depth`, with `limit` mapping to `thread_stack_size`, and
 /// at least 64 MiB. Shallower text does not map a huge stack: large mappings fail on systems
-/// that do not allow memory overcommit
+/// that do not allow memory overcommit. Rounded up to a multiple of the page size: macOS rejects
+/// other stack sizes
 pub fn threadStackSize(depth: u32, limit: u32) usize {
-    return @max(64 * 1024 * 1024, @as(usize, thread_stack_size) / limit * depth);
+    const size = @max(64 * 1024 * 1024, @as(usize, thread_stack_size) / limit * depth);
+    return std.mem.alignForward(usize, size, std.heap.page_size_max);
 }
 
 /// Upper-bound estimate of the recursion depth of the official parser and AstGen. Each level
@@ -87,4 +89,16 @@ fn startsStatement(tag: std.zig.Token.Tag) bool {
         .identifier, .builtin, .number_literal, .string_literal, .multiline_string_literal_line, .char_literal, .doc_comment, .container_doc_comment => true,
         else => std.zig.Token.keywords.has(tag.lexeme() orelse return false),
     };
+}
+
+test "thread stack sizes are multiples of the page size, up to thread_stack_size" {
+    for ([_]u32{ thread_depth, format_depth }) |limit| {
+        var depth: u32 = 1;
+        while (depth <= limit) : (depth += 997) {
+            const size = threadStackSize(depth, limit);
+            try std.testing.expect(std.mem.isAligned(size, std.heap.page_size_max));
+            try std.testing.expect(size <= thread_stack_size);
+        }
+        try std.testing.expect(std.mem.isAligned(threadStackSize(limit, limit), std.heap.page_size_max));
+    }
 }

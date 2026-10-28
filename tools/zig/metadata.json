@@ -6,6 +6,8 @@
   "langref_sha256": "553503ea235fd96a3643e382b58c6240e60ce535e2bab0cce1e5c7cdd6f43c63",
   "builtin_registry_path": "lib/std/zig/BuiltinFn.zig",
   "builtin_registry_sha256": "42062ec69edfac554be1add745ce70cb1e1323ff762bbe4b6c0e4a3d69533dcc",
+  "build_zig_zon_path": "doc/build.zig.zon.md",
+  "build_zig_zon_sha256": "fb7e6da18d7eba76f2b79ed009c622ce19a5da3407fd592c4bb977a7de72dfcf",
   "documentation_url": "https://ziglang.org/documentation/0.17.0/",
   "license": "MIT"
 }

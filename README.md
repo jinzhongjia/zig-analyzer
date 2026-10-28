@@ -23,13 +23,14 @@ The lib and global cache directories come from `zig env`; `zig.lib_path` and `zi
   - Inactive code (opt-in, `diagnostics.inactive_code`): code that comptime knows is not compiled in the current build configuration is marked as unnecessary.
 - **Navigation**: goto definition / declaration / type definition, find references, document highlight, document symbols, workspace symbols.
 - **Editing**
-  - Completion: name completion is ranked by how well candidates match, fuzzy-matches members of visible namespaces by their whole path (`memeql` → `std.mem.eql`), and offers declarations and modules that are not imported yet (auto-import, on by default); items carry the kind of the symbol (namespace, struct, enum, method, type parameter, …); the selected function shows its signature and docs; builtins come with official documentation. With an editor that supports snippets, functions and builtins complete as calls with a placeholder for each argument (methods called on a value skip the receiver; nothing is added when `(` already follows), and common snippets are offered where a statement or declaration starts (`if`, `for`, `switch`, `print`, `fn`, `test`, `struct`, `main`, …).
+  - Completion: name completion ranks candidates by how well they match, ranking those whose type fits the expected type at the cursor (call arguments, typed declarations, `return`, field initializers, assignments, comparisons) higher, fuzzy-matches members of visible namespaces by their whole path (`memeql` → `std.mem.eql`), offers fields and callable methods of local values by their path (`gpa` → `sema.gpa`), and offers declarations and modules that are not imported yet (auto-import, on by default); items carry the kind of the symbol (namespace, struct, enum, method, type parameter, …); the selected function shows its signature and docs; builtins come with official documentation. With an editor that supports snippets, functions and builtins complete as calls with a placeholder for each argument (methods called on a value skip the receiver; nothing is added when `(` already follows), and common snippets are offered where a statement or declaration starts (`if`, `for`, `switch`, `print`, `fn`, `test`, `struct`, `main`, …).
   - Hover, signature help.
   - Inlay hints: inferred types, field types in struct and union initializers, and parameter names (including builtins whose arguments are easy to confuse); single-argument calls and arguments that already carry the parameter's name (also behind `&`, `.*`, `.?`, `try`) are left unannotated.
   - Semantic tokens (full, delta, range), with unused bindings marked; optionally only the tokens that need semantic analysis (`semantic_tokens.mode = .partial`, to layer over the editor's syntax highlighting), and container-level `var`s marked `global`.
 - **Refactoring**: rename (with prepare); code actions:
   - discard an unused name, or remove a pointless discard;
   - remove an unused function parameter together with the matching argument at every call in the workspace, refusing with the reason when some use of the function cannot be updated;
+  - remove an unused capture (`if (x) |v|` → `if (x != null)`, `catch |err|` → `catch`), or rename it to `_` where it cannot be removed;
   - change a local `var` that is never mutated to `const`;
   - add missing switch prongs;
   - add missing struct fields;
@@ -37,6 +38,7 @@ The lib and global cache directories come from `zig env`; `zig.lib_path` and `zi
   - convert between string literals and multiline string literals, keeping the bytes;
   - organize imports: sort the top-level `@import` declarations (and declarations derived from them) into std / modules / files groups; auto-import adds new imports in the same order.
 - **Formatting**: identical to `zig fmt`, for `.zig` and `.zon`.
+- **ZON files**: the outline lists the fields; a `.zon` file imported with a result type (`const cfg: Config = @import("cfg.zon");`) gets the same field and enum-literal completion, goto and inlay hints as the same literal in Zig; `build.zig.zon` gets field completion with the official docs on hover, and completion and goto for its paths.
 - **Structure**: folding ranges, selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.0/#Names) section of the Zig style guide, judged by what each declaration actually is (type, function, value), with rename fixes that refuse unsafe renames.
 

@@ -19,8 +19,17 @@ const tree = @import("tree.zig");
 
 const Parse = @This();
 
+/// Whether source text is treated as Zig or as ZON
+pub const Mode = enum { zig, zon };
+
+/// `.zon` files are treated as ZON, all others as Zig
+pub fn modeOf(path: []const u8) Mode {
+    return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
+}
+
 arena: std.heap.ArenaAllocator,
 gpa: Allocator,
+mode: Mode,
 source: [:0]const u8,
 root: *const green.GreenNode,
 errors: []const parser.Error,
@@ -33,7 +42,7 @@ chain_bytes: usize,
 /// Arena capacity of the full parse at the bottom of the chain
 full_bytes: usize,
 
-pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
+pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Parse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -41,7 +50,10 @@ pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
     const source = try a.dupeSentinel(u8, text, 0);
     const tokens = try lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    const events = try runParser(gpa, source, tokens, grammar.sourceFile);
+    const events = switch (mode) {
+        .zig => try runParser(gpa, source, tokens, grammar.sourceFile),
+        .zon => try runParser(gpa, source, tokens, grammar.zonFile),
+    };
     defer gpa.free(events.events);
     defer gpa.free(events.errors);
 
@@ -56,6 +68,7 @@ pub fn create(gpa: Allocator, text: []const u8) Allocator.Error!*Parse {
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
+        .mode = mode,
         .source = source,
         .root = root,
         .errors = errors,
@@ -87,19 +100,21 @@ pub fn rootNode(self: *const Parse) tree.SyntaxNode {
     return .{ .green = self.root, .offset = 0 };
 }
 
-/// Parses new text based on `old`: when a local reparse is possible, reparses only the affected
-/// block; otherwise does a full parse.
-/// The result is exactly the same as `create(gpa, text)`.
+/// Parses new text based on `old`, in the same mode: when a local reparse is possible, reparses
+/// only the affected block; otherwise does a full parse.
+/// The result is exactly the same as `create(gpa, text, old.mode)`. A ZON file holds a single
+/// expression and is usually small, so it is always parsed in full
 pub fn reparse(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!*Parse {
+    if (old.mode == .zon) return create(gpa, text, .zon);
     if (try reparseBlock(gpa, old, text)) |p| return p;
     if (try reparseTopLevel(gpa, old, text)) |p| return p;
-    return create(gpa, text);
+    return create(gpa, text, old.mode);
 }
 
-/// Whether two parse results have exactly the same syntax tree and errors (used to verify that
-/// incremental results match full ones)
+/// Whether two parse results have exactly the same mode, syntax tree and errors (used to verify
+/// that incremental results match full ones)
 pub fn sameAs(a: *const Parse, b: *const Parse) bool {
-    if (!greenEql(a.root, b.root)) return false;
+    if (a.mode != b.mode or !greenEql(a.root, b.root)) return false;
     if (a.errors.len != b.errors.len) return false;
     for (a.errors, b.errors) |x, y| {
         if (x.offset != y.offset or !std.mem.eql(u8, x.message, y.message)) return false;
@@ -250,6 +265,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
+        .mode = old.mode,
         .source = try a.dupeSentinel(u8, text, 0),
         .root = new_node,
         .errors = errors.items,
@@ -268,8 +284,10 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
 /// end of the file, reusing the earlier top-level children as is. Top-level members are parsed
 /// independently one by one, looking ahead at most one or two tokens; backing up one extra member
 /// keeps every token seen by lookahead before the edit. Returns null when the conditions are not
-/// met (the result is the same as a full parse)
+/// met (the result is the same as a full parse). Does not apply to ZON, whose top level is one
+/// expression rather than container members
 pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
+    if (old.mode == .zon) return null;
     const old_text = old.source;
     const edit_start: u32 = @intCast(std.mem.indexOfDiff(u8, old_text, text) orelse return null);
     if (old.chain_bytes > 2 * old.full_bytes) return null;
@@ -332,6 +350,7 @@ pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
+        .mode = old.mode,
         .source = try a.dupeSentinel(u8, text, 0),
         .root = new_root,
         .errors = errors.items,

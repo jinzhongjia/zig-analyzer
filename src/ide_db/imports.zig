@@ -1419,6 +1419,11 @@ const Builder = struct {
 fn depthFactor(parts: Parts) f32 {
     var segments: usize = 1 + std.mem.count(u8, parts[0], ".");
     if (parts[1].len != 0) segments += 1 + std.mem.count(u8, parts[1], ".");
+    return segmentFactor(segments);
+}
+
+/// Depth factor of a path with `segments` segments (see `depth_step`)
+pub fn segmentFactor(segments: usize) f32 {
     return @max(min_depth_factor, 1 - depth_step * @as(f32, @floatFromInt(segments - 1)));
 }
 

@@ -48,7 +48,7 @@ pub const World = struct {
     }
 
     /// Like `add`, but `path` is already a native path
-    fn addNative(w: *World, path: []const u8, text: []const u8) !Added {
+    pub fn addNative(w: *World, path: []const u8, text: []const u8) !Added {
         const file = try w.vfs.intern(path);
         const cursor = std.mem.indexOf(u8, text, "<|>");
         const clean = if (cursor) |c| try std.mem.concat(testing.allocator, u8, &.{ text[0..c], text[c + 3 ..] }) else try testing.allocator.dupe(u8, text);

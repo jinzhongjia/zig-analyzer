@@ -34,7 +34,7 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
         var summaries: ?*const syntax.ItemSummaries.Summaries = null;
         for (tree.items, 0..) |item, i| {
             switch (item.kind) {
-                .@"test", .@"comptime" => continue,
+                .@"test", .@"comptime", .zon => continue,
                 else => {},
             }
             const name = item.name orelse continue;

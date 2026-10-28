@@ -102,8 +102,9 @@
     //       // imported yet, adding the import when one is accepted, and members of visible
     //       // namespaces matched by their whole path (`memeql` -> `std.mem.eql`).
     //       .auto_import = true,
-    //       // At most this many auto-import candidates per completion (the best ranked are kept;
-    //       // the list is marked incomplete and refreshed as you type); 0 never limits.
+    //       // At most this many candidates besides the names in scope (members of local values and
+    //       // auto-import candidates) per completion (the best ranked are kept; the list is marked
+    //       // incomplete and refreshed as you type); 0 never limits.
     //       .max_auto_imports = 128,
     //       // When the editor supports snippets: functions and builtins complete as calls
     //       // (`add(${1:a}, ${2:b})`; methods called on a value skip the receiver), except where

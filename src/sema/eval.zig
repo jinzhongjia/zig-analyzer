@@ -384,9 +384,25 @@ pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue
     return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = source.text } }) };
 }
 
-/// Type of a field in a tuple, anonymous struct, constructed type, or source container
+/// Type of a field in a tuple, anonymous struct, constructed type, or source container (of a
+/// source container, only the type of that field is computed)
 pub fn fieldType(r: *Resolver, t: Index, name: []const u8) Error!?Index {
-    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    const ip = r.ctx.db.env.ip;
+    switch (ip.key(t)) {
+        .container_type => |c| {
+            if (c.kind == .@"enum" or c.kind == .@"opaque") return null;
+            const ns = try queries.namespaceOfType(r, t) orelse return null;
+            const tree = try r.itemTree(ns.file);
+            for (tree.containerMembers(ns.container)) |m| {
+                const it = tree.items[m];
+                if (it.kind != .field or !std.mem.eql(u8, it.name orelse "", name)) continue;
+                return (try queries.defType(r, .{ .item = .{ .file = ns.file, .item = m } }, null, c.inst)).ty;
+            }
+            return null;
+        },
+        else => {},
+    }
+    var ev: Evaluator = .{ .r = r, .ip = ip, .a = r.arena };
     defer ev.deinit();
     const fields = try ev.fieldsOf(t) orelse return null;
     for (fields) |f| if (std.mem.eql(u8, f.name, name)) return f.ty;
@@ -1293,7 +1309,9 @@ const Evaluator = struct {
                 .success => |c| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = c } })),
                 .failure => return error.Abort,
             },
-            else => switch (std.zig.parseNumberLiteral(text)) {
+            else => if (Body.zonFloatValue(text)) |x| {
+                return Val.of(.comptime_float_type, (try value.floatValue(ip, .comptime_float_type, x)).?);
+            } else switch (std.zig.parseNumberLiteral(text)) {
                 .int => |v| return Val.of(.comptime_int_type, try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } })),
                 .float => {
                     const x = std.fmt.parseFloat(f128, text) catch return error.Abort;

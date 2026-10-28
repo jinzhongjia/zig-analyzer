@@ -16,14 +16,22 @@ const Range = Body.Range;
 
 const Error = Allocator.Error;
 
-/// Lowers a container member (fn_decl / var_decl / container_field / test_decl / comptime_decl).
-/// `field_is_name`: the member is an enum member or a union field written as just a name
-/// (`red`, `red = 1`, `union(enum) { b }`); the type expression position holds its name,
-/// not an expression
-pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body {
+/// What is being lowered
+pub const Owner = enum {
+    /// A container member (fn_decl / var_decl / container_field / test_decl / comptime_decl)
+    member,
+    /// An enum member or a union field written as just a name (`red`, `red = 1`,
+    /// `union(enum) { b }`): the type expression position holds its name, not an expression
+    bare_field,
+    /// The root expression of a ZON file: `inf` and `nan` are float literals
+    zon,
+};
+
+/// Lowers `member`: a container member, or the root expression of a ZON file (`owner == .zon`)
+pub fn lower(gpa: Allocator, member: SyntaxNode, owner: Owner) Error!Body {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
-    var l: Lowerer = .{ .gpa = gpa, .a = arena.allocator(), .base = member.offset };
+    var l: Lowerer = .{ .gpa = gpa, .a = arena.allocator(), .base = member.offset, .zon = owner == .zon };
     defer l.deinit();
     try l.scopes.append(gpa, .{ .parent = null, .bindings = &.{} });
 
@@ -31,7 +39,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
     var type_expr: ?ExprId = null;
     var align_expr: ?ExprId = null;
     var params: std.ArrayList(BindingId) = .empty;
-    switch (member.kind()) {
+    if (owner == .zon) value = try l.expr(member) else switch (member.kind()) {
         .fn_decl => {
             const decl = ast.cast(ast.FnDecl, member).?;
             if (decl.proto()) |proto| {
@@ -64,7 +72,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, field_is_name: bool) Error!Body
         },
         .container_field => {
             const field = ast.cast(ast.ContainerField, member).?;
-            type_expr = if (field_is_name) null else try l.optExpr(field.typeExpr());
+            type_expr = if (owner == .bare_field) null else try l.optExpr(field.typeExpr());
             align_expr = try l.clauses(member);
             value = try l.optExpr(field.defaultValue());
         },
@@ -100,6 +108,8 @@ const Lowerer = struct {
     a: Allocator,
     /// Start of the owner node
     base: u32,
+    /// A ZON file: `inf` and `nan` are float literals, not names
+    zon: bool,
     exprs: std.ArrayList(Expr) = .empty,
     ranges: std.ArrayList(Range) = .empty,
     expr_scopes: std.ArrayList(ScopeId) = .empty,
@@ -256,7 +266,10 @@ const Lowerer = struct {
             .paren_expr, .expr_stmt => return l.exprOrMissing(firstChild(n)),
             // A recovered reference position may hold only an invalid token; a missing name stays
             // unknown and does not enter name resolution.
-            .name_ref => if ((ast.NameRef{ .syntax = n }).name()) |name| .{ .name_ref = try l.ident(name.text) } else .missing,
+            .name_ref => if ((ast.NameRef{ .syntax = n }).name()) |name|
+                if (l.zon and Body.zonFloatValue(name.text) != null) .{ .literal = try l.str(name.text) } else .{ .name_ref = try l.ident(name.text) }
+            else
+                .missing,
             .literal => .{ .literal = try l.literal(n) },
             .field_access => blk: {
                 const fa = ast.FieldAccess{ .syntax = n };
@@ -613,10 +626,10 @@ const testing = std.testing;
 const Parse = @import("../syntax/Parse.zig");
 
 fn lowerFirst(text: []const u8) !struct { parse: *Parse, body: Body } {
-    const p = try Parse.create(testing.allocator, text);
+    const p = try Parse.create(testing.allocator, text, .zig);
     errdefer p.destroy();
     var it = ast.childNodes(p.rootNode());
-    return .{ .parse = p, .body = try lower(testing.allocator, it.next().?, false) };
+    return .{ .parse = p, .body = try lower(testing.allocator, it.next().?, .member) };
 }
 
 fn offsetOf(text: []const u8, needle: []const u8) u32 {
@@ -762,4 +775,29 @@ test "recovered invalid names remain unknown while preserving enclosing bindings
             try testing.expect(saw_input_ref);
         }
     }
+}
+
+test "zon root expression is the value; inf and nan are literals" {
+    const text = "// c\n.{ .a = inf, .b = -nan, .c = @\"inf\", .d = .{ x, 1 } }";
+    const p = try Parse.create(testing.allocator, text, .zon);
+    defer p.destroy();
+    const root = @import("../syntax/ItemTree.zig").zonRoot(p.rootNode()).?;
+    var body = try lower(testing.allocator, root, .zon);
+    defer body.deinit(testing.allocator);
+    const fields = body.expr(body.value.?).init.fields;
+    try testing.expectEqual(4, fields.len);
+    try testing.expectEqualStrings("inf", body.expr(fields[0].value).literal);
+    try testing.expectEqualStrings("nan", body.expr(body.expr(fields[1].value).prefix.operand).literal);
+    // A quoted identifier is not a float literal
+    try testing.expectEqualStrings("inf", body.expr(fields[2].value).name_ref);
+    try testing.expectEqualStrings("x", body.expr(body.expr(fields[3].value).init.fields[0].value).name_ref);
+    // Positions are relative to the start of the root expression
+    const r = body.range(fields[0].value);
+    try testing.expectEqualStrings("inf", text[root.offset + r.start .. root.offset + r.end]);
+
+    // In a Zig file `inf` is a name
+    var zig = try lowerFirst("const x = inf;");
+    defer zig.parse.destroy();
+    defer zig.body.deinit(testing.allocator);
+    try testing.expectEqualStrings("inf", zig.body.expr(zig.body.value.?).name_ref);
 }

@@ -157,7 +157,7 @@ pub fn collect(
             break :blk t;
         };
         // Mark AstGen errors: run AstGen on the same text and match by range and message
-        const mode: live.Mode = if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
+        const mode = live.modeOf(path);
         const astgen = try live.check(gpa, text, mode);
         defer astgen.destroy(gpa);
         for (items.items) |*item| {

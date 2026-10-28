@@ -9,6 +9,9 @@
 //! Positions are looked up through `AstId` in `AstIdMap`. Containers defined inside function
 //! bodies (such as the `struct {...}` returned by a generic type constructor) are included too,
 //! since their members are part of name resolution.
+//!
+//! A ZON file has a single member: its root expression (kind `zon`, without a name), which owns
+//! the Body that infers it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,6 +20,7 @@ const SyntaxNode = tree.SyntaxNode;
 const SyntaxKind = @import("kind.zig").SyntaxKind;
 const isTrivia = @import("kind.zig").isTrivia;
 const ast = @import("ast.zig");
+const Mode = @import("Parse.zig").Mode;
 
 const ItemTree = @This();
 
@@ -49,7 +53,8 @@ pub const Container = struct {
 pub const Item = struct {
     ast_id: AstId,
     kind: Kind,
-    /// Tuple fields, comptime blocks, and anonymous tests have no name
+    /// Tuple fields, comptime blocks, anonymous tests, and the root expression of a ZON file have
+    /// no name
     name: ?[]const u8,
     container: u32,
     flags: Flags,
@@ -59,7 +64,9 @@ pub const Item = struct {
     /// Doc comment text (with the `///` prefix removed), lines joined with `\n`
     doc: ?[]const u8,
 
-    pub const Kind = enum { @"fn", @"const", @"var", field, @"test", @"comptime" };
+    /// `zon`: the root expression of a ZON file. It is not a declaration: it takes no part in the
+    /// outline, symbol search, naming checks, or name resolution
+    pub const Kind = enum { @"fn", @"const", @"var", field, @"test", @"comptime", zon };
 
     pub const Flags = packed struct(u8) {
         is_pub: bool = false,
@@ -115,7 +122,14 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 
 // ── Build ────────────────────────────────────────────────────────────
 
-pub fn build(gpa: Allocator, root: SyntaxNode) Allocator.Error!ItemTree {
+/// The root expression of a ZON file (the only child of the root node that is not an error node)
+pub fn zonRoot(root: SyntaxNode) ?SyntaxNode {
+    var it = root.children();
+    while (it.nextNode()) |n| if (n.kind() != .error_node) return n;
+    return null;
+}
+
+pub fn build(gpa: Allocator, root: SyntaxNode, mode: Mode) Allocator.Error!ItemTree {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     var b: Builder = .{ .gpa = gpa, .arena = arena.allocator() };
@@ -124,7 +138,10 @@ pub fn build(gpa: Allocator, root: SyntaxNode) Allocator.Error!ItemTree {
     const file_id = mixId(0, "file", "", 0);
     try b.taken.put(gpa, file_id, {});
     try b.containers.append(gpa, .{ .ast_id = file_id, .kind = .file, .parent_item = null, .members = undefined });
-    try b.visitContainer(root, 0);
+    switch (mode) {
+        .zig => try b.visitContainer(root, 0),
+        .zon => try b.visitZonRoot(root),
+    }
 
     // Lay out the member lists in container order
     var member_list: std.ArrayList(u32) = .empty;
@@ -181,6 +198,25 @@ const Builder = struct {
             try b.pending_members.items[index].append(b.arena, item_index);
             try b.visitNested(member, item_index);
         }
+    }
+
+    /// A ZON file: the root expression is the only member of the file; container definitions inside
+    /// it (not part of ZON, but parsable) are collected as usual
+    fn visitZonRoot(b: *Builder, root: SyntaxNode) Allocator.Error!void {
+        try b.pending_members.append(b.gpa, .empty);
+        if (zonRoot(root) == null) return;
+        const item_index: u32 = @intCast(b.items.items.len);
+        try b.items.append(b.gpa, .{
+            .ast_id = try b.uniqueId(b.containers.items[0].ast_id, "zon", ""),
+            .kind = .zon,
+            .name = null,
+            .container = 0,
+            .flags = .{},
+            .sig_hash = 0,
+            .doc = null,
+        });
+        try b.pending_members.items[0].append(b.arena, item_index);
+        try b.visitNested(root, item_index);
     }
 
     /// Finds container definitions in a member's subtree (including inside function bodies),
@@ -322,7 +358,7 @@ fn signatureHash(member: SyntaxNode, kind: Item.Kind) u64 {
                 } else hashTokens(&h, e.node);
             }
         },
-        .@"test", .@"comptime" => {},
+        .@"test", .@"comptime", .zon => {},
     }
     return h.final();
 }
@@ -390,7 +426,11 @@ pub const AstIdMap = struct {
         var i_index: u32 = 0;
         result.map.putAssumeCapacity(item_tree.containers[0].ast_id, root);
         c_index += 1;
-        walk(item_tree, root, &result, &c_index, &i_index);
+        if (item_tree.items.len != 0 and item_tree.items[0].kind == .zon) {
+            result.map.putAssumeCapacity(item_tree.items[0].ast_id, zonRoot(root).?);
+            i_index += 1;
+            walkNested(item_tree, root, &result, &c_index, &i_index);
+        } else walk(item_tree, root, &result, &c_index, &i_index);
         return result;
     }
 

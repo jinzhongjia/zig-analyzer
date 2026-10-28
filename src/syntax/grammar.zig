@@ -32,6 +32,33 @@ pub fn sourceFile(p: *Parser) Error!void {
     _ = try m.complete(p, .source_file);
 }
 
+/// A ZON file: one expression, parsed like a Zig expression (whether it stays within the ZON subset
+/// is diagnosed by `zig ast-check --zon`). Each token before the expression that cannot start one
+/// (such as a doc comment) is wrapped in its own error node; extra tokens after it go into one
+/// error node
+pub fn zonFile(p: *Parser) Error!void {
+    const m = try p.start();
+    var root: CM = null;
+    var junk = false;
+    while (!p.atEof()) {
+        root = try expr(p);
+        if (root != null) break;
+        if (!junk) try p.err("expected expression");
+        junk = true;
+        const e = try p.start();
+        try p.bump();
+        _ = try e.complete(p, .error_node);
+    }
+    if (root == null and !junk) try p.err("expected expression");
+    if (!p.atEof()) {
+        try p.err("expected end of file");
+        const e = try p.start();
+        while (!p.atEof()) try p.bump();
+        _ = try e.complete(p, .error_node);
+    }
+    _ = try m.complete(p, .source_file);
+}
+
 /// Parses container members up to `}` or the end of the file (does not consume `}`).
 fn containerMembers(p: *Parser) Error!void {
     while (p.at(.container_doc_comment)) try p.bump();

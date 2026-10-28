@@ -5,9 +5,9 @@ const Parse = @import("Parse.zig");
 /// Asserts that the incremental result for old → new matches a full parse; `expect_incremental`
 /// asserts whether the local reparse path was taken
 fn expectReparse(old_text: []const u8, new_text: []const u8, expect_incremental: bool) !void {
-    const old = try Parse.create(testing.allocator, old_text);
+    const old = try Parse.create(testing.allocator, old_text, .zig);
     defer old.destroy();
-    const full = try Parse.create(testing.allocator, new_text);
+    const full = try Parse.create(testing.allocator, new_text, .zig);
     defer full.destroy();
     const inc = try Parse.reparseBlock(testing.allocator, old, new_text);
     try testing.expectEqual(expect_incremental, inc != null);
@@ -33,7 +33,7 @@ test "edits inside a container use block reparse" {
 }
 
 test "picks the deepest block" {
-    const old = try Parse.create(testing.allocator, "fn f() void {\n    while (true) {\n        a();\n    }\n}\n");
+    const old = try Parse.create(testing.allocator, "fn f() void {\n    while (true) {\n        a();\n    }\n}\n", .zig);
     defer old.destroy();
     const inc = (try Parse.reparseBlock(testing.allocator, old, "fn f() void {\n    while (true) {\n        b();\n    }\n}\n")).?;
     defer inc.destroy();
@@ -68,7 +68,7 @@ test "outer errors are kept and shifted after incremental parse" {
 }
 
 test "ref counting: old result stays valid until the incremental result is freed" {
-    const old = try Parse.create(testing.allocator, "fn f() void {\n    g();\n}\n");
+    const old = try Parse.create(testing.allocator, "fn f() void {\n    g();\n}\n", .zig);
     const inc = (try Parse.reparseBlock(testing.allocator, old, "fn f() void {\n    h();\n}\n")).?;
     old.destroy(); // the query engine frees the old value
     // The reused fn_proto node is still accessible
@@ -78,9 +78,9 @@ test "ref counting: old result stays valid until the incremental result is freed
 
 /// Like `expectReparse`, but checks the top-level local reparse
 fn expectTopLevel(old_text: []const u8, new_text: []const u8, expect_incremental: bool) !void {
-    const old = try Parse.create(testing.allocator, old_text);
+    const old = try Parse.create(testing.allocator, old_text, .zig);
     defer old.destroy();
-    const full = try Parse.create(testing.allocator, new_text);
+    const full = try Parse.create(testing.allocator, new_text, .zig);
     defer full.destroy();
     const inc = try Parse.reparseTopLevel(testing.allocator, old, new_text);
     try testing.expectEqual(expect_incremental, inc != null);
@@ -117,7 +117,7 @@ test "top-level reparse falls back when an earlier error sits at the cut" {
 fn expectConsistent(old: *Parse, new_text: []const u8) !void {
     const inc = try Parse.reparse(testing.allocator, old, new_text);
     defer inc.destroy();
-    const full = try Parse.create(testing.allocator, new_text);
+    const full = try Parse.create(testing.allocator, new_text, .zig);
     defer full.destroy();
     try testing.expect(inc.sameAs(full));
 }
@@ -131,11 +131,35 @@ test "deep nesting: edits in the innermost block reparse locally" {
     try src.appendSlice(a, "a();");
     for (0..1500) |_| try src.append(a, '}');
     try src.append(a, '\n');
-    const old = try Parse.create(a, src.items);
+    const old = try Parse.create(a, src.items, .zig);
     defer old.destroy();
     const edited = try std.mem.replaceOwned(u8, a, src.items, "a();", "{{{{{{{{{{a();}}}}}}}}}}");
     defer a.free(edited);
     const inc = try Parse.reparseBlock(a, old, edited) orelse return error.TestUnexpectedResult;
     defer inc.destroy();
     try expectConsistent(old, edited);
+}
+
+test "zon files keep the zon mode and are always parsed in full" {
+    const old_text = ".{\n    .a = .{\n        .b = 1,\n    },\n}\n";
+    const old = try Parse.create(testing.allocator, old_text, .zon);
+    defer old.destroy();
+    const edits = [_][]const u8{
+        // An edit inside braces: Zig mode would reparse the block locally
+        ".{\n    .a = .{\n        .b = 2,\n        .c = 3,\n    },\n}\n",
+        // Top-level edits: Zig mode would reparse them as container members
+        ".{\n    .a = .{\n        .b = 1,\n    },\n}\n\n",
+        ".{\n    .a = .{\n        .b = 1,\n    },\n}\n.{}",
+    };
+    for (edits) |new_text| {
+        const full = try Parse.create(testing.allocator, new_text, .zon);
+        defer full.destroy();
+        const inc = try Parse.reparse(testing.allocator, old, new_text);
+        defer inc.destroy();
+        try testing.expectEqual(.zon, inc.mode);
+        try testing.expect(inc.base == null);
+        try testing.expect(inc.sameAs(full));
+        try testing.expect(inc.rootNode().childNode(.init_expr) != null);
+        try testing.expect(inc.rootNode().childNode(.container_field) == null);
+    }
 }

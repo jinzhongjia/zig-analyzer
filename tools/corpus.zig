@@ -1,12 +1,12 @@
-//! Corpus cross-check: validates the project's own CST parser on a set of Zig sources.
+//! Corpus cross-check: validates the project's own CST parser on a set of Zig and ZON sources.
 //!
 //! Usage: zig build corpus -- <dir or file>...
 //!
-//! Checks:
+//! `.zon` files are parsed in ZON mode and compared with the ZON mode of `std.zig.Ast`. Checks:
 //! 1. Lossless: the concatenated text of the syntax tree equals the source
 //! 2. No false errors: a file without `std.zig.Ast` errors must have no CST errors either
 //! 3. Same structure: the (kind, name) sequence of the top-level members of each container
-//!    matches `std.zig.Ast`
+//!    matches `std.zig.Ast` (the root of a ZON file is one expression)
 //! 4. Robustness: parsing a file truncated at several positions does not crash and is still
 //!    lossless
 //! 5. HIR: every member can be lowered, expression positions lie within the member, and name
@@ -72,7 +72,8 @@ pub fn main(init: std.process.Init) !u8 {
         var walker = try dir.walk(gpa);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".zig") and !std.mem.endsWith(u8, entry.basename, ".zon")) continue;
             const path = try std.fs.path.join(gpa, &.{ root, entry.path });
             defer gpa.free(path);
             try checkFile(gpa, io, cwd, path, &stats);
@@ -125,9 +126,10 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     defer gpa.free(source);
     stats.files += 1;
     stats.bytes += source.len;
+    const mode = syntax.Parse.modeOf(path);
 
     const t0 = std.Io.Clock.awake.now(io);
-    const parse = try syntax.Parse.create(gpa, source);
+    const parse = try syntax.Parse.create(gpa, source, mode);
     stats.parse_ns += @intCast(t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     defer parse.destroy();
 
@@ -140,7 +142,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     // ItemTree and AstIdMap: every member maps back to a node of the matching kind
     {
         const t1 = std.Io.Clock.awake.now(io);
-        var items = try syntax.ItemTree.build(gpa, parse.rootNode());
+        var items = try syntax.ItemTree.build(gpa, parse.rootNode(), mode);
         defer items.deinit(gpa);
         var map = try syntax.ItemTree.AstIdMap.build(gpa, &items, parse.rootNode());
         defer map.deinit(gpa);
@@ -154,6 +156,9 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
                 .field => .container_field,
                 .@"test" => .test_decl,
                 .@"comptime" => .comptime_decl,
+                // The root expression of ZON can be any expression: the node that `zonRoot`
+                // returns
+                .zon => syntax.ItemTree.zonRoot(parse.rootNode()).?.kind(),
             };
             if (node.kind() != expected_kind) break false;
         } else true;
@@ -169,8 +174,9 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             const container_kind = items.containers[item.container].kind;
             const field_is_name = item.kind == .field and (container_kind == .@"enum" or container_kind == .@"union") and
                 (syntax.ast.ContainerField{ .syntax = node }).name() == null;
+            const owner: za.hir.lower.Owner = if (item.kind == .zon) .zon else if (field_is_name) .bare_field else .member;
             const t2 = std.Io.Clock.awake.now(io);
-            var body = try za.hir.lower.lower(gpa, node, field_is_name);
+            var body = try za.hir.lower.lower(gpa, node, owner);
             defer body.deinit(gpa);
             stats.hir_ns += @intCast(t2.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
             stats.hir_exprs += body.exprs.len;
@@ -178,7 +184,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             defer references.deinit(gpa);
             const name_node = if (field_is_name) (syntax.ast.ContainerField{ .syntax = node }).typeExpr() else null;
             const excluded = if (name_node) |name| if (name.kind() == .name_ref) name.offset else null else null;
-            try collectNameRefs(gpa, node, excluded, &references);
+            try collectNameRefs(gpa, node, excluded, if (owner == .zon) .zon else .zig, &references);
             const expected = references.count();
             const in_range = body.exprs.len == body.expr_ranges.len and for (body.expr_ranges) |r| {
                 if (r.start > r.end or r.end > node.green.text_len) break false;
@@ -211,7 +217,10 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     if (try syntax.nesting.estimate(gpa, source_z, syntax.nesting.inline_depth) > syntax.nesting.inline_depth) {
         stats.std_skipped += 1;
     } else {
-        var ast = try std.zig.Ast.parse(gpa, source_z, .{});
+        var ast = try std.zig.Ast.parse(gpa, source_z, .{ .mode = switch (mode) {
+            .zig => .zig,
+            .zon => .zon,
+        } });
         defer ast.deinit(gpa);
         if (ast.errors.len != 0) {
             stats.std_errors += 1;
@@ -223,7 +232,11 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
                 report(stats, "[false error] {s}:{d}:{d}: {s} ({d} total)", .{ path, loc.line, loc.col, e.message, parse.errors.len });
             }
             // 3. Top-level structure
-            if (!try sameStructure(gpa, &ast, parse.rootNode(), source)) {
+            const same = switch (mode) {
+                .zig => try sameStructure(gpa, &ast, parse.rootNode(), source),
+                .zon => zonRootIsExpr(parse.rootNode()),
+            };
+            if (!same) {
                 stats.structure_mismatches += 1;
                 report(stats, "[structure mismatch] {s}", .{path});
             }
@@ -238,7 +251,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
     const cuts = 8;
     for (1..cuts) |i| {
         const end = source.len * i / cuts;
-        const partial = try syntax.Parse.create(gpa, source[0..end]);
+        const partial = try syntax.Parse.create(gpa, source[0..end], mode);
         defer partial.destroy();
         stats.truncations += 1;
         if (!try isLossless(gpa, partial.rootNode(), source[0..end])) {
@@ -258,7 +271,7 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
     var prng: std.Random.DefaultPrng = .init(std.hash.Wyhash.hash(0, path));
     const rand = prng.random();
 
-    var chain = try syntax.Parse.create(gpa, source);
+    var chain = try syntax.Parse.create(gpa, source, syntax.Parse.modeOf(path));
     defer chain.destroy();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
@@ -275,7 +288,7 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
         const t0 = std.Io.Clock.awake.now(io);
         const inc = try syntax.Parse.reparse(gpa, chain, text.items);
         const t1 = std.Io.Clock.awake.now(io);
-        const full = try syntax.Parse.create(gpa, text.items);
+        const full = try syntax.Parse.create(gpa, text.items, chain.mode);
         const t2 = std.Io.Clock.awake.now(io);
         defer full.destroy();
 
@@ -298,15 +311,18 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
 
 /// Collects the source references that must appear in the HIR; members of nested containers
 /// are checked by their own owners.
-fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references: *std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken)) !void {
+fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, mode: syntax.Parse.Mode, references: *std.AutoHashMapUnmanaged(syntax.TextRange, syntax.SyntaxToken)) !void {
     switch (node.kind()) {
         .name_ref => {
             if (excluded == node.offset) return;
-            if ((syntax.ast.NameRef{ .syntax = node }).name()) |token| try references.put(gpa, token.range(), token);
+            const token = (syntax.ast.NameRef{ .syntax = node }).name() orelse return;
+            // `inf` and `nan` are float literals in ZON
+            if (mode == .zon and za.hir.Body.zonFloatValue(token.text) != null) return;
+            try references.put(gpa, token.range(), token);
             return;
         },
         .container_decl => {
-            if ((syntax.ast.ContainerDecl{ .syntax = node }).argExpr()) |arg| try collectNameRefs(gpa, arg, excluded, references);
+            if ((syntax.ast.ContainerDecl{ .syntax = node }).argExpr()) |arg| try collectNameRefs(gpa, arg, excluded, mode, references);
             return;
         },
         .asm_output => if (node.childToken(.arrow) == null) {
@@ -325,7 +341,7 @@ fn collectNameRefs(gpa: Allocator, node: SyntaxNode, excluded: ?u32, references:
         else => {},
     }
     var children = node.children();
-    while (children.nextNode()) |child| try collectNameRefs(gpa, child, excluded, references);
+    while (children.nextNode()) |child| try collectNameRefs(gpa, child, excluded, mode, references);
 }
 
 fn isLossless(gpa: Allocator, root: SyntaxNode, source: []const u8) !bool {
@@ -351,6 +367,17 @@ fn lineCol(source: []const u8, offset: u32) struct { line: usize, col: usize } {
 }
 
 const Member = struct { kind: []const u8, name: []const u8 };
+
+/// The root of a ZON file has exactly one child node (the expression) and no error node
+fn zonRootIsExpr(root: SyntaxNode) bool {
+    var it = root.children();
+    var count: usize = 0;
+    while (it.nextNode()) |n| {
+        if (n.kind() == .error_node) return false;
+        count += 1;
+    }
+    return count == 1;
+}
 
 /// Compares the member sequences container by container. A container is identified by the
 /// offset of its keyword (struct/enum/...); the file root uses offset maxInt.

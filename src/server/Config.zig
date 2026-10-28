@@ -107,8 +107,9 @@ imports_sort: ImportOptions.Sort = .path,
 /// Offer, in plain name completion, auto-imports of reachable declarations and modules, as well as
 /// members of visible namespaces matched by their full path
 completion_auto_import: bool = true,
-/// Maximum number of auto-import candidates offered by one completion (the best-ranked ones are
-/// kept; the client gets the rest by requesting again as the user types); 0 means no limit
+/// Maximum number of candidates besides the names in scope (members of local values and
+/// auto-import candidates) offered by one completion in total (the best-ranked ones are kept; the
+/// client gets the rest by requesting again as the user types); 0 means no limit
 completion_max_auto_imports: u32 = 128,
 /// When the client supports snippets: function completions insert calls (not when parentheses
 /// already follow the cursor), and common snippets are offered where statements and declarations

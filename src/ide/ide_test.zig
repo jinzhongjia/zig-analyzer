@@ -12,6 +12,7 @@ const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const Vfs = @import("../base/Vfs.zig");
 const seed = database.ide_db.seed;
 const search = @import("../ide_db/search.zig");
 
@@ -283,11 +284,16 @@ test "signature help and parameter hints through aliases" {
         \\fn add(a: u32, b: u32) u32 { return a + b; }
         \\const plus = add;
         \\const ns = struct { const sum = plus; };
-        \\fn run(x: u32) void {
+        \\const S = struct {
+        \\    fn addImpl(self: S, a: u32, b: u32) u32 { _ = self; return a + b; }
+        \\    pub const sum = addImpl;
+        \\};
+        \\fn run(x: u32, s: S) void {
         \\    const local = add;
         \\    _ = plus(x, 1);
         \\    _ = ns.sum(x, 2);
         \\    _ = local(x, 3);
+        \\    _ = s.sum(x, 4);
         \\}
         \\
     ;
@@ -304,13 +310,17 @@ test "signature help and parameter hints through aliases" {
         try testing.expectEqualStrings("fn add(a: u32, b: u32) u32", s.label);
         try testing.expectEqual(1, s.active);
     }
+    // An alias of a method, called through a value, binds the receiver like the method itself
+    const s = try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, "4);").?)) orelse return error.NoSignature;
+    try testing.expectEqualStrings("fn addImpl(self: S, a: u32, b: u32) u32", s.label);
+    try testing.expectEqual(2, s.active);
     const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{});
     var out: std.ArrayList(u8) = .empty;
     for (hints) |h| if (h.kind == .parameter) {
         try out.appendSlice(w.arena.allocator(), h.label);
         try out.append(w.arena.allocator(), ' ');
     };
-    try testing.expectEqualStrings("a: b: a: b: a: b: ", out.items);
+    try testing.expectEqualStrings("a: b: a: b: a: b: a: b: ", out.items);
 }
 
 test "hover and signature help drop comments from multi-line function prototypes" {
@@ -372,6 +382,554 @@ test "name completion ranks scope names before namespace members, each by how we
     // Local names, parameters, container members and members through `std` come in that order;
     // names in scope that do not match sort last and are filtered by the client
     try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
+/// Labels of the candidates besides the names in scope (member paths of local values) given by name
+/// completion without auto-import, sorted and joined by spaces
+fn localMemberPaths(source: []const u8) ![]u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
+        if (it.weight == 0) try labels.append(w.arena.allocator(), it.label);
+    }
+    std.mem.sort([]const u8, labels.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
+test "name completion offers fields and callable methods of local values two levels deep" {
+    const types =
+        \\const Inner = struct {
+        \\    depth: u32,
+        \\    pub fn get(self: *const Inner) u32 { return self.depth; }
+        \\    pub fn bump(self: *Inner) void { self.depth += 1; }
+        \\    pub const peek = get;
+        \\};
+        \\const Outer = struct {
+        \\    inner: Inner,
+        \\    ptr: *Inner,
+        \\    opt: ?Inner,
+        \\    res: anyerror!Inner,
+        \\    pub fn copy(self: Outer) Inner { return self.inner; }
+        \\    pub fn view(self: *Outer) *Inner { return self.ptr; }
+        \\    pub fn maybe(self: Outer) ?Inner { return self.opt; }
+        \\    pub fn fallible(self: Outer) anyerror!Inner { return self.res; }
+        \\    pub fn pick(self: Outer, n: u32) Inner { _ = n; return self.inner; }
+        \\    pub fn make() Outer { return undefined; }
+        \\};
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Fields and the results of methods that take only self and return a container or a
+        // single-item pointer expand to a second level; `?T` and `E!T` values and methods with
+        // parameters do not
+        .{ "fn run(o: Outer) void { _ = o; _ = depth<|>; }", "o.copy().depth o.inner.depth o.ptr.depth" },
+        // Methods receiving `*T` are offered only when the path can be modified (a local var, or
+        // through a mutable pointer); a value returned by a method is a temporary that cannot be
+        // modified
+        .{ "fn run(o: Outer) void { _ = o; _ = bump<|>; }", "o.ptr.bump" },
+        .{ "fn run() void { var o: Outer = undefined; _ = &o; _ = bump<|>; }", "o.inner.bump o.ptr.bump o.view().bump" },
+        .{ "fn run(o: *Outer) void { _ = o; _ = bump<|>; }", "o.inner.bump o.ptr.bump o.view().bump" },
+        .{ "fn run(o: *const Outer) void { _ = o; _ = bump<|>; }", "o.ptr.bump" },
+        .{ "fn run(o: Outer) void { _ = o; _ = get<|>; }", "o.copy().get o.inner.get o.ptr.get" },
+        // Methods with parameters are offered at the first level; a function whose first parameter
+        // is not the enclosing container is not a method
+        .{ "fn run(o: Outer) void { _ = o; _ = pick<|>; }", "o.pick" },
+        .{ "fn run(o: Outer) void { _ = o; _ = make<|>; }", "" },
+        // Pointers to pointers are not expanded
+        .{ "fn run(o: **Outer) void { _ = o; _ = depth<|>; }", "" },
+        // Local values that are types or whose types cannot be computed are not expanded
+        .{ "fn run() void { const T = Outer; const u = missing(); _ = .{ T, u }; _ = make<|>; }", "" },
+        // Slices, arrays, and tuples
+        .{ "fn run(s: []const u8, a: [4]u8, t: struct { u8, bool }) void { _ = .{ s, a, t }; _ = len<|>; }", "a.len s.len t.len" },
+        .{ "fn run(s: []const u8) void { _ = s; _ = ptr<|>; }", "s.ptr" },
+        // Inside a generic function body, types are inferred from the call-site instance
+        .{ "fn generic(comptime T: type, v: T) void { _ = v; _ = depth<|>; }\nfn caller() void { generic(Inner, .{ .depth = 1 }); }", "v.depth" },
+        // Functions in a container cannot access the runtime values of the enclosing function
+        .{ "fn outer(o: Outer) void { _ = o; const S = struct { fn f() void { _ = depth<|>; } }; _ = S; }", "" },
+        // Shadowed local values are not expanded
+        .{ "fn run(o: Outer) void { _ = o; { const o: u32 = 1; _ = o; _ = depth<|>; } }", "" },
+        // A value capture cannot be modified; a pointer capture can be when the pointer is mutable
+        .{ "fn run(xs: []Inner) void { for (xs) |x| { _ = x; _ = bump<|>; } }", "" },
+        .{ "fn run(xs: []Inner) void { for (xs) |*x| { _ = x; _ = bump<|>; } }", "x.bump" },
+        .{ "fn run(xs: []const Inner) void { for (xs) |*x| { _ = x; _ = bump<|>; } }", "" },
+        // An alias of a method is a method too
+        .{ "fn run(o: Outer) void { _ = o; _ = peek<|>; }", "o.copy().peek o.inner.peek o.ptr.peek" },
+        // Fields of unions
+        .{ "const U = union(enum) { in: Inner, n: u8 };\nfn run(u: U) void { _ = u; _ = depth<|>; }", "u.in.depth" },
+        // Comptime parameters of an enclosing function are comptime-known
+        .{ "fn outer(comptime o: Outer) type { return struct { fn f() void { _ = depth<|>; } }; }", "o.copy().depth o.inner.depth o.ptr.depth" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ types, c[0] });
+        defer testing.allocator.free(source);
+        const got = try localMemberPaths(source);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "name completion offers only pub methods of local values whose type is in another file" {
+    const got = try localMemberPaths(
+        \\//- /p/main.zig module:app
+        \\const other = @import("other.zig");
+        \\fn run(o: other.Thing) void {
+        \\    _ = o;
+        \\    _ = val<|>;
+        \\}
+        \\//- /p/other.zig in:app
+        \\pub const Thing = struct {
+        \\    value: u32,
+        \\    pub fn valid(self: Thing) bool { return self.validate(); }
+        \\    fn validate(self: Thing) bool { return self.value != 0; }
+        \\};
+    );
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("o.valid o.value", got);
+}
+
+test "local member paths carry kinds, types, filters and the replaced range" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Point = struct {
+        \\    x: i32,
+        \\    inner: struct { @"type": u8 },
+        \\    /// Scales the point.
+        \\    pub fn scale(self: Point, k: i32) Point { return .{ .x = self.x * k, .inner = self.inner }; }
+        \\};
+        \\fn run(point: Point) void {
+        \\    _ = point;
+        \\    _ = pt<|>;
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    const find = struct {
+        fn find(all: []const completion.Item, label: []const u8) !completion.Item {
+            for (all) |it| if (std.mem.eql(u8, it.label, label)) return it;
+            std.debug.print("missing `{s}`\n", .{label});
+            return error.MissingCompletion;
+        }
+    }.find;
+    const x = try find(items, "point.x");
+    try testing.expectEqual(.field, x.kind);
+    try testing.expectEqualStrings("i32", x.detail.?);
+    // When the name does not start with the input, the whole path is the filter
+    try testing.expectEqualStrings("point.x", x.filter.?);
+    try testing.expectEqual(@as(u32, at.offset - 2), x.replace.?.start);
+    // A name that is a primitive type needs no escaping inside a path
+    const t = try find(items, "point.inner.type");
+    try testing.expectEqualStrings("u8", t.detail.?);
+    const scale = try find(items, "point.scale");
+    try testing.expectEqual(.method, scale.kind);
+    try testing.expectEqualStrings("Scales the point.", scale.doc.?);
+    const desc = try completion.describe(&r, at.file, scale.target.?);
+    try testing.expectEqualStrings("pub fn scale(self: Point, k: i32) Point", desc.detail);
+}
+
+test "local member paths classify functions as completion after `.` does" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Thing = @import("Thing.zig");
+        \\const Point = struct {
+        \\    x: i32,
+        \\    pub fn negated(self: Point) Point { return .{ .x = -self.x }; }
+        \\};
+        \\fn run(thing: Thing, point: Point) void {
+        \\    _ = .{ thing, point };
+        \\    _ = neg<|>;
+        \\}
+        \\//- /p/Thing.zig in:app
+        \\value: u32,
+        \\const Thing = @This();
+        \\pub fn negative(self: Thing) bool { return self.value == 0; }
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    // A function in a file is Function, a method of another container is Method
+    for ([_]struct { []const u8, completion.Item.Kind }{ .{ "point.negated", .method }, .{ "thing.negative", .function } }) |c| {
+        const item = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[0])) break it;
+        } else return error.MissingCompletion;
+        try testing.expectEqual(c[1], item.kind);
+    }
+}
+
+test "local member paths filter by the member name when it starts with the input" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Point = struct { scale: u32 };
+        \\fn run(point: Point) void {
+        \\    _ = point;
+        \\    _ = Sca<|>;
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
+        if (std.mem.eql(u8, it.label, "point.scale")) break try testing.expectEqualStrings("scale", it.filter.?);
+    } else return error.MissingCompletion;
+}
+
+test "local member paths rank below scope names and above namespace members, deeper paths lower" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\const Box = struct { mem: u32, inner: struct { mem: u32 } };
+        \\fn run(box: Box) void {
+        \\    const memory = 2;
+        \\    _ = .{ memory, box };
+        \\    _ = mem<|>;
+        \\}
+        \\//- /zig/std/std.zig std
+        \\pub const mem = struct { pub fn eql() void {} };
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{})).items;
+    const rankOf = struct {
+        fn rankOf(all: []const completion.Item, label: []const u8) ![]const u8 {
+            for (all) |it| if (std.mem.eql(u8, it.label, label)) return it.sort.?;
+            std.debug.print("missing `{s}`\n", .{label});
+            return error.MissingCompletion;
+        }
+    }.rankOf;
+    // Among equal matches, local names rank above member paths of local values, which rank above
+    // candidates accessed through a namespace; deeper paths rank lower
+    const order = [_][2][]const u8{ .{ "memory", "box.mem" }, .{ "box.mem", "std.mem" }, .{ "box.mem", "box.inner.mem" } };
+    for (order) |pair| {
+        testing.expect(std.mem.lessThan(u8, try rankOf(items, pair[0]), try rankOf(items, pair[1]))) catch |err| {
+            std.debug.print("`{s}` should rank before `{s}`\n", .{ pair[0], pair[1] });
+            return err;
+        };
+    }
+}
+
+test "local member paths and auto-import candidates share the candidate limit" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig",
+        \\const Stamp = struct { stamp: u32, start: u32 };
+        \\fn run(stamp_box: Stamp) void {
+        \\    _ = stamp_box;
+        \\    _ = st<|>;
+        \\}
+    );
+    const std_file = (try w.add("/lib/std/std.zig", "pub const standard = u32;\npub const static_value = 1;\n")).file;
+    try w.setGraph(std_file, &.{}, &.{});
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const scored = struct {
+        /// Labels of the candidates besides the names in scope, from the highest score down
+        fn scored(rr: *resolve.Resolver, file: FileId, offset: u32, limit: usize, incomplete: *bool) ![]const []const u8 {
+            const result = try completion.complete(rr, file, offset, .{ .max_auto_imports = limit });
+            incomplete.* = result.is_incomplete;
+            const items = try rr.arena.dupe(completion.Item, result.items);
+            std.mem.sort(completion.Item, items, {}, struct {
+                fn less(_: void, a: completion.Item, b: completion.Item) bool {
+                    return std.mem.lessThan(u8, a.sort.?, b.sort.?);
+                }
+            }.less);
+            var labels: std.ArrayList([]const u8) = .empty;
+            for (items) |it| if (it.weight == 0) try labels.append(rr.arena, it.label);
+            return labels.items;
+        }
+    }.scored;
+    var incomplete = false;
+    const all = try scored(&r, added.file, added.cursor, std.math.maxInt(usize), &incomplete);
+    try testing.expect(!incomplete);
+    var members: usize = 0;
+    for (all) |label| {
+        if (std.mem.startsWith(u8, label, "stamp_box.")) members += 1;
+    }
+    try testing.expect(members > 0 and members < all.len);
+    // Over the limit, the highest-scoring candidates are kept, without a separate limit per source
+    for (1..all.len + 1) |limit| {
+        const kept = try scored(&r, added.file, added.cursor, limit, &incomplete);
+        try testing.expectEqual(limit < all.len, incomplete);
+        try testing.expectEqual(limit, kept.len);
+        for (kept, all[0..limit]) |a, b| try testing.expectEqualStrings(b, a);
+    }
+}
+
+test "local member paths are incomplete only when a path left out can be built" {
+    // `abd` needs a mutable receiver and `abmake` is not a method: neither is an item, so a limit
+    // that keeps every other path leaves nothing out
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig",
+        \\const Big = struct {
+        \\    ab1: u8,
+        \\    ab2: u8,
+        \\    pub fn abc(self: Big) void { _ = self; }
+        \\    pub fn abd(self: *Big) void { _ = self; }
+        \\    pub fn abmake() Big { return undefined; }
+        \\};
+        \\fn run(b: Big) void {
+        \\    _ = b;
+        \\    _ = ab<|>;
+        \\}
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { usize, bool }{ .{ 2, true }, .{ 3, false }, .{ 4, false } }) |c| {
+        const result = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false, .max_auto_imports = c[0] });
+        var paths: usize = 0;
+        for (result.items) |it| {
+            if (it.weight == 0) paths += 1;
+        }
+        try testing.expectEqual(@min(c[0], 3), paths);
+        try testing.expectEqual(c[1], result.is_incomplete);
+    }
+}
+
+/// Labels of the candidates that match the input in name completion, in rank order, joined by
+/// spaces
+fn rankedLabels(source: []const u8, auto_import: bool) ![]u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = auto_import })).items) |it| {
+        if (it.score > 0) try labels.append(w.arena.allocator(), it.label);
+    }
+    return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
+}
+
+/// Checks `cases` in order: the completion ranking at the cursor in the source of each case,
+/// placed after `decls`
+fn expectRanked(decls: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ decls, c[0] });
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+/// Three container members matching `cd` equally: without the expected-type boost, they rank in
+/// declaration order
+const expected_decls =
+    \\const Want = enum { a, b };
+    \\const Other = struct {
+    \\    w: Want = .a,
+    \\    pub fn put(self: Other, w: Want) void { _ = .{ self, w }; }
+    \\};
+    \\const Hook = struct { call: *const fn (Want) void };
+    \\const Tagged = union(Want) { a: u8, b: void };
+    \\const cd_n: u8 = 0;
+    \\const cd_o: Other = .{};
+    \\const cd_w: Want = .a;
+    \\fn take(w: Want) void { _ = w; }
+    \\fn takeOther(o: Other) void { _ = o; }
+    \\
+;
+const unchanged = "cd_n cd_o cd_w";
+const want_first = "cd_w cd_n cd_o";
+const other_first = "cd_o cd_n cd_w";
+
+test "name completion ranks candidates fitting the expected type first" {
+    try expectRanked(expected_decls, &.{
+        .{ "fn run() void { _ = cd<|>; }", unchanged },
+        // Call arguments: calling a method through a value skips self; calling through the type
+        // or calling a field of function type does not
+        .{ "fn run() void { take(cd<|>); }", want_first },
+        .{ "fn run() void { cd_o.put(cd<|>); }", want_first },
+        .{ "fn run() void { Other.put(cd<|>, .a); }", other_first },
+        .{ "fn run() void { Other.put(cd_o, cd<|>); }", want_first },
+        .{ "fn run(h: Hook) void { h.call(cd<|>); }", want_first },
+        // Declarations with a type annotation, including declarations in containers and default
+        // values of fields; the same while typing, before the `;` exists
+        .{ "fn run() void { const x: Want = cd<|>; _ = x; }", want_first },
+        .{ "fn run() void { var x: Want = cd<|>; _ = &x; }", want_first },
+        .{ "fn run() void {\n    const x: Want = cd<|>\n}", want_first },
+        .{ "const top: Want = cd<|>;", want_first },
+        .{ "const Holder = struct { w: Want = cd<|> };", want_first },
+        // Return values
+        .{ "fn run() Want { return cd<|>; }", want_first },
+        .{ "fn run() !Want { return cd<|>; }", want_first },
+        .{ "fn run() Other { return cd<|>; }", other_first },
+        // Fields in initializers: the field of the initializer's type (annotated, written out, or
+        // from the parameter it is passed to); no expected type when there is no such field
+        .{ "fn run() void { const o: Other = .{ .w = cd<|> }; _ = o; }", want_first },
+        .{ "fn run() void { _ = Other{ .w = cd<|> }; }", want_first },
+        .{ "fn run() void { takeOther(.{ .w = cd<|> }); }", want_first },
+        .{ "fn run() void { takeOther(.{ .missing = cd<|> }); }", unchanged },
+        // Assignments and comparisons; a tagged union compared with its tag
+        .{ "fn run() void { var x: Want = .a; x = cd<|>; }", want_first },
+        .{ "fn run(w: Want) void { if (w == cd<|>) {} }", want_first },
+        .{ "fn run(o: Other) void { if (o.w != cd<|>) {} }", want_first },
+        .{ "fn run(t: Tagged) void { if (t == cd<|>) {} }", want_first },
+        // `@as(T, e)`; the branches of `if`, `switch`, `orelse`, and `catch`, `break :label`, and
+        // `comptime e` take the expected type of the expression they produce
+        .{ "fn run() void { _ = @as(Want, cd<|>); }", want_first },
+        .{ "fn run(c: bool) void { const x: Want = if (c) .a else cd<|>; _ = x; }", want_first },
+        .{ "fn run(n: u8) void { const x: Want = switch (n) { 0 => .a, else => cd<|> }; _ = x; }", want_first },
+        .{ "fn run(o: ?Want) void { const x: Want = o orelse cd<|>; _ = x; }", want_first },
+        .{ "fn run(e: anyerror!Want) void { const x: Want = e catch cd<|>; _ = x; }", want_first },
+        .{ "fn run() void { const x: Want = blk: { break :blk cd<|>; }; _ = x; }", want_first },
+        .{ "fn run() void { const x: Want = comptime cd<|>; _ = x; }", want_first },
+        .{ "fn run(c: bool) void { const x: Other = if (c) .{} else cd<|>; _ = x; }", other_first },
+    });
+}
+
+test "candidates fit the expected type only by exact rules" {
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ "Want", "const cd_b: Want = .a;", true },
+        .{ "?Want", "const cd_b: Want = .a;", true },
+        .{ "anyerror!Want", "const cd_b: Want = .a;", true },
+        .{ "?*const Want", "const cd_b: *Want = undefined;", true },
+        .{ "*const Want", "const cd_b: *Want = undefined;", true },
+        .{ "[]const u8", "const cd_b: []u8 = undefined;", true },
+        .{ "type", "const cd_b = u8;", true },
+        // Functions (including function pointers) whose return value fits
+        .{ "Want", "fn cd_b() Want { return .a; }", true },
+        .{ "Want", "const cd_b: *const fn () Want = undefined;", true },
+        // Other conversions, such as integer widening and comptime_int, do not count
+        .{ "u64", "const cd_b: u32 = 0;", false },
+        .{ "u32", "const cd_b = 1;", false },
+        .{ "*Want", "const cd_b: *const Want = undefined;", false },
+        .{ "[]u8", "const cd_b: []const u8 = undefined;", false },
+        .{ "Want", "const cd_b: ?Want = .a;", false },
+        .{ "Want", "fn cd_b() ?Want { return .a; }", false },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\const Want = enum {{ a, b }};
+            \\const Other = struct {{}};
+            \\const cd_a: Other = .{{}};
+            \\{s}
+            \\fn run() void {{
+            \\    const x: {s} = cd<|>;
+            \\    _ = x;
+            \\}}
+            \\
+        , .{ c[1], c[0] });
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(if (c[2]) "cd_b cd_a" else "cd_a cd_b", got) catch |err| {
+            std.debug.print("expected `{s}`, candidate `{s}`\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
+test "expected types are not used where the syntax tree may be wrong" {
+    try expectRanked(expected_decls ++ "const cd_t = u8;\n", &.{
+        // An unclosed call makes the next line recover as an error node and `Want = cd`; the type
+        // of the left-hand side, `type`, is not the expected type
+        .{ "fn run() void {\n    take(cd_n,\n    const x: Want = cd<|>;\n    _ = x;\n}", "cd_n cd_o cd_w cd_t" },
+        // The call at the cursor is not closed; the statement has a syntax error
+        .{ "fn run() void {\n    take(cd<|>\n}", "cd_n cd_o cd_w cd_t" },
+        .{ "fn run() void {\n    const o: Other = .{ .w = cd<|>, .w = };\n    _ = o;\n}", "cd_n cd_o cd_w cd_t" },
+        // Syntax errors in other statements do not matter, including a `;` missing from the
+        // previous statement
+        .{ "fn run() void {\n    const y: u8 = ;\n    const x: Want = cd<|>;\n    _ = .{ x, y };\n}", "cd_w cd_n cd_o cd_t" },
+        .{ "fn run() void {\n    const y: u8 = 0\n    const x: Want = cd<|>;\n    _ = .{ x, y };\n}", "cd_w cd_n cd_o cd_t" },
+    });
+}
+
+test "expected types of generic parameters are not used" {
+    try expectRanked(expected_decls ++
+        \\fn generic(comptime T: type, v: T) void { _ = v; }
+        \\fn any(v: anytype) void { _ = v; }
+        \\
+    , &.{
+        // Parameters that depend on comptime parameters, and anytype parameters
+        .{ "fn run() void { generic(Want, cd<|>); }", unchanged },
+        .{ "fn run() void { any(cd<|>); }", unchanged },
+        // Inside a generic function body, types are inferred from the call-site instance; without
+        // a call site the type is unknown
+        .{ "fn inner(comptime T: type) void { const x: T = cd<|>; _ = x; }\nfn caller() void { inner(Want); }", want_first },
+        .{ "fn inner(comptime T: type) void { const x: T = cd<|>; _ = x; }", unchanged },
+    });
+}
+
+test "local member paths and auto-import candidates fitting the expected type rank first" {
+    const source =
+        \\//- /p/main.zig module:app
+        \\const std = @import("std");
+        \\const Pair = struct {{ a: u8, z: std.Want }};
+        \\fn run(cd_p: Pair) void {{
+        \\    _ = cd_p;
+        \\    {s}
+        \\}}
+        \\//- /zig/std/std.zig std
+        \\pub const Want = enum {{ a, b }};
+        \\pub const cd_a: u8 = 0;
+        \\pub const cd_z: Want = .a;
+        \\
+    ;
+    const cases = [_]struct { []const u8, bool }{ .{ "_ = cd<|>;", false }, .{ "const x: std.Want = cd<|>;\n    _ = x;", true } };
+    for (cases) |c| {
+        const text = try std.fmt.allocPrint(testing.allocator, source, .{c[0]});
+        defer testing.allocator.free(text);
+        const got = try rankedLabels(text, true);
+        defer testing.allocator.free(got);
+        var it = std.mem.tokenizeScalar(u8, got, ' ');
+        var rank: std.StringHashMapUnmanaged(usize) = .empty;
+        defer rank.deinit(testing.allocator);
+        var i: usize = 0;
+        while (it.next()) |label| : (i += 1) try rank.put(testing.allocator, label, i);
+        for ([_][2][]const u8{ .{ "cd_p.a", "cd_p.z" }, .{ "std.cd_a", "std.cd_z" } }) |pair| {
+            const a = rank.get(pair[0]) orelse return error.MissingCompletion;
+            const z = rank.get(pair[1]) orelse return error.MissingCompletion;
+            testing.expectEqual(c[1], z < a) catch |err| {
+                std.debug.print("case: {s}\nranked: {s}\n", .{ c[0], got });
+                return err;
+            };
+        }
+    }
 }
 
 test "completion item kinds follow what each symbol is" {
@@ -1252,6 +1810,480 @@ test "zon import values follow edits to the zon file" {
         // `.zig` files are still namespaces
         try testing.expectEqualStrings("answer", try memberLabels(&w, &r, file, text, "lib.answer"));
     }
+}
+
+const zon_cfg_decls =
+    \\const Cfg = struct { port: u16, host: []const u8, verbose: bool = false, level: Level = .info, server: Server = .{} };
+    \\const Level = enum { debug, info };
+    \\const Server = struct { threads: u8 = 1, backlog: u32 = 128 };
+;
+
+/// The completion labels at the cursor
+fn completionAt(w: *World, at: World.Added) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| try labels.append(w.arena.allocator(), it.label);
+    return std.mem.join(w.arena.allocator(), " ", labels.items);
+}
+
+/// The completion at the cursor is `expected` both when the same literal (containing `<|>`) is a
+/// `.zon` file imported by `const cfg: Cfg = @import("cfg.zon");` and when it is the value of
+/// `const lit: Cfg = <literal>;` in a `.zig` file
+fn expectZonCompletionLikeZig(literal: []const u8, expected: []const u8) !void {
+    for ([_]bool{ true, false }) |in_zon| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const a = w.arena.allocator();
+        const at = if (in_zon) blk: {
+            _ = try w.fixture(try std.fmt.allocPrint(a, "//- /p/main.zig module:app\n{s}\nconst cfg: Cfg = @import(\"cfg.zon\");", .{zon_cfg_decls}));
+            break :blk try w.add("/p/cfg.zon", literal);
+        } else try w.add("/p/main.zig", try std.fmt.allocPrint(a, "{s}\nconst lit: Cfg = {s};\n", .{ zon_cfg_decls, literal }));
+        testing.expectEqualStrings(expected, try completionAt(&w, at)) catch |err| {
+            std.debug.print("literal `{s}` in {s}\n", .{ literal, if (in_zon) "zon" else "zig" });
+            return err;
+        };
+    }
+}
+
+test "zon files take the result type of their typed imports" {
+    // Field names, enum literals, nested initializer lists: the same results as for the same
+    // literal in a `.zig` file
+    try expectZonCompletionLikeZig(".{ .port = 8080, .<|> }", "host verbose level server");
+    try expectZonCompletionLikeZig(".{ .port = 8080, .level = .<|> }", "debug info");
+    try expectZonCompletionLikeZig(".{ .port = 8080, .server = .{ .threads = 2, .<|> } }", "backlog");
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.fixture("//- /p/main.zig module:app\n" ++ zon_cfg_decls ++ "\nconst cfg: Cfg = @import(\"cfg.zon\");")).file("/p/main.zig");
+    const zon_text =
+        \\.{
+        \\    .port = 8080,
+        \\    .host = "localhost",
+        \\    .level = .debug,
+        \\    .server = .{ .threads = 4 },
+        \\}
+        \\
+    ;
+    const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+    try testing.expectEqualStrings(
+        \\.{
+        \\    .port: u16 = 8080,
+        \\    .host: []const u8 = "localhost",
+        \\    .level: Level = .debug,
+        \\    .server: Server = .{ .threads: u8 = 4 },
+        \\}
+        \\
+    , try inlaid(&w, zon_file, zon_text, .{ .types = false, .parameters = false }));
+
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const main_text = (try ctx.get(database.syntax.SourceText, main)).text;
+    // A field name jumps to the declaration of the field in the result type, an enum literal to
+    // the enum member
+    const jumps = [_]struct { []const u8, []const u8 }{
+        .{ "port", "port:" },
+        .{ "threads", "threads:" },
+        .{ "debug", "debug," },
+    };
+    for (jumps) |j| {
+        const t = try definition.definition(&r, zon_file, @intCast(std.mem.indexOf(u8, zon_text, j[0]).?)) orelse return error.NoDefinition;
+        try testing.expectEqual(main, t.file);
+        try testing.expectEqual(std.mem.indexOf(u8, main_text, j[1]).?, t.start);
+    }
+    // The references of a field include the field name in the `.zon` file
+    const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, main_text, "port:").?)) orelse return error.NoDefinition;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file } });
+    try testing.expectEqual(2, refs.len);
+    try testing.expectEqual(zon_file, refs[1].file);
+    try testing.expectEqual(std.mem.indexOf(u8, zon_text, "port").?, refs[1].start);
+}
+
+test "references do not look into zon files without a result type" {
+    // Nothing in an untyped `.zon` file refers to a declaration, even where the values cannot be
+    // inferred (`foo` is not a ZON value): such files leave no uncertain references
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main_text = "const Cfg = struct { port: u16 };\nconst raw = @import(\"cfg.zon\");\n";
+    const main = (try w.fixture("//- /p/main.zig module:app\n" ++ main_text)).file("/p/main.zig");
+    const zon_file = (try w.add("/p/cfg.zon", ".{ .port = foo, .other = .{ .port = 1 } }\n")).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, main_text, "port:").?)) orelse return error.NoDefinition;
+    var uncertain: ?search.Reference = null;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file }, .uncertain = &uncertain });
+    try testing.expectEqual(1, refs.len);
+    try testing.expectEqual(null, uncertain);
+}
+
+test "zon files have no result type unless their typed imports agree" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        // No import site; only an import without a result type
+        .{ "", "" },
+        .{ "const raw = @import(\"cfg.zon\");", "" },
+        // An import site without a result type does not constrain the value
+        .{ "const raw = @import(\"cfg.zon\");\nconst cfg: Cfg = @import(\"cfg.zon\");", "host verbose level server" },
+        // The import sites agree on the type (including an import inside a function); they disagree
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nfn load() Cfg {\n    return @import(\"cfg.zon\");\n}", "host verbose level server" },
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst server: Server = @import(\"cfg.zon\");", "" },
+        // Pointers and optionals around the same type parse the value the same way
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\nconst p: *const Cfg = @import(\"cfg.zon\");\nconst o: ?Cfg = @import(\"cfg.zon\");", "host verbose level server" },
+        .{ "const p: *const Cfg = @import(\"cfg.zon\");\nconst s: *const Server = @import(\"cfg.zon\");", "" },
+        // The result type depends on a generic parameter
+        .{ "fn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}", "" },
+        // A branch known at comptime not to execute is not compiled
+        .{ "const cfg: Cfg = @import(\"cfg.zon\");\ncomptime {\n    if (false) {\n        const s: Server = @import(\"cfg.zon\");\n        _ = s;\n    }\n}", "host verbose level server" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app\n{s}\n{s}", .{ zon_cfg_decls, c[0] }));
+        const at = try w.add("/p/cfg.zon", ".{ .port = 8080, .<|> }");
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("importer:\n{s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "zon values take pointer and slice result types like the compiler" {
+    // The compiler parses the value of a single-item pointer as the pointee type, and the value of
+    // a slice is an array literal (a `.zig` file needs `&.{ ... }`)
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "const cfg: *const Cfg = @import(\"cfg.zon\");", ".{ .port = 8080, .<|> }", "host verbose level server" },
+        .{ "const cfg: ?*const Cfg = @import(\"cfg.zon\");", ".{ .port = 8080, .level = .<|> }", "debug info" },
+        .{ "const cfgs: []const Cfg = @import(\"cfg.zon\");", ".{ .{ .port = 1 }, .{ .port = 2, .<|> } }", "host verbose level server" },
+        .{ "const cfgs: []const Cfg = @import(\"cfg.zon\");", ".{ .{ .port = 1, .level = .<|> } }", "debug info" },
+        .{ "const Group = struct { servers: []const Server };\nconst g: Group = @import(\"cfg.zon\");", ".{ .servers = .{ .{ .threads = 2, .<|> } } }", "backlog" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(try std.fmt.allocPrint(w.arena.allocator(), "//- /p/main.zig module:app\n{s}\n{s}", .{ zon_cfg_decls, c[0] }));
+        const at = try w.add("/p/cfg.zon", c[1]);
+        testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
+            std.debug.print("importer:\n{s}\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture("//- /p/main.zig module:app\n" ++ zon_cfg_decls ++ "\nconst Group = struct { servers: []const Server };\nconst g: *const Group = @import(\"cfg.zon\");");
+    const zon_text = ".{ .servers = .{ .{ .threads = 2 } } }";
+    const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+    try testing.expectEqualStrings(".{ .servers: []const Server = .{ .{ .threads: u8 = 2 } } }", try inlaid(&w, zon_file, zon_text, .{ .types = false, .parameters = false }));
+}
+
+test "zon result types follow the importers across files and edits" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\pub const Cfg = struct { port: u16, host: []const u8 = "" };
+        \\const cfg: Cfg = @import("conf/cfg.zon");
+        \\//- /p/other.zig in:app
+        \\const Cfg = @import("main.zig").Cfg;
+        \\const cfg: Cfg = @import("conf/cfg.zon");
+    );
+    var at = try w.add("/p/conf/cfg.zon", ".{ .port = 8080, .<|> }");
+    try testing.expectEqualStrings("host", try completionAt(&w, at));
+    const steps = [_]struct { path: []const u8, text: []const u8, labels: []const u8 }{
+        // Change the type in the importer
+        .{ .path = "main", .text = "pub const Cfg = struct { port: u16, name: []const u8 = \"\", debug: bool = false };\nconst cfg: Cfg = @import(\"conf/cfg.zon\");", .labels = "name debug" },
+        // Change the content of the `.zon` file
+        .{ .path = "zon", .text = ".{ .port = 8080, .name = \"x\", .<|> }", .labels = "debug" },
+        // One import site switches to another type
+        .{ .path = "other", .text = "const cfg: u32 = @import(\"conf/cfg.zon\");", .labels = "" },
+        .{ .path = "other", .text = "const cfg = @import(\"conf/cfg.zon\");", .labels = "debug" },
+    };
+    for (steps) |step| {
+        if (std.mem.eql(u8, step.path, "main")) {
+            _ = try w.add("/p/main.zig", step.text);
+        } else if (std.mem.eql(u8, step.path, "other")) {
+            _ = try w.add("/p/other.zig", step.text);
+        } else at = try w.add("/p/conf/cfg.zon", step.text);
+        testing.expectEqualStrings(step.labels, try completionAt(&w, at)) catch |err| {
+            std.debug.print("after editing {s}: `{s}`\n", .{ step.path, step.text });
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon fields are completed from the schema" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .<|> }", "name fingerprint version minimum_zig_version dependencies paths" },
+        // Fields already given are not listed again
+        .{ ".{ .name = .demo, .version = \"0.1.0\", .<|> }", "fingerprint minimum_zig_version dependencies paths" },
+        // The `url` and `path` of a dependency are mutually exclusive; dependencies can have any
+        // name
+        .{ ".{ .dependencies = .{ .foo = .{ .<|> } } }", "url hash path lazy" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"https://example.com/foo.tar.gz\", .<|> } } }", "hash lazy" },
+        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "hash lazy" },
+        // Dependency names, elements of `.paths`, field values, and objects outside the schema
+        .{ ".{ .dependencies = .{ .<|> } }", "" },
+        .{ ".{ .paths = .{ .<|> } }", "" },
+        .{ ".{ .name = .<|> }", "" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"u\", .extra = .{ .<|> } } } }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.add("/p/build.zig.zon", c[0]);
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = try w.add("/p/build.zig.zon", ".{ .<|> }");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const first = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items[0];
+    try testing.expectEqual(.field, first.kind);
+    try testing.expect(std.mem.startsWith(u8, first.doc.?, "Enum literal. Required."));
+}
+
+test "build.zig.zon uses the schema only without a result type" {
+    const schema = "name fingerprint version minimum_zig_version dependencies paths";
+    const typed = "const M = struct { a: u8, b: u8 };\nconst m: M = @import(\"build.zig.zon\");";
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // Imported without a result type, as build scripts usually do
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\nconst zon = @import(\"build.zig.zon\");", schema },
+        // With a result type, the file is inferred with that type
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n" ++ typed, "a b" },
+        // Import sites are searched in the files of the module graph, which do not include build
+        // scripts
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n//- /p/build.zig\n" ++ typed, schema },
+        // `.zon` files with other names don't use the schema
+        .{ "/p/cfg.zon", "//- /p/main.zig module:app\nconst zon = @import(\"cfg.zon\");", "" },
+        .{ "/p/sub/build.zig.zon.zig", "//- /p/main.zig module:app\n", "" },
+    };
+    inline for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture(c[1]);
+        const at = try w.add(c[0], ".{ .<|> }");
+        testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
+            std.debug.print("{s} imported by:\n{s}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon fields have the official documentation" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .name = .demo,
+        \\    .@"version" = "0.1.0",
+        \\    .dependencies = .{
+        \\        .foo = .{ .url = "https://example.com/foo.tar.gz", .hash = "abc", .lazy = true },
+        \\        .paths = .{ .path = "libs/paths" },
+        \\    },
+        \\    .paths = .{ "build.zig", .{ .name = 1 } },
+        \\    .unknown = .{ .url = "u" },
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/build.zig.zon", text)).file;
+    const cfg = (try w.add("/p/cfg.zon", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "name =", "Enum literal. Required." },
+        .{ "@\"version\"", "String. Required." },
+        .{ "dependencies", "Struct." },
+        .{ "url = \"https://", "String.\n\nWhen updating" },
+        .{ "hash", "String.\n\n[multihash]" },
+        .{ "lazy", "Boolean." },
+        // A dependency named `paths` and the `path` in it
+        .{ "path = ", "String.\n\nWhen this is provided" },
+        .{ "paths = .{ \"", "List. Required." },
+        // Dependency names, values, and fields and objects outside the schema
+        .{ "foo", null },
+        .{ "paths = .{ .path", null },
+        .{ "demo", null },
+        .{ "name = 1", null },
+        .{ "unknown", null },
+        .{ "url = \"u\"", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const info = try hover.hover(&r, file, offset);
+        const other = try hover.hover(&r, cfg, offset);
+        const got = if (info) |i| i.text else "";
+        if (c[1]) |want| {
+            testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+            try testing.expectEqual(offset, info.?.start);
+            // `.zon` files with other names have no schema documentation
+            try testing.expectEqual(null, other);
+        } else {
+            // Outside the schema, the same as in other `.zon` files
+            testing.expectEqualStrings(if (other) |o| o.text else "", got) catch |err| {
+                std.debug.print("hover at `{s}`\n", .{c[0]});
+                return err;
+            };
+        }
+    }
+}
+
+/// A build root: `build.zig.zon` and some files and directories (entries starting with `.` and
+/// `zig-out` are not listed)
+const ManifestRoot = struct {
+    tmp: testing.TmpDir,
+    dir: [:0]const u8,
+
+    fn create() !ManifestRoot {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        for ([_][]const u8{ "src/util", "libs/foo", "zig-out/bin", ".zig-cache" }) |d| try tmp.dir.createDirPath(testing.io, d);
+        for ([_][]const u8{ "build.zig", "build.zig.zon", "README.md", ".gitignore", "src/main.zig", "src/util/a.zig", "libs/foo/build.zig.zon" }) |f| {
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = f, .data = "" });
+        }
+        return .{ .tmp = tmp, .dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator) };
+    }
+
+    fn deinit(m: *ManifestRoot) void {
+        testing.allocator.free(m.dir);
+        m.tmp.cleanup();
+    }
+
+    /// Uses `text` as the content of its `build.zig.zon`
+    fn add(m: ManifestRoot, w: *World, text: []const u8) !World.Added {
+        return w.addNative(try std.fs.path.join(w.arena.allocator(), &.{ m.dir, "build.zig.zon" }), text);
+    }
+};
+
+test "build.zig.zon paths are completed relative to the build root" {
+    var root: ManifestRoot = try .create();
+    defer root.deinit();
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Elements of `.paths`: files and directories
+        .{ ".{ .paths = .{ \"<|>\" } }", "README.md build.zig build.zig.zon libs src" },
+        .{ ".{ .paths = .{ \"build.zig\", \"src/<|>\" } }", "src/main.zig src/util" },
+        .{ ".{ .paths = .{ \"src/util/a<|>\" } }", "src/util/a.zig" },
+        // The `.path` of a dependency: directories only
+        .{ ".{ .dependencies = .{ .foo = .{ .path = \"<|>\" } } }", "libs src" },
+        .{ ".{ .dependencies = .{ .foo = .{ .path = \"libs/<|>\" } } }", "libs/foo" },
+        // Unclosed strings
+        .{ ".{\n    .paths = .{ \"build.zig\", \"sr<|>\n    },\n}", "README.md build.zig build.zig.zon libs src" },
+        .{ ".{\n    .dependencies = .{ .foo = .{ .path = \"li<|>\n    } },\n}", "libs src" },
+        // Strings that are not paths
+        .{ ".{ .version = \"<|>\" }", "" },
+        .{ ".{ .dependencies = .{ .foo = .{ .url = \"<|>\" } } }", "" },
+        .{ ".{ .paths = .{ .{ .path = \"<|>\" } } }", "" },
+        .{ ".{ .other = .{ \"<|>\" } }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try root.add(&w, c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        const text = (try ctx.get(database.syntax.SourceText, at.file)).text;
+        for (items) |it| {
+            try labels.append(w.arena.allocator(), it.label);
+            // The replacement range starts at the start of the string content
+            const quote = std.mem.lastIndexOfScalar(u8, text[0..at.cursor], '"').?;
+            try testing.expectEqual(quote + 1, it.replace.?.start);
+            try testing.expectEqual(at.cursor, it.replace.?.end);
+        }
+        std.mem.sort([]const u8, labels.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "build.zig.zon paths go to the files they name" {
+    var root: ManifestRoot = try .create();
+    defer root.deinit();
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .version = "build.zig",
+        \\    .dependencies = .{
+        \\        .foo = .{ .path = "libs/foo" },
+        \\        .bar = .{ .path = "build.zig" },
+        \\    },
+        \\    .paths = .{ "build.zig", "src/main.zig", "README.md", "src", "", "missing.zig", "/build.zig" },
+        \\}
+        \\
+    ;
+    const file = (try root.add(&w, text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "\"build.zig\", \"src", "build.zig" },
+        .{ "src/main.zig", "src/main.zig" },
+        .{ "README.md", "README.md" },
+        // The `.path` of a dependency goes to a file as well
+        .{ "build.zig\" }", "build.zig" },
+        // Directories, missing files, absolute paths, and strings that are not paths
+        .{ "\"src\"", null },
+        .{ "\"\"", null },
+        .{ "missing.zig", null },
+        .{ "/build.zig", null },
+        .{ "libs/foo", null },
+        .{ "build.zig\",\n", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).? + 1);
+        const got = try definition.manifestPath(&r, file, offset);
+        if (c[1]) |want| {
+            const path = got orelse {
+                std.debug.print("no path at `{s}`\n", .{c[0]});
+                return error.NoDefinition;
+            };
+            // Normalized: the path in `want` uses `/`, while paths on Windows use `\`
+            const joined = try std.fs.path.join(w.arena.allocator(), &.{ root.dir, want });
+            const expected = switch (w.vfs.style) {
+                inline else => |style| try Vfs.normalize(style, w.arena.allocator(), joined),
+            };
+            try testing.expectEqualStrings(expected.?, path);
+        } else testing.expectEqual(null, got) catch |err| {
+            std.debug.print("path at `{s}`: {s}\n", .{ c[0], got.? });
+            return err;
+        };
+    }
+    // The target is not interned: interned files other than Zig sources are watched, and their
+    // changes rebuild the project
+    try testing.expectEqual(null, try w.vfs.lookup(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, "README.md" })));
 }
 
 test "hover in generic bodies is inferred from a call site" {
@@ -4215,6 +5247,9 @@ test "completion: function and builtin calls insert argument placeholders with s
         .{ "fn t(s: S) void {\n    s.ge<|>\n}", "get", "get(${1:index}, ${2:T}, ${3:value})" },
         .{ "fn t(s: *S) void {\n    s.<|>\n}", "reset", "reset()" },
         .{ "fn t() void {\n    S.ge<|>\n}", "get", "get(${1:self}, ${2:index}, ${3:T}, ${4:value})" },
+        // Member paths of local values are called through a value and skip the receiver too
+        .{ "fn t(s: S) void {\n    _ = s;\n    ge<|>\n}", "s.get", "s.get(${1:index}, ${2:T}, ${3:value})" },
+        .{ "fn t(s: *S) void {\n    _ = s;\n    rese<|>\n}", "s.reset", "s.reset()" },
         // decl literal
         .{ "fn t() void {\n    const s: S = .in<|>\n}", "init", "init(${1:a})" },
         // Function aliases

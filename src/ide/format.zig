@@ -10,7 +10,7 @@ const nesting = @import("../syntax/nesting.zig");
 
 const log = std.log.scoped(.format);
 
-pub const Mode = enum { zig, zon };
+pub const Mode = @import("../syntax/Parse.zig").Mode;
 
 /// Returns null on syntax errors (refusing to format, like `zig fmt`); returns an empty array
 /// when the text is already formatted.

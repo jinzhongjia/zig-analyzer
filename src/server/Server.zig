@@ -3191,7 +3191,7 @@ fn maybeResetSema(server: *Server) void {
 const sema_reset_keys = 200_000;
 
 /// Queries cleared by a whole-generation reclaim
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;
@@ -3964,12 +3964,17 @@ fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineInde
 fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!types.ResultType("textDocument/formatting") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(ctx, arena, file);
-    const mode: ide.format.Mode = if (std.mem.endsWith(u8, server.vfs.path(file), ".zon")) .zon else .zig;
+    const mode = za.syntax.Parse.modeOf(server.vfs.path(file));
     return ide.format.format(arena, lines, mode, server.encoding);
 }
 
 fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    if (parse.mode == .zon) {
+        const lines = try fileLines(ctx, arena, file);
+        return .{ .array_of_DocumentSymbol = try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding) };
+    }
     const items = try ctx.get(syntax_q.FileItemTree, file);
     const map = try ctx.get(syntax_q.FileAstIdMap, file);
     const lines = try fileLines(ctx, arena, file);
@@ -4191,9 +4196,14 @@ fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types
     return .{ .Definition = .{ .Location = try server.targetLocation(r, arena, t) } };
 }
 
-/// All goto targets at the cursor, computed with `find`
+/// All goto targets at the cursor, computed with `find`. A path in `build.zig.zon` goes to the start
+/// of the file it points to, without interning that file
 fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) ![]const types.Location {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return &.{};
+    if (try ide.definition.manifestPath(r, at.file, at.offset)) |path| {
+        const target_uri = if (try server.vfs.lookup(path)) |f| try server.uriFor(arena, f) else try uri.fromPath(arena, path);
+        return arena.dupe(types.Location, &.{.{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } }});
+    }
     const targets = try find(r, at.file, at.offset);
     const locs = try arena.alloc(types.Location, targets.len);
     for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
@@ -4201,9 +4211,13 @@ fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []
 }
 
 fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.definition.Target) !types.Location {
+    const target_uri = try server.uriFor(arena, t.file);
+    // The start of a file (the target of an import or of a path in `build.zig.zon`) needs no read
+    // of the file: a path can point to a file of any size and content
+    if (t.start == 0 and t.end == 0) return .{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } };
     const target_text = (try r.ctx.get(syntax_q.SourceText, t.file)).text;
     const lines = try offsets.LineIndex.init(arena, target_text);
-    return .{ .uri = try server.uriFor(arena, t.file), .range = lines.range(t.start, t.end, server.encoding) };
+    return .{ .uri = target_uri, .range = lines.range(t.start, t.end, server.encoding) };
 }
 
 fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
@@ -4770,7 +4784,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             .title = a.title,
             .kind = kind,
             .diagnostics = diagnostics,
-            .isPreferred = if (a.diagnostic != null) true else null,
+            .isPreferred = if (a.diagnostic != null and a.preferred) true else null,
             .edit = .{ .changes = changes },
         } });
     }
@@ -5255,6 +5269,7 @@ test {
     _ = @import("refs_e2e_test.zig");
     _ = @import("naming_e2e_test.zig");
     _ = @import("remove_param_e2e_test.zig");
+    _ = @import("unused_capture_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
     _ = @import("auto_import_test.zig");
 }

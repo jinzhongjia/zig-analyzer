@@ -1,5 +1,5 @@
 //! Goto definition / declaration / type definition: names, member access, field names in
-//! initializers, labels, and `@import` strings.
+//! initializers, labels, `@import` strings, and paths to files in `build.zig.zon`.
 //!
 //! Declaration jumps to the declaration that a name resolves to directly; definition additionally
 //! follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition; type
@@ -25,6 +25,7 @@ const seed = @import("../ide_db/seed.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const ErrorSets = @import("../syntax/ErrorSets.zig");
+const manifest = @import("manifest.zig");
 
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
@@ -63,6 +64,14 @@ pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error
 
 fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
     return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
+}
+
+/// A path string in `build.zig.zon` that points to a file (an element of `.paths`, the `.path` of
+/// a dependency): the absolute path of that file, whose start is the target of definition and
+/// declaration (see `manifest.pathTarget`)
+pub fn manifestPath(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]const u8 {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    return manifest.pathTarget(r, file, tok);
 }
 
 /// All targets of the import (start of each file) when the cursor is on `@import(...)` or its

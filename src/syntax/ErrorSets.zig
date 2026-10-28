@@ -132,7 +132,7 @@ test build {
         \\fn f() error{C}!void {}
         \\
     ;
-    const p = try Parse.create(std.testing.allocator, text);
+    const p = try Parse.create(std.testing.allocator, text, .zig);
     defer p.destroy();
     var sets = try build(std.testing.allocator, p.rootNode());
     defer sets.deinit(std.testing.allocator);

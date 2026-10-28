@@ -62,8 +62,9 @@ pub const Expr = union(enum) {
     field_access: struct { lhs: ExprId, field: ?[]const u8 },
     enum_literal: []const u8,
     error_value: []const u8,
-    /// Number, string, and character literals: the source text. For a multiline string literal,
-    /// the tokens of its lines (starting with `\\`, without the newline) joined with `\n`
+    /// Number, string, and character literals, and `inf` / `nan` in ZON: the source text. For a
+    /// multiline string literal, the tokens of its lines (starting with `\\`, without the newline)
+    /// joined with `\n`
     literal: []const u8,
     /// `name` includes the `@`
     builtin_call: struct { name: []const u8, args: []const ExprId },
@@ -295,6 +296,14 @@ pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
 
 test {
     _ = @import("lower.zig");
+}
+
+/// Value of the ZON float literals `inf` and `nan` (the source text of a `literal`;
+/// `std.zig.ZonGen` also decides by the source text of the identifier); null for anything else
+pub fn zonFloatValue(text: []const u8) ?f128 {
+    if (std.mem.eql(u8, text, "inf")) return std.math.inf(f128);
+    if (std.mem.eql(u8, text, "nan")) return std.math.nan(f128);
+    return null;
 }
 
 /// Value of a string literal (the source text of a `literal`, multiline string literals
