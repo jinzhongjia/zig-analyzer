@@ -868,6 +868,42 @@ test "unused capture fixes are preferred only without a discard" {
             \\remove capture `err` (preferred)
             \\
         },
+        // Both captures of a prong are unused: only removing the tag is preferred, since applying
+        // both fixes would leave `|_|`
+        .{
+            \\const U = union(enum) { a: u32, b: u8 };
+            \\fn f(u: U) u32 {
+            \\    return switch (u) {
+            \\        inline else => |<|>p, tag| 0,
+            \\    };
+            \\}
+            ,
+            \\rename `p` to `_`
+            \\
+        },
+        .{
+            \\const U = union(enum) { a: u32, b: u8 };
+            \\fn f(u: U) u32 {
+            \\    return switch (u) {
+            \\        inline else => |p, <|>tag| 0,
+            \\    };
+            \\}
+            ,
+            \\remove capture `tag` (preferred)
+            \\
+        },
+        // The tag is used, so renaming the payload is the only fix and is preferred
+        .{
+            \\const U = union(enum) { a: u32, b: u8 };
+            \\fn f(u: U) u32 {
+            \\    return switch (u) {
+            \\        inline else => |<|>p, tag| @intFromEnum(tag),
+            \\    };
+            \\}
+            ,
+            \\rename `p` to `_` (preferred)
+            \\
+        },
     };
     for (cases) |c| {
         const got = try titles(c[0]);

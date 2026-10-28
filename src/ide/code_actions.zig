@@ -83,8 +83,10 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
                 .edits = f.edits,
                 .diagnostic = .{ .start = d.start, .end = d.end },
                 // A discard, when offered, is preferred: it leaves the capture intact, and using
-                // the name later only takes deleting the discard
-                .preferred = edit == null,
+                // the name later only takes deleting the discard. Renaming the payload of a prong
+                // is not preferred when its tag capture is unused too: the preferred fix of the
+                // tag removes it, and applying both would leave `|_|`, which is an error
+                .preferred = edit == null and !(if (f.tag) |tag| unusedTag(check.items, tag) else false),
             });
         }
     }
@@ -571,6 +573,14 @@ fn captureBody(b: *const Body, id: Body.BindingId) ?Body.ExprId {
         else => {},
     };
     return null;
+}
+
+/// AstGen reports the tag capture at `offset` as unused
+fn unusedTag(items: []const database.live.Diagnostic, offset: u32) bool {
+    for (items) |d| {
+        if (d.start == offset and std.mem.eql(u8, d.message, "unused switch tag capture")) return true;
+    }
+    return false;
 }
 
 /// Deletes the line of the `_ = name;` at `offset` (the whole line, when the line holds only this

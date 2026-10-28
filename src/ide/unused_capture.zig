@@ -37,6 +37,9 @@ pub const Fix = struct {
     removed: bool,
     /// Sorted by position, non-overlapping
     edits: []const Edit,
+    /// When the payload capture of a switch prong is renamed to `_`: the position of the tag
+    /// capture after it. Removing that tag capture as well would leave `|_|`, which is an error
+    tag: ?u32 = null,
 };
 
 /// The fix for the unused capture whose name is at `offset`; null when no rewrite is known to keep
@@ -74,7 +77,9 @@ pub fn fix(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Fix {
         .switch_prong => switch (index) {
             0 => {
                 if (captures.len == 1) return try remove(arena, text, payload);
-                return try discard(arena, captures[0]);
+                var f = try discard(arena, captures[0]);
+                f.tag = captures[1].name.offset;
+                return f;
             },
             1 => {
                 if (std.mem.eql(u8, captures[0].name.text, "_")) return try remove(arena, text, payload);
