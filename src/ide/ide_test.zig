@@ -534,6 +534,40 @@ test "local member paths carry kinds, types, filters and the replaced range" {
     try testing.expectEqualStrings("pub fn scale(self: Point, k: i32) Point", desc.detail);
 }
 
+test "local member paths classify functions as completion after `.` does" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:app
+        \\const Thing = @import("Thing.zig");
+        \\const Point = struct {
+        \\    x: i32,
+        \\    pub fn negated(self: Point) Point { return .{ .x = -self.x }; }
+        \\};
+        \\fn run(thing: Thing, point: Point) void {
+        \\    _ = .{ thing, point };
+        \\    _ = neg<|>;
+        \\}
+        \\//- /p/Thing.zig in:app
+        \\value: u32,
+        \\const Thing = @This();
+        \\pub fn negative(self: Thing) bool { return self.value == 0; }
+    );
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    // A function in a file is Function, a method of another container is Method
+    for ([_]struct { []const u8, completion.Item.Kind }{ .{ "point.negated", .method }, .{ "thing.negative", .function } }) |c| {
+        const item = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[0])) break it;
+        } else return error.MissingCompletion;
+        try testing.expectEqual(c[1], item.kind);
+    }
+}
+
 test "local member paths filter by the member name when it starts with the input" {
     var w: World = undefined;
     try w.init();

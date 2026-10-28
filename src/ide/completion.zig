@@ -942,7 +942,8 @@ const MemberSearch = struct {
                     else => return null,
                 };
                 if (sig.params.len == 0 or !receives(ip, sig.params[0], p.holder)) return null;
-                item.kind = .method;
+                // Classified like the same declaration after `.` (a function in a file is Function)
+                item.kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item));
                 item.target = if (f.alias) try fnTarget(r, tv) else .{ .decl = .{ .file = f.file, .item = f.item } };
                 item.origin = .{ .value = tv };
             },
