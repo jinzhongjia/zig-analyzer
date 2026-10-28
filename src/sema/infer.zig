@@ -3103,11 +3103,11 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
     }
 }
 
-/// Whether the place `e` cannot be modified, which makes `&e` a `*const T`: const declarations and
-/// locals other than `var`s (parameters and captures included), members and elements of such
-/// places, and those reached through a const pointer; expressions that are not places (calls,
-/// literals, and so on) are temporaries that cannot be modified. `types` gives the types of the
-/// subexpressions (`types.exprType(e)`)
+/// Whether the place `e` cannot be modified, which makes `&e` a `*const T` (matches the compiler):
+/// const declarations and locals other than `var`s (parameters and captures included), members and
+/// elements of such places, and those reached through a const pointer; expressions that are not
+/// places (calls, literals, and so on) are temporaries that cannot be modified. `types` gives the
+/// types of the subexpressions (`types.exprType(e)`)
 pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types: anytype, e: ExprId) Error!bool {
     switch (b.expr(e)) {
         .name_ref => |name| {
@@ -3121,11 +3121,15 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
             };
         },
         .field_access => |fa| return partIsConst(r, file, item, b, types, fa.lhs),
+        // `@field(x, name)` is a member of `x`, as `x.name` is
+        .builtin_call => |c| return if (std.mem.eql(u8, c.name, "@field") and c.args.len == 2) partIsConst(r, file, item, b, types, c.args[0]) else true,
         .index => |x| return partIsConst(r, file, item, b, types, x.lhs),
         .deref => |x| return switch (r.ctx.db.env.ip.key(types.exprType(x).ty)) {
             .ptr_type => |p| p.is_const,
             else => false,
         },
+        // The payload of an optional is part of the optional
+        .unwrap_optional => |x| return placeIsConst(r, file, item, b, types, x),
         else => return true,
     }
 }

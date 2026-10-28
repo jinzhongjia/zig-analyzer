@@ -257,6 +257,29 @@ test "pointer captures follow the constness of the captured place" {
     });
 }
 
+test "the payload of an optional and @field are places that can be modified when their holder can" {
+    // `&o.?` and `&@field(s, "x")` used to be `*const` even when `o` and `s` are vars
+    try expectTypes(
+        \\const S = struct { x: u8 };
+        \\fn f() void {
+        \\    var o: ?S = null;
+        \\    var s: S = .{ .x = 1 };
+        \\    const co: ?S = null;
+        \\    const cs: S = .{ .x = 1 };
+        \\    const p = &o.?;
+        \\    const q = &@field(s, "x");
+        \\    const cp = &co.?;
+        \\    const cq = &@field(cs, "x");
+        \\    _ = .{ p, q, cp, cq, &o, &s };
+        \\}
+    , &.{
+        .{ "p", "*S" },
+        .{ "q", "*u8" },
+        .{ "cp", "*const S" },
+        .{ "cq", "*const u8" },
+    });
+}
+
 test "enums, tagged unions and switch" {
     try expectTypes(
         \\const Color = enum { red, green };
