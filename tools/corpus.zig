@@ -174,7 +174,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             const container_kind = items.containers[item.container].kind;
             const field_is_name = item.kind == .field and (container_kind == .@"enum" or container_kind == .@"union") and
                 (syntax.ast.ContainerField{ .syntax = node }).name() == null;
-            const owner: za.hir.lower.Owner = if (mode == .zon) .zon else if (field_is_name) .bare_field else .member;
+            const owner: za.hir.lower.Owner = if (item.kind == .zon) .zon else if (field_is_name) .bare_field else .member;
             const t2 = std.Io.Clock.awake.now(io);
             var body = try za.hir.lower.lower(gpa, node, owner);
             defer body.deinit(gpa);
@@ -184,7 +184,7 @@ fn checkFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, stat
             defer references.deinit(gpa);
             const name_node = if (field_is_name) (syntax.ast.ContainerField{ .syntax = node }).typeExpr() else null;
             const excluded = if (name_node) |name| if (name.kind() == .name_ref) name.offset else null else null;
-            try collectNameRefs(gpa, node, excluded, mode, &references);
+            try collectNameRefs(gpa, node, excluded, if (owner == .zon) .zon else .zig, &references);
             const expected = references.count();
             const in_range = body.exprs.len == body.expr_ranges.len and for (body.expr_ranges) |r| {
                 if (r.start > r.end or r.end > node.green.text_len) break false;
