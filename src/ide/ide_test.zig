@@ -12,6 +12,7 @@ const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const Vfs = @import("../base/Vfs.zig");
 const seed = database.ide_db.seed;
 const search = @import("../ide_db/search.zig");
 
@@ -1655,7 +1656,7 @@ test "build.zig.zon paths go to the files they name" {
         \\        .foo = .{ .path = "libs/foo" },
         \\        .bar = .{ .path = "build.zig" },
         \\    },
-        \\    .paths = .{ "build.zig", "src/main.zig", "src", "", "missing.zig", "/build.zig" },
+        \\    .paths = .{ "build.zig", "src/main.zig", "README.md", "src", "", "missing.zig", "/build.zig" },
         \\}
         \\
     ;
@@ -1666,6 +1667,7 @@ test "build.zig.zon paths go to the files they name" {
     const cases = [_]struct { []const u8, ?[]const u8 }{
         .{ "\"build.zig\", \"src", "build.zig" },
         .{ "src/main.zig", "src/main.zig" },
+        .{ "README.md", "README.md" },
         // The `.path` of a dependency goes to a file as well
         .{ "build.zig\" }", "build.zig" },
         // Directories, missing files, absolute paths, and strings that are not paths
@@ -1678,20 +1680,26 @@ test "build.zig.zon paths go to the files they name" {
     };
     for (cases) |c| {
         const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).? + 1);
-        const t = try definition.definition(&r, file, offset);
+        const got = try definition.manifestPath(&r, file, offset);
         if (c[1]) |want| {
-            const got = t orelse {
-                std.debug.print("no definition at `{s}`\n", .{c[0]});
+            const path = got orelse {
+                std.debug.print("no path at `{s}`\n", .{c[0]});
                 return error.NoDefinition;
             };
-            try testing.expectEqualStrings(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, want }), w.vfs.path(got.file));
-            try testing.expectEqual(0, got.start);
-            try testing.expectEqual(0, got.end);
-        } else testing.expectEqual(null, t) catch |err| {
-            std.debug.print("definition at `{s}`: {s}\n", .{ c[0], w.vfs.path(t.?.file) });
+            // Normalized: the path in `want` uses `/`, while paths on Windows use `\`
+            const joined = try std.fs.path.join(w.arena.allocator(), &.{ root.dir, want });
+            const expected = switch (w.vfs.style) {
+                inline else => |style| try Vfs.normalize(style, w.arena.allocator(), joined),
+            };
+            try testing.expectEqualStrings(expected.?, path);
+        } else testing.expectEqual(null, got) catch |err| {
+            std.debug.print("path at `{s}`: {s}\n", .{ c[0], got.? });
             return err;
         };
     }
+    // The target is not interned: interned files other than Zig sources are watched, and their
+    // changes rebuild the project
+    try testing.expectEqual(null, try w.vfs.lookup(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, "README.md" })));
 }
 
 test "hover in generic bodies is inferred from a call site" {

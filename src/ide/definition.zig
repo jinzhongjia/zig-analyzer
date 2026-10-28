@@ -30,7 +30,6 @@ const manifest = @import("manifest.zig");
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    if (try manifestPathTarget(r, file, offset)) |t| return t;
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
     if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
@@ -40,7 +39,6 @@ pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    if (try manifestPathTarget(r, file, offset)) |t| return t;
     if (try labelTarget(r, file, offset)) |t| return t;
     if (try errorMemberTarget(r, file, offset)) |t| return t;
     if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
@@ -69,11 +67,11 @@ fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
 }
 
 /// A path string in `build.zig.zon` that points to a file (an element of `.paths`, the `.path` of
-/// a dependency): the start of that file
-fn manifestPathTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+/// a dependency): the absolute path of that file, whose start is the target of definition and
+/// declaration (see `manifest.pathTarget`)
+pub fn manifestPath(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]const u8 {
     const tok = try tokenAt(r, file, offset) orelse return null;
-    const path_file = try manifest.pathTarget(r, file, tok) orelse return null;
-    return .{ .file = path_file, .start = 0, .end = 0 };
+    return manifest.pathTarget(r, file, tok);
 }
 
 /// All targets of the import (start of each file) when the cursor is on `@import(...)` or its

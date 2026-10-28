@@ -14,6 +14,7 @@ const SyntaxNode = ast.SyntaxNode;
 const SyntaxToken = ast.SyntaxToken;
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const Vfs = @import("../base/Vfs.zig");
 const data = @import("manifest_data.zig");
 
 pub const Field = struct {
@@ -215,17 +216,21 @@ pub fn pathKind(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?Pat
     return null;
 }
 
-/// The file that the path string `tok` points to (null for directories, missing paths, absolute
-/// paths and unclosed strings)
-pub fn pathTarget(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?FileId {
+/// The absolute path of the file that the path string `tok` points to (null for directories,
+/// missing paths, absolute paths and unclosed strings). The file is not interned: it takes no part
+/// in analysis, and interned files other than Zig sources are watched, their changes rebuilding
+/// the project
+pub fn pathTarget(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?[]const u8 {
     if (tok.kind != .string_literal) return null;
     _ = try pathKind(r, file, tok) orelse return null;
     const value = try Body.stringLiteralValue(r.arena, tok.text) orelse return null;
     if (value.len == 0 or std.fs.path.isAbsolute(value)) return null;
     const vfs = r.ctx.db.env.vfs;
     const dir = std.fs.path.dirname(vfs.path(file)) orelse return null;
-    const full = try std.fs.path.join(r.arena, &.{ dir, value });
+    const full = switch (vfs.style) {
+        inline else => |style| try Vfs.resolve(style, r.arena, dir, value),
+    } orelse return null;
     const stat = std.Io.Dir.cwd().statFile(vfs.io, full, .{}) catch return null;
     if (stat.kind != .file) return null;
-    return try vfs.intern(full);
+    return full;
 }

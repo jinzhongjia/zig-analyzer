@@ -4191,9 +4191,14 @@ fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types
     return .{ .Definition = .{ .Location = try server.targetLocation(r, arena, t) } };
 }
 
-/// All goto targets at the cursor, computed with `find`
+/// All goto targets at the cursor, computed with `find`. A path in `build.zig.zon` goes to the start
+/// of the file it points to, without interning that file
 fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) ![]const types.Location {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return &.{};
+    if (try ide.definition.manifestPath(r, at.file, at.offset)) |path| {
+        const target_uri = if (try server.vfs.lookup(path)) |f| try server.uriFor(arena, f) else try uri.fromPath(arena, path);
+        return arena.dupe(types.Location, &.{.{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } }});
+    }
     const targets = try find(r, at.file, at.offset);
     const locs = try arena.alloc(types.Location, targets.len);
     for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
