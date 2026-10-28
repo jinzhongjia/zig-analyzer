@@ -978,6 +978,16 @@ test "add missing struct fields" {
         \\    .y = undefined,
         \\};
     );
+    // A file is a struct
+    try expectAction(
+        \\x: i32,
+        \\y: i32,
+        \\const p: @This() = .{ .x = 1<|> };
+    , "add missing struct fields",
+        \\x: i32,
+        \\y: i32,
+        \\const p: @This() = .{ .x = 1, .y = undefined };
+    );
 }
 
 test "add missing fields and prongs with names that need quoting" {

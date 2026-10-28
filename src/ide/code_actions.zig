@@ -659,7 +659,7 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
     if (res.exprs.len != at.body.exprs.len) return null;
     const ty = res.exprs[@backingInt(at.expr)].ty;
     switch (r.ctx.db.env.ip.key(ty)) {
-        .container_type => |c| if (c.kind != .@"struct") return null,
+        .container_type => |c| if (!c.kind.isStruct()) return null,
         else => return null,
     }
     const ns = try queries.namespaceOfType(r, ty) orelse return null;
