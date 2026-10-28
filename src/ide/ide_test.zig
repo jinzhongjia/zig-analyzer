@@ -1346,6 +1346,25 @@ test "zon files take the result type of their typed imports" {
     try testing.expectEqual(std.mem.indexOf(u8, zon_text, "port").?, refs[1].start);
 }
 
+test "references do not look into zon files without a result type" {
+    // Nothing in an untyped `.zon` file refers to a declaration, even where the values cannot be
+    // inferred (`foo` is not a ZON value): such files leave no uncertain references
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main_text = "const Cfg = struct { port: u16 };\nconst raw = @import(\"cfg.zon\");\n";
+    const main = (try w.fixture("//- /p/main.zig module:app\n" ++ main_text)).file("/p/main.zig");
+    const zon_file = (try w.add("/p/cfg.zon", ".{ .port = foo, .other = .{ .port = 1 } }\n")).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, main_text, "port:").?)) orelse return error.NoDefinition;
+    var uncertain: ?search.Reference = null;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file }, .uncertain = &uncertain });
+    try testing.expectEqual(1, refs.len);
+    try testing.expectEqual(null, uncertain);
+}
+
 test "zon files have no result type unless their typed imports agree" {
     const cases = [_]struct { []const u8, []const u8 }{
         // No import site; only an import without a result type

@@ -261,9 +261,14 @@ const Finder = struct {
         if (!mentions(body, f.name)) return;
         // In a file that does not import the file containing the definition, code outside generic
         // functions can neither reference the definition by name nor obtain its containing type.
-        // The root expression of a `.zon` file is an exception: its result type comes from the
-        // files that import it (see `sema.ZonResultType`)
-        if (f.def == .item and !f.importing.contains(file) and (try r.itemTree(file)).items[item_index].kind != .zon and try seed.genericRoot(r, file, item_index) == null) return;
+        // The root expression of a `.zon` file is an exception when it has a result type, which
+        // comes from the files that import it (see `sema.ZonResultType`); without one, nothing in
+        // it refers to a declaration
+        if (f.def == .item and !f.importing.contains(file)) {
+            if ((try r.itemTree(file)).items[item_index].kind == .zon) {
+                if (try r.ctx.get(database.sema.ZonResultType, file) == null) return;
+            } else if (try seed.genericRoot(r, file, item_index) == null) return;
+        }
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
         for (body.exprs, 0..) |e, i| {
