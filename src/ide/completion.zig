@@ -1407,7 +1407,8 @@ fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
     }
 }
 
-/// The type of parameter `index` of the function `def` is a function or a function pointer
+/// The type of parameter `index` of the function `def` is a function or a function pointer, or the
+/// parameter is `anytype` and receives a function (see `receivesFn`)
 fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
     const d = switch (def) {
         .item => |d| d,
@@ -1416,12 +1417,51 @@ fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
     const it = (try r.itemTree(d.file)).items[d.item];
     if (it.kind != .@"fn") return false;
     const fb = try r.body(d.file, d.item);
-    if (index < fb.params.len) if (fb.binding(fb.params[index]).ty) |t| if (isFnTypeExpr(fb, t)) return true;
+    if (index < fb.params.len) {
+        if (fb.binding(fb.params[index]).ty) |t| {
+            if (isFnTypeExpr(fb, t)) return true;
+        } else if (try receivesFn(r, d.file, d.item, fb, fb.params[index])) return true;
+    }
     const ip = r.ctx.db.env.ip;
     return switch (ip.key((try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = it.ast_id } })).ty)) {
         .fn_type => |f| index < f.params.len and isFnType(ip, f.params[index]),
         else => false,
     };
+}
+
+/// The `anytype` parameter `param` receives a function: the type of another parameter is
+/// `std.meta.ArgsTuple(@TypeOf(param))`, which accepts only function types (`Io.async(io, function,
+/// args)`)
+fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Body.BindingId) resolve.Error!bool {
+    const name = fb.binding(param).name;
+    for (fb.params) |other| {
+        const t = fb.binding(other).ty orelse continue;
+        const call = switch (fb.expr(t)) {
+            .call => |c| c,
+            else => continue,
+        };
+        if (call.args.len != 1) continue;
+        const type_of = switch (fb.expr(call.args[0])) {
+            .builtin_call => |c| c,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, type_of.name, "@TypeOf") or type_of.args.len != 1) continue;
+        const arg = type_of.args[0];
+        switch (fb.expr(arg)) {
+            .name_ref => |n| if (!std.mem.eql(u8, n, name)) continue,
+            else => continue,
+        }
+        const local = try r.resolveName(file, item, fb, fb.expr_scopes[@backingInt(arg)], name) orelse continue;
+        if (local != .local or local.local.binding != param) continue;
+        const callee: resolve.Def = switch (fb.expr(call.callee)) {
+            .name_ref => |n| try r.resolveName(file, item, fb, fb.expr_scopes[@backingInt(call.callee)], n),
+            .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse continue) else null,
+            else => null,
+        } orelse continue;
+        const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse return false;
+        if (std.meta.eql(try r.aliasTarget(callee), args_tuple)) return true;
+    }
+    return false;
 }
 
 /// The type annotation is a function or a function pointer: by syntax, or by the computed type (for
@@ -1599,12 +1639,18 @@ fn isStd(r: *Resolver, file: FileId, def: ?resolve.Def) resolve.Error!bool {
 
 /// The standard library declares `path` (such as `process.Init`)
 fn stdHas(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!bool {
-    var ns: Namespace = .{ .file = try r.resolveImport(file, "std") orelse return false, .container = 0 };
+    return try stdDecl(r, file, path) != null;
+}
+
+/// The declaration `path` of the standard library
+fn stdDecl(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!?resolve.Def {
+    var ns: Namespace = .{ .file = try r.resolveImport(file, "std") orelse return null, .container = 0 };
     for (path, 0..) |name, i| {
-        const def = try r.memberDef(ns, name) orelse return false;
-        if (i + 1 < path.len) ns = try r.namespaceOf(def) orelse return false;
+        const def = try r.memberDef(ns, name) orelse return null;
+        if (i + 1 == path.len) return def;
+        ns = try r.namespaceOf(def) orelse return null;
     }
-    return true;
+    return null;
 }
 
 /// The container has fields both before and after the range `start..end`: declarations cannot be

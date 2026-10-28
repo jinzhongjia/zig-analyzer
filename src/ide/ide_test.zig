@@ -4273,6 +4273,57 @@ test "completion: function and builtin calls insert argument placeholders with s
     }
 }
 
+test "completion: anytype parameters take a function name when another parameter is its ArgsTuple" {
+    // `std.meta.ArgsTuple` accepts only function types
+    const std_root =
+        \\pub const meta = struct {
+        \\    pub fn ArgsTuple(comptime Function: type) type {
+        \\        _ = Function;
+        \\        return struct {};
+        \\    }
+        \\};
+        \\
+    ;
+    const decls =
+        \\const std = @import("std");
+        \\const Io = struct {
+        \\    pub fn async(io: Io, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+        \\        _ = .{ io, args };
+        \\    }
+        \\};
+        \\const ArgsTuple = std.meta.ArgsTuple;
+        \\fn run(function: anytype, args: ArgsTuple(@TypeOf(function))) void {
+        \\    _ = args;
+        \\}
+        \\fn same(value: anytype, other: @TypeOf(value)) void {
+        \\    _ = other;
+        \\}
+        \\fn work(n: u32) void {
+        \\    _ = n;
+        \\}
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn t(io: Io) void {\n    io.async(wor<|>, .{1});\n}", "-" },
+        .{ "fn t(io: Io) void {\n    io.async(<|>, .{1});\n}", "-" },
+        .{ "fn t() void {\n    run(wor<|>, .{1});\n}", "-" },
+        // Other `anytype` parameters may receive any value
+        .{ "fn t() void {\n    same(wor<|>, 1);\n}", "work(${1:n})" },
+        .{ "fn t(io: Io) void {\n    io.async(work, .{wor<|>});\n}", "work(${1:n})" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const fixture = try snippetFixture(&w, try std.mem.concat(w.arena.allocator(), u8, &.{ decls, c[0] }), std_root);
+        const cursor = fixture.cursor.?;
+        testing.expectEqualStrings(c[1], try snippetOf(&w, cursor.file, cursor.offset, "work", .{ .auto_import = false, .snippets = true })) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
 test "completion: call snippets without argument placeholders, and nothing changes without snippets" {
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
         .{ "fn t() void {\n    ad<|>\n}", "add", "add($1)" },
