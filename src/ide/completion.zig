@@ -848,6 +848,44 @@ const Member = struct {
     const Decl = struct { file: FileId, item: u32, ast_id: ItemTree.AstId, inst: ?Index, alias: bool = false };
 };
 
+/// Members of a value (dereferenced): fields, and the functions and consts in `from` or pub
+/// (whether a const is a function is known only when it is used). Enum and opaque values have no
+/// fields: enum members are accessed through the type. Values that are not containers, tuples,
+/// slices, or arrays have no members (`?T`, `E!T`, single-item pointers to pointers, many-item
+/// pointers, and so on)
+fn valueMembers(r: *Resolver, from: FileId, t: Index) resolve.Error![]const Member {
+    const ip = r.ctx.db.env.ip;
+    var out: std.ArrayList(Member) = .empty;
+    switch (ip.key(t)) {
+        .ptr_type => |p| if (p.size == .slice) {
+            try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
+            const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
+            try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
+        },
+        .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
+        .tuple_type, .anon_struct_type, .reified_type => {
+            for (try eval.fieldNames(r, t)) |f| try out.append(r.arena, .{ .name = f.name, .what = .{ .typed = f.ty } });
+            if (ip.key(t) == .tuple_type) try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
+        },
+        .container_type => |c| if (try queries.namespaceOfType(r, t)) |ns| {
+            const tree = try r.itemTree(ns.file);
+            const fields = c.kind != .@"enum" and c.kind != .@"opaque";
+            for (tree.containerMembers(ns.container)) |m| {
+                const it = tree.items[m];
+                const name = it.name orelse continue;
+                const decl: Member.Decl = .{ .file = ns.file, .item = m, .ast_id = it.ast_id, .inst = c.inst, .alias = it.kind == .@"const" };
+                switch (it.kind) {
+                    .field => if (fields) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .field = decl } }),
+                    .@"fn", .@"const" => if (ns.file == from or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .method = decl } }),
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+    return out.items;
+}
+
 /// A matched member path: `root.leaf`, or `root.mid.leaf` / `root.mid().leaf` through a middle
 /// segment
 const MemberPath = struct {
@@ -930,44 +968,12 @@ const MemberSearch = struct {
         });
     }
 
-    /// Members of a value (dereferenced): fields, and the functions and consts in this file or pub
-    /// (whether a const is a function is known only when the item is built). Values that are not
-    /// containers, tuples, slices, or arrays have no members (`?T`, `E!T`, single-item pointers to
-    /// pointers, many-item pointers, and so on)
+    /// Members of a value (see `valueMembers`)
     fn membersOf(s: *MemberSearch, t: Index) resolve.Error![]const Member {
         if (s.members.get(t)) |known| return known;
-        const r = s.r;
-        const ip = r.ctx.db.env.ip;
-        var out: std.ArrayList(Member) = .empty;
-        switch (ip.key(t)) {
-            .ptr_type => |p| if (p.size == .slice) {
-                try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
-                const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
-                try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
-            },
-            .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
-            .tuple_type, .anon_struct_type, .reified_type => {
-                for (try eval.fieldNames(r, t)) |f| try out.append(r.arena, .{ .name = f.name, .what = .{ .typed = f.ty } });
-                if (ip.key(t) == .tuple_type) try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
-            },
-            .container_type => |c| if (try queries.namespaceOfType(r, t)) |ns| {
-                const tree = try r.itemTree(ns.file);
-                const fields = c.kind != .@"enum" and c.kind != .@"opaque";
-                for (tree.containerMembers(ns.container)) |m| {
-                    const it = tree.items[m];
-                    const name = it.name orelse continue;
-                    const decl: Member.Decl = .{ .file = ns.file, .item = m, .ast_id = it.ast_id, .inst = c.inst, .alias = it.kind == .@"const" };
-                    switch (it.kind) {
-                        .field => if (fields) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .field = decl } }),
-                        .@"fn", .@"const" => if (ns.file == s.file or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .method = decl } }),
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-        try s.members.put(r.arena, t, out.items);
-        return out.items;
+        const found = try valueMembers(s.r, s.file, t);
+        try s.members.put(s.r.arena, t, found);
+        return found;
     }
 
     /// The value (dereferenced) reached through the first-level member `m`, whose members form the
