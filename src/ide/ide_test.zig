@@ -4394,6 +4394,13 @@ test "completion: statement and declaration snippets follow the syntax position"
         .{ "fn t() void {\n    t(<|>);\n}", "" },
         .{ "fn t(x: u8) void {\n    switch (x) {\n        <|>\n    }\n}", "" },
         .{ "fn t() void {\n    defer <|>\n}", "" },
+        // The word starts inside a token: after the `.` of a number, between the characters of an
+        // operator (computing the position used to slice the text backwards and crash)
+        .{ "fn t() void {\n    const x = 1.5<|>;\n    _ = x;\n}", "" },
+        .{ "fn t() void {\n    const x = 1e-5<|>;\n    _ = x;\n}", "" },
+        .{ "const x = 0x1.8p1<|>;", "" },
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        else =<|>> {},\n    }\n}", "" },
+        .{ "fn t(a: []const u8) void {\n    _ = a +<|>+ a;\n}", "" },
         // Start of a container member
         .{ "<|>", declarations ++ ", std, builtin, main" },
         .{ "const a = 1;\nfo<|>", declarations ++ ", std, builtin, main" },

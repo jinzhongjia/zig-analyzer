@@ -941,6 +941,9 @@ fn positionOf(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u32)
     var start = offset;
     while (start > 0 and isIdentChar(text[start - 1])) start -= 1;
     var pos: Position = .{ .start = start, .end = identEnd(text, offset), .prev = tokenBefore(root, start) };
+    // The word starts inside a token (the digits after the `.` of `1.5`, the cursor between the
+    // two characters of `=>`): neither a statement nor a member starts there
+    if (pos.prev) |p| if (p.range().end > start) return pos;
     var before = pos.prev;
     var gap_end = start;
     if (before) |p| if (p.kind == .keyword_pub) {
