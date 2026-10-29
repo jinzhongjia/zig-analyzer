@@ -345,3 +345,110 @@ test "rename refuses when a reference cannot be confirmed" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// "file:line:column" of every edit in a rename result, sorted
+fn renameEdits(h: *Harness, resp: std.json.Value) ![]const u8 {
+    const a = h.arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = resp.object.get("result").?.object.get("changes").?.object.iterator();
+    while (it.next()) |kv| for (kv.value_ptr.array.items) |e| try out.append(a, try loc(h, kv.key_ptr.*, e.object.get("range").?));
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return join(h, out.items);
+}
+
+test "references and rename reach closed files outside any build graph" {
+    const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
+    const main_body = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    _ = lib.scale(3);\n}\n";
+    // Single-file mode: no build.zig, and main.zig and util.zig are never opened
+    const files = [_]fixture.File{
+        .{ .path = "lib.zig", .text = scale_text },
+        .{ .path = "main.zig", .text = main_body },
+        .{ .path = "util.zig", .text = "pub fn helperOne() void {}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = position(scale_text, "scale");
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |l| try out.append(a, try loc(&h, l.object.get("uri").?.string, l.object.get("range").?));
+        std.mem.sort([]const u8, out.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12", try join(&h, out.items));
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12", try renameEdits(&h, renamed));
+    }
+    // Workspace symbol lists declarations of closed files too
+    {
+        const resp = try h.request("workspace/symbol", .{ .query = "helperOne" });
+        const syms = resp.object.get("result").?.array.items;
+        try testing.expectEqual(1, syms.len);
+        try testing.expectEqualStrings("util.zig", basename(syms[0].object.get("location").?.object.get("uri").?.string));
+    }
+    // A file created on disk later joins the scope
+    {
+        const other = "const lib = @import(\"lib.zig\");\ntest {\n    _ = lib.scale(1);\n}\n";
+        try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.zig", .data = other });
+        try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, try project.path(a, "other.zig")), .type = 1 }} });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12 other.zig:2:12", try renameEdits(&h, renamed));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename reaches build scripts and their helpers" {
+    const helpers_text =
+        \\const std = @import("std");
+        \\pub fn addThing(b: *std.Build, exe: *std.Build.Step.Compile) void {
+        \\    b.installArtifact(exe);
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\const helpers = @import("build_helpers.zig");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = b.graph.host }) });
+        \\    helpers.addThing(b, exe);
+        \\}
+        \\
+        },
+        .{ .path = "build_helpers.zig", .text = helpers_text },
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const helpers_uri = try za.base.uri.fromPath(a, try project.path(a, "build_helpers.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = helpers_uri, .languageId = "zig", .version = 1, .text = helpers_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // build.zig is not in the module graph of any compile step and is not open
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = helpers_uri }, .position = position(helpers_text, "addThing"), .newName = "addArtifact" });
+    try testing.expectEqualStrings("build.zig:4:12 build_helpers.zig:1:7", try renameEdits(&h, renamed));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

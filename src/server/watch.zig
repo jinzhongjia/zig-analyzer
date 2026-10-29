@@ -14,7 +14,9 @@
 //! A directory that does not exist yet is watched through its nearest existing ancestor; once it
 //! appears, it is watched itself, and files of interest already in it are treated as created. The
 //! directories to watch are recomputed when new files are interned, roots are added or removed,
-//! directories are created or deleted, or notifications are lost.
+//! directories are created or deleted, or notifications are lost. Source files created in watched
+//! directories that are not files of interest yet, and directories created or deleted, make the
+//! server scan the root directories for source files again (see `Server.scheduleScan`).
 //!
 //! Polling (periodically checking size and modification time) is only the last resort: when
 //! native notifications are unavailable (other platforms, initialization failure), or some
@@ -32,6 +34,7 @@ const uri = za.base.uri;
 const Vfs = za.base.Vfs;
 const Server = @import("Server.zig");
 const Config = @import("Config.zig");
+const workspace_files = @import("workspace_files.zig");
 
 const log = std.log.scoped(.watch);
 
@@ -392,21 +395,34 @@ pub const Watcher = struct {
         // means all files.
         var dirs: std.StringHashMapUnmanaged(void) = .empty;
         var all = false;
+        // Source files the server does not know yet may belong to the workspace (see
+        // `Server.scheduleScan`), and so may directories that appear or disappear
+        var rescan = false;
+        var created: std.ArrayList([]const u8) = .empty;
         for (events) |ev| switch (ev.kind) {
             .changed, .created, .removed => {
                 const k = try w.key(a, ev.path);
                 if (w.files.get(k)) |path| {
                     try pending.add(a, path, if (ev.kind == .created) .created else .changed);
-                } else if (ev.kind == .created and w.leadsToMissing(k)) {
+                } else if (ev.kind == .created) {
                     // Not known whether it is a directory (Windows notifications do not tell):
                     // a path leading to a nonexistent directory has appeared
-                    try dirs.put(a, k, {});
+                    if (w.leadsToMissing(k)) try dirs.put(a, k, {});
+                    if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
                 }
             },
             .dir_created, .dir_gone, .overflow => {
+                rescan = true;
                 if (ev.path.len == 0) all = true else try dirs.put(a, try w.key(a, ev.path), {});
             },
         };
+        if (!rescan and created.items.len != 0) {
+            const rules = try w.server.originRules(a);
+            for (created.items) |path| {
+                if (workspace_files.contains(&w.server.vfs, rules, path)) rescan = true;
+            }
+        }
+        if (rescan) w.server.scheduleScan();
         if (!all and dirs.count() == 0) return false;
         for (w.files.keys(), w.files.values()) |k, path| {
             if (!all and !underAny(k, &dirs)) continue;

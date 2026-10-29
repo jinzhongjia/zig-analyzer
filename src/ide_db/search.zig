@@ -153,6 +153,16 @@ pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
     return out.items;
 }
 
+/// Files whose references are searched: the project files in the module graph and the user's
+/// source files under the workspace roots (see `inputs.WorkspaceFiles`), which include files in
+/// no build graph (single-file mode, build scripts, examples)
+pub fn searchFiles(r: *Resolver) resolve.Error![]const FileId {
+    var set: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    for (try projectFiles(r)) |f| try set.put(r.arena, f, {});
+    for (try r.ctx.get(database.inputs.WorkspaceFiles, {})) |f| try set.put(r.arena, f, {});
+    return set.keys();
+}
+
 /// Candidate files that may reference definitions in a file whose importers (see `importers`) are
 /// `reach`: the files in `scope` reachable from `reach` through `@import` chains (through any
 /// files), and `reach` itself. Every compilation that contains the definition has a root that

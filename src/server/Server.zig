@@ -23,6 +23,7 @@ const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const WorkspaceFiles = database.inputs.WorkspaceFiles;
 const syntax_q = database.syntax;
 const live = database.live;
 const ide = za.ide;
@@ -38,6 +39,7 @@ pub const Config = @import("Config.zig");
 const SemanticCache = @import("semantic_cache.zig");
 const watch = @import("watch.zig");
 const client_process = @import("client_process.zig");
+const workspace_files = @import("workspace_files.zig");
 
 const log = std.log.scoped(.server);
 
@@ -167,6 +169,11 @@ imports_basis: std.atomic.Value(u64) = .init(imports_pending),
 /// open documents)
 indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 indexed_mutex: Io.Mutex = .init,
+/// Generation of the workspace file scan (see `scheduleScan`): incremented whenever the source
+/// files under the root directories may have changed
+scan_generation: std.atomic.Value(u64) = .init(0),
+/// Whether a scan task is running (only one runs at a time)
+scanning: std.atomic.Value(bool) = .init(false),
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── Pulled configuration (accessed only on the main loop) ──
@@ -1011,6 +1018,71 @@ fn indexTask(server: *Server) Io.Cancelable!void {
     }
 }
 
+/// Scans the root directories for the user's source files in the background (see
+/// `workspace_files.scan`): when the scope of find references and rename may have changed (startup,
+/// root directories added or removed, source files or directories created or deleted). Like
+/// indexing, a running task does another pass when this is called again meanwhile. Must not be
+/// called inside a read or write transaction: the task may run inline.
+pub fn scheduleScan(server: *Server) void {
+    _ = server.scan_generation.fetchAdd(1, .monotonic);
+    if (server.scanning.swap(true, .acq_rel)) return;
+    server.busyBegin();
+    spawn(server.io, &server.bg_group, scanTask, .{server});
+}
+
+fn scanTask(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    while (true) {
+        const generation = server.scan_generation.load(.monotonic);
+        server.scanOnce() catch |err| switch (err) {
+            error.OutOfMemory => log.err("out of memory while scanning the workspace for source files", .{}),
+        };
+        if (server.scan_generation.load(.monotonic) != generation) continue;
+        server.scanning.store(false, .release);
+        // Scheduled again after the flag was released, and no other task took over: continue
+        if (server.scan_generation.load(.monotonic) == generation) return;
+        if (server.scanning.swap(true, .acq_rel)) return;
+    }
+}
+
+/// One scan: updates `WorkspaceFiles` when the files found differ, and then indexes them for
+/// workspace symbol
+fn scanOnce(server: *Server) Allocator.Error!void {
+    if (server.isShuttingDown()) return;
+    var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const rules = try server.originRules(a);
+    const paths = try workspace_files.scan(server.io, a, &server.vfs, rules);
+    var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    for (paths) |p| try set.put(a, try server.vfs.intern(p), {});
+    const files = set.keys();
+    std.mem.sort(Vfs.FileId, files, {}, struct {
+        fn lt(_: void, x: Vfs.FileId, y: Vfs.FileId) bool {
+            return @backingInt(x) < @backingInt(y);
+        }
+    }.lt);
+    // A write transaction cancels in-flight requests: write only when the files differ. Scans run
+    // one at a time, so nobody else changes the input after the comparison.
+    const unchanged = blk: {
+        var ctx = server.db.beginRead(a);
+        defer ctx.end();
+        const current = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => break :blk false,
+        };
+        break :blk std.mem.eql(Vfs.FileId, current, files);
+    };
+    if (unchanged) return;
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        // The engine takes ownership of the value, also when it fails
+        try server.db.set(WorkspaceFiles, {}, try server.gpa.dupe(Vfs.FileId, files), .low);
+    }
+    server.scheduleIndexing();
+}
+
 fn indexOnce(server: *Server) Io.Cancelable!void {
     var pc: panic_context.Text = .{};
     pc.enter("workspace symbol indexing", .{});
@@ -1018,7 +1090,8 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     var basis: u64 = 0;
-    const files = while (true) {
+    const Files = struct { symbols: []const Vfs.FileId, project: []const Vfs.FileId };
+    const files: Files = while (true) {
         if (server.isShuttingDown()) return;
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
@@ -1028,21 +1101,26 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
             error.Canceled => continue,
             error.OutOfMemory => return,
         });
-        break za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
+        const symbols = za.ide_db.search.searchFiles(&r) catch |err| switch (err) {
             error.Canceled => continue,
             error.OutOfMemory => return,
         };
+        const project = za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        };
+        break .{ .symbols = symbols, .project = project };
     };
-    // Two steps: first the regular index of project files (workspace symbols), usable as soon as
-    // it is built; then the auto-import index (public closures of the standard library and of each
-    // module, `FileLinks` of project files), during which completion works as usual, only without
-    // auto-import
-    if (!try server.indexBatches(files, "Indexing", false)) return;
+    // Two steps: first the regular index of the searched files (workspace symbols), usable as soon
+    // as it is built; then the auto-import index (public closures of the standard library and of
+    // each module, `FileLinks` of project files), during which completion works as usual, only
+    // without auto-import
+    if (!try server.indexBatches(files.symbols, "Indexing", false)) return;
     if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
     // When warming up fails (out of memory), the index is not marked usable: the next completion
     // retries, instead of the closures being expanded synchronously in a request
     if (!server.indexImportRoots()) return;
-    if (!try server.indexBatches(files, "Indexing for auto-import", true)) return;
+    if (!try server.indexBatches(files.project, "Indexing for auto-import", true)) return;
     // The project-level results completion needs are also computed before the index is marked
     // usable, rather than being left to the first completion
     while (true) {
@@ -1565,12 +1643,16 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         if (!std.fs.path.isAbsolute(path)) continue;
         try events.put(arena, path, event.type);
     }
+    // Source files created or deleted under the root directories change what find references and
+    // rename search
+    const rescan = try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
+    defer if (rescan) server.scheduleScan();
     for (events.keys(), events.values()) |path, kind| {
         const base = std.fs.path.basename(path);
         const dir = std.fs.path.dirname(path) orelse "";
         if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, dir);
-        // Files never seen before do not matter for analysis (a new file is loaded when it is
-        // imported); project files have no contents to compare against and count as changed
+        // Files never seen before have no known contents to update (a new file is loaded when it
+        // is imported); project files have no contents to compare against and count as changed
         const file = try server.vfs.lookup(path) orelse {
             if (isProjectFile(base)) try build_files.append(arena, dir);
             continue;
@@ -1679,6 +1761,38 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     server.recompileSingle(open, rebuilt.items);
     // If it cannot be recorded, the next change rebuilds as usual
     for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+}
+
+/// Whether file events change the user's source files under the root directories (see
+/// `scheduleScan`): a source file the scan would find is created and is not known to be one yet,
+/// or one of them is deleted
+fn changesWorkspaceFiles(server: *Server, arena: Allocator, rules: origin.Rules, paths: []const []const u8, kinds: []const types.FileChangeType) !bool {
+    var current: ?[]const Vfs.FileId = null;
+    for (paths, kinds) |path, kind| {
+        if (kind == .Changed or !workspace_files.contains(&server.vfs, rules, path)) continue;
+        const file = try server.vfs.lookup(path) orelse {
+            if (kind == .Created) return true;
+            continue;
+        };
+        const list = current orelse blk: {
+            var ctx = server.db.beginRead(arena);
+            defer ctx.end();
+            const value = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // A write transaction is waiting: scan instead of deciding here
+                error.Canceled => return true,
+            };
+            break :blk try arena.dupe(Vfs.FileId, value);
+        };
+        current = list;
+        const listed = std.sort.binarySearch(Vfs.FileId, list, file, struct {
+            fn order(x: Vfs.FileId, y: Vfs.FileId) std.math.Order {
+                return std.math.order(@backingInt(x), @backingInt(y));
+            }
+        }.order) != null;
+        if (listed != (kind == .Created)) return true;
+    }
+    return false;
 }
 
 /// The file's known text is the same as `text` (including both being absent); a failed read counts
@@ -2156,6 +2270,9 @@ const version_mismatch_message = "zig {s} differs from zig {s} that zig-analyzer
 /// system protocol for each workspace with a build.zig
 fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
+    // The origin rules (the Zig installation and the global cache) are known from here on, also
+    // when the zig environment cannot be queried
+    defer server.scheduleScan();
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
@@ -2768,6 +2885,8 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     server.publishOpenFiles();
     server.reconcileSingle();
     server.resyncWatcher();
+    // Before startup, the scan at the end of startup covers the new roots
+    if (server.started) server.scheduleScan();
 }
 
 /// Restarts the project of `ws` (finding the project's current instance by root directory: the
@@ -4461,10 +4580,10 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
 }
 
 /// Scope of find references and workspace symbol: project files in the module graph (excluding the
-/// standard library) and open documents
+/// standard library), the user's source files under the root directories, and open documents
 fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-    for (try za.ide_db.search.projectFiles(r)) |f| try set.put(r.arena, f, {});
+    for (try za.ide_db.search.searchFiles(r)) |f| try set.put(r.arena, f, {});
     server.docs_mutex.lockUncancelable(server.io);
     defer server.docs_mutex.unlock(server.io);
     for (server.open_docs.keys()) |f| try set.put(r.arena, f, {});
@@ -5264,6 +5383,7 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 
 test {
     _ = origin;
+    _ = workspace_files;
     _ = Workspace;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
