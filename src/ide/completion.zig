@@ -364,7 +364,9 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             // function, use the instance from a call site)
             const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .member };
             const tv = a.exprType(fa.lhs);
-            try typedMembers(r, &out, tv, file);
+            // Methods receiving `*T` need a value that can be modified (see `receives`)
+            const mutable = !tv.isType() and !try infer.placeIsConst(r, a.file, a.item, a.body, a, fa.lhs);
+            try typedMembers(r, &out, tv, mutable, file);
             return .{ .items = out.items.items, .context = .member, .bound = !tv.isType(), .at = a };
         },
         else => {},
@@ -655,9 +657,11 @@ fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
     };
 }
 
-/// Lists members by type: declarations when the value is a type; fields and methods for
-/// instances (including single pointers); slices and arrays have len
-fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) resolve.Error!void {
+/// Lists members by type: declarations when the value is a type; for other values (also through a
+/// single pointer), their members (see `valueMembers`): the fields, and the functions that can be
+/// called on the value as methods (see `receives`; `mutable` tells whether the value can be
+/// modified)
+fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
         // Constructed enums (`@Enum`, the tag enum of a union(enum)): members
@@ -676,54 +680,26 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, from: FileId) res
         const ns = try queries.namespaceOfType(r, t) orelse return;
         return members(r, out, ns, ns.file == from);
     }
-    var t = tv.ty;
     // A single pointer is dereferenced automatically once: len of `*[N]T`, fields and methods of
-    // `*S`, len and ptr of `*[]T`
-    switch (ip.key(t)) {
-        .ptr_type => |p| if (p.size == .one) {
-            t = p.child;
+    // `*S`, len and ptr of `*[]T`; whether the value can be modified then depends on the pointer
+    const holder = (Place{ .ty = tv.ty, .mutable = mutable }).deref(ip);
+    for (try valueMembers(r, from, holder.ty)) |m| switch (m.what) {
+        .typed => |ty| try out.add(.{ .label = m.name, .kind = .field, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null }),
+        .field => |f| {
+            const ty = (try declType(r, f)).ty;
+            try out.add(.{ .label = m.name, .kind = .field, .doc = m.doc, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null });
         },
-        else => {},
-    }
-    switch (ip.key(t)) {
-        .ptr_type => |p| {
-            // Single pointers to pointers and many-item pointers have no members
-            if (p.size == .slice) {
-                try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
-                try out.add(.{ .label = "ptr", .kind = .field });
-            }
-            return;
+        .method => |f| {
+            const ftv = try declType(r, f);
+            if (!callableOn(ip, ftv.ty, f.alias, holder)) continue;
+            // Function aliases (`pub const isPowerPC = isPowerpc;`) show the signature of the
+            // function they refer to when selected
+            try out.add(if (f.alias)
+                .{ .label = m.name, .kind = .function, .doc = m.doc, .target = try fnTarget(r, ftv) }
+            else
+                .{ .label = m.name, .kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item)), .doc = m.doc, .target = .{ .decl = .{ .file = f.file, .item = f.item } } });
         },
-        .array_type => return out.add(.{ .label = "len", .kind = .field, .detail = "usize" }),
-        // Tuples, anonymous structs, constructed structs and unions: fields
-        .tuple_type, .anon_struct_type, .reified_type => {
-            for (try eval.fieldNames(r, t)) |f| try out.add(.{ .label = f.name, .kind = .field, .detail = if (f.ty != .unknown) try render.typeAlloc(r, f.ty) else null });
-            if (ip.key(t) == .tuple_type) try out.add(.{ .label = "len", .kind = .field, .detail = "usize" });
-            return;
-        },
-        else => {},
-    }
-    const ns = try queries.namespaceOfType(r, t) orelse return;
-    const tree = try r.itemTree(ns.file);
-    const same_file = ns.file == from;
-    for (tree.containerMembers(ns.container)) |m| {
-        const it = tree.items[m];
-        const name = it.name orelse continue;
-        switch (it.kind) {
-            .field => {
-                const fty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(r.ctx.db.env.ip, t) })).ty;
-                try out.add(.{ .label = name, .kind = .field, .doc = it.doc, .detail = if (fty != .unknown) try render.typeAlloc(r, fty) else null });
-            },
-            .@"fn" => if (same_file or it.flags.is_pub) try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = .{ .decl = .{ .file = ns.file, .item = m } } }),
-            // Function aliases (`pub const isPowerPC = isPowerpc;`) can also be called as methods;
-            // when selected, they show the signature of the aliased function
-            .@"const" => if (same_file or it.flags.is_pub) {
-                const ctv = try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = queries.instOfType(ip, t) });
-                if (ip.key(ctv.ty) == .fn_type) try out.add(.{ .label = name, .kind = .function, .doc = it.doc, .target = try fnTarget(r, ctv) });
-            },
-            else => {},
-        }
-    }
+    };
 }
 
 /// After `.`: enum members and union fields of the expected type (`T` for `?T`), and
@@ -848,6 +824,44 @@ const Member = struct {
     const Decl = struct { file: FileId, item: u32, ast_id: ItemTree.AstId, inst: ?Index, alias: bool = false };
 };
 
+/// Members of a value (dereferenced): fields, and the functions and consts in `from` or pub
+/// (whether a const is a function is known only when it is used). Enum and opaque values have no
+/// fields: enum members are accessed through the type. Values that are not containers, tuples,
+/// slices, or arrays have no members (`?T`, `E!T`, single-item pointers to pointers, many-item
+/// pointers, and so on)
+fn valueMembers(r: *Resolver, from: FileId, t: Index) resolve.Error![]const Member {
+    const ip = r.ctx.db.env.ip;
+    var out: std.ArrayList(Member) = .empty;
+    switch (ip.key(t)) {
+        .ptr_type => |p| if (p.size == .slice) {
+            try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
+            const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
+            try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
+        },
+        .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
+        .tuple_type, .anon_struct_type, .reified_type => {
+            for (try eval.fieldNames(r, t)) |f| try out.append(r.arena, .{ .name = f.name, .what = .{ .typed = f.ty } });
+            if (ip.key(t) == .tuple_type) try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
+        },
+        .container_type => |c| if (try queries.namespaceOfType(r, t)) |ns| {
+            const tree = try r.itemTree(ns.file);
+            const fields = c.kind != .@"enum" and c.kind != .@"opaque";
+            for (tree.containerMembers(ns.container)) |m| {
+                const it = tree.items[m];
+                const name = it.name orelse continue;
+                const decl: Member.Decl = .{ .file = ns.file, .item = m, .ast_id = it.ast_id, .inst = c.inst, .alias = it.kind == .@"const" };
+                switch (it.kind) {
+                    .field => if (fields) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .field = decl } }),
+                    .@"fn", .@"const" => if (ns.file == from or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .method = decl } }),
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+    return out.items;
+}
+
 /// A matched member path: `root.leaf`, or `root.mid.leaf` / `root.mid().leaf` through a middle
 /// segment
 const MemberPath = struct {
@@ -930,44 +944,12 @@ const MemberSearch = struct {
         });
     }
 
-    /// Members of a value (dereferenced): fields, and the functions and consts in this file or pub
-    /// (whether a const is a function is known only when the item is built). Values that are not
-    /// containers, tuples, slices, or arrays have no members (`?T`, `E!T`, single-item pointers to
-    /// pointers, many-item pointers, and so on)
+    /// Members of a value (see `valueMembers`)
     fn membersOf(s: *MemberSearch, t: Index) resolve.Error![]const Member {
         if (s.members.get(t)) |known| return known;
-        const r = s.r;
-        const ip = r.ctx.db.env.ip;
-        var out: std.ArrayList(Member) = .empty;
-        switch (ip.key(t)) {
-            .ptr_type => |p| if (p.size == .slice) {
-                try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
-                const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
-                try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
-            },
-            .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
-            .tuple_type, .anon_struct_type, .reified_type => {
-                for (try eval.fieldNames(r, t)) |f| try out.append(r.arena, .{ .name = f.name, .what = .{ .typed = f.ty } });
-                if (ip.key(t) == .tuple_type) try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
-            },
-            .container_type => |c| if (try queries.namespaceOfType(r, t)) |ns| {
-                const tree = try r.itemTree(ns.file);
-                const fields = c.kind != .@"enum" and c.kind != .@"opaque";
-                for (tree.containerMembers(ns.container)) |m| {
-                    const it = tree.items[m];
-                    const name = it.name orelse continue;
-                    const decl: Member.Decl = .{ .file = ns.file, .item = m, .ast_id = it.ast_id, .inst = c.inst, .alias = it.kind == .@"const" };
-                    switch (it.kind) {
-                        .field => if (fields) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .field = decl } }),
-                        .@"fn", .@"const" => if (ns.file == s.file or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .method = decl } }),
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-        try s.members.put(r.arena, t, out.items);
-        return out.items;
+        const found = try valueMembers(s.r, s.file, t);
+        try s.members.put(s.r.arena, t, found);
+        return found;
     }
 
     /// The value (dereferenced) reached through the first-level member `m`, whose members form the
@@ -1015,11 +997,7 @@ const MemberSearch = struct {
             },
             .method => |f| {
                 const tv = try declType(r, f);
-                const sig = switch (ip.key(tv.ty)) {
-                    .fn_type => |sig| sig,
-                    else => return null,
-                };
-                if (sig.params.len == 0 or !receives(ip, sig.params[0], p.holder)) return null;
+                if (!callableOn(ip, tv.ty, f.alias, p.holder)) return null;
                 // Classified like the same declaration after `.` (a function in a file is Function)
                 item.kind = kindOf(try symbol_kind.ofDecl(r, f.file, f.item));
                 item.bound = true;
@@ -1044,13 +1022,27 @@ fn declType(r: *Resolver, d: Member.Decl) resolve.Error!TypedValue {
     return r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = d.ast_id }, .inst = d.inst });
 }
 
-/// Whether the first parameter of a method can receive the value at `holder`: the parameter is the
-/// enclosing container, a `*const` pointer to it, or a `*T` pointer to it when the value can be
-/// modified
+/// Whether the function or function alias of type `ty` can be called as a method on the value at
+/// `holder` (see `receives`): a function whose signature cannot be computed counts as yes, an alias
+/// only when its value is known to be a function
+fn callableOn(ip: *InternPool, ty: Index, alias: bool, holder: Place) bool {
+    return switch (ip.key(ty)) {
+        .fn_type => |sig| sig.params.len != 0 and receives(ip, sig.params[0], holder),
+        else => !alias and ty == .unknown,
+    };
+}
+
+/// Whether the first parameter of a method can receive the value at `holder` (matches the
+/// compiler): the parameter is the enclosing container `T`, `?T`, `E!T`, or a single-item or C
+/// pointer to it (also `?*T`), and a pointer that is not const needs a value that can be modified;
+/// an `anytype` parameter, whose type is not known before a call, and a parameter whose type cannot
+/// be computed count as yes
 fn receives(ip: *InternPool, param: Index, holder: Place) bool {
-    if (sameContainer(ip, param, holder.ty)) return true;
+    if (param == .unknown or sameContainer(ip, param, holder.ty)) return true;
     return switch (ip.key(param)) {
-        .ptr_type => |p| p.size == .one and sameContainer(ip, p.child, holder.ty) and (p.is_const or holder.mutable),
+        .ptr_type => |p| (p.size == .one or p.size == .c) and sameContainer(ip, p.child, holder.ty) and (p.is_const or holder.mutable),
+        .optional_type => |c| sameContainer(ip, c, holder.ty) or (ip.key(c) == .ptr_type and receives(ip, c, holder)),
+        .error_union_type => |eu| sameContainer(ip, eu.payload, holder.ty),
         else => false,
     };
 }

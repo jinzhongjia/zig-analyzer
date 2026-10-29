@@ -2935,45 +2935,14 @@ const Inferrer = struct {
         };
     }
 
-    fn isConstPtr(inf: *Inferrer, t: Index) bool {
-        return switch (inf.ip.key(t)) {
-            .ptr_type => |p| p.is_const,
-            else => false,
-        };
+    /// `&x`: see `placeIsConst`
+    fn isConstPlace(inf: *Inferrer, e: ExprId) Error!bool {
+        return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
     }
 
-    /// `&x`: `*const T` when x is a const declaration or a const local variable
-    fn isConstPlace(inf: *Inferrer, e: ExprId) Error!bool {
-        const b = inf.body;
-        switch (b.expr(e)) {
-            .name_ref => |name| {
-                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
-                return switch (def) {
-                    // A local of the outer function (referenced in a member of a container in
-                    // the body) is in the Body of the member it belongs to
-                    .local => |l| (if (l.file == inf.file and l.item == inf.item) b else try inf.r.body(l.file, l.item)).binding(l.binding).kind != .local_var,
-                    .item => |it| (try inf.r.itemTree(it.file)).items[it.item].kind == .@"const",
-                    .file => true,
-                };
-            },
-            .field_access => |fa| {
-                // Access through a pointer depends on the pointer; otherwise on the left-hand side
-                const lhs = inf.get(fa.lhs);
-                return switch (inf.ip.key(lhs.ty)) {
-                    .ptr_type => |p| p.is_const,
-                    else => inf.isConstPlace(fa.lhs),
-                };
-            },
-            .deref => |x| return inf.isConstPtr(inf.get(x).ty),
-            .index => |x| {
-                const lhs = inf.get(x.lhs).ty;
-                return switch (inf.ip.key(lhs)) {
-                    .ptr_type => |p| p.is_const,
-                    else => inf.isConstPlace(x.lhs),
-                };
-            },
-            else => return true,
-        }
+    /// Type of an inferred subexpression (for `placeIsConst`)
+    fn exprType(inf: *Inferrer, e: ExprId) TypedValue {
+        return inf.get(e);
     }
 
     fn unwrapErrorUnion(inf: *Inferrer, t: Index) struct { Index, Index } {
@@ -3132,6 +3101,45 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
         },
         else => {},
     }
+}
+
+/// Whether the place `e` cannot be modified, which makes `&e` a `*const T` (matches the compiler):
+/// const declarations and locals other than `var`s (parameters and captures included), members and
+/// elements of such places, and those reached through a const pointer; expressions that are not
+/// places (calls, literals, and so on) are temporaries that cannot be modified. `types` gives the
+/// types of the subexpressions (`types.exprType(e)`)
+pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types: anytype, e: ExprId) Error!bool {
+    switch (b.expr(e)) {
+        .name_ref => |name| {
+            const def = try r.resolveName(file, item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
+            return switch (def) {
+                // A local of the outer function (referenced in a member of a container in the body)
+                // is in the Body of the member it belongs to
+                .local => |l| (if (l.file == file and l.item == item) b else try r.body(l.file, l.item)).binding(l.binding).kind != .local_var,
+                .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"const",
+                .file => true,
+            };
+        },
+        .field_access => |fa| return partIsConst(r, file, item, b, types, fa.lhs),
+        // `@field(x, name)` is a member of `x`, as `x.name` is
+        .builtin_call => |c| return if (std.mem.eql(u8, c.name, "@field") and c.args.len == 2) partIsConst(r, file, item, b, types, c.args[0]) else true,
+        .index => |x| return partIsConst(r, file, item, b, types, x.lhs),
+        .deref => |x| return switch (r.ctx.db.env.ip.key(types.exprType(x).ty)) {
+            .ptr_type => |p| p.is_const,
+            else => false,
+        },
+        // The payload of an optional is part of the optional
+        .unwrap_optional => |x| return placeIsConst(r, file, item, b, types, x),
+        else => return true,
+    }
+}
+
+/// A member or element of `base`: through a pointer it depends on the pointer, otherwise on `base`
+fn partIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types: anytype, base: ExprId) Error!bool {
+    return switch (r.ctx.db.env.ip.key(types.exprType(base).ty)) {
+        .ptr_type => |p| p.is_const,
+        else => placeIsConst(r, file, item, b, types, base),
+    };
 }
 
 /// Expressions in an owner and their inference results
