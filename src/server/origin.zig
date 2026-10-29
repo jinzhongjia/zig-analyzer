@@ -62,7 +62,9 @@ pub const Rules = struct {
 /// Origin of `path`; `in_project` means the file is in some project's module graph, and only
 /// affects files outside the roots. Checked in order: dependency packages, generated files (even
 /// under a root), user code under a root, the Zig installation (under a root, it is being edited
-/// by developers of Zig itself, so it is user code), project modules.
+/// by developers of Zig itself, so it is user code), project modules. A root inside the Zig
+/// installation (such as its `std` directory opened as a workspace folder) does not make the
+/// installation user code.
 pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: bool) Origin {
     if (isVirtual(path)) return .virtual;
     for (rules.packages) |p| if (vfs.isUnder(path, p)) return .package;
@@ -71,6 +73,7 @@ pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: boo
     var in_root = false;
     for (rules.roots) |root| {
         if (path.len <= root.len or !vfs.isUnder(path, root)) continue;
+        if (rules.zig_lib) |l| if (vfs.isUnder(root, l)) continue;
         in_root = true;
         const rest = path[root.len..];
         const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
@@ -123,6 +126,10 @@ test classify {
     // The Zig installation is under a workspace root: Zig itself is being developed
     const in_root: Rules = .{ .zig_lib = native("/ws/lib"), .roots = &.{native("/ws")} };
     try testing.expectEqual(.user, classify(&vfs, in_root, native("/ws/lib/std/std.zig"), true));
+    // A workspace root inside the Zig installation: renaming there would edit the installation
+    const inside: Rules = .{ .zig_lib = native("/zig/lib"), .roots = &.{ native("/proj"), native("/zig/lib/std") } };
+    try testing.expectEqual(.zig_lib, classify(&vfs, inside, native("/zig/lib/std/mem.zig"), false));
+    try testing.expectEqual(.user, classify(&vfs, inside, native("/proj/main.zig"), false));
     // Unknown zig environment: classified only by roots and projects
     try testing.expectEqual(.other, classify(&vfs, .{}, native("/zig/lib/std/std.zig"), false));
 }

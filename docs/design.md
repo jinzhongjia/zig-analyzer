@@ -126,7 +126,7 @@ For **the same disk contents, the same Zig version, and the same build step and 
 - The origin of a file (`server/origin.zig`) is checked in this order:
   - Fetched dependency packages: packages fetched by hash that contain modules (the `<hash>` subdirectories of the package directory; the package directory defaults to `<build root>/zig-pkg` and changes with `--pkg-dir` and `--system`);
   - Generated files: the global cache and the local cache of each project;
-  - User code: files under a workspace root directory, excluding the `.zig-cache` and `zig-pkg` in it (when the Zig installation directory is under a root directory, Zig itself is being developed, so it is user code as well);
+  - User code: files under a workspace root directory, excluding the `.zig-cache` and `zig-pkg` in it (when the Zig installation directory is under a root directory, Zig itself is being developed, so it is user code as well; a root directory inside the Zig installation, such as its `std` opened as a workspace folder, does not count);
   - The Zig installation directory (the standard library, `lib/compiler`, etc.);
   - User code: modules outside the root directories that belong to some project (modules added by path, packages specified with `--fork`).
   - Fetched dependency packages, generated files, and the Zig installation directory are collectively called dependency libraries. The compile context, durability (§4.2), and the scopes of rename (§4.6), server-side watching (§4.8), and workspace symbol are all derived from this one classification.
