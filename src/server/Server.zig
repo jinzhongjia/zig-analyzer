@@ -297,8 +297,6 @@ pub const HandlerError = error{
     Canceled,
     OutOfMemory,
     InvalidParams,
-    /// The rename target is outside the workspace (standard library, dependency packages)
-    RenameOutsideWorkspace,
     /// The new name is not a valid identifier
     InvalidIdentifier,
 };
@@ -1834,7 +1832,7 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
 pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
     if (rules.zig_lib == null) return false;
     return switch (origin.classify(&server.vfs, rules, path, false)) {
-        .user, .other => true,
+        .user, .outside, .other => true,
         .virtual, .zig_lib, .generated, .package => false,
     };
 }
@@ -2315,6 +2313,9 @@ fn startup(server: *Server) Io.Cancelable!void {
     // Detached files opened before startup: compile them now that the zig environment is ready and
     // projects have started loading
     server.startup_done.store(true, .release);
+    // The origins of files opened before startup (the standard library, files outside the
+    // workspace folders) are known only now, and naming hints depend on them
+    server.publishOpenFiles();
     server.reconcileSingle();
 }
 
@@ -2508,7 +2509,7 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     switch (server.originOf(file, in_project)) {
         .virtual => return .none,
         .zig_lib, .generated, .package => return .library,
-        .user, .other => {},
+        .user, .outside, .other => {},
     }
     if (in_project) return .project;
     const path = server.vfs.path(file);
@@ -3952,9 +3953,9 @@ const NamingSettings = struct {
     }
 };
 
-/// Whether the file gets naming checks, and their settings: open user code
-/// (see `origin.Origin.user`) with the check enabled, not in `naming.exclude`, and not generated
-/// code (see `naming.isGenerated`)
+/// Whether the file gets naming checks, and their settings: open user code (see
+/// `origin.Origin.user` and `origin.Origin.outside`) with the check enabled, not in
+/// `naming.exclude`, and not generated code (see `naming.isGenerated`)
 fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     {
         server.docs_mutex.lockUncancelable(server.io);
@@ -4007,7 +4008,7 @@ fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const 
         for (exclude) |pattern| if (ide.naming.globMatch(pattern, normalized)) return null;
     }
     switch (server.fileOrigin(file)) {
-        .virtual, .user => {},
+        .virtual, .user, .outside => {},
         .zig_lib, .generated, .package, .other => return null,
     }
     if (ide.naming.isGenerated(text)) return null;
@@ -4689,43 +4690,49 @@ fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: ty
     return out;
 }
 
-/// Definitions that can be renamed: the user's own code
-/// (see `origin.Origin.user`) and unsaved documents
-fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
-    if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
+/// Why `def` cannot be renamed, or null when it can: the user's own code (see
+/// `origin.Origin.user`) and unsaved documents can be renamed. In a file outside the workspace
+/// folders (`origin.Origin.outside`), only what its own file alone can refer to can be renamed
+/// (local names, and declarations without `pub` other than fields): which other files use the rest
+/// is not known.
+fn renameRefusal(server: *Server, r: *Resolver, def: za.names.resolve.Def) !?[]const u8 {
     const file = switch (def) {
         .item => |it| it.file,
         .local => |l| l.file,
-        .file => unreachable,
+        // `@import` and its path string lead to a file, which is not a name in the code
+        .file => return "cannot rename: the cursor is on the import of a file, and files cannot be renamed",
     };
+    if (try za.ide_db.search.defName(r, def) == null) return "cannot rename: there is no name here";
     const rules = try server.originRules(r.arena);
     return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
         // Unsaved documents (`untitled:` etc.) exist only in the editor
-        .virtual, .user => true,
-        .zig_lib, .generated, .package, .other => false,
+        .virtual, .user => null,
+        .outside => if (try za.ide_db.search.visibleOutsideFile(r, def))
+            "cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known"
+        else
+            null,
+        .zig_lib, .generated, .package, .other => "cannot rename a symbol defined outside the workspace",
     };
 }
 
-fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!types.ResultType("textDocument/prepareRename") {
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return null;
-    if (tok.kind != .identifier) return null;
-    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
-    if (!try server.renamable(r, def)) return error.RenameOutsideWorkspace;
+fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!Outcome(types.ResultType("textDocument/prepareRename")) {
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (tok.kind != .identifier) return .{ .ok = null };
+    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
     const lines = try offsets.LineIndex.init(arena, at.text);
-    return .{ .PrepareRenamePlaceholder = .{
+    return .{ .ok = .{ .PrepareRenamePlaceholder = .{
         .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
         .placeholder = za.syntax.ast.identName(tok.text),
-    } };
+    } } };
 }
 
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!Outcome(types.ResultType("textDocument/rename")) {
     _ = try identifierText(arena, params.newName, false);
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
-    // `@import` and its path string lead to a file, which is not a name in the code
-    if (def == .file) return .{ .failed = "cannot rename: the cursor is on the import of a file, and files cannot be renamed" };
-    if (!try server.renamable(r, def)) return error.RenameOutsideWorkspace;
+    if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
     const old = (try za.ide_db.search.defName(r, def)).?;
     const refs = switch (try server.renameReferences(r, arena, def, old, params.newName)) {
         .ok => |refs| refs,
@@ -5081,7 +5088,7 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
         .local => |l| l.file,
         .file => unreachable,
     };
-    if (!try server.renamable(r, def)) return .{ .failed = "cannot rename a symbol defined outside the workspace" };
+    if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
     const refs = switch (try server.renameReferences(r, arena, def, f.name, f.suggestion)) {
         .ok => |refs| refs,
         .failed => |reason| return .{ .failed = reason },
@@ -5132,7 +5139,7 @@ fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u
 /// parameter cannot be removed, the reason is attached if the client supports `disabled`;
 /// otherwise the action is not offered.
 fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, t: ide.remove_param.Target, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
-    if (!try server.renamable(r, .{ .item = .{ .file = t.file, .item = t.item } })) return null;
+    if (try server.renameRefusal(r, .{ .item = .{ .file = t.file, .item = t.item } }) != null) return null;
     var action: types.CodeAction = .{
         .title = try std.fmt.allocPrint(arena, "remove parameter `{s}`", .{t.name}),
         .kind = types.CodeActionKind.QuickFix,
@@ -5403,7 +5410,6 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
         else
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
-        error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }

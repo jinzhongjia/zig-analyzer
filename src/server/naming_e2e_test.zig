@@ -346,3 +346,51 @@ test "naming fixes: resolve, conflicts, public names and the project still build
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "files outside the workspace folders: what only the file itself uses can be renamed" {
+    const text =
+        \\fn add(a: u32, unused: u32) u32 {
+        \\    var total: u32 = a;
+        \\    total += 1;
+        \\    return total;
+        \\}
+        \\pub fn scale(x: u32, factor: u32) u32 {
+        \\    return x * 2;
+        \\}
+        \\pub fn main() void {
+        \\    const BadName: u32 = add(1, 2) + scale(3, 4);
+        \\    _ = BadName;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // No workspace folder at all, as editors send for a file opened on its own
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = try jsonValue(&h,
+        \\{"build": {"enable": false}, "diagnostics": {"compiler": false}, "naming": {"enable": true}}
+    ) });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Such files were refused even for locals, got no remove-parameter fix and no naming hints
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "total"), .newName = "sum" });
+        var it = resp.object.get("result").?.object.get("changes").?.object.iterator();
+        try testing.expectEqual(3, it.next().?.value_ptr.array.items.len);
+    }
+    try testing.expect(actionWithTitle(try codeActions(&h, uri, text, "unused"), "remove parameter `unused`") != null);
+    try testing.expectEqualStrings("9:10 naming.value `BadName` should be snake_case: `bad_name`\n", try namingHints(&h, "main.zig"));
+    // Other files may use a `pub` declaration, and which ones is not known
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "scale"), .newName = "times" });
+        try testing.expectEqualStrings("cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known", resp.object.get("error").?.object.get("message").?.string);
+        try testing.expectEqual(null, actionWithTitle(try codeActions(&h, uri, text, "factor"), "remove parameter"));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
