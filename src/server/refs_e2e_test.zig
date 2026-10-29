@@ -127,6 +127,9 @@ test "references, highlight, rename and workspace symbol" {
         // outside the workspace
         const import_rename = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "lib\")"), .newName = "helpers" });
         try testing.expectEqualStrings("cannot rename: the cursor is on the import of a file, and files cannot be renamed", import_rename.object.get("error").?.object.get("message").?.string);
+        // std calls `root.main`: renaming it in the root source file used to break the build
+        const main_rename = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "main"), .newName = "run" });
+        try testing.expectEqualStrings("cannot rename `main` to `run`: the standard library looks up `root.main` by this name in the root source file (src/main.zig:3:8)", main_rename.object.get("error").?.object.get("message").?.string);
     }
 
     // workspace symbol

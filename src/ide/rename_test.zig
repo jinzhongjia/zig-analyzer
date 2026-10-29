@@ -164,6 +164,54 @@ test "rename: names referenced by string literals" {
     try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "other"));
 }
 
+test "rename: declarations the standard library looks up in the root source file" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const root_text =
+        \\const std = @import("std");
+        \\const lib = @import("lib.zig");
+        \\pub const std_options: std.Options = .{};
+        \\pub const panic = std.debug.FullPanic(lib.onPanic);
+        \\pub const debug = struct {
+        \\    pub const SelfInfo = void;
+        \\    pub const other = 1;
+        \\};
+        \\pub fn main() void {}
+        \\pub fn helper() void {}
+        \\
+    ;
+    const lib_text = "pub fn onPanic(msg: []const u8, ra: ?usize) noreturn {\n    _ = msg;\n    _ = ra;\n    unreachable;\n}\npub fn main() void {}\n";
+    const fx = try w.fixture("//- /p/main.zig module:app\n" ++ root_text ++ "//- /p/lib.zig in:app\n" ++ lib_text);
+    const root = fx.file("/p/main.zig");
+    const lib = fx.file("/p/lib.zig");
+    const a = w.arena.allocator();
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    const root_src = (try ctx.get(database.syntax.SourceText, root)).text;
+    for ([_]struct { []const u8, ?[]const u8 }{
+        .{ "std_options", "3:11 the standard library looks up `root.std_options` by this name in the root source file" },
+        .{ "panic", "4:11 the standard library looks up `root.panic` by this name in the root source file" },
+        .{ "SelfInfo", "6:15 the standard library looks up `root.debug.SelfInfo` by this name in the root source file" },
+        .{ "main", "9:8 the standard library looks up `root.main` by this name in the root source file" },
+        .{ "other", null },
+        .{ "helper", null },
+    }) |c| {
+        const def = (try definition.defAt(&r, root, @intCast(std.mem.indexOf(u8, root_src, c[0]).?))).?;
+        const problem = try rename.stdRootLookup(&r, def);
+        if (c[1]) |expected| {
+            const got = try format(root_src, problem.?);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(expected, got);
+        } else try testing.expectEqual(null, problem);
+    }
+    // `main` of a file that is not the root of its compilation is not looked up
+    const lib_src = (try ctx.get(database.syntax.SourceText, lib)).text;
+    const lib_main = (try definition.defAt(&r, lib, @intCast(std.mem.indexOf(u8, lib_src, "main").?))).?;
+    try testing.expectEqual(null, try rename.stdRootLookup(&r, lib_main));
+}
+
 /// Extra AstGen error after renaming all references of the definition at `<|>` to `new`; with
 /// `skip_uses`, only the declaration is renamed (simulating references missed by the rename)
 fn verify(text: []const u8, new: []const u8, skip_uses: bool) ![]const u8 {

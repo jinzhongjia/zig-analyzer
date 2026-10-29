@@ -4721,6 +4721,10 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
     if (tok.kind != .identifier) return .{ .ok = null };
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
     if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
+    if (try ide.rename.stdRootLookup(r, def)) |p| {
+        const prefix = try std.fmt.allocPrint(arena, "cannot rename `{s}`", .{za.syntax.ast.identName(tok.text)});
+        return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
+    }
     const lines = try offsets.LineIndex.init(arena, at.text);
     return .{ .ok = .{ .PrepareRenamePlaceholder = .{
         .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
@@ -4747,11 +4751,13 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
 }
 
 /// All references of `def` for renaming it from `old` to `new`, or why they cannot all be
-/// confirmed, in which case renaming would leave a partially renamed result: the search scope is
-/// still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic function, goes
-/// through a member access of unknown type, or depends on instances that grow without bound, or a
-/// file that mentions the name has syntax errors.
+/// confirmed, in which case renaming would leave a partially renamed result: the standard library
+/// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
+/// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
+/// function, goes through a member access of unknown type, or depends on instances that grow
+/// without bound, or a file that mentions the name has syntax errors.
 fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
+    if (try ide.rename.stdRootLookup(r, def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     if (try server.scopeIncompleteFor(r, def)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
     const scope = try server.searchScope(r);
     var ambiguous: ?za.ide_db.search.Reference = null;
