@@ -1,12 +1,12 @@
 //! Find references: coarsely filter candidate files by name, then confirm each occurrence by
 //! precise resolution.
 //!
-//! Candidate files: files that can reach the file containing the definition through an `@import`
-//! chain, plus the remaining files in scope (generic code can access the members of the file
-//! containing the definition without importing it, through an `anytype` value or a comptime type
-//! parameter; see `candidateFiles`), provided that the file index contains the name. A local
-//! name is searched for only in its enclosing member (and the members of containers defined in
-//! its body).
+//! Candidate files: the files in scope that can be compiled together with the file containing
+//! the definition (see `candidateFiles`): the files that can reach it through an `@import` chain,
+//! and the files those reach (generic code can access the members of the file containing the
+//! definition without importing it, through an `anytype` value or a comptime type parameter),
+//! provided that the file index contains the name. A local name is searched for only in its
+//! enclosing member (and the members of containers defined in its body).
 //! Only members in which the name occurs are resolved; name references use name resolution, and
 //! field accesses prefer namespace evaluation, reading the member's type inference result only
 //! when that fails.
@@ -154,16 +154,30 @@ pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
 }
 
 /// Candidate files that may reference definitions in a file whose importers (see `importers`) are
-/// `reach`: those files come first, followed by the remaining files in `scope`. Generic code can
-/// access the members of the file containing a definition without importing it: through the value
-/// of an `anytype` parameter (`x.foo()`, where the type of `x` in an instance comes from that
-/// file) or a comptime type parameter (`M.foo`). Same as ZLS, which searches all files of the
-/// module when using the build system
+/// `reach`: the files in `scope` reachable from `reach` through `@import` chains (through any
+/// files), and `reach` itself. Every compilation that contains the definition has a root that
+/// reaches it, so a file that no importer reaches is never compiled together with the definition.
+/// Generic code in the reachable files can access the members of the file containing the
+/// definition without importing it: through the value of an `anytype` parameter (`x.foo()`, where
+/// the type of `x` in an instance comes from that file) or a comptime type parameter (`M.foo`)
 pub fn candidateFiles(r: *Resolver, reach: []const FileId, scope: []const FileId) resolve.Error![]const FileId {
-    var out: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-    for (reach) |f| try out.put(r.arena, f, {});
-    for (scope) |f| try out.put(r.arena, f, {});
-    return out.keys();
+    var keep: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    for (scope) |f| try keep.put(r.arena, f, {});
+    var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    for (reach) |f| {
+        try keep.put(r.arena, f, {});
+        try seen.put(r.arena, f, {});
+    }
+    var i: usize = 0;
+    while (i < seen.count()) : (i += 1) {
+        const f = seen.keys()[i];
+        const index = try r.ctx.get(FileIndex.Query, f);
+        // Every module the file belongs to may import a different file under a name
+        for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| try seen.put(r.arena, to, {});
+    }
+    var out: std.ArrayList(FileId) = .empty;
+    for (seen.keys()) |f| if (keep.contains(f)) try out.append(r.arena, f);
+    return out.items;
 }
 
 /// Files in `scope` that can reach `target` through an `@import` chain (including `target`

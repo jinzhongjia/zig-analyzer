@@ -506,6 +506,28 @@ test "files with syntax errors that mention the name are reported" {
     try testing.expectEqual(main_file, syntax_error.?);
 }
 
+test "files that are never compiled together with the definition are not searched" {
+    // `script.zig` is a separate root that does not import lib.zig: a syntax error in it that
+    // mentions the name used to make renames of `x` refuse
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = "pub const S = struct { x: u32 };\n";
+    const main = "const lib = @import(\"lib.zig\");\nfn f(s: lib.S) u32 {\n    return s.x;\n}\n";
+    const script = "fn g(p: anytype) u32 {\n    return p.x +;\n}\n";
+    const lib_file = (try w.add("/p/lib.zig", lib)).file;
+    const main_file = (try w.add("/p/main.zig", main)).file;
+    const script_file = (try w.add("/p/script.zig", script)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var syntax_error: ?FileId = null;
+    const def = (try definition.defAt(&r, lib_file, at(lib, "x", 0))).?;
+    const list = try search.findReferences(&r, def, .{ .scope = &.{ lib_file, script_file, main_file }, .syntax_error = &syntax_error });
+    try testing.expectEqual(null, syntax_error);
+    try testing.expectEqual(2, list.len);
+}
+
 test "references in generic code of files that do not import the definition" {
     // Guards against searching only the files that import the file containing the definition:
     // `c.zig` does not import `a.zig` and calls `foo` through an anytype value
