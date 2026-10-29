@@ -248,6 +248,32 @@ test "references to quoted names with escaped quotes" {
     try testing.expectEqualStrings("x:5:@\"\\x66oo\"* x:6:foo x:6:@\"foo\"", try refs(&w, fs, f, at(src, "@\"\\x66", 0), null));
 }
 
+test "bare primitive names are not references to quoted declarations of the same name" {
+    // `f32` in `addf3` is the float type even with `@"f32"` declared: it used to be a reference,
+    // and renaming `@"f32"` rewrote the parameter types
+    const src =
+        \\pub const @"f32" = enum { soft, hard };
+        \\pub fn addf3(a: f32, b: f32) f32 {
+        \\    const mode = @"f32".hard;
+        \\    _ = mode;
+        \\    return a + b;
+        \\}
+        \\fn local() u32 {
+        \\    const @"undefined": u32 = 7;
+        \\    var y: u32 = undefined;
+        \\    y = @"undefined";
+        \\    return y;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:@\"f32\"* x:3:@\"f32\"", try refs(&w, fs, f, at(src, "@\"f32\"", 0), null));
+    try testing.expectEqualStrings("x:8:@\"undefined\"* x:10:@\"undefined\"", try refs(&w, fs, f, at(src, "@\"undefined\"", 0), null));
+}
+
 test "member references inside generic functions cover every call-site instance" {
     const src =
         \\const S = struct { x: u32 };

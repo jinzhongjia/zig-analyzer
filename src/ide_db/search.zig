@@ -334,7 +334,9 @@ const Finder = struct {
             const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
             const range = body.expr_ranges[i];
             switch (e) {
-                .name_ref => |n| if (std.mem.eql(u8, n, f.name)) {
+                // A bare primitive name (`f32`, `null`) is the primitive even where a declaration
+                // written `@"f32"` is in scope
+                .name_ref => |n| if (std.mem.eql(u8, n, f.name) and !body.nameRefIsBuiltin(id)) {
                     const d = try r.resolveName(file, item_index, body, body.expr_scopes[i], n) orelse continue;
                     if (deepEql(d, f.def)) try f.add(file, base + range.start, base + range.end);
                 },
