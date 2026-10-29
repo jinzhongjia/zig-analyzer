@@ -4723,6 +4723,8 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
     _ = try identifierText(arena, params.newName, false);
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    // `@import` and its path string lead to a file, which is not a name in the code
+    if (def == .file) return .{ .failed = "cannot rename: the cursor is on the import of a file, and files cannot be renamed" };
     if (!try server.renamable(r, def)) return error.RenameOutsideWorkspace;
     const old = (try za.ide_db.search.defName(r, def)).?;
     const refs = switch (try server.renameReferences(r, arena, def, old, params.newName)) {

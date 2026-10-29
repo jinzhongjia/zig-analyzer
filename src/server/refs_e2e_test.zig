@@ -123,6 +123,10 @@ test "references, highlight, rename and workspace symbol" {
         // Declarations in the standard library cannot be renamed
         const std_rename = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(main_text, "Allocator") });
         try testing.expect(std_rename.object.get("error") != null);
+        // The import of a workspace file is not a name: it used to be refused as a symbol defined
+        // outside the workspace
+        const import_rename = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "lib\")"), .newName = "helpers" });
+        try testing.expectEqualStrings("cannot rename: the cursor is on the import of a file, and files cannot be renamed", import_rename.object.get("error").?.object.get("message").?.string);
     }
 
     // workspace symbol
