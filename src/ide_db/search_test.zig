@@ -139,6 +139,51 @@ test "references to standard library declarations from project files" {
     try testing.expectEqualStrings("mem:1* mem:4 main:3 ", out.items);
 }
 
+test "references reach files that import the definition through files outside the scope" {
+    // The chains main → std.zig → mem.zig and app2 → config.zig → load.zig pass through files
+    // outside the scope; they used to be dropped once the defining file was in the scope
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const ModuleGraph = database.ModuleGraph;
+    const std_root = try w.add("/zig/std/std.zig", "pub const mem = @import(\"mem.zig\");\n");
+    const mem_src = "pub fn eql() bool {\n    return true;\n}\n";
+    const mem = try w.add("/zig/std/mem.zig", mem_src);
+    const app_src = "const std = @import(\"std\");\npub fn main() void {\n    _ = std.mem.eql();\n}\n";
+    const app = try w.add("/p/main.zig", app_src);
+    // A closed project file between the user and the definition: app2 → config.zig → load.zig
+    const app2_src = "const config = @import(\"config.zig\");\ntest {\n    _ = config.load.load();\n}\n";
+    const app2 = try w.add("/p/app2.zig", app2_src);
+    _ = try w.add("/p/config.zig", "pub const load = @import(\"load.zig\");\n");
+    const load_src = "pub fn load() u32 {\n    return 42;\n}\n";
+    const load = try w.add("/p/load.zig", load_src);
+    try w.setGraph(std_root.file, &.{.{ .root = app.file, .imports = &.{} }}, &.{
+        .{ .file = app.file, .module = 0, .root_module = 0 },
+        .{ .file = std_root.file, .module = ModuleGraph.std_module, .root_module = 0 },
+        .{ .file = mem.file, .module = ModuleGraph.std_module, .root_module = 0 },
+    });
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const Case = struct { def_file: FileId, def_text: []const u8, name: []const u8, scope: []const FileId, only_file: ?FileId, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .def_file = mem.file, .def_text = mem_src, .name = "eql", .scope = &.{ app.file, mem.file }, .only_file = null, .expected = "mem:1* main:3 " },
+        .{ .def_file = mem.file, .def_text = mem_src, .name = "eql", .scope = &.{ app.file, mem.file }, .only_file = app.file, .expected = "main:3 " },
+        .{ .def_file = load.file, .def_text = load_src, .name = "load", .scope = &.{ app2.file, load.file }, .only_file = null, .expected = "app2:3 load:1* " },
+        .{ .def_file = load.file, .def_text = load_src, .name = "load", .scope = &.{ app2.file, load.file }, .only_file = app2.file, .expected = "app2:3 " },
+    };
+    for (cases) |c| {
+        const def = try definition.defAt(&r, c.def_file, @intCast(std.mem.indexOf(u8, c.def_text, c.name).?)) orelse return error.NoDefinition;
+        const list = try search.findReferences(&r, def, .{ .scope = c.scope, .only_file = c.only_file });
+        var out: std.ArrayList(u8) = .empty;
+        for (list) |ref| {
+            const text = (try ctx.get(database.syntax.SourceText, ref.file)).text;
+            try out.print(w.arena.allocator(), "{s}:{d}{s} ", .{ std.fs.path.stem(w.vfs.path(ref.file)), std.mem.count(u8, text[0..ref.start], "\n") + 1, if (ref.is_decl) "*" else "" });
+        }
+        try testing.expectEqualStrings(c.expected, out.items);
+    }
+}
+
 test "enum member names are not references to declarations of the same name" {
     const src =
         \\pub fn read() void {}

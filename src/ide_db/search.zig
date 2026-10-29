@@ -102,8 +102,13 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
             }
         },
         .item => {
-            const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, def_file, opts.scope);
-            for (try importers(r, def_file, opts.scope)) |f| try finder.importing.put(r.arena, f, {});
+            // Only whether the one file can reach the definition matters (document highlight)
+            const reach = if (opts.only_file) |f|
+                (if (f == def_file or try reaches(r, f, def_file)) try r.arena.dupe(FileId, &.{f}) else &.{})
+            else
+                try importers(r, def_file, opts.scope);
+            for (reach) |f| try finder.importing.put(r.arena, f, {});
+            const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, reach, opts.scope);
             for (files) |f| {
                 const index = try r.ctx.get(FileIndex.Query, f);
                 if (!index.contains(name)) continue;
@@ -148,31 +153,30 @@ pub fn projectFiles(r: *Resolver) resolve.Error![]const FileId {
     return out.items;
 }
 
-/// Candidate files that may reference definitions in `target`: files that can reach `target`
-/// through an `@import` chain come first (see `importers`), followed by the remaining files in
-/// `scope`. Generic code can access the members of the file containing a definition without
-/// importing it: through the value of an `anytype` parameter (`x.foo()`, where the type of `x` in
-/// an instance comes from `target`) or a comptime type parameter (`M.foo`). Same as ZLS, which
-/// searches all files of the module when using the build system
-pub fn candidateFiles(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
+/// Candidate files that may reference definitions in a file whose importers (see `importers`) are
+/// `reach`: those files come first, followed by the remaining files in `scope`. Generic code can
+/// access the members of the file containing a definition without importing it: through the value
+/// of an `anytype` parameter (`x.foo()`, where the type of `x` in an instance comes from that
+/// file) or a comptime type parameter (`M.foo`). Same as ZLS, which searches all files of the
+/// module when using the build system
+pub fn candidateFiles(r: *Resolver, reach: []const FileId, scope: []const FileId) resolve.Error![]const FileId {
     var out: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-    for (try importers(r, target, scope)) |f| try out.put(r.arena, f, {});
+    for (reach) |f| try out.put(r.arena, f, {});
     for (scope) |f| try out.put(r.arena, f, {});
     return out.keys();
 }
 
 /// Files in `scope` that can reach `target` through an `@import` chain (including `target`
-/// itself). When `target` is not in `scope` (standard library, dependency packages), the import
-/// chain passes through files outside the scope (project → `std.zig` → `mem.zig`): all files
-/// reachable from the files in scope are collected by following imports, and reverse edges are
-/// built over them; other files outside the scope are not in the result
+/// itself). The chain may pass through files outside the scope (project → `std.zig` → `mem.zig`,
+/// or a closed file that is not in the scope): all files reachable from the files in scope are
+/// collected by following imports, and reverse edges are built over them; files outside the scope
+/// other than `target` are not in the result
 pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
     // Files in scope come first (indices below `scope_len`), followed by the reachable files
     // outside the scope
     var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
     for (scope) |f| try nodes.put(r.arena, f, {});
     const scope_len = nodes.count();
-    const in_scope = nodes.contains(target);
     // Reverse edges: imported file → the files importing it
     var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
     var n: usize = 0;
@@ -184,7 +188,7 @@ pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Er
             const gop = try reverse.getOrPut(r.arena, to);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(r.arena, f);
-            if (!in_scope) try nodes.put(r.arena, to, {});
+            try nodes.put(r.arena, to, {});
         }
     }
     var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
@@ -195,12 +199,28 @@ pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Er
         const from = reverse.get(f) orelse continue;
         for (from.items) |x| try seen.put(r.arena, x, {});
     }
-    if (in_scope) return seen.keys();
     var out: std.ArrayList(FileId) = .empty;
     for (seen.keys()) |f| {
         if (f == target or nodes.getIndex(f).? < scope_len) try out.append(r.arena, f);
     }
     return out.items;
+}
+
+/// Whether `from` can reach `target` through an `@import` chain (through any files)
+pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
+    var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+    try seen.put(r.arena, from, {});
+    var i: usize = 0;
+    while (i < seen.count()) : (i += 1) {
+        const f = seen.keys()[i];
+        const index = try r.ctx.get(FileIndex.Query, f);
+        for (index.imports) |s| {
+            const to = try r.resolveImport(f, s) orelse continue;
+            if (to == target) return true;
+            try seen.put(r.arena, to, {});
+        }
+    }
+    return false;
 }
 
 /// The project-wide reverse import closure is shared between the seed lookups of all members;
