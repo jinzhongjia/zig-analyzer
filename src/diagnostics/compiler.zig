@@ -73,6 +73,11 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 /// When `src_path` does not resolve to an absolute path (a malformed error bundle, see
 /// `absolute`), it is treated as having no location: the error is attached to the start of
 /// `fallback_path`, and the notes and reference trace are placed at the start of the error.
+/// The files are read from disk after the build. A location that carries its source line (the
+/// compiler gives one for errors and for notes not at the error's position) shows whether the
+/// text read is the one the compiler read; when it is not (the file changed during the build), no
+/// location in that file is kept: its errors are dropped with their notes, and notes and
+/// references into it are dropped. The next build that reads the file reports them again.
 pub fn collect(
     gpa: Allocator,
     bundles: []const ErrorBundle,
@@ -84,6 +89,15 @@ pub fn collect(
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const a = arena_state.allocator();
+    var sources: Sources = .{ .a = a, .build_root = build_root, .read_ctx = read_ctx, .read = read };
+    // Find the files that changed after the compiler read them
+    for (bundles) |eb| {
+        if (eb.errorMessageCount() == 0) continue;
+        for (eb.getMessages()) |mi| {
+            try sources.check(eb, eb.getErrorMessage(mi).src_loc);
+            for (eb.getNotes(mi)) |ni| try sources.check(eb, eb.getErrorMessage(ni).src_loc);
+        }
+    }
 
     var lists: std.StringArrayHashMapUnmanaged(std.ArrayList(Item)) = .empty;
     // Dedup: several compile steps may report the same error in the same file. The value is the
@@ -108,6 +122,7 @@ pub fn collect(
             if (msg.src_loc != .none) {
                 const loc = eb.getSourceLocation(msg.src_loc);
                 if (try absolute(a, build_root, eb.nullTerminatedString(loc.src_path))) |p| {
+                    if (sources.stale.contains(p)) continue;
                     path = p;
                     start, end = byteSpan(loc);
                 }
@@ -121,41 +136,37 @@ pub fn collect(
 
             // The notes are followed by the reference trace
             const refs: u32 = if (msg.src_loc != .none) eb.getSourceLocation(msg.src_loc).reference_trace_len else 0;
-            const notes = try a.alloc(Note, msg.notes_len + refs);
-            for (notes[0..msg.notes_len], eb.getNotes(mi)) |*note, ni| {
+            var notes: std.ArrayList(Note) = try .initCapacity(a, msg.notes_len + refs);
+            for (eb.getNotes(mi)) |ni| {
                 const n = eb.getErrorMessage(ni);
-                note.* = .{ .path = path, .start = start, .end = start, .message = try a.dupe(u8, eb.nullTerminatedString(n.msg)) };
+                var note: Note = .{ .path = path, .start = start, .end = start, .message = "" };
                 if (n.src_loc != .none) {
                     const nl = eb.getSourceLocation(n.src_loc);
                     if (try absolute(a, build_root, eb.nullTerminatedString(nl.src_path))) |p| {
+                        if (sources.stale.contains(p)) continue;
                         note.path = p;
                         note.start, note.end = byteSpan(nl);
                     }
                 }
+                note.message = try a.dupe(u8, eb.nullTerminatedString(n.msg));
+                notes.appendAssumeCapacity(note);
             }
-            if (refs != 0) try referenceTrace(a, eb, msg.src_loc, build_root, path, start, notes[msg.notes_len..]);
+            if (refs != 0) try referenceTrace(a, eb, msg.src_loc, refs, build_root, &sources.stale, path, start, &notes);
             const gop = try lists.getOrPut(a, path);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             seen_gop.value_ptr.* = gop.value_ptr.items.len;
-            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes, .compile_log = compile_log });
+            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes.items, .compile_log = compile_log });
         }
     }
 
     var files: std.StringArrayHashMapUnmanaged(FileResult) = .empty;
     // A file that notes point to is not in `files` when it has no errors of its own; its
     // build-time text is saved as well, for shifting the notes
-    var texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (lists.values()) |items| for (items.items) |item| for (item.notes) |n| {
-        if (texts.contains(n.path)) continue;
-        const text = read(read_ctx, a, n.path) orelse continue;
-        try texts.put(a, n.path, text);
+        _ = try sources.text(n.path);
     };
     for (lists.keys(), lists.values()) |path, *items| {
-        const text = texts.get(path) orelse blk: {
-            const t = read(read_ctx, a, path) orelse "";
-            try texts.put(a, path, t);
-            break :blk t;
-        };
+        const text = try sources.text(path) orelse "";
         // Mark AstGen errors: run AstGen on the same text and match by range and message
         const mode = live.modeOf(path);
         const astgen = try live.check(gpa, text, mode);
@@ -168,40 +179,95 @@ pub fn collect(
         try files.put(a, path, .{ .base_text = text, .items = items.items });
     }
     const result = try a.create(BuildResult);
-    result.* = .{ .arena = undefined, .files = files, .texts = texts };
+    result.* = .{ .arena = undefined, .files = files, .texts = sources.texts };
     // Take the arena state after the last allocation
     result.arena = arena_state.state;
     return result;
 }
 
-/// Converts the reference trace following source location `src_loc` into notes, with messages
-/// matching the output of `zig build`. A reference with a location points to the referencing
-/// site; the trailing hidden marker has no location and, like notes without a location, is
-/// placed at the start of the error (`start` in `path`).
-fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLocationIndex, build_root: []const u8, path: []const u8, start: u32, out: []Note) Allocator.Error!void {
+/// Disk texts of the files that the locations of a build point into, read after the build
+const Sources = struct {
+    a: Allocator,
+    build_root: []const u8,
+    read_ctx: *anyopaque,
+    read: ReadFn,
+    texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    unreadable: std.StringHashMapUnmanaged(void) = .empty,
+    /// Files whose text read is not the one the compiler read
+    stale: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Text of `path`, read once; null when it cannot be read
+    fn text(s: *Sources, path: []const u8) Allocator.Error!?[]const u8 {
+        if (s.texts.get(path)) |t| return t;
+        if (s.unreadable.contains(path)) return null;
+        const t = s.read(s.read_ctx, s.a, path) orelse {
+            try s.unreadable.put(s.a, path, {});
+            return null;
+        };
+        try s.texts.put(s.a, path, t);
+        return t;
+    }
+
+    /// Marks the file of `src_loc` stale when the location carries its source line and the text
+    /// read does not have that line at the location's main position, with that position at the
+    /// same column (both as `std.zig.findLineColumn` computes them on the text the compiler read)
+    fn check(s: *Sources, eb: ErrorBundle, src_loc: ErrorBundle.SourceLocationIndex) Allocator.Error!void {
+        if (src_loc == .none) return;
+        const loc = eb.getSourceLocation(src_loc);
+        if (loc.source_line == 0) return;
+        const path = try absolute(s.a, s.build_root, eb.nullTerminatedString(loc.src_path)) orelse return;
+        const t = try s.text(path) orelse "";
+        const main = loc.span_main;
+        const same = main <= t.len and blk: {
+            const line_start = if (std.mem.lastIndexOfScalar(u8, t[0..main], '\n')) |i| i + 1 else 0;
+            const line_end = std.mem.indexOfScalarPos(u8, t, main, '\n') orelse t.len;
+            break :blk main - line_start == loc.column and std.mem.eql(u8, t[line_start..line_end], eb.nullTerminatedString(loc.source_line));
+        };
+        if (!same) try s.stale.put(s.a, path, {});
+    }
+};
+
+/// Appends the `count` references of the reference trace following source location `src_loc` to
+/// `out` as notes, with messages matching the output of `zig build`; references into a `stale`
+/// file are left out. A reference with a location points to the referencing site; the trailing
+/// hidden marker has no location and, like notes without a location, is placed at the start of
+/// the error (`start` in `path`).
+fn referenceTrace(
+    a: Allocator,
+    eb: ErrorBundle,
+    src_loc: ErrorBundle.SourceLocationIndex,
+    count: u32,
+    build_root: []const u8,
+    stale: *const std.StringHashMapUnmanaged(void),
+    path: []const u8,
+    start: u32,
+    out: *std.ArrayList(Note),
+) Allocator.Error!void {
     // ErrorBundle has no public interface for reading the reference trace: it is read from
     // `extra` according to its layout. `SourceLocation` is followed by the `ReferenceTrace`s one
     // after another, each storing `decl_name` and `src_loc` in field order.
     const first = @backingInt(src_loc) + @typeInfo(ErrorBundle.SourceLocation).@"struct".field_names.len;
     const stride = @typeInfo(ErrorBundle.ReferenceTrace).@"struct".field_names.len;
-    for (out, 0..) |*note, k| {
+    for (0..count) |k| {
         const at = first + k * stride;
         const decl_name: ErrorBundle.String = eb.extra[at];
         const ref_loc: ErrorBundle.SourceLocationIndex = @fromBackingInt(eb.extra[at + 1]);
-        note.* = .{ .path = path, .start = start, .end = start, .message = "" };
+        var note: Note = .{ .path = path, .start = start, .end = start, .message = "" };
         if (ref_loc != .none) {
             const rl = eb.getSourceLocation(ref_loc);
             if (try absolute(a, build_root, eb.nullTerminatedString(rl.src_path))) |p| {
+                if (stale.contains(p)) continue;
                 note.path = p;
                 note.start, note.end = byteSpan(rl);
             }
             note.message = try std.fmt.allocPrint(a, "referenced by: {s}", .{eb.nullTerminatedString(decl_name)});
         } else if (decl_name != 0) {
             // Hidden marker: `decl_name` is the number of hidden references
-            note.message = try std.fmt.allocPrint(a, "{d} reference(s) hidden; use '-freference-trace={d}' to see all references", .{ decl_name, decl_name + out.len - 1 });
+            note.message = try std.fmt.allocPrint(a, "{d} reference(s) hidden; use '-freference-trace={d}' to see all references", .{ decl_name, @as(usize, decl_name) + count - 1 });
         } else {
             note.message = "remaining reference traces hidden; use '-freference-trace' to see all reference traces";
         }
+        out.appendAssumeCapacity(note);
     }
 }
 

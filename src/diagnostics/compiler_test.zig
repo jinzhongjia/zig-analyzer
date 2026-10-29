@@ -482,6 +482,99 @@ fn traceBundle() !ErrorBundle {
     return wip.toOwnedBundle("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")\n");
 }
 
+const lib_v1 =
+    \\pub fn get() u8 {
+    \\    const big: u8 = 256;
+    \\    return big;
+    \\}
+    \\
+;
+const lib_v2 = "// one\n// two\n" ++ lib_v1;
+
+/// Disk whose `lib.zig` has the text `lib`
+const LibDisk = struct {
+    lib: []const u8,
+
+    fn read(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
+        const self: *LibDisk = @ptrCast(@alignCast(ctx));
+        if (std.mem.endsWith(u8, path, "lib.zig")) return gpa.dupe(u8, self.lib) catch null;
+        return Disk.read(ctx, gpa, path);
+    }
+};
+
+/// Source location of `needle` in `text`, with its line, column and source line as the compiler
+/// reports them
+fn compilerLocation(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: []const u8, reference_trace_len: u32) !ErrorBundle.SourceLocationIndex {
+    const start: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
+    const loc = std.zig.findLineColumn(text, start);
+    return wip.addSourceLocation(.{
+        .src_path = try wip.addString(path),
+        .line = @intCast(loc.line),
+        .column = @intCast(loc.column),
+        .span_start = start,
+        .span_main = start,
+        .span_end = start + @as(u32, @intCast(needle.len)),
+        .source_line = try wip.addString(loc.source_line),
+        .reference_trace_len = reference_trace_len,
+    });
+}
+
+/// A build that read `lib` as `src/lib.zig`: an error on `256` in it, and an error in main.zig with
+/// a note and a reference into it
+fn libBundle(lib: []const u8) !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(testing.allocator);
+    defer wip.deinit();
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString("type 'u8' cannot represent integer value '256'"), .src_loc = try compilerLocation(&wip, "src/lib.zig", lib, "256", 0) });
+    const note_loc = try compilerLocation(&wip, "src/lib.zig", lib, "big;", 0);
+    const ref_loc = try location(&wip, "src/lib.zig", lib, "get", 0);
+    const err_loc = try compilerLocation(&wip, "src/main.zig", main_text, "\"s\"", 1);
+    try wip.addReferenceTrace(.{ .decl_name = try wip.addString("get"), .src_loc = ref_loc });
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("a note"), .src_loc = note_loc }},
+    );
+    return wip.toOwnedBundle("");
+}
+
+test "collect: locations in a file changed after the compiler read it are discarded" {
+    const gpa = testing.allocator;
+    const lib_path = native("/proj/src/lib.zig");
+    const main_path = native("/proj/src/main.zig");
+    var v1 = try libBundle(lib_v1);
+    defer v1.deinit(gpa);
+
+    // The disk still has the text the compiler read
+    var disk: LibDisk = .{ .lib = lib_v1 };
+    const same = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    defer same.release(gpa);
+    try testing.expectEqual(std.mem.indexOf(u8, lib_v1, "256").?, same.files.get(lib_path).?.items[0].start);
+    try testing.expectEqual(2, same.files.get(main_path).?.items[0].notes.len);
+
+    // Guards against applying the spans to a text written during the build, which put the error
+    // inside a comment: everything located in lib.zig is dropped
+    disk.lib = lib_v2;
+    const changed = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    defer changed.release(gpa);
+    try testing.expect(changed.files.get(lib_path) == null);
+    const main = changed.files.get(main_path).?;
+    try testing.expectEqual(1, main.items.len);
+    try testing.expectEqual(0, main.items[0].notes.len);
+
+    // The build after the change places the error on the new text
+    var v2 = try libBundle(lib_v2);
+    defer v2.deinit(gpa);
+    const rebuilt = try compiler.collect(gpa, &.{v2}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    defer rebuilt.release(gpa);
+    const lib = rebuilt.files.get(lib_path).?;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const lines = try offsets.LineIndex.init(arena.allocator(), lib.base_text);
+    const range = lines.range(lib.items[0].start, lib.items[0].end, .utf8);
+    try testing.expectEqual(3, range.start.line);
+    try testing.expectEqual(20, range.start.character);
+    try testing.expectEqual(2, rebuilt.files.get(main_path).?.items[0].notes.len);
+}
+
 test "collect: reference trace and compile log output are kept" {
     const gpa = testing.allocator;
     var eb = try traceBundle();
