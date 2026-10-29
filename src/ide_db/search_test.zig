@@ -580,3 +580,37 @@ test "references in generic code of files that do not import the definition" {
     try testing.expectEqual(fc, list[1].file);
     try testing.expectEqual(at(c_src, "foo", 0), list[1].start);
 }
+
+test "members of a namespace chosen per configuration refer to every choice" {
+    // Under the current configuration `Impl` is posix.zig, but on Windows `Impl.open` is win.zig's
+    // `open`: it used to be no reference to it, and renaming either broke the other target
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const impl_src =
+        \\const native = .linux;
+        \\const win = @import("win.zig");
+        \\const posix = @import("posix.zig");
+        \\const Impl = switch (native) { .windows => win, else => posix };
+        \\pub fn main() void {
+        \\    Impl.open();
+        \\}
+    ;
+    const fm = (try w.add("/p/main.zig", impl_src)).file;
+    const fw = (try w.add("/p/win.zig", "pub fn open() void {}\n")).file;
+    const fp = (try w.add("/p/posix.zig", "pub fn open() void {}\n")).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const use = at(impl_src, "open", 0);
+    for ([_]FileId{ fw, fp }) |def_file| {
+        const def = (try definition.defAt(&r, def_file, 7)).?;
+        var ambiguous: ?search.Reference = null;
+        const list = try search.findReferences(&r, def, .{ .scope = &.{ fm, fw, fp }, .ambiguous = &ambiguous });
+        try testing.expectEqual(2, list.len);
+        try testing.expect(for (list) |ref| {
+            if (ref.file == fm and ref.start == use) break true;
+        } else false);
+        try testing.expectEqual(use - "Impl.".len, ambiguous.?.start);
+    }
+}

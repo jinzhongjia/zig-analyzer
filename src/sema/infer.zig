@@ -3069,6 +3069,16 @@ fn alternativeContainers(r: *Resolver, a: Allocator, owner: hir.OwnerKey, out: *
     for (leaves.items) |leaf| try leafAlternatives(r, a, owner.file, item, body, res.exprs, leaf, out, depth);
 }
 
+/// Possible values (container types) of the declaration `def` across build configurations (see
+/// `alternativeContainers`), the current one included: e.g. both files for
+/// `const Impl = if (builtin.os.tag == .windows) @import("win.zig") else @import("posix.zig")`
+pub fn declAlternatives(r: *Resolver, a: Allocator, def: resolve.Def) Error![]const Index {
+    const key = try defKey(r, def) orelse return &.{};
+    var out: std.ArrayList(Index) = .empty;
+    try alternativeContainers(r, a, key, &out, 0);
+    return out.items;
+}
+
 /// Maximum depth along alias and inference chains when looking up candidates in other
 /// configurations: mutually referencing declarations would not terminate
 const max_alternative_depth = 16;

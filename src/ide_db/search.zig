@@ -343,9 +343,12 @@ const Finder = struct {
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
                     // Namespace declarations are compared directly; other members (field tags of
-                    // tagged unions, declarations in other targets' branches) come from inference
+                    // tagged unions, declarations in other targets' branches) come from inference.
+                    // Either way, a namespace chosen per build configuration has the member of
+                    // each choice
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
-                    const target: Target = if (ns_def) |d| (if (deepEql(d, f.def)) .hit else .miss) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    const current: Target = if (ns_def) |d| (if (deepEql(d, f.def)) .hit else .miss) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
                     switch (target) {
                         .hit => try f.addLastToken(file, base + range.end),
                         .miss => {},
@@ -380,6 +383,43 @@ const Finder = struct {
         const x = try f.r.ctx.get(sema.Infer, .{ .owner = try f.r.ownerKey(file, item_index), .mode = .full });
         res.* = x;
         return x;
+    }
+
+    /// Whether the member named like `def` of the namespace `lhs` is `def` under some build
+    /// configuration (`here`: under the current one). A namespace that a declaration chooses per
+    /// configuration (`const Impl = if (builtin.os.tag == .windows) @import("win.zig") else
+    /// @import("posix.zig")`) has the member of each choice: the access refers to `def` if any of
+    /// them is `def`, and is recorded as ambiguous when others are not (renaming one would break
+    /// the build for the other configurations)
+    fn configurations(f: *Finder, file: FileId, item_index: u32, body: *const Body, lhs: Body.ExprId, here: bool, at: Reference) resolve.Error!Target {
+        if (here and f.ambiguous == null) return .hit;
+        var hit = here;
+        var miss = !here;
+        for (try f.alternatives(file, item_index, body, lhs)) |t| {
+            const ns = try sema.namespaceOfType(f.r, t) orelse continue;
+            const d = try f.r.memberDef(ns, f.name) orelse continue;
+            if (deepEql(d, f.def)) hit = true else miss = true;
+        }
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
+        };
+        return if (hit) .hit else .miss;
+    }
+
+    /// The containers the namespace `lhs` may be under the build configurations that the
+    /// declaration it names chooses between (see `infer.declAlternatives`)
+    fn alternatives(f: *Finder, file: FileId, item_index: u32, body: *const Body, lhs: Body.ExprId) resolve.Error![]const InternPool.Index {
+        const r = f.r;
+        const decl: Def = switch (body.expr(lhs)) {
+            .name_ref => |n| try r.resolveName(file, item_index, body, body.expr_scopes[@backingInt(lhs)], n) orelse return &.{},
+            .field_access => |fa| blk: {
+                const ns = try r.evalNamespace(file, item_index, body, fa.lhs) orelse return &.{};
+                break :blk try r.memberDef(ns, fa.field orelse return &.{}) orelse return &.{};
+            },
+            else => return &.{},
+        };
+        if (decl != .item) return &.{};
+        return infer.declAlternatives(r, r.arena, decl);
     }
 
     /// Whether the member recorded in the inference result (field, method, decl literal, enum
