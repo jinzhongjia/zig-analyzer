@@ -527,7 +527,7 @@ pub fn computeComptimeOnly(r: *Resolver, t: Index) Error!bool {
     if (value.isComptimeOnly(ip, t)) return true;
     switch (ip.key(t)) {
         .container_type => |c| {
-            if (c.kind != .@"struct" and c.kind != .@"union") return false;
+            if (!c.kind.isStruct() and c.kind != .@"union") return false;
             const ns = try queries.namespaceOfType(r, t) orelse return false;
             const tree = try r.itemTree(ns.file);
             for (tree.containerMembers(ns.container)) |m| {
@@ -902,7 +902,7 @@ const Evaluator = struct {
             .anon_struct_type => |s| s.names.len,
             .reified_type => |rt| if (rt.kind == .@"struct") rt.names.len else null,
             .ptr_type => |p| if (p.size == .one) try ev.typeElemCount(p.child) else null,
-            .container_type => |c| if (c.kind == .@"struct" or c.kind == .file) (if (try ev.fieldsOf(t)) |f| f.len else null) else null,
+            .container_type => |c| if (c.kind.isStruct()) (if (try ev.fieldsOf(t)) |f| f.len else null) else null,
             else => null,
         };
     }

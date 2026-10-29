@@ -1487,7 +1487,7 @@ fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.Fiel
         else => ty,
     };
     switch (ip.key(t)) {
-        .container_type => |c| if (c.kind != .@"struct" and c.kind != .@"union") return,
+        .container_type => |c| if (!c.kind.isStruct() and c.kind != .@"union") return,
         else => return,
     }
     const ns = try queries.namespaceOfType(r, t) orelse return;

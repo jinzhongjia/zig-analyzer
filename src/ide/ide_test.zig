@@ -2857,6 +2857,8 @@ test "completion: builtins, labels, init fields and import names" {
         .{ "const s: S = .{ .x = 1, .<|> };", "y z" },
         .{ "const s = S{ .<|> };", "x y z" },
         .{ "const s: ?S = .{ .y = 2, .<|> };", "x z" },
+        // Fields of a file, which is a struct
+        .{ "w: u8,\nconst s: @This() = .{ .<|> };", "w" },
         // import: module names (only the fixed three without a project)
         .{ "const a = @import(\"<|>\");", "std builtin root" },
         // No completion in comments and strings (it used to list every name in scope)
