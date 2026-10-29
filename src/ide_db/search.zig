@@ -69,9 +69,10 @@ pub const Options = struct {
     scope: []const FileId,
     /// Search only in this file (document highlight)
     only_file: ?FileId = null,
-    /// When not null, records the first ambiguous reference: a member access in a generic function
-    /// body that refers to `def` under some call-site instances and to other definitions under
-    /// others (renaming would break the other instances, so it should be refused)
+    /// When not null, records the first ambiguous reference: a member access that refers to `def`
+    /// under some call-site instances of its generic function, iterations of its loop, or build
+    /// configurations of its namespace, and to other definitions under others (renaming would
+    /// break the others, so it should be refused; see `ambiguous_message`)
     ambiguous: ?*?Reference = null,
     /// When not null, records the first member access with the same name that cannot be confirmed
     /// (field access, enum literal, field in an initializer): the type of the left-hand side or the
@@ -86,6 +87,9 @@ pub const Options = struct {
     /// `seed.AllInstances`): it may or may not be a reference in the other instances
     incomplete: ?*?Reference = null,
 };
+
+/// Why an ambiguous reference (see `Options.ambiguous`) prevents a rename or fix
+pub const ambiguous_message = "this reference also refers to other declarations in other instantiations of its generic function, iterations of its loop, or build configurations";
 
 /// All references to `def` (including the definition itself), sorted by file and position
 pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Reference {
@@ -426,10 +430,12 @@ const Finder = struct {
     /// member, initializer field) is `def`.
     /// When abstract inference inside a generic function body cannot determine it, all call-site
     /// instances are checked: it is a reference if any instance refers to `def`; if other instances
-    /// refer to other definitions as well, it is recorded as ambiguous (`at`). The result
-    /// is `unknown` when neither abstract inference nor any instance determines the member.
+    /// refer to other definitions as well, it is recorded as ambiguous (`at`). In a loop or an
+    /// `inline` prong inferred per iteration (a heterogeneous `inline for`), each iteration is
+    /// checked the same way. The result is `unknown` when none of them determines the member.
     fn refersTo(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, l: Lookup, at: Reference) resolve.Error!Target {
-        if (l.member(try f.inferred(res, file, item_index))) |m| {
+        const abstract = try f.inferred(res, file, item_index);
+        if (l.member(abstract)) |m| {
             const d = try keyDef(f.r, m) orelse return .miss;
             return if (deepEql(d, f.def)) .hit else .miss;
         }
@@ -442,6 +448,15 @@ const Finder = struct {
             const d = try keyDef(f.r, m) orelse continue;
             if (deepEql(d, f.def)) hit = true else miss = true;
         }
+        if (!hit and !miss) {
+            const body = try f.r.body(file, item_index);
+            const rel = body.range(l.e).start;
+            try f.iterationMembers(owner, body, abstract, null, rel, l, &hit, &miss);
+            for (all.list) |inst| {
+                const inst_res = try f.r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+                try f.iterationMembers(owner, body, inst_res, inst, rel, l, &hit, &miss);
+            }
+        }
         if (!all.complete) if (f.incomplete) |slot| if (slot.* == null) {
             slot.* = at;
         };
@@ -450,6 +465,17 @@ const Finder = struct {
         };
         if (hit) return .hit;
         return if (miss) .miss else .unknown;
+    }
+
+    /// Compares the member of `l` in each iteration of the per-iteration region containing `rel`
+    /// (see `seed.iterationResults`) with `def`
+    fn iterationMembers(f: *Finder, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?InternPool.Index, rel: u32, l: Lookup, hit: *bool, miss: *bool) resolve.Error!void {
+        if (res.exprs.len != body.exprs.len) return;
+        for (try seed.iterationResults(f.r, owner, body, res, inst, rel)) |iteration| {
+            const m = l.member(iteration) orelse continue;
+            const d = try keyDef(f.r, m) orelse continue;
+            if (deepEql(d, f.def)) hit.* = true else miss.* = true;
+        }
     }
 
     /// A field access whose member cannot be determined: when the type of the left-hand side is

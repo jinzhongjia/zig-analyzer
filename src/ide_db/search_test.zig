@@ -659,3 +659,46 @@ test "members of a namespace chosen per configuration refer to every choice" {
         try testing.expectEqual(use - "Impl.".len, ambiguous.?.start);
     }
 }
+
+test "member accesses in a heterogeneous inline for refer to the member of each iteration" {
+    // `shape.area()` is Circle.area in the first iteration and Square.area in the second: goto and
+    // hover resolved it per iteration, but references dropped it and rename broke the build
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const shapes_src =
+        \\pub const Circle = struct {
+        \\    pub fn area(_: Circle) u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\pub const Square = struct {
+        \\    pub fn area(_: Square) u32 {
+        \\        return 2;
+        \\    }
+        \\};
+    ;
+    const total_src =
+        \\const shapes = @import("shapes.zig");
+        \\fn total(c: shapes.Circle, s: shapes.Square) u32 {
+        \\    var sum: u32 = 0;
+        \\    inline for (.{ c, s }) |shape| sum += shape.area();
+        \\    return sum;
+        \\}
+    ;
+    const fs = (try w.add("/p/shapes.zig", shapes_src)).file;
+    const fm = (try w.add("/p/main.zig", total_src)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const use = at(total_src, "area", 0);
+    for ([_]usize{ 0, 1 }) |nth| {
+        const def = (try definition.defAt(&r, fs, at(shapes_src, "area", nth))).?;
+        var ambiguous: ?search.Reference = null;
+        const list = try search.findReferences(&r, def, .{ .scope = &.{ fs, fm }, .ambiguous = &ambiguous });
+        try testing.expectEqual(2, list.len);
+        try testing.expectEqual(fm, list[1].file);
+        try testing.expectEqual(use, list[1].start);
+        try testing.expectEqual(use - "shape.".len, ambiguous.?.start);
+    }
+}

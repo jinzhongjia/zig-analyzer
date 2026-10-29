@@ -4814,7 +4814,7 @@ fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.nam
         .syntax_error = &syntax_error,
     });
     if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
-    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
+    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, za.ide_db.search.ambiguous_message) };
     if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
     if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
     const rules = try server.originRules(arena);
