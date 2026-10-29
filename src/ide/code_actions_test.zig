@@ -1248,6 +1248,84 @@ test "extract to local constant keeps operands that are used by reference" {
     );
 }
 
+test "extract to local constant keeps the result type" {
+    // Without the result type of the original position these no longer compile: a decl literal
+    // call becomes a call of an enum literal, `@fromBackingInt` has no destination type, and
+    // number literals chosen at runtime are comptime_int values that depend on runtime control flow
+    for ([_][]const u8{
+        "const S = struct {\n    x: u32,\n    fn init(v: u32) S {\n        return .{ .x = v };\n    }\n};\nfn f() u32 {\n    const s: S = «.init(5)»;\n    return s.x;\n}",
+        "const S = struct {\n    x: u32,\n    fn init(v: u32) !S {\n        return .{ .x = v };\n    }\n};\nfn f() !u32 {\n    const s: S = «try .init(5)»;\n    return s.x;\n}",
+        "const S = struct {\n    x: u32,\n    fn init(v: u32) S {\n        return .{ .x = v };\n    }\n};\nfn use(s: S) u32 {\n    return s.x;\n}\nfn f() u32 {\n    return use(«.init(5)»);\n}",
+        "const P = packed struct(u8) { a: u4, b: u4 };\nfn f(raw: u8) P {\n    const p: P = «@fromBackingInt(raw)»;\n    return p;\n}",
+    }) |text| {
+        const got = try apply(text, "extract");
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings("no action", got) catch |err| {
+            std.debug.print("{s}\n", .{text});
+            return err;
+        };
+    }
+    try expectAction(
+        \\fn pick(c: bool) u8 {
+        \\    const x: u8 = «if (c) 1 else 2»;
+        \\    return x;
+        \\}
+    , "extract",
+        \\fn pick(c: bool) u8 {
+        \\    const value: u8 = if (c) 1 else 2;
+        \\    const x: u8 = value;
+        \\    return x;
+        \\}
+    );
+    try expectAction(
+        \\fn f(c: bool) i32 {
+        \\    var r: i32 = 0;
+        \\    r += «if (c) 100 else -1»;
+        \\    return r;
+        \\}
+    , "extract",
+        \\fn f(c: bool) i32 {
+        \\    var r: i32 = 0;
+        \\    const value: i32 = if (c) 100 else -1;
+        \\    r += value;
+        \\    return r;
+        \\}
+    );
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u8 {
+        \\    return «switch (e) {
+        \\        .a => 1,
+        \\        .b => 2,
+        \\        .c => 4,
+        \\    }»;
+        \\}
+    , "extract",
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u8 {
+        \\    const value: u8 = switch (e) {
+        \\        .a => 1,
+        \\        .b => 2,
+        \\        .c => 4,
+        \\    };
+        \\    return value;
+        \\}
+    );
+    // Under a comptime-known condition the literal is a comptime_int as in the original
+    try expectAction(
+        \\fn f() u32 {
+        \\    const k = «if (true) 1 else 2»;
+        \\    return k;
+        \\}
+    , "extract",
+        \\fn f() u32 {
+        \\    const value = if (true) 1 else 2;
+        \\    const k = value;
+        \\    return k;
+        \\}
+    );
+}
+
 /// Verifies the edit result with the compiler's syntax tree and reads the byte value from the
 /// string token.
 fn stringValue(source: []const u8) ![]u8 {

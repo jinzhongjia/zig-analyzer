@@ -268,7 +268,7 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
     // Expressions whose type depends on the result location (such as `@intCast(x)`): the extracted
     // constant is annotated explicitly with the type at the original position; when the type cannot
     // be written out, nothing is extracted
-    const annotation: []const u8 = if (needsResultType(b, e)) blk: {
+    const annotation: []const u8 = if (needsResultType(b, res, e)) blk: {
         const ty = res.exprs[@backingInt(e)].ty;
         if (!isPlainType(r.ctx.db.env.ip, ty)) return null;
         break :blk try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, ty)});
@@ -484,29 +484,55 @@ pub const pure_builtins = [_][]const u8{
     "@mulWithOverflow", "@shlWithOverflow", "@Vector",    "@Type",       "@embedFile",    "@src",
 };
 
-/// Casts whose type is determined by the result location (consistent with `casts` in `Infer`)
+/// Builtins whose type is determined by the result location (consistent with `casts` in `Infer`,
+/// plus `@fromBackingInt`)
 const result_typed_builtins = [_][]const u8{
-    "@intCast", "@truncate",  "@floatCast",     "@floatFromInt", "@intFromFloat",   "@enumFromInt", "@bitCast",
-    "@ptrCast", "@alignCast", "@addrSpaceCast", "@ptrFromInt",   "@fieldParentPtr", "@errorCast",   "@splat",
+    "@intCast",       "@truncate",       "@floatCast",      "@floatFromInt", "@intFromFloat",
+    "@enumFromInt",   "@fromBackingInt", "@bitCast",        "@ptrCast",      "@alignCast",
+    "@addrSpaceCast", "@ptrFromInt",     "@fieldParentPtr", "@errorCast",    "@splat",
 };
 
 /// The type (or validity) of the expression depends on its result location: used alone as the
-/// initial value of a `const`, it needs a type annotation
-fn needsResultType(b: *const Body, e: Body.ExprId) bool {
+/// initial value of a `const`, it needs a type annotation. This includes decl literal calls
+/// (`.init(x)`, looked up in the result type), and `if` / `switch` choosing among number literals
+/// by a condition that is not comptime-known (without a result type the literals are comptime_int
+/// / comptime_float values, which cannot depend on runtime control flow).
+fn needsResultType(b: *const Body, res: queries.Infer.Value, e: Body.ExprId) bool {
     return switch (b.expr(e)) {
         .builtin_call => |c| for (result_typed_builtins) |n| {
             if (std.mem.eql(u8, c.name, n)) break true;
         } else false,
+        .call => |c| b.expr(c.callee) == .enum_literal,
         .init => |i| i.ty == null,
         .enum_literal => true,
         .name_ref => |n| std.mem.eql(u8, n, "undefined") or std.mem.eql(u8, n, "null"),
-        .@"if" => |f| needsResultType(b, f.then) or (if (f.@"else") |x| needsResultType(b, x) else false),
-        .@"switch" => |sw| for (sw.prongs) |p| {
-            if (needsResultType(b, p.body)) break true;
-        } else false,
-        .@"catch" => |c| needsResultType(b, c.lhs) or needsResultType(b, c.rhs),
-        .binary => |bin| bin.op == .keyword_orelse and (needsResultType(b, bin.lhs) or needsResultType(b, bin.rhs)),
-        .prefix => |p| p.op == .keyword_try and needsResultType(b, p.operand),
+        .@"if" => |f| {
+            const other = f.@"else" orelse return needsResultType(b, res, f.then);
+            if (needsResultType(b, res, f.then) or needsResultType(b, res, other)) return true;
+            return res.exprs[@backingInt(f.cond)].val == null and numberOrExit(b, f.then) and numberOrExit(b, other);
+        },
+        .@"switch" => |sw| {
+            var numbers = res.exprs[@backingInt(sw.operand)].val == null;
+            for (sw.prongs) |p| {
+                if (needsResultType(b, res, p.body)) return true;
+                numbers = numbers and numberOrExit(b, p.body);
+            }
+            return numbers;
+        },
+        .@"catch" => |c| needsResultType(b, res, c.lhs) or needsResultType(b, res, c.rhs),
+        .binary => |bin| bin.op == .keyword_orelse and (needsResultType(b, res, bin.lhs) or needsResultType(b, res, bin.rhs)),
+        .prefix => |p| p.op == .keyword_try and needsResultType(b, res, p.operand),
+        else => false,
+    };
+}
+
+/// A branch value that is a number or character literal (also negated), or a branch that leaves
+/// without a value (which does not take part in the peer type)
+fn numberOrExit(b: *const Body, e: Body.ExprId) bool {
+    return switch (b.expr(e)) {
+        .literal => |text| text.len > 0 and (std.ascii.isDigit(text[0]) or text[0] == '\''),
+        .prefix => |p| p.op == .minus and b.expr(p.operand) == .literal and numberOrExit(b, p.operand),
+        .@"return", .@"break", .@"continue", .@"unreachable" => true,
         else => false,
     };
 }
