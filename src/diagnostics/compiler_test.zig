@@ -206,6 +206,129 @@ test "merge: notes in another file are remapped by that file's edits" {
     try testing.expectEqual(4, related.location.range.start.character);
 }
 
+/// Span of the `n`th (from 0) occurrence of `needle` in `text`
+fn spanOf(text: []const u8, needle: []const u8, n: usize) [2]u32 {
+    var at: usize = std.mem.indexOf(u8, text, needle).?;
+    for (0..n) |_| at = std.mem.indexOfPos(u8, text, at + 1, needle).?;
+    return .{ @intCast(at), @intCast(at + needle.len) };
+}
+
+/// Merges a build result for `base` with one non-AstGen error on each of `spans` into the buffer
+/// `text`; returns the published ranges as "line:character-line:character"
+fn remappedRanges(a: Allocator, base: []const u8, text: []const u8, spans: []const [2]u32) ![]const []const u8 {
+    const items = try a.alloc(compiler.Item, spans.len);
+    for (items, spans) |*item, s| item.* = .{ .start = s[0], .end = s[1], .message = "error", .is_astgen = false, .notes = &.{} };
+    const result: compiler.FileResult = .{ .base_text = base, .items = items };
+    var dummy: u8 = 0;
+    const diags = try compiler.merge(a, .{
+        .text = text,
+        .lines = try offsets.LineIndex.init(a, text),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = NoOther.get,
+        .other_ctx = &dummy,
+    });
+    const out = try a.alloc([]const u8, diags.len);
+    for (diags, out) |d, *o| o.* = try std.fmt.allocPrint(a, "{d}:{d}-{d}:{d}", .{ d.range.start.line, d.range.start.character, d.range.end.line, d.range.end.character });
+    return out;
+}
+
+fn expectRanges(expected: []const []const u8, actual: []const []const u8) !void {
+    errdefer for (actual) |r| std.debug.print("got {s}\n", .{r});
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, r| try testing.expectEqualStrings(e, r);
+}
+
+const two_functions =
+    \\export fn f() void {
+    \\}
+    \\export fn g() void {
+    \\    const x: u8 = 300;
+    \\    _ = x;
+    \\}
+    \\
+;
+
+test "merge: a range after several modified regions shifts by the total length difference once" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const on_300 = &.{spanOf(two_functions, "300", 0)};
+    // Guards against adding the shift of a region again for every later region, which moved the
+    // error onto ";\n " or past the end of the file
+    try expectRanges(&.{"4:18-4:21"}, try remappedRanges(a, two_functions, "//\n" ++ two_functions, on_300));
+    // Two separated edits: a line inserted at the top and a renamed function
+    const renamed = try std.mem.replaceOwned(u8, a, "//\n" ++ two_functions, "fn g()", "fn gg()");
+    try expectRanges(&.{"4:18-4:21"}, try remappedRanges(a, two_functions, renamed, on_300));
+    // A deleted header keeps the error
+    const header = "//! a\n//! b\n//! c\n" ++ two_functions;
+    try expectRanges(&.{"3:18-3:21"}, try remappedRanges(a, header, two_functions, &.{spanOf(header, "300", 0)}));
+    // Two edits on lines that are all unique
+    const unique = "const a = 1;\nconst b = 2;\nconst c = 3;\nconst x: u8 = 300;\n";
+    const edited = "const a = 10;\nconst b = 2;\nconst c = 30;\nconst x: u8 = 300;\n";
+    try expectRanges(&.{"3:14-3:17"}, try remappedRanges(a, unique, edited, &.{spanOf(unique, "300", 0)}));
+}
+
+test "merge: a note after several modified regions of its file shifts by the total length difference once" {
+    const main = "fn f() void {\n    g();\n}\n";
+    const main_start: u32 = @intCast(std.mem.indexOf(u8, main, "g();").?);
+    const note = spanOf(two_functions, "300", 0);
+    const result: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = main_start,
+        .end = main_start + 3,
+        .message = "error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note[0], .end = note[1], .message = "note" }},
+    }} };
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (!std.mem.endsWith(u8, path, "other.zig")) return null;
+            return .{ .uri = "file:///proj/src/other.zig", .text = "//\n" ++ two_functions, .base_text = two_functions };
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dummy: u8 = 0;
+    const diags = try compiler.merge(a, .{
+        .text = main,
+        .lines = try offsets.LineIndex.init(a, main),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = Ctx.get,
+        .other_ctx = &dummy,
+    });
+    try testing.expectEqual(1, diags.len);
+    const range = diags[0].relatedInformation.?[0].location.range;
+    try testing.expectEqual(4, range.start.line);
+    try testing.expectEqual(18, range.start.character);
+    try testing.expectEqual(4, range.end.line);
+    try testing.expectEqual(21, range.end.character);
+}
+
+test "combine: an older result shifted over several modified regions matches the newest one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const newer_text = "//\n" ++ two_functions;
+    const message = "type 'u8' cannot represent integer value '300'";
+    const new = spanOf(newer_text, "300", 0);
+    const old = spanOf(two_functions, "300", 0);
+    const newest: compiler.FileResult = .{ .base_text = newer_text, .items = &.{
+        .{ .start = new[0], .end = new[1], .message = message, .is_astgen = false, .notes = &.{} },
+    } };
+    const older: compiler.FileResult = .{ .base_text = two_functions, .items = &.{
+        .{ .start = old[0], .end = old[1], .message = message, .is_astgen = false, .notes = &.{} },
+    } };
+    const c = try compiler.combine(arena.allocator(), &.{ &newest, &older });
+    // Guards against shifting the older error too far, which kept it as a ghost duplicate
+    try testing.expectEqual(1, c.items.len);
+    try testing.expectEqual(new[0], c.items[0].start);
+}
+
 test "merge: malformed compiler spans do not overflow when remapped" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

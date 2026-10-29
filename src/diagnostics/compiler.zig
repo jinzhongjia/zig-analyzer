@@ -309,8 +309,10 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
     return out.items;
 }
 
-/// A differing range between the old and new text: old text [start, old_end) is replaced by new
-/// text [start, new_end)
+/// A differing range between the old and new text: old text [start, old_end) is replaced by the
+/// new text that ends at `new_end`. `old_end` and `new_end` are offsets in their own text, so
+/// `new_end - old_end` is the total shift of everything after this range, including the length
+/// differences of the ranges before it.
 const Edit = struct { start: u32, old_end: u32, new_end: u32 };
 
 const Line = struct { start: u32, end: u32 };
@@ -435,7 +437,7 @@ fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
     for (edits) |e| {
         if (end <= e.start) break;
         if (start < e.old_end) return null;
-        delta += @as(i64, e.new_end) - @as(i64, e.old_end);
+        delta = @as(i64, e.new_end) - @as(i64, e.old_end);
     }
     const shifted_start = std.math.cast(u32, @as(i64, start) + delta) orelse return null;
     const shifted_end = std.math.cast(u32, @as(i64, end) + delta) orelse return null;
