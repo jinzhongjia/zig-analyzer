@@ -830,6 +830,13 @@ test "labels and error names: references, highlight and rename" {
         for (resp.object.get("result").?.array.items) |x| try out.append(a, try std.fmt.allocPrint(a, "{s}/{d}", .{ try loc(&h, uri, x.object.get("range").?), x.object.get("kind").?.integer }));
         try testing.expectEqualStrings("main.zig:11:4/3 main.zig:13:34/2 main.zig:16:27/2", try join(&h, out.items));
     }
+    // The target of an assignment is written (`Write` = 3), other uses read (`Read` = 2)
+    {
+        const resp = try h.request("textDocument/documentHighlight", .{ .textDocument = doc, .position = position(text, "n: u32") });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |x| try out.append(a, try std.fmt.allocPrint(a, "{s}/{d}", .{ try loc(&h, uri, x.object.get("range").?), x.object.get("kind").?.integer }));
+        try testing.expectEqualStrings("main.zig:10:8/3 main.zig:11:18/2 main.zig:11:28/3 main.zig:13:16/2 main.zig:14:16/2 main.zig:16:12/2 main.zig:18:15/2", try join(&h, out.items));
+    }
     {
         const prep = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(text, "blk 2") });
         try testing.expectEqualStrings("blk", prep.object.get("result").?.object.get("placeholder").?.string);

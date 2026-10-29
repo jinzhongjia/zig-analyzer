@@ -806,3 +806,41 @@ test "labels and error names" {
     _ = try search.symbolReferences(&r, (try definition.symbolAt(&r, fm, at(jumps_src, "Oops", 3))).?, .{ .scope = scope, .uncertain = &uncertain });
     try testing.expectEqual(at(jumps_src, "x.Oops", 0), uncertain.?.start);
 }
+
+test "targets of assignments are written" {
+    // Every occurrence other than the declaration was reported as a read
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src =
+        \\const S = struct { f: u32 = 0 };
+        \\test {
+        \\    var n: u32 = 0;
+        \\    n = 5;
+        \\    n += 1;
+        \\    var s: S = .{};
+        \\    s.f = n;
+        \\    s.f += 1;
+        \\    _ = s.f;
+        \\    var m: u32 = 0;
+        \\    n, m = .{ m, n };
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", src)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "n:", "3:decl 4:write 5:write 7:read 11:write 11:read" },
+        .{ "f:", "1:decl 7:write 8:write 9:read" },
+    }) |c| {
+        const symbol = (try definition.symbolAt(&r, file, at(src, c[0], 0))).?;
+        var out: std.ArrayList(u8) = .empty;
+        for (try search.symbolReferences(&r, symbol, .{ .scope = &.{}, .only_file = file }), 0..) |ref, i| {
+            if (i > 0) try out.append(w.arena.allocator(), ' ');
+            const line = std.mem.count(u8, src[0..ref.start], "\n") + 1;
+            try out.print(w.arena.allocator(), "{d}:{s}", .{ line, if (ref.is_decl) "decl" else if (ref.is_write) "write" else "read" });
+        }
+        try testing.expectEqualStrings(c[1], out.items);
+    }
+}

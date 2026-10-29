@@ -36,6 +36,9 @@ pub const Reference = struct {
     end: u32,
     /// Name at the definition site
     is_decl: bool = false,
+    /// Written to: the target of an assignment (`x = v`, `x += v`) or of a destructuring
+    /// assignment (`a, b = v`)
+    is_write: bool = false,
 };
 
 /// Name of the definition; null when it has no referenceable name (files, test and comptime blocks)
@@ -157,6 +160,7 @@ fn sortUnique(refs: []Reference) []Reference {
     for (refs) |ref| {
         if (n > 0 and refs[n - 1].file == ref.file and refs[n - 1].start == ref.start) {
             refs[n - 1].is_decl = refs[n - 1].is_decl or ref.is_decl;
+            refs[n - 1].is_write = refs[n - 1].is_write or ref.is_write;
             continue;
         }
         refs[n] = ref;
@@ -541,6 +545,7 @@ const Finder = struct {
         }
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
+        var written: ?[]const bool = null;
         for (body.exprs, 0..) |e, i| {
             const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
             const range = body.expr_ranges[i];
@@ -549,7 +554,7 @@ const Finder = struct {
                 // written `@"f32"` is in scope
                 .name_ref => |n| if (std.mem.eql(u8, n, f.name) and !body.nameRefIsBuiltin(id)) {
                     const d = try r.resolveName(file, item_index, body, body.expr_scopes[i], n) orelse continue;
-                    if (deepEql(d, f.def)) try f.add(file, base + range.start, base + range.end);
+                    if (deepEql(d, f.def)) try f.addAccess(file, base + range.start, base + range.end, try isWritten(r, &written, body, id));
                 },
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
@@ -561,7 +566,7 @@ const Finder = struct {
                     const current: Target = if (ns_def) |d| (if (deepEql(d, f.def)) .hit else .miss) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
                     switch (target) {
-                        .hit => try f.addLastToken(file, base + range.end),
+                        .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
                         .miss => {},
                         .unknown => try f.noteUncertain(&res, file, item_index, fa.lhs, at),
                     }
@@ -569,7 +574,7 @@ const Finder = struct {
                 .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
                     switch (try f.refersTo(&res, file, item_index, .{ .e = id }, at)) {
-                        .hit => try f.addLastToken(file, base + range.end),
+                        .hit => try f.addLastToken(file, base + range.end, false),
                         .miss => {},
                         .unknown => try f.noteUncertainLiteral(&res, file, item_index, id, at),
                     }
@@ -725,18 +730,45 @@ const Finder = struct {
     }
 
     fn add(f: *Finder, file: FileId, start: u32, end: u32) resolve.Error!void {
-        try f.out.append(f.r.arena, .{ .file = file, .start = start, .end = end });
+        try f.addAccess(file, start, end, false);
+    }
+
+    fn addAccess(f: *Finder, file: FileId, start: u32, end: u32, write: bool) resolve.Error!void {
+        try f.out.append(f.r.arena, .{ .file = file, .start = start, .end = end, .is_write = write });
     }
 
     /// Uses the name at the end of the expression (field name, name of an enum literal) as the
     /// reference position. Scans backward over the source text directly instead of relying on the
     /// parse result (which may have been evicted).
-    fn addLastToken(f: *Finder, file: FileId, end: u32) resolve.Error!void {
+    fn addLastToken(f: *Finder, file: FileId, end: u32, write: bool) resolve.Error!void {
         const text = (try f.r.ctx.get(database.syntax.SourceText, file)).text;
         const start = lastNameStart(text, end) orelse return;
-        try f.add(file, start, end);
+        try f.addAccess(file, start, end, write);
     }
 };
+
+/// Whether expression `e` of the body is written to (see `Reference.is_write`); `cache` keeps the
+/// targets of the body once they are collected
+fn isWritten(r: *Resolver, cache: *?[]const bool, body: *const Body, e: Body.ExprId) resolve.Error!bool {
+    const targets = cache.* orelse blk: {
+        const out = try r.arena.alloc(bool, body.exprs.len);
+        @memset(out, false);
+        for (body.exprs) |x| switch (x) {
+            .assign => |a| out[@backingInt(a.lhs)] = true,
+            .block => |blk| for (blk.stmts) |s| switch (s.kind) {
+                .destructure => |d| for (d.targets) |t| switch (t) {
+                    .expr => |target| out[@backingInt(target)] = true,
+                    .binding => {},
+                },
+                else => {},
+            },
+            else => {},
+        };
+        cache.* = out;
+        break :blk out;
+    };
+    return targets[@backingInt(e)];
+}
 
 /// Relation between the target of a member access and the definition being searched for
 const Target = enum { hit, miss, unknown };

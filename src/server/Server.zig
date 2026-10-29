@@ -4691,12 +4691,14 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
     return .{ .ok = out.items };
 }
 
+/// Occurrences of the symbol at the cursor in the same file: declarations and the targets of
+/// assignments are written to (`Write`), other uses read it (`Read`)
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
     const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
     const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = &.{}, .only_file = found.file });
     const out = try arena.alloc(types.DocumentHighlight, refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
-    for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
+    for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl or ref.is_write) .Write else .Read };
     return out;
 }
 
