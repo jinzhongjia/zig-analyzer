@@ -664,3 +664,66 @@ test "renames and fixes refuse to edit fetched packages" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "rename refuses new names that conflict with existing ones" {
+    const text =
+        \\const S = struct {
+        \\    a: u32 = 0,
+        \\    b: u32 = 0,
+        \\    fn len(s: S) u32 {
+        \\        return s.a + s.b;
+        \\    }
+        \\};
+        \\
+        \\fn helper(x: u32) u32 {
+        \\    const y: u32 = 2;
+        \\    const z: u32 = 3;
+        \\    return x + y + z;
+        \\}
+        \\
+        \\const max = 10;
+        \\const Limits = struct {
+        \\    const limit = 5;
+        \\    fn get() u32 {
+        \\        return max + limit;
+        \\    }
+        \\};
+        \\
+        \\pub fn main() void {
+        \\    const s: S = .{ .a = 1, .b = 2 };
+        \\    _ = s.len() + helper(1) + Limits.get();
+        \\}
+        \\
+    ;
+    // Single-file mode: no build.zig
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Each of these used to return edits that AstGen rejects
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "y:", "z", "cannot rename `y` to `z`: " },
+        .{ "y:", "x", "cannot rename `y` to `x`: " },
+        .{ "s: S)", "len", "cannot rename `s` to `len`: " },
+        .{ "a: u32", "b", "cannot rename `a` to `b`: `b` is already declared in the same container (main.zig:3:5)" },
+        .{ "max =", "limit", "cannot rename `max` to `limit`: " },
+    }) |c| {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, c[0]), .newName = c[1] });
+        const message = resp.object.get("error").?.object.get("message").?.string;
+        testing.expect(std.mem.startsWith(u8, message, c[2])) catch |err| {
+            std.debug.print("{s} -> {s}: {s}\n", .{ c[0], c[1], message });
+            return err;
+        };
+    }
+    const ok = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "y:"), .newName = "yy" });
+    try testing.expectEqualStrings("main.zig:11:15 main.zig:9:10", try renameEdits(&h, ok));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

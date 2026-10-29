@@ -4738,16 +4738,52 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
     if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
     const old = (try za.ide_db.search.defName(r, def)).?;
-    const refs = switch (try server.renameReferences(r, arena, def, old, params.newName)) {
+    const checked = switch (try server.checkedRename(r, arena, def, old, params.newName)) {
+        .ok => |checked| checked,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, null) };
+}
+
+const CheckedRename = struct {
+    refs: []const za.ide_db.search.Reference,
+    /// The new name as written in the source (see `identifierText`)
+    text: []const u8,
+};
+
+/// The references of `def` and the source text of the new name for renaming it from `old` to
+/// `new` (as given, possibly `@"..."`), or why the result would be partial or break the build:
+/// the references cannot all be confirmed (see `renameReferences`), the new name conflicts with an
+/// existing one (a member of the same container, shadowing, or a name that would refer to another
+/// declaration; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
+/// reports a new error in the declaration's file once it is renamed (`rename.verifyAstGen`).
+fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, def, old, new)) {
         .ok => |refs| refs,
         .failed => |reason| return .{ .failed = reason },
+    };
+    const name = if (std.mem.startsWith(u8, new, "@\"")) std.zig.string_literal.parseAlloc(arena, new[1..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return error.InvalidIdentifier,
+    } else new;
+    if (try ide.rename.declarationConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    if (try ide.rename.resolutionConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    const def_file = switch (def) {
+        .item => |it| it.file,
+        .local => |l| l.file,
+        .file => unreachable,
     };
     const is_field = switch (def) {
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         .local, .file => false,
     };
-    const new_name = try identifierText(arena, params.newName, is_field);
-    return .{ .ok = try server.renameEdit(r, arena, refs, new_name, null) };
+    const text = try identifierText(arena, new, is_field);
+    // Shadowing and name clashes can only occur in the file of the declaration, and missed
+    // references in that file are reported too: confirm by running AstGen on the renamed text
+    var edits: std.ArrayList(ide.rename.Edit) = .empty;
+    for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
+    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    return .{ .ok = .{ .refs = refs, .text = text } };
 }
 
 /// All references of `def` for renaming it from `old` to `new`, or why they cannot all be
@@ -5114,30 +5150,18 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
         .file => unreachable,
     };
     if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
-    const refs = switch (try server.renameReferences(r, arena, def, f.name, f.suggestion)) {
-        .ok => |refs| refs,
+    const checked = switch (try server.checkedRename(r, arena, def, f.name, f.suggestion)) {
+        .ok => |checked| checked,
         .failed => |reason| return .{ .failed = reason },
     };
-    if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
-    if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
     // Only container members can be referenced by strings; a
     // non-pub declaration is accessible only in its own file
     if (def == .item) {
         const files = if (f.public) try za.ide_db.search.importers(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
         if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
     }
-    const is_field = switch (def) {
-        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
-        .local, .file => false,
-    };
-    const new_text = try identifierText(arena, f.suggestion, is_field);
-    // Shadowing and name clashes can only occur in the file of the declaration, and missed
-    // references in that file are reported too: confirm by running AstGen on the renamed text
-    var edits: std.ArrayList(ide.rename.Edit) = .empty;
-    for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = new_text });
-    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
     const confirm = if (f.public) try std.fmt.allocPrint(arena, "Rename public `{s}` to `{s}`", .{ f.name, f.suggestion }) else null;
-    return .{ .ok = try server.renameEdit(r, arena, refs, new_text, confirm) };
+    return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, confirm) };
 }
 
 /// Explanation of why a name cannot be renamed:
