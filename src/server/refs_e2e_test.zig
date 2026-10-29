@@ -452,3 +452,59 @@ test "rename reaches build scripts and their helpers" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "references and rename fail instead of returning partial results while the project loads" {
+    const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
+    const files = [_]fixture.File{
+        .{ .path = "src/lib.zig", .text = scale_text },
+        .{ .path = "src/util.zig", .text = "const lib = @import(\"lib.zig\");\npub fn twice(x: u32) u32 {\n    return lib.scale(x);\n}\n" },
+        .{ .path = "src/main.zig", .text = "const lib = @import(\"lib.zig\");\nconst util = @import(\"util.zig\");\npub fn main() void {\n    _ = lib.scale(2) + util.twice(3);\n}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The first load waits until the marker file exists
+    const marker = try project.path(a, "go");
+    const build_text = try std.fmt.allocPrint(a,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {{
+        \\    while (true) {{
+        \\        std.Io.Dir.accessAbsolute(b.graph.io, "{f}", .{{}}) catch {{
+        \\            b.graph.io.sleep(.fromMilliseconds(10), .awake) catch {{}};
+        \\            continue;
+        \\        }};
+        \\        break;
+        \\    }}
+        \\    const exe = b.addExecutable(.{{ .name = "app", .root_module = b.createModule(.{{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }}) }});
+        \\    b.installArtifact(exe);
+        \\}}
+        \\
+    , .{std.zig.fmtString(marker)});
+    try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = build_text });
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "src/lib.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
+    const at = position(scale_text, "scale");
+    // Only the open file is known while loading: answering would have returned one reference and a
+    // rename editing lib.zig alone
+    {
+        const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        try testing.expect(std.mem.startsWith(u8, refs.object.get("error").?.object.get("message").?.string, "cannot find all references: "));
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expect(std.mem.startsWith(u8, renamed.object.get("error").?.object.get("message").?.string, "cannot rename `scale` to `double`: "));
+    }
+    try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "go", .data = "" });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    {
+        const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        try testing.expectEqual(3, refs.object.get("result").?.array.items.len);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:3:12 util.zig:2:15", try renameEdits(&h, renamed));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

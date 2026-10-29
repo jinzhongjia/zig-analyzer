@@ -50,8 +50,22 @@ pub fn defName(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
     }
 }
 
+/// Whether code in other files can refer to the definition: `pub` declarations and fields (members
+/// without `pub` and local names are visible only in their own file)
+pub fn visibleOutsideFile(r: *Resolver, def: Def) resolve.Error!bool {
+    return switch (def) {
+        .item => |it| blk: {
+            const item = (try r.itemTree(it.file)).items[it.item];
+            break :blk item.flags.is_pub or item.kind == .field;
+        },
+        .local => false,
+        .file => true,
+    };
+}
+
 pub const Options = struct {
-    /// Search scope (files in the project); always includes the file containing the definition
+    /// Search scope (files in the project); always includes the file containing the definition.
+    /// Not used with `only_file`
     scope: []const FileId,
     /// Search only in this file (document highlight)
     only_file: ?FileId = null,

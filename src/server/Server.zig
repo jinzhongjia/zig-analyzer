@@ -172,6 +172,9 @@ indexed_mutex: Io.Mutex = .init,
 /// Generation of the workspace file scan (see `scheduleScan`): incremented whenever the source
 /// files under the root directories may have changed
 scan_generation: std.atomic.Value(u64) = .init(0),
+/// Generation of the last finished scan (`never_scanned` before the first one): the search scope is
+/// complete only when it equals `scan_generation` (see `scopeIncomplete`)
+scan_done: std.atomic.Value(u64) = .init(never_scanned),
 /// Whether a scan task is running (only one runs at a time)
 scanning: std.atomic.Value(bool) = .init(false),
 config_mutex: Io.Mutex = .init,
@@ -1024,7 +1027,7 @@ fn indexTask(server: *Server) Io.Cancelable!void {
 /// indexing, a running task does another pass when this is called again meanwhile. Must not be
 /// called inside a read or write transaction: the task may run inline.
 pub fn scheduleScan(server: *Server) void {
-    _ = server.scan_generation.fetchAdd(1, .monotonic);
+    _ = server.scan_generation.fetchAdd(1, .acq_rel);
     if (server.scanning.swap(true, .acq_rel)) return;
     server.busyBegin();
     spawn(server.io, &server.bg_group, scanTask, .{server});
@@ -1033,11 +1036,12 @@ pub fn scheduleScan(server: *Server) void {
 fn scanTask(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     while (true) {
-        const generation = server.scan_generation.load(.monotonic);
+        const generation = server.scan_generation.load(.acquire);
         server.scanOnce() catch |err| switch (err) {
             error.OutOfMemory => log.err("out of memory while scanning the workspace for source files", .{}),
         };
-        if (server.scan_generation.load(.monotonic) != generation) continue;
+        server.scan_done.store(generation, .release);
+        if (server.scan_generation.load(.acquire) != generation) continue;
         server.scanning.store(false, .release);
         // Scheduled again after the flag was released, and no other task took over: continue
         if (server.scan_generation.load(.monotonic) == generation) return;
@@ -4579,6 +4583,21 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     return out;
 }
 
+/// `scan_done` before the first scan of the root directories has finished
+const never_scanned = std.math.maxInt(u64);
+
+/// Why the search scope may lack files that refer to a declaration right now, or null: the root
+/// directories have not been scanned since source files may have changed (see `scheduleScan`), or
+/// a project is still in its first load (until then, which files belong to it and what its imports
+/// by name resolve to are not known). Find references, rename and the fixes that edit references
+/// fail with this reason instead of returning partial results.
+fn scopeIncomplete(server: *Server) ?[]const u8 {
+    if (server.scan_done.load(.acquire) != server.scan_generation.load(.acquire))
+        return "the workspace folders are still being searched for source files, so not all files that may refer to it are known yet";
+    if (server.projectsLoading()) return "the project is still loading, so not all files that may refer to it are known yet";
+    return null;
+}
+
 /// Scope of find references and workspace symbol: project files in the module graph (excluding the
 /// standard library), the user's source files under the root directories, and open documents
 fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
@@ -4618,13 +4637,18 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return out.items;
 }
 
-/// The definition at the cursor and all its references
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// The definition at the cursor
+fn defAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { def: za.names.resolve.Def, file: Vfs.FileId } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
-    const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null });
-    return .{ .def = def, .refs = refs };
+    return .{ .def = def, .file = at.file };
+}
+
+/// Why the references of `def` cannot all be found now (see `scopeIncomplete`); null also when
+/// only its own file can refer to it
+fn scopeIncompleteFor(server: *Server, r: *Resolver, def: za.names.resolve.Def) !?[]const u8 {
+    if (!try za.ide_db.search.visibleOutsideFile(r, def)) return null;
+    return server.scopeIncomplete();
 }
 
 /// Converts reference positions to LSP ranges (caching the line index per file)
@@ -4643,22 +4667,25 @@ const RangeMapper = struct {
     }
 };
 
-fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
+fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!Outcome(types.ResultType("textDocument/references")) {
+    const found = try server.defAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    if (try server.scopeIncompleteFor(r, found.def)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
+    const refs = try za.ide_db.search.findReferences(r, found.def, .{ .scope = try server.searchScope(r) });
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
-    for (found.refs) |ref| {
+    for (refs) |ref| {
         if (ref.is_decl and !params.context.includeDeclaration) continue;
         try out.append(arena, .{ .uri = try server.uriFor(arena, ref.file), .range = try m.range(ref.file, ref.start, ref.end) });
     }
-    return out.items;
+    return .{ .ok = out.items };
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true) orelse return null;
-    const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
+    const found = try server.defAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const refs = try za.ide_db.search.findReferences(r, found.def, .{ .scope = &.{}, .only_file = found.file });
+    const out = try arena.alloc(types.DocumentHighlight, refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
-    for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
+    for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
     return out;
 }
 
@@ -4711,10 +4738,12 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
 }
 
 /// All references of `def` for renaming it from `old` to `new`, or why they cannot all be
-/// confirmed, in which case renaming would leave a partially renamed result: a reference is
-/// ambiguous in a generic function, goes through a member access of unknown type, or depends on
-/// instances that grow without bound, or a file that mentions the name has syntax errors.
+/// confirmed, in which case renaming would leave a partially renamed result: the search scope is
+/// still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic function, goes
+/// through a member access of unknown type, or depends on instances that grow without bound, or a
+/// file that mentions the name has syntax errors.
 fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
+    if (try server.scopeIncompleteFor(r, def)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
     const scope = try server.searchScope(r);
     var ambiguous: ?za.ide_db.search.Reference = null;
     var uncertain: ?za.ide_db.search.Reference = null;
@@ -5138,6 +5167,8 @@ fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: [
 /// are not updated.
 fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
+    if (try server.scopeIncompleteFor(r, .{ .item = .{ .file = t.file, .item = t.item } })) |reason|
+        return .{ .failed = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`: {s}", .{ t.name, reason }) };
     switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
         .ok => |files| return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
             .id = "zig-analyzer.remove-param-public",
