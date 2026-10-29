@@ -85,6 +85,7 @@ test scan {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{
+        "ws/zig-pkgs/a.zig",
         "ws/main.zig",
         "ws/build.zig",
         "ws/build.zig.zon",
@@ -136,6 +137,7 @@ test scan {
         "nested" ++ sep ++ "inner.zig",
         "src" ++ sep ++ "data.zon",
         "src" ++ sep ++ "lib.zig",
+        "zig-pkgs" ++ sep ++ "a.zig",
     };
     try testing.expectEqual(expected.len, names.items.len);
     for (expected, names.items) |e, n| try testing.expectEqualStrings(e, n);

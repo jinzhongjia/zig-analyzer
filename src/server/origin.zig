@@ -75,15 +75,24 @@ pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: boo
     for (rules.local_caches) |c| if (vfs.isUnder(path, c)) return .generated;
     if (rules.global_cache) |c| if (vfs.isUnder(path, c)) return .generated;
     var in_root = false;
-    for (rules.roots) |root| {
+    roots: for (rules.roots) |root| {
         if (path.len <= root.len or !vfs.isUnder(path, root)) continue;
         if (rules.zig_lib) |l| if (vfs.isUnder(root, l)) continue;
         in_root = true;
         const rest = path[root.len..];
         const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
         // The default local cache and package directories of maker: when others are used
-        // instead (`--cache-dir`, `--pkg-dir`), the ones here are stale copies
-        if (std.mem.startsWith(u8, sub, ".zig-cache") or std.mem.startsWith(u8, sub, "zig-pkg")) continue;
+        // instead (`--cache-dir`, `--pkg-dir`), the ones here are stale copies. Only these exact
+        // directory names count (`zig-pkgs` is an ordinary directory)
+        var end: usize = 0;
+        while (end < sub.len and !std.fs.path.isSep(sub[end])) end += 1;
+        if (end < sub.len) for ([_][]const u8{ ".zig-cache", "zig-pkg" }) |name| {
+            const same = switch (vfs.case) {
+                .sensitive => std.mem.eql(u8, sub[0..end], name),
+                .insensitive => std.ascii.eqlIgnoreCase(sub[0..end], name),
+            };
+            if (same) continue :roots;
+        };
         return .user;
     }
     if (rules.zig_lib) |l| if (vfs.isUnder(path, l)) return .zig_lib;
@@ -118,6 +127,10 @@ test classify {
         .{ native("/ws/scripts/gen.zig"), false, .user },
         // Stale copy left under the root after switching to a package directory elsewhere
         .{ native("/ws/zig-pkg/stale-hash/src/root.zig"), true, .other },
+        // Names that only start like those directories were taken for them, which refused renames
+        .{ native("/ws/zig-pkgs/a.zig"), false, .user },
+        .{ native("/ws/zig-pkg-b.zig"), false, .user },
+        .{ native("/ws/.zig-cache-c/c.zig"), false, .user },
         // Module outside the root, added to the project by path
         .{ native("/libs/shared/src/root.zig"), true, .user },
         // Outside the roots and in no project: the user's file, opened from outside the folders
