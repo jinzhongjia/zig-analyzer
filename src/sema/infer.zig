@@ -55,6 +55,10 @@ pub const Result = struct {
     /// written yet), error values (`error.X`), and anonymous initializers (`.{ ... }`), along with
     /// their expected types: completion uses them to list members, error names, and fields
     literal_expected: []const LiteralExpected = &.{},
+    /// Enum literals (including the callees of decl literal calls) and anonymous initializers whose
+    /// result type exists but is unknown: they may name members of whatever type it is (reference
+    /// search cannot confirm whether they refer to a declaration)
+    unknown_expected: []const ExprId = &.{},
     /// `if` / `switch` branches known at comptime not to execute, and the right-hand sides of
     /// `and` / `or` whose left-hand side already decides the result (the outermost ones): code
     /// that is not compiled under the current build configuration
@@ -91,7 +95,7 @@ pub const Result = struct {
     };
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -149,12 +153,13 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const ret = try inf.returnValue();
     const field_refs = try a.dupe(Result.FieldRef, inf.field_refs.items);
     const literal_expected = try a.dupe(Result.LiteralExpected, inf.literal_expected.items);
+    const unknown_expected = try a.dupe(ExprId, inf.unknown_expected.items);
     const inactive = try a.dupe(ExprId, inf.inactive.items);
     const dead_spans = try a.dupe(Body.Range, inf.dead_spans.items);
     const param_coercions = try a.dupe(Result.ParamCoercion, inf.param_coercions.items);
     const iteration_vars = try a.dupe(Result.IterationVar, inf.iteration_vars.items);
     const zon_imports = try a.dupe(Result.ZonImport, inf.zon_imports.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports };
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports };
 }
 
 /// Infers only one local binding or comptime expression in the member `owner` (see
@@ -257,6 +262,8 @@ const Inferrer = struct {
     lazy: ?Body.Range = null,
     /// See `Result.literal_expected`
     literal_expected: std.ArrayList(Result.LiteralExpected) = .empty,
+    /// See `Result.unknown_expected`
+    unknown_expected: std.ArrayList(ExprId) = .empty,
     /// See `Result.inactive`
     inactive: std.ArrayList(ExprId) = .empty,
     /// See `Result.dead_spans`
@@ -605,6 +612,29 @@ const Inferrer = struct {
         return if (through_ptr) t else x;
     }
 
+    /// Records the result type of a literal: see `Result.literal_expected`, and
+    /// `Result.unknown_expected` when the result type is unknown
+    fn noteExpected(inf: *Inferrer, e: ExprId, want: Index) Error!void {
+        if (want == .unknown) return inf.unknown_expected.append(inf.scratch, e);
+        try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = want });
+    }
+
+    /// `e` has a result type that is unknown (the target of an assignment, a parameter of an
+    /// unknown callee, a field of an unknown container): a literal that takes its members from its
+    /// result type (an enum literal, the callee of a decl literal call, an anonymous initializer)
+    /// is recorded in `Result.unknown_expected`
+    fn noteUnknownResult(inf: *Inferrer, e: ExprId) Error!void {
+        const b = inf.body;
+        switch (b.expr(e)) {
+            .enum_literal => {},
+            .init => |x| if (x.ty != null) return,
+            .call => |c| return if (b.expr(c.callee) == .enum_literal) inf.noteUnknownResult(c.callee),
+            .prefix => |p| return if (p.op == .keyword_try) inf.noteUnknownResult(p.operand),
+            else => return,
+        }
+        try inf.unknown_expected.append(inf.scratch, e);
+    }
+
     /// Branch results without a result type are coerced to the peer type
     /// (`if (b.op()) |t| t.kind else .invalid`): enum literals in the branches refer to members of
     /// the peer type and use it as their expected type
@@ -754,7 +784,7 @@ const Inferrer = struct {
             .literal => |text| return inf.literal(text),
             .field_access => |fa| return inf.fieldAccess(e, fa.lhs, fa.field),
             .enum_literal => |name| {
-                if (expected) |want| if (want != .unknown) try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = want });
+                if (expected) |want| try inf.noteExpected(e, want);
                 if (expected) |want| if (try inf.declLiteral(e, want, name)) |tv| return tv;
                 return .{ .ty = .enum_literal_type, .val = try ip.get(.{ .enum_literal = name }) };
             },
@@ -800,6 +830,8 @@ const Inferrer = struct {
                 // executed prong could be chosen
                 const item_ty = try inf.comparedType(operand.ty);
                 for (s.prongs) |prong| for (prong.items) |item| {
+                    // Items of a switch on a value of unknown type have an unknown result type
+                    if (operand.ty == .unknown) try inf.noteUnknownResult(item);
                     _ = try inf.infer(item, item_ty);
                 };
                 // Labeled switch: the value of `break :label value` is also a result
@@ -858,6 +890,7 @@ const Inferrer = struct {
             .prefix => |p| return inf.prefix(p.op, p.operand, expected),
             .assign => |a| {
                 const lhs = try inf.infer(a.lhs, null);
+                if (lhs.ty == .unknown) try inf.noteUnknownResult(a.rhs);
                 const rhs = try inf.infer(a.rhs, try inf.assignRhsType(a.op, lhs.ty));
                 if (try inf.comptimeVarOf(a.lhs)) |v| try inf.assignComptimeVar(v, a.op, rhs);
                 return .{ .ty = .void_type };
@@ -901,7 +934,7 @@ const Inferrer = struct {
                 return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) o.val else null };
             },
             .init => |x| {
-                if (x.ty == null) if (expected) |want| if (want != .unknown) try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = want });
+                if (x.ty == null) if (expected) |want| try inf.noteExpected(e, want);
                 const saved = inf.current_init;
                 inf.current_init = e;
                 defer inf.current_init = saved;
@@ -1272,7 +1305,11 @@ const Inferrer = struct {
                 return .unknown;
             },
             else => {
-                for (args) |a| _ = try inf.infer(a, null);
+                for (args) |a| {
+                    // The parameter types of an unknown callee are unknown
+                    if (callee.ty == .unknown) try inf.noteUnknownResult(a);
+                    _ = try inf.infer(a, null);
+                }
                 return .unknown;
             },
         };
@@ -2402,11 +2439,14 @@ const Inferrer = struct {
                 // An enum literal on the left (`.a == e`): infer the right-hand side first, and the
                 // literal takes the type of the right-hand side (peer)
                 const literal_lhs = inf.body.expr(lhs_e) == .enum_literal and inf.body.expr(rhs_e) != .enum_literal;
+                // A literal compared with a value of unknown type has an unknown result type
                 const lhs, const rhs = if (literal_lhs) blk: {
                     const r = try inf.infer(rhs_e, null);
+                    if (r.ty == .unknown) try inf.noteUnknownResult(lhs_e);
                     break :blk .{ try inf.infer(lhs_e, try inf.comparedType(r.ty)), r };
                 } else blk: {
                     const l = try inf.infer(lhs_e, null);
+                    if (l.ty == .unknown) try inf.noteUnknownResult(rhs_e);
                     break :blk .{ l, try inf.infer(rhs_e, try inf.comparedType(l.ty)) };
                 };
                 // Vectors are compared element-wise; the result is a vector of bool
@@ -2604,6 +2644,7 @@ const Inferrer = struct {
         for (fields, 0..) |f, fi_index| {
             const field = try initField(inf.r, t, ns, fi_index, f.name);
             if (field.member) |m| if (inf.current_init) |init_e| try inf.field_refs.append(inf.scratch, .{ .init = init_e, .index = @intCast(fi_index), .member = m });
+            if (t == .unknown or field.ty == .unknown) try inf.noteUnknownResult(f.value);
             _ = try inf.infer(f.value, if (field.ty) |x| (if (x != .unknown) x else null) else null);
         }
         return .{ .ty = t };

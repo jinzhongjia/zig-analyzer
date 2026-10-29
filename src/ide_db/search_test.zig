@@ -500,6 +500,51 @@ test "initializer field names are not uncertain references to other declarations
     }
 }
 
+test "literals whose result type is unknown are reported as uncertain" {
+    // The literal keeps its own type when its result type is unknown: it used to be skipped as a
+    // concrete type without the member, and fixes edited the other uses only
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src =
+        \\const Mode = enum { fastPath, slowPath };
+        \\const Child = struct {
+        \\    v: u32,
+        \\    pub fn make(v: u32) Child {
+        \\        return .{ .v = v };
+        \\    }
+        \\};
+        \\fn touch(x: *Missing) bool {
+        \\    x.child = .make(5);
+        \\    x.lim = .{ .v = 3 };
+        \\    switch (x.kind) {
+        \\        .slowPath => {},
+        \\        else => {},
+        \\    }
+        \\    return x.mode == .fastPath;
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", src)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "make", ".make" },
+        .{ "v:", "v" },
+        .{ "fastPath", ".fastPath" },
+        .{ "slowPath", ".slowPath" },
+    }) |c| {
+        var uncertain: ?search.Reference = null;
+        const def = (try definition.defAt(&r, file, at(src, c[0], 0))).?;
+        _ = try search.findReferences(&r, def, .{ .scope = &.{file}, .uncertain = &uncertain });
+        const u = uncertain orelse {
+            std.debug.print("no uncertain reference for `{s}`\n", .{c[0]});
+            return error.NotUncertain;
+        };
+        try testing.expectEqualStrings(c[1], src[u.start..u.end]);
+    }
+}
+
 test "files with syntax errors that mention the name are reported" {
     var w: World = undefined;
     try w.init();

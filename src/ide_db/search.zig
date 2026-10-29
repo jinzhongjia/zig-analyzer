@@ -360,7 +360,7 @@ const Finder = struct {
                     switch (try f.refersTo(&res, file, item_index, .{ .e = id }, at)) {
                         .hit => try f.addLastToken(file, base + range.end),
                         .miss => {},
-                        .unknown => try f.noteUncertain(&res, file, item_index, id, at),
+                        .unknown => try f.noteUncertainLiteral(&res, file, item_index, id, at),
                     }
                 },
                 .init => |x| if (f.is_field) for (x.fields, 0..) |fi, k| {
@@ -370,7 +370,7 @@ const Finder = struct {
                     switch (try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at)) {
                         .hit => try f.add(file, at.start, at.end),
                         .miss => {},
-                        .unknown => try f.noteUncertain(&res, file, item_index, id, at),
+                        .unknown => try f.noteUncertainLiteral(&res, file, item_index, id, at),
                     }
                 },
                 else => {},
@@ -452,8 +452,7 @@ const Finder = struct {
         return if (miss) .miss else .unknown;
     }
 
-    /// An access whose member cannot be determined: when the type that determines the member (the
-    /// left-hand side of a field access, the enum literal or initializer expression itself) is
+    /// A field access whose member cannot be determined: when the type of the left-hand side is
     /// unknown or abstract, it is recorded as uncertain (when a concrete type has no such member,
     /// it is not a reference, e.g. `len` of a slice)
     fn noteUncertain(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, e: Body.ExprId, at: Reference) resolve.Error!void {
@@ -462,6 +461,27 @@ const Finder = struct {
         const exprs = (try f.inferred(res, file, item_index)).exprs;
         const i = @backingInt(e);
         if (i >= exprs.len or seed.wanted(f.r.ctx.db.env.ip, exprs[i])) slot.* = at;
+    }
+
+    /// A literal whose member cannot be determined (an enum literal, including the callee of a decl
+    /// literal call, or a field of an anonymous initializer): its members come from its result type,
+    /// and when that is unknown or abstract it is recorded as uncertain. The literal itself keeps
+    /// its own type when it cannot be coerced (`@EnumLiteral()`, an anonymous struct), so the
+    /// result type is read from the inference result (`literal_expected`, `unknown_expected`)
+    fn noteUncertainLiteral(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32, e: Body.ExprId, at: Reference) resolve.Error!void {
+        const slot = f.uncertain orelse return;
+        if (slot.* != null) return;
+        const result = try f.inferred(res, file, item_index);
+        const ip = f.r.ctx.db.env.ip;
+        const i = @backingInt(e);
+        if (i >= result.exprs.len or seed.wanted(ip, result.exprs[i]) or std.mem.indexOfScalar(Body.ExprId, result.unknown_expected, e) != null) {
+            slot.* = at;
+            return;
+        }
+        for (result.literal_expected) |x| if (x.expr == e and seed.wanted(ip, .{ .ty = x.ty })) {
+            slot.* = at;
+            return;
+        };
     }
 
     fn instances(f: *Finder, file: FileId, item_index: u32) resolve.Error!struct { list: []const InternPool.Index, complete: bool } {
