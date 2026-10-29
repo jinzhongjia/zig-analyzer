@@ -329,6 +329,58 @@ test "combine: an older result shifted over several modified regions matches the
     try testing.expectEqual(new[0], c.items[0].start);
 }
 
+const repeated_lines =
+    \\pub fn main() void {
+    \\    zero();
+    \\    one();
+    \\    two();
+    \\}
+    \\
+    \\fn zero() void {
+    \\    const w: u8 = 256;
+    \\    _ = w;
+    \\}
+    \\
+    \\fn one() void {
+    \\    const v: u8 = 300;
+    \\    _ = v;
+    \\}
+    \\
+    \\fn two() void {
+    \\    const v: u8 = 300;
+    \\    _ = v;
+    \\}
+    \\
+;
+
+test "merge: unchanged repeated lines next to an edit keep their errors" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spans = &.{ spanOf(repeated_lines, "256", 0), spanOf(repeated_lines, "300", 0), spanOf(repeated_lines, "300", 1) };
+    // Guards against treating every unchanged run of repeated lines (`}`, blank lines, duplicated
+    // statements) between unique lines as modified, which hid the errors on them
+    try expectRanges(&.{ "7:18-7:21", "12:18-12:21", "17:18-17:21" }, try remappedRanges(a, repeated_lines, repeated_lines ++ "// trailing comment\n", spans));
+    const changed = try std.mem.replaceOwned(u8, a, repeated_lines, "fn one() void {\n    const v: u8 = 300;", "fn one() void {\n    const v: u8 = 30;");
+    try expectRanges(&.{ "7:18-7:21", "17:18-17:21" }, try remappedRanges(a, repeated_lines, changed, spans));
+    try expectRanges(&.{ "8:18-8:21", "13:18-13:21", "18:18-18:21" }, try remappedRanges(a, repeated_lines, "// top\n" ++ repeated_lines, spans));
+
+    // Fixing one of two identical statements keeps the error on the other one
+    const duplicated =
+        \\fn f() void {
+        \\    var list = std.ArrayList(u8).init(allocator);
+        \\    _ = &list;
+        \\}
+        \\fn g() void {
+        \\    var list = std.ArrayList(u8).init(allocator);
+        \\    _ = &list;
+        \\}
+        \\
+    ;
+    const fixed = try std.mem.replaceOwned(u8, a, duplicated, "fn f() void {\n    var list = std.ArrayList(u8).init(allocator);", "fn f() void {\n    var list: std.ArrayList(u8) = .empty;");
+    try expectRanges(&.{"5:33-5:37"}, try remappedRanges(a, duplicated, fixed, &.{ spanOf(duplicated, "init", 0), spanOf(duplicated, "init", 1) }));
+}
+
 test "merge: malformed compiler spans do not overflow when remapped" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

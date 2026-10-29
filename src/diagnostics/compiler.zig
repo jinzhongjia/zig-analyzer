@@ -317,48 +317,84 @@ const Edit = struct { start: u32, old_end: u32, new_end: u32 };
 
 const Line = struct { start: u32, end: u32 };
 
-/// Line anchor: a line with identical content that is unique on both sides
-const Anchor = struct { old: usize, new: usize };
+/// Line `old` of the old text matched with the identical line `new` of the new text
+const Match = struct {
+    old: usize,
+    new: usize,
 
-/// Compares the old and new text line by line and returns disjoint replacement ranges sorted by
-/// position. Identical lines that are unique on both sides serve as anchors, and the lines between
-/// the anchors of their longest increasing subsequence are treated as modified regions as a whole.
-/// Line granularity is conservative: modifying a line hides the diagnostics on that line without
-/// affecting unmodified lines.
+    fn before(_: void, a: Match, b: Match) bool {
+        return a.old < b.old;
+    }
+};
+
+/// Compares the old and new text line by line (a patience diff) and returns disjoint replacement
+/// ranges sorted by position. In each range of lines still to compare, identical lines at its start
+/// and end are matched; of the remaining lines, those identical and unique on both sides within
+/// the range are matched along their longest increasing subsequence, and the ranges between them
+/// are compared the same way. Lines left without a match form the modified regions, so no region
+/// starts or ends with a line that is identical on both sides. Line granularity is conservative:
+/// modifying a line hides the diagnostics on that line without affecting unmodified lines.
 fn diffEdits(a: Allocator, old: []const u8, new: []const u8) Allocator.Error![]const Edit {
     if (std.mem.eql(u8, old, new)) return &.{};
     const old_lines = try splitLines(a, old);
     const new_lines = try splitLines(a, new);
-    var old_counts: std.StringHashMapUnmanaged(usize) = .empty;
-    for (old_lines) |l| {
-        const gop = try old_counts.getOrPut(a, old[l.start..l.end]);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    const Range = struct { old_start: usize, old_end: usize, new_start: usize, new_end: usize };
+    // Occurrences of a line in the range on each side, and the old line it first occurs on
+    const Count = struct { old: usize, new: usize, old_line: usize };
+    var matches: std.ArrayList(Match) = .empty;
+    var pending: std.ArrayList(Range) = .empty;
+    var counts: std.StringHashMapUnmanaged(Count) = .empty;
+    var unique: std.ArrayList(Match) = .empty;
+    try pending.append(a, .{ .old_start = 0, .old_end = old_lines.len, .new_start = 0, .new_end = new_lines.len });
+    while (pending.pop()) |range| {
+        var r = range;
+        while (r.old_start < r.old_end and r.new_start < r.new_end and
+            std.mem.eql(u8, lineText(old, old_lines, r.old_start), lineText(new, new_lines, r.new_start)))
+        {
+            try matches.append(a, .{ .old = r.old_start, .new = r.new_start });
+            r.old_start += 1;
+            r.new_start += 1;
+        }
+        while (r.old_start < r.old_end and r.new_start < r.new_end and
+            std.mem.eql(u8, lineText(old, old_lines, r.old_end - 1), lineText(new, new_lines, r.new_end - 1)))
+        {
+            r.old_end -= 1;
+            r.new_end -= 1;
+            try matches.append(a, .{ .old = r.old_end, .new = r.new_end });
+        }
+        counts.clearRetainingCapacity();
+        for (r.old_start..r.old_end) |i| {
+            const gop = try counts.getOrPut(a, lineText(old, old_lines, i));
+            if (gop.found_existing) gop.value_ptr.old += 1 else gop.value_ptr.* = .{ .old = 1, .new = 0, .old_line = i };
+        }
+        for (r.new_start..r.new_end) |i| {
+            if (counts.getPtr(lineText(new, new_lines, i))) |c| c.new += 1;
+        }
+        unique.clearRetainingCapacity();
+        for (r.new_start..r.new_end) |i| {
+            const c = counts.get(lineText(new, new_lines, i)) orelse continue;
+            if (c.old == 1 and c.new == 1) try unique.append(a, .{ .old = c.old_line, .new = i });
+        }
+        const anchors = try longestIncreasing(a, unique.items);
+        if (anchors.len == 0) continue;
+        var old_start = r.old_start;
+        var new_start = r.new_start;
+        for (anchors) |m| {
+            try matches.append(a, m);
+            try pending.append(a, .{ .old_start = old_start, .old_end = m.old, .new_start = new_start, .new_end = m.new });
+            old_start = m.old + 1;
+            new_start = m.new + 1;
+        }
+        try pending.append(a, .{ .old_start = old_start, .old_end = r.old_end, .new_start = new_start, .new_end = r.new_end });
     }
-    var new_counts: std.StringHashMapUnmanaged(usize) = .empty;
-    for (new_lines) |l| {
-        const gop = try new_counts.getOrPut(a, new[l.start..l.end]);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
-    }
-    var old_unique: std.StringHashMapUnmanaged(usize) = .empty;
-    for (old_lines, 0..) |l, i| {
-        const line = old[l.start..l.end];
-        if (old_counts.get(line).? == 1) try old_unique.put(a, line, i);
-    }
-    var pairs: std.ArrayList(Anchor) = .empty;
-    for (new_lines, 0..) |l, i| {
-        const line = new[l.start..l.end];
-        if (new_counts.get(line).? != 1) continue;
-        const oi = old_unique.get(line) orelse continue;
-        try pairs.append(a, .{ .old = oi, .new = i });
-    }
-    const anchors = try longestIncreasing(a, pairs.items);
+    std.mem.sort(Match, matches.items, {}, Match.before);
     var edits: std.ArrayList(Edit) = .empty;
     var oi: usize = 0;
     var ni: usize = 0;
-    for (anchors) |an| {
-        try addEdit(a, &edits, old, new, old_lines, new_lines, oi, an.old, ni, an.new);
-        oi = an.old + 1;
-        ni = an.new + 1;
+    for (matches.items) |m| {
+        try addEdit(a, &edits, old, new, old_lines, new_lines, oi, m.old, ni, m.new);
+        oi = m.old + 1;
+        ni = m.new + 1;
     }
     try addEdit(a, &edits, old, new, old_lines, new_lines, oi, old_lines.len, ni, new_lines.len);
     return edits.items;
@@ -374,6 +410,10 @@ fn splitLines(a: Allocator, text: []const u8) Allocator.Error![]const Line {
         start = end;
     }
     return lines.items;
+}
+
+fn lineText(text: []const u8, lines: []const Line, i: usize) []const u8 {
+    return text[lines[i].start..lines[i].end];
 }
 
 fn lineOffset(lines: []const Line, text: []const u8, i: usize) u32 {
@@ -402,7 +442,7 @@ fn addEdit(
 
 /// `pairs` is sorted by increasing `new`; returns the longest subsequence with strictly increasing
 /// `old`
-fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]const Anchor {
+fn longestIncreasing(a: Allocator, pairs: []const Match) Allocator.Error![]const Match {
     if (pairs.len == 0) return &.{};
     const tails = try a.alloc(usize, pairs.len);
     const prev = try a.alloc(?usize, pairs.len);
@@ -418,7 +458,7 @@ fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]cons
         tails[lo] = i;
         if (lo == len) len += 1;
     }
-    const out = try a.alloc(Anchor, len);
+    const out = try a.alloc(Match, len);
     var k: ?usize = if (len > 0) tails[len - 1] else null;
     var i: usize = len;
     while (k) |x| : (k = prev[x]) {
