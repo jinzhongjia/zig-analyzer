@@ -261,8 +261,9 @@ pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
     return false;
 }
 
-/// The project-wide reverse import closure is shared between the seed lookups of all members;
-/// the file indexes and the module configuration are still the actual dependencies.
+/// The reverse import closure over the searched files (see `searchFiles`) is shared between the
+/// seed lookups of all members; the file indexes and the module configuration are still the
+/// actual dependencies.
 pub const ProjectImporters = struct {
     pub const kind: @import("../db/engine.zig").Kind = .derived;
     pub const Key = FileId;
@@ -272,7 +273,7 @@ pub const ProjectImporters = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return ctx.db.gpa.dupe(FileId, try importers(&r, target, try projectFiles(&r)));
+        return ctx.db.gpa.dupe(FileId, try importers(&r, target, try searchFiles(&r)));
     }
 
     pub fn eql(a: Value, b: Value) bool {

@@ -508,3 +508,34 @@ test "references and rename fail instead of returning partial results while the 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "generic bodies get the instances of callers in files outside any build graph" {
+    const util_text = "pub fn area(shape: anytype) u32 {\n    const w = shape.width;\n    return w * shape.height;\n}\n";
+    const main_body = "const util = @import(\"util.zig\");\n\nconst Rect = struct { width: u32, height: u32 };\n\npub fn main() void {\n    const r: Rect = .{ .width = 2, .height = 3 };\n    _ = util.area(r);\n}\n";
+    // Single-file mode: no build.zig
+    const files = [_]fixture.File{
+        .{ .path = "util.zig", .text = util_text },
+        .{ .path = "main.zig", .text = main_body },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const util_uri = try za.base.uri.fromPath(a, try project.path(a, "util.zig"));
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = util_uri, .languageId = "zig", .version = 1, .text = util_text } });
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The call in main.zig instantiates `area`: `w` was unknown, and rename missed `shape.width`
+    const hover = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = util_uri }, .position = position(util_text, "w =") });
+    const value = hover.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, value, "const w: u32") != null);
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "width"), .newName = "wide" });
+    try testing.expectEqualStrings("main.zig:2:22 main.zig:5:24 util.zig:1:20", try renameEdits(&h, renamed));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

@@ -1183,13 +1183,12 @@ pub const Candidates = struct {
 
     pub const Data = struct {
         arena: std.heap.ArenaAllocator,
-        /// Project files that can reach the target's file via `@import` chains: lookups of the
-        /// first instance and of the first few instances follow their order, so instances found
-        /// earlier come first
+        /// Searched files (see `search.searchFiles`) that can reach the target's file via
+        /// `@import` chains: lookups of the first instance and of the first few instances follow
+        /// their order, so instances found earlier come first
         files: []const FileId,
-        /// `files` followed by the remaining files of the project (see `search.candidateFiles`):
-        /// the closure of all instances does not miss calls in generic code through `anytype`
-        /// values or comptime type parameters
+        /// `files` followed by the remaining searched files: the closure of all instances does not
+        /// miss calls in generic code through `anytype` values or comptime type parameters
         all_files: []const FileId,
         names: []const []const u8,
     };
@@ -1215,7 +1214,7 @@ pub const Candidates = struct {
         data.files = try allocator.dupe(FileId, try ctx.get(search.ProjectImporters, key.file));
         var all: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         for (data.files) |f| try all.put(r.arena, f, {});
-        for (try search.projectFiles(&r)) |f| try all.put(r.arena, f, {});
+        for (try search.searchFiles(&r)) |f| try all.put(r.arena, f, {});
         data.all_files = try allocator.dupe(FileId, all.keys());
         const names = try callNames(&r, key.file, root, data.files);
         const owned = try allocator.alloc([]const u8, names.len);
