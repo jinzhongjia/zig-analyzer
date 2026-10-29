@@ -2069,9 +2069,9 @@ test "build.zig.zon uses the schema only without a result type" {
         .{ "/p/build.zig.zon", "//- /p/main.zig module:app\nconst zon = @import(\"build.zig.zon\");", schema },
         // With a result type, the file is inferred with that type
         .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n" ++ typed, "a b" },
-        // Import sites are searched in the files of the module graph, which do not include build
-        // scripts
-        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n//- /p/build.zig\n" ++ typed, schema },
+        // Import sites are searched in the files of the module graph and in the user's source files
+        // under the workspace roots, which include build scripts
+        .{ "/p/build.zig.zon", "//- /p/main.zig module:app\n//- /p/build.zig\n" ++ typed, "a b" },
         // `.zon` files with other names don't use the schema
         .{ "/p/cfg.zon", "//- /p/main.zig module:app\nconst zon = @import(\"cfg.zon\");", "" },
         .{ "/p/sub/build.zig.zon.zig", "//- /p/main.zig module:app\n", "" },
@@ -2080,7 +2080,7 @@ test "build.zig.zon uses the schema only without a result type" {
         var w: World = undefined;
         try w.init();
         defer w.deinit();
-        _ = try w.fixture(c[1]);
+        try w.setWorkspaceFiles((try w.fixture(c[1])).files);
         const at = try w.add(c[0], ".{ .<|> }");
         testing.expectEqualStrings(c[2], try completionAt(&w, at)) catch |err| {
             std.debug.print("{s} imported by:\n{s}\n", .{ c[0], c[1] });

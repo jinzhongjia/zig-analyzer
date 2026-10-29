@@ -539,3 +539,29 @@ test "generic bodies get the instances of callers in files outside any build gra
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "rename reaches typed .zon files imported from files outside any build graph" {
+    const main_body = "const S = struct { x: u32, y: bool = false };\nconst cfg: S = @import(\"cfg.zon\");\npub fn main() void {\n    _ = cfg.x;\n}\n";
+    // Single-file mode: no build.zig, and cfg.zon is never opened
+    const files = [_]fixture.File{
+        .{ .path = "main.zig", .text = main_body },
+        .{ .path = "cfg.zon", .text = ".{ .x = 1 }\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The `.zon` file got no result type from its importer in no module: the rename left `.x` in
+    // it and the build failed with "unexpected field 'x'"
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "x"), .newName = "count" });
+    try testing.expectEqualStrings("cfg.zon:0:4 main.zig:0:19 main.zig:3:12", try renameEdits(&h, renamed));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

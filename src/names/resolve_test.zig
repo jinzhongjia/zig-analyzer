@@ -72,6 +72,19 @@ pub const World = struct {
         try w.db.set(ModuleGraph.Input, {}, g, .low);
     }
 
+    /// Sets the user's source files under the workspace roots (`inputs.WorkspaceFiles`)
+    pub fn setWorkspaceFiles(w: *World, files: []const FileId) !void {
+        const sorted = try testing.allocator.dupe(FileId, files);
+        std.mem.sort(FileId, sorted, {}, struct {
+            fn lt(_: void, a: FileId, b: FileId) bool {
+                return @backingInt(a) < @backingInt(b);
+            }
+        }.lt);
+        w.db.beginWrite();
+        defer w.db.endWrite();
+        try w.db.set(database.inputs.WorkspaceFiles, {}, sorted, .low);
+    }
+
     /// The files in a `fixture` and the position of `<|>`
     pub const Fixture = struct {
         /// Paths as written in the fixture (posix style) and the corresponding files
