@@ -4783,6 +4783,12 @@ fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.
     var edits: std.ArrayList(ide.rename.Edit) = .empty;
     for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
     if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    // Strings (`@field`, `@hasDecl`, `@fieldParentPtr`, serialization keys) can name only
+    // container members, and one without `pub` only in its own file
+    if (def == .item) {
+        const files = if (try za.ide_db.search.visibleOutsideFile(r, def)) try za.ide_db.search.importers(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
+        if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    }
     return .{ .ok = .{ .refs = refs, .text = text } };
 }
 
@@ -5139,27 +5145,16 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
 }
 
 /// Renames a name that violates the naming conventions to the suggested spelling. Returns only
-/// complete and safe edits: nothing is renamed when some reference cannot be confirmed (ambiguity,
-/// member access on an unknown type, a file with syntax errors), the new name conflicts with an
-/// existing one, or the name appears in a string (reflection).
+/// complete and safe edits, as rename does (see `checkedRename`): nothing is renamed when some
+/// reference cannot be confirmed, the new name conflicts with an existing one, or the name appears
+/// in a string (reflection).
 fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
     const def = f.def;
-    const def_file = switch (def) {
-        .item => |it| it.file,
-        .local => |l| l.file,
-        .file => unreachable,
-    };
     if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
     const checked = switch (try server.checkedRename(r, arena, def, f.name, f.suggestion)) {
         .ok => |checked| checked,
         .failed => |reason| return .{ .failed = reason },
     };
-    // Only container members can be referenced by strings; a
-    // non-pub declaration is accessible only in its own file
-    if (def == .item) {
-        const files = if (f.public) try za.ide_db.search.importers(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
-        if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
-    }
     const confirm = if (f.public) try std.fmt.allocPrint(arena, "Rename public `{s}` to `{s}`", .{ f.name, f.suggestion }) else null;
     return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, confirm) };
 }

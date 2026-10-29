@@ -683,14 +683,27 @@ const Inferrer = struct {
     }
 
     fn recordTagMemberOf(inf: *Inferrer, e: ExprId, want: Index) Error!void {
+        const name = inf.body.expr(e).enum_literal;
         const c = switch (inf.ip.key(want)) {
             .container_type => |c| c,
+            // A tag of an enum or union constructed from the members of a container
+            // (`std.meta.FieldEnum(T)` builds its tags from the fields of T): the member it is
+            // named after, which a rename of that member has to follow
+            .reified_type => |rt| {
+                if (rt.kind == .@"struct") return;
+                for (rt.names) |n| {
+                    if (std.mem.eql(u8, n, name)) break;
+                } else return;
+                const def = try typeInfoMember(inf.r, rt, name) orelse return;
+                inf.members[@backingInt(e)] = try defKey(inf.r, def);
+                return;
+            },
             else => return,
         };
         if (c.kind != .@"enum" and c.kind != .@"union") return;
         const ns = try queries.namespaceOfType(inf.r, want) orelse return;
         const tree = try inf.r.itemTree(ns.file);
-        const f = fieldItem(tree, ns.container, inf.body.expr(e).enum_literal) orelse return;
+        const f = fieldItem(tree, ns.container, name) orelse return;
         inf.members[@backingInt(e)] = .{ .file = ns.file, .item = tree.items[f].ast_id };
     }
 
@@ -3077,6 +3090,32 @@ pub fn declAlternatives(r: *Resolver, a: Allocator, def: resolve.Def) Error![]co
     var out: std.ArrayList(Index) = .empty;
     try alternativeContainers(r, a, key, &out, 0);
     return out.items;
+}
+
+/// The member that a member `name` of the constructed type `rt` is named after, when the member
+/// that constructs it takes the names from `@typeInfo(X)` (`std.meta.FieldEnum(T)` builds its tags
+/// from `@typeInfo(T)`): the member of X with the same name (the first `@typeInfo` argument that
+/// has one)
+pub fn typeInfoMember(r: *Resolver, rt: InternPool.Reified, name: []const u8) Error!?resolve.Def {
+    const tree = try r.itemTree(rt.file);
+    const owner_item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == rt.owner) break @intCast(i);
+    } else return null;
+    const owner = try r.ownerKey(rt.file, owner_item);
+    const body = try r.ctx.get(hir.ItemBody, owner);
+    const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = rt.inst });
+    if (res.exprs.len != body.exprs.len) return null;
+    for (body.exprs) |x| switch (x) {
+        .builtin_call => |call| {
+            if (!std.mem.eql(u8, call.name, "@typeInfo") or call.args.len != 1) continue;
+            const t = res.exprs[@backingInt(call.args[0])].asType() orelse continue;
+            const ns = try queries.namespaceOfType(r, t) orelse continue;
+            const f = fieldItem(try r.itemTree(ns.file), ns.container, name) orelse continue;
+            return .{ .item = .{ .file = ns.file, .item = f } };
+        },
+        else => {},
+    };
+    return null;
 }
 
 /// Maximum depth along alias and inference chains when looking up candidates in other

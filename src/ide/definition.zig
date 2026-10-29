@@ -438,29 +438,11 @@ fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) re
 }
 
 /// When the member names of a constructed type come from `@typeInfo(X)` (such as
-/// `@typeInfo(Tag).@"enum".field_names`), the member of the same name in X: finds the arguments of
-/// `@typeInfo` in the member where the construction happens, and takes the first type that has
-/// this member
+/// `@typeInfo(Tag).@"enum".field_names`), the member of the same name in X (see
+/// `infer.typeInfoMember`)
 fn typeInfoOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
-    const tree = try r.itemTree(rt.file);
-    const owner_item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == rt.owner) break @intCast(i);
-    } else return null;
-    const owner = try r.ownerKey(rt.file, owner_item);
-    const body = try r.ctx.get(database.hir.ItemBody, owner);
-    const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = rt.inst });
-    if (res.exprs.len != body.exprs.len) return null;
-    for (body.exprs) |x| switch (x) {
-        .builtin_call => |call| {
-            if (!std.mem.eql(u8, call.name, "@typeInfo") or call.args.len != 1) continue;
-            const t = res.exprs[@backingInt(call.args[0])].asType() orelse continue;
-            const ns = try queries.namespaceOfType(r, t) orelse continue;
-            const f = infer.fieldItem(try r.itemTree(ns.file), ns.container, name) orelse continue;
-            return target(r, .{ .item = .{ .file = ns.file, .item = f } });
-        },
-        else => {},
-    };
-    return null;
+    const def = try infer.typeInfoMember(r, rt, name) orelse return null;
+    return target(r, def);
 }
 
 /// The range of `e` contains a string literal whose content contains `name`

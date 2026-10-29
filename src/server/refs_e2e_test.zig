@@ -727,3 +727,43 @@ test "rename refuses new names that conflict with existing ones" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "rename covers tags named after fields and refuses names used in strings" {
+    const text =
+        \\const std = @import("std");
+        \\const Item = struct {
+        \\    id: u32,
+        \\    node: u8 = 0,
+        \\};
+        \\test {
+        \\    var list: std.MultiArrayList(Item) = .empty;
+        \\    defer list.deinit(std.testing.allocator);
+        \\    try list.append(std.testing.allocator, .{ .id = 7 });
+        \\    try std.testing.expectEqual(@as(u32, 7), list.items(.id)[0]);
+        \\    const item: Item = .{ .id = 1 };
+        \\    _ = @field(item, "node");
+        \\}
+        \\
+    ;
+    // Single-file mode: no build.zig
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `.id` in `list.items(.id)` is a tag of `std.meta.FieldEnum(Item)`, named after the field: it
+    // used to be missing, and the renamed copy failed with "has no member named 'id'"
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "id:"), .newName = "key" });
+    try testing.expectEqualStrings("main.zig:10:27 main.zig:2:4 main.zig:8:47 main.zig:9:57", try renameEdits(&h, renamed));
+    // `@field(item, "node")` names the field by a string that a rename would not update
+    const node = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "node:"), .newName = "link" });
+    try testing.expectEqualStrings("cannot rename `node` to `link`: `node` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated (main.zig:12:22)", node.object.get("error").?.object.get("message").?.string);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
