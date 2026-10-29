@@ -145,7 +145,7 @@ For **the same disk contents, the same Zig version, and the same build step and 
   - Compiles are deferred before startup finishes (the zig environment is ready and projects have started loading) and while some project is still in its first load (before it has read the build graph and computed the compile set): at that point it is not yet known whether files outside the root directories belong to projects.
   - Single-file mode is reconciled whenever the context of files may have changed (the zig environment becomes ready, a project finishes loading, a compile set changes, a new instance replaces an old one, projects or root directories are added or removed, build integration or compiler diagnostics are toggled): roots that are no longer detached files drop their results; deferred compiles are run, and open detached files that have never been compiled are compiled.
   - When a root file is not on disk (it is found deleted when recompiling or closing), its results are dropped.
-- With unsaved changes: live diagnostics are based on the buffer; compiler diagnostics are based on the saved contents, with positions shifted by the incremental edits.
+- With unsaved changes: live diagnostics are based on the buffer; compiler diagnostics are based on the saved contents, with positions shifted by the incremental edits. Lines that differ only in their terminator (`\r\n` or `\n`) count as unchanged.
 
 ---
 

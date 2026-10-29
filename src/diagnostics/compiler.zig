@@ -313,9 +313,17 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
 /// new text that ends at `new_end`. `old_end` and `new_end` are offsets in their own text, so
 /// `new_end - old_end` is the total shift of everything after this range, including the length
 /// differences of the ranges before it.
-const Edit = struct { start: u32, old_end: u32, new_end: u32 };
+const Edit = struct {
+    start: u32,
+    old_end: u32,
+    new_end: u32,
+    /// Only the line terminator differs (`\r\n` and `\n`): the lines on both sides are the same
+    line_break: bool = false,
+};
 
-const Line = struct { start: u32, end: u32 };
+/// A line of a text: its content [start, end) and the start of the next line; the line terminator
+/// lies in between
+const Line = struct { start: u32, end: u32, next: u32 };
 
 /// Line `old` of the old text matched with the identical line `new` of the new text
 const Match = struct {
@@ -328,12 +336,14 @@ const Match = struct {
 };
 
 /// Compares the old and new text line by line (a patience diff) and returns disjoint replacement
-/// ranges sorted by position. In each range of lines still to compare, identical lines at its start
-/// and end are matched; of the remaining lines, those identical and unique on both sides within
-/// the range are matched along their longest increasing subsequence, and the ranges between them
-/// are compared the same way. Lines left without a match form the modified regions, so no region
-/// starts or ends with a line that is identical on both sides. Line granularity is conservative:
-/// modifying a line hides the diagnostics on that line without affecting unmodified lines.
+/// ranges sorted by position. Lines are compared without their terminator (`\r\n` and `\n` are
+/// equivalent, as for the compiler); identical lines whose terminators differ yield a `line_break`
+/// edit. In each range of lines still to compare, identical lines at its start and end are
+/// matched; of the remaining lines, those identical and unique on both sides within the range are
+/// matched along their longest increasing subsequence, and the ranges between them are compared
+/// the same way. Lines left without a match form the modified regions, so no region starts or ends
+/// with a line that is identical on both sides. Line granularity is conservative: modifying a line
+/// hides the diagnostics on that line without affecting unmodified lines.
 fn diffEdits(a: Allocator, old: []const u8, new: []const u8) Allocator.Error![]const Edit {
     if (std.mem.eql(u8, old, new)) return &.{};
     const old_lines = try splitLines(a, old);
@@ -393,6 +403,11 @@ fn diffEdits(a: Allocator, old: []const u8, new: []const u8) Allocator.Error![]c
     var ni: usize = 0;
     for (matches.items) |m| {
         try addEdit(a, &edits, old, new, old_lines, new_lines, oi, m.old, ni, m.new);
+        const ol = old_lines[m.old];
+        const nl = new_lines[m.new];
+        if (!std.mem.eql(u8, old[ol.end..ol.next], new[nl.end..nl.next])) {
+            try edits.append(a, .{ .start = ol.end, .old_end = ol.next, .new_end = nl.next, .line_break = true });
+        }
         oi = m.old + 1;
         ni = m.new + 1;
     }
@@ -405,9 +420,10 @@ fn splitLines(a: Allocator, text: []const u8) Allocator.Error![]const Line {
     var start: usize = 0;
     while (start < text.len) {
         const nl = std.mem.indexOfScalarPos(u8, text, start, '\n');
-        const end = if (nl) |i| i + 1 else text.len;
-        try lines.append(a, .{ .start = @intCast(start), .end = @intCast(end) });
-        start = end;
+        const next = if (nl) |i| i + 1 else text.len;
+        const end = if (nl) |i| if (i > start and text[i - 1] == '\r') i - 1 else i else text.len;
+        try lines.append(a, .{ .start = @intCast(start), .end = @intCast(end), .next = @intCast(next) });
+        start = next;
     }
     return lines.items;
 }
@@ -469,18 +485,29 @@ fn longestIncreasing(a: Allocator, pairs: []const Match) Allocator.Error![]const
 }
 
 /// A range entirely before the modified regions stays unchanged, one entirely after them is
-/// shifted by the length difference, and one that intersects any modified region yields null.
-/// Ranges from the compiler are not necessarily valid (end before start, far beyond the text): a
-/// range that exceeds u32 after shifting also yields null.
+/// shifted by the length difference, and one that intersects any modified region yields null. A
+/// range may cross a `line_break` edit: its start and end are shifted separately, and only a start
+/// or end inside the line terminator yields null. Ranges from the compiler are not necessarily
+/// valid (end before start, far beyond the text): a range that exceeds u32 after shifting also
+/// yields null.
 fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
-    var delta: i64 = 0;
+    var start_delta: i64 = 0;
+    var end_delta: i64 = 0;
     for (edits) |e| {
         if (end <= e.start) break;
-        if (start < e.old_end) return null;
-        delta = @as(i64, e.new_end) - @as(i64, e.old_end);
+        const delta = @as(i64, e.new_end) - @as(i64, e.old_end);
+        if (e.line_break) {
+            if (start > e.start and start < e.old_end) return null;
+            if (end < e.old_end) return null;
+            if (start >= e.old_end) start_delta = delta;
+        } else {
+            if (start < e.old_end) return null;
+            start_delta = delta;
+        }
+        end_delta = delta;
     }
-    const shifted_start = std.math.cast(u32, @as(i64, start) + delta) orelse return null;
-    const shifted_end = std.math.cast(u32, @as(i64, end) + delta) orelse return null;
+    const shifted_start = std.math.cast(u32, @as(i64, start) + start_delta) orelse return null;
+    const shifted_end = std.math.cast(u32, @as(i64, end) + end_delta) orelse return null;
     return .{ shifted_start, shifted_end };
 }
 

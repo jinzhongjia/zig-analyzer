@@ -381,6 +381,23 @@ test "merge: unchanged repeated lines next to an edit keep their errors" {
     try expectRanges(&.{"5:33-5:37"}, try remappedRanges(a, duplicated, fixed, &.{ spanOf(duplicated, "init", 0), spanOf(duplicated, "init", 1) }));
 }
 
+test "merge: lines that differ only in the line terminator keep their errors" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const crlf = "pub fn main() void {\r\n    f();\r\n    const v: u8 = 300;\r\n    _ = v;\r\n}\r\nfn f() void {\r\n    const w: i8 = 200;\r\n    _ = w;\r\n}\r\n";
+    const lf = try std.mem.replaceOwned(u8, a, crlf, "\r\n", "\n");
+    // Guards against treating every line as modified when the disk text uses CRLF and the buffer
+    // LF, which hid all compiler errors; a range may also cross a line terminator
+    const spans = &.{ spanOf(crlf, "f();\r\n    const", 0), spanOf(crlf, "300", 0), spanOf(crlf, "200", 0) };
+    try expectRanges(&.{ "1:4-2:9", "2:18-2:21", "6:18-6:21" }, try remappedRanges(a, crlf, lf, spans));
+
+    // A mixed-EOL disk text against a buffer normalized to CRLF
+    const mixed = "pub fn main() void {\r\n    f();\r\n    const v: u8 = 300;\n    _ = v;\n}\r\nfn f() void {\n    const w: i8 = 200;\r\n    _ = w;\r\n}\r\n";
+    const normalized = try std.mem.replaceOwned(u8, a, lf, "\n", "\r\n");
+    try expectRanges(&.{ "2:18-2:21", "6:18-6:21" }, try remappedRanges(a, mixed, normalized, &.{ spanOf(mixed, "300", 0), spanOf(mixed, "200", 0) }));
+}
+
 test "merge: malformed compiler spans do not overflow when remapped" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
