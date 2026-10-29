@@ -221,8 +221,8 @@ fn zigFmtEdit(r: *Resolver, file: FileId, text: []const u8, raw: Edit) resolve.E
 
 /// Extracts the selected expression (ignoring surrounding whitespace) into a local constant before
 /// the statement containing it, and replaces the original with its name.
-/// The left-hand side of an assignment, the operand of address-of, and control flow expressions
-/// are not extracted (extracting them would change the semantics or be invalid).
+/// Expressions whose storage is used rather than their value (see `addressUsed`) and control flow
+/// expressions are not extracted (extracting them would change the semantics or be invalid).
 fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -245,11 +245,6 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         .missing, .@"return", .@"break", .@"continue", .@"unreachable", .assign, .block, .loop, .container => return null,
         else => {},
     }
-    for (b.exprs) |x| switch (x) {
-        .assign => |a| if (a.lhs == e) return null,
-        .prefix => |p| if (p.op == .ampersand and p.operand == e) return null,
-        else => {},
-    };
 
     // The enclosing statement: a direct child of a block
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
@@ -267,6 +262,7 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
     }
     const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, item), .mode = .full });
     if (res.exprs.len != b.exprs.len) return null;
+    if (addressUsed(r.ctx.db.env.ip, b, res, e)) return null;
     const purity: Purity = .{ .r = r, .file = file, .item = item, .body = b, .res = res };
     if (s.offset < base or !try hoistable(purity, e, s.offset - base, s.range().end - base)) return null;
     // Expressions whose type depends on the result location (such as `@intCast(x)`): the extracted
@@ -296,6 +292,71 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         .kind = .refactor_extract,
         .edits = try r.arena.dupe(Edit, &.{.{ .start = s.offset, .end = end, .text = new_text }}),
     };
+}
+
+/// Zig evaluates `x` by reference (result location `.ref`) and uses its storage: the left-hand
+/// side of an assignment, the operand of address-of, the base of a member, element, or slice in
+/// such a position (`p` in `&p.a`, `s.inner` in `s.inner.x = 5`), a sliced array, the receiver
+/// of a method taking a pointer, and the operand of `if` / `while` / `switch` with a `|*p|`
+/// capture. A constant holding a copy of `x` would give the address of the copy instead (or a
+/// `*const` where `*T` is needed). Through a pointer the address comes from the pointer value,
+/// which the copy keeps.
+fn addressUsed(ip: *InternPool, b: *const Body, res: queries.Infer.Value, x: Body.ExprId) bool {
+    const ty = res.exprs[@backingInt(x)].ty;
+    const copy_keeps_address = ip.key(ty) == .ptr_type or ty == .type_type;
+    for (b.exprs, 0..) |p, i| {
+        const parent: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        switch (p) {
+            .prefix => |pre| if (pre.operand == x) return pre.op == .ampersand,
+            .assign => |a| if (a.lhs == x) return true,
+            .field_access => |fa| if (fa.lhs == x)
+                return !copy_keeps_address and (addressUsed(ip, b, res, parent) or receivesPointer(ip, b, res, parent)),
+            .index => |ix| if (ix.lhs == x) return !copy_keeps_address and addressUsed(ip, b, res, parent),
+            .slice => |s| if (s.lhs == x) return !copy_keeps_address,
+            .unwrap_optional => |o| if (o == x) return addressUsed(ip, b, res, parent),
+            .builtin_call => |c| if (c.args.len > 0 and c.args[0] == x and std.mem.eql(u8, c.name, "@field"))
+                return !copy_keeps_address and addressUsed(ip, b, res, parent),
+            .@"if" => |f| if (f.cond == x) return anyPointerCapture(b, f.capture),
+            .loop => |l| if (l.kind == .@"while" and std.mem.indexOfScalar(Body.ExprId, l.inputs, x) != null)
+                return anyPointerCapture(b, l.capture),
+            .@"switch" => |sw| if (sw.operand == x) return for (sw.prongs) |pr| {
+                if (anyPointerCapture(b, pr.capture)) break true;
+            } else false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// `callee` is called as a method whose first parameter receives the address of the receiver:
+/// a single-item or C pointer (also optional), or `anytype` (matching the compiler, which passes
+/// the receiver's address to an `anytype` first parameter). A method whose signature cannot be
+/// computed counts as yes; calling a function pointer field loads the field.
+fn receivesPointer(ip: *InternPool, b: *const Body, res: queries.Infer.Value, callee: Body.ExprId) bool {
+    for (b.exprs) |x| switch (x) {
+        .call => |c| if (c.callee == callee) break,
+        else => {},
+    } else return false;
+    const ty = res.exprs[@backingInt(callee)].ty;
+    const sig = switch (ip.key(ty)) {
+        .fn_type => |f| f,
+        .unknown => return true,
+        else => return false,
+    };
+    if (sig.params.len == 0) return false;
+    const first = switch (ip.key(sig.params[0])) {
+        .optional_type => |c| c,
+        else => sig.params[0],
+    };
+    return switch (ip.key(first)) {
+        .ptr_type, .unknown => true,
+        else => false,
+    };
+}
+
+fn anyPointerCapture(b: *const Body, captures: []const Body.BindingId) bool {
+    for (captures) |c| if (b.binding(c).is_ptr) return true;
+    return false;
 }
 
 /// After `e` is extracted to before its statement (`[stmt_start, stmt_end)` relative to the
