@@ -572,3 +572,95 @@ test "rename reaches typed .zon files imported from files outside any build grap
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "renames and fixes refuse to edit fetched packages" {
+    // A dependency fetched by hash (faked: maker does not fetch it again when the package
+    // directory already has it), placed outside the build root with `--pkg-dir`
+    const hash = "foo-0.0.1-OjQ08eFlFQAb4BLnwZNNE3R5Dx2TI67EIpAsy2h0ZyoC";
+    const pkg_root = "pub fn callIt(x: anytype) u32 {\n    return x.method() + x.withExtra(7);\n}\n";
+    const main_body =
+        \\const dep = @import("foo");
+        \\const Mine = struct {
+        \\    n: u32 = 3,
+        \\    pub fn method(self: Mine) u32 {
+        \\        return self.n;
+        \\    }
+        \\    pub fn withExtra(self: Mine, extra: u32) u32 {
+        \\        return self.n;
+        \\    }
+        \\};
+        \\export fn entry() u32 {
+        \\    return dep.callIt(Mine{});
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "proj/build.zig.zon", .text = ".{ .name = .proj, .version = \"0.0.0\", .fingerprint = 0x520c3c90be36badb, .paths = .{\"\"}, " ++
+            ".dependencies = .{ .foo = .{ .url = \"https://example.invalid/foo.tar.gz\", .hash = \"" ++ hash ++ "\" } } }\n" },
+        .{ .path = "proj/build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const foo = b.dependency("foo", .{});
+        \\    const root = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.graph.host,
+        \\        .imports = &.{.{ .name = "foo", .module = foo.module("foo") }},
+        \\    });
+        \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "probe", .root_module = root }).step);
+        \\}
+        \\
+        },
+        .{ .path = "proj/main.zig", .text = main_body },
+        .{ .path = "proj/zig-analyzer.zon", .text = ".{ .build = .{ .args = .{ \"--pkg-dir\", \"../pkgs\" } } }" },
+        .{ .path = "pkgs/" ++ hash ++ "/build.zig.zon", .text = ".{ .name = .foo, .version = \"0.0.1\", .fingerprint = 0x8c736521e67512df, .paths = .{\"\"} }\n" },
+        .{ .path = "pkgs/" ++ hash ++ "/build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addModule("foo", .{ .root_source_file = b.path("src/root.zig") });
+        \\}
+        \\
+        },
+        .{ .path = "pkgs/" ++ hash ++ "/src/root.zig", .text = pkg_root },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, try project.path(a, "proj")),
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .dataSupport = true, .disabledSupport = true, .resolveSupport = .{ .properties = &[_][]const u8{"edit"} } } } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "proj/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `x.method()` in the package refers to `Mine.method` through the instance: references list it,
+    // but a rename used to edit the package, whose copy restored by hash elsewhere then broke
+    const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "method"), .context = .{ .includeDeclaration = true } });
+    try testing.expectEqual(2, refs.object.get("result").?.array.items.len);
+    const pkg_file = try project.path(a, "pkgs/" ++ hash ++ "/src/root.zig");
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "method"), .newName = "run" });
+        const expected = try std.fmt.allocPrint(a, "cannot rename `method` to `run`: this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited ({s}:2:14)", .{pkg_file});
+        try testing.expectEqualStrings(expected, resp.object.get("error").?.object.get("message").?.string);
+    }
+    {
+        const p = position(main_body, "extra:");
+        const actions = (try h.request("textDocument/codeAction", .{
+            .textDocument = .{ .uri = main_uri },
+            .range = .{ .start = p, .end = p },
+            .context = .{ .diagnostics = &[_]Empty{} },
+        })).object.get("result").?.array.items;
+        const fix = for (actions) |x| {
+            if (std.mem.eql(u8, x.object.get("title").?.string, "remove parameter `extra`")) break x;
+        } else return error.NoFix;
+        const resp = try h.request("codeAction/resolve", fix);
+        const message = resp.object.get("error").?.object.get("message").?.string;
+        try testing.expect(std.mem.startsWith(u8, message, "cannot remove parameter `extra`: this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited ("));
+        try testing.expect(std.mem.indexOf(u8, message, pkg_file) != null);
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

@@ -4775,7 +4775,26 @@ fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.nam
     if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
     if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
     if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
+    const rules = try server.originRules(arena);
+    for (refs, 0..) |ref, i| {
+        // Sorted by file: check each file once
+        if (i > 0 and refs[i - 1].file == ref.file) continue;
+        if (!server.editable(rules, ref.file)) return .{ .failed = try server.renameProblem(r, arena, old, new, ref.file, ref.start, not_editable) };
+    }
     return .{ .ok = refs };
+}
+
+/// Why an edit that a rename or fix needs in a file that is not `editable` is refused
+const not_editable = "this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited";
+
+/// Whether renames and fixes may edit `file`: the user's own code (see `origin.Origin`). A
+/// fetched package is restored from its hash on other machines, the Zig installation is shared by
+/// every project, and generated files are overwritten by builds.
+fn editable(server: *Server, rules: origin.Rules, file: Vfs.FileId) bool {
+    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
+        .virtual, .user, .outside => true,
+        .zig_lib, .generated, .package, .other => false,
+    };
 }
 
 /// Edits that change the references (sorted by file and position, including the declaration) to
@@ -5184,16 +5203,20 @@ fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remov
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
     if (try server.scopeIncompleteFor(r, .{ .item = .{ .file = t.file, .item = t.item } })) |reason|
         return .{ .failed = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`: {s}", .{ t.name, reason }) };
+    const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
     switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
-        .ok => |files| return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
-            .id = "zig-analyzer.remove-param-public",
-            .label = try std.fmt.allocPrint(arena, "Remove parameter `{s}` of public `{s}`", .{ t.name, fn_name }),
-            .description = "code outside this workspace that calls the function is not updated",
-        } else null) },
-        .failed => |p| {
-            const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
-            return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
+        .ok => |files| {
+            const rules = try server.originRules(arena);
+            for (files) |fe| if (!server.editable(rules, fe.file)) {
+                return .{ .failed = try server.fixProblem(r, arena, prefix, fe.file, if (fe.edits.len != 0) fe.edits[0].start else null, not_editable) };
+            };
+            return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
+                .id = "zig-analyzer.remove-param-public",
+                .label = try std.fmt.allocPrint(arena, "Remove parameter `{s}` of public `{s}`", .{ t.name, fn_name }),
+                .description = "code outside this workspace that calls the function is not updated",
+            } else null) };
         },
+        .failed => |p| return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) },
     }
 }
 
