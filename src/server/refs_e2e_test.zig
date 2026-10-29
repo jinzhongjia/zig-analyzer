@@ -767,3 +767,101 @@ test "rename covers tags named after fields and refuses names used in strings" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "labels and error names: references, highlight and rename" {
+    const text =
+        \\const std = @import("std");
+        \\const E = error{ Oops, Other };
+        \\const F = error{Oops};
+        \\fn f(x: u32) E!u32 {
+        \\    if (x == 0) return error.Oops;
+        \\    if (x == 9) return E.Oops;
+        \\    const v: u32 = blk: {
+        \\        if (x == 1) break :blk 1;
+        \\        break :blk 2;
+        \\    };
+        \\    var n: u32 = 0;
+        \\    outer: while (n < 3) : (n += 1) {
+        \\        inner: for (0..2) |_| {
+        \\            if (n == 1) continue :outer;
+        \\            if (n == 2) break :inner;
+        \\        }
+        \\        if (n == 2) break :outer;
+        \\    }
+        \\    return v + n;
+        \\}
+        \\fn grow(a: std.mem.Allocator) error{OutOfMemory}!void {
+        \\    a.free(try a.alloc(u8, 1));
+        \\}
+        \\test {
+        \\    const r = f(2) catch |err| switch (err) {
+        \\        error.Oops => 0,
+        \\        error.Other => 1,
+        \\    };
+        \\    try std.testing.expect(r == 4);
+        \\    try std.testing.expect(@intFromError(E.Oops) == @intFromError(F.Oops));
+        \\    try grow(std.testing.allocator);
+        \\}
+        \\
+    ;
+    // Single-file mode: no build.zig
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    const doc = .{ .uri = uri };
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // All of these returned null although goto resolved them
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(text, "blk:"), .context = .{ .includeDeclaration = true } });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |l| try out.append(a, try loc(&h, uri, l.object.get("range").?));
+        try testing.expectEqualStrings("main.zig:6:19 main.zig:7:27 main.zig:8:15", try join(&h, out.items));
+    }
+    {
+        const resp = try h.request("textDocument/documentHighlight", .{ .textDocument = doc, .position = position(text, "outer;") });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |x| try out.append(a, try std.fmt.allocPrint(a, "{s}/{d}", .{ try loc(&h, uri, x.object.get("range").?), x.object.get("kind").?.integer }));
+        try testing.expectEqualStrings("main.zig:11:4/3 main.zig:13:34/2 main.zig:16:27/2", try join(&h, out.items));
+    }
+    {
+        const prep = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(text, "blk 2") });
+        try testing.expectEqualStrings("blk", prep.object.get("result").?.object.get("placeholder").?.string);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "blk 2"), .newName = "done" });
+        try testing.expectEqualStrings("main.zig:6:19 main.zig:7:27 main.zig:8:15", try renameEdits(&h, renamed));
+        // A label must not redefine the label of an enclosing loop
+        const redefined = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "inner:"), .newName = "outer" });
+        try testing.expectEqualStrings("cannot rename `inner` to `outer`: redefinition of label 'outer' (main.zig:13:9)", redefined.object.get("error").?.object.get("message").?.string);
+    }
+    // Error names are global: every error set that contains the name, and `E.X` on error sets
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(text, "Oops;"), .context = .{ .includeDeclaration = true } });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |l| try out.append(a, try loc(&h, uri, l.object.get("range").?));
+        try testing.expectEqualStrings("main.zig:1:17 main.zig:2:16 main.zig:4:29 main.zig:5:25 main.zig:25:14 main.zig:29:43 main.zig:29:68", try join(&h, out.items));
+        const prep = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(text, "Oops =>") });
+        try testing.expectEqualStrings("Oops", prep.object.get("result").?.object.get("placeholder").?.string);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "Oops =>"), .newName = "Failed" });
+        try testing.expectEqualStrings("main.zig:1:17 main.zig:25:14 main.zig:29:43 main.zig:29:68 main.zig:2:16 main.zig:4:29 main.zig:5:25", try renameEdits(&h, renamed));
+    }
+    // Renaming to an existing error name would merge the two errors (the switch prongs would
+    // become duplicates)
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "Oops;"), .newName = "Other" });
+        try testing.expectEqualStrings("cannot rename `Oops` to `Other`: `Other` is already an error name: error names are global, so the renamed error would become this one (main.zig:2:24)", resp.object.get("error").?.object.get("message").?.string);
+    }
+    // The standard library uses `error.OutOfMemory` and is not renamed
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "OutOfMemory"), .newName = "Oom" });
+        const message = resp.object.get("error").?.object.get("message").?.string;
+        try testing.expect(std.mem.startsWith(u8, message, "cannot rename `OutOfMemory` to `Oom`: this file also uses the error `OutOfMemory` and is not renamed: error names are global, so it would no longer be the same error ("));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

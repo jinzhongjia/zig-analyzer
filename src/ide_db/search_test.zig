@@ -62,11 +62,16 @@ fn at(src: []const u8, needle: []const u8, nth: usize) u32 {
 
 /// Reference list: `file:line` entries joined by spaces (the definition is marked with `*`)
 fn refs(w: *World, fs: Files, file: FileId, offset: u32, only_file: ?FileId) ![]const u8 {
+    return symbolRefs(w, file, offset, .{ .scope = &.{ fs.main, fs.lib, fs.other }, .only_file = only_file });
+}
+
+/// References of the symbol at `offset` (see `refs`)
+fn symbolRefs(w: *World, file: FileId, offset: u32, opts: search.Options) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    const def = try definition.defAt(&r, file, offset) orelse return "null";
-    const list = try search.findReferences(&r, def, .{ .scope = &.{ fs.main, fs.lib, fs.other }, .only_file = only_file });
+    const symbol = try definition.symbolAt(&r, file, offset) orelse return "null";
+    const list = try search.symbolReferences(&r, symbol, opts);
     var out: std.ArrayList(u8) = .empty;
     for (list, 0..) |ref, i| {
         const text = (try ctx.get(database.syntax.SourceText, ref.file)).text;
@@ -701,4 +706,103 @@ test "member accesses in a heterogeneous inline for refer to the member of each 
         try testing.expectEqual(use, list[1].start);
         try testing.expectEqual(use - "shape.".len, ambiguous.?.start);
     }
+}
+
+const jumps_src =
+    \\const lib = @import("lib.zig");
+    \\const E = error{ Oops, Other };
+    \\const F = error{Oops};
+    \\const Mode = enum { Oops, Calm };
+    \\fn f(x: u32) E!u32 {
+    \\    if (x == 0) return error.Oops;
+    \\    if (x == 9) return E.Oops;
+    \\    const v: u32 = blk: {
+    \\        if (x == 1) break :blk 1;
+    \\        break :blk 2;
+    \\    };
+    \\    const w: u32 = blk: {
+    \\        break :blk 3;
+    \\    };
+    \\    var n: u32 = 0;
+    \\    outer: while (n < 3) : (n += 1) {
+    \\        inner: for (0..2) |_| {
+    \\            if (n == 1) continue :outer;
+    \\            if (n == 2) break :inner;
+    \\        }
+    \\        if (n == 2) break :outer;
+    \\    }
+    \\    sw: switch (x) {
+    \\        0 => continue :sw 1,
+    \\        else => {},
+    \\    }
+    \\    const m: Mode = .Oops;
+    \\    _ = m;
+    \\    return v + w + n;
+    \\}
+    \\fn g(x: anytype) void {
+    \\    _ = x.Oops;
+    \\}
+    \\test {
+    \\    const r = f(2) catch |err| switch (err) {
+    \\        error.Oops => 0,
+    \\        error.Other => 1,
+    \\    };
+    \\    _ = r;
+    \\    _ = (E || F).Oops;
+    \\    _ = Mode.Oops;
+    \\    lib.h() catch {};
+    \\}
+;
+
+test "labels and error names" {
+    // Both had no references, highlight or rename although goto resolved them
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib_text =
+        \\pub fn h() !void {
+        \\    return error.Oops;
+        \\}
+    ;
+    // Not compiled together with main.zig: its `error.Oops` is not the same error
+    const other_text =
+        \\fn k() !void {
+        \\    return error.Oops;
+        \\}
+    ;
+    const fm = (try w.add("/p/main.zig", jumps_src)).file;
+    const fl = (try w.add("/p/lib.zig", lib_text)).file;
+    const fo = (try w.add("/p/other.zig", other_text)).file;
+    const scope: []const FileId = &.{ fm, fl, fo };
+    const cases = [_]struct { []const u8, usize, []const u8 }{
+        // Each `break` / `continue` targets the innermost enclosing expression with the label
+        .{ "blk", 0, "main:8:blk* main:9:blk main:10:blk" },
+        .{ "blk", 4, "main:12:blk* main:13:blk" },
+        .{ "outer", 1, "main:16:outer* main:18:outer main:21:outer" },
+        .{ "inner", 1, "main:17:inner* main:19:inner" },
+        .{ "sw", 2, "main:23:sw* main:24:sw" },
+        // Error names are global: every error set and `E.X` on an error set type, but not the enum
+        // member with the same name
+        .{ "Oops", 3, "main:2:Oops* main:3:Oops* main:6:Oops main:7:Oops main:36:Oops main:40:Oops lib:2:Oops" },
+        .{ "Oops", 0, "main:2:Oops* main:3:Oops* main:6:Oops main:7:Oops main:36:Oops main:40:Oops lib:2:Oops" },
+        .{ "Oops", 4, "main:2:Oops* main:3:Oops* main:6:Oops main:7:Oops main:36:Oops main:40:Oops lib:2:Oops" },
+        .{ "Oops", 2, "main:4:Oops* main:27:Oops main:41:Oops" },
+    };
+    for (cases) |c| {
+        const got = try symbolRefs(&w, fm, at(jumps_src, c[0], c[1]), .{ .scope = scope });
+        testing.expectEqualStrings(c[2], got) catch |err| {
+            std.debug.print("references of `{s}` #{d}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+    // Document highlight: in one file
+    try testing.expectEqualStrings("lib:2:Oops", try symbolRefs(&w, fl, at(lib_text, "Oops", 0), .{ .scope = &.{}, .only_file = fl }));
+    try testing.expectEqualStrings("other:2:Oops", try symbolRefs(&w, fo, at(other_text, "Oops", 0), .{ .scope = scope }));
+    // `x.Oops` on a value of unknown type may be the error
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var uncertain: ?search.Reference = null;
+    _ = try search.symbolReferences(&r, (try definition.symbolAt(&r, fm, at(jumps_src, "Oops", 3))).?, .{ .scope = scope, .uncertain = &uncertain });
+    try testing.expectEqual(at(jumps_src, "x.Oops", 0), uncertain.?.start);
 }

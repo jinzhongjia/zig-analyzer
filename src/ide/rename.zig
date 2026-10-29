@@ -6,7 +6,9 @@
 //! report errors, which `declarationConflict` detects in advance and `verifyAstGen` confirms on
 //! the renamed text. A declaration in a container, however, may share its name with a declaration
 //! of an outer container (the inner one takes precedence); such a rename causes no error, but the
-//! name silently refers to another declaration, which `resolutionConflict` checks.
+//! name silently refers to another declaration, which `resolutionConflict` checks. Error names are
+//! global, so renaming one must neither split it from a use that is not renamed nor merge it with
+//! another error (`errorNameConflict`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +21,7 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const search = @import("../ide_db/search.zig");
 
 /// Reason a rename is not possible
 pub const Problem = struct {
@@ -130,6 +133,35 @@ pub fn resolutionConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error
             }
         }
     }
+    return null;
+}
+
+/// Conflicts of renaming the error `old`, found in `file`, to `new`. Error names are global: all
+/// files compiled together with `file` (see `search.reachable`) share them. A file outside `scope`
+/// (the standard library, a file outside the workspace that is in no module) that uses `old` is
+/// not renamed, so its error would no longer be the renamed one; and when `new` is already an
+/// error name, the renamed error would become that error (switch prongs and comparisons that told
+/// them apart would no longer compile or would change meaning). The tests of files outside `scope`
+/// are not compiled with the project.
+pub fn errorNameConflict(r: *Resolver, file: FileId, scope: []const FileId, old: []const u8, new: []const u8) resolve.Error!?Problem {
+    var in_scope: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    for (scope) |f| try in_scope.put(r.arena, f, {});
+    try in_scope.put(r.arena, file, {});
+    const files = try search.reachable(r, try search.importers(r, file, scope));
+    for (files) |f| {
+        if (in_scope.contains(f)) continue;
+        if (try search.errorUse(r, f, old, true, false)) |at| return .{
+            .file = f,
+            .offset = at,
+            .message = try std.fmt.allocPrint(r.arena, "this file also uses the error `{s}` and is not renamed: error names are global, so it would no longer be the same error", .{old}),
+        };
+    }
+    if (std.mem.eql(u8, old, new)) return null;
+    for (files) |f| if (try search.errorUse(r, f, new, false, in_scope.contains(f))) |at| return .{
+        .file = f,
+        .offset = at,
+        .message = try std.fmt.allocPrint(r.arena, "`{s}` is already an error name: error names are global, so the renamed error would become this one", .{new}),
+    };
     return null;
 }
 

@@ -4638,18 +4638,28 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return out.items;
 }
 
-/// The definition at the cursor
-fn defAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { def: za.names.resolve.Def, file: Vfs.FileId } {
+/// The symbol at the cursor (see `definition.symbolAt`)
+fn symbolAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { symbol: za.ide_db.search.Symbol, file: Vfs.FileId } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
-    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
-    return .{ .def = def, .file = at.file };
+    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return null;
+    return .{ .symbol = symbol, .file = at.file };
 }
 
-/// Why the references of `def` cannot all be found now (see `scopeIncomplete`); null also when
+/// Why the references of `symbol` cannot all be found now (see `scopeIncomplete`); null also when
 /// only its own file can refer to it
-fn scopeIncompleteFor(server: *Server, r: *Resolver, def: za.names.resolve.Def) !?[]const u8 {
-    if (!try za.ide_db.search.visibleOutsideFile(r, def)) return null;
-    return server.scopeIncomplete();
+fn scopeIncompleteFor(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
+    if (!try ownFileOnly(r, symbol)) return server.scopeIncomplete();
+    return null;
+}
+
+/// Whether only the file of `symbol` can refer to it: local names, labels, and declarations without
+/// `pub` other than fields. Error names are global.
+fn ownFileOnly(r: *Resolver, symbol: za.ide_db.search.Symbol) !bool {
+    return switch (symbol) {
+        .def => |def| !try za.ide_db.search.visibleOutsideFile(r, def),
+        .label => true,
+        .error_name => false,
+    };
 }
 
 /// Converts reference positions to LSP ranges (caching the line index per file)
@@ -4669,9 +4679,9 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!Outcome(types.ResultType("textDocument/references")) {
-    const found = try server.defAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    if (try server.scopeIncompleteFor(r, found.def)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
-    const refs = try za.ide_db.search.findReferences(r, found.def, .{ .scope = try server.searchScope(r) });
+    const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    if (try server.scopeIncompleteFor(r, found.symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
+    const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = try server.searchScope(r) });
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (refs) |ref| {
@@ -4682,35 +4692,40 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.defAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const refs = try za.ide_db.search.findReferences(r, found.def, .{ .scope = &.{}, .only_file = found.file });
+    const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = &.{}, .only_file = found.file });
     const out = try arena.alloc(types.DocumentHighlight, refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
     return out;
 }
 
-/// Why `def` cannot be renamed, or null when it can: the user's own code (see
+/// Why `symbol` cannot be renamed, or null when it can: the user's own code (see
 /// `origin.Origin.user`) and unsaved documents can be renamed. In a file outside the workspace
 /// folders (`origin.Origin.outside`), only what its own file alone can refer to can be renamed
-/// (local names, and declarations without `pub` other than fields): which other files use the rest
-/// is not known.
-fn renameRefusal(server: *Server, r: *Resolver, def: za.names.resolve.Def) !?[]const u8 {
-    const file = switch (def) {
-        .item => |it| it.file,
-        .local => |l| l.file,
-        // `@import` and its path string lead to a file, which is not a name in the code
-        .file => return "cannot rename: the cursor is on the import of a file, and files cannot be renamed",
+/// (see `ownFileOnly`): which other files use the rest is not known.
+fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
+    const file = switch (symbol) {
+        .def => |def| switch (def) {
+            .item => |it| it.file,
+            .local => |l| l.file,
+            // `@import` and its path string lead to a file, which is not a name in the code
+            .file => return "cannot rename: the cursor is on the import of a file, and files cannot be renamed",
+        },
+        .label => |l| l.file,
+        .error_name => |e| e.file,
     };
-    if (try za.ide_db.search.defName(r, def) == null) return "cannot rename: there is no name here";
+    if (try za.ide_db.search.symbolName(r, symbol) == null) return "cannot rename: there is no name here";
     const rules = try server.originRules(r.arena);
     return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
         // Unsaved documents (`untitled:` etc.) exist only in the editor
         .virtual, .user => null,
-        .outside => if (try za.ide_db.search.visibleOutsideFile(r, def))
-            "cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known"
+        .outside => if (try ownFileOnly(r, symbol))
+            null
+        else if (symbol == .error_name)
+            "cannot rename an error name in a file outside the workspace folders: error names are global, and the files that use it are not known"
         else
-            null,
+            "cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known",
         .zig_lib, .generated, .package, .other => "cannot rename a symbol defined outside the workspace",
     };
 }
@@ -4719,12 +4734,12 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
     const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return .{ .ok = null };
     if (tok.kind != .identifier) return .{ .ok = null };
-    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
-    if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
-    if (try ide.rename.stdRootLookup(r, def)) |p| {
+    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (try server.renameRefusal(r, symbol)) |reason| return .{ .failed = reason };
+    if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| {
         const prefix = try std.fmt.allocPrint(arena, "cannot rename `{s}`", .{za.syntax.ast.identName(tok.text)});
         return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
-    }
+    };
     const lines = try offsets.LineIndex.init(arena, at.text);
     return .{ .ok = .{ .PrepareRenamePlaceholder = .{
         .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
@@ -4735,10 +4750,15 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
 fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!Outcome(types.ResultType("textDocument/rename")) {
     _ = try identifierText(arena, params.newName, false);
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
-    if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
-    const old = (try za.ide_db.search.defName(r, def)).?;
-    const checked = switch (try server.checkedRename(r, arena, def, old, params.newName)) {
+    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (try server.renameRefusal(r, symbol)) |reason| return .{ .failed = reason };
+    const old = (try za.ide_db.search.symbolName(r, symbol)).?;
+    const outcome = switch (symbol) {
+        .def => |def| try server.checkedRename(r, arena, def, old, params.newName),
+        .label => |l| try server.checkedLabelRename(r, arena, l, old, params.newName),
+        .error_name => |e| try server.checkedErrorRename(r, arena, e.file, old, params.newName),
+    };
+    const checked = switch (outcome) {
         .ok => |checked| checked,
         .failed => |reason| return .{ .failed = reason },
     };
@@ -4758,14 +4778,11 @@ const CheckedRename = struct {
 /// declaration; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
 /// reports a new error in the declaration's file once it is renamed (`rename.verifyAstGen`).
 fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
-    const refs = switch (try server.renameReferences(r, arena, def, old, new)) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .def = def }, old, new)) {
         .ok => |refs| refs,
         .failed => |reason| return .{ .failed = reason },
     };
-    const name = if (std.mem.startsWith(u8, new, "@\"")) std.zig.string_literal.parseAlloc(arena, new[1..]) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidLiteral => return error.InvalidIdentifier,
-    } else new;
+    const name = try decodedName(arena, new);
     if (try ide.rename.declarationConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     if (try ide.rename.resolutionConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     const def_file = switch (def) {
@@ -4792,21 +4809,72 @@ fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.
     return .{ .ok = .{ .refs = refs, .text = text } };
 }
 
-/// All references of `def` for renaming it from `old` to `new`, or why they cannot all be
+/// The name that `new` (as given, possibly `@"..."`) spells
+fn decodedName(arena: Allocator, new: []const u8) HandlerError![]const u8 {
+    if (!std.mem.startsWith(u8, new, "@\"")) return new;
+    return std.zig.string_literal.parseAlloc(arena, new[1..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return error.InvalidIdentifier,
+    };
+}
+
+/// The references of a label and the source text of its new name (see `checkedRename`): the label
+/// and the `break` / `continue` that target it are all in one member, and AstGen confirms the
+/// renamed file (a label must not redefine a label of an enclosing expression)
+fn checkedLabelRename(server: *Server, r: *Resolver, arena: Allocator, label: za.ide_db.search.Label, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .label = label }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const text = try identifierText(arena, new, false);
+    const edits = try arena.alloc(ide.rename.Edit, refs.len);
+    for (refs, edits) |ref, *e| e.* = .{ .start = ref.start, .end = ref.end, .text = text };
+    if (try ide.rename.verifyAstGen(r, label.file, edits)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
+/// The uses of the error `old`, found in `file`, and the source text of its new name (see
+/// `checkedRename`). Error names are global, so the uses in all files compiled together with
+/// `file` are renamed: each must be confirmed and editable (see `renameReferences`), no file that
+/// is not renamed may use `old`, and `new` must not already be an error name (see
+/// `rename.errorNameConflict`); `@errorName` results may be compared with a string of the name,
+/// and AstGen confirms each renamed file.
+fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs.FileId, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .error_name = .{ .file = file, .name = old } }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const scope = try server.searchScope(r);
+    if (try ide.rename.errorNameConflict(r, file, scope, old, try decodedName(arena, new))) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    const files = try za.ide_db.search.candidateFiles(r, try za.ide_db.search.importers(r, file, scope), scope);
+    if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    // Error names may be names of primitive types (`error.u8`)
+    const text = try identifierText(arena, new, true);
+    var i: usize = 0;
+    while (i < refs.len) {
+        const f = refs[i].file;
+        var edits: std.ArrayList(ide.rename.Edit) = .empty;
+        while (i < refs.len and refs[i].file == f) : (i += 1) try edits.append(arena, .{ .start = refs[i].start, .end = refs[i].end, .text = text });
+        if (try ide.rename.verifyAstGen(r, f, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    }
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
+/// All references of `symbol` for renaming it from `old` to `new`, or why they cannot all be
 /// confirmed, in which case renaming would leave a partially renamed result: the standard library
 /// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
 /// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
 /// function, goes through a member access of unknown type, or depends on instances that grow
 /// without bound, or a file that mentions the name has syntax errors.
-fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
-    if (try ide.rename.stdRootLookup(r, def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    if (try server.scopeIncompleteFor(r, def)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
+fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
+    if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
     const scope = try server.searchScope(r);
     var ambiguous: ?za.ide_db.search.Reference = null;
     var uncertain: ?za.ide_db.search.Reference = null;
     var incomplete: ?za.ide_db.search.Reference = null;
     var syntax_error: ?Vfs.FileId = null;
-    const refs = try za.ide_db.search.findReferences(r, def, .{
+    const refs = try za.ide_db.search.symbolReferences(r, symbol, .{
         .scope = scope,
         .ambiguous = &ambiguous,
         .uncertain = &uncertain,
@@ -4815,7 +4883,10 @@ fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.nam
     });
     if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
     if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, za.ide_db.search.ambiguous_message) };
-    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
+    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, if (symbol == .error_name)
+        "the type here is unknown, so whether this is the same error cannot be confirmed"
+    else
+        "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
     if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
     const rules = try server.originRules(arena);
     for (refs, 0..) |ref, i| {
@@ -5150,7 +5221,7 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
 /// in a string (reflection).
 fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
     const def = f.def;
-    if (try server.renameRefusal(r, def)) |reason| return .{ .failed = reason };
+    if (try server.renameRefusal(r, .{ .def = def })) |reason| return .{ .failed = reason };
     const checked = switch (try server.checkedRename(r, arena, def, f.name, f.suggestion)) {
         .ok => |checked| checked,
         .failed => |reason| return .{ .failed = reason },
@@ -5183,7 +5254,7 @@ fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u
 /// parameter cannot be removed, the reason is attached if the client supports `disabled`;
 /// otherwise the action is not offered.
 fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, t: ide.remove_param.Target, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
-    if (try server.renameRefusal(r, .{ .item = .{ .file = t.file, .item = t.item } }) != null) return null;
+    if (try server.renameRefusal(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } }) != null) return null;
     var action: types.CodeAction = .{
         .title = try std.fmt.allocPrint(arena, "remove parameter `{s}`", .{t.name}),
         .kind = types.CodeActionKind.QuickFix,
@@ -5220,7 +5291,7 @@ fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: [
 /// are not updated.
 fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
-    if (try server.scopeIncompleteFor(r, .{ .item = .{ .file = t.file, .item = t.item } })) |reason|
+    if (try server.scopeIncompleteFor(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } })) |reason|
         return .{ .failed = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`: {s}", .{ t.name, reason }) };
     const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
     switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {

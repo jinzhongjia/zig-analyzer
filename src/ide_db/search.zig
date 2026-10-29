@@ -9,7 +9,9 @@
 //! enclosing member (and the members of containers defined in its body).
 //! Only members in which the name occurs are resolved; name references use name resolution, and
 //! field accesses prefer namespace evaluation, reading the member's type inference result only
-//! when that fails.
+//! when that fails. Labels are searched only in the member that contains them, and error names,
+//! which are global, in the files compiled together with the file where the name was found (see
+//! `Symbol`).
 
 const std = @import("std");
 const database = @import("../database.zig");
@@ -22,6 +24,7 @@ const Body = @import("../hir/Body.zig");
 const ast = @import("../syntax/ast.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
+const ErrorSets = @import("../syntax/ErrorSets.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const seed = @import("seed.zig");
@@ -138,24 +141,224 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .file => unreachable,
     }
 
-    std.mem.sort(Reference, out.items, {}, struct {
+    return sortUnique(out.items);
+}
+
+/// Sorts references by file and position and drops duplicates: the definition site may also show up
+/// as an expression (e.g. several resolution paths at the same position)
+fn sortUnique(refs: []Reference) []Reference {
+    std.mem.sort(Reference, refs, {}, struct {
         fn lt(_: void, a: Reference, b: Reference) bool {
             if (a.file != b.file) return @backingInt(a.file) < @backingInt(b.file);
             return a.start < b.start;
         }
     }.lt);
-    // The definition site may also show up as an expression (e.g. several resolution paths at the
-    // same position): deduplicate
     var n: usize = 0;
-    for (out.items) |ref| {
-        if (n > 0 and out.items[n - 1].file == ref.file and out.items[n - 1].start == ref.start) {
-            out.items[n - 1].is_decl = out.items[n - 1].is_decl or ref.is_decl;
+    for (refs) |ref| {
+        if (n > 0 and refs[n - 1].file == ref.file and refs[n - 1].start == ref.start) {
+            refs[n - 1].is_decl = refs[n - 1].is_decl or ref.is_decl;
             continue;
         }
-        out.items[n] = ref;
+        refs[n] = ref;
         n += 1;
     }
-    return out.items[0..n];
+    return refs[0..n];
+}
+
+/// A label: the labeled block, loop or switch `expr` of member `item`. A label is visible only
+/// inside the expression it labels, so all its references are in that member
+pub const Label = struct {
+    file: FileId,
+    item: u32,
+    expr: Body.ExprId,
+};
+
+/// What find references, document highlight and rename work on
+pub const Symbol = union(enum) {
+    /// A declaration or a local name
+    def: Def,
+    label: Label,
+    /// An error name found in `file`. Error names are global: `error.X`, the `X` of `error{ X }`
+    /// and the member `X` of an error set type are one error in a compilation, whichever error set
+    /// they are written in, so the files compiled together with `file` are searched
+    error_name: struct { file: FileId, name: []const u8 },
+};
+
+/// Name of the symbol (see `defName`)
+pub fn symbolName(r: *Resolver, symbol: Symbol) resolve.Error!?[]const u8 {
+    return switch (symbol) {
+        .def => |def| defName(r, def),
+        .label => |l| labelName(try r.body(l.file, l.item), l.expr),
+        .error_name => |e| e.name,
+    };
+}
+
+fn labelName(b: *const Body, e: Body.ExprId) ?[]const u8 {
+    for (b.scopes) |s| if (s.label) |l| if (l.expr == e) return l.name;
+    return null;
+}
+
+/// All references to the symbol, sorted by file and position (see `findReferences`,
+/// `labelReferences` and `findErrorReferences`)
+pub fn symbolReferences(r: *Resolver, symbol: Symbol, opts: Options) resolve.Error![]Reference {
+    switch (symbol) {
+        .def => |def| return findReferences(r, def, opts),
+        .label => |l| {
+            if (opts.only_file) |f| if (f != l.file) return &.{};
+            try noteSyntaxError(r, opts.syntax_error, l.file);
+            return labelReferences(r, l);
+        },
+        .error_name => |e| return findErrorReferences(r, e.name, e.file, opts),
+    }
+}
+
+/// References to a label: the label itself and the `break :l` / `continue :l` that target it,
+/// sorted by position
+pub fn labelReferences(r: *Resolver, label: Label) resolve.Error![]Reference {
+    const b = try r.body(label.file, label.item);
+    const node = try r.itemNode(label.file, label.item) orelse return &.{};
+    const name = labelName(b, label.expr) orelse return &.{};
+    var out: std.ArrayList(Reference) = .empty;
+    // The labeled expression starts at its label
+    const def = node.tokenAtOffset(node.offset + b.range(label.expr).start) orelse return &.{};
+    try out.append(r.arena, .{ .file = label.file, .start = def.offset, .end = def.range().end, .is_decl = true });
+    for (b.exprs, 0..) |e, i| {
+        const l = switch (e) {
+            .@"break" => |x| x.label,
+            .@"continue" => |x| x.label,
+            else => null,
+        } orelse continue;
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        if (!std.mem.eql(u8, l, name) or b.labelTarget(id, l) != label.expr) continue;
+        // The keyword is a token of the `break` / `continue` node itself
+        const path = try node.coveringPath(r.arena, node.offset + b.expr_ranges[i].start);
+        const jump = path[path.len - 1];
+        if (jump.kind() != .break_expr and jump.kind() != .continue_expr) continue;
+        const tok = (ast.BreakExpr{ .syntax = jump }).label() orelse continue;
+        try out.append(r.arena, .{ .file = label.file, .start = tok.offset, .end = tok.range().end });
+    }
+    return sortUnique(out.items);
+}
+
+/// All uses of the error named `name` in the files of `opts.scope` compiled together with `file`
+/// (see `Symbol.error_name`), or in `opts.only_file`, sorted by file and position: the members of
+/// error set declarations (`is_decl`), `error.X`, and member accesses `E.X` on error set types. A
+/// member access whose left-hand side cannot be determined is recorded as uncertain, and one whose
+/// left-hand side is an error set in some call-site instances only as ambiguous (`opts`)
+pub fn findErrorReferences(r: *Resolver, name: []const u8, file: FileId, opts: Options) resolve.Error![]Reference {
+    var out: std.ArrayList(Reference) = .empty;
+    const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, try importers(r, file, opts.scope), opts.scope);
+    for (files) |f| {
+        if (!(try r.ctx.get(FileIndex.Query, f)).contains(name)) continue;
+        try noteSyntaxError(r, opts.syntax_error, f);
+        try errorUses(r, f, name, true, true, &out, opts);
+    }
+    return sortUnique(out.items);
+}
+
+/// Position of the first use of the error named `name` in `file` (see `findErrorReferences`); with
+/// `accesses`, member accesses `E.X` count too, including those whose left-hand side cannot be
+/// determined. Every error name of a compilation is written in an `error{ ... }` or an `error.X`
+/// somewhere (unless built by reflection), so without `accesses` a file that declares or writes
+/// the name is found. Without `tests`, uses in `test` blocks do not count: the tests of a module
+/// other than the root module (the standard library, packages) are not compiled.
+pub fn errorUse(r: *Resolver, file: FileId, name: []const u8, accesses: bool, tests: bool) resolve.Error!?u32 {
+    if (!(try r.ctx.get(FileIndex.Query, file)).contains(name)) return null;
+    var out: std.ArrayList(Reference) = .empty;
+    var uncertain: ?Reference = null;
+    var ambiguous: ?Reference = null;
+    try errorUses(r, file, name, accesses, tests, &out, .{ .scope = &.{}, .uncertain = &uncertain, .ambiguous = &ambiguous });
+    var first: ?u32 = if (uncertain) |u| u.start else null;
+    for (out.items) |ref| if (first == null or ref.start < first.?) {
+        first = ref.start;
+    };
+    return first;
+}
+
+/// Appends the uses of the error named `name` in `file` (see `findErrorReferences`); member
+/// accesses only with `accesses`, and uses in `test` blocks only with `tests`
+fn errorUses(r: *Resolver, file: FileId, name: []const u8, accesses: bool, tests: bool, out: *std.ArrayList(Reference), opts: Options) resolve.Error!void {
+    const tree = try r.itemTree(file);
+    var skipped: std.ArrayList(Body.Range) = .empty;
+    if (!tests) for (tree.items, 0..) |it, i| if (it.kind == .@"test") if (try r.itemNode(file, @intCast(i))) |n| {
+        try skipped.append(r.arena, .{ .start = n.range().start, .end = n.range().end });
+    };
+    for ((try r.ctx.get(ErrorSets.Query, file)).sets) |set| for (set.members) |m| {
+        if (!std.mem.eql(u8, m.name, name) or inRanges(skipped.items, m.start)) continue;
+        try out.append(r.arena, .{ .file = file, .start = m.start, .end = m.end, .is_decl = true });
+    };
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    for (0..tree.items.len) |i| {
+        const item: u32 = @intCast(i);
+        if (!try r.mayMention(file, item, name)) continue;
+        const base = try r.itemOffset(file, item) orelse continue;
+        if (inRanges(skipped.items, base)) continue;
+        const body = try r.body(file, item);
+        var res: ?*const infer.Result = null;
+        for (body.exprs, body.expr_ranges) |e, range| switch (e) {
+            .error_value => |n| if (std.mem.eql(u8, n, name)) {
+                const end = base + range.end;
+                if (lastNameStart(text, end)) |start| try out.append(r.arena, .{ .file = file, .start = start, .end = end });
+            },
+            .field_access => |fa| if (accesses and fa.field != null and std.mem.eql(u8, fa.field.?, name)) {
+                const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                switch (try errorSetAccess(r, &res, file, item, fa.lhs, at, opts)) {
+                    .hit => if (lastNameStart(text, at.end)) |start| try out.append(r.arena, .{ .file = file, .start = start, .end = at.end }),
+                    .miss => {},
+                    .unknown => if (opts.uncertain) |slot| if (slot.* == null) {
+                        slot.* = at;
+                    },
+                }
+            },
+            else => {},
+        };
+    }
+}
+
+fn inRanges(ranges: []const Body.Range, offset: u32) bool {
+    for (ranges) |rg| if (rg.start <= offset and offset < rg.end) return true;
+    return false;
+}
+
+/// Whether the left-hand side `lhs` of a member access in member `item` is an error set type, which
+/// makes the member an error name: by the inference of the member, else by its call-site instances
+/// (as `Finder.refersTo` decides members)
+fn errorSetAccess(r: *Resolver, res: *?*const infer.Result, file: FileId, item: u32, lhs: Body.ExprId, at: Reference, opts: Options) resolve.Error!Target {
+    const ip = r.ctx.db.env.ip;
+    const owner = try r.ownerKey(file, item);
+    const abstract = res.* orelse blk: {
+        const x = try r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full });
+        res.* = x;
+        break :blk x;
+    };
+    if (errorSetType(ip, abstract, lhs)) |is| return if (is) .hit else .miss;
+    var hit = false;
+    var miss = false;
+    const all = try seed.allInstances(r, file, item);
+    for (all.insts) |inst| {
+        const is = errorSetType(ip, try r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .inst = inst }), lhs) orelse continue;
+        if (is) hit = true else miss = true;
+    }
+    if (!all.complete) if (opts.incomplete) |slot| if (slot.* == null) {
+        slot.* = at;
+    };
+    if (hit and miss) if (opts.ambiguous) |a| if (a.* == null) {
+        a.* = at;
+    };
+    if (hit) return .hit;
+    return if (miss) .miss else .unknown;
+}
+
+/// Whether the value of `e` in the inference result is an error set type; null when it is unknown
+/// or abstract
+fn errorSetType(ip: *InternPool, res: *const infer.Result, e: Body.ExprId) ?bool {
+    const i = @backingInt(e);
+    if (i >= res.exprs.len or seed.wanted(ip, res.exprs[i])) return null;
+    const t = res.exprs[i].asType() orelse return false;
+    return switch (ip.key(t)) {
+        .error_set_type, .inferred_error_set => true,
+        else => false,
+    };
 }
 
 fn noteSyntaxError(r: *Resolver, slot: ?*?FileId, file: FileId) resolve.Error!void {
@@ -191,11 +394,17 @@ pub fn searchFiles(r: *Resolver) resolve.Error![]const FileId {
 pub fn candidateFiles(r: *Resolver, reach: []const FileId, scope: []const FileId) resolve.Error![]const FileId {
     var keep: std.AutoHashMapUnmanaged(FileId, void) = .empty;
     for (scope) |f| try keep.put(r.arena, f, {});
+    for (reach) |f| try keep.put(r.arena, f, {});
+    var out: std.ArrayList(FileId) = .empty;
+    for (try reachable(r, reach)) |f| if (keep.contains(f)) try out.append(r.arena, f);
+    return out.items;
+}
+
+/// Files reachable from `from` through `@import` chains (through any files, including the
+/// standard library and packages), and `from` itself
+pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileId {
     var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-    for (reach) |f| {
-        try keep.put(r.arena, f, {});
-        try seen.put(r.arena, f, {});
-    }
+    for (from) |f| try seen.put(r.arena, f, {});
     var i: usize = 0;
     while (i < seen.count()) : (i += 1) {
         const f = seen.keys()[i];
@@ -203,9 +412,7 @@ pub fn candidateFiles(r: *Resolver, reach: []const FileId, scope: []const FileId
         // Every module the file belongs to may import a different file under a name
         for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| try seen.put(r.arena, to, {});
     }
-    var out: std.ArrayList(FileId) = .empty;
-    for (seen.keys()) |f| if (keep.contains(f)) try out.append(r.arena, f);
-    return out.items;
+    return seen.keys();
 }
 
 /// Files in `scope` that can reach `target` through an `@import` chain (including `target`
