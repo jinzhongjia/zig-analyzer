@@ -3734,11 +3734,9 @@ fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![
 const OtherFiles = struct {
     server: *Server,
     ctx: *Db.Ctx,
-    /// Text, at the time of that compile, of the files that compiler diagnostic notes point into
-    /// (note ranges refer to it), keyed by the path in the note
-    texts: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Compile results in use, each with a reference held (released by `release`): they are not
-    /// freed by being replaced with newer results before the diagnostics are computed
+    /// freed by being replaced with newer results before the diagnostics are computed (the notes
+    /// of their errors also refer to the texts they hold)
     builds: std.ArrayList(*compiler.BuildResult) = .empty,
 
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
@@ -3747,20 +3745,14 @@ const OtherFiles = struct {
         const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
         const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
         const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
-        return .{ .uri = u, .text = text, .base_text = self.texts.get(path) };
+        return .{ .uri = u, .text = text };
     }
 
     /// Takes `fr` from the compile result `build` (called while holding the lock that protects
-    /// `build`), and records the text, at the time of this compile, of the files its notes point
-    /// into (for the same path, only the first recorded text is kept)
+    /// `build`)
     fn use(self: *OtherFiles, arena: Allocator, fr: *const compiler.FileResult, build: *compiler.BuildResult) Allocator.Error!*const compiler.FileResult {
         try self.builds.ensureUnusedCapacity(arena, 1);
         self.builds.appendAssumeCapacity(build.retain());
-        for (fr.items) |item| for (item.notes) |n| {
-            if (self.texts.contains(n.path)) continue;
-            const text = build.texts.get(n.path) orelse continue;
-            try self.texts.put(arena, n.path, text);
-        };
         return fr;
     }
 
@@ -3774,8 +3766,8 @@ const OtherFiles = struct {
 /// that contains it; whether single-file compile results are used depends on the
 /// file's context (see `FileContext.usesSingle`). Multiple results are merged with
 /// `compiler.combine`, taking the text read by the newest compile as authoritative.
-/// A reference to each result is taken under its lock and recorded in `other` (along
-/// with the text of the files the notes point into); no lock is held while merging.
+/// A reference to each result is taken under its lock and recorded in `other`; no lock is held
+/// while merging.
 fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
     const Found = struct {
         generation: u64,
@@ -3857,6 +3849,89 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     };
     if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
     return .{ .uri = document_uri, .diagnostics = diags };
+}
+
+test "computeDiagnostics: notes of combined results keep the coordinates of their own build" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(io, gpa, &writer);
+    defer server.deinit();
+
+    const old_util =
+        \\pub fn bad() u32 {
+        \\    return helper(1, 2);
+        \\} // end bad
+        \\fn helper(x: u32) u32 {
+        \\    return x;
+        \\} // end helper
+        \\
+    ;
+    const new_util = "// one\n// two\n// three\n" ++ old_util;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = new_util });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const util_path = try std.fs.path.join(arena, &.{ dir, "util.zig" });
+
+    const Disk = struct {
+        text: []const u8,
+        fn read(ctx: *anyopaque, a: Allocator, _: []const u8) ?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return a.dupe(u8, self.text) catch null;
+        }
+    };
+    const Build = struct {
+        /// A compile of a root importing util.zig that read `text` as util.zig
+        fn result(path: []const u8, text: []const u8) !*compiler.BuildResult {
+            var wip: std.zig.ErrorBundle.Wip = try .init(gpa);
+            defer wip.deinit();
+            const call: u32 = @intCast(std.mem.indexOf(u8, text, "helper(1, 2)").?);
+            const decl: u32 = @intCast(std.mem.indexOf(u8, text, "fn helper(x: u32) u32").?);
+            const src_path = try wip.addString(path);
+            try wip.addRootErrorMessageWithNotes(.{
+                .msg = try wip.addString("expected 1 argument(s), found 2"),
+                .src_loc = try wip.addSourceLocation(.{ .src_path = src_path, .line = 0, .column = 0, .span_start = call, .span_main = call, .span_end = call + 12 }),
+                .notes_len = 1,
+            }, &.{.{
+                .msg = try wip.addString("function declared here"),
+                .src_loc = try wip.addSourceLocation(.{ .src_path = src_path, .line = 0, .column = 0, .span_start = decl, .span_main = decl, .span_end = decl + 21 }),
+            }});
+            var eb = try wip.toOwnedBundle("");
+            defer eb.deinit(gpa);
+            var disk: Disk = .{ .text = text };
+            return compiler.collect(gpa, &.{eb}, std.fs.path.dirname(path).?, path, &disk, Disk.read);
+        }
+    };
+    const util = try server.vfs.intern(util_path);
+    // The root opened first is still compiling the older text when the other root's compile of
+    // the saved text finishes: the older result is iterated first
+    for ([_][]const u8{ "b.zig", "a.zig" }, [_][]const u8{ old_util, new_util }, 1..) |root, text, generation| {
+        const result = try Build.result(util_path, text);
+        const gop = try server.single.getOrPut(gpa, try server.vfs.intern(try std.fs.path.join(arena, &.{ dir, root })));
+        gop.value_ptr.* = .{ .result = result, .generation = generation };
+        try gop.value_ptr.files.put(gpa, util, result.files.getPtr(util_path).?);
+    }
+
+    var ctx = server.db.beginRead(arena);
+    defer ctx.end();
+    const params = try server.computeDiagnostics(&ctx, arena, util);
+    try std.testing.expectEqual(1, params.diagnostics.len);
+    const related = params.diagnostics[0].relatedInformation.?;
+    try std.testing.expectEqual(1, related.len);
+    // Guards against shifting the newest build's notes with the older build's text of the file,
+    // which moved them by the length of the inserted lines a second time
+    try std.testing.expectEqual(6, related[0].location.range.start.line);
+    try std.testing.expectEqual(0, related[0].location.range.start.character);
+    try std.testing.expectEqual(6, related[0].location.range.end.line);
+    try std.testing.expectEqual(21, related[0].location.range.end.character);
 }
 
 /// An open file that belongs to a project that is not loaded (see `FileContext.unloaded_project`):

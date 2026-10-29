@@ -173,19 +173,15 @@ test "merge: notes in another file are remapped by that file's edits" {
         .end = main_start + 3,
         .message = "error",
         .is_astgen = false,
-        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note_start, .end = note_start + 3, .message = "note" }},
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note_start, .end = note_start + 3, .message = "note", .base_text = other_base }},
     }} };
     const Ctx = struct {
-        base: []const u8,
-        current: []const u8,
-        fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
-            _ = arena;
-            const self: *@This() = @ptrCast(@alignCast(opaque_ctx));
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
             if (!std.mem.endsWith(u8, path, "other.zig")) return null;
-            return .{ .uri = "file:///proj/src/other.zig", .text = self.current, .base_text = self.base };
+            return .{ .uri = "file:///proj/src/other.zig", .text = other_current };
         }
     };
-    var ctx: Ctx = .{ .base = other_base, .current = other_current };
+    var ctx: u8 = 0;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -280,12 +276,12 @@ test "merge: a note after several modified regions of its file shifts by the tot
         .end = main_start + 3,
         .message = "error",
         .is_astgen = false,
-        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note[0], .end = note[1], .message = "note" }},
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note[0], .end = note[1], .message = "note", .base_text = two_functions }},
     }} };
     const Ctx = struct {
         fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
             if (!std.mem.endsWith(u8, path, "other.zig")) return null;
-            return .{ .uri = "file:///proj/src/other.zig", .text = "//\n" ++ two_functions, .base_text = two_functions };
+            return .{ .uri = "file:///proj/src/other.zig", .text = "//\n" ++ two_functions };
         }
     };
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -327,6 +323,57 @@ test "combine: an older result shifted over several modified regions matches the
     // Guards against shifting the older error too far, which kept it as a ghost duplicate
     try testing.expectEqual(1, c.items.len);
     try testing.expectEqual(new[0], c.items[0].start);
+}
+
+test "combine: each note is shifted from the text its own build read" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const main = "fn f() void {\n    g();\n    h();\n}\n";
+    const g = spanOf(main, "g()", 0);
+    const h = spanOf(main, "h()", 0);
+    // other.zig gained a line between the two builds; the newest build read the current text
+    const newer_other = "//\n" ++ two_functions;
+    const new_note = spanOf(newer_other, "300", 0);
+    const old_note = spanOf(two_functions, "300", 0);
+    const newest: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = g[0],
+        .end = g[1],
+        .message = "newer error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = new_note[0], .end = new_note[1], .message = "note", .base_text = newer_other }},
+    }} };
+    const older: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = h[0],
+        .end = h[1],
+        .message = "older error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = old_note[0], .end = old_note[1], .message = "note", .base_text = two_functions }},
+    }} };
+    const c = try compiler.combine(a, &.{ &newest, &older });
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (!std.mem.endsWith(u8, path, "other.zig")) return null;
+            return .{ .uri = "file:///proj/src/other.zig", .text = newer_other };
+        }
+    };
+    var dummy: u8 = 0;
+    const diags = try compiler.merge(a, .{
+        .text = main,
+        .lines = try offsets.LineIndex.init(a, main),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &c,
+        .other_file = Ctx.get,
+        .other_ctx = &dummy,
+    });
+    try testing.expectEqual(2, diags.len);
+    for (diags) |d| {
+        const range = d.relatedInformation.?[0].location.range;
+        try testing.expectEqual(4, range.start.line);
+        try testing.expectEqual(18, range.start.character);
+    }
 }
 
 const repeated_lines =
@@ -583,15 +630,14 @@ test "collect: reference trace and compile log output are kept" {
     const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
     defer r.release(gpa);
 
-    // The build-time text is kept for a file that notes point to even if it has no errors
-    try testing.expectEqualStrings(caller_text, r.texts.get(native("/proj/src/caller.zig")).?);
-    try testing.expectEqualStrings(main_text, r.texts.get(native("/proj/src/main.zig")).?);
-
     const items = r.files.get(native("/proj/src/main.zig")).?.items;
     try testing.expectEqual(3, items.len);
     const err_start: u32 = @intCast(std.mem.indexOf(u8, main_text, "\"s\"").?);
     const notes = items[0].notes;
     try testing.expectEqual(3, notes.len);
+    try testing.expectEqualStrings(main_text, notes[0].base_text.?);
+    // The build-time text is kept for a file that notes point to even if it has no errors
+    try testing.expectEqualStrings(caller_text, notes[1].base_text.?);
     try testing.expectEqualStrings("a note", notes[0].message);
     try testing.expectEqualStrings(native("/proj/src/caller.zig"), notes[1].path);
     try testing.expectEqual(std.mem.indexOf(u8, caller_text, "m.main()").?, notes[1].start);

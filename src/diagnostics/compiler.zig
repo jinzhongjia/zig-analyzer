@@ -36,6 +36,9 @@ pub const Note = struct {
     start: u32,
     end: u32,
     message: []const u8,
+    /// Text of the note's file read when its build finished (the range refers to it); null when
+    /// the file could not be read
+    base_text: ?[]const u8 = null,
 };
 
 /// All results of one build, allocated in an arena together with this struct itself. Immutable
@@ -47,9 +50,6 @@ pub const BuildResult = struct {
     arena: std.heap.ArenaAllocator.State,
     /// Absolute path → result
     files: std.StringArrayHashMapUnmanaged(FileResult),
-    /// Texts read during the build: each file in `files`, plus files that notes point to but that
-    /// have no errors (looked up by path)
-    texts: std.StringArrayHashMapUnmanaged([]const u8),
     refs: std.atomic.Value(u32) = .init(1),
 
     pub fn retain(r: *BuildResult) *BuildResult {
@@ -149,9 +149,10 @@ pub fn collect(
                     }
                 }
                 note.message = try a.dupe(u8, eb.nullTerminatedString(n.msg));
+                note.base_text = try sources.text(note.path);
                 notes.appendAssumeCapacity(note);
             }
-            if (refs != 0) try referenceTrace(a, eb, msg.src_loc, refs, build_root, &sources.stale, path, start, &notes);
+            if (refs != 0) try referenceTrace(eb, msg.src_loc, refs, &sources, path, start, &notes);
             const gop = try lists.getOrPut(a, path);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             seen_gop.value_ptr.* = gop.value_ptr.items.len;
@@ -160,11 +161,6 @@ pub fn collect(
     }
 
     var files: std.StringArrayHashMapUnmanaged(FileResult) = .empty;
-    // A file that notes point to is not in `files` when it has no errors of its own; its
-    // build-time text is saved as well, for shifting the notes
-    for (lists.values()) |items| for (items.items) |item| for (item.notes) |n| {
-        _ = try sources.text(n.path);
-    };
     for (lists.keys(), lists.values()) |path, *items| {
         const text = try sources.text(path) orelse "";
         // Mark AstGen errors: run AstGen on the same text and match by range and message
@@ -179,7 +175,7 @@ pub fn collect(
         try files.put(a, path, .{ .base_text = text, .items = items.items });
     }
     const result = try a.create(BuildResult);
-    result.* = .{ .arena = undefined, .files = files, .texts = sources.texts };
+    result.* = .{ .arena = undefined, .files = files };
     // Take the arena state after the last allocation
     result.arena = arena_state.state;
     return result;
@@ -191,7 +187,7 @@ const Sources = struct {
     build_root: []const u8,
     read_ctx: *anyopaque,
     read: ReadFn,
-    texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    texts: std.StringHashMapUnmanaged([]const u8) = .empty,
     unreadable: std.StringHashMapUnmanaged(void) = .empty,
     /// Files whose text read is not the one the compiler read
     stale: std.StringHashMapUnmanaged(void) = .empty,
@@ -228,21 +224,20 @@ const Sources = struct {
 };
 
 /// Appends the `count` references of the reference trace following source location `src_loc` to
-/// `out` as notes, with messages matching the output of `zig build`; references into a `stale`
-/// file are left out. A reference with a location points to the referencing site; the trailing
-/// hidden marker has no location and, like notes without a location, is placed at the start of
-/// the error (`start` in `path`).
+/// `out` as notes, with messages matching the output of `zig build`; references into a stale file
+/// (see `Sources`) are left out. A reference with a location points to the referencing site; the
+/// trailing hidden marker has no location and, like notes without a location, is placed at the
+/// start of the error (`start` in `path`).
 fn referenceTrace(
-    a: Allocator,
     eb: ErrorBundle,
     src_loc: ErrorBundle.SourceLocationIndex,
     count: u32,
-    build_root: []const u8,
-    stale: *const std.StringHashMapUnmanaged(void),
+    sources: *Sources,
     path: []const u8,
     start: u32,
     out: *std.ArrayList(Note),
 ) Allocator.Error!void {
+    const a = sources.a;
     // ErrorBundle has no public interface for reading the reference trace: it is read from
     // `extra` according to its layout. `SourceLocation` is followed by the `ReferenceTrace`s one
     // after another, each storing `decl_name` and `src_loc` in field order.
@@ -255,8 +250,8 @@ fn referenceTrace(
         var note: Note = .{ .path = path, .start = start, .end = start, .message = "" };
         if (ref_loc != .none) {
             const rl = eb.getSourceLocation(ref_loc);
-            if (try absolute(a, build_root, eb.nullTerminatedString(rl.src_path))) |p| {
-                if (stale.contains(p)) continue;
+            if (try absolute(a, sources.build_root, eb.nullTerminatedString(rl.src_path))) |p| {
+                if (sources.stale.contains(p)) continue;
                 note.path = p;
                 note.start, note.end = byteSpan(rl);
             }
@@ -267,6 +262,7 @@ fn referenceTrace(
         } else {
             note.message = "remaining reference traces hidden; use '-freference-trace' to see all reference traces";
         }
+        note.base_text = try sources.text(note.path);
         out.appendAssumeCapacity(note);
     }
 }
@@ -344,7 +340,7 @@ pub const MergeInput = struct {
     other_ctx: *anyopaque,
 };
 
-pub const OtherFile = struct { uri: []const u8, text: []const u8, base_text: ?[]const u8 = null };
+pub const OtherFile = struct { uri: []const u8, text: []const u8 };
 
 /// Returns the URI and text of another file (for note positions); null when the file cannot be
 /// read
@@ -601,10 +597,11 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
     for (item.notes) |n| {
         const other = in.other_file(in.other_ctx, arena, n.path) orelse continue;
         const lines = try offsets.LineIndex.init(arena, other.text);
-        // The note's file also has unsaved changes since the build: shift by that file's own diff
+        // The note's file changed since the note's build (unsaved changes, or a newer build of
+        // the file): shift by the diff from the text that build read
         var note_start = n.start;
         var note_end = n.end;
-        if (other.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {
+        if (n.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {
             const edits = try diffEdits(arena, base, other.text);
             const span = remap(edits, n.start, n.end) orelse continue;
             note_start = span[0];
