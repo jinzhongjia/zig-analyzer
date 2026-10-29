@@ -275,3 +275,73 @@ test "rename refuses when a generic reference also refers to other declarations"
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "rename refuses when a reference cannot be confirmed" {
+    const impls_text =
+        \\pub const Tcp = struct {
+        \\    pub fn Close(_: *Tcp) void {}
+        \\};
+        \\pub const Udp = struct {
+        \\    pub fn Close(_: *Udp) void {}
+        \\};
+        \\
+    ;
+    const conn_text =
+        \\const impls = @import("impls.zig");
+        \\pub const Conn = union(enum) {
+        \\    tcp: impls.Tcp,
+        \\    udp: impls.Udp,
+        \\    pub fn close(self: *Conn) void {
+        \\        switch (self.*) {
+        \\            inline else => |*c| c.Close(),
+        \\        }
+        \\    }
+        \\};
+        \\
+    ;
+    const main_body =
+        \\const Conn = @import("conn.zig").Conn;
+        \\pub fn main() void {
+        \\    var c: Conn = .{ .tcp = .{} };
+        \\    c.close();
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = main_body },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+        .{ .path = "src/conn.zig", .text = conn_text },
+        .{ .path = "src/impls.zig", .text = impls_text },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const impls_uri = try za.base.uri.fromPath(a, try project.path(a, "src/impls.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = impls_uri, .languageId = "zig", .version = 1, .text = impls_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `c.Close()` in the `inline else` prong is Tcp.Close in one expansion and Udp.Close in the
+    // other: a rename returned only the declaration and broke the build
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = impls_uri }, .position = position(impls_text, "Close"), .newName = "close" });
+        try testing.expectEqualStrings("cannot rename `Close` to `close`: the type here is unknown, so whether this refers to the same declaration cannot be confirmed (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
+    }
+    // A file that mentions the name but has syntax errors may hide references
+    {
+        const conn_uri = try za.base.uri.fromPath(a, try project.path(a, "src/conn.zig"));
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = conn_uri, .languageId = "zig", .version = 1, .text = conn_text } });
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+        const broken = "const Conn = @import(\"conn.zig\").Conn;\npub fn main() void {\n    if (true) {\n    var c: Conn = .{ .tcp = .{} };\n    c.close();\n}\n";
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = broken } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = conn_uri }, .position = position(conn_text, "close"), .newName = "shut" });
+        try testing.expectEqualStrings("cannot rename `close` to `shut`: the file has syntax errors, so references in it may be missed (src/main.zig)", resp.object.get("error").?.object.get("message").?.string);
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

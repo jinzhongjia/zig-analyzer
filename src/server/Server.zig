@@ -291,12 +291,6 @@ pub const HandlerError = error{
     RenameOutsideWorkspace,
     /// The new name is not a valid identifier
     InvalidIdentifier,
-    /// A reference inside a generic function body refers to another definition in some instances:
-    /// renaming would break those instances
-    RenameAmbiguous,
-    /// References inside a generic function body must be decided per instance, but the instances
-    /// are incomplete (instantiation grows without bound): not all references can be confirmed
-    RenameIncomplete,
 };
 
 /// Initializes in place: the query engine holds a pointer to `server.env`, so the Server must not
@@ -4505,14 +4499,12 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return out.items;
 }
 
-/// The definition at the cursor and all its references.
-/// When `ambiguous` and `incomplete` are not null, they record the first ambiguous reference and
-/// the first reference with incomplete instances, respectively (see `search.Options`).
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference, incomplete: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// The definition at the cursor and all its references
+fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
     const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
     const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous, .incomplete = incomplete });
+    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null });
     return .{ .def = def, .refs = refs };
 }
 
@@ -4533,7 +4525,7 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null, null) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false) orelse return null;
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs) |ref| {
@@ -4544,7 +4536,7 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 }
 
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null, null) orelse return null;
+    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true) orelse return null;
     const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
@@ -4581,21 +4573,46 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
     } };
 }
 
-fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
+fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!Outcome(types.ResultType("textDocument/rename")) {
     _ = try identifierText(arena, params.newName, false);
-    var ambiguous: ?za.ide_db.search.Reference = null;
-    var incomplete: ?za.ide_db.search.Reference = null;
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous, &incomplete) orelse return null;
-    if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
-    // Do not return a partially renamed result
-    if (ambiguous != null) return error.RenameAmbiguous;
-    if (incomplete != null) return error.RenameIncomplete;
-    const is_field = switch (found.def) {
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (!try server.renamable(r, def)) return error.RenameOutsideWorkspace;
+    const old = (try za.ide_db.search.defName(r, def)).?;
+    const refs = switch (try server.renameReferences(r, arena, def, old, params.newName)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const is_field = switch (def) {
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         .local, .file => false,
     };
     const new_name = try identifierText(arena, params.newName, is_field);
-    return try server.renameEdit(r, arena, found.refs, new_name, null);
+    return .{ .ok = try server.renameEdit(r, arena, refs, new_name, null) };
+}
+
+/// All references of `def` for renaming it from `old` to `new`, or why they cannot all be
+/// confirmed, in which case renaming would leave a partially renamed result: a reference is
+/// ambiguous in a generic function, goes through a member access of unknown type, or depends on
+/// instances that grow without bound, or a file that mentions the name has syntax errors.
+fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
+    const scope = try server.searchScope(r);
+    var ambiguous: ?za.ide_db.search.Reference = null;
+    var uncertain: ?za.ide_db.search.Reference = null;
+    var incomplete: ?za.ide_db.search.Reference = null;
+    var syntax_error: ?Vfs.FileId = null;
+    const refs = try za.ide_db.search.findReferences(r, def, .{
+        .scope = scope,
+        .ambiguous = &ambiguous,
+        .uncertain = &uncertain,
+        .incomplete = &incomplete,
+        .syntax_error = &syntax_error,
+    });
+    if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
+    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
+    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
+    if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
+    return .{ .ok = refs };
 }
 
 /// Edits that change the references (sorted by file and position, including the declaration) to
@@ -4848,7 +4865,7 @@ fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []cons
     // A conflict at the declaration needs no reference search
     if (try ide.rename.declarationConflict(r, f.def, f.suggestion)) |p| {
         if (!server.code_action_disabled) return null;
-        action.disabled = .{ .reason = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+        action.disabled = .{ .reason = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
         return action;
     }
     if (server.code_action_resolve) {
@@ -4915,29 +4932,17 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
         .file => unreachable,
     };
     if (!try server.renamable(r, def)) return .{ .failed = "cannot rename a symbol defined outside the workspace" };
-    const scope = try server.searchScope(r);
-    var ambiguous: ?za.ide_db.search.Reference = null;
-    var uncertain: ?za.ide_db.search.Reference = null;
-    var incomplete: ?za.ide_db.search.Reference = null;
-    var syntax_error: ?Vfs.FileId = null;
-    const refs = try za.ide_db.search.findReferences(r, def, .{
-        .scope = scope,
-        .ambiguous = &ambiguous,
-        .uncertain = &uncertain,
-        .incomplete = &incomplete,
-        .syntax_error = &syntax_error,
-    });
-    if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, f, file, null, "the file has syntax errors, so references in it may be missed") };
-    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, f, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
-    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
-    if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
-    if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
-    if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+    const refs = switch (try server.renameReferences(r, arena, def, f.name, f.suggestion)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
+    if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
     // Only container members can be referenced by strings; a
     // non-pub declaration is accessible only in its own file
     if (def == .item) {
-        const files = if (f.public) try za.ide_db.search.importers(r, def_file, scope) else try arena.dupe(Vfs.FileId, &.{def_file});
-        if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+        const files = if (f.public) try za.ide_db.search.importers(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
+        if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
     }
     const is_field = switch (def) {
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
@@ -4948,15 +4953,15 @@ fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Loc
     // references in that file are reported too: confirm by running AstGen on the renamed text
     var edits: std.ArrayList(ide.rename.Edit) = .empty;
     for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = new_text });
-    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
     const confirm = if (f.public) try std.fmt.allocPrint(arena, "Rename public `{s}` to `{s}`", .{ f.name, f.suggestion }) else null;
     return .{ .ok = try server.renameEdit(r, arena, refs, new_text, confirm) };
 }
 
 /// Explanation of why a name cannot be renamed:
 /// "cannot rename `a` to `b`: reason (file:line:column)"; only the file when the position is null
-fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
-    return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ f.name, f.suggestion }), file, offset, reason);
+fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, old: []const u8, new: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
+    return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ old, new }), file, offset, reason);
 }
 
 /// Why a fix cannot be applied: "<prefix>: reason (file:line:column)"; only the file when the
@@ -5247,8 +5252,6 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
-        error.RenameAmbiguous => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function also refers to other declarations in some instantiations"),
-        error.RenameIncomplete => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function depends on instantiations that grow without bound, so not all of them can be checked"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
