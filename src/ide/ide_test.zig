@@ -2463,6 +2463,50 @@ test "build.zig.zon paths are completed relative to the build root" {
     }
 }
 
+test "path completion escapes entry names and decodes the typed directory" {
+    // `"` and `\` cannot be part of file names on Windows
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "d\"ir", "src" }) |d| try tmp.dir.createDirPath(testing.io, d);
+    for ([_][]const u8{ "build.zig", "a\"b.txt", "d\"ir/inner.txt", "d\"ir/inner.zig", "src/bs\\mod.zig", "src/nl\nx.zig" }) |f| {
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = f, .data = "" });
+    }
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "build.zig.zon", ".{ .paths = .{ \"<|>\" } }", "a\\\"b.txt build.zig d\\\"ir src" },
+        .{ "build.zig.zon", ".{ .paths = .{ \"d\\\"ir/<|>\" } }", "d\\\"ir/inner.txt d\\\"ir/inner.zig" },
+        .{ "build.zig.zon", ".{ .dependencies = .{ .foo = .{ .path = \"<|>\" } } }", "d\\\"ir src" },
+        .{ "src/main.zig", "const m = @import(\"<|>\");", "std builtin root bs\\\\mod.zig nl\\nx.zig" },
+        .{ "src/main.zig", "const m = @import(\"../d\\\"ir/<|>\");", "../d\\\"ir/inner.zig" },
+        .{ "src/main.zig", "const m = @import(\"../src/<|>\");", "../src/bs\\\\mod.zig ../src/nl\\nx.zig" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.addNative(try std.fs.path.join(w.arena.allocator(), &.{ dir, c[0] }), c[1]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        // Paths in the order of the directory listing
+        const modules: usize = if (std.mem.startsWith(u8, c[2], "std")) 3 else 0;
+        std.mem.sort([]const u8, labels.items[modules..], {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        testing.expectEqualStrings(c[2], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("{s}: `{s}`\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
 test "build.zig.zon paths go to the files they name" {
     var root: ManifestRoot = try .create();
     defer root.deinit();

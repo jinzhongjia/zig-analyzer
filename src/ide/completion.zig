@@ -1422,11 +1422,19 @@ fn afterDot(text: []const u8, offset: u32) bool {
 }
 
 /// Start of the string content when the cursor is in the string of `@import("` (the string may
-/// be unterminated)
+/// be unterminated; escaped quotes do not end it)
 fn importString(text: []const u8, offset: u32) ?u32 {
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
-    const quote = std.mem.lastIndexOfScalar(u8, text[line_start..offset], '"') orelse return null;
-    const start: u32 = @intCast(line_start + quote + 1);
+    var open: ?usize = null;
+    var i = line_start;
+    while (i < offset) : (i += 1) switch (text[i]) {
+        '"' => open = if (open == null) i + 1 else null,
+        '\\' => if (open != null) {
+            i += 1;
+        },
+        else => {},
+    };
+    const start: u32 = @intCast(open orelse return null);
     var head = std.mem.trimEnd(u8, text[line_start .. start - 1], " \t");
     if (!std.mem.endsWith(u8, head, "(")) return null;
     head = std.mem.trimEnd(u8, head[0 .. head.len - 1], " \t");
@@ -1500,14 +1508,21 @@ const PathFilter = enum {
     directories,
 };
 
-/// The entries of the directory named by the part of `typed` before its last `/`, relative to the
-/// directory of `file` (excluding entries that start with `.`, the build output `zig-out`, and the
-/// fetched packages `zig-pkg`). Completion items are full paths from the start of the string
+/// The entries of the directory named by the part of `typed` (the string content as written, with
+/// escapes) before its last `/`, relative to the directory of `file` (excluding entries that start
+/// with `.`, the build output `zig-out`, and the fetched packages `zig-pkg`). Completion items are
+/// full paths from the start of the string: the directory as written, followed by the entry name
+/// escaped for a string literal
 fn listPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range, filter: PathFilter) resolve.Error!void {
     const vfs = r.ctx.db.env.vfs;
     const prefix = if (std.mem.lastIndexOfScalar(u8, typed, '/')) |s| typed[0 .. s + 1] else "";
+    const quoted = try std.fmt.allocPrint(r.arena, "\"{s}\"", .{prefix});
+    const dir_name = std.zig.string_literal.parseAlloc(r.arena, quoted) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return,
+    };
     const base = std.fs.path.dirname(vfs.path(file)) orelse return;
-    const dir_path = try std.fs.path.join(r.arena, &.{ base, prefix });
+    const dir_path = try std.fs.path.join(r.arena, &.{ base, dir_name });
     var dir = std.Io.Dir.cwd().openDir(vfs.io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(vfs.io);
     var it = dir.iterate();
@@ -1516,12 +1531,12 @@ fn listPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, ran
         switch (entry.kind) {
             .directory => {
                 const slash = if (filter == .import) "/" else "";
-                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ prefix, entry.name, slash }), .kind = .folder, .replace = range });
+                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{f}{s}", .{ prefix, std.zig.fmtString(entry.name), slash }), .kind = .folder, .replace = range });
             },
             .file => if (filter == .any or (filter == .import and
                 (std.mem.endsWith(u8, entry.name, ".zig") or std.mem.endsWith(u8, entry.name, ".zon"))))
             {
-                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}", .{ prefix, entry.name }), .kind = .file, .replace = range });
+                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{f}", .{ prefix, std.zig.fmtString(entry.name) }), .kind = .file, .replace = range });
             },
             else => {},
         }
