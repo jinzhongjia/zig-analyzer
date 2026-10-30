@@ -798,8 +798,16 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
     for (init.fields) |f| if (f.name == null) return null;
     const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, at.item), .mode = .full });
     if (res.exprs.len != at.body.exprs.len) return null;
-    const ty = res.exprs[@backingInt(at.expr)].ty;
-    switch (r.ctx.db.env.ip.key(ty)) {
+    // The initializer is of the payload type of an optional or error union result type (as with
+    // Sema's `optEuBaseType`)
+    const ip = r.ctx.db.env.ip;
+    var ty = res.exprs[@backingInt(at.expr)].ty;
+    while (true) switch (ip.key(ty)) {
+        .optional_type => |child| ty = child,
+        .error_union_type => |eu| ty = eu.payload,
+        else => break,
+    };
+    switch (ip.key(ty)) {
         .container_type => |c| if (!c.kind.isStruct()) return null,
         else => return null,
     }

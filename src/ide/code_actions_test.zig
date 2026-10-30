@@ -1286,6 +1286,28 @@ test "add missing struct fields" {
     );
 }
 
+test "add missing struct fields when the result type is optional" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: ?S = .{ .a<|> = 1 };\n    _ = s;\n}\n",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: ?S = .{ .a = 1, .b = undefined };\n    _ = s;\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\nfn mk() ?S {\n    return .{ .a<|> = 1 };\n}\n",
+            "const S = struct { a: u32, b: u32 };\nfn mk() ?S {\n    return .{ .a = 1, .b = undefined };\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\nfn take(s: ?S) void {\n    _ = s;\n}\ntest {\n    take(.{ .a<|> = 1 });\n}\n",
+            "const S = struct { a: u32, b: u32 };\nfn take(s: ?S) void {\n    _ = s;\n}\ntest {\n    take(.{ .a = 1, .b = undefined });\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\nconst T = struct { s: ?S };\nconst t: T = .{ .s = .{ .a<|> = 1 } };\n",
+            "const S = struct { a: u32, b: u32 };\nconst T = struct { s: ?S };\nconst t: T = .{ .s = .{ .a = 1, .b = undefined } };\n",
+        },
+    };
+    for (cases) |c| try expectAction(c[0], "add missing struct fields", c[1]);
+}
+
 test "add missing fields and prongs keep trailing comments intact" {
     // The comma goes after the last element, before its comment, not into the comment
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
