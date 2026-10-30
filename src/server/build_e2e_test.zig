@@ -257,3 +257,82 @@ test "build integration: builtin.is_test in single-file mode matches the single-
     try testing.expectEqualStrings("```zig\nconst in_test: u16 = 2\n```", try s.hover(one_uri, test_root_main, "in_test ="));
     try testing.expectEqualSlices(i64, &.{2}, try s.inactiveLines(one_uri));
 }
+
+fn testRunnerBuild(comptime runner: []const u8) []const u8 {
+    return
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const mod = b.addModule("mylib", .{ .root_source_file = b.path("src/root.zig"), .target = b.standardTargetOptions(.{}) });
+    \\    const mod_tests = b.addTest(.{ .root_module = mod
+    ++ runner ++
+        \\ });
+        \\    b.step("test", "Run tests").dependOn(&b.addRunArtifact(mod_tests).step);
+        \\    b.step("check", "Check").dependOn(&mod_tests.step);
+        \\}
+        \\
+    ;
+}
+
+const test_runner_root =
+    \\const std = @import("std");
+    \\pub const custom_marker = 1;
+    \\const helper = @import("helper.zig");
+    \\test "which root" {
+    \\    try std.testing.expectEqualStrings("test runner", helper.which());
+    \\}
+    \\
+;
+
+const test_runner_helper =
+    \\const root = @import("root");
+    \\pub fn which() []const u8 {
+    \\    if (@hasDecl(root, "custom_marker")) {
+    \\        return "user root";
+    \\    } else {
+    \\        return "test runner";
+    \\    }
+    \\}
+    \\fn probe() void {
+    \\    _ = root.
+    \\}
+    \\
+;
+
+test "build integration: @import(\"root\") in a test compilation is the test runner" {
+    var s: Session = undefined;
+    try s.start(&.{
+        .{ .path = "build.zig", .text = comptime testRunnerBuild("") },
+        .{ .path = "src/root.zig", .text = test_runner_root },
+        .{ .path = "src/helper.zig", .text = test_runner_helper },
+    },
+        \\{"diagnostics": {"inactive_code": true}}
+    );
+    defer s.finish();
+    const helper_uri = try s.open("src/helper.zig", test_runner_helper);
+    try s.waitIdle();
+
+    try testing.expectEqualStrings("test_runner.zig:0", try s.definition(helper_uri, test_runner_helper, "\"root\""));
+    const labels = try s.completion(helper_uri, test_runner_helper, "_ = root.");
+    try testing.expect(!contains(labels, "custom_marker"));
+    try testing.expect(contains(labels, "std_options"));
+    // The branch the test runner compiles is not inactive
+    try testing.expectEqualSlices(i64, &.{2}, try s.inactiveLines(helper_uri));
+}
+
+test "build integration: @import(\"root\") in a test compilation with a custom test runner" {
+    var s: Session = undefined;
+    try s.start(&.{
+        .{ .path = "build.zig", .text = comptime testRunnerBuild(", .test_runner = .{ .path = b.path(\"runner.zig\"), .mode = .simple }") },
+        .{ .path = "runner.zig", .text = "pub const custom_marker = 2;\npub fn main() void {}\n" },
+        .{ .path = "src/root.zig", .text = test_runner_root },
+        .{ .path = "src/helper.zig", .text = test_runner_helper },
+    },
+        \\{"diagnostics": {"inactive_code": true}}
+    );
+    defer s.finish();
+    const helper_uri = try s.open("src/helper.zig", test_runner_helper);
+    try s.waitIdle();
+
+    try testing.expectEqualStrings("runner.zig:0", try s.definition(helper_uri, test_runner_helper, "\"root\""));
+    try testing.expectEqualSlices(i64, &.{4}, try s.inactiveLines(helper_uri));
+}

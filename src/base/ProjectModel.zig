@@ -54,9 +54,20 @@ pub const Step = struct {
 pub const Compile = struct {
     /// Root module (index into `modules`)
     root_module: u32,
+    /// Target of `@import("root")`: the root module's root file, or for test compilations the
+    /// test runner, which the compiler makes the root module
+    root: Root = .module,
     /// The `builtin.zig` of each module in this compilation, in the order the compiler creates
     /// them (the root module first)
     modules: []const CompileModule = &.{},
+
+    pub const Root = union(enum) {
+        module,
+        /// Absolute path of the test runner
+        test_runner: []const u8,
+        /// The test runner is a file generated during the build
+        unknown,
+    };
 };
 
 pub const CompileModule = struct {
@@ -255,6 +266,10 @@ pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectMo
                 .name = try a.dupe(u8, s.name),
                 .kind = .{ .compile = .{
                     .root_module = base + c.root_module,
+                    .root = switch (c.root) {
+                        .module, .unknown => c.root,
+                        .test_runner => |p| .{ .test_runner = try a.dupe(u8, p) },
+                    },
                     .modules = compile_modules,
                 } },
                 .deps = &.{},

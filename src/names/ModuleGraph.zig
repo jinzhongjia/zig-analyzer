@@ -155,7 +155,11 @@ pub const Builder = struct {
 
     fn addCompile(b: *Builder, model: *const ProjectModel, step: u32) Allocator.Error!u32 {
         const c = model.steps[step].kind.compile;
-        const root = model.modules[c.root_module].root_file;
+        const root = switch (c.root) {
+            .module => model.modules[c.root_module].root_file,
+            .test_runner => |path| path,
+            .unknown => null,
+        };
         const gop = try b.compiles.getOrPut(b.gpa, .{
             .root = if (root) |p| try b.vfs.intern(p) else null,
             .builtin = try b.builtinFile(model, step, c.root_module),

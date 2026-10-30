@@ -98,7 +98,10 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     var builtins: Builtins = .{};
     defer builtins.index.deinit(gpa);
     for (c.steps, steps) |*src, *dst| switch (src.extended.get(c.extra)) {
-        .compile => |comp| dst.kind.compile.modules = try compileBuiltins(gpa, a, c, &comp, &module_ids, own, &builtins),
+        .compile => |comp| {
+            dst.kind.compile.modules = try compileBuiltins(gpa, a, c, &comp, &module_ids, own, &builtins);
+            if (comp.flags3.kind.isTest()) dst.kind.compile.root = try ctx.testRunner(&comp);
+        },
         else => {},
     };
 
@@ -442,6 +445,16 @@ const Ctx = struct {
         const package = sp.owner.get(ctx.c) orelse return null;
         const root = try ctx.packageRoot(package);
         return if (isFetched(root, package.hash.slice(ctx.c))) root else null;
+    }
+
+    /// The test runner of test compilation `comp`, which the compiler makes the root module (the
+    /// target of `@import("root")`): the default one in the lib directory, or the one set by the
+    /// compile step
+    fn testRunner(ctx: Ctx, comp: *const Configuration.Step.Compile) Allocator.Error!ProjectModel.Compile.Root {
+        return switch (comp.test_runner.u) {
+            .default => .{ .test_runner = try std.fs.path.join(ctx.arena, &.{ ctx.env.lib_dir, "compiler", "test_runner.zig" }) },
+            .simple, .server => |lp| if (try ctx.resolve(lp.get(ctx.c))) |p| .{ .test_runner = p } else .unknown,
+        };
     }
 
     fn join(ctx: Ctx, a: []const u8, b: []const u8) Allocator.Error![]const u8 {
