@@ -3534,6 +3534,48 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "type definition of fields typed by the parameter of a generic container" {
+    // Prevents an empty result on `self.items` when only the type of `self` was seeded
+    const text =
+        \\const Point = struct { x: i32 = 0 };
+        \\fn Stack(comptime T: type) type {
+        \\    return struct {
+        \\        items: [4]T = undefined,
+        \\        top_: T = undefined,
+        \\        const Self = @This();
+        \\        fn top(self: *Self) T {
+        \\            const last = self.items[0];
+        \\            _ = self.top_;
+        \\            return last;
+        \\        }
+        \\    };
+        \\}
+        \\fn firstOf(st: anytype) void {
+        \\    _ = st.items;
+        \\}
+        \\test {
+        \\    var s: Stack(Point) = .{};
+        \\    _ = s.top();
+        \\    firstOf(s);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_][]const u8{ "items[0]", "top_;", "last;", "items;" }) |needle| {
+        const t = try definition.typeDefinition(&r, file, @intCast(std.mem.indexOf(u8, text, needle).?)) orelse {
+            std.debug.print("`{s}`: no target\n", .{needle});
+            return error.NoTarget;
+        };
+        try testing.expect(std.mem.startsWith(u8, text[t.start..], "Point = struct"));
+    }
+}
+
 test "goto, hover and symbols on the types of unnamed extern parameters" {
     // Prevents the empty binding of an unnamed parameter from capturing the first token of its type
     const text =

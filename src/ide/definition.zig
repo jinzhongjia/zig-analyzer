@@ -722,18 +722,55 @@ fn target(r: *Resolver, def: Def) resolve.Error!?Target {
 
 /// Definition of the type of the symbol at the cursor: declarations and local variables take their
 /// type, expressions take the inferred type; when the value itself is a type, that type is taken.
-/// Pointers, optionals, arrays, slices, and error unions take their element / payload type.
+/// Pointers, optionals, arrays, slices, and error unions take their element / payload type. Inside
+/// a generic function, a type that is not concrete is taken from a call-site instance in which the
+/// symbol itself has a concrete type (as hover does).
 pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
-    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
-    const rel = tok.offset - a.node.offset;
-    const tv: TypedValue = blk: {
-        if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
-            break :blk try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
-        };
-        if (a.body.bindingAt(rel)) |id| break :blk a.bindingType(id);
-        break :blk a.exprType(a.body.exprAt(rel) orelse return null);
+    var a = try context.at(r, file, tok.offset, false) orelse return null;
+    const subject = try typeSubject(r, a) orelse return null;
+    const ip = r.ctx.db.env.ip;
+    if (seed.wanted(ip, try subjectType(r, a, subject))) if (subject.seedSubject()) |s| {
+        var refiner = try seed.Refiner.init(r, a.file, a.item, a.node.offset, a.body, a.res);
+        a.seeded = try refiner.at(a.rel, s);
     };
+    return typeTarget(r, try subjectType(r, a, subject));
+}
+
+/// What type definition takes the type of
+const TypeSubject = union(enum) {
+    /// The name of the member itself
+    decl,
+    binding: Body.BindingId,
+    expr: Body.ExprId,
+
+    /// The subject that call-site seeding must resolve to a concrete type
+    fn seedSubject(s: TypeSubject) ?seed.Subject {
+        return switch (s) {
+            .decl => null,
+            .binding => |b| .{ .binding = b },
+            .expr => |e| .{ .expr = e },
+        };
+    }
+};
+
+fn typeSubject(r: *Resolver, a: context.At) resolve.Error!?TypeSubject {
+    if (ast.memberName(a.node, try r.inEnum(a.file, a.item))) |name| if (name.offset == a.node.offset + a.rel) return .decl;
+    if (a.body.bindingAt(a.rel)) |id| return .{ .binding = id };
+    return .{ .expr = a.body.exprAt(a.rel) orelse return null };
+}
+
+fn subjectType(r: *Resolver, a: context.At, subject: TypeSubject) resolve.Error!TypedValue {
+    return switch (subject) {
+        .decl => r.ctx.get(queries.DeclType, .{ .owner = a.owner }),
+        .binding => |id| a.bindingType(id),
+        .expr => |e| a.exprType(e),
+    };
+}
+
+/// Definition of the type `tv` (of the type itself when `tv` is a type), with pointers, optionals,
+/// arrays, vectors, and error unions stripped
+fn typeTarget(r: *Resolver, tv: TypedValue) resolve.Error!?Target {
     const ip = r.ctx.db.env.ip;
     var t = if (tv.ty == .type_type) tv.asType() orelse return null else tv.ty;
     for (0..8) |_| t = switch (ip.key(t)) {
