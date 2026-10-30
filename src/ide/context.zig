@@ -163,9 +163,10 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 else => "",
             };
             const name = if (item.name) |n| try std.fmt.allocPrint(r.arena, "{f}", .{std.zig.fmtId(n)}) else "_";
-            // Container definition: `const S = struct`
+            // Container definition: `const S = struct`; an alias of a container is shown with the
+            // aliased type (`const T: type = S`)
             if (tv.asType()) |t| switch (ip.key(t)) {
-                .container_type => |c| if (c.kind != .file) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),
+                .container_type => |c| if (try render.declaresContainer(r, c, it.file, it.item)) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),
                 else => {},
             };
             return std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ keyword, name, try render.annotationAlloc(r, tv) });

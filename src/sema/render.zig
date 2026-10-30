@@ -9,6 +9,7 @@ const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const queries = @import("queries.zig");
 const Body = @import("../hir/Body.zig");
+const FileId = @import("../base/Vfs.zig").FileId;
 
 /// Names of container types: the name of the member that declares the container
 /// (`const Point = struct {...}` → `Point`), and the file name for a file. Containers without a
@@ -234,6 +235,22 @@ const ContainerNames = struct {
         };
     }
 };
+
+/// Whether the container is the value written in the constant `item` of `file`
+/// (`const S = struct {...}`, including a branch of an `if` / `switch`), the declaration it is
+/// named after; false for an alias of a container declared elsewhere (`const T = S`,
+/// `const Self = @This()`, `const L = List(u8)`)
+pub fn declaresContainer(r: *Resolver, c: InternPool.Container, file: FileId, item: u32) resolve.Error!bool {
+    if (c.kind == .file or c.file != file) return false;
+    const tree = try r.itemTree(file);
+    for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
+        if (x.parent_item != item) return false;
+        const rel = try r.containerRel(.{ .file = file, .container = @intCast(ci) }) orelse return false;
+        const b = try r.body(file, item);
+        return ContainerNames.yields(b, b.value orelse return false, rel);
+    };
+    return false;
+}
 
 /// Display listing the full contents: the result of `@typeName`, and types in hover and
 /// completion details (values there are limited, see `shownValue`)

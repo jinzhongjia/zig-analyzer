@@ -3544,6 +3544,55 @@ test "hover and completion details bound large comptime values and mark the cut"
     try testing.expectEqualStrings("```zig\nconst small: *const [4:0]u8 = \"fits\"\n```", small);
 }
 
+test "hover on a constant aliasing a container shows the aliased type" {
+    // Prevents an alias from reading like the definition (`const P2 = struct`)
+    const text =
+        \\const other = @import("other.zig");
+        \\/// A point
+        \\const Point = struct { x: i32 };
+        \\const P2 = Point;
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\const L = List(u8);
+        \\const Foo = other.Foo;
+        \\const Choice = if (@sizeOf(usize) == 8) struct { a: u8 } else struct { a: u16 };
+        \\const Holder = struct {
+        \\    const Self = @This();
+        \\    v: u8,
+        \\    fn get(self: Self) u8 {
+        \\        return self.v;
+        \\    }
+        \\};
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/other.zig", "pub const Foo = struct { y: u8 = 0 };\n");
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "Point = struct", "const Point = struct\n```\n\nA point" },
+        .{ "P2 =", "const P2: type = Point" },
+        .{ "L =", "const L: type = List(u8)" },
+        .{ "Foo =", "const Foo: type = Foo" },
+        .{ "Choice =", "const Choice = struct" },
+        .{ "Self =", "const Self: type = Holder" },
+        .{ "Self) u8", "const Self: type = Holder" },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))).?;
+        const expected = try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}{s}", .{ c[1], if (std.mem.indexOfScalar(u8, c[1], '`') == null) "\n```" else "" });
+        testing.expectEqualStrings(expected, info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "anonymous containers are shown by content, and their type hints only when enabled" {
     const text =
         \\const Kind = union(enum) { compile: struct { root: u32 }, none };
