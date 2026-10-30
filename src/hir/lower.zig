@@ -243,11 +243,7 @@ const Lowerer = struct {
     /// One clause: the clause itself is lowered to `.other` and its expressions are recorded in
     /// `clauses`; returns the first of them
     fn clause(l: *Lowerer, c: SyntaxNode) Error!?ExprId {
-        const id = try l.expr(c);
-        const children = switch (l.exprs.items[@backingInt(id)]) {
-            .other => |children| children,
-            else => return null,
-        };
+        const children = try l.clauseItems(c);
         const kind: Body.Clause.Kind = switch (c.kind()) {
             .align_clause => .@"align",
             .addrspace_clause => .@"addrspace",
@@ -257,6 +253,15 @@ const Lowerer = struct {
         };
         for (children, 0..) |x, i| try l.clause_list.append(l.a, .{ .kind = if (i == 0) kind else .bit_range, .expr = x });
         return if (children.len == 1) children[0] else null;
+    }
+
+    /// The expressions in a clause (the clause itself is lowered to `.other`)
+    fn clauseItems(l: *Lowerer, c: SyntaxNode) Error![]const ExprId {
+        const id = try l.expr(c);
+        return switch (l.exprs.items[@backingInt(id)]) {
+            .other => |children| children,
+            else => &.{},
+        };
     }
 
     fn expr(l: *Lowerer, n: SyntaxNode) Error!ExprId {
@@ -584,20 +589,33 @@ const Lowerer = struct {
             (if (n.childToken(.identifier)) |t| (if (std.mem.eql(u8, t.text, "c")) Body.PtrSize.c else .many) else .many)
         else
             .one;
-        var child: ?ExprId = null;
-        var sentinel: ?ExprId = null;
-        var it = ast.childNodes(n);
-        while (it.next()) |c| switch (c.kind()) {
-            .sentinel => sentinel = try l.exprOrMissing(firstChild(c)),
-            .align_clause, .addrspace_clause => _ = try l.clause(c),
-            else => child = try l.expr(c),
-        };
-        return l.add(.{ .ptr_type = .{
+        var ptr: Body.PtrType = .{
             .size = size,
             .is_const = n.childToken(.keyword_const) != null,
-            .child = child orelse try l.add(.missing, .none),
-            .sentinel = sentinel,
-        } }, l.nodeRange(n));
+            .is_volatile = n.childToken(.keyword_volatile) != null,
+            .is_allowzero = n.childToken(.keyword_allowzero) != null,
+            .child = undefined,
+        };
+        var child: ?ExprId = null;
+        var it = ast.childNodes(n);
+        while (it.next()) |c| switch (c.kind()) {
+            .sentinel => ptr.sentinel = try l.exprOrMissing(firstChild(c)),
+            .align_clause => {
+                const items = try l.clauseItems(c);
+                if (items.len > 0) ptr.@"align" = items[0];
+                if (items.len == 3) {
+                    ptr.bit_offset = items[1];
+                    ptr.host_size = items[2];
+                }
+            },
+            .addrspace_clause => {
+                const items = try l.clauseItems(c);
+                if (items.len > 0) ptr.@"addrspace" = items[0];
+            },
+            else => child = try l.expr(c),
+        };
+        ptr.child = child orelse try l.add(.missing, .none);
+        return l.add(.{ .ptr_type = ptr }, l.nodeRange(n));
     }
 };
 

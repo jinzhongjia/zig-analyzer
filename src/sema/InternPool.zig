@@ -155,11 +155,62 @@ pub const SimpleValue = enum { void, true, false, null, undefined };
 
 pub const PtrSize = enum { one, many, slice, c };
 
+pub const PtrType = struct {
+    child: Index,
+    size: PtrSize,
+    is_const: bool = false,
+    sentinel: ?Index = null,
+    attrs: PtrAttrs = .{},
+};
+
+/// Pointer attributes other than constness and the sentinel: `align(a)` / `align(a:b:h)`,
+/// `addrspace(...)`, `volatile`, `allowzero`. Pointers without any keep the defaults.
+pub const PtrAttrs = struct {
+    alignment: Alignment = .natural,
+    /// Bit pointer into a packed host integer of `host_size` bytes (0 for other pointers), at
+    /// `bit_offset` bits from its start
+    host_size: u16 = 0,
+    bit_offset: u16 = 0,
+    is_volatile: bool = false,
+    /// Always false for C pointers, which allow zero by definition (see `get`)
+    is_allowzero: bool = false,
+    /// null when the `addrspace(...)` expression cannot be evaluated
+    address_space: ?std.builtin.AddressSpace = .generic,
+
+    /// Contains no part that could not be evaluated
+    pub fn isKnown(a: PtrAttrs) bool {
+        return a.alignment != .unknown and a.address_space != null;
+    }
+};
+
+/// Explicit pointer alignment in bytes. Matching the compiler, an explicit alignment equal to the
+/// natural one still makes a different type (`*align(4) u32` is not `*u32`).
+pub const Alignment = enum(u64) {
+    /// No `align` written: the alignment of the child type
+    natural = 0,
+    /// The `align` expression cannot be evaluated
+    unknown = std.math.maxInt(u64),
+    _,
+
+    /// An alignment of `n` bytes; unknown when `n` is not a valid alignment (a power of 2)
+    pub fn fromBytes(n: u64) Alignment {
+        return if (n == 0 or n == std.math.maxInt(u64) or !std.math.isPowerOfTwo(n)) .unknown else @fromBackingInt(n);
+    }
+
+    /// The explicit alignment; null for `natural` and `unknown`
+    pub fn bytes(a: Alignment) ?u64 {
+        return switch (a) {
+            .natural, .unknown => null,
+            _ => @backingInt(a),
+        };
+    }
+};
+
 pub const Key = union(enum) {
     unknown,
     simple_type: Simple,
     int_type: struct { signedness: std.builtin.Signedness, bits: u16 },
-    ptr_type: struct { child: Index, size: PtrSize, is_const: bool = false, sentinel: ?Index = null },
+    ptr_type: PtrType,
     array_type: struct { len: u64, child: Index, sentinel: ?Index = null },
     /// An array whose length is not known: the element type and sentinel are. With `len`, the
     /// length depends on an abstract parameter (in a generic function body without a concrete
@@ -677,8 +728,11 @@ pub const VectorAbi = enum(u8) {
     }
 };
 
-/// Interns: the same Key returns the same Index
-pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
+/// Interns: the same Key returns the same Index. C pointers always allow zero (as the compiler
+/// canonicalizes them), so `allowzero` is dropped from them.
+pub fn get(ip: *InternPool, key_in: Key) Allocator.Error!Index {
+    var k = key_in;
+    if (k == .ptr_type and k.ptr_type.size == .c) k.ptr_type.attrs.is_allowzero = false;
     // Hashed before taking the lock: only probing the table is serialized
     const hashed: Prehashed = .{ .h = KeyContext.hash(.{}, k) };
     ip.mutex.lockUncancelable(ip.io);
@@ -874,7 +928,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
                     try w.writeAll("]");
                 },
             }
-            if (p.is_const) try w.writeAll("const ");
+            try writePtrQualifiers(p, w);
             try ip.print(p.child, w, container_name);
         },
         .array_type => |a| {
@@ -1073,6 +1127,24 @@ fn writeStringPrefix(text: []const u8, limit: ?usize, w: *Io.Writer) Io.Writer.E
         i += unit;
     }
     return i;
+}
+
+/// The qualifiers of a pointer type between its size and its child, in the order the compiler
+/// prints them: `allowzero align(a:b:h) addrspace(.x) const volatile ` (each only when present;
+/// C pointers never print `allowzero`). Parts that cannot be evaluated print as `unknown`.
+pub fn writePtrQualifiers(p: PtrType, w: *Io.Writer) Io.Writer.Error!void {
+    const a = p.attrs;
+    if (a.is_allowzero) try w.writeAll("allowzero ");
+    if (a.alignment != .natural or a.host_size != 0) {
+        if (a.alignment.bytes()) |n| try w.print("align({d}", .{n}) else try w.writeAll("align(unknown");
+        if (a.host_size != 0) try w.print(":{d}:{d}", .{ a.bit_offset, a.host_size });
+        try w.writeAll(") ");
+    }
+    if (a.address_space) |space| {
+        if (space != .generic) try w.print("addrspace(.{t}) ", .{space});
+    } else try w.writeAll("addrspace(unknown) ");
+    if (p.is_const) try w.writeAll("const ");
+    if (a.is_volatile) try w.writeAll("volatile ");
 }
 
 /// A field of a tuple or anonymous struct: comptime fields include their value

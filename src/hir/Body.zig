@@ -34,8 +34,9 @@ type_expr: ?ExprId,
 /// Expression in the `align(...)` of a variable or field
 align_expr: ?ExprId,
 /// Expressions in the `align` / `addrspace` / `linksection` / `callconv` clauses of function
-/// prototypes, variables and fields, local variables, and pointer types (the clauses are not part
-/// of the expression tree; they are inferred separately, against the result type of the clause)
+/// prototypes, variables and fields, and local variables (the clauses are not part of the
+/// expression tree; they are inferred separately, against the result type of the clause). The
+/// clauses of pointer types are part of `Expr.ptr_type`.
 clauses: []const Clause,
 
 pub const ExprId = enum(u32) { _ };
@@ -98,7 +99,7 @@ pub const Expr = union(enum) {
     @"unreachable",
     optional_type: ExprId,
     error_union_type: struct { err: ExprId, payload: ExprId },
-    ptr_type: struct { size: PtrSize, is_const: bool, child: ExprId, sentinel: ?ExprId = null },
+    ptr_type: PtrType,
     array_type: struct { len: ExprId, child: ExprId, sentinel: ?ExprId = null },
     error_set: []const []const u8,
     /// Other constructs (asm, nosuspend, syntax error nodes, ...): only the subexpressions are
@@ -107,6 +108,21 @@ pub const Expr = union(enum) {
 };
 
 pub const PtrSize = enum { one, many, slice, c };
+
+pub const PtrType = struct {
+    size: PtrSize,
+    is_const: bool,
+    is_volatile: bool = false,
+    is_allowzero: bool = false,
+    child: ExprId,
+    sentinel: ?ExprId = null,
+    /// `align(a)`, or `align(a:b:h)` of a bit pointer (`bit_offset` and `host_size` are then
+    /// both present)
+    @"align": ?ExprId = null,
+    bit_offset: ?ExprId = null,
+    host_size: ?ExprId = null,
+    @"addrspace": ?ExprId = null,
+};
 
 pub const Clause = struct {
     kind: Kind,

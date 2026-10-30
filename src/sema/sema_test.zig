@@ -2730,6 +2730,75 @@ test "peer types of pointers and optionals" {
     });
 }
 
+test "pointer attributes are part of the pointer type" {
+    // Prevents `*align(1) u32`, `*volatile T` and `*allowzero T` from being the plain pointer type
+    try expectTypes(
+        \\const Reg = packed struct(u32) { en: bool, _pad: u31 };
+        \\const P = *align(1) u32;
+        \\const t_eq = if (P == *u32) @as(u8, 1) else @as(u16, 2);
+        \\const t_nat = if (*align(4) u32 == *u32) @as(u8, 1) else @as(u16, 2);
+        \\const t_same = if (*align(1) u32 == P) @as(u8, 1) else @as(u16, 2);
+        \\const t_vol = if (*volatile u8 == *u8) @as(u8, 1) else @as(u16, 2);
+        \\const t_bit = if (*align(1:0:1) u8 == *align(1) u8) @as(u8, 1) else @as(u16, 2);
+        \\fn f(addr: usize, reg: *volatile u32, buf: []align(16) u8) void {
+        \\    const a4 = @as(*volatile Reg, @ptrFromInt(addr));
+        \\    const a5 = @as(*allowzero u8, @ptrFromInt(addr));
+        \\    const bp = @as(*align(4:8:4) u8, @ptrFromInt(addr));
+        \\    const all: [:0]allowzero align(2) const volatile u16 = @ptrCast(buf);
+        \\    _ = .{ reg, buf, a4, a5, bp, all };
+        \\}
+    , &.{
+        .{ "t_eq", "u16 = 2" },
+        .{ "t_nat", "u16 = 2" },
+        .{ "t_same", "u8 = 1" },
+        .{ "t_vol", "u16 = 2" },
+        .{ "t_bit", "u8 = 1" },
+        .{ "P", "type = *align(1) u32" },
+        .{ "reg", "*volatile u32" },
+        .{ "buf", "[]align(16) u8" },
+        .{ "a4", "*volatile Reg" },
+        .{ "a5", "*allowzero u8" },
+        .{ "bp", "*align(4:8:4) u8" },
+        .{ "all", "[:0]allowzero align(2) const volatile u16" },
+    });
+}
+
+test "@typeInfo, @Pointer and std results keep pointer attributes" {
+    // Prevents default attributes in `@typeInfo` and std results losing their alignment
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const P = *align(1) u32;
+        \\const malign = std.meta.alignment(P);
+        \\const pvol = @intFromBool(@typeInfo(*volatile u8).pointer.attrs.@"volatile");
+        \\const as_null = @intFromBool(@typeInfo(*u8).pointer.attrs.@"addrspace" == null);
+        \\const nat_null = @intFromBool(@typeInfo(*u8).pointer.attrs.@"align" == null);
+        \\const c_zero = @intFromBool(@typeInfo([*c]u8).pointer.attrs.@"allowzero");
+        \\const t_as = if (*addrspace(.generic) u32 == *u32) @as(u8, 1) else @as(u16, 2);
+        \\const R = @Pointer(.slice, .{ .@"volatile" = true, .@"addrspace" = .gs, .@"align" = 4 }, u8, null);
+        \\const Q = @Pointer(.one, .{ .@"const" = true }, u8, null);
+        \\pub fn probe(gpa: std.mem.Allocator, bytes: []u8, x: u32) !void {
+        \\    const a1 = std.mem.asBytes(&x);
+        \\    const a2 = std.mem.bytesAsValue(u32, bytes[0..4]);
+        \\    const a3 = try gpa.alignedAlloc(u8, .@"16", 64);
+        \\    const a8 = try gpa.alignedAlloc(u8, null, 64);
+        \\    _ = .{ a1, a2, a3, a8 };
+        \\}
+    , &.{
+        .{ "malign", "comptime_int = 1" },
+        .{ "pvol", "u1 = 1" },
+        .{ "as_null", "u1 = 0" },
+        .{ "nat_null", "u1 = 1" },
+        .{ "c_zero", "u1 = 1" },
+        .{ "t_as", "u8 = 1" },
+        .{ "R", "type = []align(4) addrspace(.gs) volatile u8" },
+        .{ "Q", "type = *const u8" },
+        .{ "a1", "*align(4) const [4]u8" },
+        .{ "a2", "*align(1) u32" },
+        .{ "a3", "[]align(16) u8" },
+        .{ "a8", "[]align(1) u8" },
+    });
+}
+
 test "generic bodies without an instance use values that do not depend on the parameters" {
     try expectTypes(
         \\fn List(comptime T: type, comptime alignment: ?u29) type {
@@ -2755,11 +2824,11 @@ test "generic bodies without an instance use values that do not depend on the pa
         \\    _ = x;
         \\}
     , &.{
-        // The condition depends on abstract parameters, but both branches have the same value
-        // (pointer alignment is not distinguished)
-        .{ "head", "[]T" },
+        // The condition depends on abstract parameters: the branches are slices of T whose
+        // alignment depends on the parameter
+        .{ "head", "[]align(unknown) T" },
         // Self-recursive type function: the container in this instance is taken
-        .{ "S", "type = []T" },
+        .{ "S", "type = []align(unknown) T" },
         // Runtime condition: the value is not comptime-known
         .{ "x", "u32" },
     });
@@ -3635,7 +3704,7 @@ test "std.mem pointer reinterpretation" {
         \\    _ = .{ bytes, fs, zb };
         \\}
     , &.{
-        .{ "bytes", "[]const u8" },
+        .{ "bytes", "[]align(2) const u8" },
         .{ "fs", "[]const F" },
         .{ "zb", "[]const u8" },
     });

@@ -1224,7 +1224,13 @@ const Evaluator = struct {
             .ptr_type => |p| {
                 const child = try ev.evalType(f, p.child);
                 const sentinel = if (p.sentinel) |s| try ev.freeze(try ev.eval(f, s, child)) orelse return error.Abort else null;
-                return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel } }));
+                var vals: PtrClauseValues = .{};
+                if (p.@"align") |x| vals.@"align" = try ev.clauseValue(f, x);
+                if (p.bit_offset) |x| vals.bit_offset = try ev.clauseValue(f, x);
+                if (p.host_size) |x| vals.host_size = try ev.clauseValue(f, x);
+                if (p.@"addrspace") |x| vals.@"addrspace" = try ev.clauseValue(f, x);
+                const attrs = try ptrAttrs(ev.r, child, p, vals);
+                return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel, .attrs = attrs } }));
             },
             .array_type => |arr| {
                 const len = try ev.evalInt(f, arr.len, .usize_type);
@@ -1234,6 +1240,16 @@ const Evaluator = struct {
             },
             .error_set => |names| return Val.ofType(try ip.errorSet(ev.a, names)),
         }
+    }
+
+    /// Value of an expression in a clause of a pointer type; null when it cannot be evaluated
+    /// (the attribute is then unknown)
+    fn clauseValue(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!?Index {
+        const v = ev.eval(f, e, null) catch |err| switch (err) {
+            error.Abort => return null,
+            else => |x| return x,
+        };
+        return ev.freeze(v);
     }
 
     fn nameRef(ev: *Evaluator, f: *Frame, e: ExprId, name: []const u8) EvalError!Val {
@@ -2896,7 +2912,19 @@ const Evaluator = struct {
             const is_const = try ev.boolField(vals[1], "const");
             const child = try asType(vals[2]);
             const sentinel = try ev.freeze(try ev.coerce(vals[3], try ip.optionalOf(child))) orelse return error.Abort;
-            return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const, .sentinel = if (sentinel == .null_value) null else sentinel } }));
+            const attrs: InternPool.PtrAttrs = .{
+                .is_volatile = try ev.boolField(vals[1], "volatile"),
+                .is_allowzero = try ev.boolField(vals[1], "allowzero"),
+                .alignment = switch (try ev.optionalAttr(vals[1], "align")) {
+                    .null_value => .natural,
+                    else => |v| alignmentOf(ip, v),
+                },
+                .address_space = switch (try ev.optionalAttr(vals[1], "addrspace")) {
+                    .null_value => .generic,
+                    else => |v| addressSpaceOf(ip, v),
+                },
+            };
+            return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const, .sentinel = if (sentinel == .null_value) null else sentinel, .attrs = attrs } }));
         }
         if (eq(u8, name, "@Fn")) {
             if (vals.len != 4) return error.Abort;
@@ -3363,6 +3391,22 @@ const Evaluator = struct {
         return (try ev.condition(fv)).yes;
     }
 
+    /// Value of an optional field of the attributes passed to a reifying builtin: `null_value`
+    /// when it is null or absent (a struct literal leaves it at its default); unknown when it
+    /// cannot be evaluated
+    fn optionalAttr(ev: *Evaluator, v: Val, name: []const u8) EvalError!Index {
+        const fields = try ev.fieldsOf(v.ty) orelse return .unknown;
+        for (fields) |fl| {
+            if (!std.mem.eql(u8, fl.name, name)) continue;
+            const fv = ev.fieldAccess(v, name) catch |err| switch (err) {
+                error.Abort => return .unknown,
+                else => |x| return x,
+            };
+            return try ev.freeze(fv) orelse .unknown;
+        }
+        return .null_value;
+    }
+
     /// Constructed type: its identity includes the construction site and the instance in which it
     /// was constructed
     fn reify(ev: *Evaluator, f: *Frame, e: ExprId, spec: struct {
@@ -3763,7 +3807,7 @@ const Evaluator = struct {
             .int_type => .{ "int", try ev.intInfoValue(type_ty, value.intInfo(ip, t).?) },
             .ptr_type => |p| .{ "pointer", try ev.structValue(try ev.member(type_ty, "Pointer"), &.{
                 .{ "size", try ev.enumTag(try ev.member(try ev.member(type_ty, "Pointer"), "Size"), @tagName(p.size)) },
-                .{ "attrs", try ev.structValue(try ev.member(try ev.member(type_ty, "Pointer"), "Attributes"), &.{.{ "const", if (p.is_const) .true_value else .false_value }}) },
+                .{ "attrs", try ev.ptrAttrsInfo(try ev.member(try ev.member(type_ty, "Pointer"), "Attributes"), p) },
                 .{ "child", p.child },
                 .{ "sentinel_ptr", try ev.sentinelPtr(p.sentinel) },
             }) },
@@ -3803,6 +3847,26 @@ const Evaluator = struct {
             else => return error.Abort,
         };
         return ip.get(.{ .union_value = .{ .ty = type_ty, .tag = payload[0], .payload = payload[1] } });
+    }
+
+    /// `std.builtin.Type.Pointer.Attributes` of a pointer type: the address space is always given
+    /// (`.generic` by default), the alignment only when written; attributes that cannot be
+    /// evaluated are unknown
+    fn ptrAttrsInfo(ev: *Evaluator, attrs_ty: Index, p: InternPool.PtrType) EvalError!Index {
+        const a = p.attrs;
+        const space: Index = if (a.address_space) |s| try ev.enumTag(try ev.stdType(&.{ "builtin", "AddressSpace" }), @tagName(s)) else .unknown;
+        const alignment: Index = switch (a.alignment) {
+            .natural => .null_value,
+            .unknown => .unknown,
+            _ => try ev.intIndex(.usize_type, a.alignment.bytes().?),
+        };
+        return ev.structValue(attrs_ty, &.{
+            .{ "const", if (p.is_const) .true_value else .false_value },
+            .{ "volatile", if (a.is_volatile) .true_value else .false_value },
+            .{ "allowzero", if (a.is_allowzero or p.size == .c) .true_value else .false_value },
+            .{ "addrspace", space },
+            .{ "align", alignment },
+        });
     }
 
     fn intIndex(ev: *Evaluator, ty: Index, x: anytype) Error!Index {
@@ -4102,6 +4166,62 @@ fn alignValue(ip: *InternPool, v: ?Index) EvalError!u64 {
     const x = value.intOf(ip, v) orelse return error.Abort;
     if (x <= 0 or x & (x - 1) != 0) return error.Abort;
     return std.math.cast(u64, x) orelse error.Abort;
+}
+
+/// Values of the clauses of a written pointer type: null when the clause is absent or its value
+/// is not known
+pub const PtrClauseValues = struct {
+    @"align": ?Index = null,
+    bit_offset: ?Index = null,
+    host_size: ?Index = null,
+    @"addrspace": ?Index = null,
+};
+
+/// Attributes of the pointer type `p` with child `child`, from the values of its clauses (see
+/// `PtrClauseValues`). A clause whose value is not known gives an unknown attribute. As in the
+/// compiler, a bit range covering the whole child is no bit range (`*align(1:0:1) u8` is
+/// `*align(1) u8`).
+pub fn ptrAttrs(r: *Resolver, child: Index, p: Body.PtrType, vals: PtrClauseValues) Error!InternPool.PtrAttrs {
+    const ip = r.ctx.db.env.ip;
+    var a: InternPool.PtrAttrs = .{ .is_volatile = p.is_volatile, .is_allowzero = p.is_allowzero };
+    if (p.@"align" != null) a.alignment = alignmentOf(ip, vals.@"align");
+    if (p.host_size != null) bits: {
+        const offset = std.math.cast(u16, value.intOf(ip, vals.bit_offset) orelse -1);
+        const host = std.math.cast(u16, value.intOf(ip, vals.host_size) orelse -1);
+        if (offset == null or host == null) {
+            // The bit range is part of the type: without it the type is not known
+            a.alignment = .unknown;
+            break :bits;
+        }
+        if (host.? == 0) break :bits;
+        a.host_size = host.?;
+        a.bit_offset = offset.?;
+        const layout = try typeLayout(r, child) orelse break :bits;
+        if (layout.bits == @as(u64, host.?) * 8) {
+            a.host_size = 0;
+            a.bit_offset = 0;
+        }
+    }
+    if (p.@"addrspace" != null) a.address_space = addressSpaceOf(ip, vals.@"addrspace");
+    return a;
+}
+
+/// Alignment given by the value of an `align` expression; unknown when the value is not known or
+/// not a valid alignment
+pub fn alignmentOf(ip: *InternPool, v: ?Index) InternPool.Alignment {
+    const x = value.intOf(ip, v) orelse return .unknown;
+    return .fromBytes(std.math.cast(u64, x) orelse return .unknown);
+}
+
+/// Address space named by the value of an `addrspace` expression (a member of
+/// `std.builtin.AddressSpace`, or an enum literal); null when it is not known
+pub fn addressSpaceOf(ip: *InternPool, v: ?Index) ?std.builtin.AddressSpace {
+    const name = switch (ip.key(v orelse return null)) {
+        .enum_tag => |t| t.name,
+        .enum_literal => |n| n,
+        else => return null,
+    };
+    return std.meta.stringToEnum(std.builtin.AddressSpace, name);
 }
 
 /// Sentinel of the result of `++` (matching the compiler): when both sides have one, they must

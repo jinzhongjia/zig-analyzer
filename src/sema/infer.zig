@@ -401,6 +401,18 @@ const Inferrer = struct {
         };
     }
 
+    /// Attributes of the written pointer type `p` (with child `child`): its clauses are inferred
+    /// with their result types and evaluated at comptime
+    fn ptrAttrs(inf: *Inferrer, p: Body.PtrType, child: Index) Error!InternPool.PtrAttrs {
+        if (p.@"align" == null and p.@"addrspace" == null) return .{ .is_volatile = p.is_volatile, .is_allowzero = p.is_allowzero };
+        var vals: eval.PtrClauseValues = .{};
+        if (p.@"align") |x| vals.@"align" = (try inf.inferComptime(x, try inf.clauseType(.@"align"))).val;
+        if (p.bit_offset) |x| vals.bit_offset = (try inf.inferComptime(x, try inf.clauseType(.bit_range))).val;
+        if (p.host_size) |x| vals.host_size = (try inf.inferComptime(x, try inf.clauseType(.bit_range))).val;
+        if (p.@"addrspace") |x| vals.@"addrspace" = (try inf.inferComptime(x, try inf.clauseType(.@"addrspace"))).val;
+        return eval.ptrAttrs(inf.r, child, p, vals);
+    }
+
     fn branchQuota(inf: *Inferrer) u32 {
         if (inf.quota) |q| return q;
         const q = eval.bodyQuota(inf.r, inf.body, inf.exprs);
@@ -923,7 +935,7 @@ const Inferrer = struct {
                 const ty = try inf.peer(&.{ then.ty, other.ty });
                 try inf.peerLiteral(x.then, ty);
                 if (x.@"else") |el| try inf.peerLiteral(el, ty);
-                return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) sameLiveValue(&.{ then, other }, ty) else null };
+                return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) try sameLiveValue(ip, &.{ then, other }, ty) else null };
             },
             .loop => |l| return inf.loop(l, expected),
             .@"switch" => |s| {
@@ -985,7 +997,7 @@ const Inferrer = struct {
                 const ty = try inf.peer(types.items);
                 for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
                 for (break_exprs) |x| try inf.peerLiteral(x, ty);
-                return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
+                return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) try sameLiveValue(ip, values.items, ty) else null };
             },
             .@"catch" => |c| {
                 const lhs = try inf.infer(c.lhs, null);
@@ -1118,8 +1130,9 @@ const Inferrer = struct {
             .ptr_type => |p| {
                 const child = (try inf.infer(p.child, null)).asType() orelse return typeUnknown();
                 const sentinel: ?Index = if (p.sentinel) |x| (try inf.infer(x, child)).val else null;
+                const attrs = try inf.ptrAttrs(p, child);
                 if (child == .unknown) return typeUnknown();
-                return TypedValue.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel } }));
+                return TypedValue.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel, .attrs = attrs } }));
             },
             .array_type => |arr| {
                 const len = try inf.inferComptime(arr.len, .usize_type);
@@ -4144,18 +4157,39 @@ fn order(op: SyntaxKind, x: anytype, y: @TypeOf(x)) ?bool {
     };
 }
 
-/// Ignoring noreturn branches: the value when all branches have the same value
-fn sameLiveValue(values: []const TypedValue, ty: Index) ?Index {
+/// Ignoring noreturn branches: the value when all branches have the same value. Branches that
+/// are pointer types differing only in their alignment (`if (alignment) |a| []align(a) T else
+/// []T` with an undetermined condition) give that pointer type with an unknown alignment.
+fn sameLiveValue(ip: *InternPool, values: []const TypedValue, ty: Index) Allocator.Error!?Index {
     var v: ?Index = null;
+    var differ = false;
     for (values) |x| {
         if (x.ty == .noreturn_type) continue;
         if (x.ty != ty) return null;
         const xv = x.val orelse return null;
         if (v) |y| {
-            if (y != xv) return null;
+            if (y != xv) differ = true;
         } else v = xv;
     }
-    return v;
+    if (!differ) return v;
+    if (ty != .type_type) return null;
+    var joined: ?InternPool.PtrType = null;
+    for (values) |x| {
+        if (x.ty == .noreturn_type) continue;
+        const p = switch (ip.key(x.val.?)) {
+            .ptr_type => |p| p,
+            else => return null,
+        };
+        const j = &(joined orelse {
+            joined = p;
+            continue;
+        });
+        var same = p;
+        same.attrs.alignment = j.attrs.alignment;
+        if (!deepEql(same, j.*)) return null;
+        if (p.attrs.alignment != j.attrs.alignment) j.attrs.alignment = .unknown;
+    }
+    return try ip.get(.{ .ptr_type = joined.? });
 }
 
 /// The value when all breaks have the same value (and its type is the merged type)

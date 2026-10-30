@@ -781,7 +781,7 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
     if (v == .unknown) return false;
     return switch (ip.key(v)) {
         .unknown, .abstract_array_type => false,
-        .ptr_type => |p| isPrecise(ip, p.child) and (p.sentinel == null or isPrecise(ip, p.sentinel.?)),
+        .ptr_type => |p| p.attrs.isKnown() and isPrecise(ip, p.child) and (p.sentinel == null or isPrecise(ip, p.sentinel.?)),
         .array_type => |a| isPrecise(ip, a.child) and (a.sentinel == null or isPrecise(ip, a.sentinel.?)),
         .optional_type => |c| isPrecise(ip, c),
         .error_union_type => |e| isPrecise(ip, e.err) and isPrecise(ip, e.payload),
@@ -831,7 +831,7 @@ fn concrete(ip: *InternPool, t: Index, unknown_len: bool) bool {
     return switch (ip.key(t)) {
         .unknown, .opaque_param => false,
         .abstract_array_type => |a| unknown_len and a.len == null and concrete(ip, a.child, true) and (a.sentinel == null or concrete(ip, a.sentinel.?, true)),
-        .ptr_type => |p| concrete(ip, p.child, unknown_len),
+        .ptr_type => |p| p.attrs.isKnown() and concrete(ip, p.child, unknown_len),
         .array_type => |a| concrete(ip, a.child, unknown_len),
         .optional_type => |c| concrete(ip, c, unknown_len),
         .error_union_type => |e| concrete(ip, e.err, unknown_len) and concrete(ip, e.payload, unknown_len),
@@ -887,7 +887,7 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .ptr_type => |p| blk: {
             const q = kb.ptr_type;
             if (p.size != q.size or p.is_const != q.is_const) break :blk false;
-            break :blk all(&.{ eqlTypes(ip, p.child, q.child), eqlSentinel(ip, p.sentinel, q.sentinel) });
+            break :blk all(&.{ eqlTypes(ip, p.child, q.child), eqlSentinel(ip, p.sentinel, q.sentinel), eqlPtrAttrs(p.attrs, q.attrs) });
         },
         .array_type => |x| blk: {
             const y = kb.array_type;
@@ -937,6 +937,15 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         // Index
         else => false,
     };
+}
+
+/// Whether two pointers have the same attributes; null when that depends on a part that cannot be
+/// evaluated
+fn eqlPtrAttrs(a: InternPool.PtrAttrs, b: InternPool.PtrAttrs) ?bool {
+    if (a.host_size != b.host_size or a.bit_offset != b.bit_offset or a.is_volatile != b.is_volatile or a.is_allowzero != b.is_allowzero) return false;
+    if (a.alignment != .unknown and b.alignment != .unknown and a.alignment != b.alignment) return false;
+    if (a.address_space != null and b.address_space != null and a.address_space != b.address_space) return false;
+    return if (a.isKnown() and b.isKnown()) true else null;
 }
 
 fn eqlTypeLists(ip: *InternPool, a: []const Index, b: []const Index) ?bool {

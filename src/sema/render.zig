@@ -363,7 +363,8 @@ const QualifiedNames = struct {
                     }
                     try w.writeAll("]");
                 }
-                if (p.is_const) try w.writeAll("const ");
+                if (!p.attrs.isKnown()) return error.Unnamed;
+                try InternPool.writePtrQualifiers(p, w);
                 try q.writeType(p.child);
             },
             .array_type => |arr| {
