@@ -305,3 +305,35 @@ test "auto import inserts into the organized block at its sorted place, otherwis
         try inserted(a, "//! Docs.\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
     );
 }
+
+test "auto import after an unclosed last import stays at the top level" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The open `@import(` must not take the function below it, which would put the new
+    // declaration inside the function body
+    for ([_][]const u8{ "fn", "pub fn" }) |head| {
+        const text = try std.fmt.allocPrint(a,
+            \\const std = @import("std");
+            \\const aaa = @import("aaa.zig"
+            \\
+            \\{s} helper(n: u32) u32 {{
+            \\    const k = n + 1;
+            \\    return k * 2;
+            \\}}
+            \\
+        , .{head});
+        const expected = try std.fmt.allocPrint(a,
+            \\const std = @import("std");
+            \\const aaa = @import("aaa.zig"
+            \\const util = @import("util.zig");
+            \\
+            \\{s} helper(n: u32) u32 {{
+            \\    const k = n + 1;
+            \\    return k * 2;
+            \\}}
+            \\
+        , .{head});
+        try testing.expectEqualStrings(expected, try inserted(a, text, "util", "util.zig", "const util = @import(\"util.zig\");"));
+    }
+}

@@ -868,9 +868,9 @@ test "candidates fit the expected type only by exact rules" {
 
 test "expected types are not used where the syntax tree may be wrong" {
     try expectRanked(expected_decls ++ "const cd_t = u8;\n", &.{
-        // An unclosed call makes the next line recover as an error node and `Want = cd`; the type
-        // of the left-hand side, `type`, is not the expected type
-        .{ "fn run() void {\n    take(cd_n,\n    const x: Want = cd<|>;\n    _ = x;\n}", "cd_n cd_o cd_w cd_t" },
+        // An unclosed call takes the next line as its arguments `x` and `cd`; the type of `x`,
+        // `Want`, is not the expected type
+        .{ "fn run() void {\n    var x: Want = .a;\n    take(cd_n,\n    x = cd<|>;\n    _ = &x;\n}", "cd_n cd_o cd_w cd_t" },
         // The call at the cursor is not closed; the statement has a syntax error
         .{ "fn run() void {\n    take(cd<|>\n}", "cd_n cd_o cd_w cd_t" },
         .{ "fn run() void {\n    const o: Other = .{ .w = cd<|>, .w = };\n    _ = o;\n}", "cd_n cd_o cd_w cd_t" },
@@ -878,6 +878,8 @@ test "expected types are not used where the syntax tree may be wrong" {
         // previous statement
         .{ "fn run() void {\n    const y: u8 = ;\n    const x: Want = cd<|>;\n    _ = .{ x, y };\n}", "cd_w cd_n cd_o cd_t" },
         .{ "fn run() void {\n    const y: u8 = 0\n    const x: Want = cd<|>;\n    _ = .{ x, y };\n}", "cd_w cd_n cd_o cd_t" },
+        // An unclosed call ends before a declaration on the next line
+        .{ "fn run() void {\n    take(cd_n,\n    const x: Want = cd<|>;\n    _ = x;\n}", "cd_w cd_n cd_o cd_t" },
     });
 }
 

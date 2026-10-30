@@ -177,3 +177,22 @@ test "zon ItemTree unchanged by value edits" {
     try testing.expect(try treesEqualIn(.zon, ".{ .a = 1 }", ".{ .a = 2, .b = .{ \"x\" } }"));
     try testing.expect(try treesEqualIn(.zon, ".{ .a = 1 }", "1"));
 }
+
+test "an unclosed list does not take the declarations after it" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const std = @import(\nconst mem = std.mem;\n", "const std\nconst mem\n" },
+        .{ "const std = @import(\"std\"\nconst mem = std.mem;\n", "const std\nconst mem\n" },
+        .{ "const a = f(1,\nvar b = 2;\n", "const a\nvar b\n" },
+        .{ "const a = .{ .x = 1,\npub const b = 2;\n", "const a\nconst b pub\n" },
+        .{ "const a = [_]u8{ 1,\nexport const b = 2;\n", "const a\nconst b\n" },
+        .{ "const E = error{ A,\ntest {}\n", "const E\ntest _\n" },
+        .{ "fn f(a: u32,\nthreadlocal var b: u32 = 0;\n", "fn f\nvar b\n" },
+        .{ "extern fn f(a: u32,\nextern fn g() void;\n", "fn f\nfn g\n" },
+        .{ "const aaa = @import(\"aaa.zig\"\nfn helper(n: u32) u32 {\n    return n;\n}\n", "const aaa\nfn helper\n" },
+        .{ "const aaa = @import(\"aaa.zig\"\npub fn helper(n: u32) u32 {\n    return n;\n}\n", "const aaa\nfn helper pub\n" },
+    };
+    for (cases) |c| expectItems(c[0], c[1]) catch |err| {
+        std.debug.print("source: `{s}`\n", .{c[0]});
+        return err;
+    };
+}
