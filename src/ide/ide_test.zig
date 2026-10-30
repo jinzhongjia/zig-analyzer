@@ -3040,10 +3040,11 @@ test "completion after `.` lists members of the expected type" {
         .{ "const c: ?E = .<|>;", "red green default parse" },
         // `init` returns `!S`, which does not coerce to `S`
         .{ "const s: S = .<|>;", "empty" },
-        .{ "const u: U = .<|>;", "num none" },
+        // Only the tag of a field with one possible value coerces to the union
+        .{ "const u: U = .<|>;", "none" },
         // The result type drops the error union and optional
         .{ "fn f() !E { return .<|>; }", "red green default parse" },
-        .{ "fn f() error{X}!?U { return .<|>; }", "num none" },
+        .{ "fn f() error{X}!?U { return .<|>; }", "none" },
         // For a tagged union, accessing fields on the type gives the tags; untagged unions have
         // none
         .{ "const t = U.<|>;", "num none" },
@@ -3282,6 +3283,31 @@ test "decl literal completion keeps the declarations that coerce to the result t
         // The error set of the result type must contain the errors of an explicit set; an inferred
         // error set is not known before the function body is analyzed
         .{ "fn f() E!S {\n    return .<|>;\n}", "init tryMake make failA" },
+    });
+}
+
+test "completion after `.` with a union result type lists only the tags that coerce to it" {
+    try expectCompletions(
+        \\const U = union(enum) {
+        \\    int: u32,
+        \\    none,
+        \\    unit: struct {},
+        \\    pub const zero: U = .{ .int = 0 };
+        \\};
+        \\const UU = union {
+        \\    a: u32,
+        \\    b: void,
+        \\    pub const first: UU = .{ .a = 1 };
+        \\};
+        \\const R = @Union(.auto, enum { ra, rb }, &.{ "ra", "rb" }, &.{ u32, void }, &.{ .{}, .{} });
+        \\
+    , &.{
+        .{ "const u: U = .<|>;", "none unit zero" },
+        .{ "const uu: UU = .<|>;", "first" },
+        // Switch prongs and comparisons take the tag type
+        .{ "fn f(u: U) void {\n    switch (u) {\n        .<|> => {},\n        else => {},\n    }\n}", "int none unit" },
+        .{ "fn f(u: U) bool {\n    return u == .<|>;\n}", "int none unit" },
+        .{ "fn f(u: R) void {\n    switch (u) {\n        .<|> => {},\n        else => {},\n    }\n}", "ra rb" },
     });
 }
 

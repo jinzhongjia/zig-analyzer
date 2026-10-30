@@ -799,15 +799,19 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
         else => break,
     };
     const tags = decl_literals != .@"try" and !through_ptr;
+    // A union result type takes only the tags of a tagged union whose field type has one possible
+    // value (`.none`), the only tags that coerce to it (see `onePossibleValue`); for a peer type
+    // (switch prongs, comparisons), all the tags
+    const all_tags = decl_literals == .none;
     switch (ip.key(t)) {
         // Constructed types have no declarations: the members of a constructed enum, and the tags
-        // of a tagged constructed union that coerce to it (see `onePossibleValue`)
+        // of a tagged constructed union
         .reified_type => |rt| {
             if (!tags) return;
             switch (rt.kind) {
                 .@"enum" => for (rt.names) |name| try out.add(.{ .label = name, .kind = .enum_member }),
                 .@"union" => if (rt.tag != null) for (rt.names, 0..) |name, i| {
-                    if (try onePossibleValue(r, if (i < rt.types.len) rt.types[i] else .unknown)) try out.add(.{ .label = name, .kind = .enum_member });
+                    if (all_tags or try onePossibleValue(r, if (i < rt.types.len) rt.types[i] else .unknown)) try out.add(.{ .label = name, .kind = .enum_member });
                 },
                 .@"struct" => {},
             }
@@ -824,13 +828,17 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
     const tree = try r.itemTree(ns.file);
     const kind = tree.containers[ns.container].kind;
     const inst = queries.instOfType(ip, t);
+    const tagged = tags and kind == .@"union" and try eval.unionTag(r, t) != null;
     for (tree.containerMembers(ns.container)) |m| {
         const it = tree.items[m];
         const name = it.name orelse continue;
         switch (it.kind) {
             .field => if (tags) switch (kind) {
                 .@"enum" => try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc }),
-                .@"union" => try out.add(.{ .label = name, .kind = .field, .doc = it.doc }),
+                .@"union" => if (tagged) {
+                    const field_ty = if (all_tags) .unknown else (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
+                    if (try onePossibleValue(r, field_ty)) try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc });
+                },
                 else => {},
             },
             .@"const", .@"fn" => {
