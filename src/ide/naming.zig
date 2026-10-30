@@ -208,7 +208,7 @@ const Collector = struct {
         const ip = r.ctx.db.env.ip;
         const body = try r.ctx.get(hir.ItemBody, key);
         if (item.name) |name| switch (item.kind) {
-            .@"fn", .@"const", .@"var" => if (!reexports(body, body.value, name)) {
+            .@"fn", .@"const", .@"var" => if (!reexports(body, body.value, name) and !(item.container == 0 and isRootHook(name))) {
                 const tv = try r.ctx.get(sema.DeclType, .{ .owner = key });
                 if (try category(r, tv)) |rule| try c.check(name, null, rule, rule.style());
             },
@@ -245,6 +245,32 @@ const Collector = struct {
         try c.out.append(c.r.arena, .{ .binding = binding, .rule = rule, .style = style });
     }
 };
+
+/// Declarations that the standard library looks up by name in the root file (`@hasDecl(root,
+/// "...")` in Zig 0.17.0): renaming one silently stops the standard library from using it.
+/// Checked in every file, as which file is the root of a compilation is not known here.
+fn isRootHook(name: []const u8) bool {
+    const hooks = [_][]const u8{
+        "main",
+        "panic",
+        "debug",
+        "os",
+        "std_options",
+        "std_options_cwd",
+        "std_options_debug_io",
+        "std_options_debug_threaded_io",
+        "std_options_elf_debug_info_search_paths",
+        "std_options_FilePermissions",
+        "DllMain",
+        "EfiMain",
+        "WinMain",
+        "WinMainCRTStartup",
+        "wWinMain",
+        "wWinMainCRTStartup",
+    };
+    for (hooks) |h| if (std.mem.eql(u8, h, name)) return true;
+    return false;
+}
 
 /// The initializer accesses a member of the same name (`const SDL_Window = c.SDL_Window;`): the
 /// name is determined by the referenced declaration, which is common for bindings that keep
