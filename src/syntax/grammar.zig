@@ -409,11 +409,10 @@ fn statement(p: *Parser, block_level: bool) Error!void {
     _ = try m.complete(p, .expr_stmt);
 }
 
-/// Prefixed statements: only errdefer allows capturing the error before the body.
+/// Prefixed statements: the keyword followed by a block or an expression statement (no capture).
 fn prefixedStatement(p: *Parser, kind: SyntaxKind) Error!void {
     const m = try p.start();
     try p.bump();
-    if (kind == .errdefer_stmt) try optPayload(p);
     try blockExprStatement(p);
     _ = try m.complete(p, kind);
 }

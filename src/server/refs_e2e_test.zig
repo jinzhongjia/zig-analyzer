@@ -141,17 +141,31 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expect(syms.len >= 1);
         try testing.expectEqualStrings("hello", syms[0].object.get("name").?.string);
 
-        // Indexing in progress: only indexed files and open documents are searched (lib.zig is
-        // neither indexed yet nor open)
+        // Indexing in progress: the request waits until the symbol index covers the module graph
+        // as it was when the request started, then searches every file. Answering at once
+        // searched only the files indexed so far, silently leaving out the others (here lib.zig,
+        // which is not open).
         h.server.indexing.store(true, .release);
-        h.server.indexed_mutex.lockUncancelable(testing.io);
-        h.server.indexed.clearRetainingCapacity();
-        h.server.indexed_mutex.unlock(testing.io);
-        defer h.server.indexing.store(false, .release);
-        const partial = try h.request("workspace/symbol", .{ .query = "hel" });
-        try testing.expectEqual(0, partial.object.get("result").?.array.items.len);
-        const open_doc = try h.request("workspace/symbol", .{ .query = "main" });
-        try testing.expectEqualStrings("main", open_doc.object.get("result").?.array.items[0].object.get("name").?.string);
+        const target = h.server.index_generation.fetchAdd(1, .monotonic) + 1;
+        const waiting = try h.send("workspace/symbol", .{ .query = "hel" });
+        // A waiting request can be canceled
+        const canceled = try h.send("workspace/symbol", .{ .query = "hel" });
+        try h.notify("$/cancelRequest", .{ .id = canceled });
+        const cancel_resp = try h.response(canceled);
+        try testing.expectEqual(za.lsp.jsonrpc.error_codes.request_cancelled, cancel_resp.object.get("error").?.object.get("code").?.integer);
+        for (h.received.items) |m| if (m.object.get("method") == null) if (m.object.get("id")) |id| {
+            try testing.expect(!(id == .integer and id.integer == waiting));
+        };
+        {
+            h.server.index_mutex.lockUncancelable(testing.io);
+            defer h.server.index_mutex.unlock(testing.io);
+            h.server.symbols_indexed = target;
+            h.server.index_cond.broadcast(testing.io);
+        }
+        const during = (try h.response(waiting)).object.get("result").?.array.items;
+        try testing.expectEqual(1, during.len);
+        try testing.expectEqualStrings("hello", during[0].object.get("name").?.string);
+        h.server.indexing.store(false, .release);
     }
 
     // code action: unused local constant

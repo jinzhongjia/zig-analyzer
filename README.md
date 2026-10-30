@@ -54,7 +54,7 @@ The binary is `zig-out/bin/zig-analyzer`. Put it in `PATH`, or point your editor
 
 ## Editor setup
 
-Any LSP client works: run `zig-analyzer` over stdio.
+Any LSP client works: run `zig-analyzer` over stdio. The arguments clients commonly pass, `--stdio` and `--clientProcessId <pid>`, are accepted; other transports (`--pipe`, `--socket`, `--port`, `--node-ipc`) are not supported.
 
 Neovim 0.11+:
 
@@ -75,7 +75,7 @@ vim.lsp.enable('zig_analyzer')
 
 ## Configuration
 
-Editor settings are read from `initializationOptions` and the `zig-analyzer` section of `workspace/configuration`. Every option is optional.
+Editor settings are read from `initializationOptions` and the `zig-analyzer` section of `workspace/configuration`. Every option is optional. A section the client answers with `null` (not set in the editor) leaves the `initializationOptions` in effect.
 
 A `zig-analyzer.zon` in the project root shares project settings (build arguments, diagnostic steps, naming checks, import order) with the team; they take precedence over editor settings.
 

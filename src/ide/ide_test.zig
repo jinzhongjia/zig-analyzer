@@ -1112,6 +1112,47 @@ test "candidates fit the expected type only by exact rules" {
     }
 }
 
+test "pointers fit the expected type by the compiler's attribute rules" {
+    // Prevents ranking `*volatile` / `*align(1)` candidates first where `*const u32` is expected,
+    // and Zig-callconv function pointers where a `callconv(.c)` one is. Expected values: zig 0.17.0
+    // accepts the coercions marked true and rejects the others (`expected type '*const u32',
+    // found '*volatile u32'`, and so on).
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ "*const u32", "const cd_b: *align(8) u32 = undefined;", true },
+        .{ "*align(1) const u32", "const cd_b: *u32 = undefined;", true },
+        .{ "*volatile const u32", "const cd_b: *u32 = undefined;", true },
+        .{ "*allowzero const u32", "const cd_b: *u32 = undefined;", true },
+        .{ "[]const u32", "const cd_b: []align(8) u32 = undefined;", true },
+        .{ "*const fn () callconv(.c) void", "fn cd_b() callconv(.c) void {}", true },
+        .{ "*const u32", "const cd_b: *volatile u32 = undefined;", false },
+        .{ "*const u32", "const cd_b: *align(1) u32 = undefined;", false },
+        .{ "*const u32", "const cd_b: *allowzero u32 = undefined;", false },
+        .{ "[]const u32", "const cd_b: []align(1) u32 = undefined;", false },
+        .{ "*const fn () callconv(.c) void", "fn cd_b() void {}", false },
+        .{ "*const fn () callconv(.c) void", "const cd_b: *const fn () void = undefined;", false },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\const Other = struct {{}};
+            \\const cd_a: Other = .{{}};
+            \\{s}
+            \\fn run() void {{
+            \\    const x: {s} = cd<|>;
+            \\    _ = x;
+            \\}}
+            \\
+        , .{ c[1], c[0] });
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(if (c[2]) "cd_b cd_a" else "cd_a cd_b", got) catch |err| {
+            std.debug.print("expected `{s}`, candidate `{s}`\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
 test "function pointer values rank by the expected type only as what they are" {
     // Parameters and locals of type `*const fn () Tone` are inserted without a call, so the
     // expected type `Tone` does not rank them first; it moves only `tint` up
@@ -2729,6 +2770,42 @@ test "build.zig.zon paths go to the files they name" {
     try testing.expectEqual(null, try w.vfs.lookup(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, "README.md" })));
 }
 
+test "hover in generic bodies does not seed an array length no instance determines" {
+    const text =
+        \\extern fn external(n: usize) usize;
+        \\fn measure(comptime fmt: []const u8) usize { return external(fmt.len); }
+        \\fn print(comptime fmt: []const u8) *const [measure(fmt):0]u8 { return undefined; }
+        \\fn gen(comptime T: type) void {
+        \\    const s = print("{d}");
+        \\    const t: T = undefined;
+        \\    _ = .{ s, t };
+        \\}
+        \\test {
+        \\    gen(u8);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // The length depends on no parameter of `gen`: the same in every instance
+        .{ "s =", "```zig\nconst s: *const [_:0]u8\n```" },
+        .{ "t: T", "```zig\nconst t: u8 = undefined\n```\n\ninferred from the call at main.zig:10" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "hover in generic bodies is inferred from a call site" {
     const text =
         \\fn List(comptime T: type) type {
@@ -2758,6 +2835,50 @@ test "hover in generic bodies is inferred from a call site" {
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "it =", "```zig\nconst it: u16\n```\n\ninferred from the call at main.zig:12" },
         .{ "bigger =", "```zig\nconst bigger: u32\n```\n\ninferred from the call at main.zig:14" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "hover on @This() in generic bodies is inferred from a call site like the written instance" {
+    // `@This()` was the bare function name and counted as concrete, so it was never seeded
+    const text =
+        \\fn Pair(comptime A: type, comptime B: type) type {
+        \\    return struct {
+        \\        a: A,
+        \\        b: B,
+        \\        const Self = @This();
+        \\        fn swap(p: @This(), s: Self) void {
+        \\            const me = p;
+        \\            const q: Pair(A, B) = p;
+        \\            _ = .{ me, q, s };
+        \\        }
+        \\    };
+        \\}
+        \\test {
+        \\    const x: Pair(u8, u16) = .{ .a = 1, .b = 2 };
+        \\    x.swap(x);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    // The instance is that of the type constructor call `Pair(u8, u16)`
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "p: @This()", "```zig\np: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+        .{ "s: Self", "```zig\ns: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+        .{ "me =", "```zig\nconst me: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+        .{ "q:", "```zig\nconst q: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
     };
     for (cases) |c| {
         const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
@@ -2970,6 +3091,50 @@ test "hover in generic bodies is inferred from a call site in another file" {
     var r = resolver(&w, &ctx);
     const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?), &.{}) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst bigger: i64\n```\n\ninferred from the call at main.zig:3", info.text);
+}
+
+test "hover in generic bodies takes the same call site whatever order the files were interned in" {
+    // The first call site followed the interning order of the files, so the instance depended on
+    // the order in which the client opened them
+    const util_text =
+        \\pub fn first(comptime T: type, items: []const T) T {
+        \\    const head = items[0];
+        \\    return head;
+        \\}
+        \\
+    ;
+    const main_text = "const util = @import(\"util.zig\");\nconst Point = struct { x: u8 };\nfn run() void {\n    _ = util.first(Point, &.{});\n}\n";
+    const net_text = "const util = @import(\"util.zig\");\nconst Color = enum { red };\nfn run() void {\n    _ = util.first(Color, &.{});\n}\n";
+    var results: [2][]const u8 = undefined;
+    for (&results, [_]bool{ false, true }) |*out, net_first| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const util = (try w.add("/p/util.zig", util_text)).file;
+        var main: FileId = undefined;
+        var net: FileId = undefined;
+        if (net_first) {
+            net = (try w.add("/p/net.zig", net_text)).file;
+            main = (try w.add("/p/main.zig", main_text)).file;
+        } else {
+            main = (try w.add("/p/main.zig", main_text)).file;
+            net = (try w.add("/p/net.zig", net_text)).file;
+        }
+        try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+            .{ .file = main, .module = 0, .compile = 0 },
+            .{ .file = net, .module = 0, .compile = 0 },
+            .{ .file = util, .module = 0, .compile = 0 },
+        });
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const info = try hover.hover(&r, util, @intCast(std.mem.indexOf(u8, util_text, "head =").?), &.{}) orelse return error.NoHover;
+        out.* = try testing.allocator.dupe(u8, info.text);
+    }
+    defer for (results) |t| testing.allocator.free(t);
+    // Call sites at the same import distance are taken in path order
+    try testing.expectEqualStrings("```zig\nconst head: Point\n```\n\ninferred from the call at main.zig:4", results[0]);
+    try testing.expectEqualStrings(results[0], results[1]);
 }
 
 test "hover in generic bodies: call sites through aliases" {

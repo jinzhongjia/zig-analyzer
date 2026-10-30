@@ -4,7 +4,9 @@
 //!    by character;
 //! 2. position → offset → position round-trips are stable, and offsets never land in the middle of
 //!    a multi-byte character or `\r\n`;
-//! 3. incremental changes give the same result as "splicing the text directly".
+//! 3. incremental changes give the same result as "splicing the text directly";
+//! 4. a batch of changes at arbitrary positions (out of range, reversed, splitting or joining
+//!    `\r\n`) gives the same result as converting and splicing each change on the whole text.
 
 const std = @import("std");
 const testing = std.testing;
@@ -65,6 +67,43 @@ fn checkAll(input: []const u8) !void {
     const expected = try std.mem.concat(a, u8, &.{ text.items[0..start], insert.items, text.items[end..] });
     defer a.free(expected);
     try testing.expectEqualStrings(expected, applied);
+
+    // A batch of changes at arbitrary positions, against a splice of each change in turn
+    const batch_enc: offsets.Encoding = e.pick(offsets.Encoding, &.{ .utf8, .utf16, .utf32 });
+    var batch: [6]types.TextDocumentContentChangeEvent = undefined;
+    var inserts: [batch.len]std.ArrayList(u8) = @splat(.empty);
+    defer for (&inserts) |*i| i.deinit(a);
+    const n = 1 + e.below(batch.len);
+    for (batch[0..n], inserts[0..n]) |*c, *ins| {
+        try genText(&e, ins);
+        if (e.below(16) == 0) {
+            c.* = .{ .TextDocumentContentChangeWholeDocument = .{ .text = ins.items } };
+            continue;
+        }
+        const pos = struct {
+            fn pos(en: *Entropy) types.Position {
+                return .{ .line = @intCast(en.below(8)), .character = @intCast(en.below(10)) };
+            }
+        }.pos;
+        c.* = .{ .TextDocumentContentChangePartial = .{ .range = .{ .start = pos(&e), .end = pos(&e) }, .text = ins.items } };
+    }
+    var reference: std.ArrayList(u8) = .empty;
+    defer reference.deinit(a);
+    try reference.appendSlice(a, text.items);
+    for (batch[0..n]) |c| switch (c) {
+        .TextDocumentContentChangeWholeDocument => |whole| {
+            reference.clearRetainingCapacity();
+            try reference.appendSlice(a, whole.text);
+        },
+        .TextDocumentContentChangePartial => |p| {
+            const s = offsets.positionToOffset(reference.items, p.range.start, batch_enc);
+            const t = @max(s, offsets.positionToOffset(reference.items, p.range.end, batch_enc));
+            try reference.replaceRange(a, s, t - s, p.text);
+        },
+    };
+    const batched = try offsets.applyChanges(a, text.items, batch[0..n], batch_enc);
+    defer a.free(batched);
+    try testing.expectEqualStrings(reference.items, batched);
 }
 
 test "position conversion properties: fixed-seed random input" {

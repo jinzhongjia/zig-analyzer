@@ -169,7 +169,9 @@ const Pidfd = struct {
     }
 };
 
-/// macOS and BSD: kqueue waits for the process's `NOTE_EXIT`; a pipe is used for stopping
+/// macOS and BSD: kqueue waits for the process's `NOTE_EXIT`; a pipe is used for stopping. Both
+/// ends are close-on-exec, like the eventfd on Linux, so the processes the server spawns do not
+/// inherit them (the kqueue itself is not inherited across fork).
 const Kqueue = struct {
     const c = std.c;
     const Kevent = std.posix.Kevent;
@@ -183,11 +185,10 @@ const Kqueue = struct {
     fn open(pid: i32) Open(Kqueue) {
         const kq = c.kqueue();
         if (kq < 0) return .{ .unavailable = "kqueue" };
-        var pipe: [2]c.fd_t = undefined;
-        if (c.pipe(&pipe) != 0) {
+        const pipe = Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch {
             _ = c.close(kq);
             return .{ .unavailable = "pipe" };
-        }
+        };
         const changes = [_]Kevent{
             .{
                 .ident = @intCast(pid),
@@ -376,4 +377,21 @@ test "watch: without native notification, the process is checked periodically" {
     var s: Watch = .{ .io = testing.io, .pid = other.id.?, .native = null };
     s.stop();
     try testing.expectEqual(Outcome.stopped, s.wait());
+}
+
+test "watch: the descriptors of the native notification are close-on-exec" {
+    // Guards against every process the server spawns (the maker and its children) inheriting the
+    // descriptors that stop the wait
+    if (Native != Pidfd and Native != Kqueue) return error.SkipZigTest;
+    var child = try spawnChild();
+    defer finishChild(&child);
+    const w = try Watch.create(testing.allocator, testing.io, child.id.?);
+    defer w.destroy(testing.allocator);
+    const n = w.native.?;
+    const fds: [2]std.posix.fd_t = if (comptime Native == Pidfd) .{ n.pidfd, n.stop_fd } else n.pipe;
+    for (fds) |fd| {
+        const rc = std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0));
+        try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(rc));
+        try testing.expect(@as(usize, @intCast(rc)) & std.posix.FD_CLOEXEC != 0);
+    }
 }

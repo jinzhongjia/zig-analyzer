@@ -449,6 +449,59 @@ test "responses for deeply nested code stay within the JSON nesting limit" {
     try h.notify("exit", {});
 }
 
+test "requests echoing deeply nested client values are answered" {
+    // Echoing a client value nested about 250 levels deep exceeded the fixed nesting limit of
+    // the JSON serializer and aborted the server
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .textDocument = .{ .codeAction = .{
+            .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "refactor", "source" } } },
+            .dataSupport = true,
+            .resolveSupport = .{ .properties = &[_][]const u8{"edit"} },
+        } } },
+        .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+    });
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = file_uri, .languageId = "zig", .version = 1, .text = "pub fn main() void {\n    const x = 1;\n}\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The diagnostic on `x`, as the client received it
+    const diagnostic = find: for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+        for (n.object.get("params").?.object.get("diagnostics").?.array.items) |d| {
+            const start = d.object.get("range").?.object.get("start").?.object;
+            if (start.get("line").?.integer == 1 and start.get("character").?.integer == 10) break :find d;
+        }
+    } else return error.TestUnexpectedResult;
+    const message = try std.json.Stringify.valueAlloc(a, diagnostic.object.get("message").?, .{});
+
+    const open: [300]u8 = @splat('[');
+    const close: [300]u8 = @splat(']');
+    const deep = try std.mem.concat(a, u8, &.{ &open, &close });
+    const bodies = [_][]const u8{
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1001,\"method\":\"completionItem/resolve\",\"params\":{{\"label\":\"x\",\"data\":{s}}}}}", .{deep}),
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1002,\"method\":\"completionItem/resolve\",\"params\":{{\"label\":\"x\",\"command\":{{\"title\":\"t\",\"command\":\"c\",\"arguments\":[{s}]}}}}}}", .{deep}),
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1003,\"method\":\"codeAction/resolve\",\"params\":{{\"title\":\"x\",\"data\":{s}}}}}", .{deep}),
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1004,\"method\":\"textDocument/codeAction\",\"params\":{{\"textDocument\":{{\"uri\":\"" ++ file_uri ++
+            "\"}},\"range\":{{\"start\":{{\"line\":1,\"character\":10}},\"end\":{{\"line\":1,\"character\":11}}}},\"context\":{{\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":1,\"character\":10}},\"end\":{{\"line\":1,\"character\":11}}}},\"message\":{s},\"data\":{s}}}]}}}}}}", .{ message, deep }),
+    };
+    for (bodies, 1001..) |body, id| {
+        try h.writeBody(body);
+        const resp = try h.response(@intCast(id));
+        try testing.expect(resp.object.get("result") != null or resp.object.get("error") != null);
+    }
+    // The server is still running
+    _ = try h.request("zig-analyzer/status", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "requests before initialize return ServerNotInitialized, unknown methods return MethodNotFound" {
     var s: Session = undefined;
     try s.run(frame(
@@ -500,6 +553,53 @@ test "error responses keep string request ids" {
     try testing.expectEqual(-32602, errorCode(msgs[4]));
 }
 
+test "unknown methods and messages that are not requests get the error code of their case" {
+    // Unknown methods got MethodNotFound before initialize and after shutdown, and valid JSON
+    // that is not a request got ParseError
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":1,"method":"foo/bar","params":{}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":2,"method":"$/foo"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\[]
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":1,"params":"bar"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":true,"method":"zig-analyzer/status"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":4,"method":"foo/bar"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":5,"method":"$/foo"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":6,"method":"shutdown"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":7,"method":"foo/bar"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":8,"method":"$/foo"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+    try testing.expectEqual(0, s.exit_code);
+    const msgs = try s.messages();
+    try testing.expectEqual(11, msgs.len);
+    try testing.expectEqual(-32002, errorCode(msgs[0]));
+    try testing.expectEqual(-32601, errorCode(msgs[1]));
+    try testing.expect(msgs[2].object.get("result").? == .object);
+    for (msgs[3..6]) |msg| {
+        try testing.expectEqual(-32600, errorCode(msg));
+        try testing.expect(msg.object.get("id").? == .null);
+    }
+    try testing.expectEqual(-32601, errorCode(msgs[6]));
+    try testing.expectEqual(-32601, errorCode(msgs[7]));
+    try testing.expect(msgs[8].object.get("result").? == .null);
+    try testing.expectEqual(-32600, errorCode(msgs[9]));
+    try testing.expectEqual(-32601, errorCode(msgs[10]));
+}
+
 test "malformed params return InvalidParams" {
     var s: Session = undefined;
     try s.run(frame(
@@ -510,6 +610,44 @@ test "malformed params return InvalidParams" {
     defer s.deinit();
     const msgs = try s.messages();
     try testing.expectEqual(-32602, errorCode(msgs[0]));
+}
+
+test "requests at the largest position coordinates are answered" {
+    // The panic context of a read request converted a coordinate of 2^32 - 1 to 1-based in
+    // `u32`, overflowing and aborting the server
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } } });
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = file_uri, .languageId = "zig", .version = 1, .text = "pub const a: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const max = std.math.maxInt(u32);
+    const Position = struct { line: u32, character: u32 };
+    const doc = .{ .uri = file_uri };
+    const corners = [_]Position{ .{ .line = max, .character = 0 }, .{ .line = 0, .character = max }, .{ .line = max, .character = max } };
+    for (corners) |p| {
+        const hover = try h.request("textDocument/hover", .{ .textDocument = doc, .position = p });
+        try testing.expect(hover.object.get("result") != null);
+        const range = .{ .start = p, .end = Position{ .line = max, .character = max } };
+        const hints = try h.request("textDocument/inlayHint", .{ .textDocument = doc, .range = range });
+        try testing.expect(hints.object.get("result") != null);
+        const tokens = try h.request("textDocument/semanticTokens/range", .{ .textDocument = doc, .range = range });
+        try testing.expect(tokens.object.get("result") != null);
+        const actions = try h.request("textDocument/codeAction", .{ .textDocument = doc, .range = range, .context = .{ .diagnostics = &[_]Empty{} } });
+        try testing.expect(actions.object.get("result") != null);
+    }
+    // The server is still running
+    const hover = try h.request("textDocument/hover", .{ .textDocument = doc, .position = Position{ .line = 0, .character = 10 } });
+    try testing.expect(hover.object.get("result").? == .object);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
 }
 
 test "read requests run on their own threads: a blocked read does not stall the main loop" {
@@ -595,6 +733,85 @@ test "input closing while a configuration request is unanswered ends the main lo
     };
     h.finish();
     try testing.expectEqual(1, h.exit_code);
+}
+
+test "exit without shutdown ends the main loop while a configuration request or waitIdle is unanswered" {
+    // Guards against the process waiting forever for the client's reply after `exit` (or the end
+    // of input with a `waitIdle` request in flight)
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    for ([_]enum { exit, wait_then_eof, wait_then_exit }{ .exit, .wait_then_eof, .wait_then_exit }) |ending| {
+        var h: Harness = undefined;
+        try h.start();
+        _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{ .configuration = true } } });
+        h.hold_requests = true;
+        try h.notify("initialized", Empty{});
+        while (true) {
+            const msg = try h.next();
+            const method = msg.object.get("method") orelse continue;
+            if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+        }
+        switch (ending) {
+            .exit => try h.notify("exit", {}),
+            .wait_then_eof => {
+                _ = try h.send("zig-analyzer/waitIdle", {});
+                h.input.close();
+            },
+            .wait_then_exit => {
+                _ = try h.send("zig-analyzer/waitIdle", {});
+                try h.notify("exit", {});
+            },
+        }
+        // Once the main loop returns, the output is closed with it; if it is still waiting, this
+        // times out with an error (finish is not called, to avoid waiting on a stuck thread)
+        while (true) _ = h.next() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        h.finish();
+        try testing.expectEqual(1, h.exit_code);
+    }
+}
+
+test "configuration replies with a null error or an incomplete error object still start the projects" {
+    // Such replies were rejected as unparsable messages, so the startup waiting for the
+    // configuration never began
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    const replies = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":"zig-analyzer/configuration/0","result":[null],"error":null}
+        ,
+        \\{"jsonrpc":"2.0","id":"zig-analyzer/configuration/0","error":{"code":-32603}}
+        ,
+    };
+    for (replies) |reply| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        _ = try h.request("initialize", .{
+            .capabilities = .{ .workspace = .{ .configuration = true } },
+            .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+        });
+        h.hold_requests = true;
+        try h.notify("initialized", Empty{});
+        while (true) {
+            const msg = try h.next();
+            const method = msg.object.get("method") orelse continue;
+            if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+        }
+        h.hold_requests = false;
+        try h.writeBody(reply);
+        // The main loop handles the reply before this request
+        _ = try h.request("zig-analyzer/status", {});
+        try testing.expect(h.server.started);
+        for (h.received.items) |msg| try testing.expect(msg.object.get("error") == null);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
 }
 
 test "live diagnostics are debounced per file and AstGen runs outside the read transaction" {
@@ -1142,6 +1359,94 @@ test "inlay hint settings apply to requests and refresh the client when they cha
     try h.notify("exit", {});
 }
 
+test "refresh requests carry no params and at most one of each awaits the client" {
+    // Refresh requests were sent with `"params": null`, which JSON-RPC does not allow
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{
+        .inlayHint = .{ .refreshSupport = true },
+        .semanticTokens = .{ .refreshSupport = true },
+    } } });
+    // The client never answers the refreshes
+    h.hold_requests = true;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = "untitled:refresh.zig", .languageId = "zig", .version = 1, .text = "pub fn f(x: u32) u32 {\n    const y = x + 1;\n    return y;\n}\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    for ([_]bool{ false, true }) |on| {
+        try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{
+            .inlay_hints = .{ .types = on },
+            .semantic_tokens = .{ .mode = if (on) "full" else "partial" },
+        } } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+    }
+    var inlay: usize = 0;
+    var semantic: usize = 0;
+    for (h.received.items) |message| if (message.object.get("method")) |method| {
+        const is_inlay = std.mem.eql(u8, method.string, "workspace/inlayHint/refresh");
+        const is_semantic = std.mem.eql(u8, method.string, "workspace/semanticTokens/refresh");
+        if (!is_inlay and !is_semantic) continue;
+        try testing.expect(message.object.get("params") == null);
+        if (is_inlay) inlay += 1 else semantic += 1;
+    };
+    try testing.expectEqual(1, inlay);
+    try testing.expectEqual(1, semantic);
+    h.hold_requests = false;
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a null configuration section keeps the settings from initialization and earlier pushes" {
+    // A null section replaced the configuration with the defaults, discarding
+    // `initializationOptions` and settings pushed before the reply
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    const text =
+        \\fn get() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn main() void {
+        \\    const x = get();
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    for ([_]bool{ false, true }) |push| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const capabilities = .{ .workspace = .{ .configuration = true } };
+        if (push) {
+            _ = try h.request("initialize", .{ .capabilities = capabilities });
+        } else {
+            _ = try h.request("initialize", .{ .capabilities = capabilities, .initializationOptions = .{ .inlay_hints = .{ .types = false } } });
+        }
+        h.hold_requests = true;
+        try h.notify("initialized", Empty{});
+        while (true) {
+            const msg = try h.next();
+            const method = msg.object.get("method") orelse continue;
+            if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+        }
+        if (push) try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{ .types = false } } } });
+        h.hold_requests = false;
+        try h.writeBody(
+            \\{"jsonrpc":"2.0","id":"zig-analyzer/configuration/0","result":[null]}
+        );
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = "untitled:null-section.zig", .languageId = "zig", .version = 1, .text = text } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const resp = try h.request("textDocument/inlayHint", .{
+            .textDocument = .{ .uri = "untitled:null-section.zig" },
+            .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 7, .character = 0 } },
+        });
+        for (resp.object.get("result").?.array.items) |hint| {
+            try testing.expect(!std.mem.eql(u8, hint.object.get("label").?.string, ": u32"));
+        }
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
 test "cache settings from initialization and later configuration limit the retained syntax trees" {
     // Guards against the cache capacity being set only when configuration is pushed, while the
     // configuration at initialization has no effect
@@ -1383,4 +1688,304 @@ test "initialize and results follow the capabilities the client declares" {
         try testing.expectEqualStrings("markdown", hover.get("kind").?.string);
         try c.close();
     }
+}
+
+test "signature help gives parameter label offsets to clients that support them" {
+    // Parameters were sent only as label substrings, so a client highlighted the first
+    // occurrence of a parameter's text in the label, which can belong to an earlier parameter
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    const text =
+        \\fn cb(_: u8, _: u8, x: u8) u8 {
+        \\    return x;
+        \\}
+        \\extern fn ext(c_int, c_int) void;
+        \\extern fn ptr(*c_int, c_int) void;
+        \\fn w(@"π": u8, _: u8) void {
+        \\    _ = @"π";
+        \\}
+        \\fn take(f: *const fn (a: u8, b: u8) void) void {
+        \\    f(1, 2);
+        \\}
+        \\pub fn main() void {
+        \\    _ = cb(1, 2, 3);
+        \\    ext(1, 2);
+        \\    var n: c_int = 0;
+        \\    ptr(&n, 2);
+        \\    w(1, 2);
+        \\    _ = @addWithOverflow(1, 2);
+        \\}
+        \\
+    ;
+    // The call before the cursor (at the second argument), and the expected offsets of the
+    // second parameter (UTF-16 code units: `π` is one unit)
+    const cases = [_]struct { []const u8, [2]i64 }{
+        .{ "cb(1, ", .{ 13, 18 } },
+        .{ "ext(1, ", .{ 14, 19 } },
+        .{ "ptr(&n, ", .{ 15, 20 } },
+        .{ "w(1, ", .{ 15, 20 } },
+        .{ "@addWithOverflow(1, ", .{ 29, 39 } },
+        .{ "f(1, ", .{ 11, 16 } },
+    };
+    for ([_]bool{ false, true }) |offsets| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const Empty = struct {};
+        _ = try h.request("initialize", .{
+            .capabilities = .{ .textDocument = .{ .signatureHelp = .{ .signatureInformation = .{ .parameterInformation = .{ .labelOffsetSupport = offsets } } } } },
+            .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+        });
+        try h.notify("initialized", Empty{});
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = file_uri, .languageId = "zig", .version = 1, .text = text } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        for (cases) |c| {
+            const offset = std.mem.indexOf(u8, text, c[0]).? + c[0].len;
+            const line_start = std.mem.lastIndexOfScalar(u8, text[0..offset], '\n').? + 1;
+            const resp = try h.request("textDocument/signatureHelp", .{
+                .textDocument = .{ .uri = file_uri },
+                .position = .{ .line = std.mem.count(u8, text[0..offset], "\n"), .character = offset - line_start },
+            });
+            const signature = resp.object.get("result").?.object.get("signatures").?.array.items[0].object;
+            try testing.expectEqual(1, signature.get("activeParameter").?.integer);
+            const label = signature.get("parameters").?.array.items[1].object.get("label").?;
+            if (offsets) {
+                try testing.expect(label == .array);
+                try testing.expectEqual(c[1][0], label.array.items[0].integer);
+                try testing.expectEqual(c[1][1], label.array.items[1].integer);
+            } else {
+                try testing.expect(label == .string);
+            }
+        }
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
+/// Names of the top-level symbols of a document (hierarchical `documentSymbol`)
+fn symbolNames(h: anytype, document_uri: []const u8) ![]const []const u8 {
+    const a = h.arena.allocator();
+    const result = (try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = document_uri } })).object.get("result").?;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (result.array.items) |s| try names.append(a, s.object.get("name").?.string);
+    return names.items;
+}
+
+test "didChange for a document that is not open changes nothing" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const main_text = "const o = @import(\"other.zig\");\npub const x = o.other;\npub const y = o.keep;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "main.zig", .data = main_text });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "pub const other = 2;\npub const keep = 3;\n" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true } } } });
+    try h.notify("initialized", struct {}{});
+    const main_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "main.zig" }));
+    const other_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "other.zig" }));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_text } });
+    // The edited text of the file would be `renamed`, which is not a valid container
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = other_uri, .version = 5 },
+        .contentChanges = &.{.{ .range = .{ .start = .{ .line = 0, .character = 10 }, .end = .{ .line = 0, .character = 15 } }, .text = "renamed" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    for ([_]u32{ 1, 2 }) |line| {
+        const def = (try h.request("textDocument/definition", .{ .textDocument = .{ .uri = main_uri }, .position = .{ .line = line, .character = 17 } })).object.get("result").?;
+        const locations = if (def == .array) def.array.items else &.{def};
+        try testing.expectEqual(1, locations.len);
+        try testing.expectEqualStrings(other_uri, locations[0].object.get("uri").?.string);
+    }
+    const names = try symbolNames(&h, other_uri);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("other", names[0]);
+    try testing.expectEqualStrings("keep", names[1]);
+    for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+        try testing.expect(!std.mem.eql(u8, other_uri, n.object.get("params").?.object.get("uri").?.string));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "file URIs without an authority name the same files and folders" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const b_text = "const a = @import(\"a.zig\");\npub const b = a.a;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "pub const a = 1;\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = b_text });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // `file:///x` → `file:/x` (RFC 8089 local form)
+    const local = struct {
+        fn local(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+            const full = try za.base.uri.fromPath(arena, path);
+            return std.fmt.allocPrint(arena, "file:{s}", .{full["file://".len..]});
+        }
+    }.local;
+    const root_uri = try local(a, root);
+    const b_uri = try local(a, try std.fs.path.join(a, &.{ root, "b.zig" }));
+    _ = try h.request("initialize", .{ .capabilities = struct {}{}, .workspaceFolders = &.{.{ .uri = root_uri, .name = "root" }} });
+    try h.notify("initialized", struct {}{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = b_uri, .languageId = "zig", .version = 1, .text = b_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = b_uri } })).object.get("result").?.object;
+    try testing.expectEqualStrings("user", status.get("origin").?.string);
+    const def = (try h.request("textDocument/definition", .{ .textDocument = .{ .uri = b_uri }, .position = .{ .line = 1, .character = 16 } })).object.get("result").?;
+    const locations = if (def == .array) def.array.items else &.{def};
+    try testing.expectEqual(1, locations.len);
+    try testing.expect(std.mem.endsWith(u8, locations[0].object.get("uri").?.string, "/a.zig"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a document whose languageId is zon is analyzed as ZON whatever its URI" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true } } } });
+    try h.notify("initialized", struct {}{});
+    const manifest = "untitled:Untitled-1";
+    const duplicate = "untitled:Untitled-2";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = manifest, .languageId = "zon", .version = 1, .text = ".{\n    .name = .demo,\n    .version = \"0.0.1\",\n}\n" } });
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = duplicate, .languageId = "zon", .version = 1, .text = ".{ .a = 1, .a = 2 }\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const names = try symbolNames(&h, manifest);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("name", names[0]);
+    try testing.expectEqualStrings("version", names[1]);
+    var last_manifest: ?[]const std.json.Value = null;
+    var last_duplicate: ?[]const std.json.Value = null;
+    for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+        const params = n.object.get("params").?.object;
+        const diags = params.get("diagnostics").?.array.items;
+        if (std.mem.eql(u8, params.get("uri").?.string, manifest)) last_manifest = diags;
+        if (std.mem.eql(u8, params.get("uri").?.string, duplicate)) last_duplicate = diags;
+    }
+    try testing.expectEqual(0, last_manifest.?.len);
+    try testing.expectEqual(1, last_duplicate.?.len);
+    try testing.expect(std.mem.indexOf(u8, last_duplicate.?[0].object.get("message").?.string, "duplicate") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "case-variant URIs of one file: each keeps its text and gets the diagnostics until the last closes" {
+    // On a case-insensitive volume `main.zig` and `Main.zig` are one file. Closing one of its
+    // documents reverted the other to the disk contents, its edits then applied to them, and
+    // diagnostics went only to the document opened last.
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "main.zig", .data = "pub const disk = 1;\n" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.startCase(.insensitive);
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true } } } });
+    try h.notify("initialized", struct {}{});
+    const lower = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "main.zig" }));
+    const upper = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "Main.zig" }));
+    const Last = struct {
+        /// The diagnostics last published for `document_uri` ("line:column message")
+        fn diagnostics(hh: *Harness, document_uri: []const u8) ![]const []const u8 {
+            var last: ?[]const []const u8 = null;
+            for (try hh.notifications("textDocument/publishDiagnostics")) |n| {
+                const params = n.object.get("params").?.object;
+                if (!std.mem.eql(u8, params.get("uri").?.string, document_uri)) continue;
+                var lines: std.ArrayList([]const u8) = .empty;
+                for (params.get("diagnostics").?.array.items) |d| {
+                    const start = d.object.get("range").?.object.get("start").?.object;
+                    try lines.append(hh.arena.allocator(), try std.fmt.allocPrint(hh.arena.allocator(), "{d}:{d} {s}", .{ start.get("line").?.integer, start.get("character").?.integer, d.object.get("message").?.string }));
+                }
+                last = lines.items;
+            }
+            return last orelse error.NothingPublished;
+        }
+    };
+
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lower, .languageId = "zig", .version = 1, .text = "pub const a_only = 1;\nconst e1 = ;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = upper, .languageId = "zig", .version = 1, .text = "pub const b_only = 2;\nconst e22 = ;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The file has the text opened last; its diagnostics go to both documents
+    for ([_][]const u8{ lower, upper }) |u| {
+        const diags = try Last.diagnostics(&h, u);
+        try testing.expectEqual(1, diags.len);
+        try testing.expectEqualStrings("1:12 expected expression, found ';'", diags[0]);
+    }
+
+    // An edit applies to the text of its own document
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = lower, .version = 2 },
+        .contentChanges = &.{.{ .range = .{ .start = .{ .line = 1, .character = 11 }, .end = .{ .line = 1, .character = 11 } }, .text = "1" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    var names = try symbolNames(&h, lower);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("a_only", names[0]);
+    try testing.expectEqualStrings("e1", names[1]);
+
+    // Closing one document leaves the file with the text of the other, still open
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = upper, .languageId = "zig", .version = 2, .text = "pub const b_only = 2;\nconst e22 = ;\n" } });
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = upper } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    names = try symbolNames(&h, lower);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("a_only", names[0]);
+    try testing.expectEqualStrings("e1", names[1]);
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = lower } })).object.get("result").?.object;
+    try testing.expect(status.get("open").?.bool);
+    try testing.expectEqual(0, (try Last.diagnostics(&h, lower)).len);
+    try testing.expectEqual(0, (try Last.diagnostics(&h, upper)).len);
+    // Later edits apply to that text, and diagnostics go to the open document only
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = lower, .version = 3 },
+        .contentChanges = &.{.{ .range = .{ .start = .{ .line = 2, .character = 0 }, .end = .{ .line = 2, .character = 0 } }, .text = "const e3 = ;\n" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    names = try symbolNames(&h, lower);
+    try testing.expectEqual(3, names.len);
+    try testing.expectEqualStrings("e3", names[2]);
+    try testing.expectEqual(1, (try Last.diagnostics(&h, lower)).len);
+    try testing.expectEqual(0, (try Last.diagnostics(&h, upper)).len);
+
+    // Closing the last document reverts the file to the disk contents
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = lower } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    names = try symbolNames(&h, lower);
+    try testing.expectEqual(1, names.len);
+    try testing.expectEqualStrings("disk", names[0]);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
 }

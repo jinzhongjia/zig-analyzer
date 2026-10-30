@@ -4,6 +4,7 @@
 //! (both CI and the development environment satisfy this).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ZigEnv = @import("ZigEnv.zig");
@@ -120,8 +121,10 @@ pub const slow = [_]File{
     .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
 };
 
-/// All processes in process group `pgid` (reaped by init after being ended) are gone within a
-/// few seconds
+/// All processes in process group `pgid` have ended within a few seconds. On Linux, ended
+/// processes not reaped yet (zombies) count as ended: they stay in the group until their parent
+/// reaps them, and the parent of orphans, init, may not do so for a long time (in a container
+/// whose PID 1 does not reap orphans, never).
 pub fn expectGroupGone(pgid: std.posix.pid_t) !void {
     for (0..100) |_| {
         std.posix.kill(-pgid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
@@ -131,7 +134,46 @@ pub fn expectGroupGone(pgid: std.posix.pid_t) !void {
             error.PermissionDenied => {},
             else => return err,
         };
+        if (builtin.os.tag == .linux and !try groupHasLiveProcess(pgid)) return;
         try testing.io.sleep(.fromMilliseconds(50), .awake);
     }
     return error.ProcessGroupStillAlive;
+}
+
+/// Linux: process group `pgid` has a process that is not a zombie (read from `/proc/<pid>/stat`)
+fn groupHasLiveProcess(pgid: std.posix.pid_t) !bool {
+    var proc = try std.Io.Dir.cwd().openDir(testing.io, "/proc", .{ .iterate = true });
+    defer proc.close(testing.io);
+    var it = proc.iterate();
+    var path_buf: [64]u8 = undefined;
+    var stat_buf: [4096]u8 = undefined;
+    while (try it.next(testing.io)) |entry| {
+        _ = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/stat", .{entry.name});
+        // The process may have been reaped since the directory was listed
+        const stat = proc.readFile(testing.io, path, &stat_buf) catch continue;
+        // `pid (comm) state ppid pgrp ...`, where comm may contain spaces and parentheses
+        const comm_end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse continue;
+        var fields = std.mem.tokenizeScalar(u8, stat[comm_end + 1 ..], ' ');
+        const state = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        const pgrp = std.fmt.parseInt(std.posix.pid_t, fields.next() orelse continue, 10) catch continue;
+        if (pgrp == pgid and !std.mem.eql(u8, state, "Z") and !std.mem.eql(u8, state, "X")) return true;
+    }
+    return false;
+}
+
+test "expectGroupGone: a group whose only members are zombies is gone" {
+    // Guards against reporting a leak when the ended processes are zombies that their parent
+    // (in a container, a PID 1 that does not reap orphans) has not reaped yet
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // The child leads its own process group, and exits once its stdin is closed; it then stays a
+    // zombie until this process reaps it
+    var child = try std.process.spawn(testing.io, .{ .argv = &.{ "/bin/sh", "-c", "read line" }, .pgid = 0, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer _ = child.wait(testing.io) catch {};
+    const pgid = child.id.?;
+    try testing.expect(try groupHasLiveProcess(pgid));
+    child.stdin.?.close(testing.io);
+    child.stdin = null;
+    try expectGroupGone(pgid);
 }

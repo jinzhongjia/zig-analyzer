@@ -609,7 +609,7 @@ test "semantic tokens retain lexical uses in captures deferred blocks and loop c
         \\fn run(fallible: anyerror!u32, values: []u32) void {
         \\    const deferred = 1;
         \\    defer { _ = deferred; }
-        \\    errdefer |failure| { _ = failure; }
+        \\    errdefer { _ = deferred; }
         \\    const value = fallible catch |caught| { _ = caught; return; };
         \\    switch (value) { 0 => {}, else => |tag| { _ = tag; } }
         \\    for (values) |*entry| { entry.* = 0; }
@@ -627,8 +627,7 @@ test "semantic tokens retain lexical uses in captures deferred blocks and loop c
     const data = try tokens(&w, file, text, .utf16, null);
     try check(data, text, .utf16, &.{
         .{ .needle = "deferred =", .ty = .variable, .mods = M.declaration | M.readonly },
-        .{ .needle = "failure|", .ty = .variable, .mods = M.declaration | M.readonly },
-        .{ .needle = "failure;", .ty = .variable, .mods = M.readonly },
+        .{ .needle = "deferred;", .nth = 1, .ty = .variable, .mods = M.readonly },
         .{ .needle = "caught|", .ty = .variable, .mods = M.declaration | M.readonly },
         .{ .needle = "caught;", .ty = .variable, .mods = M.readonly },
         .{ .needle = "tag|", .ty = .variable, .mods = M.declaration | M.readonly },
@@ -1326,4 +1325,29 @@ test "semantic tokens mark only compiler builtin functions as default library" {
     const partial = try tokensWith(&w, file, text, .utf16, null, .{ .partial = true });
     try check(partial, text, .utf16, &unknown);
     try testing.expectError(error.MissingSemanticToken, check(partial, text, .utf16, &.{.{ .needle = "@sizeOf", .ty = .function, .mods = M.defaultLibrary }}));
+}
+
+test "semantic tokens classify @SpirvType aliases as types" {
+    // zig 0.17.0: `@compileLog(@TypeOf(L))` prints `type`; a SPIR-V type alias must not be a
+    // variable token
+    const text =
+        \\pub const Sampler = @SpirvType(.sampler);
+        \\const V = @Vector(4, f32);
+        \\fn k() void {
+        \\    const L = @SpirvType(.sampler);
+        \\    _ = L;
+        \\    _ = Sampler;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &.{
+        .{ .needle = "Sampler =", .ty = .type, .mods = M.declaration | M.readonly },
+        .{ .needle = "V =", .ty = .type, .mods = M.declaration | M.readonly },
+        .{ .needle = "L =", .ty = .type, .mods = M.declaration | M.readonly },
+        .{ .needle = "L;", .ty = .type, .mods = M.readonly },
+        .{ .needle = "Sampler;", .ty = .type, .mods = M.readonly },
+    });
 }

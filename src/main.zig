@@ -18,37 +18,22 @@ fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
 
-/// Stack size of the server's worker threads: it only takes address space, and memory is
-/// allocated only for the part that is used
-const worker_stack_size = 64 * 1024 * 1024;
-/// Stack a read transaction may use on a worker thread (see `engine.StackBudget`), leaving
-/// headroom for the usage between two checks
-const worker_stack_budget = 48 * 1024 * 1024;
-
-const usage =
-    \\Usage: zig-analyzer [options]
-    \\
-    \\Zig language server (LSP) over stdio.
-    \\
-    \\Options:
-    \\  --version   print version
-    \\  --help      print this help
-    \\
-;
-
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--version")) {
+    switch (za.lsp.cli.parse(args[1..])) {
+        .serve => {},
+        .version => {
             try std.Io.File.stdout().writeStreamingAll(init.io, za.version ++ "\n");
             return 0;
-        } else if (std.mem.eql(u8, arg, "--help")) {
-            try std.Io.File.stdout().writeStreamingAll(init.io, usage);
+        },
+        .help => {
+            try std.Io.File.stdout().writeStreamingAll(init.io, za.lsp.cli.usage);
             return 0;
-        } else {
-            std.log.err("unknown argument: {s}", .{arg});
+        },
+        .invalid => |invalid| {
+            std.log.err("{f}", .{invalid});
             return 1;
-        }
+        },
     }
 
     // In ReleaseSafe, `init.gpa` is the error-checking `SafeAllocator`: every allocation carries
@@ -63,7 +48,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `init.io` is not used: its worker threads have the default stack size, so a very deep
     // dependency chain would have to be interrupted many times and computed in segments
     var threaded: std.Io.Threaded = .init(backing, .{
-        .stack_size = worker_stack_size,
+        .stack_size = za.util.worker_stack.threaded_stack_size,
         .argv0 = .init(init.minimal.args),
         .environ = init.minimal.environ,
     });
@@ -83,7 +68,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Requests run on worker threads; when no worker thread can be created, they run on the
     // caller's thread (possibly the main thread), and the main thread still has the default
     // stack limit
-    server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = worker_stack_budget };
+    server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = za.util.worker_stack.budget };
     server.heap = &counting;
     server.environ = init.minimal.environ;
     defer server.deinit();

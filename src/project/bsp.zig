@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Watchdog = @import("../util/watchdog.zig").Watchdog;
+const child_process = @import("../util/child_process.zig");
 const native_os = @import("builtin").os.tag;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -221,7 +222,7 @@ pub const Client = struct {
         errdefer gpa.destroy(c);
         var group: Group = .create(io);
         errdefer group.destroy(io);
-        var child = try std.process.spawn(io, .{
+        var child = try child_process.spawn(io, .{
             .argv = argv.items,
             .cwd = .{ .path = build_root },
             .environ_map = env.childEnviron(),
@@ -482,18 +483,19 @@ const StderrParser = struct {
     }
 };
 
-/// The maker and its child processes as a whole.
+/// A zig child process (the maker, or the compiler of a single file) and the child processes it
+/// starts, as a whole.
 ///
-/// POSIX: the maker joins the process group whose leader is a watchdog process (`sh`). The
-/// watchdog blocks reading a pipe whose write end only the server holds, and on end of input
-/// sends SIGKILL to the whole process group: however the server exits (including being SIGKILLed
-/// or crashing), the operating system closes the write end, and the maker and the compilers end
-/// with it. When the watchdog cannot be started, the maker forms its own group, and the whole
-/// group is ended only when the server stops it explicitly.
+/// POSIX: zig joins the process group whose leader is a watchdog process (`sh`). The watchdog
+/// blocks reading a pipe whose write end only the server holds, and on end of input sends
+/// SIGKILL to the whole process group: however the server exits (including being SIGKILLed or
+/// crashing), the operating system closes the write end, and zig and the compilers end with it.
+/// When the watchdog cannot be started, zig forms its own group, and the whole group is ended
+/// only when the server stops it explicitly.
 ///
-/// Windows: the maker is started suspended, put into a Job Object with KILL_ON_JOB_CLOSE set,
-/// and then resumed; the child processes it starts afterwards are all in the job. When the
-/// server exits, the handle is closed with it and all processes in the job end.
+/// Windows: zig is started suspended, put into a Job Object with KILL_ON_JOB_CLOSE set, and then
+/// resumed; the child processes it starts afterwards are all in the job. When the server exits,
+/// the handle is closed with it and all processes in the job end.
 const Group = switch (native_os) {
     .windows => struct {
         job: ?std.os.windows.HANDLE,
@@ -501,14 +503,14 @@ const Group = switch (native_os) {
         fn create(io: Io) @This() {
             _ = io;
             const job = win32.CreateJobObjectW(null, null) orelse {
-                log.warn("cannot create a job object for zig build: child processes may outlive zig-analyzer", .{});
+                log.warn("cannot create a job object for zig: its child processes may outlive zig-analyzer", .{});
                 return .{ .job = null };
             };
             var info = std.mem.zeroes(win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
             info.BasicLimitInformation.LimitFlags = win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             if (win32.SetInformationJobObject(job, win32.JobObjectExtendedLimitInformation, &info, @sizeOf(win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION)) == 0) {
                 std.os.windows.CloseHandle(job);
-                log.warn("cannot configure the job object for zig build: child processes may outlive zig-analyzer", .{});
+                log.warn("cannot configure the job object for zig: its child processes may outlive zig-analyzer", .{});
                 return .{ .job = null };
             }
             return .{ .job = job };
@@ -522,12 +524,12 @@ const Group = switch (native_os) {
             return g.job != null;
         }
 
-        /// Puts the maker into the job, then resumes it; if it cannot be put in, only the maker
-        /// itself can be ended
+        /// Puts zig into the job, then resumes it; if it cannot be put in, only zig itself can be
+        /// ended
         fn adopt(g: *@This(), child: *std.process.Child) void {
             const job = g.job orelse return;
             if (win32.AssignProcessToJobObject(job, child.id.?) == 0) {
-                log.warn("cannot assign zig build to a job object: child processes may outlive zig-analyzer", .{});
+                log.warn("cannot assign zig to a job object: its child processes may outlive zig-analyzer", .{});
                 std.os.windows.CloseHandle(job);
                 g.job = null;
             }
@@ -550,19 +552,19 @@ const Group = switch (native_os) {
     },
     else => struct {
         watchdog: ?std.process.Child,
-        /// Process group ID: the watchdog's pid; without a watchdog, the maker's pid (known
-        /// after it starts)
+        /// Process group ID: the watchdog's pid; without a watchdog, zig's pid (known after it
+        /// starts)
         pgid: std.posix.pid_t = 0,
 
         fn create(io: Io) @This() {
-            const watchdog = std.process.spawn(io, .{
+            const watchdog = child_process.spawn(io, .{
                 .argv = &.{ "/bin/sh", "-c", "read _; kill -9 0" },
                 .stdin = .pipe,
                 .stdout = .ignore,
                 .stderr = .ignore,
                 .pgid = 0,
             }) catch |err| {
-                log.warn("cannot start the watchdog of zig build ({t}): child processes may outlive zig-analyzer", .{err});
+                log.warn("cannot start the watchdog of zig ({t}): its child processes may outlive zig-analyzer", .{err});
                 return .{ .watchdog = null };
             };
             return .{ .watchdog = watchdog, .pgid = watchdog.id.? };
@@ -653,23 +655,93 @@ pub const SingleFileResult = struct {
     }
 };
 
+/// The single-file compiles in progress (see `compileSingleFile`), so that the server can end
+/// them when it stops instead of waiting for them
+pub const SingleFileCompiles = struct {
+    mutex: Io.Mutex = .init,
+    /// Set by `stop`: no compile starts after it
+    stopped: bool = false,
+    /// `Running` entries, which live on the stacks of the compiling tasks
+    running: std.DoublyLinkedList = .{},
+
+    const Running = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        child: *std.process.Child,
+        group: *Group,
+    };
+
+    /// Ends the compiles in progress together with the processes they started (their tasks then
+    /// return `error.Stopped`), and makes later compiles return `error.Stopped` without starting
+    /// zig
+    pub fn stop(s: *SingleFileCompiles, io: Io) void {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        s.stopped = true;
+        var it = s.running.first;
+        while (it) |node| : (it = node.next) {
+            const r: *Running = @fieldParentPtr("node", node);
+            r.group.terminate(r.child);
+        }
+    }
+
+    fn isStopped(s: *SingleFileCompiles, io: Io) bool {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        return s.stopped;
+    }
+};
+
 /// Single-file mode (no build.zig): runs `zig build-obj -fno-emit-bin --listen=- <file>` with the
-/// zig of `env` and requests one compilation
-pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8) !SingleFileResult {
+/// zig of `env` and requests one compilation. The compiler and the processes it starts form a
+/// group (see `Group`) that ends with the server however it exits, and that `compiles.stop` ends
+/// at once; the compile then returns `error.Stopped`.
+pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8, compiles: *SingleFileCompiles) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
-    var child = try std.process.spawn(io, .{
+    if (compiles.isStopped(io)) return error.Stopped;
+    var group: Group = .create(io);
+    defer group.destroy(io);
+    // Started while holding the lock, so that `stop` either sees the compile or prevents it
+    compiles.mutex.lockUncancelable(io);
+    if (compiles.stopped) {
+        compiles.mutex.unlock(io);
+        return error.Stopped;
+    }
+    var child = child_process.spawn(io, .{
         .argv = &.{ env.zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path) },
         .cwd = .{ .path = dir },
         .environ_map = env.childEnviron(),
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
-    });
+        .pgid = group.spawnPgid(),
+        .start_suspended = group.spawnSuspended(),
+    }) catch |err| {
+        compiles.mutex.unlock(io);
+        return err;
+    };
+    group.adopt(&child);
+    var running: SingleFileCompiles.Running = .{ .child = &child, .group = &group };
+    compiles.running.append(&running.node);
+    compiles.mutex.unlock(io);
+    // Reaps the compiler; `group.destroy` runs after it and ends whatever is left in the group
     defer child.kill(io);
+    defer {
+        compiles.mutex.lockUncancelable(io);
+        compiles.running.remove(&running.node);
+        compiles.mutex.unlock(io);
+    }
     var watchdog: Watchdog = .{};
     watchdog.start(io, child.id.?, .{ .duration = .{ .raw = Io.Duration.fromSeconds(120), .clock = .awake } });
     defer watchdog.stop();
 
+    return exchangeSingleFile(gpa, io, &child, file_path) catch |err| {
+        // Ended by `stop`: the read or write failed because the compiler is gone
+        if (compiles.isStopped(io)) return error.Stopped;
+        return err;
+    };
+}
+
+fn exchangeSingleFile(gpa: Allocator, io: Io, child: *std.process.Child, file_path: []const u8) !SingleFileResult {
     var read_buffer: [64 * 1024]u8 = undefined;
     var reader = child.stdout.?.readerStreaming(io, &read_buffer);
     var write_buffer: [64]u8 = undefined;
@@ -898,7 +970,8 @@ test "single-file mode: compile one file, get its errors and the files it read" 
     const gpa = testing.allocator;
     const path = try project.path(gpa, "one.zig");
     defer gpa.free(path);
-    var result = try compileSingleFile(gpa, testing.io, &project.env, path);
+    var compiles: SingleFileCompiles = .{};
+    var result = try compileSingleFile(gpa, testing.io, &project.env, path, &compiles);
     defer result.deinit(gpa);
     const eb = result.errors;
     try testing.expectEqual(1, eb.errorMessageCount());
@@ -917,12 +990,100 @@ test "single-file mode: compile one file, get its errors and the files it read" 
     const dep = try project.path(gpa, "dep.zig");
     defer gpa.free(dep);
     for (0..2) |_| {
-        var r = try compileSingleFile(gpa, testing.io, &project.env, ok);
+        var r = try compileSingleFile(gpa, testing.io, &project.env, ok, &compiles);
         defer r.deinit(gpa);
         try testing.expectEqual(0, r.errors.errorMessageCount());
         try testing.expectEqual(2, r.inputs.len);
         for (r.inputs) |input| try testing.expect(std.mem.eql(u8, input, ok) or std.mem.eql(u8, input, dep));
     }
+}
+
+/// A zig whose `zig build-obj` starts a process of its own and then hangs, both keeping the
+/// stdout pipe open; `tmp` holds the script and the file to compile
+const HangingZig = struct {
+    tmp: testing.TmpDir,
+    env: ZigEnv,
+    file: []u8,
+
+    fn create() !HangingZig {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "zig", .data = "#!/bin/sh\nsleep 600 &\nexec sleep 600\n", .flags = .{ .permissions = .executable_file } });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "one.zig", .data = "" });
+        const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(root);
+        const zig = try std.fs.path.join(testing.allocator, &.{ root, "zig" });
+        errdefer testing.allocator.free(zig);
+        const file = try std.fs.path.join(testing.allocator, &.{ root, "one.zig" });
+        return .{
+            .tmp = tmp,
+            .env = .{ .arena = undefined, .zig_exe = zig, .lib_dir = "", .std_dir = "", .global_cache_dir = "", .version = "" },
+            .file = file,
+        };
+    }
+
+    fn deinit(z: *HangingZig) void {
+        testing.allocator.free(z.env.zig_exe);
+        testing.allocator.free(z.file);
+        z.tmp.cleanup();
+    }
+
+    fn compile(z: *HangingZig, compiles: *SingleFileCompiles) !void {
+        var result = try compileSingleFile(testing.allocator, testing.io, &z.env, z.file, compiles);
+        result.deinit(testing.allocator);
+        return error.CompileFinished;
+    }
+
+    /// The compile in progress, once zig has started
+    fn running(compiles: *SingleFileCompiles) !*SingleFileCompiles.Running {
+        for (0..1000) |_| {
+            {
+                compiles.mutex.lockUncancelable(testing.io);
+                defer compiles.mutex.unlock(testing.io);
+                if (compiles.running.first) |node| return @fieldParentPtr("node", node);
+            }
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.CompileDidNotStart;
+    }
+};
+
+test "single-file mode: stopping ends a compile in progress and the processes it started" {
+    // Shutdown waited for the compiler to finish, and a compile requested meanwhile started after it
+    if (native_os == .windows) return error.SkipZigTest;
+    var zig: HangingZig = try .create();
+    defer zig.deinit();
+    var compiles: SingleFileCompiles = .{};
+    var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
+    defer task.cancel(testing.io) catch {};
+    const pgid = (try HangingZig.running(&compiles)).group.pgid;
+    compiles.stop(testing.io);
+    try testing.expectError(error.Stopped, task.await(testing.io));
+    try @import("fixture.zig").expectGroupGone(pgid);
+    try testing.expectError(error.Stopped, zig.compile(&compiles));
+}
+
+test "single-file mode: the compiler and the processes it started end when the server goes away" {
+    // A server that was killed or crashed left the compiler running
+    if (native_os == .windows) return error.SkipZigTest;
+    var zig: HangingZig = try .create();
+    defer zig.deinit();
+    var compiles: SingleFileCompiles = .{};
+    var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
+    defer task.cancel(testing.io) catch {};
+    const pgid = blk: {
+        const r = try HangingZig.running(&compiles);
+        compiles.mutex.lockUncancelable(testing.io);
+        defer compiles.mutex.unlock(testing.io);
+        // When the server process exits (no matter how), the operating system closes the write
+        // end of the watchdog's input
+        const watchdog = &r.group.watchdog.?;
+        watchdog.stdin.?.close(testing.io);
+        watchdog.stdin = null;
+        break :blk r.group.pgid;
+    };
+    try testing.expectError(error.EndOfStream, task.await(testing.io));
+    try @import("fixture.zig").expectGroupGone(pgid);
 }
 
 test "single-file mode: a malformed error bundle is discarded, the files read are kept" {

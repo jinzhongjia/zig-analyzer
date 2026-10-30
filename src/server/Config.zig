@@ -150,7 +150,8 @@ naming_rules: NamingRules = .{},
 files_watcher: Watcher = .auto,
 /// Log level (err / warn / info / debug)
 log_level: std.log.Level = .info,
-/// Log messages are also appended to this file; null means stderr only
+/// Log messages are also appended to this file (each line at the end of the file as it is then, so
+/// several servers can share it); null means stderr only
 log_file: ?[]const u8 = null,
 /// When a request takes longer than this many milliseconds, log the time spent in queries (slow
 /// request log); 0 disables it

@@ -1657,10 +1657,11 @@ fn wellFormed(r: *Resolver, file: FileId, offset: u32) resolve.Error!bool {
 
 /// Whether a candidate of type `have` can be a value of the expected type `want`, counting only
 /// what can be decided exactly: the same type; `T` when `?T` or `E!T` is expected; `*T` as
-/// `*const T` and `[]T` as `[]const T`; functions whose return value fits, and function pointers
-/// whose return value fits when the candidate is inserted as a call (`called`; a function pointer
-/// never coerces to what it returns). Other conversions (integer widening, comptime_int, and so on)
-/// do not count
+/// `*const T` and `[]T` as `[]const T`, with the compiler's rules for the other pointer attributes
+/// (see `ptrAttrsCoerce`); functions whose return value fits, and function pointers whose return
+/// value fits when the candidate is inserted as a call (`called`; a function pointer never
+/// coerces to what it returns). Other conversions (integer widening, comptime_int, and so on) do
+/// not count
 fn fits(ip: *InternPool, want: Index, have: Index, called: bool) bool {
     if (coerces(ip, want, have)) return true;
     const f = switch (ip.key(have)) {
@@ -1705,14 +1706,37 @@ fn coerces(ip: *InternPool, want: Index, have: Index) bool {
                 };
                 if (h.is_const and !w.is_const) return false;
                 if (w.sentinel) |s| if (array.sentinel != s) return false;
-                return value.eqlTypes(ip, w.child, array.child) orelse false;
+                return ptrAttrsCoerce(ip, w, h) and (value.eqlTypes(ip, w.child, array.child) orelse false);
             }
             if (w.size != h.size or (w.size != .one and w.size != .slice)) return false;
             if (!w.is_const or h.is_const or !std.meta.eql(w.sentinel, h.sentinel)) return false;
-            return value.eqlTypes(ip, w.child, h.child) orelse false;
+            return ptrAttrsCoerce(ip, w, h) and (value.eqlTypes(ip, w.child, h.child) orelse false);
         },
         else => return false,
     }
+}
+
+/// Whether the attributes of the pointer `h` allow it to coerce to the pointer `w` (the
+/// compiler's `coerceInMemoryAllowedPtrs`): the alignment may only decrease, `volatile` and
+/// `allowzero` may be added but not removed, and the address space and the bit range must be
+/// the same. An alignment that cannot be computed does not count.
+fn ptrAttrsCoerce(ip: *InternPool, w: InternPool.PtrType, h: InternPool.PtrType) bool {
+    const a = w.attrs;
+    const b = h.attrs;
+    if ((b.is_volatile and !a.is_volatile) or (b.is_allowzero and !a.is_allowzero)) return false;
+    if (a.address_space == null or b.address_space == null or a.address_space.? != b.address_space.?) return false;
+    if (a.host_size != b.host_size or a.bit_offset != b.bit_offset) return false;
+    if (a.alignment == .natural and b.alignment == .natural) return true;
+    const want_align = ptrAlignment(ip, w) orelse return false;
+    const have_align = ptrAlignment(ip, h) orelse return false;
+    return have_align >= want_align;
+}
+
+/// Alignment in bytes of the address of a pointer: the explicit one, or that of its child; null
+/// when not known
+fn ptrAlignment(ip: *InternPool, p: InternPool.PtrType) ?u64 {
+    if (p.attrs.alignment != .natural) return p.attrs.alignment.bytes();
+    return (value.typeLayout(ip, p.child) orelse return null).alignment;
 }
 
 fn isErrorSet(ip: *InternPool, t: Index) bool {

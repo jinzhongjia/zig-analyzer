@@ -154,7 +154,7 @@ fn checkCaseProperties(comptime style: Style, e: *Entropy) !void {
     }
 
     inline for (.{ Vfs.CaseMode.insensitive, Vfs.CaseMode.sensitive }) |case| {
-        var vfs: Vfs = .initOptions(testing.io, a, .{ .style = style, .case = case });
+        var vfs: Vfs = .initOptions(testing.io, a, .{ .style = style, .case = .{ .fixed = case } });
         defer vfs.deinit();
         const id = try vfs.intern(raw.items);
         const id2 = try vfs.intern(variant);

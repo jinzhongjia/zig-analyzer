@@ -450,6 +450,36 @@ test "workspace folders: added folders start a project, removed ones clear its d
     try h.notify("exit", {});
 }
 
+test "a project is not started for a folder removed before its start" {
+    // Guards against startup, which iterates a copy of the root directories, starting (and keeping
+    // loaded) the project of a folder that the client removed meanwhile
+    var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
+    defer first.deinit();
+    var second = try fixture.Project.create(&fixture.basic);
+    defer second.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const first_uri = try za.base.uri.fromPath(a, first.root);
+    const second_uri = try za.base.uri.fromPath(a, second.root);
+    _ = try h.request("initialize", .{ .workspaceFolders = &.{ .{ .uri = first_uri, .name = "first" }, .{ .uri = second_uri, .name = "second" } }, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try (Projects{ .n = 1 }).done(&h));
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &.{.{ .uri = second_uri, .name = "second" }} } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try (Projects{ .n = 0 }).done(&h));
+
+    // The start that startup began for the folder before the removal comes in after it
+    h.server.startWorkspace(second.root);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try (Projects{ .n = 0 }).done(&h));
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "removed workspace folder: open files belong to a project that is not loaded, with a hint" {
     const main_text =
         \\pub fn main() void {

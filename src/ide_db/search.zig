@@ -25,7 +25,8 @@ const ast = @import("../syntax/ast.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const ErrorSets = @import("../syntax/ErrorSets.zig");
-const FileId = @import("../base/Vfs.zig").FileId;
+const Vfs = @import("../base/Vfs.zig");
+const FileId = Vfs.FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const seed = @import("seed.zig");
 const InternPool = @import("../sema/InternPool.zig");
@@ -388,6 +389,18 @@ pub fn searchFiles(r: *Resolver) resolve.Error![]const FileId {
     return set.keys();
 }
 
+/// `files` ordered by path: an order that follows the source tree, not the order in which the
+/// files were interned (which depends on the order the client opened them)
+pub fn byPath(r: *Resolver, files: []const FileId) resolve.Error![]const FileId {
+    const out = try r.arena.dupe(FileId, files);
+    std.mem.sort(FileId, out, r.ctx.db.env.vfs, struct {
+        fn lt(vfs: *Vfs, a: FileId, b: FileId) bool {
+            return std.mem.lessThan(u8, vfs.path(a), vfs.path(b));
+        }
+    }.lt);
+    return out;
+}
+
 /// Candidate files that may reference definitions in a file whose importers (see `importers`) are
 /// `reach`: the files in `scope` reachable from `reach` through `@import` chains (through any
 /// files), and `reach` itself. Every compilation that contains the definition has a root that
@@ -478,7 +491,8 @@ pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
 
 /// The reverse import closure over the searched files (see `searchFiles`) is shared between the
 /// seed lookups of all members; the file indexes and the module configuration are still the
-/// actual dependencies.
+/// actual dependencies. Files at the same import distance from the target come in path order
+/// (see `byPath`), so the first call site found does not depend on the interning order.
 pub const ProjectImporters = struct {
     pub const kind: @import("../db/engine.zig").Kind = .derived;
     pub const Key = FileId;
@@ -488,7 +502,7 @@ pub const ProjectImporters = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return ctx.db.gpa.dupe(FileId, try importers(&r, target, try searchFiles(&r)));
+        return ctx.db.gpa.dupe(FileId, try importers(&r, target, try byPath(&r, try searchFiles(&r))));
     }
 
     pub fn eql(a: Value, b: Value) bool {

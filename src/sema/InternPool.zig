@@ -155,23 +155,116 @@ pub const SimpleValue = enum { void, true, false, null, undefined };
 
 pub const PtrSize = enum { one, many, slice, c };
 
+pub const PtrType = struct {
+    child: Index,
+    size: PtrSize,
+    is_const: bool = false,
+    sentinel: ?Index = null,
+    attrs: PtrAttrs = .{},
+};
+
+/// Pointer attributes other than constness and the sentinel: `align(a)` / `align(a:b:h)`,
+/// `addrspace(...)`, `volatile`, `allowzero`. Pointers without any keep the defaults.
+pub const PtrAttrs = struct {
+    alignment: Alignment = .natural,
+    /// Bit pointer into a packed host integer of `host_size` bytes (0 for other pointers), at
+    /// `bit_offset` bits from its start
+    host_size: u16 = 0,
+    bit_offset: u16 = 0,
+    is_volatile: bool = false,
+    /// Always false for C pointers, which allow zero by definition (see `get`)
+    is_allowzero: bool = false,
+    /// null when the `addrspace(...)` expression cannot be evaluated
+    address_space: ?std.builtin.AddressSpace = .generic,
+
+    /// Contains no part that could not be evaluated
+    pub fn isKnown(a: PtrAttrs) bool {
+        return a.alignment != .unknown and a.address_space != null;
+    }
+};
+
+/// Explicit pointer alignment in bytes. Matching the compiler, an explicit alignment equal to the
+/// natural one still makes a different type (`*align(4) u32` is not `*u32`).
+pub const Alignment = enum(u64) {
+    /// No `align` written: the alignment of the child type
+    natural = 0,
+    /// The `align` expression cannot be evaluated
+    unknown = std.math.maxInt(u64),
+    _,
+
+    /// An alignment of `n` bytes; unknown when `n` is not a valid alignment (a power of 2)
+    pub fn fromBytes(n: u64) Alignment {
+        return if (n == 0 or n == std.math.maxInt(u64) or !std.math.isPowerOfTwo(n)) .unknown else @fromBackingInt(n);
+    }
+
+    /// The explicit alignment; null for `natural` and `unknown`
+    pub fn bytes(a: Alignment) ?u64 {
+        return switch (a) {
+            .natural, .unknown => null,
+            _ => @backingInt(a),
+        };
+    }
+};
+
+pub const FnType = struct {
+    params: []const Index,
+    ret: Index,
+    varargs: bool = false,
+    cc: CallConv = .auto,
+    /// Has comptime or `anytype` parameters
+    is_generic: bool = false,
+};
+
+/// Calling convention of a function type: a value of `std.builtin.CallingConvention`. The tags
+/// without options and the target's C calling convention have their own variants, so that they
+/// are known without evaluating `std.builtin`.
+pub const CallConv = union(enum) {
+    auto,
+    @"inline",
+    naked,
+    async,
+    /// `.c`: the C calling convention of the target
+    c,
+    /// Any other value of `std.builtin.CallingConvention`
+    other: Index,
+    /// The `callconv(...)` expression cannot be evaluated
+    unknown,
+
+    /// The variant written as `.name`: a tag without options or the declaration `c`; null for
+    /// other names
+    pub fn fromName(name: []const u8) ?CallConv {
+        inline for (.{ "auto", "inline", "naked", "async", "c" }) |n| {
+            if (std.mem.eql(u8, name, n)) return @field(CallConv, n);
+        }
+        return null;
+    }
+
+    /// Contains no part that could not be evaluated
+    pub fn isKnown(cc: CallConv) bool {
+        return cc != .unknown;
+    }
+};
+
 pub const Key = union(enum) {
     unknown,
     simple_type: Simple,
     int_type: struct { signedness: std.builtin.Signedness, bits: u16 },
-    ptr_type: struct { child: Index, size: PtrSize, is_const: bool = false, sentinel: ?Index = null },
+    ptr_type: PtrType,
     array_type: struct { len: u64, child: Index, sentinel: ?Index = null },
-    /// An array whose length depends on an abstract parameter (in a generic function body without
-    /// a concrete instance, e.g. `[block_length]u8`): the element type is known, the length is
-    /// not; `len` is the source text of the length expression, used only for display
-    abstract_array_type: struct { len: []const u8, child: Index, sentinel: ?Index = null },
+    /// An array whose length is not known: the element type and sentinel are. With `len`, the
+    /// length depends on an abstract parameter (in a generic function body without a concrete
+    /// instance, e.g. `[block_length]u8`), and `len` is the source text of the length expression,
+    /// used only for display. Without `len`, the length depends on no abstract parameter but
+    /// cannot be evaluated (`count(fmt, args)` in an instance of `std.fmt.comptimePrint`): no
+    /// instance determines it, and it is displayed as `_`.
+    abstract_array_type: struct { len: ?[]const u8, child: Index, sentinel: ?Index = null },
     optional_type: Index,
     error_union_type: struct { err: Index, payload: Index },
     error_set_type: ErrorSet,
     /// The error set of a function's `!T` inferred from the function body. The signature records
     /// only this marker; the members are computed on demand by `ErrorSetOf`.
     inferred_error_set: struct { file: FileId, decl: AstId, inst: ?Index = null },
-    fn_type: struct { params: []const Index, ret: Index, varargs: bool = false },
+    fn_type: FnType,
     /// Identity = definition location (file + AstId of the container)
     container_type: Container,
     /// Tuple `struct { A, B }` (`@Tuple`, tuple literals)
@@ -674,8 +767,11 @@ pub const VectorAbi = enum(u8) {
     }
 };
 
-/// Interns: the same Key returns the same Index
-pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
+/// Interns: the same Key returns the same Index. C pointers always allow zero (as the compiler
+/// canonicalizes them), so `allowzero` is dropped from them.
+pub fn get(ip: *InternPool, key_in: Key) Allocator.Error!Index {
+    var k = key_in;
+    if (k == .ptr_type and k.ptr_type.size == .c) k.ptr_type.attrs.is_allowzero = false;
     // Hashed before taking the lock: only probing the table is serialized
     const hashed: Prehashed = .{ .h = KeyContext.hash(.{}, k) };
     ip.mutex.lockUncancelable(ip.io);
@@ -708,9 +804,13 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
             for (es.names, out) |n, *o| o.* = try a.dupe(u8, n);
             break :blk .{ .error_set_type = .{ .names = out, .sorted = try a.dupe(u32, es.sorted) } };
         },
-        .fn_type => |f| .{ .fn_type = .{ .params = try a.dupe(Index, f.params), .ret = f.ret, .varargs = f.varargs } },
+        .fn_type => |f| blk: {
+            var out = f;
+            out.params = try a.dupe(Index, f.params);
+            break :blk .{ .fn_type = out };
+        },
         .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
-        .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = try a.dupe(u8, t.len), .child = t.child, .sentinel = t.sentinel } },
+        .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = if (t.len) |l| try a.dupe(u8, l) else null, .child = t.child, .sentinel = t.sentinel } },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
         .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent, .iteration = i.iteration } },
@@ -871,7 +971,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
                     try w.writeAll("]");
                 },
             }
-            if (p.is_const) try w.writeAll("const ");
+            try writePtrQualifiers(p, w);
             try ip.print(p.child, w, container_name);
         },
         .array_type => |a| {
@@ -884,7 +984,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(a.child, w, container_name);
         },
         .abstract_array_type => |a| {
-            try w.print("[{s}", .{a.len});
+            try w.print("[{s}", .{a.len orelse "_"});
             if (a.sentinel) |s| {
                 try w.writeAll(":");
                 try ip.print(s, w, container_name);
@@ -920,6 +1020,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             }
             if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
             try w.writeAll(") ");
+            try ip.writeCallConv(f.cc, w, container_name);
             try ip.print(f.ret, w, container_name);
         },
         .container_type => |c| try container_name.write(c, w),
@@ -1027,6 +1128,21 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
     }
 }
 
+/// `callconv(...) ` of a function type as the compiler prints it: nothing for `.auto`, the tag
+/// for tags without options, `.c` for the target's C calling convention, and the value otherwise
+fn writeCallConv(ip: *InternPool, cc: CallConv, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+    switch (cc) {
+        .auto => {},
+        .other => |v| {
+            try w.writeAll("callconv(");
+            try ip.print(v, w, container_name);
+            try w.writeAll(") ");
+        },
+        .unknown => try w.writeAll("callconv(unknown) "),
+        else => try w.print("callconv(.{f}) ", .{std.zig.fmtId(@tagName(cc))}),
+    }
+}
+
 /// `container_name.remaining(w)`: the number of characters the output can still take (the
 /// length limit of inlay hints); null means unlimited
 fn remaining(container_name: anytype, w: *Io.Writer) ?usize {
@@ -1070,6 +1186,24 @@ fn writeStringPrefix(text: []const u8, limit: ?usize, w: *Io.Writer) Io.Writer.E
         i += unit;
     }
     return i;
+}
+
+/// The qualifiers of a pointer type between its size and its child, in the order the compiler
+/// prints them: `allowzero align(a:b:h) addrspace(.x) const volatile ` (each only when present;
+/// C pointers never print `allowzero`). Parts that cannot be evaluated print as `unknown`.
+pub fn writePtrQualifiers(p: PtrType, w: *Io.Writer) Io.Writer.Error!void {
+    const a = p.attrs;
+    if (a.is_allowzero) try w.writeAll("allowzero ");
+    if (a.alignment != .natural or a.host_size != 0) {
+        if (a.alignment.bytes()) |n| try w.print("align({d}", .{n}) else try w.writeAll("align(unknown");
+        if (a.host_size != 0) try w.print(":{d}:{d}", .{ a.bit_offset, a.host_size });
+        try w.writeAll(") ");
+    }
+    if (a.address_space) |space| {
+        if (space != .generic) try w.print("addrspace(.{t}) ", .{space});
+    } else try w.writeAll("addrspace(unknown) ");
+    if (p.is_const) try w.writeAll("const ");
+    if (a.is_volatile) try w.writeAll("volatile ");
 }
 
 /// A field of a tuple or anonymous struct: comptime fields include their value

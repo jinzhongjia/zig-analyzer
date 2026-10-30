@@ -1303,7 +1303,7 @@ pub const Candidates = struct {
         data.files = try allocator.dupe(FileId, try ctx.get(search.ProjectImporters, key.file));
         var all: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         for (data.files) |f| try all.put(r.arena, f, {});
-        for (try search.searchFiles(&r)) |f| try all.put(r.arena, f, {});
+        for (try search.byPath(&r, try search.searchFiles(&r))) |f| try all.put(r.arena, f, {});
         data.all_files = try allocator.dupe(FileId, all.keys());
         const names = try callNames(&r, key.file, root, data.files);
         const owned = try allocator.alloc([]const u8, names.len);
@@ -1677,9 +1677,10 @@ fn enclosedBy(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!bo
 }
 
 /// The type contains abstract parameters or unknown parts: worth re-inferring under a call-site
-/// instance
+/// instance. An array length that depends on no abstract parameter is the same in every instance
+/// (see `value.isSettled`).
 pub fn wanted(ip: *InternPool, tv: TypedValue) bool {
-    if (tv.ty == .unknown or !value.isConcrete(ip, tv.ty)) return true;
-    if (tv.ty == .type_type) return tv.val == null or !value.isConcrete(ip, tv.val.?);
+    if (tv.ty == .unknown or !value.isSettled(ip, tv.ty)) return true;
+    if (tv.ty == .type_type) return tv.val == null or !value.isSettled(ip, tv.val.?);
     return false;
 }

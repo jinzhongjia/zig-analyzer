@@ -13,6 +13,9 @@ pub const Signature = struct {
     label: []const u8,
     /// Display text of the parameters (substrings of label)
     params: []const []const u8,
+    /// Byte range of each parameter in label: a parameter's text may also occur earlier in the
+    /// label (`fn f(_: u8, _: u8)`)
+    ranges: []const [2]u32,
     active: u32,
     doc: ?[]const u8,
 };
@@ -27,9 +30,11 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
         const name = call.name() orelse return null;
         const entry = builtins.get(name.text) orelse return null;
         const label = entry.signature orelse return null;
+        const ranges = try builtinRanges(r.arena, label, entry.parameters) orelse return null;
         return .{
             .label = label,
             .params = entry.parameters,
+            .ranges = ranges,
             .active = if (entry.parameters.len == 0) 0 else @min(active, @as(u32, @intCast(entry.parameters.len - 1))),
             .doc = entry.documentation,
         };
@@ -49,12 +54,38 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
     // Same as the parameters in label (see `ast.FnProto.writeParams`)
     const texts = try r.arena.alloc([]const u8, params.len);
     for (params, texts) |p, *t| t.* = try ast.collapsedAlloc(r.arena, p.syntax);
+    const ranges = try target.proto.signatureParamRanges(r.arena);
     const doc = if (target.def) |d| try context.doc(r, d) else null;
     var current = active + @as(u32, @intFromBool(target.bound));
     // Every argument from the C-variadic `...` on is one of its arguments; without `...` an extra
     // argument has no parameter and is left past the end
     if (params.len > 0 and params[params.len - 1].isVarargs()) current = @min(current, @as(u32, @intCast(params.len - 1)));
-    return .{ .label = label.written(), .params = texts, .active = current, .doc = doc };
+    return .{ .label = label.written(), .params = texts, .ranges = ranges, .active = current, .doc = doc };
+}
+
+/// Byte ranges of the parameters of a builtin in its signature: they follow one another in the
+/// parameter list, separated by commas and whitespace. Null when the signature does not contain
+/// them in order.
+fn builtinRanges(a: std.mem.Allocator, label: []const u8, params: []const []const u8) error{OutOfMemory}!?[]const [2]u32 {
+    const ranges = try a.alloc([2]u32, params.len);
+    var at = (std.mem.indexOfScalar(u8, label, '(') orelse return null) + 1;
+    for (params, ranges) |p, *range| {
+        const start = std.mem.indexOfPos(u8, label, at, p) orelse return null;
+        if (std.mem.trim(u8, label[at..start], ", \n").len != 0) return null;
+        at = start + p.len;
+        range.* = .{ @intCast(start), @intCast(at) };
+    }
+    return ranges;
+}
+
+test "builtin signatures contain their parameters in order" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    for (builtins.entries) |entry| {
+        const label = entry.signature orelse continue;
+        const ranges = (try builtinRanges(arena.allocator(), label, entry.parameters)).?;
+        for (entry.parameters, ranges) |p, range| try std.testing.expectEqualStrings(p, label[range[0]..range[1]]);
+    }
 }
 
 /// The CST argument list directly contains the separating commas; commas in nested expressions,

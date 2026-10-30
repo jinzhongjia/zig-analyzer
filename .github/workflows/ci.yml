@@ -52,6 +52,8 @@ jobs:
         run: |
           zig build gen
           git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig src/ide/manifest_data.zig
+      - name: The Windows build imports only functions Windows 10 1507 has
+        run: zig build check -Dtarget=x86_64-windows
 
   fuzz:
     name: Coverage-guided fuzzing

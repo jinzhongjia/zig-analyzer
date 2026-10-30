@@ -37,6 +37,33 @@ pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
     };
 }
 
+/// Result type of `@abs` (matches the compiler's `zirAbs` and `Type.toUnsigned`): signed integer
+/// types map to their unsigned counterparts (`isize` to `usize`, `c_int` to `c_uint`, other
+/// widths to `uN`), vectors element-wise; every other type is its own result. Null when the
+/// signedness or bit width needed for the mapping is unknown.
+pub fn absType(ip: *InternPool, t: Index) Allocator.Error!?Index {
+    return switch (ip.key(t)) {
+        .simple_type => |s| switch (s) {
+            .isize => try ip.get(.{ .simple_type = .usize }),
+            .c_short => try ip.get(.{ .simple_type = .c_ushort }),
+            .c_int => try ip.get(.{ .simple_type = .c_uint }),
+            .c_long => try ip.get(.{ .simple_type = .c_ulong }),
+            .c_longlong => try ip.get(.{ .simple_type = .c_ulonglong }),
+            .c_char => {
+                const info = intInfo(ip, t) orelse return null;
+                return if (info.signed) try ip.intType(.unsigned, info.bits) else t;
+            },
+            else => t,
+        },
+        .int_type => |i| if (i.signedness == .signed) try ip.intType(.unsigned, i.bits) else t,
+        .vector_type => |v| {
+            const child = try absType(ip, v.child) orelse return null;
+            return if (child == v.child) t else try ip.get(.{ .vector_type = .{ .len = v.len, .child = child } });
+        },
+        else => t,
+    };
+}
+
 /// Intermediate result of arithmetic: holds both the product of two i128 values and shift results
 const Wide = i256;
 
@@ -253,26 +280,57 @@ pub fn intFits(ip: *InternPool, ty: Index, v: i128) bool {
 /// Result type of `@min` / `@max` with integer operands (matches the compiler's `analyzeMinMax`):
 /// the ranges of the operands (the value when it is known, otherwise the range of the type) are
 /// combined by `@min` / `@max`, and the result is the smallest integer type that holds the
-/// combined range; comptime_int when all operands are comptime_int. Null when an operand is not
-/// an integer or a range cannot be computed.
+/// combined range; comptime_int when all operands are comptime_int. Vector operands (all of the
+/// same length) give a vector of that type, the range of a known vector value spanning its
+/// elements. Null when an operand is not an integer (or a vector of integers) or a range cannot
+/// be computed.
 pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool.TypedValue) Allocator.Error!?Index {
+    const vector_len: ?u32 = switch (ip.key(operands[0].ty)) {
+        .vector_type => |v| v.len,
+        else => null,
+    };
     var result: Bounds = undefined;
     var all_comptime = true;
     for (operands, 0..) |o, i| {
-        const r: Bounds = if (intOf(ip, o.val)) |x| .{ .min = x, .max = x } else if (o.ty == .comptime_int_type)
+        const scalar = switch (ip.key(o.ty)) {
+            .vector_type => |v| if (v.len == vector_len) v.child else return null,
+            else => if (vector_len == null) o.ty else return null,
+        };
+        const r: Bounds = if (vector_len != null) (elemBounds(ip, o.val) orelse
+            bounds(intInfo(ip, scalar) orelse return null) orelse return null) else if (intOf(ip, o.val)) |x| .{ .min = x, .max = x } else if (scalar == .comptime_int_type)
             return null
         else
-            bounds(intInfo(ip, o.ty) orelse return null) orelse return null;
-        if (o.ty != .comptime_int_type) all_comptime = false;
+            bounds(intInfo(ip, scalar) orelse return null) orelse return null;
+        if (scalar != .comptime_int_type) all_comptime = false;
         result = if (i == 0) r else if (is_min)
             .{ .min = @min(result.min, r.min), .max = @min(result.max, r.max) }
         else
             .{ .min = @max(result.min, r.min), .max = @max(result.max, r.max) };
     }
-    if (all_comptime) return .comptime_int_type;
     // Same as the compiler's `intFittingRange`
     const signed = result.min < 0;
-    return try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
+    const scalar = if (all_comptime) .comptime_int_type else try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
+    return if (vector_len) |len| try ip.get(.{ .vector_type = .{ .len = len, .child = scalar } }) else scalar;
+}
+
+/// Smallest and largest element of a known vector value of integers
+fn elemBounds(ip: *InternPool, v: ?Index) ?Bounds {
+    var r: Bounds = .{ .min = std.math.maxInt(Wide), .max = std.math.minInt(Wide) };
+    const elems = switch (ip.key(v orelse return null)) {
+        .aggregate => |a| a.elems,
+        .bytes => |b| {
+            if (b.bytes.len == 0) return null;
+            for (b.bytes) |x| r = .{ .min = @min(r.min, x), .max = @max(r.max, x) };
+            return r;
+        },
+        else => return null,
+    };
+    if (elems.len == 0) return null;
+    for (elems) |e| {
+        const x = intOf(ip, e) orelse return null;
+        r = .{ .min = @min(r.min, x), .max = @max(r.max, x) };
+    }
+    return r;
 }
 
 /// Bit width needed to hold `x`, including the sign bit when `signed` (`signed` is true when `x`
@@ -723,11 +781,12 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
     if (v == .unknown) return false;
     return switch (ip.key(v)) {
         .unknown, .abstract_array_type => false,
-        .ptr_type => |p| isPrecise(ip, p.child) and (p.sentinel == null or isPrecise(ip, p.sentinel.?)),
+        .ptr_type => |p| p.attrs.isKnown() and isPrecise(ip, p.child) and (p.sentinel == null or isPrecise(ip, p.sentinel.?)),
         .array_type => |a| isPrecise(ip, a.child) and (a.sentinel == null or isPrecise(ip, a.sentinel.?)),
         .optional_type => |c| isPrecise(ip, c),
         .error_union_type => |e| isPrecise(ip, e.err) and isPrecise(ip, e.payload),
         .fn_type => |f| blk: {
+            if (!f.cc.isKnown()) break :blk false;
             for (f.params) |p| if (!isPrecise(ip, p)) break :blk false;
             break :blk isPrecise(ip, f.ret);
         },
@@ -758,34 +817,47 @@ fn allPrecise(ip: *InternPool, items: []const Index) bool {
 /// A type without abstract parameters or unknown parts: it can be used outside the instance that
 /// defines it (e.g. as the caller's expected type)
 pub fn isConcrete(ip: *InternPool, t: Index) bool {
+    return concrete(ip, t, false);
+}
+
+/// A type or instance without abstract parameters: inferring it under another instance gives the
+/// same result. Unlike `isConcrete`, an array whose length cannot be evaluated but depends on no
+/// abstract parameter (`InternPool.Key.abstract_array_type` without `len`) counts.
+pub fn isSettled(ip: *InternPool, t: Index) bool {
+    return concrete(ip, t, true);
+}
+
+fn concrete(ip: *InternPool, t: Index, unknown_len: bool) bool {
     if (t == .unknown) return false;
     return switch (ip.key(t)) {
-        .unknown, .opaque_param, .abstract_array_type => false,
-        .ptr_type => |p| isConcrete(ip, p.child),
-        .array_type => |a| isConcrete(ip, a.child),
-        .optional_type => |c| isConcrete(ip, c),
-        .error_union_type => |e| isConcrete(ip, e.err) and isConcrete(ip, e.payload),
+        .unknown, .opaque_param => false,
+        .abstract_array_type => |a| unknown_len and a.len == null and concrete(ip, a.child, true) and (a.sentinel == null or concrete(ip, a.sentinel.?, true)),
+        .ptr_type => |p| p.attrs.isKnown() and concrete(ip, p.child, unknown_len),
+        .array_type => |a| concrete(ip, a.child, unknown_len),
+        .optional_type => |c| concrete(ip, c, unknown_len),
+        .error_union_type => |e| concrete(ip, e.err, unknown_len) and concrete(ip, e.payload, unknown_len),
         .fn_type => |f| blk: {
-            for (f.params) |p| if (!isConcrete(ip, p)) break :blk false;
-            break :blk isConcrete(ip, f.ret);
+            if (!f.cc.isKnown()) break :blk false;
+            for (f.params) |p| if (!concrete(ip, p, unknown_len)) break :blk false;
+            break :blk concrete(ip, f.ret, unknown_len);
         },
-        .container_type => |c| c.inst == null or isConcrete(ip, c.inst.?),
-        .tuple_type => |tt| allConcrete(ip, tt.types) and allConcrete(ip, tt.values),
-        .vector_type => |v| isConcrete(ip, v.child),
-        .anon_struct_type => |a| allConcrete(ip, a.types) and allConcrete(ip, a.values),
-        .reified_type => |r| allConcrete(ip, r.types) and (r.inst == null or isConcrete(ip, r.inst.?)),
-        .union_tag_type => |u| isConcrete(ip, u),
+        .container_type => |c| c.inst == null or concrete(ip, c.inst.?, unknown_len),
+        .tuple_type => |tt| allConcrete(ip, tt.types, unknown_len) and allConcrete(ip, tt.values, unknown_len),
+        .vector_type => |v| concrete(ip, v.child, unknown_len),
+        .anon_struct_type => |a| allConcrete(ip, a.types, unknown_len) and allConcrete(ip, a.values, unknown_len),
+        .reified_type => |r| allConcrete(ip, r.types, unknown_len) and (r.inst == null or concrete(ip, r.inst.?, unknown_len)),
+        .union_tag_type => |u| concrete(ip, u, unknown_len),
         .instance => |i| blk: {
             if (i.iteration) |it| if (it.index == InternPool.Instance.Iteration.unknown_index) break :blk false;
-            for (i.args) |a| if (a != .runtime and !isConcrete(ip, a)) break :blk false;
-            break :blk i.parent == null or isConcrete(ip, i.parent.?);
+            for (i.args) |a| if (a != .runtime and !concrete(ip, a, unknown_len)) break :blk false;
+            break :blk i.parent == null or concrete(ip, i.parent.?, unknown_len);
         },
         else => true,
     };
 }
 
-fn allConcrete(ip: *InternPool, items: []const Index) bool {
-    for (items) |x| if (!isConcrete(ip, x)) return false;
+fn allConcrete(ip: *InternPool, items: []const Index, unknown_len: bool) bool {
+    for (items) |x| if (!concrete(ip, x, unknown_len)) return false;
     return true;
 }
 
@@ -817,7 +889,7 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .ptr_type => |p| blk: {
             const q = kb.ptr_type;
             if (p.size != q.size or p.is_const != q.is_const) break :blk false;
-            break :blk all(&.{ eqlTypes(ip, p.child, q.child), eqlSentinel(ip, p.sentinel, q.sentinel) });
+            break :blk all(&.{ eqlTypes(ip, p.child, q.child), eqlSentinel(ip, p.sentinel, q.sentinel), eqlPtrAttrs(p.attrs, q.attrs) });
         },
         .array_type => |x| blk: {
             const y = kb.array_type;
@@ -828,8 +900,9 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .error_union_type => |e| all(&.{ eqlTypes(ip, e.err, kb.error_union_type.err), eqlTypes(ip, e.payload, kb.error_union_type.payload) }),
         .fn_type => |f| blk: {
             const g = kb.fn_type;
-            if (f.params.len != g.params.len or f.varargs != g.varargs) break :blk false;
-            var unknown = false;
+            if (f.params.len != g.params.len or f.varargs != g.varargs or f.is_generic != g.is_generic) break :blk false;
+            if (f.cc.isKnown() and g.cc.isKnown() and !std.meta.eql(f.cc, g.cc)) break :blk false;
+            var unknown = !f.cc.isKnown() or !g.cc.isKnown();
             for (f.params, g.params) |x, y| {
                 const r = eqlTypes(ip, x, y) orelse {
                     unknown = true;
@@ -867,6 +940,15 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         // Index
         else => false,
     };
+}
+
+/// Whether two pointers have the same attributes; null when that depends on a part that cannot be
+/// evaluated
+fn eqlPtrAttrs(a: InternPool.PtrAttrs, b: InternPool.PtrAttrs) ?bool {
+    if (a.host_size != b.host_size or a.bit_offset != b.bit_offset or a.is_volatile != b.is_volatile or a.is_allowzero != b.is_allowzero) return false;
+    if (a.alignment != .unknown and b.alignment != .unknown and a.alignment != b.alignment) return false;
+    if (a.address_space != null and b.address_space != null and a.address_space != b.address_space) return false;
+    return if (a.isKnown() and b.isKnown()) true else null;
 }
 
 fn eqlTypeLists(ip: *InternPool, a: []const Index, b: []const Index) ?bool {

@@ -94,6 +94,8 @@ pub const util = struct {
     pub const panic_context = @import("util/panic_context.zig");
     pub const assert = @import("util/assert.zig");
     pub const watchdog = @import("util/watchdog.zig");
+    pub const child_process = @import("util/child_process.zig");
+    pub const worker_stack = @import("util/worker_stack.zig");
     /// Test-only: converts posix-style paths to native paths
     pub const test_path = @import("util/test_path.zig");
 };
@@ -102,6 +104,8 @@ pub const lsp = struct {
     pub const json_ext = @import("lsp/json_ext.zig");
     pub const jsonrpc = @import("lsp/jsonrpc.zig");
     pub const transport = @import("lsp/transport.zig");
+    /// Command-line arguments of the server executable
+    pub const cli = @import("lsp/cli.zig");
 };
 
 test {

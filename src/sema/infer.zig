@@ -352,6 +352,10 @@ const Inferrer = struct {
                 const own = inf.ownInstance();
                 for (b.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null);
                 if (b.type_expr) |t| inf.ret_type = (try inf.inferComptime(t, null)).asType();
+                // The calling convention belongs to the signature: the function type reads it
+                for (b.clauses) |c| if (c.kind == .@"callconv") {
+                    _ = try inf.inferComptime(c.expr, try inf.clauseType(.@"callconv"));
+                };
                 if (mode == .full) if (b.value) |v| {
                     _ = try inf.infer(v, null);
                 };
@@ -399,6 +403,18 @@ const Inferrer = struct {
             .@"callconv" => try inf.stdType(&.{ "builtin", "CallingConvention" }),
             .@"addrspace" => try inf.stdType(&.{ "builtin", "AddressSpace" }),
         };
+    }
+
+    /// Attributes of the written pointer type `p` (with child `child`): its clauses are inferred
+    /// with their result types and evaluated at comptime
+    fn ptrAttrs(inf: *Inferrer, p: Body.PtrType, child: Index) Error!InternPool.PtrAttrs {
+        if (p.@"align" == null and p.@"addrspace" == null) return .{ .is_volatile = p.is_volatile, .is_allowzero = p.is_allowzero };
+        var vals: eval.PtrClauseValues = .{};
+        if (p.@"align") |x| vals.@"align" = (try inf.inferComptime(x, try inf.clauseType(.@"align"))).val;
+        if (p.bit_offset) |x| vals.bit_offset = (try inf.inferComptime(x, try inf.clauseType(.bit_range))).val;
+        if (p.host_size) |x| vals.host_size = (try inf.inferComptime(x, try inf.clauseType(.bit_range))).val;
+        if (p.@"addrspace") |x| vals.@"addrspace" = (try inf.inferComptime(x, try inf.clauseType(.@"addrspace"))).val;
+        return eval.ptrAttrs(inf.r, child, p, vals);
     }
 
     fn branchQuota(inf: *Inferrer) u32 {
@@ -865,6 +881,16 @@ const Inferrer = struct {
             else => {},
         }
         if (target != want and tv.ty == target) return .{ .ty = want, .val = tv.val };
+        // An error coerced to an error union keeps its value, which marks the union as failed; a
+        // payload keeps its value coerced to the payload type, which marks the union as successful
+        if (tv.val) |v| switch (ip.key(want)) {
+            .error_union_type => |eu| {
+                if (ip.key(v) == .error_value) return .{ .ty = want, .val = v };
+                const payload = try inf.coerce(tv, eu.payload);
+                if (payload.ty == eu.payload) return .{ .ty = want, .val = payload.val };
+            },
+            else => {},
+        };
         return tv;
     }
 
@@ -913,7 +939,7 @@ const Inferrer = struct {
                 const ty = try inf.peer(&.{ then.ty, other.ty });
                 try inf.peerLiteral(x.then, ty);
                 if (x.@"else") |el| try inf.peerLiteral(el, ty);
-                return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) sameLiveValue(&.{ then, other }, ty) else null };
+                return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) try sameLiveValue(ip, &.{ then, other }, ty) else null };
             },
             .loop => |l| return inf.loop(l, expected),
             .@"switch" => |s| {
@@ -975,13 +1001,17 @@ const Inferrer = struct {
                 const ty = try inf.peer(types.items);
                 for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
                 for (break_exprs) |x| try inf.peerLiteral(x, ty);
-                return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
+                return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) try sameLiveValue(ip, values.items, ty) else null };
             },
             .@"catch" => |c| {
                 const lhs = try inf.infer(c.lhs, null);
                 const payload, const err = inf.unwrapErrorUnion(lhs.ty);
                 if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err };
-                const rhs = try inf.infer(c.rhs, inf.fallbackType(expected, payload, c.rhs));
+                // When comptime-known, only one side is evaluated, and a right-hand side that is
+                // taken gets only the result type of the whole expression
+                const ok = inf.condValue(lhs);
+                const rhs = try inf.inferBranch(c.rhs, inf.fallbackType(expected, if (ok == false) .unknown else payload, c.rhs), ok == true);
+                if (ok) |o| return if (o) .{ .ty = payload, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
             },
             .binary => |bin| return inf.binary(e, bin.op, bin.lhs, bin.rhs, expected),
@@ -1060,7 +1090,8 @@ const Inferrer = struct {
                 const params = try inf.scratch.alloc(Index, f.params.len);
                 for (f.params, params) |p, *out| out.* = (try inf.infer(p, null)).asType() orelse .unknown;
                 const ret = if (f.ret) |r| (try inf.infer(r, null)).asType() orelse .unknown else .unknown;
-                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret } }));
+                const cc: InternPool.CallConv = if (f.@"callconv") |x| try eval.writtenCallConv(inf.r, inf.body, x, (try inf.inferComptime(x, try inf.clauseType(.@"callconv"))).val) else .auto;
+                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = f.varargs, .is_generic = f.is_generic, .cc = cc } }));
             },
             .@"return" => |v| {
                 const ret: TypedValue = if (v) |x| try inf.infer(x, inf.ret_type) else .{ .ty = .void_type };
@@ -1104,8 +1135,9 @@ const Inferrer = struct {
             .ptr_type => |p| {
                 const child = (try inf.infer(p.child, null)).asType() orelse return typeUnknown();
                 const sentinel: ?Index = if (p.sentinel) |x| (try inf.infer(x, child)).val else null;
+                const attrs = try inf.ptrAttrs(p, child);
                 if (child == .unknown) return typeUnknown();
-                return TypedValue.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel } }));
+                return TypedValue.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = @fromBackingInt(@intCast(@backingInt(p.size))), .is_const = p.is_const, .sentinel = sentinel, .attrs = attrs } }));
             },
             .array_type => |arr| {
                 const len = try inf.inferComptime(arr.len, .usize_type);
@@ -1115,9 +1147,13 @@ const Inferrer = struct {
                     .int_value => |iv| std.math.cast(u64, iv.value) orelse return typeUnknown(),
                     else => return typeUnknown(),
                 } else {
-                    // The length cannot be evaluated (e.g. it depends on an abstract parameter):
-                    // the element type is known, and the length is shown as in the source
+                    // The length cannot be evaluated; the element type is known. When the length
+                    // depends on an abstract parameter, it is shown as in the source; otherwise
+                    // (in a concrete instance, where the source text would belong to the
+                    // declaration, not to the instance) no instance determines it, and it is
+                    // unknown
                     if (child == .unknown or (arr.sentinel != null and sentinel == null)) return typeUnknown();
+                    if (!try inf.dependsOnAbstract(arr.len, 0)) return TypedValue.ofType(try ip.get(.{ .abstract_array_type = .{ .len = null, .child = child, .sentinel = sentinel } }));
                     var text: std.ArrayList(u8) = .empty;
                     if (!try inf.exprText(arr.len, &text, 0)) return typeUnknown();
                     return TypedValue.ofType(try ip.get(.{ .abstract_array_type = .{ .len = text.items, .child = child, .sentinel = sentinel } }));
@@ -1322,14 +1358,14 @@ const Inferrer = struct {
         switch (ip.key(t)) {
             .ptr_type => |p| if (p.size == .one) {
                 // `ptr` of a pointer to an array: a many-item pointer to its elements, with the
-                // sentinel of the array and the constness of the pointer
+                // sentinel of the array and the other attributes of the pointer
                 if (std.mem.eql(u8, name, "ptr")) {
                     const elem: ?struct { Index, ?Index } = switch (ip.key(p.child)) {
                         .array_type => |arr| .{ arr.child, arr.sentinel },
                         .abstract_array_type => |arr| .{ arr.child, arr.sentinel },
                         else => null,
                     };
-                    if (elem) |el| return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = el[0], .size = .many, .is_const = p.is_const, .sentinel = el[1] } }) };
+                    if (elem) |el| return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = el[0], .size = .many, .is_const = p.is_const, .sentinel = el[1], .attrs = p.attrs } }) };
                 }
                 t = p.child;
             },
@@ -1358,7 +1394,7 @@ const Inferrer = struct {
             },
             .ptr_type => |p| if (p.size == .slice) {
                 if (std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type };
-                if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } }) };
+                if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel, .attrs = p.attrs } }) };
             },
             // Tuples, anonymous structs, and constructed structs and unions
             .tuple_type, .anon_struct_type, .reified_type => {
@@ -1588,6 +1624,35 @@ const Inferrer = struct {
         }
         // The module name is decided by the build system (see `std.builtin.SourceLocation.module`)
         // and is absent from the project model, so only the type is given
+        // GPU, wasm and C variadic builtins: the result types of the compiler's Sema and Air
+        if (eq(u8, name, "@workItemId") or eq(u8, name, "@workGroupId") or eq(u8, name, "@workGroupSize")) {
+            const u32_type = try ip.intType(.unsigned, 32);
+            for (args) |a| _ = try inf.infer(a, u32_type);
+            return .{ .ty = u32_type };
+        }
+        if (eq(u8, name, "@wasmMemorySize") or eq(u8, name, "@wasmMemoryGrow")) {
+            const u32_type = try ip.intType(.unsigned, 32);
+            for (args, 0..) |a, i| _ = try inf.infer(a, if (i == 0) u32_type else .usize_type);
+            return .{ .ty = if (eq(u8, name, "@wasmMemorySize")) .usize_type else .isize_type };
+        }
+        if (eq(u8, name, "@cVaStart") or eq(u8, name, "@cVaCopy")) {
+            for (args) |a| _ = try inf.infer(a, null);
+            return .{ .ty = (try inf.stdType(&.{ "lang", "VaList" })) orelse .unknown };
+        }
+        if (eq(u8, name, "@cVaEnd")) {
+            for (args) |a| _ = try inf.infer(a, null);
+            return .{ .ty = .void_type };
+        }
+        if (eq(u8, name, "@cVaArg")) {
+            for (args) |a| _ = try inf.infer(a, null);
+            if (args.len != 2) return .unknown;
+            return .{ .ty = inf.get(args[1]).asType() orelse .unknown };
+        }
+        // A SPIR-V type: a type whose value is not modeled
+        if (eq(u8, name, "@SpirvType")) {
+            for (args) |a| _ = try inf.infer(a, (try inf.stdType(&.{ "lang", "Type", "Spirv" })));
+            return typeUnknown();
+        }
         if (eq(u8, name, "@src")) return .{ .ty = try inf.stdType(&.{ "builtin", "SourceLocation" }) orelse .unknown };
         if (eq(u8, name, "@as")) {
             if (args.len != 2) return .unknown;
@@ -1617,6 +1682,8 @@ const Inferrer = struct {
                 else => null,
             } else null;
             if (sign == null or n == null) return typeUnknown();
+            // Sema rejects a signed integer type with bit width 0
+            if (sign.? == .signed and n.? == 0) return typeUnknown();
             return TypedValue.ofType(try ip.intType(sign.?, n.?));
         }
         // Builtins that construct types: evaluated by the interpreter (their arguments are
@@ -1646,6 +1713,11 @@ const Inferrer = struct {
         }
         if (eq(u8, name, "@intFromBool")) {
             for (args) |a| _ = try inf.infer(a, .bool_type);
+            // A vector of bools gives a vector of u1
+            if (args.len == 1) switch (ip.key(inf.get(args[0]).ty)) {
+                .vector_type => |v| return .{ .ty = try ip.get(.{ .vector_type = .{ .len = v.len, .child = .u1_type } }) },
+                else => {},
+            };
             const b = if (args.len == 1) inf.condValue(inf.get(args[0])) else null;
             return .{ .ty = .u1_type, .val = if (b) |x| try ip.get(.{ .int_value = .{ .ty = .u1_type, .value = @intFromBool(x) } }) else null };
         }
@@ -1803,8 +1875,8 @@ const Inferrer = struct {
                 for (args, operands) |a, *o| o.* = inf.get(a);
                 return .{ .ty = try value.minMaxIntType(ip, eq(u8, name, "@min"), operands) orelse try inf.peer(types.items) };
             }
-            // The absolute value of a signed integer is an unsigned integer of the same bit width
-            if (eq(u8, name, "@abs")) if (value.intInfo(ip, types.items[0])) |info| if (info.signed) return .{ .ty = try ip.intType(.unsigned, info.bits) };
+            // The absolute value of a signed integer is the unsigned integer of the same bit width
+            if (eq(u8, name, "@abs")) return .{ .ty = try value.absType(ip, types.items[0]) orelse .unknown };
             // Division and remainder: the peer type of both sides
             if (args.len == 2) return .{ .ty = try inf.peer(types.items) };
             return .{ .ty = types.items[0] };
@@ -1826,6 +1898,15 @@ const Inferrer = struct {
                 else => null,
             } else null;
             for (args) |a| _ = try inf.infer(a, elem);
+            // A known scalar splatted into a vector gives a known vector
+            if (dest) |d| if (ip.key(d) == .vector_type and args.len == 1) {
+                const scalar = inf.get(args[0]);
+                if (scalar.val) |v| if (scalar.ty == elem.? and v != .unknown and v != .undefined_value) {
+                    const elems = try inf.scratch.alloc(Index, ip.key(d).vector_type.len);
+                    @memset(elems, v);
+                    return .{ .ty = d, .val = try value.aggregate(ip, inf.scratch, d, elems) };
+                };
+            };
             return .{ .ty = dest orelse .unknown };
         }
         // The argument's result type is the backing integer of the destination type
@@ -2037,13 +2118,8 @@ const Inferrer = struct {
                 }
                 return .void_type;
             },
-            .@"defer" => |e| {
+            .@"defer", .@"errdefer" => |e| {
                 _ = try inf.infer(e, null);
-                return .void_type;
-            },
-            .@"errdefer" => |d| {
-                if (d.capture) |c| inf.bindings[@backingInt(c)] = .{ .ty = .anyerror_type };
-                _ = try inf.infer(d.body, null);
                 return .void_type;
             },
             .destructure => |d| {
@@ -2176,11 +2252,12 @@ const Inferrer = struct {
                 const cap = l.capture[i];
                 const ptr = inf.body.binding(cap).is_ptr;
                 const is_const = if (ptr) try inf.forCaptureConst(input, list.ty) else false;
-                const ty = if (ptr) try ip.ptrTo(elem, .one, is_const) else elem;
+                const attrs: InternPool.PtrAttrs = if (ptr) try inf.forCaptureAttrs(l, input, list.ty, elem, iteration) else .{};
+                const ty = if (ptr) try singlePtr(ip, elem, is_const, attrs) else elem;
                 inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
                     try inf.typeCapture(cap, list, iteration)
                 else if (iteration) |n| blk: {
-                    const it_ty = try inf.iterationType(list.ty, elem, n, ptr, is_const);
+                    const it_ty = try inf.iterationType(list.ty, elem, n, ptr, is_const, attrs);
                     const v = try inf.iterationValue(list, start, n);
                     // A pointer capture takes a pointer to this iteration's element; elements of a
                     // mutable list change at runtime, so no value is taken
@@ -2189,6 +2266,23 @@ const Inferrer = struct {
                 } else .{ .ty = ty };
             }
         }
+    }
+
+    /// Attributes of a pointer capture of `for` over `input` (of type `list`, elements of type
+    /// `elem`): those of a pointer to the element at the loop index, which is runtime-known
+    /// except when inferring one iteration (`iteration`). Without an iteration, the capture of
+    /// an `inline for` differs between iterations when the first element is aligned differently
+    /// from the others, so its alignment is unknown then.
+    fn forCaptureAttrs(inf: *Inferrer, l: Body.Loop, input: ExprId, list: Index, elem: Index, iteration: ?u32) Error!InternPool.PtrAttrs {
+        if (elem == .unknown) return .{};
+        const parent = switch (inf.ip.key(list)) {
+            .ptr_type => |p| p.attrs,
+            else => try inf.placeAttrs(input),
+        };
+        if (iteration) |n| return eval.elemPtrAttrs(inf.r, parent, elem, n);
+        var attrs = try eval.elemPtrAttrs(inf.r, parent, elem, null);
+        if (l.is_inline and attrs.alignment != (try eval.elemPtrAttrs(inf.r, parent, elem, 0)).alignment) attrs.alignment = .unknown;
+        return attrs;
     }
 
     /// The binding when the name `e` refers to a `comptime var` of this member
@@ -2349,12 +2443,12 @@ const Inferrer = struct {
 
     /// Type of a non-type loop variable when inferring the `n`-th iteration: for a tuple whose
     /// items have different types (`.{ &posix, &windows }`), the type of the `n`-th item
-    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool, is_const: bool) Error!Index {
+    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool, is_const: bool, attrs: InternPool.PtrAttrs) Error!Index {
         var t = elem;
         if (t == .unknown) if (tupleOf(inf.ip, list)) |tt| if (n < tt.types.len) {
             t = tt.types[n];
         };
-        return if (ptr) inf.ip.ptrTo(t, .one, is_const) else t;
+        return if (ptr) singlePtr(inf.ip, t, is_const, attrs) else t;
     }
 
     /// Value of a non-type loop variable when inferring the `n`-th iteration: `start + n` for a
@@ -2450,7 +2544,15 @@ const Inferrer = struct {
         if (is_ptr and inf.var_levels.len != 0) if (try inf.comptimeVarPlace(cond_e)) |v| inf.untrackComptimeVar(v);
         // A known non-null optional value is its payload value
         const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) cond_tv.val else null;
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
+        if (!is_ptr) {
+            inf.bindings[@backingInt(cap)] = .{ .ty = t, .val = val };
+            return;
+        }
+        // The payload of an optional is at its start; a pointer to the payload of an error union
+        // keeps only the address space
+        const place = try inf.placeAttrs(cond_e);
+        const attrs: InternPool.PtrAttrs = if (ip.key(cond) == .optional_type) place else .{ .address_space = place.address_space };
+        inf.bindings[@backingInt(cap)] = .{ .ty = try singlePtr(ip, t, try inf.isConstPlace(cond_e), attrs) };
     }
 
     /// Captures of a switch. For a tagged union, the capture of an ordinary prong is the peer of
@@ -2513,12 +2615,38 @@ const Inferrer = struct {
         if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
             if ((try inlineProngValues(ip, inf.body, inf.exprs, prong, operand, seed.index)).value) |v| val = v;
         };
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(operand_e)) else t, .val = if (is_ptr) null else val };
+        if (is_ptr) {
+            const attrs = try inf.switchCaptureAttrs(prongs, pi, operand_e, operand, t, is_union, inline_tag);
+            inf.bindings[@backingInt(cap)] = .{ .ty = try singlePtr(ip, t, try inf.isConstPlace(operand_e), attrs) };
+        } else inf.bindings[@backingInt(cap)] = .{ .ty = t, .val = val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
             const tag_val: ?Index = if (inline_tag) |name| (if (tag != .unknown) try ip.get(.{ .enum_tag = .{ .ty = tag, .name = name } }) else null) else null;
             inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag, .val = tag_val };
         }
+    }
+
+    /// Attributes of the pointer capture of a switch prong (with payload type `t`): for a tagged
+    /// union, those of a pointer to the field of the prong's items (the alignment is unknown when
+    /// they differ between the items); otherwise those of a pointer to the operand
+    fn switchCaptureAttrs(inf: *Inferrer, prongs: []const Body.Prong, pi: usize, operand_e: ExprId, operand: Index, t: Index, is_union: bool, inline_tag: ?[]const u8) Error!InternPool.PtrAttrs {
+        const prong = prongs[pi];
+        if (!is_union) return inf.placeAttrs(operand_e);
+        if (t == .unknown) return .{};
+        if (inline_tag) |name| return inf.fieldPlaceAttrs(operand_e, name, t);
+        var names: std.ArrayList([]const u8) = .empty;
+        if (prong.is_inline) {
+            const payloads = try inlineUnionPayloads(inf.r, inf.body, inf.exprs, prongs, pi, operand) orelse return .{ .alignment = .unknown };
+            for (payloads) |p| try names.append(inf.scratch, p.name);
+        } else for (prong.items) |item| {
+            try names.append(inf.scratch, itemTagName(inf.ip, inf.body, inf.exprs, item) orelse return .{ .alignment = .unknown });
+        }
+        if (names.items.len == 0) return .{};
+        var attrs = try inf.fieldPlaceAttrs(operand_e, names.items[0], t);
+        for (names.items[1..]) |name| {
+            if ((try inf.fieldPlaceAttrs(operand_e, name, t)).alignment != attrs.alignment) attrs.alignment = .unknown;
+        }
+        return attrs;
     }
 
     /// Type of a prong capture in a switch on an error set: for an ordinary prong, the set of the
@@ -2602,9 +2730,10 @@ const Inferrer = struct {
                     .optional_type => |c| c,
                     else => .unknown,
                 };
-                // When comptime-known, only one side is evaluated
+                // When comptime-known, only one side is evaluated, and a right-hand side that is
+                // taken gets only the result type of the whole expression
                 const non_null = inf.condValue(lhs);
-                const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, child, rhs_e), non_null == true);
+                const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, if (non_null == false) .unknown else child, rhs_e), non_null == true);
                 if (non_null) |n| return if (n) .{ .ty = child, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
@@ -2653,14 +2782,15 @@ const Inferrer = struct {
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
-            // Pointer arithmetic (matches the compiler): `[*]T ± usize` is still the original
-            // pointer type, and the difference of two pointers is usize
+            // Pointer arithmetic (matches the compiler): `[*]T ± usize` is the original pointer
+            // type with the alignment of the element at the offset, and the difference of two
+            // pointers is usize
             .plus, .minus => {
                 const lhs = try inf.infer(lhs_e, null);
                 if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e);
                 const rhs = try inf.infer(rhs_e, .usize_type);
                 if (isNonSlicePtr(ip, rhs.ty)) return .{ .ty = if (op == .minus) .usize_type else .unknown };
-                return .{ .ty = if (isManyPtr(ip, lhs.ty)) lhs.ty else .unknown };
+                return .{ .ty = if (isManyPtr(ip, lhs.ty)) try inf.ptrArithmetic(lhs.ty, rhs) else .unknown };
             },
             // Merging error sets
             .pipe_pipe => {
@@ -2769,8 +2899,10 @@ const Inferrer = struct {
                 return .{ .ty = payload };
             },
             .bang => {
-                const v = inf.condValue(try inf.infer(operand_e, .bool_type));
-                if (v) |b| if (inf.get(operand_e).ty == .bool_type) return boolValue(!b);
+                const operand = try inf.infer(operand_e, .bool_type);
+                // A vector of bools is negated element-wise
+                if (ip.key(operand.ty) == .vector_type) return .{ .ty = operand.ty };
+                if (inf.condValue(operand)) |b| if (operand.ty == .bool_type) return boolValue(!b);
                 return .{ .ty = .bool_type };
             },
             .ampersand => {
@@ -2791,7 +2923,7 @@ const Inferrer = struct {
                 } else null;
                 var v = try inf.infer(operand_e, child_expected);
                 const is_const = try inf.isConstPlace(operand_e);
-                const ty = try ip.ptrTo(v.ty, .one, is_const);
+                const ty: Index = if (v.ty == .unknown) .unknown else try ip.get(.{ .ptr_type = .{ .child = v.ty, .size = .one, .is_const = is_const, .attrs = try inf.placeAttrs(operand_e) } });
                 // Typed aggregate literals get no value from inference: a pointer to an array
                 // literal whose elements are all comptime-known (`&.{ 1, 2 }` coerced to a slice)
                 // gets the array from the interpreter
@@ -3014,6 +3146,56 @@ const Inferrer = struct {
         }
     }
 
+    /// Whether the inferred expression `e` depends on an abstract parameter: a parameter of this
+    /// member without a settled argument in the instance, a type that is not settled (such as an
+    /// abstract type parameter or a type loop variable), or a name of an enclosing scope without a
+    /// value outside a settled instance (see `value.isSettled`)
+    fn dependsOnAbstract(inf: *Inferrer, e: ExprId, depth: u32) Error!bool {
+        if (depth > 8) return true;
+        const b = inf.body;
+        const tv = inf.get(e);
+        if (tv.val) |v| return tv.isType() and !value.isSettled(inf.ip, v);
+        switch (b.expr(e)) {
+            .name_ref => |name| {
+                if (!b.nameRefIsEscaped(e)) if (try primitive(inf.ip, name) != null) return false;
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
+                const l = switch (def) {
+                    .local => |l| l,
+                    .item, .file => return !inf.concreteContext(),
+                };
+                if (l.file != inf.file or l.item != inf.item) return !inf.concreteContext();
+                const binding = b.binding(l.binding);
+                switch (binding.kind) {
+                    .param => {
+                        const own = inf.ownInstance() orelse return true;
+                        const i = std.mem.indexOfScalar(Body.BindingId, b.params, l.binding) orelse return true;
+                        return i >= own.args.len or (own.args[i] != .runtime and !value.isSettled(inf.ip, own.args[i]));
+                    },
+                    .local_const, .local_var => return if (binding.init) |init| inf.dependsOnAbstract(init, depth + 1) else false,
+                    .capture => return false,
+                }
+            },
+            .field_access => |fa| return inf.dependsOnAbstract(fa.lhs, depth + 1),
+            .call => |c| {
+                if (try inf.dependsOnAbstract(c.callee, depth + 1)) return true;
+                for (c.args) |x| if (try inf.dependsOnAbstract(x, depth + 1)) return true;
+                return false;
+            },
+            .builtin_call => |c| {
+                for (c.args) |x| if (try inf.dependsOnAbstract(x, depth + 1)) return true;
+                return false;
+            },
+            .binary => |x| return try inf.dependsOnAbstract(x.lhs, depth + 1) or try inf.dependsOnAbstract(x.rhs, depth + 1),
+            else => return false,
+        }
+    }
+
+    /// Every parameter of the enclosing instances has a settled argument
+    fn concreteContext(inf: *Inferrer) bool {
+        const i = inf.inst orelse return false;
+        return value.isSettled(inf.ip, i);
+    }
+
     /// Source form of an expression (used to display arrays of unknown length): names, field
     /// accesses, literals, calls and binary operations; false for other forms
     fn exprText(inf: *Inferrer, e: ExprId, out: *std.ArrayList(u8), depth: u32) Error!bool {
@@ -3121,43 +3303,54 @@ const Inferrer = struct {
 
     /// Slicing (matches the compiler's `analyzeSlice`): a pointer to an array when the length is
     /// comptime-known, a slice otherwise; slicing a many-item pointer without an end is pointer
-    /// arithmetic and keeps the original pointer type. Slicing up to the end of an array or slice
-    /// keeps its original sentinel.
+    /// arithmetic. Slicing up to the end of an array or slice keeps its original sentinel. The
+    /// result has the attributes of a pointer to the start element (see `elemPtrAttrs`).
     fn slice(inf: *Inferrer, e: ExprId, lhs_e: ExprId, start_e: ExprId, end_e: ?ExprId, sentinel_e: ?ExprId) Error!TypedValue {
         const ip = inf.ip;
         const lhs = try inf.infer(lhs_e, null);
         const start = try inf.infer(start_e, .usize_type);
         const end: ?TypedValue = if (end_e) |x| try inf.infer(x, .usize_type) else null;
-        const Source = struct { elem: Index, sentinel: ?Index = null, len: ?u64 = null, is_const: bool = false };
+        const Source = struct { elem: Index, sentinel: ?Index = null, len: ?u64 = null, is_const: bool = false, attrs: InternPool.PtrAttrs = .{} };
         const src: Source = switch (ip.key(lhs.ty)) {
-            .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = try inf.isConstPlace(lhs_e) },
-            .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = try inf.isConstPlace(lhs_e) },
+            .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = try inf.isConstPlace(lhs_e), .attrs = try inf.placeAttrs(lhs_e) },
+            .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = try inf.isConstPlace(lhs_e), .attrs = try inf.placeAttrs(lhs_e) },
             .ptr_type => |p| switch (p.size) {
                 .one => switch (ip.key(p.child)) {
-                    .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const },
-                    .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = p.is_const },
+                    .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const, .attrs = p.attrs },
+                    .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = p.is_const, .attrs = p.attrs },
                     // A pointer to a single element is sliced as an array of length 1
-                    else => .{ .elem = p.child, .len = 1, .is_const = p.is_const },
+                    else => .{ .elem = p.child, .len = 1, .is_const = p.is_const, .attrs = p.attrs },
                 },
-                .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const },
+                .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const, .attrs = p.attrs },
             },
             else => .{ .elem = .unknown },
         };
         const explicit: ?TypedValue = if (sentinel_e) |x| try inf.infer(x, if (src.elem != .unknown) src.elem else null) else null;
         if (src.elem == .unknown) return .unknown;
-        if (end == null and isManyPtr(ip, lhs.ty)) return .{ .ty = lhs.ty };
+        if (end == null and isManyPtr(ip, lhs.ty)) return .{ .ty = try inf.ptrArithmetic(lhs.ty, start) };
         const start_n = std.math.cast(u64, value.intOf(ip, start.val) orelse -1);
         const end_n: ?u64 = if (end) |x| std.math.cast(u64, value.intOf(ip, x.val) orelse -1) else src.len;
         const end_is_len = end == null or (src.len != null and end_n != null and end_n.? == src.len.?);
         const sentinel: ?Index = if (explicit) |x| (x.val orelse return .unknown) else if (end_is_len) src.sentinel else null;
+        const attrs = try eval.elemPtrAttrs(inf.r, src.attrs, src.elem, start_n);
         if (start_n != null and end_n != null and end_n.? >= start_n.?) {
             const array = try ip.get(.{ .array_type = .{ .len = end_n.? - start_n.?, .child = src.elem, .sentinel = sentinel } });
-            const ty = try ip.ptrTo(array, .one, src.is_const);
+            const ty = try ip.get(.{ .ptr_type = .{ .child = array, .size = .one, .is_const = src.is_const, .attrs = attrs } });
             // comptime-known constant and range: the interpreter computes the value of the slice
             if (src.is_const) if (try inf.knownValue(e, lhs.val, ty)) |tv| return tv;
             return .{ .ty = ty };
         }
-        return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel } }) };
+        return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel, .attrs = attrs } }) };
+    }
+
+    /// Type of `ptr + offset` / `ptr - offset` for a many-item or C pointer type `ptr` (the
+    /// compiler's `analyzePtrArithmetic`): the same pointer type with the attributes of a pointer
+    /// to the element at `offset`
+    fn ptrArithmetic(inf: *Inferrer, ptr: Index, offset: TypedValue) Error!Index {
+        var p = inf.ip.key(ptr).ptr_type;
+        const index = std.math.cast(u64, value.intOf(inf.ip, offset.val) orelse -1);
+        p.attrs = try eval.elemPtrAttrs(inf.r, p.attrs, p.child, index);
+        return inf.ip.get(.{ .ptr_type = p });
     }
 
     /// Result type `Log2Int(T)` of the right-hand side of a shift (matches the compiler); null for
@@ -3193,6 +3386,92 @@ const Inferrer = struct {
         return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
     }
 
+    /// Attributes of a pointer to the place `e` (`&e`, pointer captures): the `align(...)` of a
+    /// variable; for a field or an element, those of the pointer or place it is reached through,
+    /// adjusted for its offset (the compiler's `fieldPtrType` / `elemPtrType`)
+    fn placeAttrs(inf: *Inferrer, e: ExprId) Error!InternPool.PtrAttrs {
+        const ip = inf.ip;
+        const b = inf.body;
+        switch (b.expr(e)) {
+            .name_ref => |name| {
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .{};
+                return inf.defAttrs(def);
+            },
+            .field_access => |fa| {
+                const field = fa.field orelse return .{};
+                // A member of a namespace is a declaration
+                if (inf.get(fa.lhs).asType()) |t| {
+                    const ns = try queries.namespaceOfType(inf.r, t) orelse return .{};
+                    return inf.defAttrs(try inf.r.memberDef(ns, field) orelse return .{});
+                }
+                return inf.fieldPlaceAttrs(fa.lhs, field, inf.get(e).ty);
+            },
+            .builtin_call => |c| {
+                if (!std.mem.eql(u8, c.name, "@field") or c.args.len != 2) return .{};
+                const written: ?[]const u8 = switch (b.expr(c.args[1])) {
+                    .literal => |text| if (try Body.stringLiteralValue(inf.scratch, text)) |s| s else null,
+                    else => null,
+                };
+                const field = written orelse try eval.stringValue(inf.r, inf.get(c.args[1])) orelse return .{ .alignment = .unknown };
+                return inf.fieldPlaceAttrs(c.args[0], field, inf.get(e).ty);
+            },
+            .index => |x| {
+                const lhs = inf.get(x.lhs).ty;
+                const index: ?u64 = if (value.intOf(ip, inf.get(x.index).val)) |n| std.math.cast(u64, n) else null;
+                // An element of a tuple is a field
+                if (tupleOf(ip, lhs) != null) {
+                    var buf: [20]u8 = undefined;
+                    const name = std.fmt.bufPrint(&buf, "{d}", .{index orelse return .{ .alignment = .unknown }}) catch unreachable;
+                    return inf.fieldPlaceAttrs(x.lhs, name, inf.get(e).ty);
+                }
+                const parent = switch (ip.key(lhs)) {
+                    .ptr_type => |p| p.attrs,
+                    else => try inf.placeAttrs(x.lhs),
+                };
+                return eval.elemPtrAttrs(inf.r, parent, inf.get(e).ty, index);
+            },
+            .deref => |x| return switch (ip.key(inf.get(x).ty)) {
+                .ptr_type => |p| p.attrs,
+                else => .{},
+            },
+            // The payload of an optional is at its start
+            .unwrap_optional => |x| return inf.placeAttrs(x),
+            .binary => |bin| return if (bin.op == .keyword_orelse and inf.get(bin.rhs).ty == .noreturn_type) inf.placeAttrs(bin.lhs) else .{},
+            // A pointer to the payload of an error union keeps only the address space
+            .@"catch" => |c| return if (inf.get(c.rhs).ty == .noreturn_type) .{ .address_space = (try inf.placeAttrs(c.lhs)).address_space } else .{},
+            else => return .{},
+        }
+    }
+
+    /// `placeAttrs` of the field `name` (of type `field_ty`) of `base`: through a pointer or of
+    /// the place `base`
+    fn fieldPlaceAttrs(inf: *Inferrer, base: ExprId, name: []const u8, field_ty: Index) Error!InternPool.PtrAttrs {
+        const t = inf.get(base).ty;
+        const parent: InternPool.PtrAttrs, const agg: Index = switch (inf.ip.key(t)) {
+            .ptr_type => |p| if (p.size == .one or p.size == .c) .{ p.attrs, p.child } else .{ try inf.placeAttrs(base), t },
+            else => .{ try inf.placeAttrs(base), t },
+        };
+        if (agg == .unknown) return .{ .alignment = .unknown };
+        return eval.fieldPtrAttrs(inf.r, parent, agg, name, field_ty);
+    }
+
+    /// Attributes of a pointer to a variable: its `align(...)`
+    fn defAttrs(inf: *Inferrer, def: resolve.Def) Error!InternPool.PtrAttrs {
+        switch (def) {
+            .local => |l| {
+                if (l.file != inf.file or l.item != inf.item) {
+                    // A local of the outer function: its alignment is inferred there
+                    const outer = (try inf.r.body(l.file, l.item)).binding(l.binding);
+                    return if (outer.@"align" != null) .{ .alignment = .unknown } else .{};
+                }
+                const a = inf.body.binding(l.binding).@"align" orelse return .{};
+                return .{ .alignment = eval.alignmentOf(inf.ip, (try inf.inferComptime(a, try inf.clauseType(.@"align"))).val) };
+            },
+            .item => |it| return .{ .alignment = try eval.declAlignment(inf.r, it.file, it.item, inf.inst) },
+            .file => return .{},
+        }
+    }
+
     /// Type of an inferred subexpression (for `placeIsConst`)
     fn exprType(inf: *Inferrer, e: ExprId) TypedValue {
         return inf.get(e);
@@ -3205,7 +3484,9 @@ const Inferrer = struct {
         };
     }
 
-    /// A commonly used subset of peer type resolution; unknown when the types cannot be unified
+    /// Peer type resolution (matches the compiler's strategies for error sets and error unions, C
+    /// pointers, numbers, enum literals, optionals, pointers, arrays and vectors); unknown when
+    /// the types cannot be unified
     pub fn peer(inf: *Inferrer, types: []const Index) Error!Index {
         const ip = inf.ip;
         var result: ?Index = null;
@@ -3225,6 +3506,19 @@ const Inferrer = struct {
                 continue;
             };
             if (cur == t) continue;
+            // An error set or error union on either side: the error sets merge and the other
+            // types are the payload
+            if (isErrorSet(ip, cur) or isErrorSet(ip, t) or ip.key(cur) == .error_union_type or ip.key(t) == .error_union_type) {
+                result = try inf.peerErrors(cur, t);
+                if (result.? == .unknown) return .unknown;
+                continue;
+            }
+            // A C pointer on either side: the other side is a pointer, an optional pointer or an
+            // integer, and the result is a C pointer
+            if (isCPtr(ip, cur) or isCPtr(ip, t)) {
+                result = try peerCPtr(inf.r, ip, cur, t) orelse return .unknown;
+                continue;
+            }
             if (cur == .comptime_int_type and (ip.isInt(t) or ip.isFloat(t))) {
                 result = t;
                 continue;
@@ -3254,6 +3548,18 @@ const Inferrer = struct {
                 if (y > x) result = t;
                 continue;
             }
+            // A fixed-width float with an integer: the float, when every value of the integer
+            // type is exact in it (a comptime-known integer value always is, but values are not
+            // part of peer resolution here)
+            if (ip.isInt(cur) and t != .comptime_float_type and ip.isFloat(t)) {
+                if (!intFitsFloat(ip, cur, t)) return .unknown;
+                result = t;
+                continue;
+            }
+            if (ip.isInt(t) and cur != .comptime_float_type and ip.isFloat(cur)) {
+                if (!intFitsFloat(ip, t, cur)) return .unknown;
+                continue;
+            }
             // One side is an optional: the peer of the payload and the other side is wrapped back
             // into an optional
             if (ip.key(cur) == .optional_type or ip.key(t) == .optional_type) {
@@ -3262,15 +3568,103 @@ const Inferrer = struct {
                 result = try ip.optionalOf(p);
                 continue;
             }
-            if (try peerPtr(ip, cur, t)) |p| {
+            if (try peerPtr(inf.r, ip, cur, t)) |p| {
+                result = p;
+                continue;
+            }
+            if (try inf.peerArrayLike(cur, t)) |p| {
                 result = p;
                 continue;
             }
             return .unknown;
         }
-        const t = result orelse return if (has_null) .null_type else if (types.len != 0 and allNoreturn(types)) .noreturn_type else .void_type;
-        if (has_null and ip.key(t) != .optional_type) return ip.optionalOf(t);
+        // Only noreturn and undefined peers: they must all be the same type
+        const t = result orelse return if (has_null) .null_type else if (types.len == 0) .void_type else if (allEqual(types)) types[0] else .unknown;
+        if (has_null) switch (ip.key(t)) {
+            .optional_type => {},
+            // A C pointer can already hold null
+            .ptr_type => |p| if (p.size != .c) return ip.optionalOf(t),
+            // The null goes into the payload of an error union
+            .error_union_type => |eu| return ip.get(.{ .error_union_type = .{ .err = eu.err, .payload = try inf.peer(&.{ eu.payload, .null_type }) } }),
+            else => return if (isErrorSet(ip, t)) ip.get(.{ .error_union_type = .{ .err = t, .payload = .null_type } }) else ip.optionalOf(t),
+        };
         return t;
+    }
+
+    /// Peer of two types where at least one is an error set or an error union (matches the
+    /// compiler's `error_set` / `error_union` strategies): the error sets merge, the payloads
+    /// (and the types that are neither) resolve as peers
+    fn peerErrors(inf: *Inferrer, a: Index, b: Index) Error!Index {
+        const ip = inf.ip;
+        const set_a, const payload_a = splitErrors(ip, a);
+        const set_b, const payload_b = splitErrors(ip, b);
+        const set = if (set_a) |x| (if (set_b) |y| try inf.mergeErrorSets(x, y) else x) else set_b.?;
+        if (set == .unknown) return .unknown;
+        const payload = if (payload_a) |x| (if (payload_b) |y| try inf.peer(&.{ x, y }) else x) else payload_b orelse return set;
+        if (payload == .unknown) return .unknown;
+        return ip.get(.{ .error_union_type = .{ .err = set, .payload = payload } });
+    }
+
+    /// Error set and payload of a peer: an error set has no payload, an error union both, and any
+    /// other type is a payload
+    fn splitErrors(ip: *InternPool, t: Index) struct { ?Index, ?Index } {
+        if (isErrorSet(ip, t)) return .{ t, null };
+        return switch (ip.key(t)) {
+            .error_union_type => |eu| .{ eu.err, eu.payload },
+            else => .{ null, t },
+        };
+    }
+
+    /// Merge of two error sets (matches the compiler's `maybeMergeErrorSets`): a set that holds
+    /// the other is the result as is, otherwise the union of the members; unknown when the
+    /// members cannot be computed
+    fn mergeErrorSets(inf: *Inferrer, a: Index, b: Index) Error!Index {
+        if (a == b or a == .anyerror_type) return a;
+        if (b == .anyerror_type) return b;
+        const x = try queries.errorSetMembers(inf.r, a) orelse return .unknown;
+        const y = try queries.errorSetMembers(inf.r, b) orelse return .unknown;
+        if (isSubset(y, x)) return a;
+        if (isSubset(x, y)) return b;
+        return inf.ip.errorSet(inf.scratch, try std.mem.concat(inf.scratch, []const u8, &.{ x, y }));
+    }
+
+    fn isSubset(sub: []const []const u8, set: []const []const u8) bool {
+        outer: for (sub) |name| {
+            for (set) |n| if (std.mem.eql(u8, n, name)) continue :outer;
+            return false;
+        }
+        return true;
+    }
+
+    /// Peer of two types where at least one is an array or a vector (matches the compiler's
+    /// `array` / `vector` strategies): the lengths must agree; with a vector, the element types
+    /// resolve as peers into a vector; between arrays, the element types must be the same and
+    /// the sentinel is kept when both have it; a tuple of the same length takes the element type
+    /// of the other side. Null when they cannot be unified.
+    fn peerArrayLike(inf: *Inferrer, a: Index, b: Index) Error!?Index {
+        const ip = inf.ip;
+        const x = arrayLike(ip, a) orelse return null;
+        const y = arrayLike(ip, b) orelse return null;
+        if ((x.kind == .tuple and y.kind == .tuple) or x.len != y.len) return null;
+        if (x.kind == .vector or y.kind == .vector) {
+            const child = if (x.child) |cx| (if (y.child) |cy| try inf.peer(&.{ cx, cy }) else cx) else y.child.?;
+            if (child == .unknown) return null;
+            return try ip.get(.{ .vector_type = .{ .len = @intCast(x.len), .child = child } });
+        }
+        const child = if (x.child) |cx| (if (y.child) |cy| (if (cx == cy) cx else return null) else cx) else y.child.?;
+        const sentinel: ?Index = if (x.sentinel != null and y.sentinel != null and x.sentinel.? == y.sentinel.?) x.sentinel else null;
+        return try ip.get(.{ .array_type = .{ .len = x.len, .child = child, .sentinel = sentinel } });
+    }
+
+    const ArrayLike = struct { kind: enum { array, vector, tuple }, len: u64, child: ?Index, sentinel: ?Index = null };
+
+    fn arrayLike(ip: *InternPool, t: Index) ?ArrayLike {
+        return switch (ip.key(t)) {
+            .array_type => |arr| .{ .kind = .array, .len = arr.len, .child = arr.child, .sentinel = arr.sentinel },
+            .vector_type => |v| .{ .kind = .vector, .len = v.len, .child = v.child },
+            .tuple_type => |tt| .{ .kind = .tuple, .len = tt.types.len, .child = null },
+            else => null,
+        };
     }
 
     /// Types an enum literal can coerce to: enums and unions
@@ -3283,8 +3677,8 @@ const Inferrer = struct {
         };
     }
 
-    fn allNoreturn(types: []const Index) bool {
-        for (types) |t| if (t != .noreturn_type) return false;
+    fn allEqual(types: []const Index) bool {
+        for (types[1..]) |t| if (t != types[0]) return false;
         return true;
     }
 
@@ -3583,6 +3977,88 @@ fn isPtrCast(name: []const u8) bool {
     return false;
 }
 
+fn isErrorSet(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .error_set_type, .inferred_error_set => true,
+        .simple_type => |s| s == .anyerror,
+        else => false,
+    };
+}
+
+fn isCPtr(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size == .c,
+        else => false,
+    };
+}
+
+/// Peer of two types where at least one is a C pointer (matches the compiler's `c_ptr`
+/// strategy): integers coerce to the C pointer; pointers and optional pointers must have the
+/// same element type; const if either side is const, the sentinel is kept only when both sides
+/// have the same one, and the attributes join as in `peerPtrAttrs`. Null when they cannot be
+/// unified.
+fn peerCPtr(r: *Resolver, ip: *InternPool, a: Index, b: Index) Error!?Index {
+    if (ip.isInt(a)) return if (isCPtr(ip, b)) b else null;
+    if (ip.isInt(b)) return if (isCPtr(ip, a)) a else null;
+    const x = runtimePtr(ip, a) orelse return null;
+    const y = runtimePtr(ip, b) orelse return null;
+    if (x.child != y.child) return null;
+    const sentinel: ?Index = if (x.sentinel != null and y.sentinel != null and x.sentinel.? == y.sentinel.?) x.sentinel else null;
+    const attrs = try peerPtrAttrs(r, x, y) orelse return null;
+    return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .c, .is_const = x.is_const or y.is_const, .sentinel = sentinel, .attrs = attrs } });
+}
+
+/// Attributes of the peer of the pointers `x` and `y` (the compiler's `c_ptr` and `ptr`
+/// strategies): the lower of the two alignments, explicit unless neither side has an explicit
+/// one, and volatile and allowzero when either side is. Null when the address spaces or the bit
+/// ranges differ.
+fn peerPtrAttrs(r: *Resolver, x: InternPool.PtrType, y: InternPool.PtrType) Error!?InternPool.PtrAttrs {
+    const a = x.attrs;
+    const b = y.attrs;
+    if (a.host_size != b.host_size or a.bit_offset != b.bit_offset) return null;
+    var out = a;
+    if (a.address_space == null or b.address_space == null) {
+        out.address_space = null;
+    } else if (a.address_space.? != b.address_space.?) return null;
+    out.is_volatile = a.is_volatile or b.is_volatile;
+    out.is_allowzero = a.is_allowzero or b.is_allowzero;
+    if (a.alignment == .natural and b.alignment == .natural) return out;
+    const x_align = try ptrAlignment(r, x);
+    const y_align = try ptrAlignment(r, y);
+    out.alignment = if (x_align != null and y_align != null) .fromBytes(@min(x_align.?, y_align.?)) else .unknown;
+    return out;
+}
+
+/// Alignment in bytes of the address of a pointer: the explicit one, or that of its child;
+/// null when not known
+fn ptrAlignment(r: *Resolver, p: InternPool.PtrType) Error!?u64 {
+    if (p.attrs.alignment != .natural) return p.attrs.alignment.bytes();
+    return if (try eval.typeLayout(r, p.child)) |l| l.alignment else null;
+}
+
+/// The pointer type of a pointer or of an optional pointer
+fn runtimePtr(ip: *InternPool, t: Index) ?@FieldType(InternPool.Key, "ptr_type") {
+    return switch (ip.key(optionalChild(ip, t))) {
+        .ptr_type => |p| p,
+        else => null,
+    };
+}
+
+/// Whether every value of the integer type `int` is exact in the float type `float` (the
+/// compiler's peer resolution check for runtime integers)
+fn intFitsFloat(ip: *InternPool, int: Index, float: Index) bool {
+    const info = value.intInfo(ip, int) orelse return false;
+    const significand: u16 = switch (value.floatBits(ip, float) orelse return false) {
+        16 => 11,
+        32 => 24,
+        64 => 53,
+        80 => 64,
+        128 => 113,
+        else => return false,
+    };
+    return info.bits - @intFromBool(info.signed) <= significand;
+}
+
 fn optionalChild(ip: *InternPool, t: Index) Index {
     return switch (ip.key(t)) {
         .optional_type => |c| c,
@@ -3592,9 +4068,10 @@ fn optionalChild(ip: *InternPool, t: Index) Index {
 
 /// Peer of two pointers (matches the compiler): the element types must be the same; a single-item
 /// pointer to an array unifies with a slice or many-item pointer into the latter, and array
-/// pointers of different lengths unify into a slice; const if either side is const, and the
-/// sentinel is kept only when both sides have the same one. null when they cannot be unified.
-fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
+/// pointers of different lengths unify into a slice; const if either side is const, the
+/// sentinel is kept only when both sides have the same one, and the attributes join as in
+/// `peerPtrAttrs`. null when they cannot be unified.
+fn peerPtr(r: *Resolver, ip: *InternPool, a: Index, b: Index) Error!?Index {
     const x = switch (ip.key(a)) {
         .ptr_type => |p| p,
         else => return null,
@@ -3603,8 +4080,8 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
         .ptr_type => |p| p,
         else => return null,
     };
-    if (try tupleAsArray(ip, x, y)) |p| return peerPtr(ip, p, b);
-    if (try tupleAsArray(ip, y, x)) |p| return peerPtr(ip, a, p);
+    if (try tupleAsArray(ip, x, y)) |p| return peerPtr(r, ip, p, b);
+    if (try tupleAsArray(ip, y, x)) |p| return peerPtr(r, ip, a, p);
     const xa: ?@FieldType(InternPool.Key, "array_type") = if (x.size == .one) switch (ip.key(x.child)) {
         .array_type => |arr| arr,
         else => null,
@@ -3614,10 +4091,11 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
         else => null,
     } else null;
     const is_const = x.is_const or y.is_const;
+    const attrs = try peerPtrAttrs(r, x, y) orelse return null;
     // A single-item pointer to a non-array only unifies with the same single-item pointer type
     if ((x.size == .one and xa == null) or (y.size == .one and ya == null)) {
         if (x.size != y.size or x.child != y.child) return null;
-        return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .one, .is_const = is_const } });
+        return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .one, .is_const = is_const, .attrs = attrs } });
     }
     const x_elem = if (xa) |arr| arr.child else x.child;
     const y_elem = if (ya) |arr| arr.child else y.child;
@@ -3628,12 +4106,12 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
     if (xa != null and ya != null) {
         if (xa.?.len == ya.?.len) {
             const arr = try ip.get(.{ .array_type = .{ .len = xa.?.len, .child = x_elem, .sentinel = sentinel } });
-            return try ip.ptrTo(arr, .one, is_const);
+            return try ip.get(.{ .ptr_type = .{ .child = arr, .size = .one, .is_const = is_const, .attrs = attrs } });
         }
-        return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = .slice, .is_const = is_const, .sentinel = sentinel } });
+        return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = .slice, .is_const = is_const, .sentinel = sentinel, .attrs = attrs } });
     }
     const size: InternPool.PtrSize = if (xa != null) y.size else if (ya != null) x.size else if (x.size == y.size) x.size else return null;
-    return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel } });
+    return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel, .attrs = attrs } });
 }
 
 /// The pointer to an array corresponding to the single-item pointer to a tuple `p` (`&.{}`,
@@ -3652,7 +4130,13 @@ fn tupleAsArray(ip: *InternPool, p: @FieldType(InternPool.Key, "ptr_type"), othe
     } else other.child;
     for (tt.types) |t| if (t != elem) return null;
     const arr = try ip.get(.{ .array_type = .{ .len = @intCast(tt.types.len), .child = elem, .sentinel = null } });
-    return try ip.ptrTo(arr, .one, p.is_const);
+    return try singlePtr(ip, arr, p.is_const, p.attrs);
+}
+
+/// `*T` with the given constness and attributes; unknown when `T` is
+fn singlePtr(ip: *InternPool, child: Index, is_const: bool, attrs: InternPool.PtrAttrs) Allocator.Error!Index {
+    if (child == .unknown) return .unknown;
+    return ip.get(.{ .ptr_type = .{ .child = child, .size = .one, .is_const = is_const, .attrs = attrs } });
 }
 
 /// Pointers that support pointer arithmetic (many-item pointers and C pointers)
@@ -3866,18 +4350,39 @@ fn order(op: SyntaxKind, x: anytype, y: @TypeOf(x)) ?bool {
     };
 }
 
-/// Ignoring noreturn branches: the value when all branches have the same value
-fn sameLiveValue(values: []const TypedValue, ty: Index) ?Index {
+/// Ignoring noreturn branches: the value when all branches have the same value. Branches that
+/// are pointer types differing only in their alignment (`if (alignment) |a| []align(a) T else
+/// []T` with an undetermined condition) give that pointer type with an unknown alignment.
+fn sameLiveValue(ip: *InternPool, values: []const TypedValue, ty: Index) Allocator.Error!?Index {
     var v: ?Index = null;
+    var differ = false;
     for (values) |x| {
         if (x.ty == .noreturn_type) continue;
         if (x.ty != ty) return null;
         const xv = x.val orelse return null;
         if (v) |y| {
-            if (y != xv) return null;
+            if (y != xv) differ = true;
         } else v = xv;
     }
-    return v;
+    if (!differ) return v;
+    if (ty != .type_type) return null;
+    var joined: ?InternPool.PtrType = null;
+    for (values) |x| {
+        if (x.ty == .noreturn_type) continue;
+        const p = switch (ip.key(x.val.?)) {
+            .ptr_type => |p| p,
+            else => return null,
+        };
+        const j = &(joined orelse {
+            joined = p;
+            continue;
+        });
+        var same = p;
+        same.attrs.alignment = j.attrs.alignment;
+        if (!deepEql(same, j.*)) return null;
+        if (p.attrs.alignment != j.attrs.alignment) j.attrs.alignment = .unknown;
+    }
+    return try ip.get(.{ .ptr_type = joined.? });
 }
 
 /// The value when all breaks have the same value (and its type is the merged type)
@@ -4073,6 +4578,8 @@ pub fn primitive(ip: *InternPool, name: []const u8) Error!?TypedValue {
     if (name.len >= 2 and (name[0] == 'u' or name[0] == 'i')) {
         const bits = std.fmt.parseInt(u16, name[1..], 10) catch return null;
         if (name[1] == '0' and name.len > 2) return null;
+        // AstGen rejects a signed integer type with bit width 0
+        if (name[0] == 'i' and bits == 0) return null;
         return TypedValue.ofType(try ip.intType(if (name[0] == 'u') .unsigned else .signed, bits));
     }
     return null;

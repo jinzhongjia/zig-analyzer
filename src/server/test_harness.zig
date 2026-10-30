@@ -122,12 +122,23 @@ pub const Harness = struct {
     /// Like `start`, but the server uses the given Io (such as an `Io.Threaded` that limits the
     /// number of threads)
     pub fn startIo(h: *Harness, io: Io) !void {
+        return h.startWith(io, null);
+    }
+
+    /// Like `start`, with the case rule of file identity given (to cover the case-insensitive
+    /// rules on any platform)
+    pub fn startCase(h: *Harness, case: za.base.Vfs.CaseRule) !void {
+        return h.startWith(testing.io, case);
+    }
+
+    fn startWith(h: *Harness, io: Io, case: ?za.base.Vfs.CaseRule) !void {
         h.* = .{};
         h.arena = .init(testing.allocator);
         h.input.reader.buffer = &h.input.read_buf;
         h.writer = .{ .io = testing.io, .inner = &h.output.writer };
         try h.server.init(io, testing.allocator, &h.writer);
         h.server.environ = testing.environ;
+        if (case) |c| h.server.vfs.case = c;
         h.thread = try std.Thread.spawn(.{}, runServer, .{h});
     }
 
@@ -149,6 +160,11 @@ pub const Harness = struct {
     pub fn write(h: *Harness, value: anytype) !void {
         const body = try std.json.Stringify.valueAlloc(testing.allocator, value, .{ .emit_null_optional_fields = false });
         defer testing.allocator.free(body);
+        try h.writeBody(body);
+    }
+
+    /// Sends `body` as one message, byte for byte
+    pub fn writeBody(h: *Harness, body: []const u8) !void {
         var header: [64]u8 = undefined;
         const w = &h.input.writer;
         try w.writeAll(try std.fmt.bufPrint(&header, "Content-Length: {d}\r\n\r\n", .{body.len}));

@@ -31,10 +31,19 @@ pub const ResponseError = struct {
 pub const Message = union(enum) {
     request: struct { id: Id, method: []const u8, params: json.Value },
     notification: struct { method: []const u8, params: json.Value },
-    response: struct { id: ?Id, result: json.Value, @"error": ?ResponseError },
+    /// `failed`: the response has an `error` member that is not null. Its content is not
+    /// inspected: a malformed error object (such as one without `message`) still reports the
+    /// failure of the request it answers.
+    response: struct { id: ?Id, result: json.Value, failed: bool },
 };
 
-pub const ParseError = error{ InvalidMessage, OutOfMemory };
+pub const ParseError = error{
+    /// The body is not valid JSON
+    InvalidJson,
+    /// The body is valid JSON but not a request, notification or response
+    InvalidMessage,
+    OutOfMemory,
+};
 
 /// Parses the outer structure of a message; `params` / `result` are kept as `json.Value` and
 /// parsed into concrete types per method by the handlers.
@@ -42,7 +51,7 @@ pub const ParseError = error{ InvalidMessage, OutOfMemory };
 pub fn parse(arena: Allocator, body: []const u8) ParseError!Message {
     const value = json.parseFromSliceLeaky(json.Value, arena, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidMessage,
+        else => return error.InvalidJson,
     };
     if (value != .object) return error.InvalidMessage;
     const obj = value.object;
@@ -61,17 +70,27 @@ pub fn parse(arena: Allocator, body: []const u8) ParseError!Message {
         return .{ .notification = .{ .method = method.string, .params = params } };
     }
 
-    const err: ?ResponseError = if (obj.get("error")) |e|
-        json.parseFromValueLeaky(ResponseError, arena, e, .{ .ignore_unknown_fields = true }) catch return error.InvalidMessage
-    else
-        null;
-    return .{ .response = .{ .id = id, .result = obj.get("result") orelse .null, .@"error" = err } };
+    const failed = if (obj.get("error")) |e| e != .null else false;
+    return .{ .response = .{ .id = id, .result = obj.get("result") orelse .null, .failed = failed } };
 }
 
 /// Parses `params` into the parameter type of the method.
 pub fn parseParams(comptime T: type, arena: Allocator, params: json.Value) json.ParseFromValueError!T {
     if (T == void) return {};
     return json.parseFromValueLeaky(T, arena, params, .{ .ignore_unknown_fields = true });
+}
+
+/// Whether arrays and objects in `value` nest more than `limit` levels deep (`[]` is one level);
+/// descends at most `limit` levels
+pub fn nestedDeeper(value: json.Value, limit: usize) bool {
+    const children: []const json.Value = switch (value) {
+        .array => |a| a.items,
+        .object => |o| o.values(),
+        else => return false,
+    };
+    if (limit == 0) return true;
+    for (children) |child| if (nestedDeeper(child, limit - 1)) return true;
+    return false;
 }
 
 const stringify_options: json.Stringify.Options = .{ .emit_null_optional_fields = false };
@@ -118,7 +137,8 @@ pub fn errorResponse(gpa: Allocator, id: ?Id, code: i32, message: []const u8) Al
     return error.OutOfMemory;
 }
 
-/// A request from the server to the client
+/// A request from the server to the client; `params` of type `void` omits the member (for
+/// methods without parameters: JSON-RPC allows only a structured value there)
 pub fn request(gpa: Allocator, id: Id, method: []const u8, params: anytype) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -197,10 +217,27 @@ test "classify requests, notifications and responses" {
         \\{"jsonrpc":"2.0","id":"abc","error":{"code":-32601,"message":"no"}}
     );
     try testing.expectEqualStrings("abc", resp.response.id.?.string);
-    try testing.expectEqual(-32601, resp.response.@"error".?.code);
+    try testing.expect(resp.response.failed);
+
+    // A null error is no error; an error object missing members is still an error
+    const ok = try parse(a,
+        \\{"jsonrpc":"2.0","id":2,"result":[null],"error":null}
+    );
+    try testing.expect(!ok.response.failed);
+    try testing.expect(ok.response.result == .array);
+    const incomplete = try parse(a,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32603}}
+    );
+    try testing.expect(incomplete.response.failed);
 
     try testing.expectError(error.InvalidMessage, parse(a, "[1]"));
-    try testing.expectError(error.InvalidMessage, parse(a, "{"));
+    try testing.expectError(error.InvalidMessage, parse(a,
+        \\{"jsonrpc":"2.0","id":true,"method":"x"}
+    ));
+    try testing.expectError(error.InvalidMessage, parse(a,
+        \\{"jsonrpc":"2.0","method":1}
+    ));
+    try testing.expectError(error.InvalidJson, parse(a, "{"));
 }
 
 test request {
@@ -210,6 +247,22 @@ test request {
     try testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":7,"method":"window/workDoneProgress/create","params":{"token":"t"}}
     , a);
+    const b = try request(gpa, .{ .string = "r" }, "workspace/inlayHint/refresh", {});
+    defer gpa.free(b);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":"r","method":"workspace/inlayHint/refresh"}
+    , b);
+}
+
+test nestedDeeper {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const v = try json.parseFromSliceLeaky(json.Value, arena.allocator(),
+        \\{"a":1,"b":[2,{"c":[]}]}
+    , .{});
+    try testing.expect(!nestedDeeper(v, 4));
+    try testing.expect(nestedDeeper(v, 3));
+    try testing.expect(!nestedDeeper(.{ .integer = 1 }, 0));
 }
 
 test "build response: void result is null, optional fields omitted" {

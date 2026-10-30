@@ -10,6 +10,7 @@ const queries = @import("queries.zig");
 const render = @import("render.zig");
 const InternPool = @import("InternPool.zig");
 const value = @import("value.zig");
+const infer = @import("infer.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 /// Type at the `nth` occurrence of `needle`: the type of the binding when the name coincides with
@@ -456,6 +457,38 @@ test "generic bodies without an instance use abstract parameters" {
         \\}
     , &.{
         .{ "it", "T" },
+    });
+}
+
+test "@This() in a generic body is the abstract instance, like the written call" {
+    // `@This()` was the bare function name `Pair` and counted as a concrete type
+    try expectTypes(
+        \\fn Pair(comptime A: type, comptime B: type) type {
+        \\    return struct {
+        \\        a: A,
+        \\        b: B,
+        \\        const Self = @This();
+        \\        fn swap(p: @This(), s: Self) Pair(B, A) {
+        \\            const r: Pair(B, A) = .{ .a = p.b, .b = p.a };
+        \\            const me = p;
+        \\            const q: Pair(A, B) = p;
+        \\            const same = @This() == Pair(A, B);
+        \\            const tn = @typeName(@This());
+        \\            _ = .{ me, q, s, same, tn };
+        \\            return r;
+        \\        }
+        \\    };
+        \\}
+    , &.{
+        .{ "p", "Pair(A, B)" },
+        .{ "s", "Pair(A, B)" },
+        .{ "me", "Pair(A, B)" },
+        .{ "q", "Pair(A, B)" },
+        .{ "r", "Pair(B, A)" },
+        // As in the compiler
+        .{ "same", "bool = true" },
+        // The name depends on the instance
+        .{ "tn", "unknown" },
     });
 }
 
@@ -962,6 +995,59 @@ test "comptime arguments are coerced to their instantiated parameter types" {
     });
 }
 
+test "@TypeOf(undefined) is the type of undefined" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(tu, nm, t2, ie, at, tx)` prints
+    // `@TypeOf(undefined)`, `"@TypeOf(undefined)"`, `@TypeOf(undefined)`, `u2`,
+    // `@TypeOf(undefined)`, `@TypeOf(undefined)`); it must not resolve to void
+    try expectTypes(
+        \\const x = undefined;
+        \\fn typeOfArg(v: anytype) type {
+        \\    return @TypeOf(v);
+        \\}
+        \\const tu = @TypeOf(undefined);
+        \\const nm = @typeName(@TypeOf(x));
+        \\const t2 = @TypeOf(undefined, undefined);
+        \\const ie = if (@TypeOf(undefined) == void) u1 else u2;
+        \\const at = typeOfArg(undefined);
+        \\const tx = @TypeOf(x);
+    , &.{
+        .{ "tu", "type = @TypeOf(undefined)" },
+        .{ "nm", "*const [18:0]u8 = \"@TypeOf(undefined)\"" },
+        .{ "t2", "type = @TypeOf(undefined)" },
+        .{ "ie", "type = u2" },
+        .{ "at", "type = @TypeOf(undefined)" },
+        .{ "tx", "type = @TypeOf(undefined)" },
+    });
+}
+
+test "signed integer types with bit width 0 are no types" {
+    // zig 0.17.0 rejects `i0` and `@Int(.signed, 0)` ("signed integer cannot have bit width 0");
+    // `@compileLog(Z, W, @bitSizeOf(Z))` prints `u0`, `u0`, `0`. A zero-bit signed integer type
+    // must not be produced.
+    try expectTypes(
+        \\const T = i0;
+        \\const U = @Int(.signed, 0);
+        \\const Z = u0;
+        \\const W = @Int(.unsigned, 0);
+        \\const L = u01;
+        \\const B = @bitSizeOf(T);
+        \\const BZ = @bitSizeOf(Z);
+    , &.{
+        .{ "T", "unknown" },
+        .{ "U", "type" },
+        .{ "Z", "type = u0" },
+        .{ "W", "type = u0" },
+        .{ "L", "unknown" },
+        .{ "B", "comptime_int" },
+        .{ "BZ", "comptime_int = 0" },
+    });
+    var ip = try InternPool.init(testing.allocator, testing.io);
+    defer ip.deinit();
+    try testing.expect(try infer.primitive(&ip, "i0") == null);
+    try testing.expect(try infer.primitive(&ip, "u01") == null);
+    try testing.expect(try infer.primitive(&ip, "u0") != null);
+}
+
 test "comparisons that depend on unknown parts stay unknown" {
     try expectTypes(
         \\fn Id(comptime n: usize) type { return struct { pub const N = n; }; }
@@ -1423,6 +1509,146 @@ test "float math builtins use the precision of the operand type" {
     });
 }
 
+test "@abs maps signed integer types to their unsigned counterparts" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(@abs(v)), ...)` prints
+    // `@Vector(4, u32)`, `usize`, `c_uint`, `c_ulong`, `c_ushort`, `c_ulonglong`, `u32`,
+    // `@Vector(4, u32)`, `@Vector(2, f32)`, `u8`)
+    try expectTypes(
+        \\fn probe(v: @Vector(4, i32), d: isize, c: c_int, l: c_long, s: c_short, ll: c_longlong, u: i32, vu: @Vector(4, u32), vf: @Vector(2, f32)) void {
+        \\    const a_vec = @abs(v);
+        \\    const a_isize = @abs(d);
+        \\    const a_cint = @abs(c);
+        \\    const a_clong = @abs(l);
+        \\    const a_cshort = @abs(s);
+        \\    const a_cll = @abs(ll);
+        \\    const a_i32 = @abs(u);
+        \\    const a_vu = @abs(vu);
+        \\    const a_vf = @abs(vf);
+        \\    const k_cint = @abs(@as(c_int, -3));
+        \\    _ = .{ a_vec, a_isize, a_cint, a_clong, a_cshort, a_cll, a_i32, a_vu, a_vf, k_cint };
+        \\}
+    , &.{
+        .{ "a_vec", "@Vector(4, u32)" },
+        .{ "a_isize", "usize" },
+        .{ "a_cint", "c_uint" },
+        .{ "a_clong", "c_ulong" },
+        .{ "a_cshort", "c_ushort" },
+        .{ "a_cll", "c_ulonglong" },
+        .{ "a_i32", "u32" },
+        .{ "a_vu", "@Vector(4, u32)" },
+        .{ "a_vf", "@Vector(2, f32)" },
+        .{ "k_cint", "c_uint = 3" },
+    });
+}
+
+test "orelse and catch on comptime-known operands take only the evaluated side" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(cfg_port), @TypeOf(z1),
+    // @TypeOf(z2), nn, ok, @TypeOf(rt), @TypeOf(rte), @TypeOf(ann))` prints `comptime_int`,
+    // `comptime_int`, `comptime_int`, `@as(i32, 7)`, `@as(u8, 9)`, `u8`, `u8`, `u32`); a taken
+    // right-hand side must not be coerced to the payload type
+    try expectTypes(
+        \\const Opts = struct { port: ?u16 = null };
+        \\const opts: Opts = .{};
+        \\fn probe(r: ?u8, re: anyerror!u8) void {
+        \\    const cfg_port = opts.port orelse 8080;
+        \\    const n: ?i32 = null;
+        \\    const z1 = n orelse 1234;
+        \\    const e: anyerror!u8 = error.Bad;
+        \\    const z2 = e catch 5;
+        \\    const m: ?i32 = 7;
+        \\    const nn = m orelse 1;
+        \\    const g: anyerror!u8 = 9;
+        \\    const ok = g catch 5;
+        \\    const rt = r orelse 3;
+        \\    const rte = re catch 4;
+        \\    const ann: u32 = n orelse 2;
+        \\    _ = .{ cfg_port, z1, z2, nn, ok, rt, rte, ann };
+        \\}
+    , &.{
+        .{ "cfg_port", "comptime_int = 8080" },
+        .{ "z1", "comptime_int = 1234" },
+        .{ "z2", "comptime_int = 5" },
+        .{ "nn", "i32 = 7" },
+        .{ "ok", "u8 = 9" },
+        .{ "rt", "u8" },
+        .{ "rte", "u8" },
+        .{ "ann", "u32 = 2" },
+    });
+}
+
+test "peer types of error sets, error unions, arrays, vectors, floats and C pointers" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(p1), ..., @TypeOf(p14))`
+    // prints `error{Foo}!u8`, `error{A,B}`, `anyerror!u32`, `[2]u32`, `@Vector(2, u16)`,
+    // `error{Empty}!u32`, `f32`, `[*c]u8`, `comptime_float`, `[2:0]u8`, `@Vector(2, u16)`,
+    // `[*c]u8`, `error{A}!@TypeOf(null)`, `f32`); these peers must not resolve to unknown
+    try expectTypes(
+        \\const E = error{Empty};
+        \\fn parse(s: []const u8) E!u32 {
+        \\    if (s.len == 0) return error.Empty;
+        \\    return 1;
+        \\}
+        \\fn probe(c: bool, k: u8, eu: anyerror!u32, a: [2]u32, v: @Vector(2, u16), w: @Vector(2, u8), s: []const u8, cp: [*c]u8, p: *u8, x: f32, sa: [2:0]u8, sb: [2:0]u8, op: ?*u8, ar: [2]u16) void {
+        \\    const p1 = if (c) @as(u8, 1) else error.Foo;
+        \\    const p2 = switch (k) { 0 => error.A, else => error.B };
+        \\    const p3 = if (c) eu else error.Bar;
+        \\    const p4 = if (c) a else .{ 1, 2 };
+        \\    const p5 = if (c) v else w;
+        \\    const p6 = parse(s) catch |err| err;
+        \\    const kb: u8 = 3;
+        \\    const p7 = if (c) kb else x;
+        \\    const p8 = if (c) cp else p;
+        \\    const p9 = @TypeOf(1, 2.5);
+        \\    const p10 = if (c) sa else sb;
+        \\    const p11 = if (c) v else ar;
+        \\    const p12 = if (c) cp else op;
+        \\    const p13 = @TypeOf(error.A, null);
+        \\    const p14 = if (c) k else x;
+        \\    const c1 = if (c) @as(u8, 1) else @as(u16, 2);
+        \\    const c2 = if (c) @as(u8, 1) else null;
+        \\    _ = .{ p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, c1, c2 };
+        \\}
+    , &.{
+        .{ "p1", "error{Foo}!u8" },
+        .{ "p2", "error{A,B}" },
+        .{ "p3", "anyerror!u32" },
+        .{ "p4", "[2]u32" },
+        .{ "p5", "@Vector(2, u16)" },
+        .{ "p6", "error{Empty}!u32" },
+        .{ "p7", "f32" },
+        .{ "p8", "[*c]u8" },
+        .{ "p9", "type = comptime_float" },
+        .{ "p10", "[2:0]u8" },
+        .{ "p11", "@Vector(2, u16)" },
+        .{ "p12", "[*c]u8" },
+        .{ "p13", "type = error{A}!@TypeOf(null)" },
+        .{ "p14", "f32" },
+        .{ "c1", "u16" },
+        .{ "c2", "?u8" },
+    });
+}
+
+test "the peer type of a C pointer and null is the C pointer" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(a1), @TypeOf(a2), T1,
+    // @TypeOf(o), @TypeOf(p))` prints `[*c]u8`, `[*c]u8`, `[*c]u8`, `?u8`, `?*u8`); a C pointer
+    // must not be wrapped into an optional
+    try expectTypes(
+        \\fn probe(c: bool, cp: [*c]u8) void {
+        \\    const a1 = if (c) cp else null;
+        \\    const a2 = if (c) null else cp;
+        \\    const T1 = @TypeOf(cp, null);
+        \\    const o = if (c) @as(?u8, 1) else null;
+        \\    const p = if (c) @as(*u8, undefined) else null;
+        \\    _ = .{ a1, a2, T1, o, p };
+        \\}
+    , &.{
+        .{ "a1", "[*c]u8" },
+        .{ "a2", "[*c]u8" },
+        .{ "T1", "type = [*c]u8" },
+        .{ "o", "?u8" },
+        .{ "p", "?*u8" },
+    });
+}
+
 test "@min and @max narrow the result type like the compiler" {
     // Expected values are the results of zig 0.17.0
     try expectTypes(
@@ -1452,6 +1678,38 @@ test "@min and @max narrow the result type like the compiler" {
         .{ "k_neg", "i3 = -3" },
         .{ "k_ct", "comptime_int = 3" },
         .{ "k_f", "f64 = 2" },
+    });
+}
+
+test "!, @intFromBool, @min and @max work element-wise on vectors" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(not_v), ...,
+    // @TypeOf(lim))` prints `@Vector(4, bool)`, `@Vector(4, u1)`, `@Vector(4, u8)`,
+    // `@Vector(4, u2)`, `@Vector(4, u31)`, `@Vector(4, bool)`, `bool`, `u1`, `u2`); vector operands
+    // must not give scalar types or skip the narrowing
+    try expectTypes(
+        \\fn probe(m: @Vector(4, bool), v: @Vector(4, u32), a: @Vector(4, i32), b: @Vector(4, i32), c: bool, x: u8) void {
+        \\    const not_v = !m;
+        \\    const ifb_v = @intFromBool(m);
+        \\    const clamp_v = @min(v, @as(@Vector(4, u32), @splat(255)));
+        \\    const clamp3 = @min(v, @as(@Vector(4, u32), @splat(3)));
+        \\    const zero: @Vector(4, i32) = @splat(0);
+        \\    const relu = @max(a, zero);
+        \\    const ne = !(a == b);
+        \\    const not_c = !c;
+        \\    const ifb_c = @intFromBool(c);
+        \\    const lim = @min(x, 3);
+        \\    _ = .{ not_v, ifb_v, clamp_v, clamp3, relu, ne, not_c, ifb_c, lim };
+        \\}
+    , &.{
+        .{ "not_v", "@Vector(4, bool)" },
+        .{ "ifb_v", "@Vector(4, u1)" },
+        .{ "clamp_v", "@Vector(4, u8)" },
+        .{ "clamp3", "@Vector(4, u2)" },
+        .{ "relu", "@Vector(4, u31)" },
+        .{ "ne", "@Vector(4, bool)" },
+        .{ "not_c", "bool" },
+        .{ "ifb_c", "u1" },
+        .{ "lim", "u2" },
     });
 }
 
@@ -2004,7 +2262,7 @@ test "unnamed parameters of extern functions are inferred" {
         \\    _ = r;
         \\}
     , &.{
-        .{ "ext", "fn (*const u32, u32) bool" },
+        .{ "ext", "fn (*const u32, u32) callconv(.c) bool" },
         .{ "*const u32", "type = *const u32" },
         .{ "74", "u32 = 74" },
         .{ "r", "bool" },
@@ -2020,8 +2278,8 @@ test "extern varargs function type keeps the varargs flag" {
         \\    _ = f;
         \\}
     , &.{
-        .{ "FT", "type = fn (u8, ...) void" },
-        .{ "f", "fn (u8, ...) void" },
+        .{ "FT", "type = fn (u8, ...) callconv(.c) void" },
+        .{ "f", "fn (u8, ...) callconv(.c) void" },
     });
 }
 
@@ -2304,6 +2562,56 @@ test "builtin result types follow the compiler" {
     });
 }
 
+test "GPU, wasm, SPIR-V and C variadic builtins have the compiler's result types" {
+    // Expected values are the results of zig 0.17.0: `@compileLog` prints `type` for
+    // `@TypeOf(@SpirvType(.sampler))`, `u32` for `@workItemId(0)`, `@workGroupId(0)` and
+    // `@workGroupSize(0)` (spirv64-opencl), `usize` and `isize` for `@wasmMemorySize(0)` and
+    // `@wasmMemoryGrow(0, 1)` (wasm32-freestanding), `lang.VaListX86_64` for `@cVaStart()` and
+    // `@cVaCopy(&va)`, `c_int` for `@cVaArg(&va, c_int)` and `void` for `@cVaEnd(&cp)`
+    // (x86_64-linux; hover shows the container name without its namespace); none of these
+    // results may be unknown
+    try expectStdTypesBuiltin(
+        \\const std = @import("std");
+        \\pub const cpu: std.Target.Cpu = .{ .arch = .x86_64, .model = undefined, .features = undefined };
+        \\pub const os: std.Target.Os = .{ .tag = .linux, .version_range = undefined };
+    ,
+        \\pub const Sampler = @SpirvType(.sampler);
+        \\fn shader() void {
+        \\    const L = @SpirvType(.sampler);
+        \\    const c = @workItemId(0);
+        \\    const g = @workGroupId(0);
+        \\    const s = @workGroupSize(0);
+        \\    _ = .{ L, c, g, s };
+        \\}
+        \\fn wasm() isize {
+        \\    const a = @wasmMemorySize(0);
+        \\    const b = @wasmMemoryGrow(0, 1);
+        \\    _ = a;
+        \\    return b;
+        \\}
+        \\fn sum(n: c_int, ...) callconv(.c) c_int {
+        \\    var va = @cVaStart();
+        \\    const x = @cVaArg(&va, c_int);
+        \\    var cp = @cVaCopy(&va);
+        \\    const e = @cVaEnd(&cp);
+        \\    _ = e;
+        \\    return n + x;
+        \\}
+    , &.{
+        .{ "Sampler", "type" },
+        .{ "L", "type" },
+        .{ "c", "u32" },
+        .{ "g", "u32" },
+        .{ "s", "u32" },
+        .{ "a", "usize" },
+        .{ "b", "isize" },
+        .{ "va", "VaListX86_64" },
+        .{ "x", "c_int" },
+        .{ "cp", "VaListX86_64" },
+        .{ "e", "void" },
+    });
+}
+
 test "builtin arguments get their result types" {
     try expectTypes(
         \\const E = enum(u4) { x, y, z };
@@ -2422,6 +2730,334 @@ test "peer types of pointers and optionals" {
     });
 }
 
+test "pointer attributes are part of the pointer type" {
+    // Prevents `*align(1) u32`, `*volatile T` and `*allowzero T` from being the plain pointer type
+    try expectTypes(
+        \\const Reg = packed struct(u32) { en: bool, _pad: u31 };
+        \\const P = *align(1) u32;
+        \\const t_eq = if (P == *u32) @as(u8, 1) else @as(u16, 2);
+        \\const t_nat = if (*align(4) u32 == *u32) @as(u8, 1) else @as(u16, 2);
+        \\const t_same = if (*align(1) u32 == P) @as(u8, 1) else @as(u16, 2);
+        \\const t_vol = if (*volatile u8 == *u8) @as(u8, 1) else @as(u16, 2);
+        \\const t_bit = if (*align(1:0:1) u8 == *align(1) u8) @as(u8, 1) else @as(u16, 2);
+        \\fn f(addr: usize, reg: *volatile u32, buf: []align(16) u8) void {
+        \\    const a4 = @as(*volatile Reg, @ptrFromInt(addr));
+        \\    const a5 = @as(*allowzero u8, @ptrFromInt(addr));
+        \\    const bp = @as(*align(4:8:4) u8, @ptrFromInt(addr));
+        \\    const all: [:0]allowzero align(2) const volatile u16 = @ptrCast(buf);
+        \\    _ = .{ reg, buf, a4, a5, bp, all };
+        \\}
+    , &.{
+        .{ "t_eq", "u16 = 2" },
+        .{ "t_nat", "u16 = 2" },
+        .{ "t_same", "u8 = 1" },
+        .{ "t_vol", "u16 = 2" },
+        .{ "t_bit", "u8 = 1" },
+        .{ "P", "type = *align(1) u32" },
+        .{ "reg", "*volatile u32" },
+        .{ "buf", "[]align(16) u8" },
+        .{ "a4", "*volatile Reg" },
+        .{ "a5", "*allowzero u8" },
+        .{ "bp", "*align(4:8:4) u8" },
+        .{ "all", "[:0]allowzero align(2) const volatile u16" },
+    });
+}
+
+test "pointers to fields, elements and aligned variables carry their attributes" {
+    // Prevents `&reg.en` of a packed field and `&p.x` through an attributed pointer from being
+    // plain pointers
+    try expectTypes(
+        \\const Reg = packed struct(u32) { en: bool, _pad: u31 };
+        \\const S = extern struct { a: u8, b: u32 };
+        \\const A = struct { x: u8 align(4), y: u32 };
+        \\var global: u32 align(8) = 0;
+        \\fn f(reg: *Reg, s: *S, ua: *align(1) A, v: *volatile A, arr: *align(8) [4]u8, n: usize) void {
+        \\    var local: [4]u8 align(16) = undefined;
+        \\    const a7 = &reg.en;
+        \\    const sa = &s.a;
+        \\    const sb = &s.b;
+        \\    const ax = &ua.x;
+        \\    const ay = &ua.y;
+        \\    const vy = &v.y;
+        \\    const e0 = &arr[0];
+        \\    const e1 = &arr[1];
+        \\    const er = &arr[n];
+        \\    const g = &global;
+        \\    const l = &local;
+        \\    _ = .{ a7, sa, sb, ax, ay, vy, e0, e1, er, g, l };
+        \\}
+    , &.{
+        .{ "a7", "*align(4:0:4) bool" },
+        .{ "sa", "*align(4) u8" },
+        .{ "sb", "*u32" },
+        .{ "ax", "*align(1) u8" },
+        .{ "ay", "*align(1) u32" },
+        .{ "vy", "*volatile u32" },
+        .{ "e0", "*align(8) u8" },
+        .{ "e1", "*align(1) u8" },
+        .{ "er", "*align(1) u8" },
+        .{ "g", "*align(8) u32" },
+        .{ "l", "*align(16) [4]u8" },
+    });
+}
+
+test "slices, pointer arithmetic, captures and peers keep pointer attributes" {
+    // Prevents derived pointers from dropping the attributes of the pointer they come from.
+    // Expected values: zig 0.17.0 `@compileLog(@TypeOf(...))` of each name.
+    try expectTypes(
+        \\const U = union(enum) { a: u32, b: u8 };
+        \\const E = error{X};
+        \\fn f(s: []align(16) u32, m: [*]align(16) u32, pa: *align(16) [8]u32, sv: []volatile u8, za: [*]allowzero u8, cp: [*c]align(16) u32, n: usize, sa: []allowzero u8, pv: *volatile u32) void {
+        \\    var arr: [8]u32 align(16) = undefined;
+        \\    const s1 = s[1..n];
+        \\    const s2 = s[2..];
+        \\    const s4 = s[4..8];
+        \\    const sp = s.ptr;
+        \\    const pp = pa.ptr;
+        \\    const m1 = m[1..];
+        \\    const m2 = m[2..n];
+        \\    const mo = m + 1;
+        \\    const mn = m - n;
+        \\    const mz = m + 0;
+        \\    const p1 = pa[1..];
+        \\    const p4 = pa[4..n];
+        \\    const a1 = arr[1..3];
+        \\    const a0 = arr[0..];
+        \\    const v1 = sv[1..];
+        \\    const z0 = za[0..n];
+        \\    const z1 = za[1..n];
+        \\    const za1 = za + 1;
+        \\    const c1 = cp[1..n];
+        \\    const c2 = cp + 2;
+        \\    const sk = s[n..][0..4];
+        \\    const pv1 = pv[0..1];
+        \\    _ = .{ s1, s2, s4, sp, pp, m1, m2, mo, mn, mz, p1, p4, a1, a0, v1, z0, z1, za1, c1, c2, sk, pv1, sa };
+        \\}
+        \\fn g(s: []align(16) u32, sv: []volatile u8, sa: []allowzero u8, opt: *align(16) ?u32, eu: *align(16) (E!u32), u: *align(1) U, pv: *volatile u32) void {
+        \\    var arr: [8]u32 align(16) = undefined;
+        \\    for (s) |*fs| _ = fs;
+        \\    for (&arr) |*fa| _ = fa;
+        \\    for (sv) |*fv| _ = fv;
+        \\    for (sa) |*fz| _ = fz;
+        \\    if (opt.*) |*io| _ = io;
+        \\    while (opt.*) |*wo| _ = wo;
+        \\    if (eu.*) |*ie| _ = ie else |_| {}
+        \\    switch (u.*) {
+        \\        .a => |*ua| _ = ua,
+        \\        .b => |*ub| _ = ub,
+        \\    }
+        \\    switch (pv.*) {
+        \\        else => |*se| _ = se,
+        \\    }
+        \\}
+        \\fn h(c: bool, a: *align(16) u32, b: *u32, v: *volatile u32, z: *allowzero u32, ma: [*]align(8) u32, mb: [*]u32, sa: []align(2) u16, sb: []u16, ac: *align(4) [4]u16, cp: [*c]align(2) u16, cq: [*c]u16, cv: [*c]volatile u16, pq: *align(8) u16) void {
+        \\    const ab = if (c) a else b;
+        \\    const bv = if (c) b else v;
+        \\    const bz = if (c) b else z;
+        \\    const mab = if (c) ma else mb;
+        \\    const sac = if (c) sa else ac;
+        \\    const acb = if (c) ac else sb;
+        \\    const cpq = if (c) cp else cq;
+        \\    const cqv = if (c) cq else cv;
+        \\    const cqp = if (c) cq else pq;
+        \\    _ = .{ ab, bv, bz, mab, sac, acb, cpq, cqv, cqp };
+        \\}
+    , &.{
+        .{ "s1", "[]align(4) u32" },
+        .{ "s2", "[]align(8) u32" },
+        .{ "s4", "*align(16) [4]u32" },
+        .{ "sp", "[*]align(16) u32" },
+        .{ "pp", "[*]align(16) u32" },
+        .{ "m1", "[*]align(4) u32" },
+        .{ "m2", "[]align(8) u32" },
+        .{ "mo", "[*]align(4) u32" },
+        .{ "mn", "[*]align(4) u32" },
+        .{ "mz", "[*]align(16) u32" },
+        .{ "p1", "*align(4) [7]u32" },
+        .{ "p4", "[]align(16) u32" },
+        .{ "a1", "*align(4) [2]u32" },
+        .{ "a0", "*align(16) [8]u32" },
+        .{ "v1", "[]volatile u8" },
+        .{ "z0", "[]allowzero u8" },
+        .{ "z1", "[]u8" },
+        .{ "za1", "[*]u8" },
+        .{ "c1", "[]align(4) u32" },
+        .{ "c2", "[*c]align(8) u32" },
+        .{ "sk", "*align(4) [4]u32" },
+        .{ "pv1", "*volatile [1]u32" },
+        .{ "fs", "*align(4) u32" },
+        .{ "fa", "*align(4) u32" },
+        .{ "fv", "*volatile u8" },
+        .{ "fz", "*allowzero u8" },
+        .{ "io", "*align(16) u32" },
+        .{ "wo", "*align(16) u32" },
+        .{ "ie", "*u32" },
+        .{ "ua", "*align(1) u32" },
+        .{ "ub", "*u8" },
+        .{ "se", "*volatile u32" },
+        .{ "ab", "*align(4) u32" },
+        .{ "bv", "*volatile u32" },
+        .{ "bz", "*allowzero u32" },
+        .{ "mab", "[*]align(4) u32" },
+        .{ "sac", "[]align(2) u16" },
+        .{ "acb", "[]align(2) u16" },
+        .{ "cpq", "[*c]align(2) u16" },
+        .{ "cqv", "[*c]volatile u16" },
+        .{ "cqp", "[*c]align(2) u16" },
+    });
+}
+
+test "inline for pointer captures take the alignment of each element" {
+    // Prevents the capture of an inline for from taking the alignment of every iteration.
+    // Expected values: zig 0.17.0 gives `*align(16) u32` for the first element and
+    // `*align(4) u32` for the second one.
+    try expectTypes(
+        \\fn f() u32 {
+        \\    var arr: [2]u32 align(16) = .{ 1, 2 };
+        \\    var sum: u32 = 0;
+        \\    inline for (&arr) |*x| sum += x.*;
+        \\    return sum;
+        \\}
+    , &.{
+        .{ "x", "*align(unknown) u32" },
+    });
+}
+
+test "function types keep their calling convention" {
+    // Prevents `fn (u8) callconv(.c) void` from being the Zig-callconv function type.
+    // Expected values: zig 0.17.0 `@compileLog` of each name.
+    try expectTypes(
+        \\fn cfn(a: u8) callconv(.c) void { _ = a; }
+        \\inline fn inl(a: u8) u8 { return a; }
+        \\export fn exp(a: u8) u8 { return a; }
+        \\extern fn ext(a: u8) u8;
+        \\fn nak() callconv(.naked) void {}
+        \\fn plain(a: u8) void { _ = a; }
+        \\const FT = fn (u8) callconv(.c) void;
+        \\const VT = fn (u8, ...) callconv(.c) void;
+        \\const T_cfn = @TypeOf(cfn);
+        \\const T_inl = @TypeOf(inl);
+        \\const T_exp = @TypeOf(exp);
+        \\const T_ext = @TypeOf(ext);
+        \\const T_nak = @TypeOf(nak);
+        \\const T_plain = @TypeOf(plain);
+        \\const t_fn_eq = if (@TypeOf(cfn) == fn (u8) void) @as(u8, 1) else @as(u16, 2);
+        \\const t_ft_eq = if (@TypeOf(cfn) == FT) @as(u8, 1) else @as(u16, 2);
+        \\fn f() void {
+        \\    const a6 = &cfn;
+        \\    _ = a6;
+        \\}
+    , &.{
+        .{ "FT", "type = fn (u8) callconv(.c) void" },
+        .{ "VT", "type = fn (u8, ...) callconv(.c) void" },
+        .{ "T_cfn", "type = fn (u8) callconv(.c) void" },
+        .{ "T_inl", "type = fn (u8) callconv(.@\"inline\") u8" },
+        .{ "T_exp", "type = fn (u8) callconv(.c) u8" },
+        .{ "T_ext", "type = fn (u8) callconv(.c) u8" },
+        .{ "T_nak", "type = fn () callconv(.naked) void" },
+        .{ "T_plain", "type = fn (u8) void" },
+        .{ "t_fn_eq", "u16 = 2" },
+        .{ "t_ft_eq", "u8 = 1" },
+        .{ "a6", "*const fn (u8) callconv(.c) void = &fn (u8) callconv(.c) void" },
+    });
+}
+
+test "@typeInfo and @Fn keep the calling convention and genericity of functions" {
+    // Prevents `@typeInfo` from reporting `.auto` and `is_generic = false` for every function.
+    // Expected values: zig 0.17.0 `@compileLog` of each name on x86_64-linux-gnu, where
+    // `@TypeOf(sysv)` is `fn (u8) callconv(.c) void` and `@TypeOf(win)` is
+    // `fn (u8) callconv(.{ .x86_64_win = .{ .incoming_stack_alignment = null } }) void`.
+    const src =
+        \\fn cfn(a: u8) callconv(.c) void { _ = a; }
+        \\fn gen(comptime T: type, x: T) T { return x; }
+        \\fn gct(comptime x: u8) u8 { return x; }
+        \\fn gany(x: anytype) void { _ = x; }
+        \\inline fn inl(a: u8) u8 { return a; }
+        \\fn nak() callconv(.naked) void {}
+        \\fn sysv(a: u8) callconv(.{ .x86_64_sysv = .{} }) void { _ = a; }
+        \\fn win(a: u8) callconv(.{ .x86_64_win = .{} }) void { _ = a; }
+        \\const cc_auto = @intFromBool(@typeInfo(@TypeOf(cfn)).@"fn".attrs.@"callconv" == .auto);
+        \\const cc_inl = @intFromBool(@typeInfo(@TypeOf(inl)).@"fn".attrs.@"callconv" == .@"inline");
+        \\const cc_nak = @intFromBool(@typeInfo(@TypeOf(nak)).@"fn".attrs.@"callconv" == .naked);
+        \\const isgen = @intFromBool(@typeInfo(@TypeOf(gen)).@"fn".is_generic);
+        \\const isgen_ct = @intFromBool(@typeInfo(@TypeOf(gct)).@"fn".is_generic);
+        \\const isgen_any = @intFromBool(@typeInfo(@TypeOf(gany)).@"fn".is_generic);
+        \\const isgen_c = @intFromBool(@typeInfo(@TypeOf(cfn)).@"fn".is_generic);
+        \\const R = @Fn(&.{u8}, &.{.{}}, void, .{ .@"callconv" = .c });
+        \\const N = @Fn(&.{}, &.{}, void, .{ .@"callconv" = .naked });
+        \\const r_eq = @intFromBool(R == @TypeOf(cfn));
+        \\const T_sysv = @TypeOf(sysv);
+        \\const T_win = @TypeOf(win);
+        \\const sysv_eq = @intFromBool(@TypeOf(sysv) == @TypeOf(cfn));
+    ;
+    try expectStdTypesBuiltin(
+        \\const std = @import("std");
+        \\pub const target: std.Target = .{
+        \\    .cpu = .{ .arch = .x86_64, .model = undefined, .features = undefined },
+        \\    .os = .{ .tag = .linux, .version_range = undefined },
+        \\    .abi = .gnu,
+        \\    .ofmt = .elf,
+        \\};
+    , src, &.{
+        .{ "cc_auto", "u1 = 0" },
+        .{ "cc_inl", "u1 = 1" },
+        .{ "cc_nak", "u1 = 1" },
+        .{ "isgen", "u1 = 1" },
+        .{ "isgen_ct", "u1 = 1" },
+        .{ "isgen_any", "u1 = 1" },
+        .{ "isgen_c", "u1 = 0" },
+        .{ "R", "type = fn (u8) callconv(.c) void" },
+        .{ "N", "type = fn () callconv(.naked) void" },
+        .{ "r_eq", "u1 = 1" },
+        .{ "T_sysv", "type = fn (u8) callconv(.c) void" },
+        .{ "T_win", "type = fn (u8) callconv(.{ .x86_64_win = .{ .incoming_stack_alignment = null } }) void" },
+        .{ "sysv_eq", "u1 = 1" },
+    });
+    // Without a target, the C calling convention has no value
+    try expectStdTypes(src, &.{
+        .{ "cc_auto", "u1" },
+        .{ "cc_inl", "u1 = 1" },
+        .{ "T_win", "type = fn (u8) callconv(unknown) void" },
+        .{ "r_eq", "u1 = 1" },
+    });
+}
+
+test "@typeInfo, @Pointer and std results keep pointer attributes" {
+    // Prevents default attributes in `@typeInfo` and std results losing their alignment
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const P = *align(1) u32;
+        \\const malign = std.meta.alignment(P);
+        \\const pvol = @intFromBool(@typeInfo(*volatile u8).pointer.attrs.@"volatile");
+        \\const as_null = @intFromBool(@typeInfo(*u8).pointer.attrs.@"addrspace" == null);
+        \\const nat_null = @intFromBool(@typeInfo(*u8).pointer.attrs.@"align" == null);
+        \\const c_zero = @intFromBool(@typeInfo([*c]u8).pointer.attrs.@"allowzero");
+        \\const t_as = if (*addrspace(.generic) u32 == *u32) @as(u8, 1) else @as(u16, 2);
+        \\const R = @Pointer(.slice, .{ .@"volatile" = true, .@"addrspace" = .gs, .@"align" = 4 }, u8, null);
+        \\const Q = @Pointer(.one, .{ .@"const" = true }, u8, null);
+        \\pub fn probe(gpa: std.mem.Allocator, bytes: []u8, x: u32) !void {
+        \\    const a1 = std.mem.asBytes(&x);
+        \\    const a2 = std.mem.bytesAsValue(u32, bytes[0..4]);
+        \\    const a3 = try gpa.alignedAlloc(u8, .@"16", 64);
+        \\    const a8 = try gpa.alignedAlloc(u8, null, 64);
+        \\    _ = .{ a1, a2, a3, a8 };
+        \\}
+    , &.{
+        .{ "malign", "comptime_int = 1" },
+        .{ "pvol", "u1 = 1" },
+        .{ "as_null", "u1 = 0" },
+        .{ "nat_null", "u1 = 1" },
+        .{ "c_zero", "u1 = 1" },
+        .{ "t_as", "u8 = 1" },
+        .{ "R", "type = []align(4) addrspace(.gs) volatile u8" },
+        .{ "Q", "type = *const u8" },
+        .{ "a1", "*align(4) const [4]u8" },
+        .{ "a2", "*align(1) u32" },
+        .{ "a3", "[]align(16) u8" },
+        .{ "a8", "[]align(1) u8" },
+    });
+}
+
 test "generic bodies without an instance use values that do not depend on the parameters" {
     try expectTypes(
         \\fn List(comptime T: type, comptime alignment: ?u29) type {
@@ -2447,11 +3083,11 @@ test "generic bodies without an instance use values that do not depend on the pa
         \\    _ = x;
         \\}
     , &.{
-        // The condition depends on abstract parameters, but both branches have the same value
-        // (pointer alignment is not distinguished)
-        .{ "head", "[]T" },
+        // The condition depends on abstract parameters: the branches are slices of T whose
+        // alignment depends on the parameter
+        .{ "head", "[]align(unknown) T" },
         // Self-recursive type function: the container in this instance is taken
-        .{ "S", "type = []T" },
+        .{ "S", "type = []align(unknown) T" },
         // Runtime condition: the value is not comptime-known
         .{ "x", "u32" },
     });
@@ -2572,6 +3208,63 @@ test "arrays whose length depends on abstract parameters keep their element type
     });
 }
 
+test "an array length that a call instance cannot evaluate is unknown, not the callee's text" {
+    // `print` returned `*const [measure(fmt):0]u8` at concrete call sites
+    try expectTypes(
+        \\extern fn external(n: usize) usize;
+        \\fn measure(comptime fmt: []const u8) usize { return external(fmt.len); }
+        \\fn print(comptime fmt: []const u8) *const [measure(fmt):0]u8 { return undefined; }
+        \\fn mk(comptime n: usize) *const [n:0]u8 { return "abcdefgh"[0..n]; }
+        \\fn abstract(comptime fmt: []const u8) void {
+        \\    const inner = print(fmt);
+        \\    _ = inner;
+        \\}
+        \\fn probe() void {
+        \\    const s = print("{d}");
+        \\    const m = mk(3);
+        \\    const n = s.len;
+        \\    const c = s[0];
+        \\    const p = s.ptr;
+        \\    const sl: []const u8 = s;
+        \\    const z: [:0]const u8 = s;
+        \\    const part = s[0..1];
+        \\    const same = @TypeOf(s) == *const [3:0]u8;
+        \\    const self = @TypeOf(s) == @TypeOf(s);
+        \\    _ = .{ m, n, c, p, sl, z, part, same, self };
+        \\}
+    , &.{
+        .{ "s", "*const [_:0]u8" },
+        .{ "m", "*const [3:0]u8" },
+        .{ "inner", "*const [measure(fmt):0]u8" },
+        .{ "n", "usize" },
+        .{ "c", "u8" },
+        .{ "p", "[*:0]const u8" },
+        .{ "sl", "[]const u8" },
+        .{ "z", "[:0]const u8" },
+        .{ "part", "*const [1]u8" },
+        // A type with an unknown length is never known to equal another type, itself included
+        .{ "same", "bool" },
+        .{ "self", "bool" },
+    });
+}
+
+test "std.fmt.comptimePrint results keep their pointer, element and sentinel types" {
+    // The results were shown with the callee's length text `count(fmt, args)`
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\pub const version = std.fmt.comptimePrint("{d}.{d}.{d}", .{ 1, 22, 3 });
+        \\fn probe() void {
+        \\    const s = std.fmt.comptimePrint("{d}", .{3});
+        \\    const n = s.len;
+        \\    _ = n;
+        \\}
+    , &.{
+        .{ "s", "*const [_:0]u8" },
+        .{ "version", "*const [_:0]u8" },
+        .{ "n", "usize" },
+    });
+}
+
 test "loops over types bind an abstract type" {
     try expectTypes(
         \\fn gamma(comptime T: type, x: T) T { return x; }
@@ -2617,6 +3310,14 @@ fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u
 /// Same as `expectStdTypes`; when `optimize` is not null, provides a builtin with that
 /// optimize mode (a member name of `std.lang.Optimize`)
 fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    var buf: [256]u8 = undefined;
+    const text = if (optimize) |o| try std.fmt.bufPrint(&buf, "const std = @import(\"std\");\npub const mode = optimize;\npub const optimize: std.lang.Optimize = .{s};\n", .{o}) else null;
+    return expectStdTypesBuiltin(text, src, cases);
+}
+
+/// Same as `expectStdTypes`; when `builtin_text` is not null, it is the source of the builtin
+/// module
+fn expectStdTypesBuiltin(builtin_text: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     var w: World = undefined;
@@ -2626,10 +3327,7 @@ fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []cons
     defer testing.allocator.free(std_root_path);
     const std_root = try w.vfs.intern(std_root_path);
     const f = try w.add("/p/main.zig", src);
-    if (optimize) |o| {
-        const text = try std.fmt.allocPrint(w.arena.allocator(), "const std = @import(\"std\");\npub const mode = optimize;\npub const optimize: std.lang.Optimize = .{s};\n", .{o});
-        w.default_builtin = (try w.add("/zig-cache/builtin.zig", text)).file;
-    }
+    if (builtin_text) |text| w.default_builtin = (try w.add("/zig-cache/builtin.zig", text)).file;
     try w.setGraph(std_root, &.{}, &.{});
     for (cases) |c| {
         const actual = try typeAt(&w, f.file, src, c[0], 0);
@@ -2891,7 +3589,7 @@ test "layouts of reified containers" {
         .{ "size_rc", "comptime_int = 4" },
         // @typeInfo reports the explicit alignment of fields
         .{ "la", "?usize = 4" },
-        .{ "lb", "usize = 0" },
+        .{ "lb", "comptime_int = 0" },
         .{ "size_ru", "comptime_int = 8" },
         .{ "size_efs", "comptime_int = 6" },
         .{ "efs_c", "comptime_int = 4" },
@@ -2941,7 +3639,7 @@ test "clauses get the compiler's result types" {
         \\}
     , &.{
         .{ "\"std\"", "*const [3:0]u8" },
-        .{ ".naked", "CallingConvention" },
+        .{ ".naked", "CallingConvention = .{ .naked = {} }" },
         .{ "16", "u29 = 16" },
     });
 }
@@ -3265,7 +3963,7 @@ test "std.mem pointer reinterpretation" {
         \\    _ = .{ bytes, fs, zb };
         \\}
     , &.{
-        .{ "bytes", "[]const u8" },
+        .{ "bytes", "[]align(2) const u8" },
         .{ "fs", "[]const F" },
         .{ "zb", "[]const u8" },
     });

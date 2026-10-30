@@ -1,4 +1,5 @@
 const std = @import("std");
+const worker_stack = @import("src/util/worker_stack.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -39,6 +40,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zig_analyzer", .module = mod }},
         }),
     });
+    setStackReserve(exe);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -48,6 +50,25 @@ pub fn build(b: *std.Build) void {
 
     const check = b.step("check", "Check that everything compiles");
     check.dependOn(&exe.step);
+
+    // A Windows build must start on every Windows 10 release (Zig's minimum): its imports from
+    // system DLLs must not postdate Windows 10 1507 (see tools/check_windows_imports.zig)
+    const check_imports = b.addExecutable(.{
+        .name = "check_windows_imports",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/check_windows_imports.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    if (target.result.os.tag == .windows and
+        @backingInt(target.result.os.version_range.windows.min) <= @backingInt(std.Target.Os.WindowsVersion.win10))
+    {
+        const check_imports_run = b.addRunArtifact(check_imports);
+        check_imports_run.addArtifactArg(exe);
+        check_imports_run.addDirectoryArg(std.Build.LazyPath.zig_lib.path(b, "libc/mingw/lib32"));
+        check.dependOn(&check_imports_run.step);
+    }
 
     // Code generation: results are written back to src/ and committed together with the sources
     const gen_step = b.step("gen", "Regenerate LSP types and other generated code");
@@ -171,13 +192,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     }));
+    const imports_checker_run = b.addRunArtifact(b.addTest(.{ .root_module = check_imports.root_module }));
     const test_step = b.step("test", "Run the tests that need no external tools");
     test_step.dependOn(&generator_run.step);
     test_step.dependOn(&manifest_generator_run.step);
+    test_step.dependOn(&imports_checker_run.step);
     test_step.dependOn(&b.addRunArtifact(analyzerTests(b, target, optimize, test_runner, tracy != null, false, null)).step);
     const all_step = b.step("test-all", "Run all tests, including those that run the zig in PATH");
     all_step.dependOn(&generator_run.step);
     all_step.dependOn(&manifest_generator_run.step);
+    all_step.dependOn(&imports_checker_run.step);
     all_step.dependOn(&b.addRunArtifact(analyzerTests(b, target, optimize, test_runner, tracy != null, true, null)).step);
 
     // Stress verification (for concurrency-related changes): run the selected tests repeatedly, one
@@ -220,9 +244,17 @@ fn analyzerTests(
         .omit_frame_pointer = false,
     });
     module.addOptions("build_options", options);
-    return b.addTest(.{
+    const tests = b.addTest(.{
         .root_module = module,
         .test_runner = .{ .path = runner, .mode = .server },
         .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
     });
+    setStackReserve(tests);
+    return tests;
+}
+
+/// Windows: threads take the executable's stack reserve as theirs, and the worker threads of
+/// the server get only a small initial commit (see src/util/worker_stack.zig)
+fn setStackReserve(compile: *std.Build.Step.Compile) void {
+    if (compile.rootModuleTarget().os.tag == .windows) compile.stack_size = worker_stack.size;
 }
