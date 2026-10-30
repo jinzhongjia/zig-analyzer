@@ -5,8 +5,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
-const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
-const isTrivia = @import("../syntax/kind.zig").isTrivia;
+const tree = @import("../syntax/tree.zig");
+const SyntaxNode = tree.SyntaxNode;
+const kind_mod = @import("../syntax/kind.zig");
+const isTrivia = kind_mod.isTrivia;
 
 /// Maximum number of levels returned per position, keeping the innermost ones. Each level of
 /// the `parent` chain nests one level deeper in JSON, and `std.json.Stringify` panics when
@@ -22,7 +24,7 @@ pub fn selectionRanges(
 ) Allocator.Error![]const types.SelectionRange {
     const result = try arena.alloc(types.SelectionRange, positions.len);
     for (positions, result) |pos, *out| {
-        const offset: u32 = @intCast(offsets.positionToOffset(lines.text, pos, enc));
+        const offset = expansionOffset(root, @intCast(offsets.positionToOffset(lines.text, pos, enc)));
         const path = try root.coveringPath(arena, offset);
 
         // Built from the outside in; parent points to the outer level
@@ -50,6 +52,26 @@ pub fn selectionRanges(
     return result;
 }
 
+/// The offset whose token the selection starts from. Between two tokens the position belongs to
+/// both; as in rust-analyzer, the token on the left is taken when it is a word (a name, keyword or
+/// literal) and the right one is not, or when the right one is whitespace or a comment: with a bar
+/// cursor right after `b` in `f(a, b)`, the selection starts at `b`, not at `)`
+fn expansionOffset(root: SyntaxNode, offset: u32) u32 {
+    if (offset == 0) return offset;
+    const left = root.tokenAtOffset(offset - 1) orelse return offset;
+    if (left.offset + left.text.len != offset or isTrivia(left.kind)) return offset;
+    const right = root.tokenAtOffset(offset) orelse return left.offset;
+    if (right.offset != offset) return offset;
+    return if (isTrivia(right.kind) or (isWord(left) and !isWord(right))) left.offset else offset;
+}
+
+fn isWord(t: tree.SyntaxToken) bool {
+    return switch (t.kind) {
+        .identifier, .builtin, .number_literal, .char_literal, .string_literal => true,
+        else => if (kind_mod.toTokenTag(t.kind)) |tag| std.mem.startsWith(u8, @tagName(tag), "keyword_") else false,
+    };
+}
+
 const testing = std.testing;
 const Parse = @import("../syntax/Parse.zig");
 
@@ -74,6 +96,35 @@ test selectionRanges {
     try testing.expectEqualStrings("(bar + 1)", texts.items[2]);
     try testing.expectEqualStrings("foo(bar + 1)", texts.items[3]);
     try testing.expectEqualStrings(text, texts.items[texts.items.len - 1]);
+}
+
+test "selection between two tokens starts at the word that ends at the cursor" {
+    // A bar cursor right after a name must not select only the punctuation after it
+    const text = "const a = foo(bar, 1);\nconst b = x;\n";
+    const parse = try Parse.create(testing.allocator, text, .zig);
+    defer parse.destroy();
+    var lines = try offsets.LineIndex.init(testing.allocator, text);
+    defer lines.deinit(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // The cursor is at `needle` plus `delta`
+    const cases = [_]struct { []const u8, usize, []const u8 }{
+        .{ "bar,", 3, "bar" },
+        .{ "foo(", 3, "foo" },
+        .{ "x;", 1, "x" },
+        // After a line-final `;`
+        .{ ";\nconst b", 1, ";" },
+        // Between `(` and a name: the name on the right
+        .{ "(bar", 1, "bar" },
+    };
+    for (cases) |c| {
+        const at = std.mem.indexOf(u8, text, c[0]).? + c[1];
+        const result = try selectionRanges(arena.allocator(), parse.rootNode(), lines, .utf8, &.{lines.position(at, .utf8)});
+        const r = result[0].range;
+        const start = offsets.positionToOffset(text, r.start, .utf8);
+        const end = offsets.positionToOffset(text, r.end, .utf8);
+        try testing.expectEqualStrings(c[2], text[start..end]);
+    }
 }
 
 test "selection ranges keep the innermost levels of a deep path" {
