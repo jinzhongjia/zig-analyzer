@@ -175,10 +175,14 @@ imports_wanted: std.atomic.Value(bool) = .init(false),
 /// when the module graph only gains or loses files (such as generated files produced by a build);
 /// new files are indexed on demand during completion.
 imports_basis: std.atomic.Value(u64) = .init(imports_pending),
-/// Indexed files: while indexing is in progress, workspace symbol searches only these files (and
-/// open documents)
-indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
-indexed_mutex: Io.Mutex = .init,
+/// Highest `index_generation` whose workspace symbol index has been built (the first step of an
+/// indexing pass). Workspace symbol requests wait for the generation current when they start, so
+/// that they do not parse the bulk of the files in one read transaction, nor answer with only part
+/// of them. Protected by `index_mutex`; `index_cond` is signaled when it advances, when indexing
+/// stops, and when requests are canceled.
+symbols_indexed: u64 = 0,
+index_mutex: Io.Mutex = .init,
+index_cond: Io.Condition = .init,
 /// Generation of the workspace file scan (see `scheduleScan`): incremented whenever the source
 /// files under the root directories may have changed
 scan_generation: std.atomic.Value(u64) = .init(0),
@@ -344,7 +348,8 @@ const Pending = struct {
     /// When the request was received: it is answered on the state at that point, or with
     /// `ContentModified` when a write transaction ordered after it has begun since then (the task
     /// may start reading only after the main loop has applied later messages such as `didChange`;
-    /// the server's own updates are not ordered with requests, see `Db.WriteOrder`)
+    /// the server's own updates are not ordered with requests, see `Db.WriteOrder`). A workspace
+    /// symbol request that waited for the index moves it to the end of the wait.
     since: Db.Mark,
 };
 
@@ -409,7 +414,6 @@ pub fn deinit(server: *Server) void {
     server.publish_files.deinit(server.gpa);
     for (server.workspaces.items) |ws| ws.release();
     server.workspaces.deinit(server.gpa);
-    server.indexed.deinit(server.gpa);
     server.edits.deinit(server.gpa);
     server.live_prepared.deinit();
     za.util.log.setFile(null) catch {};
@@ -763,6 +767,12 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
             defer server.finishRequest(arena, pending);
             const a = arena.allocator();
+            if (comptime std.mem.eql(u8, method, "workspace/symbol")) {
+                // After a wait, reads the state at its end: the request has no position that
+                // refers to the text it was sent on, and an edit during the wait would otherwise
+                // answer it with `ContentModified`
+                if (server.waitSymbolIndex(pending)) pending.since = server.db.mark(pending.since.inputs);
+            }
             server.testGate(method, .before_read, pending);
             var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
@@ -1137,12 +1147,12 @@ fn indexTask(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     while (true) {
         const generation = server.index_generation.load(.monotonic);
-        server.indexOnce() catch |err| {
-            server.indexing.store(false, .release);
+        server.indexOnce(generation) catch |err| {
+            server.stopIndexing();
             return err;
         };
         if (server.index_generation.load(.monotonic) != generation) continue;
-        server.indexing.store(false, .release);
+        server.stopIndexing();
         // Updated again after the flag was released, and no other task took over: continue
         if (server.index_generation.load(.monotonic) == generation) {
             server.requestRefresh();
@@ -1150,6 +1160,35 @@ fn indexTask(server: *Server) Io.Cancelable!void {
         }
         if (server.indexing.swap(true, .acq_rel)) return;
     }
+}
+
+/// Clears `indexing` and wakes the workspace symbol requests waiting for the index (see
+/// `waitSymbolIndex`)
+fn stopIndexing(server: *Server) void {
+    server.indexing.store(false, .release);
+    server.wakeSymbolWaiters();
+}
+
+fn wakeSymbolWaiters(server: *Server) void {
+    server.index_mutex.lockUncancelable(server.io);
+    defer server.index_mutex.unlock(server.io);
+    server.index_cond.broadcast(server.io);
+}
+
+/// Waits until the workspace symbol index covers the module graph as it is now: returns at once
+/// when no indexing is running, and also when `pending` is canceled or indexing stops without
+/// finishing (shutting down, out of memory), in which case the request computes what is missing
+/// itself. Returns whether it waited.
+fn waitSymbolIndex(server: *Server, pending: *const Pending) bool {
+    const target = server.index_generation.load(.monotonic);
+    server.index_mutex.lockUncancelable(server.io);
+    defer server.index_mutex.unlock(server.io);
+    var waited = false;
+    while (server.indexing.load(.acquire) and server.symbols_indexed < target and !pending.cancel.load(.acquire)) {
+        server.index_cond.waitUncancelable(server.io, &server.index_mutex);
+        waited = true;
+    }
+    return waited;
 }
 
 /// Scans the root directories for the user's source files in the background (see
@@ -1218,7 +1257,8 @@ fn scanOnce(server: *Server) Allocator.Error!void {
     server.scheduleIndexing();
 }
 
-fn indexOnce(server: *Server) Io.Cancelable!void {
+/// One indexing pass over the module graph as of `generation` (see `index_generation`) or later
+fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     var pc: panic_context.Text = .{};
     pc.enter("workspace symbol indexing", .{});
     defer pc.leave();
@@ -1251,6 +1291,12 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     // each module, `FileLinks` of project files), during which completion works as usual, only
     // without auto-import
     if (!try server.indexBatches(files.symbols, "Indexing", false)) return;
+    {
+        server.index_mutex.lockUncancelable(server.io);
+        defer server.index_mutex.unlock(server.io);
+        server.symbols_indexed = @max(server.symbols_indexed, generation);
+        server.index_cond.broadcast(server.io);
+    }
     if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
     // When warming up fails (out of memory), the index is not marked usable: the next completion
     // retries, instead of the closures being expanded synchronously in a request
@@ -1299,11 +1345,6 @@ fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, a
                     return false;
                 },
             };
-        }
-        if (!auto_import) {
-            server.indexed_mutex.lockUncancelable(server.io);
-            defer server.indexed_mutex.unlock(server.io);
-            for (files[done..end]) |f| server.indexed.put(server.gpa, f, {}) catch {};
         }
         done = end;
         if (server.db.wantsSweep()) _ = server.db.trySweep();
@@ -1486,18 +1527,21 @@ fn removePending(server: *Server, pending: *Pending) void {
     }
 }
 
+/// Cancels the request `id`; one waiting for the workspace symbol index stops waiting
 fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
     for (server.pending.items) |p| {
         if (p.id.eql(id)) p.cancel.store(true, .release);
     }
+    server.wakeSymbolWaiters();
 }
 
 fn cancelAllPending(server: *Server) void {
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
     for (server.pending.items) |p| p.cancel.store(true, .release);
+    server.wakeSymbolWaiters();
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
@@ -5446,31 +5490,21 @@ fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 }
 
 /// Scope of workspace symbol: excludes files in dependency libraries by default;
-/// `workspace_symbol.dependencies` includes them. While indexing is in progress, only indexed files
-/// and open documents are used, and the remaining files are not parsed during the request (LSP's
-/// workspace/symbol has no isIncomplete: the client requests again as the user types, and the
-/// results fill in as indexing progresses).
+/// `workspace_symbol.dependencies` includes them. Every file of the scope is searched: the request
+/// first waits for background indexing (see `waitSymbolIndex`), and files not indexed yet (added
+/// since, or when indexing stopped early) are indexed in the request.
 fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
-    var scope = try server.searchScope(r);
+    const scope = try server.searchScope(r);
     const dependencies = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
         break :blk server.config.workspace_symbol_dependencies;
     };
-    if (!dependencies) {
-        const rules = try server.originRules(r.arena);
-        var user: std.ArrayList(Vfs.FileId) = .empty;
-        for (scope) |f| if (!origin.classify(&server.vfs, rules, server.vfs.path(f), false).isLibrary()) try user.append(r.arena, f);
-        scope = user.items;
-    }
-    if (!server.indexing.load(.acquire)) return scope;
-    var out: std.ArrayList(Vfs.FileId) = .empty;
-    server.indexed_mutex.lockUncancelable(server.io);
-    defer server.indexed_mutex.unlock(server.io);
-    server.docs_mutex.lockUncancelable(server.io);
-    defer server.docs_mutex.unlock(server.io);
-    for (scope) |f| if (server.indexed.contains(f) or server.open_docs.contains(f)) try out.append(r.arena, f);
-    return out.items;
+    if (dependencies) return scope;
+    const rules = try server.originRules(r.arena);
+    var user: std.ArrayList(Vfs.FileId) = .empty;
+    for (scope) |f| if (!origin.classify(&server.vfs, rules, server.vfs.path(f), false).isLibrary()) try user.append(r.arena, f);
+    return user.items;
 }
 
 /// The symbol at the cursor (see `definition.symbolAt`)
