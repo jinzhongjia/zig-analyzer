@@ -2801,6 +2801,128 @@ test "pointers to fields, elements and aligned variables carry their attributes"
     });
 }
 
+test "slices, pointer arithmetic, captures and peers keep pointer attributes" {
+    // Prevents derived pointers from dropping the attributes of the pointer they come from.
+    // Expected values: zig 0.17.0 `@compileLog(@TypeOf(...))` of each name.
+    try expectTypes(
+        \\const U = union(enum) { a: u32, b: u8 };
+        \\const E = error{X};
+        \\fn f(s: []align(16) u32, m: [*]align(16) u32, pa: *align(16) [8]u32, sv: []volatile u8, za: [*]allowzero u8, cp: [*c]align(16) u32, n: usize, sa: []allowzero u8, pv: *volatile u32) void {
+        \\    var arr: [8]u32 align(16) = undefined;
+        \\    const s1 = s[1..n];
+        \\    const s2 = s[2..];
+        \\    const s4 = s[4..8];
+        \\    const sp = s.ptr;
+        \\    const pp = pa.ptr;
+        \\    const m1 = m[1..];
+        \\    const m2 = m[2..n];
+        \\    const mo = m + 1;
+        \\    const mn = m - n;
+        \\    const mz = m + 0;
+        \\    const p1 = pa[1..];
+        \\    const p4 = pa[4..n];
+        \\    const a1 = arr[1..3];
+        \\    const a0 = arr[0..];
+        \\    const v1 = sv[1..];
+        \\    const z0 = za[0..n];
+        \\    const z1 = za[1..n];
+        \\    const za1 = za + 1;
+        \\    const c1 = cp[1..n];
+        \\    const c2 = cp + 2;
+        \\    const sk = s[n..][0..4];
+        \\    const pv1 = pv[0..1];
+        \\    _ = .{ s1, s2, s4, sp, pp, m1, m2, mo, mn, mz, p1, p4, a1, a0, v1, z0, z1, za1, c1, c2, sk, pv1, sa };
+        \\}
+        \\fn g(s: []align(16) u32, sv: []volatile u8, sa: []allowzero u8, opt: *align(16) ?u32, eu: *align(16) (E!u32), u: *align(1) U, pv: *volatile u32) void {
+        \\    var arr: [8]u32 align(16) = undefined;
+        \\    for (s) |*fs| _ = fs;
+        \\    for (&arr) |*fa| _ = fa;
+        \\    for (sv) |*fv| _ = fv;
+        \\    for (sa) |*fz| _ = fz;
+        \\    if (opt.*) |*io| _ = io;
+        \\    while (opt.*) |*wo| _ = wo;
+        \\    if (eu.*) |*ie| _ = ie else |_| {}
+        \\    switch (u.*) {
+        \\        .a => |*ua| _ = ua,
+        \\        .b => |*ub| _ = ub,
+        \\    }
+        \\    switch (pv.*) {
+        \\        else => |*se| _ = se,
+        \\    }
+        \\}
+        \\fn h(c: bool, a: *align(16) u32, b: *u32, v: *volatile u32, z: *allowzero u32, ma: [*]align(8) u32, mb: [*]u32, sa: []align(2) u16, sb: []u16, ac: *align(4) [4]u16, cp: [*c]align(2) u16, cq: [*c]u16, cv: [*c]volatile u16, pq: *align(8) u16) void {
+        \\    const ab = if (c) a else b;
+        \\    const bv = if (c) b else v;
+        \\    const bz = if (c) b else z;
+        \\    const mab = if (c) ma else mb;
+        \\    const sac = if (c) sa else ac;
+        \\    const acb = if (c) ac else sb;
+        \\    const cpq = if (c) cp else cq;
+        \\    const cqv = if (c) cq else cv;
+        \\    const cqp = if (c) cq else pq;
+        \\    _ = .{ ab, bv, bz, mab, sac, acb, cpq, cqv, cqp };
+        \\}
+    , &.{
+        .{ "s1", "[]align(4) u32" },
+        .{ "s2", "[]align(8) u32" },
+        .{ "s4", "*align(16) [4]u32" },
+        .{ "sp", "[*]align(16) u32" },
+        .{ "pp", "[*]align(16) u32" },
+        .{ "m1", "[*]align(4) u32" },
+        .{ "m2", "[]align(8) u32" },
+        .{ "mo", "[*]align(4) u32" },
+        .{ "mn", "[*]align(4) u32" },
+        .{ "mz", "[*]align(16) u32" },
+        .{ "p1", "*align(4) [7]u32" },
+        .{ "p4", "[]align(16) u32" },
+        .{ "a1", "*align(4) [2]u32" },
+        .{ "a0", "*align(16) [8]u32" },
+        .{ "v1", "[]volatile u8" },
+        .{ "z0", "[]allowzero u8" },
+        .{ "z1", "[]u8" },
+        .{ "za1", "[*]u8" },
+        .{ "c1", "[]align(4) u32" },
+        .{ "c2", "[*c]align(8) u32" },
+        .{ "sk", "*align(4) [4]u32" },
+        .{ "pv1", "*volatile [1]u32" },
+        .{ "fs", "*align(4) u32" },
+        .{ "fa", "*align(4) u32" },
+        .{ "fv", "*volatile u8" },
+        .{ "fz", "*allowzero u8" },
+        .{ "io", "*align(16) u32" },
+        .{ "wo", "*align(16) u32" },
+        .{ "ie", "*u32" },
+        .{ "ua", "*align(1) u32" },
+        .{ "ub", "*u8" },
+        .{ "se", "*volatile u32" },
+        .{ "ab", "*align(4) u32" },
+        .{ "bv", "*volatile u32" },
+        .{ "bz", "*allowzero u32" },
+        .{ "mab", "[*]align(4) u32" },
+        .{ "sac", "[]align(2) u16" },
+        .{ "acb", "[]align(2) u16" },
+        .{ "cpq", "[*c]align(2) u16" },
+        .{ "cqv", "[*c]volatile u16" },
+        .{ "cqp", "[*c]align(2) u16" },
+    });
+}
+
+test "inline for pointer captures take the alignment of each element" {
+    // Prevents the capture of an inline for from taking the alignment of every iteration.
+    // Expected values: zig 0.17.0 gives `*align(16) u32` for the first element and
+    // `*align(4) u32` for the second one.
+    try expectTypes(
+        \\fn f() u32 {
+        \\    var arr: [2]u32 align(16) = .{ 1, 2 };
+        \\    var sum: u32 = 0;
+        \\    inline for (&arr) |*x| sum += x.*;
+        \\    return sum;
+        \\}
+    , &.{
+        .{ "x", "*align(unknown) u32" },
+    });
+}
+
 test "@typeInfo, @Pointer and std results keep pointer attributes" {
     // Prevents default attributes in `@typeInfo` and std results losing their alignment
     try expectStdTypes(

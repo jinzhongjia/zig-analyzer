@@ -1353,14 +1353,14 @@ const Inferrer = struct {
         switch (ip.key(t)) {
             .ptr_type => |p| if (p.size == .one) {
                 // `ptr` of a pointer to an array: a many-item pointer to its elements, with the
-                // sentinel of the array and the constness of the pointer
+                // sentinel of the array and the other attributes of the pointer
                 if (std.mem.eql(u8, name, "ptr")) {
                     const elem: ?struct { Index, ?Index } = switch (ip.key(p.child)) {
                         .array_type => |arr| .{ arr.child, arr.sentinel },
                         .abstract_array_type => |arr| .{ arr.child, arr.sentinel },
                         else => null,
                     };
-                    if (elem) |el| return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = el[0], .size = .many, .is_const = p.is_const, .sentinel = el[1] } }) };
+                    if (elem) |el| return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = el[0], .size = .many, .is_const = p.is_const, .sentinel = el[1], .attrs = p.attrs } }) };
                 }
                 t = p.child;
             },
@@ -1389,7 +1389,7 @@ const Inferrer = struct {
             },
             .ptr_type => |p| if (p.size == .slice) {
                 if (std.mem.eql(u8, name, "len")) return .{ .ty = .usize_type };
-                if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } }) };
+                if (std.mem.eql(u8, name, "ptr")) return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel, .attrs = p.attrs } }) };
             },
             // Tuples, anonymous structs, and constructed structs and unions
             .tuple_type, .anon_struct_type, .reified_type => {
@@ -2247,11 +2247,12 @@ const Inferrer = struct {
                 const cap = l.capture[i];
                 const ptr = inf.body.binding(cap).is_ptr;
                 const is_const = if (ptr) try inf.forCaptureConst(input, list.ty) else false;
-                const ty = if (ptr) try ip.ptrTo(elem, .one, is_const) else elem;
+                const attrs: InternPool.PtrAttrs = if (ptr) try inf.forCaptureAttrs(l, input, list.ty, elem, iteration) else .{};
+                const ty = if (ptr) try singlePtr(ip, elem, is_const, attrs) else elem;
                 inf.bindings[@backingInt(cap)] = if (elem == .type_type and !ptr)
                     try inf.typeCapture(cap, list, iteration)
                 else if (iteration) |n| blk: {
-                    const it_ty = try inf.iterationType(list.ty, elem, n, ptr, is_const);
+                    const it_ty = try inf.iterationType(list.ty, elem, n, ptr, is_const, attrs);
                     const v = try inf.iterationValue(list, start, n);
                     // A pointer capture takes a pointer to this iteration's element; elements of a
                     // mutable list change at runtime, so no value is taken
@@ -2260,6 +2261,23 @@ const Inferrer = struct {
                 } else .{ .ty = ty };
             }
         }
+    }
+
+    /// Attributes of a pointer capture of `for` over `input` (of type `list`, elements of type
+    /// `elem`): those of a pointer to the element at the loop index, which is runtime-known
+    /// except when inferring one iteration (`iteration`). Without an iteration, the capture of
+    /// an `inline for` differs between iterations when the first element is aligned differently
+    /// from the others, so its alignment is unknown then.
+    fn forCaptureAttrs(inf: *Inferrer, l: Body.Loop, input: ExprId, list: Index, elem: Index, iteration: ?u32) Error!InternPool.PtrAttrs {
+        if (elem == .unknown) return .{};
+        const parent = switch (inf.ip.key(list)) {
+            .ptr_type => |p| p.attrs,
+            else => try inf.placeAttrs(input),
+        };
+        if (iteration) |n| return eval.elemPtrAttrs(inf.r, parent, elem, n);
+        var attrs = try eval.elemPtrAttrs(inf.r, parent, elem, null);
+        if (l.is_inline and attrs.alignment != (try eval.elemPtrAttrs(inf.r, parent, elem, 0)).alignment) attrs.alignment = .unknown;
+        return attrs;
     }
 
     /// The binding when the name `e` refers to a `comptime var` of this member
@@ -2420,12 +2438,12 @@ const Inferrer = struct {
 
     /// Type of a non-type loop variable when inferring the `n`-th iteration: for a tuple whose
     /// items have different types (`.{ &posix, &windows }`), the type of the `n`-th item
-    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool, is_const: bool) Error!Index {
+    fn iterationType(inf: *Inferrer, list: Index, elem: Index, n: u32, ptr: bool, is_const: bool, attrs: InternPool.PtrAttrs) Error!Index {
         var t = elem;
         if (t == .unknown) if (tupleOf(inf.ip, list)) |tt| if (n < tt.types.len) {
             t = tt.types[n];
         };
-        return if (ptr) inf.ip.ptrTo(t, .one, is_const) else t;
+        return if (ptr) singlePtr(inf.ip, t, is_const, attrs) else t;
     }
 
     /// Value of a non-type loop variable when inferring the `n`-th iteration: `start + n` for a
@@ -2521,7 +2539,15 @@ const Inferrer = struct {
         if (is_ptr and inf.var_levels.len != 0) if (try inf.comptimeVarPlace(cond_e)) |v| inf.untrackComptimeVar(v);
         // A known non-null optional value is its payload value
         const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) cond_tv.val else null;
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
+        if (!is_ptr) {
+            inf.bindings[@backingInt(cap)] = .{ .ty = t, .val = val };
+            return;
+        }
+        // The payload of an optional is at its start; a pointer to the payload of an error union
+        // keeps only the address space
+        const place = try inf.placeAttrs(cond_e);
+        const attrs: InternPool.PtrAttrs = if (ip.key(cond) == .optional_type) place else .{ .address_space = place.address_space };
+        inf.bindings[@backingInt(cap)] = .{ .ty = try singlePtr(ip, t, try inf.isConstPlace(cond_e), attrs) };
     }
 
     /// Captures of a switch. For a tagged union, the capture of an ordinary prong is the peer of
@@ -2584,12 +2610,38 @@ const Inferrer = struct {
         if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
             if ((try inlineProngValues(ip, inf.body, inf.exprs, prong, operand, seed.index)).value) |v| val = v;
         };
-        inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(operand_e)) else t, .val = if (is_ptr) null else val };
+        if (is_ptr) {
+            const attrs = try inf.switchCaptureAttrs(prongs, pi, operand_e, operand, t, is_union, inline_tag);
+            inf.bindings[@backingInt(cap)] = .{ .ty = try singlePtr(ip, t, try inf.isConstPlace(operand_e), attrs) };
+        } else inf.bindings[@backingInt(cap)] = .{ .ty = t, .val = val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
             const tag_val: ?Index = if (inline_tag) |name| (if (tag != .unknown) try ip.get(.{ .enum_tag = .{ .ty = tag, .name = name } }) else null) else null;
             inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag, .val = tag_val };
         }
+    }
+
+    /// Attributes of the pointer capture of a switch prong (with payload type `t`): for a tagged
+    /// union, those of a pointer to the field of the prong's items (the alignment is unknown when
+    /// they differ between the items); otherwise those of a pointer to the operand
+    fn switchCaptureAttrs(inf: *Inferrer, prongs: []const Body.Prong, pi: usize, operand_e: ExprId, operand: Index, t: Index, is_union: bool, inline_tag: ?[]const u8) Error!InternPool.PtrAttrs {
+        const prong = prongs[pi];
+        if (!is_union) return inf.placeAttrs(operand_e);
+        if (t == .unknown) return .{};
+        if (inline_tag) |name| return inf.fieldPlaceAttrs(operand_e, name, t);
+        var names: std.ArrayList([]const u8) = .empty;
+        if (prong.is_inline) {
+            const payloads = try inlineUnionPayloads(inf.r, inf.body, inf.exprs, prongs, pi, operand) orelse return .{ .alignment = .unknown };
+            for (payloads) |p| try names.append(inf.scratch, p.name);
+        } else for (prong.items) |item| {
+            try names.append(inf.scratch, itemTagName(inf.ip, inf.body, inf.exprs, item) orelse return .{ .alignment = .unknown });
+        }
+        if (names.items.len == 0) return .{};
+        var attrs = try inf.fieldPlaceAttrs(operand_e, names.items[0], t);
+        for (names.items[1..]) |name| {
+            if ((try inf.fieldPlaceAttrs(operand_e, name, t)).alignment != attrs.alignment) attrs.alignment = .unknown;
+        }
+        return attrs;
     }
 
     /// Type of a prong capture in a switch on an error set: for an ordinary prong, the set of the
@@ -2725,14 +2777,15 @@ const Inferrer = struct {
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
-            // Pointer arithmetic (matches the compiler): `[*]T ± usize` is still the original
-            // pointer type, and the difference of two pointers is usize
+            // Pointer arithmetic (matches the compiler): `[*]T ± usize` is the original pointer
+            // type with the alignment of the element at the offset, and the difference of two
+            // pointers is usize
             .plus, .minus => {
                 const lhs = try inf.infer(lhs_e, null);
                 if (!isNonSlicePtr(ip, lhs.ty)) return inf.arith(op, lhs, rhs_e);
                 const rhs = try inf.infer(rhs_e, .usize_type);
                 if (isNonSlicePtr(ip, rhs.ty)) return .{ .ty = if (op == .minus) .usize_type else .unknown };
-                return .{ .ty = if (isManyPtr(ip, lhs.ty)) lhs.ty else .unknown };
+                return .{ .ty = if (isManyPtr(ip, lhs.ty)) try inf.ptrArithmetic(lhs.ty, rhs) else .unknown };
             },
             // Merging error sets
             .pipe_pipe => {
@@ -3245,43 +3298,54 @@ const Inferrer = struct {
 
     /// Slicing (matches the compiler's `analyzeSlice`): a pointer to an array when the length is
     /// comptime-known, a slice otherwise; slicing a many-item pointer without an end is pointer
-    /// arithmetic and keeps the original pointer type. Slicing up to the end of an array or slice
-    /// keeps its original sentinel.
+    /// arithmetic. Slicing up to the end of an array or slice keeps its original sentinel. The
+    /// result has the attributes of a pointer to the start element (see `elemPtrAttrs`).
     fn slice(inf: *Inferrer, e: ExprId, lhs_e: ExprId, start_e: ExprId, end_e: ?ExprId, sentinel_e: ?ExprId) Error!TypedValue {
         const ip = inf.ip;
         const lhs = try inf.infer(lhs_e, null);
         const start = try inf.infer(start_e, .usize_type);
         const end: ?TypedValue = if (end_e) |x| try inf.infer(x, .usize_type) else null;
-        const Source = struct { elem: Index, sentinel: ?Index = null, len: ?u64 = null, is_const: bool = false };
+        const Source = struct { elem: Index, sentinel: ?Index = null, len: ?u64 = null, is_const: bool = false, attrs: InternPool.PtrAttrs = .{} };
         const src: Source = switch (ip.key(lhs.ty)) {
-            .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = try inf.isConstPlace(lhs_e) },
-            .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = try inf.isConstPlace(lhs_e) },
+            .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = try inf.isConstPlace(lhs_e), .attrs = try inf.placeAttrs(lhs_e) },
+            .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = try inf.isConstPlace(lhs_e), .attrs = try inf.placeAttrs(lhs_e) },
             .ptr_type => |p| switch (p.size) {
                 .one => switch (ip.key(p.child)) {
-                    .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const },
-                    .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = p.is_const },
+                    .array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .len = a.len, .is_const = p.is_const, .attrs = p.attrs },
+                    .abstract_array_type => |a| .{ .elem = a.child, .sentinel = a.sentinel, .is_const = p.is_const, .attrs = p.attrs },
                     // A pointer to a single element is sliced as an array of length 1
-                    else => .{ .elem = p.child, .len = 1, .is_const = p.is_const },
+                    else => .{ .elem = p.child, .len = 1, .is_const = p.is_const, .attrs = p.attrs },
                 },
-                .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const },
+                .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const, .attrs = p.attrs },
             },
             else => .{ .elem = .unknown },
         };
         const explicit: ?TypedValue = if (sentinel_e) |x| try inf.infer(x, if (src.elem != .unknown) src.elem else null) else null;
         if (src.elem == .unknown) return .unknown;
-        if (end == null and isManyPtr(ip, lhs.ty)) return .{ .ty = lhs.ty };
+        if (end == null and isManyPtr(ip, lhs.ty)) return .{ .ty = try inf.ptrArithmetic(lhs.ty, start) };
         const start_n = std.math.cast(u64, value.intOf(ip, start.val) orelse -1);
         const end_n: ?u64 = if (end) |x| std.math.cast(u64, value.intOf(ip, x.val) orelse -1) else src.len;
         const end_is_len = end == null or (src.len != null and end_n != null and end_n.? == src.len.?);
         const sentinel: ?Index = if (explicit) |x| (x.val orelse return .unknown) else if (end_is_len) src.sentinel else null;
+        const attrs = try eval.elemPtrAttrs(inf.r, src.attrs, src.elem, start_n);
         if (start_n != null and end_n != null and end_n.? >= start_n.?) {
             const array = try ip.get(.{ .array_type = .{ .len = end_n.? - start_n.?, .child = src.elem, .sentinel = sentinel } });
-            const ty = try ip.ptrTo(array, .one, src.is_const);
+            const ty = try ip.get(.{ .ptr_type = .{ .child = array, .size = .one, .is_const = src.is_const, .attrs = attrs } });
             // comptime-known constant and range: the interpreter computes the value of the slice
             if (src.is_const) if (try inf.knownValue(e, lhs.val, ty)) |tv| return tv;
             return .{ .ty = ty };
         }
-        return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel } }) };
+        return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = src.elem, .size = .slice, .is_const = src.is_const, .sentinel = sentinel, .attrs = attrs } }) };
+    }
+
+    /// Type of `ptr + offset` / `ptr - offset` for a many-item or C pointer type `ptr` (the
+    /// compiler's `analyzePtrArithmetic`): the same pointer type with the attributes of a pointer
+    /// to the element at `offset`
+    fn ptrArithmetic(inf: *Inferrer, ptr: Index, offset: TypedValue) Error!Index {
+        var p = inf.ip.key(ptr).ptr_type;
+        const index = std.math.cast(u64, value.intOf(inf.ip, offset.val) orelse -1);
+        p.attrs = try eval.elemPtrAttrs(inf.r, p.attrs, p.child, index);
+        return inf.ip.get(.{ .ptr_type = p });
     }
 
     /// Result type `Log2Int(T)` of the right-hand side of a shift (matches the compiler); null for
@@ -3447,7 +3511,7 @@ const Inferrer = struct {
             // A C pointer on either side: the other side is a pointer, an optional pointer or an
             // integer, and the result is a C pointer
             if (isCPtr(ip, cur) or isCPtr(ip, t)) {
-                result = try peerCPtr(ip, cur, t) orelse return .unknown;
+                result = try peerCPtr(inf.r, ip, cur, t) orelse return .unknown;
                 continue;
             }
             if (cur == .comptime_int_type and (ip.isInt(t) or ip.isFloat(t))) {
@@ -3499,7 +3563,7 @@ const Inferrer = struct {
                 result = try ip.optionalOf(p);
                 continue;
             }
-            if (try peerPtr(ip, cur, t)) |p| {
+            if (try peerPtr(inf.r, ip, cur, t)) |p| {
                 result = p;
                 continue;
             }
@@ -3925,16 +3989,46 @@ fn isCPtr(ip: *InternPool, t: Index) bool {
 
 /// Peer of two types where at least one is a C pointer (matches the compiler's `c_ptr`
 /// strategy): integers coerce to the C pointer; pointers and optional pointers must have the
-/// same element type; const if either side is const, and the sentinel is kept only when both
-/// sides have the same one. Null when they cannot be unified.
-fn peerCPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
+/// same element type; const if either side is const, the sentinel is kept only when both sides
+/// have the same one, and the attributes join as in `peerPtrAttrs`. Null when they cannot be
+/// unified.
+fn peerCPtr(r: *Resolver, ip: *InternPool, a: Index, b: Index) Error!?Index {
     if (ip.isInt(a)) return if (isCPtr(ip, b)) b else null;
     if (ip.isInt(b)) return if (isCPtr(ip, a)) a else null;
     const x = runtimePtr(ip, a) orelse return null;
     const y = runtimePtr(ip, b) orelse return null;
     if (x.child != y.child) return null;
     const sentinel: ?Index = if (x.sentinel != null and y.sentinel != null and x.sentinel.? == y.sentinel.?) x.sentinel else null;
-    return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .c, .is_const = x.is_const or y.is_const, .sentinel = sentinel } });
+    const attrs = try peerPtrAttrs(r, x, y) orelse return null;
+    return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .c, .is_const = x.is_const or y.is_const, .sentinel = sentinel, .attrs = attrs } });
+}
+
+/// Attributes of the peer of the pointers `x` and `y` (the compiler's `c_ptr` and `ptr`
+/// strategies): the lower of the two alignments, explicit unless neither side has an explicit
+/// one, and volatile and allowzero when either side is. Null when the address spaces or the bit
+/// ranges differ.
+fn peerPtrAttrs(r: *Resolver, x: InternPool.PtrType, y: InternPool.PtrType) Error!?InternPool.PtrAttrs {
+    const a = x.attrs;
+    const b = y.attrs;
+    if (a.host_size != b.host_size or a.bit_offset != b.bit_offset) return null;
+    var out = a;
+    if (a.address_space == null or b.address_space == null) {
+        out.address_space = null;
+    } else if (a.address_space.? != b.address_space.?) return null;
+    out.is_volatile = a.is_volatile or b.is_volatile;
+    out.is_allowzero = a.is_allowzero or b.is_allowzero;
+    if (a.alignment == .natural and b.alignment == .natural) return out;
+    const x_align = try ptrAlignment(r, x);
+    const y_align = try ptrAlignment(r, y);
+    out.alignment = if (x_align != null and y_align != null) .fromBytes(@min(x_align.?, y_align.?)) else .unknown;
+    return out;
+}
+
+/// Alignment in bytes of the address of a pointer: the explicit one, or that of its child;
+/// null when not known
+fn ptrAlignment(r: *Resolver, p: InternPool.PtrType) Error!?u64 {
+    if (p.attrs.alignment != .natural) return p.attrs.alignment.bytes();
+    return if (try eval.typeLayout(r, p.child)) |l| l.alignment else null;
 }
 
 /// The pointer type of a pointer or of an optional pointer
@@ -3969,9 +4063,10 @@ fn optionalChild(ip: *InternPool, t: Index) Index {
 
 /// Peer of two pointers (matches the compiler): the element types must be the same; a single-item
 /// pointer to an array unifies with a slice or many-item pointer into the latter, and array
-/// pointers of different lengths unify into a slice; const if either side is const, and the
-/// sentinel is kept only when both sides have the same one. null when they cannot be unified.
-fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
+/// pointers of different lengths unify into a slice; const if either side is const, the
+/// sentinel is kept only when both sides have the same one, and the attributes join as in
+/// `peerPtrAttrs`. null when they cannot be unified.
+fn peerPtr(r: *Resolver, ip: *InternPool, a: Index, b: Index) Error!?Index {
     const x = switch (ip.key(a)) {
         .ptr_type => |p| p,
         else => return null,
@@ -3980,8 +4075,8 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
         .ptr_type => |p| p,
         else => return null,
     };
-    if (try tupleAsArray(ip, x, y)) |p| return peerPtr(ip, p, b);
-    if (try tupleAsArray(ip, y, x)) |p| return peerPtr(ip, a, p);
+    if (try tupleAsArray(ip, x, y)) |p| return peerPtr(r, ip, p, b);
+    if (try tupleAsArray(ip, y, x)) |p| return peerPtr(r, ip, a, p);
     const xa: ?@FieldType(InternPool.Key, "array_type") = if (x.size == .one) switch (ip.key(x.child)) {
         .array_type => |arr| arr,
         else => null,
@@ -3991,10 +4086,11 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
         else => null,
     } else null;
     const is_const = x.is_const or y.is_const;
+    const attrs = try peerPtrAttrs(r, x, y) orelse return null;
     // A single-item pointer to a non-array only unifies with the same single-item pointer type
     if ((x.size == .one and xa == null) or (y.size == .one and ya == null)) {
         if (x.size != y.size or x.child != y.child) return null;
-        return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .one, .is_const = is_const } });
+        return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .one, .is_const = is_const, .attrs = attrs } });
     }
     const x_elem = if (xa) |arr| arr.child else x.child;
     const y_elem = if (ya) |arr| arr.child else y.child;
@@ -4005,12 +4101,12 @@ fn peerPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
     if (xa != null and ya != null) {
         if (xa.?.len == ya.?.len) {
             const arr = try ip.get(.{ .array_type = .{ .len = xa.?.len, .child = x_elem, .sentinel = sentinel } });
-            return try ip.ptrTo(arr, .one, is_const);
+            return try ip.get(.{ .ptr_type = .{ .child = arr, .size = .one, .is_const = is_const, .attrs = attrs } });
         }
-        return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = .slice, .is_const = is_const, .sentinel = sentinel } });
+        return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = .slice, .is_const = is_const, .sentinel = sentinel, .attrs = attrs } });
     }
     const size: InternPool.PtrSize = if (xa != null) y.size else if (ya != null) x.size else if (x.size == y.size) x.size else return null;
-    return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel } });
+    return try ip.get(.{ .ptr_type = .{ .child = x_elem, .size = size, .is_const = is_const, .sentinel = sentinel, .attrs = attrs } });
 }
 
 /// The pointer to an array corresponding to the single-item pointer to a tuple `p` (`&.{}`,
@@ -4029,7 +4125,13 @@ fn tupleAsArray(ip: *InternPool, p: @FieldType(InternPool.Key, "ptr_type"), othe
     } else other.child;
     for (tt.types) |t| if (t != elem) return null;
     const arr = try ip.get(.{ .array_type = .{ .len = @intCast(tt.types.len), .child = elem, .sentinel = null } });
-    return try ip.ptrTo(arr, .one, p.is_const);
+    return try singlePtr(ip, arr, p.is_const, p.attrs);
+}
+
+/// `*T` with the given constness and attributes; unknown when `T` is
+fn singlePtr(ip: *InternPool, child: Index, is_const: bool, attrs: InternPool.PtrAttrs) Allocator.Error!Index {
+    if (child == .unknown) return .unknown;
+    return ip.get(.{ .ptr_type = .{ .child = child, .size = .one, .is_const = is_const, .attrs = attrs } });
 }
 
 /// Pointers that support pointer arithmetic (many-item pointers and C pointers)
