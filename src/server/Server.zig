@@ -274,6 +274,8 @@ publish_seq: std.atomic.Value(u64) = .init(0),
 publish_mutex: Io.Mutex = .init,
 /// File → sequence number of the diagnostics sent (protected by publish_mutex)
 sent_seq: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
+/// File → hash of the last diagnostics notification sent (protected by publish_mutex)
+sent_hash: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
 
 pub const State = enum { uninitialized, running, shutdown };
 
@@ -396,6 +398,7 @@ pub fn deinit(server: *Server) void {
     server.last_uris.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
+    server.sent_hash.deinit(server.gpa);
     server.semantic_cache.deinit(server.gpa);
     server.watched_built.deinit(server.gpa);
     server.progress.deinit(server.gpa);
@@ -1600,6 +1603,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
     server.publishFiles(&.{id}, false);
+    server.publishDependents(&.{id});
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
     server.compileSingle(id);
     server.scheduleCompileSetRefresh(&.{id});
@@ -1656,6 +1660,7 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         defer server.docs_mutex.unlock(server.io);
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
+    server.publishDependents(&.{id});
     server.requestSemanticRefresh();
     server.scheduleCompileSetRefresh(&.{id});
     // When a single-file mode root file was deleted from disk while open (notifications of
@@ -3288,9 +3293,9 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
 pub const max_publish_workers = 8;
 
 /// When `tracked`, the file's state is recorded in `publish_files`,
-/// and `clear` is taken from there when the job starts; when the state
+/// and `clear` and `always` are taken from there when the job starts; when the state
 /// cannot be recorded (allocation failure), requests are not coalesced
-const PublishJob = struct { file: Vfs.FileId, clear: bool = false, tracked: bool = true };
+const PublishJob = struct { file: Vfs.FileId, clear: bool = false, always: bool = true, tracked: bool = true };
 
 const PublishState = struct {
     /// In the queue, not started yet
@@ -3300,6 +3305,9 @@ const PublishState = struct {
     /// The next publish is sent even when there are no
     /// diagnostics (the union over coalesced requests)
     clear: bool,
+    /// The next publish is sent even when it is the same as the last one sent for the file (the
+    /// union over coalesced requests; see `publishDependents`)
+    always: bool,
 };
 
 /// Recomputes and publishes the diagnostics of these files in the background. When `clear` is true,
@@ -3309,6 +3317,30 @@ const PublishState = struct {
 /// files, computing the same file concurrently is just duplicate work, and the run after completion
 /// reads the latest state. The number of tasks does not exceed `max_publish_workers`.
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
+    server.enqueuePublish(files, clear, true);
+}
+
+/// Open files other than `changed`, whose text has just changed: their diagnostics may depend on
+/// that text (notes and reference traces located in it, inactive code whose conditions read it,
+/// naming hints that depend on its declarations), so they are recomputed. Most of them do not
+/// depend on it: a result is sent only when it differs from the last one sent for the file.
+fn publishDependents(server: *Server, changed: []const Vfs.FileId) void {
+    var files: std.ArrayList(Vfs.FileId) = .empty;
+    defer files.deinit(server.gpa);
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        for (server.open_docs.keys()) |file| {
+            if (std.mem.indexOfScalar(Vfs.FileId, changed, file) != null) continue;
+            files.append(server.gpa, file) catch return log.err("out of memory while publishing diagnostics", .{});
+        }
+    }
+    server.enqueuePublish(files.items, false, false);
+}
+
+/// See `publishFiles`; when `always` is false, the result is not sent when it is the same as the
+/// last one sent for the file
+fn enqueuePublish(server: *Server, files: []const Vfs.FileId, clear: bool, always: bool) void {
     if (files.len == 0) return;
     var spawn_count: usize = 0;
     {
@@ -3316,15 +3348,16 @@ pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) voi
         defer server.publish_queue_mutex.unlock(server.io);
         for (files) |file| {
             const gop = server.publish_files.getOrPut(server.gpa, file) catch {
-                server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear, .tracked = false }) catch {};
+                server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear, .always = always, .tracked = false }) catch {};
                 continue;
             };
             if (gop.found_existing) {
                 gop.value_ptr.clear = gop.value_ptr.clear or clear;
+                gop.value_ptr.always = gop.value_ptr.always or always;
                 if (!gop.value_ptr.queued) gop.value_ptr.again = true;
                 continue;
             }
-            gop.value_ptr.* = .{ .clear = clear };
+            gop.value_ptr.* = .{ .clear = clear, .always = always };
             server.publish_queue.append(server.gpa, .{ .file = file }) catch {
                 _ = server.publish_files.remove(file);
             };
@@ -3365,10 +3398,12 @@ fn publishWorker(server: *Server) Io.Cancelable!void {
                 state.queued = false;
                 job.clear = state.clear;
                 state.clear = false;
+                job.always = state.always;
+                state.always = false;
             }
             break :blk job;
         };
-        server.publishNow(job.file, job.clear, null);
+        server.publishNow(job.file, job.clear, job.always, null);
         if (job.tracked) server.publishDone(job.file);
         server.maybeResetSema();
     }
@@ -3442,7 +3477,8 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         const ms = server.debounce_ms.load(.monotonic);
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
-    server.publishNow(file, false, seen);
+    server.publishNow(file, false, true, seen);
+    server.publishDependents(&.{file});
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
     server.refreshCompileSets(&.{file});
     server.maybeResetSema();
@@ -3540,8 +3576,9 @@ fn resetSemaLocked(server: *Server) void {
 }
 
 /// `generation`: the edit generation that an edit-triggered publish is for. When interrupted, it
-/// gives up if a newer edit exists; the publish triggered by that edit takes over.
-fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) void {
+/// gives up if a newer edit exists; the publish triggered by that edit takes over. `clear` and
+/// `always`: see `sendDiagnostics`.
+fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, generation: ?u64) void {
     var pc: panic_context.Text = .{};
     pc.enter("publish diagnostics {s}", .{server.vfs.path(file)});
     defer pc.leave();
@@ -3585,7 +3622,7 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
         const canceled = if (ctx.checkCanceled()) |_| false else |_| true;
         ctx.end();
         if (canceled) continue;
-        server.sendDiagnostics(file, params, clear, seq);
+        server.sendDiagnostics(file, params, clear, always, seq);
         return;
     }
 }
@@ -3633,16 +3670,20 @@ fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
 /// than the one already sent are sent, the last result sent has read the state after
 /// the last change. Comparing and writing both happen inside publish_mutex, so the
 /// order of writes matches the comparisons; serialization happens outside the lock.
-fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, seq: u64) void {
+/// `clear`: sent even when empty for a file that is not showing diagnostics; `always`: sent even
+/// when it is the same as the last result sent for the file.
+fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, always: bool, seq: u64) void {
     const bytes = jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", params) catch return log.err("out of memory while building notification", .{});
     var sent = false;
     defer if (!sent) server.gpa.free(bytes);
+    const hash = std.hash.Wyhash.hash(0, bytes);
     server.publish_mutex.lockUncancelable(server.io);
     defer server.publish_mutex.unlock(server.io);
     if (server.sent_seq.getOrPut(server.gpa, file)) |gop| {
         if (gop.found_existing and gop.value_ptr.* > seq) return;
         gop.value_ptr.* = seq;
     } else |_| {}
+    if (!always) if (server.sent_hash.get(file)) |last| if (last == hash) return;
     {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
@@ -3657,6 +3698,9 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
         }
     }
     sent = true;
+    server.sent_hash.put(server.gpa, file, hash) catch {
+        _ = server.sent_hash.remove(file);
+    };
     server.send(bytes);
     // The clearing for the virtual document has been sent: its URI is no longer needed
     if (isVirtual(server.vfs.path(file))) {
@@ -3680,10 +3724,14 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
     const stale: types.Diagnostic = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 1 } }, .message = .{ .string = "stale" } };
     // The 2nd computation finishes first and is sent; the 1st is based on older state and is
     // dropped when it finishes later. Other files are not affected.
-    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, 2);
-    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 1);
-    server.sendDiagnostics(b, .{ .uri = "file:///b.zig", .diagnostics = &.{stale} }, true, 0);
-    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 3);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, true, 2);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, true, 1);
+    server.sendDiagnostics(b, .{ .uri = "file:///b.zig", .diagnostics = &.{stale} }, true, true, 0);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, true, 3);
+    // A republish of a file for a change in another file is sent only when its result differs
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, false, false, 4);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, false, false, 5);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, true, 6);
 
     var reader: Io.Reader = .fixed(out.written());
     var sent: std.ArrayList(u8) = .empty;
@@ -3696,7 +3744,7 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
         const uri_text = params.get("uri").?.string;
         try sent.print(gpa, "{s}:{d} ", .{ uri_text[uri_text.len - 5 ..], params.get("diagnostics").?.array.items.len });
     } else |err| if (err != error.EndOfStream) return err;
-    try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 ", sent.items);
+    try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 a.zig:0 a.zig:0 ", sent.items);
 }
 
 test "publishFiles: large batches use a bounded number of workers" {

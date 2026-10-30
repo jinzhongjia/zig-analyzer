@@ -1803,3 +1803,78 @@ test "settings: invalid zig paths fall back to zig env with a message, zig.built
     try testing.expectEqual(messages.len, (try shownMessages(&h)).len);
     try shutdown(&h);
 }
+
+/// The diagnostics last published for a document, and how many times it was published
+fn lastPublished(h: *Harness, document_uri: []const u8) !struct { diagnostics: []const std.json.Value, count: usize } {
+    var last: ?[]const std.json.Value = null;
+    var count: usize = 0;
+    for (try h.notifications("textDocument/publishDiagnostics")) |m| {
+        const params = m.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("uri").?.string, document_uri)) continue;
+        last = params.get("diagnostics").?.array.items;
+        count += 1;
+    }
+    return .{ .diagnostics = last orelse return error.NotPublished, .count = count };
+}
+
+/// "uri-basename line:character message" of each relatedInformation entry of a diagnostic
+fn relatedLocations(h: *Harness, diagnostic: std.json.Value) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const related = diagnostic.object.get("relatedInformation") orelse return out.items;
+    for (related.array.items) |r| {
+        const location = r.object.get("location").?.object;
+        const file_uri = location.get("uri").?.string;
+        const start = location.get("range").?.object.get("start").?.object;
+        try out.append(h.arena.allocator(), try std.fmt.allocPrint(h.arena.allocator(), "{s} {d}:{d} {s}", .{
+            file_uri[std.mem.lastIndexOfScalar(u8, file_uri, '/').? + 1 ..],
+            start.get("line").?.integer,
+            start.get("character").?.integer,
+            r.object.get("message").?.string,
+        }));
+    }
+    return out.items;
+}
+
+test "notes into another open file follow its unsaved edits and its close" {
+    const util_text = "pub fn helper(x: u32) u32 {\n    return x;\n}\n";
+    const main_text = "const util = @import(\"util.zig\");\nexport fn f() u32 {\n    return util.helper(1, 2);\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "util.zig", .text = util_text },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"diagnostics": {"debounce_ms": 0}}
+    ));
+    try waitIdle(&h);
+    const util_uri = try open(&h, try project.path(a, "util.zig"), util_text);
+    const main_uri = try open(&h, try project.path(a, "main.zig"), main_text);
+    try waitIdle(&h);
+    const declared = "util.zig 0:0 function declared here";
+    {
+        const diags = (try lastPublished(&h, main_uri)).diagnostics;
+        try testing.expectEqual(1, diags.len);
+        try testing.expectEqualStrings(declared, (try relatedLocations(&h, diags[0]))[0]);
+    }
+
+    // Unsaved lines inserted above the function: the note moves with them. Guards against keeping
+    // main.zig's note on the old line until main.zig itself is republished.
+    const published = (try lastPublished(&h, main_uri)).count;
+    try change(&h, util_uri, 2, "// one\n// two\n// three\n" ++ util_text);
+    try waitIdle(&h);
+    {
+        const last = try lastPublished(&h, main_uri);
+        try testing.expect(last.count > published);
+        try testing.expectEqualStrings("util.zig 3:0 function declared here", (try relatedLocations(&h, last.diagnostics[0]))[0]);
+    }
+
+    // Closed without saving: back to the text on disk
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = util_uri } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(declared, (try relatedLocations(&h, (try lastPublished(&h, main_uri)).diagnostics[0]))[0]);
+    try shutdown(&h);
+}
