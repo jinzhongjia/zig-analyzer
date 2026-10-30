@@ -192,7 +192,7 @@ pub const Binding = struct {
 pub const Scope = struct {
     parent: ?ScopeId,
     bindings: []const BindingId,
-    /// Labeled block or loop
+    /// Labeled block, loop or switch
     label: ?struct { name: []const u8, expr: ExprId } = null,
 };
 
@@ -290,6 +290,18 @@ pub fn lookup(b: *const Body, from: ScopeId, name: []const u8) ?BindingId {
             if (candidate.range.end - candidate.range.start == 1 and std.mem.eql(u8, candidate.name, "_")) continue;
             if (std.mem.eql(u8, candidate.name, name)) return bindings[i];
         }
+    }
+    return null;
+}
+
+/// The labeled block, loop or switch that `break :name` / `continue :name` at `e` targets: the
+/// innermost enclosing expression with the label (the compiler rejects redefining a label inside
+/// the expression it labels)
+pub fn labelTarget(b: *const Body, e: ExprId, name: []const u8) ?ExprId {
+    var s: ?ScopeId = b.expr_scopes[@backingInt(e)];
+    while (s) |id| : (s = b.scope(id).parent) {
+        const l = b.scope(id).label orelse continue;
+        if (std.mem.eql(u8, l.name, name)) return l.expr;
     }
     return null;
 }

@@ -221,8 +221,8 @@ fn zigFmtEdit(r: *Resolver, file: FileId, text: []const u8, raw: Edit) resolve.E
 
 /// Extracts the selected expression (ignoring surrounding whitespace) into a local constant before
 /// the statement containing it, and replaces the original with its name.
-/// The left-hand side of an assignment, the operand of address-of, and control flow expressions
-/// are not extracted (extracting them would change the semantics or be invalid).
+/// Expressions whose storage is used rather than their value (see `addressUsed`) and control flow
+/// expressions are not extracted (extracting them would change the semantics or be invalid).
 fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -245,11 +245,6 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         .missing, .@"return", .@"break", .@"continue", .@"unreachable", .assign, .block, .loop, .container => return null,
         else => {},
     }
-    for (b.exprs) |x| switch (x) {
-        .assign => |a| if (a.lhs == e) return null,
-        .prefix => |p| if (p.op == .ampersand and p.operand == e) return null,
-        else => {},
-    };
 
     // The enclosing statement: a direct child of a block
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
@@ -267,12 +262,13 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
     }
     const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, item), .mode = .full });
     if (res.exprs.len != b.exprs.len) return null;
+    if (addressUsed(r.ctx.db.env.ip, b, res, e)) return null;
     const purity: Purity = .{ .r = r, .file = file, .item = item, .body = b, .res = res };
     if (s.offset < base or !try hoistable(purity, e, s.offset - base, s.range().end - base)) return null;
     // Expressions whose type depends on the result location (such as `@intCast(x)`): the extracted
     // constant is annotated explicitly with the type at the original position; when the type cannot
     // be written out, nothing is extracted
-    const annotation: []const u8 = if (needsResultType(b, e)) blk: {
+    const annotation: []const u8 = if (needsResultType(b, res, e)) blk: {
         const ty = res.exprs[@backingInt(e)].ty;
         if (!isPlainType(r.ctx.db.env.ip, ty)) return null;
         break :blk try std.fmt.allocPrint(r.arena, ": {s}", .{try render.typeAlloc(r, ty)});
@@ -296,6 +292,71 @@ fn extractVariable(r: *Resolver, file: FileId, text: []const u8, sel_start: u32,
         .kind = .refactor_extract,
         .edits = try r.arena.dupe(Edit, &.{.{ .start = s.offset, .end = end, .text = new_text }}),
     };
+}
+
+/// Zig evaluates `x` by reference (result location `.ref`) and uses its storage: the left-hand
+/// side of an assignment, the operand of address-of, the base of a member, element, or slice in
+/// such a position (`p` in `&p.a`, `s.inner` in `s.inner.x = 5`), a sliced array, the receiver
+/// of a method taking a pointer, and the operand of `if` / `while` / `switch` with a `|*p|`
+/// capture. A constant holding a copy of `x` would give the address of the copy instead (or a
+/// `*const` where `*T` is needed). Through a pointer the address comes from the pointer value,
+/// which the copy keeps.
+fn addressUsed(ip: *InternPool, b: *const Body, res: queries.Infer.Value, x: Body.ExprId) bool {
+    const ty = res.exprs[@backingInt(x)].ty;
+    const copy_keeps_address = ip.key(ty) == .ptr_type or ty == .type_type;
+    for (b.exprs, 0..) |p, i| {
+        const parent: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        switch (p) {
+            .prefix => |pre| if (pre.operand == x) return pre.op == .ampersand,
+            .assign => |a| if (a.lhs == x) return true,
+            .field_access => |fa| if (fa.lhs == x)
+                return !copy_keeps_address and (addressUsed(ip, b, res, parent) or receivesPointer(ip, b, res, parent)),
+            .index => |ix| if (ix.lhs == x) return !copy_keeps_address and addressUsed(ip, b, res, parent),
+            .slice => |s| if (s.lhs == x) return !copy_keeps_address,
+            .unwrap_optional => |o| if (o == x) return addressUsed(ip, b, res, parent),
+            .builtin_call => |c| if (c.args.len > 0 and c.args[0] == x and std.mem.eql(u8, c.name, "@field"))
+                return !copy_keeps_address and addressUsed(ip, b, res, parent),
+            .@"if" => |f| if (f.cond == x) return anyPointerCapture(b, f.capture),
+            .loop => |l| if (l.kind == .@"while" and std.mem.indexOfScalar(Body.ExprId, l.inputs, x) != null)
+                return anyPointerCapture(b, l.capture),
+            .@"switch" => |sw| if (sw.operand == x) return for (sw.prongs) |pr| {
+                if (anyPointerCapture(b, pr.capture)) break true;
+            } else false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// `callee` is called as a method whose first parameter receives the address of the receiver:
+/// a single-item or C pointer (also optional), or `anytype` (matching the compiler, which passes
+/// the receiver's address to an `anytype` first parameter). A method whose signature cannot be
+/// computed counts as yes; calling a function pointer field loads the field.
+fn receivesPointer(ip: *InternPool, b: *const Body, res: queries.Infer.Value, callee: Body.ExprId) bool {
+    for (b.exprs) |x| switch (x) {
+        .call => |c| if (c.callee == callee) break,
+        else => {},
+    } else return false;
+    const ty = res.exprs[@backingInt(callee)].ty;
+    const sig = switch (ip.key(ty)) {
+        .fn_type => |f| f,
+        .unknown => return true,
+        else => return false,
+    };
+    if (sig.params.len == 0) return false;
+    const first = switch (ip.key(sig.params[0])) {
+        .optional_type => |c| c,
+        else => sig.params[0],
+    };
+    return switch (ip.key(first)) {
+        .ptr_type, .unknown => true,
+        else => false,
+    };
+}
+
+fn anyPointerCapture(b: *const Body, captures: []const Body.BindingId) bool {
+    for (captures) |c| if (b.binding(c).is_ptr) return true;
+    return false;
 }
 
 /// After `e` is extracted to before its statement (`[stmt_start, stmt_end)` relative to the
@@ -423,29 +484,55 @@ pub const pure_builtins = [_][]const u8{
     "@mulWithOverflow", "@shlWithOverflow", "@Vector",    "@Type",       "@embedFile",    "@src",
 };
 
-/// Casts whose type is determined by the result location (consistent with `casts` in `Infer`)
+/// Builtins whose type is determined by the result location (consistent with `casts` in `Infer`,
+/// plus `@fromBackingInt`)
 const result_typed_builtins = [_][]const u8{
-    "@intCast", "@truncate",  "@floatCast",     "@floatFromInt", "@intFromFloat",   "@enumFromInt", "@bitCast",
-    "@ptrCast", "@alignCast", "@addrSpaceCast", "@ptrFromInt",   "@fieldParentPtr", "@errorCast",   "@splat",
+    "@intCast",       "@truncate",       "@floatCast",      "@floatFromInt", "@intFromFloat",
+    "@enumFromInt",   "@fromBackingInt", "@bitCast",        "@ptrCast",      "@alignCast",
+    "@addrSpaceCast", "@ptrFromInt",     "@fieldParentPtr", "@errorCast",    "@splat",
 };
 
 /// The type (or validity) of the expression depends on its result location: used alone as the
-/// initial value of a `const`, it needs a type annotation
-fn needsResultType(b: *const Body, e: Body.ExprId) bool {
+/// initial value of a `const`, it needs a type annotation. This includes decl literal calls
+/// (`.init(x)`, looked up in the result type), and `if` / `switch` choosing among number literals
+/// by a condition that is not comptime-known (without a result type the literals are comptime_int
+/// / comptime_float values, which cannot depend on runtime control flow).
+fn needsResultType(b: *const Body, res: queries.Infer.Value, e: Body.ExprId) bool {
     return switch (b.expr(e)) {
         .builtin_call => |c| for (result_typed_builtins) |n| {
             if (std.mem.eql(u8, c.name, n)) break true;
         } else false,
+        .call => |c| b.expr(c.callee) == .enum_literal,
         .init => |i| i.ty == null,
         .enum_literal => true,
         .name_ref => |n| std.mem.eql(u8, n, "undefined") or std.mem.eql(u8, n, "null"),
-        .@"if" => |f| needsResultType(b, f.then) or (if (f.@"else") |x| needsResultType(b, x) else false),
-        .@"switch" => |sw| for (sw.prongs) |p| {
-            if (needsResultType(b, p.body)) break true;
-        } else false,
-        .@"catch" => |c| needsResultType(b, c.lhs) or needsResultType(b, c.rhs),
-        .binary => |bin| bin.op == .keyword_orelse and (needsResultType(b, bin.lhs) or needsResultType(b, bin.rhs)),
-        .prefix => |p| p.op == .keyword_try and needsResultType(b, p.operand),
+        .@"if" => |f| {
+            const other = f.@"else" orelse return needsResultType(b, res, f.then);
+            if (needsResultType(b, res, f.then) or needsResultType(b, res, other)) return true;
+            return res.exprs[@backingInt(f.cond)].val == null and numberOrExit(b, f.then) and numberOrExit(b, other);
+        },
+        .@"switch" => |sw| {
+            var numbers = res.exprs[@backingInt(sw.operand)].val == null;
+            for (sw.prongs) |p| {
+                if (needsResultType(b, res, p.body)) return true;
+                numbers = numbers and numberOrExit(b, p.body);
+            }
+            return numbers;
+        },
+        .@"catch" => |c| needsResultType(b, res, c.lhs) or needsResultType(b, res, c.rhs),
+        .binary => |bin| bin.op == .keyword_orelse and (needsResultType(b, res, bin.lhs) or needsResultType(b, res, bin.rhs)),
+        .prefix => |p| p.op == .keyword_try and needsResultType(b, res, p.operand),
+        else => false,
+    };
+}
+
+/// A branch value that is a number or character literal (also negated), or a branch that leaves
+/// without a value (which does not take part in the peer type)
+fn numberOrExit(b: *const Body, e: Body.ExprId) bool {
+    return switch (b.expr(e)) {
+        .literal => |text| text.len > 0 and (std.ascii.isDigit(text[0]) or text[0] == '\''),
+        .prefix => |p| p.op == .minus and b.expr(p.operand) == .literal and numberOrExit(b, p.operand),
+        .@"return", .@"break", .@"continue", .@"unreachable" => true,
         else => false,
     };
 }

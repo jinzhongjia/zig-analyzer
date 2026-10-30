@@ -22,6 +22,7 @@ const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const eval = @import("../sema/eval.zig");
 const seed = @import("../ide_db/seed.zig");
+const search = @import("../ide_db/search.zig");
 const infer = @import("../sema/infer.zig");
 const FileIndex = @import("../syntax/FileIndex.zig");
 const ErrorSets = @import("../syntax/ErrorSets.zig");
@@ -438,29 +439,11 @@ fn constructionOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) re
 }
 
 /// When the member names of a constructed type come from `@typeInfo(X)` (such as
-/// `@typeInfo(Tag).@"enum".field_names`), the member of the same name in X: finds the arguments of
-/// `@typeInfo` in the member where the construction happens, and takes the first type that has
-/// this member
+/// `@typeInfo(Tag).@"enum".field_names`), the member of the same name in X (see
+/// `infer.typeInfoMember`)
 fn typeInfoOrigin(r: *Resolver, rt: InternPool.Reified, name: []const u8) resolve.Error!?Target {
-    const tree = try r.itemTree(rt.file);
-    const owner_item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == rt.owner) break @intCast(i);
-    } else return null;
-    const owner = try r.ownerKey(rt.file, owner_item);
-    const body = try r.ctx.get(database.hir.ItemBody, owner);
-    const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = rt.inst });
-    if (res.exprs.len != body.exprs.len) return null;
-    for (body.exprs) |x| switch (x) {
-        .builtin_call => |call| {
-            if (!std.mem.eql(u8, call.name, "@typeInfo") or call.args.len != 1) continue;
-            const t = res.exprs[@backingInt(call.args[0])].asType() orelse continue;
-            const ns = try queries.namespaceOfType(r, t) orelse continue;
-            const f = infer.fieldItem(try r.itemTree(ns.file), ns.container, name) orelse continue;
-            return target(r, .{ .item = .{ .file = ns.file, .item = f } });
-        },
-        else => {},
-    };
-    return null;
+    const def = try infer.typeInfoMember(r, rt, name) orelse return null;
+    return target(r, def);
 }
 
 /// The range of `e` contains a string literal whose content contains `name`
@@ -655,39 +638,80 @@ fn findErrorName(a: std.mem.Allocator, node: ast.SyntaxNode, name: []const u8, d
     return null;
 }
 
-/// Labels: `l` in `break :l` / `continue :l` jumps to the label of the labeled block or loop; a
-/// label itself returns itself
+/// Labels: `l` in `break :l` / `continue :l` jumps to the label of the labeled block, loop or
+/// switch; a label itself returns itself
 fn labelTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
+    const label = try labelAt(r, file, offset) orelse return null;
+    const refs = try search.labelReferences(r, label);
+    for (refs) |ref| if (ref.is_decl) return .{ .file = ref.file, .start = ref.start, .end = ref.end };
+    return null;
+}
+
+/// The label at the cursor: the label of a labeled block, loop or switch, or the label of
+/// `break :l` / `continue :l`, which targets the innermost enclosing expression with the label
+pub fn labelAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.Label {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
     const item = try r.ownerAt(file, tok.offset, false) orelse return null;
     const node = try r.itemNode(file, item) orelse return null;
     const b = try r.body(file, item);
     const rel = tok.offset - node.offset;
+    const name = try ast.identNameAlloc(r.arena, tok.text);
+    // The label itself: the labeled expression starts at it
+    for (b.scopes) |s| if (s.label) |l| if (b.range(l.expr).start == rel and std.mem.eql(u8, l.name, name)) {
+        return .{ .file = file, .item = item, .expr = l.expr };
+    };
     const e = b.exprAt(rel) orelse return null;
-    const name = tok.text;
-    const self_target: Target = .{ .file = file, .start = tok.offset, .end = tok.offset + @as(u32, @intCast(name.len)) };
-    // The label itself (the range of a block or loop starts at the label)
-    switch (b.expr(e)) {
-        .block => |blk| if (blk.label) |l| if (b.range(e).start == rel and std.mem.eql(u8, l, name)) return self_target,
-        .loop => |lp| if (lp.label) |l| if (b.range(e).start == rel and std.mem.eql(u8, l, name)) return self_target,
-        else => {},
-    }
     const label = switch (b.expr(e)) {
         .@"break" => |x| x.label,
         .@"continue" => |x| x.label,
         else => null,
     } orelse return null;
-    // The cursor is on the label, not in the value of the break
-    const prev = (try r.ctx.get(database.syntax.ParseFile, file)).source[tok.offset - 1];
-    if (!std.mem.eql(u8, label, name) or prev != ':') return null;
-    var scope: ?Body.ScopeId = b.expr_scopes[@backingInt(e)];
-    while (scope) |sc| : (scope = b.scopes[@backingInt(sc)].parent) {
-        const l = b.scopes[@backingInt(sc)].label orelse continue;
-        if (!std.mem.eql(u8, l.name, label)) continue;
-        const start = node.offset + b.range(l.expr).start;
-        return .{ .file = file, .start = start, .end = start + @as(u32, @intCast(label.len)) };
+    // The cursor is on the label, not in the value of the `break`
+    const path = try node.coveringPath(r.arena, node.offset + b.range(e).start);
+    const jump = path[path.len - 1];
+    if (jump.kind() != .break_expr and jump.kind() != .continue_expr) return null;
+    const tok_label = (ast.BreakExpr{ .syntax = jump }).label() orelse return null;
+    if (tok_label.offset != tok.offset) return null;
+    return .{ .file = file, .item = item, .expr = b.labelTarget(e, label) orelse return null };
+}
+
+/// The error name at the cursor: `X` in `error.X`, a member of an `error{ ... }` declaration, or a
+/// member access `E.X` whose left-hand side is an error set type
+pub fn errorNameAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]const u8 {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const name = try ast.identNameAlloc(r.arena, tok.text);
+    for ((try r.ctx.get(ErrorSets.Query, file)).sets) |set| for (set.members) |m| {
+        if (m.start == tok.offset) return name;
+    };
+    const item = try r.ownerAt(file, tok.offset, false) orelse return null;
+    const node = try r.itemNode(file, item) orelse return null;
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const e = b.exprAt(rel) orelse return null;
+    switch (b.expr(e)) {
+        .error_value => |n| return if (std.mem.eql(u8, n, name)) name else null,
+        .field_access => |fa| {
+            const field = fa.field orelse return null;
+            if (rel < b.range(fa.lhs).end or !std.mem.eql(u8, field, name)) return null;
+            const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+            const t = a.exprType(fa.lhs).asType() orelse return null;
+            return switch (r.ctx.db.env.ip.key(t)) {
+                .error_set_type, .inferred_error_set => name,
+                else => null,
+            };
+        },
+        else => return null,
     }
+}
+
+/// What references, document highlight and rename work on at the cursor: a label, an error name,
+/// or a declaration or local name (`defAt`)
+pub fn symbolAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.Symbol {
+    if (try labelAt(r, file, offset)) |l| return .{ .label = l };
+    if (try errorNameAt(r, file, offset)) |name| return .{ .error_name = .{ .file = file, .name = name } };
+    if (try defAt(r, file, offset)) |def| return .{ .def = def };
     return null;
 }
 

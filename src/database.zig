@@ -40,6 +40,7 @@ var always_on: std.atomic.Value(bool) = .init(true);
 
 pub const Db = engine.Engine(*const Env, &.{
     inputs.FileText,
+    inputs.WorkspaceFiles,
     live.LiveBackend,
     syntax.SourceText,
     syntax.ParseFile,

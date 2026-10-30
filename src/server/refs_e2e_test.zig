@@ -123,6 +123,13 @@ test "references, highlight, rename and workspace symbol" {
         // Declarations in the standard library cannot be renamed
         const std_rename = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(main_text, "Allocator") });
         try testing.expect(std_rename.object.get("error") != null);
+        // The import of a workspace file is not a name: it used to be refused as a symbol defined
+        // outside the workspace
+        const import_rename = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "lib\")"), .newName = "helpers" });
+        try testing.expectEqualStrings("cannot rename: the cursor is on the import of a file, and files cannot be renamed", import_rename.object.get("error").?.object.get("message").?.string);
+        // std calls `root.main`: renaming it in the root source file used to break the build
+        const main_rename = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "main"), .newName = "run" });
+        try testing.expectEqualStrings("cannot rename `main` to `run`: the standard library looks up `root.main` by this name in the root source file (src/main.zig:3:8)", main_rename.object.get("error").?.object.get("message").?.string);
     }
 
     // workspace symbol
@@ -272,6 +279,596 @@ test "rename refuses when a generic reference also refers to other declarations"
     // Find references still includes it
     const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x"), .context = .{ .includeDeclaration = true } });
     try testing.expectEqual(3, refs.object.get("result").?.array.items.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename refuses when a reference cannot be confirmed" {
+    const impls_text =
+        \\pub const Tcp = struct {
+        \\    pub fn Close(_: *Tcp) void {}
+        \\};
+        \\pub const Udp = struct {
+        \\    pub fn Close(_: *Udp) void {}
+        \\};
+        \\
+    ;
+    const conn_text =
+        \\const impls = @import("impls.zig");
+        \\pub const Conn = union(enum) {
+        \\    tcp: impls.Tcp,
+        \\    udp: impls.Udp,
+        \\    pub fn close(self: *Conn) void {
+        \\        switch (self.*) {
+        \\            inline else => |*c| c.Close(),
+        \\        }
+        \\    }
+        \\};
+        \\
+    ;
+    const main_body =
+        \\const Conn = @import("conn.zig").Conn;
+        \\pub fn main() void {
+        \\    var c: Conn = .{ .tcp = .{} };
+        \\    c.close();
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = main_body },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+        .{ .path = "src/conn.zig", .text = conn_text },
+        .{ .path = "src/impls.zig", .text = impls_text },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const impls_uri = try za.base.uri.fromPath(a, try project.path(a, "src/impls.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = impls_uri, .languageId = "zig", .version = 1, .text = impls_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `c.Close()` in the `inline else` prong is Tcp.Close in one expansion and Udp.Close in the
+    // other: a rename returned only the declaration and broke the build
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = impls_uri }, .position = position(impls_text, "Close"), .newName = "close" });
+        try testing.expectEqualStrings("cannot rename `Close` to `close`: the type here is unknown, so whether this refers to the same declaration cannot be confirmed (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
+    }
+    // A file that mentions the name but has syntax errors may hide references
+    {
+        const conn_uri = try za.base.uri.fromPath(a, try project.path(a, "src/conn.zig"));
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = conn_uri, .languageId = "zig", .version = 1, .text = conn_text } });
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+        const broken = "const Conn = @import(\"conn.zig\").Conn;\npub fn main() void {\n    if (true) {\n    var c: Conn = .{ .tcp = .{} };\n    c.close();\n}\n";
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = broken } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = conn_uri }, .position = position(conn_text, "close"), .newName = "shut" });
+        try testing.expectEqualStrings("cannot rename `close` to `shut`: the file has syntax errors, so references in it may be missed (src/main.zig)", resp.object.get("error").?.object.get("message").?.string);
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// "file:line:column" of every edit in a rename result, sorted
+fn renameEdits(h: *Harness, resp: std.json.Value) ![]const u8 {
+    const a = h.arena.allocator();
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = resp.object.get("result").?.object.get("changes").?.object.iterator();
+    while (it.next()) |kv| for (kv.value_ptr.array.items) |e| try out.append(a, try loc(h, kv.key_ptr.*, e.object.get("range").?));
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return join(h, out.items);
+}
+
+test "references and rename reach closed files outside any build graph" {
+    const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
+    const main_body = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    _ = lib.scale(3);\n}\n";
+    // Single-file mode: no build.zig, and main.zig and util.zig are never opened
+    const files = [_]fixture.File{
+        .{ .path = "lib.zig", .text = scale_text },
+        .{ .path = "main.zig", .text = main_body },
+        .{ .path = "util.zig", .text = "pub fn helperOne() void {}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = position(scale_text, "scale");
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |l| try out.append(a, try loc(&h, l.object.get("uri").?.string, l.object.get("range").?));
+        std.mem.sort([]const u8, out.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12", try join(&h, out.items));
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12", try renameEdits(&h, renamed));
+    }
+    // Workspace symbol lists declarations of closed files too
+    {
+        const resp = try h.request("workspace/symbol", .{ .query = "helperOne" });
+        const syms = resp.object.get("result").?.array.items;
+        try testing.expectEqual(1, syms.len);
+        try testing.expectEqualStrings("util.zig", basename(syms[0].object.get("location").?.object.get("uri").?.string));
+    }
+    // A file created on disk later joins the scope
+    {
+        const other = "const lib = @import(\"lib.zig\");\ntest {\n    _ = lib.scale(1);\n}\n";
+        try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.zig", .data = other });
+        try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, try project.path(a, "other.zig")), .type = 1 }} });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12 other.zig:2:12", try renameEdits(&h, renamed));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename reaches build scripts and their helpers" {
+    const helpers_text =
+        \\const std = @import("std");
+        \\pub fn addThing(b: *std.Build, exe: *std.Build.Step.Compile) void {
+        \\    b.installArtifact(exe);
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\const helpers = @import("build_helpers.zig");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = b.graph.host }) });
+        \\    helpers.addThing(b, exe);
+        \\}
+        \\
+        },
+        .{ .path = "build_helpers.zig", .text = helpers_text },
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const helpers_uri = try za.base.uri.fromPath(a, try project.path(a, "build_helpers.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = helpers_uri, .languageId = "zig", .version = 1, .text = helpers_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // build.zig is not in the module graph of any compile step and is not open
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = helpers_uri }, .position = position(helpers_text, "addThing"), .newName = "addArtifact" });
+    try testing.expectEqualStrings("build.zig:4:12 build_helpers.zig:1:7", try renameEdits(&h, renamed));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "references and rename fail instead of returning partial results while the project loads" {
+    const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
+    const files = [_]fixture.File{
+        .{ .path = "src/lib.zig", .text = scale_text },
+        .{ .path = "src/util.zig", .text = "const lib = @import(\"lib.zig\");\npub fn twice(x: u32) u32 {\n    return lib.scale(x);\n}\n" },
+        .{ .path = "src/main.zig", .text = "const lib = @import(\"lib.zig\");\nconst util = @import(\"util.zig\");\npub fn main() void {\n    _ = lib.scale(2) + util.twice(3);\n}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The first load waits until the marker file exists
+    const marker = try project.path(a, "go");
+    const build_text = try std.fmt.allocPrint(a,
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {{
+        \\    while (true) {{
+        \\        std.Io.Dir.accessAbsolute(b.graph.io, "{f}", .{{}}) catch {{
+        \\            b.graph.io.sleep(.fromMilliseconds(10), .awake) catch {{}};
+        \\            continue;
+        \\        }};
+        \\        break;
+        \\    }}
+        \\    const exe = b.addExecutable(.{{ .name = "app", .root_module = b.createModule(.{{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }}) }});
+        \\    b.installArtifact(exe);
+        \\}}
+        \\
+    , .{std.zig.fmtString(marker)});
+    try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = build_text });
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "src/lib.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
+    const at = position(scale_text, "scale");
+    // Only the open file is known while loading: answering would have returned one reference and a
+    // rename editing lib.zig alone
+    {
+        const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        try testing.expect(std.mem.startsWith(u8, refs.object.get("error").?.object.get("message").?.string, "cannot find all references: "));
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expect(std.mem.startsWith(u8, renamed.object.get("error").?.object.get("message").?.string, "cannot rename `scale` to `double`: "));
+    }
+    try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "go", .data = "" });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    {
+        const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        try testing.expectEqual(3, refs.object.get("result").?.array.items.len);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expectEqualStrings("lib.zig:0:7 main.zig:3:12 util.zig:2:15", try renameEdits(&h, renamed));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "generic bodies get the instances of callers in files outside any build graph" {
+    const util_text = "pub fn area(shape: anytype) u32 {\n    const w = shape.width;\n    return w * shape.height;\n}\n";
+    const main_body = "const util = @import(\"util.zig\");\n\nconst Rect = struct { width: u32, height: u32 };\n\npub fn main() void {\n    const r: Rect = .{ .width = 2, .height = 3 };\n    _ = util.area(r);\n}\n";
+    // Single-file mode: no build.zig
+    const files = [_]fixture.File{
+        .{ .path = "util.zig", .text = util_text },
+        .{ .path = "main.zig", .text = main_body },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const util_uri = try za.base.uri.fromPath(a, try project.path(a, "util.zig"));
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = util_uri, .languageId = "zig", .version = 1, .text = util_text } });
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The call in main.zig instantiates `area`: `w` was unknown, and rename missed `shape.width`
+    const hover = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = util_uri }, .position = position(util_text, "w =") });
+    const value = hover.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, value, "const w: u32") != null);
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "width"), .newName = "wide" });
+    try testing.expectEqualStrings("main.zig:2:22 main.zig:5:24 util.zig:1:20", try renameEdits(&h, renamed));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename reaches typed .zon files imported from files outside any build graph" {
+    const main_body = "const S = struct { x: u32, y: bool = false };\nconst cfg: S = @import(\"cfg.zon\");\npub fn main() void {\n    _ = cfg.x;\n}\n";
+    // Single-file mode: no build.zig, and cfg.zon is never opened
+    const files = [_]fixture.File{
+        .{ .path = "main.zig", .text = main_body },
+        .{ .path = "cfg.zon", .text = ".{ .x = 1 }\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The `.zon` file got no result type from its importer in no module: the rename left `.x` in
+    // it and the build failed with "unexpected field 'x'"
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "x"), .newName = "count" });
+    try testing.expectEqualStrings("cfg.zon:0:4 main.zig:0:19 main.zig:3:12", try renameEdits(&h, renamed));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "renames and fixes refuse to edit fetched packages" {
+    // A dependency fetched by hash (faked: maker does not fetch it again when the package
+    // directory already has it), placed outside the build root with `--pkg-dir`
+    const hash = "foo-0.0.1-OjQ08eFlFQAb4BLnwZNNE3R5Dx2TI67EIpAsy2h0ZyoC";
+    const pkg_root = "pub fn callIt(x: anytype) u32 {\n    return x.method() + x.withExtra(7);\n}\n";
+    const main_body =
+        \\const dep = @import("foo");
+        \\const Mine = struct {
+        \\    n: u32 = 3,
+        \\    pub fn method(self: Mine) u32 {
+        \\        return self.n;
+        \\    }
+        \\    pub fn withExtra(self: Mine, extra: u32) u32 {
+        \\        return self.n;
+        \\    }
+        \\};
+        \\export fn entry() u32 {
+        \\    return dep.callIt(Mine{});
+        \\}
+        \\
+    ;
+    const files = [_]fixture.File{
+        .{ .path = "proj/build.zig.zon", .text = ".{ .name = .proj, .version = \"0.0.0\", .fingerprint = 0x520c3c90be36badb, .paths = .{\"\"}, " ++
+            ".dependencies = .{ .foo = .{ .url = \"https://example.invalid/foo.tar.gz\", .hash = \"" ++ hash ++ "\" } } }\n" },
+        .{ .path = "proj/build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const foo = b.dependency("foo", .{});
+        \\    const root = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.graph.host,
+        \\        .imports = &.{.{ .name = "foo", .module = foo.module("foo") }},
+        \\    });
+        \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "probe", .root_module = root }).step);
+        \\}
+        \\
+        },
+        .{ .path = "proj/main.zig", .text = main_body },
+        .{ .path = "proj/zig-analyzer.zon", .text = ".{ .build = .{ .args = .{ \"--pkg-dir\", \"../pkgs\" } } }" },
+        .{ .path = "pkgs/" ++ hash ++ "/build.zig.zon", .text = ".{ .name = .foo, .version = \"0.0.1\", .fingerprint = 0x8c736521e67512df, .paths = .{\"\"} }\n" },
+        .{ .path = "pkgs/" ++ hash ++ "/build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addModule("foo", .{ .root_source_file = b.path("src/root.zig") });
+        \\}
+        \\
+        },
+        .{ .path = "pkgs/" ++ hash ++ "/src/root.zig", .text = pkg_root },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, try project.path(a, "proj")),
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .dataSupport = true, .disabledSupport = true, .resolveSupport = .{ .properties = &[_][]const u8{"edit"} } } } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "proj/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `x.method()` in the package refers to `Mine.method` through the instance: references list it,
+    // but a rename used to edit the package, whose copy restored by hash elsewhere then broke
+    const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "method"), .context = .{ .includeDeclaration = true } });
+    try testing.expectEqual(2, refs.object.get("result").?.array.items.len);
+    const pkg_file = try project.path(a, "pkgs/" ++ hash ++ "/src/root.zig");
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "method"), .newName = "run" });
+        const expected = try std.fmt.allocPrint(a, "cannot rename `method` to `run`: this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited ({s}:2:14)", .{pkg_file});
+        try testing.expectEqualStrings(expected, resp.object.get("error").?.object.get("message").?.string);
+    }
+    {
+        const p = position(main_body, "extra:");
+        const actions = (try h.request("textDocument/codeAction", .{
+            .textDocument = .{ .uri = main_uri },
+            .range = .{ .start = p, .end = p },
+            .context = .{ .diagnostics = &[_]Empty{} },
+        })).object.get("result").?.array.items;
+        const fix = for (actions) |x| {
+            if (std.mem.eql(u8, x.object.get("title").?.string, "remove parameter `extra`")) break x;
+        } else return error.NoFix;
+        const resp = try h.request("codeAction/resolve", fix);
+        const message = resp.object.get("error").?.object.get("message").?.string;
+        try testing.expect(std.mem.startsWith(u8, message, "cannot remove parameter `extra`: this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited ("));
+        try testing.expect(std.mem.indexOf(u8, message, pkg_file) != null);
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename refuses new names that conflict with existing ones" {
+    const text =
+        \\const S = struct {
+        \\    a: u32 = 0,
+        \\    b: u32 = 0,
+        \\    fn len(s: S) u32 {
+        \\        return s.a + s.b;
+        \\    }
+        \\};
+        \\
+        \\fn helper(x: u32) u32 {
+        \\    const y: u32 = 2;
+        \\    const z: u32 = 3;
+        \\    return x + y + z;
+        \\}
+        \\
+        \\const max = 10;
+        \\const Limits = struct {
+        \\    const limit = 5;
+        \\    fn get() u32 {
+        \\        return max + limit;
+        \\    }
+        \\};
+        \\
+        \\pub fn main() void {
+        \\    const s: S = .{ .a = 1, .b = 2 };
+        \\    _ = s.len() + helper(1) + Limits.get();
+        \\}
+        \\
+    ;
+    // Single-file mode: no build.zig
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Each of these used to return edits that AstGen rejects
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "y:", "z", "cannot rename `y` to `z`: " },
+        .{ "y:", "x", "cannot rename `y` to `x`: " },
+        .{ "s: S)", "len", "cannot rename `s` to `len`: " },
+        .{ "a: u32", "b", "cannot rename `a` to `b`: `b` is already declared in the same container (main.zig:3:5)" },
+        .{ "max =", "limit", "cannot rename `max` to `limit`: " },
+    }) |c| {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, c[0]), .newName = c[1] });
+        const message = resp.object.get("error").?.object.get("message").?.string;
+        testing.expect(std.mem.startsWith(u8, message, c[2])) catch |err| {
+            std.debug.print("{s} -> {s}: {s}\n", .{ c[0], c[1], message });
+            return err;
+        };
+    }
+    const ok = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "y:"), .newName = "yy" });
+    try testing.expectEqualStrings("main.zig:11:15 main.zig:9:10", try renameEdits(&h, ok));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename covers tags named after fields and refuses names used in strings" {
+    const text =
+        \\const std = @import("std");
+        \\const Item = struct {
+        \\    id: u32,
+        \\    node: u8 = 0,
+        \\};
+        \\test {
+        \\    var list: std.MultiArrayList(Item) = .empty;
+        \\    defer list.deinit(std.testing.allocator);
+        \\    try list.append(std.testing.allocator, .{ .id = 7 });
+        \\    try std.testing.expectEqual(@as(u32, 7), list.items(.id)[0]);
+        \\    const item: Item = .{ .id = 1 };
+        \\    _ = @field(item, "node");
+        \\}
+        \\
+    ;
+    // Single-file mode: no build.zig
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // `.id` in `list.items(.id)` is a tag of `std.meta.FieldEnum(Item)`, named after the field: it
+    // used to be missing, and the renamed copy failed with "has no member named 'id'"
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "id:"), .newName = "key" });
+    try testing.expectEqualStrings("main.zig:10:27 main.zig:2:4 main.zig:8:47 main.zig:9:57", try renameEdits(&h, renamed));
+    // `@field(item, "node")` names the field by a string that a rename would not update
+    const node = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "node:"), .newName = "link" });
+    try testing.expectEqualStrings("cannot rename `node` to `link`: `node` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated (main.zig:12:22)", node.object.get("error").?.object.get("message").?.string);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "labels and error names: references, highlight and rename" {
+    const text =
+        \\const std = @import("std");
+        \\const E = error{ Oops, Other };
+        \\const F = error{Oops};
+        \\fn f(x: u32) E!u32 {
+        \\    if (x == 0) return error.Oops;
+        \\    if (x == 9) return E.Oops;
+        \\    const v: u32 = blk: {
+        \\        if (x == 1) break :blk 1;
+        \\        break :blk 2;
+        \\    };
+        \\    var n: u32 = 0;
+        \\    outer: while (n < 3) : (n += 1) {
+        \\        inner: for (0..2) |_| {
+        \\            if (n == 1) continue :outer;
+        \\            if (n == 2) break :inner;
+        \\        }
+        \\        if (n == 2) break :outer;
+        \\    }
+        \\    return v + n;
+        \\}
+        \\fn grow(a: std.mem.Allocator) error{OutOfMemory}!void {
+        \\    a.free(try a.alloc(u8, 1));
+        \\}
+        \\test {
+        \\    const r = f(2) catch |err| switch (err) {
+        \\        error.Oops => 0,
+        \\        error.Other => 1,
+        \\    };
+        \\    try std.testing.expect(r == 4);
+        \\    try std.testing.expect(@intFromError(E.Oops) == @intFromError(F.Oops));
+        \\    try grow(std.testing.allocator);
+        \\}
+        \\
+    ;
+    // Single-file mode: no build.zig
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    const doc = .{ .uri = uri };
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // All of these returned null although goto resolved them
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(text, "blk:"), .context = .{ .includeDeclaration = true } });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |l| try out.append(a, try loc(&h, uri, l.object.get("range").?));
+        try testing.expectEqualStrings("main.zig:6:19 main.zig:7:27 main.zig:8:15", try join(&h, out.items));
+    }
+    {
+        const resp = try h.request("textDocument/documentHighlight", .{ .textDocument = doc, .position = position(text, "outer;") });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |x| try out.append(a, try std.fmt.allocPrint(a, "{s}/{d}", .{ try loc(&h, uri, x.object.get("range").?), x.object.get("kind").?.integer }));
+        try testing.expectEqualStrings("main.zig:11:4/3 main.zig:13:34/2 main.zig:16:27/2", try join(&h, out.items));
+    }
+    // The target of an assignment is written (`Write` = 3), other uses read (`Read` = 2)
+    {
+        const resp = try h.request("textDocument/documentHighlight", .{ .textDocument = doc, .position = position(text, "n: u32") });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |x| try out.append(a, try std.fmt.allocPrint(a, "{s}/{d}", .{ try loc(&h, uri, x.object.get("range").?), x.object.get("kind").?.integer }));
+        try testing.expectEqualStrings("main.zig:10:8/3 main.zig:11:18/2 main.zig:11:28/3 main.zig:13:16/2 main.zig:14:16/2 main.zig:16:12/2 main.zig:18:15/2", try join(&h, out.items));
+    }
+    {
+        const prep = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(text, "blk 2") });
+        try testing.expectEqualStrings("blk", prep.object.get("result").?.object.get("placeholder").?.string);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "blk 2"), .newName = "done" });
+        try testing.expectEqualStrings("main.zig:6:19 main.zig:7:27 main.zig:8:15", try renameEdits(&h, renamed));
+        // A label must not redefine the label of an enclosing loop
+        const redefined = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "inner:"), .newName = "outer" });
+        try testing.expectEqualStrings("cannot rename `inner` to `outer`: redefinition of label 'outer' (main.zig:13:9)", redefined.object.get("error").?.object.get("message").?.string);
+    }
+    // Error names are global: every error set that contains the name, and `E.X` on error sets
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = doc, .position = position(text, "Oops;"), .context = .{ .includeDeclaration = true } });
+        var out: std.ArrayList([]const u8) = .empty;
+        for (resp.object.get("result").?.array.items) |l| try out.append(a, try loc(&h, uri, l.object.get("range").?));
+        try testing.expectEqualStrings("main.zig:1:17 main.zig:2:16 main.zig:4:29 main.zig:5:25 main.zig:25:14 main.zig:29:43 main.zig:29:68", try join(&h, out.items));
+        const prep = try h.request("textDocument/prepareRename", .{ .textDocument = doc, .position = position(text, "Oops =>") });
+        try testing.expectEqualStrings("Oops", prep.object.get("result").?.object.get("placeholder").?.string);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "Oops =>"), .newName = "Failed" });
+        try testing.expectEqualStrings("main.zig:1:17 main.zig:25:14 main.zig:29:43 main.zig:29:68 main.zig:2:16 main.zig:4:29 main.zig:5:25", try renameEdits(&h, renamed));
+    }
+    // Renaming to an existing error name would merge the two errors (the switch prongs would
+    // become duplicates)
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "Oops;"), .newName = "Other" });
+        try testing.expectEqualStrings("cannot rename `Oops` to `Other`: `Other` is already an error name: error names are global, so the renamed error would become this one (main.zig:2:24)", resp.object.get("error").?.object.get("message").?.string);
+    }
+    // The standard library uses `error.OutOfMemory` and is not renamed
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(text, "OutOfMemory"), .newName = "Oom" });
+        const message = resp.object.get("error").?.object.get("message").?.string;
+        try testing.expect(std.mem.startsWith(u8, message, "cannot rename `OutOfMemory` to `Oom`: this file also uses the error `OutOfMemory` and is not renamed: error names are global, so it would no longer be the same error ("));
+    }
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

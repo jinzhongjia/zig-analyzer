@@ -6,7 +6,9 @@
 //! report errors, which `declarationConflict` detects in advance and `verifyAstGen` confirms on
 //! the renamed text. A declaration in a container, however, may share its name with a declaration
 //! of an outer container (the inner one takes precedence); such a rename causes no error, but the
-//! name silently refers to another declaration, which `resolutionConflict` checks.
+//! name silently refers to another declaration, which `resolutionConflict` checks. Error names are
+//! global, so renaming one must neither split it from a use that is not renamed nor merge it with
+//! another error (`errorNameConflict`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +21,7 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const search = @import("../ide_db/search.zig");
 
 /// Reason a rename is not possible
 pub const Problem = struct {
@@ -133,6 +136,35 @@ pub fn resolutionConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error
     return null;
 }
 
+/// Conflicts of renaming the error `old`, found in `file`, to `new`. Error names are global: all
+/// files compiled together with `file` (see `search.reachable`) share them. A file outside `scope`
+/// (the standard library, a file outside the workspace that is in no module) that uses `old` is
+/// not renamed, so its error would no longer be the renamed one; and when `new` is already an
+/// error name, the renamed error would become that error (switch prongs and comparisons that told
+/// them apart would no longer compile or would change meaning). The tests of files outside `scope`
+/// are not compiled with the project.
+pub fn errorNameConflict(r: *Resolver, file: FileId, scope: []const FileId, old: []const u8, new: []const u8) resolve.Error!?Problem {
+    var in_scope: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    for (scope) |f| try in_scope.put(r.arena, f, {});
+    try in_scope.put(r.arena, file, {});
+    const files = try search.reachable(r, try search.importers(r, file, scope));
+    for (files) |f| {
+        if (in_scope.contains(f)) continue;
+        if (try search.errorUse(r, f, old, true, false)) |at| return .{
+            .file = f,
+            .offset = at,
+            .message = try std.fmt.allocPrint(r.arena, "this file also uses the error `{s}` and is not renamed: error names are global, so it would no longer be the same error", .{old}),
+        };
+    }
+    if (std.mem.eql(u8, old, new)) return null;
+    for (files) |f| if (try search.errorUse(r, f, new, false, in_scope.contains(f))) |at| return .{
+        .file = f,
+        .offset = at,
+        .message = try std.fmt.allocPrint(r.arena, "`{s}` is already an error name: error names are global, so the renamed error would become this one", .{new}),
+    };
+    return null;
+}
+
 /// First occurrence of the name as a string literal: reflection (`@field(x, "name")`,
 /// `@hasDecl(T, "name")`) and serialization refer to names by string, and renaming cannot update
 /// these strings
@@ -154,6 +186,84 @@ pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) re
         }
     }
     return null;
+}
+
+/// Declarations of the root source file that the standard library of Zig 0.17.0 looks up by name
+/// through `@import("root")` (`root.main`, `@hasDecl(root, "std_options")`,
+/// `@hasDecl(root.debug, "SelfInfo")`), as paths of names from the top level of the root file
+const std_root_lookups = [_][]const []const u8{
+    &.{"main"},
+    &.{"panic"},
+    &.{"std_options"},
+    &.{"std_options_cwd"},
+    &.{"std_options_debug_io"},
+    &.{"std_options_debug_threaded_io"},
+    &.{"std_options_elf_debug_info_search_paths"},
+    &.{"std_options_FilePermissions"},
+    &.{"tracy"},
+    &.{"_start"},
+    &.{"__start"},
+    &.{"_initialize"},
+    &.{"DllMain"},
+    &.{"DllMainCRTStartup"},
+    &.{"_DllMainCRTStartup"},
+    &.{"WinMain"},
+    &.{"wWinMain"},
+    &.{"WinMainCRTStartup"},
+    &.{"wWinMainCRTStartup"},
+    &.{"EfiMain"},
+    &.{"debug"},
+    &.{ "debug", "CpuContext" },
+    &.{ "debug", "getDebugInfoAllocator" },
+    &.{ "debug", "handleSegfault" },
+    &.{ "debug", "printLineFromFile" },
+    &.{ "debug", "SelfInfo" },
+    &.{"os"},
+    &.{ "os", "heap" },
+    &.{ "os", "heap", "page_allocator" },
+    &.{ "os", "NAME_MAX" },
+    &.{ "os", "PATH_MAX" },
+};
+
+/// Renaming a declaration that the standard library looks up by name in the root source file (see
+/// `std_root_lookups`) would make it silently fall back to its default (`std_options`, `panic`) or
+/// fail to find it (`main`). The file must be the root source file of a compilation: the root of
+/// the root module of a compile step, or a file in no module, which is compiled as its own root
+pub fn stdRootLookup(r: *Resolver, def: Def) resolve.Error!?Problem {
+    const it = switch (def) {
+        .item => |it| it,
+        .local, .file => return null,
+    };
+    const tree = try r.itemTree(it.file);
+    // Names from the top level down to the declaration
+    var path: [3][]const u8 = undefined;
+    var len: usize = 0;
+    var item = it.item;
+    while (true) {
+        if (len == path.len) return null;
+        path[len] = tree.items[item].name orelse return null;
+        len += 1;
+        item = tree.containers[tree.items[item].container].parent_item orelse break;
+    }
+    std.mem.reverse([]const u8, path[0..len]);
+    for (std_root_lookups) |lookup| {
+        if (lookup.len != len) continue;
+        for (lookup, path[0..len]) |x, y| {
+            if (!std.mem.eql(u8, x, y)) break;
+        } else break;
+    } else return null;
+    if (try r.ctx.get(database.ModuleGraph.Input, {})) |graph| if (graph.entry(it.file) != null) {
+        const is_root = for (graph.files) |e| {
+            if (graph.modules[e.root_module].root == it.file) break true;
+        } else false;
+        if (!is_root) return null;
+    };
+    const loc = try r.location(def) orelse return null;
+    return .{
+        .file = it.file,
+        .offset = loc.start,
+        .message = try std.fmt.allocPrint(r.arena, "the standard library looks up `root.{s}` by this name in the root source file", .{try std.mem.join(r.arena, ".", path[0..len])}),
+    };
 }
 
 /// First AstGen error that appears after applying `edits` (sorted by position, non-overlapping)

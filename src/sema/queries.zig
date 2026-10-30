@@ -409,21 +409,28 @@ pub const ZonResultType = struct {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        const graph = try ctx.get(database.ModuleGraph.Input, {}) orelse return null;
+        // The files that may import it: the project files (excluding the standard library) and the
+        // user's source files under the workspace roots, which include files in no build graph
+        // (single-file mode, build scripts)
+        var importers: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        if (try ctx.get(database.ModuleGraph.Input, {})) |graph| for (graph.files) |entry| {
+            if (entry.module != database.ModuleGraph.std_module) try importers.put(r.arena, entry.file, {});
+        };
+        for (try ctx.get(database.inputs.WorkspaceFiles, {})) |f| try importers.put(r.arena, f, {});
         var result: ?Index = null;
-        for (graph.files) |entry| {
+        for (importers.keys()) |importer| {
             // Only Zig source files can `@import` (the root of a module can also be a `.zon` or
             // another data file)
-            if (entry.module == database.ModuleGraph.std_module or !std.mem.endsWith(u8, ctx.db.env.vfs.path(entry.file), ".zig")) continue;
-            const index = try ctx.get(database.FileIndex.Query, entry.file);
+            if (!std.mem.endsWith(u8, ctx.db.env.vfs.path(importer), ".zig")) continue;
+            const index = try ctx.get(database.FileIndex.Query, importer);
             const imports = for (index.imports) |spec| {
                 // A path ending in `.zig` names a Zig file, never a `.zon` file
                 if (std.mem.endsWith(u8, spec, ".zig")) continue;
-                if (try r.resolveImport(entry.file, spec) == file) break true;
+                if (try r.resolveImport(importer, spec) == file) break true;
             } else false;
             if (!imports) continue;
             const ip = ctx.db.env.ip;
-            for (try importOwners(&r, entry.file, file)) |owner| {
+            for (try importOwners(&r, importer, file)) |owner| {
                 const res = try ctx.get(Infer, .{ .owner = owner, .mode = .full });
                 for (res.zon_imports) |site| {
                     if (site.file != file) continue;

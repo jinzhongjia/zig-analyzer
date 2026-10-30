@@ -151,7 +151,7 @@ pub fn edits(r: *Resolver, t: Target, scope: []const FileId) resolve.Error!Outco
         .syntax_error = &syntax_error,
     });
     if (syntax_error) |f| return fail(f, null, "the file has syntax errors, so calls in it may be missed");
-    if (ambiguous) |a| return fail(a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations");
+    if (ambiguous) |a| return fail(a.file, a.start, search.ambiguous_message);
     if (uncertain) |u| return fail(u.file, u.start, "the type here is unknown, so whether this refers to the function cannot be confirmed");
     if (incomplete) |u| return fail(u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked");
     // A function that is not pub can only be accessed in its own file

@@ -205,6 +205,47 @@ pub const Refiner = struct {
     }
 };
 
+/// Per-iteration inference results, under instance `inst` (whose result is `res`), of the innermost
+/// region containing `rel` (relative to the member) that is inferred per iteration: a loop whose
+/// loop variable differs per iteration (see `iterations`), or an `inline` switch prong (see
+/// `prongIterations`); empty when there is none. As in `Refiner`, the first loop variable that needs
+/// it is chosen, and Infer refines the other captures of the same loop along with it.
+pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error![]const *const infer.Result {
+    const ip = r.ctx.db.env.ip;
+    var best: ?struct { binding: u32, n: u32 } = null;
+    var best_len: u32 = std.math.maxInt(u32);
+    for (body.exprs) |expr| switch (expr) {
+        .loop => |loop| if (loop.kind == .@"for") {
+            const range = body.range(loop.body);
+            if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
+            for (loop.capture, 0..) |capture, k| {
+                const n = try iterations(r, res, loop, k) orelse continue;
+                best = .{ .binding = @backingInt(capture), .n = n };
+                best_len = range.end - range.start;
+                break;
+            }
+        },
+        .@"switch" => |sw| for (sw.prongs, 0..) |prong, pi| {
+            if (!prong.is_inline or prong.capture.len == 0) continue;
+            const range = body.range(prong.body);
+            if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
+            const n = try prongIterations(ip, body, res, sw, @intCast(pi)) orelse continue;
+            best = .{ .binding = @backingInt(prong.capture[0]), .n = n };
+            best_len = range.end - range.start;
+        },
+        else => {},
+    };
+    const b = best orelse return &.{};
+    const out = try r.arena.alloc(*const infer.Result, b.n);
+    for (out, 0..) |*o, idx| o.* = try r.ctx.get(queries.Infer, .{
+        .owner = owner,
+        .mode = .full,
+        .inst = inst,
+        .loop = .{ .binding = b.binding, .index = @intCast(idx) },
+    });
+    return out;
+}
+
 /// Number of per-value inferences for an `inline` switch prong (the `pi`-th of `sw`): when the
 /// operand is neither a union nor an error set and the capture has no value in the inference, the
 /// number of values after expanding the prong items (see `infer.inlineProngValues`)
@@ -1183,13 +1224,12 @@ pub const Candidates = struct {
 
     pub const Data = struct {
         arena: std.heap.ArenaAllocator,
-        /// Project files that can reach the target's file via `@import` chains: lookups of the
-        /// first instance and of the first few instances follow their order, so instances found
-        /// earlier come first
+        /// Searched files (see `search.searchFiles`) that can reach the target's file via
+        /// `@import` chains: lookups of the first instance and of the first few instances follow
+        /// their order, so instances found earlier come first
         files: []const FileId,
-        /// `files` followed by the remaining files of the project (see `search.candidateFiles`):
-        /// the closure of all instances does not miss calls in generic code through `anytype`
-        /// values or comptime type parameters
+        /// `files` followed by the remaining searched files: the closure of all instances does not
+        /// miss calls in generic code through `anytype` values or comptime type parameters
         all_files: []const FileId,
         names: []const []const u8,
     };
@@ -1215,7 +1255,7 @@ pub const Candidates = struct {
         data.files = try allocator.dupe(FileId, try ctx.get(search.ProjectImporters, key.file));
         var all: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         for (data.files) |f| try all.put(r.arena, f, {});
-        for (try search.projectFiles(&r)) |f| try all.put(r.arena, f, {});
+        for (try search.searchFiles(&r)) |f| try all.put(r.arena, f, {});
         data.all_files = try allocator.dupe(FileId, all.keys());
         const names = try callNames(&r, key.file, root, data.files);
         const owned = try allocator.alloc([]const u8, names.len);

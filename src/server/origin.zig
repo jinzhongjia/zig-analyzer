@@ -21,15 +21,19 @@ pub const Origin = enum {
     /// the roots but in a module of some project (modules added by path, packages specified with
     /// `--fork`)
     user,
-    /// Other files: outside the roots and not in any project, or in `.zig-cache` or `zig-pkg` under
-    /// a root
+    /// User code outside the workspace roots that no project contains (a file opened without a
+    /// workspace folder, or from outside the folders): which other files use it is not known
+    outside,
+    /// Other files: in `.zig-cache` or `zig-pkg` under a root (stale copies), or outside the roots
+    /// and projects while the location of the Zig installation is unknown (its files cannot be
+    /// told apart)
     other,
 
     /// Library: the contents are not edited by the user
     pub fn isLibrary(o: Origin) bool {
         return switch (o) {
             .zig_lib, .generated, .package => true,
-            .virtual, .user, .other => false,
+            .virtual, .user, .outside, .other => false,
         };
     }
 
@@ -40,7 +44,7 @@ pub const Origin = enum {
         return switch (o) {
             .zig_lib, .package => .high,
             .generated => .medium,
-            .virtual, .user, .other => .low,
+            .virtual, .user, .outside, .other => .low,
         };
     }
 };
@@ -62,26 +66,39 @@ pub const Rules = struct {
 /// Origin of `path`; `in_project` means the file is in some project's module graph, and only
 /// affects files outside the roots. Checked in order: dependency packages, generated files (even
 /// under a root), user code under a root, the Zig installation (under a root, it is being edited
-/// by developers of Zig itself, so it is user code), project modules.
+/// by developers of Zig itself, so it is user code), project modules, and then the user's files
+/// outside the workspace. A root inside the Zig installation (such as its `std` directory opened
+/// as a workspace folder) does not make the installation user code.
 pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: bool) Origin {
     if (isVirtual(path)) return .virtual;
     for (rules.packages) |p| if (vfs.isUnder(path, p)) return .package;
     for (rules.local_caches) |c| if (vfs.isUnder(path, c)) return .generated;
     if (rules.global_cache) |c| if (vfs.isUnder(path, c)) return .generated;
     var in_root = false;
-    for (rules.roots) |root| {
+    roots: for (rules.roots) |root| {
         if (path.len <= root.len or !vfs.isUnder(path, root)) continue;
+        if (rules.zig_lib) |l| if (vfs.isUnder(root, l)) continue;
         in_root = true;
         const rest = path[root.len..];
         const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
         // The default local cache and package directories of maker: when others are used
-        // instead (`--cache-dir`, `--pkg-dir`), the ones here are stale copies
-        if (std.mem.startsWith(u8, sub, ".zig-cache") or std.mem.startsWith(u8, sub, "zig-pkg")) continue;
+        // instead (`--cache-dir`, `--pkg-dir`), the ones here are stale copies. Only these exact
+        // directory names count (`zig-pkgs` is an ordinary directory)
+        var end: usize = 0;
+        while (end < sub.len and !std.fs.path.isSep(sub[end])) end += 1;
+        if (end < sub.len) for ([_][]const u8{ ".zig-cache", "zig-pkg" }) |name| {
+            const same = switch (vfs.case) {
+                .sensitive => std.mem.eql(u8, sub[0..end], name),
+                .insensitive => std.ascii.eqlIgnoreCase(sub[0..end], name),
+            };
+            if (same) continue :roots;
+        };
         return .user;
     }
     if (rules.zig_lib) |l| if (vfs.isUnder(path, l)) return .zig_lib;
     if (in_root) return .other;
-    return if (in_project) .user else .other;
+    if (in_project) return .user;
+    return if (rules.zig_lib != null) .outside else .other;
 }
 
 const testing = std.testing;
@@ -110,9 +127,14 @@ test classify {
         .{ native("/ws/scripts/gen.zig"), false, .user },
         // Stale copy left under the root after switching to a package directory elsewhere
         .{ native("/ws/zig-pkg/stale-hash/src/root.zig"), true, .other },
+        // Names that only start like those directories were taken for them, which refused renames
+        .{ native("/ws/zig-pkgs/a.zig"), false, .user },
+        .{ native("/ws/zig-pkg-b.zig"), false, .user },
+        .{ native("/ws/.zig-cache-c/c.zig"), false, .user },
         // Module outside the root, added to the project by path
         .{ native("/libs/shared/src/root.zig"), true, .user },
-        .{ native("/tmp/scratch.zig"), false, .other },
+        // Outside the roots and in no project: the user's file, opened from outside the folders
+        .{ native("/tmp/scratch.zig"), false, .outside },
     };
     for (cases) |c| {
         testing.expectEqual(c[2], classify(&vfs, rules, c[0], c[1])) catch |err| {
@@ -123,8 +145,14 @@ test classify {
     // The Zig installation is under a workspace root: Zig itself is being developed
     const in_root: Rules = .{ .zig_lib = native("/ws/lib"), .roots = &.{native("/ws")} };
     try testing.expectEqual(.user, classify(&vfs, in_root, native("/ws/lib/std/std.zig"), true));
-    // Unknown zig environment: classified only by roots and projects
+    // A workspace root inside the Zig installation: renaming there would edit the installation
+    const inside: Rules = .{ .zig_lib = native("/zig/lib"), .roots = &.{ native("/proj"), native("/zig/lib/std") } };
+    try testing.expectEqual(.zig_lib, classify(&vfs, inside, native("/zig/lib/std/mem.zig"), false));
+    try testing.expectEqual(.user, classify(&vfs, inside, native("/proj/main.zig"), false));
+    // Unknown zig environment: files outside the roots and projects cannot be told apart from the
+    // installation
     try testing.expectEqual(.other, classify(&vfs, .{}, native("/zig/lib/std/std.zig"), false));
+    try testing.expectEqual(.other, classify(&vfs, .{}, native("/tmp/scratch.zig"), false));
 }
 
 test "durability follows the origin" {

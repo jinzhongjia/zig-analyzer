@@ -173,19 +173,15 @@ test "merge: notes in another file are remapped by that file's edits" {
         .end = main_start + 3,
         .message = "error",
         .is_astgen = false,
-        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note_start, .end = note_start + 3, .message = "note" }},
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note_start, .end = note_start + 3, .message = "note", .base_text = other_base }},
     }} };
     const Ctx = struct {
-        base: []const u8,
-        current: []const u8,
-        fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
-            _ = arena;
-            const self: *@This() = @ptrCast(@alignCast(opaque_ctx));
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
             if (!std.mem.endsWith(u8, path, "other.zig")) return null;
-            return .{ .uri = "file:///proj/src/other.zig", .text = self.current, .base_text = self.base };
+            return .{ .uri = "file:///proj/src/other.zig", .text = other_current };
         }
     };
-    var ctx: Ctx = .{ .base = other_base, .current = other_current };
+    var ctx: u8 = 0;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -204,6 +200,249 @@ test "merge: notes in another file are remapped by that file's edits" {
     // A line is inserted at the top of the note's file: the note moves down one line
     try testing.expectEqual(2, related.location.range.start.line);
     try testing.expectEqual(4, related.location.range.start.character);
+}
+
+/// Span of the `n`th (from 0) occurrence of `needle` in `text`
+fn spanOf(text: []const u8, needle: []const u8, n: usize) [2]u32 {
+    var at: usize = std.mem.indexOf(u8, text, needle).?;
+    for (0..n) |_| at = std.mem.indexOfPos(u8, text, at + 1, needle).?;
+    return .{ @intCast(at), @intCast(at + needle.len) };
+}
+
+/// Merges a build result for `base` with one non-AstGen error on each of `spans` into the buffer
+/// `text`; returns the published ranges as "line:character-line:character"
+fn remappedRanges(a: Allocator, base: []const u8, text: []const u8, spans: []const [2]u32) ![]const []const u8 {
+    const items = try a.alloc(compiler.Item, spans.len);
+    for (items, spans) |*item, s| item.* = .{ .start = s[0], .end = s[1], .message = "error", .is_astgen = false, .notes = &.{} };
+    const result: compiler.FileResult = .{ .base_text = base, .items = items };
+    var dummy: u8 = 0;
+    const diags = try compiler.merge(a, .{
+        .text = text,
+        .lines = try offsets.LineIndex.init(a, text),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = NoOther.get,
+        .other_ctx = &dummy,
+    });
+    const out = try a.alloc([]const u8, diags.len);
+    for (diags, out) |d, *o| o.* = try std.fmt.allocPrint(a, "{d}:{d}-{d}:{d}", .{ d.range.start.line, d.range.start.character, d.range.end.line, d.range.end.character });
+    return out;
+}
+
+fn expectRanges(expected: []const []const u8, actual: []const []const u8) !void {
+    errdefer for (actual) |r| std.debug.print("got {s}\n", .{r});
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, r| try testing.expectEqualStrings(e, r);
+}
+
+const two_functions =
+    \\export fn f() void {
+    \\}
+    \\export fn g() void {
+    \\    const x: u8 = 300;
+    \\    _ = x;
+    \\}
+    \\
+;
+
+test "merge: a range after several modified regions shifts by the total length difference once" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const on_300 = &.{spanOf(two_functions, "300", 0)};
+    // Guards against adding the shift of a region again for every later region, which moved the
+    // error onto ";\n " or past the end of the file
+    try expectRanges(&.{"4:18-4:21"}, try remappedRanges(a, two_functions, "//\n" ++ two_functions, on_300));
+    // Two separated edits: a line inserted at the top and a renamed function
+    const renamed = try std.mem.replaceOwned(u8, a, "//\n" ++ two_functions, "fn g()", "fn gg()");
+    try expectRanges(&.{"4:18-4:21"}, try remappedRanges(a, two_functions, renamed, on_300));
+    // A deleted header keeps the error
+    const header = "//! a\n//! b\n//! c\n" ++ two_functions;
+    try expectRanges(&.{"3:18-3:21"}, try remappedRanges(a, header, two_functions, &.{spanOf(header, "300", 0)}));
+    // Two edits on lines that are all unique
+    const unique = "const a = 1;\nconst b = 2;\nconst c = 3;\nconst x: u8 = 300;\n";
+    const edited = "const a = 10;\nconst b = 2;\nconst c = 30;\nconst x: u8 = 300;\n";
+    try expectRanges(&.{"3:14-3:17"}, try remappedRanges(a, unique, edited, &.{spanOf(unique, "300", 0)}));
+}
+
+test "merge: a note after several modified regions of its file shifts by the total length difference once" {
+    const main = "fn f() void {\n    g();\n}\n";
+    const main_start: u32 = @intCast(std.mem.indexOf(u8, main, "g();").?);
+    const note = spanOf(two_functions, "300", 0);
+    const result: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = main_start,
+        .end = main_start + 3,
+        .message = "error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = note[0], .end = note[1], .message = "note", .base_text = two_functions }},
+    }} };
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (!std.mem.endsWith(u8, path, "other.zig")) return null;
+            return .{ .uri = "file:///proj/src/other.zig", .text = "//\n" ++ two_functions };
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dummy: u8 = 0;
+    const diags = try compiler.merge(a, .{
+        .text = main,
+        .lines = try offsets.LineIndex.init(a, main),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = Ctx.get,
+        .other_ctx = &dummy,
+    });
+    try testing.expectEqual(1, diags.len);
+    const range = diags[0].relatedInformation.?[0].location.range;
+    try testing.expectEqual(4, range.start.line);
+    try testing.expectEqual(18, range.start.character);
+    try testing.expectEqual(4, range.end.line);
+    try testing.expectEqual(21, range.end.character);
+}
+
+test "combine: an older result shifted over several modified regions matches the newest one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const newer_text = "//\n" ++ two_functions;
+    const message = "type 'u8' cannot represent integer value '300'";
+    const new = spanOf(newer_text, "300", 0);
+    const old = spanOf(two_functions, "300", 0);
+    const newest: compiler.FileResult = .{ .base_text = newer_text, .items = &.{
+        .{ .start = new[0], .end = new[1], .message = message, .is_astgen = false, .notes = &.{} },
+    } };
+    const older: compiler.FileResult = .{ .base_text = two_functions, .items = &.{
+        .{ .start = old[0], .end = old[1], .message = message, .is_astgen = false, .notes = &.{} },
+    } };
+    const c = try compiler.combine(arena.allocator(), &.{ &newest, &older });
+    // Guards against shifting the older error too far, which kept it as a ghost duplicate
+    try testing.expectEqual(1, c.items.len);
+    try testing.expectEqual(new[0], c.items[0].start);
+}
+
+test "combine: each note is shifted from the text its own build read" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const main = "fn f() void {\n    g();\n    h();\n}\n";
+    const g = spanOf(main, "g()", 0);
+    const h = spanOf(main, "h()", 0);
+    // other.zig gained a line between the two builds; the newest build read the current text
+    const newer_other = "//\n" ++ two_functions;
+    const new_note = spanOf(newer_other, "300", 0);
+    const old_note = spanOf(two_functions, "300", 0);
+    const newest: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = g[0],
+        .end = g[1],
+        .message = "newer error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = new_note[0], .end = new_note[1], .message = "note", .base_text = newer_other }},
+    }} };
+    const older: compiler.FileResult = .{ .base_text = main, .items = &.{.{
+        .start = h[0],
+        .end = h[1],
+        .message = "older error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/other.zig"), .start = old_note[0], .end = old_note[1], .message = "note", .base_text = two_functions }},
+    }} };
+    const c = try compiler.combine(a, &.{ &newest, &older });
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (!std.mem.endsWith(u8, path, "other.zig")) return null;
+            return .{ .uri = "file:///proj/src/other.zig", .text = newer_other };
+        }
+    };
+    var dummy: u8 = 0;
+    const diags = try compiler.merge(a, .{
+        .text = main,
+        .lines = try offsets.LineIndex.init(a, main),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &c,
+        .other_file = Ctx.get,
+        .other_ctx = &dummy,
+    });
+    try testing.expectEqual(2, diags.len);
+    for (diags) |d| {
+        const range = d.relatedInformation.?[0].location.range;
+        try testing.expectEqual(4, range.start.line);
+        try testing.expectEqual(18, range.start.character);
+    }
+}
+
+const repeated_lines =
+    \\pub fn main() void {
+    \\    zero();
+    \\    one();
+    \\    two();
+    \\}
+    \\
+    \\fn zero() void {
+    \\    const w: u8 = 256;
+    \\    _ = w;
+    \\}
+    \\
+    \\fn one() void {
+    \\    const v: u8 = 300;
+    \\    _ = v;
+    \\}
+    \\
+    \\fn two() void {
+    \\    const v: u8 = 300;
+    \\    _ = v;
+    \\}
+    \\
+;
+
+test "merge: unchanged repeated lines next to an edit keep their errors" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spans = &.{ spanOf(repeated_lines, "256", 0), spanOf(repeated_lines, "300", 0), spanOf(repeated_lines, "300", 1) };
+    // Guards against treating every unchanged run of repeated lines (`}`, blank lines, duplicated
+    // statements) between unique lines as modified, which hid the errors on them
+    try expectRanges(&.{ "7:18-7:21", "12:18-12:21", "17:18-17:21" }, try remappedRanges(a, repeated_lines, repeated_lines ++ "// trailing comment\n", spans));
+    const changed = try std.mem.replaceOwned(u8, a, repeated_lines, "fn one() void {\n    const v: u8 = 300;", "fn one() void {\n    const v: u8 = 30;");
+    try expectRanges(&.{ "7:18-7:21", "17:18-17:21" }, try remappedRanges(a, repeated_lines, changed, spans));
+    try expectRanges(&.{ "8:18-8:21", "13:18-13:21", "18:18-18:21" }, try remappedRanges(a, repeated_lines, "// top\n" ++ repeated_lines, spans));
+
+    // Fixing one of two identical statements keeps the error on the other one
+    const duplicated =
+        \\fn f() void {
+        \\    var list = std.ArrayList(u8).init(allocator);
+        \\    _ = &list;
+        \\}
+        \\fn g() void {
+        \\    var list = std.ArrayList(u8).init(allocator);
+        \\    _ = &list;
+        \\}
+        \\
+    ;
+    const fixed = try std.mem.replaceOwned(u8, a, duplicated, "fn f() void {\n    var list = std.ArrayList(u8).init(allocator);", "fn f() void {\n    var list: std.ArrayList(u8) = .empty;");
+    try expectRanges(&.{"5:33-5:37"}, try remappedRanges(a, duplicated, fixed, &.{ spanOf(duplicated, "init", 0), spanOf(duplicated, "init", 1) }));
+}
+
+test "merge: lines that differ only in the line terminator keep their errors" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const crlf = "pub fn main() void {\r\n    f();\r\n    const v: u8 = 300;\r\n    _ = v;\r\n}\r\nfn f() void {\r\n    const w: i8 = 200;\r\n    _ = w;\r\n}\r\n";
+    const lf = try std.mem.replaceOwned(u8, a, crlf, "\r\n", "\n");
+    // Guards against treating every line as modified when the disk text uses CRLF and the buffer
+    // LF, which hid all compiler errors; a range may also cross a line terminator
+    const spans = &.{ spanOf(crlf, "f();\r\n    const", 0), spanOf(crlf, "300", 0), spanOf(crlf, "200", 0) };
+    try expectRanges(&.{ "1:4-2:9", "2:18-2:21", "6:18-6:21" }, try remappedRanges(a, crlf, lf, spans));
+
+    // A mixed-EOL disk text against a buffer normalized to CRLF
+    const mixed = "pub fn main() void {\r\n    f();\r\n    const v: u8 = 300;\n    _ = v;\n}\r\nfn f() void {\n    const w: i8 = 200;\r\n    _ = w;\r\n}\r\n";
+    const normalized = try std.mem.replaceOwned(u8, a, lf, "\n", "\r\n");
+    try expectRanges(&.{ "2:18-2:21", "6:18-6:21" }, try remappedRanges(a, mixed, normalized, &.{ spanOf(mixed, "300", 0), spanOf(mixed, "200", 0) }));
 }
 
 test "merge: malformed compiler spans do not overflow when remapped" {
@@ -290,6 +529,99 @@ fn traceBundle() !ErrorBundle {
     return wip.toOwnedBundle("@as(comptime_int, 3)\n@as(*const [2:0]u8, \"hi\")\n");
 }
 
+const lib_v1 =
+    \\pub fn get() u8 {
+    \\    const big: u8 = 256;
+    \\    return big;
+    \\}
+    \\
+;
+const lib_v2 = "// one\n// two\n" ++ lib_v1;
+
+/// Disk whose `lib.zig` has the text `lib`
+const LibDisk = struct {
+    lib: []const u8,
+
+    fn read(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
+        const self: *LibDisk = @ptrCast(@alignCast(ctx));
+        if (std.mem.endsWith(u8, path, "lib.zig")) return gpa.dupe(u8, self.lib) catch null;
+        return Disk.read(ctx, gpa, path);
+    }
+};
+
+/// Source location of `needle` in `text`, with its line, column and source line as the compiler
+/// reports them
+fn compilerLocation(wip: *ErrorBundle.Wip, path: []const u8, text: []const u8, needle: []const u8, reference_trace_len: u32) !ErrorBundle.SourceLocationIndex {
+    const start: u32 = @intCast(std.mem.indexOf(u8, text, needle).?);
+    const loc = std.zig.findLineColumn(text, start);
+    return wip.addSourceLocation(.{
+        .src_path = try wip.addString(path),
+        .line = @intCast(loc.line),
+        .column = @intCast(loc.column),
+        .span_start = start,
+        .span_main = start,
+        .span_end = start + @as(u32, @intCast(needle.len)),
+        .source_line = try wip.addString(loc.source_line),
+        .reference_trace_len = reference_trace_len,
+    });
+}
+
+/// A build that read `lib` as `src/lib.zig`: an error on `256` in it, and an error in main.zig with
+/// a note and a reference into it
+fn libBundle(lib: []const u8) !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(testing.allocator);
+    defer wip.deinit();
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString("type 'u8' cannot represent integer value '256'"), .src_loc = try compilerLocation(&wip, "src/lib.zig", lib, "256", 0) });
+    const note_loc = try compilerLocation(&wip, "src/lib.zig", lib, "big;", 0);
+    const ref_loc = try location(&wip, "src/lib.zig", lib, "get", 0);
+    const err_loc = try compilerLocation(&wip, "src/main.zig", main_text, "\"s\"", 1);
+    try wip.addReferenceTrace(.{ .decl_name = try wip.addString("get"), .src_loc = ref_loc });
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("a note"), .src_loc = note_loc }},
+    );
+    return wip.toOwnedBundle("");
+}
+
+test "collect: locations in a file changed after the compiler read it are discarded" {
+    const gpa = testing.allocator;
+    const lib_path = native("/proj/src/lib.zig");
+    const main_path = native("/proj/src/main.zig");
+    var v1 = try libBundle(lib_v1);
+    defer v1.deinit(gpa);
+
+    // The disk still has the text the compiler read
+    var disk: LibDisk = .{ .lib = lib_v1 };
+    const same = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    defer same.release(gpa);
+    try testing.expectEqual(std.mem.indexOf(u8, lib_v1, "256").?, same.files.get(lib_path).?.items[0].start);
+    try testing.expectEqual(2, same.files.get(main_path).?.items[0].notes.len);
+
+    // Guards against applying the spans to a text written during the build, which put the error
+    // inside a comment: everything located in lib.zig is dropped
+    disk.lib = lib_v2;
+    const changed = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    defer changed.release(gpa);
+    try testing.expect(changed.files.get(lib_path) == null);
+    const main = changed.files.get(main_path).?;
+    try testing.expectEqual(1, main.items.len);
+    try testing.expectEqual(0, main.items[0].notes.len);
+
+    // The build after the change places the error on the new text
+    var v2 = try libBundle(lib_v2);
+    defer v2.deinit(gpa);
+    const rebuilt = try compiler.collect(gpa, &.{v2}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    defer rebuilt.release(gpa);
+    const lib = rebuilt.files.get(lib_path).?;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const lines = try offsets.LineIndex.init(arena.allocator(), lib.base_text);
+    const range = lines.range(lib.items[0].start, lib.items[0].end, .utf8);
+    try testing.expectEqual(3, range.start.line);
+    try testing.expectEqual(20, range.start.character);
+    try testing.expectEqual(2, rebuilt.files.get(main_path).?.items[0].notes.len);
+}
+
 test "collect: reference trace and compile log output are kept" {
     const gpa = testing.allocator;
     var eb = try traceBundle();
@@ -298,15 +630,14 @@ test "collect: reference trace and compile log output are kept" {
     const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
     defer r.release(gpa);
 
-    // The build-time text is kept for a file that notes point to even if it has no errors
-    try testing.expectEqualStrings(caller_text, r.texts.get(native("/proj/src/caller.zig")).?);
-    try testing.expectEqualStrings(main_text, r.texts.get(native("/proj/src/main.zig")).?);
-
     const items = r.files.get(native("/proj/src/main.zig")).?.items;
     try testing.expectEqual(3, items.len);
     const err_start: u32 = @intCast(std.mem.indexOf(u8, main_text, "\"s\"").?);
     const notes = items[0].notes;
     try testing.expectEqual(3, notes.len);
+    try testing.expectEqualStrings(main_text, notes[0].base_text.?);
+    // The build-time text is kept for a file that notes point to even if it has no errors
+    try testing.expectEqualStrings(caller_text, notes[1].base_text.?);
     try testing.expectEqualStrings("a note", notes[0].message);
     try testing.expectEqualStrings(native("/proj/src/caller.zig"), notes[1].path);
     try testing.expectEqual(std.mem.indexOf(u8, caller_text, "m.main()").?, notes[1].start);

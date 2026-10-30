@@ -1157,6 +1157,175 @@ test "extract to local constant" {
     }
 }
 
+test "extract to local constant keeps operands that are used by reference" {
+    // Zig evaluates these operands by reference: a copy in a constant would hand out the address
+    // of the copy (slices of a stack copy, a `*const` receiver for a `*T` method, captures that
+    // modify the copy)
+    for ([_][]const u8{
+        // Slicing an array
+        "const R = struct {\n    buf: [8]u8,\n    len: usize,\n    fn name(self: *const R) []const u8 {\n        return «self.buf»[0..self.len];\n    }\n};",
+        // A receiver passed by pointer, or to an anytype first parameter
+        "const C = struct {\n    n: u32,\n    fn bump(c: *C) void {\n        c.n += 1;\n    }\n};\nconst O = struct { c: C };\nfn f(o: *O) void {\n    «o.c».bump();\n}",
+        "const C = struct {\n    n: u32,\n    fn touch(c: anytype) void {\n        _ = c;\n    }\n};\nconst O = struct { c: C };\nfn f(o: *O) void {\n    «o.c».touch();\n}",
+        // Operands of pointer captures
+        "const S = struct {\n    val: ?u32,\n    fn f(self: *S) void {\n        if («self.val») |*p| p.* += 1;\n    }\n};",
+        "const U = union(enum) { a: u32, b: void };\nconst S = struct {\n    u: U,\n    fn f(self: *S) void {\n        switch («self.u») {\n            .a => |*p| p.* += 1,\n            .b => {},\n        }\n    }\n};",
+        // Bases of lvalues
+        "const P = struct { a: u32 };\nfn g(x: *const u32) u32 {\n    return x.*;\n}\nfn f(p: P) u32 {\n    return g(&«p».a);\n}",
+        "const In = struct { x: u32 };\nconst S = struct {\n    inner: In,\n    fn f(self: *S) void {\n        «self.inner».x = 5;\n    }\n};",
+        "const S = struct {\n    buf: [4]u8,\n    fn first(self: *S) *u8 {\n        return &«self.buf»[0];\n    }\n};",
+    }) |text| {
+        const got = try apply(text, "extract");
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings("no action", got) catch |err| {
+            std.debug.print("{s}\n", .{text});
+            return err;
+        };
+    }
+    // Slicing a slice and a receiver passed by value copy only the value
+    try expectAction(
+        \\const S = struct {
+        \\    items: []const u8,
+        \\    fn f(self: *const S, n: usize) []const u8 {
+        \\        return «self.items»[0..n];
+        \\    }
+        \\};
+    , "extract",
+        \\const S = struct {
+        \\    items: []const u8,
+        \\    fn f(self: *const S, n: usize) []const u8 {
+        \\        const value = self.items;
+        \\        return value[0..n];
+        \\    }
+        \\};
+    );
+    try expectAction(
+        \\const V = struct {
+        \\    k: u32,
+        \\    fn get(v: V, i: u32) u32 {
+        \\        return v.k + i;
+        \\    }
+        \\};
+        \\const S = struct {
+        \\    v: V,
+        \\    fn f(self: *const S) u32 {
+        \\        return «self.v».get(1);
+        \\    }
+        \\};
+    , "extract",
+        \\const V = struct {
+        \\    k: u32,
+        \\    fn get(v: V, i: u32) u32 {
+        \\        return v.k + i;
+        \\    }
+        \\};
+        \\const S = struct {
+        \\    v: V,
+        \\    fn f(self: *const S) u32 {
+        \\        const value = self.v;
+        \\        return value.get(1);
+        \\    }
+        \\};
+    );
+    // Through a pointer the address comes from the pointer value, which the copy keeps
+    try expectAction(
+        \\const In = struct { x: u32 };
+        \\const S = struct {
+        \\    next: *In,
+        \\    fn f(self: *S) void {
+        \\        «self.next».x = 5;
+        \\    }
+        \\};
+    , "extract",
+        \\const In = struct { x: u32 };
+        \\const S = struct {
+        \\    next: *In,
+        \\    fn f(self: *S) void {
+        \\        const value = self.next;
+        \\        value.x = 5;
+        \\    }
+        \\};
+    );
+}
+
+test "extract to local constant keeps the result type" {
+    // Without the result type of the original position these no longer compile: a decl literal
+    // call becomes a call of an enum literal, `@fromBackingInt` has no destination type, and
+    // number literals chosen at runtime are comptime_int values that depend on runtime control flow
+    for ([_][]const u8{
+        "const S = struct {\n    x: u32,\n    fn init(v: u32) S {\n        return .{ .x = v };\n    }\n};\nfn f() u32 {\n    const s: S = «.init(5)»;\n    return s.x;\n}",
+        "const S = struct {\n    x: u32,\n    fn init(v: u32) !S {\n        return .{ .x = v };\n    }\n};\nfn f() !u32 {\n    const s: S = «try .init(5)»;\n    return s.x;\n}",
+        "const S = struct {\n    x: u32,\n    fn init(v: u32) S {\n        return .{ .x = v };\n    }\n};\nfn use(s: S) u32 {\n    return s.x;\n}\nfn f() u32 {\n    return use(«.init(5)»);\n}",
+        "const P = packed struct(u8) { a: u4, b: u4 };\nfn f(raw: u8) P {\n    const p: P = «@fromBackingInt(raw)»;\n    return p;\n}",
+    }) |text| {
+        const got = try apply(text, "extract");
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings("no action", got) catch |err| {
+            std.debug.print("{s}\n", .{text});
+            return err;
+        };
+    }
+    try expectAction(
+        \\fn pick(c: bool) u8 {
+        \\    const x: u8 = «if (c) 1 else 2»;
+        \\    return x;
+        \\}
+    , "extract",
+        \\fn pick(c: bool) u8 {
+        \\    const value: u8 = if (c) 1 else 2;
+        \\    const x: u8 = value;
+        \\    return x;
+        \\}
+    );
+    try expectAction(
+        \\fn f(c: bool) i32 {
+        \\    var r: i32 = 0;
+        \\    r += «if (c) 100 else -1»;
+        \\    return r;
+        \\}
+    , "extract",
+        \\fn f(c: bool) i32 {
+        \\    var r: i32 = 0;
+        \\    const value: i32 = if (c) 100 else -1;
+        \\    r += value;
+        \\    return r;
+        \\}
+    );
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u8 {
+        \\    return «switch (e) {
+        \\        .a => 1,
+        \\        .b => 2,
+        \\        .c => 4,
+        \\    }»;
+        \\}
+    , "extract",
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u8 {
+        \\    const value: u8 = switch (e) {
+        \\        .a => 1,
+        \\        .b => 2,
+        \\        .c => 4,
+        \\    };
+        \\    return value;
+        \\}
+    );
+    // Under a comptime-known condition the literal is a comptime_int as in the original
+    try expectAction(
+        \\fn f() u32 {
+        \\    const k = «if (true) 1 else 2»;
+        \\    return k;
+        \\}
+    , "extract",
+        \\fn f() u32 {
+        \\    const value = if (true) 1 else 2;
+        \\    const k = value;
+        \\    return k;
+        \\}
+    );
+}
+
 /// Verifies the edit result with the compiler's syntax tree and reads the byte value from the
 /// string token.
 fn stringValue(source: []const u8) ![]u8 {

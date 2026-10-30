@@ -36,6 +36,9 @@ pub const Note = struct {
     start: u32,
     end: u32,
     message: []const u8,
+    /// Text of the note's file read when its build finished (the range refers to it); null when
+    /// the file could not be read
+    base_text: ?[]const u8 = null,
 };
 
 /// All results of one build, allocated in an arena together with this struct itself. Immutable
@@ -47,9 +50,6 @@ pub const BuildResult = struct {
     arena: std.heap.ArenaAllocator.State,
     /// Absolute path → result
     files: std.StringArrayHashMapUnmanaged(FileResult),
-    /// Texts read during the build: each file in `files`, plus files that notes point to but that
-    /// have no errors (looked up by path)
-    texts: std.StringArrayHashMapUnmanaged([]const u8),
     refs: std.atomic.Value(u32) = .init(1),
 
     pub fn retain(r: *BuildResult) *BuildResult {
@@ -73,6 +73,11 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 /// When `src_path` does not resolve to an absolute path (a malformed error bundle, see
 /// `absolute`), it is treated as having no location: the error is attached to the start of
 /// `fallback_path`, and the notes and reference trace are placed at the start of the error.
+/// The files are read from disk after the build. A location that carries its source line (the
+/// compiler gives one for errors and for notes not at the error's position) shows whether the
+/// text read is the one the compiler read; when it is not (the file changed during the build), no
+/// location in that file is kept: its errors are dropped with their notes, and notes and
+/// references into it are dropped. The next build that reads the file reports them again.
 pub fn collect(
     gpa: Allocator,
     bundles: []const ErrorBundle,
@@ -84,6 +89,15 @@ pub fn collect(
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const a = arena_state.allocator();
+    var sources: Sources = .{ .a = a, .build_root = build_root, .read_ctx = read_ctx, .read = read };
+    // Find the files that changed after the compiler read them
+    for (bundles) |eb| {
+        if (eb.errorMessageCount() == 0) continue;
+        for (eb.getMessages()) |mi| {
+            try sources.check(eb, eb.getErrorMessage(mi).src_loc);
+            for (eb.getNotes(mi)) |ni| try sources.check(eb, eb.getErrorMessage(ni).src_loc);
+        }
+    }
 
     var lists: std.StringArrayHashMapUnmanaged(std.ArrayList(Item)) = .empty;
     // Dedup: several compile steps may report the same error in the same file. The value is the
@@ -108,6 +122,7 @@ pub fn collect(
             if (msg.src_loc != .none) {
                 const loc = eb.getSourceLocation(msg.src_loc);
                 if (try absolute(a, build_root, eb.nullTerminatedString(loc.src_path))) |p| {
+                    if (sources.stale.contains(p)) continue;
                     path = p;
                     start, end = byteSpan(loc);
                 }
@@ -121,41 +136,33 @@ pub fn collect(
 
             // The notes are followed by the reference trace
             const refs: u32 = if (msg.src_loc != .none) eb.getSourceLocation(msg.src_loc).reference_trace_len else 0;
-            const notes = try a.alloc(Note, msg.notes_len + refs);
-            for (notes[0..msg.notes_len], eb.getNotes(mi)) |*note, ni| {
+            var notes: std.ArrayList(Note) = try .initCapacity(a, msg.notes_len + refs);
+            for (eb.getNotes(mi)) |ni| {
                 const n = eb.getErrorMessage(ni);
-                note.* = .{ .path = path, .start = start, .end = start, .message = try a.dupe(u8, eb.nullTerminatedString(n.msg)) };
+                var note: Note = .{ .path = path, .start = start, .end = start, .message = "" };
                 if (n.src_loc != .none) {
                     const nl = eb.getSourceLocation(n.src_loc);
                     if (try absolute(a, build_root, eb.nullTerminatedString(nl.src_path))) |p| {
+                        if (sources.stale.contains(p)) continue;
                         note.path = p;
                         note.start, note.end = byteSpan(nl);
                     }
                 }
+                note.message = try a.dupe(u8, eb.nullTerminatedString(n.msg));
+                note.base_text = try sources.text(note.path);
+                notes.appendAssumeCapacity(note);
             }
-            if (refs != 0) try referenceTrace(a, eb, msg.src_loc, build_root, path, start, notes[msg.notes_len..]);
+            if (refs != 0) try referenceTrace(eb, msg.src_loc, refs, &sources, path, start, &notes);
             const gop = try lists.getOrPut(a, path);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             seen_gop.value_ptr.* = gop.value_ptr.items.len;
-            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes, .compile_log = compile_log });
+            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes.items, .compile_log = compile_log });
         }
     }
 
     var files: std.StringArrayHashMapUnmanaged(FileResult) = .empty;
-    // A file that notes point to is not in `files` when it has no errors of its own; its
-    // build-time text is saved as well, for shifting the notes
-    var texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    for (lists.values()) |items| for (items.items) |item| for (item.notes) |n| {
-        if (texts.contains(n.path)) continue;
-        const text = read(read_ctx, a, n.path) orelse continue;
-        try texts.put(a, n.path, text);
-    };
     for (lists.keys(), lists.values()) |path, *items| {
-        const text = texts.get(path) orelse blk: {
-            const t = read(read_ctx, a, path) orelse "";
-            try texts.put(a, path, t);
-            break :blk t;
-        };
+        const text = try sources.text(path) orelse "";
         // Mark AstGen errors: run AstGen on the same text and match by range and message
         const mode = live.modeOf(path);
         const astgen = try live.check(gpa, text, mode);
@@ -168,40 +175,95 @@ pub fn collect(
         try files.put(a, path, .{ .base_text = text, .items = items.items });
     }
     const result = try a.create(BuildResult);
-    result.* = .{ .arena = undefined, .files = files, .texts = texts };
+    result.* = .{ .arena = undefined, .files = files };
     // Take the arena state after the last allocation
     result.arena = arena_state.state;
     return result;
 }
 
-/// Converts the reference trace following source location `src_loc` into notes, with messages
-/// matching the output of `zig build`. A reference with a location points to the referencing
-/// site; the trailing hidden marker has no location and, like notes without a location, is
-/// placed at the start of the error (`start` in `path`).
-fn referenceTrace(a: Allocator, eb: ErrorBundle, src_loc: ErrorBundle.SourceLocationIndex, build_root: []const u8, path: []const u8, start: u32, out: []Note) Allocator.Error!void {
+/// Disk texts of the files that the locations of a build point into, read after the build
+const Sources = struct {
+    a: Allocator,
+    build_root: []const u8,
+    read_ctx: *anyopaque,
+    read: ReadFn,
+    texts: std.StringHashMapUnmanaged([]const u8) = .empty,
+    unreadable: std.StringHashMapUnmanaged(void) = .empty,
+    /// Files whose text read is not the one the compiler read
+    stale: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Text of `path`, read once; null when it cannot be read
+    fn text(s: *Sources, path: []const u8) Allocator.Error!?[]const u8 {
+        if (s.texts.get(path)) |t| return t;
+        if (s.unreadable.contains(path)) return null;
+        const t = s.read(s.read_ctx, s.a, path) orelse {
+            try s.unreadable.put(s.a, path, {});
+            return null;
+        };
+        try s.texts.put(s.a, path, t);
+        return t;
+    }
+
+    /// Marks the file of `src_loc` stale when the location carries its source line and the text
+    /// read does not have that line at the location's main position, with that position at the
+    /// same column (both as `std.zig.findLineColumn` computes them on the text the compiler read)
+    fn check(s: *Sources, eb: ErrorBundle, src_loc: ErrorBundle.SourceLocationIndex) Allocator.Error!void {
+        if (src_loc == .none) return;
+        const loc = eb.getSourceLocation(src_loc);
+        if (loc.source_line == 0) return;
+        const path = try absolute(s.a, s.build_root, eb.nullTerminatedString(loc.src_path)) orelse return;
+        const t = try s.text(path) orelse "";
+        const main = loc.span_main;
+        const same = main <= t.len and blk: {
+            const line_start = if (std.mem.lastIndexOfScalar(u8, t[0..main], '\n')) |i| i + 1 else 0;
+            const line_end = std.mem.indexOfScalarPos(u8, t, main, '\n') orelse t.len;
+            break :blk main - line_start == loc.column and std.mem.eql(u8, t[line_start..line_end], eb.nullTerminatedString(loc.source_line));
+        };
+        if (!same) try s.stale.put(s.a, path, {});
+    }
+};
+
+/// Appends the `count` references of the reference trace following source location `src_loc` to
+/// `out` as notes, with messages matching the output of `zig build`; references into a stale file
+/// (see `Sources`) are left out. A reference with a location points to the referencing site; the
+/// trailing hidden marker has no location and, like notes without a location, is placed at the
+/// start of the error (`start` in `path`).
+fn referenceTrace(
+    eb: ErrorBundle,
+    src_loc: ErrorBundle.SourceLocationIndex,
+    count: u32,
+    sources: *Sources,
+    path: []const u8,
+    start: u32,
+    out: *std.ArrayList(Note),
+) Allocator.Error!void {
+    const a = sources.a;
     // ErrorBundle has no public interface for reading the reference trace: it is read from
     // `extra` according to its layout. `SourceLocation` is followed by the `ReferenceTrace`s one
     // after another, each storing `decl_name` and `src_loc` in field order.
     const first = @backingInt(src_loc) + @typeInfo(ErrorBundle.SourceLocation).@"struct".field_names.len;
     const stride = @typeInfo(ErrorBundle.ReferenceTrace).@"struct".field_names.len;
-    for (out, 0..) |*note, k| {
+    for (0..count) |k| {
         const at = first + k * stride;
         const decl_name: ErrorBundle.String = eb.extra[at];
         const ref_loc: ErrorBundle.SourceLocationIndex = @fromBackingInt(eb.extra[at + 1]);
-        note.* = .{ .path = path, .start = start, .end = start, .message = "" };
+        var note: Note = .{ .path = path, .start = start, .end = start, .message = "" };
         if (ref_loc != .none) {
             const rl = eb.getSourceLocation(ref_loc);
-            if (try absolute(a, build_root, eb.nullTerminatedString(rl.src_path))) |p| {
+            if (try absolute(a, sources.build_root, eb.nullTerminatedString(rl.src_path))) |p| {
+                if (sources.stale.contains(p)) continue;
                 note.path = p;
                 note.start, note.end = byteSpan(rl);
             }
             note.message = try std.fmt.allocPrint(a, "referenced by: {s}", .{eb.nullTerminatedString(decl_name)});
         } else if (decl_name != 0) {
             // Hidden marker: `decl_name` is the number of hidden references
-            note.message = try std.fmt.allocPrint(a, "{d} reference(s) hidden; use '-freference-trace={d}' to see all references", .{ decl_name, decl_name + out.len - 1 });
+            note.message = try std.fmt.allocPrint(a, "{d} reference(s) hidden; use '-freference-trace={d}' to see all references", .{ decl_name, @as(usize, decl_name) + count - 1 });
         } else {
             note.message = "remaining reference traces hidden; use '-freference-trace' to see all reference traces";
         }
+        note.base_text = try sources.text(note.path);
+        out.appendAssumeCapacity(note);
     }
 }
 
@@ -278,7 +340,7 @@ pub const MergeInput = struct {
     other_ctx: *anyopaque,
 };
 
-pub const OtherFile = struct { uri: []const u8, text: []const u8, base_text: ?[]const u8 = null };
+pub const OtherFile = struct { uri: []const u8, text: []const u8 };
 
 /// Returns the URI and text of another file (for note positions); null when the file cannot be
 /// read
@@ -309,54 +371,107 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
     return out.items;
 }
 
-/// A differing range between the old and new text: old text [start, old_end) is replaced by new
-/// text [start, new_end)
-const Edit = struct { start: u32, old_end: u32, new_end: u32 };
+/// A differing range between the old and new text: old text [start, old_end) is replaced by the
+/// new text that ends at `new_end`. `old_end` and `new_end` are offsets in their own text, so
+/// `new_end - old_end` is the total shift of everything after this range, including the length
+/// differences of the ranges before it.
+const Edit = struct {
+    start: u32,
+    old_end: u32,
+    new_end: u32,
+    /// Only the line terminator differs (`\r\n` and `\n`): the lines on both sides are the same
+    line_break: bool = false,
+};
 
-const Line = struct { start: u32, end: u32 };
+/// A line of a text: its content [start, end) and the start of the next line; the line terminator
+/// lies in between
+const Line = struct { start: u32, end: u32, next: u32 };
 
-/// Line anchor: a line with identical content that is unique on both sides
-const Anchor = struct { old: usize, new: usize };
+/// Line `old` of the old text matched with the identical line `new` of the new text
+const Match = struct {
+    old: usize,
+    new: usize,
 
-/// Compares the old and new text line by line and returns disjoint replacement ranges sorted by
-/// position. Identical lines that are unique on both sides serve as anchors, and the lines between
-/// the anchors of their longest increasing subsequence are treated as modified regions as a whole.
-/// Line granularity is conservative: modifying a line hides the diagnostics on that line without
-/// affecting unmodified lines.
+    fn before(_: void, a: Match, b: Match) bool {
+        return a.old < b.old;
+    }
+};
+
+/// Compares the old and new text line by line (a patience diff) and returns disjoint replacement
+/// ranges sorted by position. Lines are compared without their terminator (`\r\n` and `\n` are
+/// equivalent, as for the compiler); identical lines whose terminators differ yield a `line_break`
+/// edit. In each range of lines still to compare, identical lines at its start and end are
+/// matched; of the remaining lines, those identical and unique on both sides within the range are
+/// matched along their longest increasing subsequence, and the ranges between them are compared
+/// the same way. Lines left without a match form the modified regions, so no region starts or ends
+/// with a line that is identical on both sides. Line granularity is conservative: modifying a line
+/// hides the diagnostics on that line without affecting unmodified lines.
 fn diffEdits(a: Allocator, old: []const u8, new: []const u8) Allocator.Error![]const Edit {
     if (std.mem.eql(u8, old, new)) return &.{};
     const old_lines = try splitLines(a, old);
     const new_lines = try splitLines(a, new);
-    var old_counts: std.StringHashMapUnmanaged(usize) = .empty;
-    for (old_lines) |l| {
-        const gop = try old_counts.getOrPut(a, old[l.start..l.end]);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    const Range = struct { old_start: usize, old_end: usize, new_start: usize, new_end: usize };
+    // Occurrences of a line in the range on each side, and the old line it first occurs on
+    const Count = struct { old: usize, new: usize, old_line: usize };
+    var matches: std.ArrayList(Match) = .empty;
+    var pending: std.ArrayList(Range) = .empty;
+    var counts: std.StringHashMapUnmanaged(Count) = .empty;
+    var unique: std.ArrayList(Match) = .empty;
+    try pending.append(a, .{ .old_start = 0, .old_end = old_lines.len, .new_start = 0, .new_end = new_lines.len });
+    while (pending.pop()) |range| {
+        var r = range;
+        while (r.old_start < r.old_end and r.new_start < r.new_end and
+            std.mem.eql(u8, lineText(old, old_lines, r.old_start), lineText(new, new_lines, r.new_start)))
+        {
+            try matches.append(a, .{ .old = r.old_start, .new = r.new_start });
+            r.old_start += 1;
+            r.new_start += 1;
+        }
+        while (r.old_start < r.old_end and r.new_start < r.new_end and
+            std.mem.eql(u8, lineText(old, old_lines, r.old_end - 1), lineText(new, new_lines, r.new_end - 1)))
+        {
+            r.old_end -= 1;
+            r.new_end -= 1;
+            try matches.append(a, .{ .old = r.old_end, .new = r.new_end });
+        }
+        counts.clearRetainingCapacity();
+        for (r.old_start..r.old_end) |i| {
+            const gop = try counts.getOrPut(a, lineText(old, old_lines, i));
+            if (gop.found_existing) gop.value_ptr.old += 1 else gop.value_ptr.* = .{ .old = 1, .new = 0, .old_line = i };
+        }
+        for (r.new_start..r.new_end) |i| {
+            if (counts.getPtr(lineText(new, new_lines, i))) |c| c.new += 1;
+        }
+        unique.clearRetainingCapacity();
+        for (r.new_start..r.new_end) |i| {
+            const c = counts.get(lineText(new, new_lines, i)) orelse continue;
+            if (c.old == 1 and c.new == 1) try unique.append(a, .{ .old = c.old_line, .new = i });
+        }
+        const anchors = try longestIncreasing(a, unique.items);
+        if (anchors.len == 0) continue;
+        var old_start = r.old_start;
+        var new_start = r.new_start;
+        for (anchors) |m| {
+            try matches.append(a, m);
+            try pending.append(a, .{ .old_start = old_start, .old_end = m.old, .new_start = new_start, .new_end = m.new });
+            old_start = m.old + 1;
+            new_start = m.new + 1;
+        }
+        try pending.append(a, .{ .old_start = old_start, .old_end = r.old_end, .new_start = new_start, .new_end = r.new_end });
     }
-    var new_counts: std.StringHashMapUnmanaged(usize) = .empty;
-    for (new_lines) |l| {
-        const gop = try new_counts.getOrPut(a, new[l.start..l.end]);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
-    }
-    var old_unique: std.StringHashMapUnmanaged(usize) = .empty;
-    for (old_lines, 0..) |l, i| {
-        const line = old[l.start..l.end];
-        if (old_counts.get(line).? == 1) try old_unique.put(a, line, i);
-    }
-    var pairs: std.ArrayList(Anchor) = .empty;
-    for (new_lines, 0..) |l, i| {
-        const line = new[l.start..l.end];
-        if (new_counts.get(line).? != 1) continue;
-        const oi = old_unique.get(line) orelse continue;
-        try pairs.append(a, .{ .old = oi, .new = i });
-    }
-    const anchors = try longestIncreasing(a, pairs.items);
+    std.mem.sort(Match, matches.items, {}, Match.before);
     var edits: std.ArrayList(Edit) = .empty;
     var oi: usize = 0;
     var ni: usize = 0;
-    for (anchors) |an| {
-        try addEdit(a, &edits, old, new, old_lines, new_lines, oi, an.old, ni, an.new);
-        oi = an.old + 1;
-        ni = an.new + 1;
+    for (matches.items) |m| {
+        try addEdit(a, &edits, old, new, old_lines, new_lines, oi, m.old, ni, m.new);
+        const ol = old_lines[m.old];
+        const nl = new_lines[m.new];
+        if (!std.mem.eql(u8, old[ol.end..ol.next], new[nl.end..nl.next])) {
+            try edits.append(a, .{ .start = ol.end, .old_end = ol.next, .new_end = nl.next, .line_break = true });
+        }
+        oi = m.old + 1;
+        ni = m.new + 1;
     }
     try addEdit(a, &edits, old, new, old_lines, new_lines, oi, old_lines.len, ni, new_lines.len);
     return edits.items;
@@ -367,11 +482,16 @@ fn splitLines(a: Allocator, text: []const u8) Allocator.Error![]const Line {
     var start: usize = 0;
     while (start < text.len) {
         const nl = std.mem.indexOfScalarPos(u8, text, start, '\n');
-        const end = if (nl) |i| i + 1 else text.len;
-        try lines.append(a, .{ .start = @intCast(start), .end = @intCast(end) });
-        start = end;
+        const next = if (nl) |i| i + 1 else text.len;
+        const end = if (nl) |i| if (i > start and text[i - 1] == '\r') i - 1 else i else text.len;
+        try lines.append(a, .{ .start = @intCast(start), .end = @intCast(end), .next = @intCast(next) });
+        start = next;
     }
     return lines.items;
+}
+
+fn lineText(text: []const u8, lines: []const Line, i: usize) []const u8 {
+    return text[lines[i].start..lines[i].end];
 }
 
 fn lineOffset(lines: []const Line, text: []const u8, i: usize) u32 {
@@ -400,7 +520,7 @@ fn addEdit(
 
 /// `pairs` is sorted by increasing `new`; returns the longest subsequence with strictly increasing
 /// `old`
-fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]const Anchor {
+fn longestIncreasing(a: Allocator, pairs: []const Match) Allocator.Error![]const Match {
     if (pairs.len == 0) return &.{};
     const tails = try a.alloc(usize, pairs.len);
     const prev = try a.alloc(?usize, pairs.len);
@@ -416,7 +536,7 @@ fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]cons
         tails[lo] = i;
         if (lo == len) len += 1;
     }
-    const out = try a.alloc(Anchor, len);
+    const out = try a.alloc(Match, len);
     var k: ?usize = if (len > 0) tails[len - 1] else null;
     var i: usize = len;
     while (k) |x| : (k = prev[x]) {
@@ -427,18 +547,29 @@ fn longestIncreasing(a: Allocator, pairs: []const Anchor) Allocator.Error![]cons
 }
 
 /// A range entirely before the modified regions stays unchanged, one entirely after them is
-/// shifted by the length difference, and one that intersects any modified region yields null.
-/// Ranges from the compiler are not necessarily valid (end before start, far beyond the text): a
-/// range that exceeds u32 after shifting also yields null.
+/// shifted by the length difference, and one that intersects any modified region yields null. A
+/// range may cross a `line_break` edit: its start and end are shifted separately, and only a start
+/// or end inside the line terminator yields null. Ranges from the compiler are not necessarily
+/// valid (end before start, far beyond the text): a range that exceeds u32 after shifting also
+/// yields null.
 fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
-    var delta: i64 = 0;
+    var start_delta: i64 = 0;
+    var end_delta: i64 = 0;
     for (edits) |e| {
         if (end <= e.start) break;
-        if (start < e.old_end) return null;
-        delta += @as(i64, e.new_end) - @as(i64, e.old_end);
+        const delta = @as(i64, e.new_end) - @as(i64, e.old_end);
+        if (e.line_break) {
+            if (start > e.start and start < e.old_end) return null;
+            if (end < e.old_end) return null;
+            if (start >= e.old_end) start_delta = delta;
+        } else {
+            if (start < e.old_end) return null;
+            start_delta = delta;
+        }
+        end_delta = delta;
     }
-    const shifted_start = std.math.cast(u32, @as(i64, start) + delta) orelse return null;
-    const shifted_end = std.math.cast(u32, @as(i64, end) + delta) orelse return null;
+    const shifted_start = std.math.cast(u32, @as(i64, start) + start_delta) orelse return null;
+    const shifted_end = std.math.cast(u32, @as(i64, end) + end_delta) orelse return null;
     return .{ shifted_start, shifted_end };
 }
 
@@ -466,10 +597,11 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
     for (item.notes) |n| {
         const other = in.other_file(in.other_ctx, arena, n.path) orelse continue;
         const lines = try offsets.LineIndex.init(arena, other.text);
-        // The note's file also has unsaved changes since the build: shift by that file's own diff
+        // The note's file changed since the note's build (unsaved changes, or a newer build of
+        // the file): shift by the diff from the text that build read
         var note_start = n.start;
         var note_end = n.end;
-        if (other.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {
+        if (n.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {
             const edits = try diffEdits(arena, base, other.text);
             const span = remap(edits, n.start, n.end) orelse continue;
             note_start = span[0];

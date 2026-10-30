@@ -27,3 +27,20 @@ pub const FileText = struct {
         return if (v) |text| text.len else 0;
     }
 };
+
+/// The user's source files under the workspace root directories, sorted and without duplicates
+/// (see `server/workspace_files.zig`)
+pub const WorkspaceFiles = struct {
+    pub const Key = void;
+    pub const Value = []const Vfs.FileId;
+    pub const kind: engine.Kind = .input;
+    pub const default: Value = &.{};
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(Vfs.FileId, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};

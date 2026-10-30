@@ -23,6 +23,7 @@ const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const WorkspaceFiles = database.inputs.WorkspaceFiles;
 const syntax_q = database.syntax;
 const live = database.live;
 const ide = za.ide;
@@ -38,6 +39,7 @@ pub const Config = @import("Config.zig");
 const SemanticCache = @import("semantic_cache.zig");
 const watch = @import("watch.zig");
 const client_process = @import("client_process.zig");
+const workspace_files = @import("workspace_files.zig");
 
 const log = std.log.scoped(.server);
 
@@ -167,6 +169,14 @@ imports_basis: std.atomic.Value(u64) = .init(imports_pending),
 /// open documents)
 indexed: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 indexed_mutex: Io.Mutex = .init,
+/// Generation of the workspace file scan (see `scheduleScan`): incremented whenever the source
+/// files under the root directories may have changed
+scan_generation: std.atomic.Value(u64) = .init(0),
+/// Generation of the last finished scan (`never_scanned` before the first one): the search scope is
+/// complete only when it equals `scan_generation` (see `scopeIncomplete`)
+scan_done: std.atomic.Value(u64) = .init(never_scanned),
+/// Whether a scan task is running (only one runs at a time)
+scanning: std.atomic.Value(bool) = .init(false),
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── Pulled configuration (accessed only on the main loop) ──
@@ -287,16 +297,8 @@ pub const HandlerError = error{
     Canceled,
     OutOfMemory,
     InvalidParams,
-    /// The rename target is outside the workspace (standard library, dependency packages)
-    RenameOutsideWorkspace,
     /// The new name is not a valid identifier
     InvalidIdentifier,
-    /// A reference inside a generic function body refers to another definition in some instances:
-    /// renaming would break those instances
-    RenameAmbiguous,
-    /// References inside a generic function body must be decided per instance, but the instances
-    /// are incomplete (instantiation grows without bound): not all references can be confirmed
-    RenameIncomplete,
 };
 
 /// Initializes in place: the query engine holds a pointer to `server.env`, so the Server must not
@@ -1017,6 +1019,72 @@ fn indexTask(server: *Server) Io.Cancelable!void {
     }
 }
 
+/// Scans the root directories for the user's source files in the background (see
+/// `workspace_files.scan`): when the scope of find references and rename may have changed (startup,
+/// root directories added or removed, source files or directories created or deleted). Like
+/// indexing, a running task does another pass when this is called again meanwhile. Must not be
+/// called inside a read or write transaction: the task may run inline.
+pub fn scheduleScan(server: *Server) void {
+    _ = server.scan_generation.fetchAdd(1, .acq_rel);
+    if (server.scanning.swap(true, .acq_rel)) return;
+    server.busyBegin();
+    spawn(server.io, &server.bg_group, scanTask, .{server});
+}
+
+fn scanTask(server: *Server) Io.Cancelable!void {
+    defer server.busyEnd();
+    while (true) {
+        const generation = server.scan_generation.load(.acquire);
+        server.scanOnce() catch |err| switch (err) {
+            error.OutOfMemory => log.err("out of memory while scanning the workspace for source files", .{}),
+        };
+        server.scan_done.store(generation, .release);
+        if (server.scan_generation.load(.acquire) != generation) continue;
+        server.scanning.store(false, .release);
+        // Scheduled again after the flag was released, and no other task took over: continue
+        if (server.scan_generation.load(.monotonic) == generation) return;
+        if (server.scanning.swap(true, .acq_rel)) return;
+    }
+}
+
+/// One scan: updates `WorkspaceFiles` when the files found differ, and then indexes them for
+/// workspace symbol
+fn scanOnce(server: *Server) Allocator.Error!void {
+    if (server.isShuttingDown()) return;
+    var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const rules = try server.originRules(a);
+    const paths = try workspace_files.scan(server.io, a, &server.vfs, rules);
+    var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    for (paths) |p| try set.put(a, try server.vfs.intern(p), {});
+    const files = set.keys();
+    std.mem.sort(Vfs.FileId, files, {}, struct {
+        fn lt(_: void, x: Vfs.FileId, y: Vfs.FileId) bool {
+            return @backingInt(x) < @backingInt(y);
+        }
+    }.lt);
+    // A write transaction cancels in-flight requests: write only when the files differ. Scans run
+    // one at a time, so nobody else changes the input after the comparison.
+    const unchanged = blk: {
+        var ctx = server.db.beginRead(a);
+        defer ctx.end();
+        const current = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => break :blk false,
+        };
+        break :blk std.mem.eql(Vfs.FileId, current, files);
+    };
+    if (unchanged) return;
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        // The engine takes ownership of the value, also when it fails
+        try server.db.set(WorkspaceFiles, {}, try server.gpa.dupe(Vfs.FileId, files), .low);
+    }
+    server.scheduleIndexing();
+}
+
 fn indexOnce(server: *Server) Io.Cancelable!void {
     var pc: panic_context.Text = .{};
     pc.enter("workspace symbol indexing", .{});
@@ -1024,7 +1092,8 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     var basis: u64 = 0;
-    const files = while (true) {
+    const Files = struct { symbols: []const Vfs.FileId, project: []const Vfs.FileId };
+    const files: Files = while (true) {
         if (server.isShuttingDown()) return;
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
@@ -1034,21 +1103,26 @@ fn indexOnce(server: *Server) Io.Cancelable!void {
             error.Canceled => continue,
             error.OutOfMemory => return,
         });
-        break za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
+        const symbols = za.ide_db.search.searchFiles(&r) catch |err| switch (err) {
             error.Canceled => continue,
             error.OutOfMemory => return,
         };
+        const project = za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => return,
+        };
+        break .{ .symbols = symbols, .project = project };
     };
-    // Two steps: first the regular index of project files (workspace symbols), usable as soon as
-    // it is built; then the auto-import index (public closures of the standard library and of each
-    // module, `FileLinks` of project files), during which completion works as usual, only without
-    // auto-import
-    if (!try server.indexBatches(files, "Indexing", false)) return;
+    // Two steps: first the regular index of the searched files (workspace symbols), usable as soon
+    // as it is built; then the auto-import index (public closures of the standard library and of
+    // each module, `FileLinks` of project files), during which completion works as usual, only
+    // without auto-import
+    if (!try server.indexBatches(files.symbols, "Indexing", false)) return;
     if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
     // When warming up fails (out of memory), the index is not marked usable: the next completion
     // retries, instead of the closures being expanded synchronously in a request
     if (!server.indexImportRoots()) return;
-    if (!try server.indexBatches(files, "Indexing for auto-import", true)) return;
+    if (!try server.indexBatches(files.project, "Indexing for auto-import", true)) return;
     // The project-level results completion needs are also computed before the index is marked
     // usable, rather than being left to the first completion
     while (true) {
@@ -1571,12 +1645,16 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         if (!std.fs.path.isAbsolute(path)) continue;
         try events.put(arena, path, event.type);
     }
+    // Source files created or deleted under the root directories change what find references and
+    // rename search
+    const rescan = try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
+    defer if (rescan) server.scheduleScan();
     for (events.keys(), events.values()) |path, kind| {
         const base = std.fs.path.basename(path);
         const dir = std.fs.path.dirname(path) orelse "";
         if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, dir);
-        // Files never seen before do not matter for analysis (a new file is loaded when it is
-        // imported); project files have no contents to compare against and count as changed
+        // Files never seen before have no known contents to update (a new file is loaded when it
+        // is imported); project files have no contents to compare against and count as changed
         const file = try server.vfs.lookup(path) orelse {
             if (isProjectFile(base)) try build_files.append(arena, dir);
             continue;
@@ -1687,6 +1765,38 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
 }
 
+/// Whether file events change the user's source files under the root directories (see
+/// `scheduleScan`): a source file the scan would find is created and is not known to be one yet,
+/// or one of them is deleted
+fn changesWorkspaceFiles(server: *Server, arena: Allocator, rules: origin.Rules, paths: []const []const u8, kinds: []const types.FileChangeType) !bool {
+    var current: ?[]const Vfs.FileId = null;
+    for (paths, kinds) |path, kind| {
+        if (kind == .Changed or !workspace_files.contains(&server.vfs, rules, path)) continue;
+        const file = try server.vfs.lookup(path) orelse {
+            if (kind == .Created) return true;
+            continue;
+        };
+        const list = current orelse blk: {
+            var ctx = server.db.beginRead(arena);
+            defer ctx.end();
+            const value = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // A write transaction is waiting: scan instead of deciding here
+                error.Canceled => return true,
+            };
+            break :blk try arena.dupe(Vfs.FileId, value);
+        };
+        current = list;
+        const listed = std.sort.binarySearch(Vfs.FileId, list, file, struct {
+            fn order(x: Vfs.FileId, y: Vfs.FileId) std.math.Order {
+                return std.math.order(@backingInt(x), @backingInt(y));
+            }
+        }.order) != null;
+        if (listed != (kind == .Created)) return true;
+    }
+    return false;
+}
+
 /// The file's known text is the same as `text` (including both being absent); a failed read counts
 /// as different
 fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
@@ -1722,7 +1832,7 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
 pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
     if (rules.zig_lib == null) return false;
     return switch (origin.classify(&server.vfs, rules, path, false)) {
-        .user, .other => true,
+        .user, .outside, .other => true,
         .virtual, .zig_lib, .generated, .package => false,
     };
 }
@@ -2162,6 +2272,9 @@ const version_mismatch_message = "zig {s} differs from zig {s} that zig-analyzer
 /// system protocol for each workspace with a build.zig
 fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
+    // The origin rules (the Zig installation and the global cache) are known from here on, also
+    // when the zig environment cannot be queried
+    defer server.scheduleScan();
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
@@ -2200,6 +2313,9 @@ fn startup(server: *Server) Io.Cancelable!void {
     // Detached files opened before startup: compile them now that the zig environment is ready and
     // projects have started loading
     server.startup_done.store(true, .release);
+    // The origins of files opened before startup (the standard library, files outside the
+    // workspace folders) are known only now, and naming hints depend on them
+    server.publishOpenFiles();
     server.reconcileSingle();
 }
 
@@ -2393,7 +2509,7 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     switch (server.originOf(file, in_project)) {
         .virtual => return .none,
         .zig_lib, .generated, .package => return .library,
-        .user, .other => {},
+        .user, .outside, .other => {},
     }
     if (in_project) return .project;
     const path = server.vfs.path(file);
@@ -2774,6 +2890,8 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     server.publishOpenFiles();
     server.reconcileSingle();
     server.resyncWatcher();
+    // Before startup, the scan at the end of startup covers the new roots
+    if (server.started) server.scheduleScan();
 }
 
 /// Restarts the project of `ws` (finding the project's current instance by root directory: the
@@ -3616,11 +3734,9 @@ fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![
 const OtherFiles = struct {
     server: *Server,
     ctx: *Db.Ctx,
-    /// Text, at the time of that compile, of the files that compiler diagnostic notes point into
-    /// (note ranges refer to it), keyed by the path in the note
-    texts: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Compile results in use, each with a reference held (released by `release`): they are not
-    /// freed by being replaced with newer results before the diagnostics are computed
+    /// freed by being replaced with newer results before the diagnostics are computed (the notes
+    /// of their errors also refer to the texts they hold)
     builds: std.ArrayList(*compiler.BuildResult) = .empty,
 
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
@@ -3629,20 +3745,14 @@ const OtherFiles = struct {
         const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
         const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
         const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
-        return .{ .uri = u, .text = text, .base_text = self.texts.get(path) };
+        return .{ .uri = u, .text = text };
     }
 
     /// Takes `fr` from the compile result `build` (called while holding the lock that protects
-    /// `build`), and records the text, at the time of this compile, of the files its notes point
-    /// into (for the same path, only the first recorded text is kept)
+    /// `build`)
     fn use(self: *OtherFiles, arena: Allocator, fr: *const compiler.FileResult, build: *compiler.BuildResult) Allocator.Error!*const compiler.FileResult {
         try self.builds.ensureUnusedCapacity(arena, 1);
         self.builds.appendAssumeCapacity(build.retain());
-        for (fr.items) |item| for (item.notes) |n| {
-            if (self.texts.contains(n.path)) continue;
-            const text = build.texts.get(n.path) orelse continue;
-            try self.texts.put(arena, n.path, text);
-        };
         return fr;
     }
 
@@ -3656,8 +3766,8 @@ const OtherFiles = struct {
 /// that contains it; whether single-file compile results are used depends on the
 /// file's context (see `FileContext.usesSingle`). Multiple results are merged with
 /// `compiler.combine`, taking the text read by the newest compile as authoritative.
-/// A reference to each result is taken under its lock and recorded in `other` (along
-/// with the text of the files the notes point into); no lock is held while merging.
+/// A reference to each result is taken under its lock and recorded in `other`; no lock is held
+/// while merging.
 fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
     const Found = struct {
         generation: u64,
@@ -3739,6 +3849,89 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     };
     if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
     return .{ .uri = document_uri, .diagnostics = diags };
+}
+
+test "computeDiagnostics: notes of combined results keep the coordinates of their own build" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(io, gpa, &writer);
+    defer server.deinit();
+
+    const old_util =
+        \\pub fn bad() u32 {
+        \\    return helper(1, 2);
+        \\} // end bad
+        \\fn helper(x: u32) u32 {
+        \\    return x;
+        \\} // end helper
+        \\
+    ;
+    const new_util = "// one\n// two\n// three\n" ++ old_util;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "util.zig", .data = new_util });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const util_path = try std.fs.path.join(arena, &.{ dir, "util.zig" });
+
+    const Disk = struct {
+        text: []const u8,
+        fn read(ctx: *anyopaque, a: Allocator, _: []const u8) ?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return a.dupe(u8, self.text) catch null;
+        }
+    };
+    const Build = struct {
+        /// A compile of a root importing util.zig that read `text` as util.zig
+        fn result(path: []const u8, text: []const u8) !*compiler.BuildResult {
+            var wip: std.zig.ErrorBundle.Wip = try .init(gpa);
+            defer wip.deinit();
+            const call: u32 = @intCast(std.mem.indexOf(u8, text, "helper(1, 2)").?);
+            const decl: u32 = @intCast(std.mem.indexOf(u8, text, "fn helper(x: u32) u32").?);
+            const src_path = try wip.addString(path);
+            try wip.addRootErrorMessageWithNotes(.{
+                .msg = try wip.addString("expected 1 argument(s), found 2"),
+                .src_loc = try wip.addSourceLocation(.{ .src_path = src_path, .line = 0, .column = 0, .span_start = call, .span_main = call, .span_end = call + 12 }),
+                .notes_len = 1,
+            }, &.{.{
+                .msg = try wip.addString("function declared here"),
+                .src_loc = try wip.addSourceLocation(.{ .src_path = src_path, .line = 0, .column = 0, .span_start = decl, .span_main = decl, .span_end = decl + 21 }),
+            }});
+            var eb = try wip.toOwnedBundle("");
+            defer eb.deinit(gpa);
+            var disk: Disk = .{ .text = text };
+            return compiler.collect(gpa, &.{eb}, std.fs.path.dirname(path).?, path, &disk, Disk.read);
+        }
+    };
+    const util = try server.vfs.intern(util_path);
+    // The root opened first is still compiling the older text when the other root's compile of
+    // the saved text finishes: the older result is iterated first
+    for ([_][]const u8{ "b.zig", "a.zig" }, [_][]const u8{ old_util, new_util }, 1..) |root, text, generation| {
+        const result = try Build.result(util_path, text);
+        const gop = try server.single.getOrPut(gpa, try server.vfs.intern(try std.fs.path.join(arena, &.{ dir, root })));
+        gop.value_ptr.* = .{ .result = result, .generation = generation };
+        try gop.value_ptr.files.put(gpa, util, result.files.getPtr(util_path).?);
+    }
+
+    var ctx = server.db.beginRead(arena);
+    defer ctx.end();
+    const params = try server.computeDiagnostics(&ctx, arena, util);
+    try std.testing.expectEqual(1, params.diagnostics.len);
+    const related = params.diagnostics[0].relatedInformation.?;
+    try std.testing.expectEqual(1, related.len);
+    // Guards against shifting the newest build's notes with the older build's text of the file,
+    // which moved them by the length of the inserted lines a second time
+    try std.testing.expectEqual(6, related[0].location.range.start.line);
+    try std.testing.expectEqual(0, related[0].location.range.start.character);
+    try std.testing.expectEqual(6, related[0].location.range.end.line);
+    try std.testing.expectEqual(21, related[0].location.range.end.character);
 }
 
 /// An open file that belongs to a project that is not loaded (see `FileContext.unloaded_project`):
@@ -3835,9 +4028,9 @@ const NamingSettings = struct {
     }
 };
 
-/// Whether the file gets naming checks, and their settings: open user code
-/// (see `origin.Origin.user`) with the check enabled, not in `naming.exclude`, and not generated
-/// code (see `naming.isGenerated`)
+/// Whether the file gets naming checks, and their settings: open user code (see
+/// `origin.Origin.user` and `origin.Origin.outside`) with the check enabled, not in
+/// `naming.exclude`, and not generated code (see `naming.isGenerated`)
 fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     {
         server.docs_mutex.lockUncancelable(server.io);
@@ -3890,7 +4083,7 @@ fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const 
         for (exclude) |pattern| if (ide.naming.globMatch(pattern, normalized)) return null;
     }
     switch (server.fileOrigin(file)) {
-        .virtual, .user => {},
+        .virtual, .user, .outside => {},
         .zig_lib, .generated, .package, .other => return null,
     }
     if (ide.naming.isGenerated(text)) return null;
@@ -4466,11 +4659,26 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     return out;
 }
 
+/// `scan_done` before the first scan of the root directories has finished
+const never_scanned = std.math.maxInt(u64);
+
+/// Why the search scope may lack files that refer to a declaration right now, or null: the root
+/// directories have not been scanned since source files may have changed (see `scheduleScan`), or
+/// a project is still in its first load (until then, which files belong to it and what its imports
+/// by name resolve to are not known). Find references, rename and the fixes that edit references
+/// fail with this reason instead of returning partial results.
+fn scopeIncomplete(server: *Server) ?[]const u8 {
+    if (server.scan_done.load(.acquire) != server.scan_generation.load(.acquire))
+        return "the workspace folders are still being searched for source files, so not all files that may refer to it are known yet";
+    if (server.projectsLoading()) return "the project is still loading, so not all files that may refer to it are known yet";
+    return null;
+}
+
 /// Scope of find references and workspace symbol: project files in the module graph (excluding the
-/// standard library) and open documents
+/// standard library), the user's source files under the root directories, and open documents
 fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-    for (try za.ide_db.search.projectFiles(r)) |f| try set.put(r.arena, f, {});
+    for (try za.ide_db.search.searchFiles(r)) |f| try set.put(r.arena, f, {});
     server.docs_mutex.lockUncancelable(server.io);
     defer server.docs_mutex.unlock(server.io);
     for (server.open_docs.keys()) |f| try set.put(r.arena, f, {});
@@ -4505,15 +4713,28 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return out.items;
 }
 
-/// The definition at the cursor and all its references.
-/// When `ambiguous` and `incomplete` are not null, they record the first ambiguous reference and
-/// the first reference with incomplete instances, respectively (see `search.Options`).
-fn referencesAt(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, only_file: bool, ambiguous: ?*?za.ide_db.search.Reference, incomplete: ?*?za.ide_db.search.Reference) !?struct { def: za.names.resolve.Def, refs: []const za.ide_db.search.Reference } {
+/// The symbol at the cursor (see `definition.symbolAt`)
+fn symbolAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { symbol: za.ide_db.search.Symbol, file: Vfs.FileId } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
-    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
-    const scope = try server.searchScope(r);
-    const refs = try za.ide_db.search.findReferences(r, def, .{ .scope = scope, .only_file = if (only_file) at.file else null, .ambiguous = ambiguous, .incomplete = incomplete });
-    return .{ .def = def, .refs = refs };
+    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return null;
+    return .{ .symbol = symbol, .file = at.file };
+}
+
+/// Why the references of `symbol` cannot all be found now (see `scopeIncomplete`); null also when
+/// only its own file can refer to it
+fn scopeIncompleteFor(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
+    if (!try ownFileOnly(r, symbol)) return server.scopeIncomplete();
+    return null;
+}
+
+/// Whether only the file of `symbol` can refer to it: local names, labels, and declarations without
+/// `pub` other than fields. Error names are global.
+fn ownFileOnly(r: *Resolver, symbol: za.ide_db.search.Symbol) !bool {
+    return switch (symbol) {
+        .def => |def| !try za.ide_db.search.visibleOutsideFile(r, def),
+        .label => true,
+        .error_name => false,
+    };
 }
 
 /// Converts reference positions to LSP ranges (caching the line index per file)
@@ -4532,70 +4753,238 @@ const RangeMapper = struct {
     }
 };
 
-fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!types.ResultType("textDocument/references") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, null, null) orelse return null;
+fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!Outcome(types.ResultType("textDocument/references")) {
+    const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    if (try server.scopeIncompleteFor(r, found.symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
+    const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = try server.searchScope(r) });
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
-    for (found.refs) |ref| {
+    for (refs) |ref| {
         if (ref.is_decl and !params.context.includeDeclaration) continue;
         try out.append(arena, .{ .uri = try server.uriFor(arena, ref.file), .range = try m.range(ref.file, ref.start, ref.end) });
     }
-    return out.items;
+    return .{ .ok = out.items };
 }
 
+/// Occurrences of the symbol at the cursor in the same file: declarations and the targets of
+/// assignments are written to (`Write`), other uses read it (`Read`)
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, true, null, null) orelse return null;
-    const out = try arena.alloc(types.DocumentHighlight, found.refs.len);
+    const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = &.{}, .only_file = found.file });
+    const out = try arena.alloc(types.DocumentHighlight, refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
-    for (found.refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl) .Write else .Read };
+    for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl or ref.is_write) .Write else .Read };
     return out;
 }
 
-/// Definitions that can be renamed: the user's own code
-/// (see `origin.Origin.user`) and unsaved documents
-fn renamable(server: *Server, r: *Resolver, def: za.names.resolve.Def) !bool {
-    if (def == .file or try za.ide_db.search.defName(r, def) == null) return false;
-    const file = switch (def) {
+/// Why `symbol` cannot be renamed, or null when it can: the user's own code (see
+/// `origin.Origin.user`) and unsaved documents can be renamed. In a file outside the workspace
+/// folders (`origin.Origin.outside`), only what its own file alone can refer to can be renamed
+/// (see `ownFileOnly`): which other files use the rest is not known.
+fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
+    const file = switch (symbol) {
+        .def => |def| switch (def) {
+            .item => |it| it.file,
+            .local => |l| l.file,
+            // `@import` and its path string lead to a file, which is not a name in the code
+            .file => return "cannot rename: the cursor is on the import of a file, and files cannot be renamed",
+        },
+        .label => |l| l.file,
+        .error_name => |e| e.file,
+    };
+    if (try za.ide_db.search.symbolName(r, symbol) == null) return "cannot rename: there is no name here";
+    const rules = try server.originRules(r.arena);
+    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
+        // Unsaved documents (`untitled:` etc.) exist only in the editor
+        .virtual, .user => null,
+        .outside => if (try ownFileOnly(r, symbol))
+            null
+        else if (symbol == .error_name)
+            "cannot rename an error name in a file outside the workspace folders: error names are global, and the files that use it are not known"
+        else
+            "cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known",
+        .zig_lib, .generated, .package, .other => "cannot rename a symbol defined outside the workspace",
+    };
+}
+
+fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!Outcome(types.ResultType("textDocument/prepareRename")) {
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (tok.kind != .identifier) return .{ .ok = null };
+    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (try server.renameRefusal(r, symbol)) |reason| return .{ .failed = reason };
+    if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| {
+        const prefix = try std.fmt.allocPrint(arena, "cannot rename `{s}`", .{za.syntax.ast.identName(tok.text)});
+        return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
+    };
+    const lines = try offsets.LineIndex.init(arena, at.text);
+    return .{ .ok = .{ .PrepareRenamePlaceholder = .{
+        .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
+        .placeholder = za.syntax.ast.identName(tok.text),
+    } } };
+}
+
+fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!Outcome(types.ResultType("textDocument/rename")) {
+    _ = try identifierText(arena, params.newName, false);
+    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return .{ .ok = null };
+    if (try server.renameRefusal(r, symbol)) |reason| return .{ .failed = reason };
+    const old = (try za.ide_db.search.symbolName(r, symbol)).?;
+    const outcome = switch (symbol) {
+        .def => |def| try server.checkedRename(r, arena, def, old, params.newName),
+        .label => |l| try server.checkedLabelRename(r, arena, l, old, params.newName),
+        .error_name => |e| try server.checkedErrorRename(r, arena, e.file, old, params.newName),
+    };
+    const checked = switch (outcome) {
+        .ok => |checked| checked,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, null) };
+}
+
+const CheckedRename = struct {
+    refs: []const za.ide_db.search.Reference,
+    /// The new name as written in the source (see `identifierText`)
+    text: []const u8,
+};
+
+/// The references of `def` and the source text of the new name for renaming it from `old` to
+/// `new` (as given, possibly `@"..."`), or why the result would be partial or break the build:
+/// the references cannot all be confirmed (see `renameReferences`), the new name conflicts with an
+/// existing one (a member of the same container, shadowing, or a name that would refer to another
+/// declaration; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
+/// reports a new error in the declaration's file once it is renamed (`rename.verifyAstGen`).
+fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .def = def }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const name = try decodedName(arena, new);
+    if (try ide.rename.declarationConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    if (try ide.rename.resolutionConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    const def_file = switch (def) {
         .item => |it| it.file,
         .local => |l| l.file,
         .file => unreachable,
     };
-    const rules = try server.originRules(r.arena);
-    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
-        // Unsaved documents (`untitled:` etc.) exist only in the editor
-        .virtual, .user => true,
-        .zig_lib, .generated, .package, .other => false,
-    };
-}
-
-fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!types.ResultType("textDocument/prepareRename") {
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return null;
-    if (tok.kind != .identifier) return null;
-    const def = try ide.definition.defAt(r, at.file, at.offset) orelse return null;
-    if (!try server.renamable(r, def)) return error.RenameOutsideWorkspace;
-    const lines = try offsets.LineIndex.init(arena, at.text);
-    return .{ .PrepareRenamePlaceholder = .{
-        .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
-        .placeholder = za.syntax.ast.identName(tok.text),
-    } };
-}
-
-fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!types.ResultType("textDocument/rename") {
-    _ = try identifierText(arena, params.newName, false);
-    var ambiguous: ?za.ide_db.search.Reference = null;
-    var incomplete: ?za.ide_db.search.Reference = null;
-    const found = try server.referencesAt(r, arena, params.textDocument.uri, params.position, false, &ambiguous, &incomplete) orelse return null;
-    if (!try server.renamable(r, found.def)) return error.RenameOutsideWorkspace;
-    // Do not return a partially renamed result
-    if (ambiguous != null) return error.RenameAmbiguous;
-    if (incomplete != null) return error.RenameIncomplete;
-    const is_field = switch (found.def) {
+    const is_field = switch (def) {
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         .local, .file => false,
     };
-    const new_name = try identifierText(arena, params.newName, is_field);
-    return try server.renameEdit(r, arena, found.refs, new_name, null);
+    const text = try identifierText(arena, new, is_field);
+    // Shadowing and name clashes can only occur in the file of the declaration, and missed
+    // references in that file are reported too: confirm by running AstGen on the renamed text
+    var edits: std.ArrayList(ide.rename.Edit) = .empty;
+    for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
+    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    // Strings (`@field`, `@hasDecl`, `@fieldParentPtr`, serialization keys) can name only
+    // container members, and one without `pub` only in its own file
+    if (def == .item) {
+        const files = if (try za.ide_db.search.visibleOutsideFile(r, def)) try za.ide_db.search.importers(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
+        if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    }
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
+/// The name that `new` (as given, possibly `@"..."`) spells
+fn decodedName(arena: Allocator, new: []const u8) HandlerError![]const u8 {
+    if (!std.mem.startsWith(u8, new, "@\"")) return new;
+    return std.zig.string_literal.parseAlloc(arena, new[1..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return error.InvalidIdentifier,
+    };
+}
+
+/// The references of a label and the source text of its new name (see `checkedRename`): the label
+/// and the `break` / `continue` that target it are all in one member, and AstGen confirms the
+/// renamed file (a label must not redefine a label of an enclosing expression)
+fn checkedLabelRename(server: *Server, r: *Resolver, arena: Allocator, label: za.ide_db.search.Label, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .label = label }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const text = try identifierText(arena, new, false);
+    const edits = try arena.alloc(ide.rename.Edit, refs.len);
+    for (refs, edits) |ref, *e| e.* = .{ .start = ref.start, .end = ref.end, .text = text };
+    if (try ide.rename.verifyAstGen(r, label.file, edits)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
+/// The uses of the error `old`, found in `file`, and the source text of its new name (see
+/// `checkedRename`). Error names are global, so the uses in all files compiled together with
+/// `file` are renamed: each must be confirmed and editable (see `renameReferences`), no file that
+/// is not renamed may use `old`, and `new` must not already be an error name (see
+/// `rename.errorNameConflict`); `@errorName` results may be compared with a string of the name,
+/// and AstGen confirms each renamed file.
+fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs.FileId, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .error_name = .{ .file = file, .name = old } }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const scope = try server.searchScope(r);
+    if (try ide.rename.errorNameConflict(r, file, scope, old, try decodedName(arena, new))) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    const files = try za.ide_db.search.candidateFiles(r, try za.ide_db.search.importers(r, file, scope), scope);
+    if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    // Error names may be names of primitive types (`error.u8`)
+    const text = try identifierText(arena, new, true);
+    var i: usize = 0;
+    while (i < refs.len) {
+        const f = refs[i].file;
+        var edits: std.ArrayList(ide.rename.Edit) = .empty;
+        while (i < refs.len and refs[i].file == f) : (i += 1) try edits.append(arena, .{ .start = refs[i].start, .end = refs[i].end, .text = text });
+        if (try ide.rename.verifyAstGen(r, f, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    }
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
+/// All references of `symbol` for renaming it from `old` to `new`, or why they cannot all be
+/// confirmed, in which case renaming would leave a partially renamed result: the standard library
+/// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
+/// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
+/// function, goes through a member access of unknown type, or depends on instances that grow
+/// without bound, or a file that mentions the name has syntax errors.
+fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
+    if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
+    const scope = try server.searchScope(r);
+    var ambiguous: ?za.ide_db.search.Reference = null;
+    var uncertain: ?za.ide_db.search.Reference = null;
+    var incomplete: ?za.ide_db.search.Reference = null;
+    var syntax_error: ?Vfs.FileId = null;
+    const refs = try za.ide_db.search.symbolReferences(r, symbol, .{
+        .scope = scope,
+        .ambiguous = &ambiguous,
+        .uncertain = &uncertain,
+        .incomplete = &incomplete,
+        .syntax_error = &syntax_error,
+    });
+    if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
+    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, za.ide_db.search.ambiguous_message) };
+    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, if (symbol == .error_name)
+        "the type here is unknown, so whether this is the same error cannot be confirmed"
+    else
+        "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
+    if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
+    const rules = try server.originRules(arena);
+    for (refs, 0..) |ref, i| {
+        // Sorted by file: check each file once
+        if (i > 0 and refs[i - 1].file == ref.file) continue;
+        if (!server.editable(rules, ref.file)) return .{ .failed = try server.renameProblem(r, arena, old, new, ref.file, ref.start, not_editable) };
+    }
+    return .{ .ok = refs };
+}
+
+/// Why an edit that a rename or fix needs in a file that is not `editable` is refused
+const not_editable = "this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited";
+
+/// Whether renames and fixes may edit `file`: the user's own code (see `origin.Origin`). A
+/// fetched package is restored from its hash on other machines, the Zig installation is shared by
+/// every project, and generated files are overwritten by builds.
+fn editable(server: *Server, rules: origin.Rules, file: Vfs.FileId) bool {
+    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
+        .virtual, .user, .outside => true,
+        .zig_lib, .generated, .package, .other => false,
+    };
 }
 
 /// Edits that change the references (sorted by file and position, including the declaration) to
@@ -4848,7 +5237,7 @@ fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []cons
     // A conflict at the declaration needs no reference search
     if (try ide.rename.declarationConflict(r, f.def, f.suggestion)) |p| {
         if (!server.code_action_disabled) return null;
-        action.disabled = .{ .reason = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
+        action.disabled = .{ .reason = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
         return action;
     }
     if (server.code_action_resolve) {
@@ -4904,59 +5293,24 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
 }
 
 /// Renames a name that violates the naming conventions to the suggested spelling. Returns only
-/// complete and safe edits: nothing is renamed when some reference cannot be confirmed (ambiguity,
-/// member access on an unknown type, a file with syntax errors), the new name conflicts with an
-/// existing one, or the name appears in a string (reflection).
+/// complete and safe edits, as rename does (see `checkedRename`): nothing is renamed when some
+/// reference cannot be confirmed, the new name conflicts with an existing one, or the name appears
+/// in a string (reflection).
 fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
     const def = f.def;
-    const def_file = switch (def) {
-        .item => |it| it.file,
-        .local => |l| l.file,
-        .file => unreachable,
+    if (try server.renameRefusal(r, .{ .def = def })) |reason| return .{ .failed = reason };
+    const checked = switch (try server.checkedRename(r, arena, def, f.name, f.suggestion)) {
+        .ok => |checked| checked,
+        .failed => |reason| return .{ .failed = reason },
     };
-    if (!try server.renamable(r, def)) return .{ .failed = "cannot rename a symbol defined outside the workspace" };
-    const scope = try server.searchScope(r);
-    var ambiguous: ?za.ide_db.search.Reference = null;
-    var uncertain: ?za.ide_db.search.Reference = null;
-    var incomplete: ?za.ide_db.search.Reference = null;
-    var syntax_error: ?Vfs.FileId = null;
-    const refs = try za.ide_db.search.findReferences(r, def, .{
-        .scope = scope,
-        .ambiguous = &ambiguous,
-        .uncertain = &uncertain,
-        .incomplete = &incomplete,
-        .syntax_error = &syntax_error,
-    });
-    if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, f, file, null, "the file has syntax errors, so references in it may be missed") };
-    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, f, a.file, a.start, "this reference inside a generic function also refers to other declarations in some instantiations") };
-    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
-    if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, f, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
-    if (try ide.rename.declarationConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
-    if (try ide.rename.resolutionConflict(r, def, f.suggestion)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
-    // Only container members can be referenced by strings; a
-    // non-pub declaration is accessible only in its own file
-    if (def == .item) {
-        const files = if (f.public) try za.ide_db.search.importers(r, def_file, scope) else try arena.dupe(Vfs.FileId, &.{def_file});
-        if (try ide.rename.stringReference(r, files, f.name)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
-    }
-    const is_field = switch (def) {
-        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
-        .local, .file => false,
-    };
-    const new_text = try identifierText(arena, f.suggestion, is_field);
-    // Shadowing and name clashes can only occur in the file of the declaration, and missed
-    // references in that file are reported too: confirm by running AstGen on the renamed text
-    var edits: std.ArrayList(ide.rename.Edit) = .empty;
-    for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = new_text });
-    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, f, p.file, p.offset, p.message) };
     const confirm = if (f.public) try std.fmt.allocPrint(arena, "Rename public `{s}` to `{s}`", .{ f.name, f.suggestion }) else null;
-    return .{ .ok = try server.renameEdit(r, arena, refs, new_text, confirm) };
+    return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, confirm) };
 }
 
 /// Explanation of why a name cannot be renamed:
 /// "cannot rename `a` to `b`: reason (file:line:column)"; only the file when the position is null
-fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
-    return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ f.name, f.suggestion }), file, offset, reason);
+fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, old: []const u8, new: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
+    return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ old, new }), file, offset, reason);
 }
 
 /// Why a fix cannot be applied: "<prefix>: reason (file:line:column)"; only the file when the
@@ -4977,7 +5331,7 @@ fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u
 /// parameter cannot be removed, the reason is attached if the client supports `disabled`;
 /// otherwise the action is not offered.
 fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, t: ide.remove_param.Target, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
-    if (!try server.renamable(r, .{ .item = .{ .file = t.file, .item = t.item } })) return null;
+    if (try server.renameRefusal(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } }) != null) return null;
     var action: types.CodeAction = .{
         .title = try std.fmt.allocPrint(arena, "remove parameter `{s}`", .{t.name}),
         .kind = types.CodeActionKind.QuickFix,
@@ -5014,16 +5368,22 @@ fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: [
 /// are not updated.
 fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
+    if (try server.scopeIncompleteFor(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } })) |reason|
+        return .{ .failed = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`: {s}", .{ t.name, reason }) };
+    const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
     switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
-        .ok => |files| return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
-            .id = "zig-analyzer.remove-param-public",
-            .label = try std.fmt.allocPrint(arena, "Remove parameter `{s}` of public `{s}`", .{ t.name, fn_name }),
-            .description = "code outside this workspace that calls the function is not updated",
-        } else null) },
-        .failed => |p| {
-            const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
-            return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
+        .ok => |files| {
+            const rules = try server.originRules(arena);
+            for (files) |fe| if (!server.editable(rules, fe.file)) {
+                return .{ .failed = try server.fixProblem(r, arena, prefix, fe.file, if (fe.edits.len != 0) fe.edits[0].start else null, not_editable) };
+            };
+            return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
+                .id = "zig-analyzer.remove-param-public",
+                .label = try std.fmt.allocPrint(arena, "Remove parameter `{s}` of public `{s}`", .{ t.name, fn_name }),
+                .description = "code outside this workspace that calls the function is not updated",
+            } else null) };
         },
+        .failed => |p| return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) },
     }
 }
 
@@ -5246,9 +5606,6 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
         else
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
-        error.RenameOutsideWorkspace => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename a symbol defined outside the workspace"),
-        error.RenameAmbiguous => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function also refers to other declarations in some instantiations"),
-        error.RenameIncomplete => server.sendError(id, jsonrpc.error_codes.request_failed, "cannot rename: a reference inside a generic function depends on instantiations that grow without bound, so not all of them can be checked"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
@@ -5261,6 +5618,7 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 
 test {
     _ = origin;
+    _ = workspace_files;
     _ = Workspace;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
