@@ -1602,6 +1602,35 @@ const Inferrer = struct {
         }
         // The module name is decided by the build system (see `std.builtin.SourceLocation.module`)
         // and is absent from the project model, so only the type is given
+        // GPU, wasm and C variadic builtins: the result types of the compiler's Sema and Air
+        if (eq(u8, name, "@workItemId") or eq(u8, name, "@workGroupId") or eq(u8, name, "@workGroupSize")) {
+            const u32_type = try ip.intType(.unsigned, 32);
+            for (args) |a| _ = try inf.infer(a, u32_type);
+            return .{ .ty = u32_type };
+        }
+        if (eq(u8, name, "@wasmMemorySize") or eq(u8, name, "@wasmMemoryGrow")) {
+            const u32_type = try ip.intType(.unsigned, 32);
+            for (args, 0..) |a, i| _ = try inf.infer(a, if (i == 0) u32_type else .usize_type);
+            return .{ .ty = if (eq(u8, name, "@wasmMemorySize")) .usize_type else .isize_type };
+        }
+        if (eq(u8, name, "@cVaStart") or eq(u8, name, "@cVaCopy")) {
+            for (args) |a| _ = try inf.infer(a, null);
+            return .{ .ty = (try inf.stdType(&.{ "lang", "VaList" })) orelse .unknown };
+        }
+        if (eq(u8, name, "@cVaEnd")) {
+            for (args) |a| _ = try inf.infer(a, null);
+            return .{ .ty = .void_type };
+        }
+        if (eq(u8, name, "@cVaArg")) {
+            for (args) |a| _ = try inf.infer(a, null);
+            if (args.len != 2) return .unknown;
+            return .{ .ty = inf.get(args[1]).asType() orelse .unknown };
+        }
+        // A SPIR-V type: a type whose value is not modeled
+        if (eq(u8, name, "@SpirvType")) {
+            for (args) |a| _ = try inf.infer(a, (try inf.stdType(&.{ "lang", "Type", "Spirv" })));
+            return typeUnknown();
+        }
         if (eq(u8, name, "@src")) return .{ .ty = try inf.stdType(&.{ "builtin", "SourceLocation" }) orelse .unknown };
         if (eq(u8, name, "@as")) {
             if (args.len != 2) return .unknown;

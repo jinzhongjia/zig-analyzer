@@ -2530,6 +2530,56 @@ test "builtin result types follow the compiler" {
     });
 }
 
+test "GPU, wasm, SPIR-V and C variadic builtins have the compiler's result types" {
+    // Expected values are the results of zig 0.17.0: `@compileLog` prints `type` for
+    // `@TypeOf(@SpirvType(.sampler))`, `u32` for `@workItemId(0)`, `@workGroupId(0)` and
+    // `@workGroupSize(0)` (spirv64-opencl), `usize` and `isize` for `@wasmMemorySize(0)` and
+    // `@wasmMemoryGrow(0, 1)` (wasm32-freestanding), `lang.VaListX86_64` for `@cVaStart()` and
+    // `@cVaCopy(&va)`, `c_int` for `@cVaArg(&va, c_int)` and `void` for `@cVaEnd(&cp)`
+    // (x86_64-linux; hover shows the container name without its namespace); none of these
+    // results may be unknown
+    try expectStdTypesBuiltin(
+        \\const std = @import("std");
+        \\pub const cpu: std.Target.Cpu = .{ .arch = .x86_64, .model = undefined, .features = undefined };
+        \\pub const os: std.Target.Os = .{ .tag = .linux, .version_range = undefined };
+    ,
+        \\pub const Sampler = @SpirvType(.sampler);
+        \\fn shader() void {
+        \\    const L = @SpirvType(.sampler);
+        \\    const c = @workItemId(0);
+        \\    const g = @workGroupId(0);
+        \\    const s = @workGroupSize(0);
+        \\    _ = .{ L, c, g, s };
+        \\}
+        \\fn wasm() isize {
+        \\    const a = @wasmMemorySize(0);
+        \\    const b = @wasmMemoryGrow(0, 1);
+        \\    _ = a;
+        \\    return b;
+        \\}
+        \\fn sum(n: c_int, ...) callconv(.c) c_int {
+        \\    var va = @cVaStart();
+        \\    const x = @cVaArg(&va, c_int);
+        \\    var cp = @cVaCopy(&va);
+        \\    const e = @cVaEnd(&cp);
+        \\    _ = e;
+        \\    return n + x;
+        \\}
+    , &.{
+        .{ "Sampler", "type" },
+        .{ "L", "type" },
+        .{ "c", "u32" },
+        .{ "g", "u32" },
+        .{ "s", "u32" },
+        .{ "a", "usize" },
+        .{ "b", "isize" },
+        .{ "va", "VaListX86_64" },
+        .{ "x", "c_int" },
+        .{ "cp", "VaListX86_64" },
+        .{ "e", "void" },
+    });
+}
+
 test "builtin arguments get their result types" {
     try expectTypes(
         \\const E = enum(u4) { x, y, z };
@@ -2843,6 +2893,14 @@ fn expectStdTypes(src: []const u8, cases: []const struct { []const u8, []const u
 /// Same as `expectStdTypes`; when `optimize` is not null, provides a builtin with that
 /// optimize mode (a member name of `std.lang.Optimize`)
 fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    var buf: [256]u8 = undefined;
+    const text = if (optimize) |o| try std.fmt.bufPrint(&buf, "const std = @import(\"std\");\npub const mode = optimize;\npub const optimize: std.lang.Optimize = .{s};\n", .{o}) else null;
+    return expectStdTypesBuiltin(text, src, cases);
+}
+
+/// Same as `expectStdTypes`; when `builtin_text` is not null, it is the source of the builtin
+/// module
+fn expectStdTypesBuiltin(builtin_text: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     var w: World = undefined;
@@ -2852,10 +2910,7 @@ fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []cons
     defer testing.allocator.free(std_root_path);
     const std_root = try w.vfs.intern(std_root_path);
     const f = try w.add("/p/main.zig", src);
-    if (optimize) |o| {
-        const text = try std.fmt.allocPrint(w.arena.allocator(), "const std = @import(\"std\");\npub const mode = optimize;\npub const optimize: std.lang.Optimize = .{s};\n", .{o});
-        w.default_builtin = (try w.add("/zig-cache/builtin.zig", text)).file;
-    }
+    if (builtin_text) |text| w.default_builtin = (try w.add("/zig-cache/builtin.zig", text)).file;
     try w.setGraph(std_root, &.{}, &.{});
     for (cases) |c| {
         const actual = try typeAt(&w, f.file, src, c[0], 0);

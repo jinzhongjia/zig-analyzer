@@ -1327,3 +1327,28 @@ test "semantic tokens mark only compiler builtin functions as default library" {
     try check(partial, text, .utf16, &unknown);
     try testing.expectError(error.MissingSemanticToken, check(partial, text, .utf16, &.{.{ .needle = "@sizeOf", .ty = .function, .mods = M.defaultLibrary }}));
 }
+
+test "semantic tokens classify @SpirvType aliases as types" {
+    // zig 0.17.0: `@compileLog(@TypeOf(L))` prints `type`; a SPIR-V type alias must not be a
+    // variable token
+    const text =
+        \\pub const Sampler = @SpirvType(.sampler);
+        \\const V = @Vector(4, f32);
+        \\fn k() void {
+        \\    const L = @SpirvType(.sampler);
+        \\    _ = L;
+        \\    _ = Sampler;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &.{
+        .{ .needle = "Sampler =", .ty = .type, .mods = M.declaration | M.readonly },
+        .{ .needle = "V =", .ty = .type, .mods = M.declaration | M.readonly },
+        .{ .needle = "L =", .ty = .type, .mods = M.declaration | M.readonly },
+        .{ .needle = "L;", .ty = .type, .mods = M.readonly },
+        .{ .needle = "Sampler;", .ty = .type, .mods = M.readonly },
+    });
+}
