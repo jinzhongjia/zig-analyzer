@@ -501,7 +501,7 @@ fn nodeAt(node: SyntaxNode, offset: u32, kind: ast.SyntaxKind) ?SyntaxNode {
 }
 
 /// `At` for the whole member `item` (its Body and inference result)
-fn atItem(r: *Resolver, file: FileId, item: u32) resolve.Error!?At {
+pub fn atItem(r: *Resolver, file: FileId, item: u32) resolve.Error!?At {
     const node = try r.itemNode(file, item) orelse return null;
     const owner = try r.ownerKey(file, item);
     return .{

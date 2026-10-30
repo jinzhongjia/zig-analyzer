@@ -2483,7 +2483,8 @@ fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
         .fn_value => return true,
         .arg => |arg| {
             const c = try context.callee(r, a, b.expr(arg.call).call.callee) orelse return false;
-            return paramIsFn(r, c.def, arg.index + @intFromBool(c.bound));
+            var visited: Visited = .empty;
+            return paramIsFn(r, c.def, arg.index + @intFromBool(c.bound), &visited);
         },
         .field => |f| {
             const key = a.fieldRef(f.init, f.index) orelse return false;
@@ -2511,9 +2512,13 @@ fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
     }
 }
 
+/// The `anytype` parameters `paramIsFn` has looked into: a parameter passed on in a cycle (a
+/// recursive function, or functions passing it to each other) is looked into once
+const Visited = std.AutoHashMapUnmanaged(struct { file: FileId, item: u32, index: u32 }, void);
+
 /// The type of parameter `index` of the function `def` is a function or a function pointer, or the
 /// parameter is `anytype` and receives a function (see `receivesFn`)
-fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
+fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32, visited: *Visited) resolve.Error!bool {
     const d = switch (def) {
         .item => |d| d,
         else => return false,
@@ -2524,7 +2529,9 @@ fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
     if (index < fb.params.len) {
         if (fb.binding(fb.params[index]).ty) |t| {
             if (isFnTypeExpr(fb, t)) return true;
-        } else if (try receivesFn(r, d.file, d.item, fb, fb.params[index])) return true;
+        } else if (!(try visited.getOrPut(r.arena, .{ .file = d.file, .item = d.item, .index = index })).found_existing) {
+            if (try receivesFn(r, d.file, d.item, fb, fb.params[index], visited)) return true;
+        }
     }
     const ip = r.ctx.db.env.ip;
     return switch (ip.key((try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = it.ast_id } })).ty)) {
@@ -2535,8 +2542,8 @@ fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
 
 /// The `anytype` parameter `param` receives a function: the type of another parameter is
 /// `std.meta.ArgsTuple(@TypeOf(param))`, which accepts only function types (`Io.async(io, function,
-/// args)`)
-fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Body.BindingId) resolve.Error!bool {
+/// args)`), or the function uses the parameter as a function (see `usesAsFn`)
+fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Body.BindingId, visited: *Visited) resolve.Error!bool {
     const name = fb.binding(param).name;
     for (fb.params) |other| {
         const t = fb.binding(other).ty orelse continue;
@@ -2562,10 +2569,86 @@ fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Bod
             .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse continue) else null,
             else => null,
         } orelse continue;
-        const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse return false;
+        const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse break;
         if (std.meta.eql(try r.aliasTarget(callee), args_tuple)) return true;
     }
+    const p: Param = .{ .file = file, .item = item, .binding = param, .name = name };
+    if (try usesAsFn(r, p, item, visited)) return true;
+    // The functions of containers declared in the body can use the parameter too (when it is
+    // comptime)
+    const tree = try r.itemTree(file);
+    for (tree.items, 0..) |it, i| {
+        const user: u32 = @intCast(i);
+        if (it.kind != .@"fn" or !declaredIn(tree, user, item) or !try r.mayMention(file, user, name)) continue;
+        if (try usesAsFn(r, p, user, visited)) return true;
+    }
     return false;
+}
+
+/// Member `member` is in a container declared (directly or not) in the body of member `item`
+fn declaredIn(tree: *const ItemTree, member: u32, item: u32) bool {
+    var container = tree.items[member].container;
+    while (tree.containers[container].parent_item) |parent| {
+        if (parent == item) return true;
+        container = tree.items[parent].container;
+    }
+    return false;
+}
+
+/// A parameter of a function
+const Param = struct {
+    file: FileId,
+    /// The function
+    item: u32,
+    binding: Body.BindingId,
+    name: []const u8,
+
+    /// `e` in the body `b` of function `user` (in the same file) refers to the parameter
+    fn isRef(p: Param, r: *Resolver, user: u32, b: *const Body, e: Body.ExprId) resolve.Error!bool {
+        switch (b.expr(e)) {
+            .name_ref => |n| if (!std.mem.eql(u8, n, p.name)) return false,
+            else => return false,
+        }
+        const def = try r.resolveName(p.file, user, b, b.expr_scopes[@backingInt(e)], p.name) orelse return false;
+        return def == .local and def.local.item == p.item and def.local.binding == p.binding;
+    }
+};
+
+/// The body of function `user` (the function of `p` or a function declared in its body) uses `p`
+/// as a function: calls it (`p(...)`, `@call(modifier, p, args)`), reads
+/// `@typeInfo(@TypeOf(p)).@"fn"`, or passes it on to a parameter that takes a function (see
+/// `paramIsFn`; `std.Thread.spawn` passes its function to `Impl.spawn`, which passes it to
+/// `callFn`, which calls it)
+fn usesAsFn(r: *Resolver, p: Param, user: u32, visited: *Visited) resolve.Error!bool {
+    const b = try r.body(p.file, user);
+    // The inference result of `user`, needed only to resolve the callees that receive `p`
+    var at: ?context.At = null;
+    for (b.exprs) |x| switch (x) {
+        .call => |c| {
+            if (try p.isRef(r, user, b, c.callee)) return true;
+            for (c.args, 0..) |arg, k| {
+                if (!try p.isRef(r, user, b, arg)) continue;
+                if (at == null) at = try context.atItem(r, p.file, user) orelse break;
+                const callee = try context.callee(r, at.?, c.callee) orelse break;
+                if (try paramIsFn(r, callee.def, @as(u32, @intCast(k)) + @intFromBool(callee.bound), visited)) return true;
+            }
+        },
+        .builtin_call => |c| if (std.mem.eql(u8, c.name, "@call") and c.args.len == 3 and try p.isRef(r, user, b, c.args[1])) return true,
+        .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, "fn")) {
+            const type_info = builtinArg(b, fa.lhs, "@typeInfo") orelse continue;
+            if (try p.isRef(r, user, b, builtinArg(b, type_info, "@TypeOf") orelse continue)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// The only argument of the builtin call `name(arg)` at `e`
+fn builtinArg(b: *const Body, e: Body.ExprId, name: []const u8) ?Body.ExprId {
+    return switch (b.expr(e)) {
+        .builtin_call => |c| if (c.args.len == 1 and std.mem.eql(u8, c.name, name)) c.args[0] else null,
+        else => null,
+    };
 }
 
 /// The type annotation is a function or a function pointer: by syntax, or by the computed type (for

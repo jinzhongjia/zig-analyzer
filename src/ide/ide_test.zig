@@ -6919,6 +6919,157 @@ test "completion: anytype parameters take a function name when another parameter
     }
 }
 
+test "completion: anytype parameters that are called as functions take a function name" {
+    const decls =
+        \\const Ctx = struct {
+        \\    fn work(n: u32) void {
+        \\        _ = n;
+        \\    }
+        \\};
+        \\fn work(n: u32) void {
+        \\    _ = n;
+        \\}
+        \\fn viaCall(comptime f: anytype, args: anytype) void {
+        \\    @call(.auto, f, args);
+        \\}
+        \\fn direct(f: anytype) void {
+        \\    f(1);
+        \\}
+        \\fn info(comptime f: anytype) usize {
+        \\    return @typeInfo(@TypeOf(f)).@"fn".params.len;
+        \\}
+        \\fn forward(comptime function: anytype, args: anytype) void {
+        \\    const Inner = struct {
+        \\        fn start() void {
+        \\            viaCall(function, args);
+        \\        }
+        \\    };
+        \\    Inner.start();
+        \\}
+        \\const Impl = struct {
+        \\    fn spawn(comptime f: anytype, args: anytype) void {
+        \\        direct(f);
+        \\        _ = args;
+        \\    }
+        \\};
+        \\fn spawn(comptime function: anytype, args: anytype) void {
+        \\    Impl.spawn(function, args);
+        \\}
+        \\fn value(v: anytype) void {
+        \\    _ = v;
+        \\}
+        \\fn passValue(v: anytype) void {
+        \\    value(v);
+        \\}
+        \\fn hop1(f: anytype) void {
+        \\    hop2(f);
+        \\}
+        \\fn hop2(f: anytype) void {
+        \\    hop3(f);
+        \\}
+        \\fn hop3(f: anytype) void {
+        \\    hop4(f);
+        \\}
+        \\fn hop4(f: anytype) void {
+        \\    hop5(f);
+        \\}
+        \\fn hop5(f: anytype) void {
+        \\    hop6(f);
+        \\}
+        \\fn hop6(f: anytype) void {
+        \\    direct(f);
+        \\}
+        \\fn even(f: anytype, n: u32) void {
+        \\    if (n == 0) f(0) else odd(f, n - 1);
+        \\}
+        \\fn odd(f: anytype, n: u32) void {
+        \\    even(f, n - 1);
+        \\}
+        \\fn ping(v: anytype, n: u32) void {
+        \\    if (n > 0) pong(v, n - 1);
+        \\}
+        \\fn pong(v: anytype, n: u32) void {
+        \\    ping(v, n);
+        \\}
+        \\fn again(v: anytype) void {
+        \\    again(v);
+        \\}
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "fn t() void {\n    viaCall(wor<|>, .{1});\n}", "work", "-" },
+        .{ "fn t() void {\n    viaCall(<|>, .{1});\n}", "work", "-" },
+        .{ "fn t() void {\n    viaCall(Ctx.wor<|>, .{1});\n}", "work", "-" },
+        .{ "fn t() void {\n    direct(wor<|>);\n}", "work", "-" },
+        .{ "fn t() void {\n    _ = info(wor<|>);\n}", "work", "-" },
+        // Passed on to a parameter that is called, also from a function of a local struct
+        .{ "fn t() void {\n    forward(wor<|>, .{1});\n}", "work", "-" },
+        .{ "fn t() void {\n    spawn(wor<|>, .{1});\n}", "work", "-" },
+        // Every call of a chain is followed, and functions that pass the parameter to each other
+        // are looked into once
+        .{ "fn t() void {\n    hop1(wor<|>);\n}", "work", "-" },
+        .{ "fn t() void {\n    odd(wor<|>, 3);\n}", "work", "-" },
+        // Other `anytype` parameters may receive any value
+        .{ "fn t() void {\n    value(wor<|>);\n}", "work", "work(${1:n})" },
+        .{ "fn t() void {\n    passValue(wor<|>);\n}", "work", "work(${1:n})" },
+        .{ "fn t() void {\n    viaCall(work, .{wor<|>});\n}", "work", "work(${1:n})" },
+        .{ "fn t() void {\n    ping(wor<|>, 3);\n}", "work", "work(${1:n})" },
+        .{ "fn t() void {\n    again(wor<|>);\n}", "work", "work(${1:n})" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ decls, c[0], "\n" }));
+        testing.expectEqualStrings(c[2], try snippetOf(&w, added.file, added.cursor, c[1], .{ .auto_import = false, .snippets = true })) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
+test "completion: the function argument of std.Thread.spawn takes a function name" {
+    const decls =
+        \\const std = @import("std");
+        \\fn worker(id: u32) void {
+        \\    _ = id;
+        \\}
+        \\fn testWorker(allocator: std.mem.Allocator) !void {
+        \\    _ = allocator;
+        \\}
+        \\
+    ;
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "pub fn main() !void {\n    const t = try std.Thread.spawn(.{}, work<|>, .{@as(u32, 1)});\n    t.join();\n}", "worker", "-" },
+        .{ "pub fn main() !void {\n    const t = try std.Thread.spawn(.{}, <|>, .{@as(u32, 1)});\n    t.join();\n}", "worker", "-" },
+        .{ "test {\n    try std.testing.checkAllAllocationFailures(std.testing.allocator, testW<|>, .{});\n}", "testWorker", "-" },
+        // Other `anytype` parameters keep the call snippet
+        .{ "test {\n    try std.testing.expectEqual(work<|>, 1);\n}", "worker", "worker(${1:id})" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const std_root = try w.vfs.intern(try std.fs.path.join(w.arena.allocator(), &.{ env.std_dir, "std.zig" }));
+        // `std.Thread` picks its implementation by the target in builtin
+        w.default_builtin = (try w.add("/b/builtin.zig",
+            \\const std = @import("std");
+            \\pub const single_threaded = false;
+            \\pub const os: std.Target.Os = .{ .tag = .linux, .version_range = .{ .none = {} } };
+            \\pub const link_libc = false;
+            \\
+        )).file;
+        const added = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ decls, c[0], "\n" }));
+        try w.setGraph(std_root, &.{}, &.{});
+        testing.expectEqualStrings(c[2], try snippetOf(&w, added.file, added.cursor, c[1], .{ .auto_import = false, .snippets = true })) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
 test "completion: call snippets without argument placeholders, and nothing changes without snippets" {
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
         .{ "fn t() void {\n    ad<|>\n}", "add", "add($1)" },
