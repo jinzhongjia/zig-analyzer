@@ -1343,6 +1343,57 @@ test "refresh requests carry no params and at most one of each awaits the client
     try h.notify("exit", {});
 }
 
+test "a null configuration section keeps the settings from initialization and earlier pushes" {
+    // A null section replaced the configuration with the defaults, discarding
+    // `initializationOptions` and settings pushed before the reply
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    const text =
+        \\fn get() u32 {
+        \\    return 1;
+        \\}
+        \\pub fn main() void {
+        \\    const x = get();
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    for ([_]bool{ false, true }) |push| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const capabilities = .{ .workspace = .{ .configuration = true } };
+        if (push) {
+            _ = try h.request("initialize", .{ .capabilities = capabilities });
+        } else {
+            _ = try h.request("initialize", .{ .capabilities = capabilities, .initializationOptions = .{ .inlay_hints = .{ .types = false } } });
+        }
+        h.hold_requests = true;
+        try h.notify("initialized", Empty{});
+        while (true) {
+            const msg = try h.next();
+            const method = msg.object.get("method") orelse continue;
+            if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+        }
+        if (push) try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{ .types = false } } } });
+        h.hold_requests = false;
+        try h.writeBody(
+            \\{"jsonrpc":"2.0","id":"zig-analyzer/configuration/0","result":[null]}
+        );
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = "untitled:null-section.zig", .languageId = "zig", .version = 1, .text = text } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const resp = try h.request("textDocument/inlayHint", .{
+            .textDocument = .{ .uri = "untitled:null-section.zig" },
+            .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 7, .character = 0 } },
+        });
+        for (resp.object.get("result").?.array.items) |hint| {
+            try testing.expect(!std.mem.eql(u8, hint.object.get("label").?.string, ": u32"));
+        }
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
 test "cache settings from initialization and later configuration limit the retained syntax trees" {
     // Guards against the cache capacity being set only when configuration is pushed, while the
     // configuration at initialization has no effect

@@ -75,7 +75,7 @@ vim.lsp.enable('zig_analyzer')
 
 ## Configuration
 
-Editor settings are read from `initializationOptions` and the `zig-analyzer` section of `workspace/configuration`. Every option is optional.
+Editor settings are read from `initializationOptions` and the `zig-analyzer` section of `workspace/configuration`. Every option is optional. A section the client answers with `null` (not set in the editor) leaves the `initializationOptions` in effect.
 
 A `zig-analyzer.zon` in the project root shares project settings (build arguments, diagnostic steps, naming checks, import order) with the team; they take precedence over editor settings.
 

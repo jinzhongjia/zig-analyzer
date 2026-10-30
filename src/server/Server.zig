@@ -2664,10 +2664,12 @@ fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value, fai
         server.startProjects();
     };
     if (failed) return log.info("client failed to provide configuration", .{});
-    // The result corresponds one-to-one to the requested items; it is null when the section is not
-    // set, meaning all defaults are used
+    // The result corresponds one-to-one to the requested items. A null section means the client
+    // cannot provide it (LSP): the current settings, from `initializationOptions` and earlier
+    // pushes, stay in effect
     const section: json.Value = if (result == .array and result.array.items.len == 1) result.array.items[0] else .null;
-    const fresh: Config = if (section == .null) .{} else Config.parse(server.gpa, section) catch |err| switch (err) {
+    if (section == .null) return log.info("client provided no zig-analyzer settings, keeping the current ones", .{});
+    const fresh = Config.parse(server.gpa, section) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidConfig => return server.showWarning("invalid zig-analyzer settings, keeping the previous ones"),
     };
