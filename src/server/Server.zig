@@ -129,6 +129,11 @@ progress: Progress = .{},
 
 /// Serializes module graph updates so that an older snapshot does not overwrite a newer one
 graph_mutex: Io.Mutex = .init,
+/// Target parameters last parsed from each builtin.zig (protected by `graph_mutex`): used when the
+/// file can no longer be read (the global cache was cleared during the session). Generated
+/// builtin.zig files are named by the hash of their contents, so a path always has the same
+/// contents.
+builtin_targets: std.AutoHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target) = .empty,
 /// Generation of background indexing: incremented on every module graph update
 index_generation: std.atomic.Value(u64) = .init(0),
 /// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
@@ -345,6 +350,7 @@ pub fn deinit(server: *Server) void {
     }
     server.envs.deinit(server.gpa);
     if (server.default_builtin) |p| server.gpa.free(p);
+    server.builtin_targets.deinit(server.gpa);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
     for (server.last_uris.values()) |u| server.gpa.free(u);
@@ -849,7 +855,7 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
     for (graph.modules) |m| if (m.builtin) |file| try seen.put(server.gpa, file, {});
     for (graph.compiles) |c| if (c.builtin) |file| try seen.put(server.gpa, file, {});
     for (seen.keys(), 0..) |file, i| {
-        const t = server.builtinTarget(file);
+        const t = try server.builtinTarget(file);
         if (i == 0) {
             result = t;
             continue;
@@ -863,16 +869,23 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
     return .{};
 }
 
-fn builtinTarget(server: *Server, file: Vfs.FileId) za.sema.InternPool.Target {
-    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return .{ .pointer_bits = null, .scalar_abi = .unknown };
+/// Target parameters of a builtin.zig; when it cannot be read, the ones last parsed from it (see
+/// `builtin_targets`). The caller holds `graph_mutex`.
+fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
+    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown },
+    };
     defer server.gpa.free(text);
     const facts = za.project.builtin.vectorFacts(text);
     const target = za.project.builtin.target(text);
-    return .{
+    const result: za.sema.InternPool.Target = .{
         .pointer_bits = za.project.builtin.pointerBits(text),
         .vector_abi = if (facts) |f| .of(f.backend, f.arch, f.avx, f.avx512f, f.soft_float) else .unknown,
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
     };
+    try server.builtin_targets.put(server.gpa, file, result);
+    return result;
 }
 
 /// Combines the build graphs and compile sets of all projects and updates the module graph input

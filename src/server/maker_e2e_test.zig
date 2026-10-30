@@ -275,3 +275,43 @@ test "a diagnostics step that fails without errors is reported, not shown as a c
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// Hover text at the end of `needle` in `uri` (empty without a result)
+fn hoverText(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
+    const result = try requestAt(h, "textDocument/hover", uri, text, needle, null);
+    if (result != .object) return "";
+    return result.object.get("contents").?.object.get("value").?.string;
+}
+
+test "a builtin.zig deleted from the cache keeps its target parameters" {
+    const main_text = "pub const ptr_bytes = @sizeOf(usize);\n";
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = main_text }});
+    defer project.deinit();
+    const a = testing.allocator;
+    // A 32-bit target, unlike the analyzer's own target used when no builtin.zig is known
+    const shown = try std.process.run(a, testing.io, .{ .argv = &.{ project.env.zig_exe, "build-obj", "--show-builtin", "-target", "x86-linux" } });
+    defer a.free(shown.stdout);
+    defer a.free(shown.stderr);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "builtin.zig", .data = shown.stdout });
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const ha = h.arena.allocator();
+    const builtin_path = try project.path(ha, "builtin.zig");
+    const options = try std.json.Stringify.valueAlloc(ha, .{ .zig = .{ .builtin_path = builtin_path } }, .{});
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(ha, project.root), .capabilities = Empty{}, .initializationOptions = try std.json.parseFromSliceLeaky(std.json.Value, ha, options, .{}) });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(ha, try project.path(ha, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, main_text, "ptr_by"), "= 4") != null);
+
+    // The module graph is recomputed after the file is gone
+    try project.tmp.dir.deleteFile(testing.io, "builtin.zig");
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &[_]Empty{} } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, main_text, "ptr_by"), "= 4") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
