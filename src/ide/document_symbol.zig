@@ -42,13 +42,14 @@ const Builder = struct {
             if (item.kind == .@"comptime" or item.kind == .zon) continue;
             const field_index = fields;
             if (item.kind == .field) fields += 1;
+            const name = try displayName(b.arena, item, field_index) orelse continue;
             const node = b.map.get(item.ast_id) orelse continue;
             const name_tok = ast.memberName(node, ItemTree.bareFieldNames(kind));
             const children = if (level < max_levels) try b.childrenOf(i, level + 1) else &.{};
             const r = node.range();
             const sel = if (name_tok) |t| t.range() else r;
             try out.append(b.arena, .{
-                .name = try displayName(b.arena, item, field_index),
+                .name = name,
                 .kind = symbolKind(b.items, i, kind),
                 .range = b.lines.range(r.start, r.end, b.enc),
                 .selectionRange = b.lines.range(sel.start, sel.end, b.enc),
@@ -92,7 +93,7 @@ fn zonFields(arena: Allocator, value: SyntaxNode, lines: offsets.LineIndex, enc:
         if (n.kind() == .field_init) {
             const field: ast.FieldInit = .{ .syntax = n };
             const tok = field.name() orelse continue;
-            name = try ast.identNameAlloc(arena, tok.text);
+            name = try symbolName(arena, try ast.identNameAlloc(arena, tok.text));
             sel = tok.range();
             field_value = field.value();
         } else {
@@ -113,12 +114,30 @@ fn zonFields(arena: Allocator, value: SyntaxNode, lines: offsets.LineIndex, enc:
 }
 
 /// Members without a name: a tuple field is shown as its index (`field_index` is its position
-/// among the container's fields, the same as the name in `t.@"0"`); the others are unnamed
-/// `test {}`
-fn displayName(arena: Allocator, item: ItemTree.Item, field_index: u32) Allocator.Error![]const u8 {
-    const name = item.name orelse return if (item.kind == .field) std.fmt.allocPrint(arena, "{d}", .{field_index}) else "test";
-    if (item.kind == .@"test" and name.len >= 2 and name[0] == '"') return name[1 .. name.len - 1];
-    return name;
+/// among the container's fields, the same as the name in `t.@"0"`) and an unnamed `test {}` as
+/// `test`; incomplete declarations without a name (`pub fn`, `const`) are not listed
+fn displayName(arena: Allocator, item: ItemTree.Item, field_index: u32) Allocator.Error!?[]const u8 {
+    const name = item.name orelse return switch (item.kind) {
+        .field => try std.fmt.allocPrint(arena, "{d}", .{field_index}),
+        .@"test" => "test",
+        else => null,
+    };
+    if (item.kind == .@"test" and name.len >= 2 and name[0] == '"') {
+        const inner = name[1 .. name.len - 1];
+        return if (isBlank(inner)) name else inner;
+    }
+    return try symbolName(arena, name);
+}
+
+/// LSP requires symbol names that are neither empty nor only whitespace: such names (`@""`,
+/// `@" "`) are shown in their quoted form
+pub fn symbolName(arena: Allocator, name: []const u8) Allocator.Error![]const u8 {
+    if (!isBlank(name)) return name;
+    return std.fmt.allocPrint(arena, "{f}", .{std.zig.fmtId(name)});
+}
+
+fn isBlank(name: []const u8) bool {
+    return std.mem.trim(u8, name, &std.ascii.whitespace).len == 0;
 }
 
 pub fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.Container.Kind) types.SymbolKind {
@@ -361,4 +380,34 @@ test "zon document symbols stop at the nesting limit" {
     var levels: usize = 0;
     while (syms.len > 0) : (syms = syms[0].children orelse &.{}) levels += 1;
     try testing.expectEqual(max_levels, levels);
+}
+
+test "symbol names are never blank and nameless declarations are not tests" {
+    // Empty or whitespace-only names break clients, and `pub fn` while typing is not a test
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "test \"\" {}", "\"\"\n" },
+        .{ "test \" \" {}", "\" \"\n" },
+        .{ "pub fn @\" \"() void {}", "@\" \"\n" },
+        .{ "const @\"\" = 1;", "@\"\"\n" },
+        .{ "pub fn", "" },
+        .{ "const", "" },
+        .{ "const std = @import(\"std\");\ntest \"\"\n", "std\n\"\"\n" },
+    };
+    for (cases) |c| {
+        const parse = try Parse.create(a, c[0], .zig);
+        var items = try ItemTree.build(a, parse.rootNode(), .zig);
+        var map = try ItemTree.AstIdMap.build(a, &items, parse.rootNode());
+        const syms = try documentSymbols(a, &items, &map, try offsets.LineIndex.init(a, c[0]), .utf16);
+        var out: std.Io.Writer.Allocating = .init(a);
+        try writeOutline(&out.writer, syms, 0);
+        try testing.expectEqualStrings(c[1], out.written());
+    }
+    const zon = ".{ .@\" \" = 2, .@\"\" = 1, .ok = 3 }";
+    const parse = try Parse.create(a, zon, .zon);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try writeOutline(&out.writer, try zonSymbols(a, parse.rootNode(), try offsets.LineIndex.init(a, zon), .utf16), 0);
+    try testing.expectEqualStrings("@\" \"\n@\"\"\nok\n", out.written());
 }

@@ -46,7 +46,7 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             if (at.name_len == 0) continue;
             const container = tree.containers[item.container];
             try out.append(r.arena, .{
-                .name = ast.identName(name),
+                .name = try document_symbol.symbolName(r.arena, ast.identName(name)),
                 .kind = document_symbol.symbolKind(tree, @intCast(i), container.kind),
                 .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
                 .file = file,
@@ -122,6 +122,15 @@ test "search returns the name token of each matching declaration" {
         try describe(&w, file, text, "p"),
     );
     try testing.expectEqualStrings("", try describe(&w, file, text, "zzz"));
+}
+
+test "blank names are shown in their quoted form" {
+    const text = "pub fn @\" \"() void {}\nconst @\"\" = 1;\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings("@\"\"(-):@\"\" @\" \"(-):@\" \"", try describe(&w, file, text, ""));
 }
 
 test "container names are the declarations that bind the containers" {
