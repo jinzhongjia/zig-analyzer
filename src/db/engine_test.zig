@@ -330,7 +330,96 @@ const CachedLen = struct {
     }
 };
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen });
+/// Reads Number, then stops until `gate.release` is set, without checking for cancellation: a test
+/// holds the claim of the first read transaction computing it while others need it
+const Gated = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        const n = try ctx.get(Number, key);
+        _ = gate.entered.fetchAdd(1, .acq_rel);
+        while (!gate.release.load(.acquire)) std.Thread.yield() catch {};
+        return n * 3;
+    }
+};
+var gate: struct {
+    entered: std.atomic.Value(u32) = .init(0),
+    release: std.atomic.Value(bool) = .init(false),
+} = .{};
+
+// A cycle read from two threads: CrossA(k) = CrossB(k) + 1 and CrossB(k) = CrossA(k) × 10; FixA(k)
+// = {0} ∪ FixB(k) and FixB(k) = {1} ∪ FixA(k), as fixpoint queries. Each computation goes on
+// to read the other query only once both of the pair have begun (`crossStarted`), so that each
+// claims its own query before needing the other.
+const CrossA = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        crossStarted(0);
+        return try ctx.get(CrossB, key) + 1;
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return 100;
+    }
+};
+
+const CrossB = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        crossStarted(1);
+        return try ctx.get(CrossA, key) * 10;
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return 200;
+    }
+};
+
+const FixA = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = u8;
+    pub const fixpoint = true;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        crossStarted(0);
+        return 0b01 | try ctx.get(FixB, key);
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return 0;
+    }
+    pub fn depthFallback(_: Key) Value {
+        return 0xff;
+    }
+};
+
+const FixB = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = u8;
+    pub const fixpoint = true;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        crossStarted(1);
+        return 0b10 | try ctx.get(FixA, key);
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return 0;
+    }
+    pub fn depthFallback(_: Key) Value {
+        return 0xff;
+    }
+};
+
+var cross_started: [2]std.atomic.Value(bool) = @splat(.init(false));
+
+fn crossStarted(which: usize) void {
+    cross_started[which].store(true, .release);
+    while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
+}
+
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Gated, CrossA, CrossB, FixA, FixB });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -1139,6 +1228,171 @@ test "concurrent reads: readers of the same query agree" {
     for (&threads, &outs) |*t, *o| t.* = try std.Thread.spawn(.{}, Reader.run, .{ &d, o });
     for (threads) |t| t.join();
     for (outs) |o| try testing.expectEqual(5, o);
+    // However the reads interleave, each memo is computed by one of them
+    try testing.expectEqual(1, executions(&d, Plus));
+    try testing.expectEqual(1, executions(&d, Tens));
+}
+
+/// Reads `Q(key)` in its own read transaction on another thread
+fn ReadThread(comptime Q: type) type {
+    return struct {
+        d: *Db,
+        key: Q.Key,
+        /// The cancellation flag of the read transaction
+        cancel: std.atomic.Value(bool) = .init(false),
+        result: ?db.Error!Q.Value = null,
+        done: std.atomic.Value(bool) = .init(false),
+        thread: std.Thread = undefined,
+
+        fn start(r: *@This()) !void {
+            r.thread = try std.Thread.spawn(.{}, run, .{r});
+        }
+
+        fn run(r: *@This()) void {
+            var ctx = r.d.beginRead(testing.allocator);
+            defer ctx.end();
+            ctx.cancel = &r.cancel;
+            r.result = ctx.get(Q, r.key);
+            r.done.store(true, .release);
+        }
+
+        fn join(r: *@This()) db.Error!Q.Value {
+            r.thread.join();
+            return r.result.?;
+        }
+    };
+}
+
+/// Waits until `n` read transactions wait for a memo another one computes
+fn awaitWaiting(d: *Db, n: u32) void {
+    while (d.waiting.load(.acquire) != n) std.Thread.yield() catch {};
+}
+
+test "concurrent reads: a memo several read transactions need is computed once" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    gate = .{};
+    var readers: [3]ReadThread(Gated) = @splat(.{ .d = &d, .key = 1 });
+    try readers[0].start();
+    while (gate.entered.load(.acquire) == 0) std.Thread.yield() catch {};
+    for (readers[1..], 1..) |*r, i| r.start() catch |err| {
+        gate.release.store(true, .release);
+        for (readers[0..i]) |*started| _ = started.join() catch {};
+        return err;
+    };
+    // The others wait for the computation of the first one instead of computing it too
+    awaitWaiting(&d, 2);
+    gate.release.store(true, .release);
+    for (&readers) |*r| try testing.expectEqual(21, try r.join());
+    try testing.expectEqual(1, executions(&d, Gated));
+    try testing.expectEqual(1, gate.entered.load(.acquire));
+}
+
+test "concurrent reads: a write cancels the reads waiting for a memo another one computes" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    gate = .{};
+    var owner: ReadThread(Gated) = .{ .d = &d, .key = 1 };
+    try owner.start();
+    while (gate.entered.load(.acquire) == 0) std.Thread.yield() catch {};
+    var waiter: ReadThread(Gated) = .{ .d = &d, .key = 1 };
+    waiter.start() catch |err| {
+        gate.release.store(true, .release);
+        _ = owner.join() catch {};
+        return err;
+    };
+    awaitWaiting(&d, 1);
+    const Writer = struct {
+        fn run(dd: *Db) void {
+            setNumber(dd, Number, 1, 8, .low) catch unreachable;
+        }
+    };
+    const writer = std.Thread.spawn(.{}, Writer.run, .{&d}) catch |err| {
+        gate.release.store(true, .release);
+        _ = owner.join() catch {};
+        _ = waiter.join() catch {};
+        return err;
+    };
+    // The waiting read is canceled while the owner of the claim still computes
+    const waited = waiter.join();
+    const owner_done = owner.done.load(.acquire);
+    gate.release.store(true, .release);
+    // The owner's computation sees the write when it finishes: its result is not written
+    const owned = owner.join();
+    writer.join();
+    try testing.expectError(error.Canceled, waited);
+    try testing.expect(!owner_done);
+    try testing.expectError(error.Canceled, owned);
+    try testing.expectEqual(24, try read(&d, Gated, 1));
+}
+
+test "concurrent reads: a read waiting for a memo computes it when the read computing it gives up" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    gate = .{};
+    var owner: ReadThread(Gated) = .{ .d = &d, .key = 1 };
+    try owner.start();
+    while (gate.entered.load(.acquire) == 0) std.Thread.yield() catch {};
+    var waiter: ReadThread(Gated) = .{ .d = &d, .key = 1 };
+    waiter.start() catch |err| {
+        gate.release.store(true, .release);
+        _ = owner.join() catch {};
+        return err;
+    };
+    awaitWaiting(&d, 1);
+    // Only the request of the owner is canceled: it writes no memo and releases the claim
+    owner.cancel.store(true, .release);
+    gate.release.store(true, .release);
+    const owned = owner.join();
+    const waited = waiter.join();
+    try testing.expectError(error.Canceled, owned);
+    try testing.expectEqual(21, try waited);
+    try testing.expectEqual(2, executions(&d, Gated));
+    // The waiter wrote its result to the memo
+    try testing.expectEqual(21, try read(&d, Gated, 1));
+    try testing.expectEqual(2, executions(&d, Gated));
+}
+
+/// Reads `A(1)` and `B(1)` on two threads at the same time, each claiming its query before
+/// reading the other one, and checks that each gets the value it gets when read alone, where the
+/// cycle is entered at the query read
+fn expectCrossCycle(comptime A: type, comptime B: type, a_alone: A.Value, b_alone: B.Value) !void {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    cross_started = @splat(.init(false));
+    var a: ReadThread(A) = .{ .d = &d, .key = 1 };
+    var b: ReadThread(B) = .{ .d = &d, .key = 1 };
+    try a.start();
+    b.start() catch |err| {
+        cross_started = @splat(.init(true));
+        _ = a.join() catch {};
+        return err;
+    };
+    // One of them waits for the other one's query; the other one then needs the query of the
+    // first one, and waiting for it would close a cycle of waits: it computes that query on its
+    // own stack instead, where the cycle is handled as in a single read transaction
+    const from_a = a.join();
+    const from_b = b.join();
+    try testing.expectEqual(a_alone, try from_a);
+    try testing.expectEqual(b_alone, try from_b);
+
+    var alone: Db = .init(testing.io, testing.allocator, {});
+    defer alone.deinit();
+    try testing.expectEqual(a_alone, try read(&alone, A, 1));
+    var other: Db = .init(testing.io, testing.allocator, {});
+    defer other.deinit();
+    try testing.expectEqual(b_alone, try read(&other, B, 1));
+}
+
+test "concurrent reads: a cycle across two read transactions falls back as in one" {
+    // CrossA alone: CrossA → CrossB → CrossA (fallback 100), so CrossB = 1000 and CrossA = 1001;
+    // CrossB alone: CrossB → CrossA → CrossB (fallback 200), so CrossA = 201 and CrossB = 2010
+    try expectCrossCycle(CrossA, CrossB, 1001, 2010);
+    // The fixpoint cycle head is complete whichever query is entered first
+    try expectCrossCycle(FixA, FixB, 0b11, 0b11);
 }
 
 fn setText(d: *Db, key: u32, text: []const u8) !void {

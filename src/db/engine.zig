@@ -57,7 +57,9 @@
 //! transaction begun with `beginReadAt` must see the state at an earlier `mark` and is canceled as
 //! well when a write transaction ordered after the mark (`WriteOrder`) has begun since then.
 //! Query values obtained in a read transaction stay valid until that transaction ends: replaced
-//! old values are freed only at the next write transaction.
+//! old values are freed only at the next write transaction. Concurrent read transactions that need
+//! the same memo brought up to date do it once: the first one claims it, and the others wait for
+//! its result (see `Ctx.claim`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -273,6 +275,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         garbage: std.ArrayList(Garbage) = .empty,
         /// Protects `garbage` in read transactions; taken after the mutex of a table, never before
         garbage_mutex: SpinMutex = .{},
+        /// Protects `Ctx.waiting_for` of all read transactions (see `Ctx.claim`); taken before the
+        /// mutex of a table, never after
+        wait_mutex: Io.Mutex = .init,
+        /// Advanced, and its waiters woken, when a memo that read transactions wait for is released
+        /// and when a write transaction registers (see `Ctx.claim`)
+        wake_epoch: std.atomic.Value(u32) = .init(0),
+        /// Number of read transactions waiting for a memo claimed by another one
+        waiting: std.atomic.Value(u32) = .init(0),
 
         counters: [queries.len]Counters = @splat(.{}),
         incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
@@ -338,6 +348,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     },
                     .derived => struct {
                         memo: ?Memo = null,
+                        /// The read transaction bringing the memo up to date (see `Ctx.claim`)
+                        owner: ?*Ctx = null,
+                        /// Other read transactions wait for `owner` to release it
+                        waited: bool = false,
                     },
                 };
 
@@ -497,9 +511,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             var it = changes.iterator(.{});
             while (it.next()) |qi| {
                 if (order == .after_marks) _ = db.input_writes[qi].fetchAdd(1, .monotonic);
-                _ = db.pending_inputs[qi].fetchAdd(1, .release);
+                _ = db.pending_inputs[qi].fetchAdd(1, .seq_cst);
             }
-            _ = db.pending_write.fetchAdd(1, .release);
+            _ = db.pending_write.fetchAdd(1, .seq_cst);
+            // Read transactions waiting for a memo another one computes check for cancellation
+            // when woken (see `Ctx.waitFor`)
+            if (db.waiting.load(.seq_cst) != 0) db.wakeWaiters();
             db.rw.lockUncancelable(db.io);
             _ = db.pending_write.fetchSub(1, .release);
             it = changes.iterator(.{});
@@ -746,6 +763,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.garbage.clearRetainingCapacity();
         }
 
+        /// Wakes the read transactions waiting for memos claimed by others, which then check
+        /// whether they can go on (see `Ctx.claim`)
+        fn wakeWaiters(db: *Db) void {
+            _ = db.wake_epoch.fetchAdd(1, .seq_cst);
+            db.io.futexWake(u32, &db.wake_epoch.raw, std.math.maxInt(u32));
+        }
+
         // ── Read transactions ──────────────────────────────────────────────
 
         pub fn beginRead(db: *Db, gpa: Allocator) Ctx {
@@ -827,6 +851,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// looked up here: comparing frame by frame on a very deep stack would make the cost of
             /// the computation grow quadratically with the depth.
             deep_frames: std.array_hash_map.Auto(DepKey, void) = .empty,
+            /// The memo this read transaction waits for another one to bring up to date (see
+            /// `claim`); protected by `Db.wait_mutex`
+            waiting_for: ?DepKey = null,
 
             const linear_frames = 64;
 
@@ -863,7 +890,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             };
 
             pub fn end(ctx: *Ctx) void {
-                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0);
+                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0 and ctx.waiting_for == null);
                 ctx.stack.deinit(ctx.gpa);
                 ctx.unverifiable.deinit(ctx.gpa);
                 ctx.deep_frames.deinit(ctx.gpa);
@@ -1121,6 +1148,21 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
+            /// Whether a memo as read from the table can be used without verifying it: it was
+            /// verified in this revision, and nobody replaces the value until the next write
+            /// transaction (see `execute`); an evicted value is restored only when `need_value`
+            fn upToDate(memo: anytype, revision: Revision, need_value: bool) bool {
+                return memo.verified_at == revision and (!memo.evicted or !need_value);
+            }
+
+            /// The result of a memo that is up to date (`upToDate`); `value` is invalid when the
+            /// value was evicted
+            fn freshMemo(comptime Q: type, memo: Table(Q).Memo) Fresh(Q) {
+                var fresh: Fresh(Q) = .{ .value = undefined, .changed_at = memo.changed_at, .durability = memo.durability };
+                if (!memo.evicted) fresh.value = memo.value;
+                return fresh;
+            }
+
             /// Ensures that a derived memo is valid in the current revision, verifying or
             /// recomputing it as needed; `existing` is the memo as read from the table (see
             /// `useMemoLocked`). When `need_value` is false (only verifying dependencies), an
@@ -1131,12 +1173,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const table = &db.tables[comptime queryIndex(Q)];
                 const dep: DepKey = .{ .query = comptime queryIndex(Q), .index = index };
 
-                if (existing) |memo| verify: {
-                    // Verified in this revision: nobody replaces the value until the next write
-                    // transaction (see `execute`), so it is used as read
-                    if (memo.verified_at == db.revision and !memo.evicted) {
-                        return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
-                    }
+                if (existing) |memo| if (upToDate(memo, db.revision, need_value)) return freshMemo(Q, memo);
+                var held: Claim = .{};
+                defer ctx.endClaim(Q, index, &held);
+                const current = switch (try ctx.claim(Q, index, need_value, &held)) {
+                    .ready => |fresh| return fresh,
+                    .stale => |memo| memo,
+                };
+                if (current) |memo| verify: {
                     const verdict: Verdict = if (memo.verified_at == db.revision)
                         .{ .unchanged = memo.durability }
                     else if (ctx.unverifiableDepth(dep)) |depth|
@@ -1155,24 +1199,170 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     // The value was evicted: the dependencies are unchanged, so a recomputed value
                     // is necessarily the same; keep the original changed_at
                     if (memo.evicted) {
-                        if (need_value) return ctx.execute(Q, index, key, true);
+                        if (need_value) return ctx.execute(Q, index, key, true, &held);
                         table.mutex.lockUncancelable(db.io);
                         defer table.mutex.unlock(db.io);
-                        const m = &table.slots.items[index].memo.?;
+                        const slot = &table.slots.items[index];
+                        ctx.releaseLocked(slot, &held);
+                        const m = &slot.memo.?;
                         markVerified(m, db.revision, durability);
                         return .{ .value = undefined, .changed_at = m.changed_at, .durability = m.durability };
                     }
                     table.mutex.lockUncancelable(db.io);
                     defer table.mutex.unlock(db.io);
-                    // A concurrent reader may have recomputed and replaced it; the current value in
-                    // the table wins
-                    const m = &table.slots.items[index].memo.?;
+                    const slot = &table.slots.items[index];
+                    // Without the claim, a concurrent reader may have recomputed and replaced it;
+                    // the current value in the table wins
+                    const m = &slot.memo.?;
                     if (!m.evicted) {
+                        ctx.releaseLocked(slot, &held);
                         markVerified(m, db.revision, durability);
                         return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
                     }
                 }
-                return ctx.execute(Q, index, key, false);
+                return ctx.execute(Q, index, key, false, &held);
+            }
+
+            /// A claim on a memo (see `claim`)
+            const Claim = struct {
+                /// This call holds the claim and must release it
+                owned: bool = false,
+                /// It was released while other read transactions waited for it: they must be
+                /// woken
+                wake: bool = false,
+            };
+
+            fn Claimed(comptime Q: type) type {
+                return union(enum) {
+                    /// Another read transaction brought the memo up to date meanwhile
+                    ready: Fresh(Q),
+                    /// The memo as it is now, for the caller to bring up to date
+                    stale: ?Table(Q).Memo,
+                };
+            }
+
+            /// Claims the memo at `index` for bringing it up to date (verifying or recomputing
+            /// it), so that concurrent read transactions that need it do this once. When another
+            /// read transaction holds the claim, waits until it releases it (having written the
+            /// memo, failed, or obtained a result that is not written to a memo) and tries again;
+            /// the wait is canceled like the reads of this transaction. The memo is brought up to
+            /// date without the claim when this read transaction already holds it further down
+            /// its stack (while verifying the memo), and when waiting would close a cycle of read
+            /// transactions waiting for each other: the queries then form a cycle across their
+            /// stacks, and computing the memo on this stack handles that cycle the same way as in
+            /// a single read transaction. `held` records the claim taken; `endClaim` releases it.
+            fn claim(ctx: *Ctx, comptime Q: type, index: u32, need_value: bool, held: *Claim) Error!Claimed(Q) {
+                const db = ctx.db;
+                const qi = comptime queryIndex(Q);
+                const table = &db.tables[qi];
+                while (true) {
+                    // Read before checking the claim: a release after the check advances it, so
+                    // the wait below does not miss the release
+                    const epoch = db.wake_epoch.load(.seq_cst);
+                    table.mutex.lockUncancelable(db.io);
+                    const slot = &table.slots.items[index];
+                    const memo = slot.memo;
+                    if (memo) |m| if (upToDate(m, db.revision, need_value)) {
+                        table.mutex.unlock(db.io);
+                        return .{ .ready = freshMemo(Q, m) };
+                    };
+                    const owner = slot.owner orelse ctx;
+                    if (owner == ctx) {
+                        held.owned = slot.owner == null;
+                        slot.owner = ctx;
+                        table.mutex.unlock(db.io);
+                        return .{ .stale = memo };
+                    }
+                    slot.waited = true;
+                    table.mutex.unlock(db.io);
+                    if (!try ctx.waitFor(.{ .query = qi, .index = index }, epoch)) return .{ .stale = memo };
+                }
+            }
+
+            /// Releases the claim recorded in `held` on the memo of `slot`; the caller holds the
+            /// table's mutex, and the waiters are woken by `endClaim`
+            fn releaseLocked(ctx: *Ctx, slot: anytype, held: *Claim) void {
+                if (!held.owned) return;
+                assert(slot.owner == ctx);
+                held.* = .{ .wake = slot.waited };
+                slot.owner = null;
+                slot.waited = false;
+            }
+
+            /// Releases the claim recorded in `held` if it is still held, and wakes the read
+            /// transactions waiting for it
+            fn endClaim(ctx: *Ctx, comptime Q: type, index: u32, held: *Claim) void {
+                const db = ctx.db;
+                if (held.owned) {
+                    const table = &db.tables[comptime queryIndex(Q)];
+                    table.mutex.lockUncancelable(db.io);
+                    ctx.releaseLocked(&table.slots.items[index], held);
+                    table.mutex.unlock(db.io);
+                }
+                if (held.wake) db.wakeWaiters();
+            }
+
+            /// How long a wait for a claimed memo sleeps at most before checking the cancellation
+            /// flag of the request, which wakes no one when set
+            const wait_poll: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+
+            /// Waits for the memo `dep`, claimed by another read transaction, to be released
+            /// (`epoch` is the value of `Db.wake_epoch` read before the claim was seen), for a
+            /// write transaction to register, or for `wait_poll`; then checks for cancellation.
+            /// Returns false without waiting when the wait would close a cycle of read
+            /// transactions waiting for each other.
+            fn waitFor(ctx: *Ctx, dep: DepKey, epoch: u32) Error!bool {
+                const db = ctx.db;
+                {
+                    db.wait_mutex.lockUncancelable(db.io);
+                    defer db.wait_mutex.unlock(db.io);
+                    if (ctx.closesCycle(dep)) return false;
+                    ctx.waiting_for = dep;
+                }
+                defer {
+                    db.wait_mutex.lockUncancelable(db.io);
+                    ctx.waiting_for = null;
+                    db.wait_mutex.unlock(db.io);
+                }
+                _ = db.waiting.fetchAdd(1, .seq_cst);
+                defer _ = db.waiting.fetchSub(1, .monotonic);
+                // Checked after counting this wait: a write transaction that registers later
+                // wakes it (see `beginWriteOf`)
+                try ctx.checkCanceled();
+                // The wait is not an `Io` cancelation point: the request's cancellation reaches
+                // the queries through `checkCanceled`, which also covers the result of a compute
+                // that swallowed `error.Canceled`
+                const protection = db.io.swapCancelProtection(.blocked);
+                defer _ = db.io.swapCancelProtection(protection);
+                db.io.futexWaitTimeout(u32, &db.wake_epoch.raw, epoch, wait_poll) catch |err| switch (err) {
+                    error.Canceled => unreachable,
+                };
+                try ctx.checkCanceled();
+                return true;
+            }
+
+            /// Whether waiting for `dep` would close a cycle of read transactions waiting for each
+            /// other: follows the owner of each claim to the memo it waits for. The caller holds
+            /// `wait_mutex`, so no read transaction starts or stops waiting meanwhile, and a read
+            /// transaction that waits takes no claim: the waits form no cycle, and a new one can
+            /// only be closed by this wait.
+            fn closesCycle(ctx: *Ctx, dep: DepKey) bool {
+                const db = ctx.db;
+                var next = dep;
+                while (true) {
+                    const owner_waits: ?DepKey = inline for (queries, 0..) |Q, qi| {
+                        if (comptime Q.kind == .derived) if (next.query == qi) {
+                            const table = &db.tables[qi];
+                            table.mutex.lockUncancelable(db.io);
+                            defer table.mutex.unlock(db.io);
+                            // The owner stays in its read transaction while it holds the claim
+                            const owner = table.slots.items[next.index].owner orelse return false;
+                            if (owner == ctx) return true;
+                            break owner.waiting_for;
+                        };
+                    } else unreachable;
+                    next = owner_waits orelse return false;
+                }
             }
 
             fn unverifiableDepth(ctx: *const Ctx, dep: DepKey) ?u32 {
@@ -1290,8 +1480,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             /// `restore`: the memo's value was evicted but its dependencies are unchanged, so the
-            /// recomputation only restores the value and keeps the original changed_at
-            fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, restore: bool) Error!Fresh(Q) {
+            /// recomputation only restores the value and keeps the original changed_at. `held`:
+            /// the claim on the memo (see `claim`), released when the result is published.
+            fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, restore: bool, held: *Claim) Error!Fresh(Q) {
                 const db = ctx.db;
                 const qi = comptime queryIndex(Q);
                 _ = db.counters[qi].executions.fetchAdd(1, .monotonic);
@@ -1340,8 +1531,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
 
                 const slot = &table.slots.items[index];
-                // A concurrent reader already published a result in this revision and it wins; the
-                // new value was never published, so free it directly
+                // The waiters see the slot only after the mutex is released, with the result
+                // written to the memo or not to be written
+                ctx.releaseLocked(slot, held);
+                // Another read transaction computing it at the same time (one of the two without
+                // the claim, see `claim`) already published a result in this revision and it wins;
+                // the new value was never published, so free it directly
                 if (slot.memo) |old| if (old.verified_at == db.revision and !old.evicted) {
                     frame.deps.deinit(db.gpa);
                     deinitValue(Q, &value, db.gpa);
