@@ -413,8 +413,10 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 return .{ .items = out.items.items, .context = .init_field };
             }
         }
-        const mode: DeclLiterals = if (a.literalTagsOnly(e)) .none else if (tryOperand(b, e)) .@"try" else .value;
-        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, mode, file);
+        const want = a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a };
+        const operand = literalOperand(b, e);
+        const mode: DeclLiterals = if (a.literalTagsOnly(e)) .none else if (isTryOperand(b, operand)) .@"try" else .value;
+        try expectedMembers(r, &out, if (mode == .value) try literalResultType(r, a, operand, want) else want, mode, file);
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
 
@@ -775,23 +777,28 @@ const DeclLiterals = enum {
     /// Declarations that can serve as decl literals (see `producesType`)
     value,
     /// The operand of `try` (`try .|`, `try .f|()`): only functions returning an error union whose
-    /// payload is the type (see `producesType`); tags are not error unions
+    /// payload coerces to the type (see `producesType`); tags are not error unions
     @"try",
 };
 
-/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and the
-/// declarations selected by `decl_literals`
+/// After `.`: enum members and union fields of the expected type, and the declarations selected
+/// by `decl_literals`. As in the compiler, the members are looked up in the expected type with
+/// error unions, optionals and single-item pointers stripped (`fn f() !Color { return .red; }`),
+/// and must coerce to the expected type itself: a tag does not coerce to a pointer
 fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: DeclLiterals, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
-    // Matching the compiler, strip error unions and optionals from the result type
-    // (`fn f() !Color { return .red; }`)
     var t = ty;
+    var through_ptr = false;
     while (true) t = switch (ip.key(t)) {
         .error_union_type => |eu| eu.payload,
         .optional_type => |c| c,
+        .ptr_type => |p| if (p.size == .one) blk: {
+            through_ptr = true;
+            break :blk p.child;
+        } else break,
         else => break,
     };
-    const tags = decl_literals != .@"try";
+    const tags = decl_literals != .@"try" and !through_ptr;
     switch (ip.key(t)) {
         // Constructed types have no declarations: the members of a constructed enum, and the tags
         // of a tagged constructed union that coerce to it (see `onePossibleValue`)
@@ -829,7 +836,7 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
             .@"const", .@"fn" => {
                 if (decl_literals == .none or (ns.file != from and !it.flags.is_pub)) continue;
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
-                if (!producesType(ip, decl_ty, t, it.kind == .@"fn", decl_literals == .@"try")) continue;
+                if (!producesType(ip, decl_ty, ty, it.kind == .@"fn", decl_literals == .@"try")) continue;
                 const is_fn = it.kind == .@"fn";
                 try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
             },
@@ -838,21 +845,63 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
     }
 }
 
-/// Whether a declaration can serve as a decl literal of type `t`: a constant of type `t`, or a
-/// function returning `t` or `!t`; for the operand of `try` (`in_try`), only a function returning
-/// `!t`. An unknown type counts as yes
-fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool, in_try: bool) bool {
-    if (!is_fn) return !in_try and (decl_ty == .unknown or decl_ty == t);
+/// Whether a declaration of type `decl_ty` can serve as a decl literal with the result type `want`
+/// (as in the compiler, its value, or the result of calling it, is coerced to `want`; see
+/// `declCoerces`): a constant whose type coerces, or a function whose return type does; for the
+/// operand of `try` (`in_try`), only a function returning an error union whose payload coerces.
+/// Unknown types count as yes
+fn producesType(ip: *InternPool, decl_ty: Index, want: Index, is_fn: bool, in_try: bool) bool {
+    if (!is_fn) return !in_try and declCoerces(ip, want, decl_ty);
     if (decl_ty == .unknown) return true;
     const ret = switch (ip.key(decl_ty)) {
         .fn_type => |f| f.ret,
         else => return false,
     };
-    if (ret == .unknown or (!in_try and ret == t)) return true;
+    if (ret == .unknown) return true;
+    if (!in_try) return declCoerces(ip, want, ret);
     return switch (ip.key(ret)) {
-        .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
+        .error_union_type => |eu| declCoerces(ip, want, eu.payload),
         else => false,
     };
+}
+
+/// Whether a value of type `have` coerces to `want` (see `coerces`), also an error union to an
+/// error union whose error set contains its errors (see `errorSetCoerces`); an unknown type counts
+/// as yes
+fn declCoerces(ip: *InternPool, want: Index, have: Index) bool {
+    if (have == .unknown or coerces(ip, want, have)) return true;
+    const w = switch (ip.key(want)) {
+        .error_union_type => |eu| eu,
+        else => return false,
+    };
+    const h = switch (ip.key(have)) {
+        .error_union_type => |eu| eu,
+        else => return false,
+    };
+    return errorSetCoerces(ip, w.err, h.err) and declCoerces(ip, w.payload, h.payload);
+}
+
+/// Whether the errors of the error set `have` belong to `want`: `want` is `anyerror` or inferred
+/// (it takes whatever errors are returned), or both are explicit sets and `want` contains every
+/// error of `have`. An inferred or unknown `have` counts as yes
+fn errorSetCoerces(ip: *InternPool, want: Index, have: Index) bool {
+    if (want == .anyerror_type or want == .unknown or have == .unknown) return true;
+    const w = switch (ip.key(want)) {
+        .error_set_type => |names| names,
+        .inferred_error_set => return true,
+        else => return false,
+    };
+    const h = switch (ip.key(have)) {
+        .error_set_type => |names| names,
+        .inferred_error_set => return true,
+        else => return false,
+    };
+    for (h) |name| {
+        for (w) |n| {
+            if (std.mem.eql(u8, n, name)) break;
+        } else return false;
+    }
+    return true;
 }
 
 /// Whether a value of type `ty` has exactly one possible value, so that the tag of a union field
@@ -890,22 +939,38 @@ fn onePossibleValueAt(r: *Resolver, ty: Index, depth: u32) resolve.Error!bool {
     return true;
 }
 
-/// The enum literal `e` is the operand of `try`, directly (`try .f`) or as the callee of the call
-/// that is (`try .f()`)
-fn tryOperand(b: *const Body, e: Body.ExprId) bool {
-    var operand = e;
+/// The expression the enum literal `e` stands for: the call it is the callee of (`.f()`), or `e`
+fn literalOperand(b: *const Body, e: Body.ExprId) Body.ExprId {
     for (b.exprs, 0..) |x, i| switch (x) {
-        .call => |c| if (c.callee == e) {
-            operand = @fromBackingInt(@as(u32, @intCast(i)));
-            break;
-        },
+        .call => |c| if (c.callee == e) return @fromBackingInt(@as(u32, @intCast(i))),
         else => {},
     };
+    return e;
+}
+
+/// `operand` is the operand of `try`
+fn isTryOperand(b: *const Body, operand: Body.ExprId) bool {
     for (b.exprs) |x| switch (x) {
         .prefix => |p| if (p.op == .keyword_try and p.operand == operand) return true,
         else => {},
     };
     return false;
+}
+
+/// The result type of the enum literal standing for `operand` (see `literalOperand`), whose
+/// expected type inference records as `want`: the body of a function with an inferred error set
+/// (`fn f() !T`) records `T` as the result type of `return`, while the compiler coerces the
+/// returned value to `E!T`, which also takes an error union
+fn literalResultType(r: *Resolver, a: context.At, operand: Body.ExprId, want: Index) resolve.Error!Index {
+    const returned = for (a.body.exprs) |x| switch (x) {
+        .@"return" => |v| if (v == operand) break true,
+        else => {},
+    } else false;
+    if (!returned) return want;
+    const it = (try r.itemTree(a.file)).items[a.item];
+    if (it.kind != .@"fn" or !it.flags.inferred_error_set) return want;
+    const set = try a.ip.get(.{ .inferred_error_set = .{ .file = a.owner.file, .decl = a.owner.item } });
+    return a.ip.get(.{ .error_union_type = .{ .err = set, .payload = want } });
 }
 
 /// The function declaration that a function value refers to

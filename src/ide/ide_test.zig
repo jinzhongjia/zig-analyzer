@@ -3038,7 +3038,8 @@ test "completion after `.` lists members of the expected type" {
         .{ "fn f() void { take(.gr<|>); }", "red green default parse" },
         .{ "fn f(e: E) void { switch (e) { .<|> => {}, else => {} } }", "red green default parse" },
         .{ "const c: ?E = .<|>;", "red green default parse" },
-        .{ "const s: S = .<|>;", "empty init" },
+        // `init` returns `!S`, which does not coerce to `S`
+        .{ "const s: S = .<|>;", "empty" },
         .{ "const u: U = .<|>;", "num none" },
         // The result type drops the error union and optional
         .{ "fn f() !E { return .<|>; }", "red green default parse" },
@@ -3233,6 +3234,54 @@ test "completion on the name of an existing initializer field lists the fields" 
         .{ "fn f() void {\n    const local = 5;\n    const s1 = S{ .be<|> = 2 };\n    _ = .{ s1, local };\n}", "alpha beta" },
         .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .a<|>lpha = 1 };\n    _ = .{ s1, local };\n}", "alpha beta" },
         .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .alpha = 1, .b<|> = 2 };\n    _ = .{ s1, local };\n}", "beta" },
+    });
+}
+
+test "decl literal completion keeps the declarations that coerce to the result type" {
+    try expectCompletions(
+        \\const S = struct {
+        \\    a: u32 = 0,
+        \\    pub const init: S = .{};
+        \\    pub const default_ptr: *const S = &init;
+        \\    pub fn tryMake() !S {
+        \\        return .{};
+        \\    }
+        \\    pub fn make() S {
+        \\        return .{};
+        \\    }
+        \\    pub fn ptrMake() *const S {
+        \\        return &init;
+        \\    }
+        \\    pub fn failA() error{A}!S {
+        \\        return error.A;
+        \\    }
+        \\    pub fn failC() error{C}!S {
+        \\        return error.C;
+        \\    }
+        \\};
+        \\const Color = enum {
+        \\    red,
+        \\    green,
+        \\    pub fn maybe(i: u8) ?Color {
+        \\        return if (i == 0) null else .red;
+        \\    }
+        \\    pub const none_c: ?Color = null;
+        \\};
+        \\const E = error{ A, B };
+        \\fn takeSP(s: *const S) void {
+        \\    _ = s;
+        \\}
+        \\
+    , &.{
+        .{ "const s: S = .<|>;", "init make" },
+        .{ "const c: ?Color = .<|>;", "red green maybe none_c" },
+        // A tag does not coerce to a pointer
+        .{ "const c: *const Color = .<|>;", "" },
+        .{ "fn f() void {\n    takeSP(.<|>);\n}", "default_ptr ptrMake" },
+        .{ "fn f() !S {\n    return .<|>;\n}", "init tryMake make failA failC" },
+        // The error set of the result type must contain the errors of an explicit set; an inferred
+        // error set is not known before the function body is analyzed
+        .{ "fn f() E!S {\n    return .<|>;\n}", "init tryMake make failA" },
     });
 }
 
