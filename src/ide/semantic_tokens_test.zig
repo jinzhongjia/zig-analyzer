@@ -37,28 +37,30 @@ fn check(data: []const u32, text: []const u8, enc: offsets.Encoding, cases: []co
         for (0..case.nth) |_| offset = (std.mem.indexOfPos(u8, text, offset, case.needle) orelse return error.MissingNeedle) + 1;
         offset = std.mem.indexOfPos(u8, text, offset, case.needle) orelse return error.MissingNeedle;
         const expected = offsets.offsetToPosition(text, offset, enc);
-        var pos: types.Position = .{ .line = 0, .character = 0 };
-        var found = false;
-        var i: usize = 0;
-        while (i < data.len) : (i += 5) {
-            if (data[i] != 0) pos.character = 0;
-            pos.line += data[i];
-            pos.character += data[i + 1];
-            if (!std.meta.eql(pos, expected)) continue;
-            found = true;
-            testing.expectEqual(@backingInt(case.ty), data[i + 3]) catch |err| {
-                std.debug.print("semantic token `{s}`: expected {t}, got {d}\n", .{ case.needle, case.ty, data[i + 3] });
-                return err;
-            };
-            try testing.expectEqual(case.mods, data[i + 4]);
-            if (case.len) |len| try testing.expectEqual(len, data[i + 2]);
-            break;
-        }
-        if (!found) {
+        const i = tokenAt(data, expected) orelse {
             std.debug.print("missing semantic token `{s}` at {d}:{d}\n", .{ case.needle, expected.line, expected.character });
             return error.MissingSemanticToken;
-        }
+        };
+        testing.expectEqual(@backingInt(case.ty), data[i + 3]) catch |err| {
+            std.debug.print("semantic token `{s}`: expected {t}, got {d}\n", .{ case.needle, case.ty, data[i + 3] });
+            return err;
+        };
+        try testing.expectEqual(case.mods, data[i + 4]);
+        if (case.len) |len| try testing.expectEqual(len, data[i + 2]);
     }
+}
+
+/// Index in `data` of the token that starts at `pos`
+fn tokenAt(data: []const u32, pos: types.Position) ?usize {
+    var at: types.Position = .{ .line = 0, .character = 0 };
+    var i: usize = 0;
+    while (i < data.len) : (i += 5) {
+        if (data[i] != 0) at.character = 0;
+        at.line += data[i];
+        at.character += data[i + 1];
+        if (std.meta.eql(at, pos)) return i;
+    }
+    return null;
 }
 
 test "semantic tokens resolve declarations references aliases and imported members" {
@@ -1324,7 +1326,7 @@ test "semantic tokens mark only compiler builtin functions as default library" {
     }));
     const partial = try tokensWith(&w, file, text, .utf16, null, .{ .partial = true });
     try check(partial, text, .utf16, &unknown);
-    try testing.expectError(error.MissingSemanticToken, check(partial, text, .utf16, &.{.{ .needle = "@sizeOf", .ty = .function, .mods = M.defaultLibrary }}));
+    try testing.expectEqual(null, tokenAt(partial, offsets.offsetToPosition(text, std.mem.indexOf(u8, text, "@sizeOf").?, .utf16)));
 }
 
 test "semantic tokens classify @SpirvType aliases as types" {
