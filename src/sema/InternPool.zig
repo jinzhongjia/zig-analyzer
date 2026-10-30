@@ -491,6 +491,10 @@ pub fn scalarAbi(ip: *const InternPool) *const ScalarAbi {
     return &ip.currentTarget().scalar_abi;
 }
 
+pub fn errorBits(ip: *const InternPool) ?u16 {
+    return ip.currentTarget().error_bits;
+}
+
 /// May only be called in a write transaction
 pub fn setTarget(ip: *InternPool, t: Target) void {
     ip.target = t;
@@ -521,7 +525,18 @@ pub const Target = struct {
     pointer_bits: ?u16 = @bitSizeOf(usize),
     vector_abi: VectorAbi = .unknown,
     scalar_abi: ScalarAbi = .native,
+    /// Bit width of error codes, set by the compilation's error limit (`errorBitsOf`); null when
+    /// the compilations the parameters are common to disagree
+    error_bits: ?u16 = errorBitsOf(null),
 };
+
+/// Bit width of error codes for the error limit of a compilation (`--error-limit`, the compiler's
+/// default when null): enough bits for the largest error value, as the compiler's
+/// `Zcu.errorSetBits`
+pub fn errorBitsOf(error_limit: ?u32) u16 {
+    const limit: u32 = error_limit orelse std.math.maxInt(u16);
+    return 32 - @clz(limit);
+}
 
 /// Layouts of integer, float and C types, and the bit widths and signedness of C integer types
 /// (the corresponding branches of the compiler's `Type.abiAlignment` / `abiSize` / `intInfo`),

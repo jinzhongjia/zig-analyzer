@@ -476,9 +476,9 @@ pub const Layout = struct {
     bits: ?u64,
 };
 
-/// Error codes: the integer layout of u16
+/// Error codes: the integer layout of their bit width (set by the error limit)
 fn errorLayout(ip: *InternPool) ?Layout {
-    return intLayout(ip, 16);
+    return intLayout(ip, ip.errorBits() orelse return null);
 }
 
 /// Size, alignment and bit width of a type (`@sizeOf` / `@alignOf` / `@bitSizeOf`) by the rules

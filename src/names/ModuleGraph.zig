@@ -73,6 +73,8 @@ pub const Compile = struct {
     builtin: ?FileId = null,
     /// builtin.zig of each module in the compilation (by index into `modules`)
     modules: []const ModuleBuiltin = &.{},
+    /// `--error-limit` of the compilation (the bit width of error codes); null for the default
+    error_limit: ?u32 = null,
 };
 
 pub const ModuleBuiltin = struct {
@@ -124,12 +126,13 @@ pub const Builder = struct {
         module: u32,
     };
 
-    /// The identity of a compilation: compilations with the same root, standard library and
-    /// builtin (hence target) analyze every file alike
+    /// The identity of a compilation: compilations with the same root, standard library,
+    /// builtin (hence target) and error limit analyze every file alike
     const CompileKey = struct {
         root: ?FileId,
         std_root: ?FileId,
         builtin: ?FileId,
+        error_limit: ?u32 = null,
     };
 
     pub fn init(gpa: Allocator, vfs: *Vfs) Builder {
@@ -201,6 +204,7 @@ pub const Builder = struct {
             .root = if (root) |p| try b.vfs.intern(p) else null,
             .builtin = try b.builtinFile(model, step, c.root_module),
             .std_root = try b.vfs.intern(model.stdRootOf(step)),
+            .error_limit = c.error_limit,
         });
         if (!gop.found_existing) {
             const modules = try b.arena.allocator().alloc(ModuleBuiltin, c.modules.len);
@@ -244,7 +248,7 @@ pub const Builder = struct {
         const none = try b.compiles.getOrPut(b.gpa, .{ .root = null, .std_root = std_root, .builtin = default_builtin });
         if (!none.found_existing) none.value_ptr.* = &.{};
         const compiles = try a.alloc(Compile, b.compiles.count());
-        for (compiles, b.compiles.keys(), b.compiles.values()) |*c, k, modules| c.* = .{ .root = k.root, .std_root = k.std_root, .builtin = k.builtin, .modules = modules };
+        for (compiles, b.compiles.keys(), b.compiles.values()) |*c, k, modules| c.* = .{ .root = k.root, .std_root = k.std_root, .builtin = k.builtin, .modules = modules, .error_limit = k.error_limit };
         b.files.deinit(b.gpa);
         b.others.deinit(b.gpa);
         b.compiles.deinit(b.gpa);

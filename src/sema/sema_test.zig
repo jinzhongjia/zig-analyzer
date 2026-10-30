@@ -1168,6 +1168,48 @@ test "oversized layouts degrade to unknown instead of overflowing" {
     });
 }
 
+test "error code layouts follow the error limit" {
+    // Prevents assuming 16-bit error codes when the compilation sets an error limit; expected
+    // values are the results of zig 0.17.0 with `--error-limit 255`
+    var target = try targetOf("x86_64-linux-musl", null);
+    target.error_bits = 8;
+    try expectTypesTargeted(target,
+        \\const Slot = struct { r: anyerror!u8, tag: u8 };
+        \\const E = error{ A, B };
+        \\const size_anyerror = @sizeOf(anyerror);
+        \\const bits_anyerror = @bitSizeOf(anyerror);
+        \\const align_anyerror = @alignOf(anyerror);
+        \\const size_eu_u8 = @sizeOf(anyerror!u8);
+        \\const size_eu_u32 = @sizeOf(anyerror!u32);
+        \\const size_slot = @sizeOf(Slot);
+        \\const size_set = @sizeOf(E);
+        \\const size_opt = @sizeOf(?anyerror);
+        \\fn code(e: anyerror) void {
+        \\    const int = @intFromError(e);
+        \\    _ = int;
+        \\}
+    , &.{
+        .{ "size_anyerror", "comptime_int = 1" },
+        .{ "bits_anyerror", "comptime_int = 8" },
+        .{ "align_anyerror", "comptime_int = 1" },
+        .{ "size_eu_u8", "comptime_int = 2" },
+        .{ "size_eu_u32", "comptime_int = 8" },
+        .{ "size_slot", "comptime_int = 3" },
+        .{ "size_set", "comptime_int = 1" },
+        .{ "size_opt", "comptime_int = 1" },
+        .{ "int", "u8" },
+    });
+    // Error limits that differ between the compilations sharing the parameters
+    target.error_bits = null;
+    try expectTypesTargeted(target,
+        \\const size_anyerror = @sizeOf(anyerror);
+        \\const size_eu_u8 = @sizeOf(anyerror!u8);
+    , &.{
+        .{ "size_anyerror", "comptime_int" },
+        .{ "size_eu_u8", "comptime_int" },
+    });
+}
+
 test "container layouts match the compiler" {
     // Expected values are the results of zig 0.17.0 on x86_64-linux
     try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),

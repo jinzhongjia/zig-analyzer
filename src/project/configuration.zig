@@ -456,6 +456,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
             const lib_dir = if (comp.zig_lib_dir.value) |lp| try ctx.resolve(lp.get(c)) else null;
             if (lib_dir) |dir| dst.kind.compile.std_root = try std.fs.path.join(a, &.{ dir, "std", "std.zig" });
             if (comp.flags3.kind.isTest()) dst.kind.compile.root = try ctx.testRunner(&comp, lib_dir orelse env.lib_dir);
+            dst.kind.compile.error_limit = comp.error_limit.value;
         },
         else => {},
     };

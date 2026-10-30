@@ -1746,9 +1746,8 @@ const Inferrer = struct {
             const len = std.math.cast(u32, n orelse return .unknown) orelse return .unknown;
             return .{ .ty = try ip.get(.{ .vector_type = .{ .len = len, .child = t } }) };
         }
-        // Integer value of an error: the bit width depends on the maximum number of errors
-        // (u16 by default in the compiler)
-        if (eq(u8, name, "@intFromError")) return .{ .ty = try ip.intType(.unsigned, 16) };
+        // Integer value of an error: as wide as the error codes, which the error limit sets
+        if (eq(u8, name, "@intFromError")) return .{ .ty = try ip.intType(.unsigned, ip.errorBits() orelse return .unknown) };
         if (eq(u8, name, "@errorReturnTrace")) {
             const trace = try inf.stdType(&.{ "builtin", "StackTrace" }) orelse return .unknown;
             return .{ .ty = try ip.optionalOf(try ip.ptrTo(trace, .one, false)) };

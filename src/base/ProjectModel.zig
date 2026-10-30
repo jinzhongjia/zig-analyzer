@@ -68,6 +68,8 @@ pub const Compile = struct {
     /// The `builtin.zig` of each module in this compilation, in the order the compiler creates
     /// them (the root module first)
     modules: []const CompileModule = &.{},
+    /// The compile step's `error_limit` (`--error-limit`); null for the compiler's default
+    error_limit: ?u32 = null,
 
     pub const Root = union(enum) {
         module,
@@ -291,6 +293,7 @@ pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectMo
                         .test_runner => |p| .{ .test_runner = try a.dupe(u8, p) },
                     },
                     .modules = compile_modules,
+                    .error_limit = c.error_limit,
                 } },
                 .deps = &.{},
             });

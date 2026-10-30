@@ -952,9 +952,18 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
         if (result.vector_abi != t.vector_abi) result.vector_abi = .unknown;
         result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
-    if (seen.count() != 0) return result;
-    if (graph.default_builtin) |f| return server.builtinTarget(f);
-    return .{};
+    if (seen.count() == 0) result = if (graph.default_builtin) |f| try server.builtinTarget(f) else .{};
+    // The error limit is set per compile step (the compilation of files outside every compile
+    // step uses the default)
+    var bits: ?u16 = null;
+    var agree = true;
+    for (graph.compiles, 0..) |c, i| {
+        if (graph.none) |n| if (i == n) continue;
+        const b = za.sema.InternPool.errorBitsOf(c.error_limit);
+        if (bits) |x| agree = agree and x == b else bits = b;
+    }
+    result.error_bits = if (agree) bits orelse za.sema.InternPool.errorBitsOf(null) else null;
+    return result;
 }
 
 /// Target parameters of a builtin.zig; when it cannot be read, the ones last parsed from it (see
@@ -1021,10 +1030,13 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
     const t = try server.targetAbi(graph);
     // Each compilation uses the target of its builtin (the root module's); when that is unknown,
-    // the parameters common to all compilations
+    // the parameters common to all compilations. The error limit is the compilation's own.
     const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
     defer server.gpa.free(targets);
-    for (graph.compiles, targets) |c, *ct| ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
+    for (graph.compiles, targets) |c, *ct| {
+        ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
+        ct.error_bits = za.sema.InternPool.errorBitsOf(c.error_limit);
+    }
     // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
     // and requests (the requests fail with ContentModified)
