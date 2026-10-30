@@ -21,6 +21,7 @@ const queries = @import("../sema/queries.zig");
 const context = @import("context.zig");
 const seed = @import("../ide_db/seed.zig");
 const symbol_kind = @import("../ide_db/symbol_kind.zig");
+const builtins = @import("builtins.zig");
 const OwnerKey = database.hir.OwnerKey;
 
 pub const TokenType = enum(u32) {
@@ -521,7 +522,8 @@ fn syntaxClass(token: tree.SyntaxToken, parent: SyntaxNode, in_enum: bool, zon: 
         .doc_comment, .container_doc_comment => return .{ .type = .comment, .mods = Modifier.documentation },
         .string_literal, .char_literal, .multiline_string_literal_line => return .{ .type = .string },
         .number_literal => return .{ .type = .number },
-        .builtin => return .{ .type = .function, .mods = Modifier.defaultLibrary },
+        // Only the builtin functions of the compiler are part of the default library
+        .builtin => return .{ .type = .function, .mods = if (builtins.get(token.text) != null) Modifier.defaultLibrary else 0 },
         .identifier => {
             if (std.mem.eql(u8, token.text, "_")) return null;
             return switch (parent.kind()) {

@@ -1303,3 +1303,27 @@ test "semantic tokens classify files with fields as structs and their receiver f
         .{ .needle = "make(", .ty = .function, .mods = M.declaration },
     });
 }
+
+test "semantic tokens mark only compiler builtin functions as default library" {
+    // Unknown `@name` tokens are not highlighted as valid builtins
+    const text =
+        \\const c = @cImport(@cInclude("stdio.h"));
+        \\const d = @notABuiltin();
+        \\const e = @sizeOf(u8);
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const unknown = [_]Case{
+        .{ .needle = "@cImport", .ty = .function },
+        .{ .needle = "@cInclude", .ty = .function },
+        .{ .needle = "@notABuiltin", .ty = .function },
+    };
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &(unknown ++ [_]Case{
+        .{ .needle = "@sizeOf", .ty = .function, .mods = M.defaultLibrary },
+    }));
+    const partial = try tokensWith(&w, file, text, .utf16, null, .{ .partial = true });
+    try check(partial, text, .utf16, &unknown);
+    try testing.expectError(error.MissingSemanticToken, check(partial, text, .utf16, &.{.{ .needle = "@sizeOf", .ty = .function, .mods = M.defaultLibrary }}));
+}
