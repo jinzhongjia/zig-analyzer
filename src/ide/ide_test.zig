@@ -3180,6 +3180,50 @@ test "completion of reified union tags and of @Struct and @Union initializer fie
     try testing.expectEqualStrings("north south", labels);
 }
 
+/// The completion items at the cursor of `text` (a `.zig` file) as `label@start-end:filter`
+/// joined by spaces, with the replace range relative to the cursor
+fn completionEdits(text: []const u8) ![]const u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| {
+        if (out.items.len != 0) try out.append(testing.allocator, ' ');
+        try out.print(testing.allocator, "{s}", .{it.label});
+        if (it.replace) |range| try out.print(testing.allocator, "@{d}-{d}", .{ @as(i64, range.start) - at.cursor, @as(i64, range.end) - at.cursor });
+        if (it.filter) |f| try out.print(testing.allocator, ":{s}", .{f});
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "completion inside a quoted identifier offers the candidates of a plain prefix" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f() void {\n    const @\"my var\": u32 = 1;\n    _ = @\"my v<|>\";\n}\n", "@\"my var\"@-6-1:@\"my var\" f@-6-1:@\"f\"" },
+        // Unterminated: the text after the cursor is kept
+        .{ "fn f() void {\n    const @\"my var\": u32 = 1;\n    _ = @\"my v<|>\n}\n", "@\"my var\"@-6-0:@\"my var\" f@-6-0:@\"f\"" },
+        .{ "fn f(@\"align\": u32) u32 {\n    return @\"al<|>\";\n}\n", "@\"align\"@-4-1:@\"align\" f@-4-1:@\"f\"" },
+        .{ "const S = struct { @\"error\": u8 = 0, other: u8 = 0 };\nfn f(s: S) void {\n    _ = s.@\"er<|>\";\n}\n", "@\"error\"@-4-1:@\"error\" other@-4-1:@\"other\"" },
+        .{ "const S = struct { @\"error\": u8 = 0, other: u8 = 0 };\nfn f(s: S) void {\n    _ = s.@\"er<|>\n}\n", "@\"error\"@-4-0:@\"error\" other@-4-0:@\"other\"" },
+        .{ "const K = enum { @\"struct\", @\"enum\" };\nfn f(k: K) void {\n    switch (k) {\n        .@\"st<|>\" => {},\n        else => {},\n    }\n}\n", "@\"struct\"@-4-1:@\"struct\" @\"enum\"@-4-1:@\"enum\"" },
+        // No builtins in a name, and no candidates for a declaration name
+        .{ "fn f() void {\n    _ = @\"@si<|>zeOf\";\n}\n", "f@-5-5:@\"f\"" },
+        .{ "fn f() void {\n    const @\"my v<|>\" = 1;\n}\n", "" },
+    };
+    for (cases, 0..) |c, i| {
+        const got = try completionEdits(c[0]);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;
@@ -7104,7 +7148,9 @@ test "auto import unclosed escaped recovery preserves non-reference contexts and
         const result = try completion.complete(&r, cursor.file, cursor.offset, .{});
         for (result.items) |item| {
             try testing.expect(item.import_edit == null);
-            try testing.expect(item.filter == null);
+            // Only the names in scope at a quoted reference (`value` itself) are filtered by their
+            // quoted spelling
+            try testing.expect(item.filter == null or std.mem.eql(u8, item.label, "value"));
         }
     }
 }

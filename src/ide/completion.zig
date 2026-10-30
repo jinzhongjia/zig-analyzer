@@ -333,6 +333,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
 
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return .{ .context = .ignored };
+    if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
     if (literal == .none and !paths_only) if (builtinStart(text, offset)) |start| {
@@ -1522,9 +1523,10 @@ fn identEnd(text: []const u8, offset: u32) u32 {
     return i;
 }
 
-/// Whether the cursor is in a comment, or inside a string or character literal (judged by the
-/// token containing the character before the cursor)
-fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum { none, comment, string } {
+/// Whether the cursor is in a comment, inside a string or character literal, or inside a quoted
+/// identifier (`@"..."`, also unterminated), judged by the token containing the character before
+/// the cursor
+fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum { none, comment, string, quoted } {
     if (offset == 0) return .none;
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const t = root.tokenAtOffset(offset - 1) orelse return .none;
@@ -1532,12 +1534,37 @@ fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum {
         .line_comment, .doc_comment, .container_doc_comment => .comment,
         // A cursor after the closing quote is already outside the literal
         .string_literal, .char_literal => if (offset < t.offset + t.text.len) .string else .none,
-        .identifier => if (std.mem.startsWith(u8, t.text, "@\"") and offset < t.offset + t.text.len) .string else .none,
+        .identifier => if (std.mem.startsWith(u8, t.text, "@\"") and offset < t.offset + t.text.len) .quoted else .none,
         .multiline_string_literal_line => .string,
-        // Unterminated string
-        .invalid => if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'' or std.mem.startsWith(u8, t.text, "@\""))) .string else .none,
+        // Unterminated string or quoted identifier
+        .invalid => if (std.mem.startsWith(u8, t.text, "@\"")) .quoted else if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'')) .string else .none,
         else => .none,
     };
+}
+
+/// Inside a quoted identifier (`@"my v|"`, also unterminated) at a reference (a name, the member
+/// name of a field access, an enum literal): the candidates at the same position with no name
+/// typed yet (the client filters them), replacing the quoted text (up to the closing quote when
+/// there is one) and filtered by their quoted spellings. No candidates at other names
+/// (declarations, labels, and so on), and no builtins: `@"@sizeOf"` is a name
+fn quotedName(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const tok = root.tokenAtOffset(offset - 1) orelse return .{ .context = .ignored };
+    switch (tokenParent(root, tok.offset)) {
+        .name_ref, .field_access, .enum_literal => {},
+        else => return .{ .context = .ignored },
+    }
+    var visible = try completeVisible(r, file, tok.offset, cursor_owner, false);
+    const end: u32 = if (tok.kind == .identifier) @intCast(tok.offset + tok.text.len) else offset;
+    const items = try r.arena.dupe(Item, visible.items);
+    for (items) |*it| {
+        it.replace = .{ .start = tok.offset, .end = end };
+        it.filter = if (std.mem.startsWith(u8, it.label, "@\"")) it.label else try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
+    }
+    visible.items = items;
+    // The expression at the cursor is the quoted name itself
+    if (visible.at) |*a| a.rel = offset - a.node.offset;
+    return visible;
 }
 
 /// Error names after `error.`: when the expected type is an error set (or error union), lists its
