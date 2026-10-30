@@ -675,3 +675,32 @@ test "poisoned build graphs are not left in the local cache" {
     while (try it.next(testing.io)) |entry| try left.append(a, try a.dupe(u8, entry.name));
     try testing.expectEqualSlices([]const u8, &.{}, left.items);
 }
+
+test "a zig env that fails at startup is shown to the user" {
+    // Without the zig environment there is no standard library, no named modules, and no compiler
+    // diagnostics: a zig.path typo or no zig in a GUI editor's PATH must not go unnoticed
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = options_build },
+        .{ .path = "src/main.zig", .text = options_main },
+    });
+    defer project.deinit();
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "failing-zig", .data = "#!/bin/sh\nexit 1\n", .flags = .{ .permissions = .executable_file } });
+    for ([_][]const u8{ "no-such-zig", "failing-zig" }, [_][]const u8{ "ZigNotFound", "ZigEnvFailed" }) |exe, cause| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const options = try std.fmt.allocPrint(a, "{{\"zig\": {{\"path\": \"{s}/{s}\"}}}}", .{ project.root, exe });
+        _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{}, .initializationOptions = try std.json.parseFromSliceLeaky(std.json.Value, a, options, .{}) });
+        try h.notify("initialized", Empty{});
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const shown = try h.notifications("window/showMessage");
+        try testing.expectEqual(1, shown.len);
+        const params = shown[0].object.get("params").?.object;
+        try testing.expectEqual(2, params.get("type").?.integer);
+        try testing.expect(std.mem.indexOf(u8, params.get("message").?.string, cause) != null);
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}

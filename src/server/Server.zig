@@ -2376,10 +2376,12 @@ fn startup(server: *Server) Io.Cancelable!void {
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
-        // `zig build test` deliberately cannot find zig (see `ZigEnv.query`); warn writes to
-        // stderr, which would make the build output show a misleading `failed command`
-        if (!(@import("builtin").is_test and err == error.ZigNotFound))
-            log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
+        if (err == error.Canceled) return error.Canceled;
+        // `zig build test` deliberately cannot find zig (see `ZigEnv.query`)
+        if (@import("builtin").is_test and !@import("build_options").zig_tests) return;
+        const message = std.fmt.allocPrint(server.gpa, "cannot run {s} env ({t}): the standard library, named modules, and compiler diagnostics are unavailable; set zig.path to the zig executable", .{ config.zig_path orelse "zig", err }) catch null;
+        defer if (message) |m| server.gpa.free(m);
+        server.showWarning(message orelse "cannot run zig env: the standard library, named modules, and compiler diagnostics are unavailable; set zig.path to the zig executable");
         return;
     };
     const detected = server.ownEnv(queried) catch return log.err("out of memory while storing the zig environment", .{});
