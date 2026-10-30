@@ -433,6 +433,21 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.evictLocked();
         }
 
+        /// Begins a write transaction only when no read transaction is in progress, without
+        /// canceling or waiting for any (`beginWrite` would cancel the in-flight reads, and a write
+        /// queued for the lock would block all later read transactions until the slowest read
+        /// transaction finishes, since the rw lock prefers writers). For writes that set no input,
+        /// such as reclaiming caches: they invalidate no result, so they must not cost readers
+        /// their work. Returns false when the lock cannot be taken.
+        pub fn tryBeginWrite(db: *Db) bool {
+            if (!db.rw.tryLock(db.io)) return false;
+            db.writing = true;
+            db.bumped_in_write = false;
+            db.collectGarbage();
+            db.evictLocked();
+            return true;
+        }
+
         /// Whether any query exceeds its `lru` capacity (the caller may call `trySweep` when idle)
         pub fn wantsSweep(db: *Db) bool {
             return db.sweep_wanted.load(.monotonic);
@@ -460,15 +475,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         }
 
         /// Evicts memo values beyond the `lru` capacity. Runs only when there is no read
-        /// transaction: the rw lock prefers writers, so a sweep queued for the lock would block
-        /// all later read transactions until the slowest read transaction finishes. Returns false
-        /// when the lock cannot be taken, leaving the work to the next write transaction or the
-        /// next sweep.
+        /// transaction (see `tryBeginWrite`). Returns false when the lock cannot be taken, leaving
+        /// the work to the next write transaction or the next sweep.
         pub fn trySweep(db: *Db) bool {
-            if (!db.rw.tryLock(db.io)) return false;
-            defer db.rw.unlock(db.io);
-            db.collectGarbage();
-            db.evictLocked();
+            if (!db.tryBeginWrite()) return false;
+            db.endWrite();
             return true;
         }
 

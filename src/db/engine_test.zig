@@ -954,6 +954,20 @@ test "cancellation: result of a compute that swallowed Canceled is not memoized"
     try testing.expectEqual(before + 1, executions(&d, Swallow));
 }
 
+test "tryBeginWrite neither cancels nor waits for read transactions" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    var ctx = d.beginRead(testing.allocator);
+    try testing.expect(!d.tryBeginWrite());
+    try testing.expectEqual(1, try ctx.get(Plus, 1));
+    ctx.end();
+    try testing.expect(d.tryBeginWrite());
+    d.resetQueries(&.{Plus});
+    d.endWrite();
+    try testing.expectEqual(1, try read(&d, Plus, 1));
+}
+
 test "resetQueries: cleared keys and dependent memos are recomputed" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

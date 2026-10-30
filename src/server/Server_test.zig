@@ -661,10 +661,75 @@ test "resetting type information gives the same hover results" {
     try testing.expect(std.mem.indexOf(u8, contents, "[]u8") != null);
 
     const items = h.server.ip.count();
-    h.server.resetSema();
+    // The reclaim waits until the task of the hover request has ended its read transaction
+    while (!h.server.resetSema()) std.Thread.yield() catch {};
     try testing.expect(h.server.ip.count() < items);
     const after = try h.request("textDocument/hover", at);
     try testing.expectEqualStrings(contents, after.object.get("result").?.object.get("contents").?.object.get("value").?.string);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// Whether the read or semantic request with this id is in flight (its task has not finished)
+fn inFlight(server: *Server, id: i64) bool {
+    server.pending_mutex.lockUncancelable(testing.io);
+    defer server.pending_mutex.unlock(testing.io);
+    for (server.pending.items) |p| if (p.id == .integer and p.id.integer == id) return true;
+    return false;
+}
+
+test "reclaiming type information does not cancel in-flight requests and runs once they finish" {
+    // Guards against the reclaim at the end of one request canceling the other requests in flight
+    // (answered with ContentModified), which also starved requests whose own inference exceeded
+    // the limit
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .sema = .{ .max_intern_pool_mb = 1 } } });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-3";
+    const text =
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\const L = List(u8);
+        \\pub fn main() void {
+        \\    const l: L = undefined;
+        \\    _ = l.items;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const doc = .{ .textDocument = .{ .uri = uri } };
+    const expected = (try h.request("textDocument/semanticTokens/full", doc)).object.get("result").?.object.get("data").?.array.items;
+
+    var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const held = try h.send("textDocument/semanticTokens/full", doc);
+    try gate.entered.wait(testing.io);
+    // Push the InternPool over the limit while the request holds its read transaction
+    var bits: u16 = 1;
+    while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
+    const items = h.server.ip.count();
+    // Another request finishes in the meantime and checks whether to reclaim
+    const other = try h.send("textDocument/documentSymbol", doc);
+    _ = try h.response(other);
+    while (inFlight(&h.server, other) and h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(0, h.server.db.pending_write.load(.acquire));
+
+    gate.release.set(testing.io);
+    const tokens = try h.response(held);
+    try testing.expect(tokens.object.get("error") == null);
+    try testing.expectEqualDeep(expected, tokens.object.get("result").?.object.get("data").?.array.items);
+    // No read transaction is left once the held request finishes: it reclaims
+    while (inFlight(&h.server, held)) std.Thread.yield() catch {};
+    try testing.expect(h.server.ip.count() < items);
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

@@ -59,6 +59,9 @@ encoding: offsets.Encoding = .utf16,
 group: Io.Group = .init,
 pending_mutex: Io.Mutex = .init,
 pending: std.ArrayList(*Pending) = .empty,
+/// Test hook: holds the read and semantic requests of one method at a point of their execution
+/// (see `TestGate`); always null outside tests
+test_gate: ?*TestGate = null,
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
@@ -145,8 +148,6 @@ slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
 /// generation (0 disables reclaiming); from the config option `sema.max_intern_pool_mb`
 max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
-/// Whether a thread is performing whole-generation reclamation (only one at a time)
-sema_resetting: std.atomic.Value(bool) = .init(false),
 /// Debounce (ms) of diagnostic publishing triggered by edits, from the config option
 /// `diagnostics.debounce_ms`
 debounce_ms: std.atomic.Value(u32) = .init(50),
@@ -296,6 +297,30 @@ const SingleFile = struct {
 const Pending = struct {
     id: jsonrpc.Id,
     cancel: std.atomic.Value(bool) = .init(false),
+};
+
+/// Test hook: a read or semantic request of `method` stops at `point` until `release` is set or
+/// the request is canceled, so that a test can place other messages and server work at a known
+/// point of its execution
+pub const TestGate = struct {
+    method: []const u8,
+    point: enum {
+        /// Before the read transaction begins
+        before_read,
+        /// In the read transaction, before the handler runs
+        in_read,
+    },
+    /// Set when a request reaches the gate
+    entered: Io.Event = .unset,
+    release: Io.Event = .unset,
+
+    fn pass(gate: *TestGate, io: Io, pending: *const Pending) void {
+        gate.entered.set(io);
+        while (!pending.cancel.load(.acquire)) {
+            gate.release.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch continue;
+            return;
+        }
+    }
 };
 
 pub const HandlerError = error{
@@ -641,18 +666,13 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
-            defer {
-                server.removePending(pending);
-                server.destroyArena(arena);
-                // The read transaction has ended: evict if a query exceeds its cache capacity and
-                // no other read transaction is active
-                if (server.db.wantsSweep()) _ = server.db.trySweep();
-                server.maybeResetSema();
-            }
+            defer server.finishRequest(arena, pending);
             const a = arena.allocator();
+            server.testGate(method, .before_read, pending);
             var ctx = server.db.beginRead(a);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
             var pc: panic_context.Text = .{};
@@ -679,18 +699,13 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
-            defer {
-                server.removePending(pending);
-                server.destroyArena(arena);
-                // The read transaction has ended: evict if a query exceeds its cache capacity and
-                // no other read transaction is active
-                if (server.db.wantsSweep()) _ = server.db.trySweep();
-                server.maybeResetSema();
-            }
+            defer server.finishRequest(arena, pending);
             const a = arena.allocator();
+            server.testGate(method, .before_read, pending);
             var ctx = server.db.beginRead(a);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
             var pc: panic_context.Text = .{};
@@ -712,6 +727,23 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             } else server.sendResponse(pending.id, result);
         }
     };
+}
+
+/// End of a read or semantic request task, after its read transaction: evicts when a query
+/// exceeds its cache capacity and reclaims type information when needed (both only when no other
+/// read transaction is active), then unregisters the request, which counts as in flight until
+/// then
+fn finishRequest(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending) void {
+    if (server.db.wantsSweep()) _ = server.db.trySweep();
+    server.maybeResetSema();
+    server.removePending(pending);
+    server.destroyArena(arena);
+}
+
+fn testGate(server: *Server, comptime method: []const u8, point: @FieldType(TestGate, "point"), pending: *const Pending) void {
+    if (!@import("builtin").is_test) return;
+    const gate = server.test_gate orelse return;
+    if (gate.point == point and std.mem.eql(u8, gate.method, method)) gate.pass(server.io, pending);
 }
 
 /// Result of a handler: success, or the reason for the failure (answered with `request_failed`;
@@ -3379,15 +3411,19 @@ fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
     return if (server.edits.get(file)) |e| e.generation else 0;
 }
 
-/// Reclaims the whole generation when the InternPool exceeds `sema.max_intern_pool_mb`
-/// (see `resetSema`). Called at idle points outside read transactions.
+/// Reclaims type information (see `resetSema`) when the InternPool exceeds
+/// `sema.max_intern_pool_mb` or the type-information queries have more than `sema_reset_keys`
+/// keys. Called when a request or a diagnostics publish finishes, outside read transactions.
 fn maybeResetSema(server: *Server) void {
     const limit = server.max_intern_pool_mb.load(.monotonic);
     if (limit == 0) return;
-    if (server.ip.bytes() < @as(usize, limit) * 1024 * 1024 and server.semaKeys() < sema_reset_keys) return;
-    if (server.sema_resetting.swap(true, .acq_rel)) return;
-    defer server.sema_resetting.store(false, .release);
-    server.resetSema();
+    const limit_bytes = @as(usize, limit) * 1024 * 1024;
+    if (server.ip.bytes() < limit_bytes and server.semaKeys() < sema_reset_keys) return;
+    if (!server.db.tryBeginWrite()) return;
+    defer server.db.endWrite();
+    // Another thread may have reclaimed since the check above
+    if (server.ip.bytes() < limit_bytes and server.semaKeysLocked() < sema_reset_keys) return;
+    server.resetSemaLocked();
 }
 
 /// When the total number of keys of the type-information queries exceeds this value, the whole
@@ -3416,11 +3452,23 @@ fn semaKeysLocked(server: *Server) usize {
 /// InternPool and the queries whose keys or values refer to them (memos of other queries that
 /// depend on them are dropped too). The InternPool and the keys and dependency edges of these
 /// queries never shrink and keep growing in long sessions with the generic instances visited; after
-/// the reclaim, later requests infer again on demand.
-pub fn resetSema(server: *Server) void {
-    const before = server.ip.bytes();
-    server.db.beginWrite();
+/// the reclaim, later requests infer again on demand, with the same results.
+///
+/// Runs only when no read transaction is in progress, and returns whether it ran: it sets no
+/// input and invalidates no result, so canceling in-flight requests for it would fail them for
+/// nothing, and a request whose own inference exceeds the limit would never complete. When a
+/// read transaction is in progress, the reclaim is left to a request or publish that finishes
+/// later (`maybeResetSema`).
+pub fn resetSema(server: *Server) bool {
+    if (!server.db.tryBeginWrite()) return false;
     defer server.db.endWrite();
+    server.resetSemaLocked();
+    return true;
+}
+
+/// `resetSema` in a write transaction the caller holds
+fn resetSemaLocked(server: *Server) void {
+    const before = server.ip.bytes();
     const keys = server.semaKeysLocked();
     server.db.resetQueries(&sema_queries);
     server.ip.reset() catch return log.err("out of memory while resetting the intern pool", .{});
