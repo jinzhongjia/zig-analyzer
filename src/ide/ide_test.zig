@@ -1112,6 +1112,47 @@ test "candidates fit the expected type only by exact rules" {
     }
 }
 
+test "pointers fit the expected type by the compiler's attribute rules" {
+    // Prevents ranking `*volatile` / `*align(1)` candidates first where `*const u32` is expected,
+    // and Zig-callconv function pointers where a `callconv(.c)` one is. Expected values: zig 0.17.0
+    // accepts the coercions marked true and rejects the others (`expected type '*const u32',
+    // found '*volatile u32'`, and so on).
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ "*const u32", "const cd_b: *align(8) u32 = undefined;", true },
+        .{ "*align(1) const u32", "const cd_b: *u32 = undefined;", true },
+        .{ "*volatile const u32", "const cd_b: *u32 = undefined;", true },
+        .{ "*allowzero const u32", "const cd_b: *u32 = undefined;", true },
+        .{ "[]const u32", "const cd_b: []align(8) u32 = undefined;", true },
+        .{ "*const fn () callconv(.c) void", "fn cd_b() callconv(.c) void {}", true },
+        .{ "*const u32", "const cd_b: *volatile u32 = undefined;", false },
+        .{ "*const u32", "const cd_b: *align(1) u32 = undefined;", false },
+        .{ "*const u32", "const cd_b: *allowzero u32 = undefined;", false },
+        .{ "[]const u32", "const cd_b: []align(1) u32 = undefined;", false },
+        .{ "*const fn () callconv(.c) void", "fn cd_b() void {}", false },
+        .{ "*const fn () callconv(.c) void", "const cd_b: *const fn () void = undefined;", false },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\const Other = struct {{}};
+            \\const cd_a: Other = .{{}};
+            \\{s}
+            \\fn run() void {{
+            \\    const x: {s} = cd<|>;
+            \\    _ = x;
+            \\}}
+            \\
+        , .{ c[1], c[0] });
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(if (c[2]) "cd_b cd_a" else "cd_a cd_b", got) catch |err| {
+            std.debug.print("expected `{s}`, candidate `{s}`\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
 test "function pointer values rank by the expected type only as what they are" {
     // Parameters and locals of type `*const fn () Tone` are inserted without a call, so the
     // expected type `Tone` does not rank them first; it moves only `tint` up
