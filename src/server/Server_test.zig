@@ -1031,6 +1031,61 @@ test "completion edits carry insert and replace ranges for clients that support 
     try testing.expectEqualDeep(EditRanges{ .insert = null, .replace = .{ 19, 22 } }, try completionEditRanges(replace_only, 0, 21, "std"));
 }
 
+test "completion triggered by `/` or `\"` lists only paths" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .completion = .{ .contextSupport = true } } } });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:triggers.zig";
+    const text =
+        \\const std = @import("std");
+        \\pub fn main() void {
+        \\    const a: u32 = 4;
+        \\    const b = a /
+        \\    / a;
+        \\    const t = "abc";
+        \\    const q = @import("std");
+        \\    _ = .{ b, t, q };
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const cases = [_]struct { u32, u32, u32, []const u8, []const u8 }{
+        // A division, a `/` at the start of a line, a closing quote of a string and of an import
+        .{ 3, 17, 2, "/", "" },
+        .{ 4, 5, 2, "/", "" },
+        .{ 5, 19, 2, "\"", "" },
+        .{ 6, 27, 2, "\"", "" },
+        // The opening quote of an import lists its paths; invoked completion lists names
+        .{ 6, 23, 2, "\"", "std builtin root" },
+        .{ 3, 17, 1, "", "a std main" },
+    };
+    for (cases) |c| {
+        const resp = if (c[2] == 2)
+            try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = c[0], .character = c[1] }, .context = .{ .triggerKind = c[2], .triggerCharacter = c[3] } })
+        else
+            try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = c[0], .character = c[1] }, .context = .{ .triggerKind = c[2] } });
+        const result = resp.object.get("result").?;
+        const items = if (result == .array) result.array.items else result.object.get("items").?.array.items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        defer labels.deinit(testing.allocator);
+        for (items) |it| try labels.append(testing.allocator, it.object.get("label").?.string);
+        const got = try std.mem.join(testing.allocator, " ", labels.items);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[4], got) catch |err| {
+            std.debug.print("at {d}:{d}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "inlay hint settings apply to requests and refresh the client when they change" {
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;

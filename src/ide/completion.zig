@@ -58,6 +58,10 @@ pub const Options = struct {
     snippets: bool = false,
     /// Call snippets insert a placeholder for each argument; otherwise only the parentheses
     argument_placeholders: bool = true,
+    /// Complete only paths (`@import` strings and the paths of `build.zig.zon`), with no items
+    /// elsewhere: completion triggered by `/` or `"`, which outside such a string are a division,
+    /// a comment, or the quotes of another string
+    paths_only: bool = false,
 };
 
 pub const Result = struct {
@@ -117,7 +121,8 @@ pub const Item = struct {
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
-    const visible = try completeVisible(r, file, offset, &owner);
+    const visible = try completeVisible(r, file, offset, &owner, options.paths_only);
+    if (options.paths_only and visible.context != .path) return .{ .items = &.{} };
     const base = visible.items;
     // Auto-import and snippets only in Zig source files: inserting an import declaration or code
     // into a `.zon` or similar file would break it
@@ -303,7 +308,8 @@ const Visible = struct {
         /// In a comment or string, or past the end of the text
         ignored,
         builtin,
-        import_path,
+        /// In the string of an `@import` or a string of `build.zig.zon` (paths)
+        path,
         label,
         /// After `lhs.`
         member,
@@ -317,8 +323,9 @@ const Visible = struct {
     };
 };
 
-/// `cursor_owner` records the member found at the cursor, which auto-import reuses
-fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
+/// `cursor_owner` records the member found at the cursor, which auto-import reuses; with
+/// `paths_only`, nothing but paths is completed
+fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner, paths_only: bool) resolve.Error!Visible {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return .{ .context = .ignored };
@@ -327,19 +334,20 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     if (literal == .comment) return .{ .context = .ignored };
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
-    if (literal == .none) if (builtinStart(text, offset)) |start| {
+    if (literal == .none and !paths_only) if (builtinStart(text, offset)) |start| {
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
         return .{ .items = out.items.items, .context = .builtin };
     };
     if (importString(text, offset)) |start| {
         try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) });
-        return .{ .items = out.items.items, .context = .import_path };
+        return .{ .items = out.items.items, .context = .path };
     }
     if (literal == .string) {
         try manifestPaths(r, &out, file, text, offset);
-        return .{ .items = out.items.items, .context = .ignored };
+        return .{ .items = out.items.items, .context = .path };
     }
+    if (paths_only) return .{ .context = .ignored };
 
     cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) };
     const item = cursor_owner.known orelse return .{};

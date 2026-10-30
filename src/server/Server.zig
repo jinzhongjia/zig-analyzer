@@ -4661,6 +4661,12 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         break :blk .{ c.completion_max_auto_imports, c.completion_snippets, c.completion_argument_placeholders };
     };
     const import_options = server.importOptionsFor(file);
+    // `/` and `"` are trigger characters for paths; typed elsewhere they start no name
+    const path_trigger = blk: {
+        const c = params.context orelse break :blk false;
+        const t = c.triggerCharacter orelse break :blk false;
+        break :blk c.triggerKind == .TriggerCharacter and (std.mem.eql(u8, t, "/") or std.mem.eql(u8, t, "\""));
+    };
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
@@ -4668,6 +4674,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         .imports = import_options,
         .snippets = server.snippet_support and snippets,
         .argument_placeholders = placeholders,
+        .paths_only = path_trigger,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
