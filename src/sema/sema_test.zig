@@ -1455,6 +1455,41 @@ test "@abs maps signed integer types to their unsigned counterparts" {
     });
 }
 
+test "orelse and catch on comptime-known operands take only the evaluated side" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(cfg_port), @TypeOf(z1),
+    // @TypeOf(z2), nn, ok, @TypeOf(rt), @TypeOf(rte), @TypeOf(ann))` prints `comptime_int`,
+    // `comptime_int`, `comptime_int`, `@as(i32, 7)`, `@as(u8, 9)`, `u8`, `u8`, `u32`); a taken
+    // right-hand side must not be coerced to the payload type
+    try expectTypes(
+        \\const Opts = struct { port: ?u16 = null };
+        \\const opts: Opts = .{};
+        \\fn probe(r: ?u8, re: anyerror!u8) void {
+        \\    const cfg_port = opts.port orelse 8080;
+        \\    const n: ?i32 = null;
+        \\    const z1 = n orelse 1234;
+        \\    const e: anyerror!u8 = error.Bad;
+        \\    const z2 = e catch 5;
+        \\    const m: ?i32 = 7;
+        \\    const nn = m orelse 1;
+        \\    const g: anyerror!u8 = 9;
+        \\    const ok = g catch 5;
+        \\    const rt = r orelse 3;
+        \\    const rte = re catch 4;
+        \\    const ann: u32 = n orelse 2;
+        \\    _ = .{ cfg_port, z1, z2, nn, ok, rt, rte, ann };
+        \\}
+    , &.{
+        .{ "cfg_port", "comptime_int = 8080" },
+        .{ "z1", "comptime_int = 1234" },
+        .{ "z2", "comptime_int = 5" },
+        .{ "nn", "i32 = 7" },
+        .{ "ok", "u8 = 9" },
+        .{ "rt", "u8" },
+        .{ "rte", "u8" },
+        .{ "ann", "u32 = 2" },
+    });
+}
+
 test "@min and @max narrow the result type like the compiler" {
     // Expected values are the results of zig 0.17.0
     try expectTypes(
@@ -2923,7 +2958,7 @@ test "layouts of reified containers" {
         .{ "size_rc", "comptime_int = 4" },
         // @typeInfo reports the explicit alignment of fields
         .{ "la", "?usize = 4" },
-        .{ "lb", "usize = 0" },
+        .{ "lb", "comptime_int = 0" },
         .{ "size_ru", "comptime_int = 8" },
         .{ "size_efs", "comptime_int = 6" },
         .{ "efs_c", "comptime_int = 4" },

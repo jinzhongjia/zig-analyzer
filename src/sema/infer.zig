@@ -865,6 +865,16 @@ const Inferrer = struct {
             else => {},
         }
         if (target != want and tv.ty == target) return .{ .ty = want, .val = tv.val };
+        // An error coerced to an error union keeps its value, which marks the union as failed; a
+        // payload keeps its value coerced to the payload type, which marks the union as successful
+        if (tv.val) |v| switch (ip.key(want)) {
+            .error_union_type => |eu| {
+                if (ip.key(v) == .error_value) return .{ .ty = want, .val = v };
+                const payload = try inf.coerce(tv, eu.payload);
+                if (payload.ty == eu.payload) return .{ .ty = want, .val = payload.val };
+            },
+            else => {},
+        };
         return tv;
     }
 
@@ -981,7 +991,11 @@ const Inferrer = struct {
                 const lhs = try inf.infer(c.lhs, null);
                 const payload, const err = inf.unwrapErrorUnion(lhs.ty);
                 if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err };
-                const rhs = try inf.infer(c.rhs, inf.fallbackType(expected, payload, c.rhs));
+                // When comptime-known, only one side is evaluated, and a right-hand side that is
+                // taken gets only the result type of the whole expression
+                const ok = inf.condValue(lhs);
+                const rhs = try inf.inferBranch(c.rhs, inf.fallbackType(expected, if (ok == false) .unknown else payload, c.rhs), ok == true);
+                if (ok) |o| return if (o) .{ .ty = payload, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
             },
             .binary => |bin| return inf.binary(e, bin.op, bin.lhs, bin.rhs, expected),
@@ -2602,9 +2616,10 @@ const Inferrer = struct {
                     .optional_type => |c| c,
                     else => .unknown,
                 };
-                // When comptime-known, only one side is evaluated
+                // When comptime-known, only one side is evaluated, and a right-hand side that is
+                // taken gets only the result type of the whole expression
                 const non_null = inf.condValue(lhs);
-                const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, child, rhs_e), non_null == true);
+                const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, if (non_null == false) .unknown else child, rhs_e), non_null == true);
                 if (non_null) |n| return if (n) .{ .ty = child, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
