@@ -11,6 +11,7 @@ const context = @import("context.zig");
 const render = @import("../sema/render.zig");
 const queries = @import("../sema/queries.zig");
 const TypedValue = @import("../sema/InternPool.zig").TypedValue;
+const infer = @import("../sema/infer.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const seed = @import("../ide_db/seed.zig");
@@ -86,6 +87,7 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
                 def = try definition.defAt(r, file, offset);
             },
             .builtin_call => {},
+            .init => return initFieldHover(r, file, tok, e),
             .error_value => |name| return errorValue(r, file, tok, e, name),
             else => return null,
         }
@@ -126,6 +128,27 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
     }
     if (def) |d| if (try context.doc(r, d)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
+}
+
+/// A field name in an initializer (`.{ .name = x }`, `T{ .name = x }`): the field of the
+/// initializer's type, with its type in that type (the field type in the instance for a generic
+/// container; inside a generic function body, in a call-site instance) and its documentation
+fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId) resolve.Error!?Info {
+    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+    const fields = a.body.expr(e).init.fields;
+    const rel = tok.offset - a.node.offset;
+    const k = for (fields, 0..) |f, k| {
+        if (f.name != null and rel >= f.name_range.start and rel < f.name_range.end) break k;
+    } else return null;
+    const t = a.initType(e) orelse return null;
+    if (t == .unknown) return null;
+    const field = try infer.initField(r, t, try queries.namespaceOfType(r, t), k, fields[k].name);
+    const def = try context.defOfKey(r, field.member orelse return null) orelse return null;
+    var out: std.Io.Writer.Allocating = .init(r.arena);
+    const w = &out.writer;
+    w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown })}) catch return error.OutOfMemory;
+    if (try context.doc(r, def)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
+    return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
 }
 
 /// `error.Foo`: the error name and the expected error set, plus its documentation when the

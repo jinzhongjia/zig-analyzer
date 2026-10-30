@@ -76,6 +76,106 @@ test "hover shows signature, type and doc" {
     }
 }
 
+test "hover on field names in initializers shows the field" {
+    // Prevents a null hover on `.name` in `.{ .name = x }` while goto resolves the field
+    const text =
+        \\const Opts = struct {
+        \\    /// Name of the thing.
+        \\    name: []const u8,
+        \\    inner: Inner = .{},
+        \\};
+        \\const Inner = struct { depth: u8 = 0 };
+        \\const U = union { a: u32, b: bool };
+        \\fn Pair(comptime T: type) type {
+        \\    return struct { first: T, second: T };
+        \\}
+        \\fn make(o: Opts) Opts {
+        \\    return o;
+        \\}
+        \\fn generic(comptime T: type) Pair(T) {
+        \\    return .{ .first = undefined, .second = undefined };
+        \\}
+        \\pub fn main() void {
+        \\    const a: Opts = .{ .name = "a" };
+        \\    const b = Opts{ .name = "b" };
+        \\    const c = make(.{ .name = "c", .inner = .{ .depth = 2 } });
+        \\    var d: Opts = undefined;
+        \\    d = .{ .name = "d" };
+        \\    const u: U = .{ .a = 3 };
+        \\    const p: Pair(u32) = .{ .first = 1, .second = 2 };
+        \\    _ = .{ a, b, c, d, u, p, a.name, generic(u16) };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const name = "```zig\nname: []const u8\n```\n\nName of the thing.";
+    const control = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "name, generic").?))).?;
+    try testing.expectEqualStrings(name, control.text);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "name = \"a\"", name },
+        .{ "name = \"b\"", name },
+        .{ "name = \"c\"", name },
+        .{ "name = \"d\"", name },
+        .{ "inner = .{ .depth", "```zig\ninner: Inner\n```" },
+        .{ "depth = 2", "```zig\ndepth: u8\n```" },
+        .{ "a = 3", "```zig\na: u32\n```" },
+        // The field type in the instance
+        .{ "first = 1", "```zig\nfirst: u32\n```" },
+        .{ "second = 2", "```zig\nsecond: u32\n```" },
+        // Inside a generic function, the field type in terms of its parameters
+        .{ "first = undefined", "```zig\nfirst: T\n```" },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c[0]});
+            return error.NoHover;
+        };
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "hover on field names of build.zig option structs" {
+    const text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig") }) });
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/build.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "name = ", "```zig\nname: []const u8\n```" },
+        .{ "root_module", "```zig\nroot_module: *Module\n```" },
+        .{ "root_source_file", "```zig\nroot_source_file: ?LazyPath\n```\n\nThis could either be a generated file" },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c[0]});
+            return error.NoHover;
+        };
+        testing.expect(std.mem.startsWith(u8, info.text, c[1])) catch |err| {
+            std.debug.print("hover at `{s}`: {s}\n", .{ c[0], info.text });
+            return err;
+        };
+    }
+}
+
 test "member completion and goto definition through types" {
     var w: World = undefined;
     const file = try setup(&w);

@@ -80,6 +80,19 @@ pub const At = struct {
         return null;
     }
 
+    /// Type of the initializer `e`, the same as in inference: the written type, or the result
+    /// type with error union and optional stripped (the type recorded for the expression itself
+    /// has already been converted to the result type). Null for `.{ ... }` without a result type
+    /// (an anonymous struct, whose field types are just the types of the values)
+    pub fn initType(a: At, e: Body.ExprId) ?Index {
+        const init = a.body.expr(e).init;
+        if (init.ty) |te| return a.exprType(te).asType();
+        var want = a.literalExpected(e) orelse return null;
+        if (a.ip.key(want) == .error_union_type) want = a.ip.key(want).error_union_type.payload;
+        if (a.ip.key(want) == .optional_type) want = a.ip.key(want).optional_type;
+        return want;
+    }
+
     pub fn member(a: At, e: Body.ExprId) ?hir.OwnerKey {
         const i = @backingInt(e);
         if (i < a.res.members.len) if (a.res.members[i]) |m| return m;

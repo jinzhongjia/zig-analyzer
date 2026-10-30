@@ -115,19 +115,11 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
     };
 }
 
-/// Field types after each field name in an initializer. The initializer's type is the same as
-/// in inference: the written type, or the result type with error union and optional stripped (the
-/// type recorded for the expression itself has already been converted to the result type and
-/// cannot be used directly). `.{ ... }` without a result type (an anonymous struct) gets no
-/// hints: its field types are just the types of the values
+/// Field types after each field name in an initializer, in the initializer's type (see
+/// `context.At.initType`). `.{ ... }` without a result type (an anonymous struct) gets no hints:
+/// its field types are just the types of the values
 fn fieldTypeHints(r: *Resolver, a: context.At, e: Body.ExprId, init: @FieldType(Body.Expr, "init"), start: u32, end: u32, opts: Options, out: *std.ArrayList(Hint)) resolve.Error!void {
-    const ip = a.ip;
-    const t: InternPool.Index = if (init.ty) |te| a.exprType(te).asType() orelse return else t: {
-        var want = a.literalExpected(e) orelse return;
-        if (ip.key(want) == .error_union_type) want = ip.key(want).error_union_type.payload;
-        if (ip.key(want) == .optional_type) want = ip.key(want).optional_type;
-        break :t want;
-    };
+    const t = a.initType(e) orelse return;
     if (t == .unknown) return;
     const ns = try queries.namespaceOfType(r, t);
     for (init.fields, 0..) |f, k| {
