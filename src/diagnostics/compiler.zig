@@ -77,6 +77,8 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 /// When `src_path` does not resolve to an absolute path (a malformed error bundle, see
 /// `absolute`), it is treated as having no location: the error is attached to the start of
 /// `fallback_path`, and the notes and reference trace are placed at the start of the error.
+/// A message or note that the compiler merged from several identical ones (`count` above 1) gets
+/// the same ` (N times)` suffix as in the compiler's output.
 /// The files are read from disk after the build. A location that carries its source line (the
 /// compiler gives one for errors and for notes not at the error's position) shows whether the
 /// text read is the one the compiler read; when it is not (the file changed during the build), no
@@ -123,7 +125,7 @@ pub fn collect(
         } else eb.getMessages()[0];
         for (eb.getMessages()) |mi| {
             const msg = eb.getErrorMessage(mi);
-            const message = eb.nullTerminatedString(msg.msg);
+            const message = try withCount(a, eb.nullTerminatedString(msg.msg), msg.count);
             const compile_log = if (log_target == mi) log_text else "";
             var path: []const u8 = fallback;
             var start: u32 = 0;
@@ -150,7 +152,7 @@ pub fn collect(
                         note.start, note.end = byteSpan(nl);
                     }
                 }
-                note.message = try a.dupe(u8, eb.nullTerminatedString(n.msg));
+                note.message = try withCount(a, eb.nullTerminatedString(n.msg), n.count);
                 note.base_text = try sources.text(note.path);
                 notes.appendAssumeCapacity(note);
             }
@@ -168,7 +170,7 @@ pub fn collect(
             const gop = try lists.getOrPut(a, path);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             seen_gop.value_ptr.* = gop.value_ptr.items.len;
-            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes.items, .note_count = note_count, .compile_log = compile_log });
+            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = message, .is_astgen = false, .notes = notes.items, .note_count = note_count, .compile_log = compile_log });
         }
     }
 
@@ -284,6 +286,13 @@ fn referenceTrace(
 fn addCompileLog(a: Allocator, item: *Item, compile_log: []const u8) Allocator.Error!void {
     if (compile_log.len == 0 or std.mem.eql(u8, item.compile_log, compile_log)) return;
     item.compile_log = if (item.compile_log.len == 0) compile_log else try std.mem.join(a, "\n", &.{ item.compile_log, compile_log });
+}
+
+/// Text of a message or note as the compiler prints it: a message merged from `count` identical
+/// ones ends with ` (N times)` when `count` is not 1 (`ErrorBundle.renderErrorMessage`)
+fn withCount(a: Allocator, text: []const u8, count: u32) Allocator.Error![]const u8 {
+    if (count == 1) return a.dupe(u8, text);
+    return std.fmt.allocPrint(a, "{s} ({d} times)", .{ text, count });
 }
 
 /// Whether two errors are the same error: same range, message and notes (the reference trace,

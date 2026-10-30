@@ -963,3 +963,27 @@ test "collect and combine: errors that differ only in their notes are kept apart
     try testing.expectEqual(2, c.items.len);
     try testing.expectEqual(std.mem.indexOf(u8, main_text, "_ = x").?, c.items[1].notes[0].start);
 }
+
+test "collect: repeat counts of messages and notes are kept" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    const err_loc = try location(&wip, "src/main.zig", main_text, "\"s\"", 0);
+    const note_loc = try location(&wip, "src/main.zig", main_text, "unused", 0);
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("evaluation exceeded 1000 backwards branches"), .src_loc = err_loc, .notes_len = 2 },
+        &.{
+            .{ .msg = try wip.addString("called at comptime here"), .src_loc = note_loc, .count = 3 },
+            .{ .msg = try wip.addString("called at comptime here"), .src_loc = err_loc },
+        },
+    );
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
+    const notes = r.files.get(native("/proj/src/main.zig")).?.items[0].notes;
+    // Guards against dropping the count that the compiler prints
+    try testing.expectEqualStrings("called at comptime here (3 times)", notes[0].message);
+    try testing.expectEqualStrings("called at comptime here", notes[1].message);
+}
