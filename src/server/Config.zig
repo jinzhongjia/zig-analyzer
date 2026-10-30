@@ -131,8 +131,8 @@ cache_queries: CacheQueries = .{},
 /// Whether workspace symbol also lists symbols in dependencies (fetched dependency packages,
 /// generated files, open standard library files)
 workspace_symbol_dependencies: bool = false,
-/// Maximum number of symbols workspace symbol returns (the best matches are kept); 0 means no
-/// limit. Clients that query again as the user types do not need everything at once; clients
+/// Maximum number of symbols workspace symbol returns (the best matches are kept, and exact name
+/// matches beyond it too); 0 means no limit. Clients that query again as the user types do not need everything at once; clients
 /// that query only once and filter on the client side need to raise it or set it to 0.
 workspace_symbol_limit: u32 = 256,
 /// Naming check (the Names section of the Zig style guide): whether to report names in open files

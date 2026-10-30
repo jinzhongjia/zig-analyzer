@@ -24,9 +24,11 @@ pub const Symbol = struct {
     rank: u8,
 };
 
-/// Returns at most `limit` symbols (the best ones after sorting by match rank). Name positions
-/// come from `ItemSummaries` (never evicted): when there are more project files than the parse
-/// result cache holds, repeated queries do not need to reparse every file
+/// Returns the best `limit` symbols after sorting by match rank, and every exact match beyond
+/// them: same-named symbols tie on the name alone, so the limit cannot choose among them and
+/// typing more of the name cannot select a dropped one. Name positions come from `ItemSummaries`
+/// (never evicted): when there are more project files than the parse result cache holds, repeated
+/// queries do not need to reparse every file
 pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usize) resolve.Error![]const Symbol {
     var out: std.ArrayList(Symbol) = .empty;
     for (files) |file| {
@@ -63,7 +65,9 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
-    return out.items[0..@min(out.items.len, limit)];
+    var kept = @min(out.items.len, limit);
+    while (kept < out.items.len and out.items[kept].rank == 0) kept += 1;
+    return out.items[0..kept];
 }
 
 /// Match rank: 0 exact, 1 prefix, 2 subsequence; null when there is no match (all ignoring case)
@@ -122,6 +126,30 @@ test "search returns the name token of each matching declaration" {
         try describe(&w, file, text, "p"),
     );
     try testing.expectEqualStrings("", try describe(&w, file, text, "zzz"));
+}
+
+test "the limit keeps every exact match" {
+    // Same-named symbols past the limit would be unreachable by any query
+    var text: std.ArrayList(u8) = .empty;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    for (0..300) |i| try text.print(a, "pub const Kind{d:0>3} = struct {{ pub fn init() void {{}} }};\npub fn initAll{d}() void {{}}\n", .{ i, i });
+    const file = (try w.add("/p/main.zig", text.items)).file;
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: Resolver = .{ .ctx = &ctx, .arena = a };
+    const found = try search(&r, &.{file}, "init", 256);
+    try testing.expectEqual(300, found.len);
+    var last = false;
+    for (found) |s| {
+        try testing.expectEqualStrings("init", s.name);
+        if (std.mem.eql(u8, s.container.?, "Kind299")) last = true;
+    }
+    try testing.expect(last);
+    // Prefix matches are still cut at the limit
+    try testing.expectEqual(10, (try search(&r, &.{file}, "initAll", 10)).len);
 }
 
 test "blank names are shown in their quoted form" {
