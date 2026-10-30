@@ -18,30 +18,22 @@ fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
 
-const usage =
-    \\Usage: zig-analyzer [options]
-    \\
-    \\Zig language server (LSP) over stdio.
-    \\
-    \\Options:
-    \\  --version   print version
-    \\  --help      print this help
-    \\
-;
-
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--version")) {
+    switch (za.lsp.cli.parse(args[1..])) {
+        .serve => {},
+        .version => {
             try std.Io.File.stdout().writeStreamingAll(init.io, za.version ++ "\n");
             return 0;
-        } else if (std.mem.eql(u8, arg, "--help")) {
-            try std.Io.File.stdout().writeStreamingAll(init.io, usage);
+        },
+        .help => {
+            try std.Io.File.stdout().writeStreamingAll(init.io, za.lsp.cli.usage);
             return 0;
-        } else {
-            std.log.err("unknown argument: {s}", .{arg});
+        },
+        .invalid => |invalid| {
+            std.log.err("{f}", .{invalid});
             return 1;
-        }
+        },
     }
 
     // In ReleaseSafe, `init.gpa` is the error-checking `SafeAllocator`: every allocation carries

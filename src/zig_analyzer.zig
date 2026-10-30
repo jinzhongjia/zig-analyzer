@@ -104,6 +104,8 @@ pub const lsp = struct {
     pub const json_ext = @import("lsp/json_ext.zig");
     pub const jsonrpc = @import("lsp/jsonrpc.zig");
     pub const transport = @import("lsp/transport.zig");
+    /// Command-line arguments of the server executable
+    pub const cli = @import("lsp/cli.zig");
 };
 
 test {
