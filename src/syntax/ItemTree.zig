@@ -47,6 +47,14 @@ pub const Container = struct {
     auto_enum: bool = false,
     /// An enum with a `_` member: non-exhaustive. `_` is not a field and has no item
     nonexhaustive: bool = false,
+    /// The container is what `parent_item` declares: the initializer of a `const` / `var` member,
+    /// the type of a field, or the operand of a `return` in a function member's body. Other
+    /// containers in a member (local types, call arguments, `?struct {...}`, parameter types) are
+    /// only lexically inside it
+    is_value: bool = false,
+    /// The name of the declaration (a member or a local constant) whose initializer is the
+    /// container; null for anonymous containers and the file root
+    name: ?[]const u8 = null,
 
     pub const Kind = enum { file, @"struct", @"enum", @"union", @"opaque" };
     pub const Layout = enum { auto, @"packed", @"extern" };
@@ -113,7 +121,8 @@ pub fn eql(a: *const ItemTree, b: *const ItemTree) bool {
     if (!std.mem.eql(u32, a.member_list, b.member_list)) return false;
     for (a.containers, b.containers) |x, y| {
         if (x.ast_id != y.ast_id or x.kind != y.kind or x.parent_item != y.parent_item) return false;
-        if (x.layout != y.layout or x.auto_enum != y.auto_enum or x.nonexhaustive != y.nonexhaustive) return false;
+        if (x.layout != y.layout or x.auto_enum != y.auto_enum or x.nonexhaustive != y.nonexhaustive or x.is_value != y.is_value) return false;
+        if (!optStrEql(x.name, y.name)) return false;
         if (x.members.start != y.members.start or x.members.len != y.members.len) return false;
     }
     for (a.items, b.items) |x, y| {
@@ -208,7 +217,7 @@ const Builder = struct {
                 .doc = try b.docText(member),
             });
             try b.pending_members.items[index].append(b.arena, item_index);
-            try b.visitNested(member, item_index);
+            try b.visitNested(member, item_index, valueOffset(member));
         }
     }
 
@@ -228,20 +237,28 @@ const Builder = struct {
             .doc = null,
         });
         try b.pending_members.items[0].append(b.arena, item_index);
-        try b.visitNested(root, item_index);
+        try b.visitNested(root, item_index, null);
     }
 
     /// Finds container definitions in a member's subtree (including inside function bodies),
-    /// without descending into containers already found
-    fn visitNested(b: *Builder, node: SyntaxNode, parent_item: u32) Allocator.Error!void {
+    /// without descending into containers already found. `value` is the offset of the container
+    /// that is the member's initializer or field type (see `valueOffset`)
+    fn visitNested(b: *Builder, node: SyntaxNode, parent_item: u32, value: ?u32) Allocator.Error!void {
         var it = node.children();
         while (it.nextNode()) |c| {
             if (c.kind() != .container_decl) {
-                try b.visitNested(c, parent_item);
+                try b.visitNested(c, parent_item, value);
                 continue;
             }
             const index: u32 = @intCast(b.containers.items.len);
             const kind = containerKind(c);
+            const bound = if (node.kind() == .var_decl) bound: {
+                const decl: ast.VarDecl = .{ .syntax = node };
+                const init = decl.initExpr() orelse break :bound null;
+                if (init.offset != c.offset) break :bound null;
+                const name = decl.name() orelse break :bound null;
+                break :bound try b.arena.dupe(u8, try ast.identNameAlloc(b.arena, name.text));
+            } else null;
             try b.containers.append(b.gpa, .{
                 .ast_id = try b.uniqueId(b.items.items[parent_item].ast_id, "container", ""),
                 .kind = kind,
@@ -249,9 +266,22 @@ const Builder = struct {
                 .members = undefined,
                 .layout = if (c.childToken(.keyword_packed) != null) .@"packed" else if (c.childToken(.keyword_extern) != null) .@"extern" else .auto,
                 .auto_enum = kind == .@"union" and c.childToken(.keyword_enum) != null,
+                .is_value = value == c.offset or (node.kind() == .return_expr and b.items.items[parent_item].kind == .@"fn"),
+                .name = bound,
             });
             try b.visitContainer(c, index);
         }
+    }
+
+    /// Offset of the container that a member declares directly: the initializer of a `const` /
+    /// `var` or the type of a field, when it is a container definition
+    fn valueOffset(member: SyntaxNode) ?u32 {
+        const value = switch (member.kind()) {
+            .var_decl => (ast.VarDecl{ .syntax = member }).initExpr(),
+            .container_field => (ast.ContainerField{ .syntax = member }).typeExpr(),
+            else => null,
+        } orelse return null;
+        return if (value.kind() == .container_decl) value.offset else null;
     }
 
     /// The n-th node with the same (kind, name) under the same parent

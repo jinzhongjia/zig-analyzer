@@ -15,7 +15,8 @@ const document_symbol = @import("document_symbol.zig");
 pub const Symbol = struct {
     name: []const u8,
     kind: types.SymbolKind,
-    /// Name of the enclosing container (null at the top level of a file)
+    /// Name of the enclosing container: the declaration it is the value of, or the local constant
+    /// it initializes; null at the top level of a file and for anonymous containers
     container: ?[]const u8,
     file: FileId,
     start: u32,
@@ -47,7 +48,7 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             try out.append(r.arena, .{
                 .name = ast.identName(name),
                 .kind = document_symbol.symbolKind(tree, @intCast(i), container.kind),
-                .container = if (container.parent_item) |p| tree.items[p].name else null,
+                .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
                 .file = file,
                 .start = at.name_offset,
                 .end = at.name_offset + at.name_len,
@@ -121,6 +122,34 @@ test "search returns the name token of each matching declaration" {
         try describe(&w, file, text, "p"),
     );
     try testing.expectEqualStrings("", try describe(&w, file, text, "zzz"));
+}
+
+test "container names are the declarations that bind the containers" {
+    // A member of a container nested in another declaration is not named after that declaration
+    const text =
+        \\const std = @import("std");
+        \\const List = std.ArrayList(struct { a: u8 });
+        \\fn helper() void { const A = struct { a1: u8 }; _ = A; }
+        \\test "sort" { const S = struct { fn lessThan() void {} }; _ = S; }
+        \\pub fn Wrapper(comptime T: type) type { const Impl = struct { inner: T }; return struct { impl: Impl }; }
+        \\fn take(opts: struct { verbose: bool = false }) void { _ = opts; }
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    for ([_][2][]const u8{
+        .{ "a", "a(-):a" },
+        .{ "a1", "a1(A):a1" },
+        .{ "lessThan", "lessThan(S):lessThan" },
+        .{ "inner", "inner(Impl):inner" },
+        .{ "impl", "impl(Wrapper):impl" },
+        .{ "verbose", "verbose(-):verbose" },
+    }) |c| {
+        var results = std.mem.splitScalar(u8, try describe(&w, file, text, c[0]), ' ');
+        try testing.expectEqualStrings(c[1], results.first());
+    }
 }
 
 // Guards against fetching syntax tree nodes for matching members on every query: when there are

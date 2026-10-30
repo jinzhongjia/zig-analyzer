@@ -58,12 +58,13 @@ const Builder = struct {
         return out.items;
     }
 
-    /// Containers defined inside a member (such as the fields of `const S = struct {...}`) become
-    /// child symbols of that member
+    /// The containers a member declares (the fields of `const S = struct {...}`, of a field's
+    /// struct type, or of the struct a function returns) become its child symbols; containers that
+    /// are only lexically inside it (local types, call arguments, `?struct {...}`) are not listed
     fn childrenOf(b: *Builder, item: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
         for (b.items.containers, 0..) |c, ci| {
-            if (c.parent_item == item) try out.appendSlice(b.arena, try b.container(@intCast(ci), level));
+            if (c.parent_item == item and c.is_value) try out.appendSlice(b.arena, try b.container(@intCast(ci), level));
         }
         return out.items;
     }
@@ -126,7 +127,7 @@ pub fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.C
         .@"fn" => if (container_kind == .file) .Function else .Method,
         .@"var" => .Variable,
         .@"const" => for (items.containers) |c| {
-            if (c.parent_item == index) break switch (c.kind) {
+            if (c.parent_item == index and c.is_value) break switch (c.kind) {
                 .@"enum" => .Enum,
                 .@"union", .@"struct" => .Struct,
                 .@"opaque", .file => .Object,
@@ -301,6 +302,50 @@ test "zon files list the field tree" {
     // No symbols when the root is not an initializer list
     const scalar = try Parse.create(a, "1", .zon);
     try testing.expectEqual(0, (try zonSymbols(a, scalar.rootNode(), try offsets.LineIndex.init(a, "1"), .utf16)).len);
+}
+
+test "only the container a declaration declares gives it children and a kind" {
+    // Containers nested in call arguments, `?T`, `[N]T`, function bodies, and parameter types are
+    // not merged into the enclosing declaration
+    const text =
+        \\const std = @import("std");
+        \\const List = std.ArrayList(struct { a: u8, b: u8 });
+        \\const Opt = ?struct { maybe: u8 };
+        \\const Arr = [2]struct { elem: u8 };
+        \\fn helper() void { const A = struct { a1: u8 }; const B = enum { b1, b2 }; _ = A; _ = B; }
+        \\test "sort" { const S = struct { fn lessThan() void {} }; _ = S; }
+        \\pub fn Wrapper(comptime T: type) type { const Impl = struct { inner: T }; return struct { impl: Impl }; }
+        \\fn take(opts: struct { verbose: bool = false }) void { _ = opts; }
+        \\const Outer = struct { opts: struct { x: u8 } };
+    ;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parse = try Parse.create(a, text, .zig);
+    var items = try ItemTree.build(a, parse.rootNode(), .zig);
+    var map = try ItemTree.AstIdMap.build(a, &items, parse.rootNode());
+    const lines = try offsets.LineIndex.init(a, text);
+
+    const syms = try documentSymbols(a, &items, &map, lines, .utf16);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try writeOutline(&out.writer, syms, 0);
+    try testing.expectEqualStrings(
+        \\std
+        \\List
+        \\Opt
+        \\Arr
+        \\helper
+        \\sort
+        \\Wrapper
+        \\  impl
+        \\take
+        \\Outer
+        \\  opts
+        \\    x
+        \\
+    , out.written());
+    for (syms[1..4]) |s| try testing.expectEqual(types.SymbolKind.Constant, s.kind);
+    try testing.expectEqual(types.SymbolKind.Struct, syms[8].kind);
 }
 
 test "zon document symbols stop at the nesting limit" {
