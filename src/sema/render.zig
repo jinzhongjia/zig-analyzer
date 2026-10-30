@@ -27,10 +27,14 @@ const ContainerNames = struct {
     /// hints, completion details, etc.) nested anonymous containers are displayed as
     /// `struct {...}`.
     full: bool = false,
-    /// Maximum number of characters in the output (`max_length` of inlay hints); null means
-    /// unlimited. See `InternPool.truncateList`; the output must be written to an
-    /// `Io.Writer.Allocating`, which keeps everything written so far in its buffer.
+    /// Maximum number of characters in the output (`max_length` of inlay hints, and
+    /// `max_value_length` for values); null means unlimited. See `InternPool.truncateList`; the
+    /// output must be written to an `Io.Writer.Allocating`, which keeps everything written so far
+    /// in its buffer.
     max_length: ?usize = null,
+    /// Write the full number of items after the `…` of a cut list or string (see
+    /// `InternPool.truncateList`)
+    show_total: bool = false,
 
     const Outer = struct { c: InternPool.Container, parent: ?*const Outer };
 
@@ -65,16 +69,19 @@ const ContainerNames = struct {
             while (o) |up| : (o = up.parent) if (up.c.file == c.file and up.c.ast_id == c.ast_id) return w.writeAll(" {...}");
         } else if (n.outer != null) return w.writeAll(" {...}");
         const here: Outer = .{ .c = c, .parent = n.outer };
-        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full, .max_length = n.max_length };
+        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full, .max_length = n.max_length, .show_total = n.show_total };
         const ip = n.r.ctx.db.env.ip;
         try w.writeAll(" {");
+        const members = tree.containerMembers(@intCast(ci));
+        var total: usize = 0;
+        for (members) |m| total += @intFromBool(tree.items[m].kind == .field);
         var count: usize = 0;
-        for (tree.containerMembers(@intCast(ci))) |m| {
+        for (members) |m| {
             const it = tree.items[m];
             if (it.kind != .field) continue;
             try w.writeAll(if (count == 0) " " else ", ");
             count += 1;
-            if (try InternPool.truncateList(n, w)) break;
+            if (try InternPool.truncateList(n, w, total)) break;
             // Tuple fields have no names
             if (it.name) |field| try w.print("{f}", .{std.zig.fmtId(field)});
             if (c.kind == .@"enum") continue;
@@ -163,11 +170,14 @@ const ContainerNames = struct {
         var first = true;
         // Non-comptime parameters are not part of the instance's identity and are not shown;
         // unknown comptime arguments are shown as `_`
-        for (ip.key(inst).instance.args) |arg| {
+        const args = ip.key(inst).instance.args;
+        var total: usize = 0;
+        for (args) |arg| total += @intFromBool(arg != .runtime);
+        for (args) |arg| {
             if (arg == .runtime) continue;
             if (!first) try w.writeAll(", ");
             first = false;
-            if (try InternPool.truncateList(n, w)) break;
+            if (try InternPool.truncateList(n, w, total)) break;
             if (arg == .unknown) try w.writeAll("_") else try ip.print(arg, w, n);
         }
         try w.writeAll(")");
@@ -225,8 +235,8 @@ const ContainerNames = struct {
     }
 };
 
-/// Display listing the full contents: the result of `@typeName`, and types and values in hover
-/// and completion details
+/// Display listing the full contents: the result of `@typeName`, and types in hover and
+/// completion details (values there are limited, see `shownValue`)
 pub fn writeFull(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
     try r.ctx.db.env.ip.print(t, w, ContainerNames{ .r = r, .full = true });
 }
@@ -246,7 +256,8 @@ pub fn typeAllocNoting(r: *Resolver, t: Index, max_length: ?usize) error{OutOfMe
 }
 
 /// Displays `type = T` when the value is a type, and `T = v` for other values known at comptime.
-/// Lists the full contents without truncation (hover, completion details).
+/// Lists the full contents of the type; the value is limited (see `shownValue`) (hover,
+/// completion details).
 pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     var out: Io.Writer.Allocating = .init(r.arena);
     writeFull(r, tv.ty, &out.writer) catch return error.OutOfMemory;
@@ -285,12 +296,17 @@ fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
     return true;
 }
 
-/// The value known at comptime (functions are not displayed: the type already shows the
-/// signature)
+/// Maximum number of characters of a displayed comptime value: a value such as a large binary
+/// `@embedFile` would otherwise make a hover of several megabytes. The cut is marked: `…` and the
+/// full number of items or bytes follow (`"ab…" (1048576 bytes total)`)
+pub const max_value_length = 2000;
+
+/// The value known at comptime, at most about `max_value_length` characters (functions are not
+/// displayed: the type already shows the signature)
 fn shownValue(r: *Resolver, tv: TypedValue) error{OutOfMemory}!?[]const u8 {
     const v = tv.val orelse return null;
     if (r.ctx.db.env.ip.key(v) == .fn_value) return null;
     var out: Io.Writer.Allocating = .init(r.arena);
-    writeFull(r, v, &out.writer) catch return error.OutOfMemory;
+    r.ctx.db.env.ip.print(v, &out.writer, ContainerNames{ .r = r, .full = true, .max_length = max_value_length, .show_total = true }) catch return error.OutOfMemory;
     return out.written();
 }

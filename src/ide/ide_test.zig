@@ -3495,6 +3495,55 @@ test "hover shows comptime-known bool, null, undefined and void values" {
     }
 }
 
+test "hover and completion details bound large comptime values and mark the cut" {
+    // Prevents a large binary `@embedFile` constant from producing a multi-megabyte hover
+    const text =
+        \\const blob = @embedFile("blob.bin");
+        \\const table: [3000]u16 = @splat(7);
+        \\const small = "fits";
+        \\fn f() usize {
+        \\    return blob.len + table.len + small.len;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const bytes = try w.arena.allocator().alloc(u8, 1 << 20);
+    for (bytes, 0..) |*b, i| b.* = @truncate(i *% 7919);
+    _ = try w.add("/p/blob.bin", bytes);
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+
+    const blob_prefix = "const blob: *const [1048576:0]u8 = \"\\x00\\xef\\xde";
+    const blob_suffix = "…\" (1048576 bytes total)";
+    var texts: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "blob =", "blob.len", "embedFile" }) |needle| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, needle).?))).?;
+        try texts.append(w.arena.allocator(), info.text);
+    }
+    // `completionItem/resolve` of an auto-import candidate: `blob` is the first member
+    try texts.append(w.arena.allocator(), (try completion.describe(&r, file, .{ .decl = .{ .file = file, .item = 0 } })).detail);
+    for (texts.items) |t| {
+        testing.expect(t.len < 4096) catch |err| {
+            std.debug.print("{d} bytes: {s}\n", .{ t.len, t[0..@min(t.len, 200)] });
+            return err;
+        };
+        try testing.expect(std.mem.indexOf(u8, t, blob_prefix) != null or std.mem.indexOf(u8, t, blob_prefix["const blob: ".len..]) != null);
+        try testing.expect(std.mem.indexOf(u8, t, blob_suffix) != null);
+    }
+
+    const table = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "table:").?))).?.text;
+    try testing.expect(table.len < 4096);
+    try testing.expect(std.mem.startsWith(u8, table, "```zig\nconst table: [3000]u16 = .{ 7, 7, "));
+    try testing.expect(std.mem.endsWith(u8, table, ", … (3000 total) }\n```"));
+    // Values within the limit are shown in full
+    const small = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "small =").?))).?.text;
+    try testing.expectEqualStrings("```zig\nconst small: *const [4:0]u8 = \"fits\"\n```", small);
+}
+
 test "anonymous containers are shown by content, and their type hints only when enabled" {
     const text =
         \\const Kind = union(enum) { compile: struct { root: u32 }, none };

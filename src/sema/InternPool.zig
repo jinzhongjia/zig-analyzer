@@ -721,7 +721,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("error{");
             for (names, 0..) |n, i| {
                 if (i != 0) try w.writeAll(",");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, names.len)) break;
                 try w.writeAll(n);
             }
             try w.writeAll("}");
@@ -730,7 +730,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("fn (");
             for (f.params, 0..) |p, i| {
                 if (i != 0) try w.writeAll(", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, f.params.len)) break;
                 try ip.print(p, w, container_name);
             }
             if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
@@ -745,7 +745,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("struct {");
             for (t.types, 0..) |ty, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, t.types.len)) break;
                 try ip.printField(null, ty, fieldValue(t.values, i), w, container_name);
             }
             try w.writeAll(" }");
@@ -759,7 +759,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("struct {");
             for (t.names, t.types, 0..) |n, ty, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, t.names.len)) break;
                 try ip.printField(n, ty, fieldValue(t.values, i), w, container_name);
             }
             try w.writeAll(if (t.names.len == 0) "}" else " }");
@@ -799,7 +799,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll(".{");
             for (v.elems, 0..) |e, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, v.elems.len)) break;
                 if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
                 try ip.print(e, w, container_name);
             }
@@ -807,8 +807,11 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         .bytes => |v| switch (ip.key(v.ty)) {
             .array_type, .ptr_type => {
-                const shown = v.bytes[0..@min(v.bytes.len, remaining(container_name, w) orelse v.bytes.len)];
-                try w.print("\"{f}{s}\"", .{ std.zig.fmtString(shown), if (shown.len < v.bytes.len) "…" else "" });
+                try w.writeAll("\"");
+                const shown = try writeStringPrefix(v.bytes, remaining(container_name, w), w);
+                if (shown == v.bytes.len) return w.writeAll("\"");
+                try w.writeAll("…\"");
+                try writeTotal(container_name, w, v.bytes.len, " bytes");
             },
             // Structs, tuples and vectors whose elements are all u8 (also represented as
             // bytes): shown element by element like an aggregate
@@ -817,7 +820,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
                 try w.writeAll(".{");
                 for (v.bytes, 0..) |byte, i| {
                     try w.writeAll(if (i == 0) " " else ", ");
-                    if (try truncateList(container_name, w)) break;
+                    if (try truncateList(container_name, w, v.bytes.len)) break;
                     if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
                     try w.print("{d}", .{byte});
                 }
@@ -846,12 +849,42 @@ fn remaining(container_name: anytype, w: *Io.Writer) ?usize {
 }
 
 /// Called before writing the next item of a list (fields, elements, parameters): when the output
-/// is already full, writes `…` and returns true, and the list stops there. The output can thus
-/// exceed the limit by one item; strings are written only up to the limit.
-pub fn truncateList(container_name: anytype, w: *Io.Writer) Io.Writer.Error!bool {
+/// is already full, writes `…` (see `writeTotal`) and returns true, and the list stops there. The
+/// output can thus exceed the limit by one item; strings are written only up to the limit.
+/// `total` is the number of items in the list.
+pub fn truncateList(container_name: anytype, w: *Io.Writer, total: usize) Io.Writer.Error!bool {
     if (remaining(container_name, w) != 0) return false;
     try w.writeAll("…");
+    try writeTotal(container_name, w, total, "");
     return true;
+}
+
+/// After the `…` of a cut list or string: ` (N total)` with the full number of items (or of
+/// `unit`s) when `container_name.show_total` is set, so that the cut states how much is left out
+fn writeTotal(container_name: anytype, w: *Io.Writer, total: usize, unit: []const u8) Io.Writer.Error!void {
+    if (@hasField(@TypeOf(container_name), "show_total") and container_name.show_total) try w.print(" ({d}{s} total)", .{ total, unit });
+}
+
+/// Writes `text` escaped as in a string literal, stopping once about `limit` characters are
+/// written (null: no limit); returns the number of bytes written. A valid UTF-8 sequence is
+/// written whole, so the output is the same as escaping the whole string at once.
+fn writeStringPrefix(text: []const u8, limit: ?usize, w: *Io.Writer) Io.Writer.Error!usize {
+    const max = limit orelse {
+        try std.zig.stringEscape(text, w);
+        return text.len;
+    };
+    var i: usize = 0;
+    var written: usize = 0;
+    while (i < text.len and written < max) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const unit = if (i + len <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..len])) len else 1;
+        const before = w.buffered().len;
+        try std.zig.stringEscape(text[i..][0..unit], w);
+        const out = w.buffered()[before..];
+        written += std.unicode.utf8CountCodepoints(out) catch out.len;
+        i += unit;
+    }
+    return i;
 }
 
 /// A field of a tuple or anonymous struct: comptime fields include their value
@@ -872,7 +905,7 @@ pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: 
     try w.print("{t} {{", .{t.kind});
     for (t.names, 0..) |n, i| {
         try w.writeAll(if (i == 0) " " else ", ");
-        if (try truncateList(container_name, w)) break;
+        if (try truncateList(container_name, w, t.names.len)) break;
         try w.writeAll(n);
         if (i < t.types.len) {
             try w.writeAll(": ");
