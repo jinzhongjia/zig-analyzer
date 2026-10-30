@@ -4613,8 +4613,14 @@ fn declaration(server: *Server, r: *Resolver, arena: Allocator, params: types.De
 
 fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types.TypeDefinitionParams) HandlerError!types.ResultType("textDocument/typeDefinition") {
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const t = try ide.definition.typeDefinition(r, at.file, at.offset) orelse return null;
-    return .{ .Definition = .{ .Location = try server.targetLocation(r, arena, t) } };
+    const targets = try ide.definition.typeDefinitionTargets(r, at.file, at.offset);
+    const locs = try arena.alloc(types.Location, targets.len);
+    for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
+    return switch (locs.len) {
+        0 => null,
+        1 => .{ .Definition = .{ .Location = locs[0] } },
+        else => .{ .Definition = .{ .array_of_Location = locs } },
+    };
 }
 
 /// All goto targets at the cursor, computed with `find`. A path in `build.zig.zon` goes to the start

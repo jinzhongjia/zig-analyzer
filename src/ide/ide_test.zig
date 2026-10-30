@@ -3534,6 +3534,76 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+/// "file:line" of each target of `find` at the first occurrence of `needle` in `file`, sorted and
+/// joined by spaces
+fn gotoLines(w: *World, r: *resolve.Resolver, file: FileId, needle: []const u8, comptime find: anytype) ![]const u8 {
+    const a = w.arena.allocator();
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    var labels: std.ArrayList([]const u8) = .empty;
+    for (try find(r, file, @intCast(std.mem.indexOf(u8, text, needle).?))) |t| {
+        const target_text = (try r.ctx.get(database.syntax.SourceText, t.file)).text;
+        const line = std.mem.count(u8, target_text[0..t.start], "\n") + 1;
+        try labels.append(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ std.fs.path.basename(w.vfs.path(t.file)), line }));
+    }
+    std.mem.sort([]const u8, labels.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    return std.mem.join(a, " ", labels.items);
+}
+
+test "goto in generic functions lists the targets under every instance" {
+    // Prevents goto from returning only the target under the instance of the first call site
+    const types =
+        \\//- /p/main.zig module:app
+        \\const lib = @import("lib.zig");
+        \\const A = struct { len: u32 = 1, pub fn name() []const u8 { return "a"; } };
+        \\const B = struct { len: u32 = 2, pub fn name() []const u8 { return "b"; } };
+        \\fn show(comptime T: type) []const u8 { return T.name(); }
+        \\fn getLen(x: anytype) u32 { return x.len; }
+        \\
+    ;
+    for ([_][]const u8{
+        \\test {
+        \\    _ = .{ show(A), show(B), getLen(A{}), getLen(B{}), lib.run(A, 1), lib.run(B, 2) };
+        \\}
+        ,
+        \\test {
+        \\    _ = .{ show(B), show(A), getLen(B{}), getLen(A{}), lib.run(B, 2), lib.run(A, 1) };
+        \\}
+    }) |calls| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const f = try w.fixture(try std.mem.concat(w.arena.allocator(), u8, &.{
+            types, calls,
+            \\
+            \\//- /p/lib.zig in:app
+            \\pub fn run(comptime Q: type, key: u32) []const u8 {
+            \\    _ = key;
+            \\    return Q.name();
+            \\}
+        }));
+        const main = f.file("/p/main.zig");
+        const lib = f.file("/p/lib.zig");
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        for ([_]struct { FileId, []const u8, []const u8 }{
+            .{ main, "name(); }", "main.zig:2 main.zig:3" },
+            .{ main, "len; }", "main.zig:2 main.zig:3" },
+            .{ lib, "name();", "main.zig:2 main.zig:3" },
+        }) |c| {
+            try testing.expectEqualStrings(c[2], try gotoLines(&w, &r, c[0], c[1], definition.definitionTargets));
+            try testing.expectEqualStrings(c[2], try gotoLines(&w, &r, c[0], c[1], definition.declarationTargets));
+        }
+        try testing.expectEqualStrings("main.zig:2 main.zig:3", try gotoLines(&w, &r, main, "x.len", definition.typeDefinitionTargets));
+        try testing.expectEqualStrings("main.zig:2 main.zig:3", try gotoLines(&w, &r, main, "T.name", definition.typeDefinitionTargets));
+        try testing.expectEqualStrings("main.zig:2 main.zig:3", try gotoLines(&w, &r, lib, "Q.name", definition.typeDefinitionTargets));
+    }
+}
+
 test "type definition of fields typed by the parameter of a generic container" {
     // Prevents an empty result on `self.items` when only the type of `self` was seeded
     const text =

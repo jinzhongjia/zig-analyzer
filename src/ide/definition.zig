@@ -50,21 +50,76 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
 
 /// All targets of definition: when the cursor is on `@import("name")` and the modules the file
 /// belongs to import different modules as `name`, the root files of those modules (in module
-/// priority order); otherwise the result of `definition`. The first one is the result of
-/// `definition`.
+/// priority order); otherwise the result of `definition`, followed by the definitions the name
+/// refers to under the other instances of the generic function containing it (see
+/// `instanceDefs`). The first one is the result of `definition`.
 pub fn definitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
-    return single(r, try definition(r, file, offset));
+    return withInstances(r, file, offset, try definition(r, file, offset), true);
 }
 
 /// All targets of declaration: like `definitionTargets`, but otherwise the result of `declaration`
 pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
-    return single(r, try declaration(r, file, offset));
+    return withInstances(r, file, offset, try declaration(r, file, offset), false);
 }
 
-fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
-    return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
+/// `first` followed by the targets of `instanceDefs` (through aliases with `follow_alias`), each
+/// target once
+fn withInstances(r: *Resolver, file: FileId, offset: u32, first: ?Target, follow_alias: bool) resolve.Error![]const Target {
+    var out: std.ArrayList(Target) = .empty;
+    if (first) |t| try out.append(r.arena, t);
+    for (try instanceDefs(r, file, offset)) |def| {
+        const t = try target(r, if (follow_alias) try r.aliasTarget(def) else def) orelse continue;
+        try appendNew(r, &out, t);
+    }
+    return out.items;
+}
+
+fn appendNew(r: *Resolver, out: *std.ArrayList(Target), t: Target) resolve.Error!void {
+    for (out.items) |x| if (std.meta.eql(x, t)) return;
+    try out.append(r.arena, t);
+}
+
+/// The definitions that a member name at the cursor whose target comes from inference (a field or
+/// method via the type of the left-hand side, a decl literal, a field name in an initializer)
+/// refers to under each instance of the generic function containing it (see `context.allSeeded`),
+/// when the abstract inference does not determine it; empty otherwise. Each instance of a generic
+/// function is analyzed separately, and the same name can refer to a different declaration in each.
+fn instanceDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Def {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const a = try context.at(r, file, tok.offset, false) orelse return &.{};
+    const b = a.body;
+    if (b.bindingAt(a.rel) != null) return &.{};
+    const e = b.exprAt(a.rel) orelse return &.{};
+    // The index of the field name in an initializer; null for a member
+    const field: ?u32 = switch (b.expr(e)) {
+        .field_access => |fa| blk: {
+            if (a.rel < b.range(fa.lhs).end) return &.{};
+            if (try r.evalNamespace(file, a.item, b, fa.lhs)) |ns| {
+                if (try r.memberDef(ns, fa.field orelse return &.{}) != null) return &.{};
+            }
+            break :blk null;
+        },
+        .enum_literal => null,
+        .init => |x| for (x.fields, 0..) |fi, k| {
+            if (fi.name != null and a.rel >= fi.name_range.start and a.rel < fi.name_range.end) break @intCast(k);
+        } else return &.{},
+        else => return &.{},
+    };
+    if (memberAt(a, e, field) != null) return &.{};
+    var out: std.ArrayList(Def) = .empty;
+    for (try context.allSeeded(r, a)) |v| {
+        try out.append(r.arena, try context.defOfKey(r, memberAt(v, e, field) orelse continue) orelse continue);
+    }
+    return out.items;
+}
+
+/// The member that the member access or decl literal `e` (`field` null), or the `field`-th field
+/// name of the initializer `e`, resolves to in `a`
+fn memberAt(a: context.At, e: Body.ExprId, field: ?u32) ?database.hir.OwnerKey {
+    return if (field) |k| a.fieldRef(e, k) else a.member(e);
 }
 
 /// A path string in `build.zig.zon` that points to a file (an element of `.paths`, the `.path` of
@@ -726,15 +781,31 @@ fn target(r: *Resolver, def: Def) resolve.Error!?Target {
 /// a generic function, a type that is not concrete is taken from a call-site instance in which the
 /// symbol itself has a concrete type (as hover does).
 pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    const tok = try tokenAt(r, file, offset) orelse return null;
-    var a = try context.at(r, file, tok.offset, false) orelse return null;
-    const subject = try typeSubject(r, a) orelse return null;
-    const ip = r.ctx.db.env.ip;
-    if (seed.wanted(ip, try subjectType(r, a, subject))) if (subject.seedSubject()) |s| {
-        var refiner = try seed.Refiner.init(r, a.file, a.item, a.node.offset, a.body, a.res);
-        a.seeded = try refiner.at(a.rel, s);
-    };
-    return typeTarget(r, try subjectType(r, a, subject));
+    const targets = try typeDefinitionTargets(r, file, offset);
+    return if (targets.len > 0) targets[0] else null;
+}
+
+/// All targets of type definition: the result of `typeDefinition`, followed, when the type of the
+/// symbol is not concrete in the abstract inference of a generic function, by the definitions of
+/// its type under the other instances of the function (see `context.allSeeded`), each target once
+pub fn typeDefinitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    const a = try context.at(r, file, tok.offset, false) orelse return &.{};
+    const subject = try typeSubject(r, a) orelse return &.{};
+    var out: std.ArrayList(Target) = .empty;
+    const s = subject.seedSubject();
+    if (s == null or !seed.wanted(r.ctx.db.env.ip, try subjectType(r, a, subject))) {
+        if (try typeTarget(r, try subjectType(r, a, subject))) |t| try out.append(r.arena, t);
+        return out.items;
+    }
+    var refiner = try seed.Refiner.init(r, a.file, a.item, a.node.offset, a.body, a.res);
+    var first = a;
+    first.seeded = try refiner.at(a.rel, s);
+    if (try typeTarget(r, try subjectType(r, first, subject))) |t| try out.append(r.arena, t);
+    for (try context.allSeeded(r, a)) |v| {
+        if (try typeTarget(r, try subjectType(r, v, subject))) |t| try appendNew(r, &out, t);
+    }
+    return out.items;
 }
 
 /// What type definition takes the type of

@@ -120,6 +120,19 @@ pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) re
     return a;
 }
 
+/// `a` under every call-site instance of the generic function containing its member (and every
+/// iteration of a region inferred per iteration; see `seed.allSeeds`): one `At` per inference
+/// result, with `seeded` set to it
+pub fn allSeeded(r: *Resolver, a: At) resolve.Error![]const At {
+    const seeds = try seed.allSeeds(r, a.file, a.item, a.body, a.res, a.rel);
+    const out = try r.arena.alloc(At, seeds.len);
+    for (seeds, out) |s, *x| {
+        x.* = a;
+        x.seeded = s;
+    }
+    return out;
+}
+
 /// Expression at the position whose type must be known: the left-hand side when the position is
 /// on the member name of a member access, otherwise the expression containing it. With
 /// `inclusive_end`, the position is right after just-typed text (completion), so the expression
