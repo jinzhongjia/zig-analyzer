@@ -294,6 +294,9 @@ fn typeCategory(r: *Resolver, t: Index) resolve.Error!?Rule {
 
 /// A value (not a type) of type `ty`: a callable, or an ordinary value
 fn valueCategory(ip: *InternPool, ty: Index) ?Rule {
+    // `@compileError` stubs: the declaration never has a value, and it is named after the API
+    // it stands for, which callers still use until they reach its message
+    if (ty == .noreturn_type) return null;
     return switch (ip.key(ty)) {
         .unknown, .opaque_param => null,
         .fn_type => |f| callable(ip, f.ret),
