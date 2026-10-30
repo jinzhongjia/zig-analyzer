@@ -299,8 +299,9 @@ const Pending = struct {
     id: jsonrpc.Id,
     cancel: std.atomic.Value(bool) = .init(false),
     /// When the request was received: it is answered on the state at that point, or with
-    /// `ContentModified` when a write transaction has begun since then (the task may start
-    /// reading only after the main loop has applied later messages such as `didChange`)
+    /// `ContentModified` when a write transaction ordered after it has begun since then (the task
+    /// may start reading only after the main loop has applied later messages such as `didChange`;
+    /// the server's own updates are not ordered with requests, see `Db.WriteOrder`)
     since: Db.Mark,
 };
 
@@ -983,7 +984,9 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     if (try server.moduleGraphUnchanged(graph, t)) return;
     // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it.
     // Requests that read only text cannot change with the module graph: they are not canceled.
-    server.db.beginWriteOf(comptime Db.inputSet(&.{ ModuleGraph.Input, za.sema.queries.TargetAbi }));
+    // The update is not ordered with the requests: one received earlier that starts reading after
+    // it reads the new graph.
+    server.db.beginWriteOf(comptime Db.inputSet(&.{ ModuleGraph.Input, za.sema.queries.TargetAbi }), .unordered);
     defer server.db.endWrite();
     // `set` allocates only when the key is not interned yet: ensure both keys first, so that
     // the two set calls afterwards cannot fail and cannot leave a partial update either
@@ -1132,7 +1135,7 @@ fn scanOnce(server: *Server) Allocator.Error!void {
     };
     if (unchanged) return;
     {
-        server.db.beginWriteOf(comptime Db.inputSet(&.{WorkspaceFiles}));
+        server.db.beginWriteOf(comptime Db.inputSet(&.{WorkspaceFiles}), .unordered);
         defer server.db.endWrite();
         // The engine takes ownership of the value, also when it fails
         try server.db.set(WorkspaceFiles, {}, try server.gpa.dupe(Vfs.FileId, files), .low);
@@ -2399,7 +2402,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         defer if (message) |m| server.gpa.free(m);
         server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
-        server.db.beginWriteOf(comptime Db.inputSet(&.{live.LiveBackend}));
+        server.db.beginWriteOf(comptime Db.inputSet(&.{live.LiveBackend}), .unordered);
         defer server.db.endWrite();
         server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
     }

@@ -1294,7 +1294,9 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
         try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = origin.classify(&ws.server.vfs, rules, path, false).durability() });
     }
     const db = &ws.server.db;
-    db.beginWrite();
+    // The server's own update, not ordered with the client's requests: a request received before
+    // it and starting after it reads the loaded files instead of failing with ContentModified
+    db.beginWriteOf(comptime database.Db.inputSet(&.{FileText}), .unordered);
     defer db.endWrite();
     for (batch.items) |l| {
         // Files the client opened in the meantime: their buffers take precedence

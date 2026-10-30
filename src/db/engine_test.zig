@@ -979,6 +979,21 @@ test "cancellation: a read bound to a mark is canceled by any write transaction 
     try testing.expectEqual(8, try ctx.get(Plus, 1));
 }
 
+test "cancellation: a write not ordered with marks is read by the reads that begin after it" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    const m = d.mark(null);
+    {
+        d.beginWriteOf(Db.inputSet(&.{Number}), .unordered);
+        defer d.endWrite();
+        try d.set(Number, 1, 70, .low);
+    }
+    var ctx = d.beginReadAt(testing.allocator, m);
+    defer ctx.end();
+    try testing.expectEqual(8, try ctx.get(Plus, 1));
+}
+
 test "cancellation: a write transaction cancels only the reads that may depend on the inputs it changes" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
@@ -988,7 +1003,7 @@ test "cancellation: a write transaction cancels only the reads that may depend o
     const before_numbers = d.mark(numbers);
     const Writer = struct {
         fn run(dd: *Db) void {
-            dd.beginWriteOf(Db.inputSet(&.{Stable}));
+            dd.beginWriteOf(Db.inputSet(&.{Stable}), .after_marks);
             defer dd.endWrite();
             dd.set(Stable, 1, 5, .low) catch unreachable;
         }

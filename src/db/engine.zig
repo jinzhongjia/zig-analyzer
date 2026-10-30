@@ -55,7 +55,7 @@
 //! a write transaction (`beginWrite`) first registers in `pending_write` so that in-flight read
 //! queries exit with `error.Canceled` as soon as possible, then acquires the exclusive lock. A read
 //! transaction begun with `beginReadAt` must see the state at an earlier `mark` and is canceled as
-//! well when a write transaction has begun since then.
+//! well when a write transaction ordered after the mark (`WriteOrder`) has begun since then.
 //! Query values obtained in a read transaction stay valid until that transaction ends: replaced
 //! old values are freed only at the next write transaction.
 
@@ -250,9 +250,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// Like `pending_write`, per input query (indexed like `queries`): the write transactions
         /// waiting for the exclusive lock that may change it
         pending_inputs: [queries.len]std.atomic.Value(u32) = @splat(.init(0)),
-        /// Per input query (indexed like `queries`): the number of write transactions begun that may
-        /// change it, the position of a `Mark` restricted to some inputs
+        /// Per input query (indexed like `queries`): the number of write transactions begun after
+        /// the marks taken before them (`WriteOrder.after_marks`) that may change it, the position
+        /// of a `Mark` restricted to some inputs
         input_writes: [queries.len]std.atomic.Value(u64) = @splat(.init(0)),
+        /// Number of write transactions begun after the marks taken before them, the position of a
+        /// `Mark` of all inputs
+        ordered_writes: std.atomic.Value(u64) = .init(0),
         /// Number of in-flight read transactions. It must be 0 when memo values are freed
         /// (eviction, garbage collection, `resetQueries`), which is checked by assertions.
         active_readers: std.atomic.Value(u32) = .init(0),
@@ -273,7 +277,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         counters: [queries.len]Counters = @splat(.{}),
         incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
         deep_verifications: std.atomic.Value(u64) = .init(0),
-        /// See `Stats.writes`; also the position of a `Mark`
+        /// See `Stats.writes`
         writes: std.atomic.Value(u64) = .init(0),
         /// Counter for the last-use times of memos (LRU)
         access_tick: std.atomic.Value(u64) = .init(0),
@@ -465,21 +469,34 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         // ── Write transactions ─────────────────────────────────────────────
 
-        /// Begins a write transaction that may set any input: cancels in-flight read queries and
-        /// waits for all read transactions to finish.
+        /// Begins a write transaction that may set any input, ordered after all marks taken before
+        /// it: cancels in-flight read queries and waits for all read transactions to finish.
         pub fn beginWrite(db: *Db) void {
-            db.beginWriteOf(all_inputs);
+            db.beginWriteOf(all_inputs, .after_marks);
         }
+
+        /// How a write transaction relates to the read transactions bound to marks taken before it
+        /// (`beginReadAt`)
+        pub const WriteOrder = enum {
+            /// It comes after them: they are canceled even when they begin after it has finished
+            /// (such as an edit applied after a request was received)
+            after_marks,
+            /// It is not ordered with them (such as the updates a server makes on its own, which
+            /// happen independently of the requests): one that begins after it has finished reads
+            /// its changes; one in progress is still canceled
+            unordered,
+        };
 
         /// Begins a write transaction that sets only the inputs in `changes`: cancels the in-flight
         /// queries of the read transactions that may depend on them, and waits for all read
         /// transactions to finish (those that cannot depend on them run to completion, since the
         /// write cannot change their results).
-        pub fn beginWriteOf(db: *Db, changes: Inputs) void {
+        pub fn beginWriteOf(db: *Db, changes: Inputs, order: WriteOrder) void {
             _ = db.writes.fetchAdd(1, .monotonic);
+            if (order == .after_marks) _ = db.ordered_writes.fetchAdd(1, .monotonic);
             var it = changes.iterator(.{});
             while (it.next()) |qi| {
-                _ = db.input_writes[qi].fetchAdd(1, .monotonic);
+                if (order == .after_marks) _ = db.input_writes[qi].fetchAdd(1, .monotonic);
                 _ = db.pending_inputs[qi].fetchAdd(1, .release);
             }
             _ = db.pending_write.fetchAdd(1, .release);
@@ -749,10 +766,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return .{ .inputs = inputs, .writes = db.writesTo(inputs) };
         }
 
-        /// Number of write transactions begun that may change any of `inputs` (null: all), counted
-        /// once per input: it grows exactly when such a write transaction begins
+        /// Number of write transactions ordered after earlier marks (`WriteOrder.after_marks`)
+        /// begun that may change any of `inputs` (null: all), counted once per input: it grows
+        /// exactly when such a write transaction begins
         fn writesTo(db: *Db, inputs: ?Inputs) u64 {
-            const some = inputs orelse return db.writes.load(.acquire);
+            const some = inputs orelse return db.ordered_writes.load(.acquire);
             var n: u64 = 0;
             var it = some.iterator(.{});
             while (it.next()) |qi| n += db.input_writes[qi].load(.acquire);
@@ -761,10 +779,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         /// Begins a read transaction for a read that must see the inputs as they were at `since`
         /// (taken earlier with `mark`), such as a request that is answered on the state it was
-        /// received in: when a write transaction that may change the inputs of the mark has begun
-        /// after the mark, even one that has already finished, the read transaction is canceled
-        /// (its reads return `error.Canceled`). Write transactions that cannot change those inputs
-        /// do not cancel it at all (see `Ctx.inputs`). Null reads the current state of all inputs.
+        /// received in: when a write transaction ordered after the mark (`WriteOrder.after_marks`)
+        /// that may change the inputs of the mark has begun since then, even one that has already
+        /// finished, the read transaction is canceled (its reads return `error.Canceled`). Write
+        /// transactions that cannot change those inputs do not cancel it at all (see `Ctx.inputs`).
+        /// Null reads the current state of all inputs.
         pub fn beginReadAt(db: *Db, gpa: Allocator, since: ?Mark) Ctx {
             db.rw.lockSharedUncancelable(db.io);
             _ = db.active_readers.fetchAdd(1, .acq_rel);
