@@ -4514,6 +4514,52 @@ test "inlay hints: the length limit cuts comptime strings on whole characters" {
     }
 }
 
+test "inlay hints: parameter names only inside the requested range" {
+    // Arguments of an intersecting call outside the range get no hints
+    const text =
+        \\fn three(alpha: u32, beta: u32, gamma: u32) u32 {
+        \\    return alpha + beta + gamma;
+        \\}
+        \\pub fn main() void {
+        \\    const total = three(
+        \\        1,
+        \\        2,
+        \\        3,
+        \\    );
+        \\    var buf: [2]u8 = undefined;
+        \\    @memcpy(
+        \\        buf[0..1],
+        \\        "a",
+        \\    );
+        \\    _ = total;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn f(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.f;
+    const cases = [_]struct { u32, u32, []const u8 }{
+        .{ at("        3,"), at("    );"), "gamma:" },
+        .{ 0, at("        1,"), ": u32" },
+        .{ at("    );"), at("    var buf"), "" },
+        .{ at("        \"a\""), at("    _ = total"), "source:" },
+    };
+    for (cases) |c| {
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (try inlay_hints.inlayHints(&r, file, c[0], c[1], .{})) |h| try labels.append(w.arena.allocator(), h.label);
+        try testing.expectEqualStrings(c[2], try std.mem.join(w.arena.allocator(), " ", labels.items));
+    }
+}
+
 test "inlay hints: field types in initializers that have a result type" {
     const text =
         \\const Point = struct { x: i32, y: i32 = 0 };

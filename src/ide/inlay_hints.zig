@@ -99,7 +99,7 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
                 for (c.args, 0..) |arg, ai| {
                     if (ai + skip >= params.len) break;
                     const name = (params[ai + skip].name() orelse continue).text;
-                    try paramHint(r, a, arg, name, opts, out);
+                    try paramHint(r, a, arg, name, start, end, opts, out);
                 }
             },
             .builtin_call => |c| {
@@ -108,7 +108,7 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
                 const entry = builtins.get(c.name) orelse continue;
                 if (!showsParamNames(entry)) continue;
                 const n = @min(c.args.len, entry.parameters.len);
-                for (c.args[0..n], entry.parameters[0..n]) |arg, param| try paramHint(r, a, arg, builtinParamName(param), opts, out);
+                for (c.args[0..n], entry.parameters[0..n]) |arg, param| try paramHint(r, a, arg, builtinParamName(param), start, end, opts, out);
             },
             else => {},
         }
@@ -140,10 +140,12 @@ fn typeLabel(r: *Resolver, t: InternPool.Index, opts: Options) resolve.Error!?[]
     return try std.fmt.allocPrint(r.arena, ": {s}", .{shown.text});
 }
 
-fn paramHint(r: *Resolver, a: context.At, arg: Body.ExprId, name: []const u8, opts: Options, out: *std.ArrayList(Hint)) resolve.Error!void {
+fn paramHint(r: *Resolver, a: context.At, arg: Body.ExprId, name: []const u8, start: u32, end: u32, opts: Options, out: *std.ArrayList(Hint)) resolve.Error!void {
     if (std.mem.eql(u8, name, "_")) return;
+    const at = a.node.offset + a.body.range(arg).start;
+    if (at < start or at > end) return;
     if (opts.hide_redundant_param_names and namesParam(a.body, arg, name)) return;
-    try out.append(r.arena, .{ .offset = a.node.offset + a.body.range(arg).start, .label = try std.fmt.allocPrint(r.arena, "{s}:", .{name}), .kind = .parameter });
+    try out.append(r.arena, .{ .offset = at, .label = try std.fmt.allocPrint(r.arena, "{s}:", .{name}), .kind = .parameter });
 }
 
 /// Whether the argument, after stripping wrappers that do not change the value it refers to (`&x`,
