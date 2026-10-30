@@ -3,8 +3,9 @@
 //! They are obtained by running `zig <subcommand> --show-builtin` with the same arguments as the
 //! build system, and written to the cache directory by content hash
 //! (unchanged contents keep the same path; writing to disk lets goto definition open the file).
-//! In addition, the content hash is recorded under the hash of "zig version + arguments", so
-//! generating again with the same arguments does not need to start the compiler.
+//! In addition, the content hash is recorded under the hash of "zig version + host + arguments",
+//! so generating again with the same arguments on the same host does not need to start the
+//! compiler.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,11 +19,17 @@ const log = std.log.scoped(.builtin);
 /// (`build-exe`, etc.); the rest are compile arguments.
 /// Returns null when the compiler cannot run or the arguments are invalid
 pub fn generate(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const u8) (Allocator.Error || Io.Cancelable)!?[]u8 {
+    return generateOnHost(gpa, io, env, args, hostKey(io));
+}
+
+/// `generate` with `host` identifying the native target (see `hostKey`)
+fn generateOnHost(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const u8, host: u64) (Allocator.Error || Io.Cancelable)!?[]u8 {
     const zig_exe = env.zig_exe;
     const cache_dir = env.global_cache_dir;
     // Record of arguments → content hash: `<cache>/zig-analyzer/builtin/args/<args hash>`
     var hasher: std.hash.Wyhash = .init(0);
     hasher.update(env.version);
+    hasher.update(std.mem.asBytes(&host));
     for (args) |a| {
         hasher.update(&.{0});
         hasher.update(a);
@@ -102,6 +109,38 @@ fn cached(gpa: Allocator, io: Io, cache_dir: []const u8, index_path: []const u8)
         return null;
     };
     return path;
+}
+
+/// The native target as zig detects it, hashed: the compiler resolves every `native` part of the
+/// target (the architecture, CPU model and features, OS version range, ABI and libc version,
+/// dynamic linker) again on each run, and arguments without `-target` / `-mcpu` describe the host.
+/// It is part of the record key so that a builtin.zig generated on another host, or before an OS
+/// or libc update, is not reused. Detected once per process with the standard library code the
+/// compiler uses; when detection fails, all hosts share one key.
+fn hostKey(io: Io) u64 {
+    const S = struct {
+        var key: std.atomic.Value(u64) = .init(0);
+    };
+    const known = S.key.load(.monotonic);
+    if (known != 0) return known;
+    // Detection gives the same result every time in a process: a race only computes it twice
+    const key = hostKeyOf(std.zig.system.resolveTargetQuery(io, .{}) catch null) | 1;
+    S.key.store(key, .monotonic);
+    return key;
+}
+
+fn hostKeyOf(native: ?std.Target) u64 {
+    const t = native orelse return 0;
+    var hasher: std.hash.Wyhash = .init(0);
+    var buf: [512]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    // The triple includes the OS version range and the libc version
+    hasher.update(t.zigTriple(fba.allocator()) catch "");
+    hasher.update(&.{0});
+    hasher.update(t.cpu.model.name);
+    hasher.update(std.mem.sliceAsBytes(&t.cpu.features.ints));
+    hasher.update(t.dynamic_linker.get() orelse "");
+    return hasher.final();
 }
 
 /// Pointer bit width of the target in builtin.zig: computed from `cpu.arch` and `abi`
@@ -311,4 +350,38 @@ test generate {
     const wasm_text = try Io.Dir.cwd().readFileAlloc(testing.io, wasm, testing.allocator, .unlimited);
     defer testing.allocator.free(wasm_text);
     try testing.expectEqual(32, pointerBits(wasm_text));
+}
+
+test "a builtin.zig recorded on another host is not reused" {
+    // Native modules pass no `-target`: the same arguments describe a different target once the
+    // host changes (an OS update, a cache shared between machines)
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    // A zig whose `--show-builtin` prints the file `out`
+    const script = try std.fmt.allocPrint(gpa, "#!/bin/sh\ncat \"{s}/out\"\n", .{root});
+    defer gpa.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "zig", .data = script, .flags = .{ .permissions = .executable_file } });
+    const zig = try std.fs.path.join(gpa, &.{ root, "zig" });
+    defer gpa.free(zig);
+    const env: ZigEnv = .{ .arena = .{}, .zig_exe = zig, .lib_dir = root, .std_dir = root, .global_cache_dir = root, .version = "0.17.0" };
+    const args: []const []const u8 = &.{ "build-obj", "-Odebug" };
+
+    var paths: [3][]u8 = undefined;
+    for (&paths, [_]u64{ 1, 2, 1 }, [_][]const u8{ "pub const host = 1;\n", "pub const host = 2;\n", "pub const host = 3;\n" }) |*path, host, out| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "out", .data = out });
+        path.* = (try generateOnHost(gpa, io, &env, args, host)).?;
+    }
+    defer for (paths) |p| gpa.free(p);
+    const second = try Io.Dir.cwd().readFileAlloc(io, paths[1], gpa, .unlimited);
+    defer gpa.free(second);
+    try testing.expectEqualStrings("pub const host = 2;\n", second);
+    // Back on the first host: its record is still used
+    try testing.expectEqualStrings(paths[0], paths[2]);
+    try testing.expect(hostKey(io) == hostKey(io));
 }
