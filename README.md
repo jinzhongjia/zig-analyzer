@@ -54,7 +54,7 @@ The binary is `zig-out/bin/zig-analyzer`. Put it in `PATH`, or point your editor
 
 ## Editor setup
 
-Any LSP client works: run `zig-analyzer` over stdio.
+Any LSP client works: run `zig-analyzer` over stdio. The arguments clients commonly pass, `--stdio` and `--clientProcessId <pid>`, are accepted; other transports (`--pipe`, `--socket`, `--port`, `--node-ipc`) are not supported.
 
 Neovim 0.11+:
 
