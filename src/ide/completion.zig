@@ -76,8 +76,10 @@ pub const Item = struct {
     /// Type
     detail: ?[]const u8 = null,
     /// Range to replace (byte offsets in the file; the inserted text is `label`, or `snippet` when
-    /// there is one); when null, the client determines it by word. Needed for characters that are
-    /// not part of a word, such as `@` and the `/` in paths.
+    /// there is one); when null, the client determines it by word. It ends at the end of the word
+    /// (for paths, of the string content) after the cursor; inserting instead of replacing ends at
+    /// the cursor. Needed for characters that are not part of a word, such as `@` and the `/` in
+    /// paths.
     replace: ?Range = null,
     filter: ?[]const u8 = null,
     qualifier: ?[]const u8 = null,
@@ -331,7 +333,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         return .{ .items = out.items.items, .context = .builtin };
     };
     if (importString(text, offset)) |start| {
-        try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = offset });
+        try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) });
         return .{ .items = out.items.items, .context = .import_path };
     }
     if (literal == .string) {
@@ -1389,6 +1391,18 @@ fn importString(text: []const u8, offset: u32) ?u32 {
     return start;
 }
 
+/// End of the content of the string literal holding `offset`: its closing quote, or `offset` when
+/// the string is not closed in the line
+fn stringContentEnd(text: []const u8, offset: u32) u32 {
+    var i = offset;
+    while (i < text.len and text[i] != '\n') : (i += 1) switch (text[i]) {
+        '"' => return i,
+        '\\' => i += 1,
+        else => {},
+    };
+    return offset;
+}
+
 /// Start of the label when the cursor is at the label position after `break :` / `continue :`
 fn labelStart(text: []const u8, offset: u32) ?u32 {
     var i = offset;
@@ -1427,7 +1441,7 @@ fn manifestPaths(r: *Resolver, out: *Collector, file: FileId, text: []const u8, 
     const kind = try manifest.pathKind(r, file, tok) orelse return;
     const start = tok.offset + 1;
     if (offset < start) return;
-    try listPaths(r, out, file, text[start..offset], .{ .start = start, .end = offset }, switch (kind) {
+    try listPaths(r, out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) }, switch (kind) {
         .included => .any,
         .dependency => .directories,
     });

@@ -210,6 +210,9 @@ code_action_disabled: bool = false,
 change_annotations: bool = false,
 /// The client supports snippets in completion items (`completionItem.snippetSupport`)
 snippet_support: bool = false,
+/// The client supports insert and replace ranges in completion items
+/// (`completionItem.insertReplaceSupport`)
+insert_replace_support: bool = false,
 /// The client supports the workspace semantic tokens refresh; at most one refresh response is
 /// awaited at a time.
 semantic_refresh: bool = false,
@@ -4481,6 +4484,7 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
     };
     if (params.capabilities.textDocument) |td| if (td.completion) |c| if (c.completionItem) |ci| {
         server.snippet_support = ci.snippetSupport orelse false;
+        server.insert_replace_support = ci.insertReplaceSupport orelse false;
     };
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
@@ -4699,8 +4703,17 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
             .data = if (it.target) |t| try completionData(r, arena, file, t) else null,
             .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
+        // A replaced range ends at the end of the word (or path) at the cursor; inserting replaces
+        // only up to the cursor. Clients that support both ranges apply the one the user chose;
+        // others get the replaced range for every item
         if (it.replace) |range| {
-            o.textEdit = .{ .TextEdit = .{ .range = try ranges.get(arena, range.start, range.end), .newText = it.snippet orelse it.label } };
+            const new_text = it.snippet orelse it.label;
+            const replace = try ranges.get(arena, range.start, range.end);
+            o.textEdit = if (server.insert_replace_support) .{ .InsertReplaceEdit = .{
+                .newText = new_text,
+                .insert = try ranges.get(arena, range.start, std.math.clamp(offset, range.start, range.end)),
+                .replace = replace,
+            } } else .{ .TextEdit = .{ .range = replace, .newText = new_text } };
             if (it.snippet != null) o.insertTextFormat = .Snippet;
         }
         if (it.import_edit) |edit| {

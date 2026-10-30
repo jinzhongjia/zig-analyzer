@@ -970,6 +970,67 @@ test "function completions insert calls with placeholders only for clients that 
     try expectAddCompletion(snippet_client, .{ .completion = .{ .argument_placeholders = false } }, "add($1)");
 }
 
+/// Character columns of the ranges of a completion edit in one line: the insert range (null for a
+/// plain text edit) and the replaced range
+const EditRanges = struct { insert: ?[2]i64, replace: [2]i64 };
+
+/// The edit ranges of the completion item `label` at `line:character`
+fn completionEditRanges(capabilities: anytype, line: u32, character: u32, label: []const u8) !EditRanges {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = capabilities });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:ranges.zig";
+    const text =
+        \\const s = @import("std");
+        \\fn f(c: bool) u32 {
+        \\    _ = c;
+        \\    ifreturn 1;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const resp = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
+    const result = resp.object.get("result").?;
+    const items = if (result == .array) result.array.items else result.object.get("items").?.array.items;
+    const item = for (items) |it| {
+        if (std.mem.eql(u8, it.object.get("label").?.string, label)) break it;
+    } else return error.MissingCompletion;
+    const edit = item.object.get("textEdit").?.object;
+    const columns = struct {
+        fn of(range: std.json.Value) [2]i64 {
+            const start = range.object.get("start").?.object;
+            const end = range.object.get("end").?.object;
+            std.debug.assert(start.get("line").?.integer == end.get("line").?.integer);
+            return .{ start.get("character").?.integer, end.get("character").?.integer };
+        }
+    }.of;
+    const out: EditRanges = if (edit.get("range")) |range|
+        .{ .insert = null, .replace = columns(range) }
+    else
+        .{ .insert = columns(edit.get("insert").?), .replace = columns(edit.get("replace").?) };
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+    return out;
+}
+
+test "completion edits carry insert and replace ranges for clients that support both" {
+    const both = .{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true, .insertReplaceSupport = true } } } };
+    const replace_only = .{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true } } } };
+    // A snippet at `if|return 1;` inserts up to the cursor and replaces the whole word; a path at
+    // `"st|d"` inserts up to the cursor and replaces the rest of the string
+    try testing.expectEqualDeep(EditRanges{ .insert = .{ 4, 6 }, .replace = .{ 4, 12 } }, try completionEditRanges(both, 3, 6, "if"));
+    try testing.expectEqualDeep(EditRanges{ .insert = .{ 19, 21 }, .replace = .{ 19, 22 } }, try completionEditRanges(both, 0, 21, "std"));
+    // Without the capability, every item replaces the whole word or path
+    try testing.expectEqualDeep(EditRanges{ .insert = null, .replace = .{ 4, 12 } }, try completionEditRanges(replace_only, 3, 6, "if"));
+    try testing.expectEqualDeep(EditRanges{ .insert = null, .replace = .{ 19, 22 } }, try completionEditRanges(replace_only, 0, 21, "std"));
+}
+
 test "inlay hint settings apply to requests and refresh the client when they change" {
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;
