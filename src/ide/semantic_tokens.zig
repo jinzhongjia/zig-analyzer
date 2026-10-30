@@ -440,6 +440,14 @@ const Builder = struct {
             // A bare enum member may also be a name_ref in the error-tolerant HIR;
             // the declaration overrides that syntactic expression.
             if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| if (b.visible == null or b.visible_names.contains(name.range().end)) {
+                const name_end = name.offset + @as(u32, @intCast(name.text.len));
+                // The identifier of a decltest refers to the tested declaration
+                if (node.kind() == .test_decl and name.kind == .identifier) {
+                    const def = try b.r.resolveContainerName(file, @intCast(index), try ast.identNameAlloc(b.r.arena, name.text));
+                    const c: Class = if (def) |d| try b.defClass(d, .unknown, key, body, res) else .{ .type = .variable };
+                    try b.names.put(b.r.arena, name_end, c);
+                    continue;
+                }
                 var tv = initializer_value;
                 if ((item.kind == .@"const" or item.kind == .@"var") and seed.wanted(a.ip, tv) and dependsOnType(try b.itemClass(key))) if (body.value) |initializer| {
                     a.seeded = null;
@@ -451,7 +459,7 @@ const Builder = struct {
                 };
                 var c = try b.itemClassAt(key, tv);
                 c.mods |= Modifier.declaration;
-                try b.names.put(b.r.arena, name.offset + @as(u32, @intCast(name.text.len)), c);
+                try b.names.put(b.r.arena, name_end, c);
             };
         }
         if (b.visible != null) for (usage_names, 0..) |*names, index| {

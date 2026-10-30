@@ -1232,3 +1232,34 @@ test "semantic global var modifier marks container level var declarations and re
         .{ .needle = "total", .ty = .variable },
     });
 }
+
+test "semantic tokens classify decltest names as references to the tested declaration" {
+    // The identifier of a decltest is not a declaration of a variable
+    const text =
+        \\fn add() void {}
+        \\const P = struct {};
+        \\const limit: u32 = 10;
+        \\test add {}
+        \\test P {}
+        \\test limit {}
+        \\const S = struct {
+        \\    fn h() void {}
+        \\    test h {}
+        \\};
+        \\test "name" {}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const cases = [_]Case{
+        .{ .needle = "add {", .ty = .function },
+        .{ .needle = "P {", .ty = .@"struct", .mods = M.readonly },
+        .{ .needle = "limit {", .ty = .variable, .mods = M.readonly },
+        .{ .needle = "h {", .ty = .function },
+        .{ .needle = "\"name\"", .ty = .string },
+    };
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &cases);
+    try check(try tokens(&w, file, text, .utf16, needleRange(text, "test add", .utf16)), text, .utf16, cases[0..1]);
+    try check(try tokensWith(&w, file, text, .utf16, null, .{ .partial = true }), text, .utf16, cases[0..4]);
+}
