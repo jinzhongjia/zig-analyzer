@@ -3422,6 +3422,40 @@ test "hover shows tuples whose fields are all comptime by value and does not tru
     }
 }
 
+test "hover writes the void value inside aggregates and union values as {}" {
+    // Prevents writing it as `void`, which in Zig syntax is the type, not the value
+    const text =
+        \\const State = union(enum) {
+        \\    idle,
+        \\    running: u32,
+        \\};
+        \\const initial: State = .idle;
+        \\const S2 = struct { a: void = {}, b: bool = true };
+        \\const s2: S2 = .{};
+        \\const tup = .{ {}, true };
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "initial:", "const initial: State = .{ .idle = {} }" },
+        .{ "s2:", "const s2: S2 = .{ .a = {}, .b = true }" },
+        .{ "tup =", "const tup = .{ {}, true }" },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))).?;
+        testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "anonymous containers are shown by content, and their type hints only when enabled" {
     const text =
         \\const Kind = union(enum) { compile: struct { root: u32 }, none };

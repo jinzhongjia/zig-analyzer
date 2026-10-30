@@ -770,7 +770,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(u, w, container_name);
             try w.writeAll(").@\"union\".tag_type.?");
         },
-        .simple_value => |v| try w.writeAll(@tagName(v)),
+        // The void value is written as `{}` (`void` is the type)
+        .simple_value => |v| try w.writeAll(if (v == .void) "{}" else @tagName(v)),
         .int_value => |v| try w.print("{d}", .{v.value}),
         .float_value => |v| {
             // Prints the shortest representation for the type of the value (√2 as f32 is
@@ -862,8 +863,7 @@ fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Wr
     try ip.print(ty, w, container_name);
     if (!is_comptime) return;
     try w.writeAll(" = ");
-    // The void value is written as `{}`
-    if (v == .void_value) try w.writeAll("{}") else try ip.print(v, w, container_name);
+    try ip.print(v, w, container_name);
 }
 
 /// Displays a constructed type by its contents when there is no name for its construction
