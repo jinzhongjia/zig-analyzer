@@ -1851,7 +1851,6 @@ const Evaluator = struct {
         switch (l.kind) {
             .@"while" => while (true) {
                 try ev.tick();
-                try ev.backwardBranch();
                 const taken = try ev.condition(try ev.eval(f, l.inputs[0], null));
                 if (!taken.yes) {
                     if (l.else_capture.len != 0) try ev.bindCapture(f, l.else_capture[0], taken.payload);
@@ -1860,6 +1859,8 @@ const Evaluator = struct {
                 if (l.capture.len != 0) try ev.bindCapture(f, l.capture[0], taken.payload);
                 if (try ev.loopBody(f, l.body, index)) |v| return ev.coerce(v, want);
                 if (l.cont) |c| _ = try ev.eval(f, c, null);
+                // Going back to the condition is a backward branch (once per completed iteration)
+                try ev.backwardBranch();
             },
             .@"for" => {
                 const Input = union(enum) { range: i128, seq: Val };

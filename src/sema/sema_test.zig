@@ -3647,6 +3647,25 @@ test "comptime evaluation: backward branches follow the compiler's quota" {
     });
 }
 
+test "comptime while loops count one backward branch per iteration" {
+    // Prevents counting a backward branch for the first condition check of each `while` loop,
+    // which gave up below the compiler's quota; expected values are the results of zig 0.17.0
+    try expectTypes(
+        \\const w1000 = blk: { var s: usize = 0; var i: usize = 0; while (i < 1000) : (i += 1) s += 1; break :blk s; };
+        \\const q2000 = blk: { @setEvalBranchQuota(2000); var s: usize = 0; var i: usize = 0; while (i < 2000) : (i += 1) s += 1; break :blk s; };
+        \\const n500x0 = blk: { var s: usize = 0; var i: usize = 0; while (i < 500) : (i += 1) { var j: usize = 0; while (j < 0) : (j += 1) s += 1; s += 1; } break :blk s; };
+        \\const c1000 = blk: { var s: usize = 0; var i: usize = 0; while (i < 1000) : (i += 1) { if (i % 2 == 0) continue; s += 1; } break :blk s; };
+        \\const w1001 = blk: { var s: usize = 0; var i: usize = 0; while (i < 1001) : (i += 1) s += 1; break :blk s; };
+    , &.{
+        .{ "w1000", "usize = 1000" },
+        .{ "q2000", "usize = 2000" },
+        .{ "n500x0", "usize = 500" },
+        .{ "c1000", "usize = 500" },
+        // The compiler reports that the quota is exceeded
+        .{ "w1001", "usize" },
+    });
+}
+
 test "function pointers are runtime values, not comptime-only" {
     // Guards against treating function pointers as comptime-only: a struct containing a function
     // pointer field (such as the vtable of `std.mem.Allocator`) is not comptime-only, calls
