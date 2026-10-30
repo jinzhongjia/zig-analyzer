@@ -1085,6 +1085,12 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
                 try builder.push(.{ .score = score * import_weight, .parts = .{ spec, "" }, .what = .{ .module = .{ .name = spec, .kind = .module, .spec = spec, .target = target } } });
             try builder.exported(ns, spec);
         };
+        // `root` (the root module of the compilation) is offered as a module; its declarations
+        // are offered through the file itself (below) when it can be imported by path
+        if (g.importTarget(file, "root")) |target| if (target != file) if (try builder.matcher.score("root")) |score| {
+            if (try builder.namespaceAlias(.{ .file = target, .container = 0 }) == null and try builder.visible("root") == null)
+                try builder.push(.{ .score = score * import_weight, .parts = .{ "root", "" }, .what = .{ .module = .{ .name = "root", .kind = .module, .spec = "root", .target = target } } });
+        };
         // For project files, only the prefix range of the small index is queried; ItemTree/Body
         // are not scanned on the keystroke path. Files used only by tests are imported only in
         // test code (files likewise used only by tests, test declarations).
@@ -1103,6 +1109,9 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
             const stem_score = try builder.matcher.score(stem);
             if (public.len == 0 and stem_score == null) continue;
             const spec = try importSpec(r, g, file, entry.file) orelse continue;
+            // A module root imported by its name is offered under that name, with its exports,
+            // above; its file name (often `root`) is no name for it
+            if (g.importTarget(file, spec) == entry.file) continue;
             const ns: Namespace = .{ .file = entry.file, .container = 0 };
             const aliased = try builder.namespaceAlias(ns) != null;
             if (stem_score) |score| if (!aliased and try builder.visible(stem) == null)

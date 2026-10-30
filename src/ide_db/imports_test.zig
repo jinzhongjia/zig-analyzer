@@ -998,3 +998,35 @@ test "auto import candidates are classified like the declarations they import" {
     try testing.expectEqual(.file, kinds[0].?);
     try testing.expectEqual(.namespace, kinds[1].?);
 }
+
+test "auto import offers the root module and names other module roots by their import names" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app deps:mylib,other
+        \\const util = @import("util.zig");
+        \\pub const app_config = 1;
+        \\pub fn main() void { util.run(); }
+        \\//- /p/src/util.zig in:app
+        \\pub fn run() void { _ = <|>roo; }
+        \\//- /p/src/root.zig module:mylib
+        \\pub const lib_value = 1;
+        \\//- /p/deps/other/src/root.zig module:other
+        \\pub const other_value = 1;
+    );
+    const at = f.cursor.?;
+    const result = try run(&w, at.file, at.offset, "roo", 128);
+    // Neither `mylib` nor `other` is bound as `root`, which names the root module
+    var roots: usize = 0;
+    for (result.items) |item| if (std.mem.eql(u8, item.label, "root")) {
+        roots += 1;
+        try testing.expectEqualStrings("const root = @import(\"root\");\n", item.import_edit.?.text);
+    };
+    try testing.expectEqual(1, roots);
+    // The module roots keep their import names
+    const lib = find(try run(&w, at.file, at.offset, "myl", 128), "mylib").?;
+    try testing.expectEqualStrings("const mylib = @import(\"mylib\");\n", lib.import_edit.?.text);
+    const value = find(try run(&w, at.file, at.offset, "lib_val", 128), "lib_value").?;
+    try testing.expectEqualStrings("const lib_value = @import(\"mylib\").lib_value;\n", value.import_edit.?.text);
+}
