@@ -559,7 +559,9 @@ fn containsValue(ip: *InternPool, v: Index, values: []const Index, budget: *u32,
 }
 
 /// Members of named error sets: `Error.Foo` jumps to `Foo` in the declaration
-/// `const Error = error{ Foo, ... }` (following the alias when the declaration is an alias)
+/// `const Error = error{ Foo, ... }` (following the alias when the declaration is an alias). Only
+/// when the left-hand side is an error set type: on any other type, `X.Foo` is a member of `X` even
+/// if a function in `X` returns `error{Foo}`.
 fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -574,12 +576,14 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
     };
     if (rel < b.range(fa.lhs).end) return null;
     const name = fa.field orelse return null;
+    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+    switch (r.ctx.db.env.ip.key(a.exprType(fa.lhs).asType() orelse return null)) {
+        .error_set_type, .inferred_error_set => {},
+        else => return null,
+    }
     const lhs_def: Def = switch (b.expr(fa.lhs)) {
         .name_ref => |n| try r.resolveName(file, item, b, b.expr_scopes[@backingInt(fa.lhs)], n) orelse return null,
-        .field_access => blk: {
-            const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
-            break :blk try context.defOfKey(r, a.member(fa.lhs) orelse return null) orelse return null;
-        },
+        .field_access => try context.defOfKey(r, a.member(fa.lhs) orelse return null) orelse return null,
         else => return null,
     };
     for ([_]Def{ lhs_def, try r.aliasTarget(lhs_def) }) |def| {

@@ -3534,6 +3534,50 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "goto on a member of a container does not jump to an error of the same name inside it" {
+    // Prevents `Http.NotFound` from jumping to `error{NotFound}` in a function of `Http`
+    const text =
+        \\const Http = struct {
+        \\    pub const NotFound: u16 = 404;
+        \\    pub fn get() error{NotFound}!void {}
+        \\};
+        \\const Errno = enum(u16) {
+        \\    NOENT = 2,
+        \\    pub fn toError(e: Errno) error{NOENT}!void {
+        \\        _ = e;
+        \\    }
+        \\};
+        \\const Err = error{ NotFound, Other };
+        \\test {
+        \\    _ = Http.NotFound;
+        \\    _ = Errno.NOENT;
+        \\    _ = Err.NotFound;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "NotFound;\n    _ = Errno", "NotFound: u16" },
+        .{ "NOENT;", "NOENT = 2" },
+        .{ "NotFound;\n}", "NotFound, Other" },
+    }) |c| {
+        const at: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        for ([_]*const fn (*resolve.Resolver, FileId, u32) resolve.Error!?definition.Target{ definition.definition, definition.declaration }) |find| {
+            const t = try find(&r, file, at) orelse return error.NoTarget;
+            testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+                std.debug.print("`{s}`: target `{s}`\n", .{ c[0], text[t.start..t.end] });
+                return err;
+            };
+        }
+    }
+}
+
 test "type definition of field names in initializers goes to the type of the field" {
     // Prevents a jump to the type of the enclosing initializer
     const text =
