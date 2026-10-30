@@ -11,6 +11,7 @@ const context = @import("context.zig");
 const render = @import("../sema/render.zig");
 const queries = @import("../sema/queries.zig");
 const TypedValue = @import("../sema/InternPool.zig").TypedValue;
+const infer = @import("../sema/infer.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const seed = @import("../ide_db/seed.zig");
@@ -24,7 +25,9 @@ pub const Info = struct {
     end: u32,
 };
 
-pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
+/// `roots`: the workspace folders, the paths of embedded files are shown relative to them (see
+/// `Vfs.shownPath`)
+pub fn hover(r: *Resolver, file: FileId, offset: u32, roots: []const []const u8) resolve.Error!?Info {
     const tok = try definition.tokenAt(r, file, offset) orelse return null;
     if (tok.kind == .string_literal) return null;
     if (tok.kind == .builtin) {
@@ -33,16 +36,16 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Info {
         const w = &out.writer;
         if (entry.signature) |signature| w.print("```zig\n{s}\n```\n\n", .{signature}) catch return error.OutOfMemory;
         w.writeAll(entry.documentation) catch return error.OutOfMemory;
-        if (try semanticHover(r, file, offset, tok)) |inferred| {
+        if (try semanticHover(r, file, offset, tok, roots)) |inferred| {
             w.print("\n\nInferred result:\n\n{s}", .{inferred.text}) catch return error.OutOfMemory;
         }
         return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
     }
     if (try manifest.fieldDoc(r, file, tok)) |doc| return .{ .text = doc, .start = tok.offset, .end = tok.range().end };
-    return semanticHover(r, file, offset, tok);
+    return semanticHover(r, file, offset, tok, roots);
 }
 
-fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) resolve.Error!?Info {
+fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, roots: []const []const u8) resolve.Error!?Info {
     const a = try context.at(r, file, tok.offset, false) orelse return null;
     const b = a.body;
 
@@ -72,7 +75,9 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
     };
     if (def == null) {
         const e = b.exprAt(tok.offset - a.node.offset) orelse return null;
-        tv = a.exprType(e);
+        // The reference's own value: a result type coercion (`take(a)` with a `?u8` parameter)
+        // does not change what the name or member is
+        tv = a.uncoercedType(e);
         expr_id = e;
         switch (b.expr(e)) {
             .name_ref => |name| {
@@ -84,16 +89,10 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
                 def = try definition.defAt(r, file, offset);
             },
             .builtin_call => {},
+            .init => return initFieldHover(r, file, tok, e),
             .error_value => |name| return errorValue(r, file, tok, e, name),
             else => return null,
         }
-        // A directly referenced declaration is shown with its declared type (the expression may
-        // have gone through a result type conversion); a member access keeps the type of the
-        // expression (the member type in a generic instance is determined by the instance)
-        if (b.expr(e) == .name_ref) if (def) |d| switch (d) {
-            .item => |it| tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(it.file, it.item) }),
-            else => {},
-        };
     }
 
     // A generic function body has no concrete instance: infer with a call-site instance
@@ -106,7 +105,8 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
             const res = s.res;
             const better: TypedValue = if (binding_id) |id|
                 (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
-            else if (@backingInt(expr_id.?) < res.exprs.len) res.exprs[@backingInt(expr_id.?)] else .unknown;
+            else
+                res.uncoercedValue(expr_id.?);
             if (!seed.wanted(r.ctx.db.env.ip, better)) {
                 tv = better;
                 seeded_from = s;
@@ -116,9 +116,17 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
-    const code = if (def) |d| try context.signature(r, d, tv) else try render.exprAlloc(r, tv);
+    // A value that is directly the result of `@embedFile`: the call instead of the content
+    const embed = if (def) |d| try context.embedOf(r, d, tv) else if (tv.val != null) try context.embedCall(r, a, expr_id.?) else null;
+    const code = if (def) |d|
+        try context.signature(r, d, tv)
+    else if (embed) |e|
+        try render.embedAlloc(r, tv.ty, e.path)
+    else
+        try render.exprAlloc(r, tv);
     if (tv.ty == .unknown and def == null) return null;
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
+    if (embed) |e| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(roots, r.ctx.db.env.vfs.path(e.file)), e.text) catch return error.OutOfMemory;
     if (seeded_from) |s| {
         const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
         const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
@@ -130,6 +138,65 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
     }
     if (def) |d| if (try context.doc(r, d)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
+}
+
+/// The file a value comes from with `@embedFile` and its size; its content when it is text of at
+/// most `render.max_value_length` characters
+fn writeEmbedded(w: *std.Io.Writer, path: []const u8, content: []const u8) std.Io.Writer.Error!void {
+    try w.print("\n\nEmbedded file `{s}`: {d} bytes", .{ path, content.len });
+    if (!isShortText(content)) return;
+    // The fence is longer than any run of backticks in the content
+    var fence: usize = 3;
+    var run: usize = 0;
+    for (content) |c| {
+        run = if (c == '`') run + 1 else 0;
+        fence = @max(fence, run + 1);
+    }
+    try w.writeAll("\n\n");
+    try w.splatByteAll('`', fence);
+    try w.writeAll("text\n");
+    try w.writeAll(content);
+    if (content.len > 0 and content[content.len - 1] != '\n') try w.writeByte('\n');
+    try w.splatByteAll('`', fence);
+}
+
+/// Valid UTF-8 of at most `render.max_value_length` code points, without control characters
+/// other than tab, line feed and carriage return
+fn isShortText(content: []const u8) bool {
+    const view = std.unicode.Utf8View.init(content) catch return false;
+    var it = view.iterator();
+    var count: usize = 0;
+    while (it.nextCodepoint()) |c| {
+        count += 1;
+        if (count > render.max_value_length) return false;
+        switch (c) {
+            '\t', '\n', '\r' => {},
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0x9f => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// A field name in an initializer (`.{ .name = x }`, `T{ .name = x }`): the field of the
+/// initializer's type, with its type in that type (the field type in the instance for a generic
+/// container; inside a generic function body, in a call-site instance) and its documentation
+fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId) resolve.Error!?Info {
+    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+    const fields = a.body.expr(e).init.fields;
+    const rel = tok.offset - a.node.offset;
+    const k = for (fields, 0..) |f, k| {
+        if (f.name != null and rel >= f.name_range.start and rel < f.name_range.end) break k;
+    } else return null;
+    const t = a.initType(e) orelse return null;
+    if (t == .unknown) return null;
+    const field = try infer.initField(r, t, try queries.namespaceOfType(r, t), k, fields[k].name);
+    const def = try context.defOfKey(r, field.member orelse return null) orelse return null;
+    var out: std.Io.Writer.Allocating = .init(r.arena);
+    const w = &out.writer;
+    w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown })}) catch return error.OutOfMemory;
+    if (try context.doc(r, def)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
+    return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
 }
 
 /// `error.Foo`: the error name and the expected error set, plus its documentation when the

@@ -76,9 +76,9 @@ pub const Options = struct {
     /// Search only in this file (document highlight)
     only_file: ?FileId = null,
     /// When not null, records the first ambiguous reference: a member access that refers to `def`
-    /// under some call-site instances of its generic function, iterations of its loop, or build
-    /// configurations of its namespace, and to other definitions under others (renaming would
-    /// break the others, so it should be refused; see `ambiguous_message`)
+    /// under some call-site instances of its generic function, iterations of its loop or `inline`
+    /// prong, or build configurations of its namespace, and to other definitions under others
+    /// (renaming would break the others, so it should be refused; see `ambiguous_message`)
     ambiguous: ?*?Reference = null,
     /// When not null, records the first member access with the same name that cannot be confirmed
     /// (field access, enum literal, field in an initializer): the type of the left-hand side or the
@@ -95,7 +95,7 @@ pub const Options = struct {
 };
 
 /// Why an ambiguous reference (see `Options.ambiguous`) prevents a rename or fix
-pub const ambiguous_message = "this reference also refers to other declarations in other instantiations of its generic function, iterations of its loop, or build configurations";
+pub const ambiguous_message = "this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations";
 
 /// All references to `def` (including the definition itself), sorted by file and position
 pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Reference {

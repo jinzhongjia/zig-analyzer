@@ -3,18 +3,23 @@
 //!
 //! Threading model: each Workspace has a dedicated background task that blocks reading BSP events
 //! and handles them; the LSP main loop interacts with it only through `requestBuild` / `stop`.
+//! Edits of files in the compile set may recompute it from other tasks (see `refreshImports`).
 //!
-//! Lifecycle: when maker crashes, or build.zig or the build configuration changes, the project is
-//! restarted as a new instance. The new instance is invisible until its first build completes (or
-//! configuration fails); meanwhile the old instance's model, compile set, and compiler diagnostics
-//! remain in effect. If the old instance has no model, the new instance replaces it as soon as it
-//! is configured (see `Server.restartWorkspace`, `Server.promote`).
+//! Lifecycle: when maker crashes, build.zig or the build configuration changes, or maker's local
+//! cache directory is deleted, the project is restarted as a new instance. The new instance is
+//! invisible until its first build completes (or configuration fails); meanwhile the old
+//! instance's model, compile set, and compiler diagnostics remain in effect. If the old instance
+//! has no model, the new instance replaces it as soon as it is configured; if it has one and
+//! configuration fails, the old instance stays (see `Server.restartWorkspace`, `Server.promote`,
+//! `Server.keepOnConfigurationFailure`).
 //! Instances are reclaimed by reference counting: the server's project list, the background task,
 //! and callers that use an instance temporarily each hold one reference.
 //!
 //! Lock order: never begin a write transaction of the query engine while holding `mutex`. The
 //! diagnostics publishing task acquires `mutex` inside a read transaction, and a write transaction
 //! waits for all read transactions to finish, so acquiring them in opposite orders deadlocks.
+//! `set_mutex` is acquired before `mutex` and outside any transaction; transactions may begin
+//! while holding it.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,6 +34,7 @@ const builtin = za.project.builtin;
 const ZigEnv = za.project.ZigEnv;
 const configuration = za.project.configuration;
 const exports = za.project.exports;
+const dependency_packages = za.project.packages;
 const ProjectModel = za.base.ProjectModel;
 const Vfs = za.base.Vfs;
 const FileId = Vfs.FileId;
@@ -37,7 +43,7 @@ const CompileSet = za.diagnostics.compile_set;
 const database = @import("../database.zig");
 const panic_context = za.util.panic_context;
 const FileText = database.inputs.FileText;
-const AstCheck = database.live.AstCheck;
+const FileIndex = database.FileIndex;
 
 const Progress = Server.Progress.Progress;
 
@@ -75,6 +81,10 @@ successor: ?*Workspace = null,
 placed: Io.Event = .unset,
 
 mutex: Io.Mutex = .init,
+/// Serializes the computations of the compile set (by the background task, and by the tasks that
+/// check edited files, see `refreshImports`) with changes to `model`, whose pointer the
+/// computations use outside `mutex`
+set_mutex: Io.Mutex = .init,
 // ── The following fields are protected by mutex ──
 client: ?*bsp.Client = null,
 model: ?ProjectModel = null,
@@ -82,10 +92,17 @@ compile_set: ?CompileSet.Result = null,
 /// Files reachable from compile steps other than the diagnostics steps (used only to determine
 /// which modules files belong to, see `recomputeCompileSet`); null when it equals the compile set
 resolve_set: ?CompileSet.Result = null,
-/// Build scripts (see `CompileSet.buildScripts`): computed when the background task starts, from
-/// the current text of the files (open files use their buffers, the rest are read from disk);
-/// valid even when reading the build graph fails
+/// Build scripts (see `CompileSet.buildScripts`) of the project and of its dependency packages
+/// with a build.zig (see `dependency_packages.discover`): all of them are compiled into the
+/// configure program, so a change to any of them reconfigures. Computed when the background task
+/// starts, from the current text of the files (open files use their buffers, the rest are read
+/// from disk); valid even when reading the build graph fails
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
+/// The modules of the build scripts (one per package, rooted at its build.zig and importing the
+/// build.zig modules of its dependencies by name) and the files that belong to them, computed
+/// with `build_scripts`; added to the module graph so `@import("dep")` in build.zig resolves
+script_model: ?ProjectModel = null,
+script_set: ?CompileSet.Result = null,
 /// Compiler diagnostics of the most recent build
 result: ?*compiler.BuildResult = null,
 /// Compile result sequence number taken when `result` was stored (see
@@ -124,12 +141,30 @@ build_done: u32 = 0,
 /// published as compiler diagnostics (the extra steps in the build request that produce generated
 /// files do not affect diagnostics, consistent with running `zig build <step>` directly)
 diag_steps: std.DynamicBitSetUnmanaged = .{},
+/// Identities (inode numbers) of the maker's local cache directory and of its manifest directory
+/// `h`, taken when the build graph is read. The maker opens both once at startup and keeps
+/// writing through those handles: once either is deleted or replaced, steps that write into the
+/// cache fail without errors, so the maker is restarted (see `cacheReplaced`)
+cache_identity: ?[2]Io.File.INode = null,
 
 // ── The following fields are accessed only by the background task ──
 bundles: std.ArrayList(ErrorBundle) = .empty,
+/// Steps among the diagnostics steps and their dependencies that failed in this round, and those
+/// of them that reported no errors (a missing system library, a failing Run or Fail step: the
+/// cause is only on the maker's stderr, or a dependency failed)
+failed_steps: std.ArrayList(u32) = .empty,
+silent_steps: std.ArrayList(u32) = .empty,
+/// Hash of the names of the steps last reported as failing without errors (0: none), so the
+/// warning is not repeated on every save while nothing changes
+silent_warned: u64 = 0,
+
+// ── The following fields are protected by set_mutex ──
 /// Files whose loading from disk has already been attempted (nonexistent files are recorded too,
 /// to avoid repeated attempts)
 loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+/// Hash of the imports (see `importsHash`) of each file the latest compile set computation read;
+/// null when the computation read different imports at different times
+read_imports: std.AutoHashMapUnmanaged(FileId, ?u64) = .empty,
 
 /// Recomputing the compile set during a build because of generated file paths: at least
 /// `generated_recompute_interval_ms` after the previous recompute ended, and no less than
@@ -223,6 +258,8 @@ fn destroy(ws: *Workspace) void {
     if (ws.compile_set) |*s| s.deinit(gpa);
     if (ws.resolve_set) |*s| s.deinit(gpa);
     ws.build_scripts.deinit(gpa);
+    if (ws.script_model) |*m| m.deinit(gpa);
+    if (ws.script_set) |*s| s.deinit(gpa);
     if (ws.result) |r| r.release(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
@@ -230,16 +267,20 @@ fn destroy(ws: *Workspace) void {
     if (ws.project) |*p| p.deinit(gpa);
     for (ws.bundles.items) |*eb| eb.deinit(gpa);
     ws.bundles.deinit(gpa);
+    ws.failed_steps.deinit(gpa);
+    ws.silent_steps.deinit(gpa);
     ws.loaded.deinit(gpa);
+    ws.read_imports.deinit(gpa);
     gpa.free(ws.root);
     gpa.destroy(ws);
 }
 
 /// Requests a build after a file is saved; while a build is in progress, marks it to be rebuilt
-/// once it finishes
+/// once it finishes. When the maker's local cache directory has been deleted or replaced, the
+/// project is restarted instead (its build would fail).
 pub fn requestBuild(ws: *Workspace) void {
     const io = ws.server.io;
-    {
+    const replaced = blk: {
         ws.mutex.lockUncancelable(io);
         defer ws.mutex.unlock(io);
         const client = ws.client orelse return;
@@ -249,6 +290,7 @@ pub fn requestBuild(ws: *Workspace) void {
             ws.rebuild = true;
             return;
         }
+        if (ws.cacheReplaced()) break :blk true;
         const steps = model.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
         defer ws.gpa.free(steps);
         if (steps.len != 0) {
@@ -264,10 +306,36 @@ pub fn requestBuild(ws: *Workspace) void {
             };
             return;
         }
+        break :blk false;
+    };
+    if (replaced) {
+        log.info("{s}: the local cache directory of zig build was deleted or replaced, restarting", .{ws.root});
+        ws.server.restartWorkspace(ws, 0);
+        return;
     }
     // The compiler is not run and there are no generated files to produce: do not build, but
     // finish once with an empty result (clears compiler diagnostics published before a restart)
     ws.finishBuild() catch {};
+}
+
+/// Identities of the local cache directory `cache` and of its manifest directory `h`; null when
+/// either cannot be found
+fn cacheIdentity(io: Io, cache: []const u8) ?[2]Io.File.INode {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const h = std.fmt.bufPrint(&buf, "{s}{c}h", .{ cache, std.fs.path.sep }) catch return null;
+    const root = Io.Dir.cwd().statFile(io, cache, .{}) catch return null;
+    const manifests = Io.Dir.cwd().statFile(io, h, .{}) catch return null;
+    return .{ root.inode, manifests.inode };
+}
+
+/// The local cache directory the maker opened has been deleted or replaced since the build graph
+/// was read. While the maker holds the old directories open, their inode numbers cannot be reused,
+/// so a recreated directory always has a different identity. The caller holds mutex.
+fn cacheReplaced(ws: *Workspace) bool {
+    const known = ws.cache_identity orelse return false;
+    const model = &(ws.model orelse return false);
+    const now = cacheIdentity(ws.server.io, model.local_cache_root) orelse return true;
+    return !std.mem.eql(Io.File.INode, &known, &now);
 }
 
 /// Title of the build progress: the names of the diagnostics steps; without compiler diagnostics
@@ -342,8 +410,12 @@ fn finishLoading(ws: *Workspace) void {
     ws.server.reconcileSingle();
 }
 
-/// Whether to publish live diagnostics: yes before the compile set is computed; afterwards only
-/// for files in the set and build scripts (matches the compiler)
+/// Whether to publish live diagnostics: yes before the compile set is computed; afterwards for
+/// build scripts, files reachable from any compile step, and files under the directory of a
+/// module's root file. A relative `@import` cannot leave the directory of its module's root file,
+/// so a file outside all of them is never compiled with the project; a file inside one is compiled
+/// once it is imported, so files not imported yet and files only tests compile get syntax and
+/// AstGen errors while they are edited.
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -352,7 +424,15 @@ pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     // The build graph compiles nothing: treat an empty set as not yet computed, so that not every
     // file loses live diagnostics
     if (set.files.count() == 0) return true;
-    return set.contains(file);
+    if (set.contains(file)) return true;
+    if (ws.resolve_set) |*s| if (s.contains(file)) return true;
+    const model = &(ws.model orelse return false);
+    const path = ws.server.vfs.path(file);
+    for (model.modules) |m| {
+        const dir = std.fs.path.dirname(m.root_file orelse continue) orelse continue;
+        if (ws.server.vfs.isUnder(path, dir)) return true;
+    }
+    return false;
 }
 
 /// Whether this project takes part in the module graph: it has a model and a compile set (see
@@ -370,6 +450,35 @@ pub fn isBuildScript(ws: *Workspace, file: FileId) bool {
     return ws.build_scripts.contains(file);
 }
 
+/// How a path changed on disk, for `changesConfigureInput`
+pub const PathChange = enum { created, changed, deleted };
+
+/// Whether a change of `path` (an absolute, normalized path) changes an input of the configure
+/// phase that build.zig declares (see `ProjectModel.configure_inputs`): such a file itself, or
+/// such a directory itself or an entry created in or deleted from it. Outside watch mode the
+/// maker does not reconfigure by itself, so the project is restarted.
+pub fn changesConfigureInput(ws: *Workspace, path: []const u8, change: PathChange) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const model = &(ws.model orelse return false);
+    const vfs = &ws.server.vfs;
+    for (model.configure_inputs) |input| {
+        if (path.len == input.path.len and vfs.isUnder(path, input.path)) return true;
+        if (!input.directory or change == .changed) continue;
+        const dir = std.fs.path.dirname(path) orelse continue;
+        if (dir.len == input.path.len and vfs.isUnder(dir, input.path)) return true;
+    }
+    return false;
+}
+
+/// Directories among the configure inputs (see `changesConfigureInput`), copied into `arena`
+pub fn configureInputDirs(ws: *Workspace, arena: Allocator, out: *std.ArrayList([]const u8)) Allocator.Error!void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const model = &(ws.model orelse return);
+    for (model.configure_inputs) |input| if (input.directory) try out.append(arena, try arena.dupe(u8, input.path));
+}
+
 // ── Background task ──────────────────────────────────────────────────
 
 fn run(ws: *Workspace) Io.Cancelable!void {
@@ -377,6 +486,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     // maker exits when build.zig fails to compile, which is expected (it is restarted when
     // build.zig is saved)
     var config_failed = false;
+    // maker exited during the configure phase without reporting errors (see below)
+    var configure_exited = false;
     const client = ws.client.?;
     ws.placed.waitUncancelable(ws.server.io);
     ws.computeBuildScripts() catch log.err("{s}: out of memory while finding build scripts", .{ws.root});
@@ -386,6 +497,14 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 // Server shutting down: the reading task was canceled, not a maker problem
             } else if (config_failed) {
                 log.info("{s}: build.zig failed to compile, build system exited; will restart when build.zig is saved", .{ws.root});
+            } else if (started and !ws.isStopping()) {
+                // The maker exited before sending a build graph or configuration errors: the
+                // configure phase failed in a way the protocol does not report (an invalid option
+                // in the build arguments, an unknown target, an error or panic in `build()`), and
+                // the cause is only on its stderr. Starting it again would fail the same way: it
+                // is restarted when build.zig or the settings change
+                configure_exited = true;
+                ws.reportConfigureExit(client);
             } else if (!ws.isStopping()) {
                 // maker crashed (e.g. the 0.17 maker has a race when it receives a new build
                 // request, easily triggered with few cores): restart automatically
@@ -429,7 +548,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.client = null;
     ws.server.progress.end(ws.server, ws.build_progress, "Build interrupted");
     ws.build_progress = null;
-    ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else null);
+    ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else if (configure_exited) "zig build failed to configure" else null);
     ws.loading = null;
     ws.mutex.unlock(ws.server.io);
     ws.finishLoading();
@@ -447,15 +566,36 @@ fn isStopping(ws: *Workspace) bool {
     return ws.stopping;
 }
 
+/// The maker exited during the configure phase without reporting errors through the protocol:
+/// shows the user the cause from its stderr, and stops waiting for this instance to replace an
+/// old one (as when the maker keeps crashing)
+fn reportConfigureExit(ws: *Workspace, client: *bsp.Client) void {
+    const gpa = ws.gpa;
+    const output = client.stderrOutput(gpa) catch "";
+    defer gpa.free(output);
+    log.info("{s}: zig build failed to configure:\n{s}", .{ ws.root, output });
+    const message = std.fmt.allocPrint(gpa, "zig build cannot configure {s}: {s}; compiler diagnostics are unavailable until build.zig or the build settings change", .{
+        ws.root,
+        bsp.failureSummary(output) orelse "it exited without giving a reason",
+    }) catch null;
+    defer if (message) |m| gpa.free(m);
+    ws.server.showWarning(message orelse "zig build cannot configure the project; compiler diagnostics are unavailable until build.zig or the build settings change");
+    ws.server.abandon(ws);
+}
+
 fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     const io = ws.server.io;
     var pc: panic_context.Text = .{};
     pc.enter("project {s}: build event {t}", .{ ws.root, event.* });
     defer pc.leave();
     // A stopped instance (replaced by a restart, project removed, server shutting down) no longer
-    // handles events maker sent before exiting: their results would not be used.
+    // handles events maker sent before exiting: their results would not be used (a build graph it
+    // will not read is still deleted when it is poisoned, see `configuration.load`).
     // Progress and the busy count are wrapped up when the background task ends.
-    if (ws.isStopping()) return;
+    if (ws.isStopping()) {
+        if (event.* == .configuration) configuration.discard(io, ws.root, event.configuration);
+        return;
+    }
     switch (event.*) {
         .handshake => |h| if (h.version != bsp.protocol_version) {
             log.err("{s}: build system protocol version {d} does not match supported version {d}", .{ ws.root, h.version, bsp.protocol_version });
@@ -490,11 +630,15 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     ws.server.showWarning(std.fmt.bufPrint(&buf, "some diagnostics.steps are not steps of {s}, they are ignored", .{ws.root}) catch "some diagnostics.steps are not steps of the project, they are ignored");
                 }
             }
+            const identity = cacheIdentity(io, model.local_cache_root);
             {
+                ws.set_mutex.lockUncancelable(io);
+                defer ws.set_mutex.unlock(io);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
                 if (ws.model) |*old| old.deinit(ws.gpa);
                 ws.model = model;
+                ws.cache_identity = identity;
                 ws.diag_steps.deinit(ws.gpa);
                 ws.diag_steps = .{};
                 // Without compiler diagnostics there are no diagnostics steps: errors in the
@@ -504,6 +648,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 else
                     try .initEmpty(ws.gpa, ws.model.?.steps.len);
             }
+            // Files among the configure inputs are watched like the other known files (interned);
+            // the watcher takes the directories among them from `configureInputDirs`
+            for (ws.model.?.configure_inputs) |input| if (!input.directory) {
+                _ = try ws.server.vfs.intern(input.path);
+            };
+            if (ws.model.?.configure_inputs.len != 0) ws.server.resyncWatcher();
             try ws.recomputeCompileSet();
             // If the old instance has no model worth keeping, there is no need to wait for the
             // whole build to finish
@@ -513,16 +663,40 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         },
         .configuration_failed => |*eb| {
             // build.zig itself has errors: publish them as a build result. When build.zig.zon is
-            // wrong or fetching a dependency package fails, maker only writes the errors to its
-            // stderr and the errors it sends are empty: notify the user
+            // wrong or fetching a dependency package fails, the errors maker sends are empty and
+            // it writes them only to its stderr, just before exiting: they are taken from there
+            // (located in build.zig.zon), and when none can be located the user is notified
             if (eb.errorMessageCount() == 0) {
-                var buf: [512]u8 = undefined;
-                ws.server.showWarning(std.fmt.bufPrint(&buf, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root}) catch
-                    "zig build cannot load the project (build.zig.zon or a dependency may have errors), run zig build to see why");
+                ws.mutex.lockUncancelable(io);
+                const client = ws.client;
+                ws.mutex.unlock(io);
+                const output = if (client) |c| try c.stderrOutput(ws.gpa) else try ws.gpa.dupe(u8, "");
+                defer ws.gpa.free(output);
+                const located = try bsp.stderrErrors(ws.gpa, io, ws.root, output);
+                if (located.errorMessageCount() != 0) {
+                    eb.* = located;
+                } else {
+                    var empty = located;
+                    empty.deinit(ws.gpa);
+                    log.info("{s}: zig build cannot load the project:\n{s}", .{ ws.root, output });
+                    const message = if (bsp.failureSummary(output)) |summary|
+                        try std.fmt.allocPrint(ws.gpa, "zig build cannot load {s}: {s}", .{ ws.root, summary })
+                    else
+                        try std.fmt.allocPrint(ws.gpa, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root});
+                    defer ws.gpa.free(message);
+                    ws.server.showWarning(message);
+                }
             }
             try ws.bundles.append(ws.gpa, eb.*);
             eb.* = .empty;
-            try ws.finishBuild();
+            // After a restart, an old instance with a build graph stays in effect: without a build
+            // graph, named imports would stop resolving and references and rename would miss
+            // their importers until the configuration is fixed. The configuration errors replace
+            // its compiler diagnostics, as in `zig build`.
+            if (ws.server.keepOnConfigurationFailure(ws)) |old| {
+                defer old.release();
+                try ws.storeResult(old);
+            } else try ws.finishBuild();
         },
         .step_started => |step| {
             ws.mutex.lockUncancelable(io);
@@ -533,10 +707,16 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         .step_completed => |*sc| {
             var roots_changed = false;
             {
+                ws.set_mutex.lockUncancelable(io);
+                defer ws.set_mutex.unlock(io);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
                 ws.build_done += 1;
                 const in_diag = sc.step < ws.diag_steps.bit_length and ws.diag_steps.isSet(sc.step);
+                if (in_diag and sc.status == .failure) {
+                    try ws.failed_steps.append(ws.gpa, sc.step);
+                    if (sc.errors.errorMessageCount() == 0) try ws.silent_steps.append(ws.gpa, sc.step);
+                }
                 if (in_diag and sc.errors.errorMessageCount() != 0) {
                     try ws.bundles.append(ws.gpa, sc.errors);
                     sc.errors = .empty;
@@ -585,15 +765,68 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 };
                 return;
             }
+            {
+                // The local cache directory was deleted or replaced during the build: steps that
+                // write into it failed without errors, so the result is not that of the sources.
+                // Keep the published diagnostics and restart; the new instance's first build
+                // replaces them.
+                ws.mutex.lockUncancelable(io);
+                const replaced = ws.cacheReplaced();
+                if (replaced) {
+                    ws.server.progress.end(ws.server, ws.build_progress, "Cache directory deleted, restarting");
+                    ws.build_progress = null;
+                    ws.building = false;
+                    ws.rebuild = false;
+                }
+                ws.mutex.unlock(io);
+                if (replaced) {
+                    ws.clearBundles();
+                    log.info("{s}: the local cache directory of zig build was deleted or replaced during the build, restarting", .{ws.root});
+                    ws.server.restartWorkspace(ws, 0);
+                    ws.server.busyEnd();
+                    return;
+                }
+            }
             var errors: u32 = 0;
             for (ws.bundles.items) |eb| errors += eb.errorMessageCount();
+            var warning_buf: [768]u8 = undefined;
+            var warning: ?[]const u8 = null;
             {
-                var buf: [64]u8 = undefined;
+                var buf: [256]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
-                ws.server.progress.end(ws.server, ws.build_progress, if (errors == 0) "Done" else std.fmt.bufPrint(&buf, "{d} error(s)", .{errors}) catch null);
+                if (errors != 0) w.print("{d} error(s)", .{errors}) catch {};
+                // Steps that failed without reporting errors, not because a dependency failed:
+                // the build is not clean even when no errors are published. Their output is only
+                // on the maker's stderr.
+                var hasher: std.hash.Wyhash = .init(0);
+                var first: ?[]const u8 = null;
+                var count: usize = 0;
+                if (ws.model) |*m| for (ws.silent_steps.items) |s| {
+                    const dependency_failed = for (m.steps[s].deps) |d| {
+                        if (std.mem.indexOfScalar(u32, ws.failed_steps.items, d) != null) break true;
+                    } else false;
+                    if (dependency_failed) continue;
+                    const name = m.steps[s].name;
+                    hasher.update(name);
+                    hasher.update(&.{0});
+                    if (first == null) first = name;
+                    count += 1;
+                    w.print("{s}{s} failed", .{ if (w.end == 0) "" else "; ", name }) catch {};
+                };
+                const key = if (count == 0) 0 else hasher.final() | 1;
+                if (key != 0 and key != ws.silent_warned) {
+                    var more_buf: [32]u8 = undefined;
+                    const more = if (count > 1) std.fmt.bufPrint(&more_buf, " (and {d} more)", .{count - 1}) catch "" else "";
+                    warning = std.fmt.bufPrint(&warning_buf, "zig build step '{s}'{s} failed without reporting errors in {s}: run `{s}` there to see why", .{ first.?, more, ws.root, buildTitle(&ws.model.?, ws.config.compiler_diagnostics) }) catch
+                        "a zig build step failed without reporting errors: run zig build to see why";
+                }
+                ws.silent_warned = key;
+                ws.server.progress.end(ws.server, ws.build_progress, if (w.end == 0) "Done" else w.buffered());
                 ws.build_progress = null;
             }
+            if (warning) |message| ws.server.showWarning(message);
             try ws.finishBuild();
             ws.generated_dirty = false;
             try ws.recomputeCompileSet();
@@ -646,42 +879,24 @@ fn loadExports(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     try model.appendExports(ws.gpa, &exported);
 }
 
-/// Generates builtin.zig for each module (only once for identical arguments)
+/// Generates builtin.zig for each distinct argument list of the model
 fn generateBuiltins(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     const env = ws.env;
     const io = ws.server.io;
     ws.reportLoading("Generating builtin.zig");
-    // Modules with identical arguments share one copy; different arguments are generated in
-    // parallel (each copy launches the compiler once, unless the argument record has a hit)
-    var unique: std.StringArrayHashMapUnmanaged(?[]u8) = .empty;
+    // Generated in parallel (each launches the compiler once, unless the argument record has a hit)
+    const paths = try ws.gpa.alloc(?[]u8, model.builtins.len);
     defer {
-        for (unique.keys(), unique.values()) |k, v| {
-            ws.gpa.free(k);
-            if (v) |p| ws.gpa.free(p);
-        }
-        unique.deinit(ws.gpa);
+        for (paths) |p| if (p) |x| ws.gpa.free(x);
+        ws.gpa.free(paths);
     }
-    const slots = try ws.gpa.alloc(?usize, model.modules.len);
-    defer ws.gpa.free(slots);
-    for (model.modules, slots) |m, *slot| {
-        slot.* = null;
-        if (m.builtin_args.len == 0) continue;
-        const key = try std.mem.join(ws.gpa, "\x00", m.builtin_args);
-        const gop = try unique.getOrPut(ws.gpa, key);
-        if (gop.found_existing) ws.gpa.free(key) else gop.value_ptr.* = null;
-        slot.* = gop.index;
-    }
-    const args = try ws.gpa.alloc([]const []const u8, unique.count());
-    defer ws.gpa.free(args);
-    for (model.modules, slots) |m, slot| if (slot) |i| {
-        args[i] = m.builtin_args;
-    };
+    @memset(paths, null);
     var failed: std.atomic.Value(bool) = .init(false);
     var group: Io.Group = .init;
-    for (args, unique.values()) |a, *out| group.async(io, generateOne, .{ ws.gpa, io, env, a, out, &failed });
+    for (model.builtins, paths) |b, *out| group.async(io, generateOne, .{ ws.gpa, io, env, b.args, out, &failed });
     group.await(io) catch {};
     if (failed.load(.acquire)) return error.OutOfMemory;
-    for (slots, 0..) |slot, i| if (slot) |u| if (unique.values()[u]) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
+    for (paths, 0..) |p, i| if (p) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
 }
 
 fn generateOne(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const u8, out: *?[]u8, failed: *std.atomic.Value(bool)) Io.Cancelable!void {
@@ -707,14 +922,24 @@ fn endLoading(ws: *Workspace, message: ?[]const u8) void {
     ws.loading = null;
 }
 
+/// Discards what this round collected: error bundles and failed steps
 fn clearBundles(ws: *Workspace) void {
     for (ws.bundles.items) |*eb| eb.deinit(ws.gpa);
     ws.bundles.clearRetainingCapacity();
+    ws.failed_steps.clearRetainingCapacity();
+    ws.silent_steps.clearRetainingCapacity();
 }
 
 /// Converts the errors collected in this round into diagnostics, replaces the previous round's
 /// result, and republishes the affected files
 fn finishBuild(ws: *Workspace) Allocator.Error!void {
+    try ws.storeResult(ws);
+}
+
+/// Converts the errors collected in this round into diagnostics, replaces the result of `target`
+/// (this instance, or the old instance that stays in effect, see `Server.keepOnConfigurationFailure`)
+/// with them, and republishes the files that had or now have diagnostics
+fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
     const build_zig = try std.fs.path.join(ws.gpa, &.{ ws.root, "build.zig" });
     defer ws.gpa.free(build_zig);
@@ -732,20 +957,20 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
     defer affected.deinit(ws.gpa);
     {
         const io = ws.server.io;
-        ws.mutex.lockUncancelable(io);
-        defer ws.mutex.unlock(io);
-        try affected.appendSlice(ws.gpa, ws.result_files.keys());
+        target.mutex.lockUncancelable(io);
+        defer target.mutex.unlock(io);
+        try affected.appendSlice(ws.gpa, target.result_files.keys());
         try affected.appendSlice(ws.gpa, files.keys());
-        if (ws.result) |old| old.release(ws.gpa);
-        ws.result_files.deinit(ws.gpa);
-        ws.result = result;
-        ws.result_generation = ws.server.nextCompileGeneration();
-        ws.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
-        ws.result_files = files;
+        if (target.result) |old| old.release(ws.gpa);
+        target.result_files.deinit(ws.gpa);
+        target.result = result;
+        target.result_generation = ws.server.nextCompileGeneration();
+        target.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+        target.result_files = files;
     }
     // For a new instance created by a restart, the first result replaces the old instance along
     // with the model and the compile set
-    ws.promote(.built);
+    if (target == ws) ws.promote(.built);
     ws.server.publishFiles(affected.items, true);
 }
 
@@ -802,6 +1027,8 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 const Resolver = struct {
     ws: *Workspace,
     ctx: *database.Db.Ctx,
+    /// Records the hash of the imports read for each file (see `importsHash`)
+    read: ?*std.AutoHashMapUnmanaged(FileId, u64) = null,
 
     pub fn intern(r: Resolver, file_path: []const u8) !FileId {
         return r.ws.server.vfs.intern(file_path);
@@ -813,14 +1040,85 @@ const Resolver = struct {
 
     pub fn imports(r: Resolver, file: FileId) !?[]const []const u8 {
         const text = try r.ctx.get(FileText, file);
-        if (text == null) return if (r.ws.loaded.contains(file)) &.{} else null;
-        return (try r.ctx.get(AstCheck, file)).imports;
+        const list = if (text != null)
+            try syntaxImports(r.ws.server, r.ctx, file)
+        else if (r.ws.loaded.contains(file))
+            &.{}
+        else
+            return null;
+        if (r.read) |read| try read.put(r.ws.gpa, file, importsHash(list));
+        return list;
     }
 };
+
+fn importsHash(list: []const []const u8) u64 {
+    var h: std.hash.Wyhash = .init(0);
+    for (list) |s| {
+        h.update(std.mem.asBytes(&s.len));
+        h.update(s);
+    }
+    return h.final();
+}
+
+/// The `@import` strings of a file in its syntax tree. The compiler follows the imports recorded in
+/// ZIR, but a file with a parse error or a duplicate member name has no ZIR: while such a file is
+/// being edited, the files imported through it still belong to the same modules in every build
+/// that compiles, so the syntax tree, which keeps the imports of a broken file, is used instead.
+/// ZON files import nothing.
+fn syntaxImports(server: *Server, ctx: *database.Db.Ctx, file: FileId) za.db.Error![]const []const u8 {
+    if (database.live.modeOf(server.vfs.path(file)) == .zon) return &.{};
+    return (try ctx.get(FileIndex.Query, file)).imports;
+}
 
 /// Computes the compile set; on encountering files that are not loaded, loads them from disk and
 /// recomputes, until nothing is missing
 pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
+    ws.set_mutex.lockUncancelable(ws.server.io);
+    defer ws.set_mutex.unlock(ws.server.io);
+    try ws.recomputeLocked();
+}
+
+/// Recomputes the compile set when the imports of one of `files` (whose text has changed) differ
+/// from those the latest computation read: the compile set and the module membership follow
+/// imports added and removed by edits without waiting for a build, which with compiler
+/// diagnostics off never runs. Files the computation did not read cannot change the result.
+pub fn refreshImports(ws: *Workspace, files: []const FileId) Allocator.Error!void {
+    const io = ws.server.io;
+    ws.set_mutex.lockUncancelable(io);
+    defer ws.set_mutex.unlock(io);
+    {
+        ws.mutex.lockUncancelable(io);
+        defer ws.mutex.unlock(io);
+        if (ws.stopping or ws.model == null or ws.compile_set == null) return;
+    }
+    for (files) |f| {
+        if (ws.read_imports.contains(f)) break;
+    } else return;
+    const changed = while (true) {
+        var arena: std.heap.ArenaAllocator = .init(ws.gpa);
+        defer arena.deinit();
+        var ctx = ws.server.db.beginRead(arena.allocator());
+        defer ctx.end();
+        break ws.importsChanged(&ctx, files) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Interrupted by an edit: retry
+            error.Canceled => continue,
+        };
+    };
+    if (changed) try ws.recomputeLocked();
+}
+
+fn importsChanged(ws: *Workspace, ctx: *database.Db.Ctx, files: []const FileId) za.db.Error!bool {
+    for (files) |f| {
+        const read = ws.read_imports.get(f) orelse continue;
+        const list = if (try ctx.get(FileText, f) != null) try syntaxImports(ws.server, ctx, f) else &.{};
+        if (read != importsHash(list)) return true;
+    }
+    return false;
+}
+
+/// `recomputeCompileSet` with `set_mutex` held
+fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
     const io = ws.server.io;
     var steps: []u32 = &.{};
     defer ws.gpa.free(steps);
@@ -844,21 +1142,21 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
         // a native example) are analyzed for the native target
         const Native = struct {
             fn lt(m: *const ProjectModel, a: u32, b: u32) bool {
-                return isNativeStep(m, a) and !isNativeStep(m, b);
-            }
-            fn isNativeStep(m: *const ProjectModel, step: u32) bool {
-                return m.modules[m.steps[step].kind.compile.root_module].isNativeTarget();
+                return m.isNativeStep(a) and !m.isNativeStep(b);
             }
         };
         std.mem.sort(u32, steps, model, Native.lt);
         std.mem.sort(u32, all.items, model, Native.lt);
     }
 
-    var result = try ws.computeSet(steps) orelse return;
+    var read: std.AutoHashMapUnmanaged(FileId, ?u64) = .empty;
+    defer read.deinit(ws.gpa);
+    var result = try ws.computeSet(steps, &read) orelse return;
     errdefer result.deinit(ws.gpa);
     // Files reachable from the other compile steps (tests, examples, etc.): used only to determine
     // which modules files belong to and to resolve imports; no live diagnostics are published
-    const extra: ?CompileSet.Result = if (all.items.len > steps.len) try ws.computeSet(all.items) else null;
+    const extra: ?CompileSet.Result = if (all.items.len > steps.len) try ws.computeSet(all.items, &read) else null;
+    std.mem.swap(std.AutoHashMapUnmanaged(FileId, ?u64), &ws.read_imports, &read);
     ws.mutex.lockUncancelable(io);
     if (ws.compile_set) |*old| old.deinit(ws.gpa);
     ws.compile_set = result;
@@ -874,57 +1172,150 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
     ws.server.reconcileSingle();
 }
 
-/// Computes the build scripts; missing files are read in and the computation repeated
+/// Computes the build scripts of the project and of its dependency packages (see
+/// `dependency_packages.discover`) and the modules the configure program gives them; missing
+/// files are read in and the computation repeated
 fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
+    ws.set_mutex.lockUncancelable(ws.server.io);
+    defer ws.set_mutex.unlock(ws.server.io);
+    const gpa = ws.gpa;
+    const io = ws.server.io;
+    var found = blk: {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const env_pkg_dir = if (ws.env.childEnviron()) |m| m.get("ZIG_LOCAL_PKG_DIR") else ws.server.environ.getAlloc(a, "ZIG_LOCAL_PKG_DIR") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        const pkg_dir = try dependency_packages.packageDir(a, ws.root, ws.config.build_args, env_pkg_dir);
+        break :blk try dependency_packages.discover(gpa, io, ws.root, pkg_dir);
+    };
+    defer found.deinit(gpa);
+    var rounds: usize = 0;
+    while (rounds < 256) : (rounds += 1) {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        // Package index → its scripts
+        const results = try arena.allocator().alloc(CompileSet.Scripts, found.list.len);
+        @memset(results, .{});
+        defer for (results) |*r| r.deinit(gpa);
+        var missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        defer missing.deinit(gpa);
+        const canceled = blk: {
+            var ctx = ws.server.db.beginRead(arena.allocator());
+            defer ctx.end();
+            for (found.list, results) |p, *r| {
+                r.* = CompileSet.buildScripts(gpa, p.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // Interrupted by an edit: retry
+                    error.Canceled => break :blk true,
+                };
+                for (r.missing.keys()) |f| try missing.put(gpa, f, {});
+            }
+            break :blk false;
+        };
+        if (canceled) continue;
+        if (missing.count() != 0) {
+            try ws.loadFiles(missing.keys());
+            continue;
+        }
+        var scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        errdefer scripts.deinit(gpa);
+        for (results) |r| for (r.files.keys()) |f| try scripts.put(gpa, f, {});
+        var script_set = try ws.scriptMembership(found.list, results);
+        errdefer script_set.deinit(gpa);
+        var script_model = try scriptModel(gpa, ws.root, found.list);
+        errdefer script_model.deinit(gpa);
+        ws.mutex.lockUncancelable(io);
+        defer ws.mutex.unlock(io);
+        ws.build_scripts.deinit(gpa);
+        ws.build_scripts = scripts;
+        if (ws.script_set) |*s| s.deinit(gpa);
+        ws.script_set = script_set;
+        if (ws.script_model) |*m| m.deinit(gpa);
+        ws.script_model = script_model;
+        return;
+    }
+    log.warn("{s}: build script computation did not converge", .{ws.root});
+}
+
+/// Module membership of the build scripts: the files reachable from the build.zig of each package
+/// along relative imports belong to that package's build.zig module (see `scriptModel`). The
+/// build.zig.zon of a package is not part of its module.
+fn scriptMembership(ws: *Workspace, list: []const dependency_packages.Package, results: []const CompileSet.Scripts) Allocator.Error!CompileSet.Result {
+    var set: CompileSet.Result = .{};
+    errdefer set.deinit(ws.gpa);
+    for (list, results, 0..) |p, r, i| {
+        const module: u32 = @intCast(i);
+        const zon_path = try std.fs.path.join(ws.gpa, &.{ p.root, "build.zig.zon" });
+        defer ws.gpa.free(zon_path);
+        const zon = try ws.server.vfs.intern(zon_path);
+        for (r.files.keys()) |f| {
+            if (f == zon) continue;
+            const gop = try set.files.getOrPut(ws.gpa, f);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .module = module, .step = null };
+            } else if (gop.value_ptr.module != module) {
+                try set.others.put(ws.gpa, .{ .file = f, .module = module }, {});
+            }
+        }
+    }
+    return set;
+}
+
+/// The modules the configure program gives the build scripts: one module per package, rooted at
+/// its build.zig and importing the build.zig modules of its dependencies by name
+fn scriptModel(gpa: Allocator, root: []const u8, list: []const dependency_packages.Package) Allocator.Error!ProjectModel {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena_state.deinit();
+    const a = arena_state.allocator();
+    const modules = try a.alloc(ProjectModel.Module, list.len);
+    for (list, modules) |p, *m| {
+        const imports = try a.alloc(ProjectModel.Import, p.deps.len);
+        for (p.deps, imports) |d, *imp| imp.* = .{ .name = try a.dupe(u8, d.name), .module = d.package };
+        m.* = .{ .root_file = try std.fs.path.join(a, &.{ p.root, "build.zig" }), .imports = imports };
+    }
+    const build_root = try a.dupe(u8, root);
+    return .{ .arena = arena_state.state, .build_root = build_root, .std_root = "", .steps = &.{}, .modules = modules, .default_step = 0 };
+}
+
+/// Files reachable through imports from the root modules of these compile steps; missing files
+/// are read in and the computation repeated. Returns null when it does not converge. The hashes of
+/// the imports read in the final round are added to `read`, with null for a file whose imports
+/// differ from those an earlier computation added (the file changed in between).
+fn computeSet(ws: *Workspace, steps: []const u32, read: *std.AutoHashMapUnmanaged(FileId, ?u64)) Allocator.Error!?CompileSet.Result {
+    const io = ws.server.io;
+    var round_read: std.AutoHashMapUnmanaged(FileId, u64) = .empty;
+    defer round_read.deinit(ws.gpa);
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
         var arena: std.heap.ArenaAllocator = .init(ws.gpa);
         defer arena.deinit();
+        round_read.clearRetainingCapacity();
         var result = blk: {
             var ctx = ws.server.db.beginRead(arena.allocator());
             defer ctx.end();
-            break :blk CompileSet.buildScripts(ws.gpa, ws.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
+            ws.mutex.lockUncancelable(io);
+            // model is replaced or changed only with set_mutex held, which the caller holds, so its
+            // pointer is safe to use outside the lock
+            const model = &ws.model.?;
+            ws.mutex.unlock(io);
+            break :blk CompileSet.compute(ws.gpa, model, steps, Resolver{ .ws = ws, .ctx = &ctx, .read = &round_read }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // Interrupted by an edit: retry
                 error.Canceled => continue,
             };
         };
         if (result.missing.count() == 0) {
-            result.missing.deinit(ws.gpa);
-            ws.mutex.lockUncancelable(ws.server.io);
-            defer ws.mutex.unlock(ws.server.io);
-            ws.build_scripts.deinit(ws.gpa);
-            ws.build_scripts = result.files;
-            return;
+            errdefer result.deinit(ws.gpa);
+            var it = round_read.iterator();
+            while (it.next()) |e| {
+                const gop = try read.getOrPut(ws.gpa, e.key_ptr.*);
+                gop.value_ptr.* = if (gop.found_existing and gop.value_ptr.* != e.value_ptr.*) null else e.value_ptr.*;
+            }
+            return result;
         }
-        defer result.deinit(ws.gpa);
-        try ws.loadFiles(result.missing.keys());
-    }
-    log.warn("{s}: build script computation did not converge", .{ws.root});
-}
-
-/// Files reachable through imports from the root modules of these compile steps; missing files
-/// are read in and the computation repeated. Returns null when it does not converge.
-fn computeSet(ws: *Workspace, steps: []const u32) Allocator.Error!?CompileSet.Result {
-    const io = ws.server.io;
-    var rounds: usize = 0;
-    while (rounds < 256) : (rounds += 1) {
-        var arena: std.heap.ArenaAllocator = .init(ws.gpa);
-        defer arena.deinit();
-        var result = blk: {
-            var ctx = ws.server.db.beginRead(arena.allocator());
-            defer ctx.end();
-            ws.mutex.lockUncancelable(io);
-            // model is replaced only in this task, so its pointer is safe to use outside the lock
-            const model = &ws.model.?;
-            ws.mutex.unlock(io);
-            break :blk CompileSet.compute(ws.gpa, model, steps, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // Interrupted by an edit: retry
-                error.Canceled => continue,
-            };
-        };
-        if (result.missing.count() == 0) return result;
         defer result.deinit(ws.gpa);
         var buf: [64]u8 = undefined;
         ws.reportLoading(std.fmt.bufPrint(&buf, "Analyzing compile set ({d} files)", .{result.files.count()}) catch null);
@@ -951,7 +1342,9 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
         try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = origin.classify(&ws.server.vfs, rules, path, false).durability() });
     }
     const db = &ws.server.db;
-    db.beginWrite();
+    // The server's own update, not ordered with the client's requests: a request received before
+    // it and starting after it reads the loaded files instead of failing with ContentModified
+    db.beginWriteOf(comptime database.Db.inputSet(&.{FileText}), .unordered);
     defer db.endWrite();
     for (batch.items) |l| {
         // Files the client opened in the meantime: their buffers take precedence

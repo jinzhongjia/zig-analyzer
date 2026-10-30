@@ -654,6 +654,163 @@ test "files of a package that only exports modules resolve module imports" {
     try h.notify("exit", {});
 }
 
+/// Modules the file belongs to (from `zig-analyzer/fileStatus`), as their root file paths; empty
+/// when the server does not know the file
+fn fileModules(h: *Harness, uri: []const u8) ![]const []const u8 {
+    const result = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = uri } })).object.get("result").?;
+    if (result == .null) return &.{};
+    const status = result.object;
+    var modules: std.ArrayList([]const u8) = .empty;
+    for (status.get("modules").?.array.items) |m| try modules.append(h.arena.allocator(), m.string);
+    return modules.items;
+}
+
+test "files imported only through a file with a syntax error keep their module membership" {
+    // A build that completes while main.zig does not parse must not drop core.zig and util.zig
+    // from their modules: `zig build` passes the same module arguments either way
+    const core_text = "const util = @import(\"util\");\npub fn run() u32 {\n    return util.answer;\n}\n";
+    const main_text = "const core = @import(\"core\");\npub fn main() void {\n    _ = core.run();\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const util = b.createModule(.{ .root_source_file = b.path("lib/util.zig"), .target = b.graph.host });
+        \\    const core = b.createModule(.{ .root_source_file = b.path("lib/core.zig"), .target = b.graph.host, .imports = &.{.{ .name = "util", .module = util }} });
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host, .imports = &.{.{ .name = "core", .module = core }} }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = main_text },
+        .{ .path = "lib/core.zig", .text = core_text },
+        .{ .path = "lib/util.zig", .text = "pub const answer: u32 = 42;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    const core_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/core.zig"));
+    const util_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/util.zig"));
+    try open(&h, main_uri, main_text);
+    try open(&h, core_uri, core_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("answer", try completionLabels(&h, core_uri, core_text, "util."));
+
+    // Saved with a parse error: the build completes and the compile set is recomputed
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = "const core = @import(\"core\");\npub fn main() void {\n    _ = core.run();\n    const y = 1\n}\n" }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("answer", try completionLabels(&h, core_uri, core_text, "util."));
+    try testing.expectEqual(1, (try fileModules(&h, util_uri)).len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a new @import adds the file to the compile set without a build" {
+    // With compiler diagnostics off no build ever runs: the edit alone must bring b.zig into
+    // main.zig's module, so references and rename of `a.Point` include the closed b.zig
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "src/a.zig", .text = "pub const Point = struct { x: u32 };\n" },
+        .{ .path = "src/b.zig", .text = "const a = @import(\"a.zig\");\npub fn getX(p: a.Point) u32 {\n    return p.x;\n}\n" },
+        .{ .path = "src/main.zig", .text = "const a = @import(\"a.zig\");\npub fn main() void {\n    const p: a.Point = .{ .x = 1 };\n    _ = p;\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    const options = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"diagnostics\": {\"compiler\": false}}", .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = options });
+    try h.notify("initialized", Empty{});
+    const main_path = try project.path(a, "src/main.zig");
+    const main_uri = try za.base.uri.fromPath(a, main_path);
+    const a_uri = try za.base.uri.fromPath(a, try project.path(a, "src/a.zig"));
+    const b_uri = try za.base.uri.fromPath(a, try project.path(a, "src/b.zig"));
+    try open(&h, main_uri, "const a = @import(\"a.zig\");\npub fn main() void {\n    const p: a.Point = .{ .x = 1 };\n    _ = p;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = "const a = @import(\"a.zig\");\nconst b = @import(\"b.zig\");\npub fn main() void {\n    const p: a.Point = .{ .x = 1 };\n    _ = b.getX(p);\n}\n" }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const modules = try fileModules(&h, b_uri);
+    try testing.expectEqual(1, modules.len);
+    try testing.expectEqualStrings(main_path, modules[0]);
+    const refs = (try h.request("textDocument/references", .{ .textDocument = .{ .uri = a_uri }, .position = .{ .line = 0, .character = 10 }, .context = .{ .includeDeclaration = true } })).object.get("result").?.array.items;
+    var in_b: usize = 0;
+    for (refs) |r| {
+        if (std.mem.eql(u8, r.object.get("uri").?.string, b_uri)) in_b += 1;
+    }
+    try testing.expectEqual(1, in_b);
+    try testing.expectEqual(3, refs.len);
+
+    // The newly imported file gets live diagnostics
+    try open(&h, b_uri, "const a = @import(\"a.zig\");\npub fn getX(p: a.Point) u32 {\n    return p.x +;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const diags = (try lastDiagnostics(&h, b_uri)) orelse return error.NoDiagnostics;
+    try testing.expectEqual(1, diags.len);
+    try testing.expect(std.mem.indexOf(u8, diags[0], "whitespace") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "live diagnostics for files of module directories outside the diagnostics compile set" {
+    // util.zig is imported nowhere yet and parser_test.zig is compiled only by the test step: both
+    // must still get their syntax and AstGen errors. tools/gen.zig is outside every module
+    // directory, can never be compiled with the project, and gets none.
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("test/root.zig"), .target = b.graph.host }) });
+        \\    b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "test/root.zig", .text = "test {\n    _ = @import(\"parser_test.zig\");\n}\n" },
+        .{ .path = "test/parser_test.zig", .text = "test \"parse\" {}\n" },
+        .{ .path = "tools/gen.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "src/util.zig")), "pub fn add(a: u32, b: u32) u32 {\n    return a + ;\n}\n");
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "test/parser_test.zig")), "const std = @import(\"std\");\ntest \"parse\" {\n    const unused = 1;\n    try std.testing.expect(true);\n}\n");
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "tools/gen.zig")), "pub fn main() void {\n    const unused = 1;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const diags = try h.diagnostics();
+    const util = diags.get("util.zig").?;
+    try testing.expectEqual(1, util.len);
+    try testing.expect(std.mem.startsWith(u8, util[0], "1:15 ") and std.mem.endsWith(u8, util[0], "expected expression, found ';'"));
+    const parser_test = diags.get("parser_test.zig").?;
+    try testing.expectEqual(1, parser_test.len);
+    try testing.expect(std.mem.startsWith(u8, parser_test[0], "2:10 ") and std.mem.endsWith(u8, parser_test[0], "unused local constant"));
+    try testing.expectEqual(0, diags.get("gen.zig").?.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a project whose background task cannot be started does not leave the server busy" {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
@@ -1213,7 +1370,10 @@ test "files read by @embedFile are watched on disk by the server, or registered 
         const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
         try open(&h, main_uri, main_text);
         _ = try h.request("zig-analyzer/waitIdle", {});
-        try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "\"hi\"") != null);
+        try testing.expectEqualStrings(
+            "```zig\nconst greeting: *const [2:0]u8 = @embedFile(\"greeting.txt\")\n```\n\nEmbedded file `greeting.txt`: 2 bytes\n\n```text\nhi\n```",
+            try hoverText(&h, main_uri, 0, 7),
+        );
 
         const path = try project.path(a, "greeting.txt");
         try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "hello" });
@@ -1236,9 +1396,9 @@ test "files read by @embedFile are watched on disk by the server, or registered 
             }
             try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, path), .type = 2 }} });
             _ = try h.request("zig-analyzer/waitIdle", {});
-            try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "\"hello\"") != null);
+            try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "```text\nhello\n```") != null);
         } else {
-            try waitWatched(&h, Hover{ .uri = main_uri, .line = 0, .character = 7, .want = "\"hello\"" });
+            try waitWatched(&h, Hover{ .uri = main_uri, .line = 0, .character = 7, .want = "```text\nhello\n```" });
         }
     }
 }

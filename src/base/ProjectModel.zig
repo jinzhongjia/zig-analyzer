@@ -18,12 +18,16 @@ local_cache_root: []const u8 = "",
 /// They contain dependency code rather than user code; packages given by `--fork` and path
 /// dependencies are not included
 package_roots: []const []const u8 = &.{},
-/// Standard library root file `<std_dir>/std.zig`
+/// Standard library root file `<std_dir>/std.zig`: used by compile steps that do not set their
+/// own `zig_lib_dir`
 std_root: []const u8,
 steps: []const Step,
 /// Mutable: once the path of a generated file becomes known during the build,
 /// `setGeneratedPath` fills it into the `root_file` of the corresponding module
 modules: []Module,
+/// The distinct sets of arguments that `builtin.zig` is generated from, referred to by
+/// `Compile.modules`; mutable: `setBuiltinFile` records the path of each generated file
+builtins: []Builtin = &.{},
 default_step: u32,
 /// Generated file index → the step that produces it (`GeneratedFileIndex` in the build graph)
 producers: []const ?u32 = &.{},
@@ -31,6 +35,11 @@ producers: []const ?u32 = &.{},
 /// the project defines it, otherwise the default step), and replaced by `setDiagnosticsSteps`
 /// when the user configures `diagnostics.steps`
 diagnostics_steps: []const u32 = &.{},
+/// Inputs of the configure phase that build.zig declares (`b.dependOnFileContents`,
+/// `dependOnFileMetadata`, `dependOnDirectoryContents`, ...): `zig build` runs build.zig again when
+/// such a file is created, deleted or changed, or when such a directory gains, loses or renames
+/// an entry (not recursive)
+configure_inputs: []const ConfigureInput = &.{},
 
 pub const Step = struct {
     name: []const u8,
@@ -40,10 +49,63 @@ pub const Step = struct {
 
     pub const Kind = union(enum) {
         top_level: struct { description: []const u8 },
-        /// Root module (index into `modules`)
-        compile: struct { root_module: u32 },
+        compile: Compile,
         other,
     };
+};
+
+/// A compilation: one run of the compiler, which creates its own copy of every module it
+/// contains (the same build graph module can have different options in different compilations)
+pub const Compile = struct {
+    /// Root module (index into `modules`)
+    root_module: u32,
+    /// Absolute path of the standard library root file of this compilation
+    /// (`<zig_lib_dir>/std/std.zig`); null when it is the project's `std_root`
+    std_root: ?[]const u8 = null,
+    /// Target of `@import("root")`: the root module's root file, or for test compilations the
+    /// test runner, which the compiler makes the root module
+    root: Root = .module,
+    /// The `builtin.zig` of each module in this compilation, in the order the compiler creates
+    /// them (the root module first)
+    modules: []const CompileModule = &.{},
+
+    pub const Root = union(enum) {
+        module,
+        /// Absolute path of the test runner
+        test_runner: []const u8,
+        /// The test runner is a file generated during the build
+        unknown,
+    };
+};
+
+pub const CompileModule = struct {
+    module: u32,
+    /// Index into `builtins`
+    builtin: u32,
+};
+
+pub const Builtin = struct {
+    /// Compiler arguments for generating `builtin.zig`: the subcommand (`build-exe`, etc.) and
+    /// the arguments that affect builtin (the module's options, inherited from the module that
+    /// imports it when unset, and the options of the whole compilation)
+    args: []const []const u8,
+    /// Path of the generated `builtin.zig` (filled in by Workspace after loading the build graph)
+    file: ?[]const u8 = null,
+
+    /// The target is native (no `-target` given, or a triple starting with `native`)
+    pub fn isNativeTarget(b: *const Builtin) bool {
+        for (b.args, 0..) |arg, i| {
+            if (!std.mem.eql(u8, arg, "-target") or i + 1 >= b.args.len) continue;
+            return std.mem.startsWith(u8, b.args[i + 1], "native");
+        }
+        return true;
+    }
+};
+
+pub const ConfigureInput = struct {
+    /// Absolute path
+    path: []const u8,
+    directory: bool,
 };
 
 pub const Module = struct {
@@ -53,20 +115,6 @@ pub const Module = struct {
     /// The root file is a file generated during the build
     generated_root: ?GeneratedPath = null,
     imports: []const Import,
-    /// Compiler arguments for generating this module's `builtin.zig`: the subcommand
-    /// (`build-exe`, etc.) and the module arguments that affect builtin
-    builtin_args: []const []const u8 = &.{},
-    /// Path of the generated `builtin.zig` (filled in by Workspace after loading the build graph)
-    builtin_file: ?[]const u8 = null,
-
-    /// The target is native (no `-target` given, or a triple starting with `native`)
-    pub fn isNativeTarget(m: *const Module) bool {
-        for (m.builtin_args, 0..) |arg, i| {
-            if (!std.mem.eql(u8, arg, "-target") or i + 1 >= m.builtin_args.len) continue;
-            return std.mem.startsWith(u8, m.builtin_args[i + 1], "native");
-        }
-        return true;
-    }
 };
 
 /// A path relative to a generated file: `up` directory levels up from the generated file, then
@@ -150,15 +198,33 @@ pub fn buildSteps(m: *const ProjectModel, gpa: Allocator, diagnostics: bool) All
     return steps.toOwnedSlice(gpa);
 }
 
-/// Records the absolute path of generated file `file` and updates the modules rooted at it;
-/// returns true when the root file of some module changed
-/// Records the path of a module's `builtin.zig`
-pub fn setBuiltinFile(m: *ProjectModel, gpa: Allocator, module: u32, path: []const u8) Allocator.Error!void {
+/// Records the path of the `builtin.zig` generated from `builtins[builtin]`
+pub fn setBuiltinFile(m: *ProjectModel, gpa: Allocator, builtin: u32, path: []const u8) Allocator.Error!void {
     var arena = m.arena.promote(gpa);
     defer m.arena = arena.state;
-    m.modules[module].builtin_file = try arena.allocator().dupe(u8, path);
+    m.builtins[builtin].file = try arena.allocator().dupe(u8, path);
 }
 
+/// The `builtin.zig` arguments (index into `builtins`) of module `module` in compile step `step`;
+/// null when the compilation does not contain the module
+pub fn builtinOf(m: *const ProjectModel, step: u32, module: u32) ?u32 {
+    for (m.steps[step].kind.compile.modules) |cm| if (cm.module == module) return cm.builtin;
+    return null;
+}
+
+/// The root module of compile step `step` is for the native target
+pub fn isNativeStep(m: *const ProjectModel, step: u32) bool {
+    const b = m.builtinOf(step, m.steps[step].kind.compile.root_module) orelse return true;
+    return m.builtins[b].isNativeTarget();
+}
+
+/// The standard library root file of compile step `step`
+pub fn stdRootOf(m: *const ProjectModel, step: u32) []const u8 {
+    return m.steps[step].kind.compile.std_root orelse m.std_root;
+}
+
+/// Records the absolute path of generated file `file` and updates the modules rooted at it;
+/// returns true when the root file of some module changed
 pub fn setGeneratedPath(m: *ProjectModel, gpa: Allocator, file: u32, path: []const u8) Allocator.Error!bool {
     var arena = m.arena.promote(gpa);
     defer m.arena = arena.state;
@@ -191,34 +257,51 @@ pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectMo
     defer m.arena = arena.state;
     const a = arena.allocator();
     const base: u32 = @intCast(m.modules.len);
+    const builtin_base: u32 = @intCast(m.builtins.len);
     const modules = try a.alloc(Module, m.modules.len + exports.modules.len);
     @memcpy(modules[0..m.modules.len], m.modules);
     for (exports.modules, modules[m.modules.len..]) |src, *dst| {
         const imports = try a.alloc(Import, src.imports.len);
         for (src.imports, imports) |imp, *out| out.* = .{ .name = try a.dupe(u8, imp.name), .module = base + imp.module };
-        const builtin_args = try a.alloc([]const u8, src.builtin_args.len);
-        for (src.builtin_args, builtin_args) |arg, *out| out.* = try a.dupe(u8, arg);
         dst.* = .{
             .root_file = if (src.generated_root != null) null else if (src.root_file) |p| try a.dupe(u8, p) else null,
             .imports = imports,
-            .builtin_args = builtin_args,
-            .builtin_file = if (src.builtin_file) |p| try a.dupe(u8, p) else null,
         };
+    }
+    const builtins = try a.alloc(Builtin, m.builtins.len + exports.builtins.len);
+    @memcpy(builtins[0..m.builtins.len], m.builtins);
+    for (exports.builtins, builtins[m.builtins.len..]) |src, *dst| {
+        const args = try a.alloc([]const u8, src.args.len);
+        for (src.args, args) |arg, *out| out.* = try a.dupe(u8, arg);
+        dst.* = .{ .args = args, .file = if (src.file) |p| try a.dupe(u8, p) else null };
     }
     var steps: std.ArrayList(Step) = .empty;
     try steps.appendSlice(a, m.steps);
     for (exports.steps) |s| switch (s.kind) {
-        .compile => |c| try steps.append(a, .{
-            .name = try a.dupe(u8, s.name),
-            .kind = .{ .compile = .{ .root_module = base + c.root_module } },
-            .deps = &.{},
-        }),
+        .compile => |c| {
+            const compile_modules = try a.alloc(CompileModule, c.modules.len);
+            for (c.modules, compile_modules) |cm, *out| out.* = .{ .module = base + cm.module, .builtin = builtin_base + cm.builtin };
+            try steps.append(a, .{
+                .name = try a.dupe(u8, s.name),
+                .kind = .{ .compile = .{
+                    .root_module = base + c.root_module,
+                    .std_root = if (c.std_root) |p| try a.dupe(u8, p) else null,
+                    .root = switch (c.root) {
+                        .module, .unknown => c.root,
+                        .test_runner => |p| .{ .test_runner = try a.dupe(u8, p) },
+                    },
+                    .modules = compile_modules,
+                } },
+                .deps = &.{},
+            });
+        },
         else => {},
     };
     var package_roots: std.ArrayList([]const u8) = .empty;
     try package_roots.appendSlice(a, m.package_roots);
     for (exports.package_roots) |p| try package_roots.append(a, try a.dupe(u8, p));
     m.modules = modules;
+    m.builtins = builtins;
     m.steps = steps.items;
     m.package_roots = package_roots.items;
 }
@@ -241,10 +324,10 @@ pub fn compileStepsOf(m: *const ProjectModel, gpa: Allocator, roots: []const u32
     return result.toOwnedSlice(gpa);
 }
 
-test "Module.isNativeTarget" {
-    const native: Module = .{ .root_file = null, .imports = &.{}, .builtin_args = &.{ "build-exe", "-Odebug" } };
-    const explicit_native: Module = .{ .root_file = null, .imports = &.{}, .builtin_args = &.{ "build-exe", "-target", "native-linux" } };
-    const wasm: Module = .{ .root_file = null, .imports = &.{}, .builtin_args = &.{ "build-lib", "-target", "wasm32-freestanding", "-mcpu", "generic" } };
+test "Builtin.isNativeTarget" {
+    const native: Builtin = .{ .args = &.{ "build-exe", "-Odebug" } };
+    const explicit_native: Builtin = .{ .args = &.{ "build-exe", "-target", "native-linux" } };
+    const wasm: Builtin = .{ .args = &.{ "build-lib", "-target", "wasm32-freestanding", "-mcpu", "generic" } };
     try std.testing.expect(native.isNativeTarget());
     try std.testing.expect(explicit_native.isNativeTarget());
     try std.testing.expect(!wasm.isNativeTarget());
@@ -266,18 +349,23 @@ test appendExports {
     defer m.deinit(gpa);
 
     var exports_modules = [_]Module{
-        .{ .root_file = "/p/lib.zig", .imports = &.{.{ .name = "dep", .module = 1 }}, .builtin_args = &.{"build-obj"} },
+        .{ .root_file = "/p/lib.zig", .imports = &.{.{ .name = "dep", .module = 1 }} },
         .{ .root_file = "/p/.zig-cache/o/x/options.zig", .generated_root = .{ .file = 3 }, .imports = &.{} },
     };
+    var exports_builtins = [_]Builtin{.{ .args = &.{"build-obj"} }};
     const exports: ProjectModel = .{
         .arena = undefined,
         .build_root = "/p/.zig-cache/zig-analyzer/exports",
         .std_root = "/std/std.zig",
         .steps = &.{
             .{ .name = "exports", .kind = .{ .top_level = .{ .description = "" } }, .deps = &.{1} },
-            .{ .name = "compile obj lib", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
+            .{ .name = "compile obj lib", .kind = .{ .compile = .{
+                .root_module = 0,
+                .modules = &.{ .{ .module = 0, .builtin = 0 }, .{ .module = 1, .builtin = 0 } },
+            } }, .deps = &.{} },
         },
         .modules = &exports_modules,
+        .builtins = &exports_builtins,
         .default_step = 0,
     };
     try m.appendExports(gpa, &exports);
@@ -290,7 +378,7 @@ test appendExports {
     try std.testing.expectEqualStrings("/p/a.zig", m.modules[0].root_file.?);
     try std.testing.expectEqualStrings("/p/lib.zig", m.modules[1].root_file.?);
     try std.testing.expectEqual(2, m.modules[1].imports[0].module);
-    try std.testing.expectEqualStrings("build-obj", m.modules[1].builtin_args[0]);
+    try std.testing.expectEqualStrings("build-obj", m.builtins[m.builtinOf(1, 2).?].args[0]);
     // The generated file index belongs to the probe's build graph and must not be taken as a
     // generated file of this project
     try std.testing.expectEqual(null, m.modules[2].root_file);

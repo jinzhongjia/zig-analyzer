@@ -292,7 +292,7 @@ const test_main =
     \\
 ;
 
-test "a module that is also the root of a test step is analyzed as a test" {
+test "a module that is also the root of a test step is analyzed as the executable that diagnostics build" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = test_build },
         .{ .path = "src/main.zig", .text = test_main },
@@ -308,7 +308,9 @@ test "a module that is also the root of a test step is analyzed as a test" {
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = test_main } });
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    try testing.expectEqualStrings("```zig\nconst t: u8 = 1\n```", try hoverText(&h, uri, test_main, "t ="));
+    // The default install step builds the executable: `builtin.is_test` is false, and the testing
+    // allocator used in a test block is still inferred
+    try testing.expectEqualStrings("```zig\nconst t: u16 = 2\n```", try hoverText(&h, uri, test_main, "t ="));
     try testing.expectEqualStrings("```zig\nconst gpa: Allocator\n```", try hoverText(&h, uri, test_main, "gpa ="));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
@@ -504,10 +506,10 @@ test "pointer width follows the project's target" {
     // wasm32 uses the LLVM backend by default: vectors are aligned to their byte size
     try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", wasm.vec);
 
-    // Two targets at once, x86_64 (self-hosted backend) and wasm32 (LLVM): both the pointer width
-    // and the vector rules differ, so size-related values are unknown (no possibly wrong value is
-    // given). The host target is not used: x86_64-windows also uses LLVM by default in Debug, with
-    // the same vector rules as wasm32.
+    // Two targets at once, x86_64 (self-hosted backend) and wasm32 (LLVM), with different pointer
+    // widths and vector rules: by itself, the file is analyzed in the first compilation that
+    // reaches it, the wasm32 one (as its `builtin` is), with exactly that compilation's layout
+    // rather than a mixture of both
     const mixed = try sizesHover(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
@@ -531,9 +533,9 @@ test "pointer width follows the project's target" {
     defer testing.allocator.free(mixed.size);
     defer testing.allocator.free(mixed.max);
     defer testing.allocator.free(mixed.vec);
-    try testing.expectEqualStrings("```zig\nconst size: comptime_int\n```", mixed.size);
-    try testing.expectEqualStrings("```zig\nconst max: comptime_int\n```", mixed.max);
-    try testing.expectEqualStrings("```zig\nconst vec: comptime_int\n```", mixed.vec);
+    try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", mixed.size);
+    try testing.expectEqualStrings("```zig\nconst max: comptime_int = 4294967295\n```", mixed.max);
+    try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", mixed.vec);
 
     // Single-file mode: the native target
     const single = try sizesHover(&.{.{ .path = "main.zig", .text = sizes_main }}, null);

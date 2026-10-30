@@ -9,6 +9,7 @@ const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const queries = @import("queries.zig");
 const Body = @import("../hir/Body.zig");
+const FileId = @import("../base/Vfs.zig").FileId;
 
 /// Names of container types: the name of the member that declares the container
 /// (`const Point = struct {...}` → `Point`), and the file name for a file. Containers without a
@@ -27,10 +28,14 @@ const ContainerNames = struct {
     /// hints, completion details, etc.) nested anonymous containers are displayed as
     /// `struct {...}`.
     full: bool = false,
-    /// Maximum number of characters in the output (`max_length` of inlay hints); null means
-    /// unlimited. See `InternPool.truncateList`; the output must be written to an
-    /// `Io.Writer.Allocating`, which keeps everything written so far in its buffer.
+    /// Maximum number of characters in the output (`max_length` of inlay hints, and
+    /// `max_value_length` for values); null means unlimited. See `InternPool.truncateList`; the
+    /// output must be written to an `Io.Writer.Allocating`, which keeps everything written so far
+    /// in its buffer.
     max_length: ?usize = null,
+    /// Write the full number of items after the `…` of a cut list or string (see
+    /// `InternPool.truncateList`)
+    show_total: bool = false,
 
     const Outer = struct { c: InternPool.Container, parent: ?*const Outer };
 
@@ -43,10 +48,55 @@ const ContainerNames = struct {
     }
 
     pub fn write(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
-        const found = n.name(c) catch null;
-        try w.writeAll(found orelse return n.writeContent(c, w));
-        // Generic instance: `List(u8)`, listing only the arguments known at comptime
-        try n.writeArgs(n.shownInst(c.inst) orelse return, w);
+        if (c.kind == .file) {
+            const base = std.fs.path.basename(n.r.ctx.db.env.vfs.path(c.file));
+            return w.writeAll(if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else base);
+        }
+        const found = n.name(c) catch null orelse return n.writeContent(c, w);
+        // Only the type a generic function returns carries the arguments (`List(u8)`); a container
+        // named inside a generic instance is qualified by the named container or function, as the
+        // compiler names it: `Outer(u8).Inner`, `Outer(u8).Gen(u16)`, and `Local.S` for a local
+        // constant (the function without arguments)
+        const inst = n.shownInst(c.inst) orelse return w.writeAll(found.name);
+        switch (found.by) {
+            .member => {
+                try n.writeQualifier(c, found.item, w);
+                try w.writeAll(found.name);
+            },
+            .local => {
+                try n.writeOwner(c, found.item, null, w);
+                try w.print(".{s}", .{found.name});
+            },
+            .returned => try n.writeOwner(c, found.item, inst, w),
+        }
+    }
+
+    /// The member `item` whose body names the container: qualified as in `writeQualifier`, with
+    /// the arguments when `inst` is the instance of `item` itself (a generic function)
+    fn writeOwner(n: ContainerNames, c: InternPool.Container, item: u32, inst: ?Index, w: *Io.Writer) Io.Writer.Error!void {
+        const tree = n.r.itemTree(c.file) catch return;
+        const it = tree.items[item];
+        try n.writeQualifier(c, item, w);
+        try w.writeAll(it.name orelse "_");
+        const i = inst orelse return;
+        const key = n.r.ctx.db.env.ip.key(i).instance;
+        if (key.file == c.file and key.decl == it.ast_id) try n.writeArgs(i, w);
+    }
+
+    /// `Q.` when the container `Q` that declares `item` is named and lies in a generic function
+    /// body (its name carries the instance arguments); nothing otherwise
+    fn writeQualifier(n: ContainerNames, c: InternPool.Container, item: u32, w: *Io.Writer) Io.Writer.Error!void {
+        const ip = n.r.ctx.db.env.ip;
+        const tree = n.r.itemTree(c.file) catch return;
+        const parent = queries.containerType(n.r, .{ .file = c.file, .container = tree.items[item].container }, c.inst) catch return;
+        const p = switch (ip.key(parent)) {
+            .container_type => |p| p,
+            else => return,
+        };
+        const generic = if (p.inst) |i| ip.key(i) != .context else false;
+        if (!generic or p.kind == .file or (n.name(p) catch null) == null) return;
+        try n.write(p, w);
+        try w.writeAll(".");
     }
 
     /// Contents of an anonymous container: layout, kind and fields (only names for enums)
@@ -65,16 +115,19 @@ const ContainerNames = struct {
             while (o) |up| : (o = up.parent) if (up.c.file == c.file and up.c.ast_id == c.ast_id) return w.writeAll(" {...}");
         } else if (n.outer != null) return w.writeAll(" {...}");
         const here: Outer = .{ .c = c, .parent = n.outer };
-        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full, .max_length = n.max_length };
+        const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full, .max_length = n.max_length, .show_total = n.show_total };
         const ip = n.r.ctx.db.env.ip;
         try w.writeAll(" {");
+        const members = tree.containerMembers(@intCast(ci));
+        var total: usize = 0;
+        for (members) |m| total += @intFromBool(tree.items[m].kind == .field);
         var count: usize = 0;
-        for (tree.containerMembers(@intCast(ci))) |m| {
+        for (members) |m| {
             const it = tree.items[m];
             if (it.kind != .field) continue;
             try w.writeAll(if (count == 0) " " else ", ");
             count += 1;
-            if (try InternPool.truncateList(n, w)) break;
+            if (try InternPool.truncateList(n, w, total)) break;
             // Tuple fields have no names
             if (it.name) |field| try w.print("{f}", .{std.zig.fmtId(field)});
             if (c.kind == .@"enum") continue;
@@ -87,10 +140,13 @@ const ContainerNames = struct {
 
     /// The instance whose arguments are displayed: for the per-iteration instance (see
     /// `InternPool.Instance.iteration`) of a member that has no instance, the enclosing instance
-    /// is displayed
+    /// is displayed; null outside generic functions (a compilation context is not displayed)
     fn shownInst(n: ContainerNames, inst: ?Index) ?Index {
         const i = inst orelse return null;
-        const key = n.r.ctx.db.env.ip.key(i).instance;
+        const key = switch (n.r.ctx.db.env.ip.key(i)) {
+            .instance => |key| key,
+            else => return null,
+        };
         if (key.iteration) |it| if (it.abstract) return n.shownInst(key.parent);
         return i;
     }
@@ -101,11 +157,14 @@ const ContainerNames = struct {
     /// otherwise displayed by their contents
     pub fn writeReified(n: ContainerNames, t: InternPool.Reified, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
-        const inst = t.inst orelse {
-            const decl_name = n.constNaming(t) catch null orelse return ip.printReified(t, w, n);
-            return w.writeAll(decl_name);
+        const i = switch (ip.key(t.inst orelse .unknown)) {
+            .instance => |i| i,
+            else => {
+                const decl_name = n.constNaming(t) catch null orelse return ip.printReified(t, w, n);
+                return w.writeAll(decl_name);
+            },
         };
-        const i = ip.key(inst).instance;
+        const inst = t.inst.?;
         const tree = n.r.itemTree(i.file) catch return ip.printReified(t, w, n);
         for (tree.items) |it| if (it.ast_id == i.decl) {
             try w.writeAll(it.name orelse return ip.printReified(t, w, n));
@@ -122,10 +181,10 @@ const ContainerNames = struct {
         for (tree.items) |it| {
             if (it.ast_id != t.owner) continue;
             if (it.kind != .@"const") return null;
-            const decl = try n.r.ctx.get(queries.DeclType, .{ .owner = .{ .file = t.file, .item = it.ast_id } });
+            const decl = try n.r.ctx.get(queries.DeclType, .{ .owner = .{ .file = t.file, .item = it.ast_id }, .inst = t.inst });
             const v = decl.val orelse return null;
             const same = switch (ip.key(v)) {
-                .reified_type => |x| x.file == t.file and x.owner == t.owner and x.expr == t.expr and x.inst == null,
+                .reified_type => |x| x.file == t.file and x.owner == t.owner and x.expr == t.expr and x.inst == t.inst,
                 else => false,
             };
             return if (same) it.name else null;
@@ -163,28 +222,29 @@ const ContainerNames = struct {
         var first = true;
         // Non-comptime parameters are not part of the instance's identity and are not shown;
         // unknown comptime arguments are shown as `_`
-        for (ip.key(inst).instance.args) |arg| {
+        const args = ip.key(inst).instance.args;
+        var total: usize = 0;
+        for (args) |arg| total += @intFromBool(arg != .runtime);
+        for (args) |arg| {
             if (arg == .runtime) continue;
             if (!first) try w.writeAll(", ");
             first = false;
-            if (try InternPool.truncateList(n, w)) break;
+            if (try InternPool.truncateList(n, w, total)) break;
             if (arg == .unknown) try w.writeAll("_") else try ip.print(arg, w, n);
         }
         try w.writeAll(")");
     }
 
-    /// A container that is the value of a member is named after the member:
-    /// `const S = struct {...}` is `S`, in a function body it is named after the local constant,
-    /// and a `return`ed container is named after the function (`List(u8)`); the same naming
-    /// applies when the value is an `if` / `switch` choosing among several containers (the
-    /// compiler names it `S__struct_1` here; naming after the member is more readable).
+    /// How a container is named: after the member whose value it is (`const S = struct {...}` is
+    /// `S`), after the local constant of a function body, or after the function that `return`s it
+    /// (`List(u8)`); the same naming applies when the value is an `if` / `switch` choosing among
+    /// several containers (the compiler names it `S__struct_1` here; naming after the member is
+    /// more readable). `item` is the member whose name or body names it.
+    const Naming = struct { name: []const u8, item: u32, by: enum { member, local, returned } };
+
     /// Containers in type annotations of fields and variables, in arguments, and in
-    /// `?struct {...}` have no name; returns null.
-    fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?[]const u8 {
-        if (c.kind == .file) {
-            const base = std.fs.path.basename(n.r.ctx.db.env.vfs.path(c.file));
-            return if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else base;
-        }
+    /// `?struct {...}` have no name; returns null. Files are not handled here (see `write`).
+    fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?Naming {
         const tree = try n.r.itemTree(c.file);
         for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
             const parent = x.parent_item orelse return null;
@@ -194,15 +254,16 @@ const ContainerNames = struct {
             const b = try n.r.body(c.file, parent);
             if (item.kind == .@"const" or item.kind == .@"var") {
                 const value = b.value orelse return null;
-                return if (yields(b, value, rel)) item.name else null;
+                if (!yields(b, value, rel)) return null;
+                return .{ .name = item.name orelse return null, .item = parent, .by = .member };
             }
             for (b.bindings) |binding| {
                 const init = binding.init orelse continue;
-                if (yields(b, init, rel)) return binding.name;
+                if (yields(b, init, rel)) return .{ .name = binding.name, .item = parent, .by = .local };
             }
             if (item.kind != .@"fn") return null;
             for (b.exprs) |e| switch (e) {
-                .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return item.name,
+                .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return .{ .name = item.name orelse return null, .item = parent, .by = .returned },
                 else => {},
             };
             return null;
@@ -225,8 +286,24 @@ const ContainerNames = struct {
     }
 };
 
-/// Display listing the full contents: the result of `@typeName`, and types and values in hover
-/// and completion details
+/// Whether the container is the value written in the constant `item` of `file`
+/// (`const S = struct {...}`, including a branch of an `if` / `switch`), the declaration it is
+/// named after; false for an alias of a container declared elsewhere (`const T = S`,
+/// `const Self = @This()`, `const L = List(u8)`)
+pub fn declaresContainer(r: *Resolver, c: InternPool.Container, file: FileId, item: u32) resolve.Error!bool {
+    if (c.kind == .file or c.file != file) return false;
+    const tree = try r.itemTree(file);
+    for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
+        if (x.parent_item != item) return false;
+        const rel = try r.containerRel(.{ .file = file, .container = @intCast(ci) }) orelse return false;
+        const b = try r.body(file, item);
+        return ContainerNames.yields(b, b.value orelse return false, rel);
+    };
+    return false;
+}
+
+/// Display listing the full contents: the result of `@typeName`, and types in hover and
+/// completion details (values there are limited, see `shownValue`)
 pub fn writeFull(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
     try r.ctx.db.env.ip.print(t, w, ContainerNames{ .r = r, .full = true });
 }
@@ -246,7 +323,8 @@ pub fn typeAllocNoting(r: *Resolver, t: Index, max_length: ?usize) error{OutOfMe
 }
 
 /// Displays `type = T` when the value is a type, and `T = v` for other values known at comptime.
-/// Lists the full contents without truncation (hover, completion details).
+/// Lists the full contents of the type; the value is limited (see `shownValue`) (hover,
+/// completion details).
 pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     var out: Io.Writer.Allocating = .init(r.arena);
     writeFull(r, tv.ty, &out.writer) catch return error.OutOfMemory;
@@ -268,6 +346,15 @@ pub fn exprAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     return typedValueAlloc(r, tv);
 }
 
+/// Display of a value that is directly the result of `@embedFile(path)`: the type (in full) and
+/// the call instead of the content, `T = @embedFile("path")`
+pub fn embedAlloc(r: *Resolver, ty: Index, path: []const u8) error{OutOfMemory}![]const u8 {
+    var out: Io.Writer.Allocating = .init(r.arena);
+    writeFull(r, ty, &out.writer) catch return error.OutOfMemory;
+    out.writer.print(" = @embedFile(\"{f}\")", .{std.zig.fmtString(path)}) catch return error.OutOfMemory;
+    return out.written();
+}
+
 /// Tuples and anonymous structs whose fields are all comptime fields, when the value is known:
 /// the type is fully determined by the value (the type of `.{ A, B }` is
 /// `struct { comptime type = A, comptime type = B }`), so displaying the value suffices
@@ -285,14 +372,18 @@ fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
     return true;
 }
 
-/// The value known at comptime (functions and `simple_value` are not displayed)
+/// Maximum number of characters of a displayed comptime value: a value such as a slice of a large
+/// binary `@embedFile` would otherwise make a hover of several megabytes. The cut is marked: `…`
+/// and the full number of items or bytes follow (`"ab…" (1048576 bytes total)`). Also the
+/// maximum number of characters of embedded text shown in hover.
+pub const max_value_length = 2000;
+
+/// The value known at comptime, at most about `max_value_length` characters (functions are not
+/// displayed: the type already shows the signature)
 fn shownValue(r: *Resolver, tv: TypedValue) error{OutOfMemory}!?[]const u8 {
     const v = tv.val orelse return null;
-    switch (r.ctx.db.env.ip.key(v)) {
-        .fn_value, .simple_value => return null,
-        else => {},
-    }
+    if (r.ctx.db.env.ip.key(v) == .fn_value) return null;
     var out: Io.Writer.Allocating = .init(r.arena);
-    writeFull(r, v, &out.writer) catch return error.OutOfMemory;
+    r.ctx.db.env.ip.print(v, &out.writer, ContainerNames{ .r = r, .full = true, .max_length = max_value_length, .show_total = true }) catch return error.OutOfMemory;
     return out.written();
 }

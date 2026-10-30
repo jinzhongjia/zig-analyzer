@@ -3,7 +3,8 @@
 //! Types are values too (of type `type`). The same Key always yields the same Index regardless of
 //! the interning order, so Indexes in query results can be compared directly. Items are only
 //! appended, never removed: type identity is stable for the whole process. Multiple queries
-//! intern concurrently, protected by a mutex.
+//! intern concurrently, protected by a mutex; looking up the Key of an Index takes no lock (keys
+//! are stored in chunks that never move).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,21 +13,80 @@ const Allocator = std.mem.Allocator;
 const FileId = @import("../base/Vfs.zig").FileId;
 const AstId = @import("../syntax/ItemTree.zig").AstId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const SpinMutex = @import("../util/SpinMutex.zig");
 
 const InternPool = @This();
 
 gpa: Allocator,
 io: Io,
-mutex: Io.Mutex = .init,
-/// Target-dependent parameters for value computations. Set in the same write transaction as the
+/// Protects `map`, `arena`, and appending to `items`
+mutex: SpinMutex = .{},
+/// Target-dependent parameters for value computations outside every compilation: the parts the
+/// targets of all compilations agree on. Set in the same write transaction as the
 /// `queries.TargetAbi` input; every query that reads it reads that input first to record the
 /// dependency. Read and write transactions are mutually exclusive, so it is never modified while
 /// being read.
 target: Target = .{},
+/// Target-dependent parameters of each compilation (indexed like `ModuleGraph.compiles`, the
+/// value of a `context` key), set in the same write transaction as the `queries.ContextTarget`
+/// inputs. A computation running in a compilation selects its entry with `enterContext`.
+targets: []const Target = &.{},
 /// Storage for the slices in Keys
 arena: std.heap.ArenaAllocator,
-items: std.ArrayList(Key) = .empty,
+items: Items = .{},
 map: std.HashMapUnmanaged(Key, Index, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+
+/// The Key of each Index, in chunks of doubling size that are never moved or freed while the pool
+/// is in use: a thread that has obtained an Index (from `get`, or from a query result published
+/// after it was interned) reads its Key without the lock. Interning is far less frequent than
+/// looking up keys, which concurrent requests would otherwise serialize on.
+const Items = struct {
+    /// Chunk `c` holds the `first_chunk << c` keys from index `first_chunk * (2^c - 1)` on
+    chunks: [chunk_count]?[*]Key = @splat(null),
+    len: u32 = 0,
+
+    const first_chunk = 256;
+    /// Enough chunks for every u32 index
+    const chunk_count = locate(std.math.maxInt(u32)).chunk + 1;
+
+    fn locate(index: u32) struct { chunk: usize, offset: usize } {
+        const n = @as(u64, index) / first_chunk + 1;
+        const chunk = std.math.log2_int(u64, n);
+        return .{ .chunk = chunk, .offset = index - first_chunk * ((@as(u64, 1) << chunk) - 1) };
+    }
+
+    fn chunkLen(chunk: usize) usize {
+        return @as(usize, first_chunk) << @intCast(chunk);
+    }
+
+    fn at(items: *const Items, index: u32) *Key {
+        const loc = locate(index);
+        return &items.chunks[loc.chunk].?[loc.offset];
+    }
+
+    /// Appends a key (the caller holds the mutex)
+    fn append(items: *Items, gpa: Allocator, k: Key) Allocator.Error!u32 {
+        const index = items.len;
+        const loc = locate(index);
+        if (items.chunks[loc.chunk] == null) items.chunks[loc.chunk] = (try gpa.alloc(Key, chunkLen(loc.chunk))).ptr;
+        items.chunks[loc.chunk].?[loc.offset] = k;
+        items.len = index + 1;
+        return index;
+    }
+
+    fn capacity(items: *const Items) usize {
+        var n: usize = 0;
+        for (items.chunks, 0..) |c, i| if (c != null) {
+            n += chunkLen(i);
+        };
+        return n;
+    }
+
+    fn deinit(items: *Items, gpa: Allocator) void {
+        for (items.chunks, 0..) |c, i| if (c) |p| gpa.free(p[0..chunkLen(i)]);
+        items.* = undefined;
+    }
+};
 
 pub const Index = enum(u32) {
     /// Unknown type (absorbs everything: any operation involving it also yields unknown, and no
@@ -153,8 +213,15 @@ pub const Key = union(enum) {
     /// argument value for comptime parameters, unknown when it is not known; the argument type
     /// for anytype parameters; `runtime` for non-comptime parameters).
     /// `parent` is the instance the function itself belongs to (for a function defined in another
-    /// instantiated container).
+    /// instantiated container), or the `context` of a function outside every generic function.
     instance: Instance,
+    /// The compilation (an index into `ModuleGraph.compiles`) code is analyzed in when it is not
+    /// its file's own compilation (`ModuleGraph.home`): a file shared by several compilations,
+    /// such as the standard library, is analyzed once per compilation that uses it. It takes the
+    /// place of an instance where code is outside every generic function (`inst` of declarations,
+    /// container types and function values) and ends the `parent` chain of instances, so values
+    /// from different compilations never share an identity. Neither a type nor a value.
+    context: u32,
     /// A comptime type parameter without a concrete instance (abstract instance), displayed as the
     /// parameter name
     opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
@@ -329,6 +396,7 @@ pub fn init(gpa: Allocator, io: Io) Allocator.Error!InternPool {
 }
 
 pub fn deinit(ip: *InternPool) void {
+    ip.gpa.free(ip.targets);
     ip.items.deinit(ip.gpa);
     ip.map.deinit(ip.gpa);
     ip.arena.deinit();
@@ -348,7 +416,7 @@ pub fn reset(ip: *InternPool) Allocator.Error!void {
     for (preset, 0..) |k, i| std.debug.assert(@backingInt(try fresh.get(k)) == i);
 
     ip.mutex.lockUncancelable(ip.io);
-    std.mem.swap(std.ArrayList(Key), &ip.items, &fresh.items);
+    std.mem.swap(Items, &ip.items, &fresh.items);
     std.mem.swap(@TypeOf(ip.map), &ip.map, &fresh.map);
     std.mem.swap(std.heap.ArenaAllocator, &ip.arena, &fresh.arena);
     ip.mutex.unlock(ip.io);
@@ -361,19 +429,29 @@ pub fn reset(ip: *InternPool) Allocator.Error!void {
 pub fn bytes(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    return ip.items.capacity * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
+    return ip.items.capacity() * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
+}
+
+/// The target parameters value computations on this thread use: those of the compilation the
+/// innermost computation in progress runs in (see `enterContext`); null outside every compilation,
+/// where the parameters common to all compilations (`target`) apply. A computation runs entirely
+/// on one thread, and nested computations restore it when they return.
+threadlocal var active_target: ?*const Target = null;
+
+fn currentTarget(ip: *const InternPool) *const Target {
+    return active_target orelse &ip.target;
 }
 
 pub fn pointerBits(ip: *const InternPool) ?u16 {
-    return ip.target.pointer_bits;
+    return ip.currentTarget().pointer_bits;
 }
 
 pub fn vectorAbi(ip: *const InternPool) VectorAbi {
-    return ip.target.vector_abi;
+    return ip.currentTarget().vector_abi;
 }
 
 pub fn scalarAbi(ip: *const InternPool) *const ScalarAbi {
-    return &ip.target.scalar_abi;
+    return &ip.currentTarget().scalar_abi;
 }
 
 /// May only be called in a write transaction
@@ -381,10 +459,28 @@ pub fn setTarget(ip: *InternPool, t: Target) void {
     ip.target = t;
 }
 
-/// Target-dependent parameters for value computations (the parts consistent across modules);
-/// defaults to the native target
+/// Replaces the target parameters of the compilations. May only be called in a write transaction.
+pub fn setTargets(ip: *InternPool, targets: []const Target) Allocator.Error!void {
+    const copy = try ip.gpa.dupe(Target, targets);
+    ip.gpa.free(ip.targets);
+    ip.targets = copy;
+}
+
+/// Makes value computations on this thread use the target of compilation `context` (null: the
+/// parameters common to all compilations) until `leaveContext` is called with the returned value
+pub fn enterContext(ip: *const InternPool, context: ?u32) ?*const Target {
+    const prev = active_target;
+    active_target = if (context) |c| (if (c < ip.targets.len) &ip.targets[c] else null) else null;
+    return prev;
+}
+
+pub fn leaveContext(prev: ?*const Target) void {
+    active_target = prev;
+}
+
+/// Target-dependent parameters for value computations; defaults to the native target
 pub const Target = struct {
-    /// Pointer bit width; null when the modules disagree
+    /// Pointer bit width; null when unknown (the targets the parameters are common to disagree)
     pointer_bits: ?u16 = @bitSizeOf(usize),
     vector_abi: VectorAbi = .unknown,
     scalar_abi: ScalarAbi = .native,
@@ -528,16 +624,28 @@ pub const VectorAbi = enum(u8) {
 
 /// Interns: the same Key returns the same Index
 pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
+    // Hashed before taking the lock: only probing the table is serialized
+    const hashed: Prehashed = .{ .h = KeyContext.hash(.{}, k) };
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    if (ip.map.get(k)) |i| return i;
+    if (ip.map.getAdapted(k, hashed)) |i| return i;
     const owned = try ip.own(k);
-    const index: Index = @fromBackingInt(@as(u32, @intCast(ip.items.items.len)));
-    try ip.items.append(ip.gpa, owned);
-    errdefer _ = ip.items.pop();
-    try ip.map.put(ip.gpa, owned, index);
+    const index: Index = @fromBackingInt(try ip.items.append(ip.gpa, owned));
+    errdefer ip.items.len -= 1;
+    try ip.map.putNoClobber(ip.gpa, owned, index);
     return index;
 }
+
+/// Lookup context carrying a hash already computed with `KeyContext`
+const Prehashed = struct {
+    h: u64,
+    pub fn hash(c: Prehashed, _: Key) u64 {
+        return c.h;
+    }
+    pub fn eql(_: Prehashed, a: Key, b: Key) bool {
+        return deepEql(a, b);
+    }
+};
 
 /// Copies the slices in a Key into the arena
 fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
@@ -579,18 +687,17 @@ fn dupeNames(a: Allocator, names: []const []const u8) Allocator.Error![]const []
     return out;
 }
 
-/// The slices in the returned Key are valid for the lifetime of the InternPool
 /// Number of interned types and values
 pub fn count(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    return ip.items.items.len;
+    return ip.items.len;
 }
 
+/// The slices in the returned Key are valid for the lifetime of the InternPool. Takes no lock (see
+/// `Items`).
 pub fn key(ip: *InternPool, index: Index) Key {
-    ip.mutex.lockUncancelable(ip.io);
-    defer ip.mutex.unlock(ip.io);
-    return ip.items.items[@backingInt(index)];
+    return ip.items.at(@backingInt(index)).*;
 }
 
 // ── Common constructors ──────────────────────────────────────────────
@@ -662,7 +769,13 @@ pub fn isFloat(ip: *InternPool, t: Index) bool {
 pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     switch (ip.key(index)) {
         .unknown => try w.writeAll("unknown"),
-        .simple_type => |s| try w.writeAll(@tagName(s)),
+        // Types without a name of their own are written as Zig spells them
+        .simple_type => |s| try w.writeAll(switch (s) {
+            .null => "@TypeOf(null)",
+            .undefined => "@TypeOf(undefined)",
+            .enum_literal => "@EnumLiteral()",
+            else => @tagName(s),
+        }),
         .int_type => |i| try w.print("{c}{d}", .{ @as(u8, if (i.signedness == .signed) 'i' else 'u'), i.bits }),
         .ptr_type => |p| {
             switch (p.size) {
@@ -715,7 +828,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("error{");
             for (names, 0..) |n, i| {
                 if (i != 0) try w.writeAll(",");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, names.len)) break;
                 try w.writeAll(n);
             }
             try w.writeAll("}");
@@ -724,7 +837,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("fn (");
             for (f.params, 0..) |p, i| {
                 if (i != 0) try w.writeAll(", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, f.params.len)) break;
                 try ip.print(p, w, container_name);
             }
             if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
@@ -739,7 +852,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("struct {");
             for (t.types, 0..) |ty, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, t.types.len)) break;
                 try ip.printField(null, ty, fieldValue(t.values, i), w, container_name);
             }
             try w.writeAll(" }");
@@ -753,7 +866,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("struct {");
             for (t.names, t.types, 0..) |n, ty, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, t.names.len)) break;
                 try ip.printField(n, ty, fieldValue(t.values, i), w, container_name);
             }
             try w.writeAll(if (t.names.len == 0) "}" else " }");
@@ -764,7 +877,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(u, w, container_name);
             try w.writeAll(").@\"union\".tag_type.?");
         },
-        .simple_value => |v| try w.writeAll(@tagName(v)),
+        // The void value is written as `{}` (`void` is the type)
+        .simple_value => |v| try w.writeAll(if (v == .void) "{}" else @tagName(v)),
         .int_value => |v| try w.print("{d}", .{v.value}),
         .float_value => |v| {
             // Prints the shortest representation for the type of the value (√2 as f32 is
@@ -792,7 +906,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll(".{");
             for (v.elems, 0..) |e, i| {
                 try w.writeAll(if (i == 0) " " else ", ");
-                if (try truncateList(container_name, w)) break;
+                if (try truncateList(container_name, w, v.elems.len)) break;
                 if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
                 try ip.print(e, w, container_name);
             }
@@ -800,8 +914,11 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         .bytes => |v| switch (ip.key(v.ty)) {
             .array_type, .ptr_type => {
-                const shown = v.bytes[0..@min(v.bytes.len, remaining(container_name, w) orelse v.bytes.len)];
-                try w.print("\"{f}{s}\"", .{ std.zig.fmtString(shown), if (shown.len < v.bytes.len) "…" else "" });
+                try w.writeAll("\"");
+                const shown = try writeStringPrefix(v.bytes, remaining(container_name, w), w);
+                if (shown == v.bytes.len) return w.writeAll("\"");
+                try w.writeAll("…\"");
+                try writeTotal(container_name, w, v.bytes.len, " bytes");
             },
             // Structs, tuples and vectors whose elements are all u8 (also represented as
             // bytes): shown element by element like an aggregate
@@ -810,7 +927,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
                 try w.writeAll(".{");
                 for (v.bytes, 0..) |byte, i| {
                     try w.writeAll(if (i == 0) " " else ", ");
-                    if (try truncateList(container_name, w)) break;
+                    if (try truncateList(container_name, w, v.bytes.len)) break;
                     if (names) |n| if (i < n.len) try w.print(".{f} = ", .{std.zig.fmtId(n[i])});
                     try w.print("{d}", .{byte});
                 }
@@ -826,7 +943,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("&");
             try ip.print(v.pointee, w, container_name);
         },
-        .instance => try w.writeAll("instance"),
+        .instance, .context => try w.writeAll("instance"),
         .opaque_param => |o| try w.writeAll(o.name),
         .runtime => try w.writeAll("_"),
     }
@@ -839,12 +956,42 @@ fn remaining(container_name: anytype, w: *Io.Writer) ?usize {
 }
 
 /// Called before writing the next item of a list (fields, elements, parameters): when the output
-/// is already full, writes `…` and returns true, and the list stops there. The output can thus
-/// exceed the limit by one item; strings are written only up to the limit.
-pub fn truncateList(container_name: anytype, w: *Io.Writer) Io.Writer.Error!bool {
+/// is already full, writes `…` (see `writeTotal`) and returns true, and the list stops there. The
+/// output can thus exceed the limit by one item; strings are written only up to the limit.
+/// `total` is the number of items in the list.
+pub fn truncateList(container_name: anytype, w: *Io.Writer, total: usize) Io.Writer.Error!bool {
     if (remaining(container_name, w) != 0) return false;
     try w.writeAll("…");
+    try writeTotal(container_name, w, total, "");
     return true;
+}
+
+/// After the `…` of a cut list or string: ` (N total)` with the full number of items (or of
+/// `unit`s) when `container_name.show_total` is set, so that the cut states how much is left out
+fn writeTotal(container_name: anytype, w: *Io.Writer, total: usize, unit: []const u8) Io.Writer.Error!void {
+    if (@hasField(@TypeOf(container_name), "show_total") and container_name.show_total) try w.print(" ({d}{s} total)", .{ total, unit });
+}
+
+/// Writes `text` escaped as in a string literal, stopping once about `limit` characters are
+/// written (null: no limit); returns the number of bytes written. A valid UTF-8 sequence is
+/// written whole, so the output is the same as escaping the whole string at once.
+fn writeStringPrefix(text: []const u8, limit: ?usize, w: *Io.Writer) Io.Writer.Error!usize {
+    const max = limit orelse {
+        try std.zig.stringEscape(text, w);
+        return text.len;
+    };
+    var i: usize = 0;
+    var written: usize = 0;
+    while (i < text.len and written < max) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const unit = if (i + len <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..len])) len else 1;
+        const before = w.buffered().len;
+        try std.zig.stringEscape(text[i..][0..unit], w);
+        const out = w.buffered()[before..];
+        written += std.unicode.utf8CountCodepoints(out) catch out.len;
+        i += unit;
+    }
+    return i;
 }
 
 /// A field of a tuple or anonymous struct: comptime fields include their value
@@ -856,8 +1003,7 @@ fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Wr
     try ip.print(ty, w, container_name);
     if (!is_comptime) return;
     try w.writeAll(" = ");
-    // The void value is written as `{}`
-    if (v == .void_value) try w.writeAll("{}") else try ip.print(v, w, container_name);
+    try ip.print(v, w, container_name);
 }
 
 /// Displays a constructed type by its contents when there is no name for its construction
@@ -866,7 +1012,7 @@ pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: 
     try w.print("{t} {{", .{t.kind});
     for (t.names, 0..) |n, i| {
         try w.writeAll(if (i == 0) " " else ", ");
-        if (try truncateList(container_name, w)) break;
+        if (try truncateList(container_name, w, t.names.len)) break;
         try w.writeAll(n);
         if (i < t.types.len) {
             try w.writeAll(": ");
@@ -903,6 +1049,27 @@ test "interning is idempotent and presets are stable" {
     try testing.expectEqualStrings("anyerror!?[]const u8", w.buffered());
 }
 
+test "types of null, undefined and enum literals print as Zig spells them" {
+    // Prevents displaying them as `null`, `undefined` and `enum_literal`, which are not types
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    const cases = [_]struct { Index, []const u8 }{
+        .{ .null_type, "@TypeOf(null)" },
+        .{ .undefined_type, "@TypeOf(undefined)" },
+        .{ .enum_literal_type, "@EnumLiteral()" },
+        .{ try ip.optionalOf(.enum_literal_type), "?@EnumLiteral()" },
+    };
+    for (cases) |c| {
+        w.end = 0;
+        try ip.print(c[0], &w, struct {
+            fn write(_: @This(), _: Container, _: *Io.Writer) Io.Writer.Error!void {}
+        }{});
+        try testing.expectEqualStrings(c[1], w.buffered());
+    }
+}
+
 test "reset keeps the presets and frees everything else" {
     var ip: InternPool = try .init(testing.allocator, testing.io);
     defer ip.deinit();
@@ -915,6 +1082,37 @@ test "reset keeps the presets and frees everything else" {
     try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
     // Interning again yields the same position (the index depends only on the interning order)
     try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
+}
+
+test "concurrent interning across chunk boundaries gives each key one index and its key back" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    // Enough keys to fill several chunks while other threads read keys without the lock
+    const n = 5000;
+    const Worker = struct {
+        fn run(pool: *InternPool, out: *[n]Index, failed: *std.atomic.Value(bool)) void {
+            for (out, 0..) |*o, i| {
+                const bits: u16 = @intCast(i + 1);
+                o.* = pool.intType(.signed, bits) catch return failed.store(true, .monotonic);
+                const k = pool.key(o.*);
+                if (k != .int_type or k.int_type.bits != bits or k.int_type.signedness != .signed) failed.store(true, .monotonic);
+            }
+        }
+    };
+    var results: [4][n]Index = undefined;
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    for (&threads, &results) |*t, *r| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &ip, r, &failed });
+        spawned += 1;
+    }
+    for (threads) |t| t.join();
+    spawned = 0;
+    try testing.expect(!failed.load(.monotonic));
+    for (results[1..]) |r| try testing.expectEqualSlices(Index, &results[0], &r);
+    try testing.expectEqual(preset.len + n, ip.count());
 }
 
 test "reset that runs out of memory leaves the pool intact" {

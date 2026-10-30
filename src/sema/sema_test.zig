@@ -95,7 +95,7 @@ test "literals, annotations and primitives" {
         .{ "s", "*const [2:0]u8" },
         .{ "x", "comptime_float = 1.5" },
         .{ "flag", "bool" },
-        .{ "n", "?u8" },
+        .{ "n", "?u8 = null" },
     });
 }
 
@@ -1760,7 +1760,7 @@ test "destructuring infers each element" {
         .{ "v1", "f32" },
         // Comptime fields of a tuple literal: the value belongs to the type
         .{ "k0", "comptime_int = 5" },
-        .{ "k1", "bool" },
+        .{ "k1", "bool = true" },
     });
 }
 
@@ -2405,6 +2405,55 @@ test "builtin arguments of std types get their result types" {
     });
 }
 
+test "containers named inside a generic instance are qualified by it" {
+    // Prevents displaying `Outer(u8).Inner` as `Inner(u8)`, which reads like a call of `Inner`
+    try expectTypes(
+        \\fn Outer(comptime T: type) type {
+        \\    return struct {
+        \\        pub const Inner = struct { v: T };
+        \\        pub const Deep = struct { pub const Leaf = struct { t: T }; };
+        \\        pub fn Gen(comptime U: type) type {
+        \\            return struct { pub const X = struct { u: U, t: T }; };
+        \\        }
+        \\        pub fn make() type {
+        \\            return struct { t: T };
+        \\        }
+        \\    };
+        \\}
+        \\fn Local(comptime T: type) type {
+        \\    const S = struct { t: T };
+        \\    return struct { s: S };
+        \\}
+        \\fn Returned(comptime T: type) type {
+        \\    const S = struct { v: T };
+        \\    return S;
+        \\}
+        \\fn f() void {
+        \\    const x: Outer(u8).Inner = .{ .v = 1 };
+        \\    const leaf: Outer(u8).Deep.Leaf = .{ .t = 1 };
+        \\    const g: Outer(u8).Gen(u16).X = .{ .u = 1, .t = 2 };
+        \\    const gen: Outer(u8).Gen(u16) = .{};
+        \\    const m: Outer(u8).make() = .{ .t = 1 };
+        \\    const o: Outer(u8) = .{};
+        \\    var lv: Local(i8) = undefined;
+        \\    const ls = lv.s;
+        \\    var rv: Returned(i8) = undefined;
+        \\    const rs = rv;
+        \\    _ = .{ x, leaf, g, gen, m, o, ls, &lv, rs, &rv };
+        \\}
+    , &.{
+        .{ "x", "Outer(u8).Inner" },
+        .{ "leaf", "Outer(u8).Deep.Leaf" },
+        .{ "g", "Outer(u8).Gen(u16).X" },
+        .{ "gen", "Outer(u8).Gen(u16)" },
+        .{ "m", "Outer(u8).make()" },
+        .{ "o", "Outer(u8)" },
+        // A local constant of a function is named after the function without arguments
+        .{ "ls", "Local.S" },
+        .{ "rs", "Returned.S" },
+    });
+}
+
 test "std generic containers" {
     try expectStdTypes(
         \\const std = @import("std");
@@ -2443,7 +2492,7 @@ test "std generic containers" {
         // FieldEnum-constructed enums, @FieldType and @tagName
         .{ "xs", "[]i32" },
         .{ "flag", "?bool" },
-        .{ "entry", "GetOrPutResult(u32, []const u8, AutoContext(u32), 80)" },
+        .{ "entry", "Custom(u32, []const u8, AutoContext(u32), 80).GetOrPutResult" },
         // The result of @typeInfo is comptime-known and shown in full
         .{ "fs", "[]const [:0]const u8 = &.{ \"x\", \"y\" }" },
         .{ "info", "Type = .{ .@\"struct\" = .{ .is_tuple = false, .layout = .auto, .backing_integer = null, .field_names = &.{ \"x\", \"y\" }, .field_types = &.{ i32, i32 }, .field_attrs = &.{ .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null }, .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null } }, .decl_names = &.{} } }" },
@@ -3359,5 +3408,176 @@ test "values of structs whose fields are all u8 keep the declared field types an
         .{ "arr", "[1]Names = .{ .{ .short = 104 } }" },
         .{ "v", "u8 = 104" },
         .{ "pp", "P = .{ .a = 1, .b = 2 }" },
+    });
+}
+
+test "the address of a function declaration is a const pointer with a comptime value" {
+    // A function declaration is not a `var`: `&handler` used to be a mutable `*fn` without a value
+    try expectTypes(
+        \\fn handler(x: u8) void {
+        \\    _ = x;
+        \\}
+        \\const S = struct {
+        \\    fn m(x: u8) void {
+        \\        _ = x;
+        \\    }
+        \\};
+        \\const T1 = if (@TypeOf(&handler) == *const fn (u8) void) u8 else u16;
+        \\var g: u32 = 0;
+        \\fn f() void {
+        \\    const cb = &handler;
+        \\    var cb2 = &handler;
+        \\    _ = &cb2;
+        \\    const table = .{ .on_event = &handler };
+        \\    const via_s = &S.m;
+        \\    const pg = &g;
+        \\    _ = .{ cb, table, via_s, pg };
+        \\}
+    , &.{
+        .{ "cb", "*const fn (u8) void = &fn (u8) void" },
+        .{ "cb2", "*const fn (u8) void" },
+        .{ "table", "struct { comptime on_event: *const fn (u8) void = &fn (u8) void } = .{ .on_event = &fn (u8) void }" },
+        .{ "via_s", "*const fn (u8) void = &fn (u8) void" },
+        .{ "pg", "*u32" },
+        .{ "T1", "type = u8" },
+    });
+}
+
+test "variables reached through namespaces and payloads of noreturn orelse are mutable places" {
+    // The constness of a namespace member is its own: `&State.counter` used to follow the `const`
+    // that names the namespace and be `*const u32`
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/other.zig",
+        \\pub var global: i64 = 0;
+        \\pub const fixed: i64 = 0;
+    );
+    const src =
+        \\const other = @import("other.zig");
+        \\const State = struct {
+        \\    pub var counter: u32 = 0;
+        \\    pub const fixed: u32 = 0;
+        \\    pub var buf: [8]u8 = undefined;
+        \\};
+        \\const Self = @This();
+        \\var instance: u16 = 0;
+        \\const Sym = struct { file: ?u32 = null };
+        \\const Obj = struct {
+        \\    d_sym: ?Sym = null,
+        \\    res: anyerror!Sym = .{},
+        \\    fn close(self: *Obj) bool {
+        \\        const ds = &(self.d_sym orelse return false);
+        \\        const r_sym = &(self.res catch return false);
+        \\        _ = .{ ds, r_sym };
+        \\        return true;
+        \\    }
+        \\};
+        \\fn probe(n: usize, opt: ?Sym) void {
+        \\    const p1 = &State.counter;
+        \\    const p2 = &State.fixed;
+        \\    const p3 = &Self.instance;
+        \\    const p10 = &other.global;
+        \\    const p11 = &other.fixed;
+        \\    const s1 = State.buf[0..n];
+        \\    const o1 = &(opt orelse return);
+        \\    for (&State.buf) |*c| {
+        \\        const pc = c;
+        \\        _ = pc;
+        \\    }
+        \\    _ = .{ p1, p2, p3, p10, p11, s1, o1 };
+        \\}
+    ;
+    const f = try w.add("/p/main.zig", src);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "p1", "*u32" },
+        .{ "p2", "*const u32 = &0" },
+        .{ "p3", "*u16" },
+        .{ "p10", "*i64" },
+        .{ "p11", "*const i64 = &0" },
+        .{ "s1", "[]u8" },
+        .{ "pc", "*u8" },
+        .{ "ds", "*Sym" },
+        .{ "r_sym", "*Sym" },
+        .{ "o1", "*const Sym" },
+    };
+    for (cases) |c| {
+        const actual = try typeAt(&w, f.file, src, c[0], 0);
+        testing.expectEqualStrings(c[1], actual) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "a while loop whose condition always holds takes the type of its breaks" {
+    // The implicit `void` else branch used to be a peer of the breaks, which made these unknown
+    try expectTypes(
+        \\const Point = struct { x: i32 };
+        \\const forever = true;
+        \\fn probe(c: bool, items: []const Point) void {
+        \\    var i: usize = 0;
+        \\    const found = while (true) : (i += 1) {
+        \\        if (items[i].x == 0) break items[i];
+        \\    };
+        \\    const n = while (true) {
+        \\        if (c) break @as(u32, 1);
+        \\    };
+        \\    const m = while (forever) {
+        \\        if (c) break @as(u16, 1);
+        \\    };
+        \\    const lab = outer: while (true) {
+        \\        for (items) |_| {
+        \\            if (c) break :outer @as(u8, 1);
+        \\        }
+        \\    };
+        \\    const rt = while (c) {
+        \\        if (c) break @as(u32, 1);
+        \\    };
+        \\    const with_else = while (c) {
+        \\        if (c) break @as(u32, 1);
+        \\    } else @as(u32, 2);
+        \\    _ = .{ found, n, m, lab, rt, with_else };
+        \\}
+    , &.{
+        .{ "found", "Point" },
+        .{ "n", "u32" },
+        .{ "m", "u16" },
+        .{ "lab", "u8" },
+        .{ "rt", "unknown" },
+        .{ "with_else", "u32" },
+    });
+}
+
+test "operands of comparisons and arithmetic have no result type" {
+    // The other operand's type used to be the result type: `mode == .Debug` resolved the decl
+    // literal `Debug`, and `b + @intCast(y)` cast to u8
+    try expectTypes(
+        \\const Optimize = enum {
+        \\    debug,
+        \\    safe,
+        \\    pub const Debug: Optimize = .debug;
+        \\};
+        \\const mode: Optimize = .debug;
+        \\const t = if (mode == .Debug) 1 else 0;
+        \\const t2 = if (mode == .debug) 1 else 0;
+        \\const t3 = if (.safe != mode) 1 else 0;
+        \\var b: u8 = 1;
+        \\var y: u64 = 2;
+        \\fn f(o: ?Optimize) void {
+        \\    const v28 = b + @intCast(y);
+        \\    const v29 = b + 1;
+        \\    const eq = o == .safe;
+        \\    _ = .{ v28, v29, eq };
+        \\}
+    , &.{
+        .{ "t", "comptime_int" },
+        .{ "t2", "comptime_int = 1" },
+        .{ "t3", "comptime_int = 1" },
+        .{ "v28", "unknown" },
+        .{ "v29", "u8" },
+        .{ "eq", "bool" },
+        .{ ".Debug", "@EnumLiteral() = .Debug" },
+        .{ ".safe", "Optimize = .safe" },
     });
 }

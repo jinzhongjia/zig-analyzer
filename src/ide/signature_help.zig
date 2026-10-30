@@ -42,19 +42,19 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
     const call = for (b.exprs, b.expr_ranges) |e, range| {
         if (e == .call and a.node.offset + range.start == selected.offset) break e.call;
     } else return null;
-    const target = try context.callee(r, a, call.callee) orelse return null;
-    const params = try context.fnParams(r, target.def);
-    if (params.len == 0 and target.def != .item) return null;
-
-    const it = target.def.item;
-    const node = try r.itemNode(it.file, it.item) orelse return null;
-    const proto = (ast.cast(ast.FnDecl, node) orelse return null).proto() orelse return null;
+    const target = try context.callProto(r, a, call.callee) orelse return null;
+    const params = try target.params(r.arena);
     var label: std.Io.Writer.Allocating = .init(r.arena);
-    proto.writeSignature(&label.writer) catch return error.OutOfMemory;
+    target.proto.writeSignature(&label.writer) catch return error.OutOfMemory;
     // Same as the parameters in label (see `ast.FnProto.writeParams`)
     const texts = try r.arena.alloc([]const u8, params.len);
     for (params, texts) |p, *t| t.* = try ast.collapsedAlloc(r.arena, p.syntax);
-    return .{ .label = label.written(), .params = texts, .active = active + @as(u32, @intFromBool(target.bound)), .doc = try context.doc(r, target.def) };
+    const doc = if (target.def) |d| try context.doc(r, d) else null;
+    var current = active + @as(u32, @intFromBool(target.bound));
+    // Every argument from the C-variadic `...` on is one of its arguments; without `...` an extra
+    // argument has no parameter and is left past the end
+    if (params.len > 0 and params[params.len - 1].isVarargs()) current = @min(current, @as(u32, @intCast(params.len - 1)));
+    return .{ .label = label.written(), .params = texts, .active = current, .doc = doc };
 }
 
 /// The CST argument list directly contains the separating commas; commas in nested expressions,

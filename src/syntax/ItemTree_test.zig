@@ -177,3 +177,56 @@ test "zon ItemTree unchanged by value edits" {
     try testing.expect(try treesEqualIn(.zon, ".{ .a = 1 }", ".{ .a = 2, .b = .{ \"x\" } }"));
     try testing.expect(try treesEqualIn(.zon, ".{ .a = 1 }", "1"));
 }
+
+test "an unclosed list does not take the declarations after it" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const std = @import(\nconst mem = std.mem;\n", "const std\nconst mem\n" },
+        .{ "const std = @import(\"std\"\nconst mem = std.mem;\n", "const std\nconst mem\n" },
+        .{ "const a = f(1,\nvar b = 2;\n", "const a\nvar b\n" },
+        .{ "const a = .{ .x = 1,\npub const b = 2;\n", "const a\nconst b pub\n" },
+        .{ "const a = [_]u8{ 1,\nexport const b = 2;\n", "const a\nconst b\n" },
+        .{ "const E = error{ A,\ntest {}\n", "const E\ntest _\n" },
+        .{ "fn f(a: u32,\nthreadlocal var b: u32 = 0;\n", "fn f\nvar b\n" },
+        .{ "extern fn f(a: u32,\nextern fn g() void;\n", "fn f\nfn g\n" },
+        .{ "const aaa = @import(\"aaa.zig\"\nfn helper(n: u32) u32 {\n    return n;\n}\n", "const aaa\nfn helper\n" },
+        .{ "const aaa = @import(\"aaa.zig\"\npub fn helper(n: u32) u32 {\n    return n;\n}\n", "const aaa\nfn helper pub\n" },
+    };
+    for (cases) |c| expectItems(c[0], c[1]) catch |err| {
+        std.debug.print("source: `{s}`\n", .{c[0]});
+        return err;
+    };
+}
+
+test "an unclosed block does not take the declarations after it" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f(x: bool) void {\n    if (x) {\n        _ = 1;\n}\n\npub fn g() u32 {\n    return 1;\n}\n\ntest {\n    _ = g();\n}\n", "fn f\nfn g pub\ntest _\n" },
+        .{ "pub fn main() void {\n    const x: u32 = 3;\n    if (x > 1) {\n        _ = 2;\n}\n\nfn helper(x: u32) void {\n    _ = x;\n}\n", "fn main pub\nfn helper\n" },
+        .{ "test {\n    {\n}\nexport fn a() void {}\nextern fn b() void;\nthreadlocal var c: u32 = 0;\nnoinline fn d() void {}\ninline fn e() void {}\n", "test _\nfn a\nfn b\nvar c\nfn d\nfn e\n" },
+    };
+    for (cases) |c| expectItems(c[0], c[1]) catch |err| {
+        std.debug.print("source: `{s}`\n", .{c[0]});
+        return err;
+    };
+}
+
+test "an unclosed switch or a missing last value does not take the declarations after it" {
+    const head = "const E = enum { a, b };\nfn f(x: E) u32 {\n";
+    const tail = "}\n\nconst h: u32 = 2;\n\nfn g() u32 {\n    return h;\n}\n";
+    const types = "const E\n  <enum>\n    field a\n    field b\n";
+    const cases = [_]struct { []const u8, []const u8 }{
+        // The prong list ends at `const`, which cannot start a prong: `f` ends at its own `}`
+        .{ "    switch (x) {\n        .a => 1,\n    const y: u32 = 1;\n    return y;\n", types ++ "fn f\nconst h\nfn g\n" },
+        // These take `f`'s `}` as their own: `f` ends at the next function
+        .{ "    switch (x) {\n        .a => \n", types ++ "fn f\nfn g\n" },
+        .{ "    const s: struct { a: u32 } = .{ .a = \n", types ++ "fn f\n  <struct>\n    field a\nfn g\n" },
+        .{ "    asm volatile (\"nop\" ::: .{ .memory = \n", types ++ "fn f\nfn g\n" },
+    };
+    for (cases) |c| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{ head, c[0], tail });
+        defer testing.allocator.free(source);
+        expectItems(source, c[1]) catch |err| {
+            std.debug.print("source: `{s}`\n", .{source});
+            return err;
+        };
+    }
+}

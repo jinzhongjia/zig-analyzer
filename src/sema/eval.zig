@@ -112,14 +112,15 @@ pub fn bodyQuota(r: *Resolver, body: *const Body, exprs: []const TypedValue) u32
 
 /// Computation of `CallEval`
 pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
-    _ = try ctx.get(queries.TargetAbi, {});
     var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
     defer scratch.deinit();
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-    var ev: Evaluator = .{ .r = &r, .ip = ctx.db.env.ip, .a = scratch.allocator(), .arena = &scratch, .quota = key.quota };
-    defer ev.deinit();
-    const ip = ev.ip;
+    const ip = ctx.db.env.ip;
     const inst = ip.key(key.inst).instance;
+    const scope = try queries.enterContext(&r, inst.file, key.inst);
+    defer scope.leave();
+    var ev: Evaluator = .{ .r = &r, .ip = ip, .a = scratch.allocator(), .arena = &scratch, .quota = key.quota };
+    defer ev.deinit();
     const args = switch (ip.key(key.values)) {
         .aggregate => |agg| agg.elems,
         else => &.{},
@@ -133,6 +134,8 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
 /// comptime value of the body of a member (container-level constant, field default value).
 /// `want` is the type annotation.
 pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index) Error!TypedValue {
+    const scope = if (r.context == null) try queries.enterContext(r, owner.file, inst) else null;
+    defer if (scope) |s| s.leave();
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
@@ -149,6 +152,10 @@ pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index)
 /// evaluate a value in a comptime context. `quota` is the backward branch quota (see
 /// `bodyQuota`).
 pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index, quota: u32) Error!TypedValue {
+    // Evaluations started outside a computation in a compilation (such as by goto) run in the
+    // compilation of `file` and `inst`
+    const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
+    defer if (scope) |s| s.leave();
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena, .quota = quota };
@@ -370,18 +377,24 @@ pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Er
 }
 
 /// `@embedFile(path)`: content of the file in the directory of `file`, with the same type as a
-/// string literal (`*const [len:0]u8`). For an open document the buffer is authoritative;
-/// otherwise the file is read from disk (see `SourceText`). When the file does not exist the
-/// compiler reports an error, and the result is null.
+/// string literal (`*const [len:0]u8`). Null when the file does not exist (see `embeddedFile`).
 pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue {
+    const text = (try embeddedFile(r, file, path) orelse return null).text;
+    const ip = r.ctx.db.env.ip;
+    const ty = try ip.stringLiteralType(text.len);
+    return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = text } }) };
+}
+
+/// The file `@embedFile(path)` in `file` reads, and its content. For an open document the buffer
+/// is authoritative; otherwise the file is read from disk (see `SourceText`). When the file does
+/// not exist the compiler reports an error, and the result is null.
+pub fn embeddedFile(r: *Resolver, file: FileId, path: []const u8) Error!?struct { file: FileId, text: []const u8 } {
     const target = try r.relativeFile(file, path) orelse return null;
     const source = try r.ctx.get(syntax.SourceText, target);
     // Not open, and could not be read from disk either: the file does not exist (reading an empty
     // file yields empty content)
     if (!source.owned and try r.ctx.get(database.inputs.FileText, target) == null) return null;
-    const ip = r.ctx.db.env.ip;
-    const ty = try ip.stringLiteralType(source.text.len);
-    return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = source.text } }) };
+    return .{ .file = target, .text = source.text };
 }
 
 /// Type of a field in a tuple, anonymous struct, constructed type, or source container (of a
@@ -1599,7 +1612,7 @@ const Evaluator = struct {
     /// count, and the call site's quota), and the result is cached within this evaluation. The
     /// arguments are not interned, so repeated calls in a loop do not bloat the InternPool.
     fn scalarCall(ev: *Evaluator, owner: hir.OwnerKey, inst: Index, args: []const Val) EvalError!Val {
-        _ = try ev.r.ctx.get(queries.TargetAbi, {});
+        _ = try if (ev.r.context) |c| ev.r.ctx.get(queries.ContextTarget, c) else ev.r.ctx.get(queries.TargetAbi, {});
         const memo = ev.calls orelse blk: {
             const gpa = ev.r.ctx.db.gpa;
             const m = try gpa.create(CallMemo);
@@ -2031,10 +2044,15 @@ const Evaluator = struct {
                 return ev.eval(f, rhs_e, if (child != .unknown) child else want);
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                const lhs = try ev.eval(f, lhs_e, null);
-                // Tagged union compared with a tag: do not coerce the other side to the union type
-                const rhs_want: ?Index = if (lhs.ty == .unknown or lhs.ty == .comptime_int_type or lhs.ty == .enum_literal_type or ev.isUnion(lhs.ty)) null else lhs.ty;
-                const rhs = try ev.eval(f, rhs_e, rhs_want);
+                // Matching the compiler, the operands have no result type and are coerced to their
+                // peer type: an enum literal to the other side's enum (by tag name, never as a
+                // decl literal; a name that is not a tag is a compile error), a comptime number to
+                // the other side's float type (rounding it). A tagged union compared with a tag
+                // keeps the literal as it is.
+                var lhs = try ev.eval(f, lhs_e, null);
+                var rhs = try ev.eval(f, rhs_e, null);
+                if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
+                if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
                 if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
                     const eq = pointerEql(lhs, rhs) orelse return error.Abort;
                     return boolVal(eq == (op == .equal_equal));
@@ -2060,11 +2078,10 @@ const Evaluator = struct {
             else => {
                 // Matching the compiler, the operands have no result type:
                 // `const m: u8 = (0xFF << 4) >> 4` is computed as comptime_int and gives 255 when
-                // coerced to u8. The right side uses the left side's type as the expected type of
-                // literals, which gives the same result as peer type resolution.
+                // coerced to u8
                 const lhs = try ev.eval(f, lhs_e, null);
                 const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
-                const rhs = try ev.eval(f, rhs_e, if (is_shift or lhs.ty == .comptime_int_type) null else lhs.ty);
+                const rhs = try ev.eval(f, rhs_e, null);
                 // Bitwise operations on bool
                 if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
                     const x = (try ev.condition(lhs)).yes;
@@ -2078,8 +2095,9 @@ const Evaluator = struct {
                 }
                 if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
                     const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                    const x = ev.floatOf(lhs) orelse return error.Abort;
-                    const y = ev.floatOf(rhs) orelse return error.Abort;
+                    // Comptime operands are coerced (rounded) to the peer type first
+                    const x = ev.floatOf(try ev.coerce(lhs, ty)) orelse return error.Abort;
+                    const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
                     return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
                 }
                 const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
@@ -2552,6 +2570,18 @@ const Evaluator = struct {
         return switch (ev.ip.key(t)) {
             .container_type => |c| c.kind == .@"union",
             .reified_type => |rt| rt.kind == .@"union",
+            else => false,
+        };
+    }
+
+    /// Whether a comparison operand of type `t` is coerced to the other operand's type `other` by
+    /// peer type resolution: an enum literal compared with an enum (or an optional enum), and a
+    /// comptime number compared with a float
+    fn peerOperand(ev: *Evaluator, t: Index, other: Index) bool {
+        if (other == .unknown or other == t) return false;
+        return switch (t) {
+            .enum_literal_type => other != .enum_literal_type and !ev.isUnion(other),
+            .comptime_int_type, .comptime_float_type => ev.ip.isFloat(other),
             else => false,
         };
     }
@@ -3626,7 +3656,7 @@ const Evaluator = struct {
 
     /// Type in the standard library looked up by path (e.g. `builtin.Type`)
     fn stdType(ev: *Evaluator, path: []const []const u8) EvalError!Index {
-        const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return error.Abort;
+        const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, ev.r.context) orelse return error.Abort;
         var t = try queries.containerType(ev.r, .{ .file = std_root, .container = 0 }, null);
         for (path) |name| t = try asType(try ev.typeMember(t, name));
         return t;

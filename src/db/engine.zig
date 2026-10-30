@@ -53,16 +53,22 @@
 //!
 //! Concurrency model: read transactions (`beginRead`) hold a shared lock and may run concurrently;
 //! a write transaction (`beginWrite`) first registers in `pending_write` so that in-flight read
-//! queries exit with `error.Canceled` as soon as possible, then acquires the exclusive lock.
+//! queries exit with `error.Canceled` as soon as possible, then acquires the exclusive lock. A read
+//! transaction begun with `beginReadAt` must see the state at an earlier `mark` and is canceled as
+//! well when a write transaction ordered after the mark (`WriteOrder`) has begun since then.
 //! Query values obtained in a read transaction stay valid until that transaction ends: replaced
-//! old values are freed only at the next write transaction.
+//! old values are freed only at the next write transaction. Concurrent read transactions that need
+//! the same memo brought up to date do it once: the first one claims it, and the others wait for
+//! its result (see `Ctx.claim`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const tracy = @import("../util/tracy.zig");
 const panic_context = @import("../util/panic_context.zig");
+const SpinMutex = @import("../util/SpinMutex.zig");
 
 pub const Revision = u64;
 
@@ -206,24 +212,59 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         pub const query_types = queries;
 
+        /// A set of input queries, by index in `queries`: the inputs a write transaction may change
+        /// (`beginWriteOf`), or the inputs the results of a read transaction may depend on (`mark`)
+        pub const Inputs = std.bit_set.Static(queries.len);
+
+        /// All input queries
+        pub const all_inputs: Inputs = blk: {
+            var all: Inputs = .empty;
+            for (queries, 0..) |Q, qi| if (Q.kind == .input) all.set(qi);
+            break :blk all;
+        };
+
+        pub fn inputSet(comptime list: []const type) Inputs {
+            const inputs = comptime blk: {
+                var s: Inputs = .empty;
+                for (list) |Q| {
+                    assert(Q.kind == .input);
+                    s.set(queryIndex(Q));
+                }
+                break :blk s;
+            };
+            return inputs;
+        }
+
         io: Io,
         gpa: Allocator,
         env: Env,
 
         /// Shared by read transactions, exclusive for write transactions
         rw: Io.RwLock = .init,
-        /// Protects the metadata of all tables (key interning, slots, memos, garbage list)
-        mutex: Io.Mutex = .init,
-        /// Number of write transactions waiting for the exclusive lock; while nonzero, read queries
-        /// exit with `error.Canceled`. A write transaction decrements it only after acquiring the
-        /// lock: when several write transactions are queued, the first one to get the lock does not
-        /// clear the registrations of the ones after it, so read transactions that get the shared
-        /// lock in between are canceled as well.
+        /// Number of write transactions waiting for the exclusive lock; while nonzero, the queries of
+        /// read transactions that may depend on any input exit with `error.Canceled` (a read
+        /// transaction restricted to some inputs checks `pending_inputs` instead, see
+        /// `Ctx.inputs`). A write transaction decrements it only after acquiring the lock: when
+        /// several write transactions are queued, the first one to get the lock does not clear the
+        /// registrations of the ones after it, so read transactions that get the shared lock in
+        /// between are canceled as well.
         pending_write: std.atomic.Value(u32) = .init(0),
+        /// Like `pending_write`, per input query (indexed like `queries`): the write transactions
+        /// waiting for the exclusive lock that may change it
+        pending_inputs: [queries.len]std.atomic.Value(u32) = @splat(.init(0)),
+        /// Per input query (indexed like `queries`): the number of write transactions begun after
+        /// the marks taken before them (`WriteOrder.after_marks`) that may change it, the position
+        /// of a `Mark` restricted to some inputs
+        input_writes: [queries.len]std.atomic.Value(u64) = @splat(.init(0)),
+        /// Number of write transactions begun after the marks taken before them, the position of a
+        /// `Mark` of all inputs
+        ordered_writes: std.atomic.Value(u64) = .init(0),
         /// Number of in-flight read transactions. It must be 0 when memo values are freed
         /// (eviction, garbage collection, `resetQueries`), which is checked by assertions.
         active_readers: std.atomic.Value(u32) = .init(0),
         writing: bool = false,
+        /// The inputs the current write transaction may set
+        write_inputs: Inputs = .empty,
         bumped_in_write: bool = false,
 
         revision: Revision = 1,
@@ -232,6 +273,16 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         tables: Tables = tables_init,
         garbage: std.ArrayList(Garbage) = .empty,
+        /// Protects `garbage` in read transactions; taken after the mutex of a table, never before
+        garbage_mutex: SpinMutex = .{},
+        /// Protects `Ctx.waiting_for` of all read transactions (see `Ctx.claim`); taken before the
+        /// mutex of a table, never after
+        wait_mutex: Io.Mutex = .init,
+        /// Advanced, and its waiters woken, when a memo that read transactions wait for is released
+        /// and when a write transaction registers (see `Ctx.claim`)
+        wake_epoch: std.atomic.Value(u32) = .init(0),
+        /// Number of read transactions waiting for a memo claimed by another one
+        waiting: std.atomic.Value(u32) = .init(0),
 
         counters: [queries.len]Counters = @splat(.{}),
         incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
@@ -276,6 +327,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         fn Table(comptime Q: type) type {
             return struct {
+                /// Protects the keys, slots, and counts of this table in read transactions (a
+                /// write transaction has exclusive access). One lock per table rather than one for
+                /// all tables: concurrent reads keep taking these locks at a high rate, and with a
+                /// single lock the threads would mostly wait for each other.
+                mutex: SpinMutex = .{},
                 keys: std.AutoArrayHashMapUnmanaged(Q.Key, void) = .empty,
                 slots: std.ArrayList(Slot) = .empty,
                 /// Number of memos retaining a value (counted only for queries that declare `lru`)
@@ -292,6 +348,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     },
                     .derived => struct {
                         memo: ?Memo = null,
+                        /// The read transaction bringing the memo up to date (see `Ctx.claim`)
+                        owner: ?*Ctx = null,
+                        /// Other read transactions wait for `owner` to release it
+                        waited: bool = false,
                     },
                 };
 
@@ -348,9 +408,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// Same as `keyCount`; the caller already holds a read or write transaction
         /// (shared/exclusive rw lock)
         pub fn keyCountLocked(db: *Db, comptime Q: type) usize {
-            db.mutex.lockUncancelable(db.io);
-            defer db.mutex.unlock(db.io);
-            return db.tables[comptime queryIndex(Q)].keys.count();
+            const table = &db.tables[comptime queryIndex(Q)];
+            table.mutex.lockUncancelable(db.io);
+            defer table.mutex.unlock(db.io);
+            return table.keys.count();
         }
 
         pub fn queryIndex(comptime Q: type) u16 {
@@ -361,14 +422,15 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         }
 
         pub fn stats(db: *Db, buf: *[queries.len]QueryStats) Stats {
-            db.mutex.lockUncancelable(db.io);
-            defer db.mutex.unlock(db.io);
             inline for (queries, 0..) |Q, qi| {
+                const table = &db.tables[qi];
+                table.mutex.lockUncancelable(db.io);
+                defer table.mutex.unlock(db.io);
                 const c = &db.counters[qi];
                 var memos: usize = 0;
                 var bytes: usize = 0;
                 var deps: usize = 0;
-                for (db.tables[qi].slots.items) |slot| switch (Q.kind) {
+                for (table.slots.items) |slot| switch (Q.kind) {
                     .input => if (slot.is_set) {
                         memos += 1;
                         if (@hasDecl(Q, "bytes")) bytes += Q.bytes(slot.value);
@@ -389,7 +451,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     .self_ns = c.self_ns.load(.monotonic),
                     .max_ns = c.max_ns.load(.monotonic),
                     .memos = memos,
-                    .keys = db.tables[qi].keys.count(),
+                    .keys = table.keys.count(),
                     .bytes = bytes,
                     .deps = deps,
                     .incomplete = c.incomplete.load(.monotonic),
@@ -413,24 +475,73 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         /// Key at index `index` in the `query`-th query (the key of a `Trace.Event`)
         pub fn keyAt(db: *Db, comptime Q: type, index: u32) Q.Key {
-            db.mutex.lockUncancelable(db.io);
-            defer db.mutex.unlock(db.io);
-            return db.tables[comptime queryIndex(Q)].keys.keys()[index];
+            const table = &db.tables[comptime queryIndex(Q)];
+            table.mutex.lockUncancelable(db.io);
+            defer table.mutex.unlock(db.io);
+            return table.keys.keys()[index];
         }
 
         // ── Write transactions ─────────────────────────────────────────────
 
-        /// Begins a write transaction: cancels in-flight read queries and waits for all read
-        /// transactions to finish.
+        /// Begins a write transaction that may set any input, ordered after all marks taken before
+        /// it: cancels in-flight read queries and waits for all read transactions to finish.
         pub fn beginWrite(db: *Db) void {
+            db.beginWriteOf(all_inputs, .after_marks);
+        }
+
+        /// How a write transaction relates to the read transactions bound to marks taken before it
+        /// (`beginReadAt`)
+        pub const WriteOrder = enum {
+            /// It comes after them: they are canceled even when they begin after it has finished
+            /// (such as an edit applied after a request was received)
+            after_marks,
+            /// It is not ordered with them (such as the updates a server makes on its own, which
+            /// happen independently of the requests): one that begins after it has finished reads
+            /// its changes; one in progress is still canceled
+            unordered,
+        };
+
+        /// Begins a write transaction that sets only the inputs in `changes`: cancels the in-flight
+        /// queries of the read transactions that may depend on them, and waits for all read
+        /// transactions to finish (those that cannot depend on them run to completion, since the
+        /// write cannot change their results).
+        pub fn beginWriteOf(db: *Db, changes: Inputs, order: WriteOrder) void {
             _ = db.writes.fetchAdd(1, .monotonic);
-            _ = db.pending_write.fetchAdd(1, .release);
+            if (order == .after_marks) _ = db.ordered_writes.fetchAdd(1, .monotonic);
+            var it = changes.iterator(.{});
+            while (it.next()) |qi| {
+                if (order == .after_marks) _ = db.input_writes[qi].fetchAdd(1, .monotonic);
+                _ = db.pending_inputs[qi].fetchAdd(1, .seq_cst);
+            }
+            _ = db.pending_write.fetchAdd(1, .seq_cst);
+            // Read transactions waiting for a memo another one computes check for cancellation
+            // when woken (see `Ctx.waitFor`)
+            if (db.waiting.load(.seq_cst) != 0) db.wakeWaiters();
             db.rw.lockUncancelable(db.io);
             _ = db.pending_write.fetchSub(1, .release);
+            it = changes.iterator(.{});
+            while (it.next()) |qi| _ = db.pending_inputs[qi].fetchSub(1, .release);
             db.writing = true;
+            db.write_inputs = changes;
             db.bumped_in_write = false;
             db.collectGarbage();
             db.evictLocked();
+        }
+
+        /// Begins a write transaction only when no read transaction is in progress, without
+        /// canceling or waiting for any (`beginWrite` would cancel the in-flight reads, and a write
+        /// queued for the lock would block all later read transactions until the slowest read
+        /// transaction finishes, since the rw lock prefers writers). For writes that set no input,
+        /// such as reclaiming caches: they invalidate no result, so they must not cost readers
+        /// their work. Returns false when the lock cannot be taken.
+        pub fn tryBeginWrite(db: *Db) bool {
+            if (!db.rw.tryLock(db.io)) return false;
+            db.writing = true;
+            db.write_inputs = .empty;
+            db.bumped_in_write = false;
+            db.collectGarbage();
+            db.evictLocked();
+            return true;
         }
 
         /// Whether any query exceeds its `lru` capacity (the caller may call `trySweep` when idle)
@@ -460,15 +571,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         }
 
         /// Evicts memo values beyond the `lru` capacity. Runs only when there is no read
-        /// transaction: the rw lock prefers writers, so a sweep queued for the lock would block
-        /// all later read transactions until the slowest read transaction finishes. Returns false
-        /// when the lock cannot be taken, leaving the work to the next write transaction or the
-        /// next sweep.
+        /// transaction (see `tryBeginWrite`). Returns false when the lock cannot be taken, leaving
+        /// the work to the next write transaction or the next sweep.
         pub fn trySweep(db: *Db) bool {
-            if (!db.rw.tryLock(db.io)) return false;
-            defer db.rw.unlock(db.io);
-            db.collectGarbage();
-            db.evictLocked();
+            if (!db.tryBeginWrite()) return false;
+            db.endWrite();
             return true;
         }
 
@@ -596,15 +703,16 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// two sets.
         pub fn ensureInput(db: *Db, comptime Q: type, key: Q.Key) Allocator.Error!void {
             comptime assert(Q.kind == .input);
-            assert(db.writing);
+            assert(db.writing and db.write_inputs.isSet(comptime queryIndex(Q)));
             _ = try db.internLocked(Q, key);
         }
 
         /// Sets an input; the engine takes ownership of `value`. Does not advance the revision when
-        /// the value equals the old value.
+        /// the value equals the old value. The write transaction must have declared the input (see
+        /// `beginWriteOf`).
         pub fn set(db: *Db, comptime Q: type, key: Q.Key, value: Q.Value, durability: Durability) Allocator.Error!void {
             comptime assert(Q.kind == .input);
-            assert(db.writing);
+            assert(db.writing and db.write_inputs.isSet(comptime queryIndex(Q)));
             const table = &db.tables[comptime queryIndex(Q)];
             const index = db.internLocked(Q, key) catch |err| {
                 var v = value;
@@ -655,14 +763,59 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.garbage.clearRetainingCapacity();
         }
 
+        /// Wakes the read transactions waiting for memos claimed by others, which then check
+        /// whether they can go on (see `Ctx.claim`)
+        fn wakeWaiters(db: *Db) void {
+            _ = db.wake_epoch.fetchAdd(1, .seq_cst);
+            db.io.futexWake(u32, &db.wake_epoch.raw, std.math.maxInt(u32));
+        }
+
         // ── Read transactions ──────────────────────────────────────────────
 
         pub fn beginRead(db: *Db, gpa: Allocator) Ctx {
+            return db.beginReadAt(gpa, null);
+        }
+
+        /// A point in the sequence of write transactions that may change some inputs (see
+        /// `beginReadAt`)
+        pub const Mark = struct {
+            /// The inputs the read may depend on; null means all
+            inputs: ?Inputs,
+            writes: u64,
+        };
+
+        /// The current point in the sequence of write transactions that may change `inputs` (null
+        /// means all inputs)
+        pub fn mark(db: *Db, inputs: ?Inputs) Mark {
+            return .{ .inputs = inputs, .writes = db.writesTo(inputs) };
+        }
+
+        /// Number of write transactions ordered after earlier marks (`WriteOrder.after_marks`)
+        /// begun that may change any of `inputs` (null: all), counted once per input: it grows
+        /// exactly when such a write transaction begins
+        fn writesTo(db: *Db, inputs: ?Inputs) u64 {
+            const some = inputs orelse return db.ordered_writes.load(.acquire);
+            var n: u64 = 0;
+            var it = some.iterator(.{});
+            while (it.next()) |qi| n += db.input_writes[qi].load(.acquire);
+            return n;
+        }
+
+        /// Begins a read transaction for a read that must see the inputs as they were at `since`
+        /// (taken earlier with `mark`), such as a request that is answered on the state it was
+        /// received in: when a write transaction ordered after the mark (`WriteOrder.after_marks`)
+        /// that may change the inputs of the mark has begun since then, even one that has already
+        /// finished, the read transaction is canceled (its reads return `error.Canceled`). Write
+        /// transactions that cannot change those inputs do not cancel it at all (see `Ctx.inputs`).
+        /// Null reads the current state of all inputs.
+        pub fn beginReadAt(db: *Db, gpa: Allocator, since: ?Mark) Ctx {
             db.rw.lockSharedUncancelable(db.io);
             _ = db.active_readers.fetchAdd(1, .acq_rel);
             const main = db.stack_budget.main orelse std.Thread.getCurrentId();
             const budget = if (std.Thread.getCurrentId() == main) max_stack_bytes else db.stack_budget.worker_bytes;
-            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget };
+            const m = since orelse return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget };
+            const stale = db.writesTo(m.inputs) != m.writes;
+            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget, .inputs = m.inputs, .stale = stale };
         }
 
         pub const Ctx = struct {
@@ -672,6 +825,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             cancel: ?*const std.atomic.Value(bool) = null,
             /// Records the executed queries (slow-request log); nothing is recorded when null
             trace: ?*Trace = null,
+            /// The inputs the results of this read transaction may depend on (null: all). Write
+            /// transactions that cannot change any of them do not cancel it: they wait for it to
+            /// finish, as its results stay valid. Reading another input is a bug, checked in Debug
+            /// builds.
+            inputs: ?Inputs = null,
+            /// A write transaction began after the point this read transaction must see (see
+            /// `beginReadAt`): all its reads are canceled
+            stale: bool = false,
             stack: std.ArrayList(Frame) = .empty,
             /// Stack position where the read transaction began (the stack grows downward)
             stack_base: usize,
@@ -690,6 +851,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// looked up here: comparing frame by frame on a very deep stack would make the cost of
             /// the computation grow quadratically with the depth.
             deep_frames: std.array_hash_map.Auto(DepKey, void) = .empty,
+            /// The memo this read transaction waits for another one to bring up to date (see
+            /// `claim`); protected by `Db.wait_mutex`
+            waiting_for: ?DepKey = null,
 
             const linear_frames = 64;
 
@@ -726,7 +890,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             };
 
             pub fn end(ctx: *Ctx) void {
-                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0);
+                assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0 and ctx.waiting_for == null);
                 ctx.stack.deinit(ctx.gpa);
                 ctx.unverifiable.deinit(ctx.gpa);
                 ctx.deep_frames.deinit(ctx.gpa);
@@ -776,7 +940,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             /// Long-running computes should call this periodically.
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
-                if (ctx.db.pending_write.load(.acquire) != 0) return error.Canceled;
+                if (ctx.stale) return error.Canceled;
+                const db = ctx.db;
+                if (ctx.inputs) |inputs| {
+                    var it = inputs.iterator(.{});
+                    while (it.next()) |qi| if (db.pending_inputs[qi].load(.acquire) != 0) return error.Canceled;
+                } else if (db.pending_write.load(.acquire) != 0) return error.Canceled;
                 if (ctx.cancel) |c| if (c.load(.acquire)) return error.Canceled;
             }
 
@@ -841,9 +1010,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const db = ctx.db;
                 inline for (queries, 0..) |Q, qi| {
                     if (Q.kind == .derived and dep.query == qi) {
-                        db.mutex.lockUncancelable(db.io);
-                        const key = db.tables[qi].keys.keys()[dep.index];
-                        db.mutex.unlock(db.io);
+                        const table = &db.tables[qi];
+                        table.mutex.lockUncancelable(db.io);
+                        const key = table.keys.keys()[dep.index];
+                        table.mutex.unlock(db.io);
                         _ = try ctx.getDeepening(Q, key);
                         return ctx.verifiedMemo(Q, dep.index) != null;
                     }
@@ -855,17 +1025,27 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 try ctx.checkCanceled();
                 const qi = comptime queryIndex(Q);
                 const db = ctx.db;
+                if (Q.kind == .input and builtin.mode == .debug) if (ctx.inputs) |inputs| if (!inputs.isSet(qi)) {
+                    std.debug.panic("{s} read in a read transaction that does not declare it", .{@typeName(Q)});
+                };
 
-                db.mutex.lockUncancelable(db.io);
+                // Interning the key and reading its slot take the table's lock once: reads of
+                // values that are already up to date need no other lock
+                const table = &db.tables[qi];
+                table.mutex.lockUncancelable(db.io);
                 const index = db.internLocked(Q, key) catch |err| {
-                    db.mutex.unlock(db.io);
+                    table.mutex.unlock(db.io);
                     return err;
                 };
-                db.mutex.unlock(db.io);
+                const slot = switch (Q.kind) {
+                    .input => db.readInputLocked(Q, index),
+                    .derived => db.useMemoLocked(Q, index),
+                };
+                table.mutex.unlock(db.io);
                 const dep: DepKey = .{ .query = qi, .index = index };
 
                 const fresh = switch (Q.kind) {
-                    .input => db.readInput(Q, index),
+                    .input => slot,
                     .derived => blk: {
                         if (ctx.stackIndex(dep)) |i| return ctx.onCycle(Q, i, key);
                         if (@hasDecl(Q, "cycleFallback") and ctx.stackExhausted()) {
@@ -876,7 +1056,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                             if (ctx.frontier == null) ctx.frontier = dep;
                             return if (@hasDecl(Q, "depthFallback")) Q.depthFallback(key) else Q.cycleFallback(key);
                         }
-                        break :blk try ctx.ensureFresh(Q, index, key, true);
+                        break :blk try ctx.ensureFresh(Q, index, key, true, slot);
                     },
                 };
                 if (Q.kind == .derived and !fresh.executed) _ = db.counters[qi].hits.fetchAdd(1, .monotonic);
@@ -959,29 +1139,48 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             fn verifiedMemo(ctx: *Ctx, comptime Q: type, index: u32) ?Fresh(Q) {
                 const db = ctx.db;
-                db.mutex.lockUncancelable(db.io);
-                defer db.mutex.unlock(db.io);
-                const memo = &(db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null);
+                const table = &db.tables[comptime queryIndex(Q)];
+                table.mutex.lockUncancelable(db.io);
+                defer table.mutex.unlock(db.io);
+                const memo = &(table.slots.items[index].memo orelse return null);
                 if (memo.verified_at != db.revision or memo.evicted) return null;
                 memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
+            /// Whether a memo as read from the table can be used without verifying it: it was
+            /// verified in this revision, and nobody replaces the value until the next write
+            /// transaction (see `execute`); an evicted value is restored only when `need_value`
+            fn upToDate(memo: anytype, revision: Revision, need_value: bool) bool {
+                return memo.verified_at == revision and (!memo.evicted or !need_value);
+            }
+
+            /// The result of a memo that is up to date (`upToDate`); `value` is invalid when the
+            /// value was evicted
+            fn freshMemo(comptime Q: type, memo: Table(Q).Memo) Fresh(Q) {
+                var fresh: Fresh(Q) = .{ .value = undefined, .changed_at = memo.changed_at, .durability = memo.durability };
+                if (!memo.evicted) fresh.value = memo.value;
+                return fresh;
+            }
+
             /// Ensures that a derived memo is valid in the current revision, verifying or
-            /// recomputing it as needed. When `need_value` is false (only verifying dependencies),
-            /// an evicted value is not restored and a memo that a cycle makes unverifiable is not
+            /// recomputing it as needed; `existing` is the memo as read from the table (see
+            /// `useMemoLocked`). When `need_value` is false (only verifying dependencies), an
+            /// evicted value is not restored and a memo that a cycle makes unverifiable is not
             /// recomputed; the returned `value` is then invalid.
-            fn ensureFresh(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, need_value: bool) Error!Fresh(Q) {
+            fn ensureFresh(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, need_value: bool, existing: ?Table(Q).Memo) Error!Fresh(Q) {
                 const db = ctx.db;
                 const table = &db.tables[comptime queryIndex(Q)];
                 const dep: DepKey = .{ .query = comptime queryIndex(Q), .index = index };
 
-                db.mutex.lockUncancelable(db.io);
-                const existing = table.slots.items[index].memo;
-                if (existing) |_| table.slots.items[index].memo.?.last_used = db.access_tick.fetchAdd(1, .monotonic);
-                db.mutex.unlock(db.io);
-
-                if (existing) |memo| verify: {
+                if (existing) |memo| if (upToDate(memo, db.revision, need_value)) return freshMemo(Q, memo);
+                var held: Claim = .{};
+                defer ctx.endClaim(Q, index, &held);
+                const current = switch (try ctx.claim(Q, index, need_value, &held)) {
+                    .ready => |fresh| return fresh,
+                    .stale => |memo| memo,
+                };
+                if (current) |memo| verify: {
                     const verdict: Verdict = if (memo.verified_at == db.revision)
                         .{ .unchanged = memo.durability }
                     else if (ctx.unverifiableDepth(dep)) |depth|
@@ -1000,24 +1199,170 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     // The value was evicted: the dependencies are unchanged, so a recomputed value
                     // is necessarily the same; keep the original changed_at
                     if (memo.evicted) {
-                        if (need_value) return ctx.execute(Q, index, key, true);
-                        db.mutex.lockUncancelable(db.io);
-                        defer db.mutex.unlock(db.io);
-                        const m = &table.slots.items[index].memo.?;
+                        if (need_value) return ctx.execute(Q, index, key, true, &held);
+                        table.mutex.lockUncancelable(db.io);
+                        defer table.mutex.unlock(db.io);
+                        const slot = &table.slots.items[index];
+                        ctx.releaseLocked(slot, &held);
+                        const m = &slot.memo.?;
                         markVerified(m, db.revision, durability);
                         return .{ .value = undefined, .changed_at = m.changed_at, .durability = m.durability };
                     }
-                    db.mutex.lockUncancelable(db.io);
-                    defer db.mutex.unlock(db.io);
-                    // A concurrent reader may have recomputed and replaced it; the current value in
-                    // the table wins
-                    const m = &table.slots.items[index].memo.?;
+                    table.mutex.lockUncancelable(db.io);
+                    defer table.mutex.unlock(db.io);
+                    const slot = &table.slots.items[index];
+                    // Without the claim, a concurrent reader may have recomputed and replaced it;
+                    // the current value in the table wins
+                    const m = &slot.memo.?;
                     if (!m.evicted) {
+                        ctx.releaseLocked(slot, &held);
                         markVerified(m, db.revision, durability);
                         return .{ .value = m.value, .changed_at = m.changed_at, .durability = m.durability };
                     }
                 }
-                return ctx.execute(Q, index, key, false);
+                return ctx.execute(Q, index, key, false, &held);
+            }
+
+            /// A claim on a memo (see `claim`)
+            const Claim = struct {
+                /// This call holds the claim and must release it
+                owned: bool = false,
+                /// It was released while other read transactions waited for it: they must be
+                /// woken
+                wake: bool = false,
+            };
+
+            fn Claimed(comptime Q: type) type {
+                return union(enum) {
+                    /// Another read transaction brought the memo up to date meanwhile
+                    ready: Fresh(Q),
+                    /// The memo as it is now, for the caller to bring up to date
+                    stale: ?Table(Q).Memo,
+                };
+            }
+
+            /// Claims the memo at `index` for bringing it up to date (verifying or recomputing
+            /// it), so that concurrent read transactions that need it do this once. When another
+            /// read transaction holds the claim, waits until it releases it (having written the
+            /// memo, failed, or obtained a result that is not written to a memo) and tries again;
+            /// the wait is canceled like the reads of this transaction. The memo is brought up to
+            /// date without the claim when this read transaction already holds it further down
+            /// its stack (while verifying the memo), and when waiting would close a cycle of read
+            /// transactions waiting for each other: the queries then form a cycle across their
+            /// stacks, and computing the memo on this stack handles that cycle the same way as in
+            /// a single read transaction. `held` records the claim taken; `endClaim` releases it.
+            fn claim(ctx: *Ctx, comptime Q: type, index: u32, need_value: bool, held: *Claim) Error!Claimed(Q) {
+                const db = ctx.db;
+                const qi = comptime queryIndex(Q);
+                const table = &db.tables[qi];
+                while (true) {
+                    // Read before checking the claim: a release after the check advances it, so
+                    // the wait below does not miss the release
+                    const epoch = db.wake_epoch.load(.seq_cst);
+                    table.mutex.lockUncancelable(db.io);
+                    const slot = &table.slots.items[index];
+                    const memo = slot.memo;
+                    if (memo) |m| if (upToDate(m, db.revision, need_value)) {
+                        table.mutex.unlock(db.io);
+                        return .{ .ready = freshMemo(Q, m) };
+                    };
+                    const owner = slot.owner orelse ctx;
+                    if (owner == ctx) {
+                        held.owned = slot.owner == null;
+                        slot.owner = ctx;
+                        table.mutex.unlock(db.io);
+                        return .{ .stale = memo };
+                    }
+                    slot.waited = true;
+                    table.mutex.unlock(db.io);
+                    if (!try ctx.waitFor(.{ .query = qi, .index = index }, epoch)) return .{ .stale = memo };
+                }
+            }
+
+            /// Releases the claim recorded in `held` on the memo of `slot`; the caller holds the
+            /// table's mutex, and the waiters are woken by `endClaim`
+            fn releaseLocked(ctx: *Ctx, slot: anytype, held: *Claim) void {
+                if (!held.owned) return;
+                assert(slot.owner == ctx);
+                held.* = .{ .wake = slot.waited };
+                slot.owner = null;
+                slot.waited = false;
+            }
+
+            /// Releases the claim recorded in `held` if it is still held, and wakes the read
+            /// transactions waiting for it
+            fn endClaim(ctx: *Ctx, comptime Q: type, index: u32, held: *Claim) void {
+                const db = ctx.db;
+                if (held.owned) {
+                    const table = &db.tables[comptime queryIndex(Q)];
+                    table.mutex.lockUncancelable(db.io);
+                    ctx.releaseLocked(&table.slots.items[index], held);
+                    table.mutex.unlock(db.io);
+                }
+                if (held.wake) db.wakeWaiters();
+            }
+
+            /// How long a wait for a claimed memo sleeps at most before checking the cancellation
+            /// flag of the request, which wakes no one when set
+            const wait_poll: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+
+            /// Waits for the memo `dep`, claimed by another read transaction, to be released
+            /// (`epoch` is the value of `Db.wake_epoch` read before the claim was seen), for a
+            /// write transaction to register, or for `wait_poll`; then checks for cancellation.
+            /// Returns false without waiting when the wait would close a cycle of read
+            /// transactions waiting for each other.
+            fn waitFor(ctx: *Ctx, dep: DepKey, epoch: u32) Error!bool {
+                const db = ctx.db;
+                {
+                    db.wait_mutex.lockUncancelable(db.io);
+                    defer db.wait_mutex.unlock(db.io);
+                    if (ctx.closesCycle(dep)) return false;
+                    ctx.waiting_for = dep;
+                }
+                defer {
+                    db.wait_mutex.lockUncancelable(db.io);
+                    ctx.waiting_for = null;
+                    db.wait_mutex.unlock(db.io);
+                }
+                _ = db.waiting.fetchAdd(1, .seq_cst);
+                defer _ = db.waiting.fetchSub(1, .monotonic);
+                // Checked after counting this wait: a write transaction that registers later
+                // wakes it (see `beginWriteOf`)
+                try ctx.checkCanceled();
+                // The wait is not an `Io` cancelation point: the request's cancellation reaches
+                // the queries through `checkCanceled`, which also covers the result of a compute
+                // that swallowed `error.Canceled`
+                const protection = db.io.swapCancelProtection(.blocked);
+                defer _ = db.io.swapCancelProtection(protection);
+                db.io.futexWaitTimeout(u32, &db.wake_epoch.raw, epoch, wait_poll) catch |err| switch (err) {
+                    error.Canceled => unreachable,
+                };
+                try ctx.checkCanceled();
+                return true;
+            }
+
+            /// Whether waiting for `dep` would close a cycle of read transactions waiting for each
+            /// other: follows the owner of each claim to the memo it waits for. The caller holds
+            /// `wait_mutex`, so no read transaction starts or stops waiting meanwhile, and a read
+            /// transaction that waits takes no claim: the waits form no cycle, and a new one can
+            /// only be closed by this wait.
+            fn closesCycle(ctx: *Ctx, dep: DepKey) bool {
+                const db = ctx.db;
+                var next = dep;
+                while (true) {
+                    const owner_waits: ?DepKey = inline for (queries, 0..) |Q, qi| {
+                        if (comptime Q.kind == .derived) if (next.query == qi) {
+                            const table = &db.tables[qi];
+                            table.mutex.lockUncancelable(db.io);
+                            defer table.mutex.unlock(db.io);
+                            // The owner stays in its read transaction while it holds the claim
+                            const owner = table.slots.items[next.index].owner orelse return false;
+                            if (owner == ctx) return true;
+                            break owner.waiting_for;
+                        };
+                    } else unreachable;
+                    next = owner_waits orelse return false;
+                }
             }
 
             fn unverifiableDepth(ctx: *const Ctx, dep: DepKey) ?u32 {
@@ -1115,16 +1460,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                             return .{ .changed_at = input.changed_at, .durability = input.durability };
                         },
                         .derived => {
-                            db.mutex.lockUncancelable(db.io);
-                            const key = db.tables[qi].keys.keys()[dep.index];
-                            db.mutex.unlock(db.io);
+                            const table = &db.tables[qi];
+                            table.mutex.lockUncancelable(db.io);
+                            const key = table.keys.keys()[dep.index];
+                            const memo = db.useMemoLocked(Q, dep.index);
+                            table.mutex.unlock(db.io);
                             // The verification path came back to a query on the stack: it cannot be
                             // verified until it is popped, so force the callers to recompute
                             if (ctx.stackIndex(dep)) |i| return .{ .changed_at = db.revision, .durability = .low, .cycle = i };
                             // The stack depth exceeds the limit: likewise treated as changed and
                             // handled by recomputation (which substitutes the fallback value)
                             if (ctx.stackExhausted()) return .{ .changed_at = db.revision, .durability = .low };
-                            const fresh = try ctx.ensureFresh(Q, dep.index, key, false);
+                            const fresh = try ctx.ensureFresh(Q, dep.index, key, false, memo);
                             return .{ .changed_at = fresh.changed_at, .durability = fresh.durability, .cycle = fresh.cycle };
                         },
                     };
@@ -1133,8 +1480,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             /// `restore`: the memo's value was evicted but its dependencies are unchanged, so the
-            /// recomputation only restores the value and keeps the original changed_at
-            fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, restore: bool) Error!Fresh(Q) {
+            /// recomputation only restores the value and keeps the original changed_at. `held`:
+            /// the claim on the memo (see `claim`), released when the result is published.
+            fn execute(ctx: *Ctx, comptime Q: type, index: u32, key: Q.Key, restore: bool, held: *Claim) Error!Fresh(Q) {
                 const db = ctx.db;
                 const qi = comptime queryIndex(Q);
                 _ = db.counters[qi].executions.fetchAdd(1, .monotonic);
@@ -1150,9 +1498,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const computed = if (@hasDecl(Q, "computeIncremental")) blk: {
                     // The previous value is not freed before the next write transaction, so it can
                     // safely serve as the basis of the incremental computation
-                    db.mutex.lockUncancelable(db.io);
-                    const prev: ?Q.Value = if (db.tables[qi].slots.items[index].memo) |m| (if (m.evicted) null else m.value) else null;
-                    db.mutex.unlock(db.io);
+                    const table = &db.tables[qi];
+                    table.mutex.lockUncancelable(db.io);
+                    const prev: ?Q.Value = if (table.slots.items[index].memo) |m| (if (m.evicted) null else m.value) else null;
+                    table.mutex.unlock(db.io);
                     break :blk Q.computeIncremental(ctx, key, prev);
                 } else Q.compute(ctx, key);
                 var value = computed catch |err| {
@@ -1177,12 +1526,17 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 var frame = ctx.popFrame();
                 ctx.finishTiming(qi, &frame, t0, trace_index, false);
 
-                db.mutex.lockUncancelable(db.io);
-                defer db.mutex.unlock(db.io);
+                const table = &db.tables[qi];
+                table.mutex.lockUncancelable(db.io);
+                defer table.mutex.unlock(db.io);
 
-                const slot = &db.tables[qi].slots.items[index];
-                // A concurrent reader already published a result in this revision and it wins; the
-                // new value was never published, so free it directly
+                const slot = &table.slots.items[index];
+                // The waiters see the slot only after the mutex is released, with the result
+                // written to the memo or not to be written
+                ctx.releaseLocked(slot, held);
+                // Another read transaction computing it at the same time (one of the two without
+                // the claim, see `claim`) already published a result in this revision and it wins;
+                // the new value was never published, so free it directly
                 if (slot.memo) |old| if (old.verified_at == db.revision and !old.evicted) {
                     frame.deps.deinit(db.gpa);
                     deinitValue(Q, &value, db.gpa);
@@ -1193,7 +1547,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 // after the read transaction ends.
                 if (frame.in_cycle) {
                     defer frame.deps.deinit(db.gpa);
-                    db.discardLocked(Q, &value) catch |err| {
+                    db.discard(Q, &value) catch |err| {
                         deinitValue(Q, &value, db.gpa);
                         return err;
                     };
@@ -1212,9 +1566,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 errdefer db.gpa.free(deps);
 
                 var changed_at = db.revision;
-                const table = &db.tables[qi];
                 if (slot.memo) |*old| {
                     const same = !old.evicted and valueEql(Q, old.value, value);
+                    db.garbage_mutex.lockUncancelable(db.io);
+                    defer db.garbage_mutex.unlock(db.io);
                     // Do all allocations that can fail before transferring the old memo's
                     // resources: on failure the old memo stays intact (it still owns deps)
                     try db.garbage.ensureUnusedCapacity(db.gpa, 2);
@@ -1275,7 +1630,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         // ── Internal helpers ───────────────────────────────────────────────
 
-        /// The caller must hold the mutex (or be in a write transaction).
+        /// The caller must hold the table's mutex (or be in a write transaction).
         fn internLocked(db: *Db, comptime Q: type, key: Q.Key) Allocator.Error!u32 {
             const table = &db.tables[comptime queryIndex(Q)];
             // An already interned key does not allocate: `set` cannot fail for an existing input
@@ -1286,16 +1641,36 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return @intCast(gop.index);
         }
 
-        fn readInput(db: *Db, comptime Q: type, index: u32) struct { value: Q.Value, changed_at: Revision, durability: Durability } {
-            db.mutex.lockUncancelable(db.io);
-            defer db.mutex.unlock(db.io);
+        fn InputSlot(comptime Q: type) type {
+            return struct { value: Q.Value, changed_at: Revision, durability: Durability };
+        }
+
+        fn readInput(db: *Db, comptime Q: type, index: u32) InputSlot(Q) {
+            const table = &db.tables[comptime queryIndex(Q)];
+            table.mutex.lockUncancelable(db.io);
+            defer table.mutex.unlock(db.io);
+            return db.readInputLocked(Q, index);
+        }
+
+        /// The caller must hold the table's mutex
+        fn readInputLocked(db: *Db, comptime Q: type, index: u32) InputSlot(Q) {
             const slot = db.tables[comptime queryIndex(Q)].slots.items[index];
             return .{ .value = slot.value, .changed_at = slot.changed_at, .durability = slot.durability };
         }
 
-        /// Puts a value on the garbage list, to be freed at the next write transaction. The caller
-        /// must hold the mutex. On failure the caller keeps ownership of the value.
-        fn discardLocked(db: *Db, comptime Q: type, value: *Q.Value) Allocator.Error!void {
+        /// The memo of a derived query as it is now, marked as used (LRU). The caller must hold
+        /// the table's mutex.
+        fn useMemoLocked(db: *Db, comptime Q: type, index: u32) ?Table(Q).Memo {
+            const memo = &(db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null);
+            memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
+            return memo.*;
+        }
+
+        /// Puts a value on the garbage list, to be freed at the next write transaction. On failure
+        /// the caller keeps ownership of the value.
+        fn discard(db: *Db, comptime Q: type, value: *Q.Value) Allocator.Error!void {
+            db.garbage_mutex.lockUncancelable(db.io);
+            defer db.garbage_mutex.unlock(db.io);
             try db.garbage.ensureUnusedCapacity(db.gpa, 1);
             db.discardBoxed(Q, try db.allocBox(Q), value);
         }
@@ -1305,8 +1680,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return if (@hasDecl(Q, "deinit")) try db.gpa.create(Q.Value) else null;
         }
 
-        /// Same as `discardLocked`, but cannot fail: the caller has already reserved capacity in
-        /// the garbage list and allocated `box` (`allocBox`)
+        /// Same as `discard`, but cannot fail: the caller holds `garbage_mutex`, has already
+        /// reserved capacity in the garbage list, and has allocated `box` (`allocBox`)
         fn discardBoxed(db: *Db, comptime Q: type, box: ?*Q.Value, value: *Q.Value) void {
             if (!@hasDecl(Q, "deinit")) return;
             box.?.* = value.*;

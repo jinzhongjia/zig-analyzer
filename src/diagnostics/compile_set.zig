@@ -1,7 +1,7 @@
 //! Compile set: all files the compiler runs AstGen on, i.e. the files reachable from the root
-//! module of each compile step and from the standard library root file along the `@import`s
-//! recorded in ZIR (including imports in functions that are not analyzed). Live diagnostics are
-//! published only for the files in it.
+//! module of each compile step and from the standard library root file along `@import`s
+//! (including imports in functions that are not analyzed). It determines the modules files belong
+//! to and, together with the module directories, which files get live diagnostics.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,6 +16,8 @@ pub const Result = struct {
     /// in different compile steps the same file can belong to modules with different import tables
     /// (e.g. exe and test each create their own module but share the root file)
     others: std.AutoArrayHashMapUnmanaged(FileModule, void) = .empty,
+    /// Module → the compile step that first reached it (the standard library is not included)
+    modules: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty,
     /// Reachable files whose contents are not loaded yet; the caller should recompute after
     /// loading them
     missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
@@ -23,6 +25,7 @@ pub const Result = struct {
     pub fn deinit(r: *Result, gpa: Allocator) void {
         r.files.deinit(gpa);
         r.others.deinit(gpa);
+        r.modules.deinit(gpa);
         r.missing.deinit(gpa);
     }
 
@@ -43,8 +46,9 @@ pub const FileModule = struct {
 pub const Membership = struct {
     /// Index into `ProjectModel.modules`; `std_module` for the standard library
     module: u32,
-    /// Root module of the containing compile step (the target of `@import("root")`)
-    root_module: u32,
+    /// The compile step that reached the file first (index into `ProjectModel.steps`); null for a
+    /// file reached from no compile step (the build scripts, which the build runner compiles)
+    step: ?u32,
 };
 
 /// `resolver` must provide:
@@ -65,20 +69,31 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
     defer scratch.deinit();
 
     for (compile_steps) |step| {
-        const root_module = model.steps[step].kind.compile.root_module;
+        const compile = model.steps[step].kind.compile;
+        const root_module = compile.root_module;
         const root_file = model.modules[root_module].root_file orelse continue;
         // `@import("root")` depends on the compile step, so compile steps are traversed separately
         visited.clearRetainingCapacity();
         try stack.append(gpa, .{ .file = try resolver.intern(root_file), .module = root_module });
-        // The standard library is always part of the compilation (the entry point start.zig is in
-        // it), even if user code does not import std
-        try stack.append(gpa, .{ .file = try resolver.intern(model.std_root), .module = std_module });
+        // The target of `@import("root")`. The test runner of a test compilation is a module of
+        // its own that imports only std, builtin and root, as the standard library does
+        const root: ?Node = switch (compile.root) {
+            .module => .{ .file = try resolver.intern(root_file), .module = root_module },
+            .test_runner => |path| .{ .file = try resolver.intern(path), .module = std_module },
+            .unknown => null,
+        };
+        if (compile.root == .test_runner) try stack.append(gpa, root.?);
+        // The standard library (of the compilation's lib directory) is always part of the
+        // compilation (the entry point start.zig is in it), even if user code does not import std
+        const std_node: Node = .{ .file = try resolver.intern(model.stdRootOf(step)), .module = std_module };
+        try stack.append(gpa, std_node);
 
         while (stack.pop()) |node| {
             if ((try visited.getOrPut(gpa, node)).found_existing) continue;
+            if (node.module != std_module) _ = try result.modules.getOrPutValue(gpa, node.module, step);
             const gop = try result.files.getOrPut(gpa, node.file);
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{ .module = node.module, .root_module = root_module };
+                gop.value_ptr.* = .{ .module = node.module, .step = step };
             } else if (gop.value_ptr.module != node.module) {
                 try result.others.put(gpa, node, {});
             }
@@ -88,14 +103,16 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
             };
             _ = scratch.reset(.retain_capacity);
             const a = scratch.allocator();
+            const module_root = if (node.module == std_module) model.std_root else model.modules[node.module].root_file.?;
+            const module_dir = std.fs.path.dirname(resolver.path(try resolver.intern(module_root))) orelse continue;
             for (imports) |name| {
                 const target: Node = if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) blk: {
-                    const file = try relativeImport(a, resolver, node.file, name) orelse continue;
+                    const file = try relativeImport(a, resolver, node.file, name, module_dir) orelse continue;
                     break :blk .{ .file = file, .module = node.module };
                 } else if (std.mem.eql(u8, name, "std"))
-                    .{ .file = try resolver.intern(model.std_root), .module = std_module }
+                    std_node
                 else if (std.mem.eql(u8, name, "root"))
-                    .{ .file = try resolver.intern(root_file), .module = root_module }
+                    root orelse continue
                 else if (std.mem.eql(u8, name, "builtin"))
                     continue // generated by the compiler, not on disk
                 else blk: {
@@ -141,6 +158,8 @@ pub fn buildScripts(gpa: Allocator, build_root: []const u8, resolver: anytype) !
     for ([_][]const u8{ "build.zig.zon", "build.zig" }) |name| {
         try stack.append(gpa, try resolver.intern(try std.fs.path.join(scratch.allocator(), &.{ build_root, name })));
     }
+    // build.zig is the root file of its module
+    const module_dir = std.fs.path.dirname(resolver.path(stack.items[1])) orelse return result;
     while (stack.pop()) |file| {
         if ((try result.files.getOrPut(gpa, file)).found_existing) continue;
         const imports = try resolver.imports(file) orelse {
@@ -149,18 +168,22 @@ pub fn buildScripts(gpa: Allocator, build_root: []const u8, resolver: anytype) !
         };
         for (imports) |name| {
             if (!std.mem.endsWith(u8, name, ".zig") and !std.mem.endsWith(u8, name, ".zon")) continue;
-            try stack.append(gpa, try relativeImport(scratch.allocator(), resolver, file, name) orelse continue);
+            try stack.append(gpa, try relativeImport(scratch.allocator(), resolver, file, name, module_dir) orelse continue);
         }
     }
     return result;
 }
 
-/// Target of the relative-path `@import(name)` in file `file`. When the resolved path is not
-/// absolute (a path relative to another drive on Windows, such as `D:a.zig`), it cannot be
-/// interned, and null is returned.
-fn relativeImport(a: Allocator, resolver: anytype, file: FileId, name: []const u8) !?FileId {
+/// Target of the relative-path `@import(name)` in file `file`, whose module's root file is in
+/// `module_dir`. Null when the path leaves `module_dir`: the compiler reports `import of file
+/// outside module path` and compiles nothing from it. When the resolved path is not absolute (a
+/// path relative to another drive on Windows, such as `D:a.zig`), it is not under `module_dir`
+/// either, so it is never interned.
+fn relativeImport(a: Allocator, resolver: anytype, file: FileId, name: []const u8, module_dir: []const u8) !?FileId {
     const dir = std.fs.path.dirname(resolver.path(file)) orelse return null;
-    return try resolver.intern(try Vfs.resolve(.native, a, dir, name) orelse return null);
+    const target = try Vfs.resolve(.native, a, dir, name) orelse return null;
+    if (!Vfs.isUnderStyle(.native, .native, target, module_dir)) return null;
+    return try resolver.intern(target);
 }
 
 const testing = std.testing;
@@ -209,8 +232,8 @@ test compute {
     var fs: FakeFs = .{};
     defer fs.deinit();
     try fs.files.put(gpa, native("/p/src/main.zig"), &.{ "lib", "std", "util.zig", "builtin" });
-    try fs.files.put(gpa, native("/p/src/util.zig"), &.{"../data.zon"});
-    try fs.files.put(gpa, native("/p/data.zon"), &.{});
+    try fs.files.put(gpa, native("/p/src/util.zig"), &.{"data/../data.zon"});
+    try fs.files.put(gpa, native("/p/src/data.zon"), &.{});
     try fs.files.put(gpa, native("/p/lib/lib.zig"), &.{ "std", "nested/deep.zig", "unknown_module" });
     // std.zig is not loaded yet
 
@@ -224,9 +247,9 @@ test compute {
             return std.mem.lessThan(u8, a, b);
         }
     }.lt);
-    try testing.expectEqualStrings(native("/p/data.zon"), names.items[0]);
-    try testing.expectEqualStrings(native("/p/lib/lib.zig"), names.items[1]);
-    try testing.expectEqualStrings(native("/p/lib/nested/deep.zig"), names.items[2]);
+    try testing.expectEqualStrings(native("/p/lib/lib.zig"), names.items[0]);
+    try testing.expectEqualStrings(native("/p/lib/nested/deep.zig"), names.items[1]);
+    try testing.expectEqualStrings(native("/p/src/data.zon"), names.items[2]);
     try testing.expectEqualStrings(native("/p/src/main.zig"), names.items[3]);
     try testing.expectEqualStrings(native("/p/src/util.zig"), names.items[4]);
     try testing.expectEqualStrings(native("/zig/std/std.zig"), names.items[5]);
@@ -244,7 +267,11 @@ test compute {
     try testing.expectEqual(0, member(&r, &fs, native("/p/src/util.zig")).module);
     try testing.expectEqual(1, member(&r, &fs, native("/p/lib/nested/deep.zig")).module);
     try testing.expectEqual(std_module, member(&r, &fs, native("/zig/std/std.zig")).module);
-    try testing.expectEqual(0, member(&r, &fs, native("/p/lib/lib.zig")).root_module);
+    try testing.expectEqual(1, member(&r, &fs, native("/p/lib/lib.zig")).step);
+    // The first compile step reaching each module
+    try testing.expectEqual(1, r.modules.get(0).?);
+    try testing.expectEqual(1, r.modules.get(1).?);
+    try testing.expectEqual(2, r.modules.count());
 }
 
 test buildScripts {
@@ -334,4 +361,63 @@ test "a file shared by modules of different compile steps records every module" 
     try testing.expectEqual(2, r.others.count());
     try testing.expect(r.others.contains(.{ .file = main, .module = 1 }));
     try testing.expect(r.others.contains(.{ .file = util, .module = 1 }));
+    // The compile step that reaches a module first (its builtin comes from that compilation)
+    for ([_]u32{ 0, 1, 1, 0 }, 0..) |step, module| try testing.expectEqual(step, r.modules.get(@intCast(module)).?);
+}
+
+test "relative imports leaving the module directory are not followed" {
+    // The compiler reports `import of file outside module path` and does not compile the target:
+    // common/util.zig must not join the module of /p/src/main.zig
+    const gpa = testing.allocator;
+    var modules = [_]ProjectModel.Module{.{ .root_file = native("/p/src/main.zig"), .imports = &.{} }};
+    const steps = [_]ProjectModel.Step{.{ .name = "exe", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} }};
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    try fs.files.put(gpa, native("/p/src/main.zig"), &.{ "../common/util.zig", "sub/../inner.zig", "std" });
+    try fs.files.put(gpa, native("/p/src/inner.zig"), &.{});
+    try fs.files.put(gpa, native("/p/common/util.zig"), &.{});
+    try fs.files.put(gpa, native("/zig/std/std.zig"), &.{"../escape.zig"});
+    try fs.files.put(gpa, native("/zig/escape.zig"), &.{});
+
+    var r = try compute(gpa, &model, &.{0}, &fs);
+    defer r.deinit(gpa);
+    try testing.expect(r.contains(try fs.intern(native("/p/src/inner.zig"))));
+    try testing.expect(!r.contains(try fs.intern(native("/p/common/util.zig"))));
+    try testing.expect(!r.contains(try fs.intern(native("/zig/escape.zig"))));
+    try testing.expectEqual(3, r.files.count());
+
+    // The same holds for build scripts, whose module directory is the build root
+    try fs.files.put(gpa, native("/p/build.zig"), &.{"../outside.zig"});
+    try fs.files.put(gpa, native("/p/build.zig.zon"), &.{});
+    try fs.files.put(gpa, native("/outside.zig"), &.{});
+    var s = try buildScripts(gpa, native("/p"), &fs);
+    defer s.deinit(gpa);
+    try testing.expectEqual(2, s.files.count());
+}
+
+test "@import(\"root\") in a test compilation reaches the test runner" {
+    const gpa = testing.allocator;
+    var modules = [_]ProjectModel.Module{.{ .root_file = native("/p/src/root.zig"), .imports = &.{} }};
+    const steps = [_]ProjectModel.Step{.{ .name = "test", .kind = .{ .compile = .{
+        .root_module = 0,
+        .root = .{ .test_runner = native("/zig/compiler/test_runner.zig") },
+    } }, .deps = &.{} }};
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
+
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    try fs.files.put(gpa, native("/p/src/root.zig"), &.{"helper.zig"});
+    try fs.files.put(gpa, native("/p/src/helper.zig"), &.{"root"});
+    try fs.files.put(gpa, native("/zig/compiler/test_runner.zig"), &.{ "std", "builtin" });
+    try fs.files.put(gpa, native("/zig/std/std.zig"), &.{"root"});
+
+    var r = try compute(gpa, &model, &.{0}, &fs);
+    defer r.deinit(gpa);
+    // The runner is compiled as a module of its own, and `root` never reaches the user's root
+    // file in another module
+    const runner = r.files.get(try fs.intern(native("/zig/compiler/test_runner.zig"))).?;
+    try testing.expectEqual(std_module, runner.module);
+    try testing.expectEqual(0, r.files.get(try fs.intern(native("/p/src/root.zig"))).?.module);
+    try testing.expectEqual(0, r.others.count());
 }

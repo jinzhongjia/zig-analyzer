@@ -125,10 +125,10 @@ test "references to standard library declarations from project files" {
     const app = try w.add("/p/main.zig", app_src);
     const unrelated = try w.add("/p/other.zig", "fn eql() void {}\ntest {\n    eql();\n}\n");
     try w.setGraph(std_root.file, &.{.{ .root = app.file, .imports = &.{} }}, &.{
-        .{ .file = app.file, .module = 0, .root_module = 0 },
-        .{ .file = unrelated.file, .module = 0, .root_module = 0 },
-        .{ .file = std_root.file, .module = ModuleGraph.std_module, .root_module = 0 },
-        .{ .file = mem.file, .module = ModuleGraph.std_module, .root_module = 0 },
+        .{ .file = app.file, .module = 0, .compile = 0 },
+        .{ .file = unrelated.file, .module = 0, .compile = 0 },
+        .{ .file = std_root.file, .module = ModuleGraph.std_module, .compile = 0 },
+        .{ .file = mem.file, .module = ModuleGraph.std_module, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -163,9 +163,9 @@ test "references reach files that import the definition through files outside th
     const load_src = "pub fn load() u32 {\n    return 42;\n}\n";
     const load = try w.add("/p/load.zig", load_src);
     try w.setGraph(std_root.file, &.{.{ .root = app.file, .imports = &.{} }}, &.{
-        .{ .file = app.file, .module = 0, .root_module = 0 },
-        .{ .file = std_root.file, .module = ModuleGraph.std_module, .root_module = 0 },
-        .{ .file = mem.file, .module = ModuleGraph.std_module, .root_module = 0 },
+        .{ .file = app.file, .module = 0, .compile = 0 },
+        .{ .file = std_root.file, .module = ModuleGraph.std_module, .compile = 0 },
+        .{ .file = mem.file, .module = ModuleGraph.std_module, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -382,9 +382,9 @@ test "references in generic bodies use the instance a comptime type argument dis
         \\}
     )).file;
     try w.setGraph(null, &.{.{ .root = main_file, .imports = &.{} }}, &.{
-        .{ .file = engine_file, .module = 0, .root_module = 0 },
-        .{ .file = queries_file, .module = 0, .root_module = 0 },
-        .{ .file = main_file, .module = 0, .root_module = 0 },
+        .{ .file = engine_file, .module = 0, .compile = 0 },
+        .{ .file = queries_file, .module = 0, .compile = 0 },
+        .{ .file = main_file, .module = 0, .compile = 0 },
     });
     const fs: Files = .{ .main = main_file, .lib = queries_file, .other = engine_file };
     try testing.expectEqualStrings("queries:2:take* queries:9:take", try refs(&w, fs, queries_file, at(queries_src, "take", 0), null));
@@ -617,9 +617,9 @@ test "references in generic code of files that do not import the definition" {
     const fc = (try w.add("/p/c.zig", c_src)).file;
     const fm = (try w.add("/p/main.zig", main_text)).file;
     try w.setGraph(null, &.{.{ .root = fm, .imports = &.{} }}, &.{
-        .{ .file = fm, .module = 0, .root_module = 0 },
-        .{ .file = fa, .module = 0, .root_module = 0 },
-        .{ .file = fc, .module = 0, .root_module = 0 },
+        .{ .file = fm, .module = 0, .compile = 0 },
+        .{ .file = fa, .module = 0, .compile = 0 },
+        .{ .file = fc, .module = 0, .compile = 0 },
     });
     var ctx = w.db.beginRead(testing.allocator);
     defer ctx.end();
@@ -843,4 +843,71 @@ test "targets of assignments are written" {
         }
         try testing.expectEqualStrings(c[1], out.items);
     }
+}
+
+test "an unclosed block does not take the next declaration's locals as references" {
+    // The `if` block of `main` is not closed: `fn helper` still starts a declaration of its own,
+    // so renaming `main`'s `x` would otherwise edit `helper`'s parameter
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\pub fn main() void {
+        \\    const x: u32 = 3;
+        \\    if (x > 1) {
+        \\        _ = 2;
+        \\}
+        \\
+        \\fn helper(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings("main:2:x* main:3:x", try symbolRefs(&w, file, at(text, "x", 0), .{ .scope = &.{file} }));
+    try testing.expectEqualStrings("main:7:x* main:8:x", try symbolRefs(&w, file, at(text, "x", 2), .{ .scope = &.{file} }));
+}
+
+test "references to enum members include literals typed by the peer type of breaks and loop else values" {
+    // Without a result type, `.b` in `break :blk .b` and in a loop `else` takes the peer type of
+    // the other results: these literals used not to count as references, and rename missed them
+    const src =
+        \\const E = enum { a, b, c };
+        \\const U = union(enum) { a: u8, b: void };
+        \\fn pick(rt: bool, xs: []const u8) E {
+        \\    const v1 = blk: {
+        \\        if (rt) break :blk E.a;
+        \\        break :blk .b;
+        \\    };
+        \\    const v2 = blk: {
+        \\        if (rt) break :blk .b;
+        \\        break :blk E.a;
+        \\    };
+        \\    var i: usize = 0;
+        \\    const v3 = while (i < xs.len) : (i += 1) {
+        \\        if (rt) break E.a;
+        \\    } else .b;
+        \\    const v4 = for (xs) |x| {
+        \\        if (x == 0) break .b;
+        \\    } else E.c;
+        \\    const v5 = sw: switch (xs.len) {
+        \\        0 => break :sw .b,
+        \\        else => break :sw E.a,
+        \\    };
+        \\    const v6 = if (rt) E.c else .b;
+        \\    const u = blk: {
+        \\        if (rt) break :blk U{ .a = 1 };
+        \\        break :blk .b;
+        \\    };
+        \\    _ = .{ v1, v2, v3, v4, v5, v6, u };
+        \\    return v1;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:b* x:6:b x:9:b x:15:b x:17:b x:20:b x:23:b", try refs(&w, fs, f, at(src, "b", 0), null));
+    try testing.expectEqualStrings("x:2:b* x:26:b", try refs(&w, fs, f, at(src, "b: void", 0), null));
 }

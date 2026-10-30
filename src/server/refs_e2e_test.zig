@@ -202,7 +202,7 @@ test "references, highlight, rename and workspace symbol" {
         ctx.trace = &trace;
         var r: za.names.resolve.Resolver = .{ .ctx = &ctx, .arena = a };
         const lib = (try h.server.vfs.lookup(try project.path(a, "src/lib.zig"))).?;
-        _ = try za.ide.hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "hello();").?));
+        _ = try za.ide.hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "hello();").?), &.{});
         try testing.expect(trace.events.items.len > 0);
         var out: std.Io.Writer.Allocating = .init(a);
         try h.server.writeSlowReport(&out.writer, &ctx, &trace, 0);
@@ -336,7 +336,7 @@ test "rename refuses when a reference cannot be confirmed" {
     // other: a rename returned only the declaration and broke the build
     {
         const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = impls_uri }, .position = position(impls_text, "Close"), .newName = "close" });
-        try testing.expectEqualStrings("cannot rename `Close` to `close`: the type here is unknown, so whether this refers to the same declaration cannot be confirmed (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
+        try testing.expectEqualStrings("cannot rename `Close` to `close`: this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
     }
     // A file that mentions the name but has syntax errors may hide references
     {

@@ -661,10 +661,214 @@ test "resetting type information gives the same hover results" {
     try testing.expect(std.mem.indexOf(u8, contents, "[]u8") != null);
 
     const items = h.server.ip.count();
-    h.server.resetSema();
+    // The reclaim waits until the task of the hover request has ended its read transaction
+    while (!h.server.resetSema()) std.Thread.yield() catch {};
     try testing.expect(h.server.ip.count() < items);
     const after = try h.request("textDocument/hover", at);
     try testing.expectEqualStrings(contents, after.object.get("result").?.object.get("contents").?.object.get("value").?.string);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// Whether the read or semantic request with this id is in flight (its task has not finished)
+fn inFlight(server: *Server, id: i64) bool {
+    server.pending_mutex.lockUncancelable(testing.io);
+    defer server.pending_mutex.unlock(testing.io);
+    for (server.pending.items) |p| if (p.id == .integer and p.id.integer == id) return true;
+    return false;
+}
+
+test "reclaiming type information does not cancel in-flight requests and runs once they finish" {
+    // Guards against the reclaim at the end of one request canceling the other requests in flight
+    // (answered with ContentModified), which also starved requests whose own inference exceeded
+    // the limit
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .sema = .{ .max_intern_pool_mb = 1 } } });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-3";
+    const text =
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\const L = List(u8);
+        \\pub fn main() void {
+        \\    const l: L = undefined;
+        \\    _ = l.items;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const doc = .{ .textDocument = .{ .uri = uri } };
+    const expected = (try h.request("textDocument/semanticTokens/full", doc)).object.get("result").?.object.get("data").?.array.items;
+
+    var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const held = try h.send("textDocument/semanticTokens/full", doc);
+    try gate.entered.wait(testing.io);
+    // Push the InternPool over the limit while the request holds its read transaction
+    var bits: u16 = 1;
+    while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
+    const items = h.server.ip.count();
+    // Another request finishes in the meantime and checks whether to reclaim
+    const other = try h.send("textDocument/documentSymbol", doc);
+    _ = try h.response(other);
+    while (inFlight(&h.server, other) and h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(0, h.server.db.pending_write.load(.acquire));
+
+    gate.release.set(testing.io);
+    const tokens = try h.response(held);
+    try testing.expect(tokens.object.get("error") == null);
+    try testing.expectEqualDeep(expected, tokens.object.get("result").?.object.get("data").?.array.items);
+    // No read transaction is left once the held request finishes: it reclaims
+    while (inFlight(&h.server, held)) std.Thread.yield() catch {};
+    try testing.expect(h.server.ip.count() < items);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a request whose task starts after a later edit is not answered on the edited text" {
+    // Guards against a request sent before a didChange being answered on the text after the
+    // change, when its task starts reading only after the main loop has applied the change
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-4";
+    const text =
+        \\const alpha_value: u32 = 1;
+        \\pub fn main() void {
+        \\    _ = alpha_value;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .before_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const beta_flag: bool = true;\n" }} });
+    // The main loop has applied the change once it answers a later request
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+    gate.release.set(testing.io);
+
+    // Either the answer on the text the request was sent for, or ContentModified
+    const response = try h.response(hover);
+    if (response.object.get("error")) |e| {
+        try testing.expectEqual(-32801, e.object.get("code").?.integer);
+    } else {
+        const contents = response.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+        try testing.expect(std.mem.indexOf(u8, contents, "alpha_value") != null);
+    }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "exit and the end of input cancel the requests in flight instead of waiting for them" {
+    // Guards against the process outliving `exit` (or the end of its input) until the requests in
+    // flight have computed their results, which nobody reads anymore
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    for ([_]enum { exit, end_of_input }{ .exit, .end_of_input }) |ending| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        _ = try h.request("initialize", .{ .capabilities = Empty{} });
+        try h.notify("initialized", Empty{});
+        const uri = "untitled:Untitled-5";
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const a: u32 = 1;\n" } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+
+        // The request stays at the gate until it is canceled
+        var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
+        h.server.test_gate = &gate;
+        defer h.server.test_gate = null;
+        defer gate.release.set(testing.io);
+        const held = try h.send("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = uri } });
+        try gate.entered.wait(testing.io);
+        switch (ending) {
+            .exit => try h.notify("exit", {}),
+            .end_of_input => h.input.close(),
+        }
+        // The main loop returns, and the output is closed with it
+        while (true) _ = h.next() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try testing.expectEqual(-32800, errorCode(try h.response(held)));
+        try testing.expectEqual(1, h.exit_code);
+    }
+}
+
+test "a module graph update does not cancel the outline, folding and selection requests in flight" {
+    // Guards against server writes that change no text (the module graph after the zig
+    // environment query or a build) answering the syntax requests in flight with ContentModified,
+    // although their results cannot change
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-6";
+    const text =
+        \\const S = struct {
+        \\    a: u32,
+        \\    fn f(s: S) u32 {
+        \\        return s.a;
+        \\    }
+        \\};
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const doc = .{ .textDocument = .{ .uri = uri } };
+    const positions = .{ .textDocument = .{ .uri = uri }, .positions = &[_]struct { line: u32, character: u32 }{.{ .line = 3, .character = 17 }} };
+    inline for (.{ .{ "textDocument/documentSymbol", doc }, .{ "textDocument/foldingRange", doc }, .{ "textDocument/selectionRange", positions } }, 0..) |r, i| {
+        const expected = try std.json.Stringify.valueAlloc(a, (try h.request(r[0], r[1])).object.get("result").?, .{});
+
+        var gate: Server.TestGate = .{ .method = r[0], .point = .in_read };
+        h.server.test_gate = &gate;
+        defer h.server.test_gate = null;
+        defer gate.release.set(testing.io);
+        const held = try h.send(r[0], r[1]);
+        try gate.entered.wait(testing.io);
+        // Another default builtin.zig changes the module graph, as a zig environment query does
+        {
+            h.server.env_mutex.lockUncancelable(testing.io);
+            defer h.server.env_mutex.unlock(testing.io);
+            if (h.server.default_builtin) |p| testing.allocator.free(p);
+            h.server.default_builtin = try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i});
+        }
+        const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+        defer update.join();
+        // The update waits for the held request
+        while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+        gate.release.set(testing.io);
+        const response = try h.response(held);
+        try testing.expect(response.object.get("error") == null);
+        try testing.expectEqualStrings(expected, try std.json.Stringify.valueAlloc(a, response.object.get("result").?, .{}));
+    }
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

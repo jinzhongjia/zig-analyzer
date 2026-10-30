@@ -21,13 +21,24 @@ const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
 const mem = @import("../util/mem.zig");
 
-/// Target-dependent parameters for value computations: the pointer bit width and the layout rules
-/// for vectors, integers, floats and C types (the parts consistent across modules). The value is
-/// also stored in the InternPool for value computations to read; queries that use value
-/// computations read this input first to record the dependency.
+/// Target-dependent parameters for value computations outside every compilation (the parts the
+/// targets of all compilations agree on). The value is also stored in the InternPool for value
+/// computations to read; queries that use value computations outside a compilation read this
+/// input first to record the dependency.
 pub const TargetAbi = struct {
     pub const kind: engine.Kind = .input;
     pub const Key = void;
+    pub const Value = InternPool.Target;
+    pub const default: Value = .{};
+};
+
+/// Target-dependent parameters of a compilation (an index into `ModuleGraph.compiles`): the
+/// pointer bit width and the layout rules for vectors, integers, floats and C types of the target
+/// of its builtin. Also stored in the InternPool (`InternPool.targets`); a computation running in
+/// the compilation reads this input in `enterContext` to record the dependency.
+pub const ContextTarget = struct {
+    pub const kind: engine.Kind = .input;
+    pub const Key = u32;
     pub const Value = InternPool.Target;
     pub const default: Value = .{};
 };
@@ -69,7 +80,6 @@ pub const Infer = struct {
     }
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
-        _ = try ctx.get(TargetAbi, {});
         const gpa = ctx.db.gpa;
         const result = try gpa.create(infer.Result);
         errdefer gpa.destroy(result);
@@ -103,11 +113,12 @@ pub const DeclType = struct {
     pub const Value = TypedValue;
 
     pub fn compute(ctx: *Db.Ctx, dk: Key) engine.Error!Value {
-        _ = try ctx.get(TargetAbi, {});
         const key = dk.owner;
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const scope = try enterContext(&r, key.file, dk.inst);
+        defer scope.leave();
         const ip = ctx.db.env.ip;
         const tree = try r.itemTree(key.file);
         const item: u32 = for (tree.items, 0..) |it, i| {
@@ -237,10 +248,11 @@ pub const ErrorSetOf = struct {
     pub const fixpoint = true;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
-        _ = try ctx.get(TargetAbi, {});
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const scope = try enterContext(&r, key.owner.file, key.inst);
+        defer scope.leave();
         const ip = ctx.db.env.ip;
         const body = try ctx.get(hir.ItemBody, key.owner);
         const res = try ctx.get(Infer, .{ .owner = key.owner, .mode = .full, .inst = key.inst });
@@ -361,7 +373,6 @@ pub const CallEval = struct {
     pub const Value = TypedValue;
 
     pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
-        _ = try ctx.get(TargetAbi, {});
         return eval.compute(ctx, key);
     }
 
@@ -518,7 +529,6 @@ pub const LocalValue = struct {
     pub const Value = TypedValue;
 
     pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
-        _ = try ctx.get(TargetAbi, {});
         return infer.runLocal(ctx, key.owner, key.target, key.inst);
     }
 
@@ -551,16 +561,82 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
 
 /// The instance in an instance context that applies to member `item`: the first instance along
 /// the instance chain that belongs to `item` itself (a function) or to an enclosing function.
-/// Null when the member is not inside any generic function, which ensures the same member is not
-/// inferred repeatedly for different contexts.
+/// When the member is not inside any generic function, the compilation context (`rootInst`),
+/// which ensures the same member is not inferred repeatedly for different instances.
 pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
     const ip = r.ctx.db.env.ip;
     var cur = inst;
-    while (cur) |c| : (cur = ip.key(c).instance.parent) {
-        const i = ip.key(c).instance;
+    while (cur) |c| {
+        const i = switch (ip.key(c)) {
+            .instance => |i| i,
+            else => break,
+        };
         if (i.file == file and try enclosedBy(r, file, item, i.decl)) return c;
+        cur = i.parent;
     }
-    return null;
+    return rootInst(r, file, inst);
+}
+
+/// The instance context of code in `file` outside every generic function, reached from instance
+/// context `inst`: null when the computation runs in the file's own compilation (or nothing is
+/// known about compilations), otherwise the `context` key of the compilation. The compilation is
+/// that of the current computation (`Resolver.context`), else the one `inst` belongs to.
+pub fn rootInst(r: *Resolver, file: FileId, inst: ?Index) resolve.Error!?Index {
+    const c = r.context orelse try chainContext(r, inst) orelse return null;
+    if (try r.fileContext(file) == c) return null;
+    return try r.ctx.db.env.ip.get(.{ .context = c });
+}
+
+/// The compilation instance context `inst` belongs to: the `context` key ending its chain, else
+/// the own compilation of the file of its instances; null for no instance context
+fn chainContext(r: *Resolver, inst: ?Index) resolve.Error!?u32 {
+    const ip = r.ctx.db.env.ip;
+    var cur = inst;
+    var file: ?FileId = null;
+    while (cur) |c| switch (ip.key(c)) {
+        .context => |x| return x,
+        .instance => |i| {
+            file = i.file;
+            cur = i.parent;
+        },
+        else => break,
+    };
+    return if (file) |f| try r.fileContext(f) else null;
+}
+
+/// The compilation a computation for code in `file` with instance context `inst` runs in
+pub fn contextOf(r: *Resolver, file: FileId, inst: ?Index) resolve.Error!?u32 {
+    return try chainContext(r, inst) orelse try r.fileContext(file);
+}
+
+/// Runs the rest of a computation for code in `file` with instance context `inst` in its
+/// compilation (`contextOf`): `@import` of std, builtin and root resolves in it
+/// (`Resolver.context`), and value computations on this thread use its target until `leave`.
+/// Reads the target input to record the dependency.
+pub fn enterContext(r: *Resolver, file: FileId, inst: ?Index) resolve.Error!ContextScope {
+    const c = try contextOf(r, file, inst);
+    if (c) |i| _ = try r.ctx.get(ContextTarget, i) else _ = try r.ctx.get(TargetAbi, {});
+    const scope: ContextScope = .{ .r = r, .context = r.context, .target = r.ctx.db.env.ip.enterContext(c) };
+    r.context = c;
+    return scope;
+}
+
+pub const ContextScope = struct {
+    r: *Resolver,
+    context: ?u32,
+    target: ?*const InternPool.Target,
+
+    pub fn leave(s: ContextScope) void {
+        s.r.context = s.context;
+        InternPool.leaveContext(s.target);
+    }
+};
+
+/// `inst` when it is an instance of a generic function, null when it is only a compilation
+/// context (or null)
+pub fn genericInst(ip: *InternPool, inst: ?Index) ?Index {
+    const i = inst orelse return null;
+    return if (ip.key(i) == .instance) i else null;
 }
 
 /// The instance that applies to a member declaration (DeclType). A function takes the instance of
@@ -571,7 +647,7 @@ pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolv
 pub fn declInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
     const tree = try r.itemTree(file);
     if (tree.items[item].kind != .@"fn") return normalizeInst(r, file, item, inst);
-    const parent = tree.containers[tree.items[item].container].parent_item orelse return null;
+    const parent = tree.containers[tree.items[item].container].parent_item orelse return rootInst(r, file, inst);
     return normalizeInst(r, file, parent, inst);
 }
 
@@ -587,11 +663,12 @@ pub fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../sy
 }
 
 /// Container type of a namespace (a container in a file); when the container is defined in a
-/// generic function body, it carries the applicable instance
+/// generic function body, it carries the applicable instance, and otherwise the compilation
+/// context (`rootInst`)
 pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!Index {
     const tree = try r.itemTree(ns.file);
     const c = tree.containers[ns.container];
-    const container_inst = if (c.parent_item) |p| try normalizeInst(r, ns.file, p, inst) else null;
+    const container_inst = if (c.parent_item) |p| try normalizeInst(r, ns.file, p, inst) else try rootInst(r, ns.file, inst);
     if (c.kind == .@"struct") if (try tupleDecl(r, tree, ns, container_inst)) |t| return t;
     return r.ctx.db.env.ip.get(.{ .container_type = .{ .file = ns.file, .ast_id = c.ast_id, .kind = switch (c.kind) {
         .file => .file,

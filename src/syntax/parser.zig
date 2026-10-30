@@ -101,6 +101,16 @@ pub const Parser = struct {
         return p.tokens[p.significant[p.pos]].start;
     }
 
+    /// Whether a line break separates the current token from the previous significant token
+    pub fn atLineStart(p: *const Parser) bool {
+        if (p.pos >= p.significant.len) return false;
+        var i: u32 = if (p.pos == 0) 0 else p.significant[p.pos - 1] + 1;
+        while (i < p.significant[p.pos]) : (i += 1) {
+            if (std.mem.indexOfScalar(u8, p.tokens[i].text(p.source), '\n') != null) return true;
+        }
+        return false;
+    }
+
     // ── Consuming tokens ────────────────────────────────────────────────
 
     pub fn bump(p: *Parser) Allocator.Error!void {

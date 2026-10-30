@@ -59,6 +59,22 @@ test "falls back to full parse when conditions are not met" {
     try expectReparse(base, base, false);
 }
 
+test "a line comment that runs over the block's old `}` falls back to a full parse" {
+    // In the block's own text the comment ends at the block's old `}`: a local reparse would keep
+    // the code after it (` else { c(); }`) live
+    const one_line = "fn f(x: bool) void {\n    if (x) { a(); b(); } else { c(); }\n}\n";
+    const one_line_new = "fn f(x: bool) void {\n    if (x) { a(); } // b(); } else { c(); }\n}\n";
+    try expectReparse(one_line, one_line_new, false);
+    const multi_line = "fn f(x: bool) void {\n    if (x) {\n        a();\n    } else {\n        c();\n    }\n}\n";
+    const multi_line_new = "fn f(x: bool) void {\n    if (x) {\n        a();\n    } // } else {\n        c();\n    }\n}\n";
+    try expectReparse(multi_line, multi_line_new, false);
+    for ([_][2][]const u8{ .{ one_line, one_line_new }, .{ multi_line, multi_line_new } }) |c| {
+        const old = try Parse.create(testing.allocator, c[0], .zig);
+        defer old.destroy();
+        try expectConsistent(old, c[1]);
+    }
+}
+
 test "outer errors are kept and shifted after incremental parse" {
     // The error on the first line is before the block, the one on the last line after it
     try expectReparse("const a = ;\nfn f() void {\n    g();\n}\nconst b = ;\n", "const a = ;\nfn f() void {\n    g(1, 2, 3);\n}\nconst b = ;\n", true);

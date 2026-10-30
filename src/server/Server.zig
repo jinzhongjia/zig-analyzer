@@ -2,9 +2,10 @@
 //!
 //! - Write messages (notifications such as document sync) run serially on the main loop:
 //!   `beginWrite` cancels in-flight read queries, then modifies inputs.
-//! - Read requests run concurrently in `group`, each holding a read transaction; a request
-//!   interrupted by a write transaction is answered with `ContentModified`, and one canceled by
-//!   `$/cancelRequest` with `RequestCancelled`.
+//! - Read requests run concurrently in `group`, each holding a read transaction on the state at
+//!   the time the request was received; a request interrupted by a write transaction, or whose
+//!   read transaction begins after a write transaction that began since then, is answered with
+//!   `ContentModified`, and one canceled by `$/cancelRequest` with `RequestCancelled`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -59,6 +60,9 @@ encoding: offsets.Encoding = .utf16,
 group: Io.Group = .init,
 pending_mutex: Io.Mutex = .init,
 pending: std.ArrayList(*Pending) = .empty,
+/// Test hook: holds the read and semantic requests of one method at a point of their execution
+/// (see `TestGate`); always null outside tests
+test_gate: ?*TestGate = null,
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
@@ -129,6 +133,11 @@ progress: Progress = .{},
 
 /// Serializes module graph updates so that an older snapshot does not overwrite a newer one
 graph_mutex: Io.Mutex = .init,
+/// Target parameters last parsed from each builtin.zig (protected by `graph_mutex`): used when the
+/// file can no longer be read (the global cache was cleared during the session). Generated
+/// builtin.zig files are named by the hash of their contents, so a path always has the same
+/// contents.
+builtin_targets: std.AutoHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target) = .empty,
 /// Generation of background indexing: incremented on every module graph update
 index_generation: std.atomic.Value(u64) = .init(0),
 /// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
@@ -140,8 +149,6 @@ slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
 /// generation (0 disables reclaiming); from the config option `sema.max_intern_pool_mb`
 max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
-/// Whether a thread is performing whole-generation reclamation (only one at a time)
-sema_resetting: std.atomic.Value(bool) = .init(false),
 /// Debounce (ms) of diagnostic publishing triggered by edits, from the config option
 /// `diagnostics.debounce_ms`
 debounce_ms: std.atomic.Value(u32) = .init(50),
@@ -291,6 +298,35 @@ const SingleFile = struct {
 const Pending = struct {
     id: jsonrpc.Id,
     cancel: std.atomic.Value(bool) = .init(false),
+    /// When the request was received: it is answered on the state at that point, or with
+    /// `ContentModified` when a write transaction ordered after it has begun since then (the task
+    /// may start reading only after the main loop has applied later messages such as `didChange`;
+    /// the server's own updates are not ordered with requests, see `Db.WriteOrder`)
+    since: Db.Mark,
+};
+
+/// Test hook: a read or semantic request of `method` stops at `point` until `release` is set or
+/// the request is canceled, so that a test can place other messages and server work at a known
+/// point of its execution
+pub const TestGate = struct {
+    method: []const u8,
+    point: enum {
+        /// Before the read transaction begins
+        before_read,
+        /// In the read transaction, before the handler runs
+        in_read,
+    },
+    /// Set when a request reaches the gate
+    entered: Io.Event = .unset,
+    release: Io.Event = .unset,
+
+    fn pass(gate: *TestGate, io: Io, pending: *const Pending) void {
+        gate.entered.set(io);
+        while (!pending.cancel.load(.acquire)) {
+            gate.release.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch continue;
+            return;
+        }
+    }
 };
 
 pub const HandlerError = error{
@@ -345,6 +381,7 @@ pub fn deinit(server: *Server) void {
     }
     server.envs.deinit(server.gpa);
     if (server.default_builtin) |p| server.gpa.free(p);
+    server.builtin_targets.deinit(server.gpa);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
     for (server.last_uris.values()) |u| server.gpa.free(u);
@@ -363,9 +400,10 @@ pub fn deinit(server: *Server) void {
 }
 
 /// Runs the main loop until `exit` is received or the input ends, and returns the process exit
-/// code. Before returning, stops the build system processes of all projects and waits for the
-/// scheduled background tasks (diagnostic publishing, etc.) to finish. If the input ends without
-/// an `exit`, the client has already exited: its replies to server requests are no longer awaited.
+/// code. Before returning, cancels the read requests in flight (nobody reads their results
+/// anymore), stops the build system processes of all projects, and waits for the scheduled
+/// background tasks (diagnostic publishing, etc.) to finish. If the input ends without an `exit`,
+/// the client has already exited: its replies to server requests are no longer awaited.
 pub fn run(server: *Server, reader: *Io.Reader) !u8 {
     var exited = false;
     while (true) {
@@ -388,6 +426,7 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
             break;
         }
     }
+    server.cancelAllPending();
     server.group.await(server.io) catch {};
     if (!exited) server.abandonConfigRequests();
     server.stopWorkspaces();
@@ -503,6 +542,10 @@ const Mode = enum {
     background,
     /// Like `read`, but the handler does name resolution and type queries through a Resolver
     semantic,
+    /// Like `read`, for handlers whose results depend only on the text of documents: write
+    /// transactions that change no text (such as the module graph after a build) wait for them
+    /// instead of canceling them
+    syntax,
 };
 
 const request_handlers = .{
@@ -511,13 +554,13 @@ const request_handlers = .{
     .{ "zig-analyzer/waitIdle", Mode.background, waitIdleRequest },
     .{ "zig-analyzer/status", Mode.read, status },
     .{ "zig-analyzer/fileStatus", Mode.read, fileStatus },
-    .{ "zig-analyzer/syntaxTree", Mode.read, syntaxTree },
+    .{ "zig-analyzer/syntaxTree", Mode.syntax, syntaxTree },
     .{ "zig-analyzer/moduleGraph", Mode.read, moduleGraph },
     .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
-    .{ "textDocument/formatting", Mode.read, formatting },
-    .{ "textDocument/documentSymbol", Mode.read, documentSymbol },
-    .{ "textDocument/foldingRange", Mode.read, foldingRange },
-    .{ "textDocument/selectionRange", Mode.read, selectionRange },
+    .{ "textDocument/formatting", Mode.syntax, formatting },
+    .{ "textDocument/documentSymbol", Mode.syntax, documentSymbol },
+    .{ "textDocument/foldingRange", Mode.syntax, foldingRange },
+    .{ "textDocument/selectionRange", Mode.syntax, selectionRange },
     .{ "textDocument/semanticTokens/full", Mode.semantic, semanticTokensFull },
     .{ "textDocument/semanticTokens/full/delta", Mode.semantic, semanticTokensDelta },
     .{ "textDocument/semanticTokens/range", Mode.semantic, semanticTokensRange },
@@ -568,13 +611,14 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     const result = func(server, a, params) catch |err| return server.sendHandlerError(id, err, false);
                     server.sendResponse(id, result);
                 },
-                .read, .semantic => {
-                    const pending = server.addPending(a, id) catch |err| {
+                .read, .semantic, .syntax => {
+                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{FileText}) else null;
+                    const pending = server.addPending(a, id, inputs) catch |err| {
                         defer server.destroyArena(arena);
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
                         return err;
                     };
-                    const Task = if (h[1] == .read) ReadTask(func, h[0]) else SemanticTask(func, h[0]);
+                    const Task = if (h[1] == .semantic) SemanticTask(func, h[0]) else ReadTask(func, h[0]);
                     // semantic must run on a separate thread: when the thread count reaches the
                     // limit (CPU core count - 1; long-blocking project tasks also take slots),
                     // `async` runs synchronously on the main loop, while background requests wait
@@ -595,10 +639,11 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
 }
 
 /// Registers an in-flight request (can be canceled by `$/cancelRequest`); the Pending is allocated
-/// in the request's arena
-fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
+/// in the request's arena. Called on the main loop when the request is received; `inputs` are the
+/// inputs its result may depend on (null: all).
+fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id, inputs: ?Db.Inputs) !*Pending {
     const pending = try a.create(Pending);
-    pending.* = .{ .id = id };
+    pending.* = .{ .id = id, .since = server.db.mark(inputs) };
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
     try server.pending.append(server.gpa, pending);
@@ -635,18 +680,13 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
-            defer {
-                server.removePending(pending);
-                server.destroyArena(arena);
-                // The read transaction has ended: evict if a query exceeds its cache capacity and
-                // no other read transaction is active
-                if (server.db.wantsSweep()) _ = server.db.trySweep();
-                server.maybeResetSema();
-            }
+            defer server.finishRequest(arena, pending);
             const a = arena.allocator();
-            var ctx = server.db.beginRead(a);
+            server.testGate(method, .before_read, pending);
+            var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
             var pc: panic_context.Text = .{};
@@ -673,18 +713,13 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
-            defer {
-                server.removePending(pending);
-                server.destroyArena(arena);
-                // The read transaction has ended: evict if a query exceeds its cache capacity and
-                // no other read transaction is active
-                if (server.db.wantsSweep()) _ = server.db.trySweep();
-                server.maybeResetSema();
-            }
+            defer server.finishRequest(arena, pending);
             const a = arena.allocator();
-            var ctx = server.db.beginRead(a);
+            server.testGate(method, .before_read, pending);
+            var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
             var pc: panic_context.Text = .{};
@@ -706,6 +741,23 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             } else server.sendResponse(pending.id, result);
         }
     };
+}
+
+/// End of a read or semantic request task, after its read transaction: evicts when a query
+/// exceeds its cache capacity and reclaims type information when needed (both only when no other
+/// read transaction is active), then unregisters the request, which counts as in flight until
+/// then
+fn finishRequest(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending) void {
+    if (server.db.wantsSweep()) _ = server.db.trySweep();
+    server.maybeResetSema();
+    server.removePending(pending);
+    server.destroyArena(arena);
+}
+
+fn testGate(server: *Server, comptime method: []const u8, point: @FieldType(TestGate, "point"), pending: *const Pending) void {
+    if (!@import("builtin").is_test) return;
+    const gate = server.test_gate orelse return;
+    if (gate.point == point and std.mem.eql(u8, gate.method, method)) gate.pass(server.io, pending);
 }
 
 /// Result of a handler: success, or the reason for the failure (answered with `request_failed`;
@@ -836,21 +888,21 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
     }
 }
 
-/// Target-dependent parameters of value operations (pointer bit width, layout rules of vector and
-/// scalar types): taken from the parts the builtins of all modules agree on; parts that disagree
-/// are unknown (values depending on them are unknown); without project modules, the default
-/// builtin (native) is used
-fn targetAbi(server: *Server, modules: []const ModuleGraph.Module, default_builtin: ?Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
+/// Target-dependent parameters of value operations outside every compilation (pointer bit width,
+/// layout rules of vector and scalar types): taken from the parts the builtins of all modules and
+/// compilations agree on; parts that disagree are unknown (values depending on them are unknown);
+/// without project modules, the default builtin (native) is used
+fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema.InternPool.Target {
     var result: za.sema.InternPool.Target = .{};
     // Modules with the same parameters share the same builtin, and merging the same target again
     // does not change the result: each one is read and parsed only once
     var seen: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     defer seen.deinit(server.gpa);
-    for (modules) |m| {
-        const file = m.builtin orelse continue;
-        if ((try seen.getOrPut(server.gpa, file)).found_existing) continue;
-        const t = server.builtinTarget(file);
-        if (seen.count() == 1) {
+    for (graph.modules) |m| if (m.builtin) |file| try seen.put(server.gpa, file, {});
+    for (graph.compiles) |c| if (c.builtin) |file| try seen.put(server.gpa, file, {});
+    for (seen.keys(), 0..) |file, i| {
+        const t = try server.builtinTarget(file);
+        if (i == 0) {
             result = t;
             continue;
         }
@@ -859,20 +911,27 @@ fn targetAbi(server: *Server, modules: []const ModuleGraph.Module, default_built
         result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
     if (seen.count() != 0) return result;
-    if (default_builtin) |f| return server.builtinTarget(f);
+    if (graph.default_builtin) |f| return server.builtinTarget(f);
     return .{};
 }
 
-fn builtinTarget(server: *Server, file: Vfs.FileId) za.sema.InternPool.Target {
-    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch return .{ .pointer_bits = null, .scalar_abi = .unknown };
+/// Target parameters of a builtin.zig; when it cannot be read, the ones last parsed from it (see
+/// `builtin_targets`). The caller holds `graph_mutex`.
+fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
+    const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown },
+    };
     defer server.gpa.free(text);
     const facts = za.project.builtin.vectorFacts(text);
     const target = za.project.builtin.target(text);
-    return .{
+    const result: za.sema.InternPool.Target = .{
         .pointer_bits = za.project.builtin.pointerBits(text),
         .vector_abi = if (facts) |f| .of(f.backend, f.arch, f.avx, f.avx512f, f.soft_float) else .unknown,
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
     };
+    try server.builtin_targets.put(server.gpa, file, result);
+    return result;
 }
 
 /// Combines the build graphs and compile sets of all projects and updates the module graph input
@@ -894,6 +953,9 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         ws.mutex.lockUncancelable(server.io);
         defer ws.mutex.unlock(server.io);
         if (ws.model) |*m| if (ws.compile_set) |*cs| try b.add(m, cs, if (ws.resolve_set) |*e| e else null);
+        // The build.zig modules of the project and its dependency packages: after the compile
+        // sets, which take priority for files in both
+        if (ws.script_model) |*m| if (ws.script_set) |*s| try b.add(m, s, null);
     }
     const std_root: ?Vfs.FileId = if (server.zigEnv()) |env| blk: {
         const p = try std.fs.path.join(server.gpa, &.{ env.std_dir, "std.zig" });
@@ -905,45 +967,49 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         defer server.env_mutex.unlock(server.io);
         break :blk if (server.default_builtin) |p| try server.vfs.intern(p) else null;
     };
-    const t = try server.targetAbi(b.modules.items, default_builtin);
     const graph = try server.gpa.create(ModuleGraph);
-    var graph_owned = true;
-    errdefer if (graph_owned) server.gpa.destroy(graph);
-    graph.* = try b.finish(std_root, default_builtin);
-    // `finish` has moved the builder's arena into graph
-    builder_owned = false;
-    // Do not open a write transaction when neither the module graph nor the target has changed:
-    // every build that finishes gets here, and a write transaction cancels in-flight computations
-    // and requests (the requests fail with ContentModified)
-    const unchanged = server.moduleGraphUnchanged(graph, t) catch |err| {
-        var unused: ModuleGraph.Input.Value = graph;
-        ModuleGraph.Input.deinit(&unused, server.gpa);
-        graph_owned = false;
+    graph.* = b.finish(std_root, default_builtin) catch |err| {
+        server.gpa.destroy(graph);
         return err;
     };
-    if (unchanged) {
-        var unused: ModuleGraph.Input.Value = graph;
-        ModuleGraph.Input.deinit(&unused, server.gpa);
-        graph_owned = false;
-        return;
-    }
-    // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it
-    server.db.beginWrite();
+    // `finish` has moved the builder's arena into graph
+    builder_owned = false;
+    var graph_value: ModuleGraph.Input.Value = graph;
+    var graph_owned = true;
+    defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
+    const t = try server.targetAbi(graph);
+    // Each compilation uses the target of its builtin (the root module's); when that is unknown,
+    // the parameters common to all compilations
+    const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
+    defer server.gpa.free(targets);
+    for (graph.compiles, targets) |c, *ct| ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
+    // Do not open a write transaction when neither the module graph nor the targets have changed:
+    // every build that finishes gets here, and a write transaction cancels in-flight computations
+    // and requests (the requests fail with ContentModified)
+    if (try server.moduleGraphUnchanged(graph, t, targets)) return;
+    // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it.
+    // Requests that read only text cannot change with the module graph: they are not canceled.
+    // The update is not ordered with the requests: one received earlier that starts reading after
+    // it reads the new graph.
+    server.db.beginWriteOf(comptime Db.inputSet(&.{ ModuleGraph.Input, za.sema.queries.TargetAbi, za.sema.queries.ContextTarget }), .unordered);
     defer server.db.endWrite();
-    // `set` allocates only when the key is not interned yet: ensure both keys first, so that
-    // the two set calls afterwards cannot fail and cannot leave a partial update either
+    // `set` allocates only when the key is not interned yet: ensure every key first, so that the
+    // set calls afterwards cannot fail and cannot leave a partial update either
     try server.db.ensureInput(ModuleGraph.Input, {});
     try server.db.ensureInput(za.sema.queries.TargetAbi, {});
+    for (0..targets.len) |i| try server.db.ensureInput(za.sema.queries.ContextTarget, @intCast(i));
+    try server.ip.setTargets(targets);
     server.db.set(ModuleGraph.Input, {}, graph, .medium) catch unreachable;
     graph_owned = false;
     server.db.set(za.sema.queries.TargetAbi, {}, t, .medium) catch unreachable;
+    for (targets, 0..) |ct, i| server.db.set(za.sema.queries.ContextTarget, @intCast(i), ct, .medium) catch unreachable;
     server.ip.setTarget(t);
 }
 
-/// The current module graph and target already equal `graph` and `t`. Called with graph_mutex
-/// held: the module graph is written only here, so nobody else can change it after the
-/// comparison.
-fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target) Allocator.Error!bool {
+/// The current module graph and targets already equal `graph`, `t` and `targets`. Called with
+/// graph_mutex held: the module graph is written only here, so nobody else can change it after
+/// the comparison.
+fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target, targets: []const za.sema.InternPool.Target) Allocator.Error!bool {
     var ctx = server.db.beginRead(server.gpa);
     defer ctx.end();
     const current = ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
@@ -955,6 +1021,13 @@ fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.I
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return false,
     };
+    for (targets, 0..) |ct, i| {
+        const cur = ctx.get(za.sema.queries.ContextTarget, @intCast(i)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return false,
+        };
+        if (!std.meta.eql(cur, ct)) return false;
+    }
     return ModuleGraph.Input.eql(current, graph) and std.meta.eql(target, t);
 }
 
@@ -1077,7 +1150,7 @@ fn scanOnce(server: *Server) Allocator.Error!void {
     };
     if (unchanged) return;
     {
-        server.db.beginWrite();
+        server.db.beginWriteOf(comptime Db.inputSet(&.{WorkspaceFiles}), .unordered);
         defer server.db.endWrite();
         // The engine takes ownership of the value, also when it fails
         try server.db.set(WorkspaceFiles, {}, try server.gpa.dupe(Vfs.FileId, files), .low);
@@ -1204,6 +1277,10 @@ fn importsBasis(graph: ?*const ModuleGraph) u64 {
         }
         h.update(&.{0xff});
     }
+    for (g.compiles) |c| {
+        hashFile(&h, c.root);
+        hashFile(&h, c.builtin);
+    }
     return h.final();
 }
 
@@ -1258,6 +1335,8 @@ fn appendImportRoots(graph: ?*const ModuleGraph, roots: *std.ArrayList(Vfs.FileI
         if (module.builtin) |file| try roots.append(gpa, file);
         for (module.imports) |imp| if (g.modules[imp.module].root) |file| try roots.append(gpa, file);
     }
+    // The standard library uses the builtin of each compilation's root module
+    for (g.compiles) |c| if (c.builtin) |file| try roots.append(gpa, file);
 }
 
 fn warmImportRoots(server: *Server) Allocator.Error!bool {
@@ -1353,6 +1432,12 @@ fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     for (server.pending.items) |p| {
         if (p.id.eql(id)) p.cancel.store(true, .release);
     }
+}
+
+fn cancelAllPending(server: *Server) void {
+    server.pending_mutex.lockUncancelable(server.io);
+    defer server.pending_mutex.unlock(server.io);
+    for (server.pending.items) |p| p.cancel.store(true, .release);
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
@@ -1508,6 +1593,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     server.publishFiles(&.{id}, false);
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
     server.compileSingle(id);
+    server.scheduleCompileSetRefresh(&.{id});
 }
 
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
@@ -1543,6 +1629,7 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
     server.requestSemanticRefresh();
+    server.scheduleCompileSetRefresh(&.{id});
     // When a single-file mode root file was deleted from disk while open (notifications of
     // external changes skip open files), drop its compile results on close and republish the files
     // it imports as well
@@ -1587,11 +1674,13 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
-        if (!ws.owns(id)) continue;
-        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id)) {
-            // Outside watch mode, the maker does not reconfigure automatically: restart
+        // Outside watch mode, the maker does not reconfigure automatically: restart. Build
+        // scripts and configure inputs may lie outside the project's files.
+        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id) or
+            ws.changesConfigureInput(path, .changed))
+        {
             server.restartWorkspace(ws, 0);
-        } else {
+        } else if (ws.owns(id)) {
             server.requestBuild(ws);
         }
     }
@@ -1738,6 +1827,15 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             if (std.mem.eql(u8, dir, ws.root)) break true;
         } else for (known.items) |file| {
             if (ws.isBuildScript(file)) break true;
+        } else for (events.keys(), events.values()) |path, kind| {
+            const normalized = try Vfs.normalize(.native, arena, path) orelse continue;
+            const change: Workspace.PathChange = switch (kind) {
+                .Created => .created,
+                .Changed => .changed,
+                .Deleted => .deleted,
+                _ => .changed,
+            };
+            if (ws.changesConfigureInput(normalized, change)) break true;
         } else false;
         if (reconfigure) {
             const started = for (refreshed.items) |dir| {
@@ -1754,6 +1852,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     if (edited.items.len != 0) {
         server.publishFiles(edited.items, true);
         server.requestSemanticRefresh();
+        server.scheduleCompileSetRefresh(edited.items);
     }
     if (rebuilt.items.len == 0) return;
     // Single-file mode: files imported by open files may have changed
@@ -1846,8 +1945,22 @@ pub fn isOpen(server: *Server, path: []const u8) bool {
 }
 
 /// The watched files or the watch method may have changed: tells the watch task to recompute
-fn resyncWatcher(server: *Server) void {
+pub fn resyncWatcher(server: *Server) void {
     if (server.watcher) |w| w.requestResync();
+}
+
+/// Directories among the configure inputs of all projects, including new instances that have
+/// not replaced the old ones yet (see `Workspace.changesConfigureInput`): an entry created in or
+/// deleted from them reconfigures the project, so they are watched. Copied into `arena`.
+pub fn configureInputDirs(server: *Server, arena: Allocator) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| {
+        try ws.configureInputDirs(arena, &out);
+        if (ws.successor) |s| try s.configureInputDirs(arena, &out);
+    }
+    return out.items;
 }
 
 /// Whether the server discovers external changes itself (see `Config.Watcher`)
@@ -1871,13 +1984,7 @@ pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rul
         rules.zig_lib = try arena.dupe(u8, env.lib_dir);
         rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
     }
-    {
-        server.roots_mutex.lockUncancelable(server.io);
-        defer server.roots_mutex.unlock(server.io);
-        const roots = try arena.alloc([]const u8, server.roots.items.len);
-        for (server.roots.items, roots) |root, *r| r.* = try arena.dupe(u8, root);
-        rules.roots = roots;
-    }
+    rules.roots = try server.rootsAlloc(arena);
     var local_caches: std.ArrayList([]const u8) = .empty;
     var packages: std.ArrayList([]const u8) = .empty;
     {
@@ -2151,6 +2258,8 @@ fn applyCacheLimits(server: *Server, config: *const Config) void {
 
 /// The query named `name` in `Db`
 fn QueryNamed(comptime name: []const u8) type {
+    // Compares `name` with the names of all queries
+    @setEvalBranchQuota(10_000);
     var found: ?type = null;
     for (Db.query_types) |Q| if (std.mem.endsWith(u8, @typeName(Q), "." ++ name)) {
         if (found != null) @compileError("more than one query named " ++ name);
@@ -2278,10 +2387,12 @@ fn startup(server: *Server) Io.Cancelable!void {
     var config = server.configSnapshot() catch return;
     defer config.deinit(server.gpa);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
-        // `zig build test` deliberately cannot find zig (see `ZigEnv.query`); warn writes to
-        // stderr, which would make the build output show a misleading `failed command`
-        if (!(@import("builtin").is_test and err == error.ZigNotFound))
-            log.warn("failed to run zig env ({t}): compiler diagnostics are unavailable", .{err});
+        if (err == error.Canceled) return error.Canceled;
+        // `zig build test` deliberately cannot find zig (see `ZigEnv.query`)
+        if (@import("builtin").is_test and !@import("build_options").zig_tests) return;
+        const message = std.fmt.allocPrint(server.gpa, "cannot run {s} env ({t}): the standard library, named modules, and compiler diagnostics are unavailable; set zig.path to the zig executable", .{ config.zig_path orelse "zig", err }) catch null;
+        defer if (message) |m| server.gpa.free(m);
+        server.showWarning(message orelse "cannot run zig env: the standard library, named modules, and compiler diagnostics are unavailable; set zig.path to the zig executable");
         return;
     };
     const detected = server.ownEnv(queried) catch return log.err("out of memory while storing the zig environment", .{});
@@ -2304,7 +2415,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         defer if (message) |m| server.gpa.free(m);
         server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
-        server.db.beginWrite();
+        server.db.beginWriteOf(comptime Db.inputSet(&.{live.LiveBackend}), .unordered);
         defer server.db.endWrite();
         server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
     }
@@ -2396,10 +2507,9 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
             if (file) |f| break :blk f;
             appendNote(&notes, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{path});
         }
-        // Generated with the settings of `zig test`, so that `std.testing.allocator` and the
-        // like, which depend on `builtin.is_test`, can be inferred in test blocks (consistent with
-        // modules that have a test step; see configuration.zig)
-        break :blk za.project.builtin.generate(gpa, io, env, &.{"test"}) catch |err| switch (err) {
+        // Generated with the settings of the single-file compile (`zig build-obj`, see
+        // `compileSingle`), whose diagnostics these files get
+        break :blk za.project.builtin.generate(gpa, io, env, &.{"build-obj"}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => null,
         };
@@ -2940,7 +3050,8 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
 }
 
 /// When a new instance replaces the old one. `built`: the first build finished (or configuration
-/// failed, the build graph could not be read, or no build is needed); always replaces.
+/// failed while the old instance has no build graph, see `keepOnConfigurationFailure`; the build
+/// graph could not be read; or no build is needed); always replaces.
 /// `configured`: the build graph was read and the compile set computed; replaces
 /// only when the old instance does not take part in the module graph (configuration
 /// failed, the build graph could not be read, or the maker crashed before
@@ -2967,10 +3078,10 @@ pub fn promote(server: *Server, ws: *Workspace, stage: PromoteStage) ?*Workspace
     return null;
 }
 
-/// The new instance `ws` created by a restart will not proceed (the maker keeps crashing, or the
-/// protocol version does not match): stops waiting for it to replace the old instance. The old
-/// instance's model and compile set continue to determine which modules files belong to; its
-/// compiler diagnostics will no longer be updated, so they are cleared.
+/// The new instance `ws` created by a restart will not proceed (the maker keeps crashing, exited
+/// during the configure phase, or the protocol version does not match): stops waiting for it to
+/// replace the old instance. The old instance's model and compile set continue to determine which
+/// modules files belong to; its compiler diagnostics will no longer be updated, so they are cleared.
 pub fn abandon(server: *Server, ws: *Workspace) void {
     const old = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
@@ -2986,6 +3097,29 @@ pub fn abandon(server: *Server, ws: *Workspace) void {
     // The reference held by `successor` (the caller holds another one)
     ws.release();
     old.clearResult();
+}
+
+/// The configuration of the new instance `ws` created by a restart failed: when the old instance
+/// takes part in the module graph, it stays in the list (its model and compile set keep resolving
+/// named imports and finding importers until the configuration is fixed) and `ws` no longer
+/// replaces it. Returns the old instance with a reference held for the caller, which stores the
+/// configuration errors as its result; null when `ws` should replace the old instance as usual.
+pub fn keepOnConfigurationFailure(server: *Server, ws: *Workspace) ?*Workspace {
+    const old = blk: {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        if (server.shutting_down) return null;
+        for (server.workspaces.items) |w| if (w.successor == ws) {
+            if (!w.inModuleGraph()) return null;
+            w.successor = null;
+            w.acquire();
+            break :blk w;
+        };
+        return null;
+    };
+    // The reference held by `successor` (the caller holds another one)
+    ws.release();
+    return old;
 }
 
 /// Whether `ws` is the (visible) instance in the list
@@ -3282,7 +3416,29 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     }
     server.publishNow(file, false, seen);
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
+    server.refreshCompileSets(&.{file});
     server.maybeResetSema();
+}
+
+/// The text of these files has changed: each project whose compile set read their imports
+/// recomputes it if the imports differ (see `Workspace.refreshImports`)
+fn refreshCompileSets(server: *Server, files: []const Vfs.FileId) void {
+    const list = server.workspaceList(server.gpa) catch return log.err("out of memory while updating compile sets", .{});
+    defer server.releaseList(server.gpa, list);
+    for (list) |ws| ws.refreshImports(files) catch log.err("{s}: out of memory while updating the compile set", .{ws.root});
+}
+
+/// `refreshCompileSets` in a background task: a recompute can take a while in a large project
+fn scheduleCompileSetRefresh(server: *Server, files: []const Vfs.FileId) void {
+    const owned = server.gpa.dupe(Vfs.FileId, files) catch return log.err("out of memory while updating compile sets", .{});
+    server.busyBegin();
+    spawn(server.io, &server.bg_group, compileSetRefreshTask, .{ server, owned });
+}
+
+fn compileSetRefreshTask(server: *Server, files: []const Vfs.FileId) Io.Cancelable!void {
+    defer server.busyEnd();
+    defer server.gpa.free(files);
+    server.refreshCompileSets(files);
 }
 
 fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
@@ -3291,15 +3447,19 @@ fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
     return if (server.edits.get(file)) |e| e.generation else 0;
 }
 
-/// Reclaims the whole generation when the InternPool exceeds `sema.max_intern_pool_mb`
-/// (see `resetSema`). Called at idle points outside read transactions.
+/// Reclaims type information (see `resetSema`) when the InternPool exceeds
+/// `sema.max_intern_pool_mb` or the type-information queries have more than `sema_reset_keys`
+/// keys. Called when a request or a diagnostics publish finishes, outside read transactions.
 fn maybeResetSema(server: *Server) void {
     const limit = server.max_intern_pool_mb.load(.monotonic);
     if (limit == 0) return;
-    if (server.ip.bytes() < @as(usize, limit) * 1024 * 1024 and server.semaKeys() < sema_reset_keys) return;
-    if (server.sema_resetting.swap(true, .acq_rel)) return;
-    defer server.sema_resetting.store(false, .release);
-    server.resetSema();
+    const limit_bytes = @as(usize, limit) * 1024 * 1024;
+    if (server.ip.bytes() < limit_bytes and server.semaKeys() < sema_reset_keys) return;
+    if (!server.db.tryBeginWrite()) return;
+    defer server.db.endWrite();
+    // Another thread may have reclaimed since the check above
+    if (server.ip.bytes() < limit_bytes and server.semaKeysLocked() < sema_reset_keys) return;
+    server.resetSemaLocked();
 }
 
 /// When the total number of keys of the type-information queries exceeds this value, the whole
@@ -3328,11 +3488,23 @@ fn semaKeysLocked(server: *Server) usize {
 /// InternPool and the queries whose keys or values refer to them (memos of other queries that
 /// depend on them are dropped too). The InternPool and the keys and dependency edges of these
 /// queries never shrink and keep growing in long sessions with the generic instances visited; after
-/// the reclaim, later requests infer again on demand.
-pub fn resetSema(server: *Server) void {
-    const before = server.ip.bytes();
-    server.db.beginWrite();
+/// the reclaim, later requests infer again on demand, with the same results.
+///
+/// Runs only when no read transaction is in progress, and returns whether it ran: it sets no
+/// input and invalidates no result, so canceling in-flight requests for it would fail them for
+/// nothing, and a request whose own inference exceeds the limit would never complete. When a
+/// read transaction is in progress, the reclaim is left to a request or publish that finishes
+/// later (`maybeResetSema`).
+pub fn resetSema(server: *Server) bool {
+    if (!server.db.tryBeginWrite()) return false;
     defer server.db.endWrite();
+    server.resetSemaLocked();
+    return true;
+}
+
+/// `resetSema` in a write transaction the caller holds
+fn resetSemaLocked(server: *Server) void {
+    const before = server.ip.bytes();
     const keys = server.semaKeysLocked();
     server.db.resetQueries(&sema_queries);
     server.ip.reset() catch return log.err("out of memory while resetting the intern pool", .{});
@@ -3575,11 +3747,12 @@ test "importsBasis ignores the files of the module graph but follows modules and
         .{ .root = main, .imports = &.{.{ .name = "lib", .module = 1 }} },
         .{ .root = lib, .imports = &.{} },
     };
-    const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .files = &.{.{ .file = main, .module = 0, .root_module = 0 }} };
+    const compiles = [_]ModuleGraph.Compile{.{ .root = main }};
+    const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .compiles = &compiles, .files = &.{.{ .file = main, .module = 0, .compile = 0 }} };
     // A build produced generated files: only files were
     // added, so the auto-import index remains usable
     var more_files = base;
-    more_files.files = &.{ .{ .file = main, .module = 0, .root_module = 0 }, .{ .file = lib, .module = 1, .root_module = 0 } };
+    more_files.files = &.{ .{ .file = main, .module = 0, .compile = 0 }, .{ .file = lib, .module = 1, .compile = 0 } };
     try std.testing.expectEqual(importsBasis(&base), importsBasis(&more_files));
     const renamed = [_]ModuleGraph.Module{
         .{ .root = main, .imports = &.{.{ .name = "dep", .module = 1 }} },
@@ -3820,8 +3993,8 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     const document_uri = try server.uriFor(arena, file);
     const text = try ctx.get(FileText, file);
 
-    // Live diagnostics: the file is loaded, and (it belongs to no project, or the compile set has
-    // not been computed yet, or it is in the compile set)
+    // Live diagnostics: the file is loaded, and it belongs to no project or one of its projects
+    // wants them (see `Workspace.liveEligible`)
     var live_result: ?*live.Result = null;
     if (text != null and server.liveEligible(file)) live_result = try ctx.get(live.AstCheck, file);
 
@@ -3985,9 +4158,10 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     @memcpy(out[0..diags.len], diags);
     var n = diags.len;
     for (ranges) |x| {
-        // builtin is generated as for zig test, so inference may mark as inactive a branch that the
-        // compile behind the diagnostics actually executes: no hint is published where it overlaps
-        // a compiler diagnostic, so that the same code is not both an error and inactive
+        // Inference may mark as inactive code in which the compile behind the diagnostics reports
+        // errors (AstGen checks every branch, and a file can be compiled in several
+        // configurations): no hint is published where it overlaps a compiler diagnostic, so that
+        // the same code is not both an error and inactive
         if (conflictsWithCompilerError(diags, text, server.encoding, x)) continue;
         out[n] = .{
             .range = lines.range(x.start, x.end, server.encoding),
@@ -4101,11 +4275,14 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
 fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
-    var best: ?[]const u8 = null;
-    for (server.roots.items) |root| {
-        if (server.vfs.isUnder(path, root) and (best == null or root.len > best.?.len)) best = root;
-    }
-    return if (best) |b| try arena.dupe(u8, b) else null;
+    return if (server.vfs.rootOf(server.roots.items, path)) |b| try arena.dupe(u8, b) else null;
+}
+
+/// The workspace root directories, copied into `arena`
+fn rootsAlloc(server: *Server, arena: Allocator) Allocator.Error![]const []const u8 {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    return dupeStrings(arena, server.roots.items);
 }
 
 /// Names that violate the naming conventions (see `naming`): low-severity hints with code
@@ -4601,7 +4778,7 @@ fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: [
 
 fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverParams) HandlerError!types.ResultType("textDocument/hover") {
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const info = try ide.hover.hover(r, at.file, at.offset) orelse return null;
+    const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
     return .{
         .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = info.text } },
@@ -5316,8 +5493,7 @@ fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, old: []const u
 /// Why a fix cannot be applied: "<prefix>: reason (file:line:column)"; only the file when the
 /// position is null
 fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
-    const path = server.vfs.path(file);
-    const shown = if (try server.rootOf(arena, path)) |root| std.mem.trimStart(u8, path[root.len..], "/\\") else path;
+    const shown = server.vfs.shownPath(try server.rootsAlloc(arena), server.vfs.path(file));
     const at = offset orelse return std.fmt.allocPrint(arena, "{s}: {s} ({s})", .{ prefix, reason, shown });
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const pos = (try offsets.LineIndex.init(arena, text)).position(at, server.encoding);
@@ -5617,11 +5793,19 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 }
 
 test {
+    // Files reached only through functions: a filter that selects only their tests analyzes no
+    // function that imports them, so they are referenced here
+    _ = Progress;
+    _ = Config;
+    _ = SemanticCache;
+    _ = watch;
+    _ = client_process;
     _ = origin;
     _ = workspace_files;
     _ = Workspace;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
+    _ = @import("build_e2e_test.zig");
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
@@ -5629,5 +5813,6 @@ test {
     _ = @import("remove_param_e2e_test.zig");
     _ = @import("unused_capture_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
+    _ = @import("maker_e2e_test.zig");
     _ = @import("auto_import_test.zig");
 }

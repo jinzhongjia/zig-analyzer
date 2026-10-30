@@ -80,8 +80,21 @@ pub const Result = struct {
     /// targets a `.zon` file: the root expression of the `.zon` file is inferred with it (see
     /// `queries.ZonResultType`)
     zon_imports: []const ZonImport = &.{},
+    /// References (names, member accesses, enum literals) and builtin calls whose value is changed
+    /// by their result type coercion, with their own value before it: `a` of type `u8` in `take(a)`
+    /// with `take(o: ?u8)` is `u8` (the compiler adds a separate coercion to `?u8`), `.red` coerced
+    /// to `?Color` is a `Color`. `exprs` holds the coerced values.
+    uncoerced: []const Uncoerced = &.{},
 
-    pub const LiteralExpected = struct { expr: ExprId, ty: Index };
+    pub const Uncoerced = struct { expr: ExprId, tv: TypedValue };
+    pub const LiteralExpected = struct {
+        expr: ExprId,
+        ty: Index,
+        /// The type comes from peer type resolution, not from a result type (an enum literal in a
+        /// branch without a result type, an operand of a comparison): the literal names a tag of
+        /// it, never a declaration, since decl literals need a result type
+        tags_only: bool = false,
+    };
     pub const ZonImport = struct { file: FileId, ty: Index };
     pub const IterationVar = struct { binding: Body.BindingId, val: ?Index };
     pub const ParamCoercion = struct { param: u32, ty: Index };
@@ -94,8 +107,14 @@ pub const Result = struct {
         member: hir.OwnerKey,
     };
 
+    /// The value of `e` before its result type coercion (see `uncoerced`)
+    pub fn uncoercedValue(r: *const Result, e: ExprId) TypedValue {
+        for (r.uncoerced) |u| if (u.expr == e) return u.tv;
+        return if (@backingInt(e) < r.exprs.len) r.exprs[@backingInt(e)] else .unknown;
+    }
+
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports) and deepEql(a.uncoerced, b.uncoerced);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -122,6 +141,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+    const scope = try queries.enterContext(&r, owner.file, inst);
+    defer scope.leave();
     const tree = try r.itemTree(owner.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == owner.item) break @intCast(i);
@@ -159,7 +180,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const param_coercions = try a.dupe(Result.ParamCoercion, inf.param_coercions.items);
     const iteration_vars = try a.dupe(Result.IterationVar, inf.iteration_vars.items);
     const zon_imports = try a.dupe(Result.ZonImport, inf.zon_imports.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports };
+    const uncoerced = try a.dupe(Result.Uncoerced, inf.uncoerced.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports, .uncoerced = uncoerced };
 }
 
 /// Infers only one local binding or comptime expression in the member `owner` (see
@@ -170,6 +192,8 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
     defer scratch.deinit();
     const a = scratch.allocator();
     var r: Resolver = .{ .ctx = ctx, .arena = a };
+    const scope = try queries.enterContext(&r, owner.file, inst);
+    defer scope.leave();
     const tree = try r.itemTree(owner.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == owner.item) break @intCast(i);
@@ -272,6 +296,8 @@ const Inferrer = struct {
     param_coercions: std.ArrayList(Result.ParamCoercion) = .empty,
     /// See `Result.zon_imports`
     zon_imports: std.ArrayList(Result.ZonImport) = .empty,
+    /// See `Result.uncoerced`
+    uncoerced: std.ArrayList(Result.Uncoerced) = .empty,
     /// Instance context (the instance of the owner itself or of an outer generic function)
     inst: ?Index,
     /// See `LoopSeed`
@@ -312,6 +338,9 @@ const Inferrer = struct {
         expected: ?Index = null,
         types: std.ArrayList(Index) = .empty,
         values: std.ArrayList(TypedValue) = .empty,
+        /// The break value expressions: enum literals among them take the peer type (see
+        /// `peerLiteral`)
+        exprs: std.ArrayList(ExprId) = .empty,
     };
 
     fn runOwner(inf: *Inferrer, kind: ItemTree.Item.Kind, mode: Mode) Error!void {
@@ -423,7 +452,10 @@ const Inferrer = struct {
 
     fn ownInstance(inf: *Inferrer) ?InternPool.Instance {
         const i = inf.inst orelse return null;
-        const key = inf.ip.key(i).instance;
+        const key = switch (inf.ip.key(i)) {
+            .instance => |x| x,
+            else => return null,
+        };
         if (key.file != inf.file) return null;
         const tree = inf.r.itemTree(inf.file) catch return null;
         return if (key.decl == tree.items[inf.item].ast_id) key else null;
@@ -574,9 +606,26 @@ const Inferrer = struct {
         // corresponding member
         if (inf.members[i] == null and inf.body.expr(e) == .enum_literal) try inf.recordTagMember(e, tv.ty);
         if (raw.ty == .enum_literal_type) if (want) |w| try inf.noteParamCoercion(e, w);
+        if (want) |w| if (!deepEql(raw, tv)) try inf.noteUncoerced(e, raw, w);
         // A ZON value parsed as the pointee or as an array has the result type (pointer, slice)
         if (want != expected) inf.exprs[i] = .{ .ty = expected.? };
         return inf.exprs[i];
+    }
+
+    /// See `Result.uncoerced`: `raw` is the value of `e` before its coercion to `want`
+    fn noteUncoerced(inf: *Inferrer, e: ExprId, raw: TypedValue, want: Index) Error!void {
+        const own: TypedValue = switch (inf.body.expr(e)) {
+            // Primitive values (`null`, `undefined`) refer to no definition: they keep the type
+            // they are coerced to
+            .name_ref => |name| if (!inf.body.nameRefIsEscaped(e) and try primitive(inf.ip, name) != null) return else raw,
+            .field_access, .builtin_call => raw,
+            // An enum literal is a tag of the enum it is coerced to, without the optional or
+            // error union around it
+            .enum_literal => if (raw.ty == .enum_literal_type) try inf.coerce(raw, inf.destType(want, .eu_opt) orelse return) else raw,
+            else => return,
+        };
+        if (deepEql(own, inf.get(e))) return;
+        try inf.uncoerced.append(inf.scratch, .{ .expr = e, .tv = own });
     }
 
     /// When the compiler parses a ZON value with a result type (`LowerZon`), the value of an
@@ -637,13 +686,55 @@ const Inferrer = struct {
 
     /// Branch results without a result type are coerced to the peer type
     /// (`if (b.op()) |t| t.kind else .invalid`): enum literals in the branches refer to members of
-    /// the peer type and use it as their expected type
+    /// the peer type and use it as their expected type (naming only its tags)
     fn peerLiteral(inf: *Inferrer, e: ExprId, ty: Index) Error!void {
         if (ty == .unknown or ty == .enum_literal_type) return;
         if (inf.body.expr(e) != .enum_literal or inf.members[@backingInt(e)] != null) return;
         if (inf.get(e).ty != .enum_literal_type) return;
-        try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = ty });
+        try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = ty, .tags_only = true });
         try inf.recordTagMember(e, ty);
+    }
+
+    /// Operand `e` (inferred as `tv`) of a comparison whose other operand has type `other`.
+    /// Matching the compiler, comparison operands have no result type and are coerced to their
+    /// peer type: an enum literal compared with an enum or a tagged union names one of its tags
+    /// (never a declaration), and has no value when it names none (a compile error); a comptime
+    /// number compared with a float is rounded to it; an error value takes the other side's type
+    /// as its expected type (for completing error names).
+    fn comparedOperand(inf: *Inferrer, e: ExprId, tv: TypedValue, other: Index) Error!TypedValue {
+        switch (tv.ty) {
+            .enum_literal_type => if (try inf.comparedType(other)) |t| if (t != .enum_literal_type) {
+                try inf.peerLiteral(e, t);
+                const v = tv.val orelse return tv;
+                if (!try inf.hasTag(t, inf.ip.key(v).enum_literal)) return tv;
+                const c = try inf.coerce(tv, t);
+                if (inf.body.expr(e) == .enum_literal) inf.exprs[@backingInt(e)] = c;
+                return c;
+            },
+            .comptime_int_type, .comptime_float_type => if (inf.ip.isFloat(other)) return inf.coerce(tv, other),
+            else => if (inf.body.expr(e) == .error_value) if (try inf.comparedType(other)) |t| {
+                try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = t });
+            },
+        }
+        return tv;
+    }
+
+    /// Whether the enum `t` (or the tag enum of a tagged union, or either through an optional)
+    /// has the tag `name`
+    fn hasTag(inf: *Inferrer, t: Index, name: []const u8) Error!bool {
+        const ip = inf.ip;
+        var x = t;
+        if (ip.key(x) == .optional_type) x = ip.key(x).optional_type;
+        if (ip.key(x) == .union_tag_type) x = ip.key(x).union_tag_type;
+        switch (ip.key(x)) {
+            .container_type => |c| {
+                if (c.kind != .@"enum" and c.kind != .@"union") return false;
+                const ns = try queries.namespaceOfType(inf.r, x) orelse return false;
+                return fieldItem(try inf.r.itemTree(ns.file), ns.container, name) != null;
+            },
+            .reified_type => |rt| return rt.kind != .@"struct" and hasName(rt.names, name),
+            else => return false,
+        }
     }
 
     /// See `Result.param_coercions`: `e` is a reference to a parameter of this member, used with
@@ -848,14 +939,16 @@ const Inferrer = struct {
                     inf.uncertain -= 1;
                 };
                 for (s.prongs, 0..) |prong, i| {
-                    try inf.bindSwitchCapture(prong, s.prongs, s.operand, operand, chosen != null and chosen.? == i);
+                    try inf.bindSwitchCapture(s.prongs, i, s.operand, operand, chosen != null and chosen.? == i);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);
                 }
+                var break_exprs: []const ExprId = &.{};
                 if (label != null) {
                     const frame = inf.labels.pop().?;
+                    break_exprs = frame.exprs.items;
                     // When a prong is chosen, only its breaks are recorded (the other prongs are
                     // inferred as not executing)
                     if (chosen != null) {
@@ -869,6 +962,8 @@ const Inferrer = struct {
                         try live_types.appendSlice(inf.scratch, frame.types.items);
                         try live_values.appendSlice(inf.scratch, frame.values.items);
                         const t = try inf.peer(live_types.items);
+                        try inf.peerLiteral(s.prongs[chosen.?].body, t);
+                        for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
                         return .{ .ty = t, .val = sameValue(live_values.items, t) };
                     }
                     try types.appendSlice(inf.scratch, frame.types.items);
@@ -877,6 +972,7 @@ const Inferrer = struct {
                 if (chosen != null) return chosen_tv;
                 const ty = try inf.peer(types.items);
                 for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
+                for (break_exprs) |x| try inf.peerLiteral(x, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
             },
             .@"catch" => |c| {
@@ -966,6 +1062,7 @@ const Inferrer = struct {
                     const frame = &inf.labels.items[fi];
                     try frame.types.append(inf.scratch, brk.ty);
                     try frame.values.append(inf.scratch, brk);
+                    if (br.value) |v| try frame.exprs.append(inf.scratch, v);
                 };
                 return .{ .ty = .noreturn_type };
             },
@@ -1135,7 +1232,7 @@ const Inferrer = struct {
         const field = for (init.fields) |f| {
             if (f.name != null and std.mem.eql(u8, f.name.?, name)) break f;
         } else return null;
-        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = try queries.rootInst(inf.r, owner.file, inf.inst) });
         if (res.exprs.len != body.exprs.len) return null;
         const fv = res.exprs[@backingInt(field.value)];
         return if (fv.val != null) fv else null;
@@ -1282,7 +1379,7 @@ const Inferrer = struct {
 
     /// A type in the standard library looked up by path (e.g. `builtin.Type`)
     fn stdType(inf: *Inferrer, path: []const []const u8) Error!?Index {
-        var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return null, .container = 0 };
+        var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, inf.r.context) orelse return null, .container = 0 };
         var t: Index = .unknown;
         for (path, 0..) |name, i| {
             const def = try inf.r.memberDef(ns, name) orelse return null;
@@ -1885,6 +1982,7 @@ const Inferrer = struct {
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
             }
             const t = try inf.peer(frame.types.items);
+            for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
             return .{ .ty = t, .val = sameValue(frame.values.items, t) };
         }
         return .{ .ty = if (last == .noreturn_type) .noreturn_type else .void_type };
@@ -1960,11 +2058,17 @@ const Inferrer = struct {
 
     fn loop(inf: *Inferrer, l: Body.Loop, expected: ?Index) Error!TypedValue {
         var iteration: ?u32 = null;
+        // A `while` whose condition is comptime-known to hold and cannot change (no `comptime var`
+        // is modified by the loop) ends only through its breaks: the compiler analyzes only the
+        // taken branch of the condition, so the `else` branch (`void` when absent) is not a peer
+        var endless = false;
         switch (l.kind) {
             .@"while" => {
                 const cond = try inf.infer(l.inputs[0], null);
                 try inf.bindCaptures(l.capture, l.inputs[0], cond, .if_then);
                 try inf.bindCaptures(l.else_capture, l.inputs[0], cond, .if_else);
+                endless = inf.condValue(cond) == true and !try inf.assignsOuterComptimeVar(l.body) and
+                    (if (l.cont) |c| !try inf.assignsOuterComptimeVar(c) else true);
             },
             .@"for" => {
                 // Inferring this loop for one iteration (see `LoopSeed`): every loop variable
@@ -2011,9 +2115,15 @@ const Inferrer = struct {
                 inf.bindings[@backingInt(v)].val = null;
             }
         }
-        const other: Index = if (l.@"else") |el| (try inf.infer(el, expected)).ty else .void_type;
-        try frame.types.append(inf.scratch, other);
-        return .{ .ty = try inf.peer(frame.types.items) };
+        if (endless) {
+            if (l.@"else") |el| _ = try inf.inferArm(el, expected, true);
+        } else if (l.@"else") |el| {
+            try frame.types.append(inf.scratch, (try inf.infer(el, expected)).ty);
+            try frame.exprs.append(inf.scratch, el);
+        } else try frame.types.append(inf.scratch, .void_type);
+        const ty = try inf.peer(frame.types.items);
+        for (frame.exprs.items) |x| try inf.peerLiteral(x, ty);
+        return .{ .ty = ty };
     }
 
     /// Loop variables of a `for` loop; when inferring the `iteration`-th iteration, they take the
@@ -2278,14 +2388,16 @@ const Inferrer = struct {
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
     }
 
-    /// Captures of a switch. For a tagged union, the capture is the peer of the field types of the
-    /// prong items (matching the compiler); it is unknown for the `else` prong and for prong items
-    /// that cannot be evaluated; the second capture is the tag. `chosen`: the operand is
-    /// comptime-known and this is the prong that executes, so the capture takes the actual payload
-    /// value; when the payload types of the items have no peer, the prong can only be an `inline`
-    /// prong (each item is instantiated separately, e.g. `inline .@"struct", .@"union" => |info|`),
-    /// and the type also takes the actual payload type.
-    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, prongs: []const Body.Prong, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
+    /// Captures of a switch. For a tagged union, the capture of an ordinary prong is the peer of
+    /// the field types of the prong items (matching the compiler); it is unknown for the `else`
+    /// prong and for prong items that cannot be evaluated. An `inline` prong is instantiated for
+    /// each of its payloads (see `inlineUnionPayloads`): inferred for one of them (see
+    /// `LoopSeed`), the capture has that field's type and the tag capture that tag; otherwise the
+    /// capture has their common type, unknown when they differ. The second capture is the tag.
+    /// `chosen`: the operand is comptime-known and this is the prong that executes, so the
+    /// capture takes the actual payload value (and its type, when the capture's type is unknown).
+    fn bindSwitchCapture(inf: *Inferrer, prongs: []const Body.Prong, pi: usize, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
+        const prong = prongs[pi];
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
         const operand = operand_tv.ty;
@@ -2298,7 +2410,20 @@ const Inferrer = struct {
             .error_set_type, .inferred_error_set => true,
             else => false,
         };
-        var t: Index = if (is_union)
+        const cap = prong.capture[0];
+        // The tag of this instance of an inline prong
+        var inline_tag: ?[]const u8 = null;
+        var t: Index = if (is_union and prong.is_inline) blk: {
+            const payloads = try inlineUnionPayloads(inf.r, inf.body, inf.exprs, prongs, pi, operand) orelse break :blk .unknown;
+            if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
+                if (seed.index >= payloads.len) break :blk .unknown;
+                inline_tag = payloads[seed.index].name;
+                break :blk payloads[seed.index].ty;
+            };
+            if (payloads.len == 0) break :blk .unknown;
+            for (payloads[1..]) |p| if (p.ty != payloads[0].ty) break :blk .unknown;
+            break :blk payloads[0].ty;
+        } else if (is_union)
             try inf.prongPayloadType(prong, operand)
         else if (is_error_set)
             try inf.errorSetProngType(prong, prongs, try queries.errorSetMembers(inf.r, operand))
@@ -2316,7 +2441,6 @@ const Inferrer = struct {
             .error_value => val = v,
             else => {},
         };
-        const cap = prong.capture[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
         // Inferring for one value of an inline prong (see `LoopSeed`): the capture takes the value
         // of this prong item
@@ -2326,7 +2450,8 @@ const Inferrer = struct {
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(operand_e)) else t, .val = if (is_ptr) null else val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
-            inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag };
+            const tag_val: ?Index = if (inline_tag) |name| (if (tag != .unknown) try ip.get(.{ .enum_tag = .{ .ty = tag, .name = name } }) else null) else null;
+            inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag, .val = tag_val };
         }
     }
 
@@ -2372,13 +2497,7 @@ const Inferrer = struct {
         if (prong.is_else or prong.items.len == 0) return .unknown;
         const types = try inf.scratch.alloc(Index, prong.items.len);
         for (prong.items, types) |item, *t| {
-            const name = switch (inf.body.expr(item)) {
-                .enum_literal => |n| n,
-                else => switch (inf.ip.key(inf.get(item).val orelse return .unknown)) {
-                    .enum_tag => |tag| tag.name,
-                    else => return .unknown,
-                },
-            };
+            const name = itemTagName(inf.ip, inf.body, inf.exprs, item) orelse return .unknown;
             t.* = try inf.unionFieldType(operand, name) orelse return .unknown;
         }
         return inf.peer(types);
@@ -2436,19 +2555,17 @@ const Inferrer = struct {
                 return .{ .ty = .bool_type };
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                // An enum literal on the left (`.a == e`): infer the right-hand side first, and the
-                // literal takes the type of the right-hand side (peer)
-                const literal_lhs = inf.body.expr(lhs_e) == .enum_literal and inf.body.expr(rhs_e) != .enum_literal;
-                // A literal compared with a value of unknown type has an unknown result type
-                const lhs, const rhs = if (literal_lhs) blk: {
-                    const r = try inf.infer(rhs_e, null);
-                    if (r.ty == .unknown) try inf.noteUnknownResult(lhs_e);
-                    break :blk .{ try inf.infer(lhs_e, try inf.comparedType(r.ty)), r };
-                } else blk: {
-                    const l = try inf.infer(lhs_e, null);
-                    if (l.ty == .unknown) try inf.noteUnknownResult(rhs_e);
-                    break :blk .{ l, try inf.infer(rhs_e, try inf.comparedType(l.ty)) };
-                };
+                // Matches the compiler: the operands have no result type (see `comparedOperand`)
+                const l = try inf.infer(lhs_e, null);
+                const r = try inf.infer(rhs_e, null);
+                // A literal compared with a value of unknown type may name a member of that type
+                if (l.ty == .unknown) try inf.noteUnknownResult(rhs_e);
+                if (r.ty == .unknown) try inf.noteUnknownResult(lhs_e);
+                const lhs = try inf.comparedOperand(lhs_e, l, r.ty);
+                const rhs = try inf.comparedOperand(rhs_e, r, l.ty);
+                // An enum literal compared with a value that has no tag of that name: not a
+                // comparison the compiler accepts, so it has no value
+                if ((lhs.ty == .enum_literal_type) != (rhs.ty == .enum_literal_type)) return .{ .ty = .bool_type };
                 // Vectors are compared element-wise; the result is a vector of bool
                 const vec_len: ?u32 = switch (ip.key(lhs.ty)) {
                     .vector_type => |v| v.len,
@@ -2495,10 +2612,9 @@ const Inferrer = struct {
     /// Arithmetic and bitwise operations: the peer of both sides; when both sides are known
     /// integers, the result is folded with the bit width of the peer type. Matching the compiler,
     /// the operands have no result type (`const m: u8 = (0xFF << 4) >> 4` is computed as
-    /// comptime_int, giving 255, and only then converted to u8); the right-hand side uses the
-    /// left-hand side's type as the expected type of literals, with the same result as the peer.
+    /// comptime_int, giving 255, and only then converted to u8; `b + @intCast(y)` has no type).
     fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
-        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
+        const rhs = try inf.infer(rhs_e, null);
         return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
     }
 
@@ -2555,8 +2671,9 @@ const Inferrer = struct {
     fn foldInt(inf: *Inferrer, op: SyntaxKind, ty: Index, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
         const ip = inf.ip;
         if (ip.isFloat(ty)) {
-            const a = value.floatOf(ip, lhs.val) orelse return .{ .ty = ty };
-            const b = value.floatOf(ip, rhs.val) orelse return .{ .ty = ty };
+            // Comptime operands are coerced (rounded) to the peer type first
+            const a = value.floatOf(ip, if (lhs.val) |v| try value.coerceValue(ip, v, ty) else null) orelse return .{ .ty = ty };
+            const b = value.floatOf(ip, if (rhs.val) |v| try value.coerceValue(ip, v, ty) else null) orelse return .{ .ty = ty };
             return .{ .ty = ty, .val = try value.binaryFloat(ip, op, ty, a, b) };
         }
         if (ty != .comptime_int_type and !ip.isInt(ty)) return .{ .ty = ty };
@@ -3194,10 +3311,10 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
 }
 
 /// Whether the place `e` cannot be modified, which makes `&e` a `*const T` (matches the compiler):
-/// const declarations and locals other than `var`s (parameters and captures included), members and
-/// elements of such places, and those reached through a const pointer; expressions that are not
-/// places (calls, literals, and so on) are temporaries that cannot be modified. `types` gives the
-/// types of the subexpressions (`types.exprType(e)`)
+/// declarations other than `var`s (functions included) and locals other than `var`s (parameters
+/// and captures included), members and elements of such places, and those reached through a const
+/// pointer; expressions that are not places (calls, literals, and so on) are temporaries that
+/// cannot be modified. `types` gives the types of the subexpressions (`types.exprType(e)`)
 pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types: anytype, e: ExprId) Error!bool {
     switch (b.expr(e)) {
         .name_ref => |name| {
@@ -3206,11 +3323,23 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
                 // A local of the outer function (referenced in a member of a container in the body)
                 // is in the Body of the member it belongs to
                 .local => |l| (if (l.file == file and l.item == item) b else try r.body(l.file, l.item)).binding(l.binding).kind != .local_var,
-                .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"const",
+                .item => |it| (try r.itemTree(it.file)).items[it.item].kind != .@"var",
                 .file => true,
             };
         },
-        .field_access => |fa| return partIsConst(r, file, item, b, types, fa.lhs),
+        .field_access => |fa| {
+            // A member of a namespace (`State.counter`, `other.global`) is a declaration: its own
+            // `var` / `const` decides
+            if (types.exprType(fa.lhs).asType()) |t| {
+                const ns = try queries.namespaceOfType(r, t) orelse return true;
+                const def = try r.memberDef(ns, fa.field orelse return true) orelse return true;
+                return switch (def) {
+                    .item => |it| (try r.itemTree(it.file)).items[it.item].kind != .@"var",
+                    else => true,
+                };
+            }
+            return partIsConst(r, file, item, b, types, fa.lhs);
+        },
         // `@field(x, name)` is a member of `x`, as `x.name` is
         .builtin_call => |c| return if (std.mem.eql(u8, c.name, "@field") and c.args.len == 2) partIsConst(r, file, item, b, types, c.args[0]) else true,
         .index => |x| return partIsConst(r, file, item, b, types, x.lhs),
@@ -3220,6 +3349,10 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
         },
         // The payload of an optional is part of the optional
         .unwrap_optional => |x| return placeIsConst(r, file, item, b, types, x),
+        // `x orelse return` / `x catch return` with a noreturn right-hand side points into the
+        // payload of `x`
+        .binary => |bin| return if (bin.op == .keyword_orelse and types.exprType(bin.rhs).ty == .noreturn_type) placeIsConst(r, file, item, b, types, bin.lhs) else true,
+        .@"catch" => |c| return if (types.exprType(c.rhs).ty == .noreturn_type) placeIsConst(r, file, item, b, types, c.lhs) else true,
         else => return true,
     }
 }
@@ -3609,7 +3742,10 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
 /// other instances are returned as is
 fn splitIteration(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) Error!struct { inst: ?Index, seed: ?LoopSeed } {
     const i = inst orelse return .{ .inst = null, .seed = null };
-    const key = ip.key(i).instance;
+    const key = switch (ip.key(i)) {
+        .instance => |x| x,
+        else => return .{ .inst = i, .seed = null },
+    };
     const it = key.iteration orelse return .{ .inst = i, .seed = null };
     if (key.file != owner.file or key.decl != owner.item) return .{ .inst = i, .seed = null };
     const seed: LoopSeed = .{ .binding = it.binding, .index = it.index };
@@ -3745,6 +3881,46 @@ pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const Type
         }
     }
     return .{ .count = std.math.cast(u32, n), .value = found };
+}
+
+/// The payloads (union fields) that the `inline` prong `prongs[pi]` of a switch on the tagged
+/// union `ty` is instantiated for, in order: one per item, and for `inline else`, one per field
+/// that no other prong names, in declaration order. Null when the prong is not inline or an item
+/// cannot be evaluated.
+pub fn inlineUnionPayloads(r: *Resolver, body: *const Body, exprs: []const TypedValue, prongs: []const Body.Prong, pi: usize, ty: Index) Error!?[]const eval.Field {
+    const prong = prongs[pi];
+    if (!prong.is_inline) return null;
+    const ip = r.ctx.db.env.ip;
+    const fields = try eval.fieldNames(r, ty);
+    if (!prong.is_else) {
+        const out = try r.arena.alloc(eval.Field, prong.items.len);
+        for (prong.items, out) |item, *o| {
+            const name = itemTagName(ip, body, exprs, item) orelse return null;
+            o.* = for (fields) |f| {
+                if (std.mem.eql(u8, f.name, name)) break f;
+            } else return null;
+        }
+        return out;
+    }
+    var named: std.ArrayList([]const u8) = .empty;
+    for (prongs, 0..) |p, k| {
+        if (k == pi) continue;
+        for (p.items) |item| try named.append(r.arena, itemTagName(ip, body, exprs, item) orelse return null);
+    }
+    var out: std.ArrayList(eval.Field) = .empty;
+    for (fields) |f| if (!hasName(named.items, f.name)) try out.append(r.arena, f);
+    return out.items;
+}
+
+/// Tag name of a switch prong item on a tagged union: an enum literal, or a comptime-known tag
+fn itemTagName(ip: *InternPool, body: *const Body, exprs: []const TypedValue, item: ExprId) ?[]const u8 {
+    return switch (body.expr(item)) {
+        .enum_literal => |n| n,
+        else => switch (ip.key((if (@backingInt(item) < exprs.len) exprs[@backingInt(item)].val else null) orelse return null)) {
+            .enum_tag => |tag| tag.name,
+            else => null,
+        },
+    };
 }
 
 fn hasName(names: []const []const u8, name: []const u8) bool {

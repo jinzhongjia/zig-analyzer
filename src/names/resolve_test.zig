@@ -58,6 +58,9 @@ pub const World = struct {
         return .{ .file = file, .cursor = @intCast(cursor orelse 0) };
     }
 
+    /// `FileEntry.compile` refers to the compilation rooted at the module with the same index (the
+    /// builtin of that module is the one its standard library uses, and its standard library is
+    /// `std_root`); compilation 0 exists even without modules
     pub fn setGraph(w: *World, std_root: ?FileId, modules: []const ModuleGraph.Module, files: []const ModuleGraph.FileEntry) !void {
         const g = try testing.allocator.create(ModuleGraph);
         const sorted = try w.arena.allocator().dupe(ModuleGraph.FileEntry, files);
@@ -66,7 +69,9 @@ pub const World = struct {
                 return @backingInt(a.file) < @backingInt(b.file);
             }
         }.lt);
-        g.* = .{ .arena = .{}, .std_root = std_root, .modules = modules, .files = sorted, .default_builtin = w.default_builtin };
+        const compiles = try w.arena.allocator().alloc(ModuleGraph.Compile, @max(modules.len, 1));
+        for (compiles, 0..) |*c, i| c.* = if (i < modules.len) .{ .root = modules[i].root, .std_root = std_root, .builtin = modules[i].builtin } else .{ .root = null, .std_root = std_root };
+        g.* = .{ .arena = .{}, .std_root = std_root, .modules = modules, .compiles = compiles, .files = sorted, .default_builtin = w.default_builtin };
         w.db.beginWrite();
         defer w.db.endWrite();
         try w.db.set(ModuleGraph.Input, {}, g, .low);
@@ -215,10 +220,10 @@ pub const World = struct {
                 } else if (!std.mem.startsWith(u8, attr, "deps:")) return error.FixtureUnknownAttribute;
             }
             if (is_std) {
-                try entries.append(a, .{ .file = id, .module = ModuleGraph.std_module, .root_module = 0 });
+                try entries.append(a, .{ .file = id, .module = ModuleGraph.std_module, .compile = 0 });
                 if (std.mem.endsWith(u8, b.path, "/std.zig")) std_root = id;
             } else if (in.items.len != 0) {
-                try entries.append(a, .{ .file = id, .module = in.items[0], .root_module = root_of[in.items[0]], .others = in.items[1..] });
+                try entries.append(a, .{ .file = id, .module = in.items[0], .compile = root_of[in.items[0]], .others = in.items[1..] });
             }
         }
         try w.setGraph(std_root, modules, entries.items);
@@ -312,7 +317,7 @@ test "fixture builds the module graph from file attributes" {
             if (x.file == f.file(e.path)) break x;
         } else return error.TestUnexpectedResult;
         try testing.expectEqual(e.module, entry.module);
-        try testing.expectEqual(e.root, entry.root_module);
+        try testing.expectEqual(e.root, entry.compile);
         try testing.expectEqualSlices(u32, e.others, entry.others);
     }
     // Files without attributes are not in the module graph
@@ -475,10 +480,10 @@ test "goto on a module import that differs between the modules of a file lists e
         .{ .root = test_cfg.file, .imports = &.{} },
         .{ .root = util.file, .imports = &.{} },
     }, &.{
-        .{ .file = main.file, .module = 0, .root_module = 0, .others = &.{1} },
-        .{ .file = exe_cfg.file, .module = 2, .root_module = 0 },
-        .{ .file = test_cfg.file, .module = 3, .root_module = 1 },
-        .{ .file = util.file, .module = 4, .root_module = 0 },
+        .{ .file = main.file, .module = 0, .compile = 0, .others = &.{1} },
+        .{ .file = exe_cfg.file, .module = 2, .compile = 0 },
+        .{ .file = test_cfg.file, .module = 3, .compile = 1 },
+        .{ .file = util.file, .module = 4, .compile = 0 },
     });
     const at = struct {
         fn of(needle: []const u8) u32 {

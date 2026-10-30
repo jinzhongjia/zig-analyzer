@@ -253,8 +253,8 @@ pub fn stdRootLookup(r: *Resolver, def: Def) resolve.Error!?Problem {
         } else break;
     } else return null;
     if (try r.ctx.get(database.ModuleGraph.Input, {})) |graph| if (graph.entry(it.file) != null) {
-        const is_root = for (graph.files) |e| {
-            if (graph.modules[e.root_module].root == it.file) break true;
+        const is_root = for (graph.compiles) |c| {
+            if (c.root == it.file) break true;
         } else false;
         if (!is_root) return null;
     };

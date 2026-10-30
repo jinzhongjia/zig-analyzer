@@ -202,7 +202,8 @@ fn fnProto(p: *Parser) Error!CompletedMarker {
     _ = try clause(p, .keyword_linksection, .linksection_clause);
     _ = try clause(p, .keyword_callconv, .callconv_clause);
     _ = try p.eat(.bang);
-    if (try typeExpr(p) == null) try p.err("expected return type");
+    // After an unclosed parameter list, the next declaration is not the return type
+    if (atContainerDecl(p) or try typeExpr(p) == null) try p.err("expected return type");
     return m.complete(p, .fn_proto);
 }
 
@@ -219,7 +220,10 @@ fn paramList(p: *Parser) Error!void {
                 try p.err("expected ')'");
                 break;
             },
-            else => {},
+            else => if (atListEnd(p)) {
+                try p.err("expected ')'");
+                break;
+            },
         }
         const before = p.pos;
         try param(p);
@@ -234,10 +238,32 @@ fn paramList(p: *Parser) Error!void {
                 try p.err("expected ')'");
                 break;
             },
-            else => try p.err("expected ',' after parameter"),
+            else => if (!atListEnd(p)) try p.err("expected ',' after parameter"),
         }
     }
     _ = try m.complete(p, .param_list);
+}
+
+/// Whether the current token starts a declaration that is never a statement or an expression:
+/// a list or block still open there is unclosed, and the declaration belongs to the container
+/// (`fn` with a name: a function type cannot have one)
+fn atContainerDecl(p: *Parser) bool {
+    return switch (p.peek()) {
+        .keyword_pub, .keyword_test, .keyword_export, .keyword_threadlocal, .keyword_noinline => true,
+        .keyword_extern => switch (p.nth(1)) {
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => false,
+            else => true,
+        },
+        .keyword_fn => p.nth(1) == .identifier,
+        .keyword_inline => p.nth(1) == .keyword_fn,
+        else => false,
+    };
+}
+
+/// Whether the current token cannot start or continue an element of a parameter, argument,
+/// initializer or error set list, but starts a declaration: the list is unclosed and ends here
+fn atListEnd(p: *Parser) bool {
+    return p.at(.keyword_const) or p.at(.keyword_var) or atContainerDecl(p);
 }
 
 fn param(p: *Parser) Error!void {
@@ -309,7 +335,8 @@ fn block(p: *Parser, started: ?Marker) Error!CM {
     while (true) {
         switch (p.peek()) {
             .r_brace, .eof => break,
-            else => {},
+            // The block is unclosed: the declaration belongs to the enclosing container
+            else => if (atContainerDecl(p)) break,
         }
         const before = p.pos;
         try statement(p, true);
@@ -703,12 +730,11 @@ fn switchExpr(p: *Parser, m: Marker) Error!CompletedMarker {
                 .r_brace, .eof => break,
                 else => {},
             }
+            // A token that cannot start a prong (such as a `const` statement after an unclosed
+            // switch) ends the prong list, as in `std.zig.Parse`
             const before = p.pos;
             try switchProng(p);
-            if (p.pos == before) {
-                try p.errBump("expected switch prong");
-                continue;
-            }
+            if (p.pos == before) break;
             switch (p.peek()) {
                 .comma => try p.bump(),
                 .r_brace => {},
@@ -750,7 +776,11 @@ fn switchProng(p: *Parser) Error!void {
         }
     }
     _ = try cm.complete(p, .switch_case);
-    _ = try p.expect(.equal_angle_bracket_right);
+    if (!try p.expect(.equal_angle_bracket_right) and p.atLineStart()) {
+        // Items still being typed above the next prong: the next line is not this prong's body
+        _ = try m.complete(p, .switch_prong);
+        return;
+    }
     try optPayload(p);
     if (try singleAssignExpr(p) == null) try p.err("expected expression");
     _ = try m.complete(p, .switch_prong);
@@ -915,7 +945,7 @@ fn initList(p: *Parser) Error!void {
     try p.bump(); // {
     while (true) {
         if (try p.eat(.r_brace)) break;
-        if (p.atEof()) {
+        if (p.atEof() or atListEnd(p)) {
             try p.err("expected '}'");
             break;
         }
@@ -945,7 +975,7 @@ fn initList(p: *Parser) Error!void {
                 try p.err("expected '}'");
                 break;
             },
-            else => try p.err("expected ','"),
+            else => if (!atListEnd(p)) try p.err("expected ','"),
         }
     }
     _ = try m.complete(p, .init_list);
@@ -1022,7 +1052,13 @@ fn errorUnionExpr(p: *Parser) Error!CM {
 }
 
 fn suffixExpr(p: *Parser) Error!CM {
+    // A `.` without a name yet is an element being typed: what follows belongs to the next one
+    const nameless_literal = p.at(.period) and switch (p.nth(1)) {
+        .identifier, .l_brace => false,
+        else => true,
+    };
     var lhs = try primaryTypeExpr(p) orelse return null;
+    if (nameless_literal) return lhs;
     while (true) {
         switch (p.peek()) {
             .l_bracket => {
@@ -1046,6 +1082,9 @@ fn suffixExpr(p: *Parser) Error!CM {
             },
             .period => switch (p.nth(1)) {
                 .identifier => {
+                    // `.na` typed above a line starting with `.name` (the next field, prong or
+                    // argument): an enum literal never has fields, so the literal ends here
+                    if (lhs.kind == .enum_literal and p.atLineStart()) return lhs;
                     const m = try lhs.precede(p);
                     try p.bump();
                     try p.bump();
@@ -1082,7 +1121,7 @@ fn argList(p: *Parser) Error!void {
     try p.bump(); // (
     while (true) {
         if (try p.eat(.r_paren)) break;
-        if (p.atEof()) {
+        if (p.atEof() or atListEnd(p)) {
             try p.err("expected ')'");
             break;
         }
@@ -1105,7 +1144,7 @@ fn argList(p: *Parser) Error!void {
                 try p.err("expected ')'");
                 break;
             },
-            else => try p.err("expected ',' after parameter"),
+            else => if (!atListEnd(p)) try p.err("expected ',' after parameter"),
         }
     }
     _ = try m.complete(p, .arg_list);
@@ -1213,7 +1252,10 @@ fn errorSetBody(p: *Parser) Error!void {
                 try p.err("expected '}'");
                 break;
             },
-            else => {},
+            else => if (atListEnd(p)) {
+                try p.err("expected '}'");
+                break;
+            },
         }
         while (p.at(.doc_comment)) try p.bump();
         if (!try p.eat(.identifier)) {
@@ -1223,7 +1265,7 @@ fn errorSetBody(p: *Parser) Error!void {
         switch (p.peek()) {
             .comma => try p.bump(),
             .r_brace => {},
-            else => try p.err("expected ','"),
+            else => if (!atListEnd(p)) try p.err("expected ','"),
         }
     }
 }
