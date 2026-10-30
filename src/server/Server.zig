@@ -3211,17 +3211,19 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 }
 
 /// Starts the project for a root directory; does nothing if the root directory already has a
-/// project (startup and workspace folder changes may happen concurrently). Does not start when the
-/// user's zig differs from the version zig-analyzer was built with: the build graph format is
-/// defined by the standard library and cannot be read. Such projects get only live diagnostics
-/// (zig ast-check) and are not compiled in single-file mode (files that use named modules would
-/// report missing modules).
-fn startWorkspace(server: *Server, root: []const u8) void {
+/// project (startup and workspace folder changes may happen concurrently), or when it is no longer
+/// a root directory with a build.zig (the folder was removed, or its build.zig deleted, after the
+/// caller looked it up). Does not start when the user's zig differs from the version zig-analyzer
+/// was built with: the build graph format is defined by the standard library and cannot be read.
+/// Such projects get only live diagnostics (zig ast-check) and are not compiled in single-file
+/// mode (files that use named modules would report missing modules).
+pub fn startWorkspace(server: *Server, root: []const u8) void {
     if (server.isShuttingDown() or !server.buildFlags().build) return;
     if (server.zigEnv()) |env| if (!env.matchesBuiltin()) return;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
+        if (!server.isProjectRoot(root)) return;
         for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, root)) return;
     }
     const ws = Workspace.start(server, root, 0) catch |err| {
@@ -3231,12 +3233,25 @@ fn startWorkspace(server: *Server, root: []const u8) void {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     // The list takes over the reference returned by `start`. If a project was started for the same
-    // root directory meanwhile, or the list cannot grow, the new instance is discarded.
-    const added = server.visibleFor(root) == null and
+    // root directory meanwhile, the root directory was removed or lost its build.zig meanwhile, or
+    // the list cannot grow, the new instance is discarded. A removal updates the root directories
+    // before it takes the project out of this list, so either it is seen here or it finds the
+    // project in the list.
+    const added = server.isProjectRoot(root) and server.visibleFor(root) == null and
         (if (server.workspaces.append(server.gpa, ws)) |_| true else |_| false);
     if (!added) ws.stop();
     ws.placed.set(server.io);
     if (!added) ws.release();
+}
+
+/// `root` is a root directory recorded as having a build.zig
+fn isProjectRoot(server: *Server, root: []const u8) bool {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    for (server.roots.items, server.root_has_build.items) |r, has_build| {
+        if (server.vfs.samePath(r, root)) return has_build;
+    }
+    return false;
 }
 
 /// Adds a workspace root directory (`uri` is the URI of the directory). Starts its project
