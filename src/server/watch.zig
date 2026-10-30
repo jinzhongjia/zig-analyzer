@@ -3,11 +3,12 @@
 //! when `files.watcher` is configured as `server`.
 //!
 //! Files of interest: interned `.zig` / `.zon` files (analysis reads any imported file from disk
-//! on demand), plus `build.zig`, `build.zig.zon`, and `zig-analyzer.zon` in each workspace root;
-//! libraries, which never change, are excluded (see `Server.watchable`). Changes are handled as
-//! `workspace/didChangeWatchedFiles` notifications, along the same path as the client's
-//! notifications; open documents are skipped, since their buffers take precedence and saves in the
-//! editor are handled by `didSave`.
+//! on demand), plus `build.zig`, `build.zig.zon`, and `zig-analyzer.zon` in each workspace root,
+//! and the configure input directories of projects (see `Server.configureInputDirs`), whose
+//! created and deleted entries are reported too; libraries, which never change, are excluded (see
+//! `Server.watchable`). Changes are handled as `workspace/didChangeWatchedFiles` notifications,
+//! along the same path as the client's notifications; open documents are skipped, since their
+//! buffers take precedence and saves in the editor are handled by `didSave`.
 //!
 //! The directories containing these files are watched with the operating system's native
 //! notifications: inotify on Linux, FSEvents on macOS, directory change notifications on Windows.
@@ -89,6 +90,11 @@ pub const Watcher = struct {
     /// Directories of files of interest that do not exist yet: identity key → path (their nearest
     /// existing ancestors are watched instead)
     missing: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// Configure input directories whose entries are of interest (see
+    /// `Server.configureInputDirs`): identity keys in `state_arena`. Each is also a file of
+    /// interest itself, so its appearance and disappearance, and its modification time when
+    /// polled, are noticed.
+    entry_dirs: std.StringHashMapUnmanaged(void) = .empty,
     /// Files polled because their directory cannot be watched (paths are in `state_arena`)
     fallback: std.ArrayList([]const u8) = .empty,
     poller: Poller,
@@ -130,6 +136,7 @@ pub const Watcher = struct {
         w.fallback.deinit(w.gpa);
         w.files.deinit(w.gpa);
         w.missing.deinit(w.gpa);
+        w.entry_dirs.deinit(w.gpa);
         w.state_arena.deinit();
         w.poller.deinit();
         w.gpa.destroy(w);
@@ -181,27 +188,39 @@ pub const Watcher = struct {
     }
 
     /// When the client detects external changes, the initially registered globs cover only
-    /// `.zig` and `.zon`: other interned files (files used by `@embedFile`) are additionally
-    /// registered by file name (`**/<file name>`; notifications for other files with the same
-    /// name are ignored, since those are not interned). A file name containing glob special
-    /// characters cannot be written as a glob and is not registered.
+    /// `.zig` and `.zon`: other interned files (files used by `@embedFile`, configure inputs) are
+    /// additionally registered by file name (`**/<file name>`; notifications for other files with
+    /// the same name are ignored, since those are not interned), and configure input directories
+    /// by their name and their entries (`**/<name>`, `**/<name>/*`). A name containing glob
+    /// special characters cannot be written as a glob and is not registered.
     fn registerClientGlobs(w: *Watcher) Allocator.Error!void {
         const server = w.server;
         var arena: std.heap.ArenaAllocator = .init(w.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const rules = try server.originRules(a);
-        var out: std.Io.Writer.Allocating = .init(a);
-        var added: usize = 0;
+        var globs: std.ArrayList([]const u8) = .empty;
         for (0..server.vfs.count()) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
             if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
             if (!server.watchable(rules, path)) continue;
-            const base = std.fs.path.basename(path);
-            if (std.mem.indexOfAny(u8, base, "*?[]{}") != null or w.client_names.contains(base)) continue;
-            try w.client_names.put(w.gpa, try w.gpa.dupe(u8, base), {});
+            try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{std.fs.path.basename(path)}));
+        }
+        for (try server.configureInputDirs(a)) |dir| {
+            if (!server.watchable(rules, dir)) continue;
+            const base = std.fs.path.basename(dir);
+            try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{base}));
+            try globs.append(a, try std.fmt.allocPrint(a, "**/{s}/*", .{base}));
+        }
+        var out: std.Io.Writer.Allocating = .init(a);
+        var added: usize = 0;
+        for (globs.items) |glob| {
+            const name = glob["**/".len..];
+            const literal = if (std.mem.endsWith(u8, name, "/*")) name[0 .. name.len - 2] else name;
+            if (std.mem.indexOfAny(u8, literal, "*?[]{}") != null or w.client_names.contains(name)) continue;
+            try w.client_names.put(w.gpa, try w.gpa.dupe(u8, name), {});
             out.writer.writeAll(if (added == 0) "{\"watchers\": [" else ", ") catch return error.OutOfMemory;
-            std.json.Stringify.value(.{ .globPattern = try std.fmt.allocPrint(a, "**/{s}", .{base}) }, .{}, &out.writer) catch return error.OutOfMemory;
+            std.json.Stringify.value(.{ .globPattern = glob }, .{}, &out.writer) catch return error.OutOfMemory;
             added += 1;
         }
         if (added == 0) return;
@@ -277,6 +296,7 @@ pub const Watcher = struct {
         none.deinit(w.gpa);
         w.files.clearRetainingCapacity();
         w.missing.clearRetainingCapacity();
+        w.entry_dirs.clearRetainingCapacity();
         w.fallback.clearRetainingCapacity();
         _ = w.state_arena.reset(.retain_capacity);
         w.poller.reset();
@@ -316,6 +336,14 @@ pub const Watcher = struct {
                 try files.put(gpa, try w.key(na, path), path);
             };
         }
+        var entry_dirs: std.StringHashMapUnmanaged(void) = .empty;
+        errdefer entry_dirs.deinit(gpa);
+        for (try server.configureInputDirs(na)) |dir| {
+            if (!server.watchable(rules, dir)) continue;
+            const k = try w.key(na, dir);
+            try files.put(gpa, k, dir);
+            try entry_dirs.put(gpa, k, {});
+        }
 
         // Each file's directory: watch it if it exists, otherwise its nearest existing ancestor
         var dirs: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
@@ -340,6 +368,16 @@ pub const Watcher = struct {
             if (!gop.found_existing) gop.value_ptr.* = watch_dir;
             target.* = @intCast(gop.index);
         }
+        // Configure input directories are watched themselves for their entries
+        var entry_watches: std.ArrayList(u32) = .empty;
+        var entries = entry_dirs.keyIterator();
+        while (entries.next()) |k| {
+            const dir = files.get(k.*).?;
+            if (!isDir(server.io, dir)) continue;
+            const gop = try dirs.getOrPut(gpa, k.*);
+            if (!gop.found_existing) gop.value_ptr.* = dir;
+            try entry_watches.append(a, @intCast(gop.index));
+        }
 
         var failed: std.ArrayList([]const u8) = .empty;
         defer failed.deinit(gpa);
@@ -351,6 +389,13 @@ pub const Watcher = struct {
         errdefer fallback.deinit(gpa);
         if (failed_set.count() != 0) for (files.values(), targets) |path, target| {
             if (failed_set.contains(dirs.keys()[target])) try fallback.append(gpa, path);
+        };
+        // A configure input directory that cannot be watched: its modification time is polled
+        for (entry_watches.items) |i| if (failed_set.contains(dirs.keys()[i])) {
+            const dir = dirs.values()[i];
+            for (fallback.items) |p| {
+                if (p.ptr == dir.ptr) break;
+            } else try fallback.append(gpa, dir);
         };
 
         // Directories that did not exist before but have appeared now: files of interest already in
@@ -369,6 +414,8 @@ pub const Watcher = struct {
         w.files = files;
         w.missing.deinit(gpa);
         w.missing = missing;
+        w.entry_dirs.deinit(gpa);
+        w.entry_dirs = entry_dirs;
         w.fallback.deinit(gpa);
         w.fallback = fallback;
         w.state_arena.deinit();
@@ -404,16 +451,24 @@ pub const Watcher = struct {
                 const k = try w.key(a, ev.path);
                 if (w.files.get(k)) |path| {
                     try pending.add(a, path, if (ev.kind == .created) .created else .changed);
-                } else if (ev.kind == .created) {
-                    // Not known whether it is a directory (Windows notifications do not tell):
-                    // a path leading to a nonexistent directory has appeared
-                    if (w.leadsToMissing(k)) try dirs.put(a, k, {});
-                    if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
+                } else {
+                    // An entry created in or removed from a configure input directory
+                    if (ev.kind != .changed and w.inEntryDir(k)) try pending.add(a, ev.path, if (ev.kind == .created) .created else .changed);
+                    if (ev.kind == .created) {
+                        // Not known whether it is a directory (Windows notifications do not
+                        // tell): a path leading to a nonexistent directory has appeared
+                        if (w.leadsToMissing(k)) try dirs.put(a, k, {});
+                        if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
+                    }
                 }
             },
             .dir_created, .dir_gone, .overflow => {
                 rescan = true;
-                if (ev.path.len == 0) all = true else try dirs.put(a, try w.key(a, ev.path), {});
+                if (ev.path.len == 0) all = true else {
+                    const k = try w.key(a, ev.path);
+                    try dirs.put(a, k, {});
+                    if (ev.kind != .overflow and w.inEntryDir(k)) try pending.add(a, ev.path, if (ev.kind == .dir_created) .created else .changed);
+                }
             },
         };
         if (!rescan and created.items.len != 0) {
@@ -431,6 +486,11 @@ pub const Watcher = struct {
         return true;
     }
 
+    /// `k` (an identity key) is an entry of a configure input directory
+    fn inEntryDir(w: *const Watcher, k: []const u8) bool {
+        return w.entry_dirs.contains(std.fs.path.dirname(k) orelse return false);
+    }
+
     /// `k` (an identity key) is a nonexistent directory itself or one of its ancestors
     fn leadsToMissing(w: *const Watcher, k: []const u8) bool {
         for (w.missing.keys()) |m| if (w.server.vfs.isUnder(m, k)) return true;
@@ -438,13 +498,16 @@ pub const Watcher = struct {
     }
 
     /// Generates change events from the current state of the files and hands them to the server.
-    /// Open documents are skipped, since their buffers take precedence.
+    /// Open documents are skipped, since their buffers take precedence, except entries created in
+    /// or deleted from configure input directories: such an entry reconfigures the project
+    /// whether or not it is open.
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         var events: std.ArrayList(types.FileEvent) = .empty;
         for (pending.paths.keys(), pending.paths.values()) |path, hint| {
-            if (server.isOpen(path)) continue;
-            const kind: types.FileChangeType = if (stat(server.io, path) == null) .Deleted else if (hint == .created) .Created else .Changed;
+            const exists = stat(server.io, path) != null;
+            if (server.isOpen(path) and ((exists and hint != .created) or !w.inEntryDir(try w.key(a, path)))) continue;
+            const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
             try events.append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
         if (events.items.len == 0) return;

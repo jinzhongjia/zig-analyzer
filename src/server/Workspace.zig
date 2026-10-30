@@ -440,6 +440,35 @@ pub fn isBuildScript(ws: *Workspace, file: FileId) bool {
     return ws.build_scripts.contains(file);
 }
 
+/// How a path changed on disk, for `changesConfigureInput`
+pub const PathChange = enum { created, changed, deleted };
+
+/// Whether a change of `path` (an absolute, normalized path) changes an input of the configure
+/// phase that build.zig declares (see `ProjectModel.configure_inputs`): such a file itself, or
+/// such a directory itself or an entry created in or deleted from it. Outside watch mode the
+/// maker does not reconfigure by itself, so the project is restarted.
+pub fn changesConfigureInput(ws: *Workspace, path: []const u8, change: PathChange) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const model = &(ws.model orelse return false);
+    const vfs = &ws.server.vfs;
+    for (model.configure_inputs) |input| {
+        if (path.len == input.path.len and vfs.isUnder(path, input.path)) return true;
+        if (!input.directory or change == .changed) continue;
+        const dir = std.fs.path.dirname(path) orelse continue;
+        if (dir.len == input.path.len and vfs.isUnder(dir, input.path)) return true;
+    }
+    return false;
+}
+
+/// Directories among the configure inputs (see `changesConfigureInput`), copied into `arena`
+pub fn configureInputDirs(ws: *Workspace, arena: Allocator, out: *std.ArrayList([]const u8)) Allocator.Error!void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    const model = &(ws.model orelse return);
+    for (model.configure_inputs) |input| if (input.directory) try out.append(arena, try arena.dupe(u8, input.path));
+}
+
 // ── Background task ──────────────────────────────────────────────────
 
 fn run(ws: *Workspace) Io.Cancelable!void {
@@ -578,6 +607,12 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 else
                     try .initEmpty(ws.gpa, ws.model.?.steps.len);
             }
+            // Files among the configure inputs are watched like the other known files (interned);
+            // the watcher takes the directories among them from `configureInputDirs`
+            for (ws.model.?.configure_inputs) |input| if (!input.directory) {
+                _ = try ws.server.vfs.intern(input.path);
+            };
+            if (ws.model.?.configure_inputs.len != 0) ws.server.resyncWatcher();
             try ws.recomputeCompileSet();
             // If the old instance has no model worth keeping, there is no need to wait for the
             // whole build to finish

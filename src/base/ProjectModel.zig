@@ -35,6 +35,11 @@ producers: []const ?u32 = &.{},
 /// the project defines it, otherwise the default step), and replaced by `setDiagnosticsSteps`
 /// when the user configures `diagnostics.steps`
 diagnostics_steps: []const u32 = &.{},
+/// Inputs of the configure phase that build.zig declares (`b.dependOnFileContents`,
+/// `dependOnFileMetadata`, `dependOnDirectoryContents`, ...): `zig build` runs build.zig again when
+/// such a file is created, deleted or changed, or when such a directory gains, loses or renames
+/// an entry (not recursive)
+configure_inputs: []const ConfigureInput = &.{},
 
 pub const Step = struct {
     name: []const u8,
@@ -95,6 +100,12 @@ pub const Builtin = struct {
         }
         return true;
     }
+};
+
+pub const ConfigureInput = struct {
+    /// Absolute path
+    path: []const u8,
+    directory: bool,
 };
 
 pub const Module = struct {

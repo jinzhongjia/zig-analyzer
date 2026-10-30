@@ -1601,11 +1601,13 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
-        if (!ws.owns(id)) continue;
-        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id)) {
-            // Outside watch mode, the maker does not reconfigure automatically: restart
+        // Outside watch mode, the maker does not reconfigure automatically: restart. Build
+        // scripts and configure inputs may lie outside the project's files.
+        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id) or
+            ws.changesConfigureInput(path, .changed))
+        {
             server.restartWorkspace(ws, 0);
-        } else {
+        } else if (ws.owns(id)) {
             server.requestBuild(ws);
         }
     }
@@ -1752,6 +1754,15 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             if (std.mem.eql(u8, dir, ws.root)) break true;
         } else for (known.items) |file| {
             if (ws.isBuildScript(file)) break true;
+        } else for (events.keys(), events.values()) |path, kind| {
+            const normalized = try Vfs.normalize(.native, arena, path) orelse continue;
+            const change: Workspace.PathChange = switch (kind) {
+                .Created => .created,
+                .Changed => .changed,
+                .Deleted => .deleted,
+                _ => .changed,
+            };
+            if (ws.changesConfigureInput(normalized, change)) break true;
         } else false;
         if (reconfigure) {
             const started = for (refreshed.items) |dir| {
@@ -1861,8 +1872,22 @@ pub fn isOpen(server: *Server, path: []const u8) bool {
 }
 
 /// The watched files or the watch method may have changed: tells the watch task to recompute
-fn resyncWatcher(server: *Server) void {
+pub fn resyncWatcher(server: *Server) void {
     if (server.watcher) |w| w.requestResync();
+}
+
+/// Directories among the configure inputs of all projects, including new instances that have
+/// not replaced the old ones yet (see `Workspace.changesConfigureInput`): an entry created in or
+/// deleted from them reconfigures the project, so they are watched. Copied into `arena`.
+pub fn configureInputDirs(server: *Server, arena: Allocator) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| {
+        try ws.configureInputDirs(arena, &out);
+        if (ws.successor) |s| try s.configureInputDirs(arena, &out);
+    }
+    return out.items;
 }
 
 /// Whether the server discovers external changes itself (see `Config.Watcher`)

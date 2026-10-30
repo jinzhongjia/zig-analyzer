@@ -315,3 +315,92 @@ test "a builtin.zig deleted from the cache keeps its target parameters" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+const examples_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) !void {
+    \\    const mylib = b.addModule("mylib", .{ .root_source_file = b.path("src/mylib.zig"), .target = b.graph.host });
+    \\    const check = b.step("check", "Check");
+    \\    b.dependOnDirectoryContents(b.path("examples"));
+    \\    var dir = try b.root.openDir(b.graph.io, "examples", .{ .iterate = true });
+    \\    defer dir.close(b.graph.io);
+    \\    var it = dir.iterate();
+    \\    while (try it.next(b.graph.io)) |entry| {
+    \\        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+    \\        const exe = b.addExecutable(.{ .name = b.dupe(entry.name[0 .. entry.name.len - 4]), .root_module = b.createModule(.{
+    \\            .root_source_file = b.path(b.pathJoin(&.{ "examples", entry.name })),
+    \\            .target = b.graph.host,
+    \\            .imports = &.{.{ .name = "mylib", .module = mylib }},
+    \\        }) });
+    \\        check.dependOn(&exe.step);
+    \\    }
+    \\}
+    \\
+;
+const examples_new =
+    \\const mylib = @import("mylib");
+    \\pub fn main() void {
+    \\    const small: u8 = 300;
+    \\    _ = small;
+    \\    _ = mylib.greet();
+    \\}
+    \\
+;
+
+/// Waits until the server is idle and `cond(ctx)` holds; with the server watching files, the
+/// change may be noticed only after a while. Fails after 60 seconds.
+fn waitUntil(h: *Harness, ctx: anytype, comptime cond: fn (*Harness, @TypeOf(ctx)) anyerror!bool) !void {
+    for (0..600) |_| {
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        if (try cond(h, ctx)) return;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    return error.Timeout;
+}
+
+test "entries created in or deleted from a configure input directory reconfigure the project" {
+    // `b.dependOnDirectoryContents` makes zig build rerun build.zig when the directory gains or
+    // loses entries; a project that is not reconfigured keeps a stale build graph
+    inline for (.{ true, false }) |client_watches| {
+        var project = try fixture.Project.create(&.{
+            .{ .path = "build.zig", .text = examples_build },
+            .{ .path = "src/mylib.zig", .text = "pub fn greet() u32 {\n    return 1;\n}\n" },
+            .{ .path = "examples/a.zig", .text = "const mylib = @import(\"mylib\");\npub fn main() void {\n    _ = mylib.greet();\n}\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const root_uri = try za.base.uri.fromPath(a, project.root);
+        if (client_watches) {
+            _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+        } else {
+            _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+        }
+        try h.notify("initialized", Empty{});
+        _ = try h.request("zig-analyzer/waitIdle", {});
+
+        const new_path = try project.path(a, "examples/new.zig");
+        const new_uri = try za.base.uri.fromPath(a, new_path);
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = new_path, .data = examples_new });
+        try open(&h, new_uri, examples_new);
+        if (client_watches) try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = new_uri, .type = 1 }} });
+        const Has = struct {
+            fn error300(hh: *Harness, uri: []const u8) !bool {
+                return lastHas(hh, uri, "cannot represent integer value '300'");
+            }
+            fn noError300(hh: *Harness, uri: []const u8) !bool {
+                return !try lastHas(hh, uri, "cannot represent integer value '300'");
+            }
+        };
+        try waitUntil(&h, new_uri, Has.error300);
+        try testing.expectEqualStrings("mylib.zig", try gotoFile(&h, new_uri, examples_new, "mylib.gre"));
+
+        try std.Io.Dir.cwd().deleteFile(testing.io, new_path);
+        if (client_watches) try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = new_uri, .type = 3 }} });
+        try waitUntil(&h, new_uri, Has.noError300);
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}

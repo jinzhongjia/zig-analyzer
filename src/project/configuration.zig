@@ -121,6 +121,11 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     } else @backingInt(c.default_step);
     const diagnostics_steps = try a.dupe(u32, &.{default_diag});
     const roots = try a.dupe([]const u8, package_roots.keys());
+    var inputs: std.ArrayList(ProjectModel.ConfigureInput) = .empty;
+    for (c.path_deps) |dep| {
+        const path = try ctx.configureInput(dep) orelse continue;
+        try inputs.append(a, .{ .path = path, .directory = dep.flags.is_directory });
+    }
     // Nothing may be allocated after the arena state is copied into the result: new
     // buffers are not in the copied state and would leak when freed
     return .{
@@ -135,6 +140,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         .default_step = @backingInt(c.default_step),
         .producers = producers,
         .diagnostics_steps = diagnostics_steps,
+        .configure_inputs = inputs.items,
     };
 }
 
@@ -457,6 +463,25 @@ const Ctx = struct {
         return switch (comp.test_runner.u) {
             .default => .{ .test_runner = try std.fs.path.join(ctx.arena, &.{ lib_dir, "compiler", "test_runner.zig" }) },
             .simple, .server => |lp| if (try ctx.resolve(lp.get(ctx.c))) |p| .{ .test_runner = p } else .unknown,
+        };
+    }
+
+    /// Absolute path of a configure input (as the maker resolves it for its configuration cache);
+    /// null for bases the maker does not support there
+    fn configureInput(ctx: Ctx, dep: Configuration.PathDep) Allocator.Error!?[]const u8 {
+        const sub = dep.sub.slice(ctx.c);
+        return switch (dep.flags.base) {
+            // The maker's cwd is the build root
+            .cwd => try ctx.join(ctx.build_root, sub),
+            .local_cache => try ctx.join(ctx.local_cache_root, sub),
+            .global_cache => try ctx.join(ctx.env.global_cache_dir, sub),
+            .zig_lib => try ctx.join(ctx.env.lib_dir, sub),
+            .zig_exe => ctx.env.zig_exe,
+            .build_root => blk: {
+                const package = if (dep.pkg.unwrap()) |p| p.get(ctx.c) else null;
+                break :blk try ctx.join(if (package) |p| try ctx.packageRoot(p) else ctx.build_root, sub);
+            },
+            else => null,
         };
     }
 
