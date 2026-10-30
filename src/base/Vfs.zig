@@ -6,12 +6,13 @@
 //! `C:\Work\A.zig` and `c:/work/a.zig` map to the same FileId.
 //! Externally (display, building URIs), the path as first seen is used.
 //!
-//! Known limitation: only the case of ASCII letters (A-Z) is folded. When a path contains
-//! non-ASCII letters, spellings that the file system treats as the same file but that differ in
-//! bytes map to different FileIds:
-//! - Case of non-ASCII letters: `Été.zig` and `été.zig` (neither NTFS nor APFS distinguishes them);
-//! - The composed and decomposed Unicode forms on APFS: `é` can be U+00E9 or `e` + U+0301 (APFS
-//!   does not distinguish them).
+//! Identity is lexical: symbolic links are not resolved, and only the case of ASCII letters
+//! (A-Z) is folded. Spellings that the file system treats as the same file but that differ in
+//! bytes map to different FileIds: a path through a symbolic link and its target; the case of
+//! non-ASCII letters (`Été.zig` and `été.zig`, which neither NTFS nor APFS distinguishes); the
+//! composed and decomposed Unicode forms on APFS (`é` can be U+00E9 or `e` + U+0301). Where a
+//! tool and the client spell one file differently, the server adds the other spelling as an
+//! alias of the file it already knows (see `alias`), so both spellings map to one FileId.
 
 const std = @import("std");
 const Io = std.Io;
@@ -50,6 +51,9 @@ mutex: Io.Mutex = .init,
 keys: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// One-to-one with `keys`: the normalized path as first seen (original case preserved)
 paths: std.ArrayList([]const u8) = .empty,
+/// Other spellings of interned files (see `alias`): identity key → FileId. An alias is kept for
+/// the lifetime of the Vfs, as FileIds are.
+aliases: std.StringHashMapUnmanaged(FileId) = .empty,
 /// Notified when a new path is interned (e.g. file watching needs to watch the directories of
 /// newly appearing files); called outside the lock, on the thread that interned the path
 listener: std.atomic.Value(?*const Listener) = .init(null),
@@ -83,8 +87,11 @@ fn normalizeOwn(vfs: *const Vfs, file_path: []const u8) Allocator.Error!?[]u8 {
 pub fn deinit(vfs: *Vfs) void {
     for (vfs.keys.keys()) |k| vfs.gpa.free(k);
     for (vfs.paths.items) |p| vfs.gpa.free(p);
+    var aliases = vfs.aliases.keyIterator();
+    while (aliases.next()) |k| vfs.gpa.free(k.*);
     vfs.keys.deinit(vfs.gpa);
     vfs.paths.deinit(vfs.gpa);
+    vfs.aliases.deinit(vfs.gpa);
     vfs.* = undefined;
 }
 
@@ -178,7 +185,7 @@ pub fn shownPath(vfs: *const Vfs, roots: []const []const u8, file_path: []const 
 }
 
 /// Interns a path. The caller must ensure that `file_path` is absolute; the path is normalized
-/// (see `normalize`).
+/// (see `normalize`). An alias (see `alias`) maps to the file it was added for.
 pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
     const normalized = try vfs.normalizeOwn(file_path) orelse unreachable;
     errdefer vfs.gpa.free(normalized);
@@ -189,6 +196,11 @@ pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
         vfs.mutex.lockUncancelable(vfs.io);
         defer vfs.mutex.unlock(vfs.io);
         try vfs.paths.ensureUnusedCapacity(vfs.gpa, 1);
+        if (vfs.aliases.count() != 0 and !vfs.keys.contains(key)) if (vfs.aliases.get(key)) |id| {
+            vfs.gpa.free(key);
+            vfs.gpa.free(normalized);
+            return id;
+        };
         const gop = try vfs.keys.getOrPut(vfs.gpa, key);
         if (gop.found_existing) {
             vfs.gpa.free(key);
@@ -209,7 +221,38 @@ pub fn lookup(vfs: *Vfs, file_path: []const u8) Allocator.Error!?FileId {
     defer vfs.gpa.free(key);
     vfs.mutex.lockUncancelable(vfs.io);
     defer vfs.mutex.unlock(vfs.io);
-    return if (vfs.keys.getIndex(key)) |i| @fromBackingInt(@intCast(i)) else null;
+    if (vfs.keys.getIndex(key)) |i| return @fromBackingInt(@intCast(i));
+    return vfs.aliases.get(key);
+}
+
+/// Makes the absolute path `file_path` another spelling of `id`: `intern` and `lookup` return
+/// `id` for it from now on, while `path(id)` stays the spelling `id` was interned with. Used
+/// when a tool and the client spell one file differently (see `realPath`). Nothing changes
+/// when `file_path` is already interned or an alias.
+pub fn alias(vfs: *Vfs, file_path: []const u8, id: FileId) Allocator.Error!void {
+    const normalized = try vfs.normalizeOwn(file_path) orelse return;
+    defer vfs.gpa.free(normalized);
+    const key = try vfs.identityKey(normalized);
+    vfs.mutex.lockUncancelable(vfs.io);
+    defer vfs.mutex.unlock(vfs.io);
+    if (vfs.keys.contains(key)) return vfs.gpa.free(key);
+    const gop = vfs.aliases.getOrPut(vfs.gpa, key) catch |err| {
+        vfs.gpa.free(key);
+        return err;
+    };
+    if (gop.found_existing) return vfs.gpa.free(key);
+    gop.value_ptr.* = id;
+}
+
+/// The path of the existing file `file_path` with symbolic links resolved and names spelled as
+/// the file system stores them (on macOS, the Unicode form and case of the names on disk); two
+/// spellings name the same file when their real paths are equal. Null when the file cannot be
+/// reached.
+pub fn realPath(io: Io, gpa: Allocator, file_path: []const u8) Allocator.Error!?[:0]u8 {
+    return Io.Dir.cwd().realPathFileAlloc(io, file_path, gpa) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
 }
 
 /// The returned slice is valid for the lifetime of the Vfs.
@@ -303,6 +346,25 @@ test "listener: notified once per new path" {
     _ = try vfs.intern(a);
     _ = try vfs.intern(b);
     try t.expectEqual(2, notified);
+}
+
+test "alias: another spelling maps to the interned file, which keeps its own path" {
+    const t = std.testing;
+    var vfs: Vfs = .initOptions(t.io, t.allocator, .{ .style = .posix, .case = .insensitive });
+    defer vfs.deinit();
+    const id = try vfs.intern("/cellar/zig/lib/std/mem.zig");
+    const other = try vfs.intern("/other.zig");
+    try vfs.alias("/opt/lib/zig/std/./mem.zig", id);
+    try t.expectEqual(id, (try vfs.lookup("/opt/lib/zig/std/mem.zig")).?);
+    try t.expectEqual(id, (try vfs.lookup("/OPT/lib/zig/std/mem.zig")).?);
+    try t.expectEqual(id, try vfs.intern("/opt/lib/zig/std/mem.zig"));
+    try t.expectEqualStrings("/cellar/zig/lib/std/mem.zig", vfs.path(id));
+    try t.expectEqual(2, vfs.count());
+    // An interned path or an existing alias is not redirected
+    try vfs.alias("/other.zig", id);
+    try t.expectEqual(other, (try vfs.lookup("/other.zig")).?);
+    try vfs.alias("/opt/lib/zig/std/mem.zig", other);
+    try t.expectEqual(id, (try vfs.lookup("/opt/lib/zig/std/mem.zig")).?);
 }
 
 test "case-sensitive: different spellings are different files" {

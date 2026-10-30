@@ -2020,3 +2020,90 @@ test "zig version mismatch: files opened before startup get the live diagnostics
     try expectDiagnostics(try h.diagnostics(), "main.zig", &.{ "1:8 zig ast-check: local variable is never mutated", "0:0 zig ast-check: MARKER" });
     try shutdown(&h);
 }
+
+/// Message texts of the last diagnostics published for `uri` (null when none were published)
+fn lastDiagnostics(h: *Harness, uri: []const u8) !?[]const []const u8 {
+    var last: ?[]const []const u8 = null;
+    for (try h.notifications("textDocument/publishDiagnostics")) |m| {
+        const params = m.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("uri").?.string, uri)) continue;
+        const diags = params.get("diagnostics").?.array.items;
+        const texts = try h.arena.allocator().alloc([]const u8, diags.len);
+        for (diags, texts) |d, *t| t.* = d.object.get("message").?.string;
+        last = texts;
+    }
+    return last;
+}
+
+/// Hover text at the start of `needle` in `text` (null without a result)
+fn hoverText(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) !?[]const u8 {
+    const offset = std.mem.indexOf(u8, text, needle).?;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{
+        .line = std.mem.count(u8, text[0..offset], "\n"),
+        .character = offset - line_start,
+    } });
+    const result = resp.object.get("result").?;
+    if (result != .object) return null;
+    return result.object.get("contents").?.object.get("value").?.string;
+}
+
+test "single-file mode through symbolic links: a detached file and the zig installation keep the client's paths" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const one =
+        \\const std = @import("std");
+        \\const data = @embedFile("data.txt");
+        \\pub fn main() void {
+        \\    std.debug.print("{d}\n", .{});
+        \\    _ = data;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "real/scratch/one.zig", .text = one },
+        .{ .path = "real/scratch/data.txt", .text = "hello\n" },
+    });
+    defer project.deinit();
+    // The workspace folder and the zig installation are both reached through symbolic links, as
+    // Homebrew's /opt/homebrew/lib/zig is, while `zig env` reports the installation's real path
+    try project.tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "zig", .{ .is_directory = true });
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "link/scratch"), false);
+    try waitIdle(&h);
+    var std_uris: [3][]const u8 = undefined;
+    var mem_text: []const u8 = undefined;
+    for ([_][]const u8{ "Io/Writer.zig", "debug.zig", "mem.zig" }, &std_uris) |name, *u| {
+        const path = try std.fs.path.join(a, &.{ try project.path(a, "zig/std"), name });
+        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(4 * 1024 * 1024));
+        if (std.mem.eql(u8, name, "mem.zig")) mem_text = text;
+        u.* = try open(&h, path, text);
+    }
+    const writer_uri, const debug_uri, const mem_uri = std_uris;
+    const one_uri = try open(&h, try project.path(a, "link/scratch/one.zig"), one);
+    try waitIdle(&h);
+
+    // Guards against the documents opened through the links being files of their own: the
+    // standard library's error went to the real path and mem.zig was compiled as a root, which
+    // put it in two modules
+    const writer = (try lastDiagnostics(&h, writer_uri)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(1, writer.len);
+    try testing.expect(std.mem.indexOf(u8, writer[0], "too few arguments") != null);
+    const real_writer_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ project.env.lib_dir, "std/Io/Writer.zig" }));
+    try testing.expectEqual(null, try lastDiagnostics(&h, real_writer_uri));
+    try expectNoErrors(&h, mem_uri);
+    try testing.expectEqual(0, ((try lastDiagnostics(&h, one_uri)) orelse return error.TestUnexpectedResult).len);
+    try testing.expectEqual(null, try lastDiagnostics(&h, try za.base.uri.fromPath(a, try project.path(a, "real/scratch/one.zig"))));
+
+    // Goto into the standard library opens the client's document, and hover shows the embedded
+    // file under the workspace folder
+    try testing.expectEqualStrings(try za.base.uri.toPath(a, debug_uri), try definitionPath(&h, one_uri, one, "print"));
+    const embedded = (try hoverText(&h, one_uri, one, "data =")) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, embedded, "data.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, embedded, "/real/") == null);
+    try testing.expect(try hoverText(&h, mem_uri, mem_text, "eql(") != null);
+    try shutdown(&h);
+}

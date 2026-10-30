@@ -293,6 +293,11 @@ doc_versions: std.AutoHashMapUnmanaged(Vfs.FileId, i32) = .empty,
 /// re-encoded from the internal path. For a virtual document, the entry is deleted once its
 /// diagnostics are cleared.
 last_uris: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
+/// Real paths of open documents (see `Vfs.realPath`; null when unreachable), computed when a tool
+/// reports a path the server does not know (see `toolFile`). Guarded by docs_mutex; an entry is
+/// dropped when its document is opened or closed, and all are dropped when files are created or
+/// deleted on disk.
+open_real: std.AutoHashMapUnmanaged(Vfs.FileId, ?[:0]u8) = .empty,
 /// Files currently showing non-empty diagnostics (cleared by publishing an empty list when needed)
 published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 /// Sequence number of diagnostic computations: each computation takes one before reading state
@@ -423,6 +428,8 @@ pub fn deinit(server: *Server) void {
     server.doc_versions.deinit(server.gpa);
     for (server.last_uris.values()) |u| server.gpa.free(u);
     server.last_uris.deinit(server.gpa);
+    server.forgetRealPath(null);
+    server.open_real.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
     server.sent_hash.deinit(server.gpa);
@@ -1621,6 +1628,74 @@ fn fileIdFromUri(server: *Server, arena: Allocator, document_uri: []const u8) !?
     return try server.vfs.intern(path);
 }
 
+/// FileId of a document the client opens. A path the server does not know under this spelling
+/// may reach through symbolic links a file the server knows by its real path, or a file of a
+/// dependency library, whose locations come from tools that resolve symbolic links (`zig env`
+/// locates the Zig installation from the real path of the zig executable, so Homebrew's
+/// `/opt/homebrew/lib/zig` is reported under its `Cellar`): the document's path then becomes an
+/// alias of the file at the real path (see `Vfs.alias`). The file keeps its origin and its
+/// module, and its diagnostics are published on the document's URI.
+fn documentFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
+    const path = try documentPath(arena, document_uri) orelse return null;
+    if (try server.vfs.lookup(path)) |id| return id;
+    if (!isVirtual(path)) if (try Vfs.realPath(server.io, arena, path)) |real| if (!std.mem.eql(u8, real, path)) {
+        const known = try server.vfs.lookup(real) orelse blk: {
+            const rules = try server.originRules(arena);
+            if (!origin.classify(&server.vfs, rules, real, false).isLibrary()) break :blk null;
+            break :blk try server.vfs.intern(real);
+        };
+        if (known) |id| {
+            try server.vfs.alias(path, id);
+            return id;
+        }
+    };
+    return try server.vfs.intern(path);
+}
+
+/// FileId of a path a tool reported (compiler and build results). A path the server does not
+/// know under this spelling may name a file the client has open under another one (through a
+/// symbolic link, or with names in another Unicode normalization form): the path then becomes
+/// an alias of that document (see `Vfs.alias`), and its diagnostics are published on the
+/// document's URI. Only unknown paths are resolved on disk, and only while documents are open.
+pub fn toolFile(server: *Server, path: []const u8) Allocator.Error!Vfs.FileId {
+    if (try server.vfs.lookup(path)) |id| return id;
+    if (try server.openDocumentAt(path)) |id| {
+        try server.vfs.alias(path, id);
+        return id;
+    }
+    return server.vfs.intern(path);
+}
+
+/// The open document whose file on disk is `path` (equal real paths)
+fn openDocumentAt(server: *Server, path: []const u8) Allocator.Error!?Vfs.FileId {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    if (server.open_docs.count() == 0) return null;
+    const real = try Vfs.realPath(server.io, server.gpa, path) orelse return null;
+    defer server.gpa.free(real);
+    for (server.open_docs.keys()) |doc| {
+        const gop = try server.open_real.getOrPut(server.gpa, doc);
+        if (!gop.found_existing) gop.value_ptr.* = Vfs.realPath(server.io, server.gpa, server.vfs.path(doc)) catch |err| {
+            _ = server.open_real.remove(doc);
+            return err;
+        };
+        if (gop.value_ptr.*) |r| if (std.mem.eql(u8, r, real)) return doc;
+    }
+    return null;
+}
+
+/// Drops the cached real path of an open document (`file`, or all when null). Callers hold
+/// docs_mutex.
+fn forgetRealPath(server: *Server, file: ?Vfs.FileId) void {
+    if (file) |f| {
+        if (server.open_real.fetchRemove(f)) |kv| if (kv.value) |r| server.gpa.free(r);
+        return;
+    }
+    var it = server.open_real.valueIterator();
+    while (it.next()) |r| if (r.*) |p| server.gpa.free(p);
+    server.open_real.clearRetainingCapacity();
+}
+
 /// Path of a document: the path of a file URI; a document with a non-file URI such as `untitled:`
 /// maps to a path named after the URI under a virtual directory (it does not clash with real
 /// files and does not exist on disk, so it is not passed to the compiler; other features treat it
@@ -1653,12 +1728,13 @@ fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
 }
 
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
-    const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    const id = try server.documentFile(arena, params.textDocument.uri) orelse return;
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.uri);
         const last = try server.gpa.dupe(u8, params.textDocument.uri);
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
+        server.forgetRealPath(id);
         const gop = server.open_docs.getOrPut(server.gpa, id) catch |err| {
             server.gpa.free(owned);
             server.gpa.free(last);
@@ -1741,6 +1817,7 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
+        server.forgetRealPath(id);
     }
     server.publishDependents(&.{id});
     server.requestRefresh();
@@ -1874,6 +1951,13 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     }
     // A folder created, deleted, moved or renamed is reported by its own path only
     const folders = try server.addFolderContents(arena, &events);
+    // A file created or deleted may change what the paths of open documents resolve to
+    for (events.values()) |kind| if (kind != .Changed) {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        server.forgetRealPath(null);
+        break;
+    };
     // Source files created or deleted under the root directories change what find references and
     // rename search
     const rescan = folders or try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
@@ -3042,14 +3126,14 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             defer compiled.deinit(server.gpa);
             errors = compiled.errors.errorMessageCount();
             for (compiled.inputs) |p| {
-                const id = server.vfs.intern(p) catch continue;
+                const id = server.toolFile(p) catch continue;
                 inputs.put(server.gpa, id, {}) catch continue;
             }
             break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
         };
         var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
         if (result) |r| for (r.files.keys(), r.files.values()) |p, *fr| {
-            const id = server.vfs.intern(p) catch continue;
+            const id = server.toolFile(p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
         // During the compile, the file may have stopped being a detached file (its project finished
@@ -4032,6 +4116,39 @@ test "refreshRoot: a root directory spelled with another case is the same root" 
     try std.testing.expect(try server.refreshRoot(variant));
     try std.testing.expect(server.root_has_build.items[0]);
     try std.testing.expect(!try server.refreshRoot(variant));
+}
+
+test "toolFile: a path naming an open document under another spelling is that document" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    try tmp.dir.createDirPath(std.testing.io, "real");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/a.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/b.zig", .data = "" });
+    try tmp.dir.symLink(std.testing.io, "real", "link", .{ .is_directory = true });
+    const opened = try server.vfs.intern(try std.fs.path.join(a, &.{ dir, "link/a.zig" }));
+    const real_a = try std.fs.path.join(a, &.{ dir, "real/a.zig" });
+    const real_b = try std.fs.path.join(a, &.{ dir, "real/b.zig" });
+    // No document is open: the path is interned as it is
+    try std.testing.expect(try server.toolFile(real_b) != opened);
+    try server.open_docs.put(gpa, opened, try gpa.dupe(u8, "file:///link/a.zig"));
+    try std.testing.expectEqual(opened, try server.toolFile(real_a));
+    try std.testing.expectEqual(opened, (try server.vfs.lookup(real_a)).?);
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ dir, "link/a.zig" }), server.vfs.path(opened));
+    // Known paths are not resolved on disk again; a path no open document names stays apart
+    try std.testing.expectEqual(1, server.open_real.count());
+    try std.testing.expect(try server.toolFile(try std.fs.path.join(a, &.{ dir, "real/missing.zig" })) != opened);
 }
 
 test "importsBasis ignores the files of the module graph but follows modules and their imports" {
