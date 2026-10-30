@@ -34,6 +34,7 @@ const Workspace = @import("Workspace.zig");
 const origin = @import("origin.zig");
 const ModuleGraph = za.names.ModuleGraph;
 const Resolver = za.names.resolve.Resolver;
+const ImportOptions = za.ide_db.organize_imports.Options;
 const InternPool = za.sema.InternPool;
 pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
@@ -4270,6 +4271,28 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
     return out;
 }
 
+/// Layout rules of the import block for `file`: the client's settings, overridden by the
+/// `zig-analyzer.zon` of the project containing the file (the innermost one when nested)
+fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
+    var options = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.importOptions();
+    };
+    const path = server.vfs.path(file);
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    var best: ?*Workspace = null;
+    for (server.workspaces.items) |ws| {
+        if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+    }
+    if (best) |ws| if (ws.project) |*p| {
+        if (p.isSet("imports_derived")) options.derived = p.imports_derived;
+        if (p.isSet("imports_sort")) options.sort = p.imports_sort;
+    };
+    return options;
+}
+
 /// The workspace root directory containing `path`
 /// (the innermost one when nested), copied into `arena`
 fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
@@ -4603,12 +4626,13 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports, const import_options, const snippets, const placeholders = blk: {
+    const max_auto_imports, const snippets, const placeholders = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
         const c = &server.config;
-        break :blk .{ c.completion_max_auto_imports, c.importOptions(), c.completion_snippets, c.completion_argument_placeholders };
+        break :blk .{ c.completion_max_auto_imports, c.completion_snippets, c.completion_argument_placeholders };
     };
+    const import_options = server.importOptionsFor(file);
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
         .detect_import_position = auto_import and !imports_ready,
@@ -5309,11 +5333,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const start, const end = server.rangeOffsets(text, params.range);
     const only = params.context.only;
-    const import_options = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.importOptions();
-    };
+    const import_options = server.importOptionsFor(file);
     var actions: std.ArrayList(ide.code_actions.Action) = .empty;
     if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or wantsKind(only, types.CodeActionKind.RefactorRewrite))
         try actions.appendSlice(arena, try ide.code_actions.codeActions(r, file, start, end));
