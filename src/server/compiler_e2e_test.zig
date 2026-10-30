@@ -1051,6 +1051,63 @@ test "single-file mode: a root deleted while it compiles leaves no diagnostics" 
     try expectDiagnostics(try h.diagnostics(), "a.zig", &.{});
 }
 
+/// Writes `zigw` into the project root: a wrapper of the user's zig that `zig env` reports as zig
+/// itself and whose `zig build-obj` appends its pid to `compiles` and then hangs for 30 seconds
+fn hangingZig(h: *Harness, project: *fixture.Project) !std.json.Value {
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(h.arena.allocator(),
+        \\#!/bin/sh
+        \\case "$1" in
+        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}/zigw"|' ;;
+        \\build-obj) echo $$ >> "{s}/compiles"; exec sleep 30 ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ zig, project.root, project.root, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+    return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
+}
+
+/// The pids of the `zig build-obj` processes the wrapper of `hangingZig` has started so far
+fn hangingCompiles(h: *Harness, project: *fixture.Project) ![]const std.posix.pid_t {
+    const a = h.arena.allocator();
+    const text = project.tmp.dir.readFileAlloc(testing.io, "compiles", a, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| try pids.append(a, try std.fmt.parseInt(std.posix.pid_t, line, 10));
+    return pids.items;
+}
+
+test "single-file mode: shutdown ends a compile in progress instead of waiting for it" {
+    // Shutdown waited for a slow `zig build-obj` to finish and then ran the compile a save had
+    // requested meanwhile
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const text = "pub fn main() void {}\n";
+    var project = try fixture.Project.create(&.{.{ .path = "one.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try hangingZig(&h, &project));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
+    for (0..3000) |_| {
+        if ((try hangingCompiles(&h, &project)).len > 0) break;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    } else return error.CompileDidNotStart;
+    // A save during the compile requests another compile after it
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = uri } });
+    const started = std.Io.Clock.awake.now(testing.io);
+    _ = try h.request("shutdown", {});
+    try testing.expect(started.untilNow(testing.io, .awake).toSeconds() < 10);
+    const pids = try hangingCompiles(&h, &project);
+    try testing.expectEqual(1, pids.len);
+    try testing.expectError(error.ProcessNotFound, std.posix.kill(pids[0], @fromBackingInt(@intCast(0))));
+    try h.notify("exit", {});
+}
+
 test "generated module roots: resolved from build results, including modules check does not depend on" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text =

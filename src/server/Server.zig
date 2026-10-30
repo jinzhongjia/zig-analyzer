@@ -95,6 +95,8 @@ single_mutex: Io.Mutex = .init,
 /// Compile results of single-file mode (standalone .zig files, see `FileContext.detached`), keyed
 /// by the compiled root file. The results also include errors in files imported by the root file.
 single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
+/// The `zig build-obj` processes of single-file compiles in progress: ended when the server stops
+single_compiles: za.project.bsp.SingleFileCompiles = .{},
 /// Sequence number of the last compile result taken (shared by project builds and single-file
 /// compiles; see `nextCompileGeneration`)
 compile_generation: std.atomic.Value(u64) = .init(0),
@@ -3119,9 +3121,18 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             // The file has been deleted from disk (if deleted during a compile, `dropSingle`
             // requests a recompile): no result
             Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
-            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env, path) catch |err| {
-                log.warn("{s}: single-file compile failed: {t}", .{ path, err });
-                break :blk null;
+            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env, path, &server.single_compiles) catch |err| switch (err) {
+                // The server is stopping: the compile was ended, and nothing is published anymore
+                error.Stopped => {
+                    server.single_mutex.lockUncancelable(server.io);
+                    defer server.single_mutex.unlock(server.io);
+                    server.single.getPtr(file).?.running = false;
+                    return;
+                },
+                else => {
+                    log.warn("{s}: single-file compile failed: {t}", .{ path, err });
+                    break :blk null;
+                },
             };
             defer compiled.deinit(server.gpa);
             errors = compiled.errors.errorMessageCount();
@@ -3495,6 +3506,7 @@ fn stopWorkspaces(server: *Server) void {
         }
     }
     if (server.watcher) |w| w.stop();
+    server.single_compiles.stop(server.io);
 }
 
 pub fn isShuttingDown(server: *Server) bool {
