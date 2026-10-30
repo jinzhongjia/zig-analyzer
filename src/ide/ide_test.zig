@@ -1944,6 +1944,66 @@ test "goto declaration of reified enum members named by string literals or @type
     }
 }
 
+test "goto on fields of anonymous struct values and in initializers of reified structs" {
+    // Prevents an empty result for `anon.first` and for `.alpha` in initializers of `@Struct` types
+    const text =
+        \\const std = @import("std");
+        \\const S = @Struct(.auto, null, &.{ "alpha", "beta" }, &.{ u32, bool }, &@splat(.{}));
+        \\const Color = enum { red, green, blue };
+        \\test "reified" {
+        \\    const s: S = .{ .alpha = 1, .beta = true };
+        \\    const s2 = S{ .alpha = 2, .beta = false };
+        \\    const arr = std.EnumArray(Color, u32).init(.{ .red = 1, .green = 2, .blue = 3 });
+        \\    const fs: std.enums.EnumFieldStruct(Color, u8, 0) = .{ .blue = 7 };
+        \\    _ = .{ s, s2, arr, fs };
+        \\}
+        \\test "anon" {
+        \\    const anon = .{ .first = @as(u32, 1), .second = true };
+        \\    _ = anon.first;
+        \\    const cases = .{ .{ .input = "a", .expected = @as(u32, 1) }, .{ .input = "b", .expected = @as(u32, 2) } };
+        \\    inline for (cases) |case| {
+        \\        _ = case.input;
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.of;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "alpha = 1", "alpha\", \"beta" },
+        .{ "alpha = 2", "alpha\", \"beta" },
+        .{ "red = 1", "red, green" },
+        .{ "blue = 7", "blue }" },
+        .{ "first;", "first = @as" },
+    }) |c| {
+        const t = try definition.definition(&r, file, at(c[0])) orelse {
+            std.debug.print("`{s}`: no target\n", .{c[0]});
+            return error.NoTarget;
+        };
+        try testing.expectEqual(file, t.file);
+        testing.expect(std.mem.startsWith(u8, text[t.start..], c[1])) catch |err| {
+            std.debug.print("`{s}`: target `{s}`\n", .{ c[0], text[t.start..t.end] });
+            return err;
+        };
+    }
+    // One target per item of the tuple the loop iterates
+    const targets = try definition.definitionTargets(&r, file, at("input;"));
+    try testing.expectEqual(2, targets.len);
+    try testing.expectEqual(at("input = \"a\""), targets[0].start);
+    try testing.expectEqual(at("input = \"b\""), targets[1].start);
+}
+
 test "hover names a reified type after the constant it initializes" {
     // Types reified outside functions used to be shown by content as an anonymous `enum { ... }`
     const text =

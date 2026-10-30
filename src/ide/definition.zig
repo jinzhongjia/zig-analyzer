@@ -32,29 +32,36 @@ pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return switch (try find(r, file, offset) orelse return null) {
-        .target => |t| t,
+        .targets => |ts| ts[0],
         .def => |def| target(r, try r.aliasTarget(def)),
     };
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return switch (try find(r, file, offset) orelse return null) {
-        .target => |t| t,
+        .targets => |ts| ts[0],
         .def => |def| target(r, def),
     };
 }
 
-/// What goto finds at the cursor: a definition (`defAt`), or a position that is not one (labels,
-/// error names, the origins of the names of constructed types, declaration sites)
-const Found = union(enum) { def: Def, target: Target };
+/// What goto finds at the cursor: a definition (`defAt`), or positions that are not one (labels,
+/// error names, the origins of the names of constructed types and anonymous structs, declaration
+/// sites); `targets` is never empty
+const Found = union(enum) { def: Def, targets: []const Target };
 
 fn find(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Found {
-    if (try labelTarget(r, file, offset)) |t| return .{ .target = t };
-    if (try errorMemberTarget(r, file, offset)) |t| return .{ .target = t };
-    if (try errorValueDecl(r, file, offset, true)) |d| return .{ .target = d.target };
+    if (try labelTarget(r, file, offset)) |t| return try one(r, t);
+    if (try errorMemberTarget(r, file, offset)) |t| return try one(r, t);
+    if (try errorValueDecl(r, file, offset, true)) |d| return try one(r, d.target);
     if (try defAt(r, file, offset)) |def| return .{ .def = def };
-    if (try reifiedFieldTarget(r, file, offset)) |t| return .{ .target = t };
-    return .{ .target = try selfTarget(r, file, offset) orelse return null };
+    if (try reifiedFieldTarget(r, file, offset)) |t| return try one(r, t);
+    const anon = try anonFieldTargets(r, file, offset);
+    if (anon.len > 0) return .{ .targets = anon };
+    return try one(r, try selfTarget(r, file, offset) orelse return null);
+}
+
+fn one(r: *Resolver, t: Target) resolve.Error!Found {
+    return .{ .targets = try r.arena.dupe(Target, &.{t}) };
 }
 
 /// All targets of definition: when the cursor is on `@import("name")` and the modules the file
@@ -81,7 +88,7 @@ fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resol
     var out: std.ArrayList(Target) = .empty;
     var defs: std.ArrayList(Def) = .empty;
     if (try find(r, file, offset)) |f| switch (f) {
-        .target => |t| try out.append(r.arena, t),
+        .targets => |ts| for (ts) |t| try appendNew(r, &out, t),
         .def => |def| try defs.append(r.arena, def),
     };
     try defs.appendSlice(r.arena, try instanceDefs(r, file, offset));
@@ -199,10 +206,117 @@ fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return null;
 }
 
+/// Field access on a value of an anonymous struct type (`anon.first` with
+/// `const anon = .{ .first = 1 }`): such a type has no declaration, its fields are defined by the
+/// initializer that creates the value, so the targets are the field names there. The value is
+/// followed back through constants and local constants without a type annotation, fields of
+/// anonymous values, and the items of a tuple that a `for` loop iterates
+/// (`inline for (cases) |case| case.input`, one target per item that has the field)
+fn anonFieldTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const a = try context.at(r, file, tok.offset, false) orelse return &.{};
+    const e = a.body.exprAt(a.rel) orelse return &.{};
+    const fa = switch (a.body.expr(e)) {
+        .field_access => |x| x,
+        else => return &.{},
+    };
+    if (a.rel < a.body.range(fa.lhs).end) return &.{};
+    const name = fa.field orelse return &.{};
+    // The type is unknown in a loop inferred per iteration
+    var ty = a.exprType(fa.lhs).ty;
+    switch (a.ip.key(ty)) {
+        .ptr_type => |p| if (p.size == .one) {
+            ty = p.child;
+        },
+        else => {},
+    }
+    if (ty != .unknown and a.ip.key(ty) != .anon_struct_type) return &.{};
+    var literals: std.ArrayList(AnonLiteral) = .empty;
+    try anonLiterals(r, .{ .file = file, .item = a.item, .body = a.body, .e = fa.lhs }, &literals, 0);
+    var out: std.ArrayList(Target) = .empty;
+    for (literals.items) |lit| {
+        const field = lit.field(name) orelse continue;
+        const node = try r.itemNode(lit.file, lit.item) orelse continue;
+        try appendNew(r, &out, .{ .file = lit.file, .start = node.offset + field.name_range.start, .end = node.offset + field.name_range.end });
+    }
+    return out.items;
+}
+
+/// An expression in the body of a member
+const AnonLiteral = struct {
+    file: FileId,
+    item: u32,
+    body: *const Body,
+    e: Body.ExprId,
+
+    fn at(x: AnonLiteral, e: Body.ExprId) AnonLiteral {
+        return .{ .file = x.file, .item = x.item, .body = x.body, .e = e };
+    }
+
+    /// The field named `name` of the initializer `e`
+    fn field(x: AnonLiteral, name: []const u8) ?Body.FieldInit {
+        for (x.body.expr(x.e).init.fields) |fi| if (fi.name != null and std.mem.eql(u8, fi.name.?, name)) return fi;
+        return null;
+    }
+};
+
+/// Appends to `out` the initializers without a type (`.{ ... }`) that the value of `x` comes from
+/// (see `anonFieldTargets`), each once
+fn anonLiterals(r: *Resolver, x: AnonLiteral, out: *std.ArrayList(AnonLiteral), depth: u32) resolve.Error!void {
+    if (depth > 16) return;
+    const b = x.body;
+    switch (b.expr(x.e)) {
+        .init => |init| if (init.ty == null) {
+            for (out.items) |o| if (o.file == x.file and o.item == x.item and o.e == x.e) return;
+            try out.append(r.arena, x);
+        },
+        .@"comptime" => |inner| try anonLiterals(r, x.at(inner), out, depth + 1),
+        .name_ref => |n| switch (try r.resolveName(x.file, x.item, b, b.expr_scopes[@backingInt(x.e)], n) orelse return) {
+            .local => |l| {
+                const lb = if (l.file == x.file and l.item == x.item) b else try r.body(l.file, l.item);
+                const owner: AnonLiteral = .{ .file = l.file, .item = l.item, .body = lb, .e = x.e };
+                const binding = lb.binding(l.binding);
+                if (binding.ty != null) return;
+                if (binding.init) |init| return anonLiterals(r, owner.at(init), out, depth + 1);
+                // A capture of a `for` loop: each item of the tuple it iterates
+                for (lb.exprs) |expr| switch (expr) {
+                    .loop => |loop| for (loop.capture, 0..) |c, k| {
+                        if (c != l.binding or k >= loop.inputs.len) continue;
+                        var lists: std.ArrayList(AnonLiteral) = .empty;
+                        try anonLiterals(r, owner.at(loop.inputs[k]), &lists, depth + 1);
+                        for (lists.items) |list| for (list.body.expr(list.e).init.fields) |item| {
+                            if (item.name == null) try anonLiterals(r, list.at(item.value), out, depth + 1);
+                        };
+                    },
+                    else => {},
+                };
+            },
+            .item => |it| {
+                const tree = try r.itemTree(it.file);
+                if (tree.items[it.item].kind != .@"const") return;
+                const ib = try r.body(it.file, it.item);
+                if (ib.type_expr != null) return;
+                try anonLiterals(r, .{ .file = it.file, .item = it.item, .body = ib, .e = ib.value orelse return }, out, depth + 1);
+            },
+            .file => {},
+        },
+        // A field of an anonymous value
+        .field_access => |fa| {
+            const name = fa.field orelse return;
+            var bases: std.ArrayList(AnonLiteral) = .empty;
+            try anonLiterals(r, x.at(fa.lhs), &bases, depth + 1);
+            for (bases.items) |base| if (base.field(name)) |fi| try anonLiterals(r, base.at(fi.value), out, depth + 1);
+        },
+        else => {},
+    }
+}
+
 /// Members of constructed types (`@Struct`, `@Enum`, `@Union`): field access `x.name`, `E.name`
-/// accessed via the type, and enum literals `.name`. The name is a string computed at comptime;
-/// jumps to its origin in the source: a string literal (such as the help text of zig-clap), or the
-/// member of the same name in X given by `@typeInfo(X)`.
+/// accessed via the type, enum literals `.name`, and field names in initializers
+/// (`.{ .name = v }`, `S{ .name = v }`). The name is a string computed at comptime; jumps to its
+/// origin in the source: a string literal (such as the help text of zig-clap), or the member of
+/// the same name in X given by `@typeInfo(X)`.
 fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -231,6 +345,12 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
                 else => {},
             }
             break :blk .{ fa.field orelse return null, ty };
+        },
+        .init => |x| blk: {
+            const field = for (x.fields) |fi| {
+                if (fi.name != null and rel >= fi.name_range.start and rel < fi.name_range.end) break fi;
+            } else return null;
+            break :blk .{ field.name.?, a.initType(e) orelse return null };
         },
         .enum_literal => |n| blk: {
             // When the result type is `?E` or `E!T`, take E; for a literal passed to an anytype
