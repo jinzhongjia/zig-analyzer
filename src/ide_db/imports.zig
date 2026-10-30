@@ -1424,8 +1424,9 @@ const Builder = struct {
         if (item_kind != .@"const") return null;
         const ns = try b.r.ctx.get(DeclNamespace, key) orelse return null;
         if (!isZigSource(b.r.ctx.db.env.vfs.path(ns.file))) return null;
-        return switch ((try b.r.itemTree(ns.file)).containers[ns.container].kind) {
-            .file => .namespace,
+        const tree = try b.r.itemTree(ns.file);
+        return switch (tree.containers[ns.container].kind) {
+            .file => if (tree.hasFields(ns.container)) .@"struct" else .namespace,
             .@"struct" => .@"struct",
             .@"enum" => .@"enum",
             .@"union", .@"opaque" => .type,

@@ -804,8 +804,8 @@ test "local member paths classify functions as completion after `.` does" {
     var r = resolver(&w, &ctx);
     const at = f.cursor.?;
     const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
-    // A function in a file is Function, a method of another container is Method
-    for ([_]struct { []const u8, completion.Item.Kind }{ .{ "point.negated", .method }, .{ "thing.negative", .function } }) |c| {
+    // A function whose receiver is its container is Method, in a file with fields as in a struct
+    for ([_]struct { []const u8, completion.Item.Kind }{ .{ "point.negated", .method }, .{ "thing.negative", .method } }) |c| {
         const item = for (items) |it| {
             if (std.mem.eql(u8, it.label, c[0])) break it;
         } else return error.MissingCompletion;

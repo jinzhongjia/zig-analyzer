@@ -1263,3 +1263,43 @@ test "semantic tokens classify decltest names as references to the tested declar
     try check(try tokens(&w, file, text, .utf16, needleRange(text, "test add", .utf16)), text, .utf16, cases[0..1]);
     try check(try tokensWith(&w, file, text, .utf16, null, .{ .partial = true }), text, .utf16, cases[0..4]);
 }
+
+test "semantic tokens classify files with fields as structs and their receiver functions as methods" {
+    // A file with top-level fields is a struct type, not a namespace
+    const text =
+        \\const P = @import("P.zig");
+        \\const ns = @import("ns.zig");
+        \\fn run() void {
+        \\    var p: P = P.make();
+        \\    _ = p.get();
+        \\    _ = ns.helper();
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const p_text =
+        \\const P = @This();
+        \\x: i32,
+        \\pub fn get(self: P) i32 { return self.x; }
+        \\pub fn make() P { return .{ .x = 0 }; }
+    ;
+    const p_file = (try w.add("/p/P.zig", p_text)).file;
+    _ = try w.add("/p/ns.zig", "pub fn helper() u32 { return 1; }");
+    const file = (try w.add("/p/main.zig", text)).file;
+    try check(try tokens(&w, file, text, .utf16, null), text, .utf16, &.{
+        .{ .needle = "P =", .ty = .@"struct", .mods = M.declaration | M.readonly },
+        .{ .needle = "P = P", .ty = .@"struct", .mods = M.readonly },
+        .{ .needle = "P.make", .ty = .@"struct", .mods = M.readonly },
+        .{ .needle = "make()", .ty = .function },
+        .{ .needle = "get()", .ty = .method },
+        .{ .needle = "ns =", .ty = .namespace, .mods = M.declaration | M.readonly },
+        .{ .needle = "ns.helper", .ty = .namespace, .mods = M.readonly },
+        .{ .needle = "helper()", .ty = .function },
+    });
+    try check(try tokens(&w, p_file, p_text, .utf16, null), p_text, .utf16, &.{
+        .{ .needle = "P =", .ty = .@"struct", .mods = M.declaration | M.readonly },
+        .{ .needle = "get(", .ty = .method, .mods = M.declaration },
+        .{ .needle = "make(", .ty = .function, .mods = M.declaration },
+    });
+}

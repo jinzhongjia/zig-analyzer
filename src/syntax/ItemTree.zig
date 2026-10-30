@@ -101,6 +101,13 @@ pub fn containerMembers(self: *const ItemTree, container: u32) []const u32 {
     return self.member_list[m.start..][0..m.len];
 }
 
+/// Whether the container declares a field; a file with top-level fields is a struct type, a file
+/// without them is used as a namespace
+pub fn hasFields(self: *const ItemTree, container: u32) bool {
+    for (self.containerMembers(container)) |m| if (self.items[m].kind == .field) return true;
+    return false;
+}
+
 pub fn eql(a: *const ItemTree, b: *const ItemTree) bool {
     if (a.containers.len != b.containers.len or a.items.len != b.items.len) return false;
     if (!std.mem.eql(u32, a.member_list, b.member_list)) return false;

@@ -777,7 +777,7 @@ fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, wei
             const tv = types.of(bid);
             if (!access.allows(binding, tv)) continue;
             if (!out.seen.contains(binding.name)) if (rootOf(binding, tv, weight != null)) |root| try roots.append(out.arena, root);
-            const kind = kindOf(symbol_kind.ofBinding(r.ctx.db.env.ip, binding, tv));
+            const kind = kindOf(try symbol_kind.ofBinding(r, binding, tv));
             try out.add(.{
                 .label = binding.name,
                 .kind = kind,

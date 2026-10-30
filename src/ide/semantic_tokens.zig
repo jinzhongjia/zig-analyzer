@@ -232,7 +232,7 @@ const Builder = struct {
         // The cache stores only the abstract declaration class; the concrete type at the
         // current position must not be written back, as it would pollute other instances.
         if (dependsOnType(c) and !seed.wanted(b.r.ctx.db.env.ip, tv)) {
-            return b.valueClass(tv, c.type, c.mods);
+            return try b.valueClass(tv, c.type, c.mods);
         }
         return c;
     }
@@ -260,13 +260,13 @@ const Builder = struct {
     }
 
     /// A value that is neither a type nor a function gets `fallback` (see `symbol_kind.ofValue`)
-    fn valueClass(b: *Builder, tv: InternPool.TypedValue, fallback: TokenType, mods: u32) Class {
-        const kind = symbol_kind.ofValue(b.r.ctx.db.env.ip, tv, .variable);
+    fn valueClass(b: *Builder, tv: InternPool.TypedValue, fallback: TokenType, mods: u32) resolve.Error!Class {
+        const kind = try symbol_kind.ofValue(b.r, tv, .variable);
         return .{ .type = if (kind == .variable) fallback else tokenType(kind), .mods = mods };
     }
 
-    fn bindingClass(b: *Builder, binding: Body.Binding, tv: InternPool.TypedValue) Class {
-        const symbol = symbol_kind.ofBinding(b.r.ctx.db.env.ip, binding, tv);
+    fn bindingClass(b: *Builder, binding: Body.Binding, tv: InternPool.TypedValue) resolve.Error!Class {
+        const symbol = try symbol_kind.ofBinding(b.r, binding, tv);
         return .{ .type = tokenType(symbol.kind), .mods = if (symbol.readonly) Modifier.readonly else 0 };
     }
 
@@ -287,7 +287,7 @@ const Builder = struct {
                     const local_res = if (std.meta.eql(key, owner)) res else try b.r.ctx.get(database.sema.Infer, .{ .owner = key, .mode = .full });
                     break :local_value if (i < local_res.bindings.len) local_res.bindings[i] else tv;
                 } else tv;
-                break :blk b.bindingClass(binding, value);
+                break :blk try b.bindingClass(binding, value);
             },
         };
     }
@@ -346,7 +346,7 @@ const Builder = struct {
                 if (seed.wanted(a.ip, abstract_binding) and !(binding.kind == .param and abstract_binding.isType())) {
                     a.seeded = try refiner.at(binding.range.end - 1, .{ .binding = id });
                 }
-                var c = b.bindingClass(binding, a.bindingType(id));
+                var c = try b.bindingClass(binding, a.bindingType(id));
                 c.mods |= Modifier.declaration;
                 try b.declarations.append(b.r.arena, .{
                     .key = .{ .owner = key, .binding = @fromBackingInt(@as(u32, @intCast(i))) },

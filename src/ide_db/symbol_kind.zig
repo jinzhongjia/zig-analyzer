@@ -2,10 +2,11 @@
 //! types, completion to `CompletionItemKind`).
 //!
 //! Determined by the kind of the declaration and the inferred type: a value that is a type is
-//! classified by that type as a namespace (file), struct, enum or other type (union, opaque,
-//! scalars, ...); a value that is a function (or function pointer) is a function; a function in a
-//! container (not a file) whose first parameter is that container or a single-item pointer to it
-//! is a method. When the type cannot be inferred, the kind follows the declaration (variable).
+//! classified by that type as a namespace (a file without top-level fields), struct (including a
+//! file with top-level fields), enum or other type (union, opaque, scalars, ...); a value that is a
+//! function (or function pointer) is a function; a function in a container other than a namespace
+//! whose first parameter is that container or a single-item pointer to it is a method. When the
+//! type cannot be inferred, the kind follows the declaration (variable).
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
@@ -30,19 +31,18 @@ pub fn ofDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!Symbol {
     const tree = try r.itemTree(file);
     const it = tree.items[item];
     const key: database.hir.OwnerKey = .{ .file = file, .item = it.ast_id };
-    const ip = r.ctx.db.env.ip;
     return switch (it.kind) {
         .@"fn" => .{ .kind = try functionKind(r, key, tree.containers[it.container]) },
         .field => .{ .kind = if (tree.containers[it.container].kind == .@"enum") .enum_member else .field },
-        .@"const" => .{ .kind = ofValue(ip, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = true },
-        .@"var" => .{ .kind = ofValue(ip, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable) },
+        .@"const" => .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = true },
+        .@"var" => .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable) },
         .@"test", .@"comptime", .zon => .{ .kind = .variable },
     };
 }
 
 /// `container` is the container that the function `key` is in
 pub fn functionKind(r: *Resolver, key: database.hir.OwnerKey, container: ItemTree.Container) resolve.Error!Kind {
-    if (container.kind == .file) return .function;
+    if (container.kind == .file and !(try r.itemTree(key.file)).hasFields(0)) return .function;
     const ip = r.ctx.db.env.ip;
     const tv = try r.ctx.get(database.sema.DeclType, .{ .owner = key });
     const signature = switch (ip.key(tv.ty)) {
@@ -61,12 +61,13 @@ pub fn functionKind(r: *Resolver, key: database.hir.OwnerKey, container: ItemTre
 }
 
 /// Kind of the value `tv`; `fallback` when it is neither a type nor a function
-pub fn ofValue(ip: *InternPool, tv: InternPool.TypedValue, fallback: Kind) Kind {
+pub fn ofValue(r: *Resolver, tv: InternPool.TypedValue, fallback: Kind) resolve.Error!Kind {
+    const ip = r.ctx.db.env.ip;
     if (tv.isType()) {
         const ty = tv.asType() orelse return .type;
         return switch (ip.key(ty)) {
             .container_type => |c| switch (c.kind) {
-                .file => .namespace,
+                .file => if ((try r.itemTree(c.file)).hasFields(0)) .@"struct" else .namespace,
                 .@"struct" => .@"struct",
                 .@"enum" => .@"enum",
                 .@"union", .@"opaque" => .type,
@@ -88,9 +89,9 @@ pub fn ofValue(ip: *InternPool, tv: InternPool.TypedValue, fallback: Kind) Kind 
 }
 
 /// A local binding (of type `tv`): a parameter whose value is a type is a type parameter
-pub fn ofBinding(ip: *InternPool, binding: Body.Binding, tv: InternPool.TypedValue) Symbol {
+pub fn ofBinding(r: *Resolver, binding: Body.Binding, tv: InternPool.TypedValue) resolve.Error!Symbol {
     if (binding.kind == .param) return .{ .kind = if (tv.isType()) .type_parameter else .parameter, .readonly = true };
-    return .{ .kind = ofValue(ip, tv, .variable), .readonly = binding.kind != .local_var };
+    return .{ .kind = try ofValue(r, tv, .variable), .readonly = binding.kind != .local_var };
 }
 
 /// A kind determined by the syntax of the declaration alone, the same as the result of classifying
