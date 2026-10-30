@@ -42,9 +42,9 @@ pub const Action = struct {
     title: []const u8,
     kind: Kind = .quickfix,
     edits: []const Edit,
-    /// The diagnostic being fixed (position from `live.AstCheck`); null when there is no
-    /// corresponding diagnostic
-    diagnostic: ?struct { start: u32, end: u32 } = null,
+    /// The diagnostic being fixed (position and message from `live.AstCheck`); null when there
+    /// is no corresponding diagnostic
+    diagnostic: ?struct { start: u32, end: u32, message: []const u8 } = null,
     /// Whether this is the preferred fix for the diagnostic (LSP's `isPreferred`); when a
     /// diagnostic has several fixes, only one of them is preferred
     preferred: bool = true,
@@ -61,7 +61,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
         if (d.end < start or d.start > end) continue;
         if (std.mem.eql(u8, d.message, "local variable is never mutated")) {
             const edits = try useConst(r, file, text, d.start) orelse continue;
-            try out.append(r.arena, .{ .title = "use 'const'", .edits = edits, .diagnostic = .{ .start = d.start, .end = d.end } });
+            try out.append(r.arena, .{ .title = "use 'const'", .edits = edits, .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message } });
             continue;
         }
         const edit = if (std.mem.startsWith(u8, d.message, "unused ") and !std.mem.endsWith(u8, d.message, " label"))
@@ -74,7 +74,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
         if (edit) |e| try out.append(r.arena, .{
             .title = try std.fmt.allocPrint(r.arena, "{s} `{s}`", .{ if (e.text.len == 0) "remove discard of" else "discard", name }),
             .edits = try r.arena.dupe(Edit, &.{e}),
-            .diagnostic = .{ .start = d.start, .end = d.end },
+            .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message },
         });
         if (std.mem.eql(u8, d.message, "unused capture") or std.mem.eql(u8, d.message, "unused switch tag capture")) {
             const f = try unused_capture.fix(r, file, d.start) orelse continue;
@@ -84,7 +84,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
                 else
                     try std.fmt.allocPrint(r.arena, "rename `{s}` to `_`", .{name}),
                 .edits = f.edits,
-                .diagnostic = .{ .start = d.start, .end = d.end },
+                .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message },
                 // A discard, when offered, is preferred: it leaves the capture intact, and using
                 // the name later only takes deleting the discard. Renaming the payload of a prong
                 // is not preferred when its tag capture is unused too: the preferred fix of the

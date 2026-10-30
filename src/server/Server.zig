@@ -5382,11 +5382,14 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
         var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
         try changes.map.put(arena, doc_uri, edits);
-        // Link the same diagnostic sent by the client, so that the fix shows up on the diagnostic
+        // Link the same diagnostic sent by the client (same range and message, so another
+        // diagnostic on the same name, such as a naming hint, is not taken for it), so that the
+        // fix shows up on the diagnostic
         const diagnostics: ?[]const types.Diagnostic = if (a.diagnostic) |d| blk: {
             const range = lines.range(d.start, d.end, server.encoding);
             for (params.context.diagnostics) |cd| {
-                if (std.meta.eql(cd.range, range)) break :blk try arena.dupe(types.Diagnostic, &.{cd});
+                if (std.meta.eql(cd.range, range) and cd.message == .string and std.mem.eql(u8, cd.message.string, d.message))
+                    break :blk try arena.dupe(types.Diagnostic, &.{cd});
             }
             break :blk null;
         } else null;
