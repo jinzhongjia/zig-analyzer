@@ -3456,6 +3456,45 @@ test "hover writes the void value inside aggregates and union values as {}" {
     }
 }
 
+test "hover shows comptime-known bool, null, undefined and void values" {
+    // Prevents omitting these values while integers, enums and optionals show theirs
+    const text =
+        \\const t = true;
+        \\const n: ?u8 = null;
+        \\const st = !t;
+        \\const u: u8 = undefined;
+        \\const v = {};
+        \\fn f() void {
+        \\    var b = false;
+        \\    b = !b;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "t =", "const t: bool = true" },
+        .{ "n:", "const n: ?u8 = null" },
+        .{ "st =", "const st: bool = false" },
+        .{ "u:", "const u: u8 = undefined" },
+        .{ "v =", "const v: void = {}" },
+        // A runtime variable has no comptime-known value
+        .{ "b = false", "var b: bool" },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))).?;
+        testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "anonymous containers are shown by content, and their type hints only when enabled" {
     const text =
         \\const Kind = union(enum) { compile: struct { root: u32 }, none };
@@ -6649,7 +6688,7 @@ test "hover on a reference in a coercing context shows its own type" {
         .{ "G2;\n    const n", "```zig\nconst G2: u8 = 2\n```" },
         .{ "n;", "```zig\nconst n: comptime_int = 5\n```" },
         .{ "v);", "```zig\nv: u8\n```" },
-        .{ "null)", "```zig\n?u8\n```" },
+        .{ "null)", "```zig\n?u8 = null\n```" },
     };
     for (cases) |c| {
         const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;

@@ -285,13 +285,11 @@ fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
     return true;
 }
 
-/// The value known at comptime (functions and `simple_value` are not displayed)
+/// The value known at comptime (functions are not displayed: the type already shows the
+/// signature)
 fn shownValue(r: *Resolver, tv: TypedValue) error{OutOfMemory}!?[]const u8 {
     const v = tv.val orelse return null;
-    switch (r.ctx.db.env.ip.key(v)) {
-        .fn_value, .simple_value => return null,
-        else => {},
-    }
+    if (r.ctx.db.env.ip.key(v) == .fn_value) return null;
     var out: Io.Writer.Allocating = .init(r.arena);
     writeFull(r, v, &out.writer) catch return error.OutOfMemory;
     return out.written();

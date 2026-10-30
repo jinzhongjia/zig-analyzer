@@ -95,7 +95,7 @@ test "literals, annotations and primitives" {
         .{ "s", "*const [2:0]u8" },
         .{ "x", "comptime_float = 1.5" },
         .{ "flag", "bool" },
-        .{ "n", "?u8" },
+        .{ "n", "?u8 = null" },
     });
 }
 
@@ -1760,7 +1760,7 @@ test "destructuring infers each element" {
         .{ "v1", "f32" },
         // Comptime fields of a tuple literal: the value belongs to the type
         .{ "k0", "comptime_int = 5" },
-        .{ "k1", "bool" },
+        .{ "k1", "bool = true" },
     });
 }
 
