@@ -154,6 +154,12 @@ pub fn isUnderStyle(comptime style: Style, case: CaseMode, file_path: []const u8
     return path_type.isSep(u8, file_path[dir.len]) or (dir.len > 0 and path_type.isSep(u8, dir[dir.len - 1]));
 }
 
+/// Whether the normalized absolute paths `x` and `y` name the same file or directory, under the
+/// same rules as `isUnder`
+pub fn samePath(vfs: *const Vfs, x: []const u8, y: []const u8) bool {
+    return x.len == y.len and vfs.isUnder(x, y);
+}
+
 /// The innermost of the directories `roots` that contains `file_path` (see `isUnder`); null when
 /// none does
 pub fn rootOf(vfs: *const Vfs, roots: []const []const u8, file_path: []const u8) ?[]const u8 {
@@ -340,4 +346,16 @@ test "resolve: results that are not absolute paths are rejected" {
             }
         }
     }
+}
+
+test "samePath follows the case rule of file identity" {
+    const native = @import("../util/test_path.zig").native;
+    var insensitive: Vfs = .initOptions(std.testing.io, std.testing.allocator, .{ .case = .insensitive });
+    defer insensitive.deinit();
+    var sensitive: Vfs = .initOptions(std.testing.io, std.testing.allocator, .{ .case = .sensitive });
+    defer sensitive.deinit();
+    try std.testing.expect(insensitive.samePath(native("/w/MyProj"), native("/w/myproj")));
+    try std.testing.expect(!sensitive.samePath(native("/w/MyProj"), native("/w/myproj")));
+    try std.testing.expect(sensitive.samePath(native("/w/MyProj"), native("/w/MyProj")));
+    try std.testing.expect(!insensitive.samePath(native("/w/myproj/src"), native("/w/myproj")));
 }

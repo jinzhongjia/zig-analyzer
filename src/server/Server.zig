@@ -1765,7 +1765,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     for (list) |ws| {
         // Outside watch mode, the maker does not reconfigure automatically: restart. Build
         // scripts and configure inputs may lie outside the project's files.
-        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id) or
+        if ((is_build_file and server.vfs.samePath(std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id) or
             ws.changesConfigureInput(path, .changed))
         {
             server.restartWorkspace(ws, 0);
@@ -1939,7 +1939,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     for (list) |ws| {
         // Outside watch mode, the maker does not reconfigure automatically: restart
         const reconfigure = for (build_files.items) |dir| {
-            if (std.mem.eql(u8, dir, ws.root)) break true;
+            if (server.vfs.samePath(dir, ws.root)) break true;
         } else for (known.items) |file| {
             if (ws.isBuildScript(file)) break true;
         } else for (events.keys(), events.values()) |path, kind| {
@@ -1954,7 +1954,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         } else false;
         if (reconfigure) {
             const started = for (refreshed.items) |dir| {
-                if (std.mem.eql(u8, dir, ws.root)) break true;
+                if (server.vfs.samePath(dir, ws.root)) break true;
             } else false;
             if (!started) server.restartWorkspace(ws, 0);
             continue;
@@ -2348,12 +2348,21 @@ fn hasBuildZig(server: *Server, dir: []const u8) Allocator.Error!bool {
     return false;
 }
 
+/// The root directory that is `dir` (see `Vfs.samePath`), spelled as it was added (allocated by
+/// `gpa`); null when `dir` is not a root directory
+fn rootSpelling(server: *Server, dir: []const u8) Allocator.Error!?[]u8 {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    for (server.roots.items) |r| if (server.vfs.samePath(r, dir)) return try server.gpa.dupe(u8, r);
+    return null;
+}
+
 /// Records whether root directory `root` has a build.zig; returns whether the record changed
 /// (false when `root` is not a root directory)
 fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
-    for (server.roots.items, server.root_has_build.items) |r, *flag| if (std.mem.eql(u8, r, root)) {
+    for (server.roots.items, server.root_has_build.items) |r, *flag| if (server.vfs.samePath(r, root)) {
         if (flag.* == has_build) return false;
         flag.* = has_build;
         return true;
@@ -2367,14 +2376,18 @@ fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
 /// become standalone files, or belong to an unloaded project when an ancestor directory still
 /// has a build.zig). Returns whether anything changed.
 fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
-    const has_build = try server.hasBuildZig(dir);
-    if (!server.setRootHasBuild(dir, has_build)) return false;
+    // `dir` may be spelled differently from the root directory (see `Vfs.samePath`): the project
+    // uses the root directory's spelling
+    const root = try server.rootSpelling(dir) orelse return false;
+    defer server.gpa.free(root);
+    const has_build = try server.hasBuildZig(root);
+    if (!server.setRootHasBuild(root, has_build)) return false;
     if (has_build) {
-        log.info("{s}: build.zig was created", .{dir});
-        if (server.zigEnv() != null) server.startWorkspace(dir);
+        log.info("{s}: build.zig was created", .{root});
+        if (server.zigEnv() != null) server.startWorkspace(root);
     } else {
-        log.info("{s}: build.zig was deleted", .{dir});
-        server.removeProject(dir);
+        log.info("{s}: build.zig was deleted", .{root});
+        server.removeProject(root);
         server.updateModuleGraph();
     }
     // Open files: single-file mode results no longer apply, or they switch to single-file mode
@@ -3084,7 +3097,7 @@ fn startWorkspace(server: *Server, root: []const u8) void {
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return;
+        for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, root)) return;
     }
     const ws = Workspace.start(server, root, 0) catch |err| {
         log.err("{s}: failed to start build system protocol: {t}", .{ root, err });
@@ -3116,7 +3129,7 @@ fn addRoot(server: *Server, root_uri: []const u8) !void {
     {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
-        for (server.roots.items) |r| if (std.mem.eql(u8, r, normalized)) return;
+        for (server.roots.items) |r| if (server.vfs.samePath(r, normalized)) return;
         try server.root_has_build.ensureUnusedCapacity(server.gpa, 1);
         try server.roots.append(server.gpa, normalized);
         server.root_has_build.appendAssumeCapacity(has_build);
@@ -3136,7 +3149,7 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
-        for (server.roots.items, 0..) |r, i| if (std.mem.eql(u8, r, normalized)) {
+        for (server.roots.items, 0..) |r, i| if (server.vfs.samePath(r, normalized)) {
             server.gpa.free(server.roots.orderedRemove(i));
             _ = server.root_has_build.orderedRemove(i);
             break;
@@ -3153,7 +3166,7 @@ fn removeProject(server: *Server, root: []const u8) void {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
         // Take it out together with the reference held by the list
-        for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, root)) {
+        for (server.workspaces.items, 0..) |w, i| if (server.vfs.samePath(w.root, root)) {
             removed = server.workspaces.orderedRemove(i);
             break;
         };
@@ -3335,7 +3348,7 @@ pub fn requestBuild(server: *Server, ws: *Workspace) void {
 /// The instance in the list for the project of root
 /// directory `root`; the caller holds `workspaces_mutex`
 fn visibleFor(server: *Server, root: []const u8) ?*Workspace {
-    for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return w;
+    for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, root)) return w;
     return null;
 }
 
@@ -3958,6 +3971,34 @@ test "publishFiles: requests for a file being published coalesce into one more r
     const computed = server.publish_seq.load(.monotonic) - before;
     try std.testing.expect(computed >= 1 and computed <= 2);
     try std.testing.expectEqual(0, server.publish_files.count());
+}
+
+// Prevents ignoring a build.zig created or saved through another spelling of a root directory on a
+// case-insensitive file system: roots are compared by file identity, not byte by byte
+test "refreshRoot: a root directory spelled with another case is the same root" {
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    server.vfs.case = .insensitive;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(root);
+    const root_uri = try uri.fromPath(gpa, root);
+    defer gpa.free(root_uri);
+    try server.addRoot(root_uri);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "" });
+    const variant = try std.ascii.allocUpperString(gpa, root);
+    defer gpa.free(variant);
+    try std.testing.expect(!std.mem.eql(u8, variant, root));
+    try std.testing.expect(try server.refreshRoot(variant));
+    try std.testing.expect(server.root_has_build.items[0]);
+    try std.testing.expect(!try server.refreshRoot(variant));
 }
 
 test "importsBasis ignores the files of the module graph but follows modules and their imports" {
