@@ -3065,10 +3065,10 @@ pub fn promote(server: *Server, ws: *Workspace, stage: PromoteStage) ?*Workspace
     return null;
 }
 
-/// The new instance `ws` created by a restart will not proceed (the maker keeps crashing, or the
-/// protocol version does not match): stops waiting for it to replace the old instance. The old
-/// instance's model and compile set continue to determine which modules files belong to; its
-/// compiler diagnostics will no longer be updated, so they are cleared.
+/// The new instance `ws` created by a restart will not proceed (the maker keeps crashing, exited
+/// during the configure phase, or the protocol version does not match): stops waiting for it to
+/// replace the old instance. The old instance's model and compile set continue to determine which
+/// modules files belong to; its compiler diagnostics will no longer be updated, so they are cleared.
 pub fn abandon(server: *Server, ws: *Workspace) void {
     const old = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);

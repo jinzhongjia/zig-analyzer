@@ -179,6 +179,9 @@ pub fn encodeBuildSteps(w: *Io.Writer, steps: []const u32) Io.Writer.Error!void 
 /// Stopping ends the whole group without waiting for the maker to finish the current build (a
 /// non-watch maker does not read its input while building, so an exit it receives is handled only
 /// after the build finishes).
+/// The maker's stderr is read continuously by a task of its own (a full pipe would block the
+/// maker), keeping its end: problems the maker reports only there (a failing configure phase, an
+/// invalid build.zig.zon) are taken from it (see `stderrOutput`).
 pub const Client = struct {
     gpa: Allocator,
     io: Io,
@@ -189,8 +192,16 @@ pub const Client = struct {
     write_buffer: [256]u8 = undefined,
     writer: Io.File.Writer = undefined,
     write_mutex: Io.Mutex = .init,
+    stderr_task: Io.Future(void) = undefined,
+    /// Set when the stderr task has reached the end of the pipe (or stopped reading)
+    stderr_done: Io.Event = .unset,
+    stderr_mutex: Io.Mutex = .init,
+    /// The end of the maker's stderr: at most `stderr_keep` bytes once it grows past twice that
+    stderr_tail: std.ArrayList(u8) = .empty,
 
-    pub const StartError = std.process.SpawnError || Allocator.Error;
+    const stderr_keep = 64 * 1024;
+
+    pub const StartError = std.process.SpawnError || Allocator.Error || Io.ConcurrentError;
 
     /// Starts the maker in `build_root` with the zig of `env`. `extra_args` is passed through to
     /// `zig build` (e.g. `-Dtarget=...`).
@@ -210,15 +221,48 @@ pub const Client = struct {
             .environ_map = env.childEnviron(),
             .stdin = .pipe,
             .stdout = .pipe,
-            .stderr = .ignore,
+            .stderr = .pipe,
             .pgid = group.spawnPgid(),
             .start_suspended = group.spawnSuspended(),
         });
         group.adopt(&child);
         c.* = .{ .gpa = gpa, .io = io, .child = child, .group = group };
+        errdefer {
+            c.group.terminate(&c.child);
+            c.child.kill(io);
+        }
         c.reader = c.child.stdout.?.readerStreaming(io, &c.read_buffer);
         c.writer = c.child.stdin.?.writerStreaming(io, &c.write_buffer);
+        c.stderr_task = try io.concurrent(drainStderr, .{c});
         return c;
+    }
+
+    fn drainStderr(c: *Client) void {
+        defer c.stderr_done.set(c.io);
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = c.child.stderr.?.readStreaming(c.io, &.{&buf}) catch return;
+            c.stderr_mutex.lockUncancelable(c.io);
+            defer c.stderr_mutex.unlock(c.io);
+            // Out of memory: the output is dropped, but the pipe keeps being emptied
+            c.stderr_tail.appendSlice(c.gpa, buf[0..n]) catch continue;
+            const len = c.stderr_tail.items.len;
+            if (len > 2 * stderr_keep) {
+                @memmove(c.stderr_tail.items[0..stderr_keep], c.stderr_tail.items[len - stderr_keep ..]);
+                c.stderr_tail.shrinkRetainingCapacity(stderr_keep);
+            }
+        }
+    }
+
+    /// What the maker wrote to stderr (its last 64 KiB or more), copied into memory owned by the
+    /// caller. Meant for when the maker has exited or is about to (it ends the whole group so that
+    /// no process keeps the pipe open), and waits up to 2 seconds for the rest of the output.
+    pub fn stderrOutput(c: *Client, gpa: Allocator) Allocator.Error![]u8 {
+        c.terminate();
+        c.stderr_done.waitTimeout(c.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } }) catch {};
+        c.stderr_mutex.lockUncancelable(c.io);
+        defer c.stderr_mutex.unlock(c.io);
+        return gpa.dupe(u8, c.stderr_tail.items);
     }
 
     /// Blocks reading the next BSP event; returns `error.EndOfStream` when the maker exits,
@@ -270,11 +314,26 @@ pub const Client = struct {
     /// No other task may be reading in `next` when this is called.
     pub fn deinit(c: *Client) void {
         c.terminate();
+        c.stderr_task.cancel(c.io);
+        c.stderr_tail.deinit(c.gpa);
         c.child.kill(c.io);
         c.group.destroy(c.io);
         c.gpa.destroy(c);
     }
 };
+
+/// The line of the maker's stderr that says why it failed: the first one that is neither empty nor
+/// an `info:` or `warning:` line (e.g. `error: invalid option: "nope"`, `panic: ...` of a panicking
+/// `build()`, `unable to parse target ...`); null when there is none
+pub fn failureSummary(stderr: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, " \t\r");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "info: ") or std.mem.startsWith(u8, line, "warning: ")) continue;
+        return line;
+    }
+    return null;
+}
 
 /// The maker and its child processes as a whole.
 ///
@@ -776,4 +835,10 @@ test "single-file mode: files read that do not resolve to absolute paths are ski
     try testing.expectEqualStrings(file, result.inputs[0]);
     for (result.inputs) |input| try testing.expect(std.fs.path.isAbsolute(input));
     try testing.expectEqual(@as(usize, if (native_os == .windows) 1 else 3), result.inputs.len);
+}
+
+test failureSummary {
+    try testing.expectEqualStrings("error: invalid option: \"nope\"", failureSummary("info: x\n\nerror: invalid option: \"nope\"\r\ninfo: y\nerror: configure command exited\n").?);
+    try testing.expectEqualStrings("panic: boom", failureSummary("warning: w\npanic: boom\n/a/build.zig:1:1: 0x1 in build\n").?);
+    try testing.expectEqual(null, failureSummary("info: only\n\n"));
 }

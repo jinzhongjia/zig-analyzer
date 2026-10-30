@@ -486,6 +486,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     // maker exits when build.zig fails to compile, which is expected (it is restarted when
     // build.zig is saved)
     var config_failed = false;
+    // maker exited during the configure phase without reporting errors (see below)
+    var configure_exited = false;
     const client = ws.client.?;
     ws.placed.waitUncancelable(ws.server.io);
     ws.computeBuildScripts() catch log.err("{s}: out of memory while finding build scripts", .{ws.root});
@@ -495,6 +497,14 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 // Server shutting down: the reading task was canceled, not a maker problem
             } else if (config_failed) {
                 log.info("{s}: build.zig failed to compile, build system exited; will restart when build.zig is saved", .{ws.root});
+            } else if (started and !ws.isStopping()) {
+                // The maker exited before sending a build graph or configuration errors: the
+                // configure phase failed in a way the protocol does not report (an invalid option
+                // in the build arguments, an unknown target, an error or panic in `build()`), and
+                // the cause is only on its stderr. Starting it again would fail the same way: it
+                // is restarted when build.zig or the settings change
+                configure_exited = true;
+                ws.reportConfigureExit(client);
             } else if (!ws.isStopping()) {
                 // maker crashed (e.g. the 0.17 maker has a race when it receives a new build
                 // request, easily triggered with few cores): restart automatically
@@ -538,7 +548,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.client = null;
     ws.server.progress.end(ws.server, ws.build_progress, "Build interrupted");
     ws.build_progress = null;
-    ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else null);
+    ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else if (configure_exited) "zig build failed to configure" else null);
     ws.loading = null;
     ws.mutex.unlock(ws.server.io);
     ws.finishLoading();
@@ -554,6 +564,23 @@ fn isStopping(ws: *Workspace) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return ws.stopping;
+}
+
+/// The maker exited during the configure phase without reporting errors through the protocol:
+/// shows the user the cause from its stderr, and stops waiting for this instance to replace an
+/// old one (as when the maker keeps crashing)
+fn reportConfigureExit(ws: *Workspace, client: *bsp.Client) void {
+    const gpa = ws.gpa;
+    const output = client.stderrOutput(gpa) catch "";
+    defer gpa.free(output);
+    log.info("{s}: zig build failed to configure:\n{s}", .{ ws.root, output });
+    const message = std.fmt.allocPrint(gpa, "zig build cannot configure {s}: {s}; compiler diagnostics are unavailable until build.zig or the build settings change", .{
+        ws.root,
+        bsp.failureSummary(output) orelse "it exited without giving a reason",
+    }) catch null;
+    defer if (message) |m| gpa.free(m);
+    ws.server.showWarning(message orelse "zig build cannot configure the project; compiler diagnostics are unavailable until build.zig or the build settings change");
+    ws.server.abandon(ws);
 }
 
 fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {

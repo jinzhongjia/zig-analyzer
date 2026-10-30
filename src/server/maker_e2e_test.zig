@@ -526,3 +526,58 @@ test "editing the build.zig of a path dependency reconfigures the project" {
         try h.notify("exit", {});
     }
 }
+
+/// Writes `zigw` into the project root: a wrapper of the user's zig that `zig env` reports as zig
+/// itself and that appends a line to `starts` each time `zig build` starts
+fn writeCountingZig(project: *fixture.Project) !void {
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(testing.allocator,
+        \\#!/bin/sh
+        \\case "$1" in
+        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}/zigw"|' ;;
+        \\build) echo start >> "{s}/starts"; exec "{s}" "$@" ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ zig, project.root, project.root, zig, zig });
+    defer testing.allocator.free(script);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+}
+
+/// Number of times `zig build` was started through the wrapper of `writeCountingZig`
+fn makerStarts(project: *fixture.Project) !usize {
+    const text = project.tmp.dir.readFileAlloc(testing.io, "starts", testing.allocator, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer testing.allocator.free(text);
+    return std.mem.count(u8, text, "\n");
+}
+
+test "a configure phase that fails without errors is reported with its cause, not restarted" {
+    // The maker sends no configuration errors for an invalid option and exits: this is not a crash,
+    // and starting it again would fail the same way
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = options_build },
+        .{ .path = "src/main.zig", .text = options_main },
+    });
+    defer project.deinit();
+    try writeCountingZig(&project);
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const options = try std.fmt.allocPrint(a, "{{\"zig\": {{\"path\": \"{s}/zigw\"}}, \"build\": {{\"args\": [\"-Dnope=1\"]}}}}", .{project.root});
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{}, .initializationOptions = try std.json.parseFromSliceLeaky(std.json.Value, a, options, .{}) });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, options_main);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, try makerStarts(&project));
+    const shown = try shownMessages(&h);
+    try testing.expectEqual(1, shown.len);
+    try testing.expect(std.mem.indexOf(u8, shown[0], "invalid option: \"nope\"") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
