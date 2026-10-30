@@ -2504,7 +2504,8 @@ fn startup(server: *Server) Io.Cancelable!void {
     // projects have started loading
     server.startup_done.store(true, .release);
     // The origins of files opened before startup (the standard library, files outside the
-    // workspace folders) are known only now, and naming hints depend on them
+    // workspace folders) are known only now, and naming hints depend on them; their live
+    // diagnostics may also have switched to the configured zig's `zig ast-check`
     server.publishOpenFiles();
     server.reconcileSingle();
 }

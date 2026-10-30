@@ -1980,3 +1980,43 @@ test "inlay hint refresh after changes the client cannot see: other documents, d
     try testing.expect(countRequests(&h, "workspace/inlayHint/refresh") > before);
     try shutdown(&h);
 }
+
+test "zig version mismatch: files opened before startup get the live diagnostics of zig ast-check" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const text = "export fn f() void {\n    var x: u32 = 1;\n    _ = x;\n}\n";
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // A zig of another version, reporting itself as the zig executable, whose ast-check reports
+    // one more error than the built-in AstGen
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\case "$1" in
+        \\env) "{s}" env | sed -e 's/\.version = "[^"]*"/.version = "0.0.0-mismatch"/' -e 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}/zigw"|' ;;
+        \\ast-check) "{s}" "$@"; echo '<stdin>:1:1: error: MARKER' >&2 ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ zig, project.root, zig, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+    const settings = try jsonValue(&h, try std.fmt.allocPrint(a, "{{\"zig\": {{\"path\": \"{s}/zigw\"}}, \"diagnostics\": {{\"compiler\": false, \"debounce_ms\": 0}}}}", .{project.root}));
+    h.configuration = settings;
+    // Startup waits for the reply to workspace/configuration, which the harness sends only when
+    // it next reads messages: the document is opened before startup
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = .{ .workspace = .{ .configuration = true } },
+        .initializationOptions = settings,
+    });
+    try h.notify("initialized", Empty{});
+    _ = try open(&h, try project.path(a, "main.zig"), text);
+    try waitIdle(&h);
+    // Guards against keeping the built-in AstGen result published before the switch to the
+    // configured zig
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{ "1:8 zig ast-check: local variable is never mutated", "0:0 zig ast-check: MARKER" });
+    try shutdown(&h);
+}
