@@ -208,3 +208,25 @@ test "an unclosed block does not take the declarations after it" {
         return err;
     };
 }
+
+test "an unclosed switch or a missing last value does not take the declarations after it" {
+    const head = "const E = enum { a, b };\nfn f(x: E) u32 {\n";
+    const tail = "}\n\nconst h: u32 = 2;\n\nfn g() u32 {\n    return h;\n}\n";
+    const types = "const E\n  <enum>\n    field a\n    field b\n";
+    const cases = [_]struct { []const u8, []const u8 }{
+        // The prong list ends at `const`, which cannot start a prong: `f` ends at its own `}`
+        .{ "    switch (x) {\n        .a => 1,\n    const y: u32 = 1;\n    return y;\n", types ++ "fn f\nconst h\nfn g\n" },
+        // These take `f`'s `}` as their own: `f` ends at the next function
+        .{ "    switch (x) {\n        .a => \n", types ++ "fn f\nfn g\n" },
+        .{ "    const s: struct { a: u32 } = .{ .a = \n", types ++ "fn f\n  <struct>\n    field a\nfn g\n" },
+        .{ "    asm volatile (\"nop\" ::: .{ .memory = \n", types ++ "fn f\nfn g\n" },
+    };
+    for (cases) |c| {
+        const source = try std.mem.concat(testing.allocator, u8, &.{ head, c[0], tail });
+        defer testing.allocator.free(source);
+        expectItems(source, c[1]) catch |err| {
+            std.debug.print("source: `{s}`\n", .{source});
+            return err;
+        };
+    }
+}

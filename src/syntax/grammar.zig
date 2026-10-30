@@ -730,12 +730,11 @@ fn switchExpr(p: *Parser, m: Marker) Error!CompletedMarker {
                 .r_brace, .eof => break,
                 else => {},
             }
+            // A token that cannot start a prong (such as a `const` statement after an unclosed
+            // switch) ends the prong list, as in `std.zig.Parse`
             const before = p.pos;
             try switchProng(p);
-            if (p.pos == before) {
-                try p.errBump("expected switch prong");
-                continue;
-            }
+            if (p.pos == before) break;
             switch (p.peek()) {
                 .comma => try p.bump(),
                 .r_brace => {},
