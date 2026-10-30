@@ -5076,8 +5076,8 @@ const CheckedRename = struct {
 /// The references of `def` and the source text of the new name for renaming it from `old` to
 /// `new` (as given, possibly `@"..."`), or why the result would be partial or break the build:
 /// the references cannot all be confirmed (see `renameReferences`), the new name conflicts with an
-/// existing one (a member of the same container, shadowing, or a name that would refer to another
-/// declaration; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
+/// existing one (a member of the same container, shadowing, or a reference that would become
+/// ambiguous; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
 /// reports a new error in the declaration's file once it is renamed (`rename.verifyAstGen`).
 fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
     const refs = switch (try server.renameReferences(r, arena, .{ .def = def }, old, new)) {

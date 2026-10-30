@@ -98,9 +98,9 @@ test "rename: conflicts at the declaration" {
     , "b", .declaration, "ok");
 }
 
-test "rename: references that would change their target" {
-    // A declaration in a container may share its name with an outer one: after the rename,
-    // references in the container that used to refer to the outer `x` would refer to it
+test "rename: references that would become ambiguous" {
+    // A declaration in a container may share its name with an outer one, but after the rename,
+    // references in the container to the outer `x` would see both (`ambiguous reference`)
     try expectProblem(
         \\const x = 1;
         \\const S = struct {
@@ -109,9 +109,8 @@ test "rename: references that would change their target" {
         \\        return x;
         \\    }
         \\};
-    , "x", .resolution, "5:16 this `x` refers to another declaration, which the renamed declaration would shadow");
-    // A reference to it sees a closer declaration with the same name: after the rename, the
-    // reference is captured
+    , "x", .resolution, "5:16 this `x` would be an ambiguous reference: it refers to another declaration, and the renamed declaration would be visible here too");
+    // A reference to it would also see a closer declaration with the same name
     try expectProblem(
         \\const S = struct {
         \\    const <|>old = 1;
@@ -122,7 +121,7 @@ test "rename: references that would change their target" {
         \\        }
         \\    };
         \\};
-    , "new", .resolution, "6:20 this reference would refer to another `new` declared closer to it");
+    , "new", .resolution, "6:20 this reference would be an ambiguous reference: another `new` is declared closer to it");
     // The outer declaration with the same name is not referenced in the container
     try expectProblem(
         \\const x = 1;
