@@ -227,6 +227,8 @@ pub const ImplementationRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 pub const TypeDefinitionParams = struct {
@@ -249,6 +251,8 @@ pub const TypeDefinitionRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// A workspace folder inside a client.
@@ -298,6 +302,8 @@ pub const DocumentColorRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link ColorPresentationRequest}.
@@ -373,6 +379,8 @@ pub const FoldingRangeRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 pub const DeclarationParams = struct {
@@ -395,6 +403,8 @@ pub const DeclarationRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// A parameter literal used in selection range requests.
@@ -427,6 +437,8 @@ pub const SelectionRangeRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 pub const WorkDoneProgressCreateParams = struct {
@@ -487,6 +499,8 @@ pub const CallHierarchyRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameter of a `callHierarchy/incomingCalls` request.
@@ -591,6 +605,8 @@ pub const SemanticTokensRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// @since 3.16.0
@@ -692,6 +708,8 @@ pub const LinkedEditingRangeRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters sent in notifications/requests for user-initiated creation of
@@ -805,6 +823,8 @@ pub const MonikerRegistrationOptions = struct {
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameter of a `textDocument/prepareTypeHierarchy` request.
@@ -856,6 +876,8 @@ pub const TypeHierarchyRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameter of a `typeHierarchy/supertypes` request.
@@ -911,6 +933,8 @@ pub const InlineValueRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// A parameter literal used in inlay hint requests.
@@ -996,6 +1020,8 @@ pub const InlayHintRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters of the document diagnostic request.
@@ -1043,6 +1069,8 @@ pub const DiagnosticRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters of the workspace diagnostic request.
@@ -1207,6 +1235,8 @@ pub const InlineCompletionRegistrationOptions = struct {
     /// The id used to register the request. The id can be used to deregister
     /// the request again. See also Registration#id.
     id: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for the `workspace/textDocumentContent` request.
@@ -1302,6 +1332,8 @@ pub const InitializeParams = struct {
     ///
     /// @since 3.6.0
     workspaceFolders: ?[]const WorkspaceFolder = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{ "processId", "rootUri" }).jsonStringify;
 };
 
 /// The result returned from an initialize request.
@@ -1383,6 +1415,8 @@ pub const TextDocumentRegistrationOptions = struct {
     /// A document selector to identify the scope of the registration. If set to null
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The change text document notification's parameters.
@@ -1412,6 +1446,8 @@ pub const TextDocumentChangeRegistrationOptions = struct {
     documentSelector: ?DocumentSelector = null,
     /// How documents are synced to the server.
     syncKind: TextDocumentSyncKind,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters sent in a close text document notification
@@ -1436,6 +1472,8 @@ pub const TextDocumentSaveRegistrationOptions = struct {
     documentSelector: ?DocumentSelector = null,
     /// The client is supposed to include the content on save.
     includeText: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters sent in a will save text document notification.
@@ -1708,6 +1746,8 @@ pub const CompletionRegistrationOptions = struct {
     ///
     /// @since 3.17.0
     completionItem: ?ServerCompletionItemOptions = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link HoverRequest}.
@@ -1742,6 +1782,8 @@ pub const HoverRegistrationOptions = struct {
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link SignatureHelpRequest}.
@@ -1812,6 +1854,8 @@ pub const SignatureHelpRegistrationOptions = struct {
     ///
     /// @since 3.15.0
     retriggerCharacters: ?[]const []const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link DefinitionRequest}.
@@ -1833,6 +1877,8 @@ pub const DefinitionRegistrationOptions = struct {
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link ReferencesRequest}.
@@ -1855,6 +1901,8 @@ pub const ReferenceRegistrationOptions = struct {
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link DocumentHighlightRequest}.
@@ -1886,6 +1934,8 @@ pub const DocumentHighlightRegistrationOptions = struct {
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// Parameters for a {@link DocumentSymbolRequest}.
@@ -1973,6 +2023,8 @@ pub const DocumentSymbolRegistrationOptions = struct {
     ///
     /// @since 3.16.0
     label: ?[]const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link CodeActionRequest}.
@@ -2093,6 +2145,8 @@ pub const CodeActionRegistrationOptions = struct {
     ///
     /// @since 3.16.0
     resolveProvider: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link WorkspaceSymbolRequest}.
@@ -2193,6 +2247,8 @@ pub const CodeLensRegistrationOptions = struct {
     workDoneProgress: ?bool = null,
     /// Code lens has a resolve provider as well.
     resolveProvider: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link DocumentLinkRequest}.
@@ -2234,6 +2290,8 @@ pub const DocumentLinkRegistrationOptions = struct {
     workDoneProgress: ?bool = null,
     /// Document links have a resolve provider as well.
     resolveProvider: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link DocumentFormattingRequest}.
@@ -2252,6 +2310,8 @@ pub const DocumentFormattingRegistrationOptions = struct {
     /// the document selector provided on the client side will be used.
     documentSelector: ?DocumentSelector = null,
     workDoneProgress: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link DocumentRangeFormattingRequest}.
@@ -2276,6 +2336,8 @@ pub const DocumentRangeFormattingRegistrationOptions = struct {
     ///
     /// @since 3.18.0
     rangesSupport: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link DocumentRangesFormattingRequest}.
@@ -2318,6 +2380,8 @@ pub const DocumentOnTypeFormattingRegistrationOptions = struct {
     firstTriggerCharacter: []const u8,
     /// More trigger characters.
     moreTriggerCharacter: ?[]const []const u8 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 /// The parameters of a {@link RenameRequest}.
@@ -2344,6 +2408,8 @@ pub const RenameRegistrationOptions = struct {
     ///
     /// @since version 3.12.0
     prepareProvider: ?bool = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"documentSelector"}).jsonStringify;
 };
 
 pub const PrepareRenameParams = struct {
@@ -3249,6 +3315,8 @@ pub const _InitializeParams = struct {
     initializationOptions: ?LSPAny = null,
     /// The initial trace setting. If omitted trace is disabled ('off').
     trace: ?TraceValue = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{ "processId", "rootUri" }).jsonStringify;
 };
 
 pub const WorkspaceFoldersInitializeParams = struct {
@@ -4129,6 +4197,8 @@ pub const OptionalVersionedTextDocumentIdentifier = struct {
     /// `null` to indicate that the version is unknown and the content on disk is the
     /// truth (as specified with document content ownership).
     version: ?i32 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"version"}).jsonStringify;
 };
 
 /// A special text edit with an additional change annotation.
@@ -4258,6 +4328,8 @@ pub const WorkspaceFullDocumentDiagnosticReport = struct {
     /// The version number for which the diagnostics are reported.
     /// If the document is not marked as open `null` can be provided.
     version: ?i32 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"version"}).jsonStringify;
 };
 
 /// An unchanged document diagnostic report for a workspace diagnostic result.
@@ -4277,6 +4349,8 @@ pub const WorkspaceUnchangedDocumentDiagnosticReport = struct {
     /// The version number for which the diagnostics are reported.
     /// If the document is not marked as open `null` can be provided.
     version: ?i32 = null,
+
+    pub const jsonStringify = json_ext.RequiredNullable(@This(), &.{"version"}).jsonStringify;
 };
 
 /// A notebook cell.

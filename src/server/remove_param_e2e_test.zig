@@ -196,6 +196,10 @@ test "remove parameter: resolve, calls in other files, refusals and the project 
         const annotation = edit.object.get("changeAnnotations").?.object.get("zig-analyzer.remove-param-public").?.object;
         try testing.expect(annotation.get("needsConfirmation").?.bool);
         try testing.expectEqualStrings("Remove parameter `factor` of public `scale`", annotation.get("label").?.string);
+        // `version` is required in each `textDocument` (clients reject the edit without it)
+        for (edit.object.get("documentChanges").?.array.items) |c| {
+            try testing.expect(c.object.get("textDocument").?.object.get("version") != null);
+        }
         try testing.expectEqual(2, try applyEdit(&h, &texts, edit));
         try sync(&h, &texts, 3);
     }
