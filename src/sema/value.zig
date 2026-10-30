@@ -280,26 +280,57 @@ pub fn intFits(ip: *InternPool, ty: Index, v: i128) bool {
 /// Result type of `@min` / `@max` with integer operands (matches the compiler's `analyzeMinMax`):
 /// the ranges of the operands (the value when it is known, otherwise the range of the type) are
 /// combined by `@min` / `@max`, and the result is the smallest integer type that holds the
-/// combined range; comptime_int when all operands are comptime_int. Null when an operand is not
-/// an integer or a range cannot be computed.
+/// combined range; comptime_int when all operands are comptime_int. Vector operands (all of the
+/// same length) give a vector of that type, the range of a known vector value spanning its
+/// elements. Null when an operand is not an integer (or a vector of integers) or a range cannot
+/// be computed.
 pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool.TypedValue) Allocator.Error!?Index {
+    const vector_len: ?u32 = switch (ip.key(operands[0].ty)) {
+        .vector_type => |v| v.len,
+        else => null,
+    };
     var result: Bounds = undefined;
     var all_comptime = true;
     for (operands, 0..) |o, i| {
-        const r: Bounds = if (intOf(ip, o.val)) |x| .{ .min = x, .max = x } else if (o.ty == .comptime_int_type)
+        const scalar = switch (ip.key(o.ty)) {
+            .vector_type => |v| if (v.len == vector_len) v.child else return null,
+            else => if (vector_len == null) o.ty else return null,
+        };
+        const r: Bounds = if (vector_len != null) (elemBounds(ip, o.val) orelse
+            bounds(intInfo(ip, scalar) orelse return null) orelse return null) else if (intOf(ip, o.val)) |x| .{ .min = x, .max = x } else if (scalar == .comptime_int_type)
             return null
         else
-            bounds(intInfo(ip, o.ty) orelse return null) orelse return null;
-        if (o.ty != .comptime_int_type) all_comptime = false;
+            bounds(intInfo(ip, scalar) orelse return null) orelse return null;
+        if (scalar != .comptime_int_type) all_comptime = false;
         result = if (i == 0) r else if (is_min)
             .{ .min = @min(result.min, r.min), .max = @min(result.max, r.max) }
         else
             .{ .min = @max(result.min, r.min), .max = @max(result.max, r.max) };
     }
-    if (all_comptime) return .comptime_int_type;
     // Same as the compiler's `intFittingRange`
     const signed = result.min < 0;
-    return try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
+    const scalar = if (all_comptime) .comptime_int_type else try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
+    return if (vector_len) |len| try ip.get(.{ .vector_type = .{ .len = len, .child = scalar } }) else scalar;
+}
+
+/// Smallest and largest element of a known vector value of integers
+fn elemBounds(ip: *InternPool, v: ?Index) ?Bounds {
+    var r: Bounds = .{ .min = std.math.maxInt(Wide), .max = std.math.minInt(Wide) };
+    const elems = switch (ip.key(v orelse return null)) {
+        .aggregate => |a| a.elems,
+        .bytes => |b| {
+            if (b.bytes.len == 0) return null;
+            for (b.bytes) |x| r = .{ .min = @min(r.min, x), .max = @max(r.max, x) };
+            return r;
+        },
+        else => return null,
+    };
+    if (elems.len == 0) return null;
+    for (elems) |e| {
+        const x = intOf(ip, e) orelse return null;
+        r = .{ .min = @min(r.min, x), .max = @max(r.max, x) };
+    }
+    return r;
 }
 
 /// Bit width needed to hold `x`, including the sign bit when `signed` (`signed` is true when `x`

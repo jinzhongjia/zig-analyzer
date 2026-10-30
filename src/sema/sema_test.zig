@@ -1595,6 +1595,38 @@ test "@min and @max narrow the result type like the compiler" {
     });
 }
 
+test "!, @intFromBool, @min and @max work element-wise on vectors" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(not_v), ...,
+    // @TypeOf(lim))` prints `@Vector(4, bool)`, `@Vector(4, u1)`, `@Vector(4, u8)`,
+    // `@Vector(4, u2)`, `@Vector(4, u31)`, `@Vector(4, bool)`, `bool`, `u1`, `u2`); vector operands
+    // must not give scalar types or skip the narrowing
+    try expectTypes(
+        \\fn probe(m: @Vector(4, bool), v: @Vector(4, u32), a: @Vector(4, i32), b: @Vector(4, i32), c: bool, x: u8) void {
+        \\    const not_v = !m;
+        \\    const ifb_v = @intFromBool(m);
+        \\    const clamp_v = @min(v, @as(@Vector(4, u32), @splat(255)));
+        \\    const clamp3 = @min(v, @as(@Vector(4, u32), @splat(3)));
+        \\    const zero: @Vector(4, i32) = @splat(0);
+        \\    const relu = @max(a, zero);
+        \\    const ne = !(a == b);
+        \\    const not_c = !c;
+        \\    const ifb_c = @intFromBool(c);
+        \\    const lim = @min(x, 3);
+        \\    _ = .{ not_v, ifb_v, clamp_v, clamp3, relu, ne, not_c, ifb_c, lim };
+        \\}
+    , &.{
+        .{ "not_v", "@Vector(4, bool)" },
+        .{ "ifb_v", "@Vector(4, u1)" },
+        .{ "clamp_v", "@Vector(4, u8)" },
+        .{ "clamp3", "@Vector(4, u2)" },
+        .{ "relu", "@Vector(4, u31)" },
+        .{ "ne", "@Vector(4, bool)" },
+        .{ "not_c", "bool" },
+        .{ "ifb_c", "u1" },
+        .{ "lim", "u2" },
+    });
+}
+
 test "peer types of different integer and float types" {
     // Expected values are the results of zig 0.17.0
     try expectTypes(

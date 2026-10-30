@@ -1660,6 +1660,11 @@ const Inferrer = struct {
         }
         if (eq(u8, name, "@intFromBool")) {
             for (args) |a| _ = try inf.infer(a, .bool_type);
+            // A vector of bools gives a vector of u1
+            if (args.len == 1) switch (ip.key(inf.get(args[0]).ty)) {
+                .vector_type => |v| return .{ .ty = try ip.get(.{ .vector_type = .{ .len = v.len, .child = .u1_type } }) },
+                else => {},
+            };
             const b = if (args.len == 1) inf.condValue(inf.get(args[0])) else null;
             return .{ .ty = .u1_type, .val = if (b) |x| try ip.get(.{ .int_value = .{ .ty = .u1_type, .value = @intFromBool(x) } }) else null };
         }
@@ -1840,6 +1845,15 @@ const Inferrer = struct {
                 else => null,
             } else null;
             for (args) |a| _ = try inf.infer(a, elem);
+            // A known scalar splatted into a vector gives a known vector
+            if (dest) |d| if (ip.key(d) == .vector_type and args.len == 1) {
+                const scalar = inf.get(args[0]);
+                if (scalar.val) |v| if (scalar.ty == elem.? and v != .unknown and v != .undefined_value) {
+                    const elems = try inf.scratch.alloc(Index, ip.key(d).vector_type.len);
+                    @memset(elems, v);
+                    return .{ .ty = d, .val = try value.aggregate(ip, inf.scratch, d, elems) };
+                };
+            };
             return .{ .ty = dest orelse .unknown };
         }
         // The argument's result type is the backing integer of the destination type
@@ -2784,8 +2798,10 @@ const Inferrer = struct {
                 return .{ .ty = payload };
             },
             .bang => {
-                const v = inf.condValue(try inf.infer(operand_e, .bool_type));
-                if (v) |b| if (inf.get(operand_e).ty == .bool_type) return boolValue(!b);
+                const operand = try inf.infer(operand_e, .bool_type);
+                // A vector of bools is negated element-wise
+                if (ip.key(operand.ty) == .vector_type) return .{ .ty = operand.ty };
+                if (inf.condValue(operand)) |b| if (operand.ty == .bool_type) return boolValue(!b);
                 return .{ .ty = .bool_type };
             },
             .ampersand => {
