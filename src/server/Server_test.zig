@@ -597,6 +597,44 @@ test "input closing while a configuration request is unanswered ends the main lo
     try testing.expectEqual(1, h.exit_code);
 }
 
+test "exit without shutdown ends the main loop while a configuration request or waitIdle is unanswered" {
+    // Guards against the process waiting forever for the client's reply after `exit` (or the end
+    // of input with a `waitIdle` request in flight)
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    for ([_]enum { exit, wait_then_eof, wait_then_exit }{ .exit, .wait_then_eof, .wait_then_exit }) |ending| {
+        var h: Harness = undefined;
+        try h.start();
+        _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{ .configuration = true } } });
+        h.hold_requests = true;
+        try h.notify("initialized", Empty{});
+        while (true) {
+            const msg = try h.next();
+            const method = msg.object.get("method") orelse continue;
+            if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+        }
+        switch (ending) {
+            .exit => try h.notify("exit", {}),
+            .wait_then_eof => {
+                _ = try h.send("zig-analyzer/waitIdle", {});
+                h.input.close();
+            },
+            .wait_then_exit => {
+                _ = try h.send("zig-analyzer/waitIdle", {});
+                try h.notify("exit", {});
+            },
+        }
+        // Once the main loop returns, the output is closed with it; if it is still waiting, this
+        // times out with an error (finish is not called, to avoid waiting on a stuck thread)
+        while (true) _ = h.next() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        h.finish();
+        try testing.expectEqual(1, h.exit_code);
+    }
+}
+
 test "live diagnostics are debounced per file and AstGen runs outside the read transaction" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

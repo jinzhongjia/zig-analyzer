@@ -448,11 +448,11 @@ pub fn deinit(server: *Server) void {
 
 /// Runs the main loop until `exit` is received or the input ends, and returns the process exit
 /// code. Before returning, cancels the read requests in flight (nobody reads their results
-/// anymore), stops the build system processes of all projects, and waits for the scheduled
-/// background tasks (diagnostic publishing, etc.) to finish. If the input ends without an `exit`,
-/// the client has already exited: its replies to server requests are no longer awaited.
+/// anymore), stops waiting for the client's replies to configuration requests (the main loop no
+/// longer reads them, and a `waitIdle` request in flight waits for them), stops the build system
+/// processes of all projects, and waits for the scheduled background tasks (diagnostic
+/// publishing, etc.) to finish.
 pub fn run(server: *Server, reader: *Io.Reader) !u8 {
-    var exited = false;
     while (true) {
         const arena = try server.gpa.create(std.heap.ArenaAllocator);
         arena.* = .init(server.gpa);
@@ -468,21 +468,18 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
                 },
             }
         };
-        if (try server.processMessage(arena, body) == .exit) {
-            exited = true;
-            break;
-        }
+        if (try server.processMessage(arena, body) == .exit) break;
     }
     server.cancelAllPending();
+    server.abandonConfigRequests();
     server.group.await(server.io) catch {};
-    if (!exited) server.abandonConfigRequests();
     server.stopWorkspaces();
     server.waitIdle();
     return if (server.state == .shutdown) 0 else 1;
 }
 
 /// Stops waiting for the client's replies to configuration requests (on shutdown, or when the
-/// client has already exited)
+/// main loop ends)
 fn abandonConfigRequests(server: *Server) void {
     server.startup_pending = false;
     while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
