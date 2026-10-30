@@ -1595,3 +1595,70 @@ test "with a client that registers file watchers, the server watches the files o
         try h.notify("exit", {});
     }
 }
+
+/// Whether the client was asked to watch `glob`
+fn registeredGlob(h: *Harness, glob: []const u8) bool {
+    for (h.received.items) |m| {
+        const method = m.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "client/registerCapability")) continue;
+        for (m.object.get("params").?.object.get("registrations").?.array.items) |r| {
+            const options = r.object.get("registerOptions") orelse continue;
+            for (options.object.get("watchers").?.array.items) |watcher| {
+                if (std.mem.eql(u8, watcher.object.get("globPattern").?.string, glob)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Prevents missing folder renames and deletes in the client's watch mode: clients report a folder by
+// its own path only, which must be registered and must reach the files under it
+test "a folder renamed on disk is registered with the client and its files follow the disk" {
+    const main_text = "const inner = @import(\"sub/inner.zig\");\npub fn main() void {\n    const v = inner.innerValue;\n    _ = v;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = check_build },
+        .{ .path = "src/main.zig", .text = main_text },
+        .{ .path = "src/sub/inner.zig", .text = "pub const innerValue: u32 = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{
+        .rootUri = root_uri,
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("inner.zig", try gotoFile(&h, main_uri, main_text, "inner.inner"));
+    // Registered by a background task once the file is interned
+    while (!registeredGlob(&h, "**/sub")) _ = try h.next();
+
+    // Renamed away: the client reports the two folders only
+    const sub_path = try project.path(a, "src/sub");
+    const moved_path = try project.path(a, "src/moved");
+    const sub_uri = try za.base.uri.fromPath(a, sub_path);
+    const moved_uri = try za.base.uri.fromPath(a, moved_path);
+    try std.Io.Dir.cwd().rename(sub_path, std.Io.Dir.cwd(), moved_path, testing.io);
+    const builds = compiles(&h);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = sub_uri, .type = 3 }, .{ .uri = moved_uri, .type = 1 } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("null", try gotoFile(&h, main_uri, main_text, "inner.inner"));
+    try testing.expect(compiles(&h) > builds);
+
+    // Edited while away and renamed back
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "src/moved/inner.zig"), .data = "pub const innerValue: u64 = 2;\n" });
+    try std.Io.Dir.cwd().rename(moved_path, std.Io.Dir.cwd(), sub_path, testing.io);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = moved_uri, .type = 3 }, .{ .uri = sub_uri, .type = 1 } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = position(main_text, "inner.inner");
+    try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, at.line, at.character), "u64") != null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

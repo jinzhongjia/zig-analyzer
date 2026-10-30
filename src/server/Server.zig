@@ -1821,9 +1821,11 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         if (!std.fs.path.isAbsolute(path)) continue;
         try events.put(arena, path, event.type);
     }
+    // A folder created, deleted, moved or renamed is reported by its own path only
+    const folders = try server.addFolderContents(arena, &events);
     // Source files created or deleted under the root directories change what find references and
     // rename search
-    const rescan = try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
+    const rescan = folders or try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
     defer if (rescan) server.scheduleScan();
     for (events.keys(), events.values()) |path, kind| {
         const base = std.fs.path.basename(path);
@@ -1951,6 +1953,39 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     server.recompileSingle(open, rebuilt.items);
     // If it cannot be recorded, the next change rebuilds as usual
     for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+}
+
+/// Clients report a folder created, deleted, moved or renamed by its own path, without the files
+/// in it: adds a change of every known file under such a path to `events` (re-read from disk, so
+/// whether it still exists is decided then). Returns whether any event was such a folder.
+fn addFolderContents(server: *Server, arena: Allocator, events: *std.StringArrayHashMapUnmanaged(types.FileChangeType)) Allocator.Error!bool {
+    const insensitive = server.vfs.case == .insensitive;
+    // Identity keys (see `Vfs`) of the paths that are not known files
+    var folders: std.StringHashMapUnmanaged(void) = .empty;
+    for (events.keys()) |path| {
+        if (try server.vfs.lookup(path) != null) continue;
+        const normalized = try Vfs.normalize(.native, arena, path) orelse continue;
+        if (insensitive) _ = std.ascii.lowerString(normalized, normalized);
+        try folders.put(arena, normalized, {});
+    }
+    if (folders.count() == 0) return false;
+    var found = false;
+    var key: std.ArrayList(u8) = .empty;
+    for (0..server.vfs.count()) |i| {
+        const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
+        key.clearRetainingCapacity();
+        try key.appendSlice(arena, path);
+        if (insensitive) _ = std.ascii.lowerString(key.items, key.items);
+        var dir = std.fs.path.dirname(key.items);
+        while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+            if (!folders.contains(d)) continue;
+            found = true;
+            const gop = try events.getOrPut(arena, path);
+            if (!gop.found_existing) gop.value_ptr.* = .Changed;
+            break;
+        }
+    }
+    return found;
 }
 
 /// Whether file events change the user's source files under the root directories (see

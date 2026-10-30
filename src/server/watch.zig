@@ -193,9 +193,11 @@ pub const Watcher = struct {
     /// When the client detects external changes, the initially registered globs cover only
     /// `.zig` and `.zon`: other interned files (files used by `@embedFile`, configure inputs) are
     /// additionally registered by file name (`**/<file name>`; notifications for other files with
-    /// the same name are ignored, since those are not interned), and configure input directories
-    /// by their name and their entries (`**/<name>`, `**/<name>/*`). A name containing glob
-    /// special characters cannot be written as a glob and is not registered.
+    /// the same name are ignored, since those are not interned), the directories under the root
+    /// directories that contain interned files by their name (`**/<name>`: a directory deleted,
+    /// moved or renamed is reported by its own path only), and configure input directories by
+    /// their name and their entries (`**/<name>`, `**/<name>/*`). A name containing glob special
+    /// characters cannot be written as a glob and is not registered.
     fn registerClientGlobs(w: *Watcher) Allocator.Error!void {
         const server = w.server;
         var arena: std.heap.ArenaAllocator = .init(w.gpa);
@@ -203,10 +205,21 @@ pub const Watcher = struct {
         const a = arena.allocator();
         const rules = try server.originRules(a);
         var globs: std.ArrayList([]const u8) = .empty;
+        var dir_names: std.StringHashMapUnmanaged(void) = .empty;
         for (0..server.vfs.count()) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-            if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
             if (!server.watchable(rules, path)) continue;
+            if (server.vfs.rootOf(rules.roots, path)) |root| {
+                var dir = std.fs.path.dirname(path);
+                while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+                    if (d.len <= root.len) break;
+                    const name = std.fs.path.basename(d);
+                    if (w.client_names.contains(name)) continue;
+                    const gop = try dir_names.getOrPut(a, name);
+                    if (!gop.found_existing) try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{name}));
+                }
+            }
+            if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
             try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{std.fs.path.basename(path)}));
         }
         for (try server.configureInputDirs(a)) |dir| {
