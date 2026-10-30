@@ -23,7 +23,10 @@ pub const Item = struct {
     /// Whether this is also an AstGen (`zig ast-check`) error. When the buffer has unsaved
     /// changes, such errors come from the live source instead.
     is_astgen: bool,
+    /// The compiler's notes followed by the reference trace
     notes: []const Note,
+    /// Number of compiler notes at the start of `notes`; the rest is the reference trace
+    note_count: usize = 0,
     /// `@compileLog` output attached to this error (its lines, without the trailing newline),
     /// appended to the message when published; empty when there is none. Stored separately from
     /// `message`: dedup and AstGen matching both use the compiler's original message.
@@ -103,9 +106,12 @@ pub fn collect(
     }
 
     var lists: std.StringArrayHashMapUnmanaged(std.ArrayList(Item)) = .empty;
-    // Dedup: several compile steps may report the same error in the same file. The value is the
-    // index of the kept error in that file's list.
+    // Dedup: several compile steps may report the same error in the same file. Errors at the same
+    // range with the same message but different notes (e.g. one per inline call site) are distinct
+    // errors; the reference trace is not part of the identity. The value is the index of the kept
+    // error in that file's list.
     var seen: std.StringHashMapUnmanaged(usize) = .empty;
+    var key: std.ArrayList(u8) = .empty;
 
     for (bundles) |eb| {
         if (eb.errorMessageCount() == 0) continue;
@@ -130,13 +136,6 @@ pub fn collect(
                     start, end = byteSpan(loc);
                 }
             }
-            const key = try std.fmt.allocPrint(a, "{s}\x00{d}\x00{d}\x00{s}", .{ path, start, end, message });
-            const seen_gop = try seen.getOrPut(a, key);
-            if (seen_gop.found_existing) {
-                try addCompileLog(a, &lists.getPtr(path).?.items[seen_gop.value_ptr.*], compile_log);
-                continue;
-            }
-
             // The notes are followed by the reference trace
             const refs: u32 = if (msg.src_loc != .none) eb.getSourceLocation(msg.src_loc).reference_trace_len else 0;
             var notes: std.ArrayList(Note) = try .initCapacity(a, msg.notes_len + refs);
@@ -155,11 +154,21 @@ pub fn collect(
                 note.base_text = try sources.text(note.path);
                 notes.appendAssumeCapacity(note);
             }
+            key.clearRetainingCapacity();
+            try key.print(a, "{s}\x00{d}\x00{d}\x00{s}", .{ path, start, end, message });
+            for (notes.items) |n| try key.print(a, "\x00{s}\x00{d}\x00{d}\x00{s}", .{ n.path, n.start, n.end, n.message });
+            const seen_gop = try seen.getOrPut(a, key.items);
+            if (seen_gop.found_existing) {
+                try addCompileLog(a, &lists.getPtr(path).?.items[seen_gop.value_ptr.*], compile_log);
+                continue;
+            }
+            seen_gop.key_ptr.* = try a.dupe(u8, key.items);
+            const note_count = notes.items.len;
             if (refs != 0) try referenceTrace(eb, msg.src_loc, refs, &sources, path, start, &notes);
             const gop = try lists.getOrPut(a, path);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             seen_gop.value_ptr.* = gop.value_ptr.items.len;
-            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes.items, .compile_log = compile_log });
+            try gop.value_ptr.append(a, .{ .start = start, .end = end, .message = try a.dupe(u8, message), .is_astgen = false, .notes = notes.items, .note_count = note_count, .compile_log = compile_log });
         }
     }
 
@@ -277,6 +286,25 @@ fn addCompileLog(a: Allocator, item: *Item, compile_log: []const u8) Allocator.E
     item.compile_log = if (item.compile_log.len == 0) compile_log else try std.mem.join(a, "\n", &.{ item.compile_log, compile_log });
 }
 
+/// Whether two errors are the same error: same range, message and notes (the reference trace,
+/// which differs between the compilations that reach the error, is not compared). Each note's
+/// range refers to the text of its file that its own build read: a note of `y` read from another
+/// text is shifted onto the text of `x`'s note before comparing.
+fn sameError(arena: Allocator, x: Item, y: Item) Allocator.Error!bool {
+    if (x.start != y.start or x.end != y.end or !std.mem.eql(u8, x.message, y.message)) return false;
+    if (x.note_count != y.note_count) return false;
+    for (x.notes[0..x.note_count], y.notes[0..y.note_count]) |m, n| {
+        if (!std.mem.eql(u8, m.path, n.path) or !std.mem.eql(u8, m.message, n.message)) return false;
+        var start = n.start;
+        var end = n.end;
+        if (m.base_text) |mb| if (n.base_text) |nb| if (!std.mem.eql(u8, mb, nb)) {
+            start, end = remap(try diffEdits(arena, nb, mb), n.start, n.end) orelse return false;
+        };
+        if (m.start != start or m.end != end) return false;
+    }
+    return true;
+}
+
 /// Byte range of a source location. The values come from the error bundle sent back by the child
 /// process and are not validated: an end before the start becomes an empty range at the start, so
 /// a published Range is never reversed.
@@ -299,8 +327,8 @@ fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error!?[
 /// authoritative: results with the same text are merged as is; for results with a different text
 /// (the file was modified between the two compilations), only non-AstGen errors are merged,
 /// shifted according to the text diff, and those falling inside a modified region are dropped,
-/// the same way `merge` handles unsaved changes. Errors with the same range and message are kept
-/// only once (the compile log is merged into the kept one).
+/// the same way `merge` handles unsaved changes. The same error (see `sameError`) is kept only
+/// once (the compile log is merged into the kept one).
 pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.Error!FileResult {
     const base = results[0].base_text;
     var items: std.ArrayList(Item) = .empty;
@@ -315,7 +343,7 @@ pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.E
                 moved.end = span[1];
             }
             for (items.items) |*x| {
-                if (x.start == moved.start and x.end == moved.end and std.mem.eql(u8, x.message, moved.message)) {
+                if (try sameError(arena, x.*, moved)) {
                     try addCompileLog(arena, x, moved.compile_log);
                     continue :next;
                 }

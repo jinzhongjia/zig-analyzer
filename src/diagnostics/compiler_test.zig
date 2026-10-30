@@ -925,3 +925,41 @@ test "collect: notes of an error without a location outlive the fallback path" {
     try testing.expectEqualStrings(native("/proj/build.zig"), item.notes[0].path);
     try testing.expectEqualStrings("referenced by /proj/.zig-cache/o/x/linkerr_zcu.o:_main.main", item.notes[0].message);
 }
+
+/// An error at `"s"` with the note "called inline here" at `note_needle`
+fn addInlineError(wip: *ErrorBundle.Wip, note_needle: []const u8) !void {
+    const err_loc = try location(wip, "src/main.zig", main_text, "\"s\"", 0);
+    const note_loc = try location(wip, "src/main.zig", main_text, note_needle, 0);
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("called inline here"), .src_loc = note_loc }},
+    );
+}
+
+test "collect and combine: errors that differ only in their notes are kept apart" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    try addInlineError(&wip, "unused");
+    try addInlineError(&wip, "_ = x");
+    // A repeat with the same note is still the same error
+    try addInlineError(&wip, "unused");
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
+    const result = r.files.getPtr(native("/proj/src/main.zig")).?;
+    // Guards against merging the errors of two inline call sites into one
+    try testing.expectEqual(2, result.items.len);
+    try testing.expectEqual(std.mem.indexOf(u8, main_text, "unused").?, result.items[0].notes[0].start);
+    try testing.expectEqual(std.mem.indexOf(u8, main_text, "_ = x").?, result.items[1].notes[0].start);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const first: compiler.FileResult = .{ .base_text = main_text, .items = result.items[0..1] };
+    const second: compiler.FileResult = .{ .base_text = main_text, .items = result.items[1..2] };
+    const c = try compiler.combine(arena.allocator(), &.{ &first, &second, result });
+    try testing.expectEqual(2, c.items.len);
+    try testing.expectEqual(std.mem.indexOf(u8, main_text, "_ = x").?, c.items[1].notes[0].start);
+}
