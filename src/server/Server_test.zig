@@ -1818,3 +1818,43 @@ test "didChange for a document that is not open changes nothing" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "file URIs without an authority name the same files and folders" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const b_text = "const a = @import(\"a.zig\");\npub const b = a.a;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "pub const a = 1;\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = b_text });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // `file:///x` → `file:/x` (RFC 8089 local form)
+    const local = struct {
+        fn local(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+            const full = try za.base.uri.fromPath(arena, path);
+            return std.fmt.allocPrint(arena, "file:{s}", .{full["file://".len..]});
+        }
+    }.local;
+    const root_uri = try local(a, root);
+    const b_uri = try local(a, try std.fs.path.join(a, &.{ root, "b.zig" }));
+    _ = try h.request("initialize", .{ .capabilities = struct {}{}, .workspaceFolders = &.{.{ .uri = root_uri, .name = "root" }} });
+    try h.notify("initialized", struct {}{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = b_uri, .languageId = "zig", .version = 1, .text = b_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = b_uri } })).object.get("result").?.object;
+    try testing.expectEqualStrings("user", status.get("origin").?.string);
+    const def = (try h.request("textDocument/definition", .{ .textDocument = .{ .uri = b_uri }, .position = .{ .line = 1, .character = 16 } })).object.get("result").?;
+    const locations = if (def == .array) def.array.items else &.{def};
+    try testing.expectEqual(1, locations.len);
+    try testing.expect(std.mem.endsWith(u8, locations[0].object.get("uri").?.string, "/a.zig"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
