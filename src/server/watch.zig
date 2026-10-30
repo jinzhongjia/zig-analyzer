@@ -872,6 +872,63 @@ const Inotify = struct {
     }
 };
 
+/// `path` is the directory `dir` itself or lies under it (POSIX paths)
+fn underPosix(path: []const u8, dir: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    return path.len == dir.len or path[dir.len] == '/' or std.mem.eql(u8, dir, "/");
+}
+
+/// Watch roots whose real path differs from the written path: FSEvents reports real paths, which
+/// are mapped back to the written form. Independent of the platform's notifications.
+const RootAliases = struct {
+    list: std.ArrayList(Alias) = .empty,
+
+    const Alias = struct {
+        /// Owned by `gpa`; allocated with its sentinel (`realPathFileAlloc`), and freed as such
+        real: [:0]u8,
+        /// Borrowed from the roots passed to `set`
+        written: []const u8,
+    };
+
+    fn deinit(r: *RootAliases, gpa: Allocator) void {
+        r.clear(gpa);
+        r.list.deinit(gpa);
+    }
+
+    fn clear(r: *RootAliases, gpa: Allocator) void {
+        for (r.list.items) |al| gpa.free(al.real);
+        r.list.clearRetainingCapacity();
+    }
+
+    /// Replaces the aliases with those of `roots`, which must outlive them; a root whose real
+    /// path cannot be determined is taken as written
+    fn set(r: *RootAliases, gpa: Allocator, io: Io, roots: []const [:0]const u8) Allocator.Error!void {
+        r.clear(gpa);
+        for (roots) |root| {
+            const real = Io.Dir.cwd().realPathFileAlloc(io, root, gpa) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            if (std.mem.eql(u8, real, root)) {
+                gpa.free(real);
+                continue;
+            }
+            r.list.append(gpa, .{ .real = real, .written = root }) catch |err| {
+                gpa.free(real);
+                return err;
+            };
+        }
+    }
+
+    /// Maps a real path back to the written form of its watch root (allocated in `a`)
+    fn written(r: *const RootAliases, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
+        for (r.list.items) |al| if (underPosix(path, al.real)) {
+            return std.mem.concat(a, u8, &.{ al.written, path[al.real.len..] });
+        };
+        return a.dupe(u8, path);
+    }
+};
+
 /// macOS: FSEvents (recursive watching, managed by a system service). CoreServices is loaded
 /// dynamically, with no dependency on the SDK; callbacks run on a serial queue created by this
 /// backend, the received changes are buffered on that queue, and the background task takes them
@@ -890,14 +947,11 @@ const FsEvents = struct {
     cf_array: ?CFArrayRef = null,
     /// Current watch roots (owned by `gpa`)
     roots: std.ArrayList([:0]u8) = .empty,
-    /// Watch roots whose real path differs from the written path: FSEvents reports real paths,
-    /// which are mapped back to the written form
-    aliases: std.ArrayList(Alias) = .empty,
+    /// Real paths of the watch roots (FSEvents reports real paths)
+    aliases: RootAliases = .{},
     /// Changes received by the callback and not yet taken (accessed only on `queue`; paths are
     /// owned by `gpa`)
     queued: std.ArrayList(Event) = .empty,
-
-    const Alias = struct { real: []u8, written: []const u8 };
 
     /// FSEvents has an undocumented limit on the number of watched paths (reportedly 4096)
     const max_roots = 2048;
@@ -1019,7 +1073,7 @@ const FsEvents = struct {
         var roots: std.ArrayList([]const u8) = .empty;
         defer roots.deinit(gpa);
         for (sorted) |d| {
-            if (roots.items.len != 0 and under(d, roots.items[roots.items.len - 1])) continue;
+            if (roots.items.len != 0 and underPosix(d, roots.items[roots.items.len - 1])) continue;
             try roots.append(gpa, d);
         }
         // With too many directories, watch the whole file system: expensive, but still native
@@ -1037,27 +1091,12 @@ const FsEvents = struct {
         f.stopStream();
         f.clearRoots();
         for (roots.items) |r| try f.roots.append(gpa, try gpa.dupeSentinel(u8, r, 0));
-        for (f.roots.items) |r| {
-            const real = Io.Dir.cwd().realPathFileAlloc(f.io, r, gpa) catch continue;
-            if (std.mem.eql(u8, real, r)) {
-                gpa.free(real);
-                continue;
-            }
-            f.aliases.append(gpa, .{ .real = real, .written = r }) catch |err| {
-                gpa.free(real);
-                return err;
-            };
-        }
+        try f.aliases.set(gpa, f.io, f.roots.items);
         if (f.roots.items.len == 0) return;
         f.startStream() catch {
             log.warn("cannot start FSEvents stream, checking files on disk periodically instead", .{});
             try failed.appendSlice(gpa, dirs);
         };
-    }
-
-    fn under(path: []const u8, dir: []const u8) bool {
-        if (!std.mem.startsWith(u8, path, dir)) return false;
-        return path.len == dir.len or path[dir.len] == '/' or std.mem.eql(u8, dir, "/");
     }
 
     fn startStream(f: *FsEvents) error{ OutOfMemory, StartFailed }!void {
@@ -1096,8 +1135,7 @@ const FsEvents = struct {
     }
 
     fn clearRoots(f: *FsEvents) void {
-        for (f.aliases.items) |al| f.gpa.free(al.real);
-        f.aliases.clearRetainingCapacity();
+        f.aliases.clear(f.gpa);
         for (f.roots.items) |r| f.gpa.free(r);
         f.roots.clearRetainingCapacity();
     }
@@ -1146,15 +1184,7 @@ const FsEvents = struct {
             for (take.taken.items) |e| f.gpa.free(e.path);
             take.taken.deinit(f.gpa);
         }
-        for (take.taken.items) |e| try out.append(a, .{ .path = try f.written(a, e.path), .kind = e.kind });
-    }
-
-    /// Maps a real path back to the written form of its watch root
-    fn written(f: *const FsEvents, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
-        for (f.aliases.items) |al| if (under(path, al.real)) {
-            return std.mem.concat(a, u8, &.{ al.written, path[al.real.len..] });
-        };
-        return a.dupe(u8, path);
+        for (take.taken.items) |e| try out.append(a, .{ .path = try f.aliases.written(a, e.path), .kind = e.kind });
     }
 };
 
@@ -1468,4 +1498,54 @@ test "native watching reports changes, creation and removal in watched directori
     n.wait(null);
     var events: std.ArrayList(Event) = .empty;
     try n.drain(a, &events);
+}
+
+// Prevents freeing the real path of an aliased watch root without its sentinel: the allocator
+// rejects the size mismatch
+test "root aliases map real paths back to the written roots and free them as allocated" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "real");
+    try tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const link = try std.fs.path.joinZ(a, &.{ dir, "link" });
+    const real = try std.fs.path.join(a, &.{ dir, "real" });
+
+    var aliases: RootAliases = .{};
+    defer aliases.deinit(testing.allocator);
+    try aliases.set(testing.allocator, testing.io, &.{link});
+    try testing.expectEqual(1, aliases.list.items.len);
+    try testing.expectEqualStrings(
+        try std.fs.path.join(a, &.{ link, "a.zig" }),
+        try aliases.written(a, try std.fs.path.join(a, &.{ real, "a.zig" })),
+    );
+    try aliases.set(testing.allocator, testing.io, &.{});
+    try testing.expectEqual(0, aliases.list.items.len);
+    try aliases.set(testing.allocator, testing.io, &.{link});
+}
+
+test "FSEvents: watch roots reached through a symbolic link are replaced and freed cleanly" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "real");
+    try tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const link = try std.fs.path.join(testing.allocator, &.{ dir, "link" });
+    defer testing.allocator.free(link);
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try n.setDirs(testing.allocator, &.{link}, &failed);
+    try n.setDirs(testing.allocator, &.{}, &failed);
+    try n.setDirs(testing.allocator, &.{link}, &failed);
+    try testing.expectEqual(0, failed.items.len);
 }
