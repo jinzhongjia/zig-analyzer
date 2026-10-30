@@ -1734,3 +1734,34 @@ test "initialize takes rootPath as the root when there is no rootUri, and rootUr
         try h.notify("exit", {});
     }
 }
+
+// Prevents keeping the old text of closed files changed while nobody watched them, once the server
+// starts watching after a change of `files.watcher`
+test "switching files.watcher to the server compares the files with the disk" {
+    const main_text = "const dep = @import(\"dep.zig\");\npub fn main() void {\n    const v = dep.value;\n    _ = v;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = check_build },
+        .{ .path = "src/main.zig", .text = main_text },
+        .{ .path = "src/dep.zig", .text = "pub const value: u32 = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // Nobody watches the files: the client cannot, and the server is told not to
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = .{ .files = .{ .watcher = "client" } } });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "dep.val"));
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "src/dep.zig"), .data = "// a\n// b\n// c\npub const value: i64 = 1;\n" });
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .files = .{ .watcher = "auto" } } } });
+    try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "dep.val", .want = 3 });
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

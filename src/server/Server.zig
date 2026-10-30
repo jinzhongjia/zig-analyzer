@@ -1783,6 +1783,20 @@ fn isProjectFile(base: []const u8) bool {
     return std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon") or std.mem.eql(u8, base, Config.project_file);
 }
 
+fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
+    return server.applyFileChanges(arena, params.changes, .notified);
+}
+
+/// How changes on disk were found
+pub const ChangeSource = enum {
+    /// Reported by a file watcher (the client's or the server's)
+    notified,
+    /// Files compared with the disk because nobody watched them for a while (see
+    /// `watch.Watcher`): only a known file whose known text differs from the disk changed; open
+    /// documents and files never loaded are skipped
+    verified,
+};
+
 /// External changes on disk (outside the editor: git checkout, code generation, etc.). For open
 /// files the buffer is authoritative, but the builds read the disk, so they are rebuilt as well;
 /// other known files are updated from the disk contents (deleted ones become nonexistent),
@@ -1791,7 +1805,7 @@ fn isProjectFile(base: []const u8) bool {
 /// script restarts that project; creating or deleting build.zig in a root directory starts or
 /// stops the project; changes to other files rebuild projects and recompile single files; nothing
 /// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
-fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
+fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource) !void {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
@@ -1817,7 +1831,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     // deletes and then recreates the file, and with unchanged contents the two together are not a
     // change
     var events: std.StringArrayHashMapUnmanaged(types.FileChangeType) = .empty;
-    for (params.changes) |event| {
+    for (file_events) |event| {
         const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedScheme, error.InvalidUri => continue,
@@ -1838,6 +1852,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         // Files never seen before have no known contents to update (a new file is loaded when it
         // is imported); project files have no contents to compare against and count as changed
         const file = try server.vfs.lookup(path) orelse {
+            if (source == .verified) continue;
             if (isProjectFile(base)) try build_files.append(arena, dir);
             continue;
         };
@@ -1846,6 +1861,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             defer server.docs_mutex.unlock(server.io);
             break :blk server.open_docs.contains(file);
         };
+        if (is_open and source == .verified) continue;
         const read = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
@@ -1880,7 +1896,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         var kept: usize = 0;
         for (changes.items) |*c| {
             c.edited = !c.open and !sameText(&ctx, c.file, c.text);
-            c.rebuild = if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
+            c.rebuild = if (source == .verified) c.edited else if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
             if (!c.edited and !c.rebuild) {
                 if (c.text) |t| server.gpa.free(t);
                 continue;
@@ -1889,6 +1905,11 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             kept += 1;
         }
         changes.shrinkRetainingCapacity(kept);
+    }
+    // Only the verified files whose contents differ from the known text changed
+    if (source == .verified) {
+        events.clearRetainingCapacity();
+        for (changes.items) |c| try events.put(arena, c.path, if (c.disk == null) .Deleted else .Changed);
     }
     var edited: std.ArrayList(Vfs.FileId) = .empty;
     var rebuilt: std.ArrayList(Vfs.FileId) = .empty;
@@ -2034,8 +2055,9 @@ fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
 }
 
 /// External changes discovered by the server: handled the same way as the client's
-/// `workspace/didChangeWatchedFiles` notification, serialized with main loop message handling
-pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent) void {
+/// `workspace/didChangeWatchedFiles` notification (see `applyFileChanges`), serialized with main
+/// loop message handling
+pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) void {
     defer {
         server.watch_mutex.lockUncancelable(server.io);
         server.watch_batches += 1;
@@ -2050,7 +2072,7 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     // waits for idle (waitIdle, shutdown) must not be allowed to return in between
     server.busyBegin();
     defer server.busyEnd();
-    server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
+    server.applyFileChanges(arena, changes, source) catch |err| log.err("applying changes on disk failed: {t}", .{err});
 }
 
 /// Files watched when the server discovers external changes (besides the project files of each
@@ -2092,7 +2114,7 @@ pub fn configureInputDirs(server: *Server, arena: Allocator) Allocator.Error![]c
     return out.items;
 }
 
-/// Which files the server watches on disk itself (see `Config.Watcher`)
+/// Which files the server watches on disk itself (see `Config.Watcher`), from the narrowest
 pub const WatchScope = enum {
     none,
     /// Files outside the root directories: the client watches those inside (clients apply the

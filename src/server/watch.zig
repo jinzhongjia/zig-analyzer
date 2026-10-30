@@ -85,6 +85,10 @@ pub const Watcher = struct {
     // ── The following fields are accessed only by the background task ──
     /// What is being watched (see `Server.WatchScope`); `.none` while not watching
     scope: Server.WatchScope = .none,
+    /// The scope seen in the previous round of `run`; null before the first round
+    last_scope: ?Server.WatchScope = null,
+    /// The scope has widened: the files of interest are compared with the disk once recomputed
+    verify: bool = false,
     /// Arena holding `files` and `missing`; replaced as a whole on recomputation
     state_arena: std.heap.ArenaAllocator,
     /// Files of interest: identity key (lowercased when case-insensitive) → path
@@ -172,6 +176,12 @@ pub const Watcher = struct {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
             const scope = w.server.watchScope();
+            // Files the server starts watching may have changed while nobody watched them: they
+            // are compared with the disk. At startup, they were all just read.
+            if (w.last_scope) |last| if (@backingInt(scope) > @backingInt(last)) {
+                w.verify = true;
+            };
+            w.last_scope = scope;
             if (scope == .none) {
                 w.deactivate();
                 // Clear first, then check: new files interned during the check wake the task
@@ -264,6 +274,12 @@ pub const Watcher = struct {
         const requested = w.resync_requested.swap(false, .acq_rel);
         if (w.scope != scope or requested) {
             try w.resync(a, scope, &pending);
+            if (w.verify) {
+                w.verify = false;
+                for (w.files.keys(), w.files.values()) |k, path| {
+                    if (!w.entry_dirs.contains(k)) try pending.add(a, path, .verify);
+                }
+            }
             if (pending.paths.count() != 0) return w.apply(a, &pending);
         }
 
@@ -304,8 +320,8 @@ pub const Watcher = struct {
         if (pending.paths.count() != 0) try w.apply(a, &pending);
     }
 
-    /// Stops watching and discards the state: when watching starts again, the disk state at that
-    /// time is taken as is, and changes in between are not reported afterwards
+    /// Stops watching and discards the state; when watching starts again, the files of interest
+    /// are compared with the disk (see `verify`)
     fn deactivate(w: *Watcher) void {
         if (w.scope == .none) return;
         w.scope = .none;
@@ -527,14 +543,16 @@ pub const Watcher = struct {
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         var events: std.ArrayList(types.FileEvent) = .empty;
+        var verified: std.ArrayList(types.FileEvent) = .empty;
         for (pending.paths.keys(), pending.paths.values()) |path, hint| {
             const exists = stat(server.io, path) != null;
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
-            try events.append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
+            try (if (hint == .verify) &verified else &events).append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
+        if (verified.items.len != 0) server.applyWatchedChanges(a, verified.items, .verified);
         if (events.items.len == 0) return;
         log.debug("{d} file(s) changed on disk", .{events.items.len});
-        server.applyWatchedChanges(a, events.items);
+        server.applyWatchedChanges(a, events.items, .notified);
     }
 };
 
@@ -544,12 +562,13 @@ pub const Watcher = struct {
 const Pending = struct {
     paths: std.StringArrayHashMapUnmanaged(Hint) = .empty,
 
-    const Hint = enum { changed, created };
+    /// From the weakest: `verify` (compare with the known text, see `Server.ChangeSource`)
+    const Hint = enum { verify, changed, created };
 
     fn add(p: *Pending, a: Allocator, path: []const u8, hint: Hint) Allocator.Error!void {
         const gop = try p.paths.getOrPut(a, path);
         if (gop.found_existing) {
-            if (hint == .created) gop.value_ptr.* = hint;
+            if (@backingInt(hint) > @backingInt(gop.value_ptr.*)) gop.value_ptr.* = hint;
             return;
         }
         gop.key_ptr.* = a.dupe(u8, path) catch |err| {
