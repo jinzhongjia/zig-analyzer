@@ -3361,3 +3361,35 @@ test "values of structs whose fields are all u8 keep the declared field types an
         .{ "pp", "P = .{ .a = 1, .b = 2 }" },
     });
 }
+
+test "the address of a function declaration is a const pointer with a comptime value" {
+    // A function declaration is not a `var`: `&handler` used to be a mutable `*fn` without a value
+    try expectTypes(
+        \\fn handler(x: u8) void {
+        \\    _ = x;
+        \\}
+        \\const S = struct {
+        \\    fn m(x: u8) void {
+        \\        _ = x;
+        \\    }
+        \\};
+        \\const T1 = if (@TypeOf(&handler) == *const fn (u8) void) u8 else u16;
+        \\var g: u32 = 0;
+        \\fn f() void {
+        \\    const cb = &handler;
+        \\    var cb2 = &handler;
+        \\    _ = &cb2;
+        \\    const table = .{ .on_event = &handler };
+        \\    const via_s = &S.m;
+        \\    const pg = &g;
+        \\    _ = .{ cb, table, via_s, pg };
+        \\}
+    , &.{
+        .{ "cb", "*const fn (u8) void = &fn (u8) void" },
+        .{ "cb2", "*const fn (u8) void" },
+        .{ "table", "struct { comptime on_event: *const fn (u8) void = &fn (u8) void } = .{ .on_event = &fn (u8) void }" },
+        .{ "via_s", "*const fn (u8) void = &fn (u8) void" },
+        .{ "pg", "*u32" },
+        .{ "T1", "type = u8" },
+    });
+}

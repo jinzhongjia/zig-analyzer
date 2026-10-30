@@ -3194,10 +3194,10 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
 }
 
 /// Whether the place `e` cannot be modified, which makes `&e` a `*const T` (matches the compiler):
-/// const declarations and locals other than `var`s (parameters and captures included), members and
-/// elements of such places, and those reached through a const pointer; expressions that are not
-/// places (calls, literals, and so on) are temporaries that cannot be modified. `types` gives the
-/// types of the subexpressions (`types.exprType(e)`)
+/// declarations other than `var`s (functions included) and locals other than `var`s (parameters
+/// and captures included), members and elements of such places, and those reached through a const
+/// pointer; expressions that are not places (calls, literals, and so on) are temporaries that
+/// cannot be modified. `types` gives the types of the subexpressions (`types.exprType(e)`)
 pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types: anytype, e: ExprId) Error!bool {
     switch (b.expr(e)) {
         .name_ref => |name| {
@@ -3206,7 +3206,7 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
                 // A local of the outer function (referenced in a member of a container in the body)
                 // is in the Body of the member it belongs to
                 .local => |l| (if (l.file == file and l.item == item) b else try r.body(l.file, l.item)).binding(l.binding).kind != .local_var,
-                .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"const",
+                .item => |it| (try r.itemTree(it.file)).items[it.item].kind != .@"var",
                 .file => true,
             };
         },
