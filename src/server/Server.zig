@@ -293,10 +293,10 @@ watch_batches: u64 = 0,
 watch_mutex: Io.Mutex = .init,
 watch_cond: Io.Condition = .init,
 docs_mutex: Io.Mutex = .init,
-/// Open documents: the URI used by the client (used verbatim when publishing diagnostics)
-open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
-/// Version of each open document, set in the same database write as its text so that a read
-/// transaction sees the version of the text it reads (protected by `docs_mutex`)
+/// Open documents of each file (see `OpenDoc`)
+open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, OpenDoc) = .empty,
+/// Version of each open file's current document, set in the same database write as its text so
+/// that a read transaction sees the version of the text it reads (protected by `docs_mutex`)
 doc_versions: std.AutoHashMapUnmanaged(Vfs.FileId, i32) = .empty,
 /// URI most recently used by the client: still used to publish diagnostics after the document is
 /// closed (clearing old diagnostics, republishing compiler diagnostics), so that the URI is not
@@ -437,7 +437,7 @@ pub fn deinit(server: *Server) void {
     server.envs.deinit(server.gpa);
     if (server.default_builtin) |p| server.gpa.free(p);
     server.builtin_targets.deinit(server.gpa);
-    for (server.open_docs.values()) |u| server.gpa.free(u);
+    for (server.open_docs.values()) |*o| o.deinit(server.gpa);
     server.open_docs.deinit(server.gpa);
     server.doc_versions.deinit(server.gpa);
     for (server.last_uris.values()) |u| server.gpa.free(u);
@@ -1832,34 +1832,64 @@ fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
     try server.db.set(FileText, id, owned, .low);
 }
 
+/// The documents the client has a file open under. A file has several when the client opens
+/// spellings of its path that differ only in case on a case-insensitive volume: they are one
+/// file, as the operating system and the compiler see them. The file has the text of the
+/// document opened or changed last, and its diagnostics are published to each document. While
+/// several are open, each keeps the client's text of it, so edits apply to the text of their own
+/// document and closing one leaves the file with the text of another; the disk contents apply
+/// once the last one is closed.
+const OpenDoc = struct {
+    /// Ordered by the last open or change: the last one is the current document, whose text the
+    /// file has
+    docs: std.ArrayList(Doc) = .empty,
+
+    const Doc = struct {
+        /// The URI used by the client (used verbatim when publishing diagnostics)
+        uri: []u8,
+        /// The client's text of the document, kept while the file has several documents
+        text: ?[]u8 = null,
+        version: i32,
+
+        fn deinit(d: Doc, gpa: Allocator) void {
+            gpa.free(d.uri);
+            if (d.text) |t| gpa.free(t);
+        }
+    };
+
+    fn deinit(o: *OpenDoc, gpa: Allocator) void {
+        for (o.docs.items) |d| d.deinit(gpa);
+        o.docs.deinit(gpa);
+    }
+
+    fn current(o: *const OpenDoc) *Doc {
+        return &o.docs.items[o.docs.items.len - 1];
+    }
+
+    fn find(o: *const OpenDoc, document_uri: []const u8) ?usize {
+        for (o.docs.items, 0..) |d, i| if (std.mem.eql(u8, d.uri, document_uri)) return i;
+        return null;
+    }
+
+    /// Makes document `i` the current one
+    fn makeCurrent(o: *OpenDoc, i: usize) void {
+        const d = o.docs.orderedRemove(i);
+        o.docs.appendAssumeCapacity(d);
+    }
+};
+
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
     try server.setVirtualLanguage(params.textDocument.uri, params.textDocument.languageId);
     const id = try server.documentFile(arena, params.textDocument.uri) orelse return;
-    {
-        const owned = try server.gpa.dupe(u8, params.textDocument.uri);
-        const last = try server.gpa.dupe(u8, params.textDocument.uri);
-        server.docs_mutex.lockUncancelable(server.io);
-        defer server.docs_mutex.unlock(server.io);
-        server.forgetRealPath(id);
-        const gop = server.open_docs.getOrPut(server.gpa, id) catch |err| {
-            server.gpa.free(owned);
-            server.gpa.free(last);
-            return err;
-        };
-        if (gop.found_existing) server.gpa.free(gop.value_ptr.*);
-        gop.value_ptr.* = owned;
-        const lgop = server.last_uris.getOrPut(server.gpa, id) catch |err| {
-            server.gpa.free(last);
-            return err;
-        };
-        if (lgop.found_existing) server.gpa.free(lgop.value_ptr.*);
-        lgop.value_ptr.* = last;
-    }
     _ = server.watched_built.remove(id);
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.text);
         server.db.beginWrite();
         defer server.db.endWrite();
+        server.addDocument(id, params.textDocument) catch |err| {
+            server.gpa.free(owned);
+            return err;
+        };
         try server.db.set(FileText, id, owned, .low);
         try server.setDocVersion(id, params.textDocument.version);
         // Before a new session starts, wait for old read requests to exit; it must not inherit
@@ -1873,21 +1903,79 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     server.scheduleCompileSetRefresh(&.{id});
 }
 
+/// Records `item` as the current document of its file `id` (see `OpenDoc`); called in the write
+/// transaction that sets the file's text
+fn addDocument(server: *Server, id: Vfs.FileId, item: types.TextDocumentItem) Allocator.Error!void {
+    const gpa = server.gpa;
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    server.forgetRealPath(id);
+    try server.last_uris.ensureUnusedCapacity(gpa, 1);
+    const gop = try server.open_docs.getOrPut(gpa, id);
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    const open = gop.value_ptr;
+    errdefer if (open.docs.items.len == 0) {
+        open.deinit(gpa);
+        _ = server.open_docs.swapRemove(id);
+    };
+    // Opened again under the same URI: the new text replaces the old one
+    if (open.find(item.uri)) |i| open.docs.orderedRemove(i).deinit(gpa);
+    try open.docs.ensureUnusedCapacity(gpa, 1);
+    const doc_uri = try gpa.dupe(u8, item.uri);
+    errdefer gpa.free(doc_uri);
+    const last = try gpa.dupe(u8, item.uri);
+    errdefer gpa.free(last);
+    var text: ?[]u8 = null;
+    if (open.docs.items.len != 0) {
+        // The file gets several documents: the one open so far keeps the file's text
+        const other = &open.docs.items[0];
+        if (other.text == null) other.text = try gpa.dupe(u8, server.db.peek(FileText, id) orelse "");
+        text = try gpa.dupe(u8, item.text);
+    }
+    open.docs.appendAssumeCapacity(.{ .uri = doc_uri, .text = text, .version = item.version });
+    const lgop = server.last_uris.getOrPutAssumeCapacity(id);
+    if (lgop.found_existing) gpa.free(lgop.value_ptr.*);
+    lgop.value_ptr.* = last;
+}
+
 /// Changes to a document that is not open are ignored: the client owns a document's text only
 /// between didOpen and didClose
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
     const path = try server.documentPath(arena, params.textDocument.uri) orelse return;
     const id = try server.vfs.lookup(path) orelse return;
-    if (!server.openDocument(id)) return;
     {
         server.db.beginWrite();
         defer server.db.endWrite();
-        const old = server.db.peek(FileText, id) orelse "";
-        const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
+        const new = try server.changeDocument(id, params) orelse return;
         try server.db.set(FileText, id, new, .low);
         try server.setDocVersion(id, params.textDocument.version);
     }
     server.publishDebounced(id);
+}
+
+/// Applies the changes of `params` to its document of file `id` and makes it the current one
+/// (see `OpenDoc`); returns the new text of the file (owned by the caller), or null when the
+/// document is not open. Called in a write transaction.
+fn changeDocument(server: *Server, id: Vfs.FileId, params: types.DidChangeTextDocumentParams) Allocator.Error!?[]u8 {
+    const gpa = server.gpa;
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    const open = server.open_docs.getPtr(id) orelse return null;
+    const i = open.find(params.textDocument.uri) orelse return null;
+    const doc = &open.docs.items[i];
+    const old = doc.text orelse {
+        const new = try offsets.applyChanges(gpa, server.db.peek(FileText, id) orelse "", params.contentChanges, server.encoding);
+        doc.version = params.textDocument.version;
+        return new;
+    };
+    const new = try offsets.applyChanges(gpa, old, params.contentChanges, server.encoding);
+    errdefer gpa.free(new);
+    const file_text = try gpa.dupe(u8, new);
+    gpa.free(old);
+    doc.text = new;
+    doc.version = params.textDocument.version;
+    open.makeCurrent(i);
+    return file_text;
 }
 
 fn setDocVersion(server: *Server, id: Vfs.FileId, version: i32) Allocator.Error!void {
@@ -1906,6 +1994,19 @@ fn docVersion(server: *Server, file: Vfs.FileId) ?i32 {
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
     server.clearVirtualLanguage(params.textDocument.uri);
+    switch (try server.closeDocument(id, params.textDocument.uri)) {
+        .last => {},
+        .not_open => return,
+        .others => {
+            // The file stays open under its other documents, with the text of one of them
+            server.clearDocument(params.textDocument.uri);
+            server.publishFiles(&.{id}, false);
+            server.publishDependents(&.{id});
+            server.requestRefresh();
+            server.scheduleCompileSetRefresh(&.{id});
+            return;
+        },
+    }
     defer {
         // Even if reading from disk or replacing the text fails, still wait for old read requests
         // to exit first, which prevents a snapshot from being written again after closing.
@@ -1927,7 +2028,14 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
     {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
-        if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
+        if (server.open_docs.fetchSwapRemove(id)) |kv| {
+            var open = kv.value;
+            // Diagnostics published after closing go to the URI the document was closed under
+            if (server.last_uris.getPtr(id)) |last| if (!std.mem.eql(u8, last.*, params.textDocument.uri)) {
+                std.mem.swap([]u8, last, &open.current().uri);
+            };
+            open.deinit(server.gpa);
+        }
         server.forgetRealPath(id);
     }
     server.publishDependents(&.{id});
@@ -1943,6 +2051,47 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
     // After closing, republish from the disk contents (files in the compile set may still have
     // compiler diagnostics)
     server.publishFiles(&.{id}, true);
+}
+
+/// Removes the document `document_uri` of file `id` (see `OpenDoc`). When other documents of the
+/// file stay open, the file takes the text of the current one. `.last`: it is the file's only
+/// document, or the file has none (the caller restores the disk contents and removes it);
+/// `.not_open`: the file is open, but not under this URI.
+fn closeDocument(server: *Server, id: Vfs.FileId, document_uri: []const u8) Allocator.Error!enum { last, others, not_open } {
+    const gpa = server.gpa;
+    server.db.beginWrite();
+    defer server.db.endWrite();
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    const open = server.open_docs.getPtr(id) orelse return .last;
+    const i = open.find(document_uri) orelse return .not_open;
+    if (open.docs.items.len == 1) return .last;
+    const current = open.current();
+    const text = try gpa.dupe(u8, (if (i == open.docs.items.len - 1) &open.docs.items[i - 1] else current).text.?);
+    errdefer gpa.free(text);
+    try server.doc_versions.ensureUnusedCapacity(gpa, 1);
+    open.docs.orderedRemove(i).deinit(gpa);
+    try server.db.set(FileText, id, text, .low);
+    const now = open.current();
+    server.doc_versions.putAssumeCapacity(id, now.version);
+    // A single document is the file's text again
+    if (open.docs.items.len == 1) {
+        gpa.free(now.text.?);
+        now.text = null;
+    }
+    server.forgetRealPath(id);
+    return .others;
+}
+
+/// Clears the diagnostics shown for `document_uri`, a document closed while other documents of
+/// its file stay open (the file's diagnostics are published to those). Under publish_mutex, after
+/// the document is removed: a publish sent before is overridden, and one sent after does not go
+/// to it.
+fn clearDocument(server: *Server, document_uri: []const u8) void {
+    const bytes = jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", types.PublishDiagnosticsParams{ .uri = document_uri, .diagnostics = &.{} }) catch return log.err("out of memory while building notification", .{});
+    server.publish_mutex.lockUncancelable(server.io);
+    defer server.publish_mutex.unlock(server.io);
+    server.send(bytes);
 }
 
 /// After a document is closed, frees its single-file results if they no longer need to be kept:
@@ -4106,6 +4255,14 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
         gop.value_ptr.* = seq;
     } else |_| {}
     if (!always) if (server.sent_hash.get(file)) |last| if (last == hash) return;
+    // The other documents of the file, when it has several or `params.uri` is no longer one of
+    // them (see `OpenDoc`): they get the same diagnostics. Rare, so they are serialized here.
+    var others: std.ArrayList([]u8) = .empty;
+    defer {
+        for (others.items) |u| server.gpa.free(u);
+        others.deinit(server.gpa);
+    }
+    var to_params = true;
     {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
@@ -4118,12 +4275,28 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
         } else {
             server.published.put(server.gpa, file, {}) catch {};
         }
+        if (server.open_docs.getPtr(file)) |open| if (open.docs.items.len > 1 or open.find(params.uri) == null) {
+            to_params = open.find(params.uri) != null;
+            for (open.docs.items) |d| if (!std.mem.eql(u8, d.uri, params.uri)) {
+                const u = server.gpa.dupe(u8, d.uri) catch continue;
+                others.append(server.gpa, u) catch server.gpa.free(u);
+            };
+        };
     }
     sent = true;
     server.sent_hash.put(server.gpa, file, hash) catch {
         _ = server.sent_hash.remove(file);
     };
-    server.send(bytes);
+    if (to_params) server.send(bytes) else server.gpa.free(bytes);
+    for (others.items) |u| {
+        var copy = params;
+        copy.uri = u;
+        copy.version = null;
+        server.send(jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", copy) catch {
+            log.err("out of memory while building notification", .{});
+            continue;
+        });
+    }
     // The clearing for the virtual document has been sent: its URI is no longer needed
     if (isVirtual(server.vfs.path(file))) {
         server.docs_mutex.lockUncancelable(server.io);
@@ -4289,7 +4462,9 @@ test "toolFile: a path naming an open document under another spelling is that do
     const real_b = try std.fs.path.join(a, &.{ dir, "real/b.zig" });
     // No document is open: the path is interned as it is
     try std.testing.expect(try server.toolFile(real_b) != opened);
-    try server.open_docs.put(gpa, opened, try gpa.dupe(u8, "file:///link/a.zig"));
+    var doc: OpenDoc = .{};
+    try doc.docs.append(gpa, .{ .uri = try gpa.dupe(u8, "file:///link/a.zig"), .version = 1 });
+    try server.open_docs.put(gpa, opened, doc);
     try std.testing.expectEqual(opened, try server.toolFile(real_a));
     try std.testing.expectEqual(opened, (try server.vfs.lookup(real_a)).?);
     try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ dir, "link/a.zig" }), server.vfs.path(opened));
@@ -4458,7 +4633,7 @@ fn liveEligible(server: *Server, file: Vfs.FileId) bool {
 fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
     server.docs_mutex.lockUncancelable(server.io);
     defer server.docs_mutex.unlock(server.io);
-    if (server.open_docs.get(file)) |u| return arena.dupe(u8, u);
+    if (server.open_docs.getPtr(file)) |open| return arena.dupe(u8, open.current().uri);
     if (server.last_uris.get(file)) |u| return arena.dupe(u8, u);
     return uri.fromPath(arena, server.vfs.path(file));
 }

@@ -1893,3 +1893,99 @@ test "a document whose languageId is zon is analyzed as ZON whatever its URI" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "case-variant URIs of one file: each keeps its text and gets the diagnostics until the last closes" {
+    // On a case-insensitive volume `main.zig` and `Main.zig` are one file. Closing one of its
+    // documents reverted the other to the disk contents, its edits then applied to them, and
+    // diagnostics went only to the document opened last.
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "main.zig", .data = "pub const disk = 1;\n" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.startCase(.insensitive);
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true } } } });
+    try h.notify("initialized", struct {}{});
+    const lower = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "main.zig" }));
+    const upper = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "Main.zig" }));
+    const Last = struct {
+        /// The diagnostics last published for `document_uri` ("line:column message")
+        fn diagnostics(hh: *Harness, document_uri: []const u8) ![]const []const u8 {
+            var last: ?[]const []const u8 = null;
+            for (try hh.notifications("textDocument/publishDiagnostics")) |n| {
+                const params = n.object.get("params").?.object;
+                if (!std.mem.eql(u8, params.get("uri").?.string, document_uri)) continue;
+                var lines: std.ArrayList([]const u8) = .empty;
+                for (params.get("diagnostics").?.array.items) |d| {
+                    const start = d.object.get("range").?.object.get("start").?.object;
+                    try lines.append(hh.arena.allocator(), try std.fmt.allocPrint(hh.arena.allocator(), "{d}:{d} {s}", .{ start.get("line").?.integer, start.get("character").?.integer, d.object.get("message").?.string }));
+                }
+                last = lines.items;
+            }
+            return last orelse error.NothingPublished;
+        }
+    };
+
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lower, .languageId = "zig", .version = 1, .text = "pub const a_only = 1;\nconst e1 = ;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = upper, .languageId = "zig", .version = 1, .text = "pub const b_only = 2;\nconst e22 = ;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The file has the text opened last; its diagnostics go to both documents
+    for ([_][]const u8{ lower, upper }) |u| {
+        const diags = try Last.diagnostics(&h, u);
+        try testing.expectEqual(1, diags.len);
+        try testing.expectEqualStrings("1:12 expected expression, found ';'", diags[0]);
+    }
+
+    // An edit applies to the text of its own document
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = lower, .version = 2 },
+        .contentChanges = &.{.{ .range = .{ .start = .{ .line = 1, .character = 11 }, .end = .{ .line = 1, .character = 11 } }, .text = "1" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    var names = try symbolNames(&h, lower);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("a_only", names[0]);
+    try testing.expectEqualStrings("e1", names[1]);
+
+    // Closing one document leaves the file with the text of the other, still open
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = upper, .languageId = "zig", .version = 2, .text = "pub const b_only = 2;\nconst e22 = ;\n" } });
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = upper } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    names = try symbolNames(&h, lower);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("a_only", names[0]);
+    try testing.expectEqualStrings("e1", names[1]);
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = lower } })).object.get("result").?.object;
+    try testing.expect(status.get("open").?.bool);
+    try testing.expectEqual(0, (try Last.diagnostics(&h, lower)).len);
+    try testing.expectEqual(0, (try Last.diagnostics(&h, upper)).len);
+    // Later edits apply to that text, and diagnostics go to the open document only
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = lower, .version = 3 },
+        .contentChanges = &.{.{ .range = .{ .start = .{ .line = 2, .character = 0 }, .end = .{ .line = 2, .character = 0 } }, .text = "const e3 = ;\n" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    names = try symbolNames(&h, lower);
+    try testing.expectEqual(3, names.len);
+    try testing.expectEqualStrings("e3", names[2]);
+    try testing.expectEqual(1, (try Last.diagnostics(&h, lower)).len);
+    try testing.expectEqual(0, (try Last.diagnostics(&h, upper)).len);
+
+    // Closing the last document reverts the file to the disk contents
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = lower } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    names = try symbolNames(&h, lower);
+    try testing.expectEqual(1, names.len);
+    try testing.expectEqualStrings("disk", names[0]);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
