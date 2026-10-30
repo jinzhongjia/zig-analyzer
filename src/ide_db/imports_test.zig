@@ -1030,3 +1030,47 @@ test "auto import offers the root module and names other module roots by their i
     const value = find(try run(&w, at.file, at.offset, "lib_val", 128), "lib_value").?;
     try testing.expectEqualStrings("const lib_value = @import(\"mylib\").lib_value;\n", value.import_edit.?.text);
 }
+
+test "auto imports reuse namespace aliases of bodies and enclosing containers" {
+    // Such aliases were ignored, and a redundant top-level import was added instead.
+    const sources = [_][]const u8{
+        \\pub fn sub() void {
+        \\    const u = @import("util.zig");
+        \\    _ = u;
+        \\    _ = addNum<|>;
+        \\}
+        ,
+        \\test {
+        \\    const u = @import("util.zig");
+        \\    _ = addNum<|>;
+        \\}
+        ,
+        \\const S = struct {
+        \\    const u = @import("util.zig");
+        \\    fn f() void {
+        \\        _ = addNum<|>;
+        \\    }
+        \\};
+        ,
+        \\fn Generic(comptime T: type) type {
+        \\    return struct {
+        \\        const u = @import("util.zig");
+        \\        fn f() T {
+        \\            _ = addNum<|>;
+        \\        }
+        \\    };
+        \\}
+    };
+    for (sources) |source| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ "//- /p/main.zig module:app\n", source, "\n//- /p/util.zig in:app\npub fn addNumbers(a: u32, b: u32) u32 { return a + b; }\n" });
+        const f = try w.fixture(text);
+        const at = f.cursor.?;
+        const result = try run(&w, at.file, at.offset, "addNum", 128);
+        const member = find(result, "u.addNumbers") orelse return error.MissingLocalAliasMember;
+        try testing.expect(member.import_edit == null);
+        try testing.expect(editContaining(result, "util.zig") == null);
+    }
+}

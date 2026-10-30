@@ -1029,27 +1029,30 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         builder.scope = builder.body.?.scopeAt((offset -| base) -| 1);
     }
     // A top-level const may be an alias; whether it is visible at the cursor is checked only when
-    // it is used
-    var top: std.ArrayList(Alias) = .empty;
+    // it is used. Consts of the enclosing containers and local constants of the member at the
+    // cursor are aliases too.
+    var aliases: std.ArrayList(Alias) = .empty;
     for (current.decls, links.namespaces, links.targets) |*decl, ns, target| {
         if (decl.container != 0 or decl.kind != .@"const") continue;
-        try top.append(r.arena, .{ .decl = decl, .ns = ns, .target = target });
-        if (ns) |n| try builder.alias_namespaces.put(r.arena, n, {});
-        if (!deepEql(target, Declaration{ .file = file, .item = decl.item })) try builder.alias_targets.put(r.arena, target, {});
+        try aliases.append(r.arena, .{ .name = decl.name, .def = .{ .item = .{ .file = file, .item = decl.item } }, .ns = ns, .target = target });
     }
-    builder.top = top.items;
+    if (builder.owner) |item| try builder.innerAliases(item, &aliases);
+    for (aliases.items) |alias| {
+        if (alias.ns) |n| try builder.alias_namespaces.put(r.arena, n, {});
+        if (alias.target) |target| if (!deepEql(resolve.Def{ .item = .{ .file = target.file, .item = target.item } }, alias.def)) try builder.alias_targets.put(r.arena, target, {});
+    }
+    builder.aliases = aliases.items;
     const matches = current.matching(prefix);
     // Existing namespace aliases take precedence; no additional import is generated for the
     // same entry. Shallow exports are fuzzy-matched by their full path, deeper ones by name
     // prefix.
-    for (top.items) |alias| {
-        const decl = alias.decl;
+    for (aliases.items) |*alias| {
         const ns = alias.ns orelse continue;
         const exports = try r.ctx.get(Exports, .{ .ns = ns });
         const declared_matches = exports.matching(prefix);
         if (exports.shallow.len == 0 and declared_matches.len == 0 and (ns.file != file or matches.start == matches.end)) continue;
-        if (!try builder.refersToSelf(decl)) continue;
-        const root = try renderName(r.arena, decl.name);
+        if (!try builder.refersToSelf(alias)) continue;
+        const root = try renderName(r.arena, alias.name);
         for (exports.shallow) |j| try builder.member(root, &exports.decls[j], false);
         for (declared_matches) |*declared| if (declared.depth > shallow_depth) try builder.member(root, declared, true);
         // Private members are accessible within the same file; the public closure is still
@@ -1144,8 +1147,11 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
     return .{ .items = builder.items.items, .is_incomplete = builder.incomplete };
 }
 
-/// A top-level const of the current file, with the namespace it refers to and its canonical target
-const Alias = struct { decl: *const Decl, ns: ?Namespace, target: Declaration };
+/// A const that may be an alias: a top-level one of the current file, one of a container
+/// enclosing the cursor, or a local constant of the member at the cursor. `def` is what its name
+/// refers to where it is not shadowed; `target` is its canonical target (null for local
+/// constants, which are only reused as namespaces).
+const Alias = struct { name: []const u8, def: resolve.Def, ns: ?Namespace, target: ?Declaration };
 
 /// Path of a candidate: the two parts joined by `.` (only the first part when the second is
 /// empty); both scoring and the order among equal scores use it
@@ -1163,7 +1169,7 @@ const Found = struct {
         /// Accessed through a visible namespace; the label is the path
         member: struct { name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8, decl: Declaration },
         /// Reuses a direct alias to the same canonical target
-        reuse: struct { alias: *const Decl, name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8 },
+        reuse: struct { alias: *const Alias, name: []const u8, kind: ItemTree.Item.Kind, doc: ?[]const u8 },
         /// A private chain in the same file; the label is the declaration's path
         chain: struct { decl: *const Decl, root: []const u8 },
         /// A newly imported module or file
@@ -1183,10 +1189,11 @@ const Builder = struct {
     owner: ?u32 = null,
     body: ?*const Body = null,
     scope: Body.ScopeId = .root,
-    /// Top-level consts of the current file, sorted by name
-    top: []const Alias = &.{},
-    /// Namespaces of the entries in `top` and their canonical targets other than themselves: when
-    /// something is not among them, the entries need not be checked one by one
+    /// Aliases of the current file: the top-level consts, then those visible at the cursor only
+    /// (see `Alias`)
+    aliases: []const Alias = &.{},
+    /// Namespaces of the entries in `aliases` and their canonical targets other than themselves:
+    /// when something is not among them, the entries need not be checked one by one
     alias_namespaces: std.AutoHashMapUnmanaged(Namespace, void) = .empty,
     alias_targets: std.AutoHashMapUnmanaged(Declaration, void) = .empty,
     reused: std.AutoHashMapUnmanaged(Declaration, void) = .empty,
@@ -1226,24 +1233,49 @@ const Builder = struct {
     fn bindingConflict(b: *Builder, name: []const u8) resolve.Error!bool {
         return BindingNames.contains(try b.r.ctx.get(BindingNames, b.file), name);
     }
-    /// The top-level declaration's name still refers to the declaration itself at the cursor (not
-    /// shadowed by a local binding of the same name)
-    fn refersToSelf(b: *Builder, decl: *const Decl) resolve.Error!bool {
-        const def = try b.visible(decl.name) orelse return false;
-        return deepEql(def, resolve.Def{ .item = .{ .file = b.file, .item = decl.item } });
+    /// Appends the consts of the containers enclosing member `owner` (other than the file root)
+    /// and the local constants that refer to a namespace in scope at the cursor
+    fn innerAliases(b: *Builder, owner: u32, out: *std.ArrayList(Alias)) resolve.Error!void {
+        const r = b.r;
+        const tree = try r.itemTree(b.file);
+        var container = tree.items[owner].container;
+        while (container != 0) {
+            for (tree.containerMembers(container)) |m| {
+                const it = tree.items[m];
+                if (it.kind != .@"const") continue;
+                const key = try r.ownerKey(b.file, m);
+                try out.append(r.arena, .{ .name = it.name orelse continue, .def = .{ .item = .{ .file = b.file, .item = m } }, .ns = try r.ctx.get(DeclNamespace, key), .target = try r.ctx.get(DeclTarget, key) });
+            }
+            const parent = tree.containers[container].parent_item orelse break;
+            container = tree.items[parent].container;
+        }
+        const body = b.body.?;
+        var s: ?Body.ScopeId = b.scope;
+        while (s) |id| : (s = body.scope(id).parent) for (body.scope(id).bindings) |binding_id| {
+            const binding = body.binding(binding_id);
+            if (binding.kind != .local_const) continue;
+            const ns = try r.evalNamespace(b.file, owner, body, binding.init orelse continue) orelse continue;
+            try out.append(r.arena, .{ .name = binding.name, .def = .{ .local = .{ .file = b.file, .item = owner, .binding = binding_id } }, .ns = ns, .target = null });
+        };
     }
-    /// The first top-level alias visible at the cursor that refers to `ns`
-    fn namespaceAlias(b: *Builder, ns: Namespace) resolve.Error!?*const Decl {
+    /// The alias's name refers to the alias itself at the cursor (it is in scope and not
+    /// shadowed)
+    fn refersToSelf(b: *Builder, alias: *const Alias) resolve.Error!bool {
+        const def = try b.visible(alias.name) orelse return false;
+        return deepEql(def, alias.def);
+    }
+    /// The first alias visible at the cursor that refers to `ns`
+    fn namespaceAlias(b: *Builder, ns: Namespace) resolve.Error!?*const Alias {
         if (!b.alias_namespaces.contains(ns)) return null;
-        for (b.top) |alias| if (alias.ns) |n| if (deepEql(n, ns) and try b.refersToSelf(alias.decl)) return alias.decl;
+        for (b.aliases) |*alias| if (alias.ns) |n| if (deepEql(n, ns) and try b.refersToSelf(alias)) return alias;
         return null;
     }
-    /// The first top-level direct alias visible at the cursor whose canonical target is `target`
-    fn directAlias(b: *Builder, target: Declaration) resolve.Error!?*const Decl {
+    /// The first direct alias visible at the cursor whose canonical target is `target`
+    fn directAlias(b: *Builder, target: Declaration) resolve.Error!?*const Alias {
         if (!b.alias_targets.contains(target)) return null;
-        for (b.top) |alias| {
-            if (deepEql(alias.target, target) and !deepEql(alias.target, Declaration{ .file = b.file, .item = alias.decl.item }) and try b.refersToSelf(alias.decl)) return alias.decl;
-        }
+        for (b.aliases) |*alias| if (alias.target) |t| {
+            if (deepEql(t, target) and !deepEql(resolve.Def{ .item = .{ .file = t.file, .item = t.item } }, alias.def) and try b.refersToSelf(alias)) return alias;
+        };
         return null;
     }
     /// Reuses a direct alias visible for the canonical target instead, when there is one (`score`
@@ -1315,7 +1347,11 @@ const Builder = struct {
                 if (try b.visible(m.name) != null) return;
                 try b.add(.{ .label = try joinPath(b.r.arena, p.parts[0], p.parts[1]), .kind = try b.declKind(m.decl), .filter = try b.filterOf(m.name, p.parts), .qualifier = p.parts[0], .score = p.score, .doc = m.doc, .target = .{ .decl = m.decl } });
             },
-            .reuse => |u| try b.add(.{ .label = try renderName(b.r.arena, u.alias.name), .kind = try b.declKind(.{ .file = b.file, .item = u.alias.item }), .filter = try b.filterOf(u.name, p.parts), .qualifier = "", .score = p.score, .doc = u.doc, .target = .{ .decl = .{ .file = b.file, .item = u.alias.item } } }),
+            .reuse => |u| {
+                // Only aliases with a canonical target, all of which are declarations, are reused
+                const alias: Declaration = .{ .file = b.file, .item = u.alias.def.item.item };
+                try b.add(.{ .label = try renderName(b.r.arena, u.alias.name), .kind = try b.declKind(alias), .filter = try b.filterOf(u.name, p.parts), .qualifier = "", .score = p.score, .doc = u.doc, .target = .{ .decl = alias } });
+            },
             .chain => |c| {
                 if (try b.visible(c.decl.name) != null) return;
                 const root_def = try b.visible(c.root) orelse return;
