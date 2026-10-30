@@ -662,7 +662,13 @@ pub fn isFloat(ip: *InternPool, t: Index) bool {
 pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     switch (ip.key(index)) {
         .unknown => try w.writeAll("unknown"),
-        .simple_type => |s| try w.writeAll(@tagName(s)),
+        // Types without a name of their own are written as Zig spells them
+        .simple_type => |s| try w.writeAll(switch (s) {
+            .null => "@TypeOf(null)",
+            .undefined => "@TypeOf(undefined)",
+            .enum_literal => "@EnumLiteral()",
+            else => @tagName(s),
+        }),
         .int_type => |i| try w.print("{c}{d}", .{ @as(u8, if (i.signedness == .signed) 'i' else 'u'), i.bits }),
         .ptr_type => |p| {
             switch (p.size) {
@@ -901,6 +907,27 @@ test "interning is idempotent and presets are stable" {
     const eu = try ip.get(.{ .error_union_type = .{ .err = .anyerror_type, .payload = try ip.optionalOf(a) } });
     try ip.print(eu, &w, Names{});
     try testing.expectEqualStrings("anyerror!?[]const u8", w.buffered());
+}
+
+test "types of null, undefined and enum literals print as Zig spells them" {
+    // Prevents displaying them as `null`, `undefined` and `enum_literal`, which are not types
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    const cases = [_]struct { Index, []const u8 }{
+        .{ .null_type, "@TypeOf(null)" },
+        .{ .undefined_type, "@TypeOf(undefined)" },
+        .{ .enum_literal_type, "@EnumLiteral()" },
+        .{ try ip.optionalOf(.enum_literal_type), "?@EnumLiteral()" },
+    };
+    for (cases) |c| {
+        w.end = 0;
+        try ip.print(c[0], &w, struct {
+            fn write(_: @This(), _: Container, _: *Io.Writer) Io.Writer.Error!void {}
+        }{});
+        try testing.expectEqualStrings(c[1], w.buffered());
+    }
 }
 
 test "reset keeps the presets and frees everything else" {

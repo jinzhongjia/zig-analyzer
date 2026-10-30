@@ -3528,7 +3528,7 @@ test "operands of comparisons and arithmetic have no result type" {
         .{ "v28", "unknown" },
         .{ "v29", "u8" },
         .{ "eq", "bool" },
-        .{ ".Debug", "enum_literal = .Debug" },
+        .{ ".Debug", "@EnumLiteral() = .Debug" },
         .{ ".safe", "Optimize = .safe" },
     });
 }
