@@ -346,6 +346,8 @@ pub fn parseAstCheckOutput(gpa: Allocator, text: []const u8, output: []const u8)
     var it = std.mem.splitScalar(u8, output, '\n');
     while (it.next()) |line| try lines.append(arena, std.mem.trimEnd(u8, line, "\r"));
 
+    // Position in the output and span of the last error
+    var last_error: ?struct { line: u32, column: u32, start: u32, end: u32 } = null;
     var i: usize = 0;
     while (i < lines.items.len) : (i += 1) {
         const header = parseHeader(lines.items[i]) orelse continue;
@@ -361,11 +363,17 @@ pub fn parseAstCheckOutput(gpa: Allocator, text: []const u8, output: []const u8)
             start = @intCast(@min(line_end, line_start + first));
             end = @intCast(@min(line_end, start + len));
             i += 2;
-        }
+        } else if (header.kind == .note) if (last_error) |e| if (e.line == header.line and e.column == header.column) {
+            // AstGen omits the source line of a note located exactly at its error
+            // (`ErrorBundle.Wip.addZirErrorMessages`): the note has the error's span
+            start = e.start;
+            end = e.end;
+        };
         switch (header.kind) {
             .@"error" => {
                 if (items.items.len != 0) items.items[items.items.len - 1].notes = try notes.toOwnedSlice(arena);
                 try items.append(arena, .{ .start = start, .end = end, .message = try arena.dupe(u8, header.message), .notes = &.{} });
+                last_error = .{ .line = header.line, .column = header.column, .start = start, .end = end };
             },
             .note => try notes.append(arena, .{ .start = start, .end = end, .message = try arena.dupe(u8, header.message) }),
         }
@@ -447,6 +455,25 @@ test "parse zig ast-check output" {
     try testing.expectEqual(2, d.notes.len);
     try testing.expectEqualStrings("a", text[d.notes[0].start..d.notes[0].end]);
     try testing.expectEqualStrings("const", text[d.notes[1].start..d.notes[1].end]);
+}
+
+test "parse zig ast-check output: a note at its error's location has the error's span" {
+    const text = "export fn f() void {\n    var x: u32 = 1;\n    _ = x;\n}\n";
+    const output =
+        \\<stdin>:2:9: error: local variable is never mutated
+        \\    var x: u32 = 1;
+        \\        ^
+        \\<stdin>:2:9: note: consider using 'const'
+        \\
+    ;
+    const r = try parseAstCheckOutput(testing.allocator, text, output);
+    defer r.destroy(testing.allocator);
+    const d = r.items[0];
+    try testing.expectEqual(29, d.start);
+    try testing.expectEqual(30, d.end);
+    // Guards against a zero-width note: the compiler prints no source line for it
+    try testing.expectEqual(29, d.notes[0].start);
+    try testing.expectEqual(30, d.notes[0].end);
 }
 
 test "subprocess backend matches in-process (skipped when zig is not in PATH)" {
