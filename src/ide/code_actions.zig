@@ -554,7 +554,8 @@ fn isPlainType(ip: *InternPool, t: Index) bool {
 }
 
 /// Inserts `_ = name;` after the local binding whose name is at `offset` (after the statement of a
-/// local variable, or at the start of the block that a parameter or capture belongs to)
+/// local variable, or at the start of the block that a parameter or capture belongs to), and after
+/// the `//` comment that ends that line
 fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Edit {
     const def = try definition.defAt(r, file, offset) orelse return null;
     const l = switch (def) {
@@ -568,7 +569,7 @@ fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Er
     switch (binding.kind) {
         .local_const, .local_var => {
             const s = localStmt(b, l.binding) orelse return null;
-            const at = base + s.end;
+            const at = pastComment(text, base + s.end);
             return .{ .start = at, .end = at, .text = try std.fmt.allocPrint(r.arena, "\n{s}{s}", .{ lineIndent(text, base + binding.range.start), line }) };
         },
         .param => return blockStart(r, text, base, b, b.value orelse return null, line),
@@ -622,8 +623,18 @@ fn blockStart(r: *Resolver, text: []const u8, base: u32, b: *const Body, e: Body
     if (b.expr(e) != .block) return null;
     const range = b.range(e);
     const brace = std.mem.indexOfScalarPos(u8, text[0 .. base + range.end], base + range.start, '{') orelse return null;
-    const at: u32 = @intCast(brace + 1);
+    const at = pastComment(text, @intCast(brace + 1));
     return .{ .start = at, .end = at, .text = try std.fmt.allocPrint(r.arena, "\n{s}    {s}", .{ lineIndent(text, at - 1), line }) };
+}
+
+/// The end of the line when only whitespace and a `//` comment follow `at` on it, otherwise `at`
+fn pastComment(text: []const u8, at: u32) u32 {
+    var p = at;
+    while (p < text.len and (text[p] == ' ' or text[p] == '\t')) p += 1;
+    if (!std.mem.startsWith(u8, text[p..], "//")) return at;
+    var line_end: u32 = @intCast(std.mem.indexOfScalarPos(u8, text, p, '\n') orelse text.len);
+    if (line_end > p and text[line_end - 1] == '\r') line_end -= 1;
+    return line_end;
 }
 
 fn localStmt(b: *const Body, id: Body.BindingId) ?Body.Stmt {
@@ -784,15 +795,23 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
 
 /// Appends entries before the `}` of `[start, end)` (which ends with `}`): when multiline, one
 /// entry per line with a trailing comma; on a single line, separated by `, ` (without a trailing
-/// comma, otherwise zig fmt would expand it into multiple lines)
+/// comma, otherwise zig fmt would expand it into multiple lines). A missing comma goes right after
+/// the last element, before the `//` comments that follow it, which stay unchanged.
 fn appendBeforeClose(a: Allocator, text: []const u8, start: u32, end: u32, items: []const []const u8, multiline: bool) Allocator.Error!?Edit {
     if (end == 0 or end > text.len or text[end - 1] != '}') return null;
     const close = end - 1;
-    var p = close;
-    while (p > start and std.ascii.isWhitespace(text[p - 1])) p -= 1;
+    const comments_end = trimEnd(text, start, close);
+    var p = comments_end;
+    while (p > start) {
+        const line_start: u32 = if (std.mem.lastIndexOfScalar(u8, text[0 .. p - 1], '\n')) |i| @intCast(i + 1) else 0;
+        const comment = commentStart(text[line_start..p]) orelse break;
+        if (line_start + comment < start) break;
+        p = trimEnd(text, start, line_start + comment);
+    }
     const prev = text[p - 1];
     var out: std.ArrayList(u8) = .empty;
     if (prev != ',' and prev != '{') try out.append(a, ',');
+    try out.appendSlice(a, text[p..comments_end]);
     if (multiline) {
         const indent = lineIndent(text, start);
         for (items) |it| try out.print(a, "\n{s}    {s},", .{ indent, it });
@@ -802,6 +821,33 @@ fn appendBeforeClose(a: Allocator, text: []const u8, start: u32, end: u32, items
         try out.append(a, ' ');
     }
     return .{ .start = p, .end = close, .text = out.items };
+}
+
+/// The offset before the whitespace that ends `text[start..end]`
+fn trimEnd(text: []const u8, start: u32, end: u32) u32 {
+    var p = end;
+    while (p > start and std.ascii.isWhitespace(text[p - 1])) p -= 1;
+    return p;
+}
+
+/// Offset of the `//` comment in the source line `line`, outside string and character literals
+fn commentStart(line: []const u8) ?u32 {
+    const code = std.mem.trimStart(u8, line, " \t");
+    // A multiline string literal line
+    if (std.mem.startsWith(u8, code, "\\\\")) return null;
+    var i: u32 = 0;
+    var quote: ?u8 = null;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (quote) |q| {
+            if (c == '\\') i += 1 else if (c == q) quote = null;
+        } else if (c == '"' or c == '\'') {
+            quote = c;
+        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            return i;
+        }
+    }
+    return null;
 }
 
 /// Indentation of the line containing `offset`

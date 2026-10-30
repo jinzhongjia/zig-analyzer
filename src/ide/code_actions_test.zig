@@ -93,6 +93,33 @@ test "discard unused locals, parameters and captures" {
     );
 }
 
+test "discard keeps the trailing comment of the line it follows" {
+    try expectAction(
+        \\fn f() void {
+        \\    const <|>x: u32 = 5; // the answer
+        \\}
+    , "discard `x`",
+        \\fn f() void {
+        \\    const x: u32 = 5; // the answer
+        \\    _ = x;
+        \\}
+    );
+    try expectAction(
+        \\fn f(o: ?u32) void {
+        \\    if (o) |<|>v| { // payload not needed yet
+        \\        return;
+        \\    }
+        \\}
+    , "discard `v`",
+        \\fn f(o: ?u32) void {
+        \\    if (o) |v| { // payload not needed yet
+        \\        _ = v;
+        \\        return;
+        \\    }
+        \\}
+    );
+}
+
 /// AstGen (same as `zig ast-check`) reports no errors
 fn expectAstCheckClean(source: []const u8) !void {
     const z = try testing.allocator.dupeSentinel(u8, source, 0);
@@ -1145,6 +1172,55 @@ test "add missing struct fields" {
         \\y: i32,
         \\const p: @This() = .{ .x = 1, .y = undefined };
     );
+}
+
+test "add missing fields and prongs keep trailing comments intact" {
+    // The comma goes after the last element, before its comment, not into the comment
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = 1 // first\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .a = 1, // first\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = 1, // first\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .a = 1, // first\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        // A comment on its own line before `}` stays before the new fields
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = 1\n        // more\n        // later\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .a = 1,\n        // more\n        // later\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{<|> // TODO\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{ // TODO\n        .a = undefined,\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        // `//` inside a string is not a comment
+        .{
+            "const S = struct { a: []const u8, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = \"x//y\"\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: []const u8, b: u32 };\ntest {\n    const s: S = .{\n        .a = \"x//y\",\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        .{
+            "const E = enum { a, b };\nfn f(e: E) void {\n    <|>switch (e) {\n        .a => {} // handled\n    }\n}\n",
+            "add missing switch prongs",
+            "const E = enum { a, b };\nfn f(e: E) void {\n    switch (e) {\n        .a => {}, // handled\n        .b => {},\n    }\n}\n",
+        },
+        .{
+            "const E = enum { a, b };\nfn f(e: E) void {\n    <|>switch (e) { // TODO\n    }\n}\n",
+            "add missing switch prongs",
+            "const E = enum { a, b };\nfn f(e: E) void {\n    switch (e) { // TODO\n        .a => {},\n        .b => {},\n    }\n}\n",
+        },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], c[1]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
+        try expectAstCheckClean(got);
+    }
 }
 
 test "add missing fields and prongs with names that need quoting" {
