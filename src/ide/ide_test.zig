@@ -1063,9 +1063,10 @@ test "candidates fit the expected type only by exact rules" {
         .{ "*const Want", "const cd_b: *Want = undefined;", true },
         .{ "[]const u8", "const cd_b: []u8 = undefined;", true },
         .{ "type", "const cd_b = u8;", true },
-        // Functions (including function pointers) whose return value fits
+        // Functions whose return value fits; a function pointer is not its return value, and it
+        // does not complete as a call
         .{ "Want", "fn cd_b() Want { return .a; }", true },
-        .{ "Want", "const cd_b: *const fn () Want = undefined;", true },
+        .{ "Want", "const cd_b: *const fn () Want = undefined;", false },
         // Other conversions, such as integer widening and comptime_int, do not count
         .{ "u64", "const cd_b: u32 = 0;", false },
         .{ "u32", "const cd_b = 1;", false },
@@ -1092,6 +1093,36 @@ test "candidates fit the expected type only by exact rules" {
         defer testing.allocator.free(got);
         testing.expectEqualStrings(if (c[2]) "cd_b cd_a" else "cd_a cd_b", got) catch |err| {
             std.debug.print("expected `{s}`, candidate `{s}`\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
+test "function pointer values rank by the expected type only as what they are" {
+    // Parameters and locals of type `*const fn () Tone` are inserted without a call, so the
+    // expected type `Tone` does not rank them first; it moves only `tint` up
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "    _ = tin<|>;", "tint_note tint_cb tint tint_note.len tint_note.ptr" },
+        .{ "    apply(tin<|>);", "tint tint_note tint_cb tint_note.len tint_note.ptr" },
+        .{ "    const cb_fn: *const fn () Tone = tint_cb;\n    const cb_n: u8 = 0;\n    _ = cb_n;\n    apply(cb_<|>);", "cb_n cb_fn" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\const Tone = enum {{ warm, cool }};
+            \\fn apply(t: Tone) void {{ _ = t; }}
+            \\fn work(tint: Tone, tint_cb: *const fn () Tone, tint_note: []const u8) void {{
+            \\    _ = .{{ tint, tint_cb, tint_note }};
+            \\{s}
+            \\}}
+            \\comptime {{ _ = &work; }}
+            \\
+        , .{c[0]});
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
             return err;
         };
     }

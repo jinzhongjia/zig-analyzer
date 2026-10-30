@@ -219,7 +219,7 @@ fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
     for (items) |*it| {
         if (it.weight != 0) it.score = ((try matcher.score(it.label)) orelse 0) * it.weight;
-        if (expected) |x| if (it.score > 0 and try x.matches(it.origin)) {
+        if (expected) |x| if (it.score > 0 and try x.matches(it.origin, it.snippet != null)) {
             it.score *= expected_boost;
         };
     }
@@ -1125,9 +1125,9 @@ const Expected = struct {
     /// body), for computing the types of declarations in scope
     inst: ?Index,
 
-    /// Whether the type of the candidate fits the expected type (see `fits`); the types of
-    /// declarations and files are computed only here
-    fn matches(x: Expected, origin: Item.Origin) resolve.Error!bool {
+    /// Whether the type of the candidate fits the expected type (see `fits`; `called`: the
+    /// candidate is inserted as a call); the types of declarations and files are computed only here
+    fn matches(x: Expected, origin: Item.Origin, called: bool) resolve.Error!bool {
         const tv: TypedValue = switch (origin) {
             .none => return false,
             .value => |tv| tv,
@@ -1136,7 +1136,7 @@ const Expected = struct {
                 .file => |f| try queries.importValue(x.r, f),
             },
         };
-        return fits(x.r.ctx.db.env.ip, x.ty, tv.ty);
+        return fits(x.r.ctx.db.env.ip, x.ty, tv.ty, called);
     }
 };
 
@@ -1315,13 +1315,15 @@ fn wellFormed(r: *Resolver, file: FileId, offset: u32) resolve.Error!bool {
 
 /// Whether a candidate of type `have` can be a value of the expected type `want`, counting only
 /// what can be decided exactly: the same type; `T` when `?T` or `E!T` is expected; `*T` as
-/// `*const T` and `[]T` as `[]const T`; functions (including function pointers) whose return value
-/// fits. Other conversions (integer widening, comptime_int, and so on) do not count
-fn fits(ip: *InternPool, want: Index, have: Index) bool {
+/// `*const T` and `[]T` as `[]const T`; functions whose return value fits, and function pointers
+/// whose return value fits when the candidate is inserted as a call (`called`; a function pointer
+/// never coerces to what it returns). Other conversions (integer widening, comptime_int, and so on)
+/// do not count
+fn fits(ip: *InternPool, want: Index, have: Index, called: bool) bool {
     if (coerces(ip, want, have)) return true;
     const f = switch (ip.key(have)) {
         .fn_type => |f| f,
-        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
+        .ptr_type => |p| if (called and p.size == .one) switch (ip.key(p.child)) {
             .fn_type => |f| f,
             else => return false,
         } else return false,
