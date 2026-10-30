@@ -2584,6 +2584,47 @@ test "the _ of a non-exhaustive enum is not a field" {
     });
 }
 
+test "packed unions have a backing integer and no tag type" {
+    // Prevents treating the backing integer of `packed union(T)` as its tag type
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const PU = packed union(u8) { a: u8, b: i8 };
+        \\const PI = packed union { a: u8, b: i8 };
+        \\const PR = @Union(.@"packed", u16, &.{ "a", "b" }, &.{ u16, i16 }, &@splat(.{}));
+        \\fn tagBits(comptime T: type) comptime_int {
+        \\    if (@typeInfo(T).@"union".tag_type) |Tag| return @bitSizeOf(Tag);
+        \\    return -1;
+        \\}
+        \\fn backBits(comptime T: type) comptime_int {
+        \\    if (@typeInfo(T).@"union".backing_integer) |B| return @bitSizeOf(B);
+        \\    return -1;
+        \\}
+        \\const tag_pu = tagBits(PU);
+        \\const back_pu = backBits(PU);
+        \\const tag_pi = tagBits(PI);
+        \\const back_pi = backBits(PI);
+        \\const tag_pr = tagBits(PR);
+        \\const back_pr = backBits(PR);
+        \\const BI = std.meta.BackingInt(PU);
+        \\const Tag = std.meta.Tag(PU);
+        \\fn f() void {
+        \\    const x = PU.a;
+        \\    _ = x;
+        \\}
+    , &.{
+        .{ "tag_pu", "comptime_int = -1" },
+        .{ "back_pu", "comptime_int = 8" },
+        .{ "tag_pi", "comptime_int = -1" },
+        .{ "back_pi", "comptime_int = 8" },
+        .{ "tag_pr", "comptime_int = -1" },
+        .{ "back_pr", "comptime_int = 16" },
+        .{ "BI", "type = u8" },
+        // Compile errors in the compiler
+        .{ "Tag", "type" },
+        .{ "x", "unknown" },
+    });
+}
+
 test "layouts of reified containers" {
     // Expected values are the results of zig 0.17.0
     try expectStdTypes(

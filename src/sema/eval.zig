@@ -3846,7 +3846,7 @@ const Evaluator = struct {
             return .{ "union", try ev.structValue(union_ty, &.{
                 .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
                 .{ "tag_type", tag orelse .null_value },
-                .{ "backing_integer", .null_value },
+                .{ "backing_integer", try ev.backingInteger(t, layout, types, true) },
                 .{ "field_names", try ev.namesValue(names) },
                 .{ "field_types", try ev.sliceValue(.type_type, types) },
                 .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
@@ -3873,7 +3873,7 @@ const Evaluator = struct {
         return .{ "struct", try ev.structValue(struct_ty, &.{
             .{ "is_tuple", if (ip.key(t) == .tuple_type) .true_value else .false_value },
             .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
-            .{ "backing_integer", try ev.backingInteger(t, layout, types) },
+            .{ "backing_integer", try ev.backingInteger(t, layout, types, false) },
             .{ "field_names", try ev.namesValue(names) },
             .{ "field_types", try ev.sliceValue(.type_type, types) },
             .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
@@ -4005,10 +4005,12 @@ const Evaluator = struct {
     }
 
     /// Tag type of a union: E for `union(E)`, the automatically generated tag enum for
-    /// `union(enum)`, otherwise null
+    /// `union(enum)`, otherwise null. The argument of a packed union is its backing integer, not
+    /// a tag type.
     fn unionTagType(ev: *Evaluator, t: Index) EvalError!?Index {
         const s = try ev.containerSyntax(t);
         if (s.auto_enum) return try ev.ip.get(.{ .union_tag_type = t });
+        if (s.layout == .@"packed") return null;
         return s.arg;
     }
 
@@ -4027,14 +4029,16 @@ const Evaluator = struct {
         return null;
     }
 
-    /// Backing integer of a packed struct (a value of `?type`)
-    fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index) EvalError!Index {
+    /// Backing integer of a packed struct or union (a value of `?type`): the explicit argument,
+    /// otherwise an unsigned integer as wide as the fields together (struct) or as the widest
+    /// field (union)
+    fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index, is_union: bool) EvalError!Index {
         if (layout != .@"packed") return .null_value;
         if ((try ev.containerSyntax(t)).arg) |arg| return arg;
         var bits: u64 = 0;
         for (types) |ty| {
             const field_bits = (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
-            bits = std.math.add(u64, bits, field_bits) catch return error.Abort;
+            bits = if (is_union) @max(bits, field_bits) else std.math.add(u64, bits, field_bits) catch return error.Abort;
         }
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }
