@@ -574,10 +574,10 @@ fn requestContext(pc: *panic_context.Text, comptime method: []const u8, params: 
     if (@typeInfo(P) != .@"struct" or !@hasField(P, "textDocument")) return pc.enter("request {s}", .{method});
     const doc = params.textDocument.uri;
     if (@hasField(P, "position")) {
-        return pc.enter("request {s} {s}:{d}:{d}", .{ method, doc, params.position.line + 1, params.position.character + 1 });
+        return pc.enter("request {s} {s}:{d}:{d}", .{ method, doc, @as(u64, params.position.line) + 1, @as(u64, params.position.character) + 1 });
     }
     if (@hasField(P, "range")) {
-        return pc.enter("request {s} {s}:{d}:{d}", .{ method, doc, params.range.start.line + 1, params.range.start.character + 1 });
+        return pc.enter("request {s} {s}:{d}:{d}", .{ method, doc, @as(u64, params.range.start.line) + 1, @as(u64, params.range.start.character) + 1 });
     }
     pc.enter("request {s} {s}", .{ method, doc });
 }

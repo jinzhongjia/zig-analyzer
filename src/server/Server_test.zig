@@ -512,6 +512,44 @@ test "malformed params return InvalidParams" {
     try testing.expectEqual(-32602, errorCode(msgs[0]));
 }
 
+test "requests at the largest position coordinates are answered" {
+    // The panic context of a read request converted a coordinate of 2^32 - 1 to 1-based in
+    // `u32`, overflowing and aborting the server
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } } });
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = file_uri, .languageId = "zig", .version = 1, .text = "pub const a: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const max = std.math.maxInt(u32);
+    const Position = struct { line: u32, character: u32 };
+    const doc = .{ .uri = file_uri };
+    const corners = [_]Position{ .{ .line = max, .character = 0 }, .{ .line = 0, .character = max }, .{ .line = max, .character = max } };
+    for (corners) |p| {
+        const hover = try h.request("textDocument/hover", .{ .textDocument = doc, .position = p });
+        try testing.expect(hover.object.get("result") != null);
+        const range = .{ .start = p, .end = Position{ .line = max, .character = max } };
+        const hints = try h.request("textDocument/inlayHint", .{ .textDocument = doc, .range = range });
+        try testing.expect(hints.object.get("result") != null);
+        const tokens = try h.request("textDocument/semanticTokens/range", .{ .textDocument = doc, .range = range });
+        try testing.expect(tokens.object.get("result") != null);
+        const actions = try h.request("textDocument/codeAction", .{ .textDocument = doc, .range = range, .context = .{ .diagnostics = &[_]Empty{} } });
+        try testing.expect(actions.object.get("result") != null);
+    }
+    // The server is still running
+    const hover = try h.request("textDocument/hover", .{ .textDocument = doc, .position = Position{ .line = 0, .character = 10 } });
+    try testing.expect(hover.object.get("result").? == .object);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "read requests run on their own threads: a blocked read does not stall the main loop" {
     const Harness = @import("test_harness.zig").Harness;
     // No free slot in the thread pool: `async` runs synchronously on the caller, so zig env may
