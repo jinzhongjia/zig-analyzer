@@ -900,3 +900,28 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     try testing.expectEqual(1, msgs2.len);
     try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs2[0]);
 }
+
+test "collect: notes of an error without a location outlive the fallback path" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("undefined symbol: _za_missing"), .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("referenced by /proj/.zig-cache/o/x/linkerr_zcu.o:_main.main") }},
+    );
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    const fallback = try gpa.dupe(u8, native("/proj/build.zig"));
+    defer gpa.free(fallback);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), fallback, &dummy, Disk.read);
+    defer r.release(gpa);
+    // The caller reuses the memory of its path after the call
+    @memset(fallback, 'x');
+    // Guards against keeping the caller's path as the note's path
+    try testing.expectEqualStrings(native("/proj/build.zig"), r.files.keys()[0]);
+    const item = r.files.values()[0].items[0];
+    try testing.expectEqual(1, item.notes.len);
+    try testing.expectEqualStrings(native("/proj/build.zig"), item.notes[0].path);
+    try testing.expectEqualStrings("referenced by /proj/.zig-cache/o/x/linkerr_zcu.o:_main.main", item.notes[0].message);
+}

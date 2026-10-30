@@ -69,7 +69,8 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 
 /// Converts a set of ErrorBundles into per-file results.
 /// A relative `src_path` is relative to `build_root`; errors without location information (such
-/// as link errors) are attached to the start of `fallback_path` (usually build.zig).
+/// as link errors) are attached to the start of `fallback_path` (usually build.zig), which is
+/// copied into the result.
 /// When `src_path` does not resolve to an absolute path (a malformed error bundle, see
 /// `absolute`), it is treated as having no location: the error is attached to the start of
 /// `fallback_path`, and the notes and reference trace are placed at the start of the error.
@@ -89,6 +90,8 @@ pub fn collect(
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const a = arena_state.allocator();
+    // The caller may free `fallback_path` while the result is still in use
+    const fallback = try a.dupe(u8, fallback_path);
     var sources: Sources = .{ .a = a, .build_root = build_root, .read_ctx = read_ctx, .read = read };
     // Find the files that changed after the compiler read them
     for (bundles) |eb| {
@@ -116,7 +119,7 @@ pub fn collect(
             const msg = eb.getErrorMessage(mi);
             const message = eb.nullTerminatedString(msg.msg);
             const compile_log = if (log_target == mi) log_text else "";
-            var path: []const u8 = fallback_path;
+            var path: []const u8 = fallback;
             var start: u32 = 0;
             var end: u32 = 0;
             if (msg.src_loc != .none) {
