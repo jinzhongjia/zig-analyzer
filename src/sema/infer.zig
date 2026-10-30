@@ -312,6 +312,9 @@ const Inferrer = struct {
         expected: ?Index = null,
         types: std.ArrayList(Index) = .empty,
         values: std.ArrayList(TypedValue) = .empty,
+        /// The break value expressions: enum literals among them take the peer type (see
+        /// `peerLiteral`)
+        exprs: std.ArrayList(ExprId) = .empty,
     };
 
     fn runOwner(inf: *Inferrer, kind: ItemTree.Item.Kind, mode: Mode) Error!void {
@@ -854,8 +857,10 @@ const Inferrer = struct {
                     try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);
                 }
+                var break_exprs: []const ExprId = &.{};
                 if (label != null) {
                     const frame = inf.labels.pop().?;
+                    break_exprs = frame.exprs.items;
                     // When a prong is chosen, only its breaks are recorded (the other prongs are
                     // inferred as not executing)
                     if (chosen != null) {
@@ -869,6 +874,8 @@ const Inferrer = struct {
                         try live_types.appendSlice(inf.scratch, frame.types.items);
                         try live_values.appendSlice(inf.scratch, frame.values.items);
                         const t = try inf.peer(live_types.items);
+                        try inf.peerLiteral(s.prongs[chosen.?].body, t);
+                        for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
                         return .{ .ty = t, .val = sameValue(live_values.items, t) };
                     }
                     try types.appendSlice(inf.scratch, frame.types.items);
@@ -877,6 +884,7 @@ const Inferrer = struct {
                 if (chosen != null) return chosen_tv;
                 const ty = try inf.peer(types.items);
                 for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
+                for (break_exprs) |x| try inf.peerLiteral(x, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) sameLiveValue(values.items, ty) else null };
             },
             .@"catch" => |c| {
@@ -966,6 +974,7 @@ const Inferrer = struct {
                     const frame = &inf.labels.items[fi];
                     try frame.types.append(inf.scratch, brk.ty);
                     try frame.values.append(inf.scratch, brk);
+                    if (br.value) |v| try frame.exprs.append(inf.scratch, v);
                 };
                 return .{ .ty = .noreturn_type };
             },
@@ -1885,6 +1894,7 @@ const Inferrer = struct {
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
             }
             const t = try inf.peer(frame.types.items);
+            for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
             return .{ .ty = t, .val = sameValue(frame.values.items, t) };
         }
         return .{ .ty = if (last == .noreturn_type) .noreturn_type else .void_type };
@@ -2019,11 +2029,13 @@ const Inferrer = struct {
         }
         if (endless) {
             if (l.@"else") |el| _ = try inf.inferArm(el, expected, true);
-        } else {
-            const other: Index = if (l.@"else") |el| (try inf.infer(el, expected)).ty else .void_type;
-            try frame.types.append(inf.scratch, other);
-        }
-        return .{ .ty = try inf.peer(frame.types.items) };
+        } else if (l.@"else") |el| {
+            try frame.types.append(inf.scratch, (try inf.infer(el, expected)).ty);
+            try frame.exprs.append(inf.scratch, el);
+        } else try frame.types.append(inf.scratch, .void_type);
+        const ty = try inf.peer(frame.types.items);
+        for (frame.exprs.items) |x| try inf.peerLiteral(x, ty);
+        return .{ .ty = ty };
     }
 
     /// Loop variables of a `for` loop; when inferring the `iteration`-th iteration, they take the

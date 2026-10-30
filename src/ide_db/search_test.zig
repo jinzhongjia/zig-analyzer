@@ -867,3 +867,47 @@ test "an unclosed block does not take the next declaration's locals as reference
     try testing.expectEqualStrings("main:2:x* main:3:x", try symbolRefs(&w, file, at(text, "x", 0), .{ .scope = &.{file} }));
     try testing.expectEqualStrings("main:7:x* main:8:x", try symbolRefs(&w, file, at(text, "x", 2), .{ .scope = &.{file} }));
 }
+
+test "references to enum members include literals typed by the peer type of breaks and loop else values" {
+    // Without a result type, `.b` in `break :blk .b` and in a loop `else` takes the peer type of
+    // the other results: these literals used not to count as references, and rename missed them
+    const src =
+        \\const E = enum { a, b, c };
+        \\const U = union(enum) { a: u8, b: void };
+        \\fn pick(rt: bool, xs: []const u8) E {
+        \\    const v1 = blk: {
+        \\        if (rt) break :blk E.a;
+        \\        break :blk .b;
+        \\    };
+        \\    const v2 = blk: {
+        \\        if (rt) break :blk .b;
+        \\        break :blk E.a;
+        \\    };
+        \\    var i: usize = 0;
+        \\    const v3 = while (i < xs.len) : (i += 1) {
+        \\        if (rt) break E.a;
+        \\    } else .b;
+        \\    const v4 = for (xs) |x| {
+        \\        if (x == 0) break .b;
+        \\    } else E.c;
+        \\    const v5 = sw: switch (xs.len) {
+        \\        0 => break :sw .b,
+        \\        else => break :sw E.a,
+        \\    };
+        \\    const v6 = if (rt) E.c else .b;
+        \\    const u = blk: {
+        \\        if (rt) break :blk U{ .a = 1 };
+        \\        break :blk .b;
+        \\    };
+        \\    _ = .{ v1, v2, v3, v4, v5, v6, u };
+        \\    return v1;
+        \\}
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = (try w.add("/p/x.zig", src)).file;
+    const fs: Files = .{ .main = f, .lib = f, .other = f };
+    try testing.expectEqualStrings("x:1:b* x:6:b x:9:b x:15:b x:17:b x:20:b x:23:b", try refs(&w, fs, f, at(src, "b", 0), null));
+    try testing.expectEqualStrings("x:2:b* x:26:b", try refs(&w, fs, f, at(src, "b: void", 0), null));
+}
