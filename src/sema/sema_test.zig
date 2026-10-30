@@ -2625,6 +2625,29 @@ test "the _ of a non-exhaustive enum is not a field" {
     });
 }
 
+test "empty exhaustive enums have the tag type noreturn" {
+    // Prevents giving `enum {}` and the tag of `union(enum) {}` the tag type `u0`; expected
+    // values are the results of zig 0.17.0
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Empty = enum {};
+        \\const U = union(enum) {};
+        \\const a = @typeInfo(Empty).@"enum".tag_type;
+        \\const b = std.meta.Tag(Empty);
+        \\const c = std.meta.BackingInt(Empty);
+        \\const d = @typeInfo(std.meta.Tag(U)).@"enum".tag_type;
+        \\const e = @typeInfo(enum { x }).@"enum".tag_type;
+        \\const f = if (@typeInfo(Empty).@"enum".tag_type == noreturn) 1 else 2;
+    , &.{
+        .{ "a", "type = noreturn" },
+        .{ "b", "type = noreturn" },
+        .{ "c", "type = noreturn" },
+        .{ "d", "type = noreturn" },
+        .{ "e", "type = u0" },
+        .{ "f", "comptime_int = 1" },
+    });
+}
+
 test "packed unions have a backing integer and no tag type" {
     // Prevents treating the backing integer of `packed union(T)` as its tag type
     try expectStdTypes(

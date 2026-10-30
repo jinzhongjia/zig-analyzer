@@ -3989,6 +3989,8 @@ const Evaluator = struct {
             else => {},
         }
         const values = try ev.enumValues(t);
+        // An exhaustive enum without members has no values: the compiler gives it `noreturn`
+        if (values.len == 0) return .noreturn_type;
         var max: i128 = 0;
         for (values) |v| max = @max(max, v);
         const bits: u16 = if (max == 0) 0 else @intCast(128 - @clz(@as(u128, @intCast(max))));
