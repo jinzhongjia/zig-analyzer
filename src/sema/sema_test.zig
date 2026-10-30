@@ -1541,6 +1541,28 @@ test "peer types of error sets, error unions, arrays, vectors, floats and C poin
     });
 }
 
+test "the peer type of a C pointer and null is the C pointer" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(a1), @TypeOf(a2), T1,
+    // @TypeOf(o), @TypeOf(p))` prints `[*c]u8`, `[*c]u8`, `[*c]u8`, `?u8`, `?*u8`); a C pointer
+    // must not be wrapped into an optional
+    try expectTypes(
+        \\fn probe(c: bool, cp: [*c]u8) void {
+        \\    const a1 = if (c) cp else null;
+        \\    const a2 = if (c) null else cp;
+        \\    const T1 = @TypeOf(cp, null);
+        \\    const o = if (c) @as(?u8, 1) else null;
+        \\    const p = if (c) @as(*u8, undefined) else null;
+        \\    _ = .{ a1, a2, T1, o, p };
+        \\}
+    , &.{
+        .{ "a1", "[*c]u8" },
+        .{ "a2", "[*c]u8" },
+        .{ "T1", "type = [*c]u8" },
+        .{ "o", "?u8" },
+        .{ "p", "?*u8" },
+    });
+}
+
 test "@min and @max narrow the result type like the compiler" {
     // Expected values are the results of zig 0.17.0
     try expectTypes(

@@ -3317,6 +3317,8 @@ const Inferrer = struct {
         const t = result orelse return if (has_null) .null_type else if (types.len != 0 and allNoreturn(types)) .noreturn_type else .void_type;
         if (has_null) switch (ip.key(t)) {
             .optional_type => {},
+            // A C pointer can already hold null
+            .ptr_type => |p| if (p.size != .c) return ip.optionalOf(t),
             // The null goes into the payload of an error union
             .error_union_type => |eu| return ip.get(.{ .error_union_type = .{ .err = eu.err, .payload = try inf.peer(&.{ eu.payload, .null_type }) } }),
             else => return if (isErrorSet(ip, t)) ip.get(.{ .error_union_type = .{ .err = t, .payload = .null_type } }) else ip.optionalOf(t),
