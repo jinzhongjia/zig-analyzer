@@ -3393,3 +3393,70 @@ test "the address of a function declaration is a const pointer with a comptime v
         .{ "T1", "type = u8" },
     });
 }
+
+test "variables reached through namespaces and payloads of noreturn orelse are mutable places" {
+    // The constness of a namespace member is its own: `&State.counter` used to follow the `const`
+    // that names the namespace and be `*const u32`
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/other.zig",
+        \\pub var global: i64 = 0;
+        \\pub const fixed: i64 = 0;
+    );
+    const src =
+        \\const other = @import("other.zig");
+        \\const State = struct {
+        \\    pub var counter: u32 = 0;
+        \\    pub const fixed: u32 = 0;
+        \\    pub var buf: [8]u8 = undefined;
+        \\};
+        \\const Self = @This();
+        \\var instance: u16 = 0;
+        \\const Sym = struct { file: ?u32 = null };
+        \\const Obj = struct {
+        \\    d_sym: ?Sym = null,
+        \\    res: anyerror!Sym = .{},
+        \\    fn close(self: *Obj) bool {
+        \\        const ds = &(self.d_sym orelse return false);
+        \\        const r_sym = &(self.res catch return false);
+        \\        _ = .{ ds, r_sym };
+        \\        return true;
+        \\    }
+        \\};
+        \\fn probe(n: usize, opt: ?Sym) void {
+        \\    const p1 = &State.counter;
+        \\    const p2 = &State.fixed;
+        \\    const p3 = &Self.instance;
+        \\    const p10 = &other.global;
+        \\    const p11 = &other.fixed;
+        \\    const s1 = State.buf[0..n];
+        \\    const o1 = &(opt orelse return);
+        \\    for (&State.buf) |*c| {
+        \\        const pc = c;
+        \\        _ = pc;
+        \\    }
+        \\    _ = .{ p1, p2, p3, p10, p11, s1, o1 };
+        \\}
+    ;
+    const f = try w.add("/p/main.zig", src);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "p1", "*u32" },
+        .{ "p2", "*const u32 = &0" },
+        .{ "p3", "*u16" },
+        .{ "p10", "*i64" },
+        .{ "p11", "*const i64 = &0" },
+        .{ "s1", "[]u8" },
+        .{ "pc", "*u8" },
+        .{ "ds", "*Sym" },
+        .{ "r_sym", "*Sym" },
+        .{ "o1", "*const Sym" },
+    };
+    for (cases) |c| {
+        const actual = try typeAt(&w, f.file, src, c[0], 0);
+        testing.expectEqualStrings(c[1], actual) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}

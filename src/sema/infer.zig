@@ -3210,7 +3210,19 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
                 .file => true,
             };
         },
-        .field_access => |fa| return partIsConst(r, file, item, b, types, fa.lhs),
+        .field_access => |fa| {
+            // A member of a namespace (`State.counter`, `other.global`) is a declaration: its own
+            // `var` / `const` decides
+            if (types.exprType(fa.lhs).asType()) |t| {
+                const ns = try queries.namespaceOfType(r, t) orelse return true;
+                const def = try r.memberDef(ns, fa.field orelse return true) orelse return true;
+                return switch (def) {
+                    .item => |it| (try r.itemTree(it.file)).items[it.item].kind != .@"var",
+                    else => true,
+                };
+            }
+            return partIsConst(r, file, item, b, types, fa.lhs);
+        },
         // `@field(x, name)` is a member of `x`, as `x.name` is
         .builtin_call => |c| return if (std.mem.eql(u8, c.name, "@field") and c.args.len == 2) partIsConst(r, file, item, b, types, c.args[0]) else true,
         .index => |x| return partIsConst(r, file, item, b, types, x.lhs),
@@ -3220,6 +3232,10 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
         },
         // The payload of an optional is part of the optional
         .unwrap_optional => |x| return placeIsConst(r, file, item, b, types, x),
+        // `x orelse return` / `x catch return` with a noreturn right-hand side points into the
+        // payload of `x`
+        .binary => |bin| return if (bin.op == .keyword_orelse and types.exprType(bin.rhs).ty == .noreturn_type) placeIsConst(r, file, item, b, types, bin.lhs) else true,
+        .@"catch" => |c| return if (types.exprType(c.rhs).ty == .noreturn_type) placeIsConst(r, file, item, b, types, c.lhs) else true,
         else => return true,
     }
 }

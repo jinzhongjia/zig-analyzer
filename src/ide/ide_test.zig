@@ -6454,3 +6454,47 @@ test "enum literal completion above a line that starts with `.name`" {
         try testing.expectEqualStrings("fingerprint version minimum_zig_version paths", try completionAt(&w, at));
     }
 }
+
+test "member completion offers methods taking a pointer on variables reached through namespaces" {
+    // `State.c` and the payload pointer of `&(x orelse return)` used to be treated as constant,
+    // which hid the methods receiving `*T`
+    const ns_labels = try completionLabels(
+        \\const Counter = struct {
+        \\    n: u32 = 0,
+        \\    pub fn inc(self: *Counter) void {
+        \\        self.n += 1;
+        \\    }
+        \\    pub fn get(self: *const Counter) u32 {
+        \\        return self.n;
+        \\    }
+        \\};
+        \\const State = struct {
+        \\    pub var c: Counter = .{};
+        \\};
+        \\fn probe() void {
+        \\    State.c.<|>
+        \\}
+        \\
+    );
+    defer testing.allocator.free(ns_labels);
+    try testing.expectEqualStrings("n inc get", ns_labels);
+    const payload_labels = try completionLabels(
+        \\const Sym = struct {
+        \\    file: ?u32 = null,
+        \\    fn close(d: *Sym) void {
+        \\        d.file = null;
+        \\    }
+        \\};
+        \\const Obj = struct {
+        \\    d_sym: ?Sym = null,
+        \\    fn closeDebugInfo(self: *Obj) bool {
+        \\        const d_sym = &(self.d_sym orelse return false);
+        \\        d_sym.<|>
+        \\        return true;
+        \\    }
+        \\};
+        \\
+    );
+    defer testing.allocator.free(payload_labels);
+    try testing.expectEqualStrings("file close", payload_labels);
+}
