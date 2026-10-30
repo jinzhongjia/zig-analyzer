@@ -3147,6 +3147,39 @@ test "completion after `try .` lists the functions returning an error union of t
     try testing.expectEqualStrings("initCapacity clone", labels);
 }
 
+test "completion of reified union tags and of @Struct and @Union initializer fields" {
+    try expectCompletions(
+        \\const E = @Enum(u8, .exhaustive, &.{ "ra", "rb" }, &.{ 0, 1 });
+        \\const T = @Struct(.auto, null, &.{ "fa", "fb" }, &.{ u32, bool }, &.{ .{}, .{} });
+        \\const U = @Union(.auto, E, &.{ "ra", "rb" }, &.{ u32, void }, &.{ .{}, .{} });
+        \\const UU = @Union(.auto, null, &.{ "ua", "ub" }, &.{ u32, void }, &.{ .{}, .{} });
+        \\
+    , &.{
+        .{ "const x = U.<|>;", "ra rb" },
+        .{ "const t: T = .{ .<|> };", "fa fb" },
+        .{ "const t: T = .{ .fa = 1, .<|> };", "fb" },
+        .{ "const u: U = .{ .<|> };", "ra rb" },
+        // Only the tag of a field with one possible value coerces to the union
+        .{ "const u: U = .<|>;", "rb" },
+        // An untagged union has no tags
+        .{ "const x = UU.<|>;", "" },
+        .{ "const u: UU = .<|>;", "" },
+        .{ "const u: UU = .{ .<|> };", "ua ub" },
+    });
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try useRealStd(&w);
+    const labels = try completionAt(&w, try w.add("/p/main.zig",
+        \\const std = @import("std");
+        \\const Dir = enum { north, south };
+        \\const a = std.EnumArray(Dir, u32).init(.{ .<|> });
+        \\
+    ));
+    try testing.expectEqualStrings("north south", labels);
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;

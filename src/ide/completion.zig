@@ -706,9 +706,17 @@ fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
 fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
-        // Constructed enums (`@Enum`, the tag enum of a union(enum)): members
         switch (ip.key(t)) {
-            .reified_type, .union_tag_type => {
+            // Constructed types have no declarations: the members of a constructed enum, and the
+            // tags of a tagged constructed union (`U.a` is the tag of the field)
+            .reified_type => |rt| {
+                if (rt.kind == .@"enum" or (rt.kind == .@"union" and rt.tag != null)) {
+                    for (rt.names) |name| try out.add(.{ .label = name, .kind = .enum_member });
+                }
+                return;
+            },
+            // The tag enum of a union(enum): its members
+            .union_tag_type => {
                 for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
                 return;
             },
@@ -769,7 +777,20 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
     };
     const tags = decl_literals != .@"try";
     switch (ip.key(t)) {
-        .reified_type, .union_tag_type => {
+        // Constructed types have no declarations: the members of a constructed enum, and the tags
+        // of a tagged constructed union that coerce to it (see `onePossibleValue`)
+        .reified_type => |rt| {
+            if (!tags) return;
+            switch (rt.kind) {
+                .@"enum" => for (rt.names) |name| try out.add(.{ .label = name, .kind = .enum_member }),
+                .@"union" => if (rt.tag != null) for (rt.names, 0..) |name, i| {
+                    if (try onePossibleValue(r, if (i < rt.types.len) rt.types[i] else .unknown)) try out.add(.{ .label = name, .kind = .enum_member });
+                },
+                .@"struct" => {},
+            }
+            return;
+        },
+        .union_tag_type => {
             if (tags) for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
             return;
         },
@@ -816,6 +837,41 @@ fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool, in_try: 
         .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
         else => false,
     };
+}
+
+/// Whether a value of type `ty` has exactly one possible value, so that the tag of a union field
+/// of this type coerces to the union (as in the compiler): `void`, zero-bit integers, `null`,
+/// `undefined`, empty arrays, enums with one member, and arrays, structs, and tuples whose
+/// elements and fields all have one possible value. An unknown type counts as yes, and so does a
+/// type nested more than 16 levels deep (only an invalid type that contains itself gets there)
+fn onePossibleValue(r: *Resolver, ty: Index) resolve.Error!bool {
+    return onePossibleValueAt(r, ty, 16);
+}
+
+fn onePossibleValueAt(r: *Resolver, ty: Index, depth: u32) resolve.Error!bool {
+    switch (ty) {
+        .unknown, .void_type, .null_type, .undefined_type => return true,
+        else => {},
+    }
+    if (depth == 0) return true;
+    switch (r.ctx.db.env.ip.key(ty)) {
+        .int_type => |i| return i.bits == 0,
+        .array_type => |a| return a.len == 0 or try onePossibleValueAt(r, a.child, depth - 1),
+        .container_type => |c| switch (c.kind) {
+            .@"enum" => return (try eval.enumMemberNames(r, ty)).len == 1,
+            .@"struct", .file => {},
+            .@"union", .@"opaque" => return false,
+        },
+        .tuple_type, .anon_struct_type => {},
+        .reified_type => |rt| switch (rt.kind) {
+            .@"enum" => return rt.names.len == 1,
+            .@"struct" => {},
+            .@"union" => return false,
+        },
+        else => return false,
+    }
+    for (try eval.fieldNames(r, ty)) |f| if (!try onePossibleValueAt(r, f.ty, depth - 1)) return false;
+    return true;
 }
 
 /// The enum literal `e` is the operand of `try`, directly (`try .f`) or as the callee of the call
@@ -1659,8 +1715,9 @@ fn initOf(b: *const Body, e: Body.ExprId) ?Body.ExprId {
     return null;
 }
 
-/// The type whose fields an initializer of type `ty` names (`T` for `?T`): a struct or union;
-/// null for the other types, whose initializers list elements (arrays, slices, tuples)
+/// The type whose fields an initializer of type `ty` names (`T` for `?T`): a struct or union,
+/// also a constructed one (`@Struct`, `@Union`); null for the other types, whose initializers list
+/// elements (arrays, slices, tuples)
 fn fieldsType(ip: *InternPool, ty: Index) ?Index {
     const t = switch (ip.key(ty)) {
         .optional_type => |c| c,
@@ -1668,6 +1725,7 @@ fn fieldsType(ip: *InternPool, ty: Index) ?Index {
     };
     return switch (ip.key(t)) {
         .container_type => |c| if (c.kind.isStruct() or c.kind == .@"union") t else null,
+        .reified_type => |rt| if (rt.kind != .@"enum") t else null,
         else => null,
     };
 }
@@ -1675,6 +1733,13 @@ fn fieldsType(ip: *InternPool, ty: Index) ?Index {
 /// Fields of the struct or union `t` (see `fieldsType`) that have not been assigned yet
 fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
+    if (ip.key(t) == .reified_type) {
+        outer: for (try eval.fieldNames(r, t)) |f| {
+            for (given) |g| if (g.name) |n| if (std.mem.eql(u8, n, f.name)) continue :outer;
+            try out.add(.{ .label = f.name, .kind = .field, .detail = if (f.ty != .unknown) try render.typeAlloc(r, f.ty) else null });
+        }
+        return;
+    }
     const ns = try queries.namespaceOfType(r, t) orelse return;
     const tree = try r.itemTree(ns.file);
     outer: for (tree.containerMembers(ns.container)) |m| {
