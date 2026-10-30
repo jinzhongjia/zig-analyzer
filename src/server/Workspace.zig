@@ -5,9 +5,10 @@
 //! and handles them; the LSP main loop interacts with it only through `requestBuild` / `stop`.
 //! Edits of files in the compile set may recompute it from other tasks (see `refreshImports`).
 //!
-//! Lifecycle: when maker crashes, or build.zig or the build configuration changes, the project is
-//! restarted as a new instance. The new instance is invisible until its first build completes (or
-//! configuration fails); meanwhile the old instance's model, compile set, and compiler diagnostics
+//! Lifecycle: when maker crashes, build.zig or the build configuration changes, or maker's local
+//! cache directory is deleted, the project is restarted as a new instance. The new instance is
+//! invisible until its first build completes (or configuration fails); meanwhile the old
+//! instance's model, compile set, and compiler diagnostics
 //! remain in effect. If the old instance has no model, the new instance replaces it as soon as it
 //! is configured (see `Server.restartWorkspace`, `Server.promote`).
 //! Instances are reclaimed by reference counting: the server's project list, the background task,
@@ -131,6 +132,11 @@ build_done: u32 = 0,
 /// published as compiler diagnostics (the extra steps in the build request that produce generated
 /// files do not affect diagnostics, consistent with running `zig build <step>` directly)
 diag_steps: std.DynamicBitSetUnmanaged = .{},
+/// Identities (inode numbers) of the maker's local cache directory and of its manifest directory
+/// `h`, taken when the build graph is read. The maker opens both once at startup and keeps
+/// writing through those handles: once either is deleted or replaced, steps that write into the
+/// cache fail without errors, so the maker is restarted (see `cacheReplaced`)
+cache_identity: ?[2]Io.File.INode = null,
 
 // ── The following fields are accessed only by the background task ──
 bundles: std.ArrayList(ErrorBundle) = .empty,
@@ -249,10 +255,11 @@ fn destroy(ws: *Workspace) void {
 }
 
 /// Requests a build after a file is saved; while a build is in progress, marks it to be rebuilt
-/// once it finishes
+/// once it finishes. When the maker's local cache directory has been deleted or replaced, the
+/// project is restarted instead (its build would fail).
 pub fn requestBuild(ws: *Workspace) void {
     const io = ws.server.io;
-    {
+    const replaced = blk: {
         ws.mutex.lockUncancelable(io);
         defer ws.mutex.unlock(io);
         const client = ws.client orelse return;
@@ -262,6 +269,7 @@ pub fn requestBuild(ws: *Workspace) void {
             ws.rebuild = true;
             return;
         }
+        if (ws.cacheReplaced()) break :blk true;
         const steps = model.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
         defer ws.gpa.free(steps);
         if (steps.len != 0) {
@@ -277,10 +285,36 @@ pub fn requestBuild(ws: *Workspace) void {
             };
             return;
         }
+        break :blk false;
+    };
+    if (replaced) {
+        log.info("{s}: the local cache directory of zig build was deleted or replaced, restarting", .{ws.root});
+        ws.server.restartWorkspace(ws, 0);
+        return;
     }
     // The compiler is not run and there are no generated files to produce: do not build, but
     // finish once with an empty result (clears compiler diagnostics published before a restart)
     ws.finishBuild() catch {};
+}
+
+/// Identities of the local cache directory `cache` and of its manifest directory `h`; null when
+/// either cannot be found
+fn cacheIdentity(io: Io, cache: []const u8) ?[2]Io.File.INode {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const h = std.fmt.bufPrint(&buf, "{s}{c}h", .{ cache, std.fs.path.sep }) catch return null;
+    const root = Io.Dir.cwd().statFile(io, cache, .{}) catch return null;
+    const manifests = Io.Dir.cwd().statFile(io, h, .{}) catch return null;
+    return .{ root.inode, manifests.inode };
+}
+
+/// The local cache directory the maker opened has been deleted or replaced since the build graph
+/// was read. While the maker holds the old directories open, their inode numbers cannot be reused,
+/// so a recreated directory always has a different identity. The caller holds mutex.
+fn cacheReplaced(ws: *Workspace) bool {
+    const known = ws.cache_identity orelse return false;
+    const model = &(ws.model orelse return false);
+    const now = cacheIdentity(ws.server.io, model.local_cache_root) orelse return true;
+    return !std.mem.eql(Io.File.INode, &known, &now);
 }
 
 /// Title of the build progress: the names of the diagnostics steps; without compiler diagnostics
@@ -515,6 +549,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     ws.server.showWarning(std.fmt.bufPrint(&buf, "some diagnostics.steps are not steps of {s}, they are ignored", .{ws.root}) catch "some diagnostics.steps are not steps of the project, they are ignored");
                 }
             }
+            const identity = cacheIdentity(io, model.local_cache_root);
             {
                 ws.set_mutex.lockUncancelable(io);
                 defer ws.set_mutex.unlock(io);
@@ -522,6 +557,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 defer ws.mutex.unlock(io);
                 if (ws.model) |*old| old.deinit(ws.gpa);
                 ws.model = model;
+                ws.cache_identity = identity;
                 ws.diag_steps.deinit(ws.gpa);
                 ws.diag_steps = .{};
                 // Without compiler diagnostics there are no diagnostics steps: errors in the
@@ -613,6 +649,28 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     sendBuild(ws, c, m, steps) catch {};
                 };
                 return;
+            }
+            {
+                // The local cache directory was deleted or replaced during the build: steps that
+                // write into it failed without errors, so the result is not that of the sources.
+                // Keep the published diagnostics and restart; the new instance's first build
+                // replaces them.
+                ws.mutex.lockUncancelable(io);
+                const replaced = ws.cacheReplaced();
+                if (replaced) {
+                    ws.server.progress.end(ws.server, ws.build_progress, "Cache directory deleted, restarting");
+                    ws.build_progress = null;
+                    ws.building = false;
+                    ws.rebuild = false;
+                }
+                ws.mutex.unlock(io);
+                if (replaced) {
+                    ws.clearBundles();
+                    log.info("{s}: the local cache directory of zig build was deleted or replaced during the build, restarting", .{ws.root});
+                    ws.server.restartWorkspace(ws, 0);
+                    ws.server.busyEnd();
+                    return;
+                }
             }
             var errors: u32 = 0;
             for (ws.bundles.items) |eb| errors += eb.errorMessageCount();

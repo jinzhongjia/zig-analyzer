@@ -5655,5 +5655,6 @@ test {
     _ = @import("remove_param_e2e_test.zig");
     _ = @import("unused_capture_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
+    _ = @import("maker_e2e_test.zig");
     _ = @import("auto_import_test.zig");
 }
