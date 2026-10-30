@@ -31,7 +31,10 @@ pub const ResponseError = struct {
 pub const Message = union(enum) {
     request: struct { id: Id, method: []const u8, params: json.Value },
     notification: struct { method: []const u8, params: json.Value },
-    response: struct { id: ?Id, result: json.Value, @"error": ?ResponseError },
+    /// `failed`: the response has an `error` member that is not null. Its content is not
+    /// inspected: a malformed error object (such as one without `message`) still reports the
+    /// failure of the request it answers.
+    response: struct { id: ?Id, result: json.Value, failed: bool },
 };
 
 pub const ParseError = error{
@@ -67,11 +70,8 @@ pub fn parse(arena: Allocator, body: []const u8) ParseError!Message {
         return .{ .notification = .{ .method = method.string, .params = params } };
     }
 
-    const err: ?ResponseError = if (obj.get("error")) |e|
-        json.parseFromValueLeaky(ResponseError, arena, e, .{ .ignore_unknown_fields = true }) catch return error.InvalidMessage
-    else
-        null;
-    return .{ .response = .{ .id = id, .result = obj.get("result") orelse .null, .@"error" = err } };
+    const failed = if (obj.get("error")) |e| e != .null else false;
+    return .{ .response = .{ .id = id, .result = obj.get("result") orelse .null, .failed = failed } };
 }
 
 /// Parses `params` into the parameter type of the method.
@@ -203,7 +203,18 @@ test "classify requests, notifications and responses" {
         \\{"jsonrpc":"2.0","id":"abc","error":{"code":-32601,"message":"no"}}
     );
     try testing.expectEqualStrings("abc", resp.response.id.?.string);
-    try testing.expectEqual(-32601, resp.response.@"error".?.code);
+    try testing.expect(resp.response.failed);
+
+    // A null error is no error; an error object missing members is still an error
+    const ok = try parse(a,
+        \\{"jsonrpc":"2.0","id":2,"result":[null],"error":null}
+    );
+    try testing.expect(!ok.response.failed);
+    try testing.expect(ok.response.result == .array);
+    const incomplete = try parse(a,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32603}}
+    );
+    try testing.expect(incomplete.response.failed);
 
     try testing.expectError(error.InvalidMessage, parse(a, "[1]"));
     try testing.expectError(error.InvalidMessage, parse(a,

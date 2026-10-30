@@ -542,14 +542,14 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
         .response => |resp| {
             defer server.destroyArena(arena);
             if (resp.id) |id| switch (id) {
-                .integer => |i| _ = server.progress.handleResponse(server, i, resp.@"error" == null),
+                .integer => |i| _ = server.progress.handleResponse(server, i, !resp.failed),
                 .string => |s| if (std.mem.startsWith(u8, s, config_request_prefix)) {
-                    try server.handleConfigResponse(s, resp.result, resp.@"error" != null);
+                    try server.handleConfigResponse(s, resp.result, resp.failed);
                 } else if (std.mem.eql(u8, s, semantic_refresh_id)) {
                     server.semanticRefreshFinished();
                 } else if (std.mem.eql(u8, s, inlay_refresh_id)) {
                     server.inlayRefreshFinished();
-                } else if (resp.@"error" != null and (std.mem.eql(u8, s, register_id) or std.mem.startsWith(u8, s, watch.Watcher.registration_prefix))) {
+                } else if (resp.failed and (std.mem.eql(u8, s, register_id) or std.mem.startsWith(u8, s, watch.Watcher.registration_prefix))) {
                     server.watchRegistrationFailed();
                 },
             };

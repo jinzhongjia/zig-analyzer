@@ -720,6 +720,47 @@ test "exit without shutdown ends the main loop while a configuration request or 
     }
 }
 
+test "configuration replies with a null error or an incomplete error object still start the projects" {
+    // Such replies were rejected as unparsable messages, so the startup waiting for the
+    // configuration never began
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    const replies = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":"zig-analyzer/configuration/0","result":[null],"error":null}
+        ,
+        \\{"jsonrpc":"2.0","id":"zig-analyzer/configuration/0","error":{"code":-32603}}
+        ,
+    };
+    for (replies) |reply| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        _ = try h.request("initialize", .{
+            .capabilities = .{ .workspace = .{ .configuration = true } },
+            .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+        });
+        h.hold_requests = true;
+        try h.notify("initialized", Empty{});
+        while (true) {
+            const msg = try h.next();
+            const method = msg.object.get("method") orelse continue;
+            if (std.mem.eql(u8, method.string, "workspace/configuration")) break;
+        }
+        h.hold_requests = false;
+        try h.writeBody(reply);
+        // The main loop handles the reply before this request
+        _ = try h.request("zig-analyzer/status", {});
+        try testing.expect(h.server.started);
+        for (h.received.items) |msg| try testing.expect(msg.object.get("error") == null);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
 test "live diagnostics are debounced per file and AstGen runs outside the read transaction" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

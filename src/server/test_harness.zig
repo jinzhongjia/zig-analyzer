@@ -149,6 +149,11 @@ pub const Harness = struct {
     pub fn write(h: *Harness, value: anytype) !void {
         const body = try std.json.Stringify.valueAlloc(testing.allocator, value, .{ .emit_null_optional_fields = false });
         defer testing.allocator.free(body);
+        try h.writeBody(body);
+    }
+
+    /// Sends `body` as one message, byte for byte
+    pub fn writeBody(h: *Harness, body: []const u8) !void {
         var header: [64]u8 = undefined;
         const w = &h.input.writer;
         try w.writeAll(try std.fmt.bufPrint(&header, "Content-Length: {d}\r\n\r\n", .{body.len}));
