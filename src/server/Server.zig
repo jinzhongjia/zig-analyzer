@@ -1884,6 +1884,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     }
     if (edited.items.len != 0) {
         server.publishFiles(edited.items, true);
+        server.publishDependents(edited.items);
         server.requestSemanticRefresh();
         server.scheduleCompileSetRefresh(edited.items);
     }

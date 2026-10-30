@@ -1878,3 +1878,59 @@ test "notes into another open file follow its unsaved edits and its close" {
     try testing.expectEqualStrings(declared, (try relatedLocations(&h, (try lastPublished(&h, main_uri)).diagnostics[0]))[0]);
     try shutdown(&h);
 }
+
+/// Start positions ("line:character") of the inactive code hints last published for a document
+fn inactiveHints(h: *Harness, document_uri: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for ((try lastPublished(h, document_uri)).diagnostics) |d| {
+        if (std.mem.indexOf(u8, d.object.get("message").?.string, "inactive") == null) continue;
+        const start = d.object.get("range").?.object.get("start").?.object;
+        try out.append(h.arena.allocator(), try std.fmt.allocPrint(h.arena.allocator(), "{d}:{d}", .{ start.get("line").?.integer, start.get("character").?.integer }));
+    }
+    return out.items;
+}
+
+test "inactive code hints of other open files follow the comptime values they read" {
+    const consts_text = "pub const N: usize = 4;\npub const wide = N > 3;\n";
+    const narrow_text = "pub const N: usize = 4;\npub const wide = N > 5;\n";
+    const shapes_text = "const consts = @import(\"consts.zig\");\npub const Coord = if (consts.wide) f64 else f32;\n";
+    const main_text = "const shapes = @import(\"shapes.zig\");\nexport fn entry() void {\n    const c: shapes.Coord = 1.5;\n    _ = c;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "consts.zig", .text = consts_text },
+        .{ .path = "shapes.zig", .text = shapes_text },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"diagnostics": {"compiler": false, "inactive_code": true, "debounce_ms": 0}}
+    ));
+    try waitIdle(&h);
+    const consts_path = try project.path(a, "consts.zig");
+    const consts_uri = try open(&h, consts_path, consts_text);
+    _ = try open(&h, try project.path(a, "main.zig"), main_text);
+    const shapes_uri = try open(&h, try project.path(a, "shapes.zig"), shapes_text);
+    try waitIdle(&h);
+    const f32_hint = "1:44";
+    const f64_hint = "1:35";
+    try testing.expectEqualStrings(f32_hint, (try inactiveHints(&h, shapes_uri))[0]);
+
+    // An unsaved edit flips the condition. Guards against keeping the hint of the old value in
+    // the other open file.
+    try change(&h, consts_uri, 2, narrow_text);
+    try waitIdle(&h);
+    try testing.expectEqualStrings(f64_hint, (try inactiveHints(&h, shapes_uri))[0]);
+
+    // Closed without saving, then changed on disk while closed
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = consts_uri } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(f32_hint, (try inactiveHints(&h, shapes_uri))[0]);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = consts_path, .data = narrow_text });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = consts_uri, .type = 2 }} });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(f64_hint, (try inactiveHints(&h, shapes_uri))[0]);
+    try shutdown(&h);
+}
