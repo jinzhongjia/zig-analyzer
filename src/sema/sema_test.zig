@@ -3460,3 +3460,42 @@ test "variables reached through namespaces and payloads of noreturn orelse are m
         };
     }
 }
+
+test "a while loop whose condition always holds takes the type of its breaks" {
+    // The implicit `void` else branch used to be a peer of the breaks, which made these unknown
+    try expectTypes(
+        \\const Point = struct { x: i32 };
+        \\const forever = true;
+        \\fn probe(c: bool, items: []const Point) void {
+        \\    var i: usize = 0;
+        \\    const found = while (true) : (i += 1) {
+        \\        if (items[i].x == 0) break items[i];
+        \\    };
+        \\    const n = while (true) {
+        \\        if (c) break @as(u32, 1);
+        \\    };
+        \\    const m = while (forever) {
+        \\        if (c) break @as(u16, 1);
+        \\    };
+        \\    const lab = outer: while (true) {
+        \\        for (items) |_| {
+        \\            if (c) break :outer @as(u8, 1);
+        \\        }
+        \\    };
+        \\    const rt = while (c) {
+        \\        if (c) break @as(u32, 1);
+        \\    };
+        \\    const with_else = while (c) {
+        \\        if (c) break @as(u32, 1);
+        \\    } else @as(u32, 2);
+        \\    _ = .{ found, n, m, lab, rt, with_else };
+        \\}
+    , &.{
+        .{ "found", "Point" },
+        .{ "n", "u32" },
+        .{ "m", "u16" },
+        .{ "lab", "u8" },
+        .{ "rt", "unknown" },
+        .{ "with_else", "u32" },
+    });
+}

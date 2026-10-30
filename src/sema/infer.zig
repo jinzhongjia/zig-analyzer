@@ -1960,11 +1960,17 @@ const Inferrer = struct {
 
     fn loop(inf: *Inferrer, l: Body.Loop, expected: ?Index) Error!TypedValue {
         var iteration: ?u32 = null;
+        // A `while` whose condition is comptime-known to hold and cannot change (no `comptime var`
+        // is modified by the loop) ends only through its breaks: the compiler analyzes only the
+        // taken branch of the condition, so the `else` branch (`void` when absent) is not a peer
+        var endless = false;
         switch (l.kind) {
             .@"while" => {
                 const cond = try inf.infer(l.inputs[0], null);
                 try inf.bindCaptures(l.capture, l.inputs[0], cond, .if_then);
                 try inf.bindCaptures(l.else_capture, l.inputs[0], cond, .if_else);
+                endless = inf.condValue(cond) == true and !try inf.assignsOuterComptimeVar(l.body) and
+                    (if (l.cont) |c| !try inf.assignsOuterComptimeVar(c) else true);
             },
             .@"for" => {
                 // Inferring this loop for one iteration (see `LoopSeed`): every loop variable
@@ -2011,8 +2017,12 @@ const Inferrer = struct {
                 inf.bindings[@backingInt(v)].val = null;
             }
         }
-        const other: Index = if (l.@"else") |el| (try inf.infer(el, expected)).ty else .void_type;
-        try frame.types.append(inf.scratch, other);
+        if (endless) {
+            if (l.@"else") |el| _ = try inf.inferArm(el, expected, true);
+        } else {
+            const other: Index = if (l.@"else") |el| (try inf.infer(el, expected)).ty else .void_type;
+            try frame.types.append(inf.scratch, other);
+        }
         return .{ .ty = try inf.peer(frame.types.items) };
     }
 
