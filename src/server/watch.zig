@@ -968,6 +968,13 @@ const RootAliases = struct {
         };
         return a.dupe(u8, path);
     }
+
+    /// Appends `events` to `out` with their paths mapped back to the written form (allocated by
+    /// `gpa`)
+    fn carry(r: *const RootAliases, gpa: Allocator, events: []const Event, out: *std.ArrayList(Event)) Allocator.Error!void {
+        try out.ensureUnusedCapacity(gpa, events.len);
+        for (events) |e| out.appendAssumeCapacity(.{ .path = try r.written(gpa, e.path), .kind = e.kind });
+    }
 };
 
 /// macOS: FSEvents (recursive watching, managed by a system service). CoreServices is loaded
@@ -993,6 +1000,9 @@ const FsEvents = struct {
     /// Changes received by the callback and not yet taken (accessed only on `queue`; paths are
     /// owned by `gpa`)
     queued: std.ArrayList(Event) = .empty,
+    /// Changes received from a replaced stream, already mapped back to the written form with the
+    /// roots of that stream (accessed only by the background task; paths are owned by `gpa`)
+    carried: std.ArrayList(Event) = .empty,
 
     /// FSEvents has an undocumented limit on the number of watched paths (reportedly 4096)
     const max_roots = 2048;
@@ -1010,6 +1020,7 @@ const FsEvents = struct {
         FSEventStreamSetDispatchQueue: *const fn (stream: FSEventStreamRef, queue: dispatch.queue_t) callconv(.c) void,
         FSEventStreamStart: *const fn (stream: FSEventStreamRef) callconv(.c) bool,
         FSEventStreamStop: *const fn (stream: FSEventStreamRef) callconv(.c) void,
+        FSEventStreamFlushSync: *const fn (stream: FSEventStreamRef) callconv(.c) void,
         FSEventStreamInvalidate: *const fn (stream: FSEventStreamRef) callconv(.c) void,
         FSEventStreamRelease: *const fn (stream: FSEventStreamRef) callconv(.c) void,
         CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
@@ -1087,6 +1098,8 @@ const FsEvents = struct {
         f.aliases.deinit(gpa);
         for (f.queued.items) |e| gpa.free(e.path);
         f.queued.deinit(gpa);
+        for (f.carried.items) |e| gpa.free(e.path);
+        f.carried.deinit(gpa);
         f.queue.as_object().release();
         f.sem.as_object().release();
         f.lib.close();
@@ -1129,7 +1142,17 @@ const FsEvents = struct {
             } else return;
         }
 
+        // The changes the old stream still holds back (for its latency) are delivered now and
+        // kept, mapped with the roots they were reported under: the new stream reports only
+        // later changes
+        if (f.stream) |stream| f.sym.FSEventStreamFlushSync(stream);
         f.stopStream();
+        var taken = f.takeQueued();
+        defer {
+            for (taken.items) |e| gpa.free(e.path);
+            taken.deinit(gpa);
+        }
+        try f.aliases.carry(gpa, taken.items, &f.carried);
         f.clearRoots();
         for (roots.items) |r| try f.roots.append(gpa, try gpa.dupeSentinel(u8, r, 0));
         try f.aliases.set(gpa, f.io, f.roots.items);
@@ -1209,7 +1232,8 @@ const FsEvents = struct {
         _ = f.sem.signal();
     }
 
-    fn drain(f: *FsEvents, a: Allocator, out: *std.ArrayList(Event)) Allocator.Error!void {
+    /// Takes the changes received by the callback so far (paths owned by `gpa`)
+    fn takeQueued(f: *FsEvents) std.ArrayList(Event) {
         const Take = struct {
             f: *FsEvents,
             taken: std.ArrayList(Event) = .empty,
@@ -1221,11 +1245,19 @@ const FsEvents = struct {
         };
         var take: Take = .{ .f = f };
         dispatch.sync_f(f.queue, &take, Take.run);
+        return take.taken;
+    }
+
+    fn drain(f: *FsEvents, a: Allocator, out: *std.ArrayList(Event)) Allocator.Error!void {
+        var taken = f.takeQueued();
         defer {
-            for (take.taken.items) |e| f.gpa.free(e.path);
-            take.taken.deinit(f.gpa);
+            for (taken.items) |e| f.gpa.free(e.path);
+            taken.deinit(f.gpa);
+            for (f.carried.items) |e| f.gpa.free(e.path);
+            f.carried.clearRetainingCapacity();
         }
-        for (take.taken.items) |e| try out.append(a, .{ .path = try f.aliases.written(a, e.path), .kind = e.kind });
+        for (f.carried.items) |e| try out.append(a, .{ .path = try a.dupe(u8, e.path), .kind = e.kind });
+        for (taken.items) |e| try out.append(a, .{ .path = try f.aliases.written(a, e.path), .kind = e.kind });
     }
 };
 
@@ -1589,4 +1621,64 @@ test "FSEvents: watch roots reached through a symbolic link are replaced and fre
     try n.setDirs(testing.allocator, &.{}, &failed);
     try n.setDirs(testing.allocator, &.{link}, &failed);
     try testing.expectEqual(0, failed.items.len);
+}
+
+// Prevents losing the changes a replaced FSEvents stream still held back: they are mapped with the
+// roots they were reported under, which the replacement no longer knows
+test "root aliases carry changes over a change of the roots" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "real");
+    try tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const link = try std.fs.path.joinZ(a, &.{ dir, "link" });
+
+    var aliases: RootAliases = .{};
+    defer aliases.deinit(testing.allocator);
+    try aliases.set(testing.allocator, testing.io, &.{link});
+    var carried: std.ArrayList(Event) = .empty;
+    defer {
+        for (carried.items) |e| testing.allocator.free(e.path);
+        carried.deinit(testing.allocator);
+    }
+    const received = [_]Event{.{ .path = try std.fs.path.join(a, &.{ dir, "real", "f.zig" }), .kind = .changed }};
+    try aliases.carry(testing.allocator, &received, &carried);
+    try aliases.set(testing.allocator, testing.io, &.{});
+    try testing.expectEqual(1, carried.items.len);
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ link, "f.zig" }), carried.items[0].path);
+}
+
+test "FSEvents: changes held back by a replaced stream are still reported" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a");
+    try tmp.dir.createDirPath(testing.io, "b");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "1" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir_a = try std.fs.path.join(a, &.{ dir, "a" });
+    const dir_b = try std.fs.path.join(a, &.{ dir, "b" });
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try n.setDirs(testing.allocator, &.{dir_a}, &failed);
+    // FSEvents starts reporting shortly after the stream starts
+    try testing.io.sleep(.fromMilliseconds(200), .awake);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
+    // Within the stream's latency
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &failed);
+    try testing.expectEqual(0, failed.items.len);
+    try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
 }
