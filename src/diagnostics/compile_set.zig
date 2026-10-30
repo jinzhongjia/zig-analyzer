@@ -88,9 +88,11 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
             };
             _ = scratch.reset(.retain_capacity);
             const a = scratch.allocator();
+            const module_root = if (node.module == std_module) model.std_root else model.modules[node.module].root_file.?;
+            const module_dir = std.fs.path.dirname(resolver.path(try resolver.intern(module_root))) orelse continue;
             for (imports) |name| {
                 const target: Node = if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) blk: {
-                    const file = try relativeImport(a, resolver, node.file, name) orelse continue;
+                    const file = try relativeImport(a, resolver, node.file, name, module_dir) orelse continue;
                     break :blk .{ .file = file, .module = node.module };
                 } else if (std.mem.eql(u8, name, "std"))
                     .{ .file = try resolver.intern(model.std_root), .module = std_module }
@@ -141,6 +143,8 @@ pub fn buildScripts(gpa: Allocator, build_root: []const u8, resolver: anytype) !
     for ([_][]const u8{ "build.zig.zon", "build.zig" }) |name| {
         try stack.append(gpa, try resolver.intern(try std.fs.path.join(scratch.allocator(), &.{ build_root, name })));
     }
+    // build.zig is the root file of its module
+    const module_dir = std.fs.path.dirname(resolver.path(stack.items[1])) orelse return result;
     while (stack.pop()) |file| {
         if ((try result.files.getOrPut(gpa, file)).found_existing) continue;
         const imports = try resolver.imports(file) orelse {
@@ -149,18 +153,22 @@ pub fn buildScripts(gpa: Allocator, build_root: []const u8, resolver: anytype) !
         };
         for (imports) |name| {
             if (!std.mem.endsWith(u8, name, ".zig") and !std.mem.endsWith(u8, name, ".zon")) continue;
-            try stack.append(gpa, try relativeImport(scratch.allocator(), resolver, file, name) orelse continue);
+            try stack.append(gpa, try relativeImport(scratch.allocator(), resolver, file, name, module_dir) orelse continue);
         }
     }
     return result;
 }
 
-/// Target of the relative-path `@import(name)` in file `file`. When the resolved path is not
-/// absolute (a path relative to another drive on Windows, such as `D:a.zig`), it cannot be
-/// interned, and null is returned.
-fn relativeImport(a: Allocator, resolver: anytype, file: FileId, name: []const u8) !?FileId {
+/// Target of the relative-path `@import(name)` in file `file`, whose module's root file is in
+/// `module_dir`. Null when the path leaves `module_dir`: the compiler reports `import of file
+/// outside module path` and compiles nothing from it. When the resolved path is not absolute (a
+/// path relative to another drive on Windows, such as `D:a.zig`), it is not under `module_dir`
+/// either, so it is never interned.
+fn relativeImport(a: Allocator, resolver: anytype, file: FileId, name: []const u8, module_dir: []const u8) !?FileId {
     const dir = std.fs.path.dirname(resolver.path(file)) orelse return null;
-    return try resolver.intern(try Vfs.resolve(.native, a, dir, name) orelse return null);
+    const target = try Vfs.resolve(.native, a, dir, name) orelse return null;
+    if (!Vfs.isUnderStyle(.native, .native, target, module_dir)) return null;
+    return try resolver.intern(target);
 }
 
 const testing = std.testing;
@@ -209,8 +217,8 @@ test compute {
     var fs: FakeFs = .{};
     defer fs.deinit();
     try fs.files.put(gpa, native("/p/src/main.zig"), &.{ "lib", "std", "util.zig", "builtin" });
-    try fs.files.put(gpa, native("/p/src/util.zig"), &.{"../data.zon"});
-    try fs.files.put(gpa, native("/p/data.zon"), &.{});
+    try fs.files.put(gpa, native("/p/src/util.zig"), &.{"data/../data.zon"});
+    try fs.files.put(gpa, native("/p/src/data.zon"), &.{});
     try fs.files.put(gpa, native("/p/lib/lib.zig"), &.{ "std", "nested/deep.zig", "unknown_module" });
     // std.zig is not loaded yet
 
@@ -224,9 +232,9 @@ test compute {
             return std.mem.lessThan(u8, a, b);
         }
     }.lt);
-    try testing.expectEqualStrings(native("/p/data.zon"), names.items[0]);
-    try testing.expectEqualStrings(native("/p/lib/lib.zig"), names.items[1]);
-    try testing.expectEqualStrings(native("/p/lib/nested/deep.zig"), names.items[2]);
+    try testing.expectEqualStrings(native("/p/lib/lib.zig"), names.items[0]);
+    try testing.expectEqualStrings(native("/p/lib/nested/deep.zig"), names.items[1]);
+    try testing.expectEqualStrings(native("/p/src/data.zon"), names.items[2]);
     try testing.expectEqualStrings(native("/p/src/main.zig"), names.items[3]);
     try testing.expectEqualStrings(native("/p/src/util.zig"), names.items[4]);
     try testing.expectEqualStrings(native("/zig/std/std.zig"), names.items[5]);
@@ -334,4 +342,35 @@ test "a file shared by modules of different compile steps records every module" 
     try testing.expectEqual(2, r.others.count());
     try testing.expect(r.others.contains(.{ .file = main, .module = 1 }));
     try testing.expect(r.others.contains(.{ .file = util, .module = 1 }));
+}
+
+test "relative imports leaving the module directory are not followed" {
+    // The compiler reports `import of file outside module path` and does not compile the target:
+    // common/util.zig must not join the module of /p/src/main.zig
+    const gpa = testing.allocator;
+    var modules = [_]ProjectModel.Module{.{ .root_file = native("/p/src/main.zig"), .imports = &.{} }};
+    const steps = [_]ProjectModel.Step{.{ .name = "exe", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} }};
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    try fs.files.put(gpa, native("/p/src/main.zig"), &.{ "../common/util.zig", "sub/../inner.zig", "std" });
+    try fs.files.put(gpa, native("/p/src/inner.zig"), &.{});
+    try fs.files.put(gpa, native("/p/common/util.zig"), &.{});
+    try fs.files.put(gpa, native("/zig/std/std.zig"), &.{"../escape.zig"});
+    try fs.files.put(gpa, native("/zig/escape.zig"), &.{});
+
+    var r = try compute(gpa, &model, &.{0}, &fs);
+    defer r.deinit(gpa);
+    try testing.expect(r.contains(try fs.intern(native("/p/src/inner.zig"))));
+    try testing.expect(!r.contains(try fs.intern(native("/p/common/util.zig"))));
+    try testing.expect(!r.contains(try fs.intern(native("/zig/escape.zig"))));
+    try testing.expectEqual(3, r.files.count());
+
+    // The same holds for build scripts, whose module directory is the build root
+    try fs.files.put(gpa, native("/p/build.zig"), &.{"../outside.zig"});
+    try fs.files.put(gpa, native("/p/build.zig.zon"), &.{});
+    try fs.files.put(gpa, native("/outside.zig"), &.{});
+    var s = try buildScripts(gpa, native("/p"), &fs);
+    defer s.deinit(gpa);
+    try testing.expectEqual(2, s.files.count());
 }
