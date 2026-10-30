@@ -489,6 +489,9 @@ pub const Watcher = struct {
         // `Server.scheduleScan`), and so may directories that appear or disappear
         var rescan = false;
         var created: std.ArrayList([]const u8) = .empty;
+        // Names created or removed that are not files of interest: they may be directories
+        // (Windows notifications do not tell), moved or renamed with files of interest in them
+        var unknown: std.StringHashMapUnmanaged(void) = .empty;
         for (events) |ev| switch (ev.kind) {
             .changed, .created, .removed => {
                 const k = try w.key(a, ev.path);
@@ -497,9 +500,9 @@ pub const Watcher = struct {
                 } else {
                     // An entry created in or removed from a configure input directory
                     if (ev.kind != .changed and w.inEntryDir(k)) try pending.add(a, ev.path, if (ev.kind == .created) .created else .changed);
+                    if (ev.kind != .changed) try unknown.put(a, k, {});
                     if (ev.kind == .created) {
-                        // Not known whether it is a directory (Windows notifications do not
-                        // tell): a path leading to a nonexistent directory has appeared
+                        // A path leading to a nonexistent directory has appeared
                         if (w.leadsToMissing(k)) try dirs.put(a, k, {});
                         if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
                     }
@@ -514,6 +517,14 @@ pub const Watcher = struct {
                 }
             },
         };
+        // Files of interest under an unknown name: it is a directory
+        var moved = false;
+        if (unknown.count() != 0) for (w.files.keys(), w.files.values()) |k, path| {
+            if (!underAny(k, &unknown)) continue;
+            moved = true;
+            try pending.add(a, path, .changed);
+        };
+        if (moved) rescan = true;
         if (!rescan and created.items.len != 0) {
             const rules = try w.server.originRules(a);
             for (created.items) |path| {
@@ -521,7 +532,7 @@ pub const Watcher = struct {
             }
         }
         if (rescan) w.server.scheduleScan();
-        if (!all and dirs.count() == 0) return false;
+        if (!all and dirs.count() == 0) return moved;
         for (w.files.keys(), w.files.values()) |k, path| {
             if (!all and !underAny(k, &dirs)) continue;
             try pending.add(a, path, .changed);
@@ -1740,4 +1751,40 @@ test "poller: a change before the first check of a tracked file is reported" {
     // Files no longer tracked are forgotten
     try poller.track(testing.io, a, paths[0..1]);
     try testing.expectEqual(1, poller.seen.count());
+}
+
+// Prevents ignoring a directory renamed, moved or deleted when the notification does not say it is
+// a directory (Windows): the files of interest under it must be checked again
+test "a name created or removed without being reported as a directory reaches the files under it" {
+    const native = @import("../util/test_path.zig").native;
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var writer: za.lsp.transport.Writer = .{ .io = testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(testing.io, testing.allocator, &writer);
+    defer server.deinit();
+    const w = try Watcher.create(&server);
+    defer w.destroy();
+    const sa = w.state_arena.allocator();
+    for ([_][]const u8{ native("/p/src/sub/x.zig"), native("/p/src/main.zig") }) |path| {
+        try w.files.put(testing.allocator, try w.key(sa, path), path);
+    }
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Renamed (the old and the new name), as Windows reports it
+    var pending: Pending = .{};
+    const renamed = [_]Event{
+        .{ .path = native("/p/src/sub"), .kind = .removed },
+        .{ .path = native("/p/src/sub2"), .kind = .created },
+    };
+    try testing.expect(try w.handle(a, &renamed, &pending));
+    try testing.expectEqual(1, pending.paths.count());
+    try testing.expect(pending.paths.contains(native("/p/src/sub/x.zig")));
+
+    // A removed file that is not of interest changes nothing
+    pending = .{};
+    try testing.expect(!try w.handle(a, &.{.{ .path = native("/p/src/other.txt"), .kind = .removed }}, &pending));
+    try testing.expectEqual(0, pending.paths.count());
 }
