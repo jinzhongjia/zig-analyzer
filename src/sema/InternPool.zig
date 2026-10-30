@@ -3,7 +3,8 @@
 //! Types are values too (of type `type`). The same Key always yields the same Index regardless of
 //! the interning order, so Indexes in query results can be compared directly. Items are only
 //! appended, never removed: type identity is stable for the whole process. Multiple queries
-//! intern concurrently, protected by a mutex.
+//! intern concurrently, protected by a mutex; looking up the Key of an Index takes no lock (keys
+//! are stored in chunks that never move).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,12 +13,14 @@ const Allocator = std.mem.Allocator;
 const FileId = @import("../base/Vfs.zig").FileId;
 const AstId = @import("../syntax/ItemTree.zig").AstId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const SpinMutex = @import("../util/SpinMutex.zig");
 
 const InternPool = @This();
 
 gpa: Allocator,
 io: Io,
-mutex: Io.Mutex = .init,
+/// Protects `map`, `arena`, and appending to `items`
+mutex: SpinMutex = .{},
 /// Target-dependent parameters for value computations. Set in the same write transaction as the
 /// `queries.TargetAbi` input; every query that reads it reads that input first to record the
 /// dependency. Read and write transactions are mutually exclusive, so it is never modified while
@@ -25,8 +28,60 @@ mutex: Io.Mutex = .init,
 target: Target = .{},
 /// Storage for the slices in Keys
 arena: std.heap.ArenaAllocator,
-items: std.ArrayList(Key) = .empty,
+items: Items = .{},
 map: std.HashMapUnmanaged(Key, Index, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+
+/// The Key of each Index, in chunks of doubling size that are never moved or freed while the pool
+/// is in use: a thread that has obtained an Index (from `get`, or from a query result published
+/// after it was interned) reads its Key without the lock. Interning is far less frequent than
+/// looking up keys, which concurrent requests would otherwise serialize on.
+const Items = struct {
+    /// Chunk `c` holds the `first_chunk << c` keys from index `first_chunk * (2^c - 1)` on
+    chunks: [chunk_count]?[*]Key = @splat(null),
+    len: u32 = 0,
+
+    const first_chunk = 256;
+    /// Enough chunks for every u32 index
+    const chunk_count = locate(std.math.maxInt(u32)).chunk + 1;
+
+    fn locate(index: u32) struct { chunk: usize, offset: usize } {
+        const n = @as(u64, index) / first_chunk + 1;
+        const chunk = std.math.log2_int(u64, n);
+        return .{ .chunk = chunk, .offset = index - first_chunk * ((@as(u64, 1) << chunk) - 1) };
+    }
+
+    fn chunkLen(chunk: usize) usize {
+        return @as(usize, first_chunk) << @intCast(chunk);
+    }
+
+    fn at(items: *const Items, index: u32) *Key {
+        const loc = locate(index);
+        return &items.chunks[loc.chunk].?[loc.offset];
+    }
+
+    /// Appends a key (the caller holds the mutex)
+    fn append(items: *Items, gpa: Allocator, k: Key) Allocator.Error!u32 {
+        const index = items.len;
+        const loc = locate(index);
+        if (items.chunks[loc.chunk] == null) items.chunks[loc.chunk] = (try gpa.alloc(Key, chunkLen(loc.chunk))).ptr;
+        items.chunks[loc.chunk].?[loc.offset] = k;
+        items.len = index + 1;
+        return index;
+    }
+
+    fn capacity(items: *const Items) usize {
+        var n: usize = 0;
+        for (items.chunks, 0..) |c, i| if (c != null) {
+            n += chunkLen(i);
+        };
+        return n;
+    }
+
+    fn deinit(items: *Items, gpa: Allocator) void {
+        for (items.chunks, 0..) |c, i| if (c) |p| gpa.free(p[0..chunkLen(i)]);
+        items.* = undefined;
+    }
+};
 
 pub const Index = enum(u32) {
     /// Unknown type (absorbs everything: any operation involving it also yields unknown, and no
@@ -348,7 +403,7 @@ pub fn reset(ip: *InternPool) Allocator.Error!void {
     for (preset, 0..) |k, i| std.debug.assert(@backingInt(try fresh.get(k)) == i);
 
     ip.mutex.lockUncancelable(ip.io);
-    std.mem.swap(std.ArrayList(Key), &ip.items, &fresh.items);
+    std.mem.swap(Items, &ip.items, &fresh.items);
     std.mem.swap(@TypeOf(ip.map), &ip.map, &fresh.map);
     std.mem.swap(std.heap.ArenaAllocator, &ip.arena, &fresh.arena);
     ip.mutex.unlock(ip.io);
@@ -361,7 +416,7 @@ pub fn reset(ip: *InternPool) Allocator.Error!void {
 pub fn bytes(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    return ip.items.capacity * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
+    return ip.items.capacity() * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
 }
 
 pub fn pointerBits(ip: *const InternPool) ?u16 {
@@ -528,16 +583,28 @@ pub const VectorAbi = enum(u8) {
 
 /// Interns: the same Key returns the same Index
 pub fn get(ip: *InternPool, k: Key) Allocator.Error!Index {
+    // Hashed before taking the lock: only probing the table is serialized
+    const hashed: Prehashed = .{ .h = KeyContext.hash(.{}, k) };
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    if (ip.map.get(k)) |i| return i;
+    if (ip.map.getAdapted(k, hashed)) |i| return i;
     const owned = try ip.own(k);
-    const index: Index = @fromBackingInt(@as(u32, @intCast(ip.items.items.len)));
-    try ip.items.append(ip.gpa, owned);
-    errdefer _ = ip.items.pop();
-    try ip.map.put(ip.gpa, owned, index);
+    const index: Index = @fromBackingInt(try ip.items.append(ip.gpa, owned));
+    errdefer ip.items.len -= 1;
+    try ip.map.putNoClobber(ip.gpa, owned, index);
     return index;
 }
+
+/// Lookup context carrying a hash already computed with `KeyContext`
+const Prehashed = struct {
+    h: u64,
+    pub fn hash(c: Prehashed, _: Key) u64 {
+        return c.h;
+    }
+    pub fn eql(_: Prehashed, a: Key, b: Key) bool {
+        return deepEql(a, b);
+    }
+};
 
 /// Copies the slices in a Key into the arena
 fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
@@ -579,18 +646,17 @@ fn dupeNames(a: Allocator, names: []const []const u8) Allocator.Error![]const []
     return out;
 }
 
-/// The slices in the returned Key are valid for the lifetime of the InternPool
 /// Number of interned types and values
 pub fn count(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    return ip.items.items.len;
+    return ip.items.len;
 }
 
+/// The slices in the returned Key are valid for the lifetime of the InternPool. Takes no lock (see
+/// `Items`).
 pub fn key(ip: *InternPool, index: Index) Key {
-    ip.mutex.lockUncancelable(ip.io);
-    defer ip.mutex.unlock(ip.io);
-    return ip.items.items[@backingInt(index)];
+    return ip.items.at(@backingInt(index)).*;
 }
 
 // ── Common constructors ──────────────────────────────────────────────
@@ -975,6 +1041,37 @@ test "reset keeps the presets and frees everything else" {
     try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
     // Interning again yields the same position (the index depends only on the interning order)
     try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
+}
+
+test "concurrent interning across chunk boundaries gives each key one index and its key back" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    // Enough keys to fill several chunks while other threads read keys without the lock
+    const n = 5000;
+    const Worker = struct {
+        fn run(pool: *InternPool, out: *[n]Index, failed: *std.atomic.Value(bool)) void {
+            for (out, 0..) |*o, i| {
+                const bits: u16 = @intCast(i + 1);
+                o.* = pool.intType(.signed, bits) catch return failed.store(true, .monotonic);
+                const k = pool.key(o.*);
+                if (k != .int_type or k.int_type.bits != bits or k.int_type.signedness != .signed) failed.store(true, .monotonic);
+            }
+        }
+    };
+    var results: [4][n]Index = undefined;
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    for (&threads, &results) |*t, *r| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &ip, r, &failed });
+        spawned += 1;
+    }
+    for (threads) |t| t.join();
+    spawned = 0;
+    try testing.expect(!failed.load(.monotonic));
+    for (results[1..]) |r| try testing.expectEqualSlices(Index, &results[0], &r);
+    try testing.expectEqual(preset.len + n, ip.count());
 }
 
 test "reset that runs out of memory leaves the pool intact" {
