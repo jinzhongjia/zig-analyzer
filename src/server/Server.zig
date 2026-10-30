@@ -245,6 +245,10 @@ completion_kinds: bool = false,
 /// documentation: true unless it lists the formats it supports without markdown
 hover_markdown: bool = true,
 signature_markdown: bool = true,
+/// The client takes parameter labels as offsets into the signature label
+/// (`parameterInformation.labelOffsetSupport`); otherwise they are substrings of it, which the
+/// client looks up and may find at an earlier parameter with the same text
+signature_label_offsets: bool = false,
 completion_markdown: bool = true,
 /// The client supports the workspace semantic tokens refresh; at most one refresh response is
 /// awaited at a time.
@@ -5008,8 +5012,9 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
         if (td.hover) |hv| if (hv.contentFormat) |f| {
             server.hover_markdown = acceptsMarkdown(f);
         };
-        if (td.signatureHelp) |sh| if (sh.signatureInformation) |si| if (si.documentationFormat) |f| {
-            server.signature_markdown = acceptsMarkdown(f);
+        if (td.signatureHelp) |sh| if (sh.signatureInformation) |si| {
+            if (si.documentationFormat) |f| server.signature_markdown = acceptsMarkdown(f);
+            if (si.parameterInformation) |pi| server.signature_label_offsets = pi.labelOffsetSupport orelse false;
         };
     }
     if (params.initializationOptions) |options| if (options != .null) {
@@ -5443,7 +5448,10 @@ fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
     const sig = try ide.signature_help.signatureHelp(r, at.file, at.offset) orelse return null;
     const ps = try arena.alloc(types.ParameterInformation, sig.params.len);
-    for (sig.params, ps) |p, *o| o.* = .{ .label = .{ .string = p } };
+    for (sig.params, sig.ranges, ps) |p, range, *o| o.* = .{ .label = if (server.signature_label_offsets) .{ .tuple = .{
+        offsets.unitCount(sig.label[0..range[0]], server.encoding),
+        offsets.unitCount(sig.label[0..range[1]], server.encoding),
+    } } else .{ .string = p } };
     const info = try arena.alloc(types.SignatureInformation, 1);
     info[0] = .{
         .label = sig.label,

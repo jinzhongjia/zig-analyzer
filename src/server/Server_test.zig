@@ -1689,3 +1689,77 @@ test "initialize and results follow the capabilities the client declares" {
         try c.close();
     }
 }
+
+test "signature help gives parameter label offsets to clients that support them" {
+    // Parameters were sent only as label substrings, so a client highlighted the first
+    // occurrence of a parameter's text in the label, which can belong to an earlier parameter
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    const text =
+        \\fn cb(_: u8, _: u8, x: u8) u8 {
+        \\    return x;
+        \\}
+        \\extern fn ext(c_int, c_int) void;
+        \\extern fn ptr(*c_int, c_int) void;
+        \\fn w(@"π": u8, _: u8) void {
+        \\    _ = @"π";
+        \\}
+        \\fn take(f: *const fn (a: u8, b: u8) void) void {
+        \\    f(1, 2);
+        \\}
+        \\pub fn main() void {
+        \\    _ = cb(1, 2, 3);
+        \\    ext(1, 2);
+        \\    var n: c_int = 0;
+        \\    ptr(&n, 2);
+        \\    w(1, 2);
+        \\    _ = @addWithOverflow(1, 2);
+        \\}
+        \\
+    ;
+    // The call before the cursor (at the second argument), and the expected offsets of the
+    // second parameter (UTF-16 code units: `π` is one unit)
+    const cases = [_]struct { []const u8, [2]i64 }{
+        .{ "cb(1, ", .{ 13, 18 } },
+        .{ "ext(1, ", .{ 14, 19 } },
+        .{ "ptr(&n, ", .{ 15, 20 } },
+        .{ "w(1, ", .{ 15, 20 } },
+        .{ "@addWithOverflow(1, ", .{ 29, 39 } },
+        .{ "f(1, ", .{ 11, 16 } },
+    };
+    for ([_]bool{ false, true }) |offsets| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const Empty = struct {};
+        _ = try h.request("initialize", .{
+            .capabilities = .{ .textDocument = .{ .signatureHelp = .{ .signatureInformation = .{ .parameterInformation = .{ .labelOffsetSupport = offsets } } } } },
+            .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+        });
+        try h.notify("initialized", Empty{});
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = file_uri, .languageId = "zig", .version = 1, .text = text } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        for (cases) |c| {
+            const offset = std.mem.indexOf(u8, text, c[0]).? + c[0].len;
+            const line_start = std.mem.lastIndexOfScalar(u8, text[0..offset], '\n').? + 1;
+            const resp = try h.request("textDocument/signatureHelp", .{
+                .textDocument = .{ .uri = file_uri },
+                .position = .{ .line = std.mem.count(u8, text[0..offset], "\n"), .character = offset - line_start },
+            });
+            const signature = resp.object.get("result").?.object.get("signatures").?.array.items[0].object;
+            try testing.expectEqual(1, signature.get("activeParameter").?.integer);
+            const label = signature.get("parameters").?.array.items[1].object.get("label").?;
+            if (offsets) {
+                try testing.expect(label == .array);
+                try testing.expectEqual(c[1][0], label.array.items[0].integer);
+                try testing.expectEqual(c[1][1], label.array.items[1].integer);
+            } else {
+                try testing.expect(label == .string);
+            }
+        }
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}

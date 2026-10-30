@@ -60,6 +60,11 @@ fn countUnits(text: []const u8, from: usize, target: usize, end: usize, enc: Enc
     return n;
 }
 
+/// Number of code units in `text` (a line break counts as one unit, like any other character)
+pub fn unitCount(text: []const u8, enc: Encoding) u32 {
+    return countUnits(text, 0, text.len, text.len, enc);
+}
+
 /// One line of the text: converts positions and offsets within this line only, without building a
 /// line table for the whole file
 pub const Line = struct {

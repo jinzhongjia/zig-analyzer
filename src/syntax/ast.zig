@@ -262,6 +262,26 @@ pub const FnProto = struct {
         try n.writeReturnType(w);
     }
 
+    /// Byte range of each parameter (as written by `writeCollapsed`) in the text of
+    /// `writeSignature`, in the order of `params`; follows the layout of `writeSignature` and
+    /// `writeParams`
+    pub fn signatureParamRanges(n: FnProto, a: std.mem.Allocator) std.mem.Allocator.Error![]const [2]u32 {
+        var out: std.ArrayList([2]u32) = .empty;
+        // `fn name(` or `fn (`
+        var at: usize = "fn ".len + (if (n.name()) |t| t.text.len else 0) + "(".len;
+        var it = n.params();
+        var first = true;
+        while (it.next()) |p| : (first = false) {
+            if (!first) at += ", ".len;
+            var counter: std.Io.Writer.Discarding = .init(&.{});
+            writeCollapsed(p, &counter.writer) catch unreachable;
+            const end = at + counter.fullCount();
+            try out.append(a, .{ @intCast(at), @intCast(end) });
+            at = end;
+        }
+        return out.items;
+    }
+
     /// Parameter list and the clauses after it: `(a: T, b: U) callconv(.c)`. For each part see
     /// `writeCollapsed`; parameters are separated by `, `
     /// (the trailing comma of a multiline parameter list is not shown)
@@ -909,6 +929,14 @@ test "fn signature display drops comments and collapses whitespace" {
         defer out.deinit();
         try proto.writeSignature(&out.writer);
         try testing.expectEqualStrings(c[0], out.written());
+        // Each parameter range covers that parameter in the signature
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var params = proto.params();
+        for (try proto.signatureParamRanges(arena.allocator())) |range| {
+            try testing.expectEqualStrings(try collapsedAlloc(arena.allocator(), params.next().?), out.written()[range[0]..range[1]]);
+        }
+        try testing.expect(params.next() == null);
         out.clearRetainingCapacity();
         try proto.writeParams(&out.writer);
         try testing.expectEqualStrings(c[1], out.written());
