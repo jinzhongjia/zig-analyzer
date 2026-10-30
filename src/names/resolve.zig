@@ -13,6 +13,7 @@ const ModuleGraph = @import("ModuleGraph.zig");
 const Vfs = @import("../base/Vfs.zig");
 const FileId = Vfs.FileId;
 const ItemTree = @import("../syntax/ItemTree.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
 const Parse = @import("../syntax/Parse.zig");
 const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
@@ -327,16 +328,173 @@ pub const Resolver = struct {
 
     /// All targets of `@import(name)` in a file: there are several when the modules the file
     /// belongs to import different modules as `name`, ordered by module priority, the first one
-    /// being the result of `resolveImport`; a relative path has at most one. Reads the module graph
-    /// directly, without `FileImports` cutting off other changes; meant for requests such as goto,
-    /// and must not be used in inference.
+    /// being the result of `resolveImport`; a relative path has at most one. `@import("root")` in
+    /// a file outside the module graph, which name resolution leaves unknown, has the files that
+    /// may be compiled as its root (see `singleFileRoots`). Reads the module graph directly,
+    /// without `FileImports` cutting off other changes; meant for requests such as goto, and must
+    /// not be used in inference.
     pub fn resolveImportTargets(r: *Resolver, file: FileId, name: []const u8) Error![]const FileId {
         if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
             const target = try r.resolveImport(file, name) orelse return &.{};
             return r.arena.dupe(FileId, &.{target});
         }
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
-        return graph.importTargets(r.arena, file, name);
+        const targets = try graph.importTargets(r.arena, file, name);
+        if (targets.len == 0 and std.mem.eql(u8, name, "root") and graph.entry(file) == null) return r.singleFileRoots(graph, file);
+        return targets;
+    }
+
+    /// The files that may be the root module of `file`, a file outside the module graph: such a
+    /// file is compiled on its own as the root module (single-file mode compiles it with
+    /// `zig build-obj`; `zig run` does the same), or imported through relative paths by a file
+    /// compiled so. These are the files outside the module graph (among the user's source files)
+    /// that reach `file` through relative imports and that no such file imports; `file` itself
+    /// when there is none. `zig test` makes the test runner the root instead, so inference keeps
+    /// `@import("root")` unknown there.
+    fn singleFileRoots(r: *Resolver, graph: *const ModuleGraph, file: FileId) Error![]const FileId {
+        // The files outside the module graph, with the files among them importing each
+        var importers: std.AutoArrayHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
+        try importers.put(r.arena, file, .empty);
+        for (try r.ctx.get(database.inputs.WorkspaceFiles, {})) |f| {
+            if (graph.entry(f) == null) try importers.put(r.arena, f, .empty);
+        }
+        for (importers.keys()) |f| for ((try r.ctx.get(FileIndex.Query, f)).imports) |s| {
+            if (!std.mem.endsWith(u8, s, ".zig")) continue;
+            const to = importers.getPtr(try r.resolveImport(f, s) orelse continue) orelse continue;
+            try to.append(r.arena, f);
+        };
+        var reached: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        try reached.put(r.arena, file, {});
+        var roots: std.ArrayList(FileId) = .empty;
+        var i: usize = 0;
+        while (i < reached.count()) : (i += 1) {
+            const f = reached.keys()[i];
+            const from = importers.get(f).?;
+            if (from.items.len == 0) try roots.append(r.arena, f);
+            for (from.items) |x| try reached.put(r.arena, x, {});
+        }
+        if (roots.items.len == 0) try roots.append(r.arena, file);
+        return roots.items;
+    }
+
+    /// The members `name` of `lhs` (an expression in `b`, the body of member `item` in `file`)
+    /// when `lhs` names an `@import` (directly or through constants) that name resolution leaves
+    /// unresolved but `resolveImportTargets` resolves (`@import("root")` in a file outside the
+    /// module graph): the member in each target. Like `resolveImportTargets`, meant for requests
+    /// such as goto, and must not be used in inference.
+    pub fn unresolvedImportMembers(r: *Resolver, file: FileId, item: u32, b: *const Body, lhs: Body.ExprId, name: []const u8) Error![]const Def {
+        var cur_file = file;
+        var cur_item = item;
+        var cur_body = b;
+        var cur = lhs;
+        for (0..max_depth) |_| switch (cur_body.expr(cur)) {
+            .name_ref => |n| {
+                if (cur_body.nameRefIsBuiltin(cur)) return &.{};
+                const it = switch (try r.resolveName(cur_file, cur_item, cur_body, cur_body.expr_scopes[@backingInt(cur)], n) orelse return &.{}) {
+                    .item => |it| it,
+                    else => return &.{},
+                };
+                if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return &.{};
+                cur_file = it.file;
+                cur_item = it.item;
+                cur_body = try r.body(it.file, it.item);
+                cur = cur_body.value orelse return &.{};
+            },
+            .builtin_call => |call| {
+                if (!std.mem.eql(u8, call.name, "@import") or try r.importTarget(cur_file, cur_body, call.args) != null) return &.{};
+                var out: std.ArrayList(Def) = .empty;
+                for (try r.importTargets(cur_file, cur_body, call.args)) |t| {
+                    try out.append(r.arena, try r.memberDef(.{ .file = t, .container = 0 }, name) orelse continue);
+                }
+                return out.items;
+            },
+            else => return &.{},
+        };
+        return &.{};
+    }
+
+    /// The definitions that `def` corresponds to in the other modules of `file`: when `def` is in
+    /// the file that `file` imports under a name whose target differs between the modules `file`
+    /// belongs to (the highest-priority target, see `resolveImportTargets`), the definition at the
+    /// same member path (`Mode.fast` for a field `fast` of `const Mode = enum {...}`) in each other
+    /// target, in module priority order; the other targets themselves for `def` the file. Code in
+    /// `file` compiled as another module reaches those through the same names, while name
+    /// resolution and inference use the highest-priority module. Empty when `def` is not in such a
+    /// file, or is not reached by a path of names (a container returned by a function). Like
+    /// `resolveImportTargets`, meant for requests such as goto, and must not be used in inference.
+    pub fn moduleAlternatives(r: *Resolver, file: FileId, def: Def) Error![]const Def {
+        const def_file = switch (def) {
+            .item => |it| it.file,
+            .file => |f| f,
+            .local => return &.{},
+        };
+        // A file in a single module imports one target under each name
+        const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
+        if ((graph.entry(file) orelse return &.{}).others.len == 0) return &.{};
+        var out: std.ArrayList(Def) = .empty;
+        var path: ?[]const []const u8 = null;
+        for ((try r.ctx.get(FileIndex.Query, file)).imports) |name| {
+            const targets = try r.resolveImportTargets(file, name);
+            if (targets.len < 2 or targets[0] != def_file) continue;
+            const names = path orelse switch (def) {
+                .item => |it| try r.memberPath(it.file, it.item) orelse return &.{},
+                else => &.{},
+            };
+            path = names;
+            for (targets[1..]) |t| {
+                const alt: Def = switch (def) {
+                    .item => |it| try r.memberAtPath(t, names, (try r.itemTree(it.file)).items[it.item].kind == .field) orelse continue,
+                    else => .{ .file = t },
+                };
+                for (out.items) |x| {
+                    if (std.meta.eql(x, alt)) break;
+                } else try out.append(r.arena, alt);
+            }
+        }
+        return out.items;
+    }
+
+    /// The names leading from the root of the file to member `item`, outermost first; null when a
+    /// container on the way is not the value of a `const` declaration (`const S = struct {...}`)
+    fn memberPath(r: *Resolver, file: FileId, item: u32) Error!?[]const []const u8 {
+        const tree = try r.itemTree(file);
+        var names: std.ArrayList([]const u8) = .empty;
+        var cur = item;
+        for (0..max_depth) |_| {
+            try names.append(r.arena, tree.items[cur].name orelse return null);
+            const c = tree.items[cur].container;
+            if (c == 0) {
+                std.mem.reverse([]const u8, names.items);
+                return names.items;
+            }
+            const p = tree.containers[c].parent_item orelse return null;
+            if (tree.items[p].kind != .@"const") return null;
+            const rel_c = try r.containerRel(.{ .file = file, .container = c }) orelse return null;
+            const b = try r.body(file, p);
+            const v = b.value orelse return null;
+            if (b.range(v).start != rel_c) return null;
+            cur = p;
+        }
+        return null;
+    }
+
+    /// The member at `path` (see `memberPath`) in `file`, the containers on the way evaluated as
+    /// for member access; the last name is a field when `field` is set, else a declaration
+    fn memberAtPath(r: *Resolver, file: FileId, path: []const []const u8, field: bool) Error!?Def {
+        if (path.len == 0) return null;
+        var ns: Namespace = .{ .file = file, .container = 0 };
+        for (path[0 .. path.len - 1]) |name| {
+            ns = try r.namespaceOf(try r.memberDef(ns, name) orelse return null) orelse return null;
+        }
+        const last = path[path.len - 1];
+        const tree = try r.itemTree(ns.file);
+        if (ns.container >= tree.containers.len) return null;
+        if (!field) return .{ .item = .{ .file = ns.file, .item = lookupDecl(tree, ns.container, last) orelse return null } };
+        for (tree.containerMembers(ns.container)) |m| {
+            const it = tree.items[m];
+            if (it.kind == .field and it.name != null and std.mem.eql(u8, it.name.?, last)) return .{ .item = .{ .file = ns.file, .item = m } };
+        }
+        return null;
     }
 
     // ── Positions ────────────────────────────────────────────────────

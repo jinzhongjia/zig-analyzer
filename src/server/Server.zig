@@ -34,6 +34,7 @@ const Workspace = @import("Workspace.zig");
 const origin = @import("origin.zig");
 const ModuleGraph = za.names.ModuleGraph;
 const Resolver = za.names.resolve.Resolver;
+const ImportOptions = za.ide_db.organize_imports.Options;
 const InternPool = za.sema.InternPool;
 pub const Progress = @import("progress.zig");
 pub const Config = @import("Config.zig");
@@ -196,9 +197,15 @@ register_config: bool = false,
 /// The client supports dynamically registering `workspace/didChangeWatchedFiles` (watching
 /// external changes on disk)
 register_watch: bool = false,
-/// The client supports `workspace/inlayHint/refresh` (after the inlay hints settings change, the
-/// client is asked to request them again)
+/// The client answered a registration of file watchers with an error: it does not watch files
+watch_registration_failed: std.atomic.Value(bool) = .init(false),
+/// The client supports `workspace/inlayHint/refresh` (when the inlay hints settings or results of
+/// other documents change, the client is asked to request them again); at most one refresh
+/// response is awaited at a time.
 inlay_refresh: bool = false,
+inlay_refresh_mutex: Io.Mutex = .init,
+inlay_refresh_pending: bool = false,
+inlay_refresh_dirty: bool = false,
 /// The client supports deferring `edit` to `codeAction/resolve` (and sends `data` back unchanged):
 /// naming fixes look up references only after the user has chosen them
 code_action_resolve: bool = false,
@@ -209,6 +216,30 @@ code_action_disabled: bool = false,
 change_annotations: bool = false,
 /// The client supports snippets in completion items (`completionItem.snippetSupport`)
 snippet_support: bool = false,
+/// The client supports insert and replace ranges in completion items
+/// (`completionItem.insertReplaceSupport`)
+insert_replace_support: bool = false,
+/// The client supports `prepareRename` (`rename.prepareSupport`); otherwise `renameProvider` is
+/// a boolean, as `RenameOptions` may only be sent to such clients
+prepare_rename: bool = false,
+/// The client supports `CodeAction` literals (`codeAction.codeActionLiteralSupport`); otherwise
+/// `codeActionProvider` is a boolean and no actions are returned: every action carries an edit
+code_action_literals: bool = false,
+/// The client supports `DocumentSymbol` trees (`hierarchicalDocumentSymbolSupport`); otherwise
+/// the outline is a flat `SymbolInformation[]`
+hierarchical_symbols: bool = false,
+/// The client lists the symbol kinds it supports in `documentSymbol` and `workspace/symbol`, and
+/// so handles any kind; otherwise it supports only `File` to `Array` (see `clientSymbolKind`)
+document_symbol_kinds: bool = false,
+workspace_symbol_kinds: bool = false,
+/// The client lists the completion item kinds it supports, and so handles any kind; otherwise it
+/// supports only `Text` to `Reference` (see `clientCompletionKind`)
+completion_kinds: bool = false,
+/// The client accepts markdown in hover contents, signature documentation, and completion
+/// documentation: true unless it lists the formats it supports without markdown
+hover_markdown: bool = true,
+signature_markdown: bool = true,
+completion_markdown: bool = true,
 /// The client supports the workspace semantic tokens refresh; at most one refresh response is
 /// awaited at a time.
 semantic_refresh: bool = false,
@@ -254,11 +285,19 @@ watch_cond: Io.Condition = .init,
 docs_mutex: Io.Mutex = .init,
 /// Open documents: the URI used by the client (used verbatim when publishing diagnostics)
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
+/// Version of each open document, set in the same database write as its text so that a read
+/// transaction sees the version of the text it reads (protected by `docs_mutex`)
+doc_versions: std.AutoHashMapUnmanaged(Vfs.FileId, i32) = .empty,
 /// URI most recently used by the client: still used to publish diagnostics after the document is
 /// closed (clearing old diagnostics, republishing compiler diagnostics), so that the URI is not
 /// re-encoded from the internal path. For a virtual document, the entry is deleted once its
 /// diagnostics are cleared.
 last_uris: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
+/// Real paths of open documents (see `Vfs.realPath`; null when unreachable), computed when a tool
+/// reports a path the server does not know (see `toolFile`). Guarded by docs_mutex; an entry is
+/// dropped when its document is opened or closed, and all are dropped when files are created or
+/// deleted on disk.
+open_real: std.AutoHashMapUnmanaged(Vfs.FileId, ?[:0]u8) = .empty,
 /// Files currently showing non-empty diagnostics (cleared by publishing an empty list when needed)
 published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 /// Sequence number of diagnostic computations: each computation takes one before reading state
@@ -267,6 +306,8 @@ publish_seq: std.atomic.Value(u64) = .init(0),
 publish_mutex: Io.Mutex = .init,
 /// File → sequence number of the diagnostics sent (protected by publish_mutex)
 sent_seq: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
+/// File → hash of the last diagnostics notification sent (protected by publish_mutex)
+sent_hash: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
 
 pub const State = enum { uninitialized, running, shutdown };
 
@@ -384,10 +425,14 @@ pub fn deinit(server: *Server) void {
     server.builtin_targets.deinit(server.gpa);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
+    server.doc_versions.deinit(server.gpa);
     for (server.last_uris.values()) |u| server.gpa.free(u);
     server.last_uris.deinit(server.gpa);
+    server.forgetRealPath(null);
+    server.open_real.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
+    server.sent_hash.deinit(server.gpa);
     server.semantic_cache.deinit(server.gpa);
     server.watched_built.deinit(server.gpa);
     server.progress.deinit(server.gpa);
@@ -496,6 +541,10 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
                     try server.handleConfigResponse(s, resp.result, resp.@"error" != null);
                 } else if (std.mem.eql(u8, s, semantic_refresh_id)) {
                     server.semanticRefreshFinished();
+                } else if (std.mem.eql(u8, s, inlay_refresh_id)) {
+                    server.inlayRefreshFinished();
+                } else if (resp.@"error" != null and (std.mem.eql(u8, s, register_id) or std.mem.startsWith(u8, s, watch.Watcher.registration_prefix))) {
+                    server.watchRegistrationFailed();
                 },
             };
         },
@@ -910,9 +959,18 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
         if (result.vector_abi != t.vector_abi) result.vector_abi = .unknown;
         result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
-    if (seen.count() != 0) return result;
-    if (graph.default_builtin) |f| return server.builtinTarget(f);
-    return .{};
+    if (seen.count() == 0) result = if (graph.default_builtin) |f| try server.builtinTarget(f) else .{};
+    // The error limit is set per compile step (the compilation of files outside every compile
+    // step uses the default)
+    var bits: ?u16 = null;
+    var agree = true;
+    for (graph.compiles, 0..) |c, i| {
+        if (graph.none) |n| if (i == n) continue;
+        const b = za.sema.InternPool.errorBitsOf(c.error_limit);
+        if (bits) |x| agree = agree and x == b else bits = b;
+    }
+    result.error_bits = if (agree) bits orelse za.sema.InternPool.errorBitsOf(null) else null;
+    return result;
 }
 
 /// Target parameters of a builtin.zig; when it cannot be read, the ones last parsed from it (see
@@ -979,10 +1037,13 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
     const t = try server.targetAbi(graph);
     // Each compilation uses the target of its builtin (the root module's); when that is unknown,
-    // the parameters common to all compilations
+    // the parameters common to all compilations. The error limit is the compilation's own.
     const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
     defer server.gpa.free(targets);
-    for (graph.compiles, targets) |c, *ct| ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
+    for (graph.compiles, targets) |c, *ct| {
+        ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
+        ct.error_bits = za.sema.InternPool.errorBitsOf(c.error_limit);
+    }
     // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
     // and requests (the requests fail with ContentModified)
@@ -1085,7 +1146,7 @@ fn indexTask(server: *Server) Io.Cancelable!void {
         server.indexing.store(false, .release);
         // Updated again after the flag was released, and no other task took over: continue
         if (server.index_generation.load(.monotonic) == generation) {
-            server.requestSemanticRefresh();
+            server.requestRefresh();
             return;
         }
         if (server.indexing.swap(true, .acq_rel)) return;
@@ -1441,6 +1502,15 @@ fn cancelAllPending(server: *Server) void {
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
+const inlay_refresh_id = "zig-analyzer/inlayHintRefresh";
+
+/// Results of other documents may have changed in ways the client cannot see (another document
+/// edited, files changed on disk, the module graph loaded): semantic tokens and inlay hints are
+/// pulled by the client, which is asked to pull both again
+fn requestRefresh(server: *Server) void {
+    server.requestSemanticRefresh();
+    server.requestInlayRefresh();
+}
 
 fn openDocumentCount(server: *Server) usize {
     server.docs_mutex.lockUncancelable(server.io);
@@ -1482,6 +1552,36 @@ fn semanticRefreshFinished(server: *Server) void {
     server.semantic_refresh_dirty = false;
     server.semantic_refresh_mutex.unlock(server.io);
     if (dirty) server.requestSemanticRefresh();
+}
+
+/// Like `requestSemanticRefresh`: at most one refresh awaits the client's response, and requests
+/// made meanwhile are merged into one more refresh after it
+fn requestInlayRefresh(server: *Server) void {
+    if (!server.inlay_refresh or server.isShuttingDown() or server.openDocumentCount() == 0) return;
+    server.inlay_refresh_mutex.lockUncancelable(server.io);
+    if (server.inlay_refresh_pending) {
+        server.inlay_refresh_dirty = true;
+        server.inlay_refresh_mutex.unlock(server.io);
+        return;
+    }
+    server.inlay_refresh_pending = true;
+    server.inlay_refresh_mutex.unlock(server.io);
+    const bytes = jsonrpc.request(server.gpa, .{ .string = inlay_refresh_id }, "workspace/inlayHint/refresh", null) catch {
+        server.inlay_refresh_mutex.lockUncancelable(server.io);
+        server.inlay_refresh_pending = false;
+        server.inlay_refresh_mutex.unlock(server.io);
+        return log.err("out of memory while building inlay hint refresh", .{});
+    };
+    server.send(bytes);
+}
+
+fn inlayRefreshFinished(server: *Server) void {
+    server.inlay_refresh_mutex.lockUncancelable(server.io);
+    const dirty = server.inlay_refresh_dirty;
+    server.inlay_refresh_pending = false;
+    server.inlay_refresh_dirty = false;
+    server.inlay_refresh_mutex.unlock(server.io);
+    if (dirty) server.requestInlayRefresh();
 }
 
 // ── Notifications ────────────────────────────────────────────────────
@@ -1528,6 +1628,74 @@ fn fileIdFromUri(server: *Server, arena: Allocator, document_uri: []const u8) !?
     return try server.vfs.intern(path);
 }
 
+/// FileId of a document the client opens. A path the server does not know under this spelling
+/// may reach through symbolic links a file the server knows by its real path, or a file of a
+/// dependency library, whose locations come from tools that resolve symbolic links (`zig env`
+/// locates the Zig installation from the real path of the zig executable, so Homebrew's
+/// `/opt/homebrew/lib/zig` is reported under its `Cellar`): the document's path then becomes an
+/// alias of the file at the real path (see `Vfs.alias`). The file keeps its origin and its
+/// module, and its diagnostics are published on the document's URI.
+fn documentFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
+    const path = try documentPath(arena, document_uri) orelse return null;
+    if (try server.vfs.lookup(path)) |id| return id;
+    if (!isVirtual(path)) if (try Vfs.realPath(server.io, arena, path)) |real| if (!std.mem.eql(u8, real, path)) {
+        const known = try server.vfs.lookup(real) orelse blk: {
+            const rules = try server.originRules(arena);
+            if (!origin.classify(&server.vfs, rules, real, false).isLibrary()) break :blk null;
+            break :blk try server.vfs.intern(real);
+        };
+        if (known) |id| {
+            try server.vfs.alias(path, id);
+            return id;
+        }
+    };
+    return try server.vfs.intern(path);
+}
+
+/// FileId of a path a tool reported (compiler and build results). A path the server does not
+/// know under this spelling may name a file the client has open under another one (through a
+/// symbolic link, or with names in another Unicode normalization form): the path then becomes
+/// an alias of that document (see `Vfs.alias`), and its diagnostics are published on the
+/// document's URI. Only unknown paths are resolved on disk, and only while documents are open.
+pub fn toolFile(server: *Server, path: []const u8) Allocator.Error!Vfs.FileId {
+    if (try server.vfs.lookup(path)) |id| return id;
+    if (try server.openDocumentAt(path)) |id| {
+        try server.vfs.alias(path, id);
+        return id;
+    }
+    return server.vfs.intern(path);
+}
+
+/// The open document whose file on disk is `path` (equal real paths)
+fn openDocumentAt(server: *Server, path: []const u8) Allocator.Error!?Vfs.FileId {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    if (server.open_docs.count() == 0) return null;
+    const real = try Vfs.realPath(server.io, server.gpa, path) orelse return null;
+    defer server.gpa.free(real);
+    for (server.open_docs.keys()) |doc| {
+        const gop = try server.open_real.getOrPut(server.gpa, doc);
+        if (!gop.found_existing) gop.value_ptr.* = Vfs.realPath(server.io, server.gpa, server.vfs.path(doc)) catch |err| {
+            _ = server.open_real.remove(doc);
+            return err;
+        };
+        if (gop.value_ptr.*) |r| if (std.mem.eql(u8, r, real)) return doc;
+    }
+    return null;
+}
+
+/// Drops the cached real path of an open document (`file`, or all when null). Callers hold
+/// docs_mutex.
+fn forgetRealPath(server: *Server, file: ?Vfs.FileId) void {
+    if (file) |f| {
+        if (server.open_real.fetchRemove(f)) |kv| if (kv.value) |r| server.gpa.free(r);
+        return;
+    }
+    var it = server.open_real.valueIterator();
+    while (it.next()) |r| if (r.*) |p| server.gpa.free(p);
+    server.open_real.clearRetainingCapacity();
+}
+
 /// Path of a document: the path of a file URI; a document with a non-file URI such as `untitled:`
 /// maps to a path named after the URI under a virtual directory (it does not clash with real
 /// files and does not exist on disk, so it is not passed to the compiler; other features treat it
@@ -1560,12 +1728,13 @@ fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
 }
 
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
-    const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    const id = try server.documentFile(arena, params.textDocument.uri) orelse return;
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.uri);
         const last = try server.gpa.dupe(u8, params.textDocument.uri);
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
+        server.forgetRealPath(id);
         const gop = server.open_docs.getOrPut(server.gpa, id) catch |err| {
             server.gpa.free(owned);
             server.gpa.free(last);
@@ -1586,12 +1755,14 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         server.db.beginWrite();
         defer server.db.endWrite();
         try server.db.set(FileText, id, owned, .low);
+        try server.setDocVersion(id, params.textDocument.version);
         // Before a new session starts, wait for old read requests to exit; it must not inherit
         // delta baselines from the period while the document was closed or from the old session.
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
     server.publishFiles(&.{id}, false);
-    if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
+    server.publishDependents(&.{id});
+    if (server.openDocumentCount() > 1) server.requestRefresh();
     server.compileSingle(id);
     server.scheduleCompileSetRefresh(&.{id});
 }
@@ -1604,8 +1775,22 @@ fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocum
         const old = server.db.peek(FileText, id) orelse "";
         const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
         try server.db.set(FileText, id, new, .low);
+        try server.setDocVersion(id, params.textDocument.version);
     }
     server.publishDebounced(id);
+}
+
+fn setDocVersion(server: *Server, id: Vfs.FileId, version: i32) Allocator.Error!void {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    try server.doc_versions.put(server.gpa, id, version);
+}
+
+/// The version of `file` when it is open in the client; null otherwise
+fn docVersion(server: *Server, file: Vfs.FileId) ?i32 {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    return server.doc_versions.get(file);
 }
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
@@ -1618,6 +1803,11 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
     // After closing, the disk contents are authoritative
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        _ = server.doc_versions.remove(id);
+    }
     const disk = server.vfs.readFromDisk(id, arena) catch |err| switch (err) {
         error.FileTooBig => null,
         else => |e| return e,
@@ -1627,8 +1817,10 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
+        server.forgetRealPath(id);
     }
-    server.requestSemanticRefresh();
+    server.publishDependents(&.{id});
+    server.requestRefresh();
     server.scheduleCompileSetRefresh(&.{id});
     // When a single-file mode root file was deleted from disk while open (notifications of
     // external changes skip open files), drop its compile results on close and republish the files
@@ -1664,6 +1856,13 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const path = server.vfs.path(id);
     const base = std.fs.path.basename(path);
     const is_build_file = isProjectFile(base);
+    // The rebuilds below read the saved contents: the notification of this write by a file
+    // watcher then rebuilds nothing more (see `didChangeWatchedFiles`)
+    const saved = server.vfs.readFromDisk(id, arena) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        error.FileTooBig => null,
+    };
+    if (saved) |t| server.watched_built.put(server.gpa, id, std.hash.Wyhash.hash(0, t)) catch {} else _ = server.watched_built.remove(id);
 
     // A build.zig newly created in a root directory: start the project
     if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
@@ -1676,7 +1875,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     for (list) |ws| {
         // Outside watch mode, the maker does not reconfigure automatically: restart. Build
         // scripts and configure inputs may lie outside the project's files.
-        if ((is_build_file and std.mem.eql(u8, std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id) or
+        if ((is_build_file and server.vfs.samePath(std.fs.path.dirname(path) orelse "", ws.root)) or ws.isBuildScript(id) or
             ws.changesConfigureInput(path, .changed))
         {
             server.restartWorkspace(ws, 0);
@@ -1694,19 +1893,35 @@ fn isProjectFile(base: []const u8) bool {
     return std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon") or std.mem.eql(u8, base, Config.project_file);
 }
 
-/// External changes on disk (outside the editor: git checkout, code generation, etc.). For open
-/// files the buffer is authoritative; other known files are updated from the disk contents
-/// (deleted ones become nonexistent), without writing or republishing when the contents equal
-/// the known ones. A change to build.zig / build.zig.zon / zig-analyzer.zon in a workspace root
-/// directory or to a project's build script restarts that project; creating or deleting
-/// build.zig in a root directory starts or stops the project; changes to other files rebuild
-/// projects and recompile single files; nothing is rebuilt when the disk contents equal those the
-/// last rebuild was based on.
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
+    return server.applyFileChanges(arena, params.changes, .notified);
+}
+
+/// How changes on disk were found
+pub const ChangeSource = enum {
+    /// Reported by a file watcher (the client's or the server's)
+    notified,
+    /// Files compared with the disk because nobody watched them for a while (see
+    /// `watch.Watcher`): only a known file whose known text differs from the disk changed; open
+    /// documents and files never loaded are skipped
+    verified,
+};
+
+/// External changes on disk (outside the editor: git checkout, code generation, etc.). For open
+/// files the buffer is authoritative, but the builds read the disk, so they are rebuilt as well;
+/// other known files are updated from the disk contents (deleted ones become nonexistent),
+/// without writing or republishing when the contents equal the known ones. A change to build.zig
+/// / build.zig.zon / zig-analyzer.zon in a workspace root directory or to a project's build
+/// script restarts that project; creating or deleting build.zig in a root directory starts or
+/// stops the project; changes to other files rebuild projects and recompile single files; nothing
+/// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
+fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource) !void {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
+        /// Disk contents to write; null for open documents (their buffer is authoritative)
         text: ?[]u8,
+        open: bool,
         durability: database.Durability,
         /// Hash of the disk contents; null if the file does not exist
         disk: ?u64,
@@ -1720,13 +1935,13 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     const rules = try server.originRules(arena);
     var build_files: std.ArrayList([]const u8) = .empty;
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
-    // Known files that changed (including open files: the maker reads the disk)
+    // Known files that changed
     var known: std.ArrayList(Vfs.FileId) = .empty;
     // When a file changes several times in one batch, the last change wins: an atomic save first
     // deletes and then recreates the file, and with unchanged contents the two together are not a
     // change
     var events: std.StringArrayHashMapUnmanaged(types.FileChangeType) = .empty;
-    for (params.changes) |event| {
+    for (file_events) |event| {
         const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedScheme, error.InvalidUri => continue,
@@ -1734,9 +1949,18 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         if (!std.fs.path.isAbsolute(path)) continue;
         try events.put(arena, path, event.type);
     }
+    // A folder created, deleted, moved or renamed is reported by its own path only
+    const folders = try server.addFolderContents(arena, &events);
+    // A file created or deleted may change what the paths of open documents resolve to
+    for (events.values()) |kind| if (kind != .Changed) {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        server.forgetRealPath(null);
+        break;
+    };
     // Source files created or deleted under the root directories change what find references and
     // rename search
-    const rescan = try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
+    const rescan = folders or try server.changesWorkspaceFiles(arena, rules, events.keys(), events.values());
     defer if (rescan) server.scheduleScan();
     for (events.keys(), events.values()) |path, kind| {
         const base = std.fs.path.basename(path);
@@ -1745,6 +1969,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         // Files never seen before have no known contents to update (a new file is loaded when it
         // is imported); project files have no contents to compare against and count as changed
         const file = try server.vfs.lookup(path) orelse {
+            if (source == .verified) continue;
             if (isProjectFile(base)) try build_files.append(arena, dir);
             continue;
         };
@@ -1753,22 +1978,24 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             defer server.docs_mutex.unlock(server.io);
             break :blk server.open_docs.contains(file);
         };
-        if (is_open) {
-            if (isProjectFile(base)) try build_files.append(arena, dir);
-            try known.append(arena, file);
-            continue;
-        }
-        const text = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+        if (is_open and source == .verified) continue;
+        const read = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             error.FileTooBig => null,
         };
+        const disk: ?u64 = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+        const text = if (is_open) blk: {
+            if (read) |t| server.gpa.free(t);
+            break :blk null;
+        } else read;
         changes.append(arena, .{
             .file = file,
             .path = path,
             .text = text,
+            .open = is_open,
             .durability = origin.classify(&server.vfs, rules, server.vfs.path(file), false).durability(),
-            .disk = if (text) |t| std.hash.Wyhash.hash(0, t) else null,
+            .disk = disk,
         }) catch |err| {
             if (text) |t| server.gpa.free(t);
             return err;
@@ -1785,8 +2012,8 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         defer ctx.end();
         var kept: usize = 0;
         for (changes.items) |*c| {
-            c.edited = !sameText(&ctx, c.file, c.text);
-            c.rebuild = if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
+            c.edited = !c.open and !sameText(&ctx, c.file, c.text);
+            c.rebuild = if (source == .verified) c.edited else if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
             if (!c.edited and !c.rebuild) {
                 if (c.text) |t| server.gpa.free(t);
                 continue;
@@ -1795,6 +2022,11 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             kept += 1;
         }
         changes.shrinkRetainingCapacity(kept);
+    }
+    // Only the verified files whose contents differ from the known text changed
+    if (source == .verified) {
+        events.clearRetainingCapacity();
+        for (changes.items) |c| try events.put(arena, c.path, if (c.disk == null) .Deleted else .Changed);
     }
     var edited: std.ArrayList(Vfs.FileId) = .empty;
     var rebuilt: std.ArrayList(Vfs.FileId) = .empty;
@@ -1824,7 +2056,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     for (list) |ws| {
         // Outside watch mode, the maker does not reconfigure automatically: restart
         const reconfigure = for (build_files.items) |dir| {
-            if (std.mem.eql(u8, dir, ws.root)) break true;
+            if (server.vfs.samePath(dir, ws.root)) break true;
         } else for (known.items) |file| {
             if (ws.isBuildScript(file)) break true;
         } else for (events.keys(), events.values()) |path, kind| {
@@ -1839,7 +2071,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         } else false;
         if (reconfigure) {
             const started = for (refreshed.items) |dir| {
-                if (std.mem.eql(u8, dir, ws.root)) break true;
+                if (server.vfs.samePath(dir, ws.root)) break true;
             } else false;
             if (!started) server.restartWorkspace(ws, 0);
             continue;
@@ -1851,7 +2083,8 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     }
     if (edited.items.len != 0) {
         server.publishFiles(edited.items, true);
-        server.requestSemanticRefresh();
+        server.publishDependents(edited.items);
+        server.requestRefresh();
         server.scheduleCompileSetRefresh(edited.items);
     }
     if (rebuilt.items.len == 0) return;
@@ -1862,6 +2095,39 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     server.recompileSingle(open, rebuilt.items);
     // If it cannot be recorded, the next change rebuilds as usual
     for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+}
+
+/// Clients report a folder created, deleted, moved or renamed by its own path, without the files
+/// in it: adds a change of every known file under such a path to `events` (re-read from disk, so
+/// whether it still exists is decided then). Returns whether any event was such a folder.
+fn addFolderContents(server: *Server, arena: Allocator, events: *std.StringArrayHashMapUnmanaged(types.FileChangeType)) Allocator.Error!bool {
+    const insensitive = server.vfs.case == .insensitive;
+    // Identity keys (see `Vfs`) of the paths that are not known files
+    var folders: std.StringHashMapUnmanaged(void) = .empty;
+    for (events.keys()) |path| {
+        if (try server.vfs.lookup(path) != null) continue;
+        const normalized = try Vfs.normalize(.native, arena, path) orelse continue;
+        if (insensitive) _ = std.ascii.lowerString(normalized, normalized);
+        try folders.put(arena, normalized, {});
+    }
+    if (folders.count() == 0) return false;
+    var found = false;
+    var key: std.ArrayList(u8) = .empty;
+    for (0..server.vfs.count()) |i| {
+        const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
+        key.clearRetainingCapacity();
+        try key.appendSlice(arena, path);
+        if (insensitive) _ = std.ascii.lowerString(key.items, key.items);
+        var dir = std.fs.path.dirname(key.items);
+        while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+            if (!folders.contains(d)) continue;
+            found = true;
+            const gop = try events.getOrPut(arena, path);
+            if (!gop.found_existing) gop.value_ptr.* = .Changed;
+            break;
+        }
+    }
+    return found;
 }
 
 /// Whether file events change the user's source files under the root directories (see
@@ -1897,16 +2163,18 @@ fn changesWorkspaceFiles(server: *Server, arena: Allocator, rules: origin.Rules,
 }
 
 /// The file's known text is the same as `text` (including both being absent); a failed read counts
-/// as different
+/// as different. A text never set is not known: the file is then read from disk on demand
+/// (`SourceText`), and that read is kept until the text is set, even to absent.
 fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
     const current = ctx.get(FileText, file) catch return false;
-    const known = current orelse return text == null;
+    const known = current orelse return text == null and ctx.isSet(FileText, file);
     return std.mem.eql(u8, known, text orelse return false);
 }
 
 /// External changes discovered by the server: handled the same way as the client's
-/// `workspace/didChangeWatchedFiles` notification, serialized with main loop message handling
-pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent) void {
+/// `workspace/didChangeWatchedFiles` notification (see `applyFileChanges`), serialized with main
+/// loop message handling
+pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) void {
     defer {
         server.watch_mutex.lockUncancelable(server.io);
         server.watch_batches += 1;
@@ -1921,7 +2189,7 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     // waits for idle (waitIdle, shutdown) must not be allowed to return in between
     server.busyBegin();
     defer server.busyEnd();
-    server.didChangeWatchedFiles(arena, .{ .changes = changes }) catch |err| log.err("applying changes on disk failed: {t}", .{err});
+    server.applyFileChanges(arena, changes, source) catch |err| log.err("applying changes on disk failed: {t}", .{err});
 }
 
 /// Files watched when the server discovers external changes (besides the project files of each
@@ -1963,15 +2231,41 @@ pub fn configureInputDirs(server: *Server, arena: Allocator) Allocator.Error![]c
     return out.items;
 }
 
-/// Whether the server discovers external changes itself (see `Config.Watcher`)
-pub fn watchesFiles(server: *Server) bool {
+/// Which files the server watches on disk itself (see `Config.Watcher`), from the narrowest
+pub const WatchScope = enum {
+    none,
+    /// Files outside the root directories: the client watches those inside (clients apply the
+    /// registered watchers inside the workspace folders only)
+    outside_roots,
+    all,
+};
+
+pub fn watchScope(server: *Server) WatchScope {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return switch (server.config.files_watcher) {
-        .auto => !server.register_watch,
-        .client => false,
-        .server => true,
+        .auto => if (server.clientWatches()) .outside_roots else .all,
+        .client => .none,
+        .server => .all,
     };
+}
+
+/// The client watches files: it supports registering file watchers, and has not rejected a
+/// registration
+pub fn clientWatches(server: *Server) bool {
+    return server.register_watch and !server.watch_registration_failed.load(.acquire);
+}
+
+/// Id of the registration request sent after `initialized`
+const register_id = "zig-analyzer/register";
+
+/// The client answered a registration of file watchers with an error (an error answers a
+/// registration request as a whole): with `files.watcher` set to `auto`, the server watches the
+/// files itself instead
+fn watchRegistrationFailed(server: *Server) void {
+    if (server.watch_registration_failed.swap(true, .acq_rel)) return;
+    log.info("the client cannot watch files, watching them on the server instead", .{});
+    server.resyncWatcher();
 }
 
 /// Rules for classifying file origins (see `origin.classify`), copied into `arena`: the zig
@@ -2072,7 +2366,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         spawn(server.io, &server.bg_group, reloadZigPathsTask, .{server});
     }
     if (compiler_disabled) server.clearSingleFileResults();
-    if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
+    if (inlay_changed) server.requestInlayRefresh();
     if (semantic_changed) server.requestSemanticRefresh();
     if (imports_enabled and server.imports_wanted.load(.acquire)) server.scheduleIndexing();
     if (build_changed) {
@@ -2171,12 +2465,21 @@ fn hasBuildZig(server: *Server, dir: []const u8) Allocator.Error!bool {
     return false;
 }
 
+/// The root directory that is `dir` (see `Vfs.samePath`), spelled as it was added (allocated by
+/// `gpa`); null when `dir` is not a root directory
+fn rootSpelling(server: *Server, dir: []const u8) Allocator.Error!?[]u8 {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    for (server.roots.items) |r| if (server.vfs.samePath(r, dir)) return try server.gpa.dupe(u8, r);
+    return null;
+}
+
 /// Records whether root directory `root` has a build.zig; returns whether the record changed
 /// (false when `root` is not a root directory)
 fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
-    for (server.roots.items, server.root_has_build.items) |r, *flag| if (std.mem.eql(u8, r, root)) {
+    for (server.roots.items, server.root_has_build.items) |r, *flag| if (server.vfs.samePath(r, root)) {
         if (flag.* == has_build) return false;
         flag.* = has_build;
         return true;
@@ -2190,14 +2493,18 @@ fn setRootHasBuild(server: *Server, root: []const u8, has_build: bool) bool {
 /// become standalone files, or belong to an unloaded project when an ancestor directory still
 /// has a build.zig). Returns whether anything changed.
 fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
-    const has_build = try server.hasBuildZig(dir);
-    if (!server.setRootHasBuild(dir, has_build)) return false;
+    // `dir` may be spelled differently from the root directory (see `Vfs.samePath`): the project
+    // uses the root directory's spelling
+    const root = try server.rootSpelling(dir) orelse return false;
+    defer server.gpa.free(root);
+    const has_build = try server.hasBuildZig(root);
+    if (!server.setRootHasBuild(root, has_build)) return false;
     if (has_build) {
-        log.info("{s}: build.zig was created", .{dir});
-        if (server.zigEnv() != null) server.startWorkspace(dir);
+        log.info("{s}: build.zig was created", .{root});
+        if (server.zigEnv() != null) server.startWorkspace(root);
     } else {
-        log.info("{s}: build.zig was deleted", .{dir});
-        server.removeProject(dir);
+        log.info("{s}: build.zig was deleted", .{root});
+        server.removeProject(root);
         server.updateModuleGraph();
     }
     // Open files: single-file mode results no longer apply, or they switch to single-file mode
@@ -2332,7 +2639,7 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
         try registrations.append(arena, .{ .id = "zig-analyzer/didChangeWatchedFiles", .method = "workspace/didChangeWatchedFiles", .registerOptions = options });
     }
     if (registrations.items.len != 0) {
-        server.sendRequest(.{ .string = "zig-analyzer/register" }, "client/registerCapability", types.RegistrationParams{ .registrations = registrations.items });
+        server.sendRequest(.{ .string = register_id }, "client/registerCapability", types.RegistrationParams{ .registrations = registrations.items });
     }
     if (server.pull_config) {
         // Start projects once the configuration has been pulled
@@ -2425,7 +2732,8 @@ fn startup(server: *Server) Io.Cancelable!void {
     // projects have started loading
     server.startup_done.store(true, .release);
     // The origins of files opened before startup (the standard library, files outside the
-    // workspace folders) are known only now, and naming hints depend on them
+    // workspace folders) are known only now, and naming hints depend on them; their live
+    // diagnostics may also have switched to the configured zig's `zig ast-check`
     server.publishOpenFiles();
     server.reconcileSingle();
 }
@@ -2818,14 +3126,14 @@ fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             defer compiled.deinit(server.gpa);
             errors = compiled.errors.errorMessageCount();
             for (compiled.inputs) |p| {
-                const id = server.vfs.intern(p) catch continue;
+                const id = server.toolFile(p) catch continue;
                 inputs.put(server.gpa, id, {}) catch continue;
             }
             break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
         };
         var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
         if (result) |r| for (r.files.keys(), r.files.values()) |p, *fr| {
-            const id = server.vfs.intern(p) catch continue;
+            const id = server.toolFile(p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
         // During the compile, the file may have stopped being a detached file (its project finished
@@ -2906,7 +3214,7 @@ fn startWorkspace(server: *Server, root: []const u8) void {
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return;
+        for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, root)) return;
     }
     const ws = Workspace.start(server, root, 0) catch |err| {
         log.err("{s}: failed to start build system protocol: {t}", .{ root, err });
@@ -2938,7 +3246,7 @@ fn addRoot(server: *Server, root_uri: []const u8) !void {
     {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
-        for (server.roots.items) |r| if (std.mem.eql(u8, r, normalized)) return;
+        for (server.roots.items) |r| if (server.vfs.samePath(r, normalized)) return;
         try server.root_has_build.ensureUnusedCapacity(server.gpa, 1);
         try server.roots.append(server.gpa, normalized);
         server.root_has_build.appendAssumeCapacity(has_build);
@@ -2958,7 +3266,7 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     {
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
-        for (server.roots.items, 0..) |r, i| if (std.mem.eql(u8, r, normalized)) {
+        for (server.roots.items, 0..) |r, i| if (server.vfs.samePath(r, normalized)) {
             server.gpa.free(server.roots.orderedRemove(i));
             _ = server.root_has_build.orderedRemove(i);
             break;
@@ -2975,7 +3283,7 @@ fn removeProject(server: *Server, root: []const u8) void {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
         // Take it out together with the reference held by the list
-        for (server.workspaces.items, 0..) |w, i| if (std.mem.eql(u8, w.root, root)) {
+        for (server.workspaces.items, 0..) |w, i| if (server.vfs.samePath(w.root, root)) {
             removed = server.workspaces.orderedRemove(i);
             break;
         };
@@ -3157,7 +3465,7 @@ pub fn requestBuild(server: *Server, ws: *Workspace) void {
 /// The instance in the list for the project of root
 /// directory `root`; the caller holds `workspaces_mutex`
 fn visibleFor(server: *Server, root: []const u8) ?*Workspace {
-    for (server.workspaces.items) |w| if (std.mem.eql(u8, w.root, root)) return w;
+    for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, root)) return w;
     return null;
 }
 
@@ -3260,9 +3568,9 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
 pub const max_publish_workers = 8;
 
 /// When `tracked`, the file's state is recorded in `publish_files`,
-/// and `clear` is taken from there when the job starts; when the state
+/// and `clear` and `always` are taken from there when the job starts; when the state
 /// cannot be recorded (allocation failure), requests are not coalesced
-const PublishJob = struct { file: Vfs.FileId, clear: bool = false, tracked: bool = true };
+const PublishJob = struct { file: Vfs.FileId, clear: bool = false, always: bool = true, tracked: bool = true };
 
 const PublishState = struct {
     /// In the queue, not started yet
@@ -3272,6 +3580,9 @@ const PublishState = struct {
     /// The next publish is sent even when there are no
     /// diagnostics (the union over coalesced requests)
     clear: bool,
+    /// The next publish is sent even when it is the same as the last one sent for the file (the
+    /// union over coalesced requests; see `publishDependents`)
+    always: bool,
 };
 
 /// Recomputes and publishes the diagnostics of these files in the background. When `clear` is true,
@@ -3281,6 +3592,30 @@ const PublishState = struct {
 /// files, computing the same file concurrently is just duplicate work, and the run after completion
 /// reads the latest state. The number of tasks does not exceed `max_publish_workers`.
 pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) void {
+    server.enqueuePublish(files, clear, true);
+}
+
+/// Open files other than `changed`, whose text has just changed: their diagnostics may depend on
+/// that text (notes and reference traces located in it, inactive code whose conditions read it,
+/// naming hints that depend on its declarations), so they are recomputed. Most of them do not
+/// depend on it: a result is sent only when it differs from the last one sent for the file.
+fn publishDependents(server: *Server, changed: []const Vfs.FileId) void {
+    var files: std.ArrayList(Vfs.FileId) = .empty;
+    defer files.deinit(server.gpa);
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        for (server.open_docs.keys()) |file| {
+            if (std.mem.indexOfScalar(Vfs.FileId, changed, file) != null) continue;
+            files.append(server.gpa, file) catch return log.err("out of memory while publishing diagnostics", .{});
+        }
+    }
+    server.enqueuePublish(files.items, false, false);
+}
+
+/// See `publishFiles`; when `always` is false, the result is not sent when it is the same as the
+/// last one sent for the file
+fn enqueuePublish(server: *Server, files: []const Vfs.FileId, clear: bool, always: bool) void {
     if (files.len == 0) return;
     var spawn_count: usize = 0;
     {
@@ -3288,15 +3623,16 @@ pub fn publishFiles(server: *Server, files: []const Vfs.FileId, clear: bool) voi
         defer server.publish_queue_mutex.unlock(server.io);
         for (files) |file| {
             const gop = server.publish_files.getOrPut(server.gpa, file) catch {
-                server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear, .tracked = false }) catch {};
+                server.publish_queue.append(server.gpa, .{ .file = file, .clear = clear, .always = always, .tracked = false }) catch {};
                 continue;
             };
             if (gop.found_existing) {
                 gop.value_ptr.clear = gop.value_ptr.clear or clear;
+                gop.value_ptr.always = gop.value_ptr.always or always;
                 if (!gop.value_ptr.queued) gop.value_ptr.again = true;
                 continue;
             }
-            gop.value_ptr.* = .{ .clear = clear };
+            gop.value_ptr.* = .{ .clear = clear, .always = always };
             server.publish_queue.append(server.gpa, .{ .file = file }) catch {
                 _ = server.publish_files.remove(file);
             };
@@ -3337,10 +3673,12 @@ fn publishWorker(server: *Server) Io.Cancelable!void {
                 state.queued = false;
                 job.clear = state.clear;
                 state.clear = false;
+                job.always = state.always;
+                state.always = false;
             }
             break :blk job;
         };
-        server.publishNow(job.file, job.clear, null);
+        server.publishNow(job.file, job.clear, job.always, null);
         if (job.tracked) server.publishDone(job.file);
         server.maybeResetSema();
     }
@@ -3414,8 +3752,9 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         const ms = server.debounce_ms.load(.monotonic);
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
-    server.publishNow(file, false, seen);
-    if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
+    server.publishNow(file, false, true, seen);
+    server.publishDependents(&.{file});
+    if (server.openDocumentCount() > 1) server.requestRefresh();
     server.refreshCompileSets(&.{file});
     server.maybeResetSema();
 }
@@ -3512,8 +3851,9 @@ fn resetSemaLocked(server: *Server) void {
 }
 
 /// `generation`: the edit generation that an edit-triggered publish is for. When interrupted, it
-/// gives up if a newer edit exists; the publish triggered by that edit takes over.
-fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) void {
+/// gives up if a newer edit exists; the publish triggered by that edit takes over. `clear` and
+/// `always`: see `sendDiagnostics`.
+fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, generation: ?u64) void {
     var pc: panic_context.Text = .{};
     pc.enter("publish diagnostics {s}", .{server.vfs.path(file)});
     defer pc.leave();
@@ -3557,7 +3897,7 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, generation: ?u64) 
         const canceled = if (ctx.checkCanceled()) |_| false else |_| true;
         ctx.end();
         if (canceled) continue;
-        server.sendDiagnostics(file, params, clear, seq);
+        server.sendDiagnostics(file, params, clear, always, seq);
         return;
     }
 }
@@ -3605,16 +3945,20 @@ fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
 /// than the one already sent are sent, the last result sent has read the state after
 /// the last change. Comparing and writing both happen inside publish_mutex, so the
 /// order of writes matches the comparisons; serialization happens outside the lock.
-fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, seq: u64) void {
+/// `clear`: sent even when empty for a file that is not showing diagnostics; `always`: sent even
+/// when it is the same as the last result sent for the file.
+fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, always: bool, seq: u64) void {
     const bytes = jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", params) catch return log.err("out of memory while building notification", .{});
     var sent = false;
     defer if (!sent) server.gpa.free(bytes);
+    const hash = std.hash.Wyhash.hash(0, bytes);
     server.publish_mutex.lockUncancelable(server.io);
     defer server.publish_mutex.unlock(server.io);
     if (server.sent_seq.getOrPut(server.gpa, file)) |gop| {
         if (gop.found_existing and gop.value_ptr.* > seq) return;
         gop.value_ptr.* = seq;
     } else |_| {}
+    if (!always) if (server.sent_hash.get(file)) |last| if (last == hash) return;
     {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
@@ -3629,6 +3973,9 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
         }
     }
     sent = true;
+    server.sent_hash.put(server.gpa, file, hash) catch {
+        _ = server.sent_hash.remove(file);
+    };
     server.send(bytes);
     // The clearing for the virtual document has been sent: its URI is no longer needed
     if (isVirtual(server.vfs.path(file))) {
@@ -3652,10 +3999,14 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
     const stale: types.Diagnostic = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 1 } }, .message = .{ .string = "stale" } };
     // The 2nd computation finishes first and is sent; the 1st is based on older state and is
     // dropped when it finishes later. Other files are not affected.
-    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, 2);
-    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 1);
-    server.sendDiagnostics(b, .{ .uri = "file:///b.zig", .diagnostics = &.{stale} }, true, 0);
-    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, 3);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, true, 2);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, true, 1);
+    server.sendDiagnostics(b, .{ .uri = "file:///b.zig", .diagnostics = &.{stale} }, true, true, 0);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, true, true, 3);
+    // A republish of a file for a change in another file is sent only when its result differs
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{stale} }, false, false, 4);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, false, false, 5);
+    server.sendDiagnostics(a, .{ .uri = "file:///a.zig", .diagnostics = &.{} }, true, true, 6);
 
     var reader: Io.Reader = .fixed(out.written());
     var sent: std.ArrayList(u8) = .empty;
@@ -3668,7 +4019,7 @@ test "sendDiagnostics: a result computed earlier is not sent after a later one" 
         const uri_text = params.get("uri").?.string;
         try sent.print(gpa, "{s}:{d} ", .{ uri_text[uri_text.len - 5 ..], params.get("diagnostics").?.array.items.len });
     } else |err| if (err != error.EndOfStream) return err;
-    try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 ", sent.items);
+    try std.testing.expectEqualStrings("a.zig:0 b.zig:1 a.zig:1 a.zig:0 a.zig:0 ", sent.items);
 }
 
 test "publishFiles: large batches use a bounded number of workers" {
@@ -3737,6 +4088,67 @@ test "publishFiles: requests for a file being published coalesce into one more r
     const computed = server.publish_seq.load(.monotonic) - before;
     try std.testing.expect(computed >= 1 and computed <= 2);
     try std.testing.expectEqual(0, server.publish_files.count());
+}
+
+// Prevents ignoring a build.zig created or saved through another spelling of a root directory on a
+// case-insensitive file system: roots are compared by file identity, not byte by byte
+test "refreshRoot: a root directory spelled with another case is the same root" {
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    server.vfs.case = .insensitive;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(root);
+    const root_uri = try uri.fromPath(gpa, root);
+    defer gpa.free(root_uri);
+    try server.addRoot(root_uri);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "" });
+    const variant = try std.ascii.allocUpperString(gpa, root);
+    defer gpa.free(variant);
+    try std.testing.expect(!std.mem.eql(u8, variant, root));
+    try std.testing.expect(try server.refreshRoot(variant));
+    try std.testing.expect(server.root_has_build.items[0]);
+    try std.testing.expect(!try server.refreshRoot(variant));
+}
+
+test "toolFile: a path naming an open document under another spelling is that document" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    try tmp.dir.createDirPath(std.testing.io, "real");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/a.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/b.zig", .data = "" });
+    try tmp.dir.symLink(std.testing.io, "real", "link", .{ .is_directory = true });
+    const opened = try server.vfs.intern(try std.fs.path.join(a, &.{ dir, "link/a.zig" }));
+    const real_a = try std.fs.path.join(a, &.{ dir, "real/a.zig" });
+    const real_b = try std.fs.path.join(a, &.{ dir, "real/b.zig" });
+    // No document is open: the path is interned as it is
+    try std.testing.expect(try server.toolFile(real_b) != opened);
+    try server.open_docs.put(gpa, opened, try gpa.dupe(u8, "file:///link/a.zig"));
+    try std.testing.expectEqual(opened, try server.toolFile(real_a));
+    try std.testing.expectEqual(opened, (try server.vfs.lookup(real_a)).?);
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ dir, "link/a.zig" }), server.vfs.path(opened));
+    // Known paths are not resolved on disk again; a path no open document names stays apart
+    try std.testing.expectEqual(1, server.open_real.count());
+    try std.testing.expect(try server.toolFile(try std.fs.path.join(a, &.{ dir, "real/missing.zig" })) != opened);
 }
 
 test "importsBasis ignores the files of the module graph but follows modules and their imports" {
@@ -4270,6 +4682,28 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
     return out;
 }
 
+/// Layout rules of the import block for `file`: the client's settings, overridden by the
+/// `zig-analyzer.zon` of the project containing the file (the innermost one when nested)
+fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
+    var options = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.importOptions();
+    };
+    const path = server.vfs.path(file);
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    var best: ?*Workspace = null;
+    for (server.workspaces.items) |ws| {
+        if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+    }
+    if (best) |ws| if (ws.project) |*p| {
+        if (p.isSet("imports_derived")) options.derived = p.imports_derived;
+        if (p.isSet("imports_sort")) options.sort = p.imports_sort;
+    };
+    return options;
+}
+
 /// The workspace root directory containing `path`
 /// (the innermost one when nested), copied into `arena`
 fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
@@ -4341,14 +4775,39 @@ fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.Doc
 fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const parse = try ctx.get(syntax_q.ParseFile, file);
-    if (parse.mode == .zon) {
-        const lines = try fileLines(ctx, arena, file);
-        return .{ .array_of_DocumentSymbol = try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding) };
-    }
-    const items = try ctx.get(syntax_q.FileItemTree, file);
-    const map = try ctx.get(syntax_q.FileAstIdMap, file);
     const lines = try fileLines(ctx, arena, file);
-    return .{ .array_of_DocumentSymbol = try ide.document_symbol.documentSymbols(arena, items, map, lines, server.encoding) };
+    const symbols = if (parse.mode == .zon)
+        try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding)
+    else
+        try ide.document_symbol.documentSymbols(arena, try ctx.get(syntax_q.FileItemTree, file), try ctx.get(syntax_q.FileAstIdMap, file), lines, server.encoding);
+    if (server.hierarchical_symbols) return .{ .array_of_DocumentSymbol = try server.clientSymbolTree(arena, symbols) };
+    var flat: std.ArrayList(types.SymbolInformation) = .empty;
+    try server.flattenSymbols(arena, params.textDocument.uri, symbols, null, &flat);
+    return .{ .array_of_SymbolInformation = flat.items };
+}
+
+/// The outline with the symbol kinds the client supports
+fn clientSymbolTree(server: *Server, arena: Allocator, symbols: []const types.DocumentSymbol) Allocator.Error![]const types.DocumentSymbol {
+    const out = try arena.dupe(types.DocumentSymbol, symbols);
+    for (out) |*s| {
+        s.kind = clientSymbolKind(server.document_symbol_kinds, s.kind);
+        if (s.children) |children| s.children = try server.clientSymbolTree(arena, children);
+    }
+    return out;
+}
+
+/// The outline as a flat list for clients without `hierarchicalDocumentSymbolSupport`: each symbol
+/// names its parent symbol as `containerName`
+fn flattenSymbols(server: *Server, arena: Allocator, doc_uri: []const u8, symbols: []const types.DocumentSymbol, container: ?[]const u8, out: *std.ArrayList(types.SymbolInformation)) Allocator.Error!void {
+    for (symbols) |s| {
+        try out.append(arena, .{
+            .name = s.name,
+            .kind = clientSymbolKind(server.document_symbol_kinds, s.kind),
+            .containerName = container,
+            .location = .{ .uri = doc_uri, .range = s.range },
+        });
+        try server.flattenSymbols(arena, doc_uri, s.children orelse &.{}, s.name, out);
+    }
 }
 
 fn foldingRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.FoldingRangeParams) HandlerError!types.ResultType("textDocument/foldingRange") {
@@ -4406,7 +4865,7 @@ fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: 
     return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range, server.semanticTokensOptions()) };
 }
 
-fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
+fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
     // Prefer UTF-8 (matches the internal byte offsets);
     // otherwise fall back to the protocol default UTF-16
     if (params.capabilities.general) |general| {
@@ -4425,16 +4884,40 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         if (ws.inlayHint) |ih| server.inlay_refresh = ih.refreshSupport orelse false;
         if (ws.semanticTokens) |st| server.semantic_refresh = st.refreshSupport orelse false;
         if (ws.workspaceEdit) |we| server.change_annotations = (we.documentChanges orelse false) and we.changeAnnotationSupport != null;
+        if (ws.symbol) |s| if (s.symbolKind) |k| {
+            server.workspace_symbol_kinds = k.valueSet != null;
+        };
     }
     if (params.capabilities.textDocument) |td| if (td.codeAction) |ca| {
         server.code_action_disabled = ca.disabledSupport orelse false;
+        server.code_action_literals = ca.codeActionLiteralSupport != null;
         if (ca.resolveSupport) |rs| for (rs.properties) |p| {
             if (std.mem.eql(u8, p, "edit")) server.code_action_resolve = ca.dataSupport orelse false;
         };
     };
     if (params.capabilities.textDocument) |td| if (td.completion) |c| if (c.completionItem) |ci| {
         server.snippet_support = ci.snippetSupport orelse false;
+        server.insert_replace_support = ci.insertReplaceSupport orelse false;
     };
+    if (params.capabilities.textDocument) |td| {
+        if (td.rename) |rn| server.prepare_rename = rn.prepareSupport orelse false;
+        if (td.documentSymbol) |ds| {
+            server.hierarchical_symbols = ds.hierarchicalDocumentSymbolSupport orelse false;
+            if (ds.symbolKind) |k| server.document_symbol_kinds = k.valueSet != null;
+        }
+        if (td.completion) |c| {
+            if (c.completionItemKind) |k| server.completion_kinds = k.valueSet != null;
+            if (c.completionItem) |ci| if (ci.documentationFormat) |f| {
+                server.completion_markdown = acceptsMarkdown(f);
+            };
+        }
+        if (td.hover) |hv| if (hv.contentFormat) |f| {
+            server.hover_markdown = acceptsMarkdown(f);
+        };
+        if (td.signatureHelp) |sh| if (sh.signatureInformation) |si| if (si.documentationFormat) |f| {
+            server.signature_markdown = acceptsMarkdown(f);
+        };
+    }
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -4454,7 +4937,13 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
     var root_uris: std.ArrayList([]const u8) = .empty;
     defer root_uris.deinit(server.gpa);
     if (params.workspaceFolders) |folders| for (folders) |f| try root_uris.append(server.gpa, f.uri);
-    if (root_uris.items.len == 0) if (params.rootUri) |r| try root_uris.append(server.gpa, r);
+    if (root_uris.items.len == 0) {
+        if (params.rootUri) |r| {
+            try root_uris.append(server.gpa, r);
+        } else if (params.rootPath) |p| if (std.fs.path.isAbsolute(p)) {
+            try root_uris.append(server.gpa, try uri.fromPath(arena, p));
+        };
+    }
     for (root_uris.items) |root_uri| try server.addRoot(root_uri);
 
     return .{
@@ -4478,13 +4967,14 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
             .inlayHintProvider = .{ .boolean = true },
             .referencesProvider = .{ .boolean = true },
             .documentHighlightProvider = .{ .boolean = true },
-            .renameProvider = .{ .RenameOptions = .{ .prepareProvider = true } },
+            .renameProvider = if (server.prepare_rename) .{ .RenameOptions = .{ .prepareProvider = true } } else .{ .boolean = true },
             .workspaceSymbolProvider = .{ .boolean = true },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
-            .codeActionProvider = .{ .CodeActionOptions = .{
+            // Every action carries an edit, which only `CodeAction` literals can hold
+            .codeActionProvider = if (server.code_action_literals) .{ .CodeActionOptions = .{
                 .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.RefactorRewrite, types.CodeActionKind.SourceOrganizeImports },
                 .resolveProvider = true,
-            } },
+            } } else .{ .boolean = false },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .SemanticTokensFullDelta = .{ .delta = true } },
@@ -4493,6 +4983,52 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
         },
         .serverInfo = .{ .name = "zig-analyzer", .version = za.version },
     };
+}
+
+/// A symbol kind the client supports: a client that lists its kinds handles any kind; for other
+/// clients, kinds added after the initial protocol version (`File` to `Array`) are sent as the
+/// closest initial kind
+fn clientSymbolKind(listed: bool, kind: types.SymbolKind) types.SymbolKind {
+    if (listed or @backingInt(kind) <= @backingInt(types.SymbolKind.Array)) return kind;
+    return switch (kind) {
+        .Struct, .Object => .Class,
+        .EnumMember => .Enum,
+        .TypeParameter => .Class,
+        else => .Variable,
+    };
+}
+
+/// A completion item kind the client supports (see `clientSymbolKind`)
+/// (the initial kinds are `Text` to `Reference`)
+fn clientCompletionKind(listed: bool, kind: types.CompletionItemKind) types.CompletionItemKind {
+    if (listed or @backingInt(kind) <= @backingInt(types.CompletionItemKind.Reference)) return kind;
+    return switch (kind) {
+        .Struct, .TypeParameter => .Class,
+        .EnumMember => .Enum,
+        .Constant => .Variable,
+        .Folder => .File,
+        else => .Text,
+    };
+}
+
+fn acceptsMarkdown(formats: []const types.MarkupKind) bool {
+    return std.mem.findScalar(types.MarkupKind, formats, .markdown) != null;
+}
+
+/// Markup content in the formats the client accepts: without markdown, code fences are removed
+/// and the text is sent as plain text
+fn markup(arena: Allocator, markdown: bool, text: []const u8) Allocator.Error!types.MarkupContent {
+    if (markdown) return .{ .kind = .markdown, .value = text };
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "```")) continue;
+        if (!first) try out.append(arena, '\n');
+        first = false;
+        try out.appendSlice(arena, line);
+    }
+    return .{ .kind = .plaintext, .value = out.items };
 }
 
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
@@ -4562,8 +5098,14 @@ fn declaration(server: *Server, r: *Resolver, arena: Allocator, params: types.De
 
 fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types.TypeDefinitionParams) HandlerError!types.ResultType("textDocument/typeDefinition") {
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const t = try ide.definition.typeDefinition(r, at.file, at.offset) orelse return null;
-    return .{ .Definition = .{ .Location = try server.targetLocation(r, arena, t) } };
+    const targets = try ide.definition.typeDefinitionTargets(r, at.file, at.offset);
+    const locs = try arena.alloc(types.Location, targets.len);
+    for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
+    return switch (locs.len) {
+        0 => null,
+        1 => .{ .Definition = .{ .Location = locs[0] } },
+        else => .{ .Definition = .{ .array_of_Location = locs } },
+    };
 }
 
 /// All goto targets at the cursor, computed with `find`. A path in `build.zig.zon` goes to the start
@@ -4603,11 +5145,18 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports, const import_options, const snippets, const placeholders = blk: {
+    const max_auto_imports, const snippets, const placeholders = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
         const c = &server.config;
-        break :blk .{ c.completion_max_auto_imports, c.importOptions(), c.completion_snippets, c.completion_argument_placeholders };
+        break :blk .{ c.completion_max_auto_imports, c.completion_snippets, c.completion_argument_placeholders };
+    };
+    const import_options = server.importOptionsFor(file);
+    // `/` and `"` are trigger characters for paths; typed elsewhere they start no name
+    const path_trigger = blk: {
+        const c = params.context orelse break :blk false;
+        const t = c.triggerCharacter orelse break :blk false;
+        break :blk c.triggerKind == .TriggerCharacter and (std.mem.eql(u8, t, "/") or std.mem.eql(u8, t, "\""));
     };
     const result = try ide.completion.complete(r, file, offset, .{
         .auto_import = auto_import and imports_ready,
@@ -4616,6 +5165,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         .imports = import_options,
         .snippets = server.snippet_support and snippets,
         .argument_placeholders = placeholders,
+        .paths_only = path_trigger,
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
@@ -4627,7 +5177,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
-            .kind = switch (it.kind) {
+            .kind = clientCompletionKind(server.completion_kinds, switch (it.kind) {
                 .param, .variable => .Variable,
                 .type_param => .TypeParameter,
                 .function, .builtin => .Function,
@@ -4643,16 +5193,25 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
                 .folder => .Folder,
                 .label => .Reference,
                 .snippet => .Snippet,
-            },
-            .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+            }),
+            .documentation = if (it.doc) |d| .{ .MarkupContent = try markup(arena, server.completion_markdown, d) } else null,
             .detail = it.detail,
             .filterText = it.filter,
             .sortText = it.sort,
             .data = if (it.target) |t| try completionData(r, arena, file, t) else null,
             .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
         };
+        // A replaced range ends at the end of the word (or path) at the cursor; inserting replaces
+        // only up to the cursor. Clients that support both ranges apply the one the user chose;
+        // others get the replaced range for every item
         if (it.replace) |range| {
-            o.textEdit = .{ .TextEdit = .{ .range = try ranges.get(arena, range.start, range.end), .newText = it.snippet orelse it.label } };
+            const new_text = it.snippet orelse it.label;
+            const replace = try ranges.get(arena, range.start, range.end);
+            o.textEdit = if (server.insert_replace_support) .{ .InsertReplaceEdit = .{
+                .newText = new_text,
+                .insert = try ranges.get(arena, range.start, std.math.clamp(offset, range.start, range.end)),
+                .replace = replace,
+            } } else .{ .TextEdit = .{ .range = replace, .newText = new_text } };
             if (it.snippet != null) o.insertTextFormat = .Snippet;
         }
         if (it.import_edit) |edit| {
@@ -4743,7 +5302,7 @@ fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.i
 /// A completion item was selected: fills in the signature (`detail`), the doc comment and the
 /// definition's location (`documentation`). Returns the item unchanged if `data` did not come from
 /// this server or the declaration it refers to no longer exists.
-fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
+fn completionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
     var item = params;
     const data = switch (params.data orelse return item) {
         .object => |o| o,
@@ -4758,7 +5317,7 @@ fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.
     } else .{ .file = file };
     const description = try ide.completion.describe(r, from, target);
     item.detail = description.detail;
-    item.documentation = .{ .MarkupContent = .{ .kind = .markdown, .value = description.doc } };
+    item.documentation = .{ .MarkupContent = try markup(arena, server.completion_markdown, description.doc) };
     return item;
 }
 
@@ -4781,7 +5340,7 @@ fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverPar
     const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
     return .{
-        .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = info.text } },
+        .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, info.text) },
         .range = lines.range(info.start, info.end, server.encoding),
     };
 }
@@ -4796,7 +5355,7 @@ fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.
         .label = sig.label,
         .parameters = ps,
         .activeParameter = if (ps.len == 0) null else sig.active,
-        .documentation = if (sig.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+        .documentation = if (sig.doc) |d| .{ .MarkupContent = try markup(arena, server.signature_markdown, d) } else null,
     };
     return .{ .signatures = info, .activeSignature = 0, .activeParameter = if (ps.len == 0) null else sig.active };
 }
@@ -5028,8 +5587,8 @@ const CheckedRename = struct {
 /// The references of `def` and the source text of the new name for renaming it from `old` to
 /// `new` (as given, possibly `@"..."`), or why the result would be partial or break the build:
 /// the references cannot all be confirmed (see `renameReferences`), the new name conflicts with an
-/// existing one (a member of the same container, shadowing, or a name that would refer to another
-/// declaration; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
+/// existing one (a member of the same container, shadowing, or a reference that would become
+/// ambiguous; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
 /// reports a new error in the declaration's file once it is renamed (`rename.verifyAstGen`).
 fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
     const refs = switch (try server.renameReferences(r, arena, .{ .def = def }, old, new)) {
@@ -5207,7 +5766,7 @@ fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []const
         if (annotated) {
             const edits = try arena.alloc(DocumentEdit, fe.edits.len);
             for (fe.edits, edits) |e, *o| o.* = .{ .AnnotatedTextEdit = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text, .annotationId = confirm.?.id } };
-            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = null }, .edits = edits } });
+            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = server.docVersion(fe.file) }, .edits = edits } });
         } else {
             const edits = try arena.alloc(types.TextEdit, fe.edits.len);
             for (fe.edits, edits) |e, *o| o.* = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text };
@@ -5285,7 +5844,7 @@ fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: type
     var m: RangeMapper = .{ .server = server, .r = r };
     for (syms, out) |s, *o| o.* = .{
         .name = s.name,
-        .kind = s.kind,
+        .kind = clientSymbolKind(server.workspace_symbol_kinds, s.kind),
         .containerName = s.container,
         .location = .{ .Location = .{ .uri = try server.uriFor(arena, s.file), .range = try m.range(s.file, s.start, s.end) } },
     };
@@ -5305,15 +5864,13 @@ fn wantsKind(only: ?[]const []const u8, kind: []const u8) bool {
 }
 
 fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
+    // Every action carries an edit, which only `CodeAction` literals can hold
+    if (!server.code_action_literals) return null;
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const start, const end = server.rangeOffsets(text, params.range);
     const only = params.context.only;
-    const import_options = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.importOptions();
-    };
+    const import_options = server.importOptionsFor(file);
     var actions: std.ArrayList(ide.code_actions.Action) = .empty;
     if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or wantsKind(only, types.CodeActionKind.RefactorRewrite))
         try actions.appendSlice(arena, try ide.code_actions.codeActions(r, file, start, end));
@@ -5338,11 +5895,14 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
         var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
         try changes.map.put(arena, doc_uri, edits);
-        // Link the same diagnostic sent by the client, so that the fix shows up on the diagnostic
+        // Link the same diagnostic sent by the client (same range and message, so another
+        // diagnostic on the same name, such as a naming hint, is not taken for it), so that the
+        // fix shows up on the diagnostic
         const diagnostics: ?[]const types.Diagnostic = if (a.diagnostic) |d| blk: {
             const range = lines.range(d.start, d.end, server.encoding);
             for (params.context.diagnostics) |cd| {
-                if (std.meta.eql(cd.range, range)) break :blk try arena.dupe(types.Diagnostic, &.{cd});
+                if (std.meta.eql(cd.range, range) and cd.message == .string and std.mem.eql(u8, cd.message.string, d.message))
+                    break :blk try arena.dupe(types.Diagnostic, &.{cd});
             }
             break :blk null;
         } else null;

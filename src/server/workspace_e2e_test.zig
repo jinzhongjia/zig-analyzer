@@ -156,6 +156,34 @@ test "without file watching from the client, the server watches files on disk" {
     try h.notify("exit", {});
 }
 
+test "the server watches files on disk: a change notified under another spelling of a file counts for it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const main_text = "const lib = @import(\"lib.zig\");\npub fn first() void {\n    lib.\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "lib.impl", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    // The notifications name the file as stored on disk (`lib.impl`), the server knows it as
+    // `lib.zig`, as with FSEvents reporting decomposed Unicode names for composed ones
+    try project.tmp.dir.symLink(testing.io, "lib.impl", "lib.zig", .{});
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("hello", try completionLabels(&h, main_uri, main_text, "    lib."));
+    // Guards against dropping the notification as one for an unknown file
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.impl"), .data = "pub fn goodbye() void {}\n" });
+    try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "goodbye" });
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 /// Number of batches of external changes the server has handled
 fn watchBatches(h: *Harness) u64 {
     h.server.watch_mutex.lockUncancelable(testing.io);
@@ -1401,4 +1429,367 @@ test "files read by @embedFile are watched on disk by the server, or registered 
             try waitWatched(&h, Hover{ .uri = main_uri, .line = 0, .character = 7, .want = "```text\nhello\n```" });
         }
     }
+}
+
+/// Condition for `waitWatched`: the last diagnostics published for `uri` include one containing
+/// `needle` (`has`), or none does (`!has`)
+const Diagnostic = struct {
+    uri: []const u8,
+    needle: []const u8,
+    has: bool,
+
+    fn done(c: Diagnostic, h: *Harness) !bool {
+        return try lastHas(h, c.uri, c.needle) == c.has;
+    }
+};
+
+const check_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = b.graph.host,
+    \\    }) });
+    \\    b.installArtifact(exe);
+    \\    const check = b.step("check", "Check");
+    \\    check.dependOn(&exe.step);
+    \\}
+    \\
+;
+
+// Prevents ignoring an open document rewritten on disk: the build reads the disk, so keeping the
+// old build's diagnostics would map them onto the new text
+test "an open document rewritten on disk is rebuilt, with the client's or the server's watcher" {
+    const v1 = "const T = u8;\nconst util = @import(\"util.zig\");\npub fn main() void {\n    const bad: T = 300;\n    _ = bad;\n    util.f();\n}\n";
+    const v2 = "const T = u16;\nconst util = @import(\"util.zig\");\npub fn main() void {\n    const bad: T = 300;\n    _ = bad;\n    util.f();\n}\n";
+    const v3 = "const T = u8;\nconst util = @import(\"util.zig\");\npub fn main() void {\n    const bad: T = 300;\n    _ = bad;\n    util.f();\n}\n// saved\n";
+    const message = "type 'u8' cannot represent integer value '300'";
+    inline for (.{ "client", "server" }) |watcher| {
+        const client = comptime std.mem.eql(u8, watcher, "client");
+        var project = try fixture.Project.create(&.{
+            .{ .path = "build.zig", .text = check_build },
+            .{ .path = "src/main.zig", .text = v1 },
+            .{ .path = "src/util.zig", .text = "pub fn f() void {}\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const root_uri = try za.base.uri.fromPath(a, project.root);
+        _ = try h.request("initialize", .{
+            .rootUri = root_uri,
+            .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+            .initializationOptions = .{ .files = .{ .watcher = watcher } },
+        });
+        try h.notify("initialized", Empty{});
+        const main_path = try project.path(a, "src/main.zig");
+        const main_uri = try za.base.uri.fromPath(a, main_path);
+        try open(&h, main_uri, v1);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expect(try lastHas(&h, main_uri, message));
+
+        // Rewritten on disk (git checkout), and the editor reloads the buffer without saving
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = main_path, .data = v2 });
+        if (client) try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = main_uri, .type = 2 }} });
+        try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = v2 }} });
+        try waitWatched(&h, Diagnostic{ .uri = main_uri, .needle = message, .has = false });
+
+        // A save is rebuilt once: the watcher's notification of the same write adds no rebuild
+        if (client) {
+            try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 3 }, .contentChanges = &.{.{ .text = v3 }} });
+            try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = main_path, .data = v3 });
+            const builds = compiles(&h);
+            try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+            try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = main_uri, .type = 2 }} });
+            _ = try h.request("zig-analyzer/waitIdle", {});
+            try testing.expectEqual(builds + 1, compiles(&h));
+            try testing.expect(try lastHas(&h, main_uri, message));
+        }
+
+        // An open build.zig rewritten on disk restarts the project
+        const build_path = try project.path(a, "build.zig");
+        const build_uri = try za.base.uri.fromPath(a, build_path);
+        try open(&h, build_uri, check_build);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const instance = visibleInstance(&h);
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = check_build ++ "// changed\n" });
+        if (client) try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = build_uri, .type = 2 }} });
+        try waitWatched(&h, Restarted{ .from = instance });
+
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
+/// Condition for `waitWatched`: the project instance is no longer `from`
+const Restarted = struct {
+    from: *Workspace,
+
+    fn done(c: Restarted, h: *Harness) !bool {
+        return visibleInstance(h) != c.from;
+    }
+};
+
+// Prevents a deleted file that was only read from disk (imported in single-file mode) from keeping
+// its old text: its absence equals the never-set text, which must still replace the read
+test "a deleted imported file of a single file is no longer resolved" {
+    const main_text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    const n = lib.compute(3);\n    _ = n;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "lib.zig", .text = "pub fn compute(x: u32) u32 {\n    return x * 2;\n}\npub const answer: u8 = 42;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{
+        .rootUri = root_uri,
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("lib.zig", try gotoFile(&h, main_uri, main_text, "lib.comp"));
+    try testing.expectEqualStrings("compute answer", try completionLabels(&h, main_uri, main_text, "= lib."));
+
+    const lib_path = try project.path(a, "lib.zig");
+    try std.Io.Dir.cwd().deleteFile(testing.io, lib_path);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, lib_path), .type = 3 }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("null", try gotoFile(&h, main_uri, main_text, "lib.comp"));
+    try testing.expectEqualStrings("", try completionLabels(&h, main_uri, main_text, "= lib."));
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// Line of the goto result (-1 without a result)
+fn gotoLine(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) !i64 {
+    const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
+    const result = resp.object.get("result") orelse return -1;
+    if (result != .object) return -1;
+    return result.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+}
+
+/// Condition for `waitWatched`: the goto result of `needle` is on line `want`
+const GotoLine = struct {
+    uri: []const u8,
+    text: []const u8,
+    needle: []const u8,
+    want: i64,
+
+    fn done(c: GotoLine, h: *Harness) !bool {
+        return try gotoLine(h, c.uri, c.text, c.needle) == c.want;
+    }
+};
+
+// Prevents leaving files outside the workspace folders unwatched when the client registers file
+// watchers: clients apply them inside the workspace folders only
+test "with a client that registers file watchers, the server watches the files outside the workspace folders" {
+    const main_text = "const util = @import(\"../libs/util.zig\");\npub fn main() void {\n    util.helper();\n}\n";
+    inline for (.{ false, true }) |with_folder| {
+        var project = try fixture.Project.create(&.{
+            .{ .path = "app/main.zig", .text = main_text },
+            .{ .path = "libs/util.zig", .text = "pub fn helper() void {}\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true, .relativePatternSupport = true } } };
+        if (with_folder) {
+            const app_uri = try za.base.uri.fromPath(a, try project.path(a, "app"));
+            _ = try h.request("initialize", .{ .rootUri = app_uri, .workspaceFolders = &.{.{ .uri = app_uri, .name = "app" }}, .capabilities = capabilities });
+        } else {
+            _ = try h.request("initialize", .{ .capabilities = capabilities });
+        }
+        try h.notify("initialized", Empty{});
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "app/main.zig"));
+        try open(&h, main_uri, main_text);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "util.help"));
+
+        // Rewritten outside the editor, and the client sends no notification
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "libs/util.zig"), .data = "// one\n// two\npub fn helper() void {}\n" });
+        try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "util.help", .want = 2 });
+
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
+/// Whether the client was asked to watch `glob`
+fn registeredGlob(h: *Harness, glob: []const u8) bool {
+    for (h.received.items) |m| {
+        const method = m.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "client/registerCapability")) continue;
+        for (m.object.get("params").?.object.get("registrations").?.array.items) |r| {
+            const options = r.object.get("registerOptions") orelse continue;
+            for (options.object.get("watchers").?.array.items) |watcher| {
+                if (std.mem.eql(u8, watcher.object.get("globPattern").?.string, glob)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Prevents missing folder renames and deletes in the client's watch mode: clients report a folder by
+// its own path only, which must be registered and must reach the files under it
+test "a folder renamed on disk is registered with the client and its files follow the disk" {
+    const main_text = "const inner = @import(\"sub/inner.zig\");\npub fn main() void {\n    const v = inner.innerValue;\n    _ = v;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = check_build },
+        .{ .path = "src/main.zig", .text = main_text },
+        .{ .path = "src/sub/inner.zig", .text = "pub const innerValue: u32 = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{
+        .rootUri = root_uri,
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("inner.zig", try gotoFile(&h, main_uri, main_text, "inner.inner"));
+    // Registered by a background task once the file is interned
+    while (!registeredGlob(&h, "**/sub")) _ = try h.next();
+
+    // Renamed away: the client reports the two folders only
+    const sub_path = try project.path(a, "src/sub");
+    const moved_path = try project.path(a, "src/moved");
+    const sub_uri = try za.base.uri.fromPath(a, sub_path);
+    const moved_uri = try za.base.uri.fromPath(a, moved_path);
+    try std.Io.Dir.cwd().rename(sub_path, std.Io.Dir.cwd(), moved_path, testing.io);
+    const builds = compiles(&h);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = sub_uri, .type = 3 }, .{ .uri = moved_uri, .type = 1 } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("null", try gotoFile(&h, main_uri, main_text, "inner.inner"));
+    try testing.expect(compiles(&h) > builds);
+
+    // Edited while away and renamed back
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "src/moved/inner.zig"), .data = "pub const innerValue: u64 = 2;\n" });
+    try std.Io.Dir.cwd().rename(moved_path, std.Io.Dir.cwd(), sub_path, testing.io);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = moved_uri, .type = 3 }, .{ .uri = sub_uri, .type = 1 } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = position(main_text, "inner.inner");
+    try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, at.line, at.character), "u64") != null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+// Prevents leaving files unwatched when the client rejects the registration of file watchers
+test "a client that rejects the registration of file watchers leaves the watching to the server" {
+    const main_text = "const util = @import(\"util.zig\");\npub fn main() void {\n    util.add(1, 2);\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "util.zig", .text = "pub fn add(a: u32, b: u32) void {\n    _ = a + b;\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    h.hold_requests = true;
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+    try h.notify("initialized", Empty{});
+    const id = while (true) {
+        const m = try h.next();
+        const method = m.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "client/registerCapability")) break m.object.get("id").?;
+    };
+    h.hold_requests = false;
+    try h.write(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = -32603, .message = "cannot watch files" } });
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "util.ad"));
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "util.zig"), .data = "// one\n// two\npub fn add(a: u32, b: u32) void {\n    _ = a + b;\n}\n" });
+    try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "util.ad", .want = 2 });
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// The root directories of the server
+fn roots(h: *Harness) ![]const []const u8 {
+    h.server.roots_mutex.lockUncancelable(testing.io);
+    defer h.server.roots_mutex.unlock(testing.io);
+    return h.arena.allocator().dupe([]const u8, h.server.roots.items);
+}
+
+// Prevents ignoring the deprecated `rootPath` of clients that send no `rootUri`
+test "initialize takes rootPath as the root when there is no rootUri, and rootUri wins over it" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = check_build },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/util.zig", .text = "pub fn f() void {}\n" },
+    });
+    defer project.deinit();
+    inline for (.{ false, true }) |with_uri| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        if (with_uri) {
+            const src_uri = try za.base.uri.fromPath(a, try project.path(a, "src"));
+            _ = try h.request("initialize", .{ .rootUri = src_uri, .rootPath = project.root, .capabilities = Empty{} });
+        } else {
+            _ = try h.request("initialize", .{ .rootPath = project.root, .capabilities = Empty{} });
+        }
+        try h.notify("initialized", Empty{});
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const found = try roots(&h);
+        try testing.expectEqual(1, found.len);
+        try testing.expectEqualStrings(if (with_uri) try project.path(a, "src") else project.root, found[0]);
+        try testing.expect(try (Projects{ .n = if (with_uri) 0 else 1 }).done(&h));
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
+// Prevents keeping the old text of closed files changed while nobody watched them, once the server
+// starts watching after a change of `files.watcher`
+test "switching files.watcher to the server compares the files with the disk" {
+    const main_text = "const dep = @import(\"dep.zig\");\npub fn main() void {\n    const v = dep.value;\n    _ = v;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = check_build },
+        .{ .path = "src/main.zig", .text = main_text },
+        .{ .path = "src/dep.zig", .text = "pub const value: u32 = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // Nobody watches the files: the client cannot, and the server is told not to
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = .{ .files = .{ .watcher = "client" } } });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "dep.val"));
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "src/dep.zig"), .data = "// a\n// b\n// c\npub const value: i64 = 1;\n" });
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .files = .{ .watcher = "auto" } } } });
+    try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "dep.val", .want = 3 });
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
 }

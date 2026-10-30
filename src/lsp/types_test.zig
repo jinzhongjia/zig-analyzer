@@ -60,3 +60,25 @@ test "stringify: integer enums as numbers, string literals and unions" {
     , .{});
     try testing.expectEqualStrings("file:///b", change.RenameFile.newUri);
 }
+
+test "stringify: required nullable properties are written as null" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const opts: json.Stringify.Options = .{ .emit_null_optional_fields = false };
+
+    // `version: integer | null` is required: omitting it makes clients reject the edit
+    const unversioned: types.OptionalVersionedTextDocumentIdentifier = .{ .uri = "file:///a", .version = null };
+    try testing.expectEqualStrings(
+        \\{"uri":"file:///a","version":null}
+    , try json.Stringify.valueAlloc(a, unversioned, opts));
+    const versioned: types.OptionalVersionedTextDocumentIdentifier = .{ .uri = "file:///a", .version = 3 };
+    try testing.expectEqualStrings(
+        \\{"uri":"file:///a","version":3}
+    , try json.Stringify.valueAlloc(a, versioned, opts));
+    // Optional properties stay omitted when null
+    const report: types.WorkspaceFullDocumentDiagnosticReport = .{ .uri = "file:///a", .version = null, .items = &.{} };
+    try testing.expectEqualStrings(
+        \\{"kind":"full","items":[],"uri":"file:///a","version":null}
+    , try json.Stringify.valueAlloc(a, report, opts));
+}

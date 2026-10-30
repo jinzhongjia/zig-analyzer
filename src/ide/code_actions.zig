@@ -1,5 +1,6 @@
 //! Quick fixes for textDocument/codeAction:
-//! - Unused local names (AstGen's `unused ...` diagnostics): insert `_ = name;`
+//! - Unused local names (AstGen's `unused ...` diagnostics): insert `_ = name;` (`_ = &name;` for
+//!   a `var`, an error set, or an error union)
 //! - Unused function parameters: alternatively, remove the parameter and the argument at each
 //!   call site (across files; see `remove_param.zig`)
 //! - Unused captures: alternatively, remove the capture or rename it to `_` (see
@@ -7,7 +8,8 @@
 //! - Pointless discards (`pointless discard of ...`): delete `_ = name;`
 //! - Local variables that are never mutated (`local variable is never mutated`): change `var` to
 //!   `const`
-//! - Enum / union prongs missing from a switch: add `.name => {},`
+//! - Enum / union prongs missing from a switch: add `.name => {},` (and `_ => {},` for a
+//!   non-exhaustive enum), with `@panic("TODO")` instead of `{}` where the switch value is used
 //! - Fields missing from a struct initializer (those without a default value): add
 //!   `.name = undefined`
 //!
@@ -40,9 +42,9 @@ pub const Action = struct {
     title: []const u8,
     kind: Kind = .quickfix,
     edits: []const Edit,
-    /// The diagnostic being fixed (position from `live.AstCheck`); null when there is no
-    /// corresponding diagnostic
-    diagnostic: ?struct { start: u32, end: u32 } = null,
+    /// The diagnostic being fixed (position and message from `live.AstCheck`); null when there
+    /// is no corresponding diagnostic
+    diagnostic: ?struct { start: u32, end: u32, message: []const u8 } = null,
     /// Whether this is the preferred fix for the diagnostic (LSP's `isPreferred`); when a
     /// diagnostic has several fixes, only one of them is preferred
     preferred: bool = true,
@@ -59,7 +61,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
         if (d.end < start or d.start > end) continue;
         if (std.mem.eql(u8, d.message, "local variable is never mutated")) {
             const edits = try useConst(r, file, text, d.start) orelse continue;
-            try out.append(r.arena, .{ .title = "use 'const'", .edits = edits, .diagnostic = .{ .start = d.start, .end = d.end } });
+            try out.append(r.arena, .{ .title = "use 'const'", .edits = edits, .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message } });
             continue;
         }
         const edit = if (std.mem.startsWith(u8, d.message, "unused ") and !std.mem.endsWith(u8, d.message, " label"))
@@ -72,7 +74,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
         if (edit) |e| try out.append(r.arena, .{
             .title = try std.fmt.allocPrint(r.arena, "{s} `{s}`", .{ if (e.text.len == 0) "remove discard of" else "discard", name }),
             .edits = try r.arena.dupe(Edit, &.{e}),
-            .diagnostic = .{ .start = d.start, .end = d.end },
+            .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message },
         });
         if (std.mem.eql(u8, d.message, "unused capture") or std.mem.eql(u8, d.message, "unused switch tag capture")) {
             const f = try unused_capture.fix(r, file, d.start) orelse continue;
@@ -82,7 +84,7 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
                 else
                     try std.fmt.allocPrint(r.arena, "rename `{s}` to `_`", .{name}),
                 .edits = f.edits,
-                .diagnostic = .{ .start = d.start, .end = d.end },
+                .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message },
                 // A discard, when offered, is preferred: it leaves the capture intact, and using
                 // the name later only takes deleting the discard. Renaming the payload of a prong
                 // is not preferred when its tag capture is unused too: the preferred fix of the
@@ -118,7 +120,8 @@ pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: o
 
 /// Replaces only complete string literals; the multiline form is decoded token by token, so that
 /// source indentation and CRLF are not counted in the string value. The layout matches `zig fmt`
-/// (see `zigFmtEdit`).
+/// (see `zigFmtEdit`). A multiline string literal is not offered where Zig requires an ordinary
+/// one: the operand of `@import` and the strings of a `build.zig.zon` manifest.
 fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -127,14 +130,21 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
     while (end > start and std.ascii.isWhitespace(text[end - 1])) end -= 1;
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const path = try root.coveringPath(r.arena, start);
-    var literal: ?ast.SyntaxNode = null;
-    for (path) |n| if (n.kind() == .literal) {
-        literal = n;
+    var literal: ?usize = null;
+    for (path, 0..) |n, i| if (n.kind() == .literal) {
+        literal = i;
     };
-    const node = literal orelse return null;
+    const node = path[literal orelse return null];
     const first = node.firstToken() orelse return null;
     const multiline = first.kind == .multiline_string_literal_line;
     if (!multiline and first.kind != .string_literal) return null;
+    if (!multiline) {
+        if (std.mem.eql(u8, std.fs.path.basename(r.ctx.db.env.vfs.path(file)), "build.zig.zon")) return null;
+        if (literal.? >= 2 and path[literal.? - 1].kind() == .arg_list and path[literal.? - 2].kind() == .builtin_call) {
+            const name = path[literal.? - 2].childToken(.builtin) orelse return null;
+            if (std.mem.eql(u8, name.text, "@import")) return null;
+        }
+    }
     var last = first;
     var bytes: std.ArrayList(u8) = .empty;
     var children = node.children();
@@ -553,7 +563,10 @@ fn isPlainType(ip: *InternPool, t: Index) bool {
 }
 
 /// Inserts `_ = name;` after the local binding whose name is at `offset` (after the statement of a
-/// local variable, or at the start of the block that a parameter or capture belongs to)
+/// local variable, or at the start of the block that a parameter or capture belongs to), and after
+/// the `//` comment that ends that line. A `var`, an error set, and an error union are discarded
+/// by address (`_ = &name;`): Sema rejects discarding errors, and a discard does not count as a
+/// mutation of a `var`.
 fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Edit {
     const def = try definition.defAt(r, file, offset) orelse return null;
     const l = switch (def) {
@@ -563,16 +576,28 @@ fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Er
     const b = try r.body(file, l.item);
     const base = (try r.itemNode(file, l.item) orelse return null).offset;
     const binding = b.binding(l.binding);
-    const line = try std.fmt.allocPrint(r.arena, "_ = {s};", .{text[offset .. offset + tokenLen(text, offset)]});
+    const by_address = binding.kind == .local_var or try isError(r, file, l.item, b, l.binding);
+    const line = try std.fmt.allocPrint(r.arena, "_ = {s}{s};", .{ if (by_address) "&" else "", text[offset .. offset + tokenLen(text, offset)] });
     switch (binding.kind) {
         .local_const, .local_var => {
             const s = localStmt(b, l.binding) orelse return null;
-            const at = base + s.end;
+            const at = pastComment(text, base + s.end);
             return .{ .start = at, .end = at, .text = try std.fmt.allocPrint(r.arena, "\n{s}{s}", .{ lineIndent(text, base + binding.range.start), line }) };
         },
         .param => return blockStart(r, text, base, b, b.value orelse return null, line),
         .capture => return blockStart(r, text, base, b, captureBody(b, l.binding) orelse return null, line),
     }
+}
+
+/// The binding's type is an error set or an error union
+fn isError(r: *Resolver, file: FileId, item: u32, b: *const Body, id: Body.BindingId) resolve.Error!bool {
+    const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, item), .mode = .full });
+    if (res.bindings.len != b.bindings.len) return false;
+    return switch (r.ctx.db.env.ip.key(res.bindings[@backingInt(id)].ty)) {
+        .error_set_type, .inferred_error_set, .error_union_type => true,
+        .simple_type => |s| s == .anyerror,
+        else => false,
+    };
 }
 
 /// Changes the never-mutated local `var` whose name is at `offset` to `const`, replacing only the
@@ -621,8 +646,18 @@ fn blockStart(r: *Resolver, text: []const u8, base: u32, b: *const Body, e: Body
     if (b.expr(e) != .block) return null;
     const range = b.range(e);
     const brace = std.mem.indexOfScalarPos(u8, text[0 .. base + range.end], base + range.start, '{') orelse return null;
-    const at: u32 = @intCast(brace + 1);
+    const at = pastComment(text, @intCast(brace + 1));
     return .{ .start = at, .end = at, .text = try std.fmt.allocPrint(r.arena, "\n{s}    {s}", .{ lineIndent(text, at - 1), line }) };
+}
+
+/// The end of the line when only whitespace and a `//` comment follow `at` on it, otherwise `at`
+fn pastComment(text: []const u8, at: u32) u32 {
+    var p = at;
+    while (p < text.len and (text[p] == ' ' or text[p] == '\t')) p += 1;
+    if (!std.mem.startsWith(u8, text[p..], "//")) return at;
+    var line_end: u32 = @intCast(std.mem.indexOfScalarPos(u8, text, p, '\n') orelse text.len);
+    if (line_end > p and text[line_end - 1] == '\r') line_end -= 1;
+    return line_end;
 }
 
 fn localStmt(b: *const Body, id: Body.BindingId) ?Body.Stmt {
@@ -700,22 +735,32 @@ fn innermost(r: *Resolver, file: FileId, offset: u32, comptime tag: std.meta.Tag
     return .{ .item = item, .base = node.offset, .body = b, .expr = best orelse return null };
 }
 
+/// Adds `.name => {}` for the enum or union tags that no prong covers, and `_ => {}` for a
+/// non-exhaustive enum without a `_` prong (Sema requires both even with a `_` prong). An item
+/// other than an enum literal or `_` (`E.a`, an alias) covers the tag it evaluates to; not offered
+/// when the value of such an item is unknown.
 fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Action {
     const at = try innermost(r, file, offset, .@"switch") orelse return null;
     const sw = at.body.expr(at.expr).@"switch";
-    var covered: std.StringHashMapUnmanaged(void) = .empty;
-    for (sw.prongs) |p| {
-        if (p.is_else) return null;
-        for (p.items) |i| switch (at.body.expr(i)) {
-            .enum_literal => |n| try covered.put(r.arena, ast.identName(n), {}),
-            // `_` of a non-exhaustive enum
-            .name_ref => |n| if (std.mem.eql(u8, n, "_")) return null,
-            else => {},
-        };
-    }
+    for (sw.prongs) |p| if (p.is_else) return null;
     const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, at.item), .mode = .full });
     if (res.exprs.len != at.body.exprs.len) return null;
     const ip = r.ctx.db.env.ip;
+    var covered: std.StringHashMapUnmanaged(void) = .empty;
+    var has_underscore = false;
+    for (sw.prongs) |p| for (p.items) |i| switch (at.body.expr(i)) {
+        .enum_literal => |n| try covered.put(r.arena, ast.identName(n), {}),
+        else => |e| if (e == .name_ref and std.mem.eql(u8, e.name_ref, "_") and !at.body.nameRefIsEscaped(i)) {
+            has_underscore = true;
+        } else {
+            const val = res.exprs[@backingInt(i)].val orelse return null;
+            switch (ip.key(val)) {
+                .enum_tag => |t| try covered.put(r.arena, t.name, {}),
+                .enum_literal => |n| try covered.put(r.arena, n, {}),
+                else => return null,
+            }
+        },
+    };
     var ty = res.exprs[@backingInt(sw.operand)].ty;
     if (ip.key(ty) == .union_tag_type) ty = ip.key(ty).union_tag_type;
     const kind = switch (ip.key(ty)) {
@@ -725,17 +770,34 @@ fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
     if (kind != .@"enum" and kind != .@"union") return null;
     const ns = try queries.namespaceOfType(r, ty) orelse return null;
     const tree = try r.itemTree(ns.file);
+    // `{}` is void; where the value of the switch is used, `@panic` coerces to any result type
+    const body = if (isStatement(at.body, at.expr) or res.exprs[@backingInt(at.expr)].ty == .void_type) "{}" else "@panic(\"TODO\")";
     var items: std.ArrayList([]const u8) = .empty;
     for (tree.containerMembers(ns.container)) |m| {
         const it = tree.items[m];
         if (it.kind != .field) continue;
         const name = it.name orelse continue;
         if (covered.contains(ast.identName(name))) continue;
-        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} => {{}}", .{std.zig.fmtIdP(ast.identName(name))}));
+        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} => {s}", .{ std.zig.fmtIdP(ast.identName(name)), body }));
     }
+    if (kind == .@"enum" and tree.containers[ns.container].nonexhaustive and !has_underscore) try items.append(r.arena, try std.fmt.allocPrint(r.arena, "_ => {s}", .{body}));
     if (items.items.len == 0) return null;
     const edit = try appendBeforeClose(r.arena, text, at.base + at.body.range(at.expr).start, at.base + at.body.range(at.expr).end, items.items, true) orelse return null;
     return .{ .title = "add missing switch prongs", .edits = try r.arena.dupe(Edit, &.{edit}) };
+}
+
+/// The expression is a statement of a block (or the body of a `defer` / `errdefer`), where its
+/// value must be void
+fn isStatement(b: *const Body, e: Body.ExprId) bool {
+    for (b.exprs) |x| switch (x) {
+        .block => |blk| for (blk.stmts) |s| switch (s.kind) {
+            .expr, .@"defer" => |y| if (y == e) return true,
+            .@"errdefer" => |y| if (y.body == e) return true,
+            else => {},
+        },
+        else => {},
+    };
+    return false;
 }
 
 fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Action {
@@ -744,8 +806,16 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
     for (init.fields) |f| if (f.name == null) return null;
     const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, at.item), .mode = .full });
     if (res.exprs.len != at.body.exprs.len) return null;
-    const ty = res.exprs[@backingInt(at.expr)].ty;
-    switch (r.ctx.db.env.ip.key(ty)) {
+    // The initializer is of the payload type of an optional or error union result type (as with
+    // Sema's `optEuBaseType`)
+    const ip = r.ctx.db.env.ip;
+    var ty = res.exprs[@backingInt(at.expr)].ty;
+    while (true) switch (ip.key(ty)) {
+        .optional_type => |child| ty = child,
+        .error_union_type => |eu| ty = eu.payload,
+        else => break,
+    };
+    switch (ip.key(ty)) {
         .container_type => |c| if (!c.kind.isStruct()) return null,
         else => return null,
     }
@@ -772,15 +842,23 @@ fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
 
 /// Appends entries before the `}` of `[start, end)` (which ends with `}`): when multiline, one
 /// entry per line with a trailing comma; on a single line, separated by `, ` (without a trailing
-/// comma, otherwise zig fmt would expand it into multiple lines)
+/// comma, otherwise zig fmt would expand it into multiple lines). A missing comma goes right after
+/// the last element, before the `//` comments that follow it, which stay unchanged.
 fn appendBeforeClose(a: Allocator, text: []const u8, start: u32, end: u32, items: []const []const u8, multiline: bool) Allocator.Error!?Edit {
     if (end == 0 or end > text.len or text[end - 1] != '}') return null;
     const close = end - 1;
-    var p = close;
-    while (p > start and std.ascii.isWhitespace(text[p - 1])) p -= 1;
+    const comments_end = trimEnd(text, start, close);
+    var p = comments_end;
+    while (p > start) {
+        const line_start: u32 = if (std.mem.lastIndexOfScalar(u8, text[0 .. p - 1], '\n')) |i| @intCast(i + 1) else 0;
+        const comment = commentStart(text[line_start..p]) orelse break;
+        if (line_start + comment < start) break;
+        p = trimEnd(text, start, line_start + comment);
+    }
     const prev = text[p - 1];
     var out: std.ArrayList(u8) = .empty;
     if (prev != ',' and prev != '{') try out.append(a, ',');
+    try out.appendSlice(a, text[p..comments_end]);
     if (multiline) {
         const indent = lineIndent(text, start);
         for (items) |it| try out.print(a, "\n{s}    {s},", .{ indent, it });
@@ -790,6 +868,33 @@ fn appendBeforeClose(a: Allocator, text: []const u8, start: u32, end: u32, items
         try out.append(a, ' ');
     }
     return .{ .start = p, .end = close, .text = out.items };
+}
+
+/// The offset before the whitespace that ends `text[start..end]`
+fn trimEnd(text: []const u8, start: u32, end: u32) u32 {
+    var p = end;
+    while (p > start and std.ascii.isWhitespace(text[p - 1])) p -= 1;
+    return p;
+}
+
+/// Offset of the `//` comment in the source line `line`, outside string and character literals
+fn commentStart(line: []const u8) ?u32 {
+    const code = std.mem.trimStart(u8, line, " \t");
+    // A multiline string literal line
+    if (std.mem.startsWith(u8, code, "\\\\")) return null;
+    var i: u32 = 0;
+    var quote: ?u8 = null;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (quote) |q| {
+            if (c == '\\') i += 1 else if (c == q) quote = null;
+        } else if (c == '"' or c == '\'') {
+            quote = c;
+        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '/') {
+            return i;
+        }
+    }
+    return null;
 }
 
 /// Indentation of the line containing `offset`

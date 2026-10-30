@@ -171,6 +171,44 @@ test "build graph: an imported module inherits the options it does not set from 
     try testing.expectEqualStrings("build-obj", leaf);
 }
 
+test "build graph: compile steps carry their error limit" {
+    // Prevents ignoring `error_limit`, which sets the bit width of error codes
+    var model = try loadModel(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = b.graph.host,
+        \\    }) });
+        \\    exe.error_limit = 255;
+        \\    b.installArtifact(exe);
+        \\    const tool = b.addObject(.{ .name = "tool", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("tool.zig"),
+        \\        .target = b.graph.host,
+        \\    }) });
+        \\    b.step("tool", "Build the tool").dependOn(&tool.step);
+        \\}
+        \\
+        },
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "tool.zig", .text = "" },
+    }, &.{});
+    defer model.deinit(testing.allocator);
+    var seen: u32 = 0;
+    for (model.steps) |s| {
+        if (s.kind != .compile) continue;
+        if (std.mem.startsWith(u8, s.name, "compile exe app")) {
+            try testing.expectEqual(@as(?u32, 255), s.kind.compile.error_limit);
+            seen += 1;
+        } else if (std.mem.startsWith(u8, s.name, "compile obj tool")) {
+            try testing.expectEqual(@as(?u32, null), s.kind.compile.error_limit);
+            seen += 1;
+        }
+    }
+    try testing.expectEqual(2, seen);
+}
+
 fn stopAfter(io: std.Io, client: *bsp.Client, fired: *bool) std.Io.Cancelable!void {
     try io.sleep(.fromSeconds(20), .awake);
     fired.* = true;

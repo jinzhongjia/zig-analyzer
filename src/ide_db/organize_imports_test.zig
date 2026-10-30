@@ -206,6 +206,25 @@ test "organize imports: comments move with their declarations, other code splits
     , try organized(arena.allocator(), text, .{}));
 }
 
+test "organize imports and auto import keep a file header touching the first import first" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The header must not move into the import list with the first import
+    const header = "// Copyright 2024 Example\n// SPDX-License-Identifier: MIT\n";
+    for ([_][]const u8{ "", "\xEF\xBB\xBF" }) |bom| {
+        const text = try std.mem.concat(a, u8, &.{ bom, header, "const foo = @import(\"foo.zig\");\nconst std = @import(\"std\");\n" });
+        try testing.expectEqualStrings(
+            try std.mem.concat(a, u8, &.{ bom, header, "const std = @import(\"std\");\n\nconst foo = @import(\"foo.zig\");\n" }),
+            try organized(a, text, .{}),
+        );
+    }
+    try testing.expectEqualStrings(
+        header ++ "const eql = @import(\"std\").mem.eql;\n\nconst foo = @import(\"foo.zig\");\n",
+        try inserted(a, header ++ "const foo = @import(\"foo.zig\");\n", "eql", "std", "const eql = @import(\"std\").mem.eql;"),
+    );
+}
+
 test "organize imports: CRLF files keep CRLF" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -303,6 +322,20 @@ test "auto import inserts into the organized block at its sorted place, otherwis
     try testing.expectEqualStrings(
         "//! Docs.\nconst c = @import(\"c.zig\");\nfn main() void {}",
         try inserted(a, "//! Docs.\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
+    );
+    // No imports: after a comment header that a blank line separates from the code; a comment
+    // directly above a declaration belongs to it
+    try testing.expectEqualStrings(
+        "// SPDX-License-Identifier: MIT\n\nconst c = @import(\"c.zig\");\nfn main() void {}",
+        try inserted(a, "// SPDX-License-Identifier: MIT\n\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
+    );
+    try testing.expectEqualStrings(
+        "//! Docs.\n\n// License\n// Copyright\n\nconst c = @import(\"c.zig\");\nfn main() void {}",
+        try inserted(a, "//! Docs.\n\n// License\n// Copyright\n\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
+    );
+    try testing.expectEqualStrings(
+        "const c = @import(\"c.zig\");\n// Entry point.\nfn main() void {}",
+        try inserted(a, "// Entry point.\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
     );
 }
 

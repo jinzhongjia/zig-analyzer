@@ -167,8 +167,7 @@ pub const Key = union(enum) {
     abstract_array_type: struct { len: []const u8, child: Index, sentinel: ?Index = null },
     optional_type: Index,
     error_union_type: struct { err: Index, payload: Index },
-    /// Names sorted lexicographically, without duplicates
-    error_set_type: []const []const u8,
+    error_set_type: ErrorSet,
     /// The error set of a function's `!T` inferred from the function body. The signature records
     /// only this marker; the members are computed on demand by `ErrorSetOf`.
     inferred_error_set: struct { file: FileId, decl: AstId, inst: ?Index = null },
@@ -227,6 +226,33 @@ pub const Key = union(enum) {
     opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
     /// Placeholder for non-comptime parameters among the arguments of an instance
     runtime,
+};
+
+/// Members of an error set, without duplicates. Two sets with the same members are the same
+/// type whatever the order of their names: identity (hashing, equality) follows `sorted`, and
+/// `names` keeps the order of the first set interned with these members. The compiler lists
+/// `@typeInfo(E).error_set.error_names` in the order in which it first saw each name (in
+/// practice, the declaration order), but `@typeName` sorted by bytes.
+pub const ErrorSet = struct {
+    names: []const []const u8,
+    /// Indexes into `names`, ordering the names by their bytes
+    sorted: []const u32,
+
+    pub const empty: ErrorSet = .{ .names = &.{}, .sorted = &.{} };
+
+    fn hash(es: ErrorSet, h: *std.hash.Wyhash) void {
+        std.hash.autoHash(h, es.sorted.len);
+        for (es.sorted) |i| {
+            std.hash.autoHash(h, es.names[i].len);
+            h.update(es.names[i]);
+        }
+    }
+
+    fn eql(a: ErrorSet, b: ErrorSet) bool {
+        if (a.sorted.len != b.sorted.len) return false;
+        for (a.sorted, b.sorted) |i, j| if (!std.mem.eql(u8, a.names[i], b.names[j])) return false;
+        return true;
+    }
 };
 
 /// Fields of a tuple
@@ -352,14 +378,25 @@ pub const TypedValue = struct {
 const KeyContext = struct {
     pub fn hash(_: KeyContext, k: Key) u64 {
         var h: std.hash.Wyhash = .init(0);
-        // Error sets are slices of slices: pointers must be followed at every level
-        std.hash.autoHashStrat(&h, k, .DeepRecursive);
+        switch (k) {
+            .error_set_type => |es| {
+                std.hash.autoHash(&h, std.meta.activeTag(k));
+                es.hash(&h);
+            },
+            // Name lists are slices of slices: pointers must be followed at every level
+            else => std.hash.autoHashStrat(&h, k, .DeepRecursive),
+        }
         return h.final();
     }
     pub fn eql(_: KeyContext, a: Key, b: Key) bool {
-        return deepEql(a, b);
+        return keyEql(a, b);
     }
 };
+
+fn keyEql(a: Key, b: Key) bool {
+    if (a == .error_set_type and b == .error_set_type) return a.error_set_type.eql(b.error_set_type);
+    return deepEql(a, b);
+}
 
 /// Corresponds one-to-one to the preset members of `Index`
 const preset = [_]Key{
@@ -385,7 +422,7 @@ const preset = [_]Key{
     .{ .simple_value = .null },
     .{ .simple_value = .undefined },
     .runtime,
-    .{ .error_set_type = &.{} },
+    .{ .error_set_type = .empty },
 };
 
 pub fn init(gpa: Allocator, io: Io) Allocator.Error!InternPool {
@@ -454,6 +491,10 @@ pub fn scalarAbi(ip: *const InternPool) *const ScalarAbi {
     return &ip.currentTarget().scalar_abi;
 }
 
+pub fn errorBits(ip: *const InternPool) ?u16 {
+    return ip.currentTarget().error_bits;
+}
+
 /// May only be called in a write transaction
 pub fn setTarget(ip: *InternPool, t: Target) void {
     ip.target = t;
@@ -484,7 +525,18 @@ pub const Target = struct {
     pointer_bits: ?u16 = @bitSizeOf(usize),
     vector_abi: VectorAbi = .unknown,
     scalar_abi: ScalarAbi = .native,
+    /// Bit width of error codes, set by the compilation's error limit (`errorBitsOf`); null when
+    /// the compilations the parameters are common to disagree
+    error_bits: ?u16 = errorBitsOf(null),
 };
+
+/// Bit width of error codes for the error limit of a compilation (`--error-limit`, the compiler's
+/// default when null): enough bits for the largest error value, as the compiler's
+/// `Zcu.errorSetBits`
+pub fn errorBitsOf(error_limit: ?u32) u16 {
+    const limit: u32 = error_limit orelse std.math.maxInt(u16);
+    return 32 - @clz(limit);
+}
 
 /// Layouts of integer, float and C types, and the bit widths and signedness of C integer types
 /// (the corresponding branches of the compiler's `Type.abiAlignment` / `abiSize` / `intInfo`),
@@ -643,7 +695,7 @@ const Prehashed = struct {
         return c.h;
     }
     pub fn eql(_: Prehashed, a: Key, b: Key) bool {
-        return deepEql(a, b);
+        return keyEql(a, b);
     }
 };
 
@@ -651,10 +703,10 @@ const Prehashed = struct {
 fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
     const a = ip.arena.allocator();
     return switch (k) {
-        .error_set_type => |names| blk: {
-            const out = try a.alloc([]const u8, names.len);
-            for (names, out) |n, *o| o.* = try a.dupe(u8, n);
-            break :blk .{ .error_set_type = out };
+        .error_set_type => |es| blk: {
+            const out = try a.alloc([]const u8, es.names.len);
+            for (es.names, out) |n, *o| o.* = try a.dupe(u8, n);
+            break :blk .{ .error_set_type = .{ .names = out, .sorted = try a.dupe(u32, es.sorted) } };
         },
         .fn_type => |f| .{ .fn_type = .{ .params = try a.dupe(Index, f.params), .ret = f.ret, .varargs = f.varargs } },
         .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
@@ -716,22 +768,48 @@ pub fn ptrTo(ip: *InternPool, child: Index, size: PtrSize, is_const: bool) Alloc
     return ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const } });
 }
 
-/// Error set: the names are sorted and deduplicated
+/// Error set with the given names (later duplicates are dropped); when a set with the same
+/// members already exists, that set (with the order of its names) is returned
 pub fn errorSet(ip: *InternPool, gpa: Allocator, names: []const []const u8) Allocator.Error!Index {
-    const sorted = try gpa.dupe([]const u8, names);
-    defer gpa.free(sorted);
-    std.mem.sort([]const u8, sorted, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    // Positions ordered by the bytes of the names, equal names by position: the first occurrence
+    // of a name comes first
+    const order = try gpa.alloc(u32, names.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, names, struct {
+        fn lt(ns: []const []const u8, a: u32, b: u32) bool {
+            return switch (std.mem.order(u8, ns[a], ns[b])) {
+                .lt => true,
+                .gt => false,
+                .eq => a < b,
+            };
         }
     }.lt);
-    var n: usize = 0;
-    for (sorted) |s| {
-        if (n > 0 and std.mem.eql(u8, sorted[n - 1], s)) continue;
-        sorted[n] = s;
+    // Position of each first occurrence among the kept names (`dropped` for duplicates)
+    const dropped = std.math.maxInt(u32);
+    const pos = try gpa.alloc(u32, names.len);
+    defer gpa.free(pos);
+    @memset(pos, dropped);
+    var prev: ?u32 = null;
+    for (order) |i| if (prev == null or !std.mem.eql(u8, names[prev.?], names[i])) {
+        pos[i] = 0;
+        prev = i;
+    };
+    const kept = try gpa.alloc([]const u8, names.len);
+    defer gpa.free(kept);
+    var n: u32 = 0;
+    for (names, pos) |name, *p| if (p.* != dropped) {
+        kept[n] = name;
+        p.* = n;
         n += 1;
-    }
-    return ip.get(.{ .error_set_type = sorted[0..n] });
+    };
+    // `order` becomes the positions of the kept names ordered by bytes (written behind reading)
+    var m: usize = 0;
+    for (order) |i| if (pos[i] != dropped) {
+        order[m] = pos[i];
+        m += 1;
+    };
+    return ip.get(.{ .error_set_type = .{ .names = kept[0..n], .sorted = order[0..m] } });
 }
 
 /// Type of a string literal, `*const [len:0]u8`
@@ -824,12 +902,12 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(e.payload, w, container_name);
         },
         .inferred_error_set => if (@hasDecl(@TypeOf(container_name), "writeInferredErrorSet")) try container_name.writeInferredErrorSet(index, w) else try w.writeAll("anyerror"),
-        .error_set_type => |names| {
+        .error_set_type => |es| {
             try w.writeAll("error{");
-            for (names, 0..) |n, i| {
+            for (es.sorted, 0..) |n, i| {
                 if (i != 0) try w.writeAll(",");
-                if (try truncateList(container_name, w, names.len)) break;
-                try w.writeAll(n);
+                if (try truncateList(container_name, w, es.sorted.len)) break;
+                try w.writeAll(es.names[n]);
             }
             try w.writeAll("}");
         },

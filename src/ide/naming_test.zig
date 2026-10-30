@@ -263,3 +263,33 @@ test "naming: unclear cases are skipped" {
         \\
     );
 }
+
+test "naming: @compileError stubs keep the name of the API they replace" {
+    // Guards against renaming a deprecation stub, which drops its message for old callers
+    try expectFindings(
+        \\//- /p/main.zig
+        \\pub const getHost = @compileError("This function has been moved to HostName.fromUri");
+        \\const PtRegs = @compileError("TODO missing os bits: PtRegs");
+        \\const maxSize: usize = 4;
+    ,
+        \\maxSize -> max_size (value)
+        \\
+    );
+}
+
+test "naming: top-level declarations the standard library looks up by name" {
+    // Guards against renaming a declaration that the standard library finds by name
+    try expectFindings(
+        \\//- /p/main.zig
+        \\pub fn DllMain() void {}
+        \\pub fn std_options_cwd() void {}
+        \\pub const std_options_FilePermissions = u32;
+        \\const S = struct {
+        \\    a: u32,
+        \\    pub fn DllMain() void {}
+        \\};
+    ,
+        \\DllMain -> dllMain (function)
+        \\
+    );
+}

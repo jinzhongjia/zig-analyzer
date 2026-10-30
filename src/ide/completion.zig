@@ -1,6 +1,7 @@
 //! Completion: after `a.`, lists the members of the namespace; after `.`, lists members by the
-//! expected type, and in initializers the fields not yet assigned; after `error.`, lists error
-//! names; after `@`, lists builtins; inside `@import("`, lists modules and files; after `break :` /
+//! expected type, and in initializers the fields not yet assigned; after `.@`, the same names
+//! quoted (`.@"name"`); after `error.`, lists error names; after `@`, lists builtins (not in `.zon`
+//! files); inside `@import("`, lists modules and files; after `break :` /
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
 //! the declarations of enclosing containers). When `build.zig.zon` has no result type, its fields
 //! and paths are listed by the built-in schema (see `manifest.zig`).
@@ -58,6 +59,10 @@ pub const Options = struct {
     snippets: bool = false,
     /// Call snippets insert a placeholder for each argument; otherwise only the parentheses
     argument_placeholders: bool = true,
+    /// Complete only paths (`@import` strings and the paths of `build.zig.zon`), with no items
+    /// elsewhere: completion triggered by `/` or `"`, which outside such a string are a division,
+    /// a comment, or the quotes of another string
+    paths_only: bool = false,
 };
 
 pub const Result = struct {
@@ -76,8 +81,10 @@ pub const Item = struct {
     /// Type
     detail: ?[]const u8 = null,
     /// Range to replace (byte offsets in the file; the inserted text is `label`, or `snippet` when
-    /// there is one); when null, the client determines it by word. Needed for characters that are
-    /// not part of a word, such as `@` and the `/` in paths.
+    /// there is one); when null, the client determines it by word. It ends at the end of the word
+    /// (for paths, of the string content) after the cursor; inserting instead of replacing ends at
+    /// the cursor. Needed for characters that are not part of a word, such as `@` and the `/` in
+    /// paths.
     replace: ?Range = null,
     filter: ?[]const u8 = null,
     qualifier: ?[]const u8 = null,
@@ -115,7 +122,8 @@ pub const Item = struct {
 
 pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resolve.Error!Result {
     var owner: imports.Owner = .unknown;
-    const visible = try completeVisible(r, file, offset, &owner);
+    const visible = try completeVisible(r, file, offset, &owner, options.paths_only);
+    if (options.paths_only and visible.context != .path) return .{ .items = &.{} };
     const base = visible.items;
     // Auto-import and snippets only in Zig source files: inserting an import declaration or code
     // into a `.zon` or similar file would break it
@@ -124,10 +132,15 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     if (offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = if (offset == 0) null else try importPrefix(r.arena, root, text, offset);
-    if (name == null and !options.snippets) return .{ .items = base };
+    // Before a name is typed in an expression, the member paths of local values and the
+    // auto-import candidates are not listed yet: typing a prefix adds them, so the client must ask
+    // again
+    const incomplete = name == null and visible.context == .scope and
+        (options.auto_import or visible.roots.len != 0) and namePosition(root, text, offset);
+    if (name == null and !options.snippets) return .{ .items = base, .is_incomplete = incomplete };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    var result: Result = .{ .items = &.{}, .import_position = name != null and (options.auto_import or options.detect_import_position) };
+    var result: Result = .{ .items = &.{}, .is_incomplete = incomplete, .import_position = name != null and (options.auto_import or options.detect_import_position) };
     if (name) |n| {
         const limit = options.max_auto_imports;
         const paths = try localMembers(r, file, visible.roots, n, limit);
@@ -211,7 +224,7 @@ fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
     for (items) |*it| {
         if (it.weight != 0) it.score = ((try matcher.score(it.label)) orelse 0) * it.weight;
-        if (expected) |x| if (it.score > 0 and try x.matches(it.origin)) {
+        if (expected) |x| if (it.score > 0 and try x.matches(it.origin, it.snippet != null)) {
             it.score *= expected_boost;
         };
     }
@@ -301,7 +314,8 @@ const Visible = struct {
         /// In a comment or string, or past the end of the text
         ignored,
         builtin,
-        import_path,
+        /// In the string of an `@import` or a string of `build.zig.zon` (paths)
+        path,
         label,
         /// After `lhs.`
         member,
@@ -315,39 +329,51 @@ const Visible = struct {
     };
 };
 
-/// `cursor_owner` records the member found at the cursor, which auto-import reuses
-fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
+/// `cursor_owner` records the member found at the cursor, which auto-import reuses; with
+/// `paths_only`, nothing but paths is completed
+fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner, paths_only: bool) resolve.Error!Visible {
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return .{ .context = .ignored };
 
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return .{ .context = .ignored };
+    if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
-    if (literal == .none) if (builtinStart(text, offset)) |start| {
+    if (literal == .none and !paths_only) if (builtinStart(text, offset)) |start| {
+        // Only a name follows a `.`, so `.@` starts a quoted name (`.@"name"`): the names that
+        // complete after the `.`, quoted
+        if (afterDot(text, start)) return quotedAfterDot(r, file, start, offset, cursor_owner);
+        // `.zon` files have no builtin calls
+        if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) return .{ .context = .ignored };
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
         return .{ .items = out.items.items, .context = .builtin };
     };
     if (importString(text, offset)) |start| {
-        try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = offset });
-        return .{ .items = out.items.items, .context = .import_path };
+        try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) });
+        return .{ .items = out.items.items, .context = .path };
     }
     if (literal == .string) {
         try manifestPaths(r, &out, file, text, offset);
-        return .{ .items = out.items.items, .context = .ignored };
+        return .{ .items = out.items.items, .context = .path };
     }
+    if (paths_only) return .{ .context = .ignored };
 
-    cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) };
+    cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) orelse try protoOwner(r, file, offset) };
     const item = cursor_owner.known orelse return .{};
     const node = try r.itemNode(file, item) orelse return .{};
     const b = try r.body(file, item);
     const rel = offset - node.offset;
 
-    if (labelStart(text, offset) != null) {
+    // `continue` targets only loops and labeled switches, `break` any labeled expression
+    if (labelKeyword(text, offset)) |keyword| {
         var s: ?Body.ScopeId = b.scopeAt(rel);
-        while (s) |id| : (s = b.scope(id).parent) if (b.scope(id).label) |l| try out.add(.{ .label = l.name, .kind = .label });
+        while (s) |id| : (s = b.scope(id).parent) if (b.scope(id).label) |l| {
+            if (keyword == .@"continue" and b.expr(l.expr) == .block) continue;
+            try out.add(.{ .label = l.name, .kind = .label });
+        };
         return .{ .items = out.items.items, .context = .label };
     }
 
@@ -379,7 +405,9 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     };
 
     // `.` / `.na` (enum literals, decl literals): list members by the expected type; in an
-    // initializer (`.{ .x = 1, .| }`), list the fields not yet assigned
+    // initializer of a struct or union (`.{ .x = 1, .| }`), list the fields not yet assigned. An
+    // element of an array, slice or tuple initializer is a value whose expected type is the element
+    // type
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
         out.member_mode = true;
         const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .enum_literal };
@@ -389,27 +417,53 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 for (try manifest.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
                 return .{ .items = out.items.items, .context = .init_field };
             } else a.exprType(init).ty;
-            try initFields(r, &out, ty, x.fields);
-            return .{ .items = out.items.items, .context = .init_field };
+            if (fieldsType(r.ctx.db.env.ip, ty)) |t| {
+                try initFields(r, &out, t, x.fields);
+                return .{ .items = out.items.items, .context = .init_field };
+            }
         }
-        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, !a.literalTagsOnly(e), file);
+        const want = a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a };
+        const operand = literalOperand(b, e);
+        const mode: DeclLiterals = if (a.literalTagsOnly(e)) .none else if (isTryOperand(b, operand)) .@"try" else .value;
+        try expectedMembers(r, &out, if (mode == .value) try literalResultType(r, a, operand, want) else want, mode, file);
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
 
-    // Names in scope: when the cursor immediately follows a name, use the scope of that name
-    const scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
+    // The name of a field already written in an initializer (`.{ .al| = 1 }`): the fields that the
+    // other names do not assign
+    if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .init) {
+        const x = b.expr(e).init;
+        for (x.fields, 0..) |f, i| {
+            if (f.name == null or rel - 1 < f.name_range.start or rel - 1 >= f.name_range.end) continue;
+            out.member_mode = true;
+            const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .init_field };
+            const ty = if (x.ty == null) a.literalExpected(e) orelse return .{ .context = .init_field } else a.exprType(e).ty;
+            const t = fieldsType(r.ctx.db.env.ip, ty) orelse return .{ .context = .init_field };
+            try initFields(r, &out, t, try std.mem.concat(r.arena, Body.FieldInit, &.{ x.fields[0..i], x.fields[i + 1 ..] }));
+            return .{ .items = out.items.items, .context = .init_field };
+        }
+    };
+
+    // Names in scope: when the cursor immediately follows a name, use the scope of that name; at a
+    // parameter or return type not written yet, the scope of the parameters before it
+    var scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .name_ref => b.expr_scopes[@backingInt(e)],
         else => b.scopeAt(rel),
     } else b.scopeAt(rel) else b.scopeAt(rel);
+    if (scope == .root) if (protoScope(b, node, offset)) |s| {
+        scope = s;
+    };
     // The kinds of local names come from the inference result of the member at the cursor
     // (inside a generic function body, from a call-site instance)
     const at = try context.atSeeded(r, file, offset, true);
     const types: BindingTypes = if (at) |a| .{ .at = a } else .none;
     // Local values that are not shadowed are the roots of member paths
     var roots: std.ArrayList(Root) = .empty;
-    try locals(r, &out, b, scope, null, types, &roots);
+    try locals(r, &out, b, scope, null, types, .all, &roots);
 
     const tree = try r.itemTree(file);
+    // Inside `@TypeOf`, only the types of the values are used: every binding is accessible
+    const in_typeof = inTypeOf(b, rel);
     var container = tree.items[item].container;
     var level: f32 = 0;
     while (true) : (level += 1) {
@@ -423,10 +477,101 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
         const parent_res = try r.ctx.get(database.sema.Infer, .{ .owner = try r.ownerKey(file, parent), .mode = .full });
-        try locals(r, &out, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res }, &roots);
+        const access: Access = if (in_typeof or tree.items[parent].kind != .@"fn") .all else if (returnsType(pb, parent_res)) .no_vars else .comptime_known;
+        try locals(r, &out, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res }, access, &roots);
         container = tree.items[parent].container;
     }
     return .{ .items = out.items.items, .context = .scope, .item = item, .scope = scope, .at = at, .roots = roots.items };
+}
+
+/// Completion at `.@` (the `@` at `at`): the names that complete right after the `.` (members,
+/// enum and decl literals, initializer fields), written as quoted identifiers that replace from
+/// the `@`. Nothing when name characters precede the cursor (`.@na` is no name)
+fn quotedAfterDot(r: *Resolver, file: FileId, at: u32, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
+    if (offset != at + 1) return .{ .context = .ignored };
+    var visible = try completeVisible(r, file, at, cursor_owner, false);
+    switch (visible.context) {
+        .member, .enum_literal, .init_field => {},
+        else => return .{ .context = .ignored },
+    }
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    const range: Item.Range = .{ .start = at, .end = identEnd(text, offset) };
+    const items = try r.arena.dupe(Item, visible.items);
+    for (items) |*it| {
+        if (!std.mem.startsWith(u8, it.label, "@\"")) it.label = try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
+        it.replace = range;
+    }
+    visible.items = items;
+    return visible;
+}
+
+/// The scope of the parameters before `offset` in the prototype of the function `node` (whose
+/// Body is `b`), as the compiler evaluates each parameter type and the return type: the
+/// parameters ended by a `,` before it, and all of them after the `)`. Null outside the parameter
+/// list and the return type, or when no parameter precedes. Needed where the type is not written
+/// yet, which has no expression to carry its scope
+fn protoScope(b: *const Body, node: SyntaxNode, offset: u32) ?Body.ScopeId {
+    const decl = ast.cast(ast.FnDecl, node) orelse return null;
+    if (decl.body()) |body| if (offset > body.syntax.offset) return null;
+    const proto = decl.proto() orelse return null;
+    const list = proto.syntax.childNode(.param_list) orelse return null;
+    if (offset <= list.offset) return null;
+    var last: ?SyntaxNode = null;
+    var pending: ?SyntaxNode = null;
+    var it = list.children();
+    while (it.next()) |child| {
+        if (child.range().end > offset) break;
+        switch (child) {
+            .node => |n| if (n.kind() == .param) {
+                pending = n;
+            },
+            .token => |t| switch (t.kind) {
+                .comma, .r_paren => if (pending) |p| {
+                    last = p;
+                    pending = null;
+                },
+                else => {},
+            },
+        }
+    }
+    const param = ast.cast(ast.Param, last orelse return null).?;
+    // An unnamed parameter is bound at the start of the parameter (see `lower`)
+    const start = (param.name() orelse SyntaxToken{ .kind = .identifier, .text = "", .offset = param.syntax.offset }).offset - node.offset;
+    const bid = for (b.params) |p| {
+        if (b.binding(p).range.start == start) break p;
+    } else return null;
+    for (b.scopes, 0..) |s, i| {
+        if (s.bindings.len == 1 and s.bindings[0] == bid) return @fromBackingInt(@as(u32, @intCast(i)));
+    }
+    return null;
+}
+
+/// A function with no body yet, at whose return type the cursor is (`fn f(comptime T: type) |`):
+/// the cursor is past the end of its node
+fn protoOwner(r: *Resolver, file: FileId, offset: u32) resolve.Error!?u32 {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const prev = tokenBefore(root, offset) orelse return null;
+    if (prev.kind != .r_paren and prev.kind != .bang) return null;
+    const item = try r.ownerAt(file, prev.offset, false) orelse return null;
+    if ((try r.itemTree(file)).items[item].kind != .@"fn") return null;
+    const decl = ast.cast(ast.FnDecl, try r.itemNode(file, item) orelse return null) orelse return null;
+    if (decl.body() != null) return null;
+    const proto = decl.proto() orelse return null;
+    // `prev` ends the parameter list or is the `!` of the return type
+    const end = if (prev.kind == .r_paren)
+        (proto.syntax.childNode(.param_list) orelse return null).childToken(.r_paren)
+    else
+        proto.syntax.childToken(.bang);
+    return if (end != null and end.?.offset == prev.offset) item else null;
+}
+
+/// Typing at the cursor can make a name in an expression that `importPrefix` accepts: no
+/// identifier precedes the cursor, or the one that does is a reference `importPrefix` does not take
+/// (a primitive name or `_`, which more characters turn into a name)
+fn namePosition(root: SyntaxNode, text: []const u8, offset: u32) bool {
+    if (offset == 0 or !isIdentChar(text[offset - 1])) return true;
+    const token = root.tokenAtOffset(offset - 1) orelse return false;
+    return token.kind == .identifier and tokenParent(root, offset - 1) == .name_ref;
 }
 
 const ImportPrefix = struct {
@@ -580,17 +725,59 @@ const BindingTypes = union(enum) {
     }
 };
 
+/// Which bindings of an enclosing function a function in a container declared in its body can
+/// access (as in the compiler: AstGen rejects non-comptime `var`s, Sema runtime values)
+const Access = enum {
+    /// Every binding: the function at the cursor, a comptime initializer (not a function), or
+    /// inside `@TypeOf`, where only the types are used
+    all,
+    /// A function returning `type`, whose calls are all evaluated at comptime: every binding but
+    /// the non-comptime `var`s
+    no_vars,
+    /// Comptime parameters, `comptime var`s, and the values known at comptime; a binding whose
+    /// type is unknown counts as accessible
+    comptime_known,
+
+    fn allows(access: Access, binding: Body.Binding, tv: TypedValue) bool {
+        if (access == .all or binding.is_comptime) return true;
+        if (binding.kind == .local_var) return false;
+        if (access == .no_vars or tv.ty == .unknown) return true;
+        const v = tv.val orelse return false;
+        return v != .runtime;
+    }
+};
+
+/// Whether the body of the function `fb` returns `type`
+fn returnsType(fb: *const Body, res: *const infer.Result) bool {
+    const t = fb.type_expr orelse return false;
+    if (@backingInt(t) >= res.exprs.len) return false;
+    return res.exprs[@backingInt(t)].asType() == .type_type;
+}
+
+/// The position `rel` is inside the parentheses of `@TypeOf(...)`
+fn inTypeOf(b: *const Body, rel: u32) bool {
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .builtin_call => |c| if (std.mem.eql(u8, c.name, "@TypeOf")) {
+            const range = b.range(@fromBackingInt(@as(u32, @intCast(i))));
+            if (rel > range.start + c.name.len and rel < range.end) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
 /// When `weight` is null, the weight follows the kind of the binding; otherwise every name gets
-/// `weight` (names in an enclosing function). Local values that are not shadowed are recorded in
-/// `roots` (see `rootOf`)
-fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes, roots: *std.ArrayList(Root)) resolve.Error!void {
+/// `weight` (names in an enclosing function). Only the bindings that `access` allows are listed.
+/// Local values that are not shadowed are recorded in `roots` (see `rootOf`)
+fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes, access: Access, roots: *std.ArrayList(Root)) resolve.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
         for (b.scope(id).bindings) |bid| {
             const binding = b.binding(bid);
             const tv = types.of(bid);
+            if (!access.allows(binding, tv)) continue;
             if (!out.seen.contains(binding.name)) if (rootOf(binding, tv, weight != null)) |root| try roots.append(out.arena, root);
-            const kind = kindOf(symbol_kind.ofBinding(r.ctx.db.env.ip, binding, tv));
+            const kind = kindOf(try symbol_kind.ofBinding(r, binding, tv));
             try out.add(.{
                 .label = binding.name,
                 .kind = kind,
@@ -664,15 +851,23 @@ fn kindOf(symbol: symbol_kind.Symbol) Item.Kind {
 fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     if (tv.asType()) |t| {
-        // Constructed enums (`@Enum`, the tag enum of a union(enum)): members
         switch (ip.key(t)) {
-            .reified_type, .union_tag_type => {
+            // Constructed types have no declarations: the members of a constructed enum, and the
+            // tags of a tagged constructed union (`U.a` is the tag of the field)
+            .reified_type => |rt| {
+                if (rt.kind == .@"enum" or (rt.kind == .@"union" and rt.tag != null)) {
+                    for (rt.names) |name| try out.add(.{ .label = name, .kind = .enum_member });
+                }
+                return;
+            },
+            // The tag enum of a union(enum): its members
+            .union_tag_type => {
                 for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
                 return;
             },
             // Error set (after `Error.`): its error names
-            .error_set_type => |names| {
-                for (names) |name| try out.add(.{ .label = name, .kind = .enum_member });
+            .error_set_type => |es| {
+                for (es.sorted) |i| try out.add(.{ .label = es.names[i], .kind = .enum_member });
                 return;
             },
             else => {},
@@ -680,8 +875,9 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, fr
         const ns = try queries.namespaceOfType(r, t) orelse return;
         return members(r, out, ns, ns.file == from);
     }
-    // A single pointer is dereferenced automatically once: len of `*[N]T`, fields and methods of
-    // `*S`, len and ptr of `*[]T`; whether the value can be modified then depends on the pointer
+    // A single pointer is dereferenced automatically once: fields and methods of `*S`, len and ptr
+    // of `*[]T`; whether the value can be modified then depends on the pointer. A pointer to an
+    // array keeps its own members (see `valueMembers`)
     const holder = (Place{ .ty = tv.ty, .mutable = mutable }).deref(ip);
     for (try valueMembers(r, from, holder.ty)) |m| switch (m.what) {
         .typed => |ty| try out.add(.{ .label = m.name, .kind = .field, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null }),
@@ -702,23 +898,55 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, fr
     };
 }
 
-/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and with
-/// `decl_literals` (the type is a result type, not a peer type), declarations that can serve as
-/// decl literals (constants of type `T`, functions returning `T` or `!T`; also listed when their
-/// type cannot be inferred)
-fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool, from: FileId) resolve.Error!void {
+/// Which declarations of the expected type `expectedMembers` lists
+const DeclLiterals = enum {
+    /// None: the expected type comes from peer type resolution, which names only tags
+    none,
+    /// Declarations that can serve as decl literals (see `producesType`)
+    value,
+    /// The operand of `try` (`try .|`, `try .f|()`): only functions returning an error union whose
+    /// payload coerces to the type (see `producesType`); tags are not error unions
+    @"try",
+};
+
+/// After `.`: enum members and union fields of the expected type, and the declarations selected
+/// by `decl_literals`. As in the compiler, the members are looked up in the expected type with
+/// error unions, optionals and single-item pointers stripped (`fn f() !Color { return .red; }`),
+/// and must coerce to the expected type itself: a tag does not coerce to a pointer
+fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: DeclLiterals, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
-    // Matching the compiler, strip error unions and optionals from the result type
-    // (`fn f() !Color { return .red; }`)
     var t = ty;
+    var through_ptr = false;
     while (true) t = switch (ip.key(t)) {
         .error_union_type => |eu| eu.payload,
         .optional_type => |c| c,
+        .ptr_type => |p| if (p.size == .one) blk: {
+            through_ptr = true;
+            break :blk p.child;
+        } else break,
         else => break,
     };
+    const tags = decl_literals != .@"try" and !through_ptr;
+    // A union result type takes only the tags of a tagged union whose field type has one possible
+    // value (`.none`), the only tags that coerce to it (see `onePossibleValue`); for a peer type
+    // (switch prongs, comparisons), all the tags
+    const all_tags = decl_literals == .none;
     switch (ip.key(t)) {
-        .reified_type, .union_tag_type => {
-            for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
+        // Constructed types have no declarations: the members of a constructed enum, and the tags
+        // of a tagged constructed union
+        .reified_type => |rt| {
+            if (!tags) return;
+            switch (rt.kind) {
+                .@"enum" => for (rt.names) |name| try out.add(.{ .label = name, .kind = .enum_member }),
+                .@"union" => if (rt.tag != null) for (rt.names, 0..) |name, i| {
+                    if (all_tags or try onePossibleValue(r, if (i < rt.types.len) rt.types[i] else .unknown)) try out.add(.{ .label = name, .kind = .enum_member });
+                },
+                .@"struct" => {},
+            }
+            return;
+        },
+        .union_tag_type => {
+            if (tags) for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
             return;
         },
         .container_type => {},
@@ -728,19 +956,23 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool
     const tree = try r.itemTree(ns.file);
     const kind = tree.containers[ns.container].kind;
     const inst = queries.instOfType(ip, t);
+    const tagged = tags and kind == .@"union" and try eval.unionTag(r, t) != null;
     for (tree.containerMembers(ns.container)) |m| {
         const it = tree.items[m];
         const name = it.name orelse continue;
         switch (it.kind) {
-            .field => switch (kind) {
+            .field => if (tags) switch (kind) {
                 .@"enum" => try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc }),
-                .@"union" => try out.add(.{ .label = name, .kind = .field, .doc = it.doc }),
+                .@"union" => if (tagged) {
+                    const field_ty = if (all_tags) .unknown else (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
+                    if (try onePossibleValue(r, field_ty)) try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc });
+                },
                 else => {},
             },
             .@"const", .@"fn" => {
-                if (!decl_literals or (ns.file != from and !it.flags.is_pub)) continue;
+                if (decl_literals == .none or (ns.file != from and !it.flags.is_pub)) continue;
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
-                if (!producesType(ip, decl_ty, t, it.kind == .@"fn")) continue;
+                if (!producesType(ip, decl_ty, ty, it.kind == .@"fn", decl_literals == .@"try")) continue;
                 const is_fn = it.kind == .@"fn";
                 try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
             },
@@ -749,20 +981,132 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool
     }
 }
 
-/// Whether a declaration can serve as a decl literal of type `t`: a constant of type `t`, or a
-/// function returning `t` or `!t`; an unknown type counts as yes
-fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
+/// Whether a declaration of type `decl_ty` can serve as a decl literal with the result type `want`
+/// (as in the compiler, its value, or the result of calling it, is coerced to `want`; see
+/// `declCoerces`): a constant whose type coerces, or a function whose return type does; for the
+/// operand of `try` (`in_try`), only a function returning an error union whose payload coerces.
+/// Unknown types count as yes
+fn producesType(ip: *InternPool, decl_ty: Index, want: Index, is_fn: bool, in_try: bool) bool {
+    if (!is_fn) return !in_try and declCoerces(ip, want, decl_ty);
     if (decl_ty == .unknown) return true;
-    if (!is_fn) return decl_ty == t;
     const ret = switch (ip.key(decl_ty)) {
         .fn_type => |f| f.ret,
         else => return false,
     };
-    if (ret == .unknown or ret == t) return true;
+    if (ret == .unknown) return true;
+    if (!in_try) return declCoerces(ip, want, ret);
     return switch (ip.key(ret)) {
-        .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
+        .error_union_type => |eu| declCoerces(ip, want, eu.payload),
         else => false,
     };
+}
+
+/// Whether a value of type `have` coerces to `want` (see `coerces`), also an error union to an
+/// error union whose error set contains its errors (see `errorSetCoerces`); an unknown type counts
+/// as yes
+fn declCoerces(ip: *InternPool, want: Index, have: Index) bool {
+    if (have == .unknown or coerces(ip, want, have)) return true;
+    const w = switch (ip.key(want)) {
+        .error_union_type => |eu| eu,
+        else => return false,
+    };
+    const h = switch (ip.key(have)) {
+        .error_union_type => |eu| eu,
+        else => return false,
+    };
+    return errorSetCoerces(ip, w.err, h.err) and declCoerces(ip, w.payload, h.payload);
+}
+
+/// Whether the errors of the error set `have` belong to `want`: `want` is `anyerror` or inferred
+/// (it takes whatever errors are returned), or both are explicit sets and `want` contains every
+/// error of `have`. An inferred or unknown `have` counts as yes
+fn errorSetCoerces(ip: *InternPool, want: Index, have: Index) bool {
+    if (want == .anyerror_type or want == .unknown or have == .unknown) return true;
+    const w = switch (ip.key(want)) {
+        .error_set_type => |es| es.names,
+        .inferred_error_set => return true,
+        else => return false,
+    };
+    const h = switch (ip.key(have)) {
+        .error_set_type => |es| es.names,
+        .inferred_error_set => return true,
+        else => return false,
+    };
+    for (h) |name| {
+        for (w) |n| {
+            if (std.mem.eql(u8, n, name)) break;
+        } else return false;
+    }
+    return true;
+}
+
+/// Whether a value of type `ty` has exactly one possible value, so that the tag of a union field
+/// of this type coerces to the union (as in the compiler): `void`, zero-bit integers, `null`,
+/// `undefined`, empty arrays, enums with one member, and arrays, structs, and tuples whose
+/// elements and fields all have one possible value. An unknown type counts as yes, and so does a
+/// type nested more than 16 levels deep (only an invalid type that contains itself gets there)
+fn onePossibleValue(r: *Resolver, ty: Index) resolve.Error!bool {
+    return onePossibleValueAt(r, ty, 16);
+}
+
+fn onePossibleValueAt(r: *Resolver, ty: Index, depth: u32) resolve.Error!bool {
+    switch (ty) {
+        .unknown, .void_type, .null_type, .undefined_type => return true,
+        else => {},
+    }
+    if (depth == 0) return true;
+    switch (r.ctx.db.env.ip.key(ty)) {
+        .int_type => |i| return i.bits == 0,
+        .array_type => |a| return a.len == 0 or try onePossibleValueAt(r, a.child, depth - 1),
+        .container_type => |c| switch (c.kind) {
+            .@"enum" => return (try eval.enumMemberNames(r, ty)).len == 1,
+            .@"struct", .file => {},
+            .@"union", .@"opaque" => return false,
+        },
+        .tuple_type, .anon_struct_type => {},
+        .reified_type => |rt| switch (rt.kind) {
+            .@"enum" => return rt.names.len == 1,
+            .@"struct" => {},
+            .@"union" => return false,
+        },
+        else => return false,
+    }
+    for (try eval.fieldNames(r, ty)) |f| if (!try onePossibleValueAt(r, f.ty, depth - 1)) return false;
+    return true;
+}
+
+/// The expression the enum literal `e` stands for: the call it is the callee of (`.f()`), or `e`
+fn literalOperand(b: *const Body, e: Body.ExprId) Body.ExprId {
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .call => |c| if (c.callee == e) return @fromBackingInt(@as(u32, @intCast(i))),
+        else => {},
+    };
+    return e;
+}
+
+/// `operand` is the operand of `try`
+fn isTryOperand(b: *const Body, operand: Body.ExprId) bool {
+    for (b.exprs) |x| switch (x) {
+        .prefix => |p| if (p.op == .keyword_try and p.operand == operand) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// The result type of the enum literal standing for `operand` (see `literalOperand`), whose
+/// expected type inference records as `want`: the body of a function with an inferred error set
+/// (`fn f() !T`) records `T` as the result type of `return`, while the compiler coerces the
+/// returned value to `E!T`, which also takes an error union
+fn literalResultType(r: *Resolver, a: context.At, operand: Body.ExprId, want: Index) resolve.Error!Index {
+    const returned = for (a.body.exprs) |x| switch (x) {
+        .@"return" => |v| if (v == operand) break true,
+        else => {},
+    } else false;
+    if (!returned) return want;
+    const it = (try r.itemTree(a.file)).items[a.item];
+    if (it.kind != .@"fn" or !it.flags.inferred_error_set) return want;
+    const set = try a.ip.get(.{ .inferred_error_set = .{ .file = a.owner.file, .decl = a.owner.item } });
+    return a.ip.get(.{ .error_union_type = .{ .err = set, .payload = want } });
 }
 
 /// The function declaration that a function value refers to
@@ -797,14 +1141,24 @@ const Place = struct {
     mutable: bool,
 
     /// A single-item pointer is dereferenced once automatically; whether the value it points to can
-    /// be modified depends on the pointer
+    /// be modified depends on the pointer. A pointer to an array is kept: it has a `ptr` that the
+    /// array does not have (see `valueMembers`)
     fn deref(p: Place, ip: *InternPool) Place {
         return switch (ip.key(p.ty)) {
-            .ptr_type => |ptr| if (ptr.size == .one) .{ .ty = ptr.child, .mutable = !ptr.is_const } else p,
+            .ptr_type => |ptr| if (ptr.size == .one and arrayElem(ip, ptr.child) == null) .{ .ty = ptr.child, .mutable = !ptr.is_const } else p,
             else => p,
         };
     }
 };
+
+/// The element type and sentinel of an array type
+fn arrayElem(ip: *InternPool, t: Index) ?struct { child: Index, sentinel: ?Index } {
+    return switch (ip.key(t)) {
+        .array_type => |a| .{ .child = a.child, .sentinel = a.sentinel },
+        .abstract_array_type => |a| .{ .child = a.child, .sentinel = a.sentinel },
+        else => null,
+    };
+}
 
 /// A member of a value; the types of container fields and the signatures of methods are computed
 /// only when used
@@ -827,16 +1181,22 @@ const Member = struct {
 
 /// Members of a value (dereferenced): fields, and the functions and consts in `from` or pub
 /// (whether a const is a function is known only when it is used). Enum and opaque values have no
-/// fields: enum members are accessed through the type. Values that are not containers, tuples,
-/// slices, or arrays have no members (`?T`, `E!T`, single-item pointers to pointers, many-item
-/// pointers, and so on)
+/// fields: enum members are accessed through the type. A slice and a single-item pointer to an
+/// array have `len` and `ptr` (a many-item pointer with the sentinel of the slice or array), an
+/// array only `len`. Values that are not containers, tuples, slices, arrays, or pointers to arrays
+/// have no members (`?T`, `E!T`, single-item pointers to pointers, many-item pointers, and so on)
 fn valueMembers(r: *Resolver, from: FileId, t: Index) resolve.Error![]const Member {
     const ip = r.ctx.db.env.ip;
     var out: std.ArrayList(Member) = .empty;
     switch (ip.key(t)) {
-        .ptr_type => |p| if (p.size == .slice) {
+        .ptr_type => |p| {
+            const child: Index, const sentinel: ?Index = switch (p.size) {
+                .slice => .{ p.child, p.sentinel },
+                .one => if (arrayElem(ip, p.child)) |a| .{ a.child, a.sentinel } else return &.{},
+                .many, .c => return &.{},
+            };
             try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
-            const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
+            const many = try ip.get(.{ .ptr_type = .{ .child = child, .size = .many, .is_const = p.is_const, .sentinel = sentinel } });
             try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
         },
         .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
@@ -972,7 +1332,7 @@ const MemberSearch = struct {
                 };
                 if (sig.params.len != 1 or sig.varargs or !receives(ip, sig.params[0], holder)) return null;
                 return switch (ip.key(sig.ret)) {
-                    .ptr_type => |p| if (p.size == .one) .{ .ty = p.child, .mutable = !p.is_const } else null,
+                    .ptr_type => |p| if (p.size == .one) (Place{ .ty = sig.ret, .mutable = false }).deref(ip) else null,
                     .container_type, .tuple_type, .anon_struct_type, .reified_type => .{ .ty = sig.ret, .mutable = false },
                     else => null,
                 };
@@ -1088,9 +1448,9 @@ const Expected = struct {
     /// body), for computing the types of declarations in scope
     inst: ?Index,
 
-    /// Whether the type of the candidate fits the expected type (see `fits`); the types of
-    /// declarations and files are computed only here
-    fn matches(x: Expected, origin: Item.Origin) resolve.Error!bool {
+    /// Whether the type of the candidate fits the expected type (see `fits`; `called`: the
+    /// candidate is inserted as a call); the types of declarations and files are computed only here
+    fn matches(x: Expected, origin: Item.Origin, called: bool) resolve.Error!bool {
         const tv: TypedValue = switch (origin) {
             .none => return false,
             .value => |tv| tv,
@@ -1099,7 +1459,7 @@ const Expected = struct {
                 .file => |f| try queries.importValue(x.r, f),
             },
         };
-        return fits(x.r.ctx.db.env.ip, x.ty, tv.ty);
+        return fits(x.r.ctx.db.env.ip, x.ty, tv.ty, called);
     }
 };
 
@@ -1135,13 +1495,18 @@ fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index 
                 if (f.value == e) return initFieldType(r, a, id, f.name orelse return null);
             },
             .@"return" => |v| if (v == e) {
-                if ((try r.itemTree(a.file)).items[a.item].kind != .@"fn") return null;
-                return a.exprType(b.type_expr orelse return null).asType();
+                const it = (try r.itemTree(a.file)).items[a.item];
+                if (it.kind != .@"fn") return null;
+                const ret = a.exprType(b.type_expr orelse return null).asType() orelse return null;
+                // `!T`: `T` with the error set inferred from the body (see `queries.returnType`)
+                if (!it.flags.inferred_error_set or ret == .unknown) return ret;
+                const set = try a.ip.get(.{ .inferred_error_set = .{ .file = a.file, .decl = it.ast_id, .inst = if (a.seeded) |s| s.inst else null } });
+                return try a.ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
             },
             .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
             .binary => |s| {
                 if (isComparison(s.op) and (s.lhs == e or s.rhs == e)) {
-                    return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty);
+                    return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty, s.op);
                 }
                 if (s.op == .keyword_orelse and s.rhs == e) return expectedOf(r, a, id);
             },
@@ -1225,19 +1590,33 @@ fn isComparison(op: SyntaxKind) bool {
 }
 
 /// The type of one side of a comparison as the expected type of the other side: a tagged union is
-/// compared with its tag (`u == .none`); comptime numbers, enum literals, null, and undefined have
-/// no definite type
-fn comparedType(r: *Resolver, t: Index) resolve.Error!?Index {
+/// compared with its tag (`u == .none`), and an error union only with an error set (`eu ==
+/// error.X`, by `==` and `!=`); comptime numbers, enum literals, null, and undefined have no
+/// definite type, and types whose values cannot be compared (see `comparable`) have none either
+fn comparedType(r: *Resolver, t: Index, op: SyntaxKind) resolve.Error!?Index {
     switch (t) {
         .unknown, .comptime_int_type, .comptime_float_type, .enum_literal_type, .null_type, .undefined_type => return null,
         else => {},
     }
-    const is_union = switch (r.ctx.db.env.ip.key(t)) {
-        .container_type => |c| c.kind == .@"union",
-        .reified_type => |rt| rt.kind == .@"union",
-        else => false,
+    const ip = r.ctx.db.env.ip;
+    switch (ip.key(t)) {
+        .container_type => |c| if (c.kind == .@"union") return eval.unionTag(r, t),
+        .reified_type => |rt| if (rt.kind == .@"union") return eval.unionTag(r, t),
+        .error_union_type => |eu| return if (op == .equal_equal or op == .bang_equal) eu.err else null,
+        else => {},
+    }
+    return if (comparable(ip, t)) t else null;
+}
+
+/// Whether values of type `t` can be compared with each other: not slices, arrays, and tuples (or
+/// optionals of them), as in the compiler
+fn comparable(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .slice,
+        .array_type, .abstract_array_type, .tuple_type, .anon_struct_type => false,
+        .optional_type => |child| comparable(ip, child),
+        else => true,
     };
-    return if (is_union) eval.unionTag(r, t) else t;
 }
 
 /// Whether the structure of the statement at the cursor (the innermost item of a block, file, or
@@ -1278,13 +1657,15 @@ fn wellFormed(r: *Resolver, file: FileId, offset: u32) resolve.Error!bool {
 
 /// Whether a candidate of type `have` can be a value of the expected type `want`, counting only
 /// what can be decided exactly: the same type; `T` when `?T` or `E!T` is expected; `*T` as
-/// `*const T` and `[]T` as `[]const T`; functions (including function pointers) whose return value
-/// fits. Other conversions (integer widening, comptime_int, and so on) do not count
-fn fits(ip: *InternPool, want: Index, have: Index) bool {
+/// `*const T` and `[]T` as `[]const T`; functions whose return value fits, and function pointers
+/// whose return value fits when the candidate is inserted as a call (`called`; a function pointer
+/// never coerces to what it returns). Other conversions (integer widening, comptime_int, and so on)
+/// do not count
+fn fits(ip: *InternPool, want: Index, have: Index, called: bool) bool {
     if (coerces(ip, want, have)) return true;
     const f = switch (ip.key(have)) {
         .fn_type => |f| f,
-        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
+        .ptr_type => |p| if (called and p.size == .one) switch (ip.key(p.child)) {
             .fn_type => |f| f,
             else => return false,
         } else return false,
@@ -1298,15 +1679,67 @@ fn coerces(ip: *InternPool, want: Index, have: Index) bool {
     if (value.eqlTypes(ip, want, have) orelse false) return true;
     switch (ip.key(want)) {
         .optional_type => |child| return coerces(ip, child, have),
-        .error_union_type => |eu| return coerces(ip, eu.payload, have),
+        .error_union_type => |eu| {
+            if (coerces(ip, eu.payload, have)) return true;
+            // An error set that fits in `E`, and `E'!T` whose error set fits in `E`
+            if (isErrorSet(ip, have)) return errorSetFits(ip, eu.err, have);
+            const h = switch (ip.key(have)) {
+                .error_union_type => |h| h,
+                else => return false,
+            };
+            return errorSetFits(ip, eu.err, h.err) and (value.eqlTypes(ip, eu.payload, h.payload) orelse false);
+        },
         .ptr_type => |w| {
             const h = switch (ip.key(have)) {
                 .ptr_type => |h| h,
+                // A function as a pointer to it
+                .fn_type => return w.size == .one and (value.eqlTypes(ip, w.child, have) orelse false),
                 else => return false,
             };
+            if (h.size == .one and (w.size == .slice or w.size == .many)) {
+                // A pointer to an array as a slice or a many-item pointer (`*const [5:0]u8` as
+                // `[]const u8`)
+                const array = switch (ip.key(h.child)) {
+                    .array_type => |array| array,
+                    else => return false,
+                };
+                if (h.is_const and !w.is_const) return false;
+                if (w.sentinel) |s| if (array.sentinel != s) return false;
+                return value.eqlTypes(ip, w.child, array.child) orelse false;
+            }
             if (w.size != h.size or (w.size != .one and w.size != .slice)) return false;
             if (!w.is_const or h.is_const or !std.meta.eql(w.sentinel, h.sentinel)) return false;
             return value.eqlTypes(ip, w.child, h.child) orelse false;
+        },
+        else => return false,
+    }
+}
+
+fn isErrorSet(ip: *InternPool, t: Index) bool {
+    return t == .anyerror_type or switch (ip.key(t)) {
+        .error_set_type, .inferred_error_set => true,
+        else => false,
+    };
+}
+
+/// Whether every error of the error set `have` is in the error set `want`: always for `anyerror`
+/// and for an inferred error set (the one of the function being written, which takes in the
+/// errors returned to it); for a written set, when `have` is a written set with no other names
+fn errorSetFits(ip: *InternPool, want: Index, have: Index) bool {
+    if (want == .anyerror_type) return isErrorSet(ip, have);
+    switch (ip.key(want)) {
+        .inferred_error_set => return isErrorSet(ip, have),
+        .error_set_type => |want_set| {
+            const own = switch (ip.key(have)) {
+                .error_set_type => |own| own.names,
+                else => return false,
+            };
+            for (own) |name| {
+                for (want_set.names) |n| {
+                    if (std.mem.eql(u8, n, name)) break;
+                } else return false;
+            }
+            return true;
         },
         else => return false,
     }
@@ -1322,9 +1755,10 @@ fn identEnd(text: []const u8, offset: u32) u32 {
     return i;
 }
 
-/// Whether the cursor is in a comment, or inside a string or character literal (judged by the
-/// token containing the character before the cursor)
-fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum { none, comment, string } {
+/// Whether the cursor is in a comment, inside a string or character literal, or inside a quoted
+/// identifier (`@"..."`, also unterminated), judged by the token containing the character before
+/// the cursor
+fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum { none, comment, string, quoted } {
     if (offset == 0) return .none;
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const t = root.tokenAtOffset(offset - 1) orelse return .none;
@@ -1332,12 +1766,37 @@ fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum {
         .line_comment, .doc_comment, .container_doc_comment => .comment,
         // A cursor after the closing quote is already outside the literal
         .string_literal, .char_literal => if (offset < t.offset + t.text.len) .string else .none,
-        .identifier => if (std.mem.startsWith(u8, t.text, "@\"") and offset < t.offset + t.text.len) .string else .none,
+        .identifier => if (std.mem.startsWith(u8, t.text, "@\"") and offset < t.offset + t.text.len) .quoted else .none,
         .multiline_string_literal_line => .string,
-        // Unterminated string
-        .invalid => if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'' or std.mem.startsWith(u8, t.text, "@\""))) .string else .none,
+        // Unterminated string or quoted identifier
+        .invalid => if (std.mem.startsWith(u8, t.text, "@\"")) .quoted else if (t.text.len > 0 and (t.text[0] == '"' or t.text[0] == '\'')) .string else .none,
         else => .none,
     };
+}
+
+/// Inside a quoted identifier (`@"my v|"`, also unterminated) at a reference (a name, the member
+/// name of a field access, an enum literal): the candidates at the same position with no name
+/// typed yet (the client filters them), replacing the quoted text (up to the closing quote when
+/// there is one) and filtered by their quoted spellings. No candidates at other names
+/// (declarations, labels, and so on), and no builtins: `@"@sizeOf"` is a name
+fn quotedName(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const tok = root.tokenAtOffset(offset - 1) orelse return .{ .context = .ignored };
+    switch (tokenParent(root, tok.offset)) {
+        .name_ref, .field_access, .enum_literal => {},
+        else => return .{ .context = .ignored },
+    }
+    var visible = try completeVisible(r, file, tok.offset, cursor_owner, false);
+    const end: u32 = if (tok.kind == .identifier) @intCast(tok.offset + tok.text.len) else offset;
+    const items = try r.arena.dupe(Item, visible.items);
+    for (items) |*it| {
+        it.replace = .{ .start = tok.offset, .end = end };
+        it.filter = if (std.mem.startsWith(u8, it.label, "@\"")) it.label else try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
+    }
+    visible.items = items;
+    // The expression at the cursor is the quoted name itself
+    if (visible.at) |*a| a.rel = offset - a.node.offset;
+    return visible;
 }
 
 /// Error names after `error.`: when the expected type is an error set (or error union), lists its
@@ -1351,8 +1810,8 @@ fn errorNames(r: *Resolver, out: *Collector, file: FileId, offset: u32, item: u3
             .error_union_type => |eu| eu.err,
             else => want,
         };
-        if (try queries.errorSetMembers(r, set)) |names| {
-            for (names) |name| try out.add(.{ .label = name, .kind = .error_name });
+        if (try queries.errorSetOf(r, set)) |es| {
+            for (es.sorted) |i| try out.add(.{ .label = es.names[i], .kind = .error_name });
             return;
         }
     };
@@ -1376,12 +1835,28 @@ fn builtinStart(text: []const u8, offset: u32) ?u32 {
     return i - 1;
 }
 
+/// The last token before `offset`, skipping whitespace, is a single `.` (not `..` or `...`, after
+/// which an expression follows)
+fn afterDot(text: []const u8, offset: u32) bool {
+    var i = offset;
+    while (i > 0 and std.ascii.isWhitespace(text[i - 1])) i -= 1;
+    return i > 0 and text[i - 1] == '.' and (i == 1 or text[i - 2] != '.');
+}
+
 /// Start of the string content when the cursor is in the string of `@import("` (the string may
-/// be unterminated)
+/// be unterminated; escaped quotes do not end it)
 fn importString(text: []const u8, offset: u32) ?u32 {
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
-    const quote = std.mem.lastIndexOfScalar(u8, text[line_start..offset], '"') orelse return null;
-    const start: u32 = @intCast(line_start + quote + 1);
+    var open: ?usize = null;
+    var i = line_start;
+    while (i < offset) : (i += 1) switch (text[i]) {
+        '"' => open = if (open == null) i + 1 else null,
+        '\\' => if (open != null) {
+            i += 1;
+        },
+        else => {},
+    };
+    const start: u32 = @intCast(open orelse return null);
     var head = std.mem.trimEnd(u8, text[line_start .. start - 1], " \t");
     if (!std.mem.endsWith(u8, head, "(")) return null;
     head = std.mem.trimEnd(u8, head[0 .. head.len - 1], " \t");
@@ -1389,11 +1864,22 @@ fn importString(text: []const u8, offset: u32) ?u32 {
     return start;
 }
 
-/// Start of the label when the cursor is at the label position after `break :` / `continue :`
-fn labelStart(text: []const u8, offset: u32) ?u32 {
+/// End of the content of the string literal holding `offset`: its closing quote, or `offset` when
+/// the string is not closed in the line
+fn stringContentEnd(text: []const u8, offset: u32) u32 {
+    var i = offset;
+    while (i < text.len and text[i] != '\n') : (i += 1) switch (text[i]) {
+        '"' => return i,
+        '\\' => i += 1,
+        else => {},
+    };
+    return offset;
+}
+
+/// The keyword when the cursor is at the label position after `break :` / `continue :`
+fn labelKeyword(text: []const u8, offset: u32) ?enum { @"break", @"continue" } {
     var i = offset;
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
-    const start = i;
     while (i > 0 and (text[i - 1] == ' ' or text[i - 1] == '\t')) i -= 1;
     if (i == 0 or text[i - 1] != ':') return null;
     i -= 1;
@@ -1401,8 +1887,9 @@ fn labelStart(text: []const u8, offset: u32) ?u32 {
     const end = i;
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
     const word = text[i..end];
-    if (!std.mem.eql(u8, word, "break") and !std.mem.eql(u8, word, "continue")) return null;
-    return start;
+    if (std.mem.eql(u8, word, "break")) return .@"break";
+    if (std.mem.eql(u8, word, "continue")) return .@"continue";
+    return null;
 }
 
 /// Module names in `@import("...` (std, builtin, root, and the modules imported by each module
@@ -1427,7 +1914,7 @@ fn manifestPaths(r: *Resolver, out: *Collector, file: FileId, text: []const u8, 
     const kind = try manifest.pathKind(r, file, tok) orelse return;
     const start = tok.offset + 1;
     if (offset < start) return;
-    try listPaths(r, out, file, text[start..offset], .{ .start = start, .end = offset }, switch (kind) {
+    try listPaths(r, out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) }, switch (kind) {
         .included => .any,
         .dependency => .directories,
     });
@@ -1443,28 +1930,35 @@ const PathFilter = enum {
     directories,
 };
 
-/// The entries of the directory named by the part of `typed` before its last `/`, relative to the
-/// directory of `file` (excluding entries that start with `.` and `zig-out`). Completion items are
-/// full paths from the start of the string
+/// The entries of the directory named by the part of `typed` (the string content as written, with
+/// escapes) before its last `/`, relative to the directory of `file` (excluding entries that start
+/// with `.`, the build output `zig-out`, and the fetched packages `zig-pkg`). Completion items are
+/// full paths from the start of the string: the directory as written, followed by the entry name
+/// escaped for a string literal
 fn listPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range, filter: PathFilter) resolve.Error!void {
     const vfs = r.ctx.db.env.vfs;
     const prefix = if (std.mem.lastIndexOfScalar(u8, typed, '/')) |s| typed[0 .. s + 1] else "";
+    const quoted = try std.fmt.allocPrint(r.arena, "\"{s}\"", .{prefix});
+    const dir_name = std.zig.string_literal.parseAlloc(r.arena, quoted) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return,
+    };
     const base = std.fs.path.dirname(vfs.path(file)) orelse return;
-    const dir_path = try std.fs.path.join(r.arena, &.{ base, prefix });
+    const dir_path = try std.fs.path.join(r.arena, &.{ base, dir_name });
     var dir = std.Io.Dir.cwd().openDir(vfs.io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(vfs.io);
     var it = dir.iterate();
     while (it.next(vfs.io) catch null) |entry| {
-        if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.eql(u8, entry.name, "zig-out")) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.eql(u8, entry.name, "zig-out") or std.mem.eql(u8, entry.name, "zig-pkg")) continue;
         switch (entry.kind) {
             .directory => {
                 const slash = if (filter == .import) "/" else "";
-                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ prefix, entry.name, slash }), .kind = .folder, .replace = range });
+                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{f}{s}", .{ prefix, std.zig.fmtString(entry.name), slash }), .kind = .folder, .replace = range });
             },
             .file => if (filter == .any or (filter == .import and
                 (std.mem.endsWith(u8, entry.name, ".zig") or std.mem.endsWith(u8, entry.name, ".zon"))))
             {
-                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{s}", .{ prefix, entry.name }), .kind = .file, .replace = range });
+                try out.add(.{ .label = try std.fmt.allocPrint(r.arena, "{s}{f}", .{ prefix, std.zig.fmtString(entry.name) }), .kind = .file, .replace = range });
             },
             else => {},
         }
@@ -1480,16 +1974,30 @@ fn initOf(b: *const Body, e: Body.ExprId) ?Body.ExprId {
     return null;
 }
 
-/// Fields of the initialized type (`T` for `?T`) that have not been assigned yet
-fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.FieldInit) resolve.Error!void {
-    const ip = r.ctx.db.env.ip;
+/// The type whose fields an initializer of type `ty` names (`T` for `?T`): a struct or union,
+/// also a constructed one (`@Struct`, `@Union`); null for the other types, whose initializers list
+/// elements (arrays, slices, tuples)
+fn fieldsType(ip: *InternPool, ty: Index) ?Index {
     const t = switch (ip.key(ty)) {
         .optional_type => |c| c,
         else => ty,
     };
-    switch (ip.key(t)) {
-        .container_type => |c| if (!c.kind.isStruct() and c.kind != .@"union") return,
-        else => return,
+    return switch (ip.key(t)) {
+        .container_type => |c| if (c.kind.isStruct() or c.kind == .@"union") t else null,
+        .reified_type => |rt| if (rt.kind != .@"enum") t else null,
+        else => null,
+    };
+}
+
+/// Fields of the struct or union `t` (see `fieldsType`) that have not been assigned yet
+fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit) resolve.Error!void {
+    const ip = r.ctx.db.env.ip;
+    if (ip.key(t) == .reified_type) {
+        outer: for (try eval.fieldNames(r, t)) |f| {
+            for (given) |g| if (g.name) |n| if (std.mem.eql(u8, n, f.name)) continue :outer;
+            try out.add(.{ .label = f.name, .kind = .field, .detail = if (f.ty != .unknown) try render.typeAlloc(r, f.ty) else null });
+        }
+        return;
     }
     const ns = try queries.namespaceOfType(r, t) orelse return;
     const tree = try r.itemTree(ns.file);
@@ -1975,7 +2483,8 @@ fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
         .fn_value => return true,
         .arg => |arg| {
             const c = try context.callee(r, a, b.expr(arg.call).call.callee) orelse return false;
-            return paramIsFn(r, c.def, arg.index + @intFromBool(c.bound));
+            var visited: Visited = .empty;
+            return paramIsFn(r, c.def, arg.index + @intFromBool(c.bound), &visited);
         },
         .field => |f| {
             const key = a.fieldRef(f.init, f.index) orelse return false;
@@ -2003,9 +2512,13 @@ fn slotIsFn(r: *Resolver, a: context.At, slot: Slot) resolve.Error!bool {
     }
 }
 
+/// The `anytype` parameters `paramIsFn` has looked into: a parameter passed on in a cycle (a
+/// recursive function, or functions passing it to each other) is looked into once
+const Visited = std.AutoHashMapUnmanaged(struct { file: FileId, item: u32, index: u32 }, void);
+
 /// The type of parameter `index` of the function `def` is a function or a function pointer, or the
 /// parameter is `anytype` and receives a function (see `receivesFn`)
-fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
+fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32, visited: *Visited) resolve.Error!bool {
     const d = switch (def) {
         .item => |d| d,
         else => return false,
@@ -2016,7 +2529,9 @@ fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
     if (index < fb.params.len) {
         if (fb.binding(fb.params[index]).ty) |t| {
             if (isFnTypeExpr(fb, t)) return true;
-        } else if (try receivesFn(r, d.file, d.item, fb, fb.params[index])) return true;
+        } else if (!(try visited.getOrPut(r.arena, .{ .file = d.file, .item = d.item, .index = index })).found_existing) {
+            if (try receivesFn(r, d.file, d.item, fb, fb.params[index], visited)) return true;
+        }
     }
     const ip = r.ctx.db.env.ip;
     return switch (ip.key((try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = d.file, .item = it.ast_id } })).ty)) {
@@ -2027,8 +2542,8 @@ fn paramIsFn(r: *Resolver, def: resolve.Def, index: u32) resolve.Error!bool {
 
 /// The `anytype` parameter `param` receives a function: the type of another parameter is
 /// `std.meta.ArgsTuple(@TypeOf(param))`, which accepts only function types (`Io.async(io, function,
-/// args)`)
-fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Body.BindingId) resolve.Error!bool {
+/// args)`), or the function uses the parameter as a function (see `usesAsFn`)
+fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Body.BindingId, visited: *Visited) resolve.Error!bool {
     const name = fb.binding(param).name;
     for (fb.params) |other| {
         const t = fb.binding(other).ty orelse continue;
@@ -2054,10 +2569,86 @@ fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Bod
             .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse continue) else null,
             else => null,
         } orelse continue;
-        const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse return false;
+        const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse break;
         if (std.meta.eql(try r.aliasTarget(callee), args_tuple)) return true;
     }
+    const p: Param = .{ .file = file, .item = item, .binding = param, .name = name };
+    if (try usesAsFn(r, p, item, visited)) return true;
+    // The functions of containers declared in the body can use the parameter too (when it is
+    // comptime)
+    const tree = try r.itemTree(file);
+    for (tree.items, 0..) |it, i| {
+        const user: u32 = @intCast(i);
+        if (it.kind != .@"fn" or !declaredIn(tree, user, item) or !try r.mayMention(file, user, name)) continue;
+        if (try usesAsFn(r, p, user, visited)) return true;
+    }
     return false;
+}
+
+/// Member `member` is in a container declared (directly or not) in the body of member `item`
+fn declaredIn(tree: *const ItemTree, member: u32, item: u32) bool {
+    var container = tree.items[member].container;
+    while (tree.containers[container].parent_item) |parent| {
+        if (parent == item) return true;
+        container = tree.items[parent].container;
+    }
+    return false;
+}
+
+/// A parameter of a function
+const Param = struct {
+    file: FileId,
+    /// The function
+    item: u32,
+    binding: Body.BindingId,
+    name: []const u8,
+
+    /// `e` in the body `b` of function `user` (in the same file) refers to the parameter
+    fn isRef(p: Param, r: *Resolver, user: u32, b: *const Body, e: Body.ExprId) resolve.Error!bool {
+        switch (b.expr(e)) {
+            .name_ref => |n| if (!std.mem.eql(u8, n, p.name)) return false,
+            else => return false,
+        }
+        const def = try r.resolveName(p.file, user, b, b.expr_scopes[@backingInt(e)], p.name) orelse return false;
+        return def == .local and def.local.item == p.item and def.local.binding == p.binding;
+    }
+};
+
+/// The body of function `user` (the function of `p` or a function declared in its body) uses `p`
+/// as a function: calls it (`p(...)`, `@call(modifier, p, args)`), reads
+/// `@typeInfo(@TypeOf(p)).@"fn"`, or passes it on to a parameter that takes a function (see
+/// `paramIsFn`; `std.Thread.spawn` passes its function to `Impl.spawn`, which passes it to
+/// `callFn`, which calls it)
+fn usesAsFn(r: *Resolver, p: Param, user: u32, visited: *Visited) resolve.Error!bool {
+    const b = try r.body(p.file, user);
+    // The inference result of `user`, needed only to resolve the callees that receive `p`
+    var at: ?context.At = null;
+    for (b.exprs) |x| switch (x) {
+        .call => |c| {
+            if (try p.isRef(r, user, b, c.callee)) return true;
+            for (c.args, 0..) |arg, k| {
+                if (!try p.isRef(r, user, b, arg)) continue;
+                if (at == null) at = try context.atItem(r, p.file, user) orelse break;
+                const callee = try context.callee(r, at.?, c.callee) orelse break;
+                if (try paramIsFn(r, callee.def, @as(u32, @intCast(k)) + @intFromBool(callee.bound), visited)) return true;
+            }
+        },
+        .builtin_call => |c| if (std.mem.eql(u8, c.name, "@call") and c.args.len == 3 and try p.isRef(r, user, b, c.args[1])) return true,
+        .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, "fn")) {
+            const type_info = builtinArg(b, fa.lhs, "@typeInfo") orelse continue;
+            if (try p.isRef(r, user, b, builtinArg(b, type_info, "@TypeOf") orelse continue)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// The only argument of the builtin call `name(arg)` at `e`
+fn builtinArg(b: *const Body, e: Body.ExprId, name: []const u8) ?Body.ExprId {
+    return switch (b.expr(e)) {
+        .builtin_call => |c| if (c.args.len == 1 and std.mem.eql(u8, c.name, name)) c.args[0] else null,
+        else => null,
+    };
 }
 
 /// The type annotation is a function or a function pointer: by syntax, or by the computed type (for

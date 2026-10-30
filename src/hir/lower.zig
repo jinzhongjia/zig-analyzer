@@ -463,7 +463,10 @@ const Lowerer = struct {
                     if (d.value()) |v| if (v.offset == t.offset) break;
                     if (ast.cast(ast.VarDecl, t)) |v| {
                         const name = v.name() orelse continue;
-                        const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = try l.optExpr(v.typeExpr()) });
+                        const ty = try l.optExpr(v.typeExpr());
+                        // `align(...)` is evaluated in the enclosing scope, like the type
+                        _ = try l.clauses(t);
+                        const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = ty });
                         try bindings.append(l.a, b);
                         try targets.append(l.a, .{ .binding = b });
                     } else try targets.append(l.a, .{ .expr = try l.expr(t) });

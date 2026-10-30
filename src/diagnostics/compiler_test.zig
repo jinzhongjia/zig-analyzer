@@ -894,9 +894,122 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     const msgs = try mergeMessages(a, main_text, true, result);
     try testing.expectEqual(1, msgs.len);
     try testing.expectEqualStrings("zig@1:8: unused local variable\n\nCompile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs[0]);
-    // Unsaved changes: the AstGen error comes only from live and does not duplicate the compiler's
+    // Unsaved changes: the AstGen error comes only from live and does not duplicate the compiler's.
+    // Guards against losing the compile log with the hidden error: it is published on its own at
+    // the error's start
     const edited = try std.mem.concat(a, u8, &.{ "// new comment\n", main_text });
     const msgs2 = try mergeMessages(a, edited, true, result);
-    try testing.expectEqual(1, msgs2.len);
+    try testing.expectEqual(2, msgs2.len);
     try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs2[0]);
+    try testing.expectEqualStrings("zig@2:8: Compile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs2[1]);
+    // The line of the error is modified: the log is at the start of the modified region
+    const changed_line = try std.mem.replaceOwned(u8, a, main_text, "var unused = 1;", "var unused = 12;");
+    const msgs3 = try mergeMessages(a, changed_line, false, result);
+    try testing.expectEqual(1, msgs3.len);
+    try testing.expectEqualStrings("zig@1:0: Compile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs3[0]);
+}
+
+test "compile log: attached to an error in the build root rather than one sorted before it" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    // The compiler sorts errors in the standard library first; with other errors it reports no
+    // "found compile log statement"
+    try addError(&wip, native("/usr/lib/zig/std/Io/Writer.zig"), main_text, "unused", "invalid format string 's' for type 'comptime_int'");
+    try addError(&wip, "src/main.zig", main_text, "\"s\"", "expected type 'u32', found '*const [1:0]u8'");
+    var eb = try wip.toOwnedBundle("@as(comptime_int, 24)\n");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
+    // Guards against attaching the output to the error in the standard library
+    try testing.expectEqualStrings("", r.files.get(native("/usr/lib/zig/std/Io/Writer.zig")).?.items[0].compile_log);
+    try testing.expectEqualStrings("@as(comptime_int, 24)", r.files.get(native("/proj/src/main.zig")).?.items[0].compile_log);
+}
+
+test "collect: notes of an error without a location outlive the fallback path" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("undefined symbol: _za_missing"), .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("referenced by /proj/.zig-cache/o/x/linkerr_zcu.o:_main.main") }},
+    );
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    const fallback = try gpa.dupe(u8, native("/proj/build.zig"));
+    defer gpa.free(fallback);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), fallback, &dummy, Disk.read);
+    defer r.release(gpa);
+    // The caller reuses the memory of its path after the call
+    @memset(fallback, 'x');
+    // Guards against keeping the caller's path as the note's path
+    try testing.expectEqualStrings(native("/proj/build.zig"), r.files.keys()[0]);
+    const item = r.files.values()[0].items[0];
+    try testing.expectEqual(1, item.notes.len);
+    try testing.expectEqualStrings(native("/proj/build.zig"), item.notes[0].path);
+    try testing.expectEqualStrings("referenced by /proj/.zig-cache/o/x/linkerr_zcu.o:_main.main", item.notes[0].message);
+}
+
+/// An error at `"s"` with the note "called inline here" at `note_needle`
+fn addInlineError(wip: *ErrorBundle.Wip, note_needle: []const u8) !void {
+    const err_loc = try location(wip, "src/main.zig", main_text, "\"s\"", 0);
+    const note_loc = try location(wip, "src/main.zig", main_text, note_needle, 0);
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("expected type 'u32', found '*const [1:0]u8'"), .src_loc = err_loc, .notes_len = 1 },
+        &.{.{ .msg = try wip.addString("called inline here"), .src_loc = note_loc }},
+    );
+}
+
+test "collect and combine: errors that differ only in their notes are kept apart" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    try addInlineError(&wip, "unused");
+    try addInlineError(&wip, "_ = x");
+    // A repeat with the same note is still the same error
+    try addInlineError(&wip, "unused");
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
+    const result = r.files.getPtr(native("/proj/src/main.zig")).?;
+    // Guards against merging the errors of two inline call sites into one
+    try testing.expectEqual(2, result.items.len);
+    try testing.expectEqual(std.mem.indexOf(u8, main_text, "unused").?, result.items[0].notes[0].start);
+    try testing.expectEqual(std.mem.indexOf(u8, main_text, "_ = x").?, result.items[1].notes[0].start);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const first: compiler.FileResult = .{ .base_text = main_text, .items = result.items[0..1] };
+    const second: compiler.FileResult = .{ .base_text = main_text, .items = result.items[1..2] };
+    const c = try compiler.combine(arena.allocator(), &.{ &first, &second, result });
+    try testing.expectEqual(2, c.items.len);
+    try testing.expectEqual(std.mem.indexOf(u8, main_text, "_ = x").?, c.items[1].notes[0].start);
+}
+
+test "collect: repeat counts of messages and notes are kept" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    const err_loc = try location(&wip, "src/main.zig", main_text, "\"s\"", 0);
+    const note_loc = try location(&wip, "src/main.zig", main_text, "unused", 0);
+    try wip.addRootErrorMessageWithNotes(
+        .{ .msg = try wip.addString("evaluation exceeded 1000 backwards branches"), .src_loc = err_loc, .notes_len = 2 },
+        &.{
+            .{ .msg = try wip.addString("called at comptime here"), .src_loc = note_loc, .count = 3 },
+            .{ .msg = try wip.addString("called at comptime here"), .src_loc = err_loc },
+        },
+    );
+    var eb = try wip.toOwnedBundle("");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
+    const notes = r.files.get(native("/proj/src/main.zig")).?.items[0].notes;
+    // Guards against dropping the count that the compiler prints
+    try testing.expectEqualStrings("called at comptime here (3 times)", notes[0].message);
+    try testing.expectEqualStrings("called at comptime here", notes[1].message);
 }

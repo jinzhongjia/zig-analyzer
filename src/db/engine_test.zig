@@ -456,6 +456,22 @@ test "unset input returns default" {
     try testing.expectEqual(1, try read(&d, Plus, 7));
 }
 
+test "isSet tells an input never set from one set to its default" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectEqual(0, try ctx.get(Number, 1));
+        try testing.expect(!ctx.isSet(Number, 1));
+        try testing.expect(!ctx.isSet(Number, 2));
+    }
+    try setNumber(&d, Number, 1, 0, .low);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expect(ctx.isSet(Number, 1));
+}
+
 test "memo reused across read transactions" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

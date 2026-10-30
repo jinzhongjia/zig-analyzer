@@ -1,14 +1,17 @@
 //! The server detects external changes on disk (git checkout, code generation, other editors):
 //! when the client cannot register file watchers dynamically (the default for Neovim on Linux), or
-//! when `files.watcher` is configured as `server`.
+//! when `files.watcher` is configured as `server`. With `auto` and a client that registers file
+//! watchers, the server still watches the files outside the root directories: clients apply the
+//! registered watchers inside the workspace folders only (see `Server.WatchScope`).
 //!
 //! Files of interest: interned `.zig` / `.zon` files (analysis reads any imported file from disk
 //! on demand), plus `build.zig`, `build.zig.zon`, and `zig-analyzer.zon` in each workspace root,
 //! and the configure input directories of projects (see `Server.configureInputDirs`), whose
 //! created and deleted entries are reported too; libraries, which never change, are excluded (see
 //! `Server.watchable`). Changes are handled as `workspace/didChangeWatchedFiles` notifications,
-//! along the same path as the client's notifications; open documents are skipped, since their
-//! buffers take precedence and saves in the editor are handled by `didSave`.
+//! along the same path as the client's notifications, open documents included: their buffers
+//! take precedence, but builds read the disk. A notification may name a file of interest under
+//! another spelling (see `Spellings`): it counts for that file.
 //!
 //! The directories containing these files are watched with the operating system's native
 //! notifications: inotify on Linux, FSEvents on macOS, directory change notifications on Windows.
@@ -81,12 +84,18 @@ pub const Watcher = struct {
     stopping: std.atomic.Value(bool) = .init(false),
 
     // ── The following fields are accessed only by the background task ──
-    /// Watching is active (the server is responsible for detecting external changes)
-    active: bool = false,
+    /// What is being watched (see `Server.WatchScope`); `.none` while not watching
+    scope: Server.WatchScope = .none,
+    /// The scope seen in the previous round of `run`; null before the first round
+    last_scope: ?Server.WatchScope = null,
+    /// The scope has widened: the files of interest are compared with the disk once recomputed
+    verify: bool = false,
     /// Arena holding `files` and `missing`; replaced as a whole on recomputation
     state_arena: std.heap.ArenaAllocator,
     /// Files of interest: identity key (lowercased when case-insensitive) → path
     files: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// Other spellings of files of interest seen in notifications; reset along with `files`
+    spellings: Spellings = .{},
     /// Directories of files of interest that do not exist yet: identity key → path (their nearest
     /// existing ancestors are watched instead)
     missing: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
@@ -105,6 +114,9 @@ pub const Watcher = struct {
     /// Duration of the last poll (see `min_idle_factor`)
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
+
+    /// Ids of the requests sent by `registerClientGlobs` start with this
+    pub const registration_prefix = "zig-analyzer/didChangeWatchedFiles/";
 
     /// Created on the main loop, so later `wake` / `stop` calls are not lost. Falls back to polling
     /// when native notifications are unavailable.
@@ -135,6 +147,7 @@ pub const Watcher = struct {
         w.backend.destroy(w.gpa);
         w.fallback.deinit(w.gpa);
         w.files.deinit(w.gpa);
+        w.spellings.deinit(w.gpa);
         w.missing.deinit(w.gpa);
         w.entry_dirs.deinit(w.gpa);
         w.state_arena.deinit();
@@ -166,12 +179,19 @@ pub const Watcher = struct {
     pub fn run(w: *Watcher) Io.Cancelable!void {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
-            if (!w.server.watchesFiles()) {
+            const scope = w.server.watchScope();
+            // Files the server starts watching may have changed while nobody watched them: they
+            // are compared with the disk. At startup, they were all just read.
+            if (w.last_scope) |last| if (@backingInt(scope) > @backingInt(last)) {
+                w.verify = true;
+            };
+            w.last_scope = scope;
+            if (scope == .none) {
                 w.deactivate();
                 // Clear first, then check: new files interned during the check wake the task
                 // again (see `onNewPath`)
                 w.resync_requested.store(false, .release);
-                if (w.server.register_watch) w.registerClientGlobs() catch |err| switch (err) {
+                if (w.server.clientWatches()) w.registerClientGlobs() catch |err| switch (err) {
                     error.OutOfMemory => log.err("out of memory while registering file watchers", .{}),
                 };
                 w.backend.wait(null);
@@ -181,7 +201,7 @@ pub const Watcher = struct {
                 w.backend.drain(discard.allocator(), &events) catch {};
                 continue;
             }
-            w.step() catch |err| switch (err) {
+            w.step(scope) catch |err| switch (err) {
                 error.OutOfMemory => log.err("out of memory while watching files on disk", .{}),
             };
         }
@@ -190,9 +210,11 @@ pub const Watcher = struct {
     /// When the client detects external changes, the initially registered globs cover only
     /// `.zig` and `.zon`: other interned files (files used by `@embedFile`, configure inputs) are
     /// additionally registered by file name (`**/<file name>`; notifications for other files with
-    /// the same name are ignored, since those are not interned), and configure input directories
-    /// by their name and their entries (`**/<name>`, `**/<name>/*`). A name containing glob
-    /// special characters cannot be written as a glob and is not registered.
+    /// the same name are ignored, since those are not interned), the directories under the root
+    /// directories that contain interned files by their name (`**/<name>`: a directory deleted,
+    /// moved or renamed is reported by its own path only), and configure input directories by
+    /// their name and their entries (`**/<name>`, `**/<name>/*`). A name containing glob special
+    /// characters cannot be written as a glob and is not registered.
     fn registerClientGlobs(w: *Watcher) Allocator.Error!void {
         const server = w.server;
         var arena: std.heap.ArenaAllocator = .init(w.gpa);
@@ -200,10 +222,21 @@ pub const Watcher = struct {
         const a = arena.allocator();
         const rules = try server.originRules(a);
         var globs: std.ArrayList([]const u8) = .empty;
+        var dir_names: std.StringHashMapUnmanaged(void) = .empty;
         for (0..server.vfs.count()) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-            if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
             if (!server.watchable(rules, path)) continue;
+            if (server.vfs.rootOf(rules.roots, path)) |root| {
+                var dir = std.fs.path.dirname(path);
+                while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+                    if (d.len <= root.len) break;
+                    const name = std.fs.path.basename(d);
+                    if (w.client_names.contains(name)) continue;
+                    const gop = try dir_names.getOrPut(a, name);
+                    if (!gop.found_existing) try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{name}));
+                }
+            }
+            if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
             try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{std.fs.path.basename(path)}));
         }
         for (try server.configureInputDirs(a)) |dir| {
@@ -227,13 +260,13 @@ pub const Watcher = struct {
         out.writer.writeAll("]}") catch return error.OutOfMemory;
         const options = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{}) catch return error.OutOfMemory;
         w.client_registrations += 1;
-        const id = try std.fmt.allocPrint(a, "zig-analyzer/didChangeWatchedFiles/{d}", .{w.client_registrations});
+        const id = try std.fmt.allocPrint(a, registration_prefix ++ "{d}", .{w.client_registrations});
         server.sendRequest(.{ .string = id }, "client/registerCapability", types.RegistrationParams{ .registrations = &.{.{ .id = id, .method = "workspace/didChangeWatchedFiles", .registerOptions = options }} });
     }
 
     /// One round: recompute the watched directories (if needed), wait for notifications or the
     /// time to poll, and handle this batch of changes
-    fn step(w: *Watcher) Allocator.Error!void {
+    fn step(w: *Watcher, scope: Server.WatchScope) Allocator.Error!void {
         const io = w.server.io;
         var batch_arena: std.heap.ArenaAllocator = .init(w.gpa);
         defer batch_arena.deinit();
@@ -243,9 +276,14 @@ pub const Watcher = struct {
         // Clear the request before computing: a request arriving during the computation wakes
         // the task again
         const requested = w.resync_requested.swap(false, .acq_rel);
-        if (!w.active or requested) {
-            try w.resync(a, &pending);
-            w.active = true;
+        if (w.scope != scope or requested) {
+            try w.resync(a, scope, &pending);
+            if (w.verify) {
+                w.verify = false;
+                for (w.files.keys(), w.files.values()) |k, path| {
+                    if (!w.entry_dirs.contains(k)) try pending.add(a, path, .verify);
+                }
+            }
             if (pending.paths.count() != 0) return w.apply(a, &pending);
         }
 
@@ -282,19 +320,20 @@ pub const Watcher = struct {
         // First add watches for newly appeared directories, then read the state of the files:
         // every later change will be notified
         const requested_now = w.resync_requested.swap(false, .acq_rel);
-        if (dirs_changed or requested_now) try w.resync(a, &pending);
+        if (dirs_changed or requested_now) try w.resync(a, w.scope, &pending);
         if (pending.paths.count() != 0) try w.apply(a, &pending);
     }
 
-    /// Stops watching and discards the state: when watching starts again, the disk state at that
-    /// time is taken as is, and changes in between are not reported afterwards
+    /// Stops watching and discards the state; when watching starts again, the files of interest
+    /// are compared with the disk (see `verify`)
     fn deactivate(w: *Watcher) void {
-        if (!w.active) return;
-        w.active = false;
+        if (w.scope == .none) return;
+        w.scope = .none;
         var none: std.ArrayList([]const u8) = .empty;
         w.backend.setDirs(w.gpa, &.{}, &none) catch {};
         none.deinit(w.gpa);
         w.files.clearRetainingCapacity();
+        w.spellings.reset(w.gpa);
         w.missing.clearRetainingCapacity();
         w.entry_dirs.clearRetainingCapacity();
         w.fallback.clearRetainingCapacity();
@@ -309,12 +348,14 @@ pub const Watcher = struct {
         return std.ascii.allocLowerString(a, path);
     }
 
-    /// Recomputes the files of interest and the watched directories. Files of interest that
-    /// already exist in directories that did not exist before but have appeared now are recorded
-    /// in `pending`.
-    fn resync(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
+    /// Recomputes the files of interest and the watched directories for `scope`; with
+    /// `.outside_roots`, also registers the client's additional file watchers. Files of interest
+    /// that already exist in directories that did not exist before but have appeared now are
+    /// recorded in `pending`.
+    fn resync(w: *Watcher, a: Allocator, scope: Server.WatchScope, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         const gpa = w.gpa;
+        if (scope == .outside_roots) try w.registerClientGlobs();
         var next_arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer next_arena.deinit();
         const na = next_arena.allocator();
@@ -322,13 +363,16 @@ pub const Watcher = struct {
         var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         errdefer files.deinit(gpa);
         const rules = try server.originRules(a);
+        // With `.outside_roots`, the client watches the files under the root directories
+        const outside_only = scope == .outside_roots;
         const count = server.vfs.count();
         for (0..count) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
             if (!server.watchable(rules, path)) continue;
+            if (outside_only and server.vfs.rootOf(rules.roots, path) != null) continue;
             try files.put(gpa, try w.key(na, path), path);
         }
-        {
+        if (!outside_only) {
             server.roots_mutex.lockUncancelable(server.io);
             defer server.roots_mutex.unlock(server.io);
             for (server.roots.items) |root| for ([_][]const u8{ "build.zig", "build.zig.zon", Config.project_file }) |name| {
@@ -340,6 +384,7 @@ pub const Watcher = struct {
         errdefer entry_dirs.deinit(gpa);
         for (try server.configureInputDirs(na)) |dir| {
             if (!server.watchable(rules, dir)) continue;
+            if (outside_only and server.vfs.rootOf(rules.roots, dir) != null) continue;
             const k = try w.key(na, dir);
             try files.put(gpa, k, dir);
             try entry_dirs.put(gpa, k, {});
@@ -400,7 +445,7 @@ pub const Watcher = struct {
 
         // Directories that did not exist before but have appeared now: files of interest already in
         // them were created before watching started
-        if (w.active) {
+        if (w.scope != .none) {
             var appeared: std.StringHashMapUnmanaged(void) = .empty;
             defer appeared.deinit(gpa);
             for (w.missing.keys()) |k| if (!missing.contains(k)) try appeared.put(gpa, k, {});
@@ -410,6 +455,7 @@ pub const Watcher = struct {
             };
         }
 
+        w.spellings.reset(gpa);
         w.files.deinit(gpa);
         w.files = files;
         w.missing.deinit(gpa);
@@ -420,11 +466,14 @@ pub const Watcher = struct {
         w.fallback = fallback;
         w.state_arena.deinit();
         w.state_arena = next_arena;
+        w.scope = scope;
         if (w.fallback.items.len == 0) {
             w.next_poll = null;
             w.poller.reset();
-        } else if (w.next_poll == null) {
-            w.schedulePoll();
+        } else {
+            // Like adding a watch, from now on: changes before the first poll are reported too
+            try w.poller.track(server.io, a, w.fallback.items);
+            if (w.next_poll == null) w.schedulePoll();
         }
         log.debug("watching {d} directories for {d} files ({d} checked periodically)", .{ dirs.count(), w.files.count(), w.fallback.items.len });
     }
@@ -446,20 +495,35 @@ pub const Watcher = struct {
         // `Server.scheduleScan`), and so may directories that appear or disappear
         var rescan = false;
         var created: std.ArrayList([]const u8) = .empty;
+        // Names created or removed that are not files of interest: they may be directories
+        // (Windows notifications do not tell), moved or renamed with files of interest in them
+        var unknown: std.StringHashMapUnmanaged(void) = .empty;
         for (events) |ev| switch (ev.kind) {
             .changed, .created, .removed => {
+                const hint: Pending.Hint = if (ev.kind == .created) .created else .changed;
                 const k = try w.key(a, ev.path);
-                if (w.files.get(k)) |path| {
-                    try pending.add(a, path, if (ev.kind == .created) .created else .changed);
-                } else {
-                    // An entry created in or removed from a configure input directory
-                    if (ev.kind != .changed and w.inEntryDir(k)) try pending.add(a, ev.path, if (ev.kind == .created) .created else .changed);
-                    if (ev.kind == .created) {
-                        // Not known whether it is a directory (Windows notifications do not
-                        // tell): a path leading to a nonexistent directory has appeared
-                        if (w.leadsToMissing(k)) try dirs.put(a, k, {});
-                        if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
-                    }
+                if (w.files.getIndex(k)) |i| {
+                    // The name may now lead to another file
+                    if (ev.kind != .changed) w.spellings.forgetFile(w.gpa, @intCast(i));
+                    try pending.add(a, w.files.values()[i], hint);
+                    continue;
+                }
+                // A name created anew may be another file than the one seen before
+                if (ev.kind == .created) w.spellings.forget(w.gpa, k);
+                const same = try w.spellings.find(w.gpa, w.server.io, &w.files, k, ev.path);
+                if (ev.kind == .removed) w.spellings.forget(w.gpa, k);
+                if (same) |i| {
+                    if (ev.kind != .changed) w.spellings.forgetFile(w.gpa, i);
+                    try pending.add(a, w.files.values()[i], hint);
+                    continue;
+                }
+                // An entry created in or removed from a configure input directory
+                if (ev.kind != .changed and w.inEntryDir(k)) try pending.add(a, ev.path, hint);
+                if (ev.kind != .changed) try unknown.put(a, k, {});
+                if (ev.kind == .created) {
+                    // A path leading to a nonexistent directory has appeared
+                    if (w.leadsToMissing(k)) try dirs.put(a, k, {});
+                    if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
                 }
             },
             .dir_created, .dir_gone, .overflow => {
@@ -471,6 +535,14 @@ pub const Watcher = struct {
                 }
             },
         };
+        // Files of interest under an unknown name: it is a directory
+        var moved = false;
+        if (unknown.count() != 0) for (w.files.keys(), w.files.values()) |k, path| {
+            if (!underAny(k, &unknown)) continue;
+            moved = true;
+            try pending.add(a, path, .changed);
+        };
+        if (moved) rescan = true;
         if (!rescan and created.items.len != 0) {
             const rules = try w.server.originRules(a);
             for (created.items) |path| {
@@ -478,7 +550,7 @@ pub const Watcher = struct {
             }
         }
         if (rescan) w.server.scheduleScan();
-        if (!all and dirs.count() == 0) return false;
+        if (!all and dirs.count() == 0) return moved;
         for (w.files.keys(), w.files.values()) |k, path| {
             if (!all and !underAny(k, &dirs)) continue;
             try pending.add(a, path, .changed);
@@ -498,21 +570,20 @@ pub const Watcher = struct {
     }
 
     /// Generates change events from the current state of the files and hands them to the server.
-    /// Open documents are skipped, since their buffers take precedence, except entries created in
-    /// or deleted from configure input directories: such an entry reconfigures the project
-    /// whether or not it is open.
+    /// Open documents are included: their buffers take precedence, but builds read the disk.
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         var events: std.ArrayList(types.FileEvent) = .empty;
+        var verified: std.ArrayList(types.FileEvent) = .empty;
         for (pending.paths.keys(), pending.paths.values()) |path, hint| {
             const exists = stat(server.io, path) != null;
-            if (server.isOpen(path) and ((exists and hint != .created) or !w.inEntryDir(try w.key(a, path)))) continue;
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
-            try events.append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
+            try (if (hint == .verify) &verified else &events).append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
+        if (verified.items.len != 0) server.applyWatchedChanges(a, verified.items, .verified);
         if (events.items.len == 0) return;
         log.debug("{d} file(s) changed on disk", .{events.items.len});
-        server.applyWatchedChanges(a, events.items);
+        server.applyWatchedChanges(a, events.items, .notified);
     }
 };
 
@@ -522,12 +593,13 @@ pub const Watcher = struct {
 const Pending = struct {
     paths: std.StringArrayHashMapUnmanaged(Hint) = .empty,
 
-    const Hint = enum { changed, created };
+    /// From the weakest: `verify` (compare with the known text, see `Server.ChangeSource`)
+    const Hint = enum { verify, changed, created };
 
     fn add(p: *Pending, a: Allocator, path: []const u8, hint: Hint) Allocator.Error!void {
         const gop = try p.paths.getOrPut(a, path);
         if (gop.found_existing) {
-            if (hint == .created) gop.value_ptr.* = hint;
+            if (@backingInt(hint) > @backingInt(gop.value_ptr.*)) gop.value_ptr.* = hint;
             return;
         }
         gop.key_ptr.* = a.dupe(u8, path) catch |err| {
@@ -535,6 +607,96 @@ const Pending = struct {
             return err;
         };
         gop.value_ptr.* = hint;
+    }
+};
+
+/// Other spellings of files of interest in notifications. FSEvents reports names in the Unicode
+/// form stored on disk, which may be decomposed while the client and the server use the composed
+/// form; a file may also be reached under the name of a symbolic link in its directory. A
+/// reported path that is not a file of interest is that file of interest in the same directory
+/// whose real path (see `Vfs.realPath`) is the same. Only unknown names in directories with files
+/// of interest are resolved on disk; results are kept until the files of interest are recomputed,
+/// and dropped for a name that is created or removed.
+const Spellings = struct {
+    /// Identity key of a reported path (owned) → index of the file of interest it names, or null
+    found: std.StringHashMapUnmanaged(?u32) = .empty,
+    /// Identity key of a directory → indexes of the files of interest in it; built when first
+    /// needed (the keys point into the identity keys of the files of interest)
+    dirs: ?std.StringHashMapUnmanaged(std.ArrayList(u32)) = null,
+    /// Index of a file of interest → its real path (owned), or null when unreachable
+    real: std.AutoHashMapUnmanaged(u32, ?[:0]u8) = .empty,
+
+    fn deinit(s: *Spellings, gpa: Allocator) void {
+        s.reset(gpa);
+        s.found.deinit(gpa);
+        s.real.deinit(gpa);
+    }
+
+    /// The files of interest are recomputed: their indexes change
+    fn reset(s: *Spellings, gpa: Allocator) void {
+        var found = s.found.keyIterator();
+        while (found.next()) |k| gpa.free(k.*);
+        s.found.clearRetainingCapacity();
+        if (s.dirs) |*dirs| {
+            var lists = dirs.valueIterator();
+            while (lists.next()) |l| l.deinit(gpa);
+            dirs.deinit(gpa);
+            s.dirs = null;
+        }
+        var real = s.real.valueIterator();
+        while (real.next()) |r| if (r.*) |p| gpa.free(p);
+        s.real.clearRetainingCapacity();
+    }
+
+    /// Forgets what the reported path with identity key `k` names
+    fn forget(s: *Spellings, gpa: Allocator, k: []const u8) void {
+        if (s.found.fetchRemove(k)) |kv| gpa.free(kv.key);
+    }
+
+    /// Forgets the real path of the file of interest `file`
+    fn forgetFile(s: *Spellings, gpa: Allocator, file: u32) void {
+        if (s.real.fetchRemove(file)) |kv| if (kv.value) |p| gpa.free(p);
+    }
+
+    /// The file of interest (index into `files`) that the reported `path` (identity key `k`, not
+    /// itself a file of interest) names, if any
+    fn find(s: *Spellings, gpa: Allocator, io: Io, files: *const std.StringArrayHashMapUnmanaged([]const u8), k: []const u8, path: []const u8) Allocator.Error!?u32 {
+        if (s.found.get(k)) |known| return known;
+        if (s.dirs == null) {
+            var dirs: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+            errdefer {
+                var lists = dirs.valueIterator();
+                while (lists.next()) |l| l.deinit(gpa);
+                dirs.deinit(gpa);
+            }
+            for (files.keys(), 0..) |fk, i| {
+                const gop = try dirs.getOrPut(gpa, std.fs.path.dirname(fk) orelse continue);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(gpa, @intCast(i));
+            }
+            s.dirs = dirs;
+        }
+        const in_dir = s.dirs.?.get(std.fs.path.dirname(k) orelse return null) orelse return null;
+        // Not cached: a removed name no longer leads anywhere, and one created later is resolved
+        // again
+        const real = try Vfs.realPath(io, gpa, path) orelse return null;
+        defer gpa.free(real);
+        var same: ?u32 = null;
+        for (in_dir.items) |i| {
+            const gop = try s.real.getOrPut(gpa, i);
+            if (!gop.found_existing) gop.value_ptr.* = Vfs.realPath(io, gpa, files.values()[i]) catch |err| {
+                _ = s.real.remove(i);
+                return err;
+            };
+            if (gop.value_ptr.*) |r| if (std.mem.eql(u8, r, real)) {
+                same = i;
+                break;
+            };
+        }
+        const owned = try gpa.dupe(u8, k);
+        errdefer gpa.free(owned);
+        try s.found.put(gpa, owned, same);
+        return same;
     }
 };
 
@@ -573,8 +735,8 @@ fn stat(io: Io, path: []const u8) ?Stamp {
     return .{ .size = st.size, .mtime = st.mtime.nanoseconds };
 }
 
-/// Polling: checks the size and modification time of a set of files. The first check of a file
-/// only records its state; only later changes count.
+/// Polling: checks the size and modification time of a set of files. The state of a file is
+/// recorded when it starts being polled (`track`, or its first check); only later changes count.
 const Poller = struct {
     gpa: Allocator,
     /// Path (owned by `gpa`) → state at the last check
@@ -590,17 +752,43 @@ const Poller = struct {
         p.seen.clearRetainingCapacity();
     }
 
-    /// Checks `paths` and records changes in `pending`; files not in `paths` are no longer tracked
-    fn poll(p: *Poller, io: Io, a: Allocator, paths: []const []const u8, pending: *Pending) Allocator.Error!void {
-        var current: std.StringArrayHashMapUnmanaged(?Stamp) = .empty;
-        for (paths) |path| try current.put(a, path, stat(io, path));
+    /// Starts tracking the files in `paths` not tracked yet, recording their current state, so
+    /// their changes from now on count; files not in `paths` are no longer tracked
+    fn track(p: *Poller, io: Io, a: Allocator, paths: []const []const u8) Allocator.Error!void {
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (paths) |path| try wanted.put(a, path, {});
+        p.retain(&wanted);
+        for (paths) |path| {
+            const gop = try p.seen.getOrPut(p.gpa, path);
+            if (gop.found_existing) continue;
+            gop.key_ptr.* = p.gpa.dupe(u8, path) catch |err| {
+                p.seen.swapRemoveAt(gop.index);
+                return err;
+            };
+            gop.value_ptr.* = stat(io, path);
+        }
+    }
+
+    /// Stops tracking the files not in `wanted`
+    fn retain(p: *Poller, wanted: *const std.StringHashMapUnmanaged(void)) void {
         var i: usize = p.seen.count();
         while (i > 0) {
             i -= 1;
-            if (current.contains(p.seen.keys()[i])) continue;
+            if (wanted.contains(p.seen.keys()[i])) continue;
             p.gpa.free(p.seen.keys()[i]);
             p.seen.swapRemoveAt(i);
         }
+    }
+
+    /// Checks `paths` and records changes in `pending`; files not in `paths` are no longer tracked
+    fn poll(p: *Poller, io: Io, a: Allocator, paths: []const []const u8, pending: *Pending) Allocator.Error!void {
+        var current: std.StringArrayHashMapUnmanaged(?Stamp) = .empty;
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (paths) |path| {
+            try current.put(a, path, stat(io, path));
+            try wanted.put(a, path, {});
+        }
+        p.retain(&wanted);
         for (current.keys(), current.values()) |path, now| {
             const gop = try p.seen.getOrPut(p.gpa, path);
             if (!gop.found_existing) {
@@ -872,6 +1060,70 @@ const Inotify = struct {
     }
 };
 
+/// `path` is the directory `dir` itself or lies under it (POSIX paths)
+fn underPosix(path: []const u8, dir: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    return path.len == dir.len or path[dir.len] == '/' or std.mem.eql(u8, dir, "/");
+}
+
+/// Watch roots whose real path differs from the written path: FSEvents reports real paths, which
+/// are mapped back to the written form. Independent of the platform's notifications.
+const RootAliases = struct {
+    list: std.ArrayList(Alias) = .empty,
+
+    const Alias = struct {
+        /// Owned by `gpa`; allocated with its sentinel (`realPathFileAlloc`), and freed as such
+        real: [:0]u8,
+        /// Borrowed from the roots passed to `set`
+        written: []const u8,
+    };
+
+    fn deinit(r: *RootAliases, gpa: Allocator) void {
+        r.clear(gpa);
+        r.list.deinit(gpa);
+    }
+
+    fn clear(r: *RootAliases, gpa: Allocator) void {
+        for (r.list.items) |al| gpa.free(al.real);
+        r.list.clearRetainingCapacity();
+    }
+
+    /// Replaces the aliases with those of `roots`, which must outlive them; a root whose real
+    /// path cannot be determined is taken as written
+    fn set(r: *RootAliases, gpa: Allocator, io: Io, roots: []const [:0]const u8) Allocator.Error!void {
+        r.clear(gpa);
+        for (roots) |root| {
+            const real = Io.Dir.cwd().realPathFileAlloc(io, root, gpa) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            if (std.mem.eql(u8, real, root)) {
+                gpa.free(real);
+                continue;
+            }
+            r.list.append(gpa, .{ .real = real, .written = root }) catch |err| {
+                gpa.free(real);
+                return err;
+            };
+        }
+    }
+
+    /// Maps a real path back to the written form of its watch root (allocated in `a`)
+    fn written(r: *const RootAliases, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
+        for (r.list.items) |al| if (underPosix(path, al.real)) {
+            return std.mem.concat(a, u8, &.{ al.written, path[al.real.len..] });
+        };
+        return a.dupe(u8, path);
+    }
+
+    /// Appends `events` to `out` with their paths mapped back to the written form (allocated by
+    /// `gpa`)
+    fn carry(r: *const RootAliases, gpa: Allocator, events: []const Event, out: *std.ArrayList(Event)) Allocator.Error!void {
+        try out.ensureUnusedCapacity(gpa, events.len);
+        for (events) |e| out.appendAssumeCapacity(.{ .path = try r.written(gpa, e.path), .kind = e.kind });
+    }
+};
+
 /// macOS: FSEvents (recursive watching, managed by a system service). CoreServices is loaded
 /// dynamically, with no dependency on the SDK; callbacks run on a serial queue created by this
 /// backend, the received changes are buffered on that queue, and the background task takes them
@@ -890,14 +1142,14 @@ const FsEvents = struct {
     cf_array: ?CFArrayRef = null,
     /// Current watch roots (owned by `gpa`)
     roots: std.ArrayList([:0]u8) = .empty,
-    /// Watch roots whose real path differs from the written path: FSEvents reports real paths,
-    /// which are mapped back to the written form
-    aliases: std.ArrayList(Alias) = .empty,
+    /// Real paths of the watch roots (FSEvents reports real paths)
+    aliases: RootAliases = .{},
     /// Changes received by the callback and not yet taken (accessed only on `queue`; paths are
     /// owned by `gpa`)
     queued: std.ArrayList(Event) = .empty,
-
-    const Alias = struct { real: []u8, written: []const u8 };
+    /// Changes received from a replaced stream, already mapped back to the written form with the
+    /// roots of that stream (accessed only by the background task; paths are owned by `gpa`)
+    carried: std.ArrayList(Event) = .empty,
 
     /// FSEvents has an undocumented limit on the number of watched paths (reportedly 4096)
     const max_roots = 2048;
@@ -915,6 +1167,7 @@ const FsEvents = struct {
         FSEventStreamSetDispatchQueue: *const fn (stream: FSEventStreamRef, queue: dispatch.queue_t) callconv(.c) void,
         FSEventStreamStart: *const fn (stream: FSEventStreamRef) callconv(.c) bool,
         FSEventStreamStop: *const fn (stream: FSEventStreamRef) callconv(.c) void,
+        FSEventStreamFlushSync: *const fn (stream: FSEventStreamRef) callconv(.c) void,
         FSEventStreamInvalidate: *const fn (stream: FSEventStreamRef) callconv(.c) void,
         FSEventStreamRelease: *const fn (stream: FSEventStreamRef) callconv(.c) void,
         CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
@@ -992,6 +1245,8 @@ const FsEvents = struct {
         f.aliases.deinit(gpa);
         for (f.queued.items) |e| gpa.free(e.path);
         f.queued.deinit(gpa);
+        for (f.carried.items) |e| gpa.free(e.path);
+        f.carried.deinit(gpa);
         f.queue.as_object().release();
         f.sem.as_object().release();
         f.lib.close();
@@ -1019,7 +1274,7 @@ const FsEvents = struct {
         var roots: std.ArrayList([]const u8) = .empty;
         defer roots.deinit(gpa);
         for (sorted) |d| {
-            if (roots.items.len != 0 and under(d, roots.items[roots.items.len - 1])) continue;
+            if (roots.items.len != 0 and underPosix(d, roots.items[roots.items.len - 1])) continue;
             try roots.append(gpa, d);
         }
         // With too many directories, watch the whole file system: expensive, but still native
@@ -1034,30 +1289,25 @@ const FsEvents = struct {
             } else return;
         }
 
+        // The changes the old stream still holds back (for its latency) are delivered now and
+        // kept, mapped with the roots they were reported under: the new stream reports only
+        // later changes
+        if (f.stream) |stream| f.sym.FSEventStreamFlushSync(stream);
         f.stopStream();
+        var taken = f.takeQueued();
+        defer {
+            for (taken.items) |e| gpa.free(e.path);
+            taken.deinit(gpa);
+        }
+        try f.aliases.carry(gpa, taken.items, &f.carried);
         f.clearRoots();
         for (roots.items) |r| try f.roots.append(gpa, try gpa.dupeSentinel(u8, r, 0));
-        for (f.roots.items) |r| {
-            const real = Io.Dir.cwd().realPathFileAlloc(f.io, r, gpa) catch continue;
-            if (std.mem.eql(u8, real, r)) {
-                gpa.free(real);
-                continue;
-            }
-            f.aliases.append(gpa, .{ .real = real, .written = r }) catch |err| {
-                gpa.free(real);
-                return err;
-            };
-        }
+        try f.aliases.set(gpa, f.io, f.roots.items);
         if (f.roots.items.len == 0) return;
         f.startStream() catch {
             log.warn("cannot start FSEvents stream, checking files on disk periodically instead", .{});
             try failed.appendSlice(gpa, dirs);
         };
-    }
-
-    fn under(path: []const u8, dir: []const u8) bool {
-        if (!std.mem.startsWith(u8, path, dir)) return false;
-        return path.len == dir.len or path[dir.len] == '/' or std.mem.eql(u8, dir, "/");
     }
 
     fn startStream(f: *FsEvents) error{ OutOfMemory, StartFailed }!void {
@@ -1096,8 +1346,7 @@ const FsEvents = struct {
     }
 
     fn clearRoots(f: *FsEvents) void {
-        for (f.aliases.items) |al| f.gpa.free(al.real);
-        f.aliases.clearRetainingCapacity();
+        f.aliases.clear(f.gpa);
         for (f.roots.items) |r| f.gpa.free(r);
         f.roots.clearRetainingCapacity();
     }
@@ -1130,7 +1379,8 @@ const FsEvents = struct {
         _ = f.sem.signal();
     }
 
-    fn drain(f: *FsEvents, a: Allocator, out: *std.ArrayList(Event)) Allocator.Error!void {
+    /// Takes the changes received by the callback so far (paths owned by `gpa`)
+    fn takeQueued(f: *FsEvents) std.ArrayList(Event) {
         const Take = struct {
             f: *FsEvents,
             taken: std.ArrayList(Event) = .empty,
@@ -1142,19 +1392,19 @@ const FsEvents = struct {
         };
         var take: Take = .{ .f = f };
         dispatch.sync_f(f.queue, &take, Take.run);
-        defer {
-            for (take.taken.items) |e| f.gpa.free(e.path);
-            take.taken.deinit(f.gpa);
-        }
-        for (take.taken.items) |e| try out.append(a, .{ .path = try f.written(a, e.path), .kind = e.kind });
+        return take.taken;
     }
 
-    /// Maps a real path back to the written form of its watch root
-    fn written(f: *const FsEvents, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
-        for (f.aliases.items) |al| if (under(path, al.real)) {
-            return std.mem.concat(a, u8, &.{ al.written, path[al.real.len..] });
-        };
-        return a.dupe(u8, path);
+    fn drain(f: *FsEvents, a: Allocator, out: *std.ArrayList(Event)) Allocator.Error!void {
+        var taken = f.takeQueued();
+        defer {
+            for (taken.items) |e| f.gpa.free(e.path);
+            taken.deinit(f.gpa);
+            for (f.carried.items) |e| f.gpa.free(e.path);
+            f.carried.clearRetainingCapacity();
+        }
+        for (f.carried.items) |e| try out.append(a, .{ .path = try a.dupe(u8, e.path), .kind = e.kind });
+        for (taken.items) |e| try out.append(a, .{ .path = try f.aliases.written(a, e.path), .kind = e.kind });
     }
 };
 
@@ -1468,4 +1718,242 @@ test "native watching reports changes, creation and removal in watched directori
     n.wait(null);
     var events: std.ArrayList(Event) = .empty;
     try n.drain(a, &events);
+}
+
+// Prevents freeing the real path of an aliased watch root without its sentinel: the allocator
+// rejects the size mismatch
+test "root aliases map real paths back to the written roots and free them as allocated" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "real");
+    try tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const link = try std.fs.path.joinZ(a, &.{ dir, "link" });
+    const real = try std.fs.path.join(a, &.{ dir, "real" });
+
+    var aliases: RootAliases = .{};
+    defer aliases.deinit(testing.allocator);
+    try aliases.set(testing.allocator, testing.io, &.{link});
+    try testing.expectEqual(1, aliases.list.items.len);
+    try testing.expectEqualStrings(
+        try std.fs.path.join(a, &.{ link, "a.zig" }),
+        try aliases.written(a, try std.fs.path.join(a, &.{ real, "a.zig" })),
+    );
+    try aliases.set(testing.allocator, testing.io, &.{});
+    try testing.expectEqual(0, aliases.list.items.len);
+    try aliases.set(testing.allocator, testing.io, &.{link});
+}
+
+test "FSEvents: watch roots reached through a symbolic link are replaced and freed cleanly" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "real");
+    try tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const link = try std.fs.path.join(testing.allocator, &.{ dir, "link" });
+    defer testing.allocator.free(link);
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try n.setDirs(testing.allocator, &.{link}, &failed);
+    try n.setDirs(testing.allocator, &.{}, &failed);
+    try n.setDirs(testing.allocator, &.{link}, &failed);
+    try testing.expectEqual(0, failed.items.len);
+}
+
+// Prevents losing the changes a replaced FSEvents stream still held back: they are mapped with the
+// roots they were reported under, which the replacement no longer knows
+test "root aliases carry changes over a change of the roots" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "real");
+    try tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const link = try std.fs.path.joinZ(a, &.{ dir, "link" });
+
+    var aliases: RootAliases = .{};
+    defer aliases.deinit(testing.allocator);
+    try aliases.set(testing.allocator, testing.io, &.{link});
+    var carried: std.ArrayList(Event) = .empty;
+    defer {
+        for (carried.items) |e| testing.allocator.free(e.path);
+        carried.deinit(testing.allocator);
+    }
+    const received = [_]Event{.{ .path = try std.fs.path.join(a, &.{ dir, "real", "f.zig" }), .kind = .changed }};
+    try aliases.carry(testing.allocator, &received, &carried);
+    try aliases.set(testing.allocator, testing.io, &.{});
+    try testing.expectEqual(1, carried.items.len);
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ link, "f.zig" }), carried.items[0].path);
+}
+
+test "FSEvents: changes held back by a replaced stream are still reported" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a");
+    try tmp.dir.createDirPath(testing.io, "b");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "1" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir_a = try std.fs.path.join(a, &.{ dir, "a" });
+    const dir_b = try std.fs.path.join(a, &.{ dir, "b" });
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try n.setDirs(testing.allocator, &.{dir_a}, &failed);
+    // FSEvents starts reporting shortly after the stream starts
+    try testing.io.sleep(.fromMilliseconds(200), .awake);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
+    // Within the stream's latency
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &failed);
+    try testing.expectEqual(0, failed.items.len);
+    try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
+}
+
+// Prevents losing a change made after a file starts being polled but before its first check:
+// the state is recorded when the file joins the polled files, not at the first check
+test "poller: a change before the first check of a tracked file is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const a_path = try std.fs.path.join(a, &.{ dir, "a.zig" });
+    const b_path = try std.fs.path.join(a, &.{ dir, "b.zig" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "a" });
+
+    var poller: Poller = .{ .gpa = testing.allocator };
+    defer poller.deinit();
+    const paths = [_][]const u8{ a_path, b_path };
+    try poller.track(testing.io, a, &paths);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "aa" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = "b" });
+    // Tracking again keeps the recorded states
+    try poller.track(testing.io, a, &paths);
+    var pending: Pending = .{};
+    try poller.poll(testing.io, a, &paths, &pending);
+    try testing.expectEqual(Pending.Hint.changed, pending.paths.get(a_path).?);
+    try testing.expectEqual(Pending.Hint.created, pending.paths.get(b_path).?);
+    // Files no longer tracked are forgotten
+    try poller.track(testing.io, a, paths[0..1]);
+    try testing.expectEqual(1, poller.seen.count());
+}
+
+// Prevents ignoring a directory renamed, moved or deleted when the notification does not say it is
+// a directory (Windows): the files of interest under it must be checked again
+test "a name created or removed without being reported as a directory reaches the files under it" {
+    const native = @import("../util/test_path.zig").native;
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var writer: za.lsp.transport.Writer = .{ .io = testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(testing.io, testing.allocator, &writer);
+    defer server.deinit();
+    const w = try Watcher.create(&server);
+    defer w.destroy();
+    const sa = w.state_arena.allocator();
+    for ([_][]const u8{ native("/p/src/sub/x.zig"), native("/p/src/main.zig") }) |path| {
+        try w.files.put(testing.allocator, try w.key(sa, path), path);
+    }
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Renamed (the old and the new name), as Windows reports it
+    var pending: Pending = .{};
+    const renamed = [_]Event{
+        .{ .path = native("/p/src/sub"), .kind = .removed },
+        .{ .path = native("/p/src/sub2"), .kind = .created },
+    };
+    try testing.expect(try w.handle(a, &renamed, &pending));
+    try testing.expectEqual(1, pending.paths.count());
+    try testing.expect(pending.paths.contains(native("/p/src/sub/x.zig")));
+
+    // A removed file that is not of interest changes nothing
+    pending = .{};
+    try testing.expect(!try w.handle(a, &.{.{ .path = native("/p/src/other.txt"), .kind = .removed }}, &pending));
+    try testing.expectEqual(0, pending.paths.count());
+}
+
+test "spellings: a reported name that is another spelling of a file of interest names it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    try tmp.dir.createDirPath(testing.io, "sub");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "target.zig", .data = "a" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "b" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sub/target.zig", .data = "c" });
+    try tmp.dir.symLink(testing.io, "target.zig", "link.zig", .{});
+    // On macOS, the client spells a name in the composed form while FSEvents reports the form
+    // stored on disk, here the decomposed one: APFS treats both as the same name
+    const macos = builtin.os.tag == .macos;
+    if (macos) try tmp.dir.writeFile(testing.io, .{ .sub_path = "cafe\u{301}.zig", .data = "d" });
+    const path = struct {
+        fn join(al: Allocator, d: []const u8, name: []const u8) ![]const u8 {
+            return std.fs.path.join(al, &.{ d, name });
+        }
+    }.join;
+
+    var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    defer files.deinit(gpa);
+    for ([_][]const u8{ "other.zig", "link.zig", "caf\u{e9}.zig" }) |name| {
+        if (!macos and std.mem.eql(u8, name, "caf\u{e9}.zig")) continue;
+        const p = try path(a, dir, name);
+        try files.put(gpa, p, p);
+    }
+    var s: Spellings = .{};
+    defer s.deinit(gpa);
+    const target = try path(a, dir, "target.zig");
+    // The symbolic link `link.zig` is the file the notification names as `target.zig`
+    try testing.expectEqual(1, (try s.find(gpa, testing.io, &files, target, target)).?);
+    try testing.expectEqual(1, s.found.get(target).?.?);
+    // A name of another file in the same directory, and a name in a directory without files of
+    // interest, name none
+    const nested = try path(a, dir, "sub/target.zig");
+    try testing.expectEqual(null, try s.find(gpa, testing.io, &files, nested, nested));
+    try testing.expect(!s.found.contains(nested));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "new.zig", .data = "e" });
+    const new = try path(a, dir, "new.zig");
+    try testing.expectEqual(null, try s.find(gpa, testing.io, &files, new, new));
+    if (macos) {
+        const decomposed = try path(a, dir, "cafe\u{301}.zig");
+        try testing.expectEqual(2, (try s.find(gpa, testing.io, &files, decomposed, decomposed)).?);
+    }
+    // Removed: the name is still known until it is forgotten; then it leads nowhere
+    try tmp.dir.deleteFile(testing.io, "target.zig");
+    try testing.expectEqual(1, (try s.find(gpa, testing.io, &files, target, target)).?);
+    s.forget(gpa, target);
+    s.forgetFile(gpa, 1);
+    try testing.expectEqual(null, try s.find(gpa, testing.io, &files, target, target));
+    // The files of interest are recomputed
+    s.reset(gpa);
+    try testing.expectEqual(0, s.found.count());
+    try testing.expect(s.dirs == null);
 }

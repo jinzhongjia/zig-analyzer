@@ -526,6 +526,61 @@ test "comptime recursive calls with integer arguments reuse earlier results" {
     });
 }
 
+test "comptime calls run errdefer when returning an error" {
+    // Prevents skipping `errdefer` on error returns; expected values are the results of
+    // zig 0.17.0
+    try expectTypes(
+        \\fn viaReturn(p: *u32) !void {
+        \\    errdefer p.* += 100;
+        \\    p.* += 1;
+        \\    return error.Fail;
+        \\}
+        \\fn fails() !void {
+        \\    return error.Fail;
+        \\}
+        \\fn viaTry(p: *u32) !void {
+        \\    errdefer p.* += 100;
+        \\    p.* += 1;
+        \\    try fails();
+        \\}
+        \\fn nested(p: *u32) !void {
+        \\    defer p.* *= 2;
+        \\    errdefer p.* += 10;
+        \\    {
+        \\        errdefer p.* += 1000;
+        \\        p.* += 1;
+        \\    }
+        \\    {
+        \\        errdefer p.* += 3;
+        \\        try fails();
+        \\    }
+        \\}
+        \\fn succeeds(p: *u32) !void {
+        \\    errdefer p.* += 100;
+        \\    p.* += 1;
+        \\}
+        \\fn run(comptime which: u8) u32 {
+        \\    var x: u32 = 0;
+        \\    switch (which) {
+        \\        0 => viaReturn(&x) catch {},
+        \\        1 => viaTry(&x) catch {},
+        \\        2 => nested(&x) catch {},
+        \\        else => succeeds(&x) catch {},
+        \\    }
+        \\    return x;
+        \\}
+        \\const r = run(0);
+        \\const t = run(1);
+        \\const n = run(2);
+        \\const ok = run(3);
+    , &.{
+        .{ "r", "u32 = 101" },
+        .{ "t", "u32 = 101" },
+        .{ "n", "u32 = 28" },
+        .{ "ok", "u32 = 1" },
+    });
+}
+
 test "comptime integer arithmetic follows the result type" {
     try expectTypes(
         \\fn f() void {
@@ -701,6 +756,117 @@ test "comptime name builtins produce string literal types" {
         // A runtime operand still gives a slice
         .{ "v_tagname_rt", "[:0]const u8" },
     });
+}
+
+test "@typeName gives the compiler's fully qualified name" {
+    // Prevents giving the hover display name (`"E"` instead of `"main.E"`)
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
+    defer testing.allocator.free(std_root_path);
+    const std_root = try w.vfs.intern(std_root_path);
+    const src =
+        \\const std = @import("std");
+        \\const thing = @import("util/thing.zig");
+        \\const E = enum { a, b };
+        \\const S = struct {
+        \\    const Inner = struct {};
+        \\};
+        \\fn Box(comptime T: type) type {
+        \\    return struct { v: T };
+        \\}
+        \\fn Shared(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {};
+        \\}
+        \\fn Make() type {
+        \\    return struct {};
+        \\}
+        \\fn Out(comptime T: type) type {
+        \\    return struct {
+        \\        const In = struct { t: T };
+        \\        const Plain = struct {};
+        \\        fn G(comptime U: type) type {
+        \\            return struct { u: U, t: T };
+        \\        }
+        \\    };
+        \\}
+        \\fn Gen(comptime n: u8, comptime b: bool, comptime e: E, comptime o: ?u8, comptime l: @EnumLiteral(), comptime x: ?type) type {
+        \\    return struct {
+        \\        const k = .{ n, b, e, o, l, x };
+        \\    };
+        \\}
+        \\const n_E = @typeName(E);
+        \\const n_inner = @typeName(S.Inner);
+        \\const n_box = @typeName(Box(u8));
+        \\const n_box2 = @typeName(Box(S.Inner));
+        \\const n_make = @typeName(Make());
+        \\const n_in = @typeName(Out(u8).In);
+        \\const n_g = @typeName(Out(u8).G(u16));
+        \\const n_gen = @typeName(Gen(3, true, .b, 5, .q, null));
+        \\const n_list = @typeName(std.ArrayList(u8));
+        \\const n_alloc = @typeName(std.mem.Allocator);
+        \\const n_std = @typeName(std);
+        \\const n_thing = @typeName(thing.Thing);
+        \\const n_file = @typeName(thing);
+        \\const n_lit = @typeName(@TypeOf(.x));
+        \\const n_null = @typeName(@TypeOf(null));
+        \\const n_tuple = @typeName(struct { u8, ?*const [2:0]u8 });
+        \\const n_err = @typeName(error{ B, A }!S);
+        \\const n_anon = @typeName(@TypeOf(.{ .a = 1 }));
+        \\const n_shared = @typeName(Shared(u8));
+        \\const n_plain = @typeName(Out(u8).Plain);
+        \\const is_list = std.mem.startsWith(u8, @typeName(std.ArrayList(u8)), "array_list.");
+        \\const branch = if (is_list) @as(u8, 1) else @as(u16, 2);
+        \\const eqname = @intFromBool(std.mem.eql(u8, @typeName(E), "main.E"));
+        \\fn f() void {
+        \\    const L = struct {};
+        \\    const n_local = @typeName(L);
+        \\    _ = n_local;
+        \\}
+    ;
+    const main = try w.add("/p/src/main.zig", src);
+    const thing = try w.add("/p/src/util/thing.zig", "pub const Thing = struct {};\n");
+    try w.setGraph(std_root, &.{.{ .root = main.file, .imports = &.{} }}, &.{
+        .{ .file = main.file, .module = 0, .compile = 0 },
+        .{ .file = thing.file, .module = 0, .compile = 0 },
+    });
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "n_E", "*const [6:0]u8 = \"main.E\"" },
+        .{ "n_inner", "*const [12:0]u8 = \"main.S.Inner\"" },
+        .{ "n_box", "*const [12:0]u8 = \"main.Box(u8)\"" },
+        .{ "n_box2", "*const [22:0]u8 = \"main.Box(main.S.Inner)\"" },
+        .{ "n_make", "*const [11:0]u8 = \"main.Make()\"" },
+        .{ "n_in", "*const [15:0]u8 = \"main.Out(u8).In\"" },
+        .{ "n_g", "*const [19:0]u8 = \"main.Out(u8).G(u16)\"" },
+        .{ "n_gen", "*const [29:0]u8 = \"main.Gen(3,true,.b,5,.q,null)\"" },
+        .{ "n_list", "*const [27:0]u8 = \"array_list.Aligned(u8,null)\"" },
+        .{ "n_alloc", "*const [13:0]u8 = \"mem.Allocator\"" },
+        .{ "n_std", "*const [3:0]u8 = \"std\"" },
+        .{ "n_thing", "*const [16:0]u8 = \"util.thing.Thing\"" },
+        .{ "n_file", "*const [10:0]u8 = \"util.thing\"" },
+        .{ "n_lit", "*const [14:0]u8 = \"@EnumLiteral()\"" },
+        .{ "n_null", "*const [13:0]u8 = \"@TypeOf(null)\"" },
+        .{ "n_tuple", "*const [30:0]u8 = \"struct { u8, ?*const [2:0]u8 }\"" },
+        .{ "n_err", "*const [17:0]u8 = \"error{A,B}!main.S\"" },
+        // Named after a global counter, or after whichever instance creates the shared type first
+        .{ "n_anon", "unknown" },
+        .{ "n_shared", "unknown" },
+        .{ "n_plain", "unknown" },
+        .{ "is_list", "bool = true" },
+        .{ "branch", "u8 = 1" },
+        .{ "eqname", "u1 = 1" },
+        .{ "n_local", "*const [8:0]u8 = \"main.f.L\"" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, main.file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
 }
 
 test "comptime slices keep their sentinel" {
@@ -999,6 +1165,48 @@ test "oversized layouts degrade to unknown instead of overflowing" {
         .{ "eu_size", "comptime_int" },
         .{ "t_size", "comptime_int" },
         .{ "u_size", "comptime_int" },
+    });
+}
+
+test "error code layouts follow the error limit" {
+    // Prevents assuming 16-bit error codes when the compilation sets an error limit; expected
+    // values are the results of zig 0.17.0 with `--error-limit 255`
+    var target = try targetOf("x86_64-linux-musl", null);
+    target.error_bits = 8;
+    try expectTypesTargeted(target,
+        \\const Slot = struct { r: anyerror!u8, tag: u8 };
+        \\const E = error{ A, B };
+        \\const size_anyerror = @sizeOf(anyerror);
+        \\const bits_anyerror = @bitSizeOf(anyerror);
+        \\const align_anyerror = @alignOf(anyerror);
+        \\const size_eu_u8 = @sizeOf(anyerror!u8);
+        \\const size_eu_u32 = @sizeOf(anyerror!u32);
+        \\const size_slot = @sizeOf(Slot);
+        \\const size_set = @sizeOf(E);
+        \\const size_opt = @sizeOf(?anyerror);
+        \\fn code(e: anyerror) void {
+        \\    const int = @intFromError(e);
+        \\    _ = int;
+        \\}
+    , &.{
+        .{ "size_anyerror", "comptime_int = 1" },
+        .{ "bits_anyerror", "comptime_int = 8" },
+        .{ "align_anyerror", "comptime_int = 1" },
+        .{ "size_eu_u8", "comptime_int = 2" },
+        .{ "size_eu_u32", "comptime_int = 8" },
+        .{ "size_slot", "comptime_int = 3" },
+        .{ "size_set", "comptime_int = 1" },
+        .{ "size_opt", "comptime_int = 1" },
+        .{ "int", "u8" },
+    });
+    // Error limits that differ between the compilations sharing the parameters
+    target.error_bits = null;
+    try expectTypesTargeted(target,
+        \\const size_anyerror = @sizeOf(anyerror);
+        \\const size_eu_u8 = @sizeOf(anyerror!u8);
+    , &.{
+        .{ "size_anyerror", "comptime_int" },
+        .{ "size_eu_u8", "comptime_int" },
     });
 }
 
@@ -1601,6 +1809,116 @@ test "deep dependency chains neither overflow nor pollute shallower results" {
     try testing.expectEqualStrings("u32 = 2", try typeAt(&w, f.file, src.items, "b1", 0));
 }
 
+test "comptime vars modified through pointers, methods, fields and elements are not stale" {
+    // Prevents keeping the initial value of a `comptime var` after writes other than `v = x`
+    try expectTypes(
+        \\fn bump(comptime p: *comptime_int) void {
+        \\    p.* += 1;
+        \\}
+        \\fn advance(p: *u32, n: u32) void {
+        \\    p.* += n;
+        \\}
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u16 };
+        \\const State = struct {
+        \\    s: enum { a, b } = .a,
+        \\    fn step(self: *State) void {
+        \\        self.s = .b;
+        \\    }
+        \\};
+        \\const S = struct { n: u32 = 0 };
+        \\const c_s: S = .{};
+        \\const c_a: [2]u32 = .{ 0, 0 };
+        \\export fn entry() u32 {
+        \\    comptime var m = 0;
+        \\    comptime bump(&m);
+        \\    const m_v = m;
+        \\    const T = if (m == 0) A else B;
+        \\    comptime var k = 10;
+        \\    const p = comptime &k;
+        \\    p.* = 20;
+        \\    const k_v = k;
+        \\    comptime var st: State = .{};
+        \\    comptime st.step();
+        \\    const st_v = st.s;
+        \\    comptime var s = c_s;
+        \\    s.n = 5;
+        \\    const s_v = s.n;
+        \\    comptime var a = c_a;
+        \\    a[1] = 5;
+        \\    const a_v = a[1];
+        \\    comptime var params = [_]u8{ 1, 2 };
+        \\    inline for (&params) |*q| q.* ^= 0xff;
+        \\    const params_v = params[0];
+        \\    comptime var i: u32 = 0;
+        \\    inline while (i < 3) {
+        \\        comptime advance(&i, 1);
+        \\    }
+        \\    const i_v = i;
+        \\    comptime var d = 1;
+        \\    d += 1;
+        \\    const d_v = d;
+        \\    _ = .{ m_v, T, k_v, st_v, s_v, a_v, params_v, i_v, d_v };
+        \\    return 0;
+        \\}
+    , &.{
+        .{ "m_v", "comptime_int" },
+        .{ "T", "type" },
+        .{ "k_v", "comptime_int" },
+        .{ "st_v", "enum { a, b }" },
+        .{ "s_v", "u32" },
+        .{ "a_v", "u32" },
+        .{ "params_v", "u8" },
+        .{ "i_v", "u32" },
+        // Direct modifications are still tracked
+        .{ "d_v", "comptime_int = 2" },
+    });
+}
+
+/// Type of the binding `needle` when the loop variable `seed` takes the value of iteration `index`
+fn iterationTypeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, seed: []const u8, index: u32) ![]const u8 {
+    const offset = try wordAt(text, needle, 0);
+    const seed_offset = try wordAt(text, seed, 0);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const item = try r.ownerAt(file, offset, false) orelse return "no owner";
+    const node = (try r.itemNode(file, item)).?;
+    const owner = try r.ownerKey(file, item);
+    const body = try ctx.get(database.hir.ItemBody, owner);
+    const binding = for (body.bindings, 0..) |b, i| {
+        if (b.range.start == seed_offset - node.offset) break i;
+    } else return "no loop variable";
+    const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .loop = .{ .binding = @intCast(binding), .index = index } });
+    for (body.bindings, 0..) |b, i| if (b.range.start == offset - node.offset) return render.typedValueAlloc(&r, res.bindings[i]);
+    return "no binding";
+}
+
+test "later loop iterations see edits that change only the comptime vars an iteration leaves" {
+    // Prevents keeping a stale iteration through early cutoff when an edit changes only the value
+    // an iteration leaves in an outer comptime var (the start of the next iteration); expected
+    // types are the results of zig 0.17.0
+    const head =
+        \\pub fn main() void {
+        \\    comptime var acc: u32 = 1;
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        if (T == u16) {
+        \\            const x: [acc]T = undefined;
+        \\            _ = x;
+        \\        }
+        \\
+    ;
+    const before = head ++ "        acc *= 2;\n    }\n}\n";
+    const after = head ++ "        acc += 2;\n    }\n}\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", before);
+    try testing.expectEqualStrings("[2]u16 = undefined", try iterationTypeAt(&w, f.file, before, "x", "T", 1));
+    _ = try w.add("/p/main.zig", after);
+    try testing.expectEqualStrings("[3]u16 = undefined", try iterationTypeAt(&w, f.file, after, "x", "T", 1));
+}
+
 test "comptime evaluation runs loops, mutation and calls" {
     try expectTypes(
         \\fn double(n: usize) usize { return n * 2; }
@@ -1811,6 +2129,63 @@ test "slices with comptime-known bounds are pointers to arrays" {
         .{ "t17", "*[2:1]u8" },
         // A pointer to a single element is sliced as an array of length 1
         .{ "t18", "*[1]u8" },
+    });
+}
+
+test "dereferencing a comptime-known slice gives an array" {
+    // Prevents typing `slice.*` as the element type (`u16` for `[]const u16`)
+    try expectTypes(
+        \\const slice: []const u16 = &.{ 1, 2, 3 };
+        \\const arr = slice.*;
+        \\const n = arr.len;
+        \\const ap = &slice.*;
+        \\const zs: [:0]const u8 = "hello";
+        \\const zarr = zs.*;
+        \\const sz = @sizeOf(@TypeOf(arr));
+        \\const cat = arr ++ arr;
+        \\fn get() []const u8 {
+        \\    return "abc";
+        \\}
+        \\fn probe() void {
+        \\    const cp = comptime get().*;
+        \\    const s2: []const u16 = &.{ 4, 5 };
+        \\    const a2 = s2.*;
+        \\    _ = .{ cp, a2 };
+        \\}
+    , &.{
+        .{ "arr", "[3]u16 = .{ 1, 2, 3 }" },
+        .{ "n", "usize = 3" },
+        .{ "ap", "*const [3]u16 = &.{ 1, 2, 3 }" },
+        .{ "zarr", "[5:0]u8 = \"hello\"" },
+        .{ "sz", "comptime_int = 6" },
+        .{ "cat", "[6]u16 = .{ 1, 2, 3, 1, 2, 3 }" },
+        .{ "cp", "[3]u8 = \"abc\"" },
+        .{ "a2", "[2]u16 = .{ 4, 5 }" },
+    });
+}
+
+test "dereferencing a comptime-known slice in a function body" {
+    // Prevents inferring `slice.*` and `&slice.*` as unknown
+    try expectTypes(
+        \\fn probe(rt: []const u16) void {
+        \\    const slice: []const u16 = &.{ 1, 2, 3 };
+        \\    const array = slice.*;
+        \\    const array_ptr = &slice.*;
+        \\    const z: [:0]const u16 = &.{ 1, 2, 3 };
+        \\    const za = z.*;
+        \\    var v: []const u16 = &.{ 1, 2 };
+        \\    v = rt;
+        \\    const r1 = rt.*;
+        \\    const r2 = v.*;
+        \\    _ = .{ array, array_ptr, za, r1, r2 };
+        \\}
+    , &.{
+        .{ "array", "[3]u16 = .{ 1, 2, 3 }" },
+        .{ "array_ptr", "*const [3]u16 = &.{ 1, 2, 3 }" },
+        .{ "za", "[3:0]u16 = .{ 1, 2, 3 }" },
+        // Runtime-known slices cannot be dereferenced
+        .{ "r1", "unknown" },
+        .{ "r2", "unknown" },
     });
 }
 
@@ -2121,6 +2496,47 @@ test "@hasDecl and @hasField on abstract parameters are unknown" {
     });
 }
 
+test "@hasField on slices, arrays and non-exhaustive enums" {
+    // Prevents `@hasField` from being false for slice `ptr`/`len` and array `len`, and true
+    // for the `_` of a non-exhaustive enum; expected values are the results of zig 0.17.0
+    try expectStdTypes(
+        \\const Point = struct { x: i32, y: i32 };
+        \\fn Elem(comptime T: type) type {
+        \\    return if (@hasField(T, "ptr")) @typeInfo(T).pointer.child else T;
+        \\}
+        \\fn hasLen(comptime T: type) bool {
+        \\    return @hasField(T, "len");
+        \\}
+        \\fn hasUnder(comptime T: type) bool {
+        \\    return @hasField(T, "_");
+        \\}
+        \\const E = Elem([]const Point);
+        \\const A = Elem([3]Point);
+        \\const al = @hasField([3]u8, "len");
+        \\const ap = @hasField([3]u8, "ptr");
+        \\const sx = @hasField([]u8, "x");
+        \\const t = if (@hasField([]const u8, "len")) u1 else u2;
+        \\const NE = enum(u8) { a, b, _ };
+        \\const v = if (@hasField(NE, "_")) u1 else u2;
+        \\const ve = @hasField(NE, "_");
+        \\const ca = hasLen([2]u8);
+        \\const cs = hasLen([]u8);
+        \\const cn = hasUnder(NE);
+    , &.{
+        .{ "E", "type = Point" },
+        .{ "A", "type = [3]Point" },
+        .{ "al", "bool = true" },
+        .{ "ap", "bool = false" },
+        .{ "sx", "bool = false" },
+        .{ "t", "type = u1" },
+        .{ "v", "type = u2" },
+        .{ "ve", "bool = false" },
+        .{ "ca", "bool = true" },
+        .{ "cs", "bool = true" },
+        .{ "cn", "bool = false" },
+    });
+}
+
 test "arrays whose length depends on abstract parameters keep their element type" {
     try expectTypes(
         \\fn Hasher(comptime block_length: usize) type {
@@ -2271,6 +2687,34 @@ test "std.meta type functions" {
     });
 }
 
+test "@Int in function bodies takes any known signedness and u16 bit counts" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\fn f() void {
+        \\    const L256 = @Int(.unsigned, 256);
+        \\    const W = @Int(.unsigned, 2 * @bitSizeOf(u128));
+        \\    var w: W = 0;
+        \\    const s: std.lang.Signedness = .signed;
+        \\    const N = @Int(s, 16);
+        \\    const G = @Int(@typeInfo(i32).int.signedness, @typeInfo(i32).int.bits * 2);
+        \\    const y: G = 3;
+        \\    const cb = 256;
+        \\    const C = @Int(.unsigned, cb);
+        \\    const T300 = @Int(.unsigned, 300);
+        \\    _ = .{ L256, &w, N, y, C, T300 };
+        \\}
+    , &.{
+        .{ "L256", "type = u256" },
+        .{ "W", "type = u256" },
+        .{ "w", "u256" },
+        .{ "N", "type = i16" },
+        .{ "G", "type = i64" },
+        .{ "y", "i64 = 3" },
+        .{ "C", "type = u256" },
+        .{ "T300", "type = u300" },
+    });
+}
+
 test "type reflection and reification" {
     try expectStdTypes(
         \\const std = @import("std");
@@ -2299,6 +2743,115 @@ test "type reflection and reification" {
         // Matches the compiler: comptime-known fields in a literal are comptime fields
         .{ "tuple", "struct { comptime u8 = 1, comptime bool = true } = .{ 1, true }" },
         .{ "first", "u8 = 1" },
+    });
+}
+
+test "the _ of a non-exhaustive enum is not a field" {
+    try expectStdTypes(
+        \\const NE = enum(u8) { a, b, _ };
+        \\const Q = enum(u8) { a, @"_" };
+        \\fn g() void {
+        \\    const ne_len = @typeInfo(NE).@"enum".field_names.len;
+        \\    const ne_open = @typeInfo(NE).@"enum".mode == .nonexhaustive;
+        \\    const q_len = @typeInfo(Q).@"enum".field_names.len;
+        \\    const q_open = @typeInfo(Q).@"enum".mode == .nonexhaustive;
+        \\    _ = .{ ne_len, ne_open, q_len, q_open };
+        \\}
+    , &.{
+        .{ "ne_len", "usize = 2" },
+        .{ "ne_open", "bool = true" },
+        // `@"_"` is an ordinary field
+        .{ "q_len", "usize = 2" },
+        .{ "q_open", "bool = false" },
+    });
+}
+
+test "@typeInfo lists error names in declaration order" {
+    // Prevents listing `error_names` sorted by their bytes; expected values are the results of
+    // zig 0.17.0, which sorts only the names in `@typeName`
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Err = error{ Zeta, Alpha, Mid };
+        \\const v0 = @typeInfo(Err).error_set.error_names.?[0];
+        \\const v1 = @backingInt(std.meta.FieldEnum(Err).Zeta);
+        \\const v2 = @typeInfo(error{ Kilo, Bravo } || error{Echo}).error_set.error_names.?[1];
+        \\const same = Err == error{ Mid, Zeta, Alpha };
+        \\const name = @typeName(Err);
+        \\fn f() Err!void {
+        \\    return error.Zeta;
+        \\}
+        \\const v3 = @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+    , &.{
+        .{ "v0", "[:0]const u8 = \"Zeta\"" },
+        .{ "v1", "u2 = 0" },
+        .{ "v2", "[:0]const u8 = \"Bravo\"" },
+        .{ "same", "bool = true" },
+        .{ "name", "*const [21:0]u8 = \"error{Alpha,Mid,Zeta}\"" },
+        .{ "v3", "type = error{Alpha,Mid,Zeta}" },
+    });
+}
+
+test "empty exhaustive enums have the tag type noreturn" {
+    // Prevents giving `enum {}` and the tag of `union(enum) {}` the tag type `u0`; expected
+    // values are the results of zig 0.17.0
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Empty = enum {};
+        \\const U = union(enum) {};
+        \\const a = @typeInfo(Empty).@"enum".tag_type;
+        \\const b = std.meta.Tag(Empty);
+        \\const c = std.meta.BackingInt(Empty);
+        \\const d = @typeInfo(std.meta.Tag(U)).@"enum".tag_type;
+        \\const e = @typeInfo(enum { x }).@"enum".tag_type;
+        \\const f = if (@typeInfo(Empty).@"enum".tag_type == noreturn) 1 else 2;
+    , &.{
+        .{ "a", "type = noreturn" },
+        .{ "b", "type = noreturn" },
+        .{ "c", "type = noreturn" },
+        .{ "d", "type = noreturn" },
+        .{ "e", "type = u0" },
+        .{ "f", "comptime_int = 1" },
+    });
+}
+
+test "packed unions have a backing integer and no tag type" {
+    // Prevents treating the backing integer of `packed union(T)` as its tag type
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const PU = packed union(u8) { a: u8, b: i8 };
+        \\const PI = packed union { a: u8, b: i8 };
+        \\const PR = @Union(.@"packed", u16, &.{ "a", "b" }, &.{ u16, i16 }, &@splat(.{}));
+        \\fn tagBits(comptime T: type) comptime_int {
+        \\    if (@typeInfo(T).@"union".tag_type) |Tag| return @bitSizeOf(Tag);
+        \\    return -1;
+        \\}
+        \\fn backBits(comptime T: type) comptime_int {
+        \\    if (@typeInfo(T).@"union".backing_integer) |B| return @bitSizeOf(B);
+        \\    return -1;
+        \\}
+        \\const tag_pu = tagBits(PU);
+        \\const back_pu = backBits(PU);
+        \\const tag_pi = tagBits(PI);
+        \\const back_pi = backBits(PI);
+        \\const tag_pr = tagBits(PR);
+        \\const back_pr = backBits(PR);
+        \\const BI = std.meta.BackingInt(PU);
+        \\const Tag = std.meta.Tag(PU);
+        \\fn f() void {
+        \\    const x = PU.a;
+        \\    _ = x;
+        \\}
+    , &.{
+        .{ "tag_pu", "comptime_int = -1" },
+        .{ "back_pu", "comptime_int = 8" },
+        .{ "tag_pi", "comptime_int = -1" },
+        .{ "back_pi", "comptime_int = 8" },
+        .{ "tag_pr", "comptime_int = -1" },
+        .{ "back_pr", "comptime_int = 16" },
+        .{ "BI", "type = u8" },
+        // Compile errors in the compiler
+        .{ "Tag", "type" },
+        .{ "x", "unknown" },
     });
 }
 
@@ -3202,6 +3755,25 @@ test "comptime evaluation: backward branches follow the compiler's quota" {
         .{ "kept", "usize = 1494" },
         .{ "over", "usize" },
         .{ "in_body", "usize = 14995" },
+    });
+}
+
+test "comptime while loops count one backward branch per iteration" {
+    // Prevents counting a backward branch for the first condition check of each `while` loop,
+    // which gave up below the compiler's quota; expected values are the results of zig 0.17.0
+    try expectTypes(
+        \\const w1000 = blk: { var s: usize = 0; var i: usize = 0; while (i < 1000) : (i += 1) s += 1; break :blk s; };
+        \\const q2000 = blk: { @setEvalBranchQuota(2000); var s: usize = 0; var i: usize = 0; while (i < 2000) : (i += 1) s += 1; break :blk s; };
+        \\const n500x0 = blk: { var s: usize = 0; var i: usize = 0; while (i < 500) : (i += 1) { var j: usize = 0; while (j < 0) : (j += 1) s += 1; s += 1; } break :blk s; };
+        \\const c1000 = blk: { var s: usize = 0; var i: usize = 0; while (i < 1000) : (i += 1) { if (i % 2 == 0) continue; s += 1; } break :blk s; };
+        \\const w1001 = blk: { var s: usize = 0; var i: usize = 0; while (i < 1001) : (i += 1) s += 1; break :blk s; };
+    , &.{
+        .{ "w1000", "usize = 1000" },
+        .{ "q2000", "usize = 2000" },
+        .{ "n500x0", "usize = 500" },
+        .{ "c1000", "usize = 500" },
+        // The compiler reports that the quota is exceeded
+        .{ "w1001", "usize" },
     });
 }
 

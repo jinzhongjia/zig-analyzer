@@ -34,6 +34,31 @@ pub fn IntEnum(comptime T: type) type {
     };
 }
 
+/// Structures with required properties of type `T | null`: those properties are always written,
+/// as `null` when unset, while other null optional fields follow `emit_null_optional_fields`.
+pub fn RequiredNullable(comptime T: type, comptime required: []const []const u8) type {
+    const info = @typeInfo(T).@"struct";
+    return struct {
+        pub fn jsonStringify(self: T, jw: anytype) !void {
+            try jw.beginObject();
+            inline for (info.field_names, info.field_types) |name, F| {
+                const always = comptime for (required) |r| {
+                    if (std.mem.eql(u8, r, name)) break true;
+                } else false;
+                var emit = true;
+                if (!always and @typeInfo(F) == .optional) {
+                    if (!jw.options.emit_null_optional_fields and @field(self, name) == null) emit = false;
+                }
+                if (emit) {
+                    try jw.objectField(name);
+                    try jw.write(@field(self, name));
+                }
+            }
+            try jw.endObject();
+        }
+    };
+}
+
 /// LSP `A | B | C` union types: variants are first filtered by the shape of the JSON value;
 /// object types are tried strictly (no unknown fields) first, then leniently; the first variant
 /// that succeeds is used.

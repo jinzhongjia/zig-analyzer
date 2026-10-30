@@ -6,6 +6,11 @@ const code_actions = @import("code_actions.zig");
 
 /// Applies the fix titled `title` at `<|>` (or on the `«...»` selection) and returns the new text
 fn apply(text: []const u8, title_prefix: []const u8) ![]const u8 {
+    return applyIn("/p/main.zig", text, title_prefix);
+}
+
+/// `apply` in the file at `path`
+fn applyIn(comptime path: []const u8, text: []const u8, title_prefix: []const u8) ![]const u8 {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -19,7 +24,7 @@ fn apply(text: []const u8, title_prefix: []const u8) ![]const u8 {
         end = @intCast(close - "«".len);
         break :blk try std.mem.concat(w.arena.allocator(), u8, &.{ text[0..open], text[open + "«".len .. close], text[close + "»".len ..] });
     };
-    const added = try w.add("/p/main.zig", plain);
+    const added = try w.add(path, plain);
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
@@ -91,6 +96,71 @@ test "discard unused locals, parameters and captures" {
         \\    _ = a + 1;
         \\}
     );
+}
+
+test "discard keeps the trailing comment of the line it follows" {
+    try expectAction(
+        \\fn f() void {
+        \\    const <|>x: u32 = 5; // the answer
+        \\}
+    , "discard `x`",
+        \\fn f() void {
+        \\    const x: u32 = 5; // the answer
+        \\    _ = x;
+        \\}
+    );
+    try expectAction(
+        \\fn f(o: ?u32) void {
+        \\    if (o) |<|>v| { // payload not needed yet
+        \\        return;
+        \\    }
+        \\}
+    , "discard `v`",
+        \\fn f(o: ?u32) void {
+        \\    if (o) |v| { // payload not needed yet
+        \\        _ = v;
+        \\        return;
+        \\    }
+        \\}
+    );
+}
+
+test "discard takes the address of errors and variables" {
+    // `_ = err;` fails with `error set is discarded`, `_ = r;` of an error union with `error union
+    // is discarded`, and `_ = x;` of a `var` with `local variable is never mutated`
+    const g = "fn g(x: u32) !u32 {\n    if (x == 0) return error.Zero;\n    return x;\n}\n";
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{
+            g ++ "fn f(x: u32) u32 {\n    return g(x) catch |<|>err| {\n        return 7;\n    };\n}\n",
+            "discard `err`",
+            g ++ "fn f(x: u32) u32 {\n    return g(x) catch |err| {\n        _ = &err;\n        return 7;\n    };\n}\n",
+        },
+        .{
+            g ++ "fn f(x: u32) u32 {\n    if (g(x)) |v| {\n        return v;\n    } else |<|>err| {\n        return 7;\n    }\n}\n",
+            "discard `err`",
+            g ++ "fn f(x: u32) u32 {\n    if (g(x)) |v| {\n        return v;\n    } else |err| {\n        _ = &err;\n        return 7;\n    }\n}\n",
+        },
+        .{
+            "fn f(<|>e: anyerror) u32 {\n    return 1;\n}\n",
+            "discard `e`",
+            "fn f(e: anyerror) u32 {\n    _ = &e;\n    return 1;\n}\n",
+        },
+        .{
+            g ++ "fn f() void {\n    const <|>r = g(1);\n}\n",
+            "discard `r`",
+            g ++ "fn f() void {\n    const r = g(1);\n    _ = &r;\n}\n",
+        },
+        .{
+            "fn f() void {\n    var <|>x: u32 = 0;\n}\n",
+            "discard `x`",
+            "fn f() void {\n    var x: u32 = 0;\n    _ = &x;\n}\n",
+        },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], c[1]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
+    }
 }
 
 /// AstGen (same as `zig ast-check`) reports no errors
@@ -952,6 +1022,237 @@ test "add missing switch prongs" {
     ));
 }
 
+test "add missing switch prongs of a non-exhaustive enum" {
+    // `_` is not a member: the fix adds `_ => {}` and is offered when a `_` prong exists
+    try expectAction(
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a => {},
+        \\        .b => {},
+        \\        .c => {},
+        \\        _ => {},
+        \\    }
+        \\}
+    );
+    try expectAction(
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a => {},
+        \\        _ => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a => {},
+        \\        _ => {},
+        \\        .b => {},
+        \\        .c => {},
+        \\    }
+        \\}
+    );
+    // `@"_"` is an ordinary member
+    try expectAction(
+        \\const E = enum { a, @"_" };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, @"_" };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a => {},
+        \\        .@"_" => {},
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("no action", try applyNone(
+        \\const E = enum(u8) { a, _ };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) { .a => {}, _ => {} }
+        \\}
+    ));
+}
+
+test "add missing switch prongs counts qualified and aliased items as covered" {
+    // Covered tags written through their type or an alias are not added again (duplicate
+    // switch value)
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u32 {
+        \\    <|>switch (e) {
+        \\        E.a => return 1,
+        \\    }
+        \\    return 0;
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u32 {
+        \\    switch (e) {
+        \\        E.a => return 1,
+        \\        .b => {},
+        \\        .c => {},
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a, E.b => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a, E.b => {},
+        \\        .c => {},
+        \\    }
+        \\}
+    );
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\const first = E.a;
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        first => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b, c };
+        \\const first = E.a;
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        first => {},
+        \\        .b => {},
+        \\        .c => {},
+        \\    }
+        \\}
+    );
+    try expectAction(
+        \\const T = enum { a, b };
+        \\const U = union(T) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    <|>switch (u) {
+        \\        T.a => |v| return v,
+        \\    }
+        \\    return 0;
+        \\}
+    , "add missing switch prongs",
+        \\const T = enum { a, b };
+        \\const U = union(T) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    switch (u) {
+        \\        T.a => |v| return v,
+        \\        .b => {},
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    // Every tag is covered
+    try testing.expectEqualStrings("no action", try applyNone(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u32 {
+        \\    return <|>switch (e) { E.a => 1, E.b => 2, E.c => 3 };
+        \\}
+    ));
+    // An item whose value is unknown may cover any tag
+    try testing.expectEqualStrings("no action", try applyNone(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) { missing => {} }
+        \\}
+    ));
+}
+
+test "add missing switch prongs whose value is used" {
+    // A `{}` body would fail with `expected type 'u32', found 'void'`
+    try expectAction(
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    const x: u32 = <|>switch (e) {
+        \\        .a => 1,
+        \\    };
+        \\    return x;
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    const x: u32 = switch (e) {
+        \\        .a => 1,
+        \\        .b => @panic("TODO"),
+        \\    };
+        \\    return x;
+        \\}
+    );
+    try expectAction(
+        \\const U = union(enum) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    return <|>switch (u) {
+        \\        .a => |v| v,
+        \\    };
+        \\}
+    , "add missing switch prongs",
+        \\const U = union(enum) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    return switch (u) {
+        \\        .a => |v| v,
+        \\        .b => @panic("TODO"),
+        \\    };
+        \\}
+    );
+    // A statement switch, even when its prongs do not return
+    try expectAction(
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    <|>switch (e) {
+        \\        .a => return 1,
+        \\    }
+        \\    return 0;
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    switch (e) {
+        \\        .a => return 1,
+        \\        .b => {},
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    // A value switch of type void
+    try expectAction(
+        \\const E = enum { a, b };
+        \\fn f(e: E, c: bool) void {
+        \\    if (c) <|>switch (e) {
+        \\        .a => {},
+        \\    };
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b };
+        \\fn f(e: E, c: bool) void {
+        \\    if (c) switch (e) {
+        \\        .a => {},
+        \\        .b => {},
+        \\    };
+        \\}
+    );
+}
+
 fn applyNone(text: []const u8) ![]const u8 {
     const got = try apply(text, "add missing switch prongs");
     defer testing.allocator.free(got);
@@ -988,6 +1289,77 @@ test "add missing struct fields" {
         \\y: i32,
         \\const p: @This() = .{ .x = 1, .y = undefined };
     );
+}
+
+test "add missing struct fields when the result type is optional" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: ?S = .{ .a<|> = 1 };\n    _ = s;\n}\n",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: ?S = .{ .a = 1, .b = undefined };\n    _ = s;\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\nfn mk() ?S {\n    return .{ .a<|> = 1 };\n}\n",
+            "const S = struct { a: u32, b: u32 };\nfn mk() ?S {\n    return .{ .a = 1, .b = undefined };\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\nfn take(s: ?S) void {\n    _ = s;\n}\ntest {\n    take(.{ .a<|> = 1 });\n}\n",
+            "const S = struct { a: u32, b: u32 };\nfn take(s: ?S) void {\n    _ = s;\n}\ntest {\n    take(.{ .a = 1, .b = undefined });\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\nconst T = struct { s: ?S };\nconst t: T = .{ .s = .{ .a<|> = 1 } };\n",
+            "const S = struct { a: u32, b: u32 };\nconst T = struct { s: ?S };\nconst t: T = .{ .s = .{ .a = 1, .b = undefined } };\n",
+        },
+    };
+    for (cases) |c| try expectAction(c[0], "add missing struct fields", c[1]);
+}
+
+test "add missing fields and prongs keep trailing comments intact" {
+    // The comma goes after the last element, before its comment, not into the comment
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = 1 // first\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .a = 1, // first\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = 1, // first\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .a = 1, // first\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        // A comment on its own line before `}` stays before the new fields
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = 1\n        // more\n        // later\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{\n        .a = 1,\n        // more\n        // later\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        .{
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{<|> // TODO\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: u32, b: u32 };\ntest {\n    const s: S = .{ // TODO\n        .a = undefined,\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        // `//` inside a string is not a comment
+        .{
+            "const S = struct { a: []const u8, b: u32 };\ntest {\n    const s: S = .{\n        .<|>a = \"x//y\"\n    };\n    _ = s;\n}\n",
+            "add missing struct fields",
+            "const S = struct { a: []const u8, b: u32 };\ntest {\n    const s: S = .{\n        .a = \"x//y\",\n        .b = undefined,\n    };\n    _ = s;\n}\n",
+        },
+        .{
+            "const E = enum { a, b };\nfn f(e: E) void {\n    <|>switch (e) {\n        .a => {} // handled\n    }\n}\n",
+            "add missing switch prongs",
+            "const E = enum { a, b };\nfn f(e: E) void {\n    switch (e) {\n        .a => {}, // handled\n        .b => {},\n    }\n}\n",
+        },
+        .{
+            "const E = enum { a, b };\nfn f(e: E) void {\n    <|>switch (e) { // TODO\n    }\n}\n",
+            "add missing switch prongs",
+            "const E = enum { a, b };\nfn f(e: E) void {\n    switch (e) { // TODO\n        .a => {},\n        .b => {},\n    }\n}\n",
+        },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], c[1]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
+        try expectAstCheckClean(got);
+    }
 }
 
 test "add missing fields and prongs with names that need quoting" {
@@ -1445,4 +1817,28 @@ test "string conversion rejects unrepresentable bytes and invalid selections" {
         defer testing.allocator.free(converted);
         try testing.expectEqualStrings("no action", converted);
     }
+}
+
+test "conversion to a multiline string literal is not offered where Zig requires an ordinary one" {
+    // A multiline `@import` operand or manifest string is rejected by Zig
+    inline for (.{
+        .{ "/p/main.zig", "const std = @import(\"s<|>td\");" },
+        .{ "/p/build.zig.zon", ".{ .version = \"0.0<|>.0\" }" },
+    }) |c| {
+        const converted = try applyIn(c[0], c[1], "convert to");
+        defer testing.allocator.free(converted);
+        try testing.expectEqualStrings("no action", converted);
+    }
+    // Elsewhere, including other `.zon` files and other builtins, it is offered
+    inline for (.{
+        .{ "/p/main.zig", "const s = \"a<|>bc\";" },
+        .{ "/p/data.zon", ".{ .version = \"0.0<|>.0\" }" },
+        .{ "/p/main.zig", "const s = @embedFile(\"a<|>.txt\");" },
+    }) |c| {
+        const converted = try applyIn(c[0], c[1], "convert to a multiline");
+        defer testing.allocator.free(converted);
+        try testing.expect(std.mem.indexOf(u8, converted, "\\\\") != null);
+    }
+    // Converting back is still offered in an `@import` operand
+    try expectAction("const std = @import(\n    \\\\s<|>td\n);", "convert to a string literal", "const std = @import(\n    \"std\"\n);");
 }

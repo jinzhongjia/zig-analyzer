@@ -1803,3 +1803,307 @@ test "settings: invalid zig paths fall back to zig env with a message, zig.built
     try testing.expectEqual(messages.len, (try shownMessages(&h)).len);
     try shutdown(&h);
 }
+
+/// The diagnostics last published for a document, and how many times it was published
+fn lastPublished(h: *Harness, document_uri: []const u8) !struct { diagnostics: []const std.json.Value, count: usize } {
+    var last: ?[]const std.json.Value = null;
+    var count: usize = 0;
+    for (try h.notifications("textDocument/publishDiagnostics")) |m| {
+        const params = m.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("uri").?.string, document_uri)) continue;
+        last = params.get("diagnostics").?.array.items;
+        count += 1;
+    }
+    return .{ .diagnostics = last orelse return error.NotPublished, .count = count };
+}
+
+/// "uri-basename line:character message" of each relatedInformation entry of a diagnostic
+fn relatedLocations(h: *Harness, diagnostic: std.json.Value) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const related = diagnostic.object.get("relatedInformation") orelse return out.items;
+    for (related.array.items) |r| {
+        const location = r.object.get("location").?.object;
+        const file_uri = location.get("uri").?.string;
+        const start = location.get("range").?.object.get("start").?.object;
+        try out.append(h.arena.allocator(), try std.fmt.allocPrint(h.arena.allocator(), "{s} {d}:{d} {s}", .{
+            file_uri[std.mem.lastIndexOfScalar(u8, file_uri, '/').? + 1 ..],
+            start.get("line").?.integer,
+            start.get("character").?.integer,
+            r.object.get("message").?.string,
+        }));
+    }
+    return out.items;
+}
+
+test "notes into another open file follow its unsaved edits and its close" {
+    const util_text = "pub fn helper(x: u32) u32 {\n    return x;\n}\n";
+    const main_text = "const util = @import(\"util.zig\");\nexport fn f() u32 {\n    return util.helper(1, 2);\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "util.zig", .text = util_text },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"diagnostics": {"debounce_ms": 0}}
+    ));
+    try waitIdle(&h);
+    const util_uri = try open(&h, try project.path(a, "util.zig"), util_text);
+    const main_uri = try open(&h, try project.path(a, "main.zig"), main_text);
+    try waitIdle(&h);
+    const declared = "util.zig 0:0 function declared here";
+    {
+        const diags = (try lastPublished(&h, main_uri)).diagnostics;
+        try testing.expectEqual(1, diags.len);
+        try testing.expectEqualStrings(declared, (try relatedLocations(&h, diags[0]))[0]);
+    }
+
+    // Unsaved lines inserted above the function: the note moves with them. Guards against keeping
+    // main.zig's note on the old line until main.zig itself is republished.
+    const published = (try lastPublished(&h, main_uri)).count;
+    try change(&h, util_uri, 2, "// one\n// two\n// three\n" ++ util_text);
+    try waitIdle(&h);
+    {
+        const last = try lastPublished(&h, main_uri);
+        try testing.expect(last.count > published);
+        try testing.expectEqualStrings("util.zig 3:0 function declared here", (try relatedLocations(&h, last.diagnostics[0]))[0]);
+    }
+
+    // Closed without saving: back to the text on disk
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = util_uri } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(declared, (try relatedLocations(&h, (try lastPublished(&h, main_uri)).diagnostics[0]))[0]);
+    try shutdown(&h);
+}
+
+/// Start positions ("line:character") of the inactive code hints last published for a document
+fn inactiveHints(h: *Harness, document_uri: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for ((try lastPublished(h, document_uri)).diagnostics) |d| {
+        if (std.mem.indexOf(u8, d.object.get("message").?.string, "inactive") == null) continue;
+        const start = d.object.get("range").?.object.get("start").?.object;
+        try out.append(h.arena.allocator(), try std.fmt.allocPrint(h.arena.allocator(), "{d}:{d}", .{ start.get("line").?.integer, start.get("character").?.integer }));
+    }
+    return out.items;
+}
+
+test "inactive code hints of other open files follow the comptime values they read" {
+    const consts_text = "pub const N: usize = 4;\npub const wide = N > 3;\n";
+    const narrow_text = "pub const N: usize = 4;\npub const wide = N > 5;\n";
+    const shapes_text = "const consts = @import(\"consts.zig\");\npub const Coord = if (consts.wide) f64 else f32;\n";
+    const main_text = "const shapes = @import(\"shapes.zig\");\nexport fn entry() void {\n    const c: shapes.Coord = 1.5;\n    _ = c;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "consts.zig", .text = consts_text },
+        .{ .path = "shapes.zig", .text = shapes_text },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initializeWith(&h, project.root, false, try jsonValue(&h,
+        \\{"diagnostics": {"compiler": false, "inactive_code": true, "debounce_ms": 0}}
+    ));
+    try waitIdle(&h);
+    const consts_path = try project.path(a, "consts.zig");
+    const consts_uri = try open(&h, consts_path, consts_text);
+    _ = try open(&h, try project.path(a, "main.zig"), main_text);
+    const shapes_uri = try open(&h, try project.path(a, "shapes.zig"), shapes_text);
+    try waitIdle(&h);
+    const f32_hint = "1:44";
+    const f64_hint = "1:35";
+    try testing.expectEqualStrings(f32_hint, (try inactiveHints(&h, shapes_uri))[0]);
+
+    // An unsaved edit flips the condition. Guards against keeping the hint of the old value in
+    // the other open file.
+    try change(&h, consts_uri, 2, narrow_text);
+    try waitIdle(&h);
+    try testing.expectEqualStrings(f64_hint, (try inactiveHints(&h, shapes_uri))[0]);
+
+    // Closed without saving, then changed on disk while closed
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = consts_uri } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(f32_hint, (try inactiveHints(&h, shapes_uri))[0]);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = consts_path, .data = narrow_text });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = consts_uri, .type = 2 }} });
+    try waitIdle(&h);
+    try testing.expectEqualStrings(f64_hint, (try inactiveHints(&h, shapes_uri))[0]);
+    try shutdown(&h);
+}
+
+test "inlay hint refresh after changes the client cannot see: other documents, disk, module graph" {
+    const dep_text = "pub fn make(width: u32, height: u32) u32 {\n    return width * height;\n}\n";
+    const extra_text = "pub const scale: u32 = 2;\n";
+    const main_text = "const dep = @import(\"dep.zig\");\nconst extra = @import(\"extra.zig\");\npub fn main() void {\n    _ = dep.make(1, extra.scale);\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "dep.zig", .text = dep_text },
+        .{ .path = "extra.zig", .text = extra_text },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = .{ .workspace = .{ .inlayHint = .{ .refreshSupport = true } } },
+        .initializationOptions = try jsonValue(&h,
+            \\{"diagnostics": {"debounce_ms": 0}}
+        ),
+    });
+    try h.notify("initialized", Empty{});
+    // A single document: its hints may have been pulled before the standard library and the
+    // module graph were loaded. Guards against asking only for semantic tokens again.
+    _ = try open(&h, try project.path(a, "main.zig"), main_text);
+    try waitIdle(&h);
+    var before = countRequests(&h, "workspace/inlayHint/refresh");
+    try testing.expect(before > 0);
+
+    // Another document is edited
+    const dep_uri = try open(&h, try project.path(a, "dep.zig"), dep_text);
+    try waitIdle(&h);
+    before = countRequests(&h, "workspace/inlayHint/refresh");
+    try change(&h, dep_uri, 2, "pub fn make(w2: u32, h2: u32) u32 {\n    return w2 * h2;\n}\n");
+    try waitIdle(&h);
+    try testing.expect(countRequests(&h, "workspace/inlayHint/refresh") > before);
+    before = countRequests(&h, "workspace/inlayHint/refresh");
+
+    const extra_path = try project.path(a, "extra.zig");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = extra_path, .data = "pub const scale: u32 = 3;\n" });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, extra_path), .type = 2 }} });
+    try waitIdle(&h);
+    try testing.expect(countRequests(&h, "workspace/inlayHint/refresh") > before);
+    try shutdown(&h);
+}
+
+test "zig version mismatch: files opened before startup get the live diagnostics of zig ast-check" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const text = "export fn f() void {\n    var x: u32 = 1;\n    _ = x;\n}\n";
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // A zig of another version, reporting itself as the zig executable, whose ast-check reports
+    // one more error than the built-in AstGen
+    const zig = project.env.zig_exe;
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\case "$1" in
+        \\env) "{s}" env | sed -e 's/\.version = "[^"]*"/.version = "0.0.0-mismatch"/' -e 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}/zigw"|' ;;
+        \\ast-check) "{s}" "$@"; echo '<stdin>:1:1: error: MARKER' >&2 ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ zig, project.root, zig, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+    const settings = try jsonValue(&h, try std.fmt.allocPrint(a, "{{\"zig\": {{\"path\": \"{s}/zigw\"}}, \"diagnostics\": {{\"compiler\": false, \"debounce_ms\": 0}}}}", .{project.root}));
+    h.configuration = settings;
+    // Startup waits for the reply to workspace/configuration, which the harness sends only when
+    // it next reads messages: the document is opened before startup
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = .{ .workspace = .{ .configuration = true } },
+        .initializationOptions = settings,
+    });
+    try h.notify("initialized", Empty{});
+    _ = try open(&h, try project.path(a, "main.zig"), text);
+    try waitIdle(&h);
+    // Guards against keeping the built-in AstGen result published before the switch to the
+    // configured zig
+    try expectDiagnostics(try h.diagnostics(), "main.zig", &.{ "1:8 zig ast-check: local variable is never mutated", "0:0 zig ast-check: MARKER" });
+    try shutdown(&h);
+}
+
+/// Message texts of the last diagnostics published for `uri` (null when none were published)
+fn lastDiagnostics(h: *Harness, uri: []const u8) !?[]const []const u8 {
+    var last: ?[]const []const u8 = null;
+    for (try h.notifications("textDocument/publishDiagnostics")) |m| {
+        const params = m.object.get("params").?.object;
+        if (!std.mem.eql(u8, params.get("uri").?.string, uri)) continue;
+        const diags = params.get("diagnostics").?.array.items;
+        const texts = try h.arena.allocator().alloc([]const u8, diags.len);
+        for (diags, texts) |d, *t| t.* = d.object.get("message").?.string;
+        last = texts;
+    }
+    return last;
+}
+
+/// Hover text at the start of `needle` in `text` (null without a result)
+fn hoverText(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) !?[]const u8 {
+    const offset = std.mem.indexOf(u8, text, needle).?;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{
+        .line = std.mem.count(u8, text[0..offset], "\n"),
+        .character = offset - line_start,
+    } });
+    const result = resp.object.get("result").?;
+    if (result != .object) return null;
+    return result.object.get("contents").?.object.get("value").?.string;
+}
+
+test "single-file mode through symbolic links: a detached file and the zig installation keep the client's paths" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const one =
+        \\const std = @import("std");
+        \\const data = @embedFile("data.txt");
+        \\pub fn main() void {
+        \\    std.debug.print("{d}\n", .{});
+        \\    _ = data;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "real/scratch/one.zig", .text = one },
+        .{ .path = "real/scratch/data.txt", .text = "hello\n" },
+    });
+    defer project.deinit();
+    // The workspace folder and the zig installation are both reached through symbolic links, as
+    // Homebrew's /opt/homebrew/lib/zig is, while `zig env` reports the installation's real path
+    try project.tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "zig", .{ .is_directory = true });
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "link/scratch"), false);
+    try waitIdle(&h);
+    var std_uris: [3][]const u8 = undefined;
+    var mem_text: []const u8 = undefined;
+    for ([_][]const u8{ "Io/Writer.zig", "debug.zig", "mem.zig" }, &std_uris) |name, *u| {
+        const path = try std.fs.path.join(a, &.{ try project.path(a, "zig/std"), name });
+        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(4 * 1024 * 1024));
+        if (std.mem.eql(u8, name, "mem.zig")) mem_text = text;
+        u.* = try open(&h, path, text);
+    }
+    const writer_uri, const debug_uri, const mem_uri = std_uris;
+    const one_uri = try open(&h, try project.path(a, "link/scratch/one.zig"), one);
+    try waitIdle(&h);
+
+    // Guards against the documents opened through the links being files of their own: the
+    // standard library's error went to the real path and mem.zig was compiled as a root, which
+    // put it in two modules
+    const writer = (try lastDiagnostics(&h, writer_uri)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(1, writer.len);
+    try testing.expect(std.mem.indexOf(u8, writer[0], "too few arguments") != null);
+    const real_writer_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ project.env.lib_dir, "std/Io/Writer.zig" }));
+    try testing.expectEqual(null, try lastDiagnostics(&h, real_writer_uri));
+    try expectNoErrors(&h, mem_uri);
+    try testing.expectEqual(0, ((try lastDiagnostics(&h, one_uri)) orelse return error.TestUnexpectedResult).len);
+    try testing.expectEqual(null, try lastDiagnostics(&h, try za.base.uri.fromPath(a, try project.path(a, "real/scratch/one.zig"))));
+
+    // Goto into the standard library opens the client's document, and hover shows the embedded
+    // file under the workspace folder
+    try testing.expectEqualStrings(try za.base.uri.toPath(a, debug_uri), try definitionPath(&h, one_uri, one, "print"));
+    const embedded = (try hoverText(&h, one_uri, one, "data =")) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, embedded, "data.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, embedded, "/real/") == null);
+    try testing.expect(try hoverText(&h, mem_uri, mem_text, "eql(") != null);
+    try shutdown(&h);
+}

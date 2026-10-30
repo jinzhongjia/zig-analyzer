@@ -245,6 +245,16 @@ pub fn scope(b: *const Body, id: ScopeId) Scope {
     return b.scopes[@backingInt(id)];
 }
 
+/// The binding whose name token starts at `offset` (relative to the owner). The binding of an
+/// unnamed parameter (`extern fn f(*const u32) void`) has an empty name at the start of its type
+/// and is never at a position: the token there belongs to the type.
+pub fn bindingAt(b: *const Body, offset: u32) ?BindingId {
+    for (b.bindings, 0..) |x, i| {
+        if (x.range.start == offset and x.range.end > x.range.start) return @fromBackingInt(@as(u32, @intCast(i)));
+    }
+    return null;
+}
+
 /// Smallest expression containing `offset` (relative to the owner)
 pub fn exprAt(b: *const Body, offset: u32) ?ExprId {
     var best: ?ExprId = null;

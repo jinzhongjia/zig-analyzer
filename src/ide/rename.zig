@@ -5,8 +5,8 @@
 //! one container (declarations and fields) cannot share a name either: such renames make AstGen
 //! report errors, which `declarationConflict` detects in advance and `verifyAstGen` confirms on
 //! the renamed text. A declaration in a container, however, may share its name with a declaration
-//! of an outer container (the inner one takes precedence); such a rename causes no error, but the
-//! name silently refers to another declaration, which `resolutionConflict` checks. Error names are
+//! of an outer container; AstGen reports only the references that see both (`ambiguous
+//! reference`), which `resolutionConflict` finds for the references the rename affects. Error names are
 //! global, so renaming one must neither split it from a use that is not renamed nor merge it with
 //! another error (`errorNameConflict`).
 
@@ -85,11 +85,10 @@ pub fn declarationConflict(r: *Resolver, def: Def, new: []const u8) resolve.Erro
 }
 
 /// After a declaration in a container is renamed to `new`, name references inside the container
-/// change their target (AstGen reports no error):
-/// - A reference to it already sees a closer `new` (a declaration or local name inside the
-///   container): after the rename, the reference is captured by that name
-/// - A reference inside the container that used to refer to a `new` outside the container: after
-///   the rename, it refers to the renamed declaration
+/// see two declarations with the same name, which Zig reports as an `ambiguous reference`:
+/// - A reference to it already sees another `new` declared inside the container
+/// - A reference inside the container to a `new` outside the container also sees the renamed
+///   declaration
 pub fn resolutionConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error!?Problem {
     const it = switch (def) {
         .item => |it| it,
@@ -121,14 +120,14 @@ pub fn resolutionConflict(r: *Resolver, def: Def, new: []const u8) resolve.Error
                 if (try definedInside(r, other, it.file, container)) return .{
                     .file = it.file,
                     .offset = base + range.start,
-                    .message = try std.fmt.allocPrint(r.arena, "this reference would refer to another `{s}` declared closer to it", .{new}),
+                    .message = try std.fmt.allocPrint(r.arena, "this reference would be an ambiguous reference: another `{s}` is declared closer to it", .{new}),
                 };
             } else if (std.mem.eql(u8, name, new)) {
                 const d = try r.resolveName(it.file, index, body, scope, new) orelse continue;
                 if (!try definedInside(r, d, it.file, container)) return .{
                     .file = it.file,
                     .offset = base + range.start,
-                    .message = try std.fmt.allocPrint(r.arena, "this `{s}` refers to another declaration, which the renamed declaration would shadow", .{new}),
+                    .message = try std.fmt.allocPrint(r.arena, "this `{s}` would be an ambiguous reference: it refers to another declaration, and the renamed declaration would be visible here too", .{new}),
                 };
             }
         }

@@ -205,21 +205,62 @@ pub const Refiner = struct {
     }
 };
 
+/// Inference results of member `item` at position `rel` (relative to the member) under every
+/// instance of the generic function containing it (see `allFound`; each instance once, at its first
+/// call site) whose code at `rel` executes, in discovery order. In a region inferred per iteration
+/// (see `iterationResults`), the results of each iteration of the abstract inference `res` and of
+/// every instance. Used where an answer must cover all instances, such as goto, which lists the
+/// target under each of them.
+pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, rel: u32) resolve.Error![]const Seed {
+    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
+    const owner = try r.ownerKey(file, item);
+    const node_offset = try r.itemOffset(file, item) orelse return &.{};
+    var out: std.ArrayList(Seed) = .empty;
+    var instances: std.ArrayList(?Seed) = .empty;
+    try instances.append(r.arena, null);
+    var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
+    for (try allFound(r, owner)) |found| {
+        const inst = found.inst orelse continue;
+        if (seen.contains(inst)) continue;
+        try instances.append(r.arena, try present(r, owner, found) orelse continue);
+        try seen.put(r.arena, inst, {});
+    }
+    for (instances.items) |instance| {
+        const inst_res = if (instance) |s| s.res else res;
+        if (instance) |s| if (!inactiveAt(body, s.res, rel)) try out.append(r.arena, s);
+        if (inst_res.exprs.len != body.exprs.len) continue;
+        const inst = if (instance) |s| s.inst else null;
+        const per = try iterationResults(r, owner, body, inst_res, inst, rel);
+        for (per.results, 0..) |it, idx| {
+            if (inactiveAt(body, it, rel)) continue;
+            try out.append(r.arena, .{ .res = it, .inst = inst, .file = file, .offset = node_offset + per.start, .iteration = @intCast(idx) });
+        }
+    }
+    return out.items;
+}
+
+/// Per-iteration inference results of a region inferred per iteration
+pub const Iterations = struct {
+    /// Start of the loop or switch (relative to the member)
+    start: u32 = 0,
+    results: []const *const infer.Result = &.{},
+};
+
 /// Per-iteration inference results, under instance `inst` (whose result is `res`), of the innermost
 /// region containing `rel` (relative to the member) that is inferred per iteration: a loop whose
 /// loop variable differs per iteration (see `iterations`), or an `inline` switch prong (see
 /// `prongIterations`); empty when there is none. As in `Refiner`, the first loop variable that needs
 /// it is chosen, and Infer refines the other captures of the same loop along with it.
-pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error![]const *const infer.Result {
-    var best: ?struct { binding: u32, n: u32 } = null;
+pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error!Iterations {
+    var best: ?struct { expr: Body.ExprId, binding: u32, n: u32 } = null;
     var best_len: u32 = std.math.maxInt(u32);
-    for (body.exprs) |expr| switch (expr) {
+    for (body.exprs, 0..) |expr, ei| switch (expr) {
         .loop => |loop| if (loop.kind == .@"for") {
             const range = body.range(loop.body);
             if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
             for (loop.capture, 0..) |capture, k| {
                 const n = try iterations(r, res, loop, k) orelse continue;
-                best = .{ .binding = @backingInt(capture), .n = n };
+                best = .{ .expr = @fromBackingInt(@as(u32, @intCast(ei))), .binding = @backingInt(capture), .n = n };
                 best_len = range.end - range.start;
                 break;
             }
@@ -229,12 +270,12 @@ pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, re
             const range = body.range(prong.body);
             if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
             const n = try prongIterations(r, body, res, sw, @intCast(pi)) orelse continue;
-            best = .{ .binding = @backingInt(prong.capture[0]), .n = n };
+            best = .{ .expr = @fromBackingInt(@as(u32, @intCast(ei))), .binding = @backingInt(prong.capture[0]), .n = n };
             best_len = range.end - range.start;
         },
         else => {},
     };
-    const b = best orelse return &.{};
+    const b = best orelse return .{};
     const out = try r.arena.alloc(*const infer.Result, b.n);
     for (out, 0..) |*o, idx| o.* = try r.ctx.get(queries.Infer, .{
         .owner = owner,
@@ -242,7 +283,7 @@ pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, re
         .inst = inst,
         .loop = .{ .binding = b.binding, .index = @intCast(idx) },
     });
-    return out;
+    return .{ .start = body.range(b.expr).start, .results = out };
 }
 
 /// Number of per-value inferences for an `inline` switch prong (the `pi`-th of `sw`), when the

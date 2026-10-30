@@ -31,40 +31,141 @@ const manifest = @import("manifest.zig");
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    if (try labelTarget(r, file, offset)) |t| return t;
-    if (try errorMemberTarget(r, file, offset)) |t| return t;
-    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
-    if (try defAt(r, file, offset)) |def| return target(r, try r.aliasTarget(def));
-    if (try reifiedFieldTarget(r, file, offset)) |t| return t;
-    return selfTarget(r, file, offset);
+    return switch (try find(r, file, offset) orelse return null) {
+        .targets => |ts| ts[0],
+        .def => |def| target(r, try r.aliasTarget(def)),
+    };
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    if (try labelTarget(r, file, offset)) |t| return t;
-    if (try errorMemberTarget(r, file, offset)) |t| return t;
-    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
-    if (try defAt(r, file, offset)) |def| return target(r, def);
-    if (try reifiedFieldTarget(r, file, offset)) |t| return t;
-    return selfTarget(r, file, offset);
+    return switch (try find(r, file, offset) orelse return null) {
+        .targets => |ts| ts[0],
+        .def => |def| target(r, def),
+    };
+}
+
+/// What goto finds at the cursor: a definition (`defAt`), or positions that are not one (labels,
+/// error names, the origins of the names of constructed types and anonymous structs, declaration
+/// sites); `targets` is never empty
+const Found = union(enum) { def: Def, targets: []const Target };
+
+fn find(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Found {
+    if (try labelTarget(r, file, offset)) |t| return try one(r, t);
+    if (try errorMemberTarget(r, file, offset)) |t| return try one(r, t);
+    if (try errorValueDecl(r, file, offset, true)) |d| return try one(r, d.target);
+    if (try defAt(r, file, offset)) |def| return .{ .def = def };
+    if (try reifiedFieldTarget(r, file, offset)) |t| return try one(r, t);
+    const anon = try anonFieldTargets(r, file, offset);
+    if (anon.len > 0) return .{ .targets = anon };
+    return try one(r, try selfTarget(r, file, offset) orelse return null);
+}
+
+fn one(r: *Resolver, t: Target) resolve.Error!Found {
+    return .{ .targets = try r.arena.dupe(Target, &.{t}) };
 }
 
 /// All targets of definition: when the cursor is on `@import("name")` and the modules the file
 /// belongs to import different modules as `name`, the root files of those modules (in module
-/// priority order); otherwise the result of `definition`. The first one is the result of
-/// `definition`.
+/// priority order); otherwise the result of `definition`, followed by the definitions the name
+/// refers to under the other instances of the generic function containing it (see
+/// `instanceDefs`), and by the definitions that correspond to each of them in the other modules
+/// the file imports under the same name (see `Resolver.moduleAlternatives`). The first one is the
+/// result of `definition`.
 pub fn definitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
-    return single(r, try definition(r, file, offset));
+    return allTargets(r, file, offset, true);
 }
 
 /// All targets of declaration: like `definitionTargets`, but otherwise the result of `declaration`
 pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
-    return single(r, try declaration(r, file, offset));
+    return allTargets(r, file, offset, false);
 }
 
-fn single(r: *Resolver, t: ?Target) resolve.Error![]const Target {
-    return r.arena.dupe(Target, if (t) |x| &.{x} else &.{});
+/// The result of `find` followed by the definitions of `instanceDefs` and `importedMemberDefs`,
+/// each definition followed by its module alternatives, as targets (through aliases with
+/// `follow_alias`), each target once
+fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resolve.Error![]const Target {
+    var out: std.ArrayList(Target) = .empty;
+    var defs: std.ArrayList(Def) = .empty;
+    if (try find(r, file, offset)) |f| switch (f) {
+        .targets => |ts| for (ts) |t| try appendNew(r, &out, t),
+        .def => |def| try defs.append(r.arena, def),
+    };
+    try defs.appendSlice(r.arena, try instanceDefs(r, file, offset));
+    try defs.appendSlice(r.arena, try importedMemberDefs(r, file, offset));
+    for (defs.items) |def| {
+        const alternatives = try r.moduleAlternatives(file, def);
+        for (0..alternatives.len + 1) |i| {
+            const d = if (i == 0) def else alternatives[i - 1];
+            const t = try target(r, if (follow_alias) try r.aliasTarget(d) else d) orelse continue;
+            try appendNew(r, &out, t);
+        }
+    }
+    return out.items;
+}
+
+fn appendNew(r: *Resolver, out: *std.ArrayList(Target), t: Target) resolve.Error!void {
+    for (out.items) |x| if (std.meta.eql(x, t)) return;
+    try out.append(r.arena, t);
+}
+
+/// The definitions of a member access at the cursor through an import that only navigation
+/// resolves, one per target (see `Resolver.unresolvedImportMembers`)
+fn importedMemberDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Def {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const item = try r.ownerAt(file, tok.offset, false) orelse return &.{};
+    const node = try r.itemNode(file, item) orelse return &.{};
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const fa = switch (b.expr(b.exprAt(rel) orelse return &.{})) {
+        .field_access => |x| x,
+        else => return &.{},
+    };
+    if (rel < b.range(fa.lhs).end) return &.{};
+    return r.unresolvedImportMembers(file, item, b, fa.lhs, fa.field orelse return &.{});
+}
+
+/// The definitions that a member name at the cursor whose target comes from inference (a field or
+/// method via the type of the left-hand side, a decl literal, a field name in an initializer)
+/// refers to under each instance of the generic function containing it (see `context.allSeeded`),
+/// when the abstract inference does not determine it; empty otherwise. Each instance of a generic
+/// function is analyzed separately, and the same name can refer to a different declaration in each.
+fn instanceDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Def {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const a = try context.at(r, file, tok.offset, false) orelse return &.{};
+    const b = a.body;
+    if (b.bindingAt(a.rel) != null) return &.{};
+    const e = b.exprAt(a.rel) orelse return &.{};
+    // The index of the field name in an initializer; null for a member
+    const field: ?u32 = switch (b.expr(e)) {
+        .field_access => |fa| blk: {
+            if (a.rel < b.range(fa.lhs).end) return &.{};
+            if (try r.evalNamespace(file, a.item, b, fa.lhs)) |ns| {
+                if (try r.memberDef(ns, fa.field orelse return &.{}) != null) return &.{};
+            }
+            break :blk null;
+        },
+        .enum_literal => null,
+        .init => |x| for (x.fields, 0..) |fi, k| {
+            if (fi.name != null and a.rel >= fi.name_range.start and a.rel < fi.name_range.end) break @intCast(k);
+        } else return &.{},
+        else => return &.{},
+    };
+    if (memberAt(a, e, field) != null) return &.{};
+    var out: std.ArrayList(Def) = .empty;
+    for (try context.allSeeded(r, a)) |v| {
+        try out.append(r.arena, try context.defOfKey(r, memberAt(v, e, field) orelse continue) orelse continue);
+    }
+    return out.items;
+}
+
+/// The member that the member access or decl literal `e` (`field` null), or the `field`-th field
+/// name of the initializer `e`, resolves to in `a`
+fn memberAt(a: context.At, e: Body.ExprId, field: ?u32) ?database.hir.OwnerKey {
+    return if (field) |k| a.fieldRef(e, k) else a.member(e);
 }
 
 /// A path string in `build.zig.zon` that points to a file (an element of `.paths`, the `.path` of
@@ -124,10 +225,117 @@ fn selfTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return null;
 }
 
+/// Field access on a value of an anonymous struct type (`anon.first` with
+/// `const anon = .{ .first = 1 }`): such a type has no declaration, its fields are defined by the
+/// initializer that creates the value, so the targets are the field names there. The value is
+/// followed back through constants and local constants without a type annotation, fields of
+/// anonymous values, and the items of a tuple that a `for` loop iterates
+/// (`inline for (cases) |case| case.input`, one target per item that has the field)
+fn anonFieldTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const a = try context.at(r, file, tok.offset, false) orelse return &.{};
+    const e = a.body.exprAt(a.rel) orelse return &.{};
+    const fa = switch (a.body.expr(e)) {
+        .field_access => |x| x,
+        else => return &.{},
+    };
+    if (a.rel < a.body.range(fa.lhs).end) return &.{};
+    const name = fa.field orelse return &.{};
+    // The type is unknown in a loop inferred per iteration
+    var ty = a.exprType(fa.lhs).ty;
+    switch (a.ip.key(ty)) {
+        .ptr_type => |p| if (p.size == .one) {
+            ty = p.child;
+        },
+        else => {},
+    }
+    if (ty != .unknown and a.ip.key(ty) != .anon_struct_type) return &.{};
+    var literals: std.ArrayList(AnonLiteral) = .empty;
+    try anonLiterals(r, .{ .file = file, .item = a.item, .body = a.body, .e = fa.lhs }, &literals, 0);
+    var out: std.ArrayList(Target) = .empty;
+    for (literals.items) |lit| {
+        const field = lit.field(name) orelse continue;
+        const node = try r.itemNode(lit.file, lit.item) orelse continue;
+        try appendNew(r, &out, .{ .file = lit.file, .start = node.offset + field.name_range.start, .end = node.offset + field.name_range.end });
+    }
+    return out.items;
+}
+
+/// An expression in the body of a member
+const AnonLiteral = struct {
+    file: FileId,
+    item: u32,
+    body: *const Body,
+    e: Body.ExprId,
+
+    fn at(x: AnonLiteral, e: Body.ExprId) AnonLiteral {
+        return .{ .file = x.file, .item = x.item, .body = x.body, .e = e };
+    }
+
+    /// The field named `name` of the initializer `e`
+    fn field(x: AnonLiteral, name: []const u8) ?Body.FieldInit {
+        for (x.body.expr(x.e).init.fields) |fi| if (fi.name != null and std.mem.eql(u8, fi.name.?, name)) return fi;
+        return null;
+    }
+};
+
+/// Appends to `out` the initializers without a type (`.{ ... }`) that the value of `x` comes from
+/// (see `anonFieldTargets`), each once
+fn anonLiterals(r: *Resolver, x: AnonLiteral, out: *std.ArrayList(AnonLiteral), depth: u32) resolve.Error!void {
+    if (depth > 16) return;
+    const b = x.body;
+    switch (b.expr(x.e)) {
+        .init => |init| if (init.ty == null) {
+            for (out.items) |o| if (o.file == x.file and o.item == x.item and o.e == x.e) return;
+            try out.append(r.arena, x);
+        },
+        .@"comptime" => |inner| try anonLiterals(r, x.at(inner), out, depth + 1),
+        .name_ref => |n| switch (try r.resolveName(x.file, x.item, b, b.expr_scopes[@backingInt(x.e)], n) orelse return) {
+            .local => |l| {
+                const lb = if (l.file == x.file and l.item == x.item) b else try r.body(l.file, l.item);
+                const owner: AnonLiteral = .{ .file = l.file, .item = l.item, .body = lb, .e = x.e };
+                const binding = lb.binding(l.binding);
+                if (binding.ty != null) return;
+                if (binding.init) |init| return anonLiterals(r, owner.at(init), out, depth + 1);
+                // A capture of a `for` loop: each item of the tuple it iterates
+                for (lb.exprs) |expr| switch (expr) {
+                    .loop => |loop| for (loop.capture, 0..) |c, k| {
+                        if (c != l.binding or k >= loop.inputs.len) continue;
+                        var lists: std.ArrayList(AnonLiteral) = .empty;
+                        try anonLiterals(r, owner.at(loop.inputs[k]), &lists, depth + 1);
+                        for (lists.items) |list| for (list.body.expr(list.e).init.fields) |item| {
+                            if (item.name == null) try anonLiterals(r, list.at(item.value), out, depth + 1);
+                        };
+                    },
+                    else => {},
+                };
+            },
+            .item => |it| {
+                const tree = try r.itemTree(it.file);
+                if (tree.items[it.item].kind != .@"const") return;
+                const ib = try r.body(it.file, it.item);
+                if (ib.type_expr != null) return;
+                try anonLiterals(r, .{ .file = it.file, .item = it.item, .body = ib, .e = ib.value orelse return }, out, depth + 1);
+            },
+            .file => {},
+        },
+        // A field of an anonymous value
+        .field_access => |fa| {
+            const name = fa.field orelse return;
+            var bases: std.ArrayList(AnonLiteral) = .empty;
+            try anonLiterals(r, x.at(fa.lhs), &bases, depth + 1);
+            for (bases.items) |base| if (base.field(name)) |fi| try anonLiterals(r, base.at(fi.value), out, depth + 1);
+        },
+        else => {},
+    }
+}
+
 /// Members of constructed types (`@Struct`, `@Enum`, `@Union`): field access `x.name`, `E.name`
-/// accessed via the type, and enum literals `.name`. The name is a string computed at comptime;
-/// jumps to its origin in the source: a string literal (such as the help text of zig-clap), or the
-/// member of the same name in X given by `@typeInfo(X)`.
+/// accessed via the type, enum literals `.name`, and field names in initializers
+/// (`.{ .name = v }`, `S{ .name = v }`). The name is a string computed at comptime; jumps to its
+/// origin in the source: a string literal (such as the help text of zig-clap), or the member of
+/// the same name in X given by `@typeInfo(X)`.
 fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -156,6 +364,12 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
                 else => {},
             }
             break :blk .{ fa.field orelse return null, ty };
+        },
+        .init => |x| blk: {
+            const field = for (x.fields) |fi| {
+                if (fi.name != null and rel >= fi.name_range.start and rel < fi.name_range.end) break fi;
+            } else return null;
+            break :blk .{ field.name.?, a.initType(e) orelse return null };
         },
         .enum_literal => |n| blk: {
             // When the result type is `?E` or `E!T`, take E; for a literal passed to an anytype
@@ -504,7 +718,9 @@ fn containsValue(ip: *InternPool, v: Index, values: []const Index, budget: *u32,
 }
 
 /// Members of named error sets: `Error.Foo` jumps to `Foo` in the declaration
-/// `const Error = error{ Foo, ... }` (following the alias when the declaration is an alias)
+/// `const Error = error{ Foo, ... }` (following the alias when the declaration is an alias). Only
+/// when the left-hand side is an error set type: on any other type, `X.Foo` is a member of `X` even
+/// if a function in `X` returns `error{Foo}`.
 fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     const tok = try tokenAt(r, file, offset) orelse return null;
     if (tok.kind != .identifier) return null;
@@ -519,23 +735,54 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
     };
     if (rel < b.range(fa.lhs).end) return null;
     const name = fa.field orelse return null;
+    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
+    switch (r.ctx.db.env.ip.key(a.exprType(fa.lhs).asType() orelse return null)) {
+        .error_set_type, .inferred_error_set => {},
+        else => return null,
+    }
     const lhs_def: Def = switch (b.expr(fa.lhs)) {
         .name_ref => |n| try r.resolveName(file, item, b, b.expr_scopes[@backingInt(fa.lhs)], n) orelse return null,
-        .field_access => blk: {
-            const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
-            break :blk try context.defOfKey(r, a.member(fa.lhs) orelse return null) orelse return null;
-        },
+        .field_access => try context.defOfKey(r, a.member(fa.lhs) orelse return null) orelse return null,
         else => return null,
     };
-    for ([_]Def{ lhs_def, try r.aliasTarget(lhs_def) }) |def| {
-        const it = switch (def) {
+    return errorInDecl(r, lhs_def, name, 0);
+}
+
+/// The error `name` in the declaration of the error set `def` (or of the declaration it aliases):
+/// in an `error{ ... }` written in it, else in the declarations of the named operands of a merge
+/// `A || B` that it is initialized with, left to right
+fn errorInDecl(r: *Resolver, def: Def, name: []const u8, depth: u32) resolve.Error!?Target {
+    if (depth > 16) return null;
+    for ([_]Def{ def, try r.aliasTarget(def) }) |d| {
+        const it = switch (d) {
             .item => |x| x,
             else => continue,
         };
         const decl = try r.itemNode(it.file, it.item) orelse continue;
         if (try findErrorName(r.arena, decl, name, 0)) |at| return .{ .file = it.file, .start = at.start, .end = at.end };
+        const body = try r.body(it.file, it.item);
+        var operands: std.ArrayList(Body.ExprId) = .empty;
+        try mergeOperands(r, body, body.value orelse continue, &operands);
+        for (operands.items) |op| {
+            const od = try declOf(r, it.file, it.item, body, op) orelse continue;
+            if (try errorInDecl(r, .{ .item = od }, name, depth + 1)) |t| return t;
+        }
     }
     return null;
+}
+
+/// The operands of the error set merge `e` (`A || B || C`), left to right; `e` itself when it is
+/// not a merge
+fn mergeOperands(r: *Resolver, body: *const Body, e: Body.ExprId, out: *std.ArrayList(Body.ExprId)) resolve.Error!void {
+    switch (body.expr(e)) {
+        .binary => |x| if (x.op == .pipe_pipe) {
+            try mergeOperands(r, body, x.lhs, out);
+            try mergeOperands(r, body, x.rhs, out);
+            return;
+        },
+        else => {},
+    }
+    try out.append(r.arena, e);
 }
 
 /// Position and documentation of the `Foo` of `error.Foo` in an error set declaration
@@ -722,20 +969,94 @@ fn target(r: *Resolver, def: Def) resolve.Error!?Target {
 
 /// Definition of the type of the symbol at the cursor: declarations and local variables take their
 /// type, expressions take the inferred type; when the value itself is a type, that type is taken.
-/// Pointers, optionals, arrays, slices, and error unions take their element / payload type.
+/// Pointers, optionals, arrays, slices, and error unions take their element / payload type. Inside
+/// a generic function, a type that is not concrete is taken from a call-site instance in which the
+/// symbol itself has a concrete type (as hover does).
 pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    const tok = try tokenAt(r, file, offset) orelse return null;
-    const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
-    const rel = tok.offset - a.node.offset;
-    const tv: TypedValue = blk: {
-        if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
-            break :blk try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
+    const targets = try typeDefinitionTargets(r, file, offset);
+    return if (targets.len > 0) targets[0] else null;
+}
+
+/// All targets of type definition: the result of `typeDefinition`, followed, when the type of the
+/// symbol is not concrete in the abstract inference of a generic function, by the definitions of
+/// its type under the other instances of the function (see `context.allSeeded`); each type is
+/// followed by its counterparts in the other modules the file imports under the same name (see
+/// `appendTypeTargets`). Each target once.
+pub fn typeDefinitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    const a = try context.at(r, file, tok.offset, false) orelse return &.{};
+    const subject = try typeSubject(r, a) orelse return &.{};
+    var out: std.ArrayList(Target) = .empty;
+    const s = subject.seedSubject();
+    if (s == null or !seed.wanted(r.ctx.db.env.ip, try subjectType(r, a, subject))) {
+        try appendTypeTargets(r, file, try subjectType(r, a, subject), &out);
+        return out.items;
+    }
+    var refiner = try seed.Refiner.init(r, a.file, a.item, a.node.offset, a.body, a.res);
+    var first = a;
+    first.seeded = try refiner.at(a.rel, s);
+    try appendTypeTargets(r, file, try subjectType(r, first, subject), &out);
+    for (try context.allSeeded(r, a)) |v| try appendTypeTargets(r, file, try subjectType(r, v, subject), &out);
+    return out.items;
+}
+
+/// What type definition takes the type of
+const TypeSubject = union(enum) {
+    /// The name of the member itself
+    decl,
+    binding: Body.BindingId,
+    expr: Body.ExprId,
+    /// The `index`-th field name in the initializer `init`: the type of that field
+    field: struct { init: Body.ExprId, index: u32 },
+
+    /// The subject that call-site seeding must resolve to a concrete type
+    fn seedSubject(s: TypeSubject) ?seed.Subject {
+        return switch (s) {
+            .decl => null,
+            .binding => |b| .{ .binding = b },
+            .expr => |e| .{ .expr = e },
+            .field => |f| .{ .expr = f.init },
         };
-        for (a.body.bindings, 0..) |binding, i| if (binding.range.start == rel) break :blk a.bindingType(@fromBackingInt(@as(u32, @intCast(i))));
-        break :blk a.exprType(a.body.exprAt(rel) orelse return null);
+    }
+};
+
+fn typeSubject(r: *Resolver, a: context.At) resolve.Error!?TypeSubject {
+    if (ast.memberName(a.node, try r.inEnum(a.file, a.item))) |name| if (name.offset == a.node.offset + a.rel) return .decl;
+    if (a.body.bindingAt(a.rel)) |id| return .{ .binding = id };
+    const e = a.body.exprAt(a.rel) orelse return null;
+    switch (a.body.expr(e)) {
+        .init => |x| for (x.fields, 0..) |fi, k| {
+            if (fi.name != null and a.rel >= fi.name_range.start and a.rel < fi.name_range.end) return .{ .field = .{ .init = e, .index = @intCast(k) } };
+        },
+        else => {},
+    }
+    return .{ .expr = e };
+}
+
+fn subjectType(r: *Resolver, a: context.At, subject: TypeSubject) resolve.Error!TypedValue {
+    return switch (subject) {
+        .decl => r.ctx.get(queries.DeclType, .{ .owner = a.owner }),
+        .binding => |id| a.bindingType(id),
+        .expr => |e| a.exprType(e),
+        .field => |f| {
+            const fields = a.body.expr(f.init).init.fields;
+            // Without a result type, the initializer is an anonymous struct whose field types are
+            // the types of the values
+            const t = a.initType(f.init) orelse return a.exprType(fields[f.index].value);
+            if (t == .unknown) return .unknown;
+            const field = try infer.initField(r, t, try queries.namespaceOfType(r, t), f.index, fields[f.index].name);
+            return .{ .ty = field.ty orelse .unknown };
+        },
     };
+}
+
+/// Appends to `out` the definition of the type `tv` (of the type itself when `tv` is a type), with
+/// pointers, optionals, arrays, vectors, and error unions stripped; when the type is a declaration
+/// in a module that `file` imports under a name other modules map to other files, also the
+/// corresponding types in those files (see `Resolver.moduleAlternatives`). Each target once.
+fn appendTypeTargets(r: *Resolver, file: FileId, tv: TypedValue, out: *std.ArrayList(Target)) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
-    var t = if (tv.ty == .type_type) tv.asType() orelse return null else tv.ty;
+    var t = if (tv.ty == .type_type) tv.asType() orelse return else tv.ty;
     for (0..8) |_| t = switch (ip.key(t)) {
         .ptr_type => |p| p.child,
         .optional_type => |c| c,
@@ -744,19 +1065,35 @@ pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
         .error_union_type => |eu| eu.payload,
         else => break,
     };
-    const ns = try queries.namespaceOfType(r, t) orelse return null;
+    const ns = try queries.namespaceOfType(r, t) orelse return;
+    if (try namespaceTarget(r, ns)) |x| try appendNew(r, out, x);
+    const def: Def = if (ns.container == 0) .{ .file = ns.file } else .{ .item = .{ .file = ns.file, .item = try containerDecl(r, ns) orelse return } };
+    for (try r.moduleAlternatives(file, def)) |alt| {
+        const alt_ns = try r.namespaceOf(alt) orelse continue;
+        if (try namespaceTarget(r, alt_ns)) |x| try appendNew(r, out, x);
+    }
+}
+
+/// The target of type definition for the container `ns`
+fn namespaceTarget(r: *Resolver, ns: resolve.Namespace) resolve.Error!?Target {
     // The file is the container: jump to the start of the file
     if (ns.container == 0) return .{ .file = ns.file, .start = 0, .end = 0 };
-    const tree = try r.itemTree(ns.file);
     // `const S = struct {...}`: jump to the name of the declaration; otherwise (such as a
     // container returned by a generic function) jump to the container itself
-    if (tree.containers[ns.container].parent_item) |p| if (tree.items[p].kind == .@"const") {
-        if (try r.containerRel(ns)) |rel_c| if ((try r.body(ns.file, p)).value) |v| if ((try r.body(ns.file, p)).range(v).start == rel_c) {
-            return target(r, .{ .item = .{ .file = ns.file, .item = p } });
-        };
-    };
+    if (try containerDecl(r, ns)) |p| return target(r, .{ .item = .{ .file = ns.file, .item = p } });
     const start = try r.containerOffset(ns) orelse return null;
     return .{ .file = ns.file, .start = start, .end = start };
+}
+
+/// The declaration `const S = struct {...}` whose value is the container `ns`
+fn containerDecl(r: *Resolver, ns: resolve.Namespace) resolve.Error!?u32 {
+    const tree = try r.itemTree(ns.file);
+    const p = tree.containers[ns.container].parent_item orelse return null;
+    if (tree.items[p].kind != .@"const") return null;
+    const rel_c = try r.containerRel(ns) orelse return null;
+    const b = try r.body(ns.file, p);
+    const v = b.value orelse return null;
+    return if (b.range(v).start == rel_c) p else null;
 }
 
 /// The token at the cursor: a token that can be jumped from is preferred; when the cursor
@@ -787,9 +1124,7 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
     const b = try r.body(file, item);
     const rel = tok.offset - node.offset;
     // The name of the local binding itself
-    for (b.bindings, 0..) |binding, i| {
-        if (binding.range.start == rel) return .{ .local = .{ .file = file, .item = item, .binding = @fromBackingInt(@as(u32, @intCast(i))) } };
-    }
+    if (b.bindingAt(rel)) |id| return .{ .local = .{ .file = file, .item = item, .binding = id } };
     const e = b.exprAt(rel) orelse return null;
     switch (b.expr(e)) {
         .name_ref => |name| {
@@ -803,7 +1138,10 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
                 if (try r.memberDef(ns, fa.field orelse return null)) |def| return def;
             }
             // Via the type: fields, methods
-            return memberViaTypes(r, file, tok.offset, e);
+            if (try memberViaTypes(r, file, tok.offset, e)) |def| return def;
+            // Through an import that only navigation resolves (`root.marker` in single-file mode)
+            const imported = try r.unresolvedImportMembers(file, item, b, fa.lhs, fa.field orelse return null);
+            return if (imported.len > 0) imported[0] else null;
         },
         // Decl literal (`.init(...)`, `.empty`)
         .enum_literal => return memberViaTypes(r, file, tok.offset, e),

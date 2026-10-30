@@ -65,13 +65,10 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
             tv = try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
         }
     };
-    if (def == null) for (b.bindings, 0..) |binding, i| {
-        if (binding.range.start != tok.offset - a.node.offset) continue;
-        const id: Body.BindingId = @fromBackingInt(@as(u32, @intCast(i)));
+    if (def == null) if (b.bindingAt(tok.offset - a.node.offset)) |id| {
         def = .{ .local = .{ .file = file, .item = a.item, .binding = id } };
         tv = a.bindingType(id);
         binding_id = id;
-        break;
     };
     if (def == null) {
         const e = b.exprAt(tok.offset - a.node.offset) orelse return null;

@@ -15,7 +15,8 @@ const document_symbol = @import("document_symbol.zig");
 pub const Symbol = struct {
     name: []const u8,
     kind: types.SymbolKind,
-    /// Name of the enclosing container (null at the top level of a file)
+    /// Name of the enclosing container: the declaration it is the value of, or the local constant
+    /// it initializes; null at the top level of a file and for anonymous containers
     container: ?[]const u8,
     file: FileId,
     start: u32,
@@ -23,9 +24,11 @@ pub const Symbol = struct {
     rank: u8,
 };
 
-/// Returns at most `limit` symbols (the best ones after sorting by match rank). Name positions
-/// come from `ItemSummaries` (never evicted): when there are more project files than the parse
-/// result cache holds, repeated queries do not need to reparse every file
+/// Returns the best `limit` symbols after sorting by match rank, and every exact match beyond
+/// them: same-named symbols tie on the name alone, so the limit cannot choose among them and
+/// typing more of the name cannot select a dropped one. Name positions come from `ItemSummaries`
+/// (never evicted): when there are more project files than the parse result cache holds, repeated
+/// queries do not need to reparse every file
 pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usize) resolve.Error![]const Symbol {
     var out: std.ArrayList(Symbol) = .empty;
     for (files) |file| {
@@ -45,9 +48,9 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             if (at.name_len == 0) continue;
             const container = tree.containers[item.container];
             try out.append(r.arena, .{
-                .name = ast.identName(name),
+                .name = try document_symbol.symbolName(r.arena, ast.identName(name)),
                 .kind = document_symbol.symbolKind(tree, @intCast(i), container.kind),
-                .container = if (container.parent_item) |p| tree.items[p].name else null,
+                .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
                 .file = file,
                 .start = at.name_offset,
                 .end = at.name_offset + at.name_len,
@@ -62,7 +65,9 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
-    return out.items[0..@min(out.items.len, limit)];
+    var kept = @min(out.items.len, limit);
+    while (kept < out.items.len and out.items[kept].rank == 0) kept += 1;
+    return out.items[0..kept];
 }
 
 /// Match rank: 0 exact, 1 prefix, 2 subsequence; null when there is no match (all ignoring case)
@@ -121,6 +126,67 @@ test "search returns the name token of each matching declaration" {
         try describe(&w, file, text, "p"),
     );
     try testing.expectEqualStrings("", try describe(&w, file, text, "zzz"));
+}
+
+test "the limit keeps every exact match" {
+    // Same-named symbols past the limit would be unreachable by any query
+    var text: std.ArrayList(u8) = .empty;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    for (0..300) |i| try text.print(a, "pub const Kind{d:0>3} = struct {{ pub fn init() void {{}} }};\npub fn initAll{d}() void {{}}\n", .{ i, i });
+    const file = (try w.add("/p/main.zig", text.items)).file;
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: Resolver = .{ .ctx = &ctx, .arena = a };
+    const found = try search(&r, &.{file}, "init", 256);
+    try testing.expectEqual(300, found.len);
+    var last = false;
+    for (found) |s| {
+        try testing.expectEqualStrings("init", s.name);
+        if (std.mem.eql(u8, s.container.?, "Kind299")) last = true;
+    }
+    try testing.expect(last);
+    // Prefix matches are still cut at the limit
+    try testing.expectEqual(10, (try search(&r, &.{file}, "initAll", 10)).len);
+}
+
+test "blank names are shown in their quoted form" {
+    const text = "pub fn @\" \"() void {}\nconst @\"\" = 1;\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings("@\"\"(-):@\"\" @\" \"(-):@\" \"", try describe(&w, file, text, ""));
+}
+
+test "container names are the declarations that bind the containers" {
+    // A member of a container nested in another declaration is not named after that declaration
+    const text =
+        \\const std = @import("std");
+        \\const List = std.ArrayList(struct { a: u8 });
+        \\fn helper() void { const A = struct { a1: u8 }; _ = A; }
+        \\test "sort" { const S = struct { fn lessThan() void {} }; _ = S; }
+        \\pub fn Wrapper(comptime T: type) type { const Impl = struct { inner: T }; return struct { impl: Impl }; }
+        \\fn take(opts: struct { verbose: bool = false }) void { _ = opts; }
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    for ([_][2][]const u8{
+        .{ "a", "a(-):a" },
+        .{ "a1", "a1(A):a1" },
+        .{ "lessThan", "lessThan(S):lessThan" },
+        .{ "inner", "inner(Impl):inner" },
+        .{ "impl", "impl(Wrapper):impl" },
+        .{ "verbose", "verbose(-):verbose" },
+    }) |c| {
+        var results = std.mem.splitScalar(u8, try describe(&w, file, text, c[0]), ' ');
+        try testing.expectEqualStrings(c[1], results.first());
+    }
 }
 
 // Guards against fetching syntax tree nodes for matching members on every query: when there are

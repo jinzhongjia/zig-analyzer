@@ -21,6 +21,7 @@ const queries = @import("../sema/queries.zig");
 const context = @import("context.zig");
 const seed = @import("../ide_db/seed.zig");
 const symbol_kind = @import("../ide_db/symbol_kind.zig");
+const builtins = @import("builtins.zig");
 const OwnerKey = database.hir.OwnerKey;
 
 pub const TokenType = enum(u32) {
@@ -232,7 +233,7 @@ const Builder = struct {
         // The cache stores only the abstract declaration class; the concrete type at the
         // current position must not be written back, as it would pollute other instances.
         if (dependsOnType(c) and !seed.wanted(b.r.ctx.db.env.ip, tv)) {
-            return b.valueClass(tv, c.type, c.mods);
+            return try b.valueClass(tv, c.type, c.mods);
         }
         return c;
     }
@@ -260,13 +261,13 @@ const Builder = struct {
     }
 
     /// A value that is neither a type nor a function gets `fallback` (see `symbol_kind.ofValue`)
-    fn valueClass(b: *Builder, tv: InternPool.TypedValue, fallback: TokenType, mods: u32) Class {
-        const kind = symbol_kind.ofValue(b.r.ctx.db.env.ip, tv, .variable);
+    fn valueClass(b: *Builder, tv: InternPool.TypedValue, fallback: TokenType, mods: u32) resolve.Error!Class {
+        const kind = try symbol_kind.ofValue(b.r, tv, .variable);
         return .{ .type = if (kind == .variable) fallback else tokenType(kind), .mods = mods };
     }
 
-    fn bindingClass(b: *Builder, binding: Body.Binding, tv: InternPool.TypedValue) Class {
-        const symbol = symbol_kind.ofBinding(b.r.ctx.db.env.ip, binding, tv);
+    fn bindingClass(b: *Builder, binding: Body.Binding, tv: InternPool.TypedValue) resolve.Error!Class {
+        const symbol = try symbol_kind.ofBinding(b.r, binding, tv);
         return .{ .type = tokenType(symbol.kind), .mods = if (symbol.readonly) Modifier.readonly else 0 };
     }
 
@@ -287,7 +288,7 @@ const Builder = struct {
                     const local_res = if (std.meta.eql(key, owner)) res else try b.r.ctx.get(database.sema.Infer, .{ .owner = key, .mode = .full });
                     break :local_value if (i < local_res.bindings.len) local_res.bindings[i] else tv;
                 } else tv;
-                break :blk b.bindingClass(binding, value);
+                break :blk try b.bindingClass(binding, value);
             },
         };
     }
@@ -346,7 +347,7 @@ const Builder = struct {
                 if (seed.wanted(a.ip, abstract_binding) and !(binding.kind == .param and abstract_binding.isType())) {
                     a.seeded = try refiner.at(binding.range.end - 1, .{ .binding = id });
                 }
-                var c = b.bindingClass(binding, a.bindingType(id));
+                var c = try b.bindingClass(binding, a.bindingType(id));
                 c.mods |= Modifier.declaration;
                 try b.declarations.append(b.r.arena, .{
                     .key = .{ .owner = key, .binding = @fromBackingInt(@as(u32, @intCast(i))) },
@@ -440,6 +441,14 @@ const Builder = struct {
             // A bare enum member may also be a name_ref in the error-tolerant HIR;
             // the declaration overrides that syntactic expression.
             if (ast.memberName(node, ItemTree.bareFieldNames(itree.containers[item.container].kind))) |name| if (b.visible == null or b.visible_names.contains(name.range().end)) {
+                const name_end = name.offset + @as(u32, @intCast(name.text.len));
+                // The identifier of a decltest refers to the tested declaration
+                if (node.kind() == .test_decl and name.kind == .identifier) {
+                    const def = try b.r.resolveContainerName(file, @intCast(index), try ast.identNameAlloc(b.r.arena, name.text));
+                    const c: Class = if (def) |d| try b.defClass(d, .unknown, key, body, res) else .{ .type = .variable };
+                    try b.names.put(b.r.arena, name_end, c);
+                    continue;
+                }
                 var tv = initializer_value;
                 if ((item.kind == .@"const" or item.kind == .@"var") and seed.wanted(a.ip, tv) and dependsOnType(try b.itemClass(key))) if (body.value) |initializer| {
                     a.seeded = null;
@@ -451,7 +460,7 @@ const Builder = struct {
                 };
                 var c = try b.itemClassAt(key, tv);
                 c.mods |= Modifier.declaration;
-                try b.names.put(b.r.arena, name.offset + @as(u32, @intCast(name.text.len)), c);
+                try b.names.put(b.r.arena, name_end, c);
             };
         }
         if (b.visible != null) for (usage_names, 0..) |*names, index| {
@@ -513,7 +522,8 @@ fn syntaxClass(token: tree.SyntaxToken, parent: SyntaxNode, in_enum: bool, zon: 
         .doc_comment, .container_doc_comment => return .{ .type = .comment, .mods = Modifier.documentation },
         .string_literal, .char_literal, .multiline_string_literal_line => return .{ .type = .string },
         .number_literal => return .{ .type = .number },
-        .builtin => return .{ .type = .function, .mods = Modifier.defaultLibrary },
+        // Only the builtin functions of the compiler are part of the default library
+        .builtin => return .{ .type = .function, .mods = if (builtins.get(token.text) != null) Modifier.defaultLibrary else 0 },
         .identifier => {
             if (std.mem.eql(u8, token.text, "_")) return null;
             return switch (parent.kind()) {

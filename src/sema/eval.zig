@@ -488,11 +488,11 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     return if (unknown) null else true;
 }
 
-const Capture = struct { item: u32, binding: Body.BindingId };
+pub const Capture = struct { item: u32, binding: Body.BindingId };
 
 /// Parameters and locals of the enclosing function that are referenced by the members of the
 /// container (including nested containers)
-fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
+pub fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
     const tree = try r.itemTree(ns.file);
     var out: std.ArrayList(Capture) = .empty;
     for (tree.items, 0..) |_, i| {
@@ -1432,7 +1432,7 @@ const Evaluator = struct {
         return thaw(try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, queries.instOfType(ip, t)));
     }
 
-    /// Enum member names (in declaration order, excluding the `_` of non-exhaustive enums)
+    /// Enum member names (in declaration order)
     fn enumNames(ev: *Evaluator, t: Index) Error!?[]const []const u8 {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -1443,7 +1443,7 @@ const Evaluator = struct {
                 var out: std.ArrayList([]const u8) = .empty;
                 for (tree.containerMembers(ns.container)) |m| {
                     const it = tree.items[m];
-                    if (it.kind == .field and it.name != null and !std.mem.eql(u8, it.name.?, "_")) try out.append(ev.a, it.name.?);
+                    if (it.kind == .field and it.name != null) try out.append(ev.a, it.name.?);
                 }
                 return out.items;
             },
@@ -1470,7 +1470,7 @@ const Evaluator = struct {
                 var next: i128 = 0;
                 for (tree.containerMembers(ns.container)) |m| {
                     const it = tree.items[m];
-                    if (it.kind != .field or it.name == null or std.mem.eql(u8, it.name.?, "_")) continue;
+                    if (it.kind != .field or it.name == null) continue;
                     // Explicit value `a = 5`
                     const owner = try ev.r.ownerKey(ns.file, m);
                     const body = try ev.r.ctx.get(hir.ItemBody, owner);
@@ -1723,31 +1723,47 @@ const Evaluator = struct {
         const index = f.labels.items.len;
         try f.labels.append(ev.a, .{ .name = blk.label, .kind = .block, .want = want });
         defer f.labels.shrinkRetainingCapacity(index);
-        var defers: std.ArrayList(ExprId) = .empty;
+        var defers: std.ArrayList(Defer) = .empty;
         ev.statements(f, blk.stmts, &defers) catch |err| {
             // Run the defers when leaving the block (the value of break is already saved in
-            // jump_value)
+            // jump_value); errdefers run when the function returns an error
             const saved_value = ev.jump_value;
             const saved_target = ev.jump_target;
-            try ev.runDefers(f, defers.items);
+            const failing = err == error.Return and try ev.isErrorReturn(defers.items, saved_value);
+            try ev.runDefers(f, defers.items, failing);
             ev.jump_value = saved_value;
             ev.jump_target = saved_target;
             if (err == error.Break and ev.jump_target == index) return ev.coerce(ev.jump_value, want);
             return err;
         };
-        try ev.runDefers(f, defers.items);
+        try ev.runDefers(f, defers.items, false);
         return Val.void_val;
     }
 
-    fn runDefers(ev: *Evaluator, f: *Frame, defers: []const ExprId) EvalError!void {
+    /// A `defer` or `errdefer` statement whose block has been reached
+    const Defer = struct { body: ExprId, on_error: bool };
+
+    /// Whether the returned value `v` is an error (only decided when an errdefer depends on it)
+    fn isErrorReturn(ev: *Evaluator, defers: []const Defer, v: Val) EvalError!bool {
+        for (defers) |d| {
+            if (!d.on_error) continue;
+            if (v.v == .unknown or v.v == .undef) return error.Abort;
+            const x = try ev.ipOf(v) orelse return false;
+            return ev.ip.key(x) == .error_value;
+        }
+        return false;
+    }
+
+    fn runDefers(ev: *Evaluator, f: *Frame, defers: []const Defer, failing: bool) EvalError!void {
         var i = defers.len;
         while (i > 0) {
             i -= 1;
-            _ = try ev.eval(f, defers[i], null);
+            if (defers[i].on_error and !failing) continue;
+            _ = try ev.eval(f, defers[i].body, null);
         }
     }
 
-    fn statements(ev: *Evaluator, f: *Frame, stmts: []const Body.Stmt, defers: *std.ArrayList(ExprId)) EvalError!void {
+    fn statements(ev: *Evaluator, f: *Frame, stmts: []const Body.Stmt, defers: *std.ArrayList(Defer)) EvalError!void {
         for (stmts) |s| switch (s.kind) {
             .expr => |x| _ = try ev.eval(f, x, null),
             .local => |bid| {
@@ -1756,8 +1772,8 @@ const Evaluator = struct {
                 const init: Val = if (binding.init) |x| try ev.eval(f, x, ty) else .{ .ty = ty orelse .unknown, .v = .undef };
                 f.slots[@backingInt(bid)] = try ev.copy(.{ .ty = ty orelse init.ty, .v = init.v });
             },
-            .@"defer" => |x| try defers.append(ev.a, x),
-            .@"errdefer" => {},
+            .@"defer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = false }),
+            .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x.body, .on_error = true }),
             .destructure => |d| {
                 const v = try ev.eval(f, d.value, null);
                 for (d.targets, 0..) |t, i| {
@@ -1835,7 +1851,6 @@ const Evaluator = struct {
         switch (l.kind) {
             .@"while" => while (true) {
                 try ev.tick();
-                try ev.backwardBranch();
                 const taken = try ev.condition(try ev.eval(f, l.inputs[0], null));
                 if (!taken.yes) {
                     if (l.else_capture.len != 0) try ev.bindCapture(f, l.else_capture[0], taken.payload);
@@ -1844,6 +1859,8 @@ const Evaluator = struct {
                 if (l.capture.len != 0) try ev.bindCapture(f, l.capture[0], taken.payload);
                 if (try ev.loopBody(f, l.body, index)) |v| return ev.coerce(v, want);
                 if (l.cont) |c| _ = try ev.eval(f, c, null);
+                // Going back to the condition is a backward branch (once per completed iteration)
+                try ev.backwardBranch();
             },
             .@"for" => {
                 const Input = union(enum) { range: i128, seq: Val };
@@ -2198,6 +2215,27 @@ const Evaluator = struct {
                 return Val.ofInt(v.ty, r);
             },
             .ampersand => {
+                // `&s.*` for a slice `s`: a single-item pointer to its array, with the constness
+                // of the slice
+                switch (f.body.expr(operand_e)) {
+                    .deref => |x| {
+                        const p = try ev.eval(f, x, null);
+                        const pt = switch (ip.key(p.ty)) {
+                            .ptr_type => |pt| pt,
+                            else => return error.Abort,
+                        };
+                        if (pt.size == .slice) {
+                            const arr = try ev.deref(p);
+                            const ty = try ip.ptrTo(arr.ty, .one, pt.is_const);
+                            return switch (p.v) {
+                                .ref => |r| .{ .ty = ty, .v = .{ .ref = r } },
+                                else => ev.pointerToNew(ty, arr),
+                            };
+                        }
+                        return ev.addressOf(f, operand_e, try ev.deref(p));
+                    },
+                    else => {},
+                }
                 const child_want: ?Index = if (want) |w| switch (ip.key(w)) {
                     .ptr_type => |p| if (p.size == .one) p.child else null,
                     else => null,
@@ -2408,13 +2446,29 @@ const Evaluator = struct {
             },
             .ip => |x| switch (ip.key(x)) {
                 .ptr_value => |pv| return Val.of(child, pv.pointee),
-                // Array pointers are represented by their elements; dereferencing yields the array
-                .aggregate => |agg| return Val.of(child, try ip.get(.{ .aggregate = .{ .ty = child, .elems = agg.elems } })),
-                .bytes => |b| return Val.of(child, try ip.get(.{ .bytes = .{ .ty = child, .bytes = b.bytes } })),
+                // Array pointers and slices are represented by their elements; dereferencing
+                // yields the array (for a slice, `[len:sentinel]T`)
+                .aggregate => |agg| {
+                    const t = try ev.derefType(p.ty, agg.elems.len);
+                    return Val.of(t, try ip.get(.{ .aggregate = .{ .ty = t, .elems = agg.elems } }));
+                },
+                .bytes => |b| {
+                    const t = try ev.derefType(p.ty, b.bytes.len);
+                    return Val.of(t, try ip.get(.{ .bytes = .{ .ty = t, .bytes = b.bytes } }));
+                },
                 else => return error.Abort,
             },
             else => return error.Abort,
         }
+    }
+
+    /// Type of `p.*` for a pointer of type `t` to `len` elements: the child type, and for a slice
+    /// the array `[len:sentinel]T`
+    fn derefType(ev: *Evaluator, t: Index, len: usize) Error!Index {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| if (p.size == .slice) try ev.ip.get(.{ .array_type = .{ .len = len, .child = p.child, .sentinel = p.sentinel } }) else p.child,
+            else => .unknown,
+        };
     }
 
     fn slice(ev: *Evaluator, f: *Frame, s: @FieldType(Body.Expr, "slice")) EvalError!Val {
@@ -2779,12 +2833,6 @@ const Evaluator = struct {
             const info = try ev.typeInfo(try asType(vals[0]));
             return Val.of(ip.key(info).union_value.ty, info);
         }
-        if (eq(u8, name, "@typeName")) {
-            if (vals.len != 1) return error.Abort;
-            var out: std.Io.Writer.Allocating = .init(ev.a);
-            @import("render.zig").writeFull(ev.r, try asType(vals[0]), &out.writer) catch return error.OutOfMemory;
-            return ev.stringLiteral(out.written());
-        }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
             if (vals.len != 1) return error.Abort;
             const x = try ev.freeze(vals[0]) orelse return error.Abort;
@@ -2807,7 +2855,10 @@ const Evaluator = struct {
             // on the instance (same as `infer.hasMember`)
             if (ip.key(t) == .opaque_param) return error.Abort;
             const field = try ev.stringOf(vals[1]);
-            if (eq(u8, name, "@hasField")) return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
+            if (eq(u8, name, "@hasField")) {
+                if (value.sliceArrayHasField(ip, t, field)) |has| return boolVal(has);
+                return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
+            }
             const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);
             const tree = try ev.r.itemTree(ns.file);
             const m = Resolver.lookupDecl(tree, ns.container, field) orelse return boolVal(false);
@@ -2979,11 +3030,10 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (eq(u8, name, "@typeName")) {
             if (vals.len != 1) return error.Abort;
-            const t = asType(vals[0]) catch return null;
-            if (!value.isConcrete(ip, t)) return null;
-            var out: std.Io.Writer.Allocating = .init(ev.a);
-            @import("render.zig").writeFull(ev.r, t, &out.writer) catch return error.OutOfMemory;
-            return try ev.stringLiteral(out.written());
+            const t = try asType(vals[0]);
+            if (!value.isConcrete(ip, t)) return error.Abort;
+            const n = try @import("render.zig").typeName(ev.r, ev.a, t) orelse return error.Abort;
+            return try ev.stringLiteral(n);
         }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
             if (vals.len != 1) return error.Abort;
@@ -3726,7 +3776,7 @@ const Evaluator = struct {
             }) },
             .optional_type => |c| .{ "optional", try ev.structValue(try ev.member(type_ty, "Optional"), &.{.{ "child", c }}) },
             .error_union_type => |eu| .{ "error_union", try ev.structValue(try ev.member(type_ty, "ErrorUnion"), &.{ .{ "error_set", eu.err }, .{ "payload", eu.payload } }) },
-            .error_set_type => |names| .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", try ev.namesValue(names) }}) },
+            .error_set_type => |es| .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", try ev.namesValue(es.names) }}) },
             .inferred_error_set => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", if (try queries.errorSetMembers(ev.r, t)) |names| try ev.namesValue(names) else .null_value }}) },
             .fn_type => |ft| blk: {
                 const fn_ty = try ev.member(type_ty, "Fn");
@@ -3816,7 +3866,7 @@ const Evaluator = struct {
             return .{ "union", try ev.structValue(union_ty, &.{
                 .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
                 .{ "tag_type", tag orelse .null_value },
-                .{ "backing_integer", .null_value },
+                .{ "backing_integer", try ev.backingInteger(t, layout, types, true) },
                 .{ "field_names", try ev.namesValue(names) },
                 .{ "field_types", try ev.sliceValue(.type_type, types) },
                 .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
@@ -3843,7 +3893,7 @@ const Evaluator = struct {
         return .{ "struct", try ev.structValue(struct_ty, &.{
             .{ "is_tuple", if (ip.key(t) == .tuple_type) .true_value else .false_value },
             .{ "layout", try ev.enumTag(layout_ty, @tagName(layout)) },
-            .{ "backing_integer", try ev.backingInteger(t, layout, types) },
+            .{ "backing_integer", try ev.backingInteger(t, layout, types, false) },
             .{ "field_names", try ev.namesValue(names) },
             .{ "field_types", try ev.sliceValue(.type_type, types) },
             .{ "field_attrs", try ev.sliceValue(fa_ty, attrs) },
@@ -3956,6 +4006,8 @@ const Evaluator = struct {
             else => {},
         }
         const values = try ev.enumValues(t);
+        // An exhaustive enum without members has no values: the compiler gives it `noreturn`
+        if (values.len == 0) return .noreturn_type;
         var max: i128 = 0;
         for (values) |v| max = @max(max, v);
         const bits: u16 = if (max == 0) 0 else @intCast(128 - @clz(@as(u128, @intCast(max))));
@@ -3968,17 +4020,19 @@ const Evaluator = struct {
             .container_type => {
                 const ns = try queries.namespaceOfType(ev.r, t) orelse return false;
                 const tree = try ev.r.itemTree(ns.file);
-                return infer.fieldItem(tree, ns.container, "_") != null;
+                return tree.containers[ns.container].nonexhaustive;
             },
             else => return false,
         }
     }
 
     /// Tag type of a union: E for `union(E)`, the automatically generated tag enum for
-    /// `union(enum)`, otherwise null
+    /// `union(enum)`, otherwise null. The argument of a packed union is its backing integer, not
+    /// a tag type.
     fn unionTagType(ev: *Evaluator, t: Index) EvalError!?Index {
         const s = try ev.containerSyntax(t);
         if (s.auto_enum) return try ev.ip.get(.{ .union_tag_type = t });
+        if (s.layout == .@"packed") return null;
         return s.arg;
     }
 
@@ -3997,14 +4051,16 @@ const Evaluator = struct {
         return null;
     }
 
-    /// Backing integer of a packed struct (a value of `?type`)
-    fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index) EvalError!Index {
+    /// Backing integer of a packed struct or union (a value of `?type`): the explicit argument,
+    /// otherwise an unsigned integer as wide as the fields together (struct) or as the widest
+    /// field (union)
+    fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index, is_union: bool) EvalError!Index {
         if (layout != .@"packed") return .null_value;
         if ((try ev.containerSyntax(t)).arg) |arg| return arg;
         var bits: u64 = 0;
         for (types) |ty| {
             const field_bits = (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
-            bits = std.math.add(u64, bits, field_bits) catch return error.Abort;
+            bits = if (is_union) @max(bits, field_bits) else std.math.add(u64, bits, field_bits) catch return error.Abort;
         }
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }

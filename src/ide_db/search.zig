@@ -420,10 +420,10 @@ pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileI
 }
 
 /// Files in `scope` that can reach `target` through an `@import` chain (including `target`
-/// itself). The chain may pass through files outside the scope (project → `std.zig` → `mem.zig`,
-/// or a closed file that is not in the scope): all files reachable from the files in scope are
-/// collected by following imports, and reverse edges are built over them; files outside the scope
-/// other than `target` are not in the result
+/// itself), in any of the modules each file belongs to. The chain may pass through files outside
+/// the scope (project → `std.zig` → `mem.zig`, or a closed file that is not in the scope): all
+/// files reachable from the files in scope are collected by following imports, and reverse edges
+/// are built over them; files outside the scope other than `target` are not in the result
 pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
     // Files in scope come first (indices below `scope_len`), followed by the reachable files
     // outside the scope
@@ -436,13 +436,13 @@ pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Er
     while (n < nodes.count()) : (n += 1) {
         const f = nodes.keys()[n];
         const index = try r.ctx.get(FileIndex.Query, f);
-        for (index.imports) |s| {
-            const to = try r.resolveImport(f, s) orelse continue;
+        // Every module the file belongs to may import a different file under a name
+        for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
             const gop = try reverse.getOrPut(r.arena, to);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(r.arena, f);
             try nodes.put(r.arena, to, {});
-        }
+        };
     }
     var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
     try seen.put(r.arena, target, {});
@@ -563,7 +563,8 @@ const Finder = struct {
                     // Either way, a namespace chosen per build configuration has the member of
                     // each choice
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
-                    const current: Target = if (ns_def) |d| (if (deepEql(d, f.def)) .hit else .miss) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    var current: Target = if (ns_def) |d| try f.matches(file, d, at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    if (current == .unknown) current = try f.importedMember(file, item_index, body, fa.lhs, at);
                     const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
                     switch (target) {
                         .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
@@ -638,6 +639,42 @@ const Finder = struct {
         return infer.declAlternatives(r, r.arena, decl);
     }
 
+    /// Whether the member `f.name` of `lhs` is `def` through an import that only navigation
+    /// resolves (see `Resolver.unresolvedImportMembers`): `unknown` when there is no such import;
+    /// ambiguous (`at`) when the targets have different members
+    fn importedMember(f: *Finder, file: FileId, item_index: u32, body: *const Body, lhs: Body.ExprId, at: Reference) resolve.Error!Target {
+        const defs = try f.r.unresolvedImportMembers(file, item_index, body, lhs, f.name);
+        if (defs.len == 0) return .unknown;
+        var hit = false;
+        var miss = false;
+        for (defs) |d| if (deepEql(d, f.def)) {
+            hit = true;
+        } else {
+            miss = true;
+        };
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
+        };
+        return if (hit) .hit else .miss;
+    }
+
+    /// Whether `d`, which a use in `file` resolves to, is `def` in some module of `file`: `def`
+    /// itself, or its counterpart in another module that `file` imports under the same name (see
+    /// `Resolver.moduleAlternatives`). When it refers to `def` in some modules and to other
+    /// definitions in others, it is recorded as ambiguous (`at`): renaming it would break the
+    /// build of those modules.
+    fn matches(f: *Finder, file: FileId, d: Def, at: Reference) resolve.Error!Target {
+        var hit = deepEql(d, f.def);
+        var miss = !hit;
+        for (try f.r.moduleAlternatives(file, d)) |alt| {
+            if (deepEql(alt, f.def)) hit = true else miss = true;
+        }
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
+        };
+        return if (hit) .hit else .miss;
+    }
+
     /// Whether the member recorded in the inference result (field, method, decl literal, enum
     /// member, initializer field) is `def`.
     /// When abstract inference inside a generic function body cannot determine it, all call-site
@@ -649,7 +686,7 @@ const Finder = struct {
         const abstract = try f.inferred(res, file, item_index);
         if (l.member(abstract)) |m| {
             const d = try keyDef(f.r, m) orelse return .miss;
-            return if (deepEql(d, f.def)) .hit else .miss;
+            return f.matches(file, d, at);
         }
         const owner = try f.r.ownerKey(file, item_index);
         var hit = false;
@@ -683,7 +720,7 @@ const Finder = struct {
     /// (see `seed.iterationResults`) with `def`
     fn iterationMembers(f: *Finder, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?InternPool.Index, rel: u32, l: Lookup, hit: *bool, miss: *bool) resolve.Error!void {
         if (res.exprs.len != body.exprs.len) return;
-        for (try seed.iterationResults(f.r, owner, body, res, inst, rel)) |iteration| {
+        for ((try seed.iterationResults(f.r, owner, body, res, inst, rel)).results) |iteration| {
             const m = l.member(iteration) orelse continue;
             const d = try keyDef(f.r, m) orelse continue;
             if (deepEql(d, f.def)) hit.* = true else miss.* = true;

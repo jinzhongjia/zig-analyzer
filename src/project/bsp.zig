@@ -205,10 +205,16 @@ pub const Client = struct {
 
     /// Starts the maker in `build_root` with the zig of `env`. `extra_args` is passed through to
     /// `zig build` (e.g. `-Dtarget=...`).
+    /// The build script is given by its path under `build_root`: otherwise the maker takes the
+    /// build root from the current directory, which the operating system reports with symbolic
+    /// links resolved, and the paths in its messages and in the compiler's errors would not be
+    /// the ones the client uses for the same files.
     pub fn start(gpa: Allocator, io: Io, env: *const ZigEnv, build_root: []const u8, extra_args: []const []const u8) StartError!*Client {
+        const build_file = try std.fs.path.join(gpa, &.{ build_root, "build.zig" });
+        defer gpa.free(build_file);
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{ env.zig_exe, "build", "--listen=-" });
+        try argv.appendSlice(gpa, &.{ env.zig_exe, "build", "--listen=-", "--build-file", build_file });
         try argv.appendSlice(gpa, extra_args);
 
         const c = try gpa.create(Client);

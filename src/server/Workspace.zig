@@ -949,7 +949,7 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     var files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty;
     errdefer files.deinit(ws.gpa);
     for (result.files.keys(), result.files.values()) |path, *fr| {
-        try files.put(ws.gpa, try ws.server.vfs.intern(path), fr);
+        try files.put(ws.gpa, try ws.server.toolFile(path), fr);
     }
 
     // Affected files: files with compiler diagnostics in the previous round or this one

@@ -303,7 +303,19 @@ const Gen = struct {
     fn emitStructure(g: *Gen, name: []const u8, s: json.Value) !void {
         try g.doc(s);
         try g.w.print("pub const {f} = struct {{\n", .{std.zig.fmtId(name)});
-        for (try g.flattenProperties(s)) |p| try g.emitProperty(p, .{ .owner = name });
+        const props = try g.flattenProperties(s);
+        for (props) |p| try g.emitProperty(p, .{ .owner = name });
+        // Required `T | null` properties must be sent as `null`, which std.json omits for
+        // null optional fields under `emit_null_optional_fields = false`
+        var required_nullable: usize = 0;
+        for (props) |p| {
+            if (flag(p, "optional") or !isNullable(field(p, "type"))) continue;
+            if (required_nullable == 0) try g.w.writeAll("\npub const jsonStringify = json_ext.RequiredNullable(@This(), &.{");
+            if (required_nullable > 0) try g.w.writeAll(", ");
+            try g.w.print("\"{f}\"", .{std.zig.fmtString(req(p, "name"))});
+            required_nullable += 1;
+        }
+        if (required_nullable > 0) try g.w.writeAll("}).jsonStringify;\n");
         try g.w.writeAll("};\n\n");
     }
 

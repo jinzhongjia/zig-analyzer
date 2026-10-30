@@ -413,6 +413,87 @@ test "remove parameter: multi-line lists" {
     );
 }
 
+test "remove parameter: comments after the separator before the item are kept" {
+    // Removing the argument must not delete a comment about the previous argument or the call
+    try expectRemove(
+        \\fn pair(a: u32, <|>unused: u32) u32 {
+        \\    return a;
+        \\}
+        \\fn g() void {
+        \\    _ = pair(1, // the count
+        \\        2);
+        \\}
+    ,
+        \\fn pair(a: u32) u32 {
+        \\    return a;
+        \\}
+        \\fn g() void {
+        \\    _ = pair(1 // the count
+        \\    );
+        \\}
+    );
+    try expectRemove(
+        \\fn first(<|>unused: u32, b: u32) u32 {
+        \\    return b;
+        \\}
+        \\fn g() void {
+        \\    _ = first( // why this call is needed
+        \\        1, 2);
+        \\}
+    ,
+        \\fn first(b: u32) u32 {
+        \\    return b;
+        \\}
+        \\fn g() void {
+        \\    _ = first( // why this call is needed
+        \\        2);
+        \\}
+    );
+    try expectRemove(
+        \\fn f(a: u32, b: u32, c: u32, <|>d: u32) u32 {
+        \\    return a + b + c;
+        \\}
+        \\fn g() void {
+        \\    _ = f(1, 2, 3, // third
+        \\        4);
+        \\}
+    ,
+        \\fn f(a: u32, b: u32, c: u32) u32 {
+        \\    return a + b + c;
+        \\}
+        \\fn g() void {
+        \\    _ = f(1, 2, 3 // third
+        \\    );
+        \\}
+    );
+    // The only argument: the comment after `(` stays
+    try expectRemove(
+        \\fn one(<|>unused: u32) void {}
+        \\fn g() void {
+        \\    one( // the call
+        \\        1);
+        \\}
+    ,
+        \\fn one() void {}
+        \\fn g() void {
+        \\    one( // the call
+        \\        );
+        \\}
+    );
+    // An unformatted parameter list
+    try expectRemove(
+        \\fn h(a: u32, // the count
+        \\    <|>unused: u32) u32 {
+        \\    return a;
+        \\}
+    ,
+        \\fn h(a: u32 // the count
+        \\) u32 {
+        \\    return a;
+        \\}
+    );
+}
+
 test "remove parameter: multiline string arguments" {
     try expectRemove(
         \\fn f(<|>a: []const u8, b: u32) u32 {

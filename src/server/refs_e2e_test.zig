@@ -8,6 +8,8 @@ const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 
 const Empty = struct {};
+/// Code action literal support, without which no code actions are returned (each carries an edit)
+const literal_actions = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "refactor", "source" } } };
 
 const main_text =
     \\const std = @import("std");
@@ -61,7 +63,7 @@ test "references, highlight, rename and workspace symbol" {
     defer h.finish();
     const a = h.arena.allocator();
     const root_uri = try za.base.uri.fromPath(a, project.root);
-    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = literal_actions } } } });
     try h.notify("initialized", Empty{});
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = main_text } });
@@ -630,7 +632,7 @@ test "renames and fixes refuse to edit fetched packages" {
     const a = h.arena.allocator();
     _ = try h.request("initialize", .{
         .rootUri = try za.base.uri.fromPath(a, try project.path(a, "proj")),
-        .capabilities = .{ .textDocument = .{ .codeAction = .{ .dataSupport = true, .disabledSupport = true, .resolveSupport = .{ .properties = &[_][]const u8{"edit"} } } } },
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = literal_actions, .dataSupport = true, .disabledSupport = true, .resolveSupport = .{ .properties = &[_][]const u8{"edit"} } } } },
     });
     try h.notify("initialized", Empty{});
     const main_uri = try za.base.uri.fromPath(a, try project.path(a, "proj/main.zig"));
