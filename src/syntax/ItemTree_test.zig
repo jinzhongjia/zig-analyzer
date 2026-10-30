@@ -196,3 +196,15 @@ test "an unclosed list does not take the declarations after it" {
         return err;
     };
 }
+
+test "an unclosed block does not take the declarations after it" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f(x: bool) void {\n    if (x) {\n        _ = 1;\n}\n\npub fn g() u32 {\n    return 1;\n}\n\ntest {\n    _ = g();\n}\n", "fn f\nfn g pub\ntest _\n" },
+        .{ "pub fn main() void {\n    const x: u32 = 3;\n    if (x > 1) {\n        _ = 2;\n}\n\nfn helper(x: u32) void {\n    _ = x;\n}\n", "fn main pub\nfn helper\n" },
+        .{ "test {\n    {\n}\nexport fn a() void {}\nextern fn b() void;\nthreadlocal var c: u32 = 0;\nnoinline fn d() void {}\ninline fn e() void {}\n", "test _\nfn a\nfn b\nvar c\nfn d\nfn e\n" },
+    };
+    for (cases) |c| expectItems(c[0], c[1]) catch |err| {
+        std.debug.print("source: `{s}`\n", .{c[0]});
+        return err;
+    };
+}

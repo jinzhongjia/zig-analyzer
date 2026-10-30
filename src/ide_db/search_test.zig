@@ -844,3 +844,26 @@ test "targets of assignments are written" {
         try testing.expectEqualStrings(c[1], out.items);
     }
 }
+
+test "an unclosed block does not take the next declaration's locals as references" {
+    // The `if` block of `main` is not closed: `fn helper` still starts a declaration of its own,
+    // so renaming `main`'s `x` would otherwise edit `helper`'s parameter
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\pub fn main() void {
+        \\    const x: u32 = 3;
+        \\    if (x > 1) {
+        \\        _ = 2;
+        \\}
+        \\
+        \\fn helper(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings("main:2:x* main:3:x", try symbolRefs(&w, file, at(text, "x", 0), .{ .scope = &.{file} }));
+    try testing.expectEqualStrings("main:7:x* main:8:x", try symbolRefs(&w, file, at(text, "x", 2), .{ .scope = &.{file} }));
+}

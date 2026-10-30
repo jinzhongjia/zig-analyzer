@@ -335,7 +335,8 @@ fn block(p: *Parser, started: ?Marker) Error!CM {
     while (true) {
         switch (p.peek()) {
             .r_brace, .eof => break,
-            else => {},
+            // The block is unclosed: the declaration belongs to the enclosing container
+            else => if (atContainerDecl(p)) break,
         }
         const before = p.pos;
         try statement(p, true);
