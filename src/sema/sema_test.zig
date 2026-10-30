@@ -2680,6 +2680,31 @@ test "the _ of a non-exhaustive enum is not a field" {
     });
 }
 
+test "@typeInfo lists error names in declaration order" {
+    // Prevents listing `error_names` sorted by their bytes; expected values are the results of
+    // zig 0.17.0, which sorts only the names in `@typeName`
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Err = error{ Zeta, Alpha, Mid };
+        \\const v0 = @typeInfo(Err).error_set.error_names.?[0];
+        \\const v1 = @backingInt(std.meta.FieldEnum(Err).Zeta);
+        \\const v2 = @typeInfo(error{ Kilo, Bravo } || error{Echo}).error_set.error_names.?[1];
+        \\const same = Err == error{ Mid, Zeta, Alpha };
+        \\const name = @typeName(Err);
+        \\fn f() Err!void {
+        \\    return error.Zeta;
+        \\}
+        \\const v3 = @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+    , &.{
+        .{ "v0", "[:0]const u8 = \"Zeta\"" },
+        .{ "v1", "u2 = 0" },
+        .{ "v2", "[:0]const u8 = \"Bravo\"" },
+        .{ "same", "bool = true" },
+        .{ "name", "*const [21:0]u8 = \"error{Alpha,Mid,Zeta}\"" },
+        .{ "v3", "type = error{Alpha,Mid,Zeta}" },
+    });
+}
+
 test "empty exhaustive enums have the tag type noreturn" {
     // Prevents giving `enum {}` and the tag of `union(enum) {}` the tag type `u0`; expected
     // values are the results of zig 0.17.0

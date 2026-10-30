@@ -3776,7 +3776,7 @@ const Evaluator = struct {
             }) },
             .optional_type => |c| .{ "optional", try ev.structValue(try ev.member(type_ty, "Optional"), &.{.{ "child", c }}) },
             .error_union_type => |eu| .{ "error_union", try ev.structValue(try ev.member(type_ty, "ErrorUnion"), &.{ .{ "error_set", eu.err }, .{ "payload", eu.payload } }) },
-            .error_set_type => |names| .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", try ev.namesValue(names) }}) },
+            .error_set_type => |es| .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", try ev.namesValue(es.names) }}) },
             .inferred_error_set => .{ "error_set", try ev.structValue(try ev.member(type_ty, "ErrorSet"), &.{.{ "error_names", if (try queries.errorSetMembers(ev.r, t)) |names| try ev.namesValue(names) else .null_value }}) },
             .fn_type => |ft| blk: {
                 const fn_ty = try ev.member(type_ty, "Fn");

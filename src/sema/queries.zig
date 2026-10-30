@@ -307,7 +307,7 @@ fn collectErrors(r: *Resolver, t: Index, names: *std.ArrayList([]const u8), requ
     switch (ip.key(t)) {
         .error_union_type => |eu| return collectErrors(r, eu.err, names, true),
         .error_set_type => |set| {
-            try names.appendSlice(r.arena, set);
+            try names.appendSlice(r.arena, set.names);
             return true;
         },
         .inferred_error_set => {
@@ -321,15 +321,22 @@ fn collectErrors(r: *Resolver, t: Index, names: *std.ArrayList([]const u8), requ
     }
 }
 
-/// Members of an error set; null for anyerror or when they cannot be computed
+/// Members of an error set (in the order of `InternPool.ErrorSet.names`); null for anyerror or
+/// when they cannot be computed
 pub fn errorSetMembers(r: *Resolver, t: Index) resolve.Error!?[]const []const u8 {
+    return if (try errorSetOf(r, t)) |es| es.names else null;
+}
+
+/// The members of an error set or of the inferred error set of a function; null for anyerror or
+/// when they cannot be computed
+pub fn errorSetOf(r: *Resolver, t: Index) resolve.Error!?InternPool.ErrorSet {
     const ip = r.ctx.db.env.ip;
     switch (ip.key(t)) {
-        .error_set_type => |names| return names,
+        .error_set_type => |es| return es,
         .inferred_error_set => |s| {
             const set = try r.ctx.get(ErrorSetOf, .{ .owner = .{ .file = s.file, .item = s.decl }, .inst = s.inst });
             return switch (ip.key(set)) {
-                .error_set_type => |names| names,
+                .error_set_type => |es| es,
                 else => null,
             };
         },

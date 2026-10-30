@@ -385,17 +385,11 @@ const QualifiedNames = struct {
                 try q.writeType(e.payload);
             },
             // The compiler lists the names sorted by their bytes
-            .error_set_type => |names| {
-                const sorted = try q.r.arena.dupe([]const u8, names);
-                std.mem.sort([]const u8, sorted, {}, struct {
-                    fn lessThan(_: void, x: []const u8, y: []const u8) bool {
-                        return std.mem.lessThan(u8, x, y);
-                    }
-                }.lessThan);
+            .error_set_type => |es| {
                 try w.writeAll("error{");
-                for (sorted, 0..) |n, i| {
+                for (es.sorted, 0..) |n, i| {
                     if (i != 0) try w.writeAll(",");
-                    try w.writeAll(n);
+                    try w.writeAll(es.names[n]);
                 }
                 try w.writeAll("}");
             },

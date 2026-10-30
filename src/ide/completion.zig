@@ -866,8 +866,8 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, fr
                 return;
             },
             // Error set (after `Error.`): its error names
-            .error_set_type => |names| {
-                for (names) |name| try out.add(.{ .label = name, .kind = .enum_member });
+            .error_set_type => |es| {
+                for (es.sorted) |i| try out.add(.{ .label = es.names[i], .kind = .enum_member });
                 return;
             },
             else => {},
@@ -1023,12 +1023,12 @@ fn declCoerces(ip: *InternPool, want: Index, have: Index) bool {
 fn errorSetCoerces(ip: *InternPool, want: Index, have: Index) bool {
     if (want == .anyerror_type or want == .unknown or have == .unknown) return true;
     const w = switch (ip.key(want)) {
-        .error_set_type => |names| names,
+        .error_set_type => |es| es.names,
         .inferred_error_set => return true,
         else => return false,
     };
     const h = switch (ip.key(have)) {
-        .error_set_type => |names| names,
+        .error_set_type => |es| es.names,
         .inferred_error_set => return true,
         else => return false,
     };
@@ -1729,13 +1729,13 @@ fn errorSetFits(ip: *InternPool, want: Index, have: Index) bool {
     if (want == .anyerror_type) return isErrorSet(ip, have);
     switch (ip.key(want)) {
         .inferred_error_set => return isErrorSet(ip, have),
-        .error_set_type => |names| {
+        .error_set_type => |want_set| {
             const own = switch (ip.key(have)) {
-                .error_set_type => |own| own,
+                .error_set_type => |own| own.names,
                 else => return false,
             };
             for (own) |name| {
-                for (names) |n| {
+                for (want_set.names) |n| {
                     if (std.mem.eql(u8, n, name)) break;
                 } else return false;
             }
@@ -1810,8 +1810,8 @@ fn errorNames(r: *Resolver, out: *Collector, file: FileId, offset: u32, item: u3
             .error_union_type => |eu| eu.err,
             else => want,
         };
-        if (try queries.errorSetMembers(r, set)) |names| {
-            for (names) |name| try out.add(.{ .label = name, .kind = .error_name });
+        if (try queries.errorSetOf(r, set)) |es| {
+            for (es.sorted) |i| try out.add(.{ .label = es.names[i], .kind = .error_name });
             return;
         }
     };
