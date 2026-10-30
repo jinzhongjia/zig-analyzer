@@ -2941,7 +2941,8 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
 }
 
 /// When a new instance replaces the old one. `built`: the first build finished (or configuration
-/// failed, the build graph could not be read, or no build is needed); always replaces.
+/// failed while the old instance has no build graph, see `keepOnConfigurationFailure`; the build
+/// graph could not be read; or no build is needed); always replaces.
 /// `configured`: the build graph was read and the compile set computed; replaces
 /// only when the old instance does not take part in the module graph (configuration
 /// failed, the build graph could not be read, or the maker crashed before
@@ -2987,6 +2988,29 @@ pub fn abandon(server: *Server, ws: *Workspace) void {
     // The reference held by `successor` (the caller holds another one)
     ws.release();
     old.clearResult();
+}
+
+/// The configuration of the new instance `ws` created by a restart failed: when the old instance
+/// takes part in the module graph, it stays in the list (its model and compile set keep resolving
+/// named imports and finding importers until the configuration is fixed) and `ws` no longer
+/// replaces it. Returns the old instance with a reference held for the caller, which stores the
+/// configuration errors as its result; null when `ws` should replace the old instance as usual.
+pub fn keepOnConfigurationFailure(server: *Server, ws: *Workspace) ?*Workspace {
+    const old = blk: {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        if (server.shutting_down) return null;
+        for (server.workspaces.items) |w| if (w.successor == ws) {
+            if (!w.inModuleGraph()) return null;
+            w.successor = null;
+            w.acquire();
+            break :blk w;
+        };
+        return null;
+    };
+    // The reference held by `successor` (the caller holds another one)
+    ws.release();
+    return old;
 }
 
 /// Whether `ws` is the (visible) instance in the list

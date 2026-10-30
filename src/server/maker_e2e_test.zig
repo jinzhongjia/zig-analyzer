@@ -91,3 +91,121 @@ test "deleting the local cache directory during a session restarts the build sys
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// Position (0-based line and UTF-8 column) just after the first occurrence of `needle`
+fn position(text: []const u8, needle: []const u8) struct { line: u32, character: u32 } {
+    const offset = std.mem.indexOf(u8, text, needle).? + needle.len;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
+}
+
+/// Result of `method` at the end of `needle` in `uri`. A write transaction of background work
+/// (indexing) answers a request with ContentModified: it is asked again once the server is idle.
+fn requestAt(h: *Harness, method: []const u8, uri: []const u8, text: []const u8, needle: []const u8, new_name: ?[]const u8) !std.json.Value {
+    for (0..50) |_| {
+        const resp = if (new_name) |n|
+            try h.request(method, .{ .textDocument = .{ .uri = uri }, .position = position(text, needle), .newName = n })
+        else
+            try h.request(method, .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
+        if (resp.object.get("result")) |r| return r;
+        _ = try h.request("zig-analyzer/waitIdle", {});
+    }
+    return error.ContentModified;
+}
+
+/// File name of the goto result ("null" without a result)
+fn gotoFile(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
+    const result = try requestAt(h, "textDocument/definition", uri, text, needle, null);
+    if (result == .null) return "null";
+    const target = switch (result) {
+        .array => |list| if (list.items.len == 0) return "null" else list.items[0].object.get("uri").?.string,
+        else => result.object.get("uri").?.string,
+    };
+    return target[std.mem.lastIndexOfScalar(u8, target, '/').? + 1 ..];
+}
+
+/// Names of the files a rename at `needle` in `uri` edits, sorted and joined with spaces
+fn renamedFiles(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8, new_name: []const u8) ![]const u8 {
+    const a = h.arena.allocator();
+    const result = try requestAt(h, "textDocument/rename", uri, text, needle, new_name);
+    if (result == .null) return "null";
+    var names: std.ArrayList([]const u8) = .empty;
+    if (result.object.get("changes")) |changes| {
+        for (changes.object.keys()) |k| try names.append(a, k[std.mem.lastIndexOfScalar(u8, k, '/').? + 1 ..]);
+    }
+    if (result.object.get("documentChanges")) |changes| for (changes.array.items) |c| {
+        const k = c.object.get("textDocument").?.object.get("uri").?.string;
+        try names.append(a, k[std.mem.lastIndexOfScalar(u8, k, '/').? + 1 ..]);
+    };
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return std.mem.join(a, " ", names.items);
+}
+
+const lib_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const lib = b.createModule(.{ .root_source_file = b.path("src/lib.zig"), .target = b.graph.host });
+    \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"), .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "lib", .module = lib }} }) });
+    \\    b.installArtifact(exe);
+    \\}
+    \\
+;
+const lib_main =
+    \\const lib = @import("lib");
+    \\pub fn main() void {
+    \\    _ = lib.value();
+    \\}
+    \\
+;
+const lib_lib = "pub fn value() u32 { return 42; }\n";
+const lib_zon = ".{\n    .name = .app,\n    .version = \"0.0.1\",\n    .fingerprint = 0xc96e70cfdc04e3b6,\n    .paths = .{\"\"},\n}\n";
+
+test "a configuration that fails after a restart keeps the previous build graph" {
+    // Replacing the project by an instance without a build graph must not make named imports stop
+    // resolving and rename miss their importers
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = lib_build },
+        .{ .path = "build.zig.zon", .text = lib_zon },
+        .{ .path = "src/main.zig", .text = lib_main },
+        .{ .path = "src/lib.zig", .text = lib_lib },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root);
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "src/lib.zig"));
+    try open(&h, main_uri, lib_main);
+    try open(&h, lib_uri, lib_lib);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("lib.zig", try gotoFile(&h, main_uri, lib_main, "lib.val"));
+
+    // build.zig fails to compile, then build.zig.zon cannot be loaded
+    const broken_build = try std.mem.replaceOwned(u8, a, lib_build, "{\n    const lib", "{\n    const x: u32 = \"oops\";\n    _ = x;\n    const lib");
+    const broken_zon = try std.mem.replaceOwned(u8, a, lib_zon, ".name = .app", ".name = \"app\"");
+    for ([_][2][]const u8{ .{ "build.zig", broken_build }, .{ "build.zig.zon", broken_zon } }) |broken| {
+        const path = try project.path(a, broken[0]);
+        const original = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .unlimited);
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = broken[1] });
+        const uri = try za.base.uri.fromPath(a, path);
+        try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = uri } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        if (std.mem.eql(u8, broken[0], "build.zig")) try testing.expect(try lastHas(&h, uri, "expected type 'u32'"));
+        try testing.expectEqualStrings("lib.zig", try gotoFile(&h, main_uri, lib_main, "lib.val"));
+        try testing.expectEqualStrings("lib.zig main.zig", try renamedFiles(&h, lib_uri, lib_lib, "fn val", "amount"));
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = original });
+        try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = uri } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expect(!try lastHas(&h, uri, "expected type 'u32'"));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

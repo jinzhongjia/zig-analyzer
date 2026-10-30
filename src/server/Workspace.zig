@@ -8,9 +8,10 @@
 //! Lifecycle: when maker crashes, build.zig or the build configuration changes, or maker's local
 //! cache directory is deleted, the project is restarted as a new instance. The new instance is
 //! invisible until its first build completes (or configuration fails); meanwhile the old
-//! instance's model, compile set, and compiler diagnostics
-//! remain in effect. If the old instance has no model, the new instance replaces it as soon as it
-//! is configured (see `Server.restartWorkspace`, `Server.promote`).
+//! instance's model, compile set, and compiler diagnostics remain in effect. If the old instance
+//! has no model, the new instance replaces it as soon as it is configured; if it has one and
+//! configuration fails, the old instance stays (see `Server.restartWorkspace`, `Server.promote`,
+//! `Server.keepOnConfigurationFailure`).
 //! Instances are reclaimed by reference counting: the server's project list, the background task,
 //! and callers that use an instance temporarily each hold one reference.
 //!
@@ -585,7 +586,14 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             }
             try ws.bundles.append(ws.gpa, eb.*);
             eb.* = .empty;
-            try ws.finishBuild();
+            // After a restart, an old instance with a build graph stays in effect: without a build
+            // graph, named imports would stop resolving and references and rename would miss
+            // their importers until the configuration is fixed. The configuration errors replace
+            // its compiler diagnostics, as in `zig build`.
+            if (ws.server.keepOnConfigurationFailure(ws)) |old| {
+                defer old.release();
+                try ws.storeResult(old);
+            } else try ws.finishBuild();
         },
         .step_started => |step| {
             ws.mutex.lockUncancelable(io);
@@ -784,6 +792,13 @@ fn clearBundles(ws: *Workspace) void {
 /// Converts the errors collected in this round into diagnostics, replaces the previous round's
 /// result, and republishes the affected files
 fn finishBuild(ws: *Workspace) Allocator.Error!void {
+    try ws.storeResult(ws);
+}
+
+/// Converts the errors collected in this round into diagnostics, replaces the result of `target`
+/// (this instance, or the old instance that stays in effect, see `Server.keepOnConfigurationFailure`)
+/// with them, and republishes the files that had or now have diagnostics
+fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
     const build_zig = try std.fs.path.join(ws.gpa, &.{ ws.root, "build.zig" });
     defer ws.gpa.free(build_zig);
@@ -801,20 +816,20 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
     defer affected.deinit(ws.gpa);
     {
         const io = ws.server.io;
-        ws.mutex.lockUncancelable(io);
-        defer ws.mutex.unlock(io);
-        try affected.appendSlice(ws.gpa, ws.result_files.keys());
+        target.mutex.lockUncancelable(io);
+        defer target.mutex.unlock(io);
+        try affected.appendSlice(ws.gpa, target.result_files.keys());
         try affected.appendSlice(ws.gpa, files.keys());
-        if (ws.result) |old| old.release(ws.gpa);
-        ws.result_files.deinit(ws.gpa);
-        ws.result = result;
-        ws.result_generation = ws.server.nextCompileGeneration();
-        ws.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
-        ws.result_files = files;
+        if (target.result) |old| old.release(ws.gpa);
+        target.result_files.deinit(ws.gpa);
+        target.result = result;
+        target.result_generation = ws.server.nextCompileGeneration();
+        target.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+        target.result_files = files;
     }
     // For a new instance created by a restart, the first result replaces the old instance along
     // with the model and the compile set
-    ws.promote(.built);
+    if (target == ws) ws.promote(.built);
     ws.server.publishFiles(affected.items, true);
 }
 
