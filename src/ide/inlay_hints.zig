@@ -93,8 +93,8 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
         switch (e) {
             .call => |c| {
                 if (opts.exclude_single_argument and c.args.len == 1) continue;
-                const target = try context.callee(r, a, c.callee) orelse continue;
-                const params = try context.fnParams(r, target.def);
+                const target = try context.callProto(r, a, c.callee) orelse continue;
+                const params = try target.params(r.arena);
                 const skip: usize = if (target.bound) 1 else 0;
                 for (c.args, 0..) |arg, ai| {
                     if (ai + skip >= params.len) break;

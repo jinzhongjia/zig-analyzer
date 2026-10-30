@@ -251,10 +251,11 @@ pub const FnProto = struct {
     }
 
     /// Display of the signature: `fn name(a: T, b: U) callconv(.c) R`, made up of `writeParams`
-    /// and `writeReturnType`
+    /// and `writeReturnType`; a function type without a name is `fn (a: T) R`, as `zig fmt`
+    /// writes it
     pub fn writeSignature(n: FnProto, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("fn");
-        if (n.name()) |t| try w.print(" {s}", .{t.text});
+        if (n.name()) |t| try w.print(" {s}", .{t.text}) else try w.writeByte(' ');
         try n.writeParams(w);
         if (n.returnType() == null) return;
         try w.writeByte(' ');

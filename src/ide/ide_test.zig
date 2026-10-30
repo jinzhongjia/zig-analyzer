@@ -377,6 +377,97 @@ test "calls through function fields are not method calls" {
     try testing.expectEqualStrings("a: b: ", out.items);
 }
 
+test "signature help and parameter hints through function-typed values" {
+    // Prevents calls through function pointers, vtable fields, callbacks and comptime function
+    // parameters from getting no signature and no parameter names
+    const text =
+        \\fn add2(first: u32, second: u32) u32 { return first + second; }
+        \\fn double(x: u8) u8 { return x * 2; }
+        \\const Call2Op = *const fn (a: i8, b: i8) i8;
+        \\fn doOp(fnCall: Call2Op, op1: i8, op2: i8) i8 { return fnCall(op1, op2); }
+        \\const T = struct { run: *const fn (first: u32, second: u32) u32 };
+        \\const VTable = struct {
+        \\    /// Allocates `len` bytes.
+        \\    alloc: *const fn (ctx: *anyopaque, len: usize, alignment: u8) ?[*]u8,
+        \\};
+        \\const Obj = struct {
+        \\    ptr: *anyopaque,
+        \\    vtable: *const VTable,
+        \\    on_done: ?*const fn (code: u8, msg: []const u8) void,
+        \\};
+        \\fn apply(comptime f: fn (value: u8) u8, x: u8) u8 { return f(x); }
+        \\fn use(o: Obj, t: T) void {
+        \\    _ = t.run(1, 21);
+        \\    const ptr = &add2;
+        \\    _ = ptr(1, 22);
+        \\    _ = o.vtable.alloc(o.ptr, 1, 8);
+        \\    if (o.on_done) |cb| cb(31, "x");
+        \\    const fp: *const fn (u8) u8 = &double;
+        \\    _ = fp(32);
+        \\    _ = apply(double, 33);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8, u32, ?[]const u8 }{
+        .{ "op2); }", "fn (a: i8, b: i8) i8", 1, null },
+        .{ "21);", "fn (first: u32, second: u32) u32", 1, null },
+        .{ "22);", "fn add2(first: u32, second: u32) u32", 1, null },
+        .{ "8);", "fn (ctx: *anyopaque, len: usize, alignment: u8) ?[*]u8", 2, "Allocates `len` bytes." },
+        .{ "31,", "fn (code: u8, msg: []const u8) void", 0, null },
+        .{ "32);", "fn (u8) u8", 0, null },
+        .{ "x); }", "fn (value: u8) u8", 0, null },
+    };
+    for (cases) |c| {
+        const s = (try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))) orelse {
+            std.debug.print("no signature at `{s}`\n", .{c[0]});
+            return error.NoSignature;
+        };
+        testing.expectEqualStrings(c[1], s.label) catch |err| {
+            std.debug.print("signature at `{s}`\n", .{c[0]});
+            return err;
+        };
+        try testing.expectEqual(c[2], s.active);
+        if (c[3]) |doc| try testing.expectEqualStrings(doc, s.doc.?);
+    }
+    const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{});
+    var out: std.ArrayList(u8) = .empty;
+    for (hints) |h| if (h.kind == .parameter) {
+        try out.appendSlice(w.arena.allocator(), h.label);
+        try out.append(w.arena.allocator(), ' ');
+    };
+    // `fnCall(op1, op2)`, `t.run`, `ptr`, `o.vtable.alloc` (`len` is the argument `1`), `cb`
+    try testing.expectEqualStrings("a: b: first: second: first: second: ctx: len: alignment: code: msg: f: x: ", out.items);
+}
+
+test "signature help through the vtable of std.mem.Allocator" {
+    const text =
+        \\const std = @import("std");
+        \\fn f(a: std.mem.Allocator) void {
+        \\    _ = a.vtable.alloc(a.ptr, 1, .@"1", 0);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const s = (try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, "0);").?))) orelse return error.NoSignature;
+    try testing.expect(std.mem.startsWith(u8, s.label, "fn ("));
+    try testing.expectEqual(4, s.params.len);
+    try testing.expectEqual(3, s.active);
+}
+
 test "signature help and parameter hints through aliases" {
     // Calls through an alias (`const assert = std.debug.assert;`): if the alias is not followed,
     // there is no signature help and there are no parameter name hints
