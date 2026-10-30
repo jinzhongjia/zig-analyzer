@@ -10,6 +10,8 @@ const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 
 const Empty = struct {};
+/// Code action literal support, without which no code actions are returned (each carries an edit)
+const literal_actions = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "refactor", "source" } } } } };
 
 fn jsonValue(h: *Harness, text: []const u8) !std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(), text, .{});
@@ -146,7 +148,7 @@ test "naming hints are opt-in and follow settings and edits" {
     const base_settings =
         \\"build": {"enable": false}, "diagnostics": {"compiler": false, "inactive_code": false}
     ;
-    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = try jsonValue(&h, "{" ++ base_settings ++ "}") });
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .textDocument = literal_actions }, .initializationOptions = try jsonValue(&h, "{" ++ base_settings ++ "}") });
     try h.notify("initialized", Empty{});
     const uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = sample } });
@@ -261,7 +263,7 @@ test "naming fixes: resolve, conflicts, public names and the project still build
     _ = try h.request("initialize", .{
         .rootUri = root_uri,
         .capabilities = .{
-            .textDocument = .{ .codeAction = .{ .dataSupport = true, .disabledSupport = true, .resolveSupport = .{ .properties = &[_][]const u8{"edit"} } } },
+            .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = literal_actions.codeAction.codeActionLiteralSupport, .dataSupport = true, .disabledSupport = true, .resolveSupport = .{ .properties = &[_][]const u8{"edit"} } } },
             .workspace = .{ .workspaceEdit = .{ .documentChanges = true, .changeAnnotationSupport = Empty{} } },
         },
     });
@@ -370,7 +372,7 @@ test "files outside the workspace folders: what only the file itself uses can be
     defer h.finish();
     const a = h.arena.allocator();
     // No workspace folder at all, as editors send for a file opened on its own
-    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = try jsonValue(&h,
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = literal_actions }, .initializationOptions = try jsonValue(&h,
         \\{"build": {"enable": false}, "diagnostics": {"compiler": false}, "naming": {"enable": true}}
     ) });
     try h.notify("initialized", Empty{});
@@ -408,7 +410,7 @@ test "quick fixes link only the diagnostic they fix, whatever the order of the c
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = try jsonValue(&h,
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = literal_actions }, .initializationOptions = try jsonValue(&h,
         \\{"build": {"enable": false}, "diagnostics": {"compiler": false}, "naming": {"enable": true}}
     ) });
     try h.notify("initialized", Empty{});

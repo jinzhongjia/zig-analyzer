@@ -9,6 +9,8 @@ const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 
 const Empty = struct {};
+/// Code action literal support, without which no code actions are returned (each carries an edit)
+const literal_actions = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "refactor", "source" } } } } };
 
 fn position(text: []const u8, needle: []const u8) struct { line: u32, character: u32 } {
     const offset = std.mem.indexOf(u8, text, needle).?;
@@ -153,7 +155,7 @@ test "unused captures: every fix leaves no diagnostics and the project still bui
     defer h.finish();
     const a = h.arena.allocator();
     const root_uri = try za.base.uri.fromPath(a, project.root);
-    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .textDocument = literal_actions } });
     try h.notify("initialized", Empty{});
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/lib.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = lib_text } });

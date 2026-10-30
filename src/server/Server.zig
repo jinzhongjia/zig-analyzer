@@ -219,6 +219,27 @@ snippet_support: bool = false,
 /// The client supports insert and replace ranges in completion items
 /// (`completionItem.insertReplaceSupport`)
 insert_replace_support: bool = false,
+/// The client supports `prepareRename` (`rename.prepareSupport`); otherwise `renameProvider` is
+/// a boolean, as `RenameOptions` may only be sent to such clients
+prepare_rename: bool = false,
+/// The client supports `CodeAction` literals (`codeAction.codeActionLiteralSupport`); otherwise
+/// `codeActionProvider` is a boolean and no actions are returned: every action carries an edit
+code_action_literals: bool = false,
+/// The client supports `DocumentSymbol` trees (`hierarchicalDocumentSymbolSupport`); otherwise
+/// the outline is a flat `SymbolInformation[]`
+hierarchical_symbols: bool = false,
+/// The client lists the symbol kinds it supports in `documentSymbol` and `workspace/symbol`, and
+/// so handles any kind; otherwise it supports only `File` to `Array` (see `clientSymbolKind`)
+document_symbol_kinds: bool = false,
+workspace_symbol_kinds: bool = false,
+/// The client lists the completion item kinds it supports, and so handles any kind; otherwise it
+/// supports only `Text` to `Reference` (see `clientCompletionKind`)
+completion_kinds: bool = false,
+/// The client accepts markdown in hover contents, signature documentation, and completion
+/// documentation: true unless it lists the formats it supports without markdown
+hover_markdown: bool = true,
+signature_markdown: bool = true,
+completion_markdown: bool = true,
 /// The client supports the workspace semantic tokens refresh; at most one refresh response is
 /// awaited at a time.
 semantic_refresh: bool = false,
@@ -4625,14 +4646,39 @@ fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.Doc
 fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const parse = try ctx.get(syntax_q.ParseFile, file);
-    if (parse.mode == .zon) {
-        const lines = try fileLines(ctx, arena, file);
-        return .{ .array_of_DocumentSymbol = try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding) };
-    }
-    const items = try ctx.get(syntax_q.FileItemTree, file);
-    const map = try ctx.get(syntax_q.FileAstIdMap, file);
     const lines = try fileLines(ctx, arena, file);
-    return .{ .array_of_DocumentSymbol = try ide.document_symbol.documentSymbols(arena, items, map, lines, server.encoding) };
+    const symbols = if (parse.mode == .zon)
+        try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding)
+    else
+        try ide.document_symbol.documentSymbols(arena, try ctx.get(syntax_q.FileItemTree, file), try ctx.get(syntax_q.FileAstIdMap, file), lines, server.encoding);
+    if (server.hierarchical_symbols) return .{ .array_of_DocumentSymbol = try server.clientSymbolTree(arena, symbols) };
+    var flat: std.ArrayList(types.SymbolInformation) = .empty;
+    try server.flattenSymbols(arena, params.textDocument.uri, symbols, null, &flat);
+    return .{ .array_of_SymbolInformation = flat.items };
+}
+
+/// The outline with the symbol kinds the client supports
+fn clientSymbolTree(server: *Server, arena: Allocator, symbols: []const types.DocumentSymbol) Allocator.Error![]const types.DocumentSymbol {
+    const out = try arena.dupe(types.DocumentSymbol, symbols);
+    for (out) |*s| {
+        s.kind = clientSymbolKind(server.document_symbol_kinds, s.kind);
+        if (s.children) |children| s.children = try server.clientSymbolTree(arena, children);
+    }
+    return out;
+}
+
+/// The outline as a flat list for clients without `hierarchicalDocumentSymbolSupport`: each symbol
+/// names its parent symbol as `containerName`
+fn flattenSymbols(server: *Server, arena: Allocator, doc_uri: []const u8, symbols: []const types.DocumentSymbol, container: ?[]const u8, out: *std.ArrayList(types.SymbolInformation)) Allocator.Error!void {
+    for (symbols) |s| {
+        try out.append(arena, .{
+            .name = s.name,
+            .kind = clientSymbolKind(server.document_symbol_kinds, s.kind),
+            .containerName = container,
+            .location = .{ .uri = doc_uri, .range = s.range },
+        });
+        try server.flattenSymbols(arena, doc_uri, s.children orelse &.{}, s.name, out);
+    }
 }
 
 fn foldingRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.FoldingRangeParams) HandlerError!types.ResultType("textDocument/foldingRange") {
@@ -4709,9 +4755,13 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
         if (ws.inlayHint) |ih| server.inlay_refresh = ih.refreshSupport orelse false;
         if (ws.semanticTokens) |st| server.semantic_refresh = st.refreshSupport orelse false;
         if (ws.workspaceEdit) |we| server.change_annotations = (we.documentChanges orelse false) and we.changeAnnotationSupport != null;
+        if (ws.symbol) |s| if (s.symbolKind) |k| {
+            server.workspace_symbol_kinds = k.valueSet != null;
+        };
     }
     if (params.capabilities.textDocument) |td| if (td.codeAction) |ca| {
         server.code_action_disabled = ca.disabledSupport orelse false;
+        server.code_action_literals = ca.codeActionLiteralSupport != null;
         if (ca.resolveSupport) |rs| for (rs.properties) |p| {
             if (std.mem.eql(u8, p, "edit")) server.code_action_resolve = ca.dataSupport orelse false;
         };
@@ -4720,6 +4770,25 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
         server.snippet_support = ci.snippetSupport orelse false;
         server.insert_replace_support = ci.insertReplaceSupport orelse false;
     };
+    if (params.capabilities.textDocument) |td| {
+        if (td.rename) |rn| server.prepare_rename = rn.prepareSupport orelse false;
+        if (td.documentSymbol) |ds| {
+            server.hierarchical_symbols = ds.hierarchicalDocumentSymbolSupport orelse false;
+            if (ds.symbolKind) |k| server.document_symbol_kinds = k.valueSet != null;
+        }
+        if (td.completion) |c| {
+            if (c.completionItemKind) |k| server.completion_kinds = k.valueSet != null;
+            if (c.completionItem) |ci| if (ci.documentationFormat) |f| {
+                server.completion_markdown = acceptsMarkdown(f);
+            };
+        }
+        if (td.hover) |hv| if (hv.contentFormat) |f| {
+            server.hover_markdown = acceptsMarkdown(f);
+        };
+        if (td.signatureHelp) |sh| if (sh.signatureInformation) |si| if (si.documentationFormat) |f| {
+            server.signature_markdown = acceptsMarkdown(f);
+        };
+    }
     if (params.initializationOptions) |options| if (options != .null) {
         server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -4769,13 +4838,14 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
             .inlayHintProvider = .{ .boolean = true },
             .referencesProvider = .{ .boolean = true },
             .documentHighlightProvider = .{ .boolean = true },
-            .renameProvider = .{ .RenameOptions = .{ .prepareProvider = true } },
+            .renameProvider = if (server.prepare_rename) .{ .RenameOptions = .{ .prepareProvider = true } } else .{ .boolean = true },
             .workspaceSymbolProvider = .{ .boolean = true },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
-            .codeActionProvider = .{ .CodeActionOptions = .{
+            // Every action carries an edit, which only `CodeAction` literals can hold
+            .codeActionProvider = if (server.code_action_literals) .{ .CodeActionOptions = .{
                 .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.RefactorRewrite, types.CodeActionKind.SourceOrganizeImports },
                 .resolveProvider = true,
-            } },
+            } } else .{ .boolean = false },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
                 .legend = ide.semantic_tokens.legend,
                 .full = .{ .SemanticTokensFullDelta = .{ .delta = true } },
@@ -4784,6 +4854,52 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
         },
         .serverInfo = .{ .name = "zig-analyzer", .version = za.version },
     };
+}
+
+/// A symbol kind the client supports: a client that lists its kinds handles any kind; for other
+/// clients, kinds added after the initial protocol version (`File` to `Array`) are sent as the
+/// closest initial kind
+fn clientSymbolKind(listed: bool, kind: types.SymbolKind) types.SymbolKind {
+    if (listed or @backingInt(kind) <= @backingInt(types.SymbolKind.Array)) return kind;
+    return switch (kind) {
+        .Struct, .Object => .Class,
+        .EnumMember => .Enum,
+        .TypeParameter => .Class,
+        else => .Variable,
+    };
+}
+
+/// A completion item kind the client supports (see `clientSymbolKind`)
+/// (the initial kinds are `Text` to `Reference`)
+fn clientCompletionKind(listed: bool, kind: types.CompletionItemKind) types.CompletionItemKind {
+    if (listed or @backingInt(kind) <= @backingInt(types.CompletionItemKind.Reference)) return kind;
+    return switch (kind) {
+        .Struct, .TypeParameter => .Class,
+        .EnumMember => .Enum,
+        .Constant => .Variable,
+        .Folder => .File,
+        else => .Text,
+    };
+}
+
+fn acceptsMarkdown(formats: []const types.MarkupKind) bool {
+    return std.mem.findScalar(types.MarkupKind, formats, .markdown) != null;
+}
+
+/// Markup content in the formats the client accepts: without markdown, code fences are removed
+/// and the text is sent as plain text
+fn markup(arena: Allocator, markdown: bool, text: []const u8) Allocator.Error!types.MarkupContent {
+    if (markdown) return .{ .kind = .markdown, .value = text };
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "```")) continue;
+        if (!first) try out.append(arena, '\n');
+        first = false;
+        try out.appendSlice(arena, line);
+    }
+    return .{ .kind = .plaintext, .value = out.items };
 }
 
 fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
@@ -4932,7 +5048,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
-            .kind = switch (it.kind) {
+            .kind = clientCompletionKind(server.completion_kinds, switch (it.kind) {
                 .param, .variable => .Variable,
                 .type_param => .TypeParameter,
                 .function, .builtin => .Function,
@@ -4948,8 +5064,8 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
                 .folder => .Folder,
                 .label => .Reference,
                 .snippet => .Snippet,
-            },
-            .documentation = if (it.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+            }),
+            .documentation = if (it.doc) |d| .{ .MarkupContent = try markup(arena, server.completion_markdown, d) } else null,
             .detail = it.detail,
             .filterText = it.filter,
             .sortText = it.sort,
@@ -5057,7 +5173,7 @@ fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.i
 /// A completion item was selected: fills in the signature (`detail`), the doc comment and the
 /// definition's location (`documentation`). Returns the item unchanged if `data` did not come from
 /// this server or the declaration it refers to no longer exists.
-fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
+fn completionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
     var item = params;
     const data = switch (params.data orelse return item) {
         .object => |o| o,
@@ -5072,7 +5188,7 @@ fn completionResolve(server: *Server, r: *Resolver, _: Allocator, params: types.
     } else .{ .file = file };
     const description = try ide.completion.describe(r, from, target);
     item.detail = description.detail;
-    item.documentation = .{ .MarkupContent = .{ .kind = .markdown, .value = description.doc } };
+    item.documentation = .{ .MarkupContent = try markup(arena, server.completion_markdown, description.doc) };
     return item;
 }
 
@@ -5095,7 +5211,7 @@ fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverPar
     const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
     return .{
-        .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = info.text } },
+        .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, info.text) },
         .range = lines.range(info.start, info.end, server.encoding),
     };
 }
@@ -5110,7 +5226,7 @@ fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.
         .label = sig.label,
         .parameters = ps,
         .activeParameter = if (ps.len == 0) null else sig.active,
-        .documentation = if (sig.doc) |d| .{ .MarkupContent = .{ .kind = .markdown, .value = d } } else null,
+        .documentation = if (sig.doc) |d| .{ .MarkupContent = try markup(arena, server.signature_markdown, d) } else null,
     };
     return .{ .signatures = info, .activeSignature = 0, .activeParameter = if (ps.len == 0) null else sig.active };
 }
@@ -5599,7 +5715,7 @@ fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: type
     var m: RangeMapper = .{ .server = server, .r = r };
     for (syms, out) |s, *o| o.* = .{
         .name = s.name,
-        .kind = s.kind,
+        .kind = clientSymbolKind(server.workspace_symbol_kinds, s.kind),
         .containerName = s.container,
         .location = .{ .Location = .{ .uri = try server.uriFor(arena, s.file), .range = try m.range(s.file, s.start, s.end) } },
     };
@@ -5619,6 +5735,8 @@ fn wantsKind(only: ?[]const []const u8, kind: []const u8) bool {
 }
 
 fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
+    // Every action carries an edit, which only `CodeAction` literals can hold
+    if (!server.code_action_literals) return null;
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const start, const end = server.rangeOffsets(text, params.range);

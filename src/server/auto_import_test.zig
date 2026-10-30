@@ -263,7 +263,7 @@ test "zig-analyzer.zon import settings override the client's in organize imports
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     _ = try h.request("initialize", .{
         .rootUri = try za.base.uri.fromPath(a, project.root),
-        .capabilities = Empty{},
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "refactor", "source" } } } } } },
         .initializationOptions = .{
             .imports = .{ .derived = "with_import", .sort = "path" },
             .completion = .{ .auto_import = true },
@@ -576,7 +576,11 @@ test "auto-import storage public paths and direct aliases resolve after applying
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     _ = try h.request("initialize", .{
         .rootUri = try za.base.uri.fromPath(a, project.root),
-        .capabilities = .{ .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} } },
+        // The client lists its kinds, so it gets `Constant` and the other kinds above `Reference`
+        .capabilities = .{
+            .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
+            .textDocument = .{ .completion = .{ .completionItemKind = .{ .valueSet = &[_]u32{21} } } },
+        },
         .initializationOptions = .{
             .completion = .{ .auto_import = true },
             .diagnostics = .{ .compiler = false, .inactive_code = false },

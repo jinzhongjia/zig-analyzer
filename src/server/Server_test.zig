@@ -263,7 +263,7 @@ test "close: non-file documents clear diagnostics on the client URI" {
 test "syntax features end to end" {
     var s: Session = undefined;
     try s.run(frame(
-        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"textDocument":{"documentSymbol":{"hierarchicalDocumentSymbolSupport":true}}}}}
     ) ++ frame(
         \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"
     ++ file_uri ++
@@ -1179,7 +1179,7 @@ test "organize imports is offered with the cursor in an import block or when req
     try h.start();
     defer h.finish();
     _ = try h.request("initialize", .{
-        .capabilities = struct {}{},
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "source.organizeImports" } } } } } },
         .initializationOptions = .{ .imports = .{ .derived = "separate" } },
     });
     const uri = "untitled:organize-imports.zig";
@@ -1263,4 +1263,124 @@ test "workspace symbol returns at most workspace_symbol.limit best matches, all 
     try testing.expectEqualStrings("alpha alphabet another_alpha", try names(&h));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
+}
+
+test "initialize and results follow the capabilities the client declares" {
+    // A client without these capabilities must not get option objects, trees, kinds or formats
+    // the protocol allows only for clients that declare them
+    const Harness = @import("test_harness.zig").Harness;
+    const text =
+        \\/// Adds `a` and **b**.
+        \\fn add(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+        \\const Point = struct { x: i32 };
+        \\pub fn main() void {
+        \\    const p: Point = .{ .x = 1 };
+        \\    _ = p;
+        \\    const unused = 1;
+        \\    _ = add(1, 2);
+        \\    Poi
+        \\}
+        \\
+    ;
+    const uri = "untitled:capabilities.zig";
+    const Pos = struct { line: u32, character: u32 };
+    const Client = struct {
+        h: Harness = undefined,
+
+        fn open(c: *@This(), capabilities: anytype) !std.json.ObjectMap {
+            try c.h.start();
+            const init = try c.h.request("initialize", .{ .capabilities = capabilities });
+            try c.h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+            _ = try c.h.request("zig-analyzer/waitIdle", {});
+            return init.object.get("result").?.object.get("capabilities").?.object;
+        }
+
+        fn result(c: *@This(), method: []const u8, params: anytype) !std.json.Value {
+            return (try c.h.request(method, params)).object.get("result").?;
+        }
+
+        fn close(c: *@This()) !void {
+            _ = try c.h.request("shutdown", {});
+            try c.h.notify("exit", {});
+            c.h.finish();
+        }
+
+        fn kindOf(items: []const std.json.Value, label_key: []const u8, label: []const u8) !i64 {
+            for (items) |it| if (std.mem.eql(u8, it.object.get(label_key).?.string, label)) return it.object.get("kind").?.integer;
+            return error.MissingItem;
+        }
+    };
+    const hover_at: Pos = .{ .line = 9, .character = 9 };
+    const name_at: Pos = .{ .line = 10, .character = 7 };
+    const unused_at: Pos = .{ .line = 8, .character = 10 };
+
+    // Client A declares nothing
+    {
+        var c: Client = .{};
+        const caps = try c.open(struct {}{});
+        try testing.expect(caps.get("renameProvider").? == .bool);
+        try testing.expect(caps.get("codeActionProvider").? == .bool);
+        try testing.expect(try c.result("textDocument/codeAction", .{
+            .textDocument = .{ .uri = uri },
+            .range = .{ .start = unused_at, .end = unused_at },
+            .context = .{ .diagnostics = &[_]std.json.Value{} },
+        }) == .null);
+        // A flat `SymbolInformation[]` with kinds up to `Array` (18)
+        const symbols = (try c.result("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } })).array.items;
+        for (symbols) |s| {
+            try testing.expect(s.object.get("children") == null);
+            try testing.expect(s.object.get("location") != null);
+            try testing.expect(s.object.get("kind").?.integer <= 18);
+        }
+        try testing.expectEqual(5, try Client.kindOf(symbols, "name", "Point"));
+        for (symbols) |s| if (std.mem.eql(u8, s.object.get("name").?.string, "x")) {
+            try testing.expectEqualStrings("Point", s.object.get("containerName").?.string);
+        };
+        for ((try c.result("workspace/symbol", .{ .query = "Point" })).array.items) |s| try testing.expect(s.object.get("kind").?.integer <= 18);
+        // Completion kinds up to `Reference` (18)
+        const completion = try c.result("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = name_at });
+        const items = switch (completion) {
+            .array => |a| a.items,
+            else => completion.object.get("items").?.array.items,
+        };
+        for (items) |it| try testing.expect(it.object.get("kind").?.integer <= 18);
+        try testing.expectEqual(7, try Client.kindOf(items, "label", "Point"));
+        try c.close();
+    }
+    // Client B accepts only plain text
+    {
+        var c: Client = .{};
+        const plain = &[_][]const u8{"plaintext"};
+        _ = try c.open(.{ .textDocument = .{
+            .hover = .{ .contentFormat = plain },
+            .signatureHelp = .{ .signatureInformation = .{ .documentationFormat = plain } },
+            .completion = .{ .completionItem = .{ .documentationFormat = plain } },
+        } });
+        const contents = (try c.result("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = hover_at })).object.get("contents").?.object;
+        try testing.expectEqualStrings("plaintext", contents.get("kind").?.string);
+        try testing.expect(std.mem.indexOf(u8, contents.get("value").?.string, "```") == null);
+        try testing.expect(std.mem.indexOf(u8, contents.get("value").?.string, "fn add(a: u32, b: u32) u32") != null);
+        const sig = (try c.result("textDocument/signatureHelp", .{ .textDocument = .{ .uri = uri }, .position = Pos{ .line = 9, .character = 12 } })).object;
+        try testing.expectEqualStrings("plaintext", sig.get("signatures").?.array.items[0].object.get("documentation").?.object.get("kind").?.string);
+        try c.close();
+    }
+    // Client C declares everything
+    {
+        var c: Client = .{};
+        const caps = try c.open(.{ .textDocument = .{
+            .rename = .{ .prepareSupport = true },
+            .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{"quickfix"} } } },
+            .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true, .symbolKind = .{ .valueSet = &[_]u32{ 5, 23 } } },
+            .completion = .{ .completionItemKind = .{ .valueSet = &[_]u32{ 7, 22 } } },
+        } });
+        try testing.expect(caps.get("renameProvider").?.object.get("prepareProvider").?.bool);
+        try testing.expect(caps.get("codeActionProvider").? == .object);
+        const symbols = (try c.result("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } })).array.items;
+        try testing.expectEqual(23, try Client.kindOf(symbols, "name", "Point"));
+        const hover = (try c.result("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = hover_at })).object.get("contents").?.object;
+        try testing.expectEqualStrings("markdown", hover.get("kind").?.string);
+        try c.close();
+    }
 }
