@@ -1402,3 +1402,103 @@ test "files read by @embedFile are watched on disk by the server, or registered 
         }
     }
 }
+
+/// Condition for `waitWatched`: the last diagnostics published for `uri` include one containing
+/// `needle` (`has`), or none does (`!has`)
+const Diagnostic = struct {
+    uri: []const u8,
+    needle: []const u8,
+    has: bool,
+
+    fn done(c: Diagnostic, h: *Harness) !bool {
+        return try lastHas(h, c.uri, c.needle) == c.has;
+    }
+};
+
+const check_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("src/main.zig"),
+    \\        .target = b.graph.host,
+    \\    }) });
+    \\    b.installArtifact(exe);
+    \\    const check = b.step("check", "Check");
+    \\    check.dependOn(&exe.step);
+    \\}
+    \\
+;
+
+// Prevents ignoring an open document rewritten on disk: the build reads the disk, so keeping the
+// old build's diagnostics would map them onto the new text
+test "an open document rewritten on disk is rebuilt, with the client's or the server's watcher" {
+    const v1 = "const T = u8;\nconst util = @import(\"util.zig\");\npub fn main() void {\n    const bad: T = 300;\n    _ = bad;\n    util.f();\n}\n";
+    const v2 = "const T = u16;\nconst util = @import(\"util.zig\");\npub fn main() void {\n    const bad: T = 300;\n    _ = bad;\n    util.f();\n}\n";
+    const v3 = "const T = u8;\nconst util = @import(\"util.zig\");\npub fn main() void {\n    const bad: T = 300;\n    _ = bad;\n    util.f();\n}\n// saved\n";
+    const message = "type 'u8' cannot represent integer value '300'";
+    inline for (.{ "client", "server" }) |watcher| {
+        const client = comptime std.mem.eql(u8, watcher, "client");
+        var project = try fixture.Project.create(&.{
+            .{ .path = "build.zig", .text = check_build },
+            .{ .path = "src/main.zig", .text = v1 },
+            .{ .path = "src/util.zig", .text = "pub fn f() void {}\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const root_uri = try za.base.uri.fromPath(a, project.root);
+        _ = try h.request("initialize", .{
+            .rootUri = root_uri,
+            .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+            .initializationOptions = .{ .files = .{ .watcher = watcher } },
+        });
+        try h.notify("initialized", Empty{});
+        const main_path = try project.path(a, "src/main.zig");
+        const main_uri = try za.base.uri.fromPath(a, main_path);
+        try open(&h, main_uri, v1);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expect(try lastHas(&h, main_uri, message));
+
+        // Rewritten on disk (git checkout), and the editor reloads the buffer without saving
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = main_path, .data = v2 });
+        if (client) try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = main_uri, .type = 2 }} });
+        try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = v2 }} });
+        try waitWatched(&h, Diagnostic{ .uri = main_uri, .needle = message, .has = false });
+
+        // A save is rebuilt once: the watcher's notification of the same write adds no rebuild
+        if (client) {
+            try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 3 }, .contentChanges = &.{.{ .text = v3 }} });
+            try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = main_path, .data = v3 });
+            const builds = compiles(&h);
+            try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+            try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = main_uri, .type = 2 }} });
+            _ = try h.request("zig-analyzer/waitIdle", {});
+            try testing.expectEqual(builds + 1, compiles(&h));
+            try testing.expect(try lastHas(&h, main_uri, message));
+        }
+
+        // An open build.zig rewritten on disk restarts the project
+        const build_path = try project.path(a, "build.zig");
+        const build_uri = try za.base.uri.fromPath(a, build_path);
+        try open(&h, build_uri, check_build);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const instance = visibleInstance(&h);
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = build_path, .data = check_build ++ "// changed\n" });
+        if (client) try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = build_uri, .type = 2 }} });
+        try waitWatched(&h, Restarted{ .from = instance });
+
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
+/// Condition for `waitWatched`: the project instance is no longer `from`
+const Restarted = struct {
+    from: *Workspace,
+
+    fn done(c: Restarted, h: *Harness) !bool {
+        return visibleInstance(h) != c.from;
+    }
+};

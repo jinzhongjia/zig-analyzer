@@ -1742,6 +1742,13 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     const path = server.vfs.path(id);
     const base = std.fs.path.basename(path);
     const is_build_file = isProjectFile(base);
+    // The rebuilds below read the saved contents: the notification of this write by a file
+    // watcher then rebuilds nothing more (see `didChangeWatchedFiles`)
+    const saved = server.vfs.readFromDisk(id, arena) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        error.FileTooBig => null,
+    };
+    if (saved) |t| server.watched_built.put(server.gpa, id, std.hash.Wyhash.hash(0, t)) catch {} else _ = server.watched_built.remove(id);
 
     // A build.zig newly created in a root directory: start the project
     if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
@@ -1773,18 +1780,20 @@ fn isProjectFile(base: []const u8) bool {
 }
 
 /// External changes on disk (outside the editor: git checkout, code generation, etc.). For open
-/// files the buffer is authoritative; other known files are updated from the disk contents
-/// (deleted ones become nonexistent), without writing or republishing when the contents equal
-/// the known ones. A change to build.zig / build.zig.zon / zig-analyzer.zon in a workspace root
-/// directory or to a project's build script restarts that project; creating or deleting
-/// build.zig in a root directory starts or stops the project; changes to other files rebuild
-/// projects and recompile single files; nothing is rebuilt when the disk contents equal those the
-/// last rebuild was based on.
+/// files the buffer is authoritative, but the builds read the disk, so they are rebuilt as well;
+/// other known files are updated from the disk contents (deleted ones become nonexistent),
+/// without writing or republishing when the contents equal the known ones. A change to build.zig
+/// / build.zig.zon / zig-analyzer.zon in a workspace root directory or to a project's build
+/// script restarts that project; creating or deleting build.zig in a root directory starts or
+/// stops the project; changes to other files rebuild projects and recompile single files; nothing
+/// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
+        /// Disk contents to write; null for open documents (their buffer is authoritative)
         text: ?[]u8,
+        open: bool,
         durability: database.Durability,
         /// Hash of the disk contents; null if the file does not exist
         disk: ?u64,
@@ -1798,7 +1807,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     const rules = try server.originRules(arena);
     var build_files: std.ArrayList([]const u8) = .empty;
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
-    // Known files that changed (including open files: the maker reads the disk)
+    // Known files that changed
     var known: std.ArrayList(Vfs.FileId) = .empty;
     // When a file changes several times in one batch, the last change wins: an atomic save first
     // deletes and then recreates the file, and with unchanged contents the two together are not a
@@ -1831,22 +1840,23 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
             defer server.docs_mutex.unlock(server.io);
             break :blk server.open_docs.contains(file);
         };
-        if (is_open) {
-            if (isProjectFile(base)) try build_files.append(arena, dir);
-            try known.append(arena, file);
-            continue;
-        }
-        const text = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+        const read = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             error.FileTooBig => null,
         };
+        const disk: ?u64 = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+        const text = if (is_open) blk: {
+            if (read) |t| server.gpa.free(t);
+            break :blk null;
+        } else read;
         changes.append(arena, .{
             .file = file,
             .path = path,
             .text = text,
+            .open = is_open,
             .durability = origin.classify(&server.vfs, rules, server.vfs.path(file), false).durability(),
-            .disk = if (text) |t| std.hash.Wyhash.hash(0, t) else null,
+            .disk = disk,
         }) catch |err| {
             if (text) |t| server.gpa.free(t);
             return err;
@@ -1863,7 +1873,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
         defer ctx.end();
         var kept: usize = 0;
         for (changes.items) |*c| {
-            c.edited = !sameText(&ctx, c.file, c.text);
+            c.edited = !c.open and !sameText(&ctx, c.file, c.text);
             c.rebuild = if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
             if (!c.edited and !c.rebuild) {
                 if (c.text) |t| server.gpa.free(t);

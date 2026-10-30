@@ -7,8 +7,8 @@
 //! and the configure input directories of projects (see `Server.configureInputDirs`), whose
 //! created and deleted entries are reported too; libraries, which never change, are excluded (see
 //! `Server.watchable`). Changes are handled as `workspace/didChangeWatchedFiles` notifications,
-//! along the same path as the client's notifications; open documents are skipped, since their
-//! buffers take precedence and saves in the editor are handled by `didSave`.
+//! along the same path as the client's notifications, open documents included: their buffers
+//! take precedence, but builds read the disk.
 //!
 //! The directories containing these files are watched with the operating system's native
 //! notifications: inotify on Linux, FSEvents on macOS, directory change notifications on Windows.
@@ -498,15 +498,12 @@ pub const Watcher = struct {
     }
 
     /// Generates change events from the current state of the files and hands them to the server.
-    /// Open documents are skipped, since their buffers take precedence, except entries created in
-    /// or deleted from configure input directories: such an entry reconfigures the project
-    /// whether or not it is open.
+    /// Open documents are included: their buffers take precedence, but builds read the disk.
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         var events: std.ArrayList(types.FileEvent) = .empty;
         for (pending.paths.keys(), pending.paths.values()) |path, hint| {
             const exists = stat(server.io, path) != null;
-            if (server.isOpen(path) and ((exists and hint != .created) or !w.inEntryDir(try w.key(a, path)))) continue;
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
             try events.append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
