@@ -3911,10 +3911,12 @@ fn typeUnknown() TypedValue {
 }
 
 /// `@hasDecl` (counting only pub declarations) / `@hasField`; tuples, anonymous structs and
-/// constructed types have no declarations, and their field names are in the type; null for other
-/// types that are not containers in source code
+/// constructed types have no declarations, and their field names are in the type; slices have
+/// the fields `ptr` and `len`, arrays `len`, and the `_` of a non-exhaustive enum is not a field;
+/// null for other types that are not containers in source code
 fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
-    switch (r.ctx.db.env.ip.key(t)) {
+    const ip = r.ctx.db.env.ip;
+    switch (ip.key(t)) {
         .tuple_type => |tt| {
             if (decl) return false;
             const i = std.fmt.parseInt(usize, name, 10) catch return false;
@@ -3922,11 +3924,11 @@ fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
         },
         .anon_struct_type => |s| return !decl and hasName(s.names, name),
         .reified_type => |rt| return !decl and hasName(rt.names, name),
-        else => {},
+        else => if (!decl) if (value.sliceArrayHasField(ip, t, name)) |has| return has,
     }
     const ns = try queries.namespaceOfType(r, t) orelse return null;
     const tree = try r.itemTree(ns.file);
-    if (!decl) return fieldItem(tree, ns.container, name) != null;
+    if (!decl) return !(value.isEnumType(ip, t) and std.mem.eql(u8, name, "_")) and fieldItem(tree, ns.container, name) != null;
     const m = Resolver.lookupDecl(tree, ns.container, name) orelse return false;
     return tree.items[m].flags.is_pub;
 }

@@ -2838,7 +2838,10 @@ const Evaluator = struct {
             // on the instance (same as `infer.hasMember`)
             if (ip.key(t) == .opaque_param) return error.Abort;
             const field = try ev.stringOf(vals[1]);
-            if (eq(u8, name, "@hasField")) return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
+            if (eq(u8, name, "@hasField")) {
+                if (value.sliceArrayHasField(ip, t, field)) |has| return boolVal(has);
+                return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
+            }
             const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);
             const tree = try ev.r.itemTree(ns.file);
             const m = Resolver.lookupDecl(tree, ns.container, field) orelse return boolVal(false);

@@ -2355,6 +2355,47 @@ test "@hasDecl and @hasField on abstract parameters are unknown" {
     });
 }
 
+test "@hasField on slices, arrays and non-exhaustive enums" {
+    // Prevents `@hasField` from being false for slice `ptr`/`len` and array `len`, and true
+    // for the `_` of a non-exhaustive enum; expected values are the results of zig 0.17.0
+    try expectStdTypes(
+        \\const Point = struct { x: i32, y: i32 };
+        \\fn Elem(comptime T: type) type {
+        \\    return if (@hasField(T, "ptr")) @typeInfo(T).pointer.child else T;
+        \\}
+        \\fn hasLen(comptime T: type) bool {
+        \\    return @hasField(T, "len");
+        \\}
+        \\fn hasUnder(comptime T: type) bool {
+        \\    return @hasField(T, "_");
+        \\}
+        \\const E = Elem([]const Point);
+        \\const A = Elem([3]Point);
+        \\const al = @hasField([3]u8, "len");
+        \\const ap = @hasField([3]u8, "ptr");
+        \\const sx = @hasField([]u8, "x");
+        \\const t = if (@hasField([]const u8, "len")) u1 else u2;
+        \\const NE = enum(u8) { a, b, _ };
+        \\const v = if (@hasField(NE, "_")) u1 else u2;
+        \\const ve = @hasField(NE, "_");
+        \\const ca = hasLen([2]u8);
+        \\const cs = hasLen([]u8);
+        \\const cn = hasUnder(NE);
+    , &.{
+        .{ "E", "type = Point" },
+        .{ "A", "type = [3]Point" },
+        .{ "al", "bool = true" },
+        .{ "ap", "bool = false" },
+        .{ "sx", "bool = false" },
+        .{ "t", "type = u1" },
+        .{ "v", "type = u2" },
+        .{ "ve", "bool = false" },
+        .{ "ca", "bool = true" },
+        .{ "cs", "bool = true" },
+        .{ "cn", "bool = false" },
+    });
+}
+
 test "arrays whose length depends on abstract parameters keep their element type" {
     try expectTypes(
         \\fn Hasher(comptime block_length: usize) type {

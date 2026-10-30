@@ -664,6 +664,15 @@ pub fn isEnumType(ip: *InternPool, t: Index) bool {
     };
 }
 
+/// `@hasField` on slices (`ptr` and `len`) and arrays (`len`); null for other types
+pub fn sliceArrayHasField(ip: *InternPool, t: Index, name: []const u8) ?bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| if (p.size == .slice) std.mem.eql(u8, name, "ptr") or std.mem.eql(u8, name, "len") else null,
+        .array_type, .abstract_array_type => std.mem.eql(u8, name, "len"),
+        else => null,
+    };
+}
+
 /// Types that can exist only at comptime: a parameter of such a type is a comptime parameter even
 /// without `comptime`
 pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
