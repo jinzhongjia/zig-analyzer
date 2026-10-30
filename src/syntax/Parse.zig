@@ -411,11 +411,13 @@ fn editInsideBraces(node: tree.SyntaxNode, start: u32, end: u32) bool {
     return o.range().end <= start and end <= c.offset;
 }
 
-/// After the first `{` opens, the braces do not balance until the last token (which must be `}`)
+/// After the first `{` opens, the braces do not balance until the last token, which must be `}`
+/// even counting trivia: when a line comment runs to the end of the text, the node's `}` is not
+/// the end of that comment in the whole file
 fn bracesBalanced(tokens: []const lexer.Token) bool {
+    if (tokens.len == 0 or tokens[tokens.len - 1].kind != .r_brace) return false;
     var depth: i32 = 0;
     var opened = false;
-    var last: ?lexer.Token = null;
     for (tokens) |t| {
         if (kind_mod.isTrivia(t.kind)) continue;
         if (opened and depth == 0) return false; // tokens remain after the braces balance
@@ -430,10 +432,8 @@ fn bracesBalanced(tokens: []const lexer.Token) bool {
             },
             else => {},
         }
-        last = t;
     }
-    const l = last orelse return false;
-    return opened and depth == 0 and l.kind == .r_brace;
+    return opened and depth == 0;
 }
 
 /// The event stream forms exactly one root node of the given kind
