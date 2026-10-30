@@ -10,7 +10,8 @@
 //! created and deleted entries are reported too; libraries, which never change, are excluded (see
 //! `Server.watchable`). Changes are handled as `workspace/didChangeWatchedFiles` notifications,
 //! along the same path as the client's notifications, open documents included: their buffers
-//! take precedence, but builds read the disk.
+//! take precedence, but builds read the disk. A notification may name a file of interest under
+//! another spelling (see `Spellings`): it counts for that file.
 //!
 //! The directories containing these files are watched with the operating system's native
 //! notifications: inotify on Linux, FSEvents on macOS, directory change notifications on Windows.
@@ -93,6 +94,8 @@ pub const Watcher = struct {
     state_arena: std.heap.ArenaAllocator,
     /// Files of interest: identity key (lowercased when case-insensitive) → path
     files: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// Other spellings of files of interest seen in notifications; reset along with `files`
+    spellings: Spellings = .{},
     /// Directories of files of interest that do not exist yet: identity key → path (their nearest
     /// existing ancestors are watched instead)
     missing: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
@@ -144,6 +147,7 @@ pub const Watcher = struct {
         w.backend.destroy(w.gpa);
         w.fallback.deinit(w.gpa);
         w.files.deinit(w.gpa);
+        w.spellings.deinit(w.gpa);
         w.missing.deinit(w.gpa);
         w.entry_dirs.deinit(w.gpa);
         w.state_arena.deinit();
@@ -329,6 +333,7 @@ pub const Watcher = struct {
         w.backend.setDirs(w.gpa, &.{}, &none) catch {};
         none.deinit(w.gpa);
         w.files.clearRetainingCapacity();
+        w.spellings.reset(w.gpa);
         w.missing.clearRetainingCapacity();
         w.entry_dirs.clearRetainingCapacity();
         w.fallback.clearRetainingCapacity();
@@ -450,6 +455,7 @@ pub const Watcher = struct {
             };
         }
 
+        w.spellings.reset(gpa);
         w.files.deinit(gpa);
         w.files = files;
         w.missing.deinit(gpa);
@@ -494,18 +500,30 @@ pub const Watcher = struct {
         var unknown: std.StringHashMapUnmanaged(void) = .empty;
         for (events) |ev| switch (ev.kind) {
             .changed, .created, .removed => {
+                const hint: Pending.Hint = if (ev.kind == .created) .created else .changed;
                 const k = try w.key(a, ev.path);
-                if (w.files.get(k)) |path| {
-                    try pending.add(a, path, if (ev.kind == .created) .created else .changed);
-                } else {
-                    // An entry created in or removed from a configure input directory
-                    if (ev.kind != .changed and w.inEntryDir(k)) try pending.add(a, ev.path, if (ev.kind == .created) .created else .changed);
-                    if (ev.kind != .changed) try unknown.put(a, k, {});
-                    if (ev.kind == .created) {
-                        // A path leading to a nonexistent directory has appeared
-                        if (w.leadsToMissing(k)) try dirs.put(a, k, {});
-                        if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
-                    }
+                if (w.files.getIndex(k)) |i| {
+                    // The name may now lead to another file
+                    if (ev.kind != .changed) w.spellings.forgetFile(w.gpa, @intCast(i));
+                    try pending.add(a, w.files.values()[i], hint);
+                    continue;
+                }
+                // A name created anew may be another file than the one seen before
+                if (ev.kind == .created) w.spellings.forget(w.gpa, k);
+                const same = try w.spellings.find(w.gpa, w.server.io, &w.files, k, ev.path);
+                if (ev.kind == .removed) w.spellings.forget(w.gpa, k);
+                if (same) |i| {
+                    if (ev.kind != .changed) w.spellings.forgetFile(w.gpa, i);
+                    try pending.add(a, w.files.values()[i], hint);
+                    continue;
+                }
+                // An entry created in or removed from a configure input directory
+                if (ev.kind != .changed and w.inEntryDir(k)) try pending.add(a, ev.path, hint);
+                if (ev.kind != .changed) try unknown.put(a, k, {});
+                if (ev.kind == .created) {
+                    // A path leading to a nonexistent directory has appeared
+                    if (w.leadsToMissing(k)) try dirs.put(a, k, {});
+                    if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
                 }
             },
             .dir_created, .dir_gone, .overflow => {
@@ -589,6 +607,96 @@ const Pending = struct {
             return err;
         };
         gop.value_ptr.* = hint;
+    }
+};
+
+/// Other spellings of files of interest in notifications. FSEvents reports names in the Unicode
+/// form stored on disk, which may be decomposed while the client and the server use the composed
+/// form; a file may also be reached under the name of a symbolic link in its directory. A
+/// reported path that is not a file of interest is that file of interest in the same directory
+/// whose real path (see `Vfs.realPath`) is the same. Only unknown names in directories with files
+/// of interest are resolved on disk; results are kept until the files of interest are recomputed,
+/// and dropped for a name that is created or removed.
+const Spellings = struct {
+    /// Identity key of a reported path (owned) → index of the file of interest it names, or null
+    found: std.StringHashMapUnmanaged(?u32) = .empty,
+    /// Identity key of a directory → indexes of the files of interest in it; built when first
+    /// needed (the keys point into the identity keys of the files of interest)
+    dirs: ?std.StringHashMapUnmanaged(std.ArrayList(u32)) = null,
+    /// Index of a file of interest → its real path (owned), or null when unreachable
+    real: std.AutoHashMapUnmanaged(u32, ?[:0]u8) = .empty,
+
+    fn deinit(s: *Spellings, gpa: Allocator) void {
+        s.reset(gpa);
+        s.found.deinit(gpa);
+        s.real.deinit(gpa);
+    }
+
+    /// The files of interest are recomputed: their indexes change
+    fn reset(s: *Spellings, gpa: Allocator) void {
+        var found = s.found.keyIterator();
+        while (found.next()) |k| gpa.free(k.*);
+        s.found.clearRetainingCapacity();
+        if (s.dirs) |*dirs| {
+            var lists = dirs.valueIterator();
+            while (lists.next()) |l| l.deinit(gpa);
+            dirs.deinit(gpa);
+            s.dirs = null;
+        }
+        var real = s.real.valueIterator();
+        while (real.next()) |r| if (r.*) |p| gpa.free(p);
+        s.real.clearRetainingCapacity();
+    }
+
+    /// Forgets what the reported path with identity key `k` names
+    fn forget(s: *Spellings, gpa: Allocator, k: []const u8) void {
+        if (s.found.fetchRemove(k)) |kv| gpa.free(kv.key);
+    }
+
+    /// Forgets the real path of the file of interest `file`
+    fn forgetFile(s: *Spellings, gpa: Allocator, file: u32) void {
+        if (s.real.fetchRemove(file)) |kv| if (kv.value) |p| gpa.free(p);
+    }
+
+    /// The file of interest (index into `files`) that the reported `path` (identity key `k`, not
+    /// itself a file of interest) names, if any
+    fn find(s: *Spellings, gpa: Allocator, io: Io, files: *const std.StringArrayHashMapUnmanaged([]const u8), k: []const u8, path: []const u8) Allocator.Error!?u32 {
+        if (s.found.get(k)) |known| return known;
+        if (s.dirs == null) {
+            var dirs: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+            errdefer {
+                var lists = dirs.valueIterator();
+                while (lists.next()) |l| l.deinit(gpa);
+                dirs.deinit(gpa);
+            }
+            for (files.keys(), 0..) |fk, i| {
+                const gop = try dirs.getOrPut(gpa, std.fs.path.dirname(fk) orelse continue);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(gpa, @intCast(i));
+            }
+            s.dirs = dirs;
+        }
+        const in_dir = s.dirs.?.get(std.fs.path.dirname(k) orelse return null) orelse return null;
+        // Not cached: a removed name no longer leads anywhere, and one created later is resolved
+        // again
+        const real = try Vfs.realPath(io, gpa, path) orelse return null;
+        defer gpa.free(real);
+        var same: ?u32 = null;
+        for (in_dir.items) |i| {
+            const gop = try s.real.getOrPut(gpa, i);
+            if (!gop.found_existing) gop.value_ptr.* = Vfs.realPath(io, gpa, files.values()[i]) catch |err| {
+                _ = s.real.remove(i);
+                return err;
+            };
+            if (gop.value_ptr.*) |r| if (std.mem.eql(u8, r, real)) {
+                same = i;
+                break;
+            };
+        }
+        const owned = try gpa.dupe(u8, k);
+        errdefer gpa.free(owned);
+        try s.found.put(gpa, owned, same);
+        return same;
     }
 };
 
@@ -1787,4 +1895,65 @@ test "a name created or removed without being reported as a directory reaches th
     pending = .{};
     try testing.expect(!try w.handle(a, &.{.{ .path = native("/p/src/other.txt"), .kind = .removed }}, &pending));
     try testing.expectEqual(0, pending.paths.count());
+}
+
+test "spellings: a reported name that is another spelling of a file of interest names it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    try tmp.dir.createDirPath(testing.io, "sub");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "target.zig", .data = "a" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "b" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sub/target.zig", .data = "c" });
+    try tmp.dir.symLink(testing.io, "target.zig", "link.zig", .{});
+    // On macOS, the client spells a name in the composed form while FSEvents reports the form
+    // stored on disk, here the decomposed one: APFS treats both as the same name
+    const macos = builtin.os.tag == .macos;
+    if (macos) try tmp.dir.writeFile(testing.io, .{ .sub_path = "cafe\u{301}.zig", .data = "d" });
+    const path = struct {
+        fn join(al: Allocator, d: []const u8, name: []const u8) ![]const u8 {
+            return std.fs.path.join(al, &.{ d, name });
+        }
+    }.join;
+
+    var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    defer files.deinit(gpa);
+    for ([_][]const u8{ "other.zig", "link.zig", "caf\u{e9}.zig" }) |name| {
+        if (!macos and std.mem.eql(u8, name, "caf\u{e9}.zig")) continue;
+        const p = try path(a, dir, name);
+        try files.put(gpa, p, p);
+    }
+    var s: Spellings = .{};
+    defer s.deinit(gpa);
+    const target = try path(a, dir, "target.zig");
+    // The symbolic link `link.zig` is the file the notification names as `target.zig`
+    try testing.expectEqual(1, (try s.find(gpa, testing.io, &files, target, target)).?);
+    try testing.expectEqual(1, s.found.get(target).?.?);
+    // A name of another file in the same directory, and a name in a directory without files of
+    // interest, name none
+    const nested = try path(a, dir, "sub/target.zig");
+    try testing.expectEqual(null, try s.find(gpa, testing.io, &files, nested, nested));
+    try testing.expect(!s.found.contains(nested));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "new.zig", .data = "e" });
+    const new = try path(a, dir, "new.zig");
+    try testing.expectEqual(null, try s.find(gpa, testing.io, &files, new, new));
+    if (macos) {
+        const decomposed = try path(a, dir, "cafe\u{301}.zig");
+        try testing.expectEqual(2, (try s.find(gpa, testing.io, &files, decomposed, decomposed)).?);
+    }
+    // Removed: the name is still known until it is forgotten; then it leads nowhere
+    try tmp.dir.deleteFile(testing.io, "target.zig");
+    try testing.expectEqual(1, (try s.find(gpa, testing.io, &files, target, target)).?);
+    s.forget(gpa, target);
+    s.forgetFile(gpa, 1);
+    try testing.expectEqual(null, try s.find(gpa, testing.io, &files, target, target));
+    // The files of interest are recomputed
+    s.reset(gpa);
+    try testing.expectEqual(0, s.found.count());
+    try testing.expect(s.dirs == null);
 }

@@ -156,6 +156,34 @@ test "without file watching from the client, the server watches files on disk" {
     try h.notify("exit", {});
 }
 
+test "the server watches files on disk: a change notified under another spelling of a file counts for it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const main_text = "const lib = @import(\"lib.zig\");\npub fn first() void {\n    lib.\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "lib.impl", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    // The notifications name the file as stored on disk (`lib.impl`), the server knows it as
+    // `lib.zig`, as with FSEvents reporting decomposed Unicode names for composed ones
+    try project.tmp.dir.symLink(testing.io, "lib.impl", "lib.zig", .{});
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("hello", try completionLabels(&h, main_uri, main_text, "    lib."));
+    // Guards against dropping the notification as one for an unknown file
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.impl"), .data = "pub fn goodbye() void {}\n" });
+    try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "goodbye" });
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 /// Number of batches of external changes the server has handled
 fn watchBatches(h: *Harness) u64 {
     h.server.watch_mutex.lockUncancelable(testing.io);
