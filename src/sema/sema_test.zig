@@ -2763,6 +2763,44 @@ test "pointer attributes are part of the pointer type" {
     });
 }
 
+test "pointers to fields, elements and aligned variables carry their attributes" {
+    // Prevents `&reg.en` of a packed field and `&p.x` through an attributed pointer from being
+    // plain pointers
+    try expectTypes(
+        \\const Reg = packed struct(u32) { en: bool, _pad: u31 };
+        \\const S = extern struct { a: u8, b: u32 };
+        \\const A = struct { x: u8 align(4), y: u32 };
+        \\var global: u32 align(8) = 0;
+        \\fn f(reg: *Reg, s: *S, ua: *align(1) A, v: *volatile A, arr: *align(8) [4]u8, n: usize) void {
+        \\    var local: [4]u8 align(16) = undefined;
+        \\    const a7 = &reg.en;
+        \\    const sa = &s.a;
+        \\    const sb = &s.b;
+        \\    const ax = &ua.x;
+        \\    const ay = &ua.y;
+        \\    const vy = &v.y;
+        \\    const e0 = &arr[0];
+        \\    const e1 = &arr[1];
+        \\    const er = &arr[n];
+        \\    const g = &global;
+        \\    const l = &local;
+        \\    _ = .{ a7, sa, sb, ax, ay, vy, e0, e1, er, g, l };
+        \\}
+    , &.{
+        .{ "a7", "*align(4:0:4) bool" },
+        .{ "sa", "*align(4) u8" },
+        .{ "sb", "*u32" },
+        .{ "ax", "*align(1) u8" },
+        .{ "ay", "*align(1) u32" },
+        .{ "vy", "*volatile u32" },
+        .{ "e0", "*align(8) u8" },
+        .{ "e1", "*align(1) u8" },
+        .{ "er", "*align(1) u8" },
+        .{ "g", "*align(8) u32" },
+        .{ "l", "*align(16) [4]u8" },
+    });
+}
+
 test "@typeInfo, @Pointer and std results keep pointer attributes" {
     // Prevents default attributes in `@typeInfo` and std results losing their alignment
     try expectStdTypes(

@@ -2865,7 +2865,7 @@ const Inferrer = struct {
                 } else null;
                 var v = try inf.infer(operand_e, child_expected);
                 const is_const = try inf.isConstPlace(operand_e);
-                const ty = try ip.ptrTo(v.ty, .one, is_const);
+                const ty: Index = if (v.ty == .unknown) .unknown else try ip.get(.{ .ptr_type = .{ .child = v.ty, .size = .one, .is_const = is_const, .attrs = try inf.placeAttrs(operand_e) } });
                 // Typed aggregate literals get no value from inference: a pointer to an array
                 // literal whose elements are all comptime-known (`&.{ 1, 2 }` coerced to a slice)
                 // gets the array from the interpreter
@@ -3315,6 +3315,92 @@ const Inferrer = struct {
     /// `&x`: see `placeIsConst`
     fn isConstPlace(inf: *Inferrer, e: ExprId) Error!bool {
         return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
+    }
+
+    /// Attributes of a pointer to the place `e` (`&e`, pointer captures): the `align(...)` of a
+    /// variable; for a field or an element, those of the pointer or place it is reached through,
+    /// adjusted for its offset (the compiler's `fieldPtrType` / `elemPtrType`)
+    fn placeAttrs(inf: *Inferrer, e: ExprId) Error!InternPool.PtrAttrs {
+        const ip = inf.ip;
+        const b = inf.body;
+        switch (b.expr(e)) {
+            .name_ref => |name| {
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .{};
+                return inf.defAttrs(def);
+            },
+            .field_access => |fa| {
+                const field = fa.field orelse return .{};
+                // A member of a namespace is a declaration
+                if (inf.get(fa.lhs).asType()) |t| {
+                    const ns = try queries.namespaceOfType(inf.r, t) orelse return .{};
+                    return inf.defAttrs(try inf.r.memberDef(ns, field) orelse return .{});
+                }
+                return inf.fieldPlaceAttrs(fa.lhs, field, inf.get(e).ty);
+            },
+            .builtin_call => |c| {
+                if (!std.mem.eql(u8, c.name, "@field") or c.args.len != 2) return .{};
+                const written: ?[]const u8 = switch (b.expr(c.args[1])) {
+                    .literal => |text| if (try Body.stringLiteralValue(inf.scratch, text)) |s| s else null,
+                    else => null,
+                };
+                const field = written orelse try eval.stringValue(inf.r, inf.get(c.args[1])) orelse return .{ .alignment = .unknown };
+                return inf.fieldPlaceAttrs(c.args[0], field, inf.get(e).ty);
+            },
+            .index => |x| {
+                const lhs = inf.get(x.lhs).ty;
+                const index: ?u64 = if (value.intOf(ip, inf.get(x.index).val)) |n| std.math.cast(u64, n) else null;
+                // An element of a tuple is a field
+                if (tupleOf(ip, lhs) != null) {
+                    var buf: [20]u8 = undefined;
+                    const name = std.fmt.bufPrint(&buf, "{d}", .{index orelse return .{ .alignment = .unknown }}) catch unreachable;
+                    return inf.fieldPlaceAttrs(x.lhs, name, inf.get(e).ty);
+                }
+                const parent = switch (ip.key(lhs)) {
+                    .ptr_type => |p| p.attrs,
+                    else => try inf.placeAttrs(x.lhs),
+                };
+                return eval.elemPtrAttrs(inf.r, parent, inf.get(e).ty, index);
+            },
+            .deref => |x| return switch (ip.key(inf.get(x).ty)) {
+                .ptr_type => |p| p.attrs,
+                else => .{},
+            },
+            // The payload of an optional is at its start
+            .unwrap_optional => |x| return inf.placeAttrs(x),
+            .binary => |bin| return if (bin.op == .keyword_orelse and inf.get(bin.rhs).ty == .noreturn_type) inf.placeAttrs(bin.lhs) else .{},
+            // A pointer to the payload of an error union keeps only the address space
+            .@"catch" => |c| return if (inf.get(c.rhs).ty == .noreturn_type) .{ .address_space = (try inf.placeAttrs(c.lhs)).address_space } else .{},
+            else => return .{},
+        }
+    }
+
+    /// `placeAttrs` of the field `name` (of type `field_ty`) of `base`: through a pointer or of
+    /// the place `base`
+    fn fieldPlaceAttrs(inf: *Inferrer, base: ExprId, name: []const u8, field_ty: Index) Error!InternPool.PtrAttrs {
+        const t = inf.get(base).ty;
+        const parent: InternPool.PtrAttrs, const agg: Index = switch (inf.ip.key(t)) {
+            .ptr_type => |p| if (p.size == .one or p.size == .c) .{ p.attrs, p.child } else .{ try inf.placeAttrs(base), t },
+            else => .{ try inf.placeAttrs(base), t },
+        };
+        if (agg == .unknown) return .{ .alignment = .unknown };
+        return eval.fieldPtrAttrs(inf.r, parent, agg, name, field_ty);
+    }
+
+    /// Attributes of a pointer to a variable: its `align(...)`
+    fn defAttrs(inf: *Inferrer, def: resolve.Def) Error!InternPool.PtrAttrs {
+        switch (def) {
+            .local => |l| {
+                if (l.file != inf.file or l.item != inf.item) {
+                    // A local of the outer function: its alignment is inferred there
+                    const outer = (try inf.r.body(l.file, l.item)).binding(l.binding);
+                    return if (outer.@"align" != null) .{ .alignment = .unknown } else .{};
+                }
+                const a = inf.body.binding(l.binding).@"align" orelse return .{};
+                return .{ .alignment = eval.alignmentOf(inf.ip, (try inf.inferComptime(a, try inf.clauseType(.@"align"))).val) };
+            },
+            .item => |it| return .{ .alignment = try eval.declAlignment(inf.r, it.file, it.item, inf.inst) },
+            .file => return .{},
+        }
     }
 
     /// Type of an inferred subexpression (for `placeIsConst`)

@@ -186,7 +186,7 @@ const Lowerer = struct {
         return id;
     }
 
-    fn bind(l: *Lowerer, name: SyntaxToken, kind: Body.Binding.Kind, extra: struct { ty: ?ExprId = null, init: ?ExprId = null, is_ptr: bool = false, is_comptime: bool = false }) Error!BindingId {
+    fn bind(l: *Lowerer, name: SyntaxToken, kind: Body.Binding.Kind, extra: struct { ty: ?ExprId = null, init: ?ExprId = null, @"align": ?ExprId = null, is_ptr: bool = false, is_comptime: bool = false }) Error!BindingId {
         const id: BindingId = @fromBackingInt(@as(u32, @intCast(l.bindings.items.len)));
         const r = name.range();
         try l.bindings.append(l.gpa, .{
@@ -195,6 +195,7 @@ const Lowerer = struct {
             .range = l.rel(r.start, r.end),
             .ty = extra.ty,
             .init = extra.init,
+            .@"align" = extra.@"align",
             .is_ptr = extra.is_ptr,
             .is_comptime = extra.is_comptime,
         });
@@ -462,8 +463,8 @@ const Lowerer = struct {
                         const name = v.name() orelse continue;
                         const ty = try l.optExpr(v.typeExpr());
                         // `align(...)` is evaluated in the enclosing scope, like the type
-                        _ = try l.clauses(t);
-                        const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = ty });
+                        const alignment = try l.clauses(t);
+                        const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = ty, .@"align" = alignment });
                         try bindings.append(l.a, b);
                         try targets.append(l.a, .{ .binding = b });
                     } else try targets.append(l.a, .{ .expr = try l.expr(t) });
@@ -478,12 +479,12 @@ const Lowerer = struct {
     fn localDecl(l: *Lowerer, n: SyntaxNode) Error!BindingId {
         const v = ast.VarDecl{ .syntax = n };
         const ty = try l.optExpr(v.typeExpr());
-        _ = try l.clauses(n);
+        const alignment = try l.clauses(n);
         const init = try l.optExpr(v.initExpr());
         // When the name is missing, an empty name serves as a placeholder so that the statement
         // still has a binding
         const name = v.name() orelse SyntaxToken{ .kind = .identifier, .text = "", .offset = n.offset };
-        const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = ty, .init = init });
+        const b = try l.bind(name, if (v.isConst()) .local_const else .local_var, .{ .ty = ty, .init = init, .@"align" = alignment });
         _ = try l.pushScope(&.{b});
         return b;
     }

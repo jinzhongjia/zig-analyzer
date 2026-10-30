@@ -197,6 +197,8 @@ pub const Binding = struct {
     ty: ?ExprId = null,
     /// Initializer of a local variable
     init: ?ExprId = null,
+    /// `align(...)` of a local variable (also listed in `clauses`)
+    @"align": ?ExprId = null,
     /// `|*x|`
     is_ptr: bool = false,
     /// `comptime` parameter, or `comptime var` local variable

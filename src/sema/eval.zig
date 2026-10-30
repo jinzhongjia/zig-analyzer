@@ -3470,6 +3470,105 @@ const Evaluator = struct {
         return sl.bit_offsets[i];
     }
 
+    /// Attributes of a pointer to the field `name` (of type `field_ty`) of a value of type `agg`
+    /// reached through a pointer with attributes `parent` (the compiler's `Type.fieldPtrType` and
+    /// `fieldPtrAlign`): a field of a packed struct is a bit pointer into the host integer, and the
+    /// alignment follows the field's offset in an extern struct and the aggregate's alignment
+    /// where that is lower than the field's
+    fn fieldPtrAttrs(ev: *Evaluator, parent: InternPool.PtrAttrs, agg: Index, name: []const u8, field_ty: Index) EvalError!InternPool.PtrAttrs {
+        var out = parent;
+        if (parent.alignment == .unknown) return out;
+        // Slices (`ptr`, `len`) have the default layout and no explicit field alignment
+        const fields = try ev.fieldsOf(agg) orelse return ev.autoFieldPtrAttrs(out, agg, field_ty, null);
+        const i = for (fields, 0..) |fl, i| {
+            if (std.mem.eql(u8, fl.name, name)) break i;
+        } else return withUnknownAlign(out);
+        const attrs = ev.fieldAttrs(agg, i, fields[i]) catch |err| switch (err) {
+            error.Abort => return withUnknownAlign(out),
+            else => |x| return x,
+        };
+        // A comptime field: exactly the alignment specified
+        if (attrs.is_comptime) {
+            out.alignment = if (attrs.alignment) |a| .fromBytes(a) else .natural;
+            return out;
+        }
+        const layout = (try ev.containerSyntax(agg)).layout;
+        if (layout == .auto) return ev.autoFieldPtrAttrs(out, agg, field_ty, attrs.alignment);
+        if (ev.isUnion(agg)) {
+            // An extern or packed union: the alignment of the union pointer
+            if (parent.alignment == .natural) {
+                const field_align = try ev.abiAlign(field_ty) orelse return withUnknownAlign(out);
+                const agg_align = try ev.abiAlign(agg) orelse return withUnknownAlign(out);
+                if (field_align != agg_align) out.alignment = .fromBytes(agg_align);
+            }
+            return out;
+        }
+        const lf = try ev.layoutFields(agg, 0) orelse return withUnknownAlign(out);
+        const sl = try ev.structLayoutOf(agg, lf) orelse return withUnknownAlign(out);
+        const agg_align = parent.alignment.bytes() orelse sl.layout.alignment;
+        const bit_offset = sl.bit_offsets[i] orelse return withUnknownAlign(out);
+        if (layout == .@"extern") {
+            const offset = bit_offset / 8;
+            const field_align = if (offset == 0) agg_align else @min(agg_align, @as(u64, 1) << @intCast(@ctz(offset)));
+            const natural = lf[i].layout.?.alignment;
+            out.alignment = if (parent.alignment == .natural and attrs.alignment == null and field_align == natural) .natural else .fromBytes(field_align);
+            return out;
+        }
+        // A packed struct: a bit pointer into the host integer, aligned as the aggregate
+        out.alignment = .fromBytes(agg_align);
+        const field_bits = lf[i].layout.?.bits orelse return withUnknownAlign(out);
+        const host: u64 = if (parent.host_size != 0) parent.host_size else packedHostSize(ev.ip, sl.layout) orelse return withUnknownAlign(out);
+        const offset = @as(u64, parent.bit_offset) + bit_offset;
+        if (host * 8 == field_bits) {
+            out.host_size = 0;
+            out.bit_offset = 0;
+        } else {
+            out.host_size = std.math.cast(u16, host) orelse return withUnknownAlign(out);
+            out.bit_offset = std.math.cast(u16, offset) orelse return withUnknownAlign(out);
+        }
+        return out;
+    }
+
+    /// `fieldPtrAttrs` for an aggregate of the default layout: the lower of the aggregate's and
+    /// the field's alignment, explicit unless it is the field type's own
+    fn autoFieldPtrAttrs(ev: *Evaluator, parent: InternPool.PtrAttrs, agg: Index, field_ty: Index, explicit: ?u64) EvalError!InternPool.PtrAttrs {
+        var out = parent;
+        // The alignment of an aggregate is at least that of each field
+        if (parent.alignment == .natural and explicit == null) return out;
+        const natural = try ev.abiAlign(field_ty) orelse return withUnknownAlign(out);
+        const field_align = explicit orelse natural;
+        const agg_align = parent.alignment.bytes() orelse try ev.abiAlign(agg) orelse return withUnknownAlign(out);
+        out.alignment = if (agg_align < field_align)
+            .fromBytes(agg_align)
+        else if (explicit == null and field_align == natural)
+            .natural
+        else
+            .fromBytes(field_align);
+        return out;
+    }
+
+    /// Attributes of a pointer to the element at `index` (null: a runtime index) of elements of
+    /// type `elem` reached through a pointer with attributes `parent` (the compiler's
+    /// `Type.elemPtrType`): with an explicit alignment, the alignment of the element's offset
+    fn elemPtrAttrs(ev: *Evaluator, parent: InternPool.PtrAttrs, elem: Index, index: ?u64) EvalError!InternPool.PtrAttrs {
+        var out = parent;
+        out.is_allowzero = parent.is_allowzero and (index == null or index.? == 0);
+        const bytes = parent.alignment.bytes() orelse return out;
+        const l = try ev.typeLayout(elem, 0) orelse return withUnknownAlign(out);
+        // Zero-size elements share the address of the first one
+        if (l.size == 0) return out;
+        // A runtime index gives the lowest alignment of any element but the first
+        const i = index orelse 1;
+        if (i == 0) return out;
+        const offset = std.math.mul(u64, i, l.size) catch return withUnknownAlign(out);
+        out.alignment = .fromBytes(@min(bytes, @as(u64, 1) << @intCast(@ctz(offset))));
+        return out;
+    }
+
+    fn abiAlign(ev: *Evaluator, t: Index) EvalError!?u64 {
+        return if (try ev.typeLayout(t, 0)) |l| l.alignment else null;
+    }
+
     /// Whether the type has a bit representation: the bit width of an array requires its elements
     /// to have one (error sets and enums without a specified tag type have none, although
     /// `@bitSizeOf` can be evaluated on them)
@@ -4204,6 +4303,65 @@ pub fn ptrAttrs(r: *Resolver, child: Index, p: Body.PtrType, vals: PtrClauseValu
     }
     if (p.@"addrspace" != null) a.address_space = addressSpaceOf(ip, vals.@"addrspace");
     return a;
+}
+
+/// See `Evaluator.fieldPtrAttrs`; the alignment is unknown when the layout cannot be evaluated
+pub fn fieldPtrAttrs(r: *Resolver, parent: InternPool.PtrAttrs, agg: Index, name: []const u8, field_ty: Index) Error!InternPool.PtrAttrs {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    defer ev.deinit();
+    return ev.fieldPtrAttrs(parent, agg, name, field_ty) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => withUnknownAlign(parent),
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// See `Evaluator.elemPtrAttrs`; the alignment is unknown when the layout cannot be evaluated
+pub fn elemPtrAttrs(r: *Resolver, parent: InternPool.PtrAttrs, elem: Index, index: ?u64) Error!InternPool.PtrAttrs {
+    // A pointer without an explicit alignment needs no layout
+    if (parent.alignment.bytes() == null) {
+        var out = parent;
+        out.is_allowzero = parent.is_allowzero and (index == null or index.? == 0);
+        return out;
+    }
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    defer ev.deinit();
+    return ev.elemPtrAttrs(parent, elem, index) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => withUnknownAlign(parent),
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// Alignment of a pointer to a container-level variable or constant: the `align(...)` of its
+/// declaration (in instance `inst`)
+pub fn declAlignment(r: *Resolver, file: FileId, item: u32, inst: ?Index) Error!InternPool.Alignment {
+    const owner = try r.ownerKey(file, item);
+    const body = try r.ctx.get(hir.ItemBody, owner);
+    const e = body.align_expr orelse return .natural;
+    const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = try queries.declInst(r, file, item, inst) });
+    if (@backingInt(e) >= res.exprs.len) return .unknown;
+    return alignmentOf(r.ctx.db.env.ip, res.exprs[@backingInt(e)].val);
+}
+
+fn withUnknownAlign(attrs: InternPool.PtrAttrs) InternPool.PtrAttrs {
+    var out = attrs;
+    out.alignment = .unknown;
+    return out;
+}
+
+/// Byte size of the host integer of bit pointers into a packed struct with layout `l` (the
+/// compiler's `fieldPtrType`): the bytes holding its bits, except on the self-hosted x86_64 and
+/// C backends, which take its ABI size; null when that differs and the backend is not known
+fn packedHostSize(ip: *InternPool, l: value.Layout) ?u64 {
+    const bytes = ((l.bits orelse return null) + 7) / 8;
+    if (bytes == l.size) return bytes;
+    return switch (ip.vectorAbi()) {
+        .x86_64, .x86_64_avx, .x86_64_avx512 => l.size,
+        .llvm, .llvm_aarch64 => bytes,
+        // The C and wasm backends share a vector layout but not this rule
+        .elem, .unknown => null,
+    };
 }
 
 /// Alignment given by the value of an `align` expression; unknown when the value is not known or
