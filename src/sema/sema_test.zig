@@ -526,6 +526,61 @@ test "comptime recursive calls with integer arguments reuse earlier results" {
     });
 }
 
+test "comptime calls run errdefer when returning an error" {
+    // Prevents skipping `errdefer` on error returns; expected values are the results of
+    // zig 0.17.0
+    try expectTypes(
+        \\fn viaReturn(p: *u32) !void {
+        \\    errdefer p.* += 100;
+        \\    p.* += 1;
+        \\    return error.Fail;
+        \\}
+        \\fn fails() !void {
+        \\    return error.Fail;
+        \\}
+        \\fn viaTry(p: *u32) !void {
+        \\    errdefer p.* += 100;
+        \\    p.* += 1;
+        \\    try fails();
+        \\}
+        \\fn nested(p: *u32) !void {
+        \\    defer p.* *= 2;
+        \\    errdefer p.* += 10;
+        \\    {
+        \\        errdefer p.* += 1000;
+        \\        p.* += 1;
+        \\    }
+        \\    {
+        \\        errdefer p.* += 3;
+        \\        try fails();
+        \\    }
+        \\}
+        \\fn succeeds(p: *u32) !void {
+        \\    errdefer p.* += 100;
+        \\    p.* += 1;
+        \\}
+        \\fn run(comptime which: u8) u32 {
+        \\    var x: u32 = 0;
+        \\    switch (which) {
+        \\        0 => viaReturn(&x) catch {},
+        \\        1 => viaTry(&x) catch {},
+        \\        2 => nested(&x) catch {},
+        \\        else => succeeds(&x) catch {},
+        \\    }
+        \\    return x;
+        \\}
+        \\const r = run(0);
+        \\const t = run(1);
+        \\const n = run(2);
+        \\const ok = run(3);
+    , &.{
+        .{ "r", "u32 = 101" },
+        .{ "t", "u32 = 101" },
+        .{ "n", "u32 = 28" },
+        .{ "ok", "u32 = 1" },
+    });
+}
+
 test "comptime integer arithmetic follows the result type" {
     try expectTypes(
         \\fn f() void {

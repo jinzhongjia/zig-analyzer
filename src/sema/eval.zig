@@ -1723,31 +1723,47 @@ const Evaluator = struct {
         const index = f.labels.items.len;
         try f.labels.append(ev.a, .{ .name = blk.label, .kind = .block, .want = want });
         defer f.labels.shrinkRetainingCapacity(index);
-        var defers: std.ArrayList(ExprId) = .empty;
+        var defers: std.ArrayList(Defer) = .empty;
         ev.statements(f, blk.stmts, &defers) catch |err| {
             // Run the defers when leaving the block (the value of break is already saved in
-            // jump_value)
+            // jump_value); errdefers run when the function returns an error
             const saved_value = ev.jump_value;
             const saved_target = ev.jump_target;
-            try ev.runDefers(f, defers.items);
+            const failing = err == error.Return and try ev.isErrorReturn(defers.items, saved_value);
+            try ev.runDefers(f, defers.items, failing);
             ev.jump_value = saved_value;
             ev.jump_target = saved_target;
             if (err == error.Break and ev.jump_target == index) return ev.coerce(ev.jump_value, want);
             return err;
         };
-        try ev.runDefers(f, defers.items);
+        try ev.runDefers(f, defers.items, false);
         return Val.void_val;
     }
 
-    fn runDefers(ev: *Evaluator, f: *Frame, defers: []const ExprId) EvalError!void {
+    /// A `defer` or `errdefer` statement whose block has been reached
+    const Defer = struct { body: ExprId, on_error: bool };
+
+    /// Whether the returned value `v` is an error (only decided when an errdefer depends on it)
+    fn isErrorReturn(ev: *Evaluator, defers: []const Defer, v: Val) EvalError!bool {
+        for (defers) |d| {
+            if (!d.on_error) continue;
+            if (v.v == .unknown or v.v == .undef) return error.Abort;
+            const x = try ev.ipOf(v) orelse return false;
+            return ev.ip.key(x) == .error_value;
+        }
+        return false;
+    }
+
+    fn runDefers(ev: *Evaluator, f: *Frame, defers: []const Defer, failing: bool) EvalError!void {
         var i = defers.len;
         while (i > 0) {
             i -= 1;
-            _ = try ev.eval(f, defers[i], null);
+            if (defers[i].on_error and !failing) continue;
+            _ = try ev.eval(f, defers[i].body, null);
         }
     }
 
-    fn statements(ev: *Evaluator, f: *Frame, stmts: []const Body.Stmt, defers: *std.ArrayList(ExprId)) EvalError!void {
+    fn statements(ev: *Evaluator, f: *Frame, stmts: []const Body.Stmt, defers: *std.ArrayList(Defer)) EvalError!void {
         for (stmts) |s| switch (s.kind) {
             .expr => |x| _ = try ev.eval(f, x, null),
             .local => |bid| {
@@ -1756,8 +1772,8 @@ const Evaluator = struct {
                 const init: Val = if (binding.init) |x| try ev.eval(f, x, ty) else .{ .ty = ty orelse .unknown, .v = .undef };
                 f.slots[@backingInt(bid)] = try ev.copy(.{ .ty = ty orelse init.ty, .v = init.v });
             },
-            .@"defer" => |x| try defers.append(ev.a, x),
-            .@"errdefer" => {},
+            .@"defer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = false }),
+            .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x.body, .on_error = true }),
             .destructure => |d| {
                 const v = try ev.eval(f, d.value, null);
                 for (d.targets, 0..) |t, i| {
