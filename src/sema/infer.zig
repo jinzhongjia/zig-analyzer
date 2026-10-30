@@ -3330,7 +3330,8 @@ const Inferrer = struct {
             }
             return .unknown;
         }
-        const t = result orelse return if (has_null) .null_type else if (types.len != 0 and allNoreturn(types)) .noreturn_type else .void_type;
+        // Only noreturn and undefined peers: they must all be the same type
+        const t = result orelse return if (has_null) .null_type else if (types.len == 0) .void_type else if (allEqual(types)) types[0] else .unknown;
         if (has_null) switch (ip.key(t)) {
             .optional_type => {},
             // A C pointer can already hold null
@@ -3428,8 +3429,8 @@ const Inferrer = struct {
         };
     }
 
-    fn allNoreturn(types: []const Index) bool {
-        for (types) |t| if (t != .noreturn_type) return false;
+    fn allEqual(types: []const Index) bool {
+        for (types[1..]) |t| if (t != types[0]) return false;
         return true;
     }
 

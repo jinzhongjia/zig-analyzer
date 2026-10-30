@@ -962,6 +962,31 @@ test "comptime arguments are coerced to their instantiated parameter types" {
     });
 }
 
+test "@TypeOf(undefined) is the type of undefined" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(tu, nm, t2, ie, at, tx)` prints
+    // `@TypeOf(undefined)`, `"@TypeOf(undefined)"`, `@TypeOf(undefined)`, `u2`,
+    // `@TypeOf(undefined)`, `@TypeOf(undefined)`); it must not resolve to void
+    try expectTypes(
+        \\const x = undefined;
+        \\fn typeOfArg(v: anytype) type {
+        \\    return @TypeOf(v);
+        \\}
+        \\const tu = @TypeOf(undefined);
+        \\const nm = @typeName(@TypeOf(x));
+        \\const t2 = @TypeOf(undefined, undefined);
+        \\const ie = if (@TypeOf(undefined) == void) u1 else u2;
+        \\const at = typeOfArg(undefined);
+        \\const tx = @TypeOf(x);
+    , &.{
+        .{ "tu", "type = @TypeOf(undefined)" },
+        .{ "nm", "*const [18:0]u8 = \"@TypeOf(undefined)\"" },
+        .{ "t2", "type = @TypeOf(undefined)" },
+        .{ "ie", "type = u2" },
+        .{ "at", "type = @TypeOf(undefined)" },
+        .{ "tx", "type = @TypeOf(undefined)" },
+    });
+}
+
 test "comparisons that depend on unknown parts stay unknown" {
     try expectTypes(
         \\fn Id(comptime n: usize) type { return struct { pub const N = n; }; }
