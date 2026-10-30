@@ -3407,6 +3407,41 @@ test "name completion inside a struct declared in a function lists only the valu
     });
 }
 
+/// Whether the completion at the cursor is incomplete
+fn incompleteAt(w: *World, at: World.Added, options: completion.Options) !bool {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    return (try completion.complete(&r, at.file, at.cursor, options)).is_incomplete;
+}
+
+test "empty-prefix name completion is incomplete when a typed prefix adds candidates" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = try w.add("/p/main.zig",
+        \\const Holder = struct { gpa_field: u32 = 0 };
+        \\fn f(h: Holder) void {
+        \\    _ = <|>;
+        \\}
+        \\
+    );
+    // Member paths of local values (`h.gpa_field`) are added once a prefix is typed
+    try testing.expect(try incompleteAt(&w, at, .{ .auto_import = false }));
+    // So are auto-import candidates
+    try testing.expect(try incompleteAt(&w, at, .{}));
+    try testing.expect(try incompleteAt(&w, at, .{ .snippets = true }));
+    // Member completion is complete
+    const member = try w.add("/p/main.zig",
+        \\const Holder = struct { gpa_field: u32 = 0 };
+        \\fn f(h: Holder) void {
+        \\    _ = h.<|>;
+        \\}
+        \\
+    );
+    try testing.expect(!try incompleteAt(&w, member, .{}));
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;
@@ -6595,23 +6630,26 @@ test "auto import ordinary contexts and full token replacement" {
 }
 
 test "auto import does not leak into non-name contexts" {
-    const cases = [_][]const u8{
-        "const st<|>d = 1;",
-        "fn st<|>d() void {}",
-        "fn run(st<|>d: u32) void {}",
-        "const S = struct { st<|>d: u32 };",
-        "const value = \"st<|>d\";",
-        "// st<|>d\nconst value = 1;",
-        "const value = @import(\"st<|>d\");",
-        "const value = object.st<|>d;",
-        "const value = .st<|>d;",
-        "const value = error.st<|>d;",
-        "fn run() void { break :st<|>d; }",
-        "const value: u3<|>2 = undefined;",
-        "fn run() void { _<|> = 1; }",
-        "fn run() void { <|> }",
+    const cases = [_]struct { []const u8, bool }{
+        .{ "const st<|>d = 1;", false },
+        .{ "fn st<|>d() void {}", false },
+        .{ "fn run(st<|>d: u32) void {}", false },
+        .{ "const S = struct { st<|>d: u32 };", false },
+        .{ "const value = \"st<|>d\";", false },
+        .{ "// st<|>d\nconst value = 1;", false },
+        .{ "const value = @import(\"st<|>d\");", false },
+        .{ "const value = object.st<|>d;", false },
+        .{ "const value = .st<|>d;", false },
+        .{ "const value = error.st<|>d;", false },
+        .{ "fn run() void { break :st<|>d; }", false },
+        // Primitive names, `_` and an empty name: typing more makes a name that takes auto-import
+        // candidates, so the list is incomplete
+        .{ "const value: u3<|>2 = undefined;", true },
+        .{ "fn run() void { _<|> = 1; }", true },
+        .{ "fn run() void { <|> }", true },
     };
-    for (cases) |source| {
+    for (cases) |case| {
+        const source, const incomplete = case;
         var w: World = undefined;
         try w.init();
         defer w.deinit();
@@ -6623,7 +6661,7 @@ test "auto import does not leak into non-name contexts" {
         var r = resolver(&w, &ctx);
         const baseline = try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false });
         const result = try completion.complete(&r, added.file, added.cursor, .{});
-        try testing.expect(!result.is_incomplete);
+        try testing.expectEqual(incomplete, result.is_incomplete);
         // These contexts offer no auto-imports, and the results of plain completion are not lost or
         // rewritten because of it
         try testing.expectEqual(baseline.items.len, result.items.len);

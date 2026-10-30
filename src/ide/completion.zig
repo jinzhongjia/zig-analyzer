@@ -132,10 +132,15 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     if (offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = if (offset == 0) null else try importPrefix(r.arena, root, text, offset);
-    if (name == null and !options.snippets) return .{ .items = base };
+    // Before a name is typed in an expression, the member paths of local values and the
+    // auto-import candidates are not listed yet: typing a prefix adds them, so the client must ask
+    // again
+    const incomplete = name == null and visible.context == .scope and
+        (options.auto_import or visible.roots.len != 0) and namePosition(root, text, offset);
+    if (name == null and !options.snippets) return .{ .items = base, .is_incomplete = incomplete };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    var result: Result = .{ .items = &.{}, .import_position = name != null and (options.auto_import or options.detect_import_position) };
+    var result: Result = .{ .items = &.{}, .is_incomplete = incomplete, .import_position = name != null and (options.auto_import or options.detect_import_position) };
     if (name) |n| {
         const limit = options.max_auto_imports;
         const paths = try localMembers(r, file, visible.roots, n, limit);
@@ -494,6 +499,15 @@ fn quotedAfterDot(r: *Resolver, file: FileId, at: u32, offset: u32, cursor_owner
     }
     visible.items = items;
     return visible;
+}
+
+/// Typing at the cursor can make a name in an expression that `importPrefix` accepts: no
+/// identifier precedes the cursor, or the one that does is a reference `importPrefix` does not take
+/// (a primitive name or `_`, which more characters turn into a name)
+fn namePosition(root: SyntaxNode, text: []const u8, offset: u32) bool {
+    if (offset == 0 or !isIdentChar(text[offset - 1])) return true;
+    const token = root.tokenAtOffset(offset - 1) orelse return false;
+    return token.kind == .identifier and tokenParent(root, offset - 1) == .name_ref;
 }
 
 const ImportPrefix = struct {
