@@ -3220,7 +3220,9 @@ const Inferrer = struct {
         };
     }
 
-    /// A commonly used subset of peer type resolution; unknown when the types cannot be unified
+    /// Peer type resolution (matches the compiler's strategies for error sets and error unions, C
+    /// pointers, numbers, enum literals, optionals, pointers, arrays and vectors); unknown when
+    /// the types cannot be unified
     pub fn peer(inf: *Inferrer, types: []const Index) Error!Index {
         const ip = inf.ip;
         var result: ?Index = null;
@@ -3240,6 +3242,19 @@ const Inferrer = struct {
                 continue;
             };
             if (cur == t) continue;
+            // An error set or error union on either side: the error sets merge and the other
+            // types are the payload
+            if (isErrorSet(ip, cur) or isErrorSet(ip, t) or ip.key(cur) == .error_union_type or ip.key(t) == .error_union_type) {
+                result = try inf.peerErrors(cur, t);
+                if (result.? == .unknown) return .unknown;
+                continue;
+            }
+            // A C pointer on either side: the other side is a pointer, an optional pointer or an
+            // integer, and the result is a C pointer
+            if (isCPtr(ip, cur) or isCPtr(ip, t)) {
+                result = try peerCPtr(ip, cur, t) orelse return .unknown;
+                continue;
+            }
             if (cur == .comptime_int_type and (ip.isInt(t) or ip.isFloat(t))) {
                 result = t;
                 continue;
@@ -3269,6 +3284,18 @@ const Inferrer = struct {
                 if (y > x) result = t;
                 continue;
             }
+            // A fixed-width float with an integer: the float, when every value of the integer
+            // type is exact in it (a comptime-known integer value always is, but values are not
+            // part of peer resolution here)
+            if (ip.isInt(cur) and t != .comptime_float_type and ip.isFloat(t)) {
+                if (!intFitsFloat(ip, cur, t)) return .unknown;
+                result = t;
+                continue;
+            }
+            if (ip.isInt(t) and cur != .comptime_float_type and ip.isFloat(cur)) {
+                if (!intFitsFloat(ip, t, cur)) return .unknown;
+                continue;
+            }
             // One side is an optional: the peer of the payload and the other side is wrapped back
             // into an optional
             if (ip.key(cur) == .optional_type or ip.key(t) == .optional_type) {
@@ -3281,11 +3308,96 @@ const Inferrer = struct {
                 result = p;
                 continue;
             }
+            if (try inf.peerArrayLike(cur, t)) |p| {
+                result = p;
+                continue;
+            }
             return .unknown;
         }
         const t = result orelse return if (has_null) .null_type else if (types.len != 0 and allNoreturn(types)) .noreturn_type else .void_type;
-        if (has_null and ip.key(t) != .optional_type) return ip.optionalOf(t);
+        if (has_null) switch (ip.key(t)) {
+            .optional_type => {},
+            // The null goes into the payload of an error union
+            .error_union_type => |eu| return ip.get(.{ .error_union_type = .{ .err = eu.err, .payload = try inf.peer(&.{ eu.payload, .null_type }) } }),
+            else => return if (isErrorSet(ip, t)) ip.get(.{ .error_union_type = .{ .err = t, .payload = .null_type } }) else ip.optionalOf(t),
+        };
         return t;
+    }
+
+    /// Peer of two types where at least one is an error set or an error union (matches the
+    /// compiler's `error_set` / `error_union` strategies): the error sets merge, the payloads
+    /// (and the types that are neither) resolve as peers
+    fn peerErrors(inf: *Inferrer, a: Index, b: Index) Error!Index {
+        const ip = inf.ip;
+        const set_a, const payload_a = splitErrors(ip, a);
+        const set_b, const payload_b = splitErrors(ip, b);
+        const set = if (set_a) |x| (if (set_b) |y| try inf.mergeErrorSets(x, y) else x) else set_b.?;
+        if (set == .unknown) return .unknown;
+        const payload = if (payload_a) |x| (if (payload_b) |y| try inf.peer(&.{ x, y }) else x) else payload_b orelse return set;
+        if (payload == .unknown) return .unknown;
+        return ip.get(.{ .error_union_type = .{ .err = set, .payload = payload } });
+    }
+
+    /// Error set and payload of a peer: an error set has no payload, an error union both, and any
+    /// other type is a payload
+    fn splitErrors(ip: *InternPool, t: Index) struct { ?Index, ?Index } {
+        if (isErrorSet(ip, t)) return .{ t, null };
+        return switch (ip.key(t)) {
+            .error_union_type => |eu| .{ eu.err, eu.payload },
+            else => .{ null, t },
+        };
+    }
+
+    /// Merge of two error sets (matches the compiler's `maybeMergeErrorSets`): a set that holds
+    /// the other is the result as is, otherwise the union of the members; unknown when the
+    /// members cannot be computed
+    fn mergeErrorSets(inf: *Inferrer, a: Index, b: Index) Error!Index {
+        if (a == b or a == .anyerror_type) return a;
+        if (b == .anyerror_type) return b;
+        const x = try queries.errorSetMembers(inf.r, a) orelse return .unknown;
+        const y = try queries.errorSetMembers(inf.r, b) orelse return .unknown;
+        if (isSubset(y, x)) return a;
+        if (isSubset(x, y)) return b;
+        return inf.ip.errorSet(inf.scratch, try std.mem.concat(inf.scratch, []const u8, &.{ x, y }));
+    }
+
+    fn isSubset(sub: []const []const u8, set: []const []const u8) bool {
+        outer: for (sub) |name| {
+            for (set) |n| if (std.mem.eql(u8, n, name)) continue :outer;
+            return false;
+        }
+        return true;
+    }
+
+    /// Peer of two types where at least one is an array or a vector (matches the compiler's
+    /// `array` / `vector` strategies): the lengths must agree; with a vector, the element types
+    /// resolve as peers into a vector; between arrays, the element types must be the same and
+    /// the sentinel is kept when both have it; a tuple of the same length takes the element type
+    /// of the other side. Null when they cannot be unified.
+    fn peerArrayLike(inf: *Inferrer, a: Index, b: Index) Error!?Index {
+        const ip = inf.ip;
+        const x = arrayLike(ip, a) orelse return null;
+        const y = arrayLike(ip, b) orelse return null;
+        if ((x.kind == .tuple and y.kind == .tuple) or x.len != y.len) return null;
+        if (x.kind == .vector or y.kind == .vector) {
+            const child = if (x.child) |cx| (if (y.child) |cy| try inf.peer(&.{ cx, cy }) else cx) else y.child.?;
+            if (child == .unknown) return null;
+            return try ip.get(.{ .vector_type = .{ .len = @intCast(x.len), .child = child } });
+        }
+        const child = if (x.child) |cx| (if (y.child) |cy| (if (cx == cy) cx else return null) else cx) else y.child.?;
+        const sentinel: ?Index = if (x.sentinel != null and y.sentinel != null and x.sentinel.? == y.sentinel.?) x.sentinel else null;
+        return try ip.get(.{ .array_type = .{ .len = x.len, .child = child, .sentinel = sentinel } });
+    }
+
+    const ArrayLike = struct { kind: enum { array, vector, tuple }, len: u64, child: ?Index, sentinel: ?Index = null };
+
+    fn arrayLike(ip: *InternPool, t: Index) ?ArrayLike {
+        return switch (ip.key(t)) {
+            .array_type => |arr| .{ .kind = .array, .len = arr.len, .child = arr.child, .sentinel = arr.sentinel },
+            .vector_type => |v| .{ .kind = .vector, .len = v.len, .child = v.child },
+            .tuple_type => |tt| .{ .kind = .tuple, .len = tt.types.len, .child = null },
+            else => null,
+        };
     }
 
     /// Types an enum literal can coerce to: enums and unions
@@ -3596,6 +3708,58 @@ fn isPtrCast(name: []const u8) bool {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+fn isErrorSet(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .error_set_type, .inferred_error_set => true,
+        .simple_type => |s| s == .anyerror,
+        else => false,
+    };
+}
+
+fn isCPtr(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size == .c,
+        else => false,
+    };
+}
+
+/// Peer of two types where at least one is a C pointer (matches the compiler's `c_ptr`
+/// strategy): integers coerce to the C pointer; pointers and optional pointers must have the
+/// same element type; const if either side is const, and the sentinel is kept only when both
+/// sides have the same one. Null when they cannot be unified.
+fn peerCPtr(ip: *InternPool, a: Index, b: Index) Allocator.Error!?Index {
+    if (ip.isInt(a)) return if (isCPtr(ip, b)) b else null;
+    if (ip.isInt(b)) return if (isCPtr(ip, a)) a else null;
+    const x = runtimePtr(ip, a) orelse return null;
+    const y = runtimePtr(ip, b) orelse return null;
+    if (x.child != y.child) return null;
+    const sentinel: ?Index = if (x.sentinel != null and y.sentinel != null and x.sentinel.? == y.sentinel.?) x.sentinel else null;
+    return try ip.get(.{ .ptr_type = .{ .child = x.child, .size = .c, .is_const = x.is_const or y.is_const, .sentinel = sentinel } });
+}
+
+/// The pointer type of a pointer or of an optional pointer
+fn runtimePtr(ip: *InternPool, t: Index) ?@FieldType(InternPool.Key, "ptr_type") {
+    return switch (ip.key(optionalChild(ip, t))) {
+        .ptr_type => |p| p,
+        else => null,
+    };
+}
+
+/// Whether every value of the integer type `int` is exact in the float type `float` (the
+/// compiler's peer resolution check for runtime integers)
+fn intFitsFloat(ip: *InternPool, int: Index, float: Index) bool {
+    const info = value.intInfo(ip, int) orelse return false;
+    const significand: u16 = switch (value.floatBits(ip, float) orelse return false) {
+        16 => 11,
+        32 => 24,
+        64 => 53,
+        80 => 64,
+        128 => 113,
+        else => return false,
+    };
+    return info.bits - @intFromBool(info.signed) <= significand;
 }
 
 fn optionalChild(ip: *InternPool, t: Index) Index {

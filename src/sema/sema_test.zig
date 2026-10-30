@@ -1490,6 +1490,57 @@ test "orelse and catch on comptime-known operands take only the evaluated side" 
     });
 }
 
+test "peer types of error sets, error unions, arrays, vectors, floats and C pointers" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(p1), ..., @TypeOf(p14))`
+    // prints `error{Foo}!u8`, `error{A,B}`, `anyerror!u32`, `[2]u32`, `@Vector(2, u16)`,
+    // `error{Empty}!u32`, `f32`, `[*c]u8`, `comptime_float`, `[2:0]u8`, `@Vector(2, u16)`,
+    // `[*c]u8`, `error{A}!@TypeOf(null)`, `f32`); these peers must not resolve to unknown
+    try expectTypes(
+        \\const E = error{Empty};
+        \\fn parse(s: []const u8) E!u32 {
+        \\    if (s.len == 0) return error.Empty;
+        \\    return 1;
+        \\}
+        \\fn probe(c: bool, k: u8, eu: anyerror!u32, a: [2]u32, v: @Vector(2, u16), w: @Vector(2, u8), s: []const u8, cp: [*c]u8, p: *u8, x: f32, sa: [2:0]u8, sb: [2:0]u8, op: ?*u8, ar: [2]u16) void {
+        \\    const p1 = if (c) @as(u8, 1) else error.Foo;
+        \\    const p2 = switch (k) { 0 => error.A, else => error.B };
+        \\    const p3 = if (c) eu else error.Bar;
+        \\    const p4 = if (c) a else .{ 1, 2 };
+        \\    const p5 = if (c) v else w;
+        \\    const p6 = parse(s) catch |err| err;
+        \\    const kb: u8 = 3;
+        \\    const p7 = if (c) kb else x;
+        \\    const p8 = if (c) cp else p;
+        \\    const p9 = @TypeOf(1, 2.5);
+        \\    const p10 = if (c) sa else sb;
+        \\    const p11 = if (c) v else ar;
+        \\    const p12 = if (c) cp else op;
+        \\    const p13 = @TypeOf(error.A, null);
+        \\    const p14 = if (c) k else x;
+        \\    const c1 = if (c) @as(u8, 1) else @as(u16, 2);
+        \\    const c2 = if (c) @as(u8, 1) else null;
+        \\    _ = .{ p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, c1, c2 };
+        \\}
+    , &.{
+        .{ "p1", "error{Foo}!u8" },
+        .{ "p2", "error{A,B}" },
+        .{ "p3", "anyerror!u32" },
+        .{ "p4", "[2]u32" },
+        .{ "p5", "@Vector(2, u16)" },
+        .{ "p6", "error{Empty}!u32" },
+        .{ "p7", "f32" },
+        .{ "p8", "[*c]u8" },
+        .{ "p9", "type = comptime_float" },
+        .{ "p10", "[2:0]u8" },
+        .{ "p11", "@Vector(2, u16)" },
+        .{ "p12", "[*c]u8" },
+        .{ "p13", "type = error{A}!@TypeOf(null)" },
+        .{ "p14", "f32" },
+        .{ "c1", "u16" },
+        .{ "c2", "?u8" },
+    });
+}
+
 test "@min and @max narrow the result type like the compiler" {
     // Expected values are the results of zig 0.17.0
     try expectTypes(
