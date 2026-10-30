@@ -2053,14 +2053,22 @@ pub fn configureInputDirs(server: *Server, arena: Allocator) Allocator.Error![]c
     return out.items;
 }
 
-/// Whether the server discovers external changes itself (see `Config.Watcher`)
-pub fn watchesFiles(server: *Server) bool {
+/// Which files the server watches on disk itself (see `Config.Watcher`)
+pub const WatchScope = enum {
+    none,
+    /// Files outside the root directories: the client watches those inside (clients apply the
+    /// registered watchers inside the workspace folders only)
+    outside_roots,
+    all,
+};
+
+pub fn watchScope(server: *Server) WatchScope {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return switch (server.config.files_watcher) {
-        .auto => !server.register_watch,
-        .client => false,
-        .server => true,
+        .auto => if (server.register_watch) .outside_roots else .all,
+        .client => .none,
+        .server => .all,
     };
 }
 

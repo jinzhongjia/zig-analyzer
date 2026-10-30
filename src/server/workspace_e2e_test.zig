@@ -1539,3 +1539,59 @@ test "a deleted imported file of a single file is no longer resolved" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// Line of the goto result (-1 without a result)
+fn gotoLine(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) !i64 {
+    const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
+    const result = resp.object.get("result") orelse return -1;
+    if (result != .object) return -1;
+    return result.object.get("range").?.object.get("start").?.object.get("line").?.integer;
+}
+
+/// Condition for `waitWatched`: the goto result of `needle` is on line `want`
+const GotoLine = struct {
+    uri: []const u8,
+    text: []const u8,
+    needle: []const u8,
+    want: i64,
+
+    fn done(c: GotoLine, h: *Harness) !bool {
+        return try gotoLine(h, c.uri, c.text, c.needle) == c.want;
+    }
+};
+
+// Prevents leaving files outside the workspace folders unwatched when the client registers file
+// watchers: clients apply them inside the workspace folders only
+test "with a client that registers file watchers, the server watches the files outside the workspace folders" {
+    const main_text = "const util = @import(\"../libs/util.zig\");\npub fn main() void {\n    util.helper();\n}\n";
+    inline for (.{ false, true }) |with_folder| {
+        var project = try fixture.Project.create(&.{
+            .{ .path = "app/main.zig", .text = main_text },
+            .{ .path = "libs/util.zig", .text = "pub fn helper() void {}\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true, .relativePatternSupport = true } } };
+        if (with_folder) {
+            const app_uri = try za.base.uri.fromPath(a, try project.path(a, "app"));
+            _ = try h.request("initialize", .{ .rootUri = app_uri, .workspaceFolders = &.{.{ .uri = app_uri, .name = "app" }}, .capabilities = capabilities });
+        } else {
+            _ = try h.request("initialize", .{ .capabilities = capabilities });
+        }
+        try h.notify("initialized", Empty{});
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "app/main.zig"));
+        try open(&h, main_uri, main_text);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "util.help"));
+
+        // Rewritten outside the editor, and the client sends no notification
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "libs/util.zig"), .data = "// one\n// two\npub fn helper() void {}\n" });
+        try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "util.help", .want = 2 });
+
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}

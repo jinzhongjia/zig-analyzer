@@ -1,6 +1,8 @@
 //! The server detects external changes on disk (git checkout, code generation, other editors):
 //! when the client cannot register file watchers dynamically (the default for Neovim on Linux), or
-//! when `files.watcher` is configured as `server`.
+//! when `files.watcher` is configured as `server`. With `auto` and a client that registers file
+//! watchers, the server still watches the files outside the root directories: clients apply the
+//! registered watchers inside the workspace folders only (see `Server.WatchScope`).
 //!
 //! Files of interest: interned `.zig` / `.zon` files (analysis reads any imported file from disk
 //! on demand), plus `build.zig`, `build.zig.zon`, and `zig-analyzer.zon` in each workspace root,
@@ -81,8 +83,8 @@ pub const Watcher = struct {
     stopping: std.atomic.Value(bool) = .init(false),
 
     // ── The following fields are accessed only by the background task ──
-    /// Watching is active (the server is responsible for detecting external changes)
-    active: bool = false,
+    /// What is being watched (see `Server.WatchScope`); `.none` while not watching
+    scope: Server.WatchScope = .none,
     /// Arena holding `files` and `missing`; replaced as a whole on recomputation
     state_arena: std.heap.ArenaAllocator,
     /// Files of interest: identity key (lowercased when case-insensitive) → path
@@ -166,7 +168,8 @@ pub const Watcher = struct {
     pub fn run(w: *Watcher) Io.Cancelable!void {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
-            if (!w.server.watchesFiles()) {
+            const scope = w.server.watchScope();
+            if (scope == .none) {
                 w.deactivate();
                 // Clear first, then check: new files interned during the check wake the task
                 // again (see `onNewPath`)
@@ -181,7 +184,7 @@ pub const Watcher = struct {
                 w.backend.drain(discard.allocator(), &events) catch {};
                 continue;
             }
-            w.step() catch |err| switch (err) {
+            w.step(scope) catch |err| switch (err) {
                 error.OutOfMemory => log.err("out of memory while watching files on disk", .{}),
             };
         }
@@ -233,7 +236,7 @@ pub const Watcher = struct {
 
     /// One round: recompute the watched directories (if needed), wait for notifications or the
     /// time to poll, and handle this batch of changes
-    fn step(w: *Watcher) Allocator.Error!void {
+    fn step(w: *Watcher, scope: Server.WatchScope) Allocator.Error!void {
         const io = w.server.io;
         var batch_arena: std.heap.ArenaAllocator = .init(w.gpa);
         defer batch_arena.deinit();
@@ -243,9 +246,8 @@ pub const Watcher = struct {
         // Clear the request before computing: a request arriving during the computation wakes
         // the task again
         const requested = w.resync_requested.swap(false, .acq_rel);
-        if (!w.active or requested) {
-            try w.resync(a, &pending);
-            w.active = true;
+        if (w.scope != scope or requested) {
+            try w.resync(a, scope, &pending);
             if (pending.paths.count() != 0) return w.apply(a, &pending);
         }
 
@@ -282,15 +284,15 @@ pub const Watcher = struct {
         // First add watches for newly appeared directories, then read the state of the files:
         // every later change will be notified
         const requested_now = w.resync_requested.swap(false, .acq_rel);
-        if (dirs_changed or requested_now) try w.resync(a, &pending);
+        if (dirs_changed or requested_now) try w.resync(a, w.scope, &pending);
         if (pending.paths.count() != 0) try w.apply(a, &pending);
     }
 
     /// Stops watching and discards the state: when watching starts again, the disk state at that
     /// time is taken as is, and changes in between are not reported afterwards
     fn deactivate(w: *Watcher) void {
-        if (!w.active) return;
-        w.active = false;
+        if (w.scope == .none) return;
+        w.scope = .none;
         var none: std.ArrayList([]const u8) = .empty;
         w.backend.setDirs(w.gpa, &.{}, &none) catch {};
         none.deinit(w.gpa);
@@ -309,12 +311,14 @@ pub const Watcher = struct {
         return std.ascii.allocLowerString(a, path);
     }
 
-    /// Recomputes the files of interest and the watched directories. Files of interest that
-    /// already exist in directories that did not exist before but have appeared now are recorded
-    /// in `pending`.
-    fn resync(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
+    /// Recomputes the files of interest and the watched directories for `scope`; with
+    /// `.outside_roots`, also registers the client's additional file watchers. Files of interest
+    /// that already exist in directories that did not exist before but have appeared now are
+    /// recorded in `pending`.
+    fn resync(w: *Watcher, a: Allocator, scope: Server.WatchScope, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         const gpa = w.gpa;
+        if (scope == .outside_roots) try w.registerClientGlobs();
         var next_arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer next_arena.deinit();
         const na = next_arena.allocator();
@@ -322,13 +326,16 @@ pub const Watcher = struct {
         var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         errdefer files.deinit(gpa);
         const rules = try server.originRules(a);
+        // With `.outside_roots`, the client watches the files under the root directories
+        const outside_only = scope == .outside_roots;
         const count = server.vfs.count();
         for (0..count) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
             if (!server.watchable(rules, path)) continue;
+            if (outside_only and server.vfs.rootOf(rules.roots, path) != null) continue;
             try files.put(gpa, try w.key(na, path), path);
         }
-        {
+        if (!outside_only) {
             server.roots_mutex.lockUncancelable(server.io);
             defer server.roots_mutex.unlock(server.io);
             for (server.roots.items) |root| for ([_][]const u8{ "build.zig", "build.zig.zon", Config.project_file }) |name| {
@@ -340,6 +347,7 @@ pub const Watcher = struct {
         errdefer entry_dirs.deinit(gpa);
         for (try server.configureInputDirs(na)) |dir| {
             if (!server.watchable(rules, dir)) continue;
+            if (outside_only and server.vfs.rootOf(rules.roots, dir) != null) continue;
             const k = try w.key(na, dir);
             try files.put(gpa, k, dir);
             try entry_dirs.put(gpa, k, {});
@@ -400,7 +408,7 @@ pub const Watcher = struct {
 
         // Directories that did not exist before but have appeared now: files of interest already in
         // them were created before watching started
-        if (w.active) {
+        if (w.scope != .none) {
             var appeared: std.StringHashMapUnmanaged(void) = .empty;
             defer appeared.deinit(gpa);
             for (w.missing.keys()) |k| if (!missing.contains(k)) try appeared.put(gpa, k, {});
@@ -420,6 +428,7 @@ pub const Watcher = struct {
         w.fallback = fallback;
         w.state_arena.deinit();
         w.state_arena = next_arena;
+        w.scope = scope;
         if (w.fallback.items.len == 0) {
             w.next_poll = null;
             w.poller.reset();

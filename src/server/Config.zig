@@ -164,7 +164,9 @@ present: std.StaticBitSet(settings.len) = .empty,
 /// Source of external changes. When the client supports it, file watchers are always registered
 /// with it (`workspace/didChangeWatchedFiles`).
 pub const Watcher = enum {
-    /// Watched by the server when the client does not support dynamic file watcher registration
+    /// Watched by the server when the client does not support dynamic file watcher registration;
+    /// otherwise the server watches only the files outside the workspace folders (clients apply
+    /// the registered watchers inside the workspace folders only)
     auto,
     /// Only the client's notifications
     client,
