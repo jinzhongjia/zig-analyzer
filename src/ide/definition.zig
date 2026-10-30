@@ -814,6 +814,8 @@ const TypeSubject = union(enum) {
     decl,
     binding: Body.BindingId,
     expr: Body.ExprId,
+    /// The `index`-th field name in the initializer `init`: the type of that field
+    field: struct { init: Body.ExprId, index: u32 },
 
     /// The subject that call-site seeding must resolve to a concrete type
     fn seedSubject(s: TypeSubject) ?seed.Subject {
@@ -821,6 +823,7 @@ const TypeSubject = union(enum) {
             .decl => null,
             .binding => |b| .{ .binding = b },
             .expr => |e| .{ .expr = e },
+            .field => |f| .{ .expr = f.init },
         };
     }
 };
@@ -828,7 +831,14 @@ const TypeSubject = union(enum) {
 fn typeSubject(r: *Resolver, a: context.At) resolve.Error!?TypeSubject {
     if (ast.memberName(a.node, try r.inEnum(a.file, a.item))) |name| if (name.offset == a.node.offset + a.rel) return .decl;
     if (a.body.bindingAt(a.rel)) |id| return .{ .binding = id };
-    return .{ .expr = a.body.exprAt(a.rel) orelse return null };
+    const e = a.body.exprAt(a.rel) orelse return null;
+    switch (a.body.expr(e)) {
+        .init => |x| for (x.fields, 0..) |fi, k| {
+            if (fi.name != null and a.rel >= fi.name_range.start and a.rel < fi.name_range.end) return .{ .field = .{ .init = e, .index = @intCast(k) } };
+        },
+        else => {},
+    }
+    return .{ .expr = e };
 }
 
 fn subjectType(r: *Resolver, a: context.At, subject: TypeSubject) resolve.Error!TypedValue {
@@ -836,6 +846,15 @@ fn subjectType(r: *Resolver, a: context.At, subject: TypeSubject) resolve.Error!
         .decl => r.ctx.get(queries.DeclType, .{ .owner = a.owner }),
         .binding => |id| a.bindingType(id),
         .expr => |e| a.exprType(e),
+        .field => |f| {
+            const fields = a.body.expr(f.init).init.fields;
+            // Without a result type, the initializer is an anonymous struct whose field types are
+            // the types of the values
+            const t = a.initType(f.init) orelse return a.exprType(fields[f.index].value);
+            if (t == .unknown) return .unknown;
+            const field = try infer.initField(r, t, try queries.namespaceOfType(r, t), f.index, fields[f.index].name);
+            return .{ .ty = field.ty orelse .unknown };
+        },
     };
 }
 

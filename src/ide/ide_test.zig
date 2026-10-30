@@ -3534,6 +3534,41 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "type definition of field names in initializers goes to the type of the field" {
+    // Prevents a jump to the type of the enclosing initializer
+    const text =
+        \\const Color = enum { red, green };
+        \\const Inner = struct { v: u32 = 0 };
+        \\const Outer = struct { inner: Inner = .{}, color: Color = .red };
+        \\test {
+        \\    const o: Outer = .{ .inner = .{ .v = 1 }, .color = .green };
+        \\    const p = Outer{ .inner = .{} };
+        \\    _ = .{ o, p };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, ?[]const u8 }{
+        .{ "inner = .{ .v", "Inner = struct" },
+        .{ "color = .green", "Color = enum" },
+        .{ "v = 1", null },
+        .{ "inner = .{} }", "Inner = struct" },
+    }) |c| {
+        const t = try definition.typeDefinition(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?));
+        const expected = c[1] orelse {
+            try testing.expectEqual(null, t);
+            continue;
+        };
+        try testing.expect(std.mem.startsWith(u8, text[(t orelse return error.NoTarget).start..], expected));
+    }
+}
+
 /// "file:line" of each target of `find` at the first occurrence of `needle` in `file`, sorted and
 /// joined by spaces
 fn gotoLines(w: *World, r: *resolve.Resolver, file: FileId, needle: []const u8, comptime find: anytype) ![]const u8 {
