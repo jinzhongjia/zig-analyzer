@@ -118,11 +118,7 @@ pub fn collect(
     for (bundles) |eb| {
         if (eb.errorMessageCount() == 0) continue;
         const log_text = try a.dupe(u8, std.mem.trimEnd(u8, eb.getCompileLogOutput(), "\n"));
-        // The `@compileLog` output is attached to the "found compile log statement" error (or to
-        // the first error when there is no such error)
-        const log_target: ?ErrorBundle.MessageIndex = if (log_text.len == 0) null else for (eb.getMessages()) |mi| {
-            if (std.mem.eql(u8, eb.nullTerminatedString(eb.getErrorMessage(mi).msg), "found compile log statement")) break mi;
-        } else eb.getMessages()[0];
+        const log_target: ?ErrorBundle.MessageIndex = if (log_text.len == 0) null else try logTarget(a, eb, build_root);
         for (eb.getMessages()) |mi| {
             const msg = eb.getErrorMessage(mi);
             const message = try withCount(a, eb.nullTerminatedString(msg.msg), msg.count);
@@ -138,6 +134,7 @@ pub fn collect(
                     start, end = byteSpan(loc);
                 }
             }
+
             // The notes are followed by the reference trace
             const refs: u32 = if (msg.src_loc != .none) eb.getSourceLocation(msg.src_loc).reference_trace_len else 0;
             var notes: std.ArrayList(Note) = try .initCapacity(a, msg.notes_len + refs);
@@ -295,6 +292,25 @@ fn withCount(a: Allocator, text: []const u8, count: u32) Allocator.Error![]const
     return std.fmt.allocPrint(a, "{s} ({d} times)", .{ text, count });
 }
 
+/// The error of `eb` that its `@compileLog` output is attached to: the "found compile log
+/// statement" error, which the compiler reports only when there is no other error. Otherwise
+/// the output belongs to no error, and it is attached to the first error located under
+/// `build_root`, so that it shows up in the project's code rather than in a dependency or the
+/// standard library that the compiler sorts first; to the first error when none is.
+fn logTarget(a: Allocator, eb: ErrorBundle, build_root: []const u8) Allocator.Error!ErrorBundle.MessageIndex {
+    const messages = eb.getMessages();
+    for (messages) |mi| {
+        if (std.mem.eql(u8, eb.nullTerminatedString(eb.getErrorMessage(mi).msg), "found compile log statement")) return mi;
+    }
+    for (messages) |mi| {
+        const src_loc = eb.getErrorMessage(mi).src_loc;
+        if (src_loc == .none) continue;
+        const path = try absolute(a, build_root, eb.nullTerminatedString(eb.getSourceLocation(src_loc).src_path)) orelse continue;
+        if (Vfs.isUnderStyle(.native, .native, path, build_root)) return mi;
+    }
+    return messages[0];
+}
+
 /// Whether two errors are the same error: same range, message and notes (the reference trace,
 /// which differs between the compilations that reach the error, is not compared). Each note's
 /// range refers to the text of its file that its own build read: a note of `y` read from another
@@ -400,12 +416,23 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
     }
     if (in.compiler) |c| {
         // Unsaved changes: the compiler's non-AstGen errors are shifted according to the text
-        // diff, and those inside a modified region are hidden
+        // diff, and those inside a modified region are hidden. The `@compileLog` output of a
+        // hidden error is still the latest output of the build: it is published on its own, at
+        // the error's start (the start of the modified region that hides it).
         const edits = try diffEdits(arena, c.base_text, in.text);
         for (c.items) |item| {
-            if (item.is_astgen) continue;
-            const span = remap(edits, item.start, item.end) orelse continue;
-            try out.append(arena, try compilerDiagnostic(arena, in, item, span[0], span[1]));
+            if (!item.is_astgen) if (remap(edits, item.start, item.end)) |span| {
+                try out.append(arena, try compilerDiagnostic(arena, in, item, span[0], span[1]));
+                continue;
+            };
+            if (item.compile_log.len == 0) continue;
+            const at = remapPoint(edits, item.start, in.text.len);
+            try out.append(arena, .{
+                .range = in.lines.range(at, at, in.encoding),
+                .severity = .Information,
+                .source = "zig",
+                .message = .{ .string = try std.fmt.allocPrint(arena, "Compile Log Output:\n{s}", .{item.compile_log}) },
+            });
         }
     }
     return out.items;
@@ -611,6 +638,19 @@ fn remap(edits: []const Edit, start: u32, end: u32) ?[2]u32 {
     const shifted_start = std.math.cast(u32, @as(i64, start) + start_delta) orelse return null;
     const shifted_end = std.math.cast(u32, @as(i64, end) + end_delta) orelse return null;
     return .{ shifted_start, shifted_end };
+}
+
+/// Offset in the new text of the old text's offset `pos`: shifted like `remap` when it is
+/// outside the modified regions, the start of the region otherwise; at most `len` (the length of
+/// the new text), as offsets from the compiler are not necessarily valid
+fn remapPoint(edits: []const Edit, pos: u32, len: usize) u32 {
+    var delta: i64 = 0;
+    const shifted: i64 = for (edits) |e| {
+        if (pos < e.start) break @as(i64, pos) + delta;
+        if (pos < e.old_end) break @as(i64, e.start) + delta;
+        delta = @as(i64, e.new_end) - @as(i64, e.old_end);
+    } else @as(i64, pos) + delta;
+    return @intCast(std.math.clamp(shifted, 0, @as(i64, @intCast(@min(len, std.math.maxInt(u32))))));
 }
 
 // Messages are copied into `arena`: live results belong to the `AstCheck` memo and compile

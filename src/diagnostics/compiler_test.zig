@@ -894,11 +894,37 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     const msgs = try mergeMessages(a, main_text, true, result);
     try testing.expectEqual(1, msgs.len);
     try testing.expectEqualStrings("zig@1:8: unused local variable\n\nCompile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs[0]);
-    // Unsaved changes: the AstGen error comes only from live and does not duplicate the compiler's
+    // Unsaved changes: the AstGen error comes only from live and does not duplicate the compiler's.
+    // Guards against losing the compile log with the hidden error: it is published on its own at
+    // the error's start
     const edited = try std.mem.concat(a, u8, &.{ "// new comment\n", main_text });
     const msgs2 = try mergeMessages(a, edited, true, result);
-    try testing.expectEqual(1, msgs2.len);
+    try testing.expectEqual(2, msgs2.len);
     try testing.expectEqualStrings("zig ast-check@2:8: unused local variable", msgs2[0]);
+    try testing.expectEqualStrings("zig@2:8: Compile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs2[1]);
+    // The line of the error is modified: the log is at the start of the modified region
+    const changed_line = try std.mem.replaceOwned(u8, a, main_text, "var unused = 1;", "var unused = 12;");
+    const msgs3 = try mergeMessages(a, changed_line, false, result);
+    try testing.expectEqual(1, msgs3.len);
+    try testing.expectEqualStrings("zig@1:0: Compile Log Output:\n@as(comptime_int, 1)\n@as(comptime_int, 2)", msgs3[0]);
+}
+
+test "compile log: attached to an error in the build root rather than one sorted before it" {
+    const gpa = testing.allocator;
+    var wip: ErrorBundle.Wip = try .init(gpa);
+    defer wip.deinit();
+    // The compiler sorts errors in the standard library first; with other errors it reports no
+    // "found compile log statement"
+    try addError(&wip, native("/usr/lib/zig/std/Io/Writer.zig"), main_text, "unused", "invalid format string 's' for type 'comptime_int'");
+    try addError(&wip, "src/main.zig", main_text, "\"s\"", "expected type 'u32', found '*const [1:0]u8'");
+    var eb = try wip.toOwnedBundle("@as(comptime_int, 24)\n");
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    defer r.release(gpa);
+    // Guards against attaching the output to the error in the standard library
+    try testing.expectEqualStrings("", r.files.get(native("/usr/lib/zig/std/Io/Writer.zig")).?.items[0].compile_log);
+    try testing.expectEqualStrings("@as(comptime_int, 24)", r.files.get(native("/proj/src/main.zig")).?.items[0].compile_log);
 }
 
 test "collect: notes of an error without a location outlive the fallback path" {
