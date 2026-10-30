@@ -80,7 +80,13 @@ pub const Result = struct {
     /// targets a `.zon` file: the root expression of the `.zon` file is inferred with it (see
     /// `queries.ZonResultType`)
     zon_imports: []const ZonImport = &.{},
+    /// References (names, member accesses, enum literals) and builtin calls whose value is changed
+    /// by their result type coercion, with their own value before it: `a` of type `u8` in `take(a)`
+    /// with `take(o: ?u8)` is `u8` (the compiler adds a separate coercion to `?u8`), `.red` coerced
+    /// to `?Color` is a `Color`. `exprs` holds the coerced values.
+    uncoerced: []const Uncoerced = &.{},
 
+    pub const Uncoerced = struct { expr: ExprId, tv: TypedValue };
     pub const LiteralExpected = struct {
         expr: ExprId,
         ty: Index,
@@ -101,8 +107,14 @@ pub const Result = struct {
         member: hir.OwnerKey,
     };
 
+    /// The value of `e` before its result type coercion (see `uncoerced`)
+    pub fn uncoercedValue(r: *const Result, e: ExprId) TypedValue {
+        for (r.uncoerced) |u| if (u.expr == e) return u.tv;
+        return if (@backingInt(e) < r.exprs.len) r.exprs[@backingInt(e)] else .unknown;
+    }
+
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.zon_imports, b.zon_imports) and deepEql(a.uncoerced, b.uncoerced);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -166,7 +178,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const param_coercions = try a.dupe(Result.ParamCoercion, inf.param_coercions.items);
     const iteration_vars = try a.dupe(Result.IterationVar, inf.iteration_vars.items);
     const zon_imports = try a.dupe(Result.ZonImport, inf.zon_imports.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports };
+    const uncoerced = try a.dupe(Result.Uncoerced, inf.uncoerced.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports, .uncoerced = uncoerced };
 }
 
 /// Infers only one local binding or comptime expression in the member `owner` (see
@@ -279,6 +292,8 @@ const Inferrer = struct {
     param_coercions: std.ArrayList(Result.ParamCoercion) = .empty,
     /// See `Result.zon_imports`
     zon_imports: std.ArrayList(Result.ZonImport) = .empty,
+    /// See `Result.uncoerced`
+    uncoerced: std.ArrayList(Result.Uncoerced) = .empty,
     /// Instance context (the instance of the owner itself or of an outer generic function)
     inst: ?Index,
     /// See `LoopSeed`
@@ -584,9 +599,26 @@ const Inferrer = struct {
         // corresponding member
         if (inf.members[i] == null and inf.body.expr(e) == .enum_literal) try inf.recordTagMember(e, tv.ty);
         if (raw.ty == .enum_literal_type) if (want) |w| try inf.noteParamCoercion(e, w);
+        if (want) |w| if (!deepEql(raw, tv)) try inf.noteUncoerced(e, raw, w);
         // A ZON value parsed as the pointee or as an array has the result type (pointer, slice)
         if (want != expected) inf.exprs[i] = .{ .ty = expected.? };
         return inf.exprs[i];
+    }
+
+    /// See `Result.uncoerced`: `raw` is the value of `e` before its coercion to `want`
+    fn noteUncoerced(inf: *Inferrer, e: ExprId, raw: TypedValue, want: Index) Error!void {
+        const own: TypedValue = switch (inf.body.expr(e)) {
+            // Primitive values (`null`, `undefined`) refer to no definition: they keep the type
+            // they are coerced to
+            .name_ref => |name| if (!inf.body.nameRefIsEscaped(e) and try primitive(inf.ip, name) != null) return else raw,
+            .field_access, .builtin_call => raw,
+            // An enum literal is a tag of the enum it is coerced to, without the optional or
+            // error union around it
+            .enum_literal => if (raw.ty == .enum_literal_type) try inf.coerce(raw, inf.destType(want, .eu_opt) orelse return) else raw,
+            else => return,
+        };
+        if (deepEql(own, inf.get(e))) return;
+        try inf.uncoerced.append(inf.scratch, .{ .expr = e, .tv = own });
     }
 
     /// When the compiler parses a ZON value with a result type (`LowerZon`), the value of an

@@ -6556,3 +6556,75 @@ test "enum literals compared with an enum or in branches without a result type o
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "debug,").?)), tag.start);
     try testing.expectEqual(@as(?definition.Target, null), try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, ".Debug;\n}").? + 1)));
 }
+
+test "hover on a reference in a coercing context shows its own type" {
+    // A result type coerces the value, not the reference: hover used to show the coerced type
+    // (`const a: ?u8` for `a` passed to a `?u8` parameter)
+    const text =
+        \\const Color = enum {
+        \\    red,
+        \\    green,
+        \\    pub const default: Color = .red;
+        \\};
+        \\const K = struct {
+        \\    const G2: u8 = 2;
+        \\};
+        \\const S = struct { x: u32 };
+        \\fn Box(comptime T: type) type {
+        \\    return struct { v: T };
+        \\}
+        \\fn take(o: ?u8) void {
+        \\    _ = o;
+        \\}
+        \\fn r(y: u64) ?u16 {
+        \\    return @intCast(y);
+        \\}
+        \\fn g(p: u8) ?u8 {
+        \\    return p;
+        \\}
+        \\fn probe(s: S, box: Box(u8)) void {
+        \\    const a: u8 = 5;
+        \\    take(a);
+        \\    const b: u8 = a;
+        \\    const v: ?u32 = s.x;
+        \\    const c: ?Color = .red;
+        \\    const d: ?Color = .default;
+        \\    const e: ?u8 = K.G2;
+        \\    const n = 5;
+        \\    const x8: u8 = n;
+        \\    take(box.v);
+        \\    take(null);
+        \\    _ = .{ b, v, c, d, e, x8, r, g };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "a);", "```zig\nconst a: u8 = 5\n```" },
+        .{ "a;\n", "```zig\nconst a: u8 = 5\n```" },
+        .{ "p;", "```zig\np: u8\n```" },
+        .{ "x;", "```zig\nx: u32\n```" },
+        .{ "red;\n    const d", "```zig\nred: Color = .red\n```" },
+        .{ "default;\n    const e", "```zig\nconst default: Color = .red\n```" },
+        .{ "G2;\n    const n", "```zig\nconst G2: u8 = 2\n```" },
+        .{ "n;", "```zig\nconst n: comptime_int = 5\n```" },
+        .{ "v);", "```zig\nv: u8\n```" },
+        .{ "null)", "```zig\n?u8\n```" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // A cast takes its result type without the optional
+    const cast = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "@intCast").?)) orelse return error.NoHover;
+    try testing.expect(std.mem.endsWith(u8, cast.text, "Inferred result:\n\n```zig\nu16\n```"));
+}

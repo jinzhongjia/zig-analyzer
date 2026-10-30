@@ -72,7 +72,9 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
     };
     if (def == null) {
         const e = b.exprAt(tok.offset - a.node.offset) orelse return null;
-        tv = a.exprType(e);
+        // The reference's own value: a result type coercion (`take(a)` with a `?u8` parameter)
+        // does not change what the name or member is
+        tv = a.uncoercedType(e);
         expr_id = e;
         switch (b.expr(e)) {
             .name_ref => |name| {
@@ -87,13 +89,6 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
             .error_value => |name| return errorValue(r, file, tok, e, name),
             else => return null,
         }
-        // A directly referenced declaration is shown with its declared type (the expression may
-        // have gone through a result type conversion); a member access keeps the type of the
-        // expression (the member type in a generic instance is determined by the instance)
-        if (b.expr(e) == .name_ref) if (def) |d| switch (d) {
-            .item => |it| tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(it.file, it.item) }),
-            else => {},
-        };
     }
 
     // A generic function body has no concrete instance: infer with a call-site instance
@@ -106,7 +101,8 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken) 
             const res = s.res;
             const better: TypedValue = if (binding_id) |id|
                 (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
-            else if (@backingInt(expr_id.?) < res.exprs.len) res.exprs[@backingInt(expr_id.?)] else .unknown;
+            else
+                res.uncoercedValue(expr_id.?);
             if (!seed.wanted(r.ctx.db.env.ip, better)) {
                 tv = better;
                 seeded_from = s;

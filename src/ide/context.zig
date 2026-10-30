@@ -37,6 +37,17 @@ pub const At = struct {
         return a.better(a.res.exprs, if (a.seeded) |s| s.res.exprs else &.{}, @backingInt(e));
     }
 
+    /// Value of a reference or builtin call before its result type coercion (see
+    /// `infer.Result.uncoerced`)
+    pub fn uncoercedType(a: At, e: Body.ExprId) TypedValue {
+        const tv = a.res.uncoercedValue(e);
+        if (a.seeded) |s| {
+            const better_tv = s.res.uncoercedValue(e);
+            if (seed.wanted(a.ip, tv) and !seed.wanted(a.ip, better_tv)) return better_tv;
+        }
+        return tv;
+    }
+
     pub fn bindingType(a: At, b: Body.BindingId) TypedValue {
         return a.better(a.res.bindings, if (a.seeded) |s| s.res.bindings else &.{}, @backingInt(b));
     }
