@@ -6418,3 +6418,37 @@ test "hover never treats the initializer as the missing type of a declaration" {
         try testing.expectEqualStrings(c[1], info.text);
     }
 }
+
+test "enum literal completion above a line that starts with `.name`" {
+    // `zig fmt` puts each `.name = value,` and `.tag => ...,` on its own line: a `.` typed above
+    // one must not join it into a field access, which leaves the completion empty
+    const s = "const S = struct { a: u32 = 0, b: u32 = 0, c: u32 = 0, d: u32 = 0 };\n";
+    const color = "const Color = enum { red, green, blue };\nfn paint(c: Color, d: Color) void { _ = .{ c, d }; }\n";
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ s ++ "fn f() void {\n    const s: S = .{\n        .a = 1,\n        .<|>\n        .b = 2,\n    };\n    _ = s;\n}\n", "c d" },
+        .{ s ++ "fn f() void {\n    const s: S = .{\n        .<|>\n        .a = 1,\n    };\n    _ = s;\n}\n", "b c d" },
+        .{ s ++ "fn f() void {\n    const s: S = .{\n        .a = 1,\n        .c<|>\n        .b = 2,\n    };\n    _ = s;\n}\n", "c d" },
+        .{ color ++ "fn f(c: Color) void {\n    switch (c) {\n        .<|>\n        .blue => {},\n    }\n}\n", "red green blue" },
+        .{ color ++ "fn f(c: Color) void {\n    switch (c) {\n        .red,\n        .<|>\n        .blue,\n        => {},\n    }\n}\n", "red green blue" },
+        .{ color ++ "fn f(c: Color) void {\n    switch (c) {\n        .r<|>\n        .blue => {},\n    }\n}\n", "red green blue" },
+        .{ color ++ "fn f() void {\n    paint(\n        .<|>\n        .blue,\n    );\n}\n", "red green blue" },
+        .{ color ++ "const T = struct { a: Color = .red, d: Color = .red };\nfn f() void {\n    const t: T = .{\n        .d = .<|>\n        .a = .red,\n    };\n    _ = t;\n}\n", "red green blue" },
+        .{ color ++ "const T = struct { a: Color = .red, d: Color = .red };\nfn f() void {\n    const t: T = .{\n        .d = .g<|>\n        .a = .red,\n    };\n    _ = t;\n}\n", "red green blue" },
+    };
+    for (cases) |c| {
+        const labels = try completionLabels(c[0]);
+        defer testing.allocator.free(labels);
+        testing.expectEqualStrings(c[1], labels) catch |err| {
+            std.debug.print("completion in `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    for ([_][]const u8{ ".<|>", ".m<|>" }) |typed| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ ".{\n    .name = .demo,\n    ", typed, "\n    .dependencies = .{},\n}\n" });
+        const at = try w.add("/p/build.zig.zon", text);
+        try testing.expectEqualStrings("fingerprint version minimum_zig_version paths", try completionAt(&w, at));
+    }
+}

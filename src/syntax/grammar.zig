@@ -750,7 +750,11 @@ fn switchProng(p: *Parser) Error!void {
         }
     }
     _ = try cm.complete(p, .switch_case);
-    _ = try p.expect(.equal_angle_bracket_right);
+    if (!try p.expect(.equal_angle_bracket_right) and p.atLineStart()) {
+        // Items still being typed above the next prong: the next line is not this prong's body
+        _ = try m.complete(p, .switch_prong);
+        return;
+    }
     try optPayload(p);
     if (try singleAssignExpr(p) == null) try p.err("expected expression");
     _ = try m.complete(p, .switch_prong);
@@ -1022,7 +1026,13 @@ fn errorUnionExpr(p: *Parser) Error!CM {
 }
 
 fn suffixExpr(p: *Parser) Error!CM {
+    // A `.` without a name yet is an element being typed: what follows belongs to the next one
+    const nameless_literal = p.at(.period) and switch (p.nth(1)) {
+        .identifier, .l_brace => false,
+        else => true,
+    };
     var lhs = try primaryTypeExpr(p) orelse return null;
+    if (nameless_literal) return lhs;
     while (true) {
         switch (p.peek()) {
             .l_bracket => {
@@ -1046,6 +1056,9 @@ fn suffixExpr(p: *Parser) Error!CM {
             },
             .period => switch (p.nth(1)) {
                 .identifier => {
+                    // `.na` typed above a line starting with `.name` (the next field, prong or
+                    // argument): an enum literal never has fields, so the literal ends here
+                    if (lhs.kind == .enum_literal and p.atLineStart()) return lhs;
                     const m = try lhs.precede(p);
                     try p.bump();
                     try p.bump();

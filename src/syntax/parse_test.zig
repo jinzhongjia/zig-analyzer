@@ -218,6 +218,67 @@ test "recovery: garbage tokens in a statement do not affect later statements" {
     );
 }
 
+test "recovery: an element being typed above a line starting with `.name` ends there" {
+    // `.b = 2` stays a field initializer beside a nameless literal element (parsed as one
+    // expression)
+    try expectZonTree(".{ .a = 1, .\n .b = 2 }",
+        \\source_file@0..22
+        \\  init_expr@0..22
+        \\    period "."
+        \\    init_list@1..22
+        \\      l_brace "{"
+        \\      field_init@3..9
+        \\        period "."
+        \\        identifier "a"
+        \\        equal "="
+        \\        literal@8..9
+        \\          number_literal "1"
+        \\      comma ","
+        \\      enum_literal@11..12
+        \\        period "."
+        \\      field_init@14..20
+        \\        period "."
+        \\        identifier "b"
+        \\        equal "="
+        \\        literal@19..20
+        \\          number_literal "2"
+        \\      r_brace "}"
+        \\error@14: expected identifier
+        \\error@14: expected ','
+        \\
+    );
+    // `.c` stays the case item of the first prong, `.blue => {}` is a prong of its own
+    try expectZonTree("switch (x) {\n .c\n .blue => {},\n}",
+        \\source_file@0..32
+        \\  switch_expr@0..32
+        \\    keyword_switch "switch"
+        \\    l_paren "("
+        \\    name_ref@8..9
+        \\      identifier "x"
+        \\    r_paren ")"
+        \\    l_brace "{"
+        \\    switch_prong@14..16
+        \\      switch_case@14..16
+        \\        enum_literal@14..16
+        \\          period "."
+        \\          identifier "c"
+        \\    switch_prong@18..29
+        \\      switch_case@18..23
+        \\        enum_literal@18..23
+        \\          period "."
+        \\          identifier "blue"
+        \\      equal_angle_bracket_right "=>"
+        \\      block@27..29
+        \\        l_brace "{"
+        \\        r_brace "}"
+        \\    comma ","
+        \\    r_brace "}"
+        \\error@18: expected '=>'
+        \\error@18: expected ',' after switch prong
+        \\
+    );
+}
+
 test "recovery: unwinding deep unclosed nesting and long else-if chains" {
     const a = testing.allocator;
     var src: std.ArrayList(u8) = .empty;
