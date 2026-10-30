@@ -395,7 +395,9 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     };
 
     // `.` / `.na` (enum literals, decl literals): list members by the expected type; in an
-    // initializer (`.{ .x = 1, .| }`), list the fields not yet assigned
+    // initializer of a struct or union (`.{ .x = 1, .| }`), list the fields not yet assigned. An
+    // element of an array, slice or tuple initializer is a value whose expected type is the element
+    // type
     if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .enum_literal) {
         out.member_mode = true;
         const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .enum_literal };
@@ -405,8 +407,10 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 for (try manifest.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
                 return .{ .items = out.items.items, .context = .init_field };
             } else a.exprType(init).ty;
-            try initFields(r, &out, ty, x.fields);
-            return .{ .items = out.items.items, .context = .init_field };
+            if (fieldsType(r.ctx.db.env.ip, ty)) |t| {
+                try initFields(r, &out, t, x.fields);
+                return .{ .items = out.items.items, .context = .init_field };
+            }
         }
         try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, !a.literalTagsOnly(e), file);
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
@@ -1625,17 +1629,22 @@ fn initOf(b: *const Body, e: Body.ExprId) ?Body.ExprId {
     return null;
 }
 
-/// Fields of the initialized type (`T` for `?T`) that have not been assigned yet
-fn initFields(r: *Resolver, out: *Collector, ty: Index, given: []const Body.FieldInit) resolve.Error!void {
-    const ip = r.ctx.db.env.ip;
+/// The type whose fields an initializer of type `ty` names (`T` for `?T`): a struct or union;
+/// null for the other types, whose initializers list elements (arrays, slices, tuples)
+fn fieldsType(ip: *InternPool, ty: Index) ?Index {
     const t = switch (ip.key(ty)) {
         .optional_type => |c| c,
         else => ty,
     };
-    switch (ip.key(t)) {
-        .container_type => |c| if (!c.kind.isStruct() and c.kind != .@"union") return,
-        else => return,
-    }
+    return switch (ip.key(t)) {
+        .container_type => |c| if (c.kind.isStruct() or c.kind == .@"union") t else null,
+        else => null,
+    };
+}
+
+/// Fields of the struct or union `t` (see `fieldsType`) that have not been assigned yet
+fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit) resolve.Error!void {
+    const ip = r.ctx.db.env.ip;
     const ns = try queries.namespaceOfType(r, t) orelse return;
     const tree = try r.itemTree(ns.file);
     outer: for (tree.containerMembers(ns.container)) |m| {

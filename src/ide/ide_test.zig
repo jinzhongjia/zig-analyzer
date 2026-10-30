@@ -3069,6 +3069,47 @@ test "completion after `.` lists members of the expected type" {
     }
 }
 
+/// Completes at `<|>` in `decls` followed by each case and expects the labels joined by spaces
+fn expectCompletions(decls: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ decls, c[0], "\n" });
+        testing.expectEqualStrings(c[1], try completionAt(&w, try w.add("/p/main.zig", text))) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
+test "completion: enum literals at unnamed elements of array, slice and tuple initializers" {
+    const decls =
+        \\const Color = enum { red, green, blue };
+        \\const Cfg = struct { colors: []const Color = &.{}, one: Color = .red };
+        \\fn takeColors(cs: []const Color) usize {
+        \\    return cs.len;
+        \\}
+        \\
+    ;
+    try expectCompletions(decls, &.{
+        .{ "const a = [_]Color{ .red, .<|> };", "red green blue" },
+        .{ "const a = [_]Color{ .<|> };", "red green blue" },
+        .{ "const a = [_]Color{ .gr<|> };", "red green blue" },
+        .{ "const b: [2]Color = .{ .red, .<|> };", "red green blue" },
+        .{ "fn f() void {\n    _ = takeColors(&.{ .green, .<|> });\n}", "red green blue" },
+        .{ "const d: struct { Color, u8 } = .{ .<|>, 1 };", "red green blue" },
+        // A struct initializer lists the fields not yet assigned
+        .{ "const g: Cfg = .{ .one = .red, .<|> };", "colors" },
+    });
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.fixture("//- /p/main.zig module:app\n" ++ decls ++ "const Pair = struct { pair: [2]Color = .{ .red, .red } };\nconst cfg: Cfg = @import(\"cfg.zon\");\nconst pair: Pair = @import(\"pair.zon\");");
+    try testing.expectEqualStrings("red green blue", try completionAt(&w, try w.add("/p/cfg.zon", ".{ .colors = .{ .red, .<|> } }")));
+    try testing.expectEqualStrings("red green blue", try completionAt(&w, try w.add("/p/pair.zon", ".{ .pair = .{ .<|>, .blue } }")));
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;
