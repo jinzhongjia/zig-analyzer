@@ -488,11 +488,11 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     return if (unknown) null else true;
 }
 
-const Capture = struct { item: u32, binding: Body.BindingId };
+pub const Capture = struct { item: u32, binding: Body.BindingId };
 
 /// Parameters and locals of the enclosing function that are referenced by the members of the
 /// container (including nested containers)
-fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
+pub fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
     const tree = try r.itemTree(ns.file);
     var out: std.ArrayList(Capture) = .empty;
     for (tree.items, 0..) |_, i| {
@@ -2779,12 +2779,6 @@ const Evaluator = struct {
             const info = try ev.typeInfo(try asType(vals[0]));
             return Val.of(ip.key(info).union_value.ty, info);
         }
-        if (eq(u8, name, "@typeName")) {
-            if (vals.len != 1) return error.Abort;
-            var out: std.Io.Writer.Allocating = .init(ev.a);
-            @import("render.zig").writeFull(ev.r, try asType(vals[0]), &out.writer) catch return error.OutOfMemory;
-            return ev.stringLiteral(out.written());
-        }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
             if (vals.len != 1) return error.Abort;
             const x = try ev.freeze(vals[0]) orelse return error.Abort;
@@ -2979,11 +2973,10 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (eq(u8, name, "@typeName")) {
             if (vals.len != 1) return error.Abort;
-            const t = asType(vals[0]) catch return null;
-            if (!value.isConcrete(ip, t)) return null;
-            var out: std.Io.Writer.Allocating = .init(ev.a);
-            @import("render.zig").writeFull(ev.r, t, &out.writer) catch return error.OutOfMemory;
-            return try ev.stringLiteral(out.written());
+            const t = try asType(vals[0]);
+            if (!value.isConcrete(ip, t)) return error.Abort;
+            const n = try @import("render.zig").typeName(ev.r, ev.a, t) orelse return error.Abort;
+            return try ev.stringLiteral(n);
         }
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName")) {
             if (vals.len != 1) return error.Abort;

@@ -703,6 +703,117 @@ test "comptime name builtins produce string literal types" {
     });
 }
 
+test "@typeName gives the compiler's fully qualified name" {
+    // Prevents giving the hover display name (`"E"` instead of `"main.E"`)
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
+    defer testing.allocator.free(std_root_path);
+    const std_root = try w.vfs.intern(std_root_path);
+    const src =
+        \\const std = @import("std");
+        \\const thing = @import("util/thing.zig");
+        \\const E = enum { a, b };
+        \\const S = struct {
+        \\    const Inner = struct {};
+        \\};
+        \\fn Box(comptime T: type) type {
+        \\    return struct { v: T };
+        \\}
+        \\fn Shared(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {};
+        \\}
+        \\fn Make() type {
+        \\    return struct {};
+        \\}
+        \\fn Out(comptime T: type) type {
+        \\    return struct {
+        \\        const In = struct { t: T };
+        \\        const Plain = struct {};
+        \\        fn G(comptime U: type) type {
+        \\            return struct { u: U, t: T };
+        \\        }
+        \\    };
+        \\}
+        \\fn Gen(comptime n: u8, comptime b: bool, comptime e: E, comptime o: ?u8, comptime l: @EnumLiteral(), comptime x: ?type) type {
+        \\    return struct {
+        \\        const k = .{ n, b, e, o, l, x };
+        \\    };
+        \\}
+        \\const n_E = @typeName(E);
+        \\const n_inner = @typeName(S.Inner);
+        \\const n_box = @typeName(Box(u8));
+        \\const n_box2 = @typeName(Box(S.Inner));
+        \\const n_make = @typeName(Make());
+        \\const n_in = @typeName(Out(u8).In);
+        \\const n_g = @typeName(Out(u8).G(u16));
+        \\const n_gen = @typeName(Gen(3, true, .b, 5, .q, null));
+        \\const n_list = @typeName(std.ArrayList(u8));
+        \\const n_alloc = @typeName(std.mem.Allocator);
+        \\const n_std = @typeName(std);
+        \\const n_thing = @typeName(thing.Thing);
+        \\const n_file = @typeName(thing);
+        \\const n_lit = @typeName(@TypeOf(.x));
+        \\const n_null = @typeName(@TypeOf(null));
+        \\const n_tuple = @typeName(struct { u8, ?*const [2:0]u8 });
+        \\const n_err = @typeName(error{ B, A }!S);
+        \\const n_anon = @typeName(@TypeOf(.{ .a = 1 }));
+        \\const n_shared = @typeName(Shared(u8));
+        \\const n_plain = @typeName(Out(u8).Plain);
+        \\const is_list = std.mem.startsWith(u8, @typeName(std.ArrayList(u8)), "array_list.");
+        \\const branch = if (is_list) @as(u8, 1) else @as(u16, 2);
+        \\const eqname = @intFromBool(std.mem.eql(u8, @typeName(E), "main.E"));
+        \\fn f() void {
+        \\    const L = struct {};
+        \\    const n_local = @typeName(L);
+        \\    _ = n_local;
+        \\}
+    ;
+    const main = try w.add("/p/src/main.zig", src);
+    const thing = try w.add("/p/src/util/thing.zig", "pub const Thing = struct {};\n");
+    try w.setGraph(std_root, &.{.{ .root = main.file, .imports = &.{} }}, &.{
+        .{ .file = main.file, .module = 0, .compile = 0 },
+        .{ .file = thing.file, .module = 0, .compile = 0 },
+    });
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "n_E", "*const [6:0]u8 = \"main.E\"" },
+        .{ "n_inner", "*const [12:0]u8 = \"main.S.Inner\"" },
+        .{ "n_box", "*const [12:0]u8 = \"main.Box(u8)\"" },
+        .{ "n_box2", "*const [22:0]u8 = \"main.Box(main.S.Inner)\"" },
+        .{ "n_make", "*const [11:0]u8 = \"main.Make()\"" },
+        .{ "n_in", "*const [15:0]u8 = \"main.Out(u8).In\"" },
+        .{ "n_g", "*const [19:0]u8 = \"main.Out(u8).G(u16)\"" },
+        .{ "n_gen", "*const [29:0]u8 = \"main.Gen(3,true,.b,5,.q,null)\"" },
+        .{ "n_list", "*const [27:0]u8 = \"array_list.Aligned(u8,null)\"" },
+        .{ "n_alloc", "*const [13:0]u8 = \"mem.Allocator\"" },
+        .{ "n_std", "*const [3:0]u8 = \"std\"" },
+        .{ "n_thing", "*const [16:0]u8 = \"util.thing.Thing\"" },
+        .{ "n_file", "*const [10:0]u8 = \"util.thing\"" },
+        .{ "n_lit", "*const [14:0]u8 = \"@EnumLiteral()\"" },
+        .{ "n_null", "*const [13:0]u8 = \"@TypeOf(null)\"" },
+        .{ "n_tuple", "*const [30:0]u8 = \"struct { u8, ?*const [2:0]u8 }\"" },
+        .{ "n_err", "*const [17:0]u8 = \"error{A,B}!main.S\"" },
+        // Named after a global counter, or after whichever instance creates the shared type first
+        .{ "n_anon", "unknown" },
+        .{ "n_shared", "unknown" },
+        .{ "n_plain", "unknown" },
+        .{ "is_list", "bool = true" },
+        .{ "branch", "u8 = 1" },
+        .{ "eqname", "u1 = 1" },
+        .{ "n_local", "*const [8:0]u8 = \"main.f.L\"" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, main.file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "comptime slices keep their sentinel" {
     try expectTypes(
         \\fn Explicit() type {
