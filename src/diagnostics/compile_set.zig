@@ -46,8 +46,9 @@ pub const FileModule = struct {
 pub const Membership = struct {
     /// Index into `ProjectModel.modules`; `std_module` for the standard library
     module: u32,
-    /// The compile step that reached the file first (index into `ProjectModel.steps`)
-    step: u32,
+    /// The compile step that reached the file first (index into `ProjectModel.steps`); null for a
+    /// file reached from no compile step (the build scripts, which the build runner compiles)
+    step: ?u32,
 };
 
 /// `resolver` must provide:

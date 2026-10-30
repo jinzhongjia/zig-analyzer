@@ -907,6 +907,9 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         ws.mutex.lockUncancelable(server.io);
         defer ws.mutex.unlock(server.io);
         if (ws.model) |*m| if (ws.compile_set) |*cs| try b.add(m, cs, if (ws.resolve_set) |*e| e else null);
+        // The build.zig modules of the project and its dependency packages: after the compile
+        // sets, which take priority for files in both
+        if (ws.script_model) |*m| if (ws.script_set) |*s| try b.add(m, s, null);
     }
     const std_root: ?Vfs.FileId = if (server.zigEnv()) |env| blk: {
         const p = try std.fs.path.join(server.gpa, &.{ env.std_dir, "std.zig" });

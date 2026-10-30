@@ -98,6 +98,11 @@ resolve_set: ?CompileSet.Result = null,
 /// starts, from the current text of the files (open files use their buffers, the rest are read
 /// from disk); valid even when reading the build graph fails
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
+/// The modules of the build scripts (one per package, rooted at its build.zig and importing the
+/// build.zig modules of its dependencies by name) and the files that belong to them, computed
+/// with `build_scripts`; added to the module graph so `@import("dep")` in build.zig resolves
+script_model: ?ProjectModel = null,
+script_set: ?CompileSet.Result = null,
 /// Compiler diagnostics of the most recent build
 result: ?*compiler.BuildResult = null,
 /// Compile result sequence number taken when `result` was stored (see
@@ -253,6 +258,8 @@ fn destroy(ws: *Workspace) void {
     if (ws.compile_set) |*s| s.deinit(gpa);
     if (ws.resolve_set) |*s| s.deinit(gpa);
     ws.build_scripts.deinit(gpa);
+    if (ws.script_model) |*m| m.deinit(gpa);
+    if (ws.script_set) |*s| s.deinit(gpa);
     if (ws.result) |r| r.release(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
@@ -1118,7 +1125,8 @@ fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
 }
 
 /// Computes the build scripts of the project and of its dependency packages (see
-/// `dependency_packages.discover`); missing files are read in and the computation repeated
+/// `dependency_packages.discover`) and the modules the configure program gives them; missing
+/// files are read in and the computation repeated
 fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
     ws.set_mutex.lockUncancelable(ws.server.io);
     defer ws.set_mutex.unlock(ws.server.io);
@@ -1167,13 +1175,61 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
         var scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         errdefer scripts.deinit(gpa);
         for (results) |r| for (r.files.keys()) |f| try scripts.put(gpa, f, {});
+        var script_set = try ws.scriptMembership(found.list, results);
+        errdefer script_set.deinit(gpa);
+        var script_model = try scriptModel(gpa, ws.root, found.list);
+        errdefer script_model.deinit(gpa);
         ws.mutex.lockUncancelable(io);
         defer ws.mutex.unlock(io);
         ws.build_scripts.deinit(gpa);
         ws.build_scripts = scripts;
+        if (ws.script_set) |*s| s.deinit(gpa);
+        ws.script_set = script_set;
+        if (ws.script_model) |*m| m.deinit(gpa);
+        ws.script_model = script_model;
         return;
     }
     log.warn("{s}: build script computation did not converge", .{ws.root});
+}
+
+/// Module membership of the build scripts: the files reachable from the build.zig of each package
+/// along relative imports belong to that package's build.zig module (see `scriptModel`). The
+/// build.zig.zon of a package is not part of its module.
+fn scriptMembership(ws: *Workspace, list: []const dependency_packages.Package, results: []const CompileSet.Scripts) Allocator.Error!CompileSet.Result {
+    var set: CompileSet.Result = .{};
+    errdefer set.deinit(ws.gpa);
+    for (list, results, 0..) |p, r, i| {
+        const module: u32 = @intCast(i);
+        const zon_path = try std.fs.path.join(ws.gpa, &.{ p.root, "build.zig.zon" });
+        defer ws.gpa.free(zon_path);
+        const zon = try ws.server.vfs.intern(zon_path);
+        for (r.files.keys()) |f| {
+            if (f == zon) continue;
+            const gop = try set.files.getOrPut(ws.gpa, f);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .module = module, .step = null };
+            } else if (gop.value_ptr.module != module) {
+                try set.others.put(ws.gpa, .{ .file = f, .module = module }, {});
+            }
+        }
+    }
+    return set;
+}
+
+/// The modules the configure program gives the build scripts: one module per package, rooted at
+/// its build.zig and importing the build.zig modules of its dependencies by name
+fn scriptModel(gpa: Allocator, root: []const u8, list: []const dependency_packages.Package) Allocator.Error!ProjectModel {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena_state.deinit();
+    const a = arena_state.allocator();
+    const modules = try a.alloc(ProjectModel.Module, list.len);
+    for (list, modules) |p, *m| {
+        const imports = try a.alloc(ProjectModel.Import, p.deps.len);
+        for (p.deps, imports) |d, *imp| imp.* = .{ .name = try a.dupe(u8, d.name), .module = d.package };
+        m.* = .{ .root_file = try std.fs.path.join(a, &.{ p.root, "build.zig" }), .imports = imports };
+    }
+    const build_root = try a.dupe(u8, root);
+    return .{ .arena = arena_state.state, .build_root = build_root, .std_root = "", .steps = &.{}, .modules = modules, .default_step = 0 };
 }
 
 /// Files reachable through imports from the root modules of these compile steps; missing files

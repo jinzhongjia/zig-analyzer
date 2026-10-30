@@ -69,8 +69,10 @@ pub const FileEntry = struct {
     /// modules, the one with the highest priority (modules in the diagnostics step and in compile
     /// steps for the native target come first).
     module: u32,
-    /// Index into `compiles`: the compilation that reached the file first
-    compile: u32,
+    /// Index into `compiles`: the compilation that reached the file first; null for a file reached
+    /// from no compile step (the build scripts), which uses the standard library and builtin of
+    /// files that belong to no module
+    compile: ?u32,
     /// Other modules the file also belongs to, in priority order (excluding `module`)
     others: []const u32 = &.{},
 };
@@ -142,9 +144,12 @@ pub const Builder = struct {
                     try b.addOther(gop.index, module);
                     continue;
                 }
-                const compile = try compiles.getOrPut(b.gpa, mem.step);
-                if (!compile.found_existing) compile.value_ptr.* = try b.addCompile(model, mem.step);
-                gop.value_ptr.* = .{ .file = file, .module = module, .compile = compile.value_ptr.* };
+                const compile: ?u32 = if (mem.step) |step| blk: {
+                    const c = try compiles.getOrPut(b.gpa, step);
+                    if (!c.found_existing) c.value_ptr.* = try b.addCompile(model, step);
+                    break :blk c.value_ptr.*;
+                } else null;
+                gop.value_ptr.* = .{ .file = file, .module = module, .compile = compile };
             }
             // The memberships from when these files were first reached were already added above
             for (cs.others.keys()) |o| try b.addOther(b.files.getIndex(o.file).?, if (o.module == std_module) std_module else offset + o.module);
@@ -226,17 +231,18 @@ pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?File
     if (std.mem.eql(u8, name, "std")) {
         // Files that belong to no module use the standard library of the zig environment
         const e = g.entry(file) orelse return g.std_root;
-        return g.compiles[e.compile].std_root orelse g.std_root;
+        const c = e.compile orelse return g.std_root;
+        return g.compiles[c].std_root orelse g.std_root;
     }
     if (std.mem.eql(u8, name, "builtin")) {
         // The standard library uses the builtin of the root module of its compilation (matching
         // the compiler); files that belong to no module use the default one
         const e = g.entry(file) orelse return g.default_builtin;
-        const builtin = if (e.module == std_module) g.compiles[e.compile].builtin else g.modules[e.module].builtin;
+        const builtin = if (e.module != std_module) g.modules[e.module].builtin else if (e.compile) |c| g.compiles[c].builtin else null;
         return builtin orelse g.default_builtin;
     }
     const e = g.entry(file) orelse return null;
-    if (std.mem.eql(u8, name, "root")) return g.compiles[e.compile].root;
+    if (std.mem.eql(u8, name, "root")) return g.compiles[e.compile orelse return null].root;
     // For a file in several modules, look the name up in each in turn; when several modules import
     // the same name (possibly pointing to different modules), take the one from the
     // highest-priority module

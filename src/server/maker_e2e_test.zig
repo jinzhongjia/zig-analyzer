@@ -405,6 +405,62 @@ test "entries created in or deleted from a configure input directory reconfigure
     }
 }
 
+const helper_app_build =
+    \\const std = @import("std");
+    \\const helperdep = @import("helperdep");
+    \\pub fn build(b: *std.Build) void {
+    \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }) });
+    \\    helperdep.addHelper(b, exe.root_module);
+    \\    b.installArtifact(exe);
+    \\}
+    \\
+;
+const helper_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = b;
+    \\}
+    \\/// Adds the helper library to a module
+    \\pub fn addHelper(b: *std.Build, m: *std.Build.Module) void {
+    \\    _ = b;
+    \\    _ = m;
+    \\}
+    \\
+;
+
+test "build.zig resolves the build.zig of a dependency imported by name" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = helper_app_build },
+        .{ .path = "build.zig.zon", .text = ".{ .name = .app, .version = \"0.0.0\", .fingerprint = 0xc96e70cf00001234, .minimum_zig_version = \"0.17.0\", .dependencies = .{ .helperdep = .{ .path = \"libs/helperdep\" } }, .paths = .{\"\"} }\n" },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "libs/helperdep/build.zig", .text = helper_build },
+        .{ .path = "libs/helperdep/build.zig.zon", .text = ".{ .name = .helperdep, .version = \"0.0.0\", .fingerprint = 0x4938af9500001234, .minimum_zig_version = \"0.17.0\", .dependencies = .{}, .paths = .{\"\"} }\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root);
+    const build_uri = try za.base.uri.fromPath(a, try project.path(a, "build.zig"));
+    const helper_uri = try za.base.uri.fromPath(a, try project.path(a, "libs/helperdep/build.zig"));
+    try open(&h, build_uri, helper_app_build);
+    try open(&h, helper_uri, helper_build);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    // `@import("helperdep")` and a function declared there
+    try testing.expectEqualStrings("build.zig", try gotoFile(&h, build_uri, helper_app_build, "helperdep.addHel"));
+    const target = try requestAt(&h, "textDocument/definition", build_uri, helper_app_build, "helperdep.addHel", null);
+    const location = if (target == .array) target.array.items[0] else target;
+    try testing.expectEqualStrings(helper_uri, location.object.get("uri").?.string);
+    try testing.expect(std.mem.indexOf(u8, try hoverText(&h, build_uri, helper_app_build, "helperdep.addHel"), "fn addHelper") != null);
+    // Renaming it edits its users in the build scripts that import the package
+    const renamed = try renamedFiles(&h, helper_uri, helper_build, "fn addHel", "addLibrary");
+    try testing.expectEqual(2, std.mem.count(u8, renamed, "build.zig"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 const lib_app_build =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
