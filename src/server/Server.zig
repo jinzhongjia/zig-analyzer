@@ -255,6 +255,9 @@ watch_cond: Io.Condition = .init,
 docs_mutex: Io.Mutex = .init,
 /// Open documents: the URI used by the client (used verbatim when publishing diagnostics)
 open_docs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
+/// Version of each open document, set in the same database write as its text so that a read
+/// transaction sees the version of the text it reads (protected by `docs_mutex`)
+doc_versions: std.AutoHashMapUnmanaged(Vfs.FileId, i32) = .empty,
 /// URI most recently used by the client: still used to publish diagnostics after the document is
 /// closed (clearing old diagnostics, republishing compiler diagnostics), so that the URI is not
 /// re-encoded from the internal path. For a virtual document, the entry is deleted once its
@@ -385,6 +388,7 @@ pub fn deinit(server: *Server) void {
     server.builtin_targets.deinit(server.gpa);
     for (server.open_docs.values()) |u| server.gpa.free(u);
     server.open_docs.deinit(server.gpa);
+    server.doc_versions.deinit(server.gpa);
     for (server.last_uris.values()) |u| server.gpa.free(u);
     server.last_uris.deinit(server.gpa);
     server.published.deinit(server.gpa);
@@ -1587,6 +1591,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         server.db.beginWrite();
         defer server.db.endWrite();
         try server.db.set(FileText, id, owned, .low);
+        try server.setDocVersion(id, params.textDocument.version);
         // Before a new session starts, wait for old read requests to exit; it must not inherit
         // delta baselines from the period while the document was closed or from the old session.
         server.semantic_cache.remove(server.io, server.gpa, id);
@@ -1605,8 +1610,22 @@ fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocum
         const old = server.db.peek(FileText, id) orelse "";
         const new = try offsets.applyChanges(server.gpa, old, params.contentChanges, server.encoding);
         try server.db.set(FileText, id, new, .low);
+        try server.setDocVersion(id, params.textDocument.version);
     }
     server.publishDebounced(id);
+}
+
+fn setDocVersion(server: *Server, id: Vfs.FileId, version: i32) Allocator.Error!void {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    try server.doc_versions.put(server.gpa, id, version);
+}
+
+/// The version of `file` when it is open in the client; null otherwise
+fn docVersion(server: *Server, file: Vfs.FileId) ?i32 {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    return server.doc_versions.get(file);
 }
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
@@ -1619,6 +1638,11 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
     // After closing, the disk contents are authoritative
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        _ = server.doc_versions.remove(id);
+    }
     const disk = server.vfs.readFromDisk(id, arena) catch |err| switch (err) {
         error.FileTooBig => null,
         else => |e| return e,
@@ -5231,7 +5255,7 @@ fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []const
         if (annotated) {
             const edits = try arena.alloc(DocumentEdit, fe.edits.len);
             for (fe.edits, edits) |e, *o| o.* = .{ .AnnotatedTextEdit = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text, .annotationId = confirm.?.id } };
-            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = null }, .edits = edits } });
+            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = server.docVersion(fe.file) }, .edits = edits } });
         } else {
             const edits = try arena.alloc(types.TextEdit, fe.edits.len);
             for (fe.edits, edits) |e, *o| o.* = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text };
