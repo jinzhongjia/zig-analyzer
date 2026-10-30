@@ -10,7 +10,9 @@
 //! | `\\server\share\x.zig` (UNC) | `file://server/share/x.zig`      |
 //!
 //! Parsing accepts VS Code's spellings: lowercase drive letters, the colon encoded as `%3A`, and
-//! `file://localhost/`; and the local form without an authority, `file:/home/x.zig` (RFC 8089).
+//! `file://localhost/`; the local form without an authority, `file:/home/x.zig` (RFC 8089); and
+//! on Windows, UNC paths after an empty authority, `file:////server/share/x.zig` and
+//! `file://///server/share/x.zig` (RFC 8089 Appendix E.3.2).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,6 +54,19 @@ pub fn toPathStyle(comptime style: Style, gpa: Allocator, uri: []const u8) Error
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
+    // On Windows, a UNC path may also follow an empty authority, with its two leading slashes
+    // (`file:////host/share/x`) or with one more (`file://///host/share/x`), as RFC 8089
+    // Appendix E.3.2 describes; Neovim spells paths that start with `//` this way
+    if (style == .windows and authority.len == 0 and std.mem.startsWith(u8, encoded_path, "//")) {
+        const unc = if (std.mem.startsWith(u8, encoded_path, "///")) encoded_path[1..] else encoded_path;
+        try appendDecoded(gpa, &out, unc);
+        for (out.items) |*c| {
+            if (c.* == '/') c.* = '\\';
+        }
+        // The host name must not be empty
+        if (out.items.len == 2 or out.items[2] == '\\') return error.InvalidUri;
+        return out.toOwnedSlice(gpa);
+    }
     if (!is_local) {
         try out.appendSlice(gpa, "\\\\");
         try appendDecoded(gpa, &out, authority);
@@ -176,6 +191,17 @@ test "windows drive letters" {
 test "windows UNC" {
     try expectFromPath(.windows, "\\\\server\\share\\a b.zig", "file://server/share/a%20b.zig");
     try expectToPath(.windows, "file://server/share/a%20b.zig", "\\\\server\\share\\a b.zig");
+}
+
+test "windows UNC after an empty authority (RFC 8089 Appendix E.3.2)" {
+    try expectToPath(.windows, "file:////server/share/a%20b.zig", "\\\\server\\share\\a b.zig");
+    try expectToPath(.windows, "file://///server/share/a%20b.zig", "\\\\server\\share\\a b.zig");
+    try expectToPath(.windows, "file:////wsl.localhost/Ubuntu/home/u/x.zig", "\\\\wsl.localhost\\Ubuntu\\home\\u\\x.zig");
+    for ([_][]const u8{ "file:////", "file://///", "file://////server/share/x.zig", "file:////%2Fserver/share" }) |bad| {
+        try testing.expectError(error.InvalidUri, toPathStyle(.windows, testing.allocator, bad));
+    }
+    // A POSIX path may start with two slashes
+    try expectToPath(.posix, "file:////server/share/x.zig", "//server/share/x.zig");
 }
 
 test "local form without an authority (RFC 8089 file:/path)" {
