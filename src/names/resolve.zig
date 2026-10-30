@@ -13,6 +13,7 @@ const ModuleGraph = @import("ModuleGraph.zig");
 const Vfs = @import("../base/Vfs.zig");
 const FileId = Vfs.FileId;
 const ItemTree = @import("../syntax/ItemTree.zig");
+const FileIndex = @import("../syntax/FileIndex.zig");
 const Parse = @import("../syntax/Parse.zig");
 const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
@@ -337,6 +338,90 @@ pub const Resolver = struct {
         }
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
         return graph.importTargets(r.arena, file, name);
+    }
+
+    /// The definitions that `def` corresponds to in the other modules of `file`: when `def` is in
+    /// the file that `file` imports under a name whose target differs between the modules `file`
+    /// belongs to (the highest-priority target, see `resolveImportTargets`), the definition at the
+    /// same member path (`Mode.fast` for a field `fast` of `const Mode = enum {...}`) in each other
+    /// target, in module priority order; the other targets themselves for `def` the file. Code in
+    /// `file` compiled as another module reaches those through the same names, while name
+    /// resolution and inference use the highest-priority module. Empty when `def` is not in such a
+    /// file, or is not reached by a path of names (a container returned by a function). Like
+    /// `resolveImportTargets`, meant for requests such as goto, and must not be used in inference.
+    pub fn moduleAlternatives(r: *Resolver, file: FileId, def: Def) Error![]const Def {
+        const def_file = switch (def) {
+            .item => |it| it.file,
+            .file => |f| f,
+            .local => return &.{},
+        };
+        // A file in a single module imports one target under each name
+        const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
+        if ((graph.entry(file) orelse return &.{}).others.len == 0) return &.{};
+        var out: std.ArrayList(Def) = .empty;
+        var path: ?[]const []const u8 = null;
+        for ((try r.ctx.get(FileIndex.Query, file)).imports) |name| {
+            const targets = try r.resolveImportTargets(file, name);
+            if (targets.len < 2 or targets[0] != def_file) continue;
+            const names = path orelse switch (def) {
+                .item => |it| try r.memberPath(it.file, it.item) orelse return &.{},
+                else => &.{},
+            };
+            path = names;
+            for (targets[1..]) |t| {
+                const alt: Def = switch (def) {
+                    .item => |it| try r.memberAtPath(t, names, (try r.itemTree(it.file)).items[it.item].kind == .field) orelse continue,
+                    else => .{ .file = t },
+                };
+                for (out.items) |x| {
+                    if (std.meta.eql(x, alt)) break;
+                } else try out.append(r.arena, alt);
+            }
+        }
+        return out.items;
+    }
+
+    /// The names leading from the root of the file to member `item`, outermost first; null when a
+    /// container on the way is not the value of a `const` declaration (`const S = struct {...}`)
+    fn memberPath(r: *Resolver, file: FileId, item: u32) Error!?[]const []const u8 {
+        const tree = try r.itemTree(file);
+        var names: std.ArrayList([]const u8) = .empty;
+        var cur = item;
+        for (0..max_depth) |_| {
+            try names.append(r.arena, tree.items[cur].name orelse return null);
+            const c = tree.items[cur].container;
+            if (c == 0) {
+                std.mem.reverse([]const u8, names.items);
+                return names.items;
+            }
+            const p = tree.containers[c].parent_item orelse return null;
+            if (tree.items[p].kind != .@"const") return null;
+            const rel_c = try r.containerRel(.{ .file = file, .container = c }) orelse return null;
+            const b = try r.body(file, p);
+            const v = b.value orelse return null;
+            if (b.range(v).start != rel_c) return null;
+            cur = p;
+        }
+        return null;
+    }
+
+    /// The member at `path` (see `memberPath`) in `file`, the containers on the way evaluated as
+    /// for member access; the last name is a field when `field` is set, else a declaration
+    fn memberAtPath(r: *Resolver, file: FileId, path: []const []const u8, field: bool) Error!?Def {
+        if (path.len == 0) return null;
+        var ns: Namespace = .{ .file = file, .container = 0 };
+        for (path[0 .. path.len - 1]) |name| {
+            ns = try r.namespaceOf(try r.memberDef(ns, name) orelse return null) orelse return null;
+        }
+        const last = path[path.len - 1];
+        const tree = try r.itemTree(ns.file);
+        if (ns.container >= tree.containers.len) return null;
+        if (!field) return .{ .item = .{ .file = ns.file, .item = lookupDecl(tree, ns.container, last) orelse return null } };
+        for (tree.containerMembers(ns.container)) |m| {
+            const it = tree.items[m];
+            if (it.kind == .field and it.name != null and std.mem.eql(u8, it.name.?, last)) return .{ .item = .{ .file = ns.file, .item = m } };
+        }
+        return null;
     }
 
     // ── Positions ────────────────────────────────────────────────────

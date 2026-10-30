@@ -10,6 +10,7 @@ const ModuleGraph = @import("ModuleGraph.zig");
 const resolve = @import("resolve.zig");
 const definition = @import("../ide/definition.zig");
 const completion = @import("../ide/completion.zig");
+const search = @import("../ide_db/search.zig");
 const test_path = @import("../util/test_path.zig");
 const native = test_path.native;
 const InternPool = @import("../sema/InternPool.zig");
@@ -501,14 +502,77 @@ test "goto on a module import that differs between the modules of a file lists e
     // the declaration
     try testing.expectEqualStrings("main.zig:cfg", try w.gotoAll(main.file, at("cfg.mode"), definition.definitionTargets));
     try testing.expectEqualStrings("main.zig:cfg", try w.gotoAll(main.file, at("cfg.mode"), definition.declarationTargets));
-    // Members are resolved through the highest-priority module
-    try testing.expectEqualStrings("exe_cfg.zig:mode", try w.gotoAll(main.file, at("mode;"), definition.definitionTargets));
+    // A member lists the member at the same path in the target of each module
+    try testing.expectEqualStrings("exe_cfg.zig:mode test_cfg.zig:mode", try w.gotoAll(main.file, at("mode;"), definition.definitionTargets));
     // A name whose target is the same in every module, and a relative path, have only one target
     try testing.expectEqualStrings("util.zig:", try w.gotoAll(main.file, at("\"util\""), definition.definitionTargets));
     try testing.expectEqualStrings("local.zig:", try w.gotoAll(main.file, at("\"local.zig\""), definition.definitionTargets));
     try testing.expectEqualStrings("util.zig:helper", try w.gotoAll(main.file, at("helper()"), definition.definitionTargets));
     // No target
     try testing.expectEqualStrings("", try w.gotoAll(main.file, at("void"), definition.definitionTargets));
+}
+
+test "goto and references on members of a module import that differs between the modules of a file" {
+    // Prevents goto from listing only the member in the highest-priority module's target
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfgb
+        \\const cfg = @import("cfg");
+        \\pub fn main() void {
+        \\    const v = cfg.value;
+        \\    const m: cfg.Mode = .fast;
+        \\    _ = .{ v, m };
+        \\}
+        \\//- /p/cfg_a.zig module:cfga
+        \\pub const value: u32 = 1;
+        \\pub const Mode = enum { fast, small };
+        \\//- /p/cfg_b.zig module:cfgb
+        \\pub const value: u32 = 2;
+        \\pub const Mode = enum { small, fast };
+    );
+    const main = f.file("/p/main.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, main)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "value;", "cfg_a.zig:value cfg_b.zig:value" },
+        .{ "Mode =", "cfg_a.zig:Mode cfg_b.zig:Mode" },
+        .{ "fast;", "cfg_a.zig:fast cfg_b.zig:fast" },
+    }) |c| {
+        try testing.expectEqualStrings(c[1], try w.gotoAll(main, at(text, c[0]), definition.definitionTargets));
+        try testing.expectEqualStrings(c[1], try w.gotoAll(main, at(text, c[0]), definition.declarationTargets));
+    }
+    try testing.expectEqualStrings("cfg_a.zig:Mode cfg_b.zig:Mode", try w.gotoAll(main, at(text, "m }"), definition.typeDefinitionTargets));
+
+    // A use refers to the member in each module: it is a reference of both, ambiguous for rename
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    for ([_][]const u8{ "/p/cfg_a.zig", "/p/cfg_b.zig" }) |path| {
+        const cfg = f.file(path);
+        const cfg_text = (try ctx.get(database.syntax.SourceText, cfg)).text;
+        for ([_][]const u8{ "value", "fast" }) |name| {
+            const def = try definition.defAt(&r, cfg, at(cfg_text, name)) orelse return error.NoDefinition;
+            var ambiguous: ?search.Reference = null;
+            const refs = try search.findReferences(&r, def, .{ .scope = f.files, .ambiguous = &ambiguous });
+            var in_main: usize = 0;
+            for (refs) |ref| if (ref.file == main) {
+                in_main += 1;
+                try testing.expectEqualStrings(name, text[ref.start..ref.end]);
+            };
+            try testing.expectEqual(1, in_main);
+            try testing.expectEqual(main, ambiguous.?.file);
+        }
+    }
 }
 
 test "@This, enums, nested containers and generic functions" {

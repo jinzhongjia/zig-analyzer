@@ -31,47 +31,67 @@ const manifest = @import("manifest.zig");
 pub const Target = struct { file: FileId, start: u32, end: u32 };
 
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    if (try labelTarget(r, file, offset)) |t| return t;
-    if (try errorMemberTarget(r, file, offset)) |t| return t;
-    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
-    if (try defAt(r, file, offset)) |def| return target(r, try r.aliasTarget(def));
-    if (try reifiedFieldTarget(r, file, offset)) |t| return t;
-    return selfTarget(r, file, offset);
+    return switch (try find(r, file, offset) orelse return null) {
+        .target => |t| t,
+        .def => |def| target(r, try r.aliasTarget(def)),
+    };
 }
 
 pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
-    if (try labelTarget(r, file, offset)) |t| return t;
-    if (try errorMemberTarget(r, file, offset)) |t| return t;
-    if (try errorValueDecl(r, file, offset, true)) |d| return d.target;
-    if (try defAt(r, file, offset)) |def| return target(r, def);
-    if (try reifiedFieldTarget(r, file, offset)) |t| return t;
-    return selfTarget(r, file, offset);
+    return switch (try find(r, file, offset) orelse return null) {
+        .target => |t| t,
+        .def => |def| target(r, def),
+    };
+}
+
+/// What goto finds at the cursor: a definition (`defAt`), or a position that is not one (labels,
+/// error names, the origins of the names of constructed types, declaration sites)
+const Found = union(enum) { def: Def, target: Target };
+
+fn find(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Found {
+    if (try labelTarget(r, file, offset)) |t| return .{ .target = t };
+    if (try errorMemberTarget(r, file, offset)) |t| return .{ .target = t };
+    if (try errorValueDecl(r, file, offset, true)) |d| return .{ .target = d.target };
+    if (try defAt(r, file, offset)) |def| return .{ .def = def };
+    if (try reifiedFieldTarget(r, file, offset)) |t| return .{ .target = t };
+    return .{ .target = try selfTarget(r, file, offset) orelse return null };
 }
 
 /// All targets of definition: when the cursor is on `@import("name")` and the modules the file
 /// belongs to import different modules as `name`, the root files of those modules (in module
 /// priority order); otherwise the result of `definition`, followed by the definitions the name
 /// refers to under the other instances of the generic function containing it (see
-/// `instanceDefs`). The first one is the result of `definition`.
+/// `instanceDefs`), and by the definitions that correspond to each of them in the other modules
+/// the file imports under the same name (see `Resolver.moduleAlternatives`). The first one is the
+/// result of `definition`.
 pub fn definitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
-    return withInstances(r, file, offset, try definition(r, file, offset), true);
+    return allTargets(r, file, offset, true);
 }
 
 /// All targets of declaration: like `definitionTargets`, but otherwise the result of `declaration`
 pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     if (try importTargetsAt(r, file, offset)) |targets| return targets;
-    return withInstances(r, file, offset, try declaration(r, file, offset), false);
+    return allTargets(r, file, offset, false);
 }
 
-/// `first` followed by the targets of `instanceDefs` (through aliases with `follow_alias`), each
-/// target once
-fn withInstances(r: *Resolver, file: FileId, offset: u32, first: ?Target, follow_alias: bool) resolve.Error![]const Target {
+/// The result of `find` followed by the definitions of `instanceDefs`, each definition followed
+/// by its module alternatives, as targets (through aliases with `follow_alias`), each target once
+fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resolve.Error![]const Target {
     var out: std.ArrayList(Target) = .empty;
-    if (first) |t| try out.append(r.arena, t);
-    for (try instanceDefs(r, file, offset)) |def| {
-        const t = try target(r, if (follow_alias) try r.aliasTarget(def) else def) orelse continue;
-        try appendNew(r, &out, t);
+    var defs: std.ArrayList(Def) = .empty;
+    if (try find(r, file, offset)) |f| switch (f) {
+        .target => |t| try out.append(r.arena, t),
+        .def => |def| try defs.append(r.arena, def),
+    };
+    try defs.appendSlice(r.arena, try instanceDefs(r, file, offset));
+    for (defs.items) |def| {
+        const alternatives = try r.moduleAlternatives(file, def);
+        for (0..alternatives.len + 1) |i| {
+            const d = if (i == 0) def else alternatives[i - 1];
+            const t = try target(r, if (follow_alias) try r.aliasTarget(d) else d) orelse continue;
+            try appendNew(r, &out, t);
+        }
     }
     return out.items;
 }
@@ -820,7 +840,9 @@ pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
 
 /// All targets of type definition: the result of `typeDefinition`, followed, when the type of the
 /// symbol is not concrete in the abstract inference of a generic function, by the definitions of
-/// its type under the other instances of the function (see `context.allSeeded`), each target once
+/// its type under the other instances of the function (see `context.allSeeded`); each type is
+/// followed by its counterparts in the other modules the file imports under the same name (see
+/// `appendTypeTargets`). Each target once.
 pub fn typeDefinitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Target {
     const tok = try tokenAt(r, file, offset) orelse return &.{};
     const a = try context.at(r, file, tok.offset, false) orelse return &.{};
@@ -828,16 +850,14 @@ pub fn typeDefinitionTargets(r: *Resolver, file: FileId, offset: u32) resolve.Er
     var out: std.ArrayList(Target) = .empty;
     const s = subject.seedSubject();
     if (s == null or !seed.wanted(r.ctx.db.env.ip, try subjectType(r, a, subject))) {
-        if (try typeTarget(r, try subjectType(r, a, subject))) |t| try out.append(r.arena, t);
+        try appendTypeTargets(r, file, try subjectType(r, a, subject), &out);
         return out.items;
     }
     var refiner = try seed.Refiner.init(r, a.file, a.item, a.node.offset, a.body, a.res);
     var first = a;
     first.seeded = try refiner.at(a.rel, s);
-    if (try typeTarget(r, try subjectType(r, first, subject))) |t| try out.append(r.arena, t);
-    for (try context.allSeeded(r, a)) |v| {
-        if (try typeTarget(r, try subjectType(r, v, subject))) |t| try appendNew(r, &out, t);
-    }
+    try appendTypeTargets(r, file, try subjectType(r, first, subject), &out);
+    for (try context.allSeeded(r, a)) |v| try appendTypeTargets(r, file, try subjectType(r, v, subject), &out);
     return out.items;
 }
 
@@ -891,11 +911,13 @@ fn subjectType(r: *Resolver, a: context.At, subject: TypeSubject) resolve.Error!
     };
 }
 
-/// Definition of the type `tv` (of the type itself when `tv` is a type), with pointers, optionals,
-/// arrays, vectors, and error unions stripped
-fn typeTarget(r: *Resolver, tv: TypedValue) resolve.Error!?Target {
+/// Appends to `out` the definition of the type `tv` (of the type itself when `tv` is a type), with
+/// pointers, optionals, arrays, vectors, and error unions stripped; when the type is a declaration
+/// in a module that `file` imports under a name other modules map to other files, also the
+/// corresponding types in those files (see `Resolver.moduleAlternatives`). Each target once.
+fn appendTypeTargets(r: *Resolver, file: FileId, tv: TypedValue, out: *std.ArrayList(Target)) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
-    var t = if (tv.ty == .type_type) tv.asType() orelse return null else tv.ty;
+    var t = if (tv.ty == .type_type) tv.asType() orelse return else tv.ty;
     for (0..8) |_| t = switch (ip.key(t)) {
         .ptr_type => |p| p.child,
         .optional_type => |c| c,
@@ -904,19 +926,35 @@ fn typeTarget(r: *Resolver, tv: TypedValue) resolve.Error!?Target {
         .error_union_type => |eu| eu.payload,
         else => break,
     };
-    const ns = try queries.namespaceOfType(r, t) orelse return null;
+    const ns = try queries.namespaceOfType(r, t) orelse return;
+    if (try namespaceTarget(r, ns)) |x| try appendNew(r, out, x);
+    const def: Def = if (ns.container == 0) .{ .file = ns.file } else .{ .item = .{ .file = ns.file, .item = try containerDecl(r, ns) orelse return } };
+    for (try r.moduleAlternatives(file, def)) |alt| {
+        const alt_ns = try r.namespaceOf(alt) orelse continue;
+        if (try namespaceTarget(r, alt_ns)) |x| try appendNew(r, out, x);
+    }
+}
+
+/// The target of type definition for the container `ns`
+fn namespaceTarget(r: *Resolver, ns: resolve.Namespace) resolve.Error!?Target {
     // The file is the container: jump to the start of the file
     if (ns.container == 0) return .{ .file = ns.file, .start = 0, .end = 0 };
-    const tree = try r.itemTree(ns.file);
     // `const S = struct {...}`: jump to the name of the declaration; otherwise (such as a
     // container returned by a generic function) jump to the container itself
-    if (tree.containers[ns.container].parent_item) |p| if (tree.items[p].kind == .@"const") {
-        if (try r.containerRel(ns)) |rel_c| if ((try r.body(ns.file, p)).value) |v| if ((try r.body(ns.file, p)).range(v).start == rel_c) {
-            return target(r, .{ .item = .{ .file = ns.file, .item = p } });
-        };
-    };
+    if (try containerDecl(r, ns)) |p| return target(r, .{ .item = .{ .file = ns.file, .item = p } });
     const start = try r.containerOffset(ns) orelse return null;
     return .{ .file = ns.file, .start = start, .end = start };
+}
+
+/// The declaration `const S = struct {...}` whose value is the container `ns`
+fn containerDecl(r: *Resolver, ns: resolve.Namespace) resolve.Error!?u32 {
+    const tree = try r.itemTree(ns.file);
+    const p = tree.containers[ns.container].parent_item orelse return null;
+    if (tree.items[p].kind != .@"const") return null;
+    const rel_c = try r.containerRel(ns) orelse return null;
+    const b = try r.body(ns.file, p);
+    const v = b.value orelse return null;
+    return if (b.range(v).start == rel_c) p else null;
 }
 
 /// The token at the cursor: a token that can be jumped from is preferred; when the cursor
