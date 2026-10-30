@@ -318,21 +318,25 @@ fn close(a: Allocator, out: *std.ArrayList(Block), current: *std.ArrayList(Entry
 
 /// Entry for a declaration that occupies whole lines by itself: only indentation (or the BOM at
 /// the start of the file) before it, and only whitespace and a trailing comment after it; `//`
-/// comment lines directly above it are included as well
+/// comment lines directly above it are included as well, unless they start the file (a file
+/// header such as a license notice, which stays first)
 fn lineEntry(source: []const u8, node: SyntaxNode, c: Candidate) ?Entry {
     const range = node.range();
-    var line_start: usize = if (std.mem.lastIndexOfScalar(u8, source[0..range.start], '\n')) |i| i + 1 else bomLen(source);
-    if (std.mem.trim(u8, source[line_start..range.start], " \t").len != 0) return null;
+    const file_start = bomLen(source);
+    const decl_line: usize = if (std.mem.lastIndexOfScalar(u8, source[0..range.start], '\n')) |i| i + 1 else file_start;
+    if (std.mem.trim(u8, source[decl_line..range.start], " \t").len != 0) return null;
     const line_end = std.mem.indexOfScalarPos(u8, source, range.end, '\n') orelse source.len;
     const rest = std.mem.trim(u8, source[range.end..line_end], " \t\r");
     if (rest.len != 0 and !std.mem.startsWith(u8, rest, "//")) return null;
-    while (line_start > 0) {
+    var line_start = decl_line;
+    while (line_start > file_start) {
         const prev_end = line_start - 1;
-        const prev_start = if (std.mem.lastIndexOfScalar(u8, source[0..prev_end], '\n')) |i| i + 1 else 0;
+        const prev_start = if (std.mem.lastIndexOfScalar(u8, source[0..prev_end], '\n')) |i| i + 1 else file_start;
         const line = std.mem.trim(u8, source[prev_start..prev_end], " \t\r");
         if (!std.mem.startsWith(u8, line, "//") or std.mem.startsWith(u8, line, "//!")) break;
         line_start = prev_start;
     }
+    if (line_start == file_start) line_start = decl_line;
     const end = if (line_end > range.end and source[line_end - 1] == '\r') line_end - 1 else line_end;
     return .{ .start = @intCast(line_start), .end = @intCast(end), .decl = range.start, .name = c.name, .what = c.what };
 }
