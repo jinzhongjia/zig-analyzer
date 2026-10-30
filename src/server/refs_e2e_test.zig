@@ -202,7 +202,7 @@ test "references, highlight, rename and workspace symbol" {
         ctx.trace = &trace;
         var r: za.names.resolve.Resolver = .{ .ctx = &ctx, .arena = a };
         const lib = (try h.server.vfs.lookup(try project.path(a, "src/lib.zig"))).?;
-        _ = try za.ide.hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "hello();").?));
+        _ = try za.ide.hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "hello();").?), &.{});
         try testing.expect(trace.events.items.len > 0);
         var out: std.Io.Writer.Allocating = .init(a);
         try h.server.writeSlowReport(&out.writer, &ctx, &trace, 0);

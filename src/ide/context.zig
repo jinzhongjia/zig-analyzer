@@ -12,6 +12,7 @@ const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const Body = @import("../hir/Body.zig");
 const infer = @import("../sema/infer.zig");
+const eval = @import("../sema/eval.zig");
 const render = @import("../sema/render.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
@@ -173,6 +174,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .container_type => |c| if (try render.declaresContainer(r, c, it.file, it.item)) return std.fmt.allocPrint(r.arena, "{s}{s} = {t}", .{ keyword, name, c.kind }),
                 else => {},
             };
+            if (try embedOf(r, def, tv)) |e| return std.fmt.allocPrint(r.arena, "{s}{s}: {s}", .{ keyword, name, try render.embedAlloc(r, tv.ty, e.path) });
             return std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ keyword, name, try render.annotationAlloc(r, tv) });
         },
         .local => |l| {
@@ -182,10 +184,95 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .local_var => "var ",
                 .param, .capture => "",
             };
+            if (try embedOf(r, def, tv)) |e| return std.fmt.allocPrint(r.arena, "{s}{f}: {s}", .{ keyword, std.zig.fmtId(b.name), try render.embedAlloc(r, tv.ty, e.path) });
             return std.fmt.allocPrint(r.arena, "{s}{f}{s}", .{ keyword, std.zig.fmtId(b.name), try render.annotationAlloc(r, tv) });
         },
         .file => |f| return std.fmt.allocPrint(r.arena, "@import(\"{s}\")", .{std.fs.path.basename(r.ctx.db.env.vfs.path(f))}),
     }
+}
+
+/// A value that is directly the result of `@embedFile(path)`
+pub const Embed = struct {
+    /// The path argument
+    path: []const u8,
+    /// The file read
+    file: FileId,
+    /// Its content
+    text: []const u8,
+};
+
+/// The `@embedFile` call a definition of type and value `tv` is initialized with
+/// (`const x = @embedFile("a.bin")`, also with a type annotation the content coerces to, such as
+/// `[]const u8`); null for any other initializer (a slice of the content, a concatenation, an
+/// alias), for a variable whose value is not known at comptime, or when the path or the file
+/// cannot be resolved
+pub fn embedOf(r: *Resolver, def: Def, tv: TypedValue) resolve.Error!?Embed {
+    const file, const item, const is_const, const init = switch (def) {
+        .item => |it| blk: {
+            const kind = (try r.itemTree(it.file)).items[it.item].kind;
+            if (kind != .@"const" and kind != .@"var") return null;
+            break :blk .{ it.file, it.item, kind == .@"const", (try r.body(it.file, it.item)).value orelse return null };
+        },
+        .local => |l| blk: {
+            const b = (try r.body(l.file, l.item)).binding(l.binding);
+            break :blk .{ l.file, l.item, b.kind == .local_const, b.init orelse return null };
+        },
+        .file => return null,
+    };
+    if (tv.val == null and !is_const) return null;
+    const embed = try embedCall(r, try atItem(r, file, item) orelse return null, init) orelse return null;
+    // The value of a constant with a type annotation other than `*const [len:0]u8` is not kept:
+    // the call is shown when the content coerces to the type
+    if (tv.val == null and !holdsContent(r.ctx.db.env.ip, tv.ty, embed.text.len)) return null;
+    return embed;
+}
+
+/// Whether the content of a file of `len` bytes (`*const [len:0]u8`) coerces to `ty`: a const
+/// slice or many-item pointer of `u8`, a const pointer to an array of `len` bytes, with no
+/// sentinel or a zero one, or an optional of one of them
+fn holdsContent(ip: *InternPool, ty: Index, len: usize) bool {
+    const t = switch (ip.key(ty)) {
+        .optional_type => |child| child,
+        else => ty,
+    };
+    const p = switch (ip.key(t)) {
+        .ptr_type => |p| p,
+        else => return false,
+    };
+    if (!p.is_const or !zeroOrNone(ip, p.sentinel)) return false;
+    return switch (p.size) {
+        .slice, .many => p.child == .u8_type,
+        .one => switch (ip.key(p.child)) {
+            .array_type => |a| a.child == .u8_type and a.len == len and zeroOrNone(ip, a.sentinel),
+            else => false,
+        },
+        .c => false,
+    };
+}
+
+fn zeroOrNone(ip: *InternPool, sentinel: ?Index) bool {
+    const s = sentinel orelse return true;
+    return switch (ip.key(s)) {
+        .int_value => |i| i.value == 0,
+        else => false,
+    };
+}
+
+/// The `@embedFile` call `e` (in the body of `a`) with its path resolved and the file read; null
+/// for other expressions, or when the path is not known at comptime or the file does not exist
+pub fn embedCall(r: *Resolver, a: At, e: Body.ExprId) resolve.Error!?Embed {
+    const call = switch (a.body.expr(e)) {
+        .builtin_call => |c| c,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, call.name, "@embedFile") or call.args.len != 1) return null;
+    const arg = call.args[0];
+    const path = switch (a.body.expr(arg)) {
+        .literal => |text| if (text.len > 0 and text[0] == '"') std.zig.string_literal.parseAlloc(r.arena, text) catch null else null,
+        else => null,
+    } orelse try eval.stringValue(r, a.exprType(arg)) orelse return null;
+    const embedded = try eval.embeddedFile(r, a.file, path) orelse return null;
+    return .{ .path = path, .file = embedded.file, .text = embedded.text };
 }
 
 /// Target function of a call: returns the function declaration and whether it is a method call

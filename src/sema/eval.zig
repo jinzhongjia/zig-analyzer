@@ -377,18 +377,24 @@ pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Er
 }
 
 /// `@embedFile(path)`: content of the file in the directory of `file`, with the same type as a
-/// string literal (`*const [len:0]u8`). For an open document the buffer is authoritative;
-/// otherwise the file is read from disk (see `SourceText`). When the file does not exist the
-/// compiler reports an error, and the result is null.
+/// string literal (`*const [len:0]u8`). Null when the file does not exist (see `embeddedFile`).
 pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue {
+    const text = (try embeddedFile(r, file, path) orelse return null).text;
+    const ip = r.ctx.db.env.ip;
+    const ty = try ip.stringLiteralType(text.len);
+    return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = text } }) };
+}
+
+/// The file `@embedFile(path)` in `file` reads, and its content. For an open document the buffer
+/// is authoritative; otherwise the file is read from disk (see `SourceText`). When the file does
+/// not exist the compiler reports an error, and the result is null.
+pub fn embeddedFile(r: *Resolver, file: FileId, path: []const u8) Error!?struct { file: FileId, text: []const u8 } {
     const target = try r.relativeFile(file, path) orelse return null;
     const source = try r.ctx.get(syntax.SourceText, target);
     // Not open, and could not be read from disk either: the file does not exist (reading an empty
     // file yields empty content)
     if (!source.owned and try r.ctx.get(database.inputs.FileText, target) == null) return null;
-    const ip = r.ctx.db.env.ip;
-    const ty = try ip.stringLiteralType(source.text.len);
-    return .{ .ty = ty, .val = try ip.get(.{ .bytes = .{ .ty = ty, .bytes = source.text } }) };
+    return .{ .file = target, .text = source.text };
 }
 
 /// Type of a field in a tuple, anonymous struct, constructed type, or source container (of a

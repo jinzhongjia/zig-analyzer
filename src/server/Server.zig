@@ -1984,13 +1984,7 @@ pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rul
         rules.zig_lib = try arena.dupe(u8, env.lib_dir);
         rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
     }
-    {
-        server.roots_mutex.lockUncancelable(server.io);
-        defer server.roots_mutex.unlock(server.io);
-        const roots = try arena.alloc([]const u8, server.roots.items.len);
-        for (server.roots.items, roots) |root, *r| r.* = try arena.dupe(u8, root);
-        rules.roots = roots;
-    }
+    rules.roots = try server.rootsAlloc(arena);
     var local_caches: std.ArrayList([]const u8) = .empty;
     var packages: std.ArrayList([]const u8) = .empty;
     {
@@ -4281,11 +4275,14 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
 fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
-    var best: ?[]const u8 = null;
-    for (server.roots.items) |root| {
-        if (server.vfs.isUnder(path, root) and (best == null or root.len > best.?.len)) best = root;
-    }
-    return if (best) |b| try arena.dupe(u8, b) else null;
+    return if (server.vfs.rootOf(server.roots.items, path)) |b| try arena.dupe(u8, b) else null;
+}
+
+/// The workspace root directories, copied into `arena`
+fn rootsAlloc(server: *Server, arena: Allocator) Allocator.Error![]const []const u8 {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    return dupeStrings(arena, server.roots.items);
 }
 
 /// Names that violate the naming conventions (see `naming`): low-severity hints with code
@@ -4781,7 +4778,7 @@ fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: [
 
 fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverParams) HandlerError!types.ResultType("textDocument/hover") {
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const info = try ide.hover.hover(r, at.file, at.offset) orelse return null;
+    const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
     return .{
         .contents = .{ .MarkupContent = .{ .kind = .markdown, .value = info.text } },
@@ -5496,8 +5493,7 @@ fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, old: []const u
 /// Why a fix cannot be applied: "<prefix>: reason (file:line:column)"; only the file when the
 /// position is null
 fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
-    const path = server.vfs.path(file);
-    const shown = if (try server.rootOf(arena, path)) |root| std.mem.trimStart(u8, path[root.len..], "/\\") else path;
+    const shown = server.vfs.shownPath(try server.rootsAlloc(arena), server.vfs.path(file));
     const at = offset orelse return std.fmt.allocPrint(arena, "{s}: {s} ({s})", .{ prefix, reason, shown });
     const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
     const pos = (try offsets.LineIndex.init(arena, text)).position(at, server.encoding);

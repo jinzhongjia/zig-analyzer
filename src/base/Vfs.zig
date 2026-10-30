@@ -154,6 +154,23 @@ pub fn isUnderStyle(comptime style: Style, case: CaseMode, file_path: []const u8
     return path_type.isSep(u8, file_path[dir.len]) or (dir.len > 0 and path_type.isSep(u8, dir[dir.len - 1]));
 }
 
+/// The innermost of the directories `roots` that contains `file_path` (see `isUnder`); null when
+/// none does
+pub fn rootOf(vfs: *const Vfs, roots: []const []const u8, file_path: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    for (roots) |root| {
+        if (vfs.isUnder(file_path, root) and (best == null or root.len > best.?.len)) best = root;
+    }
+    return best;
+}
+
+/// `file_path` as shown to the user: relative to the innermost of the workspace folders `roots`
+/// that contains it, otherwise the absolute path
+pub fn shownPath(vfs: *const Vfs, roots: []const []const u8, file_path: []const u8) []const u8 {
+    const root = vfs.rootOf(roots, file_path) orelse return file_path;
+    return std.mem.trimStart(u8, file_path[root.len..], "/\\");
+}
+
 /// Interns a path. The caller must ensure that `file_path` is absolute; the path is normalized
 /// (see `normalize`).
 pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {

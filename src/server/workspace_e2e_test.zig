@@ -1370,7 +1370,10 @@ test "files read by @embedFile are watched on disk by the server, or registered 
         const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
         try open(&h, main_uri, main_text);
         _ = try h.request("zig-analyzer/waitIdle", {});
-        try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "\"hi\"") != null);
+        try testing.expectEqualStrings(
+            "```zig\nconst greeting: *const [2:0]u8 = @embedFile(\"greeting.txt\")\n```\n\nEmbedded file `greeting.txt`: 2 bytes\n\n```text\nhi\n```",
+            try hoverText(&h, main_uri, 0, 7),
+        );
 
         const path = try project.path(a, "greeting.txt");
         try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = "hello" });
@@ -1393,9 +1396,9 @@ test "files read by @embedFile are watched on disk by the server, or registered 
             }
             try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, path), .type = 2 }} });
             _ = try h.request("zig-analyzer/waitIdle", {});
-            try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "\"hello\"") != null);
+            try testing.expect(std.mem.indexOf(u8, try hoverText(&h, main_uri, 0, 7), "```text\nhello\n```") != null);
         } else {
-            try waitWatched(&h, Hover{ .uri = main_uri, .line = 0, .character = 7, .want = "\"hello\"" });
+            try waitWatched(&h, Hover{ .uri = main_uri, .line = 0, .character = 7, .want = "```text\nhello\n```" });
         }
     }
 }

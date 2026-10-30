@@ -346,6 +346,15 @@ pub fn exprAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     return typedValueAlloc(r, tv);
 }
 
+/// Display of a value that is directly the result of `@embedFile(path)`: the type (in full) and
+/// the call instead of the content, `T = @embedFile("path")`
+pub fn embedAlloc(r: *Resolver, ty: Index, path: []const u8) error{OutOfMemory}![]const u8 {
+    var out: Io.Writer.Allocating = .init(r.arena);
+    writeFull(r, ty, &out.writer) catch return error.OutOfMemory;
+    out.writer.print(" = @embedFile(\"{f}\")", .{std.zig.fmtString(path)}) catch return error.OutOfMemory;
+    return out.written();
+}
+
 /// Tuples and anonymous structs whose fields are all comptime fields, when the value is known:
 /// the type is fully determined by the value (the type of `.{ A, B }` is
 /// `struct { comptime type = A, comptime type = B }`), so displaying the value suffices
@@ -363,9 +372,10 @@ fn valueDetermined(ip: *InternPool, tv: TypedValue) bool {
     return true;
 }
 
-/// Maximum number of characters of a displayed comptime value: a value such as a large binary
-/// `@embedFile` would otherwise make a hover of several megabytes. The cut is marked: `…` and the
-/// full number of items or bytes follow (`"ab…" (1048576 bytes total)`)
+/// Maximum number of characters of a displayed comptime value: a value such as a slice of a large
+/// binary `@embedFile` would otherwise make a hover of several megabytes. The cut is marked: `…`
+/// and the full number of items or bytes follow (`"ab…" (1048576 bytes total)`). Also the
+/// maximum number of characters of embedded text shown in hover.
 pub const max_value_length = 2000;
 
 /// The value known at comptime, at most about `max_value_length` characters (functions are not
