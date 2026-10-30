@@ -810,8 +810,7 @@ pub const TestOnlyFiles = struct {
         const all = try reach(&r, temp, roots.items, true);
         const live = try reach(&r, temp, roots.items, false);
         var out: std.ArrayList(FileId) = .empty;
-        var it = all.keyIterator();
-        while (it.next()) |file| if (!live.contains(file.*) and isZigSource(ctx.db.env.vfs.path(file.*))) try out.append(temp, file.*);
+        for (all.keys()) |file| if (!live.contains(file) and isZigSource(ctx.db.env.vfs.path(file))) try out.append(temp, file);
         std.mem.sort(FileId, out.items, {}, struct {
             fn less(_: void, x: FileId, y: FileId) bool {
                 return @backingInt(x) < @backingInt(y);
@@ -820,20 +819,19 @@ pub const TestOnlyFiles = struct {
         return gpa.dupe(FileId, out.items);
     }
 
-    /// Files reachable from `roots` via imports; when `with_tests` is false, imports used only
-    /// for tests are not followed
-    fn reach(r: *Resolver, temp: Allocator, roots: []const FileId, with_tests: bool) resolve.Error!std.AutoHashMapUnmanaged(FileId, void) {
-        var reached: std.AutoHashMapUnmanaged(FileId, void) = .empty;
-        var queue: std.ArrayList(FileId) = .empty;
-        for (roots) |root| if (!(try reached.getOrPut(temp, root)).found_existing) try queue.append(temp, root);
+    /// Files reachable from `roots` via imports, in breadth-first order starting with the roots;
+    /// when `with_tests` is false, imports used only for tests are not followed
+    fn reach(r: *Resolver, temp: Allocator, roots: []const FileId, with_tests: bool) resolve.Error!std.AutoArrayHashMapUnmanaged(FileId, void) {
+        var reached: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        for (roots) |root| try reached.put(temp, root, {});
         var i: usize = 0;
-        while (i < queue.items.len) : (i += 1) {
-            const file = queue.items[i];
+        while (i < reached.count()) : (i += 1) {
+            const file = reached.keys()[i];
             const sites = try r.ctx.get(ImportSites, file);
             for (sites.specs, sites.in_test) |spec, in_test| {
                 if (in_test and !with_tests) continue;
                 const target = try r.resolveImport(file, spec) orelse continue;
-                if (!(try reached.getOrPut(temp, target)).found_existing) try queue.append(temp, target);
+                try reached.put(temp, target, {});
             }
         }
         return reached;
@@ -1100,36 +1098,18 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
         const test_only = try r.ctx.get(TestOnlyFiles, {});
         const in_test = TestOnlyFiles.contains(test_only, file) or
             (if (builder.owner) |item| (try r.itemTree(file)).items[item].kind == .@"test" else false);
-        for (g.files) |entry| {
-            if (entry.file == file or entry.module == database.ModuleGraph.std_module) continue;
-            if (!in_test and TestOnlyFiles.contains(test_only, entry.file)) continue;
-            const path = r.ctx.db.env.vfs.path(entry.file);
-            if (!isZigSource(path)) continue;
-            const index = try r.ctx.get(FileDecls, entry.file);
-            const public = index.matchingPublic(prefix);
-            const basename = std.fs.path.basename(path);
-            const stem = basename[0 .. basename.len - ".zig".len];
-            const stem_score = try builder.matcher.score(stem);
-            if (public.len == 0 and stem_score == null) continue;
-            const spec = try importSpec(r, g, file, entry.file) orelse continue;
-            // A module root imported by its name is offered under that name, with its exports,
-            // above; its file name (often `root`) is no name for it
-            if (g.importTarget(file, spec) == entry.file) continue;
-            const ns: Namespace = .{ .file = entry.file, .container = 0 };
-            const aliased = try builder.namespaceAlias(ns) != null;
-            if (stem_score) |score| if (!aliased and try builder.visible(stem) == null)
-                try builder.push(.{ .score = score * import_weight, .parts = .{ stem, "" }, .what = .{ .module = .{ .name = stem, .kind = .file, .spec = spec, .target = entry.file } } });
-            if (aliased or public.len == 0) continue;
-            const targets = (try r.ctx.get(FileLinks, entry.file)).targets;
-            for (public) |p| {
-                const decl = &index.decls[p.decl];
-                const target = targets[p.decl];
-                const parts: Parts = .{ stem, p.path };
-                const score = try builder.byNameScore(parts);
-                if (try builder.reuse(target, decl.name, decl.kind, decl.doc, score, parts)) continue;
-                if (builder.reused.contains(target)) continue;
-                try builder.push(.{ .score = score * import_weight, .parts = parts, .what = .{ .import = .{ .name = decl.name, .kind = decl.kind, .is_extern = decl.is_extern, .spec = spec, .path = p.path, .doc = decl.doc, .target = .{ .decl = .{ .file = entry.file, .item = decl.item } } } } });
+        if (g.entry(file) != null) {
+            for (g.files) |entry| {
+                if (entry.file == file or entry.module == database.ModuleGraph.std_module) continue;
+                if (!in_test and TestOnlyFiles.contains(test_only, entry.file)) continue;
+                try builder.projectFile(g, entry.file);
             }
+        } else if (!inStd(r, g, file)) {
+            // A file in no module (a single-file root, or a build script while the build graph
+            // lacks it) is the root of its own module, made of the files it reaches through
+            // relative imports (outside test code, only through imports not used only by tests)
+            const reached = try TestOnlyFiles.reach(r, r.arena, &.{file}, in_test);
+            for (reached.keys()) |target| if (target != file) try builder.projectFile(g, target);
         }
     }
     std.mem.sort(Found, builder.found.items, {}, foundLess);
@@ -1310,6 +1290,37 @@ const Builder = struct {
         if (try b.reuse(decl.target, decl.name, decl.kind, decl.doc, score, parts)) return;
         if (b.reused.contains(decl.target)) return;
         try b.push(.{ .score = score * import_weight, .parts = parts, .what = .{ .import = .{ .name = decl.name, .kind = decl.kind, .is_extern = decl.is_extern, .spec = spec, .path = decl.path, .doc = decl.doc, .target = .{ .decl = .{ .file = decl.file, .item = decl.item } } } } });
+    }
+    /// The project file `file` and its public declarations, imported by relative path
+    fn projectFile(b: *Builder, g: *const database.ModuleGraph, file: FileId) resolve.Error!void {
+        const r = b.r;
+        const path = r.ctx.db.env.vfs.path(file);
+        if (!isZigSource(path)) return;
+        const index = try r.ctx.get(FileDecls, file);
+        const public = index.matchingPublic(b.prefix);
+        const basename = std.fs.path.basename(path);
+        const stem = basename[0 .. basename.len - ".zig".len];
+        const stem_score = try b.matcher.score(stem);
+        if (public.len == 0 and stem_score == null) return;
+        const spec = try importSpec(r, g, b.file, file) orelse return;
+        // A module root imported by its name is offered under that name, with its exports,
+        // above; its file name (often `root`) is no name for it
+        if (g.importTarget(b.file, spec) == file) return;
+        const ns: Namespace = .{ .file = file, .container = 0 };
+        const aliased = try b.namespaceAlias(ns) != null;
+        if (stem_score) |score| if (!aliased and try b.visible(stem) == null)
+            try b.push(.{ .score = score * import_weight, .parts = .{ stem, "" }, .what = .{ .module = .{ .name = stem, .kind = .file, .spec = spec, .target = file } } });
+        if (aliased or public.len == 0) return;
+        const targets = (try r.ctx.get(FileLinks, file)).targets;
+        for (public) |p| {
+            const decl = &index.decls[p.decl];
+            const target = targets[p.decl];
+            const parts: Parts = .{ stem, p.path };
+            const score = try b.byNameScore(parts);
+            if (try b.reuse(target, decl.name, decl.kind, decl.doc, score, parts)) continue;
+            if (b.reused.contains(target)) continue;
+            try b.push(.{ .score = score * import_weight, .parts = parts, .what = .{ .import = .{ .name = decl.name, .kind = decl.kind, .is_extern = decl.is_extern, .spec = spec, .path = p.path, .doc = decl.doc, .target = .{ .decl = .{ .file = file, .item = decl.item } } } } });
+        }
     }
     /// The match score of the path multiplied by the depth factor; null when it does not match.
     /// With `by_name`, the candidate has already matched by name prefix, and when its path does not
@@ -1507,14 +1518,25 @@ fn byteAt(parts: [3][]const u8, k: usize) ?u8 {
     return null;
 }
 
+/// The file is in the standard library of its compilation
+fn inStd(r: *Resolver, graph: *const database.ModuleGraph, file: FileId) bool {
+    const vfs = r.ctx.db.env.vfs;
+    const root = graph.contextImport(file, graph.home(file), "std") orelse return false;
+    const dir = std.fs.path.dirname(vfs.path(root)) orelse return false;
+    return vfs.isUnder(vfs.path(file), dir);
+}
+
 fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, target: FileId) resolve.Error!?[]const u8 {
     for ([_][]const u8{ "std", "builtin" }) |name| if (graph.importTarget(from, name) == target) return name;
     for (try graph.importNames(r.arena, from)) |name| if (graph.importTarget(from, name) == target) return try r.arena.dupe(u8, name);
-    const src = graph.entry(from) orelse return null;
-    const dst = graph.entry(target) orelse return null;
-    if (src.module != dst.module or src.module == database.ModuleGraph.std_module) return null;
-    const root = graph.modules[src.module].root orelse return null;
     const vfs = r.ctx.db.env.vfs;
+    // A file in no module (a single-file root, or a build script while the build graph lacks it)
+    // is the root of its own module
+    const root = if (graph.entry(from)) |src| blk: {
+        const dst = graph.entry(target) orelse return null;
+        if (src.module != dst.module or src.module == database.ModuleGraph.std_module) return null;
+        break :blk graph.modules[src.module].root orelse return null;
+    } else from;
     const root_dir = std.fs.path.dirname(vfs.path(root)) orelse return null;
     const target_path = vfs.path(target);
     if (!vfs.isUnder(vfs.path(from), root_dir) or !vfs.isUnder(target_path, root_dir)) return null;

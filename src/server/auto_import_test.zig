@@ -757,3 +757,77 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     try testing.expect(!isIncomplete(unlimited));
     _ = try h.request("shutdown", {});
 }
+
+/// The text of the import edit of the candidate labeled `label` that adds an import
+fn importEdit(response: std.json.Value, label: []const u8) ?[]const u8 {
+    for (completionItems(response)) |item| {
+        if (!std.mem.eql(u8, item.object.get("label").?.string, label)) continue;
+        const edits = item.object.get("additionalTextEdits") orelse continue;
+        return edits.array.items[0].object.get("newText").?.string;
+    }
+    return null;
+}
+
+/// Opens `path` with `text` in a project without a build graph and completes at the end of
+/// `needle` once the auto-import index is built
+fn completeOpened(h: *Harness, project: *const fixture.Project, path: []const u8, text: []const u8, needle: []const u8) !std.json.Value {
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = Empty{},
+        .initializationOptions = .{
+            .completion = .{ .auto_import = true },
+            .diagnostics = .{ .compiler = false, .inactive_code = false },
+            .files = .{ .watcher = "client" },
+        },
+    });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(a, try project.path(a, path));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = try position(text, needle, @intCast(needle.len), .utf16);
+    try startAutoImport(h, uri, at);
+    return h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
+}
+
+test "auto-import offers declarations of files reached from a single-file root" {
+    // A file in no module was offered no declarations of the files it imports.
+    const main = "const a = @import(\"a.zig\");\npub fn main() void {\n    _ = a;\n    _ = bFu;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main },
+        .{ .path = "a.zig", .text = "const b = @import(\"lib/b.zig\");\npub fn aFunc() u32 {\n    return b.bFunc();\n}\n" },
+        .{ .path = "lib/b.zig", .text = "pub fn bFunc() u32 {\n    return 1;\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const response = try completeOpened(&h, &project, "main.zig", main, "bFu");
+    try testing.expectEqualStrings("const bFunc = @import(\"lib/b.zig\").bFunc;\n", importEdit(response, "bFunc") orelse return error.MissingSiblingImport);
+    _ = try h.request("shutdown", {});
+}
+
+test "auto-import offers declarations of files reached from build.zig" {
+    // While build.zig failed to configure, it was offered no declarations of the files it reaches.
+    const build =
+        \\const std = @import("std");
+        \\const steps = @import("build/steps.zig");
+        \\pub fn build(b: *std.Build) void {
+        \\    steps.add(b);
+        \\    _ = tool_na;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = build },
+        .{ .path = "build/steps.zig", .text = "const std = @import(\"std\");\nconst tools = @import(\"tools.zig\");\npub fn add(b: *std.Build) void {\n    _ = b.step(tools.tool_name, \"\");\n}\n" },
+        .{ .path = "build/tools.zig", .text = "pub const tool_name = \"tool\";\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const response = try completeOpened(&h, &project, "build.zig", build, "tool_na");
+    try testing.expectEqualStrings("const tool_name = @import(\"build/tools.zig\").tool_name;\n", importEdit(response, "tool_name") orelse return error.MissingBuildScriptImport);
+    _ = try h.request("shutdown", {});
+}
