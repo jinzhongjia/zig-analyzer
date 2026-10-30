@@ -1712,6 +1712,72 @@ test "deep dependency chains neither overflow nor pollute shallower results" {
     try testing.expectEqualStrings("u32 = 2", try typeAt(&w, f.file, src.items, "b1", 0));
 }
 
+test "comptime vars modified through pointers, methods, fields and elements are not stale" {
+    // Prevents keeping the initial value of a `comptime var` after writes other than `v = x`
+    try expectTypes(
+        \\fn bump(comptime p: *comptime_int) void {
+        \\    p.* += 1;
+        \\}
+        \\fn advance(p: *u32, n: u32) void {
+        \\    p.* += n;
+        \\}
+        \\const A = struct { a_field: u8 };
+        \\const B = struct { b_field: u16 };
+        \\const State = struct {
+        \\    s: enum { a, b } = .a,
+        \\    fn step(self: *State) void {
+        \\        self.s = .b;
+        \\    }
+        \\};
+        \\const S = struct { n: u32 = 0 };
+        \\const c_s: S = .{};
+        \\const c_a: [2]u32 = .{ 0, 0 };
+        \\export fn entry() u32 {
+        \\    comptime var m = 0;
+        \\    comptime bump(&m);
+        \\    const m_v = m;
+        \\    const T = if (m == 0) A else B;
+        \\    comptime var k = 10;
+        \\    const p = comptime &k;
+        \\    p.* = 20;
+        \\    const k_v = k;
+        \\    comptime var st: State = .{};
+        \\    comptime st.step();
+        \\    const st_v = st.s;
+        \\    comptime var s = c_s;
+        \\    s.n = 5;
+        \\    const s_v = s.n;
+        \\    comptime var a = c_a;
+        \\    a[1] = 5;
+        \\    const a_v = a[1];
+        \\    comptime var params = [_]u8{ 1, 2 };
+        \\    inline for (&params) |*q| q.* ^= 0xff;
+        \\    const params_v = params[0];
+        \\    comptime var i: u32 = 0;
+        \\    inline while (i < 3) {
+        \\        comptime advance(&i, 1);
+        \\    }
+        \\    const i_v = i;
+        \\    comptime var d = 1;
+        \\    d += 1;
+        \\    const d_v = d;
+        \\    _ = .{ m_v, T, k_v, st_v, s_v, a_v, params_v, i_v, d_v };
+        \\    return 0;
+        \\}
+    , &.{
+        .{ "m_v", "comptime_int" },
+        .{ "T", "type" },
+        .{ "k_v", "comptime_int" },
+        .{ "st_v", "enum { a, b }" },
+        .{ "s_v", "u32" },
+        .{ "a_v", "u32" },
+        .{ "params_v", "u8" },
+        .{ "i_v", "u32" },
+        // Direct modifications are still tracked
+        .{ "d_v", "comptime_int = 2" },
+    });
+}
+
 test "comptime evaluation runs loops, mutation and calls" {
     try expectTypes(
         \\fn double(n: usize) usize { return n * 2; }

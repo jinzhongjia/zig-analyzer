@@ -600,6 +600,7 @@ const Inferrer = struct {
         }
         const want = if (inf.zon) try inf.zonExpected(e, expected) else expected;
         const raw = try inf.inferInner(e, want);
+        if (inf.var_levels.len != 0) if (try inf.indirectlyModifiedVar(inf.body.expr(e))) |v| inf.untrackComptimeVar(v);
         const tv = try inf.coerce(raw, want);
         inf.exprs[i] = tv;
         // Enum literals coerced to an enum / union (`.red`, `.a =>` in a `switch`) refer to the
@@ -2200,6 +2201,46 @@ const Inferrer = struct {
         return if (binding.kind == .local_var and binding.is_comptime) l.binding else null;
     }
 
+    /// The `comptime var` of this member whose storage place `e` lies in: the variable itself, or
+    /// a field or element of it (`v`, `v.f`, `v[i]`)
+    fn comptimeVarPlace(inf: *Inferrer, e: ExprId) Error!?Body.BindingId {
+        var cur = e;
+        while (true) switch (inf.body.expr(cur)) {
+            .field_access => |fa| cur = fa.lhs,
+            .index => |x| cur = x.lhs,
+            .@"comptime" => |x| cur = x,
+            else => return inf.comptimeVarOf(cur),
+        };
+    }
+
+    /// The `comptime var` that expression `x` can modify other than by assigning to the
+    /// variable itself (`v = a`, `v += a`): an assignment to a field or element of it, its
+    /// address (`&v`, which a callee or a pointer capture can write through), a method call on it
+    /// (a `*Self` receiver takes its address), or a pointer capture of its payload
+    fn indirectlyModifiedVar(inf: *Inferrer, x: Body.Expr) Error!?Body.BindingId {
+        const b = inf.body;
+        const place = switch (x) {
+            .assign => |a| if (b.expr(a.lhs) == .name_ref) return null else a.lhs,
+            .prefix => |p| if (p.op == .ampersand) p.operand else return null,
+            .call => |c| switch (b.expr(c.callee)) {
+                .field_access => |fa| fa.lhs,
+                else => return null,
+            },
+            .@"if" => |i| if (i.capture.len > 0 and b.binding(i.capture[0]).is_ptr) i.cond else return null,
+            else => return null,
+        };
+        return inf.comptimeVarPlace(place);
+    }
+
+    /// A `comptime var` that may be modified through a pointer or a part of it: its value is
+    /// unknown from here on, also after later direct assignments (a pointer to it may still
+    /// write)
+    fn untrackComptimeVar(inf: *Inferrer, b: Body.BindingId) void {
+        if (inf.dead > 0) return;
+        inf.bindings[@backingInt(b)].val = null;
+        if (@backingInt(b) < inf.var_levels.len) inf.var_levels[@backingInt(b)] = std.math.maxInt(u32);
+    }
+
     /// Assignment to a `comptime var`: under control flow as determined as at its declaration (see
     /// `uncertain`), the assignment updates its value; otherwise the value becomes unknown
     fn assignComptimeVar(inf: *Inferrer, b: Body.BindingId, op: SyntaxKind, rhs: TypedValue) Error!void {
@@ -2254,11 +2295,8 @@ const Inferrer = struct {
         var any = false;
         for (b.exprs, b.expr_ranges) |x, rg| {
             if (rg.start < range.start or rg.end > range.end) continue;
-            const a = switch (x) {
-                .assign => |a| a,
-                else => continue,
-            };
-            const v = try inf.comptimeVarOf(a.lhs) orelse continue;
+            const v = (if (x == .assign) try inf.comptimeVarOf(x.assign.lhs) else null) orelse
+                try inf.indirectlyModifiedVar(x) orelse continue;
             if (range.contains(b.binding(v).range.start)) continue;
             any = true;
             const list = out orelse return true;
@@ -2399,6 +2437,7 @@ const Inferrer = struct {
         };
         const cap = caps[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
+        if (is_ptr and inf.var_levels.len != 0) if (try inf.comptimeVarPlace(cond_e)) |v| inf.untrackComptimeVar(v);
         // A known non-null optional value is its payload value
         const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) cond_tv.val else null;
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
@@ -2458,6 +2497,7 @@ const Inferrer = struct {
             else => {},
         };
         const is_ptr = inf.body.binding(cap).is_ptr;
+        if (is_ptr and inf.var_levels.len != 0) if (try inf.comptimeVarPlace(operand_e)) |v| inf.untrackComptimeVar(v);
         // Inferring for one value of an inline prong (see `LoopSeed`): the capture takes the value
         // of this prong item
         if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
