@@ -1,7 +1,7 @@
 //! Compile set: all files the compiler runs AstGen on, i.e. the files reachable from the root
 //! module of each compile step and from the standard library root file along `@import`s
-//! (including imports in functions that are not analyzed). Live diagnostics are published only for
-//! the files in it.
+//! (including imports in functions that are not analyzed). It determines the modules files belong
+//! to and, together with the module directories, which files get live diagnostics.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

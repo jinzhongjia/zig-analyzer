@@ -355,8 +355,12 @@ fn finishLoading(ws: *Workspace) void {
     ws.server.reconcileSingle();
 }
 
-/// Whether to publish live diagnostics: yes before the compile set is computed; afterwards only
-/// for files in the set and build scripts (matches the compiler)
+/// Whether to publish live diagnostics: yes before the compile set is computed; afterwards for
+/// build scripts, files reachable from any compile step, and files under the directory of a
+/// module's root file. A relative `@import` cannot leave the directory of its module's root file,
+/// so a file outside all of them is never compiled with the project; a file inside one is compiled
+/// once it is imported, so files not imported yet and files only tests compile get syntax and
+/// AstGen errors while they are edited.
 pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -365,7 +369,15 @@ pub fn liveEligible(ws: *Workspace, file: FileId) bool {
     // The build graph compiles nothing: treat an empty set as not yet computed, so that not every
     // file loses live diagnostics
     if (set.files.count() == 0) return true;
-    return set.contains(file);
+    if (set.contains(file)) return true;
+    if (ws.resolve_set) |*s| if (s.contains(file)) return true;
+    const model = &(ws.model orelse return false);
+    const path = ws.server.vfs.path(file);
+    for (model.modules) |m| {
+        const dir = std.fs.path.dirname(m.root_file orelse continue) orelse continue;
+        if (ws.server.vfs.isUnder(path, dir)) return true;
+    }
+    return false;
 }
 
 /// Whether this project takes part in the module graph: it has a model and a compile set (see

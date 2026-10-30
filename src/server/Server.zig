@@ -3845,8 +3845,8 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     const document_uri = try server.uriFor(arena, file);
     const text = try ctx.get(FileText, file);
 
-    // Live diagnostics: the file is loaded, and (it belongs to no project, or the compile set has
-    // not been computed yet, or it is in the compile set)
+    // Live diagnostics: the file is loaded, and it belongs to no project or one of its projects
+    // wants them (see `Workspace.liveEligible`)
     var live_result: ?*live.Result = null;
     if (text != null and server.liveEligible(file)) live_result = try ctx.get(live.AstCheck, file);
 

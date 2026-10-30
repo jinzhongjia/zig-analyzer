@@ -331,7 +331,7 @@ pub const MergeInput = struct {
     lines: offsets.LineIndex,
     encoding: offsets.Encoding,
     uri: []const u8,
-    /// Live diagnostics; null when the file is not in the compile set
+    /// Live diagnostics; null when the file gets none (see `Workspace.liveEligible`)
     live: ?*const live.Result,
     /// Compiler diagnostics of this file from the latest build
     compiler: ?*const FileResult,

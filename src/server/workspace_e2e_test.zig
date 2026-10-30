@@ -766,6 +766,51 @@ test "a new @import adds the file to the compile set without a build" {
     try h.notify("exit", {});
 }
 
+test "live diagnostics for files of module directories outside the diagnostics compile set" {
+    // util.zig is imported nowhere yet and parser_test.zig is compiled only by the test step: both
+    // must still get their syntax and AstGen errors. tools/gen.zig is outside every module
+    // directory, can never be compiled with the project, and gets none.
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\    const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("test/root.zig"), .target = b.graph.host }) });
+        \\    b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "test/root.zig", .text = "test {\n    _ = @import(\"parser_test.zig\");\n}\n" },
+        .{ .path = "test/parser_test.zig", .text = "test \"parse\" {}\n" },
+        .{ .path = "tools/gen.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "src/util.zig")), "pub fn add(a: u32, b: u32) u32 {\n    return a + ;\n}\n");
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "test/parser_test.zig")), "const std = @import(\"std\");\ntest \"parse\" {\n    const unused = 1;\n    try std.testing.expect(true);\n}\n");
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "tools/gen.zig")), "pub fn main() void {\n    const unused = 1;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const diags = try h.diagnostics();
+    const util = diags.get("util.zig").?;
+    try testing.expectEqual(1, util.len);
+    try testing.expect(std.mem.startsWith(u8, util[0], "1:15 ") and std.mem.endsWith(u8, util[0], "expected expression, found ';'"));
+    const parser_test = diags.get("parser_test.zig").?;
+    try testing.expectEqual(1, parser_test.len);
+    try testing.expect(std.mem.startsWith(u8, parser_test[0], "2:10 ") and std.mem.endsWith(u8, parser_test[0], "unused local constant"));
+    try testing.expectEqual(0, diags.get("gen.zig").?.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a project whose background task cannot be started does not leave the server busy" {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
