@@ -120,6 +120,44 @@ test "discard keeps the trailing comment of the line it follows" {
     );
 }
 
+test "discard takes the address of errors and variables" {
+    // `_ = err;` fails with `error set is discarded`, `_ = r;` of an error union with `error union
+    // is discarded`, and `_ = x;` of a `var` with `local variable is never mutated`
+    const g = "fn g(x: u32) !u32 {\n    if (x == 0) return error.Zero;\n    return x;\n}\n";
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{
+            g ++ "fn f(x: u32) u32 {\n    return g(x) catch |<|>err| {\n        return 7;\n    };\n}\n",
+            "discard `err`",
+            g ++ "fn f(x: u32) u32 {\n    return g(x) catch |err| {\n        _ = &err;\n        return 7;\n    };\n}\n",
+        },
+        .{
+            g ++ "fn f(x: u32) u32 {\n    if (g(x)) |v| {\n        return v;\n    } else |<|>err| {\n        return 7;\n    }\n}\n",
+            "discard `err`",
+            g ++ "fn f(x: u32) u32 {\n    if (g(x)) |v| {\n        return v;\n    } else |err| {\n        _ = &err;\n        return 7;\n    }\n}\n",
+        },
+        .{
+            "fn f(<|>e: anyerror) u32 {\n    return 1;\n}\n",
+            "discard `e`",
+            "fn f(e: anyerror) u32 {\n    _ = &e;\n    return 1;\n}\n",
+        },
+        .{
+            g ++ "fn f() void {\n    const <|>r = g(1);\n}\n",
+            "discard `r`",
+            g ++ "fn f() void {\n    const r = g(1);\n    _ = &r;\n}\n",
+        },
+        .{
+            "fn f() void {\n    var <|>x: u32 = 0;\n}\n",
+            "discard `x`",
+            "fn f() void {\n    var x: u32 = 0;\n    _ = &x;\n}\n",
+        },
+    };
+    for (cases) |c| {
+        const got = try apply(c[0], c[1]);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[2], got);
+    }
+}
+
 /// AstGen (same as `zig ast-check`) reports no errors
 fn expectAstCheckClean(source: []const u8) !void {
     const z = try testing.allocator.dupeSentinel(u8, source, 0);

@@ -1,5 +1,6 @@
 //! Quick fixes for textDocument/codeAction:
-//! - Unused local names (AstGen's `unused ...` diagnostics): insert `_ = name;`
+//! - Unused local names (AstGen's `unused ...` diagnostics): insert `_ = name;` (`_ = &name;` for
+//!   a `var`, an error set, or an error union)
 //! - Unused function parameters: alternatively, remove the parameter and the argument at each
 //!   call site (across files; see `remove_param.zig`)
 //! - Unused captures: alternatively, remove the capture or rename it to `_` (see
@@ -555,7 +556,9 @@ fn isPlainType(ip: *InternPool, t: Index) bool {
 
 /// Inserts `_ = name;` after the local binding whose name is at `offset` (after the statement of a
 /// local variable, or at the start of the block that a parameter or capture belongs to), and after
-/// the `//` comment that ends that line
+/// the `//` comment that ends that line. A `var`, an error set, and an error union are discarded
+/// by address (`_ = &name;`): Sema rejects discarding errors, and a discard does not count as a
+/// mutation of a `var`.
 fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Edit {
     const def = try definition.defAt(r, file, offset) orelse return null;
     const l = switch (def) {
@@ -565,7 +568,8 @@ fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Er
     const b = try r.body(file, l.item);
     const base = (try r.itemNode(file, l.item) orelse return null).offset;
     const binding = b.binding(l.binding);
-    const line = try std.fmt.allocPrint(r.arena, "_ = {s};", .{text[offset .. offset + tokenLen(text, offset)]});
+    const by_address = binding.kind == .local_var or try isError(r, file, l.item, b, l.binding);
+    const line = try std.fmt.allocPrint(r.arena, "_ = {s}{s};", .{ if (by_address) "&" else "", text[offset .. offset + tokenLen(text, offset)] });
     switch (binding.kind) {
         .local_const, .local_var => {
             const s = localStmt(b, l.binding) orelse return null;
@@ -575,6 +579,17 @@ fn discard(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Er
         .param => return blockStart(r, text, base, b, b.value orelse return null, line),
         .capture => return blockStart(r, text, base, b, captureBody(b, l.binding) orelse return null, line),
     }
+}
+
+/// The binding's type is an error set or an error union
+fn isError(r: *Resolver, file: FileId, item: u32, b: *const Body, id: Body.BindingId) resolve.Error!bool {
+    const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, item), .mode = .full });
+    if (res.bindings.len != b.bindings.len) return false;
+    return switch (r.ctx.db.env.ip.key(res.bindings[@backingInt(id)].ty)) {
+        .error_set_type, .inferred_error_set, .error_union_type => true,
+        .simple_type => |s| s == .anyerror,
+        else => false,
+    };
 }
 
 /// Changes the never-mutated local `var` whose name is at `offset` to `const`, replacing only the
