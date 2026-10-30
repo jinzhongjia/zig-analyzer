@@ -781,6 +781,42 @@ test "a request whose task starts after a later edit is not answered on the edit
     try h.notify("exit", {});
 }
 
+test "exit and the end of input cancel the requests in flight instead of waiting for them" {
+    // Guards against the process outliving `exit` (or the end of its input) until the requests in
+    // flight have computed their results, which nobody reads anymore
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    for ([_]enum { exit, end_of_input }{ .exit, .end_of_input }) |ending| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        _ = try h.request("initialize", .{ .capabilities = Empty{} });
+        try h.notify("initialized", Empty{});
+        const uri = "untitled:Untitled-5";
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const a: u32 = 1;\n" } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+
+        // The request stays at the gate until it is canceled
+        var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
+        h.server.test_gate = &gate;
+        defer h.server.test_gate = null;
+        defer gate.release.set(testing.io);
+        const held = try h.send("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = uri } });
+        try gate.entered.wait(testing.io);
+        switch (ending) {
+            .exit => try h.notify("exit", {}),
+            .end_of_input => h.input.close(),
+        }
+        // The main loop returns, and the output is closed with it
+        while (true) _ = h.next() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try testing.expectEqual(-32800, errorCode(try h.response(held)));
+        try testing.expectEqual(1, h.exit_code);
+    }
+}
+
 test "function completions carry no signature in the list and resolve to the signature and doc" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

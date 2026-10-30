@@ -399,9 +399,10 @@ pub fn deinit(server: *Server) void {
 }
 
 /// Runs the main loop until `exit` is received or the input ends, and returns the process exit
-/// code. Before returning, stops the build system processes of all projects and waits for the
-/// scheduled background tasks (diagnostic publishing, etc.) to finish. If the input ends without
-/// an `exit`, the client has already exited: its replies to server requests are no longer awaited.
+/// code. Before returning, cancels the read requests in flight (nobody reads their results
+/// anymore), stops the build system processes of all projects, and waits for the scheduled
+/// background tasks (diagnostic publishing, etc.) to finish. If the input ends without an `exit`,
+/// the client has already exited: its replies to server requests are no longer awaited.
 pub fn run(server: *Server, reader: *Io.Reader) !u8 {
     var exited = false;
     while (true) {
@@ -424,6 +425,7 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
             break;
         }
     }
+    server.cancelAllPending();
     server.group.await(server.io) catch {};
     if (!exited) server.abandonConfigRequests();
     server.stopWorkspaces();
@@ -1405,6 +1407,12 @@ fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     for (server.pending.items) |p| {
         if (p.id.eql(id)) p.cancel.store(true, .release);
     }
+}
+
+fn cancelAllPending(server: *Server) void {
+    server.pending_mutex.lockUncancelable(server.io);
+    defer server.pending_mutex.unlock(server.io);
+    for (server.pending.items) |p| p.cancel.store(true, .release);
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
