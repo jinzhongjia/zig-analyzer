@@ -82,8 +82,9 @@ pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error
     return allTargets(r, file, offset, false);
 }
 
-/// The result of `find` followed by the definitions of `instanceDefs`, each definition followed
-/// by its module alternatives, as targets (through aliases with `follow_alias`), each target once
+/// The result of `find` followed by the definitions of `instanceDefs` and `importedMemberDefs`,
+/// each definition followed by its module alternatives, as targets (through aliases with
+/// `follow_alias`), each target once
 fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resolve.Error![]const Target {
     var out: std.ArrayList(Target) = .empty;
     var defs: std.ArrayList(Def) = .empty;
@@ -92,6 +93,7 @@ fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resol
         .def => |def| try defs.append(r.arena, def),
     };
     try defs.appendSlice(r.arena, try instanceDefs(r, file, offset));
+    try defs.appendSlice(r.arena, try importedMemberDefs(r, file, offset));
     for (defs.items) |def| {
         const alternatives = try r.moduleAlternatives(file, def);
         for (0..alternatives.len + 1) |i| {
@@ -106,6 +108,23 @@ fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resol
 fn appendNew(r: *Resolver, out: *std.ArrayList(Target), t: Target) resolve.Error!void {
     for (out.items) |x| if (std.meta.eql(x, t)) return;
     try out.append(r.arena, t);
+}
+
+/// The definitions of a member access at the cursor through an import that only navigation
+/// resolves, one per target (see `Resolver.unresolvedImportMembers`)
+fn importedMemberDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Def {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const item = try r.ownerAt(file, tok.offset, false) orelse return &.{};
+    const node = try r.itemNode(file, item) orelse return &.{};
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const fa = switch (b.expr(b.exprAt(rel) orelse return &.{})) {
+        .field_access => |x| x,
+        else => return &.{},
+    };
+    if (rel < b.range(fa.lhs).end) return &.{};
+    return r.unresolvedImportMembers(file, item, b, fa.lhs, fa.field orelse return &.{});
 }
 
 /// The definitions that a member name at the cursor whose target comes from inference (a field or
@@ -1119,7 +1138,10 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
                 if (try r.memberDef(ns, fa.field orelse return null)) |def| return def;
             }
             // Via the type: fields, methods
-            return memberViaTypes(r, file, tok.offset, e);
+            if (try memberViaTypes(r, file, tok.offset, e)) |def| return def;
+            // Through an import that only navigation resolves (`root.marker` in single-file mode)
+            const imported = try r.unresolvedImportMembers(file, item, b, fa.lhs, fa.field orelse return null);
+            return if (imported.len > 0) imported[0] else null;
         },
         // Decl literal (`.init(...)`, `.empty`)
         .enum_literal => return memberViaTypes(r, file, tok.offset, e),

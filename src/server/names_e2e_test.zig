@@ -629,3 +629,39 @@ test "type layouts follow the project's target and are recomputed when it change
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "single-file mode: @import(\"root\") is the file itself for goto, references and rename" {
+    // Prevents an empty goto on `root.marker` and a rename that misses it and breaks the build
+    const text =
+        \\const std = @import("std");
+        \\const root = @import("root");
+        \\pub const marker = 1;
+        \\pub fn main() void {
+        \\    std.debug.print("{}\n", .{root.marker});
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "solo.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "solo.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    try testing.expectEqualStrings("solo.zig:0", try gotoAt(&h, uri, text, "\"root\""));
+    try testing.expectEqualStrings("solo.zig:2", try gotoAt(&h, uri, text, "marker})"));
+    const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, "marker ="), .context = .{ .includeDeclaration = true } });
+    var lines: std.ArrayList(i64) = .empty;
+    for (refs.object.get("result").?.array.items) |loc| try lines.append(h.arena.allocator(), loc.object.get("range").?.object.get("start").?.object.get("line").?.integer);
+    try testing.expectEqualSlices(i64, &.{ 2, 4 }, lines.items);
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, "marker ="), .newName = "flag" });
+    const changes = renamed.object.get("result").?.object.get("changes").?.object.get(uri).?.array.items;
+    try testing.expectEqual(2, changes.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

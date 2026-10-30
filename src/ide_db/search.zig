@@ -563,7 +563,8 @@ const Finder = struct {
                     // Either way, a namespace chosen per build configuration has the member of
                     // each choice
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
-                    const current: Target = if (ns_def) |d| try f.matches(file, d, at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    var current: Target = if (ns_def) |d| try f.matches(file, d, at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    if (current == .unknown) current = try f.importedMember(file, item_index, body, fa.lhs, at);
                     const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
                     switch (target) {
                         .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
@@ -636,6 +637,25 @@ const Finder = struct {
         };
         if (decl != .item) return &.{};
         return infer.declAlternatives(r, r.arena, decl);
+    }
+
+    /// Whether the member `f.name` of `lhs` is `def` through an import that only navigation
+    /// resolves (see `Resolver.unresolvedImportMembers`): `unknown` when there is no such import;
+    /// ambiguous (`at`) when the targets have different members
+    fn importedMember(f: *Finder, file: FileId, item_index: u32, body: *const Body, lhs: Body.ExprId, at: Reference) resolve.Error!Target {
+        const defs = try f.r.unresolvedImportMembers(file, item_index, body, lhs, f.name);
+        if (defs.len == 0) return .unknown;
+        var hit = false;
+        var miss = false;
+        for (defs) |d| if (deepEql(d, f.def)) {
+            hit = true;
+        } else {
+            miss = true;
+        };
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
+        };
+        return if (hit) .hit else .miss;
     }
 
     /// Whether `d`, which a use in `file` resolves to, is `def` in some module of `file`: `def`

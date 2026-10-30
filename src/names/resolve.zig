@@ -328,16 +328,89 @@ pub const Resolver = struct {
 
     /// All targets of `@import(name)` in a file: there are several when the modules the file
     /// belongs to import different modules as `name`, ordered by module priority, the first one
-    /// being the result of `resolveImport`; a relative path has at most one. Reads the module graph
-    /// directly, without `FileImports` cutting off other changes; meant for requests such as goto,
-    /// and must not be used in inference.
+    /// being the result of `resolveImport`; a relative path has at most one. `@import("root")` in
+    /// a file outside the module graph, which name resolution leaves unknown, has the files that
+    /// may be compiled as its root (see `singleFileRoots`). Reads the module graph directly,
+    /// without `FileImports` cutting off other changes; meant for requests such as goto, and must
+    /// not be used in inference.
     pub fn resolveImportTargets(r: *Resolver, file: FileId, name: []const u8) Error![]const FileId {
         if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
             const target = try r.resolveImport(file, name) orelse return &.{};
             return r.arena.dupe(FileId, &.{target});
         }
         const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
-        return graph.importTargets(r.arena, file, name);
+        const targets = try graph.importTargets(r.arena, file, name);
+        if (targets.len == 0 and std.mem.eql(u8, name, "root") and graph.entry(file) == null) return r.singleFileRoots(graph, file);
+        return targets;
+    }
+
+    /// The files that may be the root module of `file`, a file outside the module graph: such a
+    /// file is compiled on its own as the root module (single-file mode compiles it with
+    /// `zig build-obj`; `zig run` does the same), or imported through relative paths by a file
+    /// compiled so. These are the files outside the module graph (among the user's source files)
+    /// that reach `file` through relative imports and that no such file imports; `file` itself
+    /// when there is none. `zig test` makes the test runner the root instead, so inference keeps
+    /// `@import("root")` unknown there.
+    fn singleFileRoots(r: *Resolver, graph: *const ModuleGraph, file: FileId) Error![]const FileId {
+        // The files outside the module graph, with the files among them importing each
+        var importers: std.AutoArrayHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
+        try importers.put(r.arena, file, .empty);
+        for (try r.ctx.get(database.inputs.WorkspaceFiles, {})) |f| {
+            if (graph.entry(f) == null) try importers.put(r.arena, f, .empty);
+        }
+        for (importers.keys()) |f| for ((try r.ctx.get(FileIndex.Query, f)).imports) |s| {
+            if (!std.mem.endsWith(u8, s, ".zig")) continue;
+            const to = importers.getPtr(try r.resolveImport(f, s) orelse continue) orelse continue;
+            try to.append(r.arena, f);
+        };
+        var reached: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        try reached.put(r.arena, file, {});
+        var roots: std.ArrayList(FileId) = .empty;
+        var i: usize = 0;
+        while (i < reached.count()) : (i += 1) {
+            const f = reached.keys()[i];
+            const from = importers.get(f).?;
+            if (from.items.len == 0) try roots.append(r.arena, f);
+            for (from.items) |x| try reached.put(r.arena, x, {});
+        }
+        if (roots.items.len == 0) try roots.append(r.arena, file);
+        return roots.items;
+    }
+
+    /// The members `name` of `lhs` (an expression in `b`, the body of member `item` in `file`)
+    /// when `lhs` names an `@import` (directly or through constants) that name resolution leaves
+    /// unresolved but `resolveImportTargets` resolves (`@import("root")` in a file outside the
+    /// module graph): the member in each target. Like `resolveImportTargets`, meant for requests
+    /// such as goto, and must not be used in inference.
+    pub fn unresolvedImportMembers(r: *Resolver, file: FileId, item: u32, b: *const Body, lhs: Body.ExprId, name: []const u8) Error![]const Def {
+        var cur_file = file;
+        var cur_item = item;
+        var cur_body = b;
+        var cur = lhs;
+        for (0..max_depth) |_| switch (cur_body.expr(cur)) {
+            .name_ref => |n| {
+                if (cur_body.nameRefIsBuiltin(cur)) return &.{};
+                const it = switch (try r.resolveName(cur_file, cur_item, cur_body, cur_body.expr_scopes[@backingInt(cur)], n) orelse return &.{}) {
+                    .item => |it| it,
+                    else => return &.{},
+                };
+                if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return &.{};
+                cur_file = it.file;
+                cur_item = it.item;
+                cur_body = try r.body(it.file, it.item);
+                cur = cur_body.value orelse return &.{};
+            },
+            .builtin_call => |call| {
+                if (!std.mem.eql(u8, call.name, "@import") or try r.importTarget(cur_file, cur_body, call.args) != null) return &.{};
+                var out: std.ArrayList(Def) = .empty;
+                for (try r.importTargets(cur_file, cur_body, call.args)) |t| {
+                    try out.append(r.arena, try r.memberDef(.{ .file = t, .container = 0 }, name) orelse continue);
+                }
+                return out.items;
+            },
+            else => return &.{},
+        };
+        return &.{};
     }
 
     /// The definitions that `def` corresponds to in the other modules of `file`: when `def` is in
