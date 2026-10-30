@@ -361,7 +361,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     }
     if (paths_only) return .{ .context = .ignored };
 
-    cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) };
+    cursor_owner.* = .{ .known = try r.ownerAt(file, offset, true) orelse try protoOwner(r, file, offset) };
     const item = cursor_owner.known orelse return .{};
     const node = try r.itemNode(file, item) orelse return .{};
     const b = try r.body(file, item);
@@ -444,11 +444,15 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         }
     };
 
-    // Names in scope: when the cursor immediately follows a name, use the scope of that name
-    const scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
+    // Names in scope: when the cursor immediately follows a name, use the scope of that name; at a
+    // parameter or return type not written yet, the scope of the parameters before it
+    var scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .name_ref => b.expr_scopes[@backingInt(e)],
         else => b.scopeAt(rel),
     } else b.scopeAt(rel) else b.scopeAt(rel);
+    if (scope == .root) if (protoScope(b, node, offset)) |s| {
+        scope = s;
+    };
     // The kinds of local names come from the inference result of the member at the cursor
     // (inside a generic function body, from a call-site instance)
     const at = try context.atSeeded(r, file, offset, true);
@@ -499,6 +503,66 @@ fn quotedAfterDot(r: *Resolver, file: FileId, at: u32, offset: u32, cursor_owner
     }
     visible.items = items;
     return visible;
+}
+
+/// The scope of the parameters before `offset` in the prototype of the function `node` (whose
+/// Body is `b`), as the compiler evaluates each parameter type and the return type: the
+/// parameters ended by a `,` before it, and all of them after the `)`. Null outside the parameter
+/// list and the return type, or when no parameter precedes. Needed where the type is not written
+/// yet, which has no expression to carry its scope
+fn protoScope(b: *const Body, node: SyntaxNode, offset: u32) ?Body.ScopeId {
+    const decl = ast.cast(ast.FnDecl, node) orelse return null;
+    if (decl.body()) |body| if (offset > body.syntax.offset) return null;
+    const proto = decl.proto() orelse return null;
+    const list = proto.syntax.childNode(.param_list) orelse return null;
+    if (offset <= list.offset) return null;
+    var last: ?SyntaxNode = null;
+    var pending: ?SyntaxNode = null;
+    var it = list.children();
+    while (it.next()) |child| {
+        if (child.range().end > offset) break;
+        switch (child) {
+            .node => |n| if (n.kind() == .param) {
+                pending = n;
+            },
+            .token => |t| switch (t.kind) {
+                .comma, .r_paren => if (pending) |p| {
+                    last = p;
+                    pending = null;
+                },
+                else => {},
+            },
+        }
+    }
+    const param = ast.cast(ast.Param, last orelse return null).?;
+    // An unnamed parameter is bound at the start of the parameter (see `lower`)
+    const start = (param.name() orelse SyntaxToken{ .kind = .identifier, .text = "", .offset = param.syntax.offset }).offset - node.offset;
+    const bid = for (b.params) |p| {
+        if (b.binding(p).range.start == start) break p;
+    } else return null;
+    for (b.scopes, 0..) |s, i| {
+        if (s.bindings.len == 1 and s.bindings[0] == bid) return @fromBackingInt(@as(u32, @intCast(i)));
+    }
+    return null;
+}
+
+/// A function with no body yet, at whose return type the cursor is (`fn f(comptime T: type) |`):
+/// the cursor is past the end of its node
+fn protoOwner(r: *Resolver, file: FileId, offset: u32) resolve.Error!?u32 {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const prev = tokenBefore(root, offset) orelse return null;
+    if (prev.kind != .r_paren and prev.kind != .bang) return null;
+    const item = try r.ownerAt(file, prev.offset, false) orelse return null;
+    if ((try r.itemTree(file)).items[item].kind != .@"fn") return null;
+    const decl = ast.cast(ast.FnDecl, try r.itemNode(file, item) orelse return null) orelse return null;
+    if (decl.body() != null) return null;
+    const proto = decl.proto() orelse return null;
+    // `prev` ends the parameter list or is the `!` of the return type
+    const end = if (prev.kind == .r_paren)
+        (proto.syntax.childNode(.param_list) orelse return null).childToken(.r_paren)
+    else
+        proto.syntax.childToken(.bang);
+    return if (end != null and end.?.offset == prev.offset) item else null;
 }
 
 /// Typing at the cursor can make a name in an expression that `importPrefix` accepts: no

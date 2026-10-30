@@ -3442,6 +3442,19 @@ test "empty-prefix name completion is incomplete when a typed prefix adds candid
     try testing.expect(!try incompleteAt(&w, member, .{}));
 }
 
+test "empty-prefix completion at a parameter or return type offers the earlier parameters" {
+    try expectCompletions("", &.{
+        .{ "fn sig2(comptime Tee: type, second: <|>) void {}", "Tee sig2" },
+        .{ "fn sig2(comptime Tee: type, second: []const <|>) void {}", "Tee sig2" },
+        .{ "fn sig2(comptime Tee: type, second: ?<|>) void {}", "Tee sig2" },
+        .{ "fn sig3(comptime Tee: type) <|> {}", "Tee sig3" },
+        .{ "fn sig3(comptime Tee: type) !<|> {}", "Tee sig3" },
+        .{ "const S = struct {\n    fn m(comptime Tee: type, x: *<|>) void {}\n};", "Tee m S" },
+        // Without a body yet; inner names first
+        .{ "const other = 1;\n\nfn foo(comptime Tee: type, x: Tee) <|>\n\npub fn main() void {}", "x Tee other foo main" },
+    });
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;
