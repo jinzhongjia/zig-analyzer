@@ -85,7 +85,7 @@ pub fn organize(a: Allocator, parse: *const Parse, opts: Options) Allocator.Erro
 /// Position of a new import added by auto-import. When the block containing the last import
 /// declaration is already organized, the import is placed where it belongs by the same rules;
 /// otherwise (the block is not organized, or there are no imports yet) it goes after the last
-/// import declaration, or after the `//!` docs at the top of the file.
+/// import declaration, or after the `//!` docs and the comment header at the top of the file.
 pub const Inserter = struct {
     source: []const u8,
     opts: Options,
@@ -153,7 +153,9 @@ fn importDecl(node: SyntaxNode) bool {
 }
 
 /// Start of the line after the last import declaration (keeping a comment on the same line);
-/// without imports, after the `//!` docs at the top of the file (after the UTF-8 BOM)
+/// without imports, after the `//!` docs and the comment header (such as a license) at the top of
+/// the file (after the UTF-8 BOM). A comment followed by a blank line is a header; one directly
+/// above a declaration belongs to the declaration
 fn fallbackOffset(parse: *const Parse) u32 {
     const source = parse.source;
     var last: ?u32 = null;
@@ -173,12 +175,20 @@ fn fallbackOffset(parse: *const Parse) u32 {
     const start: usize = bomLen(source);
     var pos: usize = start;
     var docs_end: usize = start;
+    // Comment lines since the last blank line or `//!` doc line
+    var in_comment = false;
     while (pos < source.len) {
         const end = if (std.mem.indexOfScalarPos(u8, source, pos, '\n')) |e| e + 1 else source.len;
         const line = std.mem.trim(u8, source[pos..end], " \t\r\n");
         if (std.mem.startsWith(u8, line, "//!")) {
             docs_end = end;
-        } else if (line.len != 0 and !std.mem.startsWith(u8, line, "//")) break;
+            in_comment = false;
+        } else if (line.len == 0) {
+            if (in_comment) docs_end = end;
+            in_comment = false;
+        } else if (std.mem.startsWith(u8, line, "//")) {
+            in_comment = true;
+        } else break;
         pos = end;
     }
     return @intCast(docs_end);

@@ -323,6 +323,20 @@ test "auto import inserts into the organized block at its sorted place, otherwis
         "//! Docs.\nconst c = @import(\"c.zig\");\nfn main() void {}",
         try inserted(a, "//! Docs.\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
     );
+    // No imports: after a comment header that a blank line separates from the code; a comment
+    // directly above a declaration belongs to it
+    try testing.expectEqualStrings(
+        "// SPDX-License-Identifier: MIT\n\nconst c = @import(\"c.zig\");\nfn main() void {}",
+        try inserted(a, "// SPDX-License-Identifier: MIT\n\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
+    );
+    try testing.expectEqualStrings(
+        "//! Docs.\n\n// License\n// Copyright\n\nconst c = @import(\"c.zig\");\nfn main() void {}",
+        try inserted(a, "//! Docs.\n\n// License\n// Copyright\n\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
+    );
+    try testing.expectEqualStrings(
+        "const c = @import(\"c.zig\");\n// Entry point.\nfn main() void {}",
+        try inserted(a, "// Entry point.\nfn main() void {}", "c", "c.zig", "const c = @import(\"c.zig\");"),
+    );
 }
 
 test "auto import after an unclosed last import stays at the top level" {
