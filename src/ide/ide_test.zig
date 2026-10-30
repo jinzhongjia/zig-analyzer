@@ -6628,3 +6628,81 @@ test "hover on a reference in a coercing context shows its own type" {
     const cast = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "@intCast").?)) orelse return error.NoHover;
     try testing.expect(std.mem.endsWith(u8, cast.text, "Inferred result:\n\n```zig\nu16\n```"));
 }
+
+test "captures of inline prongs on tagged unions take the payload of each item" {
+    // An inline prong is instantiated for each item: its capture used to be the peer of all
+    // payloads (`i64` for `u8` and `i64`), or unknown for structs, so their fields did not resolve
+    const text =
+        \\const A = struct { x: u8 };
+        \\const B = struct { x: i64 };
+        \\const U = union(enum) { a: u8, b: i64, c: void };
+        \\const V = union(enum) { a: A, b: B, c: void };
+        \\fn probe(u: U, v: V) void {
+        \\    switch (u) {
+        \\        inline .a, .b => |p| {
+        \\            _ = &p;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    switch (u) {
+        \\        .a, .b => |q| {
+        \\            _ = &q;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    switch (v) {
+        \\        inline .a, .b => |s| {
+        \\            const x = s.x;
+        \\            _ = &x;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    switch (v) {
+        \\        .c => {},
+        \\        inline else => |e| {
+        \\            const y = e.x;
+        \\            _ = &y;
+        \\        },
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "p;", "```zig\np: u8\n```\n\ninferred from iteration 1 of the loop at main.zig:6" },
+        .{ "q| {", "```zig\nq: i64\n```" },
+        .{ "x = s.x", "```zig\nconst x: u8\n```\n\ninferred from iteration 1 of the loop at main.zig:18" },
+        .{ "y = e.x", "```zig\nconst y: u8\n```\n\ninferred from iteration 1 of the loop at main.zig:25" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?)) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // `s.x` refers to the field of each payload: `A.x` and `B.x` both find it
+    const fs: [1]FileId = .{file};
+    for ([_][]const u8{ "x: u8 }", "x: i64 }" }) |field| {
+        const def = (try definition.defAt(&r, file, @intCast(std.mem.indexOf(u8, text, field).?))) orelse return error.NoDefinition;
+        const refs = try search.findReferences(&r, def, .{ .scope = &fs });
+        var at_s = false;
+        var at_e = false;
+        for (refs) |ref| {
+            if (ref.start == std.mem.indexOf(u8, text, "s.x").? + 2) at_s = true;
+            if (ref.start == std.mem.indexOf(u8, text, "e.x").? + 2) at_e = true;
+        }
+        testing.expect(at_s and at_e) catch |err| {
+            std.debug.print("references of `{s}`\n", .{field});
+            return err;
+        };
+    }
+    const t = (try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "s.x").? + 2))) orelse return error.NoDefinition;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "x: u8 }").?)), t.start);
+}

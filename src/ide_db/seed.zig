@@ -164,7 +164,7 @@ pub const Refiner = struct {
                 const empty: LoopResults = .{ .expr = id, .prong = region.prong, .binding = 0, .results = &.{} };
                 const entry: LoopResults = if (region.prong) |pi| prong: {
                     const sw = f.body.expr(id).@"switch";
-                    const n = try prongIterations(ip, f.body, res, sw, pi) orelse break :prong empty;
+                    const n = try prongIterations(f.r, f.body, res, sw, pi) orelse break :prong empty;
                     const results = try f.r.arena.alloc(?*const infer.Result, n);
                     @memset(results, null);
                     break :prong .{ .expr = id, .prong = pi, .binding = @backingInt(sw.prongs[pi].capture[0]), .results = results };
@@ -211,7 +211,6 @@ pub const Refiner = struct {
 /// `prongIterations`); empty when there is none. As in `Refiner`, the first loop variable that needs
 /// it is chosen, and Infer refines the other captures of the same loop along with it.
 pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error![]const *const infer.Result {
-    const ip = r.ctx.db.env.ip;
     var best: ?struct { binding: u32, n: u32 } = null;
     var best_len: u32 = std.math.maxInt(u32);
     for (body.exprs) |expr| switch (expr) {
@@ -229,7 +228,7 @@ pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, re
             if (!prong.is_inline or prong.capture.len == 0) continue;
             const range = body.range(prong.body);
             if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
-            const n = try prongIterations(ip, body, res, sw, @intCast(pi)) orelse continue;
+            const n = try prongIterations(r, body, res, sw, @intCast(pi)) orelse continue;
             best = .{ .binding = @backingInt(prong.capture[0]), .n = n };
             best_len = range.end - range.start;
         },
@@ -246,21 +245,30 @@ pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, re
     return out;
 }
 
-/// Number of per-value inferences for an `inline` switch prong (the `pi`-th of `sw`): when the
-/// operand is neither a union nor an error set and the capture has no value in the inference, the
-/// number of values after expanding the prong items (see `infer.inlineProngValues`)
-fn prongIterations(ip: *InternPool, body: *const Body, res: *const infer.Result, sw: @FieldType(Body.Expr, "switch"), pi: u32) resolve.Error!?u32 {
+/// Number of per-value inferences for an `inline` switch prong (the `pi`-th of `sw`), when the
+/// capture has no value in the inference: on a tagged union, the number of payloads the prong is
+/// instantiated for when their types differ (see `infer.inlineUnionPayloads`); on an operand that
+/// is neither a union nor an error set, the number of values after expanding the prong items (see
+/// `infer.inlineProngValues`), unless the capture is a pointer
+fn prongIterations(r: *Resolver, body: *const Body, res: *const infer.Result, sw: @FieldType(Body.Expr, "switch"), pi: u32) resolve.Error!?u32 {
+    const ip = r.ctx.db.env.ip;
     const prong = sw.prongs[pi];
     if (!prong.is_inline or prong.capture.len == 0 or res.exprs.len != body.exprs.len) return null;
     const cap = prong.capture[0];
-    if (@backingInt(cap) >= res.bindings.len or res.bindings[@backingInt(cap)].val != null or body.binding(cap).is_ptr) return null;
+    if (@backingInt(cap) >= res.bindings.len or res.bindings[@backingInt(cap)].val != null) return null;
     const operand = res.exprs[@backingInt(sw.operand)].ty;
-    switch (ip.key(operand)) {
-        .container_type => |c| if (c.kind == .@"union") return null,
-        .reified_type => |rt| if (rt.kind == .@"union") return null,
+    const is_union = switch (ip.key(operand)) {
+        .container_type => |c| c.kind == .@"union",
+        .reified_type => |rt| rt.kind == .@"union",
         .error_set_type, .inferred_error_set => return null,
-        else => {},
+        else => false,
+    };
+    if (is_union) {
+        const payloads = try infer.inlineUnionPayloads(r, body, res.exprs, sw.prongs, pi, operand) orelse return null;
+        for (payloads) |p| if (p.ty != payloads[0].ty) return @intCast(payloads.len);
+        return null;
     }
+    if (body.binding(cap).is_ptr) return null;
     const n = (try infer.inlineProngValues(ip, body, res.exprs, prong, operand, null)).count orelse return null;
     return if (n > 0) n else null;
 }
@@ -298,14 +306,13 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
 /// under instance `inst` is `res`) and searched again. Collects when `all` is not null.
 fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
-    const ip = r.ctx.db.env.ip;
     for (body.exprs) |e| {
         const l = switch (e) {
             .loop => |l| l,
             .@"switch" => |sw| {
                 for (sw.prongs, 0..) |prong, pi| {
                     if (!prong.is_inline or !mentionsWithin(body, prong.body, names)) continue;
-                    const n = try prongIterations(ip, body, res, sw, @intCast(pi)) orelse continue;
+                    const n = try prongIterations(r, body, res, sw, @intCast(pi)) orelse continue;
                     for (0..n) |idx| {
                         const res_i = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = .{ .binding = @backingInt(prong.capture[0]), .index = @intCast(idx) } });
                         if (try callIn(r, in, i, body, res_i, file, item, root_key, all, strict)) |found| return found;

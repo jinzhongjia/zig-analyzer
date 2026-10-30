@@ -932,7 +932,7 @@ const Inferrer = struct {
                     inf.uncertain -= 1;
                 };
                 for (s.prongs, 0..) |prong, i| {
-                    try inf.bindSwitchCapture(prong, s.prongs, s.operand, operand, chosen != null and chosen.? == i);
+                    try inf.bindSwitchCapture(s.prongs, i, s.operand, operand, chosen != null and chosen.? == i);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
@@ -2381,14 +2381,16 @@ const Inferrer = struct {
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(cond_e)) else t, .val = val };
     }
 
-    /// Captures of a switch. For a tagged union, the capture is the peer of the field types of the
-    /// prong items (matching the compiler); it is unknown for the `else` prong and for prong items
-    /// that cannot be evaluated; the second capture is the tag. `chosen`: the operand is
-    /// comptime-known and this is the prong that executes, so the capture takes the actual payload
-    /// value; when the payload types of the items have no peer, the prong can only be an `inline`
-    /// prong (each item is instantiated separately, e.g. `inline .@"struct", .@"union" => |info|`),
-    /// and the type also takes the actual payload type.
-    fn bindSwitchCapture(inf: *Inferrer, prong: Body.Prong, prongs: []const Body.Prong, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
+    /// Captures of a switch. For a tagged union, the capture of an ordinary prong is the peer of
+    /// the field types of the prong items (matching the compiler); it is unknown for the `else`
+    /// prong and for prong items that cannot be evaluated. An `inline` prong is instantiated for
+    /// each of its payloads (see `inlineUnionPayloads`): inferred for one of them (see
+    /// `LoopSeed`), the capture has that field's type and the tag capture that tag; otherwise the
+    /// capture has their common type, unknown when they differ. The second capture is the tag.
+    /// `chosen`: the operand is comptime-known and this is the prong that executes, so the
+    /// capture takes the actual payload value (and its type, when the capture's type is unknown).
+    fn bindSwitchCapture(inf: *Inferrer, prongs: []const Body.Prong, pi: usize, operand_e: ExprId, operand_tv: TypedValue, chosen: bool) Error!void {
+        const prong = prongs[pi];
         if (prong.capture.len == 0) return;
         const ip = inf.ip;
         const operand = operand_tv.ty;
@@ -2401,7 +2403,20 @@ const Inferrer = struct {
             .error_set_type, .inferred_error_set => true,
             else => false,
         };
-        var t: Index = if (is_union)
+        const cap = prong.capture[0];
+        // The tag of this instance of an inline prong
+        var inline_tag: ?[]const u8 = null;
+        var t: Index = if (is_union and prong.is_inline) blk: {
+            const payloads = try inlineUnionPayloads(inf.r, inf.body, inf.exprs, prongs, pi, operand) orelse break :blk .unknown;
+            if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
+                if (seed.index >= payloads.len) break :blk .unknown;
+                inline_tag = payloads[seed.index].name;
+                break :blk payloads[seed.index].ty;
+            };
+            if (payloads.len == 0) break :blk .unknown;
+            for (payloads[1..]) |p| if (p.ty != payloads[0].ty) break :blk .unknown;
+            break :blk payloads[0].ty;
+        } else if (is_union)
             try inf.prongPayloadType(prong, operand)
         else if (is_error_set)
             try inf.errorSetProngType(prong, prongs, try queries.errorSetMembers(inf.r, operand))
@@ -2419,7 +2434,6 @@ const Inferrer = struct {
             .error_value => val = v,
             else => {},
         };
-        const cap = prong.capture[0];
         const is_ptr = inf.body.binding(cap).is_ptr;
         // Inferring for one value of an inline prong (see `LoopSeed`): the capture takes the value
         // of this prong item
@@ -2429,7 +2443,8 @@ const Inferrer = struct {
         inf.bindings[@backingInt(cap)] = .{ .ty = if (is_ptr) try ip.ptrTo(t, .one, try inf.isConstPlace(operand_e)) else t, .val = if (is_ptr) null else val };
         if (prong.capture.len > 1) {
             const tag: Index = if (is_union) try eval.unionTag(inf.r, operand) orelse .unknown else .unknown;
-            inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag };
+            const tag_val: ?Index = if (inline_tag) |name| (if (tag != .unknown) try ip.get(.{ .enum_tag = .{ .ty = tag, .name = name } }) else null) else null;
+            inf.bindings[@backingInt(prong.capture[1])] = .{ .ty = tag, .val = tag_val };
         }
     }
 
@@ -2475,13 +2490,7 @@ const Inferrer = struct {
         if (prong.is_else or prong.items.len == 0) return .unknown;
         const types = try inf.scratch.alloc(Index, prong.items.len);
         for (prong.items, types) |item, *t| {
-            const name = switch (inf.body.expr(item)) {
-                .enum_literal => |n| n,
-                else => switch (inf.ip.key(inf.get(item).val orelse return .unknown)) {
-                    .enum_tag => |tag| tag.name,
-                    else => return .unknown,
-                },
-            };
+            const name = itemTagName(inf.ip, inf.body, inf.exprs, item) orelse return .unknown;
             t.* = try inf.unionFieldType(operand, name) orelse return .unknown;
         }
         return inf.peer(types);
@@ -3862,6 +3871,46 @@ pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const Type
         }
     }
     return .{ .count = std.math.cast(u32, n), .value = found };
+}
+
+/// The payloads (union fields) that the `inline` prong `prongs[pi]` of a switch on the tagged
+/// union `ty` is instantiated for, in order: one per item, and for `inline else`, one per field
+/// that no other prong names, in declaration order. Null when the prong is not inline or an item
+/// cannot be evaluated.
+pub fn inlineUnionPayloads(r: *Resolver, body: *const Body, exprs: []const TypedValue, prongs: []const Body.Prong, pi: usize, ty: Index) Error!?[]const eval.Field {
+    const prong = prongs[pi];
+    if (!prong.is_inline) return null;
+    const ip = r.ctx.db.env.ip;
+    const fields = try eval.fieldNames(r, ty);
+    if (!prong.is_else) {
+        const out = try r.arena.alloc(eval.Field, prong.items.len);
+        for (prong.items, out) |item, *o| {
+            const name = itemTagName(ip, body, exprs, item) orelse return null;
+            o.* = for (fields) |f| {
+                if (std.mem.eql(u8, f.name, name)) break f;
+            } else return null;
+        }
+        return out;
+    }
+    var named: std.ArrayList([]const u8) = .empty;
+    for (prongs, 0..) |p, k| {
+        if (k == pi) continue;
+        for (p.items) |item| try named.append(r.arena, itemTagName(ip, body, exprs, item) orelse return null);
+    }
+    var out: std.ArrayList(eval.Field) = .empty;
+    for (fields) |f| if (!hasName(named.items, f.name)) try out.append(r.arena, f);
+    return out.items;
+}
+
+/// Tag name of a switch prong item on a tagged union: an enum literal, or a comptime-known tag
+fn itemTagName(ip: *InternPool, body: *const Body, exprs: []const TypedValue, item: ExprId) ?[]const u8 {
+    return switch (body.expr(item)) {
+        .enum_literal => |n| n,
+        else => switch (ip.key((if (@backingInt(item) < exprs.len) exprs[@backingInt(item)].val else null) orelse return null)) {
+            .enum_tag => |tag| tag.name,
+            else => null,
+        },
+    };
 }
 
 fn hasName(names: []const []const u8, name: []const u8) bool {

@@ -336,7 +336,7 @@ test "rename refuses when a reference cannot be confirmed" {
     // other: a rename returned only the declaration and broke the build
     {
         const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = impls_uri }, .position = position(impls_text, "Close"), .newName = "close" });
-        try testing.expectEqualStrings("cannot rename `Close` to `close`: the type here is unknown, so whether this refers to the same declaration cannot be confirmed (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
+        try testing.expectEqualStrings("cannot rename `Close` to `close`: this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
     }
     // A file that mentions the name but has syntax errors may hide references
     {
