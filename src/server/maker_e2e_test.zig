@@ -637,3 +637,41 @@ test "errors zig build reports for build.zig.zon are published on it" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "poisoned build graphs are not left in the local cache" {
+    // `b.findProgram` makes the configuration uncacheable: the maker writes it to `.zig-cache/tmp`
+    // and deletes it only on a clean exit, which a maker stopped by the server never reaches
+    const build =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.findProgram(.{ .names = &.{"sh"} });
+        \\    const mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host });
+        \\    b.step("check", "").dependOn(&b.addExecutable(.{ .name = "app", .root_module = mod }).step);
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = build },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root);
+    const build_uri = try za.base.uri.fromPath(a, try project.path(a, "build.zig"));
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    for (0..3) |_| {
+        try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+    var tmp = try project.tmp.dir.openDir(testing.io, ".zig-cache/tmp", .{ .iterate = true });
+    defer tmp.close(testing.io);
+    var it = tmp.iterate();
+    var left: std.ArrayList([]const u8) = .empty;
+    while (try it.next(testing.io)) |entry| try left.append(a, try a.dupe(u8, entry.name));
+    try testing.expectEqualSlices([]const u8, &.{}, left.items);
+}

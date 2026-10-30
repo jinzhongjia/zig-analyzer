@@ -589,9 +589,13 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
     pc.enter("project {s}: build event {t}", .{ ws.root, event.* });
     defer pc.leave();
     // A stopped instance (replaced by a restart, project removed, server shutting down) no longer
-    // handles events maker sent before exiting: their results would not be used.
+    // handles events maker sent before exiting: their results would not be used (a build graph it
+    // will not read is still deleted when it is poisoned, see `configuration.load`).
     // Progress and the busy count are wrapped up when the background task ends.
-    if (ws.isStopping()) return;
+    if (ws.isStopping()) {
+        if (event.* == .configuration) configuration.discard(io, ws.root, event.configuration);
+        return;
+    }
     switch (event.*) {
         .handshake => |h| if (h.version != bsp.protocol_version) {
             log.err("{s}: build system protocol version {d} does not match supported version {d}", .{ ws.root, h.version, bsp.protocol_version });

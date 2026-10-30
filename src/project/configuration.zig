@@ -19,23 +19,49 @@ const InvalidError = error{InvalidBuildGraph};
 /// Reads the build graph file given by the maker (`path` is relative to the build root) and
 /// converts it. The file comes from another process and is read as raw structs: it is checked
 /// before anything in it is used, so a malformed file is an error instead of a crash.
+/// A poisoned build graph (one that cannot be cached, e.g. because `build.zig` calls
+/// `b.findProgram`) is deleted once read: the maker leaves it in its `tmp` directory for a single
+/// run and deletes it only on a clean exit, which a maker stopped by the server never reaches.
 pub fn load(gpa: Allocator, io: Io, build_root: []const u8, path: []const u8, env: *const ZigEnv) !ProjectModel {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     var dir = try Io.Dir.cwd().openDir(io, build_root, .{});
     defer dir.close(io);
+    var poisoned = false;
+    defer if (poisoned) dir.deleteFile(io, path) catch {};
     var file = try dir.openFile(io, path, .{});
     defer file.close(io);
-    var header: [@sizeOf(Configuration.Header)]u8 = undefined;
-    if (try file.readPositionalAll(io, &header, 0) != header.len) return error.InvalidBuildGraph;
-    try checkLengths(std.mem.bytesToValue(Configuration.Header, &header), try file.length(io));
+    const header = try readHeader(io, file);
+    poisoned = header.flags.poisoned;
     const conf = try Configuration.loadFile(scratch.allocator(), io, file);
     try validate(scratch.allocator(), &conf);
     return convert(gpa, &conf, build_root, try localCacheRoot(scratch.allocator(), build_root, path), env);
 }
 
-/// The lengths in the header must add up to the size of the file (the maker writes the header
-/// and then exactly these arrays); otherwise loading would allocate and read by arbitrary lengths
+/// A build graph the maker sent that will not be read (its instance is stopping): deleted when it
+/// is poisoned, for the same reason as in `load`
+pub fn discard(io: Io, build_root: []const u8, path: []const u8) void {
+    var dir = Io.Dir.cwd().openDir(io, build_root, .{}) catch return;
+    defer dir.close(io);
+    const poisoned = blk: {
+        var file = dir.openFile(io, path, .{}) catch return;
+        defer file.close(io);
+        break :blk (readHeader(io, file) catch return).flags.poisoned;
+    };
+    if (poisoned) dir.deleteFile(io, path) catch {};
+}
+
+/// The header of a build graph file, once its lengths are known to add up to the size of the file
+/// (the maker writes the header and then exactly these arrays); otherwise loading would allocate
+/// and read by arbitrary lengths
+fn readHeader(io: Io, file: Io.File) !Configuration.Header {
+    var bytes: [@sizeOf(Configuration.Header)]u8 = undefined;
+    if (try file.readPositionalAll(io, &bytes, 0) != bytes.len) return error.InvalidBuildGraph;
+    const header = std.mem.bytesToValue(Configuration.Header, &bytes);
+    try checkLengths(header, try file.length(io));
+    return header;
+}
+
 fn checkLengths(h: Configuration.Header, file_len: u64) InvalidError!void {
     const size: u64 = @sizeOf(Configuration.Header) +
         @as(u64, h.string_bytes_len) +
@@ -835,7 +861,7 @@ const TestCorruption = struct {
 
 /// Writes a build graph of two top-level steps, `install` depending on `check`, with one word
 /// replaced by `corrupt`
-fn writeTestGraph(dir: Io.Dir, sub_path: []const u8, corrupt: ?TestCorruption) !void {
+fn writeTestGraph(dir: Io.Dir, sub_path: []const u8, corrupt: ?TestCorruption, poisoned: bool) !void {
     // `Wip.deinit` does not free its tables: an arena holds everything
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -849,7 +875,7 @@ fn writeTestGraph(dir: Io.Dir, sub_path: []const u8, corrupt: ?TestCorruption) !
     }
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try wip.write(&out.writer, .{ .default_step = @fromBackingInt(0), .generated_files_len = 0, .poisoned = false });
+    try wip.write(&out.writer, .{ .default_step = @fromBackingInt(0), .generated_files_len = 0, .poisoned = poisoned });
     const bytes = out.writer.buffered();
     if (corrupt) |c| {
         const start = switch (c.region) {
@@ -871,7 +897,7 @@ test "load: a malformed build graph is an error, not a crash" {
     defer gpa.free(root);
     const env: ZigEnv = .{ .arena = .{}, .zig_exe = "zig", .lib_dir = root, .std_dir = root, .global_cache_dir = root, .version = "0.17.0" };
 
-    try writeTestGraph(tmp.dir, "good", null);
+    try writeTestGraph(tmp.dir, "good", null, false);
     var model = try load(gpa, io, root, "good", &env);
     defer model.deinit(gpa);
     try std.testing.expectEqual(2, model.steps.len);
@@ -896,8 +922,35 @@ test "load: a malformed build graph is an error, not a crash" {
         .{ .region = .extra, .index = 3, .value = 31 },
         .{ .region = .extra, .index = 4, .value = 0xffffff },
     }) |corrupt| {
-        try writeTestGraph(tmp.dir, "bad", corrupt);
+        try writeTestGraph(tmp.dir, "bad", corrupt, false);
         try std.testing.expectError(error.InvalidBuildGraph, load(gpa, io, root, "bad", &env));
+    }
+}
+
+test "load: a poisoned build graph is deleted once read" {
+    // The maker leaves it in its tmp directory and deletes it only on a clean exit, which a maker
+    // stopped by the server never reaches: one file would be left per maker
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const env: ZigEnv = .{ .arena = .{}, .zig_exe = "zig", .lib_dir = root, .std_dir = root, .global_cache_dir = root, .version = "0.17.0" };
+    try tmp.dir.createDirPath(io, "cache/tmp");
+    for ([_]bool{ false, true }) |poisoned| {
+        try writeTestGraph(tmp.dir, "cache/tmp/graph", null, poisoned);
+        var model = try load(gpa, io, root, "cache/tmp/graph", &env);
+        model.deinit(gpa);
+        const exists = if (tmp.dir.access(io, "cache/tmp/graph", .{})) true else |_| false;
+        try std.testing.expectEqual(!poisoned, exists);
+    }
+    // Also when the instance that received it is stopping and does not read it
+    for ([_]bool{ false, true }) |poisoned| {
+        try writeTestGraph(tmp.dir, "cache/tmp/graph", null, poisoned);
+        discard(io, root, "cache/tmp/graph");
+        const exists = if (tmp.dir.access(io, "cache/tmp/graph", .{})) true else |_| false;
+        try std.testing.expectEqual(!poisoned, exists);
     }
 }
 
