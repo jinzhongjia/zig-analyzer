@@ -142,6 +142,10 @@ pub const DeclType = struct {
                 if (res.exprs.len == 0) return .unknown;
                 const annotation: ?Index = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else null;
                 var value: TypedValue = if (b.value) |v| res.exprs[@backingInt(v)] else .unknown;
+                if (annotation) |t| if (value.ty != t) {
+                    value = .{ .ty = value.ty, .val = try @import("value.zig").arrayPtrAsSlice(ip, value, t) };
+                    if (value.val != null) value.ty = t;
+                };
                 const is_const = tree.items[item].kind == .@"const";
                 // Container-level constants are evaluated at comptime: when inference cannot
                 // compute the value, the interpreter executes the initializer expression

@@ -2198,6 +2198,27 @@ const Evaluator = struct {
                 return Val.ofInt(v.ty, r);
             },
             .ampersand => {
+                // `&s.*` for a slice `s`: a single-item pointer to its array, with the constness
+                // of the slice
+                switch (f.body.expr(operand_e)) {
+                    .deref => |x| {
+                        const p = try ev.eval(f, x, null);
+                        const pt = switch (ip.key(p.ty)) {
+                            .ptr_type => |pt| pt,
+                            else => return error.Abort,
+                        };
+                        if (pt.size == .slice) {
+                            const arr = try ev.deref(p);
+                            const ty = try ip.ptrTo(arr.ty, .one, pt.is_const);
+                            return switch (p.v) {
+                                .ref => |r| .{ .ty = ty, .v = .{ .ref = r } },
+                                else => ev.pointerToNew(ty, arr),
+                            };
+                        }
+                        return ev.addressOf(f, operand_e, try ev.deref(p));
+                    },
+                    else => {},
+                }
                 const child_want: ?Index = if (want) |w| switch (ip.key(w)) {
                     .ptr_type => |p| if (p.size == .one) p.child else null,
                     else => null,
@@ -2408,13 +2429,29 @@ const Evaluator = struct {
             },
             .ip => |x| switch (ip.key(x)) {
                 .ptr_value => |pv| return Val.of(child, pv.pointee),
-                // Array pointers are represented by their elements; dereferencing yields the array
-                .aggregate => |agg| return Val.of(child, try ip.get(.{ .aggregate = .{ .ty = child, .elems = agg.elems } })),
-                .bytes => |b| return Val.of(child, try ip.get(.{ .bytes = .{ .ty = child, .bytes = b.bytes } })),
+                // Array pointers and slices are represented by their elements; dereferencing
+                // yields the array (for a slice, `[len:sentinel]T`)
+                .aggregate => |agg| {
+                    const t = try ev.derefType(p.ty, agg.elems.len);
+                    return Val.of(t, try ip.get(.{ .aggregate = .{ .ty = t, .elems = agg.elems } }));
+                },
+                .bytes => |b| {
+                    const t = try ev.derefType(p.ty, b.bytes.len);
+                    return Val.of(t, try ip.get(.{ .bytes = .{ .ty = t, .bytes = b.bytes } }));
+                },
                 else => return error.Abort,
             },
             else => return error.Abort,
         }
+    }
+
+    /// Type of `p.*` for a pointer of type `t` to `len` elements: the child type, and for a slice
+    /// the array `[len:sentinel]T`
+    fn derefType(ev: *Evaluator, t: Index, len: usize) Error!Index {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| if (p.size == .slice) try ev.ip.get(.{ .array_type = .{ .len = len, .child = p.child, .sentinel = p.sentinel } }) else p.child,
+            else => .unknown,
+        };
     }
 
     fn slice(ev: *Evaluator, f: *Frame, s: @FieldType(Body.Expr, "slice")) EvalError!Val {

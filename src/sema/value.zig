@@ -1058,6 +1058,32 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
     return v;
 }
 
+/// The value of pointer-to-array `tv` coerced to slice type `to` (`*const [2]u16` to
+/// `[]const u16`): both are represented by the elements, so only the type changes. Null when it is
+/// not such a coercion (different element types, a sentinel the array lacks, dropping `const`).
+pub fn arrayPtrAsSlice(ip: *InternPool, tv: InternPool.TypedValue, to: Index) Allocator.Error!?Index {
+    const v = tv.val orelse return null;
+    const from = switch (ip.key(tv.ty)) {
+        .ptr_type => |p| if (p.size == .one) p else return null,
+        else => return null,
+    };
+    const slice = switch (ip.key(to)) {
+        .ptr_type => |p| if (p.size == .slice) p else return null,
+        else => return null,
+    };
+    const array = switch (ip.key(from.child)) {
+        .array_type => |a| a,
+        else => return null,
+    };
+    if (array.child != slice.child or (from.is_const and !slice.is_const)) return null;
+    if (slice.sentinel) |s| if (array.sentinel != s) return null;
+    return switch (ip.key(v)) {
+        .aggregate => |agg| try ip.get(.{ .aggregate = .{ .ty = to, .elems = agg.elems } }),
+        .bytes => |b| try ip.get(.{ .bytes = .{ .ty = to, .bytes = b.bytes } }),
+        else => null,
+    };
+}
+
 const testing = std.testing;
 
 test "integer folding follows the type's width" {

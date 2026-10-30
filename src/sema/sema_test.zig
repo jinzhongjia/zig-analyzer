@@ -1925,6 +1925,38 @@ test "slices with comptime-known bounds are pointers to arrays" {
     });
 }
 
+test "dereferencing a comptime-known slice gives an array" {
+    // Prevents typing `slice.*` as the element type (`u16` for `[]const u16`)
+    try expectTypes(
+        \\const slice: []const u16 = &.{ 1, 2, 3 };
+        \\const arr = slice.*;
+        \\const n = arr.len;
+        \\const ap = &slice.*;
+        \\const zs: [:0]const u8 = "hello";
+        \\const zarr = zs.*;
+        \\const sz = @sizeOf(@TypeOf(arr));
+        \\const cat = arr ++ arr;
+        \\fn get() []const u8 {
+        \\    return "abc";
+        \\}
+        \\fn probe() void {
+        \\    const cp = comptime get().*;
+        \\    const s2: []const u16 = &.{ 4, 5 };
+        \\    const a2 = s2.*;
+        \\    _ = .{ cp, a2 };
+        \\}
+    , &.{
+        .{ "arr", "[3]u16 = .{ 1, 2, 3 }" },
+        .{ "n", "usize = 3" },
+        .{ "ap", "*const [3]u16 = &.{ 1, 2, 3 }" },
+        .{ "zarr", "[5:0]u8 = \"hello\"" },
+        .{ "sz", "comptime_int = 6" },
+        .{ "cat", "[6]u16 = .{ 1, 2, 3, 1, 2, 3 }" },
+        .{ "cp", "[3]u8 = \"abc\"" },
+        .{ "a2", "[2]u16 = .{ 4, 5 }" },
+    });
+}
+
 test "concatenation follows the compiler" {
     try expectTypes(
         \\fn f() void {
