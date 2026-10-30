@@ -209,3 +209,69 @@ test "a configuration that fails after a restart keeps the previous build graph"
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// Messages of the `window/showMessage` notifications received so far
+fn shownMessages(h: *Harness) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try h.notifications("window/showMessage")) |m| try out.append(h.arena.allocator(), m.object.get("params").?.object.get("message").?.string);
+    return out.items;
+}
+
+/// Messages that ended the build progress (titled `zig build ...`) so far
+fn buildProgressEnds(h: *Harness) ![]const []const u8 {
+    const a = h.arena.allocator();
+    var tokens: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try h.notifications("$/progress")) |m| {
+        const params = m.object.get("params").?.object;
+        const token = try std.json.Stringify.valueAlloc(a, params.get("token").?, .{});
+        const value = params.get("value").?.object;
+        const kind = value.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "begin")) {
+            if (std.mem.startsWith(u8, value.get("title").?.string, "zig build")) try tokens.append(a, token);
+        } else if (std.mem.eql(u8, kind, "end")) {
+            for (tokens.items) |t| if (std.mem.eql(u8, t, token)) {
+                try out.append(a, if (value.get("message")) |msg| msg.string else "");
+                break;
+            };
+        }
+    }
+    return out.items;
+}
+
+test "a diagnostics step that fails without errors is reported, not shown as a clean build" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host });
+        \\    mod.linkSystemLibrary("zanosuchlib", .{});
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = mod });
+        \\    b.installArtifact(exe);
+        \\    const check = b.step("check", "Check if app compiles");
+        \\    check.dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root);
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, "pub fn main() void {}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const shown = try shownMessages(&h);
+    try testing.expectEqual(1, shown.len);
+    try testing.expect(std.mem.indexOf(u8, shown[0], "compile exe app") != null);
+    try testing.expect(std.mem.indexOf(u8, shown[0], "failed") != null);
+    const ends = try buildProgressEnds(&h);
+    try testing.expect(ends.len != 0);
+    for (ends) |e| try testing.expect(!std.mem.eql(u8, e, "Done"));
+    try testing.expect(std.mem.indexOf(u8, ends[ends.len - 1], "compile exe app") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

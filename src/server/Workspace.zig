@@ -141,6 +141,14 @@ cache_identity: ?[2]Io.File.INode = null,
 
 // ── The following fields are accessed only by the background task ──
 bundles: std.ArrayList(ErrorBundle) = .empty,
+/// Steps among the diagnostics steps and their dependencies that failed in this round, and those
+/// of them that reported no errors (a missing system library, a failing Run or Fail step: the
+/// cause is only on the maker's stderr, or a dependency failed)
+failed_steps: std.ArrayList(u32) = .empty,
+silent_steps: std.ArrayList(u32) = .empty,
+/// Hash of the names of the steps last reported as failing without errors (0: none), so the
+/// warning is not repeated on every save while nothing changes
+silent_warned: u64 = 0,
 
 // ── The following fields are protected by set_mutex ──
 /// Files whose loading from disk has already been attempted (nonexistent files are recorded too,
@@ -249,6 +257,8 @@ fn destroy(ws: *Workspace) void {
     if (ws.project) |*p| p.deinit(gpa);
     for (ws.bundles.items) |*eb| eb.deinit(gpa);
     ws.bundles.deinit(gpa);
+    ws.failed_steps.deinit(gpa);
+    ws.silent_steps.deinit(gpa);
     ws.loaded.deinit(gpa);
     ws.read_imports.deinit(gpa);
     gpa.free(ws.root);
@@ -610,6 +620,10 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 defer ws.mutex.unlock(io);
                 ws.build_done += 1;
                 const in_diag = sc.step < ws.diag_steps.bit_length and ws.diag_steps.isSet(sc.step);
+                if (in_diag and sc.status == .failure) {
+                    try ws.failed_steps.append(ws.gpa, sc.step);
+                    if (sc.errors.errorMessageCount() == 0) try ws.silent_steps.append(ws.gpa, sc.step);
+                }
                 if (in_diag and sc.errors.errorMessageCount() != 0) {
                     try ws.bundles.append(ws.gpa, sc.errors);
                     sc.errors = .empty;
@@ -682,13 +696,44 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             }
             var errors: u32 = 0;
             for (ws.bundles.items) |eb| errors += eb.errorMessageCount();
+            var warning_buf: [768]u8 = undefined;
+            var warning: ?[]const u8 = null;
             {
-                var buf: [64]u8 = undefined;
+                var buf: [256]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
-                ws.server.progress.end(ws.server, ws.build_progress, if (errors == 0) "Done" else std.fmt.bufPrint(&buf, "{d} error(s)", .{errors}) catch null);
+                if (errors != 0) w.print("{d} error(s)", .{errors}) catch {};
+                // Steps that failed without reporting errors, not because a dependency failed:
+                // the build is not clean even when no errors are published. Their output is only
+                // on the maker's stderr.
+                var hasher: std.hash.Wyhash = .init(0);
+                var first: ?[]const u8 = null;
+                var count: usize = 0;
+                if (ws.model) |*m| for (ws.silent_steps.items) |s| {
+                    const dependency_failed = for (m.steps[s].deps) |d| {
+                        if (std.mem.indexOfScalar(u32, ws.failed_steps.items, d) != null) break true;
+                    } else false;
+                    if (dependency_failed) continue;
+                    const name = m.steps[s].name;
+                    hasher.update(name);
+                    hasher.update(&.{0});
+                    if (first == null) first = name;
+                    count += 1;
+                    w.print("{s}{s} failed", .{ if (w.end == 0) "" else "; ", name }) catch {};
+                };
+                const key = if (count == 0) 0 else hasher.final() | 1;
+                if (key != 0 and key != ws.silent_warned) {
+                    var more_buf: [32]u8 = undefined;
+                    const more = if (count > 1) std.fmt.bufPrint(&more_buf, " (and {d} more)", .{count - 1}) catch "" else "";
+                    warning = std.fmt.bufPrint(&warning_buf, "zig build step '{s}'{s} failed without reporting errors in {s}: run `{s}` there to see why", .{ first.?, more, ws.root, buildTitle(&ws.model.?, ws.config.compiler_diagnostics) }) catch
+                        "a zig build step failed without reporting errors: run zig build to see why";
+                }
+                ws.silent_warned = key;
+                ws.server.progress.end(ws.server, ws.build_progress, if (w.end == 0) "Done" else w.buffered());
                 ws.build_progress = null;
             }
+            if (warning) |message| ws.server.showWarning(message);
             try ws.finishBuild();
             ws.generated_dirty = false;
             try ws.recomputeCompileSet();
@@ -784,9 +829,12 @@ fn endLoading(ws: *Workspace, message: ?[]const u8) void {
     ws.loading = null;
 }
 
+/// Discards what this round collected: error bundles and failed steps
 fn clearBundles(ws: *Workspace) void {
     for (ws.bundles.items) |*eb| eb.deinit(ws.gpa);
     ws.bundles.clearRetainingCapacity();
+    ws.failed_steps.clearRetainingCapacity();
+    ws.silent_steps.clearRetainingCapacity();
 }
 
 /// Converts the errors collected in this round into diagnostics, replaces the previous round's
