@@ -7,7 +7,8 @@
 //! - Pointless discards (`pointless discard of ...`): delete `_ = name;`
 //! - Local variables that are never mutated (`local variable is never mutated`): change `var` to
 //!   `const`
-//! - Enum / union prongs missing from a switch: add `.name => {},`
+//! - Enum / union prongs missing from a switch: add `.name => {},` (and `_ => {},` for a
+//!   non-exhaustive enum)
 //! - Fields missing from a struct initializer (those without a default value): add
 //!   `.name = undefined`
 //!
@@ -700,16 +701,20 @@ fn innermost(r: *Resolver, file: FileId, offset: u32, comptime tag: std.meta.Tag
     return .{ .item = item, .base = node.offset, .body = b, .expr = best orelse return null };
 }
 
+/// Adds `.name => {}` for the enum or union tags that no prong covers, and `_ => {}` for a
+/// non-exhaustive enum without a `_` prong (Sema requires both even with a `_` prong)
 fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Action {
     const at = try innermost(r, file, offset, .@"switch") orelse return null;
     const sw = at.body.expr(at.expr).@"switch";
     var covered: std.StringHashMapUnmanaged(void) = .empty;
+    var has_underscore = false;
     for (sw.prongs) |p| {
         if (p.is_else) return null;
         for (p.items) |i| switch (at.body.expr(i)) {
             .enum_literal => |n| try covered.put(r.arena, ast.identName(n), {}),
-            // `_` of a non-exhaustive enum
-            .name_ref => |n| if (std.mem.eql(u8, n, "_")) return null,
+            .name_ref => |n| if (std.mem.eql(u8, n, "_") and !at.body.nameRefIsEscaped(i)) {
+                has_underscore = true;
+            },
             else => {},
         };
     }
@@ -733,6 +738,7 @@ fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
         if (covered.contains(ast.identName(name))) continue;
         try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} => {{}}", .{std.zig.fmtIdP(ast.identName(name))}));
     }
+    if (kind == .@"enum" and tree.containers[ns.container].nonexhaustive and !has_underscore) try items.append(r.arena, "_ => {}");
     if (items.items.len == 0) return null;
     const edit = try appendBeforeClose(r.arena, text, at.base + at.body.range(at.expr).start, at.base + at.body.range(at.expr).end, items.items, true) orelse return null;
     return .{ .title = "add missing switch prongs", .edits = try r.arena.dupe(Edit, &.{edit}) };

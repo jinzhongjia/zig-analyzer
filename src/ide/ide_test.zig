@@ -4298,6 +4298,21 @@ test "callsite seeding skips calls in branches the caller instance does not comp
     try testing.expectEqualStrings("memo", labels);
 }
 
+test "completion omits the _ of a non-exhaustive enum" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const NE = enum(u8) { a, b, _ };\ntest {\n    const ne: NE = .<|>;\n    _ = ne;\n}\n", "a b" },
+        .{ "const NE = enum(u8) { a, b, _ };\ntest {\n    _ = NE.<|>;\n}\n", "a b" },
+        .{ "const NE = enum(u8) { a, b, _ };\nfn f(ne: NE) void {\n    switch (ne) {\n        .<|>\n    }\n}\n", "a b" },
+        // `@"_"` is an ordinary field
+        .{ "const Q = enum { a, @\"_\" };\ntest {\n    const q: Q = .<|>;\n    _ = q;\n}\n", "a @\"_\"" },
+    };
+    for (cases) |c| {
+        const labels = try completionLabels(c[0]);
+        defer testing.allocator.free(labels);
+        try testing.expectEqualStrings(c[1], labels);
+    }
+}
+
 test "callsite seeding falls back to calls in branches no instance of the caller compiles" {
     // The only call is in a branch that no instance of the caller compiles: skipping such calls
     // used to leave no instance, so completion was empty

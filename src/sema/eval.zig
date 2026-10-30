@@ -1432,7 +1432,7 @@ const Evaluator = struct {
         return thaw(try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, queries.instOfType(ip, t)));
     }
 
-    /// Enum member names (in declaration order, excluding the `_` of non-exhaustive enums)
+    /// Enum member names (in declaration order)
     fn enumNames(ev: *Evaluator, t: Index) Error!?[]const []const u8 {
         const ip = ev.ip;
         switch (ip.key(t)) {
@@ -1443,7 +1443,7 @@ const Evaluator = struct {
                 var out: std.ArrayList([]const u8) = .empty;
                 for (tree.containerMembers(ns.container)) |m| {
                     const it = tree.items[m];
-                    if (it.kind == .field and it.name != null and !std.mem.eql(u8, it.name.?, "_")) try out.append(ev.a, it.name.?);
+                    if (it.kind == .field and it.name != null) try out.append(ev.a, it.name.?);
                 }
                 return out.items;
             },
@@ -1470,7 +1470,7 @@ const Evaluator = struct {
                 var next: i128 = 0;
                 for (tree.containerMembers(ns.container)) |m| {
                     const it = tree.items[m];
-                    if (it.kind != .field or it.name == null or std.mem.eql(u8, it.name.?, "_")) continue;
+                    if (it.kind != .field or it.name == null) continue;
                     // Explicit value `a = 5`
                     const owner = try ev.r.ownerKey(ns.file, m);
                     const body = try ev.r.ctx.get(hir.ItemBody, owner);
@@ -3968,7 +3968,7 @@ const Evaluator = struct {
             .container_type => {
                 const ns = try queries.namespaceOfType(ev.r, t) orelse return false;
                 const tree = try ev.r.itemTree(ns.file);
-                return infer.fieldItem(tree, ns.container, "_") != null;
+                return tree.containers[ns.container].nonexhaustive;
             },
             else => return false,
         }

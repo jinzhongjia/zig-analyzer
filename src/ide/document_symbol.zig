@@ -227,6 +227,24 @@ test "tuple fields are named by their index" {
     try testing.expectEqualStrings("test", syms[2].name);
 }
 
+test "the _ of a non-exhaustive enum is not a member" {
+    const text =
+        \\const NE = enum(u8) { a, b, _ };
+        \\const Q = enum { a, @"_" };
+    ;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parse = try Parse.create(a, text, .zig);
+    var items = try ItemTree.build(a, parse.rootNode(), .zig);
+    var map = try ItemTree.AstIdMap.build(a, &items, parse.rootNode());
+    const lines = try offsets.LineIndex.init(a, text);
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    try writeOutline(&out.writer, try documentSymbols(a, &items, &map, lines, .utf16), 0);
+    try testing.expectEqualStrings("NE\n  a\n  b\nQ\n  a\n  _\n", out.written());
+}
+
 fn writeOutline(w: *std.Io.Writer, syms: []const types.DocumentSymbol, depth: usize) !void {
     for (syms) |s| {
         try w.splatByteAll(' ', depth * 2);

@@ -2302,6 +2302,26 @@ test "type reflection and reification" {
     });
 }
 
+test "the _ of a non-exhaustive enum is not a field" {
+    try expectStdTypes(
+        \\const NE = enum(u8) { a, b, _ };
+        \\const Q = enum(u8) { a, @"_" };
+        \\fn g() void {
+        \\    const ne_len = @typeInfo(NE).@"enum".field_names.len;
+        \\    const ne_open = @typeInfo(NE).@"enum".mode == .nonexhaustive;
+        \\    const q_len = @typeInfo(Q).@"enum".field_names.len;
+        \\    const q_open = @typeInfo(Q).@"enum".mode == .nonexhaustive;
+        \\    _ = .{ ne_len, ne_open, q_len, q_open };
+        \\}
+    , &.{
+        .{ "ne_len", "usize = 2" },
+        .{ "ne_open", "bool = true" },
+        // `@"_"` is an ordinary field
+        .{ "q_len", "usize = 2" },
+        .{ "q_open", "bool = false" },
+    });
+}
+
 test "layouts of reified containers" {
     // Expected values are the results of zig 0.17.0
     try expectStdTypes(

@@ -952,6 +952,70 @@ test "add missing switch prongs" {
     ));
 }
 
+test "add missing switch prongs of a non-exhaustive enum" {
+    // `_` is not a member: the fix adds `_ => {}` and is offered when a `_` prong exists
+    try expectAction(
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a => {},
+        \\        .b => {},
+        \\        .c => {},
+        \\        _ => {},
+        \\    }
+        \\}
+    );
+    try expectAction(
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a => {},
+        \\        _ => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum(u8) { a, b, c, _ };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a => {},
+        \\        _ => {},
+        \\        .b => {},
+        \\        .c => {},
+        \\    }
+        \\}
+    );
+    // `@"_"` is an ordinary member
+    try expectAction(
+        \\const E = enum { a, @"_" };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, @"_" };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a => {},
+        \\        .@"_" => {},
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("no action", try applyNone(
+        \\const E = enum(u8) { a, _ };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) { .a => {}, _ => {} }
+        \\}
+    ));
+}
+
 fn applyNone(text: []const u8) ![]const u8 {
     const got = try apply(text, "add missing switch prongs");
     defer testing.allocator.free(got);
