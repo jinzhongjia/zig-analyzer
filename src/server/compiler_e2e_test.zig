@@ -482,10 +482,10 @@ test "inactive hints are not published inside compiler errors" {
         \\const builtin = @import("builtin");
         \\export fn entry() u32 {
         \\    if (builtin.is_test) {
+        \\        const unused = 1;
         \\        return 0;
         \\    } else {
-        \\        const x: u32 = "oops";
-        \\        return x;
+        \\        return 1;
         \\    }
         \\}
         \\

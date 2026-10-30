@@ -2398,10 +2398,9 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
             if (file) |f| break :blk f;
             appendNote(&notes, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{path});
         }
-        // Generated with the settings of `zig test`, so that `std.testing.allocator` and the
-        // like, which depend on `builtin.is_test`, can be inferred in test blocks (consistent with
-        // modules that have a test step; see configuration.zig)
-        break :blk za.project.builtin.generate(gpa, io, env, &.{"test"}) catch |err| switch (err) {
+        // Generated with the settings of the single-file compile (`zig build-obj`, see
+        // `compileSingle`), whose diagnostics these files get
+        break :blk za.project.builtin.generate(gpa, io, env, &.{"build-obj"}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => null,
         };
@@ -4010,9 +4009,10 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     @memcpy(out[0..diags.len], diags);
     var n = diags.len;
     for (ranges) |x| {
-        // builtin is generated as for zig test, so inference may mark as inactive a branch that the
-        // compile behind the diagnostics actually executes: no hint is published where it overlaps
-        // a compiler diagnostic, so that the same code is not both an error and inactive
+        // Inference may mark as inactive code in which the compile behind the diagnostics reports
+        // errors (AstGen checks every branch, and a file can be compiled in several
+        // configurations): no hint is published where it overlaps a compiler diagnostic, so that
+        // the same code is not both an error and inactive
         if (conflictsWithCompilerError(diags, text, server.encoding, x)) continue;
         out[n] = .{
             .range = lines.range(x.start, x.end, server.encoding),

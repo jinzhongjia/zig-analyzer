@@ -244,3 +244,16 @@ test "build integration: builtin.is_test follows the compilation used for diagno
     // Only the test arm is inactive, not the code the executable runs
     try testing.expectEqualSlices(i64, &.{2}, try s.inactiveLines(main_uri));
 }
+
+test "build integration: builtin.is_test in single-file mode matches the single-file compile" {
+    var s: Session = undefined;
+    try s.start(&.{.{ .path = "one.zig", .text = test_root_main }},
+        \\{"diagnostics": {"inactive_code": true}}
+    );
+    defer s.finish();
+    const one_uri = try s.open("one.zig", test_root_main);
+    try s.waitIdle();
+
+    try testing.expectEqualStrings("```zig\nconst in_test: u16 = 2\n```", try s.hover(one_uri, test_root_main, "in_test ="));
+    try testing.expectEqualSlices(i64, &.{2}, try s.inactiveLines(one_uri));
+}
