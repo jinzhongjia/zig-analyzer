@@ -81,7 +81,14 @@ pub const Result = struct {
     /// `queries.ZonResultType`)
     zon_imports: []const ZonImport = &.{},
 
-    pub const LiteralExpected = struct { expr: ExprId, ty: Index };
+    pub const LiteralExpected = struct {
+        expr: ExprId,
+        ty: Index,
+        /// The type comes from peer type resolution, not from a result type (an enum literal in a
+        /// branch without a result type, an operand of a comparison): the literal names a tag of
+        /// it, never a declaration, since decl literals need a result type
+        tags_only: bool = false,
+    };
     pub const ZonImport = struct { file: FileId, ty: Index };
     pub const IterationVar = struct { binding: Body.BindingId, val: ?Index };
     pub const ParamCoercion = struct { param: u32, ty: Index };
@@ -640,13 +647,55 @@ const Inferrer = struct {
 
     /// Branch results without a result type are coerced to the peer type
     /// (`if (b.op()) |t| t.kind else .invalid`): enum literals in the branches refer to members of
-    /// the peer type and use it as their expected type
+    /// the peer type and use it as their expected type (naming only its tags)
     fn peerLiteral(inf: *Inferrer, e: ExprId, ty: Index) Error!void {
         if (ty == .unknown or ty == .enum_literal_type) return;
         if (inf.body.expr(e) != .enum_literal or inf.members[@backingInt(e)] != null) return;
         if (inf.get(e).ty != .enum_literal_type) return;
-        try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = ty });
+        try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = ty, .tags_only = true });
         try inf.recordTagMember(e, ty);
+    }
+
+    /// Operand `e` (inferred as `tv`) of a comparison whose other operand has type `other`.
+    /// Matching the compiler, comparison operands have no result type and are coerced to their
+    /// peer type: an enum literal compared with an enum or a tagged union names one of its tags
+    /// (never a declaration), and has no value when it names none (a compile error); a comptime
+    /// number compared with a float is rounded to it; an error value takes the other side's type
+    /// as its expected type (for completing error names).
+    fn comparedOperand(inf: *Inferrer, e: ExprId, tv: TypedValue, other: Index) Error!TypedValue {
+        switch (tv.ty) {
+            .enum_literal_type => if (try inf.comparedType(other)) |t| if (t != .enum_literal_type) {
+                try inf.peerLiteral(e, t);
+                const v = tv.val orelse return tv;
+                if (!try inf.hasTag(t, inf.ip.key(v).enum_literal)) return tv;
+                const c = try inf.coerce(tv, t);
+                if (inf.body.expr(e) == .enum_literal) inf.exprs[@backingInt(e)] = c;
+                return c;
+            },
+            .comptime_int_type, .comptime_float_type => if (inf.ip.isFloat(other)) return inf.coerce(tv, other),
+            else => if (inf.body.expr(e) == .error_value) if (try inf.comparedType(other)) |t| {
+                try inf.literal_expected.append(inf.scratch, .{ .expr = e, .ty = t });
+            },
+        }
+        return tv;
+    }
+
+    /// Whether the enum `t` (or the tag enum of a tagged union, or either through an optional)
+    /// has the tag `name`
+    fn hasTag(inf: *Inferrer, t: Index, name: []const u8) Error!bool {
+        const ip = inf.ip;
+        var x = t;
+        if (ip.key(x) == .optional_type) x = ip.key(x).optional_type;
+        if (ip.key(x) == .union_tag_type) x = ip.key(x).union_tag_type;
+        switch (ip.key(x)) {
+            .container_type => |c| {
+                if (c.kind != .@"enum" and c.kind != .@"union") return false;
+                const ns = try queries.namespaceOfType(inf.r, x) orelse return false;
+                return fieldItem(try inf.r.itemTree(ns.file), ns.container, name) != null;
+            },
+            .reified_type => |rt| return rt.kind != .@"struct" and hasName(rt.names, name),
+            else => return false,
+        }
     }
 
     /// See `Result.param_coercions`: `e` is a reference to a parameter of this member, used with
@@ -2458,19 +2507,17 @@ const Inferrer = struct {
                 return .{ .ty = .bool_type };
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                // An enum literal on the left (`.a == e`): infer the right-hand side first, and the
-                // literal takes the type of the right-hand side (peer)
-                const literal_lhs = inf.body.expr(lhs_e) == .enum_literal and inf.body.expr(rhs_e) != .enum_literal;
-                // A literal compared with a value of unknown type has an unknown result type
-                const lhs, const rhs = if (literal_lhs) blk: {
-                    const r = try inf.infer(rhs_e, null);
-                    if (r.ty == .unknown) try inf.noteUnknownResult(lhs_e);
-                    break :blk .{ try inf.infer(lhs_e, try inf.comparedType(r.ty)), r };
-                } else blk: {
-                    const l = try inf.infer(lhs_e, null);
-                    if (l.ty == .unknown) try inf.noteUnknownResult(rhs_e);
-                    break :blk .{ l, try inf.infer(rhs_e, try inf.comparedType(l.ty)) };
-                };
+                // Matches the compiler: the operands have no result type (see `comparedOperand`)
+                const l = try inf.infer(lhs_e, null);
+                const r = try inf.infer(rhs_e, null);
+                // A literal compared with a value of unknown type may name a member of that type
+                if (l.ty == .unknown) try inf.noteUnknownResult(rhs_e);
+                if (r.ty == .unknown) try inf.noteUnknownResult(lhs_e);
+                const lhs = try inf.comparedOperand(lhs_e, l, r.ty);
+                const rhs = try inf.comparedOperand(rhs_e, r, l.ty);
+                // An enum literal compared with a value that has no tag of that name: not a
+                // comparison the compiler accepts, so it has no value
+                if ((lhs.ty == .enum_literal_type) != (rhs.ty == .enum_literal_type)) return .{ .ty = .bool_type };
                 // Vectors are compared element-wise; the result is a vector of bool
                 const vec_len: ?u32 = switch (ip.key(lhs.ty)) {
                     .vector_type => |v| v.len,
@@ -2517,10 +2564,9 @@ const Inferrer = struct {
     /// Arithmetic and bitwise operations: the peer of both sides; when both sides are known
     /// integers, the result is folded with the bit width of the peer type. Matching the compiler,
     /// the operands have no result type (`const m: u8 = (0xFF << 4) >> 4` is computed as
-    /// comptime_int, giving 255, and only then converted to u8); the right-hand side uses the
-    /// left-hand side's type as the expected type of literals, with the same result as the peer.
+    /// comptime_int, giving 255, and only then converted to u8; `b + @intCast(y)` has no type).
     fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
-        const rhs = try inf.infer(rhs_e, if (lhs.ty != .unknown and lhs.ty != .comptime_int_type) lhs.ty else null);
+        const rhs = try inf.infer(rhs_e, null);
         return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
     }
 
@@ -2577,8 +2623,9 @@ const Inferrer = struct {
     fn foldInt(inf: *Inferrer, op: SyntaxKind, ty: Index, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
         const ip = inf.ip;
         if (ip.isFloat(ty)) {
-            const a = value.floatOf(ip, lhs.val) orelse return .{ .ty = ty };
-            const b = value.floatOf(ip, rhs.val) orelse return .{ .ty = ty };
+            // Comptime operands are coerced (rounded) to the peer type first
+            const a = value.floatOf(ip, if (lhs.val) |v| try value.coerceValue(ip, v, ty) else null) orelse return .{ .ty = ty };
+            const b = value.floatOf(ip, if (rhs.val) |v| try value.coerceValue(ip, v, ty) else null) orelse return .{ .ty = ty };
             return .{ .ty = ty, .val = try value.binaryFloat(ip, op, ty, a, b) };
         }
         if (ty != .comptime_int_type and !ip.isInt(ty)) return .{ .ty = ty };

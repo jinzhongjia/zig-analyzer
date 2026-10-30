@@ -6498,3 +6498,61 @@ test "member completion offers methods taking a pointer on variables reached thr
     defer testing.allocator.free(payload_labels);
     try testing.expectEqualStrings("file close", payload_labels);
 }
+
+test "enum literals compared with an enum or in branches without a result type offer only tags" {
+    // A comparison operand has no result type, so it cannot be a decl literal: `mode == .` used
+    // to offer the declarations of the enum, which fail to compile there
+    const prefix =
+        \\const Optimize = enum {
+        \\    debug,
+        \\    safe,
+        \\    pub const Debug: Optimize = .debug;
+        \\};
+        \\var mode: Optimize = .debug;
+        \\fn probe(flag: bool) void {
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "    if (mode == .<|>) {}\n", "debug safe" },
+        .{ "    if (mode != .<|>) {}\n", "debug safe" },
+        .{ "    if (.<|> == mode) {}\n", "debug safe" },
+        .{ "    const o = if (flag) mode else .<|>;\n    _ = o;\n", "debug safe" },
+        // With a result type, decl literals are offered
+        .{ "    const m: Optimize = .<|>;\n    _ = m;\n", "debug safe Debug" },
+        .{ "    switch (mode) {\n        .<|> => {},\n        else => {},\n    }\n", "debug safe Debug" },
+    };
+    for (cases) |c| {
+        const text = try std.mem.concat(testing.allocator, u8, &.{ prefix, c[0], "    _ = flag;\n}\n" });
+        defer testing.allocator.free(text);
+        const labels = try completionLabels(text);
+        defer testing.allocator.free(labels);
+        testing.expectEqualStrings(c[1], labels) catch |err| {
+            std.debug.print("completion in `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+
+    // `.debug` in a comparison still refers to the tag; `.Debug` refers to nothing
+    const text =
+        \\const Optimize = enum {
+        \\    debug,
+        \\    safe,
+        \\    pub const Debug: Optimize = .debug;
+        \\};
+        \\var mode: Optimize = .debug;
+        \\fn probe() bool {
+        \\    return mode == .debug or mode == .Debug;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const tag = (try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, ".debug or").? + 1))) orelse return error.NoDefinition;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "debug,").?)), tag.start);
+    try testing.expectEqual(@as(?definition.Target, null), try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, ".Debug;\n}").? + 1)));
+}

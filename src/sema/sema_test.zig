@@ -3499,3 +3499,36 @@ test "a while loop whose condition always holds takes the type of its breaks" {
         .{ "with_else", "u32" },
     });
 }
+
+test "operands of comparisons and arithmetic have no result type" {
+    // The other operand's type used to be the result type: `mode == .Debug` resolved the decl
+    // literal `Debug`, and `b + @intCast(y)` cast to u8
+    try expectTypes(
+        \\const Optimize = enum {
+        \\    debug,
+        \\    safe,
+        \\    pub const Debug: Optimize = .debug;
+        \\};
+        \\const mode: Optimize = .debug;
+        \\const t = if (mode == .Debug) 1 else 0;
+        \\const t2 = if (mode == .debug) 1 else 0;
+        \\const t3 = if (.safe != mode) 1 else 0;
+        \\var b: u8 = 1;
+        \\var y: u64 = 2;
+        \\fn f(o: ?Optimize) void {
+        \\    const v28 = b + @intCast(y);
+        \\    const v29 = b + 1;
+        \\    const eq = o == .safe;
+        \\    _ = .{ v28, v29, eq };
+        \\}
+    , &.{
+        .{ "t", "comptime_int" },
+        .{ "t2", "comptime_int = 1" },
+        .{ "t3", "comptime_int = 1" },
+        .{ "v28", "unknown" },
+        .{ "v29", "u8" },
+        .{ "eq", "bool" },
+        .{ ".Debug", "enum_literal = .Debug" },
+        .{ ".safe", "Optimize = .safe" },
+    });
+}

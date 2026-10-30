@@ -392,7 +392,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             try initFields(r, &out, ty, x.fields);
             return .{ .items = out.items.items, .context = .init_field };
         }
-        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, file);
+        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, !a.literalTagsOnly(e), file);
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
 
@@ -702,10 +702,11 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, fr
     };
 }
 
-/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and
-/// declarations that can serve as decl literals (constants of type `T`, functions returning `T`
-/// or `!T`; also listed when their type cannot be inferred)
-fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resolve.Error!void {
+/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and with
+/// `decl_literals` (the type is a result type, not a peer type), declarations that can serve as
+/// decl literals (constants of type `T`, functions returning `T` or `!T`; also listed when their
+/// type cannot be inferred)
+fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     // Matching the compiler, strip error unions and optionals from the result type
     // (`fn f() !Color { return .red; }`)
@@ -737,7 +738,7 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, from: FileId) resol
                 else => {},
             },
             .@"const", .@"fn" => {
-                if (ns.file != from and !it.flags.is_pub) continue;
+                if (!decl_literals or (ns.file != from and !it.flags.is_pub)) continue;
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
                 if (!producesType(ip, decl_ty, t, it.kind == .@"fn")) continue;
                 const is_fn = it.kind == .@"fn";

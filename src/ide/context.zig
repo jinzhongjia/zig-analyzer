@@ -54,6 +54,14 @@ pub const At = struct {
         return null;
     }
 
+    /// Whether the expected type of an enum literal comes from peer type resolution (see
+    /// `infer.Result.LiteralExpected.tags_only`): it names only tags, not declarations
+    pub fn literalTagsOnly(a: At, e: Body.ExprId) bool {
+        for (a.res.literal_expected) |x| if (x.expr == e) return x.tags_only;
+        if (a.seeded) |s| for (s.res.literal_expected) |x| if (x.expr == e) return x.tags_only;
+        return false;
+    }
+
     /// Field that the `index`-th field name in the initializer `init` resolves to
     pub fn fieldRef(a: At, init: Body.ExprId, index: u32) ?hir.OwnerKey {
         for (a.res.field_refs) |f| if (f.init == init and f.index == index) return f.member;

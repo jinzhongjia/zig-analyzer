@@ -2031,10 +2031,15 @@ const Evaluator = struct {
                 return ev.eval(f, rhs_e, if (child != .unknown) child else want);
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                const lhs = try ev.eval(f, lhs_e, null);
-                // Tagged union compared with a tag: do not coerce the other side to the union type
-                const rhs_want: ?Index = if (lhs.ty == .unknown or lhs.ty == .comptime_int_type or lhs.ty == .enum_literal_type or ev.isUnion(lhs.ty)) null else lhs.ty;
-                const rhs = try ev.eval(f, rhs_e, rhs_want);
+                // Matching the compiler, the operands have no result type and are coerced to their
+                // peer type: an enum literal to the other side's enum (by tag name, never as a
+                // decl literal; a name that is not a tag is a compile error), a comptime number to
+                // the other side's float type (rounding it). A tagged union compared with a tag
+                // keeps the literal as it is.
+                var lhs = try ev.eval(f, lhs_e, null);
+                var rhs = try ev.eval(f, rhs_e, null);
+                if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
+                if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
                 if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
                     const eq = pointerEql(lhs, rhs) orelse return error.Abort;
                     return boolVal(eq == (op == .equal_equal));
@@ -2060,11 +2065,10 @@ const Evaluator = struct {
             else => {
                 // Matching the compiler, the operands have no result type:
                 // `const m: u8 = (0xFF << 4) >> 4` is computed as comptime_int and gives 255 when
-                // coerced to u8. The right side uses the left side's type as the expected type of
-                // literals, which gives the same result as peer type resolution.
+                // coerced to u8
                 const lhs = try ev.eval(f, lhs_e, null);
                 const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
-                const rhs = try ev.eval(f, rhs_e, if (is_shift or lhs.ty == .comptime_int_type) null else lhs.ty);
+                const rhs = try ev.eval(f, rhs_e, null);
                 // Bitwise operations on bool
                 if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
                     const x = (try ev.condition(lhs)).yes;
@@ -2078,8 +2082,9 @@ const Evaluator = struct {
                 }
                 if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
                     const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                    const x = ev.floatOf(lhs) orelse return error.Abort;
-                    const y = ev.floatOf(rhs) orelse return error.Abort;
+                    // Comptime operands are coerced (rounded) to the peer type first
+                    const x = ev.floatOf(try ev.coerce(lhs, ty)) orelse return error.Abort;
+                    const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
                     return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
                 }
                 const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
@@ -2552,6 +2557,18 @@ const Evaluator = struct {
         return switch (ev.ip.key(t)) {
             .container_type => |c| c.kind == .@"union",
             .reified_type => |rt| rt.kind == .@"union",
+            else => false,
+        };
+    }
+
+    /// Whether a comparison operand of type `t` is coerced to the other operand's type `other` by
+    /// peer type resolution: an enum literal compared with an enum (or an optional enum), and a
+    /// comptime number compared with a float
+    fn peerOperand(ev: *Evaluator, t: Index, other: Index) bool {
+        if (other == .unknown or other == t) return false;
+        return switch (t) {
+            .enum_literal_type => other != .enum_literal_type and !ev.isUnion(other),
+            .comptime_int_type, .comptime_float_type => ev.ip.isFloat(other),
             else => false,
         };
     }
