@@ -1957,6 +1957,31 @@ test "dereferencing a comptime-known slice gives an array" {
     });
 }
 
+test "dereferencing a comptime-known slice in a function body" {
+    // Prevents inferring `slice.*` and `&slice.*` as unknown
+    try expectTypes(
+        \\fn probe(rt: []const u16) void {
+        \\    const slice: []const u16 = &.{ 1, 2, 3 };
+        \\    const array = slice.*;
+        \\    const array_ptr = &slice.*;
+        \\    const z: [:0]const u16 = &.{ 1, 2, 3 };
+        \\    const za = z.*;
+        \\    var v: []const u16 = &.{ 1, 2 };
+        \\    v = rt;
+        \\    const r1 = rt.*;
+        \\    const r2 = v.*;
+        \\    _ = .{ array, array_ptr, za, r1, r2 };
+        \\}
+    , &.{
+        .{ "array", "[3]u16 = .{ 1, 2, 3 }" },
+        .{ "array_ptr", "*const [3]u16 = &.{ 1, 2, 3 }" },
+        .{ "za", "[3:0]u16 = .{ 1, 2, 3 }" },
+        // Runtime-known slices cannot be dereferenced
+        .{ "r1", "unknown" },
+        .{ "r2", "unknown" },
+    });
+}
+
 test "concatenation follows the compiler" {
     try expectTypes(
         \\fn f() void {
