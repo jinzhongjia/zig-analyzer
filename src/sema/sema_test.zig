@@ -2262,7 +2262,7 @@ test "unnamed parameters of extern functions are inferred" {
         \\    _ = r;
         \\}
     , &.{
-        .{ "ext", "fn (*const u32, u32) bool" },
+        .{ "ext", "fn (*const u32, u32) callconv(.c) bool" },
         .{ "*const u32", "type = *const u32" },
         .{ "74", "u32 = 74" },
         .{ "r", "bool" },
@@ -2278,8 +2278,8 @@ test "extern varargs function type keeps the varargs flag" {
         \\    _ = f;
         \\}
     , &.{
-        .{ "FT", "type = fn (u8, ...) void" },
-        .{ "f", "fn (u8, ...) void" },
+        .{ "FT", "type = fn (u8, ...) callconv(.c) void" },
+        .{ "f", "fn (u8, ...) callconv(.c) void" },
     });
 }
 
@@ -2923,6 +2923,105 @@ test "inline for pointer captures take the alignment of each element" {
     });
 }
 
+test "function types keep their calling convention" {
+    // Prevents `fn (u8) callconv(.c) void` from being the Zig-callconv function type.
+    // Expected values: zig 0.17.0 `@compileLog` of each name.
+    try expectTypes(
+        \\fn cfn(a: u8) callconv(.c) void { _ = a; }
+        \\inline fn inl(a: u8) u8 { return a; }
+        \\export fn exp(a: u8) u8 { return a; }
+        \\extern fn ext(a: u8) u8;
+        \\fn nak() callconv(.naked) void {}
+        \\fn plain(a: u8) void { _ = a; }
+        \\const FT = fn (u8) callconv(.c) void;
+        \\const VT = fn (u8, ...) callconv(.c) void;
+        \\const T_cfn = @TypeOf(cfn);
+        \\const T_inl = @TypeOf(inl);
+        \\const T_exp = @TypeOf(exp);
+        \\const T_ext = @TypeOf(ext);
+        \\const T_nak = @TypeOf(nak);
+        \\const T_plain = @TypeOf(plain);
+        \\const t_fn_eq = if (@TypeOf(cfn) == fn (u8) void) @as(u8, 1) else @as(u16, 2);
+        \\const t_ft_eq = if (@TypeOf(cfn) == FT) @as(u8, 1) else @as(u16, 2);
+        \\fn f() void {
+        \\    const a6 = &cfn;
+        \\    _ = a6;
+        \\}
+    , &.{
+        .{ "FT", "type = fn (u8) callconv(.c) void" },
+        .{ "VT", "type = fn (u8, ...) callconv(.c) void" },
+        .{ "T_cfn", "type = fn (u8) callconv(.c) void" },
+        .{ "T_inl", "type = fn (u8) callconv(.@\"inline\") u8" },
+        .{ "T_exp", "type = fn (u8) callconv(.c) u8" },
+        .{ "T_ext", "type = fn (u8) callconv(.c) u8" },
+        .{ "T_nak", "type = fn () callconv(.naked) void" },
+        .{ "T_plain", "type = fn (u8) void" },
+        .{ "t_fn_eq", "u16 = 2" },
+        .{ "t_ft_eq", "u8 = 1" },
+        .{ "a6", "*const fn (u8) callconv(.c) void = &fn (u8) callconv(.c) void" },
+    });
+}
+
+test "@typeInfo and @Fn keep the calling convention and genericity of functions" {
+    // Prevents `@typeInfo` from reporting `.auto` and `is_generic = false` for every function.
+    // Expected values: zig 0.17.0 `@compileLog` of each name on x86_64-linux-gnu, where
+    // `@TypeOf(sysv)` is `fn (u8) callconv(.c) void` and `@TypeOf(win)` is
+    // `fn (u8) callconv(.{ .x86_64_win = .{ .incoming_stack_alignment = null } }) void`.
+    const src =
+        \\fn cfn(a: u8) callconv(.c) void { _ = a; }
+        \\fn gen(comptime T: type, x: T) T { return x; }
+        \\fn gct(comptime x: u8) u8 { return x; }
+        \\fn gany(x: anytype) void { _ = x; }
+        \\inline fn inl(a: u8) u8 { return a; }
+        \\fn nak() callconv(.naked) void {}
+        \\fn sysv(a: u8) callconv(.{ .x86_64_sysv = .{} }) void { _ = a; }
+        \\fn win(a: u8) callconv(.{ .x86_64_win = .{} }) void { _ = a; }
+        \\const cc_auto = @intFromBool(@typeInfo(@TypeOf(cfn)).@"fn".attrs.@"callconv" == .auto);
+        \\const cc_inl = @intFromBool(@typeInfo(@TypeOf(inl)).@"fn".attrs.@"callconv" == .@"inline");
+        \\const cc_nak = @intFromBool(@typeInfo(@TypeOf(nak)).@"fn".attrs.@"callconv" == .naked);
+        \\const isgen = @intFromBool(@typeInfo(@TypeOf(gen)).@"fn".is_generic);
+        \\const isgen_ct = @intFromBool(@typeInfo(@TypeOf(gct)).@"fn".is_generic);
+        \\const isgen_any = @intFromBool(@typeInfo(@TypeOf(gany)).@"fn".is_generic);
+        \\const isgen_c = @intFromBool(@typeInfo(@TypeOf(cfn)).@"fn".is_generic);
+        \\const R = @Fn(&.{u8}, &.{.{}}, void, .{ .@"callconv" = .c });
+        \\const N = @Fn(&.{}, &.{}, void, .{ .@"callconv" = .naked });
+        \\const r_eq = @intFromBool(R == @TypeOf(cfn));
+        \\const T_sysv = @TypeOf(sysv);
+        \\const T_win = @TypeOf(win);
+        \\const sysv_eq = @intFromBool(@TypeOf(sysv) == @TypeOf(cfn));
+    ;
+    try expectStdTypesBuiltin(
+        \\const std = @import("std");
+        \\pub const target: std.Target = .{
+        \\    .cpu = .{ .arch = .x86_64, .model = undefined, .features = undefined },
+        \\    .os = .{ .tag = .linux, .version_range = undefined },
+        \\    .abi = .gnu,
+        \\    .ofmt = .elf,
+        \\};
+    , src, &.{
+        .{ "cc_auto", "u1 = 0" },
+        .{ "cc_inl", "u1 = 1" },
+        .{ "cc_nak", "u1 = 1" },
+        .{ "isgen", "u1 = 1" },
+        .{ "isgen_ct", "u1 = 1" },
+        .{ "isgen_any", "u1 = 1" },
+        .{ "isgen_c", "u1 = 0" },
+        .{ "R", "type = fn (u8) callconv(.c) void" },
+        .{ "N", "type = fn () callconv(.naked) void" },
+        .{ "r_eq", "u1 = 1" },
+        .{ "T_sysv", "type = fn (u8) callconv(.c) void" },
+        .{ "T_win", "type = fn (u8) callconv(.{ .x86_64_win = .{ .incoming_stack_alignment = null } }) void" },
+        .{ "sysv_eq", "u1 = 1" },
+    });
+    // Without a target, the C calling convention has no value
+    try expectStdTypes(src, &.{
+        .{ "cc_auto", "u1" },
+        .{ "cc_inl", "u1 = 1" },
+        .{ "T_win", "type = fn (u8) callconv(unknown) void" },
+        .{ "r_eq", "u1 = 1" },
+    });
+}
+
 test "@typeInfo, @Pointer and std results keep pointer attributes" {
     // Prevents default attributes in `@typeInfo` and std results losing their alignment
     try expectStdTypes(
@@ -3540,7 +3639,7 @@ test "clauses get the compiler's result types" {
         \\}
     , &.{
         .{ "\"std\"", "*const [3:0]u8" },
-        .{ ".naked", "CallingConvention" },
+        .{ ".naked", "CallingConvention = .{ .naked = {} }" },
         .{ "16", "u29 = 16" },
     });
 }

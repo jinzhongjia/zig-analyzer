@@ -206,6 +206,45 @@ pub const Alignment = enum(u64) {
     }
 };
 
+pub const FnType = struct {
+    params: []const Index,
+    ret: Index,
+    varargs: bool = false,
+    cc: CallConv = .auto,
+    /// Has comptime or `anytype` parameters
+    is_generic: bool = false,
+};
+
+/// Calling convention of a function type: a value of `std.builtin.CallingConvention`. The tags
+/// without options and the target's C calling convention have their own variants, so that they
+/// are known without evaluating `std.builtin`.
+pub const CallConv = union(enum) {
+    auto,
+    @"inline",
+    naked,
+    async,
+    /// `.c`: the C calling convention of the target
+    c,
+    /// Any other value of `std.builtin.CallingConvention`
+    other: Index,
+    /// The `callconv(...)` expression cannot be evaluated
+    unknown,
+
+    /// The variant written as `.name`: a tag without options or the declaration `c`; null for
+    /// other names
+    pub fn fromName(name: []const u8) ?CallConv {
+        inline for (.{ "auto", "inline", "naked", "async", "c" }) |n| {
+            if (std.mem.eql(u8, name, n)) return @field(CallConv, n);
+        }
+        return null;
+    }
+
+    /// Contains no part that could not be evaluated
+    pub fn isKnown(cc: CallConv) bool {
+        return cc != .unknown;
+    }
+};
+
 pub const Key = union(enum) {
     unknown,
     simple_type: Simple,
@@ -225,7 +264,7 @@ pub const Key = union(enum) {
     /// The error set of a function's `!T` inferred from the function body. The signature records
     /// only this marker; the members are computed on demand by `ErrorSetOf`.
     inferred_error_set: struct { file: FileId, decl: AstId, inst: ?Index = null },
-    fn_type: struct { params: []const Index, ret: Index, varargs: bool = false },
+    fn_type: FnType,
     /// Identity = definition location (file + AstId of the container)
     container_type: Container,
     /// Tuple `struct { A, B }` (`@Tuple`, tuple literals)
@@ -765,7 +804,11 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
             for (es.names, out) |n, *o| o.* = try a.dupe(u8, n);
             break :blk .{ .error_set_type = .{ .names = out, .sorted = try a.dupe(u32, es.sorted) } };
         },
-        .fn_type => |f| .{ .fn_type = .{ .params = try a.dupe(Index, f.params), .ret = f.ret, .varargs = f.varargs } },
+        .fn_type => |f| blk: {
+            var out = f;
+            out.params = try a.dupe(Index, f.params);
+            break :blk .{ .fn_type = out };
+        },
         .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
         .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = if (t.len) |l| try a.dupe(u8, l) else null, .child = t.child, .sentinel = t.sentinel } },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
@@ -977,6 +1020,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             }
             if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
             try w.writeAll(") ");
+            try ip.writeCallConv(f.cc, w, container_name);
             try ip.print(f.ret, w, container_name);
         },
         .container_type => |c| try container_name.write(c, w),
@@ -1081,6 +1125,21 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         .instance, .context => try w.writeAll("instance"),
         .opaque_param => |o| try w.writeAll(o.name),
         .runtime => try w.writeAll("_"),
+    }
+}
+
+/// `callconv(...) ` of a function type as the compiler prints it: nothing for `.auto`, the tag
+/// for tags without options, `.c` for the target's C calling convention, and the value otherwise
+fn writeCallConv(ip: *InternPool, cc: CallConv, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+    switch (cc) {
+        .auto => {},
+        .other => |v| {
+            try w.writeAll("callconv(");
+            try ip.print(v, w, container_name);
+            try w.writeAll(") ");
+        },
+        .unknown => try w.writeAll("callconv(unknown) "),
+        else => try w.print("callconv(.{f}) ", .{std.zig.fmtId(@tagName(cc))}),
     }
 }
 

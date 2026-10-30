@@ -352,6 +352,10 @@ const Inferrer = struct {
                 const own = inf.ownInstance();
                 for (b.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null);
                 if (b.type_expr) |t| inf.ret_type = (try inf.inferComptime(t, null)).asType();
+                // The calling convention belongs to the signature: the function type reads it
+                for (b.clauses) |c| if (c.kind == .@"callconv") {
+                    _ = try inf.inferComptime(c.expr, try inf.clauseType(.@"callconv"));
+                };
                 if (mode == .full) if (b.value) |v| {
                     _ = try inf.infer(v, null);
                 };
@@ -1086,7 +1090,8 @@ const Inferrer = struct {
                 const params = try inf.scratch.alloc(Index, f.params.len);
                 for (f.params, params) |p, *out| out.* = (try inf.infer(p, null)).asType() orelse .unknown;
                 const ret = if (f.ret) |r| (try inf.infer(r, null)).asType() orelse .unknown else .unknown;
-                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret } }));
+                const cc: InternPool.CallConv = if (f.@"callconv") |x| try eval.writtenCallConv(inf.r, inf.body, x, (try inf.inferComptime(x, try inf.clauseType(.@"callconv"))).val) else .auto;
+                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = f.varargs, .is_generic = f.is_generic, .cc = cc } }));
             },
             .@"return" => |v| {
                 const ret: TypedValue = if (v) |x| try inf.infer(x, inf.ret_type) else .{ .ty = .void_type };

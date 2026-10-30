@@ -1113,6 +1113,24 @@ const Evaluator = struct {
         return (try ev.ipOf(v)) orelse error.Abort;
     }
 
+    /// Value of the `callconv(...)` expression `e` of a function type; null when it cannot be
+    /// evaluated or is not needed (`.c` and the tags without options, see `writtenCallConv`)
+    fn callConvValue(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!?Index {
+        switch (f.body.expr(e)) {
+            .enum_literal => |n| if (InternPool.CallConv.fromName(n) != null) return null,
+            else => {},
+        }
+        const want = ev.stdType(&.{ "builtin", "CallingConvention" }) catch |err| switch (err) {
+            error.Abort => return null,
+            else => |x| return x,
+        };
+        const v = ev.eval(f, e, want) catch |err| switch (err) {
+            error.Abort => return null,
+            else => |x| return x,
+        };
+        return ev.freeze(v);
+    }
+
     fn evalInt(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!i128 {
         const v = try ev.eval(f, e, want);
         return ev.intOf(v) orelse error.Abort;
@@ -1196,7 +1214,8 @@ const Evaluator = struct {
                 const params = try ev.a.alloc(Index, ft.params.len);
                 for (ft.params, params) |p, *out| out.* = try ev.evalType(f, p);
                 const ret = if (ft.ret) |rt| try ev.evalType(f, rt) else .void_type;
-                return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret } }));
+                const cc: InternPool.CallConv = if (ft.@"callconv") |x| try writtenCallConv(ev.r, f.body, x, try ev.callConvValue(f, x)) else .auto;
+                return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = ft.varargs, .is_generic = ft.is_generic, .cc = cc } }));
             },
             .@"return" => |x| {
                 ev.jump_value = if (x) |rv| try ev.eval(f, rv, f.ret_type) else Val.void_val;
@@ -2929,7 +2948,14 @@ const Evaluator = struct {
         if (eq(u8, name, "@Fn")) {
             if (vals.len != 4) return error.Abort;
             const varargs = try ev.boolField(vals[3], "varargs");
-            return Val.ofType(try ip.get(.{ .fn_type = .{ .params = try ev.typesOf(vals[0]), .ret = try asType(vals[2]), .varargs = varargs } }));
+            const cc: InternPool.CallConv = blk: {
+                const v = ev.fieldAccess(vals[3], "callconv") catch |err| switch (err) {
+                    error.Abort => break :blk .unknown,
+                    else => |x| return x,
+                };
+                break :blk try callConv(ev.r, try ev.freeze(v));
+            };
+            return Val.ofType(try ip.get(.{ .fn_type = .{ .params = try ev.typesOf(vals[0]), .ret = try asType(vals[2]), .varargs = varargs, .cc = cc } }));
         }
         if (eq(u8, name, "@Enum")) {
             if (vals.len != 4) return error.Abort;
@@ -3933,10 +3959,10 @@ const Evaluator = struct {
                 for (param_attrs) |*o| o.* = try ev.structValue(pa_ty, &.{});
                 break :blk .{ "fn", try ev.structValue(fn_ty, &.{
                     .{ "attrs", try ev.structValue(try ev.member(fn_ty, "Attributes"), &.{
-                        .{ "callconv", try ip.get(.{ .union_value = .{ .ty = cc, .tag = "auto", .payload = .void_value } }) },
+                        .{ "callconv", try ev.callConvInfo(cc, ft.cc) },
                         .{ "varargs", if (ft.varargs) .true_value else .false_value },
                     }) },
-                    .{ "is_generic", .false_value },
+                    .{ "is_generic", if (ft.is_generic) .true_value else .false_value },
                     .{ "return_type", ft.ret },
                     .{ "param_types", try ev.sliceValue(try ip.optionalOf(.type_type), params) },
                     .{ "param_attrs", try ev.sliceValue(pa_ty, param_attrs) },
@@ -3946,6 +3972,23 @@ const Evaluator = struct {
             else => return error.Abort,
         };
         return ip.get(.{ .union_value = .{ .ty = type_ty, .tag = payload[0], .payload = payload[1] } });
+    }
+
+    /// The value of `std.builtin.CallingConvention` (`cc_ty`) of a calling convention; unknown
+    /// when it cannot be evaluated (`.c` on a target whose C calling convention is not known)
+    fn callConvInfo(ev: *Evaluator, cc_ty: Index, cc: InternPool.CallConv) EvalError!Index {
+        return switch (cc) {
+            .other => |v| v,
+            .unknown => .unknown,
+            .c => blk: {
+                const v = ev.typeMember(cc_ty, "c") catch |err| switch (err) {
+                    error.Abort => break :blk .unknown,
+                    else => |x| return x,
+                };
+                break :blk try ev.freeze(v) orelse .unknown;
+            },
+            else => ev.ip.get(.{ .union_value = .{ .ty = cc_ty, .tag = @tagName(cc), .payload = .void_value } }),
+        };
     }
 
     /// `std.builtin.Type.Pointer.Attributes` of a pointer type: the address space is always given
@@ -4380,6 +4423,34 @@ pub fn addressSpaceOf(ip: *InternPool, v: ?Index) ?std.builtin.AddressSpace {
         else => return null,
     };
     return std.meta.stringToEnum(std.builtin.AddressSpace, name);
+}
+
+/// Calling convention given by a value of `std.builtin.CallingConvention` (or an enum literal):
+/// the target's C calling convention is `.c`, as the compiler prints and compares it; unknown
+/// when the value, or for options other than a bare tag the C calling convention, cannot be
+/// evaluated
+pub fn callConv(r: *Resolver, v: ?Index) Error!InternPool.CallConv {
+    const ip = r.ctx.db.env.ip;
+    const val = v orelse return .unknown;
+    const u = switch (ip.key(val)) {
+        .union_value => |u| u,
+        .enum_literal => |n| return InternPool.CallConv.fromName(n) orelse .unknown,
+        else => return .unknown,
+    };
+    if (InternPool.CallConv.fromName(u.tag)) |cc| return cc;
+    const c = try typeMember(r, u.ty, "c") orelse return .unknown;
+    const c_val = c.val orelse return .unknown;
+    return if (c_val == val) .c else .{ .other = val };
+}
+
+/// Calling convention written as `callconv(e)`, where `e` has the value `v`: `.c` and the tags
+/// without options are known from the syntax
+pub fn writtenCallConv(r: *Resolver, body: *const Body, e: ExprId, v: ?Index) Error!InternPool.CallConv {
+    switch (body.expr(e)) {
+        .enum_literal => |n| if (InternPool.CallConv.fromName(n)) |cc| return cc,
+        else => {},
+    }
+    return callConv(r, v);
 }
 
 /// Sentinel of the result of `++` (matching the compiler): when both sides have one, they must

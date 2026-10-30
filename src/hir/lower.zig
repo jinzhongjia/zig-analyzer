@@ -352,12 +352,25 @@ const Lowerer = struct {
             .fn_proto => blk: {
                 const proto = ast.FnProto{ .syntax = n };
                 var params: std.ArrayList(ExprId) = .empty;
+                var varargs = false;
+                var is_generic = false;
                 var it = proto.params();
-                while (it.next()) |p| if ((ast.Param{ .syntax = p }).typeExpr()) |t| try params.append(l.a, try l.expr(t));
-                for (proto.clauses()) |c| if (c) |cn| {
+                while (it.next()) |p| {
+                    const param = ast.Param{ .syntax = p };
+                    if (param.isVarargs()) {
+                        varargs = true;
+                    } else if (param.typeExpr()) |t| {
+                        try params.append(l.a, try l.expr(t));
+                        if (param.isComptime()) is_generic = true;
+                    } else is_generic = true;
+                }
+                const proto_clauses = proto.clauses();
+                for (proto_clauses[0..3]) |c| if (c) |cn| {
                     _ = try l.clause(cn);
                 };
-                break :blk .{ .fn_type = .{ .params = params.items, .ret = try l.optExpr(proto.returnType()) } };
+                const cc_items: []const ExprId = if (proto_clauses[3]) |cn| try l.clauseItems(cn) else &.{};
+                const cc: ?ExprId = if (cc_items.len == 1) cc_items[0] else null;
+                break :blk .{ .fn_type = .{ .params = params.items, .ret = try l.optExpr(proto.returnType()), .varargs = varargs, .is_generic = is_generic, .@"callconv" = cc } };
             },
             .return_expr => .{ .@"return" = try l.optExpr(firstChild(n)) },
             .break_expr => blk: {

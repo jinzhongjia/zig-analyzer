@@ -36,7 +36,8 @@ align_expr: ?ExprId,
 /// Expressions in the `align` / `addrspace` / `linksection` / `callconv` clauses of function
 /// prototypes, variables and fields, and local variables (the clauses are not part of the
 /// expression tree; they are inferred separately, against the result type of the clause). The
-/// clauses of pointer types are part of `Expr.ptr_type`.
+/// clauses of pointer types and the `callconv` of function types are part of `Expr.ptr_type` /
+/// `Expr.fn_type`.
 clauses: []const Clause,
 
 pub const ExprId = enum(u32) { _ };
@@ -89,8 +90,9 @@ pub const Expr = union(enum) {
     /// `arg` is the integer type of `enum(u8)`, the tag type of `union(E)`, or the backing integer
     /// of `packed struct(u32)`
     container: struct { arg: ?ExprId },
-    /// Function type `fn (A, B) R`
-    fn_type: struct { params: []const ExprId, ret: ?ExprId },
+    /// Function type `fn (A, B) R`. `is_generic`: has comptime or `anytype` parameters. The
+    /// `callconv(...)` expression is part of the type; its other clauses are in `clauses`.
+    fn_type: struct { params: []const ExprId, ret: ?ExprId, varargs: bool = false, is_generic: bool = false, @"callconv": ?ExprId = null },
     @"return": ?ExprId,
     @"break": struct { label: ?[]const u8, value: ?ExprId },
     /// `continue :l value` of a labeled switch carries a value

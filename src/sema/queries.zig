@@ -132,9 +132,20 @@ pub const DeclType = struct {
                 // Parameters with bindings (including anytype and unnamed parameters) in order;
                 // `...` has no binding and can only come last (see `varargs` in ItemTree)
                 var params: std.ArrayList(Index) = .empty;
-                for (b.params) |p| try params.append(r.arena, res.bindings[@backingInt(p)].ty);
-                const varargs = tree.items[item].flags.varargs;
-                const ty = try ip.get(.{ .fn_type = .{ .params = params.items, .ret = try returnType(&r, key, b, res, dk.inst), .varargs = varargs } });
+                var is_generic = false;
+                for (b.params) |p| {
+                    try params.append(r.arena, res.bindings[@backingInt(p)].ty);
+                    const binding = b.binding(p);
+                    if (binding.is_comptime or binding.ty == null) is_generic = true;
+                }
+                const flags = tree.items[item].flags;
+                const ty = try ip.get(.{ .fn_type = .{
+                    .params = params.items,
+                    .ret = try returnType(&r, key, b, res, dk.inst),
+                    .varargs = flags.varargs,
+                    .cc = try fnCallConv(&r, b, res, flags),
+                    .is_generic = is_generic,
+                } });
                 return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item, .inst = dk.inst } }) };
             },
             .@"const", .@"var" => {
@@ -179,6 +190,19 @@ pub const DeclType = struct {
         return .unknown;
     }
 };
+
+/// Calling convention of a function declaration with body `body` and signature inference result
+/// `sig`: its `callconv(...)`, otherwise (matching the compiler) `.c` for `export` and `extern`
+/// functions, `.@"inline"` for `inline` functions and `.auto` for the others
+fn fnCallConv(r: *Resolver, body: *const Body, sig: *const infer.Result, flags: ItemTree.Item.Flags) resolve.Error!InternPool.CallConv {
+    for (body.clauses) |c| if (c.kind == .@"callconv") {
+        const v: ?Index = if (@backingInt(c.expr) < sig.exprs.len) sig.exprs[@backingInt(c.expr)].val else null;
+        return eval.writtenCallConv(r, body, c.expr, v);
+    };
+    if (flags.is_export or flags.is_extern) return .c;
+    if (flags.is_inline) return .@"inline";
+    return .auto;
+}
 
 /// Return type of a function in the signature inference result `sig` (instance `inst`). The error
 /// set of `!T` is the error set inferred from the function body; the signature records only a

@@ -786,6 +786,7 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
         .optional_type => |c| isPrecise(ip, c),
         .error_union_type => |e| isPrecise(ip, e.err) and isPrecise(ip, e.payload),
         .fn_type => |f| blk: {
+            if (!f.cc.isKnown()) break :blk false;
             for (f.params) |p| if (!isPrecise(ip, p)) break :blk false;
             break :blk isPrecise(ip, f.ret);
         },
@@ -836,6 +837,7 @@ fn concrete(ip: *InternPool, t: Index, unknown_len: bool) bool {
         .optional_type => |c| concrete(ip, c, unknown_len),
         .error_union_type => |e| concrete(ip, e.err, unknown_len) and concrete(ip, e.payload, unknown_len),
         .fn_type => |f| blk: {
+            if (!f.cc.isKnown()) break :blk false;
             for (f.params) |p| if (!concrete(ip, p, unknown_len)) break :blk false;
             break :blk concrete(ip, f.ret, unknown_len);
         },
@@ -898,8 +900,9 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .error_union_type => |e| all(&.{ eqlTypes(ip, e.err, kb.error_union_type.err), eqlTypes(ip, e.payload, kb.error_union_type.payload) }),
         .fn_type => |f| blk: {
             const g = kb.fn_type;
-            if (f.params.len != g.params.len or f.varargs != g.varargs) break :blk false;
-            var unknown = false;
+            if (f.params.len != g.params.len or f.varargs != g.varargs or f.is_generic != g.is_generic) break :blk false;
+            if (f.cc.isKnown() and g.cc.isKnown() and !std.meta.eql(f.cc, g.cc)) break :blk false;
+            var unknown = !f.cc.isKnown() or !g.cc.isKnown();
             for (f.params, g.params) |x, y| {
                 const r = eqlTypes(ip, x, y) orelse {
                     unknown = true;
