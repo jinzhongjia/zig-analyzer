@@ -731,7 +731,7 @@ pub fn typeDefinition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
         if (ast.memberName(a.node, try r.inEnum(file, a.item))) |name| if (name.offset == tok.offset) {
             break :blk try r.ctx.get(queries.DeclType, .{ .owner = a.owner });
         };
-        for (a.body.bindings, 0..) |binding, i| if (binding.range.start == rel) break :blk a.bindingType(@fromBackingInt(@as(u32, @intCast(i))));
+        if (a.body.bindingAt(rel)) |id| break :blk a.bindingType(id);
         break :blk a.exprType(a.body.exprAt(rel) orelse return null);
     };
     const ip = r.ctx.db.env.ip;
@@ -787,9 +787,7 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
     const b = try r.body(file, item);
     const rel = tok.offset - node.offset;
     // The name of the local binding itself
-    for (b.bindings, 0..) |binding, i| {
-        if (binding.range.start == rel) return .{ .local = .{ .file = file, .item = item, .binding = @fromBackingInt(@as(u32, @intCast(i))) } };
-    }
+    if (b.bindingAt(rel)) |id| return .{ .local = .{ .file = file, .item = item, .binding = id } };
     const e = b.exprAt(rel) orelse return null;
     switch (b.expr(e)) {
         .name_ref => |name| {

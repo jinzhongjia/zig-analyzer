@@ -3534,6 +3534,48 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "goto, hover and symbols on the types of unnamed extern parameters" {
+    // Prevents the empty binding of an unnamed parameter from capturing the first token of its type
+    const text =
+        \\const Foo = extern struct { a: u32 };
+        \\const c = struct {
+        \\    pub const fd_t = c_int;
+        \\};
+        \\extern fn ext(Foo, *const Foo) void;
+        \\extern fn prim(c_int) void;
+        \\extern fn qual(c.fd_t) void;
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn f(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.f;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "Foo, *const", "Foo = extern" },
+        .{ "Foo) void", "Foo = extern" },
+        .{ "c.fd_t", "c = struct" },
+    }) |c| {
+        const def = (try definition.definition(&r, file, at(c[0]))) orelse return error.NoDefinition;
+        try testing.expect(std.mem.startsWith(u8, text[def.start..], c[1]));
+        const decl = (try definition.declaration(&r, file, at(c[0]))) orelse return error.NoDeclaration;
+        try testing.expect(std.mem.startsWith(u8, text[decl.start..], c[1]));
+        const symbol = (try definition.symbolAt(&r, file, at(c[0]))) orelse return error.NoSymbol;
+        try testing.expect(symbol == .def and symbol.def == .item);
+    }
+    try testing.expectEqual(null, try definition.definition(&r, file, at("c_int) void")));
+    try testing.expectEqual(null, try definition.symbolAt(&r, file, at("c_int) void")));
+    const info = (try hover.hover(&r, file, at("Foo, *const"), &.{})) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst Foo = struct\n```", info.text);
+}
+
 test "goto declaration of labels and field names in initializers" {
     const text =
         \\const Point = struct { x: i32, y: i32 };
