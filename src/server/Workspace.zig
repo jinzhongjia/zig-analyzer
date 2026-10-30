@@ -37,7 +37,7 @@ const CompileSet = za.diagnostics.compile_set;
 const database = @import("../database.zig");
 const panic_context = za.util.panic_context;
 const FileText = database.inputs.FileText;
-const AstCheck = database.live.AstCheck;
+const FileIndex = database.FileIndex;
 
 const Progress = Server.Progress.Progress;
 
@@ -814,9 +814,19 @@ const Resolver = struct {
     pub fn imports(r: Resolver, file: FileId) !?[]const []const u8 {
         const text = try r.ctx.get(FileText, file);
         if (text == null) return if (r.ws.loaded.contains(file)) &.{} else null;
-        return (try r.ctx.get(AstCheck, file)).imports;
+        return try syntaxImports(r.ws.server, r.ctx, file);
     }
 };
+
+/// The `@import` strings of a file in its syntax tree. The compiler follows the imports recorded in
+/// ZIR, but a file with a parse error or a duplicate member name has no ZIR: while such a file is
+/// being edited, the files imported through it still belong to the same modules in every build
+/// that compiles, so the syntax tree, which keeps the imports of a broken file, is used instead.
+/// ZON files import nothing.
+fn syntaxImports(server: *Server, ctx: *database.Db.Ctx, file: FileId) za.db.Error![]const []const u8 {
+    if (database.live.modeOf(server.vfs.path(file)) == .zon) return &.{};
+    return (try ctx.get(FileIndex.Query, file)).imports;
+}
 
 /// Computes the compile set; on encountering files that are not loaded, loads them from disk and
 /// recomputes, until nothing is missing

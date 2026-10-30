@@ -36,11 +36,6 @@ pub const Note = struct {
 pub const Result = struct {
     arena: std.heap.ArenaAllocator.State,
     items: []const Diagnostic,
-    /// `@import` strings recorded in ZIR (including those in function bodies). These are exactly
-    /// the imports the compiler follows to determine which files to run AstGen on; a parse error or
-    /// a fatal AstGen error in the root struct means no ZIR is generated, in which case this is
-    /// empty, matching the compiler's behavior.
-    imports: []const []const u8,
 
     pub fn destroy(r: *Result, gpa: Allocator) void {
         var arena = r.arena.promote(gpa);
@@ -65,43 +60,11 @@ pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Resu
             return result;
         } else |err| log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});
     }
-    return importsOnly(gpa, source, mode);
+    return empty(gpa);
 }
 
 fn checkInto(gpa: Allocator, source: [:0]const u8, mode: Mode, result: *Allocator.Error!*Result) void {
     result.* = checkSource(gpa, source, mode);
-}
-
-/// Result when AstGen is skipped: no diagnostics, and imports are collected from tokens (what
-/// AstGen records is exactly the string literals of `@import`)
-fn importsOnly(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    errdefer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var imports: std.ArrayList([]const u8) = .empty;
-    if (mode == .zig) {
-        var tokenizer: std.zig.Tokenizer = .init(source);
-        // The previous two tokens: `@import` and `(`
-        var prev: [2]std.zig.Token = @splat(.{ .tag = .invalid, .loc = .{ .start = 0, .end = 0 } });
-        while (true) {
-            const t = tokenizer.next();
-            if (t.tag == .eof) break;
-            if (t.tag == .string_literal and prev[1].tag == .l_paren and prev[0].tag == .builtin and
-                std.mem.eql(u8, source[prev[0].loc.start..prev[0].loc.end], "@import"))
-            {
-                const name = std.zig.string_literal.parseAlloc(arena, source[t.loc.start..t.loc.end]) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.InvalidLiteral => null,
-                };
-                if (name) |n| try imports.append(arena, n);
-            }
-            prev = .{ prev[1], t };
-        }
-    }
-    const result = try arena.create(Result);
-    result.* = .{ .arena = undefined, .items = &.{}, .imports = imports.items };
-    result.arena = arena_state.state;
-    return result;
 }
 
 fn checkSource(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!*Result {
@@ -117,22 +80,11 @@ fn checkSource(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error
 
     var wip: ErrorBundle.Wip = try .init(gpa);
     defer wip.deinit();
-    var imports: std.ArrayList([]const u8) = .empty;
     switch (mode) {
         .zig => {
             var zir = try std.zig.AstGen.generate(gpa, tree);
             defer zir.deinit(gpa);
             if (zir.hasCompileErrors()) try wip.addZirErrorMessages(zir, tree, source, "");
-            const payload = zir.extra[@backingInt(std.zig.Zir.ExtraIndex.imports)];
-            if (payload != 0) {
-                const header = zir.extraData(std.zig.Zir.Inst.Imports, payload);
-                var extra_index = header.end;
-                for (0..header.data.imports_len) |_| {
-                    const item = zir.extraData(std.zig.Zir.Inst.Imports.Item, extra_index);
-                    extra_index = item.end;
-                    try imports.append(arena, try arena.dupe(u8, zir.nullTerminatedString(item.data.name)));
-                }
-            }
         },
         .zon => {
             const zoir = try std.zig.ZonGen.generate(gpa, tree, .{});
@@ -164,7 +116,7 @@ fn checkSource(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error
     }
 
     const result = try arena.create(Result);
-    result.* = .{ .arena = undefined, .items = items.items, .imports = imports.items };
+    result.* = .{ .arena = undefined, .items = items.items };
     result.arena = arena_state.state;
     return result;
 }
@@ -335,7 +287,7 @@ pub const Prepared = struct {
 fn empty(gpa: Allocator) Allocator.Error!*Result {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     const result = try arena.allocator().create(Result);
-    result.* = .{ .arena = undefined, .items = &.{}, .imports = &.{} };
+    result.* = .{ .arena = undefined, .items = &.{} };
     result.arena = arena.state;
     return result;
 }
@@ -343,8 +295,6 @@ fn empty(gpa: Allocator) Allocator.Error!*Result {
 // ── Subprocess backend: zig ast-check ────────────────────────────────
 
 /// Passes the text to `zig ast-check --color off` through stdin and parses its error output.
-/// There is no import list in subprocess mode (the build graph cannot be loaded then either, so
-/// there is no compile set).
 pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []const u8, mode: Mode) !*Result {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -423,7 +373,7 @@ pub fn parseAstCheckOutput(gpa: Allocator, text: []const u8, output: []const u8)
     if (items.items.len != 0) items.items[items.items.len - 1].notes = try notes.toOwnedSlice(arena);
 
     const result = try arena.create(Result);
-    result.* = .{ .arena = undefined, .items = items.items, .imports = &.{} };
+    result.* = .{ .arena = undefined, .items = items.items };
     result.arena = arena_state.state;
     return result;
 }
@@ -548,7 +498,7 @@ test "ZON" {
     try expectMessages(".{ .a = 1, .a = 2 }", .zon, &.{"duplicate struct field name"});
 }
 
-test "deeply nested text: AstGen on a large stack, imports only beyond the limit" {
+test "deeply nested text: AstGen on a large stack, nothing beyond the limit" {
     const gpa = testing.allocator;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(gpa);
@@ -563,44 +513,19 @@ test "deeply nested text: AstGen on a large stack, imports only beyond the limit
         defer r.destroy(gpa);
         try testing.expectEqual(1, r.items.len);
         try testing.expectEqualStrings("unused local variable", r.items[0].message);
-        try testing.expectEqual(1, r.imports.len);
     }
-    // Beyond the limit: no AstGen, no diagnostics, imports collected from tokens
+    // Beyond the limit: no AstGen, no diagnostics
     src.clearRetainingCapacity();
     try src.appendSlice(gpa, "const std = @import(\"std\");\nconst x = ");
     for (0..nesting.thread_depth) |_| try src.append(gpa, '(');
     try src.append(gpa, '1');
     for (0..nesting.thread_depth) |_| try src.append(gpa, ')');
-    try src.appendSlice(gpa, ";\nfn g() void {\n    _ = @import(\"a\\x2ezig\");\n}\n");
+    try src.appendSlice(gpa, ";\nfn g() void {\n    var unused = 1;\n}\n");
     {
         const r = try check(gpa, src.items, .zig);
         defer r.destroy(gpa);
         try testing.expectEqual(0, r.items.len);
-        try testing.expectEqual(2, r.imports.len);
-        try testing.expectEqualStrings("std", r.imports[0]);
-        try testing.expectEqualStrings("a.zig", r.imports[1]);
     }
-}
-
-test "ZIR import list matches the compiler" {
-    const a = testing.allocator;
-    // Imports inside function bodies are included too
-    const ok = try check(a, "const x = @import(\"x.zig\");\nfn f() void { _ = @import(\"y.zig\"); }\n", .zig);
-    defer ok.destroy(a);
-    try testing.expectEqual(2, ok.imports.len);
-    try testing.expectEqualStrings("x.zig", ok.imports[0]);
-    try testing.expectEqualStrings("y.zig", ok.imports[1]);
-    // Non-fatal AstGen error: imports are still present
-    const nonfatal = try check(a, "fn f() void { var u = 1; }\nconst d = @import(\"d.zig\");\n", .zig);
-    defer nonfatal.destroy(a);
-    try testing.expectEqual(1, nonfatal.imports.len);
-    // Fatal errors in the root struct and parse errors: no ZIR is generated, so no imports
-    const fatal = try check(a, "const a = 1;\nconst a = 2;\nconst d = @import(\"d.zig\");\n", .zig);
-    defer fatal.destroy(a);
-    try testing.expectEqual(0, fatal.imports.len);
-    const broken = try check(a, "const d = @import(\"d.zig\");\nconst = ;\n", .zig);
-    defer broken.destroy(a);
-    try testing.expectEqual(0, broken.imports.len);
 }
 
 test "error locations and notes" {

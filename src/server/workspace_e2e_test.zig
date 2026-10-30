@@ -654,6 +654,60 @@ test "files of a package that only exports modules resolve module imports" {
     try h.notify("exit", {});
 }
 
+/// Modules the file belongs to (from `zig-analyzer/fileStatus`), as their root file paths
+fn fileModules(h: *Harness, uri: []const u8) ![]const []const u8 {
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = uri } })).object.get("result").?.object;
+    var modules: std.ArrayList([]const u8) = .empty;
+    for (status.get("modules").?.array.items) |m| try modules.append(h.arena.allocator(), m.string);
+    return modules.items;
+}
+
+test "files imported only through a file with a syntax error keep their module membership" {
+    // A build that completes while main.zig does not parse must not drop core.zig and util.zig
+    // from their modules: `zig build` passes the same module arguments either way
+    const core_text = "const util = @import(\"util\");\npub fn run() u32 {\n    return util.answer;\n}\n";
+    const main_text = "const core = @import(\"core\");\npub fn main() void {\n    _ = core.run();\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const util = b.createModule(.{ .root_source_file = b.path("lib/util.zig"), .target = b.graph.host });
+        \\    const core = b.createModule(.{ .root_source_file = b.path("lib/core.zig"), .target = b.graph.host, .imports = &.{.{ .name = "util", .module = util }} });
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host, .imports = &.{.{ .name = "core", .module = core }} }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = main_text },
+        .{ .path = "lib/core.zig", .text = core_text },
+        .{ .path = "lib/util.zig", .text = "pub const answer: u32 = 42;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    const core_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/core.zig"));
+    const util_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/util.zig"));
+    try open(&h, main_uri, main_text);
+    try open(&h, core_uri, core_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("answer", try completionLabels(&h, core_uri, core_text, "util."));
+
+    // Saved with a parse error: the build completes and the compile set is recomputed
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = "const core = @import(\"core\");\npub fn main() void {\n    _ = core.run();\n    const y = 1\n}\n" }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("answer", try completionLabels(&h, core_uri, core_text, "util."));
+    try testing.expectEqual(1, (try fileModules(&h, util_uri)).len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a project whose background task cannot be started does not leave the server busy" {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
