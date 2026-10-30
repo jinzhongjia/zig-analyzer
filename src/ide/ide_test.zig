@@ -3143,6 +3143,47 @@ test "completion: builtins, labels, init fields and import names" {
     try testing.expectEqual(added.cursor + 3, import.replace.?.end);
 }
 
+test "completion: no builtins after `.` or in zon files" {
+    // The labels at the cursor; null for all builtins
+    const cases = [_]struct { []const u8, []const u8, ?[]const u8 }{
+        // Only a name follows `.`: `.@` starts a quoted member, initializer field, or enum member
+        .{ "/p/main.zig", "const S = struct { @\"in\": u8, b: u8 };\nfn f(s: S) void { _ = s.@<|>; }", "@\"in\" @\"b\"" },
+        .{ "/p/main.zig", "const S = struct { a: u8, b: u8 };\nconst s: S = .{ .@<|> };", "@\"a\" @\"b\"" },
+        .{ "/p/main.zig", "const E = enum { a, b };\nfn f(e: E) void {\n    switch (e) {\n        .@<|> => {},\n        else => {},\n    }\n}", "@\"a\" @\"b\"" },
+        .{ "/p/main.zig", "const S = struct { a: u8 };\nfn f(s: S) void { _ = s.@na<|>; }", "" },
+        // ZON has no builtin calls
+        .{ "/p/cfg.zon", ".{ .a = @<|> }", "" },
+        // Expressions, including after `..`
+        .{ "/p/main.zig", "const x = @<|>;", null },
+        .{ "/p/main.zig", "fn f(n: u32) void {\n    for (0..@<|>) |_| {}\n}", null },
+    };
+    inline for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add(c[0], c[1]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
+        if (c[2]) |expected| {
+            var labels: std.ArrayList([]const u8) = .empty;
+            for (items) |it| {
+                try labels.append(w.arena.allocator(), it.label);
+                // The quoted name replaces the `@`
+                try testing.expectEqual(added.cursor - 1, it.replace.?.start);
+            }
+            testing.expectEqualStrings(expected, try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+                std.debug.print("{s}: `{s}`\n", .{ c[0], c[1] });
+                return err;
+            };
+        } else {
+            try testing.expectEqual(std.zig.BuiltinFn.list.keys().len, items.len);
+            for (items) |it| try testing.expectEqual(.builtin, it.kind);
+        }
+    }
+}
+
 test "goto and hover on error values: the expected error set picks the declaration" {
     // `error.Foo` used to have neither goto nor hover
     const lib_text =

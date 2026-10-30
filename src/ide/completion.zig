@@ -1,6 +1,7 @@
 //! Completion: after `a.`, lists the members of the namespace; after `.`, lists members by the
-//! expected type, and in initializers the fields not yet assigned; after `error.`, lists error
-//! names; after `@`, lists builtins; inside `@import("`, lists modules and files; after `break :` /
+//! expected type, and in initializers the fields not yet assigned; after `.@`, the same names
+//! quoted (`.@"name"`); after `error.`, lists error names; after `@`, lists builtins (not in `.zon`
+//! files); inside `@import("`, lists modules and files; after `break :` /
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
 //! the declarations of enclosing containers). When `build.zig.zon` has no result type, its fields
 //! and paths are listed by the built-in schema (see `manifest.zig`).
@@ -335,6 +336,11 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
     if (literal == .none and !paths_only) if (builtinStart(text, offset)) |start| {
+        // Only a name follows a `.`, so `.@` starts a quoted name (`.@"name"`): the names that
+        // complete after the `.`, quoted
+        if (afterDot(text, start)) return quotedAfterDot(r, file, start, offset, cursor_owner);
+        // `.zon` files have no builtin calls
+        if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) return .{ .context = .ignored };
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
         return .{ .items = out.items.items, .context = .builtin };
@@ -437,6 +443,27 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         container = tree.items[parent].container;
     }
     return .{ .items = out.items.items, .context = .scope, .item = item, .scope = scope, .at = at, .roots = roots.items };
+}
+
+/// Completion at `.@` (the `@` at `at`): the names that complete right after the `.` (members,
+/// enum and decl literals, initializer fields), written as quoted identifiers that replace from
+/// the `@`. Nothing when name characters precede the cursor (`.@na` is no name)
+fn quotedAfterDot(r: *Resolver, file: FileId, at: u32, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
+    if (offset != at + 1) return .{ .context = .ignored };
+    var visible = try completeVisible(r, file, at, cursor_owner, false);
+    switch (visible.context) {
+        .member, .enum_literal, .init_field => {},
+        else => return .{ .context = .ignored },
+    }
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    const range: Item.Range = .{ .start = at, .end = identEnd(text, offset) };
+    const items = try r.arena.dupe(Item, visible.items);
+    for (items) |*it| {
+        if (!std.mem.startsWith(u8, it.label, "@\"")) it.label = try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
+        it.replace = range;
+    }
+    visible.items = items;
+    return visible;
 }
 
 const ImportPrefix = struct {
@@ -1384,6 +1411,14 @@ fn builtinStart(text: []const u8, offset: u32) ?u32 {
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
     if (i == 0 or text[i - 1] != '@') return null;
     return i - 1;
+}
+
+/// The last token before `offset`, skipping whitespace, is a single `.` (not `..` or `...`, after
+/// which an expression follows)
+fn afterDot(text: []const u8, offset: u32) bool {
+    var i = offset;
+    while (i > 0 and std.ascii.isWhitespace(text[i - 1])) i -= 1;
+    return i > 0 and text[i - 1] == '.' and (i == 1 or text[i - 2] != '.');
 }
 
 /// Start of the string content when the cursor is in the string of `@import("` (the string may
