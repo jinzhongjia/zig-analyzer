@@ -342,9 +342,12 @@ pub const Watcher = struct {
         w.next_poll = null;
     }
 
-    /// Identity key: consistent with Vfs file identity; lowercased when case-insensitive
+    /// Identity key: consistent with Vfs file identity; lowercased on a case-insensitive volume
     fn key(w: *const Watcher, a: Allocator, path: []const u8) Allocator.Error![]const u8 {
-        if (w.server.vfs.case == .sensitive) return path;
+        for (path) |c| {
+            if (std.ascii.isUpper(c)) break;
+        } else return path;
+        if (w.server.vfs.caseOfFile(path) == .sensitive) return path;
         return std.ascii.allocLowerString(a, path);
     }
 

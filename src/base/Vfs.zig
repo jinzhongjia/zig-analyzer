@@ -1,9 +1,12 @@
 //! Virtual file system: an interning table of paths ↔ `FileId`. File contents are stored in the
 //! query engine as `FileText` inputs.
 //!
-//! File identity is determined by the "normalized path"; on case-insensitive file systems (the
-//! default on Windows and macOS), the identity key also folds the case of ASCII letters, so that
-//! `C:\Work\A.zig` and `c:/work/a.zig` map to the same FileId.
+//! File identity is determined by the "normalized path"; on case-insensitive file systems, the
+//! identity key also folds the case of ASCII letters, so that `C:\Work\A.zig` and
+//! `c:/work/a.zig` map to the same FileId, while on case-sensitive ones the exact bytes count,
+//! as they do for the compiler. Windows file systems are case-insensitive; on macOS the rule
+//! is asked of each volume, since APFS and HFS+ volumes can be formatted either way (see
+//! `CaseRule`); other systems are case-sensitive.
 //! Externally (display, building URIs), the path as first seen is used.
 //!
 //! Identity is lexical: symbolic links are not resolved, and only the case of ASCII letters
@@ -17,6 +20,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
 
 const Vfs = @This();
 const Style = @import("uri.zig").Style;
@@ -33,17 +37,50 @@ pub const CaseMode = enum {
     sensitive,
     insensitive,
 
-    /// The default file systems of Windows and macOS are case-insensitive
-    pub const native: CaseMode = switch (@import("builtin").target.os.tag) {
+    /// The default of the system's file systems (case-insensitive on Windows and macOS), for
+    /// comparisons made without a Vfs; file identity asks each volume (see `CaseRule.native`)
+    pub const native: CaseMode = switch (builtin.target.os.tag) {
         .windows, .macos, .ios => .insensitive,
         else => .sensitive,
     };
 };
 
+/// How the case rule of a path is decided
+pub const CaseRule = union(enum) {
+    /// Every path follows one rule
+    fixed: CaseMode,
+    /// Each volume has its own rule, which the function asks of the file system for an
+    /// existing file or directory (null when it cannot tell, e.g. when the path does not exist:
+    /// the rule of its nearest ancestor that it can tell applies)
+    per_volume: *const fn (target: [:0]const u8) ?CaseMode,
+
+    pub const sensitive: CaseRule = .{ .fixed = .sensitive };
+    pub const insensitive: CaseRule = .{ .fixed = .insensitive };
+
+    /// Windows file systems are case-insensitive. APFS and HFS+ volumes are case-insensitive by
+    /// default but can be formatted case-sensitive, so on macOS each volume is asked.
+    pub const native: CaseRule = if (builtin.target.os.tag.isDarwin())
+        .{ .per_volume = darwinCase }
+    else if (builtin.target.os.tag == .windows) .insensitive else .sensitive;
+};
+
+/// `pathconf(_PC_CASE_SENSITIVE)`: 1 on a case-sensitive volume, 0 on a case-insensitive one
+fn darwinCase(target: [:0]const u8) ?CaseMode {
+    const c = struct {
+        extern "c" fn pathconf(target: [*:0]const u8, name: c_int) c_long;
+        const _PC_CASE_SENSITIVE = 11;
+    };
+    return switch (c.pathconf(target.ptr, c._PC_CASE_SENSITIVE)) {
+        1 => .sensitive,
+        0 => .insensitive,
+        else => null,
+    };
+}
+
 gpa: Allocator,
 io: Io,
 style: Style,
-case: CaseMode,
+case: CaseRule,
 /// The same file may be interned by import resolution in read transactions, so a lock is needed
 mutex: Io.Mutex = .init,
 /// Identity keys (normalized paths, additionally lowercased when case-insensitive); the index
@@ -57,6 +94,10 @@ aliases: std.StringHashMapUnmanaged(FileId) = .empty,
 /// Notified when a new path is interned (e.g. file watching needs to watch the directories of
 /// newly appearing files); called outside the lock, on the thread that interned the path
 listener: std.atomic.Value(?*const Listener) = .init(null),
+/// Under `CaseRule.per_volume`: the case rule found for each path asked so far (see `caseOf`);
+/// guarded by `case_mutex`
+case_cache: std.StringHashMapUnmanaged(CaseMode) = .empty,
+case_mutex: Io.Mutex = .init,
 
 pub const Listener = struct {
     ctx: *anyopaque,
@@ -66,14 +107,14 @@ pub const Listener = struct {
 
 pub const Options = struct {
     style: Style = .native,
-    case: CaseMode = .native,
+    case: CaseRule = .native,
 };
 
 pub fn init(io: Io, gpa: Allocator) Vfs {
     return initOptions(io, gpa, .{});
 }
 
-/// Specifies the path style and case mode (used in tests to cover both rule sets on any platform)
+/// Specifies the path style and case rule (used in tests to cover both rule sets on any platform)
 pub fn initOptions(io: Io, gpa: Allocator, options: Options) Vfs {
     return .{ .io = io, .gpa = gpa, .style = options.style, .case = options.case };
 }
@@ -92,6 +133,9 @@ pub fn deinit(vfs: *Vfs) void {
     vfs.keys.deinit(vfs.gpa);
     vfs.paths.deinit(vfs.gpa);
     vfs.aliases.deinit(vfs.gpa);
+    var cached = vfs.case_cache.keyIterator();
+    while (cached.next()) |k| vfs.gpa.free(k.*);
+    vfs.case_cache.deinit(vfs.gpa);
     vfs.* = undefined;
 }
 
@@ -102,10 +146,63 @@ pub fn count(vfs: *Vfs) usize {
 }
 
 /// Derives the identity key from a normalized path (the caller owns the returned value)
-fn identityKey(vfs: *const Vfs, normalized: []const u8) Allocator.Error![]u8 {
+fn identityKey(vfs: *Vfs, normalized: []const u8) Allocator.Error![]u8 {
     const key = try vfs.gpa.dupe(u8, normalized);
-    if (vfs.case == .insensitive) _ = std.ascii.lowerString(key, key);
+    // A path without capital letters is its own key under either rule
+    const has_upper = for (normalized) |c| {
+        if (std.ascii.isUpper(c)) break true;
+    } else false;
+    if (has_upper and vfs.caseOfFile(normalized) == .insensitive) _ = std.ascii.lowerString(key, key);
     return key;
+}
+
+fn dirname(vfs: *const Vfs, target: []const u8) ?[]const u8 {
+    return switch (vfs.style) {
+        .posix => std.fs.path.dirnamePosix(target),
+        .windows => std.fs.path.dirnameWindows(target),
+    };
+}
+
+/// The case rule of the volume that holds the file at the normalized absolute path
+/// `file_path`: that of its directory, which is asked once for all the files in it
+pub fn caseOfFile(vfs: *Vfs, file_path: []const u8) CaseMode {
+    return switch (vfs.case) {
+        .fixed => |mode| mode,
+        .per_volume => vfs.caseOf(vfs.dirname(file_path) orelse file_path),
+    };
+}
+
+/// The case rule of the volume that holds the normalized absolute path `target` (a directory,
+/// or a file)
+pub fn caseOf(vfs: *Vfs, target: []const u8) CaseMode {
+    const probe = switch (vfs.case) {
+        .fixed => |mode| return mode,
+        .per_volume => |p| p,
+    };
+    {
+        vfs.case_mutex.lockUncancelable(vfs.io);
+        defer vfs.case_mutex.unlock(vfs.io);
+        if (vfs.case_cache.get(target)) |mode| return mode;
+    }
+    // A path that does not exist (or is too long to ask about) is on the volume of its nearest
+    // ancestor that can be asked; when none can, the default of APFS (case-insensitive) applies
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var current: ?[]const u8 = target;
+    const mode: CaseMode = while (current) |p| : (current = vfs.dirname(p)) {
+        if (p.len >= buf.len) continue;
+        @memcpy(buf[0..p.len], p);
+        buf[p.len] = 0;
+        if (probe(buf[0..p.len :0])) |m| break m;
+    } else .insensitive;
+    vfs.case_mutex.lockUncancelable(vfs.io);
+    defer vfs.case_mutex.unlock(vfs.io);
+    const gop = vfs.case_cache.getOrPut(vfs.gpa, target) catch return mode;
+    if (!gop.found_existing) gop.key_ptr.* = vfs.gpa.dupe(u8, target) catch {
+        vfs.case_cache.removeByPtr(gop.key_ptr);
+        return mode;
+    };
+    gop.value_ptr.* = mode;
+    return mode;
 }
 
 /// Normalizes an absolute path: removes `.`, `..`, and duplicate and trailing separators; on
@@ -136,11 +233,12 @@ pub fn resolve(comptime style: Style, gpa: Allocator, base: []const u8, sub_path
 }
 
 /// Whether `file_path` is the directory `dir` itself or lies under it (both are normalized
-/// absolute paths). Consistent with the file identity rules: when case-insensitive, the case of
-/// ASCII letters is ignored
-pub fn isUnder(vfs: *const Vfs, file_path: []const u8, dir: []const u8) bool {
+/// absolute paths). Consistent with the file identity rules: on a case-insensitive volume (that
+/// of `dir`), the case of ASCII letters is ignored
+pub fn isUnder(vfs: *Vfs, file_path: []const u8, dir: []const u8) bool {
     return switch (vfs.style) {
-        inline else => |style| isUnderStyle(style, vfs.case, file_path, dir),
+        inline else => |style| isUnderStyle(style, .insensitive, file_path, dir) and
+            (std.mem.startsWith(u8, file_path, dir) or vfs.caseOf(dir) == .insensitive),
     };
 }
 
@@ -163,13 +261,13 @@ pub fn isUnderStyle(comptime style: Style, case: CaseMode, file_path: []const u8
 
 /// Whether the normalized absolute paths `x` and `y` name the same file or directory, under the
 /// same rules as `isUnder`
-pub fn samePath(vfs: *const Vfs, x: []const u8, y: []const u8) bool {
+pub fn samePath(vfs: *Vfs, x: []const u8, y: []const u8) bool {
     return x.len == y.len and vfs.isUnder(x, y);
 }
 
 /// The innermost of the directories `roots` that contains `file_path` (see `isUnder`); null when
 /// none does
-pub fn rootOf(vfs: *const Vfs, roots: []const []const u8, file_path: []const u8) ?[]const u8 {
+pub fn rootOf(vfs: *Vfs, roots: []const []const u8, file_path: []const u8) ?[]const u8 {
     var best: ?[]const u8 = null;
     for (roots) |root| {
         if (vfs.isUnder(file_path, root) and (best == null or root.len > best.?.len)) best = root;
@@ -179,7 +277,7 @@ pub fn rootOf(vfs: *const Vfs, roots: []const []const u8, file_path: []const u8)
 
 /// `file_path` as shown to the user: relative to the innermost of the workspace folders `roots`
 /// that contains it, otherwise the absolute path
-pub fn shownPath(vfs: *const Vfs, roots: []const []const u8, file_path: []const u8) []const u8 {
+pub fn shownPath(vfs: *Vfs, roots: []const []const u8, file_path: []const u8) []const u8 {
     const root = vfs.rootOf(roots, file_path) orelse return file_path;
     return std.mem.trimStart(u8, file_path[root.len..], "/\\");
 }
@@ -420,4 +518,72 @@ test "samePath follows the case rule of file identity" {
     try std.testing.expect(!sensitive.samePath(native("/w/MyProj"), native("/w/myproj")));
     try std.testing.expect(sensitive.samePath(native("/w/MyProj"), native("/w/MyProj")));
     try std.testing.expect(!insensitive.samePath(native("/w/myproj/src"), native("/w/myproj")));
+}
+
+test "per-volume case rule: names differing in case are one file only on case-insensitive volumes" {
+    // `/cs` is a case-sensitive volume (such as a case-sensitive APFS volume on macOS) mounted
+    // on a case-insensitive one, where `Parser.zig` and `parser.zig` are different files, as the
+    // compiler sees them
+    const t = std.testing;
+    const Volumes = struct {
+        var asked: std.ArrayList([]const u8) = .empty;
+
+        fn probe(target: [:0]const u8) ?CaseMode {
+            asked.append(t.allocator, t.allocator.dupe(u8, target) catch unreachable) catch unreachable;
+            // Only these directories exist
+            for ([_][]const u8{ "/", "/cs", "/cs/src", "/home", "/home/src" }) |dir| {
+                if (!std.mem.eql(u8, target, dir)) continue;
+                return if (std.mem.startsWith(u8, target, "/cs")) .sensitive else .insensitive;
+            }
+            return null;
+        }
+    };
+    defer {
+        for (Volumes.asked.items) |p| t.allocator.free(p);
+        Volumes.asked.deinit(t.allocator);
+    }
+    var vfs: Vfs = .initOptions(t.io, t.allocator, .{ .style = .posix, .case = .{ .per_volume = Volumes.probe } });
+    defer vfs.deinit();
+
+    // Both orders of interning
+    const upper = try vfs.intern("/cs/src/Parser.zig");
+    const lower = try vfs.intern("/cs/src/parser.zig");
+    try t.expect(upper != lower);
+    try t.expectEqual(lower, (try vfs.lookup("/cs/src/parser.zig")).?);
+    try t.expectEqual(upper, (try vfs.lookup("/cs/src/Parser.zig")).?);
+    try t.expectEqualStrings("/cs/src/Parser.zig", vfs.path(upper));
+    const lower2 = try vfs.intern("/home/src/parser.zig");
+    try t.expectEqual(lower2, try vfs.intern("/home/src/Parser.zig"));
+    // A directory that does not exist is on the volume of its nearest existing ancestor
+    try t.expect(try vfs.intern("/cs/new/A.zig") != try vfs.intern("/cs/new/a.zig"));
+    try t.expectEqual(try vfs.intern("/home/new/A.zig"), try vfs.intern("/home/new/a.zig"));
+    // Directory comparisons follow the volume of the directory
+    try t.expect(!vfs.isUnder("/cs/Src/a.zig", "/cs/src"));
+    try t.expect(vfs.isUnder("/home/Src/a.zig", "/home/src"));
+    try t.expect(!vfs.samePath("/cs/SRC", "/cs/src"));
+    try t.expect(vfs.samePath("/home/SRC", "/home/src"));
+    // Each directory is asked once
+    const asked = Volumes.asked.items.len;
+    _ = try vfs.intern("/cs/src/Lexer.zig");
+    _ = try vfs.lookup("/home/src/Lexer.zig");
+    try t.expectEqual(asked, Volumes.asked.items.len);
+}
+
+test "native case rule agrees with the file system of the temporary directory" {
+    // On macOS, a case-sensitive volume keeps `Parser.zig` and `parser.zig` apart
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "Parser.zig", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const upper = try std.fs.path.join(t.allocator, &.{ root, "Parser.zig" });
+    defer t.allocator.free(upper);
+    const lower = try std.fs.path.join(t.allocator, &.{ root, "parser.zig" });
+    defer t.allocator.free(lower);
+    const same_on_disk = if (tmp.dir.access(t.io, "parser.zig", .{})) true else |_| false;
+
+    var vfs: Vfs = .init(t.io, t.allocator);
+    defer vfs.deinit();
+    try t.expectEqual(same_on_disk, try vfs.intern(upper) == try vfs.intern(lower));
 }

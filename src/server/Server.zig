@@ -2212,26 +2212,30 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
 /// in it: adds a change of every known file under such a path to `events` (re-read from disk, so
 /// whether it still exists is decided then). Returns whether any event was such a folder.
 fn addFolderContents(server: *Server, arena: Allocator, events: *std.StringArrayHashMapUnmanaged(types.FileChangeType)) Allocator.Error!bool {
-    const insensitive = server.vfs.case == .insensitive;
-    // Identity keys (see `Vfs`) of the paths that are not known files
+    // Identity keys of directories: lowercased on a case-insensitive volume (see `Vfs`)
+    const dirKey = struct {
+        fn dirKey(vfs: *Vfs, out: *std.ArrayList(u8), a: Allocator, dir: []const u8) Allocator.Error![]const u8 {
+            out.clearRetainingCapacity();
+            try out.appendSlice(a, dir);
+            if (vfs.caseOf(dir) == .insensitive) _ = std.ascii.lowerString(out.items, out.items);
+            return out.items;
+        }
+    }.dirKey;
+    var key: std.ArrayList(u8) = .empty;
+    // The paths that are not known files
     var folders: std.StringHashMapUnmanaged(void) = .empty;
     for (events.keys()) |path| {
         if (try server.vfs.lookup(path) != null) continue;
         const normalized = try Vfs.normalize(.native, arena, path) orelse continue;
-        if (insensitive) _ = std.ascii.lowerString(normalized, normalized);
-        try folders.put(arena, normalized, {});
+        try folders.put(arena, try arena.dupe(u8, try dirKey(&server.vfs, &key, arena, normalized)), {});
     }
     if (folders.count() == 0) return false;
     var found = false;
-    var key: std.ArrayList(u8) = .empty;
     for (0..server.vfs.count()) |i| {
         const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-        key.clearRetainingCapacity();
-        try key.appendSlice(arena, path);
-        if (insensitive) _ = std.ascii.lowerString(key.items, key.items);
-        var dir = std.fs.path.dirname(key.items);
+        var dir = std.fs.path.dirname(path);
         while (dir) |d| : (dir = std.fs.path.dirname(d)) {
-            if (!folders.contains(d)) continue;
+            if (!folders.contains(try dirKey(&server.vfs, &key, arena, d))) continue;
             found = true;
             const gop = try events.getOrPut(arena, path);
             if (!gop.found_existing) gop.value_ptr.* = .Changed;

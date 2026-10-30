@@ -24,13 +24,13 @@ fn skipped(name: []const u8) bool {
 /// allocated in `arena`. Directories are walked without following symbolic links to directories;
 /// skipped directories (see `skipped`) and the local caches and package directories in `rules` are
 /// not entered, and a directory under several roots is walked once.
-pub fn scan(io: Io, arena: Allocator, vfs: *const Vfs, rules: origin.Rules) Allocator.Error![]const []const u8 {
+pub fn scan(io: Io, arena: Allocator, vfs: *Vfs, rules: origin.Rules) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var stack: std.ArrayList([]const u8) = .empty;
     var visited: std.StringHashMapUnmanaged(void) = .empty;
     for (rules.roots) |root| try stack.append(arena, root);
     while (stack.pop()) |dir_path| {
-        const key = if (vfs.case == .insensitive) try std.ascii.allocLowerString(arena, dir_path) else dir_path;
+        const key = if (vfs.caseOf(dir_path) == .insensitive) try std.ascii.allocLowerString(arena, dir_path) else dir_path;
         if ((try visited.getOrPut(arena, key)).found_existing) continue;
         var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
         defer dir.close(io);
@@ -56,7 +56,7 @@ pub fn scan(io: Io, arena: Allocator, vfs: *const Vfs, rules: origin.Rules) Allo
 /// Whether `path` is one of the files `scan` finds (when it exists): a source file under a root,
 /// reached from that root without entering a skipped or library directory, whose origin is user
 /// code
-pub fn contains(vfs: *const Vfs, rules: origin.Rules, path: []const u8) bool {
+pub fn contains(vfs: *Vfs, rules: origin.Rules, path: []const u8) bool {
     if (!isSource(std.fs.path.basename(path))) return false;
     if (origin.classify(vfs, rules, path, false) != .user) return false;
     roots: for (rules.roots) |root| {
@@ -72,7 +72,7 @@ pub fn contains(vfs: *const Vfs, rules: origin.Rules, path: []const u8) bool {
 }
 
 /// `dir` is or lies in a local cache, a fetched package, or the global cache
-fn isLibraryDir(vfs: *const Vfs, rules: origin.Rules, dir: []const u8) bool {
+fn isLibraryDir(vfs: *Vfs, rules: origin.Rules, dir: []const u8) bool {
     for (rules.local_caches) |c| if (vfs.isUnder(dir, c)) return true;
     for (rules.packages) |p| if (vfs.isUnder(dir, p)) return true;
     if (rules.global_cache) |c| if (vfs.isUnder(dir, c)) return true;

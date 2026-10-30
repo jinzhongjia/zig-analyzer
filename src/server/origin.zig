@@ -69,7 +69,7 @@ pub const Rules = struct {
 /// by developers of Zig itself, so it is user code), project modules, and then the user's files
 /// outside the workspace. A root inside the Zig installation (such as its `std` directory opened
 /// as a workspace folder) does not make the installation user code.
-pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: bool) Origin {
+pub fn classify(vfs: *Vfs, rules: Rules, path: []const u8, in_project: bool) Origin {
     if (isVirtual(path)) return .virtual;
     for (rules.packages) |p| if (vfs.isUnder(path, p)) return .package;
     for (rules.local_caches) |c| if (vfs.isUnder(path, c)) return .generated;
@@ -87,10 +87,8 @@ pub fn classify(vfs: *const Vfs, rules: Rules, path: []const u8, in_project: boo
         var end: usize = 0;
         while (end < sub.len and !std.fs.path.isSep(sub[end])) end += 1;
         if (end < sub.len) for ([_][]const u8{ ".zig-cache", "zig-pkg" }) |name| {
-            const same = switch (vfs.case) {
-                .sensitive => std.mem.eql(u8, sub[0..end], name),
-                .insensitive => std.ascii.eqlIgnoreCase(sub[0..end], name),
-            };
+            const same = std.mem.eql(u8, sub[0..end], name) or
+                (std.ascii.eqlIgnoreCase(sub[0..end], name) and vfs.caseOf(root) == .insensitive);
             if (same) continue :roots;
         };
         return .user;
