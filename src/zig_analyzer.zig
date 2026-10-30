@@ -95,6 +95,7 @@ pub const util = struct {
     pub const assert = @import("util/assert.zig");
     pub const watchdog = @import("util/watchdog.zig");
     pub const child_process = @import("util/child_process.zig");
+    pub const worker_stack = @import("util/worker_stack.zig");
     /// Test-only: converts posix-style paths to native paths
     pub const test_path = @import("util/test_path.zig");
 };

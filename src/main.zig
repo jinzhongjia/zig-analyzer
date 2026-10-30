@@ -18,13 +18,6 @@ fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, first_trace_addr orelse @returnAddress());
 }
 
-/// Stack size of the server's worker threads: it only takes address space, and memory is
-/// allocated only for the part that is used
-const worker_stack_size = 64 * 1024 * 1024;
-/// Stack a read transaction may use on a worker thread (see `engine.StackBudget`), leaving
-/// headroom for the usage between two checks
-const worker_stack_budget = 48 * 1024 * 1024;
-
 const usage =
     \\Usage: zig-analyzer [options]
     \\
@@ -63,7 +56,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `init.io` is not used: its worker threads have the default stack size, so a very deep
     // dependency chain would have to be interrupted many times and computed in segments
     var threaded: std.Io.Threaded = .init(backing, .{
-        .stack_size = worker_stack_size,
+        .stack_size = za.util.worker_stack.threaded_stack_size,
         .argv0 = .init(init.minimal.args),
         .environ = init.minimal.environ,
     });
@@ -83,7 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Requests run on worker threads; when no worker thread can be created, they run on the
     // caller's thread (possibly the main thread), and the main thread still has the default
     // stack limit
-    server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = worker_stack_budget };
+    server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = za.util.worker_stack.budget };
     server.heap = &counting;
     server.environ = init.minimal.environ;
     defer server.deinit();

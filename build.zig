@@ -1,4 +1,5 @@
 const std = @import("std");
+const worker_stack = @import("src/util/worker_stack.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -39,6 +40,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zig_analyzer", .module = mod }},
         }),
     });
+    setStackReserve(exe);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -242,9 +244,17 @@ fn analyzerTests(
         .omit_frame_pointer = false,
     });
     module.addOptions("build_options", options);
-    return b.addTest(.{
+    const tests = b.addTest(.{
         .root_module = module,
         .test_runner = .{ .path = runner, .mode = .server },
         .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{},
     });
+    setStackReserve(tests);
+    return tests;
+}
+
+/// Windows: threads take the executable's stack reserve as theirs, and the worker threads of
+/// the server get only a small initial commit (see src/util/worker_stack.zig)
+fn setStackReserve(compile: *std.Build.Step.Compile) void {
+    if (compile.rootModuleTarget().os.tag == .windows) compile.stack_size = worker_stack.size;
 }
