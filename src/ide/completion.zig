@@ -362,9 +362,13 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     const b = try r.body(file, item);
     const rel = offset - node.offset;
 
-    if (labelStart(text, offset) != null) {
+    // `continue` targets only loops and labeled switches, `break` any labeled expression
+    if (labelKeyword(text, offset)) |keyword| {
         var s: ?Body.ScopeId = b.scopeAt(rel);
-        while (s) |id| : (s = b.scope(id).parent) if (b.scope(id).label) |l| try out.add(.{ .label = l.name, .kind = .label });
+        while (s) |id| : (s = b.scope(id).parent) if (b.scope(id).label) |l| {
+            if (keyword == .@"continue" and b.expr(l.expr) == .block) continue;
+            try out.add(.{ .label = l.name, .kind = .label });
+        };
         return .{ .items = out.items.items, .context = .label };
     }
 
@@ -1749,11 +1753,10 @@ fn stringContentEnd(text: []const u8, offset: u32) u32 {
     return offset;
 }
 
-/// Start of the label when the cursor is at the label position after `break :` / `continue :`
-fn labelStart(text: []const u8, offset: u32) ?u32 {
+/// The keyword when the cursor is at the label position after `break :` / `continue :`
+fn labelKeyword(text: []const u8, offset: u32) ?enum { @"break", @"continue" } {
     var i = offset;
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
-    const start = i;
     while (i > 0 and (text[i - 1] == ' ' or text[i - 1] == '\t')) i -= 1;
     if (i == 0 or text[i - 1] != ':') return null;
     i -= 1;
@@ -1761,8 +1764,9 @@ fn labelStart(text: []const u8, offset: u32) ?u32 {
     const end = i;
     while (i > 0 and isIdentChar(text[i - 1])) i -= 1;
     const word = text[i..end];
-    if (!std.mem.eql(u8, word, "break") and !std.mem.eql(u8, word, "continue")) return null;
-    return start;
+    if (std.mem.eql(u8, word, "break")) return .@"break";
+    if (std.mem.eql(u8, word, "continue")) return .@"continue";
+    return null;
 }
 
 /// Module names in `@import("...` (std, builtin, root, and the modules imported by each module

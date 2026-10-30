@@ -3345,6 +3345,15 @@ test "completion and inference of `ptr` on pointers to arrays" {
     , try inlaid(&w, file, text, .{ .parameters = false }));
 }
 
+test "label completion after `continue :` lists only loop and switch labels" {
+    try expectCompletions("", &.{
+        .{ "fn f() void {\n    lp: while (true) {\n        blk: {\n            if (true) continue :<|>;\n            break :blk;\n        }\n    }\n}", "lp" },
+        .{ "fn f() void {\n    lp: while (true) {\n        blk: {\n            if (true) continue :lp;\n            break :<|>;\n        }\n    }\n}", "blk lp" },
+        .{ "fn f() void {\n    blk: {\n        while (true) {\n            continue :<|>;\n        }\n    }\n}", "" },
+        .{ "fn f(x: u8) void {\n    sw: switch (x) {\n        0 => {\n            continue :<|> 1;\n        },\n        else => {},\n    }\n}", "sw" },
+    });
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;
