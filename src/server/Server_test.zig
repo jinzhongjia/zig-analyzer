@@ -1858,3 +1858,38 @@ test "file URIs without an authority name the same files and folders" {
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "a document whose languageId is zon is analyzed as ZON whatever its URI" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true } } } });
+    try h.notify("initialized", struct {}{});
+    const manifest = "untitled:Untitled-1";
+    const duplicate = "untitled:Untitled-2";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = manifest, .languageId = "zon", .version = 1, .text = ".{\n    .name = .demo,\n    .version = \"0.0.1\",\n}\n" } });
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = duplicate, .languageId = "zon", .version = 1, .text = ".{ .a = 1, .a = 2 }\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const names = try symbolNames(&h, manifest);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("name", names[0]);
+    try testing.expectEqualStrings("version", names[1]);
+    var last_manifest: ?[]const std.json.Value = null;
+    var last_duplicate: ?[]const std.json.Value = null;
+    for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+        const params = n.object.get("params").?.object;
+        const diags = params.get("diagnostics").?.array.items;
+        if (std.mem.eql(u8, params.get("uri").?.string, manifest)) last_manifest = diags;
+        if (std.mem.eql(u8, params.get("uri").?.string, duplicate)) last_duplicate = diags;
+    }
+    try testing.expectEqual(0, last_manifest.?.len);
+    try testing.expectEqual(1, last_duplicate.?.len);
+    try testing.expect(std.mem.indexOf(u8, last_duplicate.?[0].object.get("message").?.string, "duplicate") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

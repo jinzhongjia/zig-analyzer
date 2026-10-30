@@ -35,10 +35,15 @@ pub fn fromPath(gpa: Allocator, path: []const u8) Allocator.Error![]u8 {
     return fromPathStyle(.native, gpa, path);
 }
 
-pub fn toPathStyle(comptime style: Style, gpa: Allocator, uri: []const u8) Error![]u8 {
+/// The URI has the `file` scheme: `toPath` fails with `UnsupportedScheme` exactly when it does not
+pub fn isFile(uri: []const u8) bool {
     const scheme = "file:";
-    if (uri.len < scheme.len or !std.ascii.eqlIgnoreCase(uri[0..scheme.len], scheme)) return error.UnsupportedScheme;
-    var rest = uri[scheme.len..];
+    return uri.len >= scheme.len and std.ascii.eqlIgnoreCase(uri[0..scheme.len], scheme);
+}
+
+pub fn toPathStyle(comptime style: Style, gpa: Allocator, uri: []const u8) Error![]u8 {
+    if (!isFile(uri)) return error.UnsupportedScheme;
+    var rest = uri["file:".len..];
     if (std.mem.indexOfAny(u8, rest, "?#")) |end| rest = rest[0..end];
 
     // `file://authority/path`, or the local form `file:/path` without an authority (RFC 8089);

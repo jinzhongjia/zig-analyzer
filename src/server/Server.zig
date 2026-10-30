@@ -308,6 +308,10 @@ last_uris: std.AutoArrayHashMapUnmanaged(Vfs.FileId, []u8) = .empty,
 /// dropped when its document is opened or closed, and all are dropped when files are created or
 /// deleted on disk.
 open_real: std.AutoHashMapUnmanaged(Vfs.FileId, ?[:0]u8) = .empty,
+/// Open documents with a non-file URI whose languageId is `zig` or `zon`: whether the document
+/// is ZON, which decides the extension of its virtual path (see `documentPath`). Keys are the
+/// URIs; guarded by docs_mutex.
+virtual_langs: std.StringHashMapUnmanaged(bool) = .empty,
 /// Files currently showing non-empty diagnostics (cleared by publishing an empty list when needed)
 published: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
 /// Sequence number of diagnostic computations: each computation takes one before reading state
@@ -440,6 +444,9 @@ pub fn deinit(server: *Server) void {
     server.last_uris.deinit(server.gpa);
     server.forgetRealPath(null);
     server.open_real.deinit(server.gpa);
+    var virtual_langs = server.virtual_langs.keyIterator();
+    while (virtual_langs.next()) |k| server.gpa.free(k.*);
+    server.virtual_langs.deinit(server.gpa);
     server.published.deinit(server.gpa);
     server.sent_seq.deinit(server.gpa);
     server.sent_hash.deinit(server.gpa);
@@ -1695,7 +1702,7 @@ fn cancelRequest(server: *Server, _: Allocator, params: types.CancelParams) !voi
 }
 
 fn fileIdFromUri(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
-    const path = try documentPath(arena, document_uri) orelse return null;
+    const path = try server.documentPath(arena, document_uri) orelse return null;
     return try server.vfs.intern(path);
 }
 
@@ -1707,7 +1714,7 @@ fn fileIdFromUri(server: *Server, arena: Allocator, document_uri: []const u8) !?
 /// alias of the file at the real path (see `Vfs.alias`). The file keeps its origin and its
 /// module, and its diagnostics are published on the document's URI.
 fn documentFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
-    const path = try documentPath(arena, document_uri) orelse return null;
+    const path = try server.documentPath(arena, document_uri) orelse return null;
     if (try server.vfs.lookup(path)) |id| return id;
     if (!isVirtual(path)) if (try Vfs.realPath(server.io, arena, path)) |real| if (!std.mem.eql(u8, real, path)) {
         const known = try server.vfs.lookup(real) orelse blk: {
@@ -1770,18 +1777,45 @@ fn forgetRealPath(server: *Server, file: ?Vfs.FileId) void {
 /// Path of a document: the path of a file URI; a document with a non-file URI such as `untitled:`
 /// maps to a path named after the URI under a virtual directory (it does not clash with real
 /// files and does not exist on disk, so it is not passed to the compiler; other features treat it
-/// as a single file)
-fn documentPath(arena: Allocator, document_uri: []const u8) Allocator.Error!?[]const u8 {
+/// as a single file). The virtual path ends in `.zon` for a document opened with languageId
+/// `zon`, in `.zig` for languageId `zig`, and otherwise follows the end of the URI.
+fn documentPath(server: *Server, arena: Allocator, document_uri: []const u8) Allocator.Error!?[]const u8 {
     const path = uri.toPath(arena, document_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedScheme => {
-            const ext = if (std.mem.endsWith(u8, document_uri, ".zon")) ".zon" else ".zig";
+            const zon = blk: {
+                server.docs_mutex.lockUncancelable(server.io);
+                defer server.docs_mutex.unlock(server.io);
+                break :blk server.virtual_langs.get(document_uri) orelse std.mem.endsWith(u8, document_uri, ".zon");
+            };
+            const ext = if (zon) ".zon" else ".zig";
             return try std.fmt.allocPrint(arena, "{s}{c}{x:0>16}{s}", .{ virtual_root, std.fs.path.sep, std.hash.Wyhash.hash(0, document_uri), ext });
         },
         error.InvalidUri => return null,
     };
     if (!std.fs.path.isAbsolute(path)) return null;
     return path;
+}
+
+/// Records the language of a document opened with a non-file URI (see `documentPath`)
+fn setVirtualLanguage(server: *Server, document_uri: []const u8, language_id: []const u8) Allocator.Error!void {
+    if (uri.isFile(document_uri)) return;
+    const zon = if (std.mem.eql(u8, language_id, "zon")) true else if (std.mem.eql(u8, language_id, "zig")) false else return;
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    const gop = try server.virtual_langs.getOrPut(server.gpa, document_uri);
+    if (!gop.found_existing) gop.key_ptr.* = server.gpa.dupe(u8, document_uri) catch |err| {
+        server.virtual_langs.removeByPtr(gop.key_ptr);
+        return err;
+    };
+    gop.value_ptr.* = zon;
+}
+
+/// Forgets the language of a closed document (see `setVirtualLanguage`)
+fn clearVirtualLanguage(server: *Server, document_uri: []const u8) void {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    if (server.virtual_langs.fetchRemove(document_uri)) |kv| server.gpa.free(kv.key);
 }
 
 /// Virtual directory for documents with non-file URIs
@@ -1799,6 +1833,7 @@ fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
 }
 
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
+    try server.setVirtualLanguage(params.textDocument.uri, params.textDocument.languageId);
     const id = try server.documentFile(arena, params.textDocument.uri) orelse return;
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.uri);
@@ -1841,7 +1876,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
 /// Changes to a document that is not open are ignored: the client owns a document's text only
 /// between didOpen and didClose
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
-    const path = try documentPath(arena, params.textDocument.uri) orelse return;
+    const path = try server.documentPath(arena, params.textDocument.uri) orelse return;
     const id = try server.vfs.lookup(path) orelse return;
     if (!server.openDocument(id)) return;
     {
@@ -1870,6 +1905,7 @@ fn docVersion(server: *Server, file: Vfs.FileId) ?i32 {
 
 fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    server.clearVirtualLanguage(params.textDocument.uri);
     defer {
         // Even if reading from disk or replacing the text fails, still wait for old read requests
         // to exit first, which prevents a snapshot from being written again after closing.
@@ -4854,7 +4890,7 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
 /// Maps a URI in a read request to a known file; returns
 /// null for files that are not open or do not exist
 fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
-    const path = try documentPath(arena, document_uri) orelse return null;
+    const path = try server.documentPath(arena, document_uri) orelse return null;
     return try server.vfs.lookup(path);
 }
 
