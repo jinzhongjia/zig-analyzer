@@ -4627,7 +4627,7 @@ fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: 
     return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range, server.semanticTokensOptions()) };
 }
 
-fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
+fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
     // Prefer UTF-8 (matches the internal byte offsets);
     // otherwise fall back to the protocol default UTF-16
     if (params.capabilities.general) |general| {
@@ -4676,7 +4676,13 @@ fn initialize(server: *Server, _: Allocator, params: types.InitializeParams) Han
     var root_uris: std.ArrayList([]const u8) = .empty;
     defer root_uris.deinit(server.gpa);
     if (params.workspaceFolders) |folders| for (folders) |f| try root_uris.append(server.gpa, f.uri);
-    if (root_uris.items.len == 0) if (params.rootUri) |r| try root_uris.append(server.gpa, r);
+    if (root_uris.items.len == 0) {
+        if (params.rootUri) |r| {
+            try root_uris.append(server.gpa, r);
+        } else if (params.rootPath) |p| if (std.fs.path.isAbsolute(p)) {
+            try root_uris.append(server.gpa, try uri.fromPath(arena, p));
+        };
+    }
     for (root_uris.items) |root_uri| try server.addRoot(root_uri);
 
     return .{

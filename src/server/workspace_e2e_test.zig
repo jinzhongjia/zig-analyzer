@@ -1697,3 +1697,40 @@ test "a client that rejects the registration of file watchers leaves the watchin
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+/// The root directories of the server
+fn roots(h: *Harness) ![]const []const u8 {
+    h.server.roots_mutex.lockUncancelable(testing.io);
+    defer h.server.roots_mutex.unlock(testing.io);
+    return h.arena.allocator().dupe([]const u8, h.server.roots.items);
+}
+
+// Prevents ignoring the deprecated `rootPath` of clients that send no `rootUri`
+test "initialize takes rootPath as the root when there is no rootUri, and rootUri wins over it" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = check_build },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/util.zig", .text = "pub fn f() void {}\n" },
+    });
+    defer project.deinit();
+    inline for (.{ false, true }) |with_uri| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        if (with_uri) {
+            const src_uri = try za.base.uri.fromPath(a, try project.path(a, "src"));
+            _ = try h.request("initialize", .{ .rootUri = src_uri, .rootPath = project.root, .capabilities = Empty{} });
+        } else {
+            _ = try h.request("initialize", .{ .rootPath = project.root, .capabilities = Empty{} });
+        }
+        try h.notify("initialized", Empty{});
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        const found = try roots(&h);
+        try testing.expectEqual(1, found.len);
+        try testing.expectEqualStrings(if (with_uri) try project.path(a, "src") else project.root, found[0]);
+        try testing.expect(try (Projects{ .n = if (with_uri) 0 else 1 }).done(&h));
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
