@@ -1524,7 +1524,7 @@ const DirNotify = struct {
     }
 
     fn listen(d: *DirNotify, dir: *Directory) !void {
-        switch (windows.ntdll.NtNotifyChangeDirectoryFileEx(
+        switch (NtNotifyChangeDirectoryFile(
             dir.handle,
             null,
             &notifyApc,
@@ -1534,12 +1534,27 @@ const DirNotify = struct {
             dir.buffer.len,
             .{ .FILE_NAME = true, .DIR_NAME = true, .SIZE = true, .LAST_WRITE = true, .CREATION = true },
             .FALSE,
-            .Notify,
         )) {
             .SUCCESS, .PENDING => dir.state = .listening,
             else => return error.CannotWatchDirectory,
         }
     }
+
+    /// Fills the buffer with `FILE_NOTIFY_INFORMATION` records, as `NtNotifyChangeDirectoryFileEx`
+    /// does with `DirectoryNotifyInformation`; the latter exists only from Windows 10 1709 on, and
+    /// a program that imports it does not start on earlier versions (Zig supports Windows 10 from
+    /// 1507 on). `std.os.windows.ntdll` declares only the latter.
+    extern "ntdll" fn NtNotifyChangeDirectoryFile(
+        FileHandle: windows.HANDLE,
+        Event: ?windows.HANDLE,
+        ApcRoutine: ?*align(2) const windows.IO_APC_ROUTINE,
+        ApcContext: ?*anyopaque,
+        IoStatusBlock: *windows.IO_STATUS_BLOCK,
+        Buffer: *anyopaque,
+        Length: windows.ULONG,
+        CompletionFilter: windows.FILE.NOTIFY.CHANGE,
+        WatchTree: windows.BOOLEAN,
+    ) callconv(.winapi) windows.NTSTATUS;
 
     fn notifyApc(context: ?*anyopaque, iosb: *windows.IO_STATUS_BLOCK, _: windows.ULONG) align(std.Io.Threaded.apc_align) callconv(.winapi) void {
         const d: *DirNotify = @ptrCast(@alignCast(context));
