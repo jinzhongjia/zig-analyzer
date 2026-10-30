@@ -1466,8 +1466,8 @@ const PathFilter = enum {
 };
 
 /// The entries of the directory named by the part of `typed` before its last `/`, relative to the
-/// directory of `file` (excluding entries that start with `.` and `zig-out`). Completion items are
-/// full paths from the start of the string
+/// directory of `file` (excluding entries that start with `.`, the build output `zig-out`, and the
+/// fetched packages `zig-pkg`). Completion items are full paths from the start of the string
 fn listPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, range: Item.Range, filter: PathFilter) resolve.Error!void {
     const vfs = r.ctx.db.env.vfs;
     const prefix = if (std.mem.lastIndexOfScalar(u8, typed, '/')) |s| typed[0 .. s + 1] else "";
@@ -1477,7 +1477,7 @@ fn listPaths(r: *Resolver, out: *Collector, file: FileId, typed: []const u8, ran
     defer dir.close(vfs.io);
     var it = dir.iterate();
     while (it.next(vfs.io) catch null) |entry| {
-        if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.eql(u8, entry.name, "zig-out")) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.eql(u8, entry.name, "zig-out") or std.mem.eql(u8, entry.name, "zig-pkg")) continue;
         switch (entry.kind) {
             .directory => {
                 const slash = if (filter == .import) "/" else "";

@@ -2394,7 +2394,8 @@ const ManifestRoot = struct {
     fn create() !ManifestRoot {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        for ([_][]const u8{ "src/util", "libs/foo", "zig-out/bin", ".zig-cache" }) |d| try tmp.dir.createDirPath(testing.io, d);
+        // The build output, the fetched packages, and the cache are never offered as paths
+        for ([_][]const u8{ "src/util", "libs/foo", "zig-out/bin", "zig-pkg/dep-0.0.1-abc", ".zig-cache" }) |d| try tmp.dir.createDirPath(testing.io, d);
         for ([_][]const u8{ "build.zig", "build.zig.zon", "README.md", ".gitignore", "src/main.zig", "src/util/a.zig", "libs/foo/build.zig.zon" }) |f| {
             try tmp.dir.writeFile(testing.io, .{ .sub_path = f, .data = "" });
         }
