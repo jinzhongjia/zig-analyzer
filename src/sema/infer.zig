@@ -1803,8 +1803,8 @@ const Inferrer = struct {
                 for (args, operands) |a, *o| o.* = inf.get(a);
                 return .{ .ty = try value.minMaxIntType(ip, eq(u8, name, "@min"), operands) orelse try inf.peer(types.items) };
             }
-            // The absolute value of a signed integer is an unsigned integer of the same bit width
-            if (eq(u8, name, "@abs")) if (value.intInfo(ip, types.items[0])) |info| if (info.signed) return .{ .ty = try ip.intType(.unsigned, info.bits) };
+            // The absolute value of a signed integer is the unsigned integer of the same bit width
+            if (eq(u8, name, "@abs")) return .{ .ty = try value.absType(ip, types.items[0]) orelse .unknown };
             // Division and remainder: the peer type of both sides
             if (args.len == 2) return .{ .ty = try inf.peer(types.items) };
             return .{ .ty = types.items[0] };

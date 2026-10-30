@@ -37,6 +37,33 @@ pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
     };
 }
 
+/// Result type of `@abs` (matches the compiler's `zirAbs` and `Type.toUnsigned`): signed integer
+/// types map to their unsigned counterparts (`isize` to `usize`, `c_int` to `c_uint`, other
+/// widths to `uN`), vectors element-wise; every other type is its own result. Null when the
+/// signedness or bit width needed for the mapping is unknown.
+pub fn absType(ip: *InternPool, t: Index) Allocator.Error!?Index {
+    return switch (ip.key(t)) {
+        .simple_type => |s| switch (s) {
+            .isize => try ip.get(.{ .simple_type = .usize }),
+            .c_short => try ip.get(.{ .simple_type = .c_ushort }),
+            .c_int => try ip.get(.{ .simple_type = .c_uint }),
+            .c_long => try ip.get(.{ .simple_type = .c_ulong }),
+            .c_longlong => try ip.get(.{ .simple_type = .c_ulonglong }),
+            .c_char => {
+                const info = intInfo(ip, t) orelse return null;
+                return if (info.signed) try ip.intType(.unsigned, info.bits) else t;
+            },
+            else => t,
+        },
+        .int_type => |i| if (i.signedness == .signed) try ip.intType(.unsigned, i.bits) else t,
+        .vector_type => |v| {
+            const child = try absType(ip, v.child) orelse return null;
+            return if (child == v.child) t else try ip.get(.{ .vector_type = .{ .len = v.len, .child = child } });
+        },
+        else => t,
+    };
+}
+
 /// Intermediate result of arithmetic: holds both the product of two i128 values and shift results
 const Wide = i256;
 

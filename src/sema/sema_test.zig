@@ -1423,6 +1423,38 @@ test "float math builtins use the precision of the operand type" {
     });
 }
 
+test "@abs maps signed integer types to their unsigned counterparts" {
+    // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(@abs(v)), ...)` prints
+    // `@Vector(4, u32)`, `usize`, `c_uint`, `c_ulong`, `c_ushort`, `c_ulonglong`, `u32`,
+    // `@Vector(4, u32)`, `@Vector(2, f32)`, `u8`)
+    try expectTypes(
+        \\fn probe(v: @Vector(4, i32), d: isize, c: c_int, l: c_long, s: c_short, ll: c_longlong, u: i32, vu: @Vector(4, u32), vf: @Vector(2, f32)) void {
+        \\    const a_vec = @abs(v);
+        \\    const a_isize = @abs(d);
+        \\    const a_cint = @abs(c);
+        \\    const a_clong = @abs(l);
+        \\    const a_cshort = @abs(s);
+        \\    const a_cll = @abs(ll);
+        \\    const a_i32 = @abs(u);
+        \\    const a_vu = @abs(vu);
+        \\    const a_vf = @abs(vf);
+        \\    const k_cint = @abs(@as(c_int, -3));
+        \\    _ = .{ a_vec, a_isize, a_cint, a_clong, a_cshort, a_cll, a_i32, a_vu, a_vf, k_cint };
+        \\}
+    , &.{
+        .{ "a_vec", "@Vector(4, u32)" },
+        .{ "a_isize", "usize" },
+        .{ "a_cint", "c_uint" },
+        .{ "a_clong", "c_ulong" },
+        .{ "a_cshort", "c_ushort" },
+        .{ "a_cll", "c_ulonglong" },
+        .{ "a_i32", "u32" },
+        .{ "a_vu", "@Vector(4, u32)" },
+        .{ "a_vf", "@Vector(2, f32)" },
+        .{ "k_cint", "c_uint = 3" },
+    });
+}
+
 test "@min and @max narrow the result type like the compiler" {
     // Expected values are the results of zig 0.17.0
     try expectTypes(

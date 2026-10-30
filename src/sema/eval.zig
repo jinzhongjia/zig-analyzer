@@ -3091,7 +3091,7 @@ const Evaluator = struct {
             if (ip.isFloat(vals[0].ty)) return try floatResult(vals[0].ty, try value.floatUnary(ip, .abs, vals[0].ty, try ev.floatArg(vals[0])));
             const x = try ev.intArg(vals[0]);
             if (x == std.math.minInt(i128)) return error.Abort;
-            const ty = if (value.intInfo(ip, vals[0].ty)) |info| (if (info.signed) try ip.intType(.unsigned, info.bits) else vals[0].ty) else vals[0].ty;
+            const ty = try value.absType(ip, vals[0].ty) orelse return error.Abort;
             return try ev.int(ty, @abs(x));
         }
         // Unary float math functions: compute in the float type of the argument
