@@ -1838,8 +1838,12 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     server.scheduleCompileSetRefresh(&.{id});
 }
 
+/// Changes to a document that is not open are ignored: the client owns a document's text only
+/// between didOpen and didClose
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
-    const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
+    const path = try documentPath(arena, params.textDocument.uri) orelse return;
+    const id = try server.vfs.lookup(path) orelse return;
+    if (!server.openDocument(id)) return;
     {
         server.db.beginWrite();
         defer server.db.endWrite();
@@ -2278,6 +2282,11 @@ pub fn watchable(server: *Server, rules: origin.Rules, path: []const u8) bool {
 /// `path` is an open document
 pub fn isOpen(server: *Server, path: []const u8) bool {
     const file = (server.vfs.lookup(path) catch return false) orelse return false;
+    return server.openDocument(file);
+}
+
+/// `file` is an open document
+fn openDocument(server: *Server, file: Vfs.FileId) bool {
     server.docs_mutex.lockUncancelable(server.io);
     defer server.docs_mutex.unlock(server.io);
     return server.open_docs.contains(file);

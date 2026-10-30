@@ -1763,3 +1763,58 @@ test "signature help gives parameter label offsets to clients that support them"
         try h.notify("exit", {});
     }
 }
+
+/// Names of the top-level symbols of a document (hierarchical `documentSymbol`)
+fn symbolNames(h: anytype, document_uri: []const u8) ![]const []const u8 {
+    const a = h.arena.allocator();
+    const result = (try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = document_uri } })).object.get("result").?;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (result.array.items) |s| try names.append(a, s.object.get("name").?.string);
+    return names.items;
+}
+
+test "didChange for a document that is not open changes nothing" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const main_text = "const o = @import(\"other.zig\");\npub const x = o.other;\npub const y = o.keep;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "main.zig", .data = main_text });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "pub const other = 2;\npub const keep = 3;\n" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true } } } });
+    try h.notify("initialized", struct {}{});
+    const main_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "main.zig" }));
+    const other_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "other.zig" }));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_text } });
+    // The edited text of the file would be `renamed`, which is not a valid container
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = other_uri, .version = 5 },
+        .contentChanges = &.{.{ .range = .{ .start = .{ .line = 0, .character = 10 }, .end = .{ .line = 0, .character = 15 } }, .text = "renamed" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    for ([_]u32{ 1, 2 }) |line| {
+        const def = (try h.request("textDocument/definition", .{ .textDocument = .{ .uri = main_uri }, .position = .{ .line = line, .character = 17 } })).object.get("result").?;
+        const locations = if (def == .array) def.array.items else &.{def};
+        try testing.expectEqual(1, locations.len);
+        try testing.expectEqualStrings(other_uri, locations[0].object.get("uri").?.string);
+    }
+    const names = try symbolNames(&h, other_uri);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("other", names[0]);
+    try testing.expectEqualStrings("keep", names[1]);
+    for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+        try testing.expect(!std.mem.eql(u8, other_uri, n.object.get("params").?.object.get("uri").?.string));
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
