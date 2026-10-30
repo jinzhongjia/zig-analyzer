@@ -309,6 +309,11 @@ pub const Param = struct {
     pub fn isComptime(n: Param) bool {
         return n.syntax.childToken(.keyword_comptime) != null;
     }
+
+    /// The C-variadic `...`, which takes every remaining argument
+    pub fn isVarargs(n: Param) bool {
+        return n.syntax.childToken(.ellipsis3) != null;
+    }
 };
 
 pub const VarDecl = struct {

@@ -468,6 +468,46 @@ test "signature help through the vtable of std.mem.Allocator" {
     try testing.expectEqual(3, s.active);
 }
 
+test "signature help keeps C-variadic arguments on the ... parameter" {
+    // Prevents the active parameter from running past `...` from the second variadic argument on
+    const text =
+        \\extern fn printf(fmt: [*:0]const u8, ...) c_int;
+        \\extern fn fcntl3(fd: c_int, cmd: c_int, ...) c_int;
+        \\fn add(a: u32, b: u32) u32 { return a + b; }
+        \\pub fn main() void {
+        \\    const a: c_int = 1;
+        \\    _ = printf("%d %d %d\n", a1, a2, a3);
+        \\    _ = fcntl3(0, 1, a4, a5);
+        \\    _ = add(1, 2, x3);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, u32 }{
+        .{ "\"%d", 0 },
+        .{ "a1", 1 },
+        .{ "a2", 1 },
+        .{ "a3", 1 },
+        .{ "a4", 2 },
+        .{ "a5", 2 },
+        // Without `...` there is no parameter for an extra argument, and it is not clamped
+        .{ "x3", 2 },
+    };
+    for (cases) |c| {
+        const s = (try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?))) orelse return error.NoSignature;
+        testing.expectEqual(c[1], s.active) catch |err| {
+            std.debug.print("signature at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "signature help and parameter hints through aliases" {
     // Calls through an alias (`const assert = std.debug.assert;`): if the alias is not followed,
     // there is no signature help and there are no parameter name hints

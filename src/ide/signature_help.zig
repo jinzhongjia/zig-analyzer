@@ -50,7 +50,11 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
     const texts = try r.arena.alloc([]const u8, params.len);
     for (params, texts) |p, *t| t.* = try ast.collapsedAlloc(r.arena, p.syntax);
     const doc = if (target.def) |d| try context.doc(r, d) else null;
-    return .{ .label = label.written(), .params = texts, .active = active + @as(u32, @intFromBool(target.bound)), .doc = doc };
+    var current = active + @as(u32, @intFromBool(target.bound));
+    // Every argument from the C-variadic `...` on is one of its arguments; without `...` an extra
+    // argument has no parameter and is left past the end
+    if (params.len > 0 and params[params.len - 1].isVarargs()) current = @min(current, @as(u32, @intCast(params.len - 1)));
+    return .{ .label = label.written(), .params = texts, .active = current, .doc = doc };
 }
 
 /// The CST argument list directly contains the separating commas; commas in nested expressions,
