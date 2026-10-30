@@ -3052,6 +3052,50 @@ test "hover in generic bodies is inferred from a call site in another file" {
     try testing.expectEqualStrings("```zig\nconst bigger: i64\n```\n\ninferred from the call at main.zig:3", info.text);
 }
 
+test "hover in generic bodies takes the same call site whatever order the files were interned in" {
+    // The first call site followed the interning order of the files, so the instance depended on
+    // the order in which the client opened them
+    const util_text =
+        \\pub fn first(comptime T: type, items: []const T) T {
+        \\    const head = items[0];
+        \\    return head;
+        \\}
+        \\
+    ;
+    const main_text = "const util = @import(\"util.zig\");\nconst Point = struct { x: u8 };\nfn run() void {\n    _ = util.first(Point, &.{});\n}\n";
+    const net_text = "const util = @import(\"util.zig\");\nconst Color = enum { red };\nfn run() void {\n    _ = util.first(Color, &.{});\n}\n";
+    var results: [2][]const u8 = undefined;
+    for (&results, [_]bool{ false, true }) |*out, net_first| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const util = (try w.add("/p/util.zig", util_text)).file;
+        var main: FileId = undefined;
+        var net: FileId = undefined;
+        if (net_first) {
+            net = (try w.add("/p/net.zig", net_text)).file;
+            main = (try w.add("/p/main.zig", main_text)).file;
+        } else {
+            main = (try w.add("/p/main.zig", main_text)).file;
+            net = (try w.add("/p/net.zig", net_text)).file;
+        }
+        try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+            .{ .file = main, .module = 0, .compile = 0 },
+            .{ .file = net, .module = 0, .compile = 0 },
+            .{ .file = util, .module = 0, .compile = 0 },
+        });
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const info = try hover.hover(&r, util, @intCast(std.mem.indexOf(u8, util_text, "head =").?), &.{}) orelse return error.NoHover;
+        out.* = try testing.allocator.dupe(u8, info.text);
+    }
+    defer for (results) |t| testing.allocator.free(t);
+    // Call sites at the same import distance are taken in path order
+    try testing.expectEqualStrings("```zig\nconst head: Point\n```\n\ninferred from the call at main.zig:4", results[0]);
+    try testing.expectEqualStrings(results[0], results[1]);
+}
+
 test "hover in generic bodies: call sites through aliases" {
     const lib_text =
         \\pub fn max(comptime T: type, a: T, b: T) T {

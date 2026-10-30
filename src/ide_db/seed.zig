@@ -1303,7 +1303,7 @@ pub const Candidates = struct {
         data.files = try allocator.dupe(FileId, try ctx.get(search.ProjectImporters, key.file));
         var all: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         for (data.files) |f| try all.put(r.arena, f, {});
-        for (try search.searchFiles(&r)) |f| try all.put(r.arena, f, {});
+        for (try search.byPath(&r, try search.searchFiles(&r))) |f| try all.put(r.arena, f, {});
         data.all_files = try allocator.dupe(FileId, all.keys());
         const names = try callNames(&r, key.file, root, data.files);
         const owned = try allocator.alloc([]const u8, names.len);
