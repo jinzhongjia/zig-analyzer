@@ -51,9 +51,10 @@ pub const Result = struct {
     ret: TypedValue,
     /// Fields that field names in initializer expressions resolve to (the `x` in `.{ .x = 1 }`)
     field_refs: []const FieldRef = &.{},
-    /// Enum literals with an expected type (including decl literals and a bare `.` with no name
-    /// written yet), error values (`error.X`), and anonymous initializers (`.{ ... }`), along with
-    /// their expected types: completion uses them to list members, error names, and fields
+    /// Enum literals with an expected type (including decl literals, a bare `.` with no name
+    /// written yet, and the operand of `try .foo`, which gets the result type of the `try`), error
+    /// values (`error.X`), and anonymous initializers (`.{ ... }`), along with their expected
+    /// types: completion uses them to list members, error names, and fields
     literal_expected: []const LiteralExpected = &.{},
     /// Enum literals (including the callees of decl literal calls) and anonymous initializers whose
     /// result type exists but is unknown: they may name members of whatever type it is (reference
@@ -2748,6 +2749,11 @@ const Inferrer = struct {
                 const decl_call = switch (inf.body.expr(operand_e)) {
                     .call => |c| inf.body.expr(c.callee) == .enum_literal,
                     else => false,
+                };
+                // A bare `try .foo` is no decl literal, but it is `try .foo(...)` being typed: its
+                // result type is recorded for completion without being used for inference
+                if (expected) |want| if (want != .unknown and inf.body.expr(operand_e) == .enum_literal) {
+                    try inf.literal_expected.append(inf.scratch, .{ .expr = operand_e, .ty = want });
                 };
                 const v = try inf.infer(operand_e, if (decl_call) expected else null);
                 const payload, _ = inf.unwrapErrorUnion(v.ty);

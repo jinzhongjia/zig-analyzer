@@ -3110,6 +3110,43 @@ test "completion: enum literals at unnamed elements of array, slice and tuple in
     try testing.expectEqualStrings("red green blue", try completionAt(&w, try w.add("/p/pair.zon", ".{ .pair = .{ .<|>, .blue } }")));
 }
 
+test "completion after `try .` lists the functions returning an error union of the result type" {
+    try expectCompletions(
+        \\const S = struct {
+        \\    pub const empty: S = .{};
+        \\    pub fn tryMake() !S {
+        \\        return .{};
+        \\    }
+        \\    pub fn make() S {
+        \\        return .{};
+        \\    }
+        \\};
+        \\
+    , &.{
+        .{ "fn f() !void {\n    const s: S = try .<|>;\n    _ = s;\n}", "tryMake" },
+        .{ "fn f() !void {\n    const s: S = try .tryM<|>;\n    _ = s;\n}", "tryMake" },
+        .{ "fn f() !void {\n    const s: S = try .<|>\n}", "tryMake" },
+        .{ "fn mk() !S {\n    return try .<|>;\n}", "tryMake" },
+        .{ "fn mk() !S {\n    return try .<|>\n}", "tryMake" },
+        // `try .make()` is a compile error: `make` returns no error union
+        .{ "fn f() !void {\n    const s: S = try .tryM<|>();\n    _ = s;\n}", "tryMake" },
+    });
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try useRealStd(&w);
+    const labels = try completionAt(&w, try w.add("/p/main.zig",
+        \\const std = @import("std");
+        \\fn f() !void {
+        \\    var list: std.ArrayList(u8) = try .<|>;
+        \\    _ = &list;
+        \\}
+        \\
+    ));
+    try testing.expectEqualStrings("initCapacity clone", labels);
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;

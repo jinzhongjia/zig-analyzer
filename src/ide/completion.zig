@@ -412,7 +412,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 return .{ .items = out.items.items, .context = .init_field };
             }
         }
-        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, !a.literalTagsOnly(e), file);
+        const mode: DeclLiterals = if (a.literalTagsOnly(e)) .none else if (tryOperand(b, e)) .@"try" else .value;
+        try expectedMembers(r, &out, a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a }, mode, file);
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
 
@@ -743,11 +744,20 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, fr
     };
 }
 
-/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and with
-/// `decl_literals` (the type is a result type, not a peer type), declarations that can serve as
-/// decl literals (constants of type `T`, functions returning `T` or `!T`; also listed when their
-/// type cannot be inferred)
-fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool, from: FileId) resolve.Error!void {
+/// Which declarations of the expected type `expectedMembers` lists
+const DeclLiterals = enum {
+    /// None: the expected type comes from peer type resolution, which names only tags
+    none,
+    /// Declarations that can serve as decl literals (see `producesType`)
+    value,
+    /// The operand of `try` (`try .|`, `try .f|()`): only functions returning an error union whose
+    /// payload is the type (see `producesType`); tags are not error unions
+    @"try",
+};
+
+/// After `.`: enum members and union fields of the expected type (`T` for `?T`), and the
+/// declarations selected by `decl_literals`
+fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: DeclLiterals, from: FileId) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
     // Matching the compiler, strip error unions and optionals from the result type
     // (`fn f() !Color { return .red; }`)
@@ -757,9 +767,10 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool
         .optional_type => |c| c,
         else => break,
     };
+    const tags = decl_literals != .@"try";
     switch (ip.key(t)) {
         .reified_type, .union_tag_type => {
-            for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
+            if (tags) for (try eval.enumMemberNames(r, t)) |name| try out.add(.{ .label = name, .kind = .enum_member });
             return;
         },
         .container_type => {},
@@ -773,15 +784,15 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool
         const it = tree.items[m];
         const name = it.name orelse continue;
         switch (it.kind) {
-            .field => switch (kind) {
+            .field => if (tags) switch (kind) {
                 .@"enum" => try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc }),
                 .@"union" => try out.add(.{ .label = name, .kind = .field, .doc = it.doc }),
                 else => {},
             },
             .@"const", .@"fn" => {
-                if (!decl_literals or (ns.file != from and !it.flags.is_pub)) continue;
+                if (decl_literals == .none or (ns.file != from and !it.flags.is_pub)) continue;
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
-                if (!producesType(ip, decl_ty, t, it.kind == .@"fn")) continue;
+                if (!producesType(ip, decl_ty, t, it.kind == .@"fn", decl_literals == .@"try")) continue;
                 const is_fn = it.kind == .@"fn";
                 try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
             },
@@ -791,19 +802,38 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: bool
 }
 
 /// Whether a declaration can serve as a decl literal of type `t`: a constant of type `t`, or a
-/// function returning `t` or `!t`; an unknown type counts as yes
-fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool) bool {
+/// function returning `t` or `!t`; for the operand of `try` (`in_try`), only a function returning
+/// `!t`. An unknown type counts as yes
+fn producesType(ip: *InternPool, decl_ty: Index, t: Index, is_fn: bool, in_try: bool) bool {
+    if (!is_fn) return !in_try and (decl_ty == .unknown or decl_ty == t);
     if (decl_ty == .unknown) return true;
-    if (!is_fn) return decl_ty == t;
     const ret = switch (ip.key(decl_ty)) {
         .fn_type => |f| f.ret,
         else => return false,
     };
-    if (ret == .unknown or ret == t) return true;
+    if (ret == .unknown or (!in_try and ret == t)) return true;
     return switch (ip.key(ret)) {
         .error_union_type => |eu| eu.payload == t or eu.payload == .unknown,
         else => false,
     };
+}
+
+/// The enum literal `e` is the operand of `try`, directly (`try .f`) or as the callee of the call
+/// that is (`try .f()`)
+fn tryOperand(b: *const Body, e: Body.ExprId) bool {
+    var operand = e;
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .call => |c| if (c.callee == e) {
+            operand = @fromBackingInt(@as(u32, @intCast(i)));
+            break;
+        },
+        else => {},
+    };
+    for (b.exprs) |x| switch (x) {
+        .prefix => |p| if (p.op == .keyword_try and p.operand == operand) return true,
+        else => {},
+    };
+    return false;
 }
 
 /// The function declaration that a function value refers to
