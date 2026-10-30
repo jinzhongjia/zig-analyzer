@@ -1875,6 +1875,50 @@ test "comptime vars modified through pointers, methods, fields and elements are 
     });
 }
 
+/// Type of the binding `needle` when the loop variable `seed` takes the value of iteration `index`
+fn iterationTypeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, seed: []const u8, index: u32) ![]const u8 {
+    const offset = try wordAt(text, needle, 0);
+    const seed_offset = try wordAt(text, seed, 0);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const item = try r.ownerAt(file, offset, false) orelse return "no owner";
+    const node = (try r.itemNode(file, item)).?;
+    const owner = try r.ownerKey(file, item);
+    const body = try ctx.get(database.hir.ItemBody, owner);
+    const binding = for (body.bindings, 0..) |b, i| {
+        if (b.range.start == seed_offset - node.offset) break i;
+    } else return "no loop variable";
+    const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .loop = .{ .binding = @intCast(binding), .index = index } });
+    for (body.bindings, 0..) |b, i| if (b.range.start == offset - node.offset) return render.typedValueAlloc(&r, res.bindings[i]);
+    return "no binding";
+}
+
+test "later loop iterations see edits that change only the comptime vars an iteration leaves" {
+    // Prevents keeping a stale iteration through early cutoff when an edit changes only the value
+    // an iteration leaves in an outer comptime var (the start of the next iteration); expected
+    // types are the results of zig 0.17.0
+    const head =
+        \\pub fn main() void {
+        \\    comptime var acc: u32 = 1;
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        if (T == u16) {
+        \\            const x: [acc]T = undefined;
+        \\            _ = x;
+        \\        }
+        \\
+    ;
+    const before = head ++ "        acc *= 2;\n    }\n}\n";
+    const after = head ++ "        acc += 2;\n    }\n}\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", before);
+    try testing.expectEqualStrings("[2]u16 = undefined", try iterationTypeAt(&w, f.file, before, "x", "T", 1));
+    _ = try w.add("/p/main.zig", after);
+    try testing.expectEqualStrings("[3]u16 = undefined", try iterationTypeAt(&w, f.file, after, "x", "T", 1));
+}
+
 test "comptime evaluation runs loops, mutation and calls" {
     try expectTypes(
         \\fn double(n: usize) usize { return n * 2; }
