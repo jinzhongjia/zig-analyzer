@@ -34,6 +34,7 @@ const builtin = za.project.builtin;
 const ZigEnv = za.project.ZigEnv;
 const configuration = za.project.configuration;
 const exports = za.project.exports;
+const dependency_packages = za.project.packages;
 const ProjectModel = za.base.ProjectModel;
 const Vfs = za.base.Vfs;
 const FileId = Vfs.FileId;
@@ -91,9 +92,11 @@ compile_set: ?CompileSet.Result = null,
 /// Files reachable from compile steps other than the diagnostics steps (used only to determine
 /// which modules files belong to, see `recomputeCompileSet`); null when it equals the compile set
 resolve_set: ?CompileSet.Result = null,
-/// Build scripts (see `CompileSet.buildScripts`): computed when the background task starts, from
-/// the current text of the files (open files use their buffers, the rest are read from disk);
-/// valid even when reading the build graph fails
+/// Build scripts (see `CompileSet.buildScripts`) of the project and of its dependency packages
+/// with a build.zig (see `dependency_packages.discover`): all of them are compiled into the
+/// configure program, so a change to any of them reconfigures. Computed when the background task
+/// starts, from the current text of the files (open files use their buffers, the rest are read
+/// from disk); valid even when reading the build graph fails
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// Compiler diagnostics of the most recent build
 result: ?*compiler.BuildResult = null,
@@ -1114,33 +1117,61 @@ fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
     ws.server.reconcileSingle();
 }
 
-/// Computes the build scripts; missing files are read in and the computation repeated
+/// Computes the build scripts of the project and of its dependency packages (see
+/// `dependency_packages.discover`); missing files are read in and the computation repeated
 fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
     ws.set_mutex.lockUncancelable(ws.server.io);
     defer ws.set_mutex.unlock(ws.server.io);
+    const gpa = ws.gpa;
+    const io = ws.server.io;
+    var found = blk: {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const env_pkg_dir = if (ws.env.childEnviron()) |m| m.get("ZIG_LOCAL_PKG_DIR") else ws.server.environ.getAlloc(a, "ZIG_LOCAL_PKG_DIR") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        const pkg_dir = try dependency_packages.packageDir(a, ws.root, ws.config.build_args, env_pkg_dir);
+        break :blk try dependency_packages.discover(gpa, io, ws.root, pkg_dir);
+    };
+    defer found.deinit(gpa);
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
-        var arena: std.heap.ArenaAllocator = .init(ws.gpa);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
-        var result = blk: {
+        // Package index → its scripts
+        const results = try arena.allocator().alloc(CompileSet.Scripts, found.list.len);
+        @memset(results, .{});
+        defer for (results) |*r| r.deinit(gpa);
+        var missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        defer missing.deinit(gpa);
+        const canceled = blk: {
             var ctx = ws.server.db.beginRead(arena.allocator());
             defer ctx.end();
-            break :blk CompileSet.buildScripts(ws.gpa, ws.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // Interrupted by an edit: retry
-                error.Canceled => continue,
-            };
+            for (found.list, results) |p, *r| {
+                r.* = CompileSet.buildScripts(gpa, p.root, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // Interrupted by an edit: retry
+                    error.Canceled => break :blk true,
+                };
+                for (r.missing.keys()) |f| try missing.put(gpa, f, {});
+            }
+            break :blk false;
         };
-        if (result.missing.count() == 0) {
-            result.missing.deinit(ws.gpa);
-            ws.mutex.lockUncancelable(ws.server.io);
-            defer ws.mutex.unlock(ws.server.io);
-            ws.build_scripts.deinit(ws.gpa);
-            ws.build_scripts = result.files;
-            return;
+        if (canceled) continue;
+        if (missing.count() != 0) {
+            try ws.loadFiles(missing.keys());
+            continue;
         }
-        defer result.deinit(ws.gpa);
-        try ws.loadFiles(result.missing.keys());
+        var scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        errdefer scripts.deinit(gpa);
+        for (results) |r| for (r.files.keys()) |f| try scripts.put(gpa, f, {});
+        ws.mutex.lockUncancelable(io);
+        defer ws.mutex.unlock(io);
+        ws.build_scripts.deinit(gpa);
+        ws.build_scripts = scripts;
+        return;
     }
     log.warn("{s}: build script computation did not converge", .{ws.root});
 }

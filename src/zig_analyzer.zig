@@ -48,6 +48,7 @@ pub const project = struct {
     pub const builtin = @import("project/builtin.zig");
     pub const configuration = @import("project/configuration.zig");
     pub const exports = @import("project/exports.zig");
+    pub const packages = @import("project/packages.zig");
     /// Test-only: creates example projects in a temporary directory
     pub const fixture = @import("project/fixture.zig");
 };

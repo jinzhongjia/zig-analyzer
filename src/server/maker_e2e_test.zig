@@ -404,3 +404,69 @@ test "entries created in or deleted from a configure input directory reconfigure
         try h.notify("exit", {});
     }
 }
+
+const lib_app_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const dep = b.dependency("lib", .{});
+    \\    const mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host });
+    \\    mod.addImport("lib", dep.module("lib"));
+    \\    const exe = b.addExecutable(.{ .name = "app", .root_module = mod });
+    \\    b.installArtifact(exe);
+    \\    b.step("check", "check").dependOn(&exe.step);
+    \\}
+    \\
+;
+const lib_app_main =
+    \\const lib = @import("lib");
+    \\pub fn main() void {
+    \\    const w: []const u8 = lib.which;
+    \\    _ = w;
+    \\}
+    \\
+;
+const lib_dep_build = "const std = @import(\"std\");\npub fn build(b: *std.Build) void {\n    _ = b.addModule(\"lib\", .{ .root_source_file = b.path(\"a.zig\") });\n}\n";
+
+test "editing the build.zig of a path dependency reconfigures the project" {
+    // Each dependency's build.zig is compiled into the configure program: a stale build graph
+    // must not keep the old module roots
+    inline for (.{ false, true }) |on_disk| {
+        var project = try fixture.Project.create(&.{
+            .{ .path = "app/build.zig", .text = lib_app_build },
+            .{ .path = "app/build.zig.zon", .text = ".{ .name = .app, .version = \"0.0.1\", .fingerprint = 0xc96e70cf9d35654b, .minimum_zig_version = \"0.17.0\", .dependencies = .{ .lib = .{ .path = \"../lib\" } }, .paths = .{ \"build.zig\", \"build.zig.zon\", \"src\" } }\n" },
+            .{ .path = "app/src/main.zig", .text = lib_app_main },
+            .{ .path = "lib/build.zig.zon", .text = ".{ .name = .lib, .version = \"0.0.1\", .fingerprint = 0xa90f3bcc2dcf582d, .minimum_zig_version = \"0.17.0\", .paths = .{ \"build.zig\", \"build.zig.zon\", \"a.zig\", \"b.zig\" } }\n" },
+            .{ .path = "lib/build.zig", .text = lib_dep_build },
+            .{ .path = "lib/a.zig", .text = "pub const which: []const u8 = \"a\";\n" },
+            .{ .path = "lib/b.zig", .text = "pub const which: u32 = 2;\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const app = try project.path(a, "app");
+        const root_uri = try za.base.uri.fromPath(a, app);
+        _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+        try h.notify("initialized", Empty{});
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "app/src/main.zig"));
+        try open(&h, main_uri, lib_app_main);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expectEqualStrings("a.zig", try gotoFile(&h, main_uri, lib_app_main, "lib.wh"));
+
+        const lib_build_path = try project.path(a, "lib/build.zig");
+        const lib_build_uri = try za.base.uri.fromPath(a, lib_build_path);
+        const changed = try std.mem.replaceOwned(u8, a, lib_dep_build, "a.zig", "b.zig");
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_build_path, .data = changed });
+        if (on_disk) {
+            try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_build_uri, .type = 2 }} });
+        } else {
+            try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = lib_build_uri } });
+        }
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expectEqualStrings("b.zig", try gotoFile(&h, main_uri, lib_app_main, "lib.wh"));
+        try testing.expect(try lastHas(&h, main_uri, "expected type '[]const u8', found 'u32'"));
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
