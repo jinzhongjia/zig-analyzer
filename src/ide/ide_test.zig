@@ -4480,6 +4480,40 @@ fn inlaid(w: *World, file: FileId, text: []const u8, opts: inlay_hints.Options) 
     return out.items;
 }
 
+test "inlay hints: the length limit cuts comptime strings on whole characters" {
+    // A cut must not split a UTF-8 sequence into `\xNN` escapes
+    const text =
+        \\fn Tag(comptime name: []const u8) type {
+        \\    return struct { v: u8 = 0, const tag = name; };
+        \\}
+        \\fn Label(comptime text: []const u8) type {
+        \\    return struct { v: u8 = 0, const tag = text; };
+        \\}
+        \\pub fn main() void {
+        \\    const a = Tag("a中文中文中文中文中文中文"){};
+        \\    const b = Tag("😀😀😀😀😀😀😀😀😀😀😀😀😀😀"){};
+        \\    const c = Label("café crème brûlée façade"){};
+        \\    _ = .{ a, b, c };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    const hinted = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false });
+    try testing.expect(std.mem.indexOf(u8, hinted, "const a: Tag(\"a中文中文中文中文中文中文\") =") != null);
+    try testing.expect(std.mem.indexOf(u8, hinted, "const b: Tag(\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀\") =") != null);
+    for (1..41) |limit| {
+        const cut = try inlaid(&w, file, text, .{ .parameters = false, .field_types = false, .max_length = @intCast(limit) });
+        try testing.expect(std.unicode.utf8ValidateSlice(cut));
+        testing.expect(std.mem.indexOf(u8, cut, "\\x") == null) catch |err| {
+            std.debug.print("max_length {d}:\n{s}\n", .{ limit, cut });
+            return err;
+        };
+    }
+}
+
 test "inlay hints: field types in initializers that have a result type" {
     const text =
         \\const Point = struct { x: i32, y: i32 = 0 };
