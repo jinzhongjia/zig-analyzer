@@ -6396,3 +6396,25 @@ test "an inline for over an undefined array in a generic body counts its element
     defer testing.allocator.free(labels);
     try testing.expectEqualStrings("a_field", labels);
 }
+
+test "hover never treats the initializer as the missing type of a declaration" {
+    // `const T2: = u32;` lacks its type: it must not be shown as a value of type `u32`
+    const text = "const T2: = u32;\nconst z = T2;\nconst w: T2 = 1;\ntest { _ = .{ T2, z, w }; }\n";
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "T2, z", "```zig\nconst T2: type = u32\n```" },
+        .{ "z, w", "```zig\nconst z: type = u32\n```" },
+        .{ "w }", "```zig\nconst w: u32 = 1\n```" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const offset: u32 = @intCast(std.mem.lastIndexOf(u8, text, c[0]).?);
+        const info = try hover.hover(&r, added.file, offset) orelse return error.NoHover;
+        try testing.expectEqualStrings(c[1], info.text);
+    }
+}

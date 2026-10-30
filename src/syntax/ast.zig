@@ -66,6 +66,20 @@ fn nodeAfterExcept(n: SyntaxNode, token: SyntaxKind, skip: []const SyntaxKind) ?
     return null;
 }
 
+/// The first direct child node after `open`, or null when a token in `closers` comes before it
+/// (the slot between them is empty)
+fn nodeInSlot(n: SyntaxNode, open: SyntaxKind, closers: []const SyntaxKind) ?SyntaxNode {
+    var it = n.children();
+    var seen = false;
+    while (it.next()) |e| switch (e) {
+        .token => |t| if (t.kind == open) {
+            seen = true;
+        } else if (seen and std.mem.indexOfScalar(SyntaxKind, closers, t.kind) != null) return null,
+        .node => |c| if (seen) return c,
+    };
+    return null;
+}
+
 /// Iterator over direct child nodes (optionally filtered by kind)
 pub const Nodes = struct {
     inner: SyntaxNode.Children,
@@ -308,9 +322,14 @@ pub const VarDecl = struct {
         return n.syntax.childToken(.keyword_var) == null;
     }
 
+    /// Null when the type after `:` is missing (the clauses and the initializer that follow are
+    /// not the type)
     pub fn typeExpr(n: VarDecl) ?SyntaxNode {
-        if (n.syntax.childToken(.colon) == null) return null;
-        return nodeAfter(n.syntax, .colon);
+        const t = nodeInSlot(n.syntax, .colon, &.{ .equal, .equal_equal, .semicolon }) orelse return null;
+        return switch (t.kind()) {
+            .align_clause, .addrspace_clause, .linksection_clause => null,
+            else => t,
+        };
     }
 
     pub fn initExpr(n: VarDecl) ?SyntaxNode {
@@ -328,8 +347,14 @@ pub const ContainerField = struct {
         return n.syntax.childToken(.identifier);
     }
 
+    /// Null when the type is missing (`a: = 1`): the align clause and the default value are not it
     pub fn typeExpr(n: ContainerField) ?SyntaxNode {
-        return firstNodeExcept(n.syntax, &.{.align_clause});
+        var it = n.syntax.children();
+        while (it.next()) |e| switch (e) {
+            .token => |t| if (t.kind == .equal) return null,
+            .node => |c| return if (c.kind() == .align_clause) null else c,
+        };
+        return null;
     }
 
     /// Enum member `red` / `red = 1`: the name is in the position of the type expression
@@ -441,7 +466,7 @@ pub const IfExpr = struct {
     pub const kind: SyntaxKind = .if_expr;
 
     pub fn cond(n: IfExpr) ?SyntaxNode {
-        return nodeAfter(n.syntax, .l_paren);
+        return nodeInSlot(n.syntax, .l_paren, &.{.r_paren});
     }
 
     pub fn payload(n: IfExpr) ?Payload {
@@ -466,7 +491,7 @@ pub const WhileExpr = struct {
     }
 
     pub fn cond(n: WhileExpr) ?SyntaxNode {
-        return nodeAfter(n.syntax, .l_paren);
+        return nodeInSlot(n.syntax, .l_paren, &.{.r_paren});
     }
 
     pub fn payload(n: WhileExpr) ?Payload {
@@ -532,7 +557,7 @@ pub const SwitchExpr = struct {
     }
 
     pub fn operand(n: SwitchExpr) ?SyntaxNode {
-        return nodeAfter(n.syntax, .l_paren);
+        return nodeInSlot(n.syntax, .l_paren, &.{.r_paren});
     }
 
     pub fn prongs(n: SwitchExpr) Nodes {
@@ -950,4 +975,34 @@ test "control flow" {
     const fa = cast(FieldAccess, stmt.childNode(.field_access).?).?;
     try testing.expect(fa.name() == null);
     try testing.expect(fa.dot() != null);
+}
+
+test "a missing type, condition or operand is null, not the next node" {
+    const p = try parseFirst(testing.allocator,
+        \\const x: = 5;
+        \\var y: align(4) = 5;
+        \\const S = struct { a: = 5, b: align(4) = 6 };
+        \\fn f() void {
+        \\    if () {}
+        \\    while () {}
+        \\    switch () { .a => |v| v }
+        \\}
+    );
+    defer p.destroy();
+    var members = nodes(p.rootNode());
+    const x = cast(VarDecl, members.next().?).?;
+    try testing.expect(x.typeExpr() == null);
+    try testing.expectEqual(.literal, x.initExpr().?.kind());
+    const y = cast(VarDecl, members.next().?).?;
+    try testing.expect(y.typeExpr() == null);
+    const s = cast(ContainerDecl, cast(VarDecl, members.next().?).?.initExpr().?).?;
+    var fields = nodes(s.syntax);
+    const a = cast(ContainerField, fields.next().?).?;
+    try testing.expect(a.typeExpr() == null);
+    try testing.expectEqual(.literal, a.defaultValue().?.kind());
+    try testing.expect(cast(ContainerField, fields.next().?).?.typeExpr() == null);
+    var stmts = cast(FnDecl, members.next().?).?.body().?.statements();
+    try testing.expect(cast(IfExpr, stmts.next().?).?.cond() == null);
+    try testing.expect(cast(WhileExpr, stmts.next().?).?.cond() == null);
+    try testing.expect(cast(SwitchExpr, stmts.next().?).?.operand() == null);
 }
