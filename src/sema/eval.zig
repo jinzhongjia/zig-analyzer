@@ -2877,6 +2877,8 @@ const Evaluator = struct {
             const sign = try ev.tagName(vals[0]);
             const bits = std.math.cast(u16, try ev.intArg(vals[1])) orelse return error.Abort;
             const s = std.meta.stringToEnum(std.builtin.Signedness, sign) orelse return error.Abort;
+            // Sema rejects a signed integer type with bit width 0
+            if (s == .signed and bits == 0) return error.Abort;
             return Val.ofType(try ip.intType(s, bits));
         }
         if (eq(u8, name, "@Vector")) {

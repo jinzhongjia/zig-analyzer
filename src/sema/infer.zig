@@ -1631,6 +1631,8 @@ const Inferrer = struct {
                 else => null,
             } else null;
             if (sign == null or n == null) return typeUnknown();
+            // Sema rejects a signed integer type with bit width 0
+            if (sign.? == .signed and n.? == 0) return typeUnknown();
             return TypedValue.ofType(try ip.intType(sign.?, n.?));
         }
         // Builtins that construct types: evaluated by the interpreter (their arguments are
@@ -4271,6 +4273,8 @@ pub fn primitive(ip: *InternPool, name: []const u8) Error!?TypedValue {
     if (name.len >= 2 and (name[0] == 'u' or name[0] == 'i')) {
         const bits = std.fmt.parseInt(u16, name[1..], 10) catch return null;
         if (name[1] == '0' and name.len > 2) return null;
+        // AstGen rejects a signed integer type with bit width 0
+        if (name[0] == 'i' and bits == 0) return null;
         return TypedValue.ofType(try ip.intType(if (name[0] == 'u') .unsigned else .signed, bits));
     }
     return null;

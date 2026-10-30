@@ -10,6 +10,7 @@ const queries = @import("queries.zig");
 const render = @import("render.zig");
 const InternPool = @import("InternPool.zig");
 const value = @import("value.zig");
+const infer = @import("infer.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 /// Type at the `nth` occurrence of `needle`: the type of the binding when the name coincides with
@@ -985,6 +986,34 @@ test "@TypeOf(undefined) is the type of undefined" {
         .{ "at", "type = @TypeOf(undefined)" },
         .{ "tx", "type = @TypeOf(undefined)" },
     });
+}
+
+test "signed integer types with bit width 0 are no types" {
+    // zig 0.17.0 rejects `i0` and `@Int(.signed, 0)` ("signed integer cannot have bit width 0");
+    // `@compileLog(Z, W, @bitSizeOf(Z))` prints `u0`, `u0`, `0`. A zero-bit signed integer type
+    // must not be produced.
+    try expectTypes(
+        \\const T = i0;
+        \\const U = @Int(.signed, 0);
+        \\const Z = u0;
+        \\const W = @Int(.unsigned, 0);
+        \\const L = u01;
+        \\const B = @bitSizeOf(T);
+        \\const BZ = @bitSizeOf(Z);
+    , &.{
+        .{ "T", "unknown" },
+        .{ "U", "type" },
+        .{ "Z", "type = u0" },
+        .{ "W", "type = u0" },
+        .{ "L", "unknown" },
+        .{ "B", "comptime_int" },
+        .{ "BZ", "comptime_int = 0" },
+    });
+    var ip = try InternPool.init(testing.allocator, testing.io);
+    defer ip.deinit();
+    try testing.expect(try infer.primitive(&ip, "i0") == null);
+    try testing.expect(try infer.primitive(&ip, "u01") == null);
+    try testing.expect(try infer.primitive(&ip, "u0") != null);
 }
 
 test "comparisons that depend on unknown parts stay unknown" {
