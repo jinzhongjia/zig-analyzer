@@ -26,7 +26,8 @@ const ModuleGraph = @This();
 /// The whole `ArenaAllocator` is not stored: the `Allocator` returned by `allocator()` points to
 /// the arena itself and becomes invalid once the value is copied.
 arena: std.heap.ArenaAllocator.State,
-/// `<std_dir>/std.zig`; null when the zig environment is unknown
+/// `<std_dir>/std.zig` of the zig environment, used by files that belong to no module (each
+/// compilation has its own, see `Compile.std_root`); null when the zig environment is unknown
 std_root: ?FileId,
 /// builtin.zig used by files that belong to no module (native target, Debug, matching single-file
 /// compiles)
@@ -51,6 +52,8 @@ pub const Module = struct {
 pub const Compile = struct {
     /// Target of `@import("root")`
     root: ?FileId,
+    /// Target of `@import("std")`: `std/std.zig` of the compilation's lib directory
+    std_root: ?FileId = null,
     /// builtin.zig of the root module, which the standard library uses
     builtin: ?FileId = null,
 };
@@ -163,6 +166,7 @@ pub const Builder = struct {
         const gop = try b.compiles.getOrPut(b.gpa, .{
             .root = if (root) |p| try b.vfs.intern(p) else null,
             .builtin = try b.builtinFile(model, step, c.root_module),
+            .std_root = try b.vfs.intern(model.stdRootOf(step)),
         });
         return @intCast(gop.index);
     }
@@ -219,7 +223,11 @@ pub fn entry(g: *const ModuleGraph, file: FileId) ?FileEntry {
 /// imported by each module the file belongs to; relative paths do not go through the module graph
 /// and are not handled here)
 pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?FileId {
-    if (std.mem.eql(u8, name, "std")) return g.std_root;
+    if (std.mem.eql(u8, name, "std")) {
+        // Files that belong to no module use the standard library of the zig environment
+        const e = g.entry(file) orelse return g.std_root;
+        return g.compiles[e.compile].std_root orelse g.std_root;
+    }
     if (std.mem.eql(u8, name, "builtin")) {
         // The standard library uses the builtin of the root module of its compilation (matching
         // the compiler); files that belong to no module use the default one

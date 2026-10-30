@@ -336,3 +336,83 @@ test "build integration: @import(\"root\") in a test compilation with a custom t
     try testing.expectEqualStrings("runner.zig:0", try s.definition(helper_uri, test_runner_helper, "\"root\""));
     try testing.expectEqualSlices(i64, &.{4}, try s.inactiveLines(helper_uri));
 }
+
+const lib_dir_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const t = b.addTest(.{
+    \\        .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }),
+    \\        .zig_lib_dir = b.path("mylib"),
+    \\    });
+    \\    b.step("check", "Compile the tests").dependOn(&t.step);
+    \\}
+    \\
+;
+
+const lib_dir_main =
+    \\const std = @import("std");
+    \\
+    \\test "local std marker" {
+    \\    const marker = std.math.verifyMarker;
+    \\    _ = marker;
+    \\    _ = std.math.
+    \\}
+    \\
+;
+
+test "build integration: @import(\"std\") follows the zig_lib_dir of the compilation" {
+    var s: Session = undefined;
+    try s.start(&.{
+        .{ .path = "build.zig", .text = lib_dir_build },
+        .{ .path = "src/main.zig", .text = lib_dir_main },
+        .{ .path = "mylib/std/std.zig", .text = "pub const math = @import(\"math.zig\");\n" },
+        .{ .path = "mylib/std/math.zig", .text = "pub const pi = 3.14;\npub const verifyMarker: u32 = 42;\n" },
+    }, "{}");
+    defer s.finish();
+    const main_uri = try s.open("src/main.zig", lib_dir_main);
+    try s.waitIdle();
+
+    try testing.expectEqualStrings("mylib/std/math.zig:1", try s.definition(main_uri, lib_dir_main, "verifyMarker"));
+    try testing.expectEqualStrings("```zig\nconst marker: u32 = 42\n```", try s.hover(main_uri, lib_dir_main, "marker ="));
+    try testing.expect(contains(try s.completion(main_uri, lib_dir_main, "_ = std.math."), "verifyMarker"));
+}
+
+const lib_tree_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const t = b.addTest(.{
+    \\        .root_module = b.createModule(.{ .root_source_file = b.path("lib/std/std.zig"), .target = b.graph.host }),
+    \\        .zig_lib_dir = b.path("lib"),
+    \\    });
+    \\    b.step("check", "Compile the tests").dependOn(&t.step);
+    \\}
+    \\
+;
+
+const lib_tree_mem = "pub fn trimEnd() void {}\n";
+
+const lib_tree_tar =
+    \\const std = @import("std");
+    \\pub fn next() void {
+    \\    std.mem.trimEnd();
+    \\}
+    \\
+;
+
+test "build integration: references in a standard library tree compiled with its own zig_lib_dir" {
+    var s: Session = undefined;
+    try s.start(&.{
+        .{ .path = "build.zig", .text = lib_tree_build },
+        .{ .path = "lib/std/std.zig", .text = "pub const mem = @import(\"mem.zig\");\npub const tar = @import(\"tar.zig\");\n" },
+        .{ .path = "lib/std/mem.zig", .text = lib_tree_mem },
+        .{ .path = "lib/std/tar.zig", .text = lib_tree_tar },
+    }, "{}");
+    defer s.finish();
+    const mem_uri = try s.open("lib/std/mem.zig", lib_tree_mem);
+    const tar_uri = try s.open("lib/std/tar.zig", lib_tree_tar);
+    try s.waitIdle();
+
+    // `@import("std")` in the tree is the tree's own standard library, not the installed one
+    try testing.expectEqualStrings("lib/std/mem.zig:0", try s.definition(tar_uri, lib_tree_tar, "trimEnd"));
+    try testing.expectEqualStrings("lib/std/mem.zig:0 lib/std/tar.zig:2", try s.references(mem_uri, lib_tree_mem, "trimEnd"));
+}

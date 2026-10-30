@@ -54,6 +54,9 @@ pub const Step = struct {
 pub const Compile = struct {
     /// Root module (index into `modules`)
     root_module: u32,
+    /// Absolute path of the standard library root file of this compilation
+    /// (`<zig_lib_dir>/std/std.zig`); null when it is the project's `std_root`
+    std_root: ?[]const u8 = null,
     /// Target of `@import("root")`: the root module's root file, or for test compilations the
     /// test runner, which the compiler makes the root module
     root: Root = .module,
@@ -204,6 +207,11 @@ pub fn isNativeStep(m: *const ProjectModel, step: u32) bool {
     return m.builtins[b].isNativeTarget();
 }
 
+/// The standard library root file of compile step `step`
+pub fn stdRootOf(m: *const ProjectModel, step: u32) []const u8 {
+    return m.steps[step].kind.compile.std_root orelse m.std_root;
+}
+
 /// Records the absolute path of generated file `file` and updates the modules rooted at it;
 /// returns true when the root file of some module changed
 pub fn setGeneratedPath(m: *ProjectModel, gpa: Allocator, file: u32, path: []const u8) Allocator.Error!bool {
@@ -266,6 +274,7 @@ pub fn appendExports(m: *ProjectModel, gpa: Allocator, exports: *const ProjectMo
                 .name = try a.dupe(u8, s.name),
                 .kind = .{ .compile = .{
                     .root_module = base + c.root_module,
+                    .std_root = if (c.std_root) |p| try a.dupe(u8, p) else null,
                     .root = switch (c.root) {
                         .module, .unknown => c.root,
                         .test_runner => |p| .{ .test_runner = try a.dupe(u8, p) },

@@ -59,8 +59,8 @@ pub const World = struct {
     }
 
     /// `FileEntry.compile` refers to the compilation rooted at the module with the same index (the
-    /// builtin of that module is the one its standard library uses); compilation 0 exists even
-    /// without modules
+    /// builtin of that module is the one its standard library uses, and its standard library is
+    /// `std_root`); compilation 0 exists even without modules
     pub fn setGraph(w: *World, std_root: ?FileId, modules: []const ModuleGraph.Module, files: []const ModuleGraph.FileEntry) !void {
         const g = try testing.allocator.create(ModuleGraph);
         const sorted = try w.arena.allocator().dupe(ModuleGraph.FileEntry, files);
@@ -70,7 +70,7 @@ pub const World = struct {
             }
         }.lt);
         const compiles = try w.arena.allocator().alloc(ModuleGraph.Compile, @max(modules.len, 1));
-        for (compiles, 0..) |*c, i| c.* = if (i < modules.len) .{ .root = modules[i].root, .builtin = modules[i].builtin } else .{ .root = null };
+        for (compiles, 0..) |*c, i| c.* = if (i < modules.len) .{ .root = modules[i].root, .std_root = std_root, .builtin = modules[i].builtin } else .{ .root = null, .std_root = std_root };
         g.* = .{ .arena = .{}, .std_root = std_root, .modules = modules, .compiles = compiles, .files = sorted, .default_builtin = w.default_builtin };
         w.db.beginWrite();
         defer w.db.endWrite();

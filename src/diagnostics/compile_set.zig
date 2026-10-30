@@ -82,9 +82,10 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
             .unknown => null,
         };
         if (compile.root == .test_runner) try stack.append(gpa, root.?);
-        // The standard library is always part of the compilation (the entry point start.zig is in
-        // it), even if user code does not import std
-        try stack.append(gpa, .{ .file = try resolver.intern(model.std_root), .module = std_module });
+        // The standard library (of the compilation's lib directory) is always part of the
+        // compilation (the entry point start.zig is in it), even if user code does not import std
+        const std_node: Node = .{ .file = try resolver.intern(model.stdRootOf(step)), .module = std_module };
+        try stack.append(gpa, std_node);
 
         while (stack.pop()) |node| {
             if ((try visited.getOrPut(gpa, node)).found_existing) continue;
@@ -108,7 +109,7 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
                     const file = try relativeImport(a, resolver, node.file, name, module_dir) orelse continue;
                     break :blk .{ .file = file, .module = node.module };
                 } else if (std.mem.eql(u8, name, "std"))
-                    .{ .file = try resolver.intern(model.std_root), .module = std_module }
+                    std_node
                 else if (std.mem.eql(u8, name, "root"))
                     root orelse continue
                 else if (std.mem.eql(u8, name, "builtin"))

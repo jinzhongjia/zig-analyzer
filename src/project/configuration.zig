@@ -100,7 +100,10 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
     for (c.steps, steps) |*src, *dst| switch (src.extended.get(c.extra)) {
         .compile => |comp| {
             dst.kind.compile.modules = try compileBuiltins(gpa, a, c, &comp, &module_ids, own, &builtins);
-            if (comp.flags3.kind.isTest()) dst.kind.compile.root = try ctx.testRunner(&comp);
+            // The lib directory the compile step passes as `--zig-lib-dir`
+            const lib_dir = if (comp.zig_lib_dir.value) |lp| try ctx.resolve(lp.get(c)) else null;
+            if (lib_dir) |dir| dst.kind.compile.std_root = try std.fs.path.join(a, &.{ dir, "std", "std.zig" });
+            if (comp.flags3.kind.isTest()) dst.kind.compile.root = try ctx.testRunner(&comp, lib_dir orelse env.lib_dir);
         },
         else => {},
     };
@@ -448,11 +451,11 @@ const Ctx = struct {
     }
 
     /// The test runner of test compilation `comp`, which the compiler makes the root module (the
-    /// target of `@import("root")`): the default one in the lib directory, or the one set by the
-    /// compile step
-    fn testRunner(ctx: Ctx, comp: *const Configuration.Step.Compile) Allocator.Error!ProjectModel.Compile.Root {
+    /// target of `@import("root")`): the default one in the lib directory `lib_dir`, or the one
+    /// set by the compile step
+    fn testRunner(ctx: Ctx, comp: *const Configuration.Step.Compile, lib_dir: []const u8) Allocator.Error!ProjectModel.Compile.Root {
         return switch (comp.test_runner.u) {
-            .default => .{ .test_runner = try std.fs.path.join(ctx.arena, &.{ ctx.env.lib_dir, "compiler", "test_runner.zig" }) },
+            .default => .{ .test_runner = try std.fs.path.join(ctx.arena, &.{ lib_dir, "compiler", "test_runner.zig" }) },
             .simple, .server => |lp| if (try ctx.resolve(lp.get(ctx.c))) |p| .{ .test_runner = p } else .unknown,
         };
     }
