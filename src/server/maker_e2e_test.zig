@@ -704,3 +704,37 @@ test "a zig env that fails at startup is shown to the user" {
         try h.notify("exit", {});
     }
 }
+
+test "a project reached through a symbolic link: errors are published on the paths the client uses" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const app_build = "const std = @import(\"std\");\npub fn build(b: *std.Build) void {\n    const lib = b.dependency(\"lib\", .{}).module(\"lib\");\n    const exe = b.addExecutable(.{ .name = \"app\", .root_module = b.createModule(.{ .root_source_file = b.path(\"src/main.zig\"), .target = b.graph.host, .imports = &.{.{ .name = \"lib\", .module = lib }} }) });\n    b.step(\"check\", \"check\").dependOn(&exe.step);\n}\n";
+    const app_main = "const lib = @import(\"lib\");\npub fn main() void {\n    _ = lib.f();\n}\n";
+    const lib_root = "pub fn f() u32 {\n    const bad: u32 = \"x\";\n    return bad;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "real/mono/app/build.zig", .text = app_build },
+        .{ .path = "real/mono/app/build.zig.zon", .text = ".{ .name = .app, .version = \"0.0.0\", .fingerprint = 0xc96e70cfc137a3b5, .dependencies = .{ .lib = .{ .path = \"../lib\" } }, .paths = .{\"\"} }\n" },
+        .{ .path = "real/mono/app/src/main.zig", .text = app_main },
+        .{ .path = "real/mono/lib/build.zig.zon", .text = ".{ .name = .lib, .version = \"0.0.0\", .fingerprint = 0xa90f3bccf01517fa, .paths = .{\"\"} }\n" },
+        .{ .path = "real/mono/lib/build.zig", .text = "const std = @import(\"std\");\npub fn build(b: *std.Build) void {\n    _ = b.addModule(\"lib\", .{ .root_source_file = b.path(\"src/root.zig\") });\n}\n" },
+        .{ .path = "real/mono/lib/src/root.zig", .text = lib_root },
+    });
+    defer project.deinit();
+    try project.tmp.dir.symLink(testing.io, "real", "link", .{ .is_directory = true });
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "link/mono/app"));
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "link/mono/app/src/main.zig"));
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "link/mono/lib/src/root.zig"));
+    try open(&h, main_uri, app_main);
+    try open(&h, lib_uri, lib_root);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Guards against the maker taking the build root from its current directory, where symbolic
+    // links are resolved: the error would go to `real/...`, which the client does not show
+    try testing.expect(try lastHas(&h, lib_uri, "expected type 'u32', found '*const [1:0]u8'"));
+    const real_uri = try za.base.uri.fromPath(a, try project.path(a, "real/mono/lib/src/root.zig"));
+    try testing.expectEqual(null, try lastDiagnostics(&h, real_uri));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
