@@ -449,6 +449,59 @@ test "responses for deeply nested code stay within the JSON nesting limit" {
     try h.notify("exit", {});
 }
 
+test "requests echoing deeply nested client values are answered" {
+    // Echoing a client value nested about 250 levels deep exceeded the fixed nesting limit of
+    // the JSON serializer and aborted the server
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const Empty = struct {};
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .textDocument = .{ .codeAction = .{
+            .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "refactor", "source" } } },
+            .dataSupport = true,
+            .resolveSupport = .{ .properties = &[_][]const u8{"edit"} },
+        } } },
+        .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+    });
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = file_uri, .languageId = "zig", .version = 1, .text = "pub fn main() void {\n    const x = 1;\n}\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The diagnostic on `x`, as the client received it
+    const diagnostic = find: for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+        for (n.object.get("params").?.object.get("diagnostics").?.array.items) |d| {
+            const start = d.object.get("range").?.object.get("start").?.object;
+            if (start.get("line").?.integer == 1 and start.get("character").?.integer == 10) break :find d;
+        }
+    } else return error.TestUnexpectedResult;
+    const message = try std.json.Stringify.valueAlloc(a, diagnostic.object.get("message").?, .{});
+
+    const open: [300]u8 = @splat('[');
+    const close: [300]u8 = @splat(']');
+    const deep = try std.mem.concat(a, u8, &.{ &open, &close });
+    const bodies = [_][]const u8{
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1001,\"method\":\"completionItem/resolve\",\"params\":{{\"label\":\"x\",\"data\":{s}}}}}", .{deep}),
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1002,\"method\":\"completionItem/resolve\",\"params\":{{\"label\":\"x\",\"command\":{{\"title\":\"t\",\"command\":\"c\",\"arguments\":[{s}]}}}}}}", .{deep}),
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1003,\"method\":\"codeAction/resolve\",\"params\":{{\"title\":\"x\",\"data\":{s}}}}}", .{deep}),
+        try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1004,\"method\":\"textDocument/codeAction\",\"params\":{{\"textDocument\":{{\"uri\":\"" ++ file_uri ++
+            "\"}},\"range\":{{\"start\":{{\"line\":1,\"character\":10}},\"end\":{{\"line\":1,\"character\":11}}}},\"context\":{{\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":1,\"character\":10}},\"end\":{{\"line\":1,\"character\":11}}}},\"message\":{s},\"data\":{s}}}]}}}}}}", .{ message, deep }),
+    };
+    for (bodies, 1001..) |body, id| {
+        try h.writeBody(body);
+        const resp = try h.response(@intCast(id));
+        try testing.expect(resp.object.get("result") != null or resp.object.get("error") != null);
+    }
+    // The server is still running
+    _ = try h.request("zig-analyzer/status", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "requests before initialize return ServerNotInitialized, unknown methods return MethodNotFound" {
     var s: Session = undefined;
     try s.run(frame(

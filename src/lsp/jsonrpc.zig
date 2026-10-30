@@ -80,6 +80,19 @@ pub fn parseParams(comptime T: type, arena: Allocator, params: json.Value) json.
     return json.parseFromValueLeaky(T, arena, params, .{ .ignore_unknown_fields = true });
 }
 
+/// Whether arrays and objects in `value` nest more than `limit` levels deep (`[]` is one level);
+/// descends at most `limit` levels
+pub fn nestedDeeper(value: json.Value, limit: usize) bool {
+    const children: []const json.Value = switch (value) {
+        .array => |a| a.items,
+        .object => |o| o.values(),
+        else => return false,
+    };
+    if (limit == 0) return true;
+    for (children) |child| if (nestedDeeper(child, limit - 1)) return true;
+    return false;
+}
+
 const stringify_options: json.Stringify.Options = .{ .emit_null_optional_fields = false };
 
 fn writeValue(s: *json.Stringify, value: anytype) json.Stringify.Error!void {
@@ -239,6 +252,17 @@ test request {
     try testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":"r","method":"workspace/inlayHint/refresh"}
     , b);
+}
+
+test nestedDeeper {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const v = try json.parseFromSliceLeaky(json.Value, arena.allocator(),
+        \\{"a":1,"b":[2,{"c":[]}]}
+    , .{});
+    try testing.expect(!nestedDeeper(v, 4));
+    try testing.expect(nestedDeeper(v, 3));
+    try testing.expect(!nestedDeeper(.{ .integer = 1 }, 0));
 }
 
 test "build response: void result is null, optional fields omitted" {

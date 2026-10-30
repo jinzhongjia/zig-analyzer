@@ -636,6 +636,9 @@ const request_handlers = .{
     .{ "codeAction/resolve", Mode.semantic, codeActionResolve },
 };
 
+/// Maximum nesting depth of request params (see `processRequest`)
+const max_params_depth = 128;
+
 fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.Id, method: []const u8, params_value: json.Value) !void {
     const a = arena.allocator();
     // A string ID points into the arena: error responses must be serialized before the arena is
@@ -650,6 +653,14 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
             if (server.state != .uninitialized and is_initialize or server.state == .shutdown) {
                 defer server.destroyArena(arena);
                 return server.sendError(id, jsonrpc.error_codes.invalid_request, "request not allowed in current state");
+            }
+            // Results echo values from the params (`LSPAny` such as `data` and command arguments,
+            // the client's diagnostics) a level or two deeper than they were, and
+            // `std.json.Stringify` panics in builds with safety checks when a message nests more
+            // than 256 levels: deeper params are rejected, leaving room for the levels around them
+            if (jsonrpc.nestedDeeper(params_value, max_params_depth)) {
+                defer server.destroyArena(arena);
+                return server.sendError(id, jsonrpc.error_codes.invalid_params, "params nested too deeply");
             }
 
             const func = h[2];
