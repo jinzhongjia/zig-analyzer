@@ -954,6 +954,31 @@ test "cancellation: result of a compute that swallowed Canceled is not memoized"
     try testing.expectEqual(before + 1, executions(&d, Swallow));
 }
 
+test "cancellation: a read bound to a mark is canceled by any write transaction begun since then" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    const m = d.mark();
+    // A write that sets no input and cancels nothing does not move the mark
+    try testing.expect(d.tryBeginWrite());
+    d.endWrite();
+    {
+        var ctx = d.beginReadAt(testing.allocator, m);
+        defer ctx.end();
+        try testing.expectEqual(1, try ctx.get(Plus, 1));
+    }
+    // Finished before the read transaction begins, the write still cancels it
+    try setNumber(&d, Number, 1, 70, .low);
+    {
+        var ctx = d.beginReadAt(testing.allocator, m);
+        defer ctx.end();
+        try testing.expectError(error.Canceled, ctx.get(Plus, 1));
+    }
+    var ctx = d.beginReadAt(testing.allocator, d.mark());
+    defer ctx.end();
+    try testing.expectEqual(8, try ctx.get(Plus, 1));
+}
+
 test "tryBeginWrite neither cancels nor waits for read transactions" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

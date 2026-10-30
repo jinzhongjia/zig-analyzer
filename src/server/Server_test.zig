@@ -735,6 +735,52 @@ test "reclaiming type information does not cancel in-flight requests and runs on
     try h.notify("exit", {});
 }
 
+test "a request whose task starts after a later edit is not answered on the edited text" {
+    // Guards against a request sent before a didChange being answered on the text after the
+    // change, when its task starts reading only after the main loop has applied the change
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-4";
+    const text =
+        \\const alpha_value: u32 = 1;
+        \\pub fn main() void {
+        \\    _ = alpha_value;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .before_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const beta_flag: bool = true;\n" }} });
+    // The main loop has applied the change once it answers a later request
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+    gate.release.set(testing.io);
+
+    // Either the answer on the text the request was sent for, or ContentModified
+    const response = try h.response(hover);
+    if (response.object.get("error")) |e| {
+        try testing.expectEqual(-32801, e.object.get("code").?.integer);
+    } else {
+        const contents = response.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+        try testing.expect(std.mem.indexOf(u8, contents, "alpha_value") != null);
+    }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "function completions carry no signature in the list and resolve to the signature and doc" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

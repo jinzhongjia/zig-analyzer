@@ -2,9 +2,10 @@
 //!
 //! - Write messages (notifications such as document sync) run serially on the main loop:
 //!   `beginWrite` cancels in-flight read queries, then modifies inputs.
-//! - Read requests run concurrently in `group`, each holding a read transaction; a request
-//!   interrupted by a write transaction is answered with `ContentModified`, and one canceled by
-//!   `$/cancelRequest` with `RequestCancelled`.
+//! - Read requests run concurrently in `group`, each holding a read transaction on the state at
+//!   the time the request was received; a request interrupted by a write transaction, or whose
+//!   read transaction begins after a write transaction that began since then, is answered with
+//!   `ContentModified`, and one canceled by `$/cancelRequest` with `RequestCancelled`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -297,6 +298,10 @@ const SingleFile = struct {
 const Pending = struct {
     id: jsonrpc.Id,
     cancel: std.atomic.Value(bool) = .init(false),
+    /// When the request was received: it is answered on the state at that point, or with
+    /// `ContentModified` when a write transaction has begun since then (the task may start
+    /// reading only after the main loop has applied later messages such as `didChange`)
+    since: Db.Mark,
 };
 
 /// Test hook: a read or semantic request of `method` stops at `point` until `release` is set or
@@ -626,10 +631,10 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
 }
 
 /// Registers an in-flight request (can be canceled by `$/cancelRequest`); the Pending is allocated
-/// in the request's arena
+/// in the request's arena. Called on the main loop when the request is received.
 fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
     const pending = try a.create(Pending);
-    pending.* = .{ .id = id };
+    pending.* = .{ .id = id, .since = server.db.mark() };
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
     try server.pending.append(server.gpa, pending);
@@ -669,7 +674,7 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             defer server.finishRequest(arena, pending);
             const a = arena.allocator();
             server.testGate(method, .before_read, pending);
-            var ctx = server.db.beginRead(a);
+            var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
             server.testGate(method, .in_read, pending);
@@ -702,7 +707,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             defer server.finishRequest(arena, pending);
             const a = arena.allocator();
             server.testGate(method, .before_read, pending);
-            var ctx = server.db.beginRead(a);
+            var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
             server.testGate(method, .in_read, pending);

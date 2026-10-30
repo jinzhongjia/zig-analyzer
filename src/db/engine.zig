@@ -53,7 +53,9 @@
 //!
 //! Concurrency model: read transactions (`beginRead`) hold a shared lock and may run concurrently;
 //! a write transaction (`beginWrite`) first registers in `pending_write` so that in-flight read
-//! queries exit with `error.Canceled` as soon as possible, then acquires the exclusive lock.
+//! queries exit with `error.Canceled` as soon as possible, then acquires the exclusive lock. A read
+//! transaction begun with `beginReadAt` must see the state at an earlier `mark` and is canceled as
+//! well when a write transaction has begun since then.
 //! Query values obtained in a read transaction stay valid until that transaction ends: replaced
 //! old values are freed only at the next write transaction.
 
@@ -236,7 +238,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         counters: [queries.len]Counters = @splat(.{}),
         incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
         deep_verifications: std.atomic.Value(u64) = .init(0),
-        /// See `Stats.writes`
+        /// See `Stats.writes`; also the position of a `Mark`
         writes: std.atomic.Value(u64) = .init(0),
         /// Counter for the last-use times of memos (LRU)
         access_tick: std.atomic.Value(u64) = .init(0),
@@ -669,11 +671,29 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         // ── Read transactions ──────────────────────────────────────────────
 
         pub fn beginRead(db: *Db, gpa: Allocator) Ctx {
+            return db.beginReadAt(gpa, null);
+        }
+
+        /// A point in the sequence of write transactions (see `beginReadAt`)
+        pub const Mark = struct { writes: u64 };
+
+        /// The current point in the sequence of write transactions
+        pub fn mark(db: *Db) Mark {
+            return .{ .writes = db.writes.load(.acquire) };
+        }
+
+        /// Begins a read transaction for a read that must see the inputs as they were at `since`
+        /// (taken earlier with `mark`), such as a request that is answered on the state it was
+        /// received in: when a write transaction has begun after the mark, even one that has
+        /// already finished, the read transaction is canceled (its reads return
+        /// `error.Canceled`). Null reads the current state.
+        pub fn beginReadAt(db: *Db, gpa: Allocator, since: ?Mark) Ctx {
             db.rw.lockSharedUncancelable(db.io);
             _ = db.active_readers.fetchAdd(1, .acq_rel);
             const main = db.stack_budget.main orelse std.Thread.getCurrentId();
             const budget = if (std.Thread.getCurrentId() == main) max_stack_bytes else db.stack_budget.worker_bytes;
-            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget };
+            const stale = if (since) |m| db.writes.load(.acquire) != m.writes else false;
+            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget, .stale = stale };
         }
 
         pub const Ctx = struct {
@@ -683,6 +703,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             cancel: ?*const std.atomic.Value(bool) = null,
             /// Records the executed queries (slow-request log); nothing is recorded when null
             trace: ?*Trace = null,
+            /// A write transaction began after the point this read transaction must see (see
+            /// `beginReadAt`): all its reads are canceled
+            stale: bool = false,
             stack: std.ArrayList(Frame) = .empty,
             /// Stack position where the read transaction began (the stack grows downward)
             stack_base: usize,
@@ -787,7 +810,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             /// Long-running computes should call this periodically.
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
-                if (ctx.db.pending_write.load(.acquire) != 0) return error.Canceled;
+                if (ctx.stale or ctx.db.pending_write.load(.acquire) != 0) return error.Canceled;
                 if (ctx.cancel) |c| if (c.load(.acquire)) return error.Canceled;
             }
 
