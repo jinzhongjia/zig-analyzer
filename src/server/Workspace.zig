@@ -675,42 +675,24 @@ fn loadExports(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     try model.appendExports(ws.gpa, &exported);
 }
 
-/// Generates builtin.zig for each module (only once for identical arguments)
+/// Generates builtin.zig for each distinct argument list of the model
 fn generateBuiltins(ws: *Workspace, model: *ProjectModel) Allocator.Error!void {
     const env = ws.env;
     const io = ws.server.io;
     ws.reportLoading("Generating builtin.zig");
-    // Modules with identical arguments share one copy; different arguments are generated in
-    // parallel (each copy launches the compiler once, unless the argument record has a hit)
-    var unique: std.StringArrayHashMapUnmanaged(?[]u8) = .empty;
+    // Generated in parallel (each launches the compiler once, unless the argument record has a hit)
+    const paths = try ws.gpa.alloc(?[]u8, model.builtins.len);
     defer {
-        for (unique.keys(), unique.values()) |k, v| {
-            ws.gpa.free(k);
-            if (v) |p| ws.gpa.free(p);
-        }
-        unique.deinit(ws.gpa);
+        for (paths) |p| if (p) |x| ws.gpa.free(x);
+        ws.gpa.free(paths);
     }
-    const slots = try ws.gpa.alloc(?usize, model.modules.len);
-    defer ws.gpa.free(slots);
-    for (model.modules, slots) |m, *slot| {
-        slot.* = null;
-        if (m.builtin_args.len == 0) continue;
-        const key = try std.mem.join(ws.gpa, "\x00", m.builtin_args);
-        const gop = try unique.getOrPut(ws.gpa, key);
-        if (gop.found_existing) ws.gpa.free(key) else gop.value_ptr.* = null;
-        slot.* = gop.index;
-    }
-    const args = try ws.gpa.alloc([]const []const u8, unique.count());
-    defer ws.gpa.free(args);
-    for (model.modules, slots) |m, slot| if (slot) |i| {
-        args[i] = m.builtin_args;
-    };
+    @memset(paths, null);
     var failed: std.atomic.Value(bool) = .init(false);
     var group: Io.Group = .init;
-    for (args, unique.values()) |a, *out| group.async(io, generateOne, .{ ws.gpa, io, env, a, out, &failed });
+    for (model.builtins, paths) |b, *out| group.async(io, generateOne, .{ ws.gpa, io, env, b.args, out, &failed });
     group.await(io) catch {};
     if (failed.load(.acquire)) return error.OutOfMemory;
-    for (slots, 0..) |slot, i| if (slot) |u| if (unique.values()[u]) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
+    for (paths, 0..) |p, i| if (p) |path| try model.setBuiltinFile(ws.gpa, @intCast(i), path);
 }
 
 fn generateOne(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const u8, out: *?[]u8, failed: *std.atomic.Value(bool)) Io.Cancelable!void {
@@ -946,10 +928,7 @@ fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
         // a native example) are analyzed for the native target
         const Native = struct {
             fn lt(m: *const ProjectModel, a: u32, b: u32) bool {
-                return isNativeStep(m, a) and !isNativeStep(m, b);
-            }
-            fn isNativeStep(m: *const ProjectModel, step: u32) bool {
-                return m.modules[m.steps[step].kind.compile.root_module].isNativeTarget();
+                return m.isNativeStep(a) and !m.isNativeStep(b);
             }
         };
         std.mem.sort(u32, steps, model, Native.lt);

@@ -343,8 +343,8 @@ test "semantic tokens resolve module namespaces and declaration literals" {
         .{ .root = file, .imports = &.{.{ .name = "package", .module = 1 }} },
         .{ .root = lib, .imports = &.{} },
     }, &.{
-        .{ .file = file, .module = 0, .root_module = 0 },
-        .{ .file = lib, .module = 1, .root_module = 0 },
+        .{ .file = file, .module = 0, .compile = 0 },
+        .{ .file = lib, .module = 1, .compile = 0 },
     });
     const data = try tokens(&w, file, text, .utf16, null);
     try check(data, text, .utf16, &.{

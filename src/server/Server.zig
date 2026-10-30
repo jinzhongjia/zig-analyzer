@@ -837,20 +837,20 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
 }
 
 /// Target-dependent parameters of value operations (pointer bit width, layout rules of vector and
-/// scalar types): taken from the parts the builtins of all modules agree on; parts that disagree
-/// are unknown (values depending on them are unknown); without project modules, the default
-/// builtin (native) is used
-fn targetAbi(server: *Server, modules: []const ModuleGraph.Module, default_builtin: ?Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
+/// scalar types): taken from the parts the builtins of all modules and compilations agree on;
+/// parts that disagree are unknown (values depending on them are unknown); without project
+/// modules, the default builtin (native) is used
+fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema.InternPool.Target {
     var result: za.sema.InternPool.Target = .{};
     // Modules with the same parameters share the same builtin, and merging the same target again
     // does not change the result: each one is read and parsed only once
     var seen: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     defer seen.deinit(server.gpa);
-    for (modules) |m| {
-        const file = m.builtin orelse continue;
-        if ((try seen.getOrPut(server.gpa, file)).found_existing) continue;
+    for (graph.modules) |m| if (m.builtin) |file| try seen.put(server.gpa, file, {});
+    for (graph.compiles) |c| if (c.builtin) |file| try seen.put(server.gpa, file, {});
+    for (seen.keys(), 0..) |file, i| {
         const t = server.builtinTarget(file);
-        if (seen.count() == 1) {
+        if (i == 0) {
             result = t;
             continue;
         }
@@ -859,7 +859,7 @@ fn targetAbi(server: *Server, modules: []const ModuleGraph.Module, default_built
         result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
     if (seen.count() != 0) return result;
-    if (default_builtin) |f| return server.builtinTarget(f);
+    if (graph.default_builtin) |f| return server.builtinTarget(f);
     return .{};
 }
 
@@ -905,28 +905,21 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         defer server.env_mutex.unlock(server.io);
         break :blk if (server.default_builtin) |p| try server.vfs.intern(p) else null;
     };
-    const t = try server.targetAbi(b.modules.items, default_builtin);
     const graph = try server.gpa.create(ModuleGraph);
-    var graph_owned = true;
-    errdefer if (graph_owned) server.gpa.destroy(graph);
-    graph.* = try b.finish(std_root, default_builtin);
+    graph.* = b.finish(std_root, default_builtin) catch |err| {
+        server.gpa.destroy(graph);
+        return err;
+    };
     // `finish` has moved the builder's arena into graph
     builder_owned = false;
+    var graph_value: ModuleGraph.Input.Value = graph;
+    var graph_owned = true;
+    defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
+    const t = try server.targetAbi(graph);
     // Do not open a write transaction when neither the module graph nor the target has changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
     // and requests (the requests fail with ContentModified)
-    const unchanged = server.moduleGraphUnchanged(graph, t) catch |err| {
-        var unused: ModuleGraph.Input.Value = graph;
-        ModuleGraph.Input.deinit(&unused, server.gpa);
-        graph_owned = false;
-        return err;
-    };
-    if (unchanged) {
-        var unused: ModuleGraph.Input.Value = graph;
-        ModuleGraph.Input.deinit(&unused, server.gpa);
-        graph_owned = false;
-        return;
-    }
+    if (try server.moduleGraphUnchanged(graph, t)) return;
     // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it
     server.db.beginWrite();
     defer server.db.endWrite();
@@ -1204,6 +1197,10 @@ fn importsBasis(graph: ?*const ModuleGraph) u64 {
         }
         h.update(&.{0xff});
     }
+    for (g.compiles) |c| {
+        hashFile(&h, c.root);
+        hashFile(&h, c.builtin);
+    }
     return h.final();
 }
 
@@ -1258,6 +1255,8 @@ fn appendImportRoots(graph: ?*const ModuleGraph, roots: *std.ArrayList(Vfs.FileI
         if (module.builtin) |file| try roots.append(gpa, file);
         for (module.imports) |imp| if (g.modules[imp.module].root) |file| try roots.append(gpa, file);
     }
+    // The standard library uses the builtin of each compilation's root module
+    for (g.compiles) |c| if (c.builtin) |file| try roots.append(gpa, file);
 }
 
 fn warmImportRoots(server: *Server) Allocator.Error!bool {
@@ -3600,11 +3599,12 @@ test "importsBasis ignores the files of the module graph but follows modules and
         .{ .root = main, .imports = &.{.{ .name = "lib", .module = 1 }} },
         .{ .root = lib, .imports = &.{} },
     };
-    const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .files = &.{.{ .file = main, .module = 0, .root_module = 0 }} };
+    const compiles = [_]ModuleGraph.Compile{.{ .root = main }};
+    const base: ModuleGraph = .{ .arena = .{}, .std_root = std_root, .modules = &modules, .compiles = &compiles, .files = &.{.{ .file = main, .module = 0, .compile = 0 }} };
     // A build produced generated files: only files were
     // added, so the auto-import index remains usable
     var more_files = base;
-    more_files.files = &.{ .{ .file = main, .module = 0, .root_module = 0 }, .{ .file = lib, .module = 1, .root_module = 0 } };
+    more_files.files = &.{ .{ .file = main, .module = 0, .compile = 0 }, .{ .file = lib, .module = 1, .compile = 0 } };
     try std.testing.expectEqual(importsBasis(&base), importsBasis(&more_files));
     const renamed = [_]ModuleGraph.Module{
         .{ .root = main, .imports = &.{.{ .name = "dep", .module = 1 }} },
@@ -5647,6 +5647,7 @@ test {
     _ = Workspace;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
+    _ = @import("build_e2e_test.zig");
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");

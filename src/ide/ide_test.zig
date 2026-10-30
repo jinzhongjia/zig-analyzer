@@ -1738,9 +1738,9 @@ test "goto declaration of a reified field whose name comes from an argument in a
     const args_file = (try w.add("/p/args.zig", args)).file;
     const main_file = (try w.add("/p/main.zig", main)).file;
     try w.setGraph(std_root, &.{.{ .root = main_file, .imports = &.{} }}, &.{
-        .{ .file = lib_file, .module = 0, .root_module = 0 },
-        .{ .file = args_file, .module = 0, .root_module = 0 },
-        .{ .file = main_file, .module = 0, .root_module = 0 },
+        .{ .file = lib_file, .module = 0, .compile = 0 },
+        .{ .file = args_file, .module = 0, .compile = 0 },
+        .{ .file = main_file, .module = 0, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -2753,9 +2753,9 @@ test "hover in generic bodies is inferred from a call site in another file" {
     const other = (try w.add("/p/a.zig", "fn max(comptime T: type, a: T, b: T) T { return a; }\nfn f() void { _ = max(u8, 1, 2); }\n")).file;
     const main = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\nfn run() void {\n    _ = lib.max(i64, 1, 2);\n}\n")).file;
     try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
-        .{ .file = other, .module = 0, .root_module = 0 },
-        .{ .file = main, .module = 0, .root_module = 0 },
-        .{ .file = lib, .module = 0, .root_module = 0 },
+        .{ .file = other, .module = 0, .compile = 0 },
+        .{ .file = main, .module = 0, .compile = 0 },
+        .{ .file = lib, .module = 0, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -2780,9 +2780,9 @@ test "hover in generic bodies: call sites through aliases" {
     const alias = (try w.add("/p/alias.zig", "const lib = @import(\"lib.zig\");\npub const biggest = lib.max;\npub const top = biggest;\n")).file;
     const main = (try w.add("/p/main.zig", "const alias = @import(\"alias.zig\");\nfn run() void {\n    _ = alias.top(u16, 1, 2);\n}\n")).file;
     try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
-        .{ .file = alias, .module = 0, .root_module = 0 },
-        .{ .file = main, .module = 0, .root_module = 0 },
-        .{ .file = lib, .module = 0, .root_module = 0 },
+        .{ .file = alias, .module = 0, .compile = 0 },
+        .{ .file = main, .module = 0, .compile = 0 },
+        .{ .file = lib, .module = 0, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -4481,9 +4481,9 @@ test "callsite seeding follows a container type passed as a comptime argument to
         \\
     )).file;
     try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
-        .{ .file = engine_file, .module = 0, .root_module = 0 },
-        .{ .file = added.file, .module = 0, .root_module = 0 },
-        .{ .file = main, .module = 0, .root_module = 0 },
+        .{ .file = engine_file, .module = 0, .compile = 0 },
+        .{ .file = added.file, .module = 0, .compile = 0 },
+        .{ .file = main, .module = 0, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -5333,9 +5333,9 @@ test "seed importer candidates invalidate for import and project module edits" {
     const other = (try w.add("/p/other.zig", lib_text)).file;
     const main = (try w.add("/p/main.zig", "const dep = @import(\"dep\");\nfn run() void { _ = dep.leaf(@as(u8, 1)); }\n")).file;
     const files = [_]database.ModuleGraph.FileEntry{
-        .{ .file = main, .module = 0, .root_module = 0 },
-        .{ .file = lib, .module = 1, .root_module = 0 },
-        .{ .file = other, .module = 2, .root_module = 0 },
+        .{ .file = main, .module = 0, .compile = 0 },
+        .{ .file = lib, .module = 1, .compile = 0 },
+        .{ .file = other, .module = 2, .compile = 0 },
     };
     try w.setGraph(null, &.{
         .{ .root = main, .imports = &.{.{ .name = "dep", .module = 1 }} },
@@ -6513,9 +6513,9 @@ test "all instances include anytype calls in files that do not import the method
     const c = (try w.add("/p/c.zig", "pub fn call(x: anytype) void {\n    x.foo(3);\n}\n")).file;
     const main = (try w.add("/p/main.zig", "const a = @import(\"a.zig\");\nconst c = @import(\"c.zig\");\npub fn main() void {\n    var s: a.S = .{};\n    c.call(&s);\n}\n")).file;
     try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
-        .{ .file = main, .module = 0, .root_module = 0 },
-        .{ .file = a, .module = 0, .root_module = 0 },
-        .{ .file = c, .module = 0, .root_module = 0 },
+        .{ .file = main, .module = 0, .compile = 0 },
+        .{ .file = a, .module = 0, .compile = 0 },
+        .{ .file = c, .module = 0, .compile = 0 },
     });
     const all = try allInstancesOf(&w, a, "foo");
     try testing.expectEqual(1, all.count);

@@ -125,10 +125,10 @@ test "references to standard library declarations from project files" {
     const app = try w.add("/p/main.zig", app_src);
     const unrelated = try w.add("/p/other.zig", "fn eql() void {}\ntest {\n    eql();\n}\n");
     try w.setGraph(std_root.file, &.{.{ .root = app.file, .imports = &.{} }}, &.{
-        .{ .file = app.file, .module = 0, .root_module = 0 },
-        .{ .file = unrelated.file, .module = 0, .root_module = 0 },
-        .{ .file = std_root.file, .module = ModuleGraph.std_module, .root_module = 0 },
-        .{ .file = mem.file, .module = ModuleGraph.std_module, .root_module = 0 },
+        .{ .file = app.file, .module = 0, .compile = 0 },
+        .{ .file = unrelated.file, .module = 0, .compile = 0 },
+        .{ .file = std_root.file, .module = ModuleGraph.std_module, .compile = 0 },
+        .{ .file = mem.file, .module = ModuleGraph.std_module, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -163,9 +163,9 @@ test "references reach files that import the definition through files outside th
     const load_src = "pub fn load() u32 {\n    return 42;\n}\n";
     const load = try w.add("/p/load.zig", load_src);
     try w.setGraph(std_root.file, &.{.{ .root = app.file, .imports = &.{} }}, &.{
-        .{ .file = app.file, .module = 0, .root_module = 0 },
-        .{ .file = std_root.file, .module = ModuleGraph.std_module, .root_module = 0 },
-        .{ .file = mem.file, .module = ModuleGraph.std_module, .root_module = 0 },
+        .{ .file = app.file, .module = 0, .compile = 0 },
+        .{ .file = std_root.file, .module = ModuleGraph.std_module, .compile = 0 },
+        .{ .file = mem.file, .module = ModuleGraph.std_module, .compile = 0 },
     });
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -382,9 +382,9 @@ test "references in generic bodies use the instance a comptime type argument dis
         \\}
     )).file;
     try w.setGraph(null, &.{.{ .root = main_file, .imports = &.{} }}, &.{
-        .{ .file = engine_file, .module = 0, .root_module = 0 },
-        .{ .file = queries_file, .module = 0, .root_module = 0 },
-        .{ .file = main_file, .module = 0, .root_module = 0 },
+        .{ .file = engine_file, .module = 0, .compile = 0 },
+        .{ .file = queries_file, .module = 0, .compile = 0 },
+        .{ .file = main_file, .module = 0, .compile = 0 },
     });
     const fs: Files = .{ .main = main_file, .lib = queries_file, .other = engine_file };
     try testing.expectEqualStrings("queries:2:take* queries:9:take", try refs(&w, fs, queries_file, at(queries_src, "take", 0), null));
@@ -617,9 +617,9 @@ test "references in generic code of files that do not import the definition" {
     const fc = (try w.add("/p/c.zig", c_src)).file;
     const fm = (try w.add("/p/main.zig", main_text)).file;
     try w.setGraph(null, &.{.{ .root = fm, .imports = &.{} }}, &.{
-        .{ .file = fm, .module = 0, .root_module = 0 },
-        .{ .file = fa, .module = 0, .root_module = 0 },
-        .{ .file = fc, .module = 0, .root_module = 0 },
+        .{ .file = fm, .module = 0, .compile = 0 },
+        .{ .file = fa, .module = 0, .compile = 0 },
+        .{ .file = fc, .module = 0, .compile = 0 },
     });
     var ctx = w.db.beginRead(testing.allocator);
     defer ctx.end();

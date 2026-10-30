@@ -82,7 +82,6 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         const root = if (m.root_source_file.unwrap()) |lp| lp.get(c) else null;
         if (root) |lp| if (try ctx.fetchedPackageRoot(lp)) |p| try package_roots.put(gpa, p, {});
         try modules.append(a, .{
-            .builtin_args = try builtinArgs(a, c, &m),
             .root_file = if (root) |lp| try ctx.resolve(lp) else null,
             .generated_root = if (root) |lp| switch (lp) {
                 .generated => |g| .{ .file = @backingInt(g.index), .up = g.flags.up, .sub_path = try a.dupe(u8, g.sub_path.slice(c)) },
@@ -92,36 +91,16 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         });
     }
 
-    // The subcommand and compiler backend for builtin come from the compile step rooted at the
-    // module (they determine output_mode / is_test / zig_backend); other modules use build-obj.
-    // The same module is often the root of both an executable and a test, in which case the test
-    // is used: `std.testing.allocator` and the like in test blocks depend on `builtin.is_test`
-    const chosen = try a.alloc(?usize, modules.items.len);
-    @memset(chosen, null);
-    for (c.steps, 0..) |*src, si| switch (src.extended.get(c.extra)) {
-        .compile => |comp| {
-            const index = module_ids.getIndex(comp.root_module) orelse continue;
-            if (chosen[index]) |prev| if (c.steps[prev].extended.get(c.extra).compile.flags3.kind.isTest() or !comp.flags3.kind.isTest()) continue;
-            chosen[index] = si;
-        },
+    // The options each module sets itself
+    const own = try gpa.alloc(ModuleOptions, module_ids.count());
+    defer gpa.free(own);
+    for (module_ids.keys(), own) |id, *o| o.* = try moduleOptions(a, c, &id.get(c));
+    var builtins: Builtins = .{};
+    defer builtins.index.deinit(gpa);
+    for (c.steps, steps) |*src, *dst| switch (src.extended.get(c.extra)) {
+        .compile => |comp| dst.kind.compile.modules = try compileBuiltins(gpa, a, c, &comp, &module_ids, own, &builtins),
         else => {},
     };
-    for (chosen, modules.items) |step, *mod| {
-        const comp = c.steps[step orelse continue].extended.get(c.extra).compile;
-        var args: std.ArrayList([]const u8) = .empty;
-        try args.appendSlice(a, mod.builtin_args);
-        args.items[0] = switch (comp.flags3.kind) {
-            .exe => "build-exe",
-            .lib => "build-lib",
-            .obj => "build-obj",
-            .@"test" => "test",
-            .test_obj => "test-obj",
-        };
-        if (comp.flags3.kind == .test_obj) try args.append(a, "--test-no-exec");
-        // The compiler backend determines `zig_backend` in builtin (vector layout depends on it)
-        if (comp.flags2.use_llvm.toBool()) |on| try args.append(a, if (on) "-fllvm" else "-fno-llvm");
-        mod.builtin_args = args.items;
-    }
 
     const producers = try a.alloc(?u32, c.generated_files_len);
     @memset(producers, null);
@@ -146,6 +125,7 @@ pub fn convert(gpa: Allocator, c: *const Configuration, build_root: []const u8, 
         .std_root = std_root,
         .steps = steps,
         .modules = modules.items,
+        .builtins = builtins.list.items,
         .default_step = @backingInt(c.default_step),
         .producers = producers,
         .diagnostics_steps = diagnostics_steps,
@@ -212,11 +192,24 @@ pub fn generatedPath(gpa: Allocator, model: *const ProjectModel, env: *const Zig
     return std.fs.path.resolveAlloc(gpa, &.{ base, sub_path });
 }
 
-/// Module arguments that affect `builtin.zig`, written the same way the build system passes them
-/// to the compiler (see appendModuleFlags in Maker/Step/Compile.zig)
-fn builtinArgs(a: Allocator, c: *const Configuration, m: *const Configuration.Module) Allocator.Error![]const []const u8 {
-    var args: std.ArrayList([]const u8) = .empty;
-    try args.append(a, "build-obj");
+/// Number of module options that affect `builtin.zig` (the slots of `ModuleOptions.args`)
+const option_count = 12;
+
+/// The options of a module that affect `builtin.zig`, each written as the arguments the build
+/// system passes to the compiler (see appendModuleFlags in Maker/Step/Compile.zig); null for an
+/// option the module does not set, which the compiler takes from the module it is created for
+const ModuleOptions = struct {
+    args: [option_count]?[]const []const u8 = @splat(null),
+    /// libc and libc++ are linked into the whole compilation when any module links them
+    link_libc: bool = false,
+    link_libcpp: bool = false,
+};
+
+fn moduleOptions(a: Allocator, c: *const Configuration, m: *const Configuration.Module) Allocator.Error!ModuleOptions {
+    var o: ModuleOptions = .{
+        .link_libc = m.flags2.link_libc == .true,
+        .link_libcpp = m.flags2.link_libcpp == .true,
+    };
     const flags = .{
         .{ "strip", m.flags.strip },
         .{ "single-threaded", m.flags.single_threaded },
@@ -227,27 +220,174 @@ fn builtinArgs(a: Allocator, c: *const Configuration, m: *const Configuration.Mo
         .{ "valgrind", m.flags2.valgrind },
         .{ "PIC", m.flags2.pic },
     };
-    inline for (flags) |f| if (f[1].toBool()) |on| try args.append(a, if (on) "-f" ++ f[0] else "-fno-" ++ f[0]);
-    switch (m.flags.unwind_tables) {
-        .none => try args.append(a, "-fno-unwind-tables"),
-        .sync => try args.append(a, "-funwind-tables"),
-        .async => try args.append(a, "-fasync-unwind-tables"),
-        .default => {},
-    }
-    switch (m.flags.optimize) {
-        .debug => try args.append(a, "-Odebug"),
-        .safe => try args.append(a, "-Osafe"),
-        .fast => try args.append(a, "-Ofast"),
-        .small => try args.append(a, "-Osmall"),
-        .default => {},
-    }
-    if (m.flags.code_model != .default) try args.appendSlice(a, &.{ "-mcmodel", @tagName(m.flags.code_model) });
-    if (m.resolved_target.get(c)) |rt| if (rt.unwrapQuery(c)) |query| {
-        try args.appendSlice(a, &.{ "-target", try query.zigTriple(a), "-mcpu", try query.serializeCpuAlloc(a) });
+    inline for (flags, 0..) |f, i| if (f[1].toBool()) |on| {
+        o.args[i] = if (on) &.{"-f" ++ f[0]} else &.{"-fno-" ++ f[0]};
     };
-    if (m.flags2.link_libc == .true) try args.append(a, "-lc");
-    if (m.flags2.link_libcpp == .true) try args.append(a, "-lc++");
-    return args.items;
+    o.args[flags.len] = switch (m.flags.unwind_tables) {
+        .none => &.{"-fno-unwind-tables"},
+        .sync => &.{"-funwind-tables"},
+        .async => &.{"-fasync-unwind-tables"},
+        .default => null,
+    };
+    o.args[flags.len + 1] = switch (m.flags.optimize) {
+        .debug => &.{"-Odebug"},
+        .safe => &.{"-Osafe"},
+        .fast => &.{"-Ofast"},
+        .small => &.{"-Osmall"},
+        .default => null,
+    };
+    if (m.flags.code_model != .default) o.args[flags.len + 2] = try a.dupe([]const u8, &.{ "-mcmodel", @tagName(m.flags.code_model) });
+    if (m.resolved_target.get(c)) |rt| if (rt.unwrapQuery(c)) |query| {
+        o.args[flags.len + 3] = try a.dupe([]const u8, &.{ "-target", try query.zigTriple(a), "-mcpu", try query.serializeCpuAlloc(a) });
+    };
+    comptime std.debug.assert(flags.len + 4 == option_count);
+    return o;
+}
+
+/// The distinct argument lists of `builtin.zig` (`ProjectModel.builtins`)
+const Builtins = struct {
+    list: std.ArrayList(ProjectModel.Builtin) = .empty,
+    index: std.HashMapUnmanaged([]const []const u8, u32, ArgsContext, std.hash_map.default_max_load_percentage) = .empty,
+
+    const ArgsContext = struct {
+        pub fn hash(_: ArgsContext, args: []const []const u8) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            for (args) |arg| {
+                h.update(arg);
+                h.update(&.{0});
+            }
+            return h.final();
+        }
+        pub fn eql(_: ArgsContext, x: []const []const u8, y: []const []const u8) bool {
+            if (x.len != y.len) return false;
+            for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+            return true;
+        }
+    };
+
+    /// Index of `args` in `list`; `args` is copied when it is new
+    fn intern(b: *Builtins, gpa: Allocator, a: Allocator, args: []const []const u8) Allocator.Error!u32 {
+        const gop = try b.index.getOrPut(gpa, args);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try a.dupe([]const u8, args);
+            gop.value_ptr.* = @intCast(b.list.items.len);
+            try b.list.append(a, .{ .args = gop.key_ptr.* });
+        }
+        return gop.value_ptr.*;
+    }
+};
+
+/// The `builtin.zig` of each module in compilation `comp`, in the order the compiler creates the
+/// modules: depth first along the import tables from the root module, each module taking the
+/// options it does not set from the module it is first reached from. Options of the whole
+/// compilation (output mode, `is_test`, link mode, libc, ...) come from the compile step
+fn compileBuiltins(
+    gpa: Allocator,
+    a: Allocator,
+    c: *const Configuration,
+    comp: *const Configuration.Step.Compile,
+    ids: *const std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void),
+    own: []const ModuleOptions,
+    builtins: *Builtins,
+) Allocator.Error![]const ProjectModel.CompileModule {
+    // Module → its options in this compilation
+    var created: std.AutoArrayHashMapUnmanaged(u32, [option_count]?[]const []const u8) = .empty;
+    defer created.deinit(gpa);
+    const Visit = struct { module: Configuration.Module.Index, parent: ?usize };
+    var stack: std.ArrayList(Visit) = .empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, .{ .module = comp.root_module, .parent = null });
+    while (stack.pop()) |v| {
+        const id: u32 = @intCast(ids.getIndex(v.module).?);
+        const gop = try created.getOrPut(gpa, id);
+        if (gop.found_existing) continue;
+        var options = own[id].args;
+        if (v.parent) |p| for (&options, created.values()[p]) |*o, inherited| {
+            if (o.* == null) o.* = inherited;
+        };
+        created.values()[gop.index] = options;
+        const table = v.module.get(c).import_table.get(c).imports.mal;
+        const targets = table.items(.module);
+        var t = targets.len;
+        while (t > 0) {
+            t -= 1;
+            try stack.append(gpa, .{ .module = targets[t], .parent = gop.index });
+        }
+    }
+
+    var wide: std.ArrayList([]const u8) = .empty;
+    defer wide.deinit(gpa);
+    if (comp.flags3.kind == .test_obj) try wide.append(gpa, "--test-no-exec");
+    // The compiler backend determines `zig_backend` (vector layout depends on it)
+    if (comp.flags2.use_llvm.toBool()) |on| try wide.append(gpa, if (on) "-fllvm" else "-fno-llvm");
+    if (comp.root_module.get(c).resolved_target.get(c)) |rt| if (rt.unwrapQuery(c)) |query| if (query.ofmt) |ofmt| {
+        try wide.append(gpa, try std.fmt.allocPrint(a, "-ofmt={t}", .{ofmt}));
+    };
+    switch (comp.flags2.linkage) {
+        .dynamic => try wide.append(gpa, "-dynamic"),
+        .static => try wide.append(gpa, "-static"),
+        .default => {},
+    }
+    if (comp.flags2.pie.toBool()) |on| try wide.append(gpa, if (on) "-fPIE" else "-fno-PIE");
+    switch (comp.flags3.wasi_exec_model) {
+        .command => try wide.append(gpa, "-mexec-model=command"),
+        .reactor => try wide.append(gpa, "-mexec-model=reactor"),
+        .default => {},
+    }
+    const libs = try linkedLibs(gpa, c, comp, ids, own);
+    if (libs.cpp) try wide.append(gpa, "-lc++");
+    if (libs.c) try wide.append(gpa, "-lc");
+
+    const result = try a.alloc(ProjectModel.CompileModule, created.count());
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(gpa);
+    for (created.keys(), created.values(), result) |module, options, *out| {
+        args.clearRetainingCapacity();
+        try args.append(gpa, switch (comp.flags3.kind) {
+            .exe => "build-exe",
+            .lib => "build-lib",
+            .obj => "build-obj",
+            .@"test" => "test",
+            .test_obj => "test-obj",
+        });
+        for (options) |o| if (o) |x| try args.appendSlice(gpa, x);
+        try args.appendSlice(gpa, wide.items);
+        out.* = .{ .module = module, .builtin = try builtins.intern(gpa, a, args.items) };
+    }
+    return result;
+}
+
+const Libs = struct { c: bool = false, cpp: bool = false };
+
+/// Whether compilation `comp` links libc and libc++: some module of it, or of a compile step it
+/// links (transitively, including dynamic libraries), links them (as `getCompileDependencies` in
+/// Maker/Step/Compile.zig does)
+fn linkedLibs(
+    gpa: Allocator,
+    c: *const Configuration,
+    comp: *const Configuration.Step.Compile,
+    ids: *const std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void),
+    own: []const ModuleOptions,
+) Allocator.Error!Libs {
+    // The modules of the compilation and of the compilations it links
+    var modules: std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void) = .empty;
+    defer modules.deinit(gpa);
+    try modules.put(gpa, comp.root_module, {});
+    var result: Libs = .{};
+    var i: usize = 0;
+    while (i < modules.count()) : (i += 1) {
+        const index = modules.keys()[i];
+        const m = index.get(c);
+        const o = &own[ids.getIndex(index).?];
+        result.c = result.c or o.link_libc;
+        result.cpp = result.cpp or o.link_libcpp;
+        for (m.import_table.get(c).imports.mal.items(.module)) |target| try modules.put(gpa, target, {});
+        for (0..m.link_objects.len) |l| switch (m.link_objects.get(c.extra, l)) {
+            .other_step => |step| try modules.put(gpa, step.ptr(c).extended.get(c.extra).compile.root_module, {}),
+            else => {},
+        };
+    }
+    return result;
 }
 
 fn internModule(gpa: Allocator, ids: *std.AutoArrayHashMapUnmanaged(Configuration.Module.Index, void), m: Configuration.Module.Index) Allocator.Error!u32 {

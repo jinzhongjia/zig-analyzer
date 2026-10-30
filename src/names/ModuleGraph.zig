@@ -32,6 +32,8 @@ std_root: ?FileId,
 /// compiles)
 default_builtin: ?FileId = null,
 modules: []const Module,
+/// The distinct compilations the files are in (see `FileEntry.compile`)
+compiles: []const Compile = &.{},
 /// Sorted by FileId
 files: []const FileEntry,
 
@@ -40,7 +42,16 @@ pub const std_module = CompileSet.std_module;
 pub const Module = struct {
     root: ?FileId,
     imports: []const Import,
-    /// builtin.zig of this module (generated from the module's target and compile options)
+    /// builtin.zig of this module in the compilation that reaches it first (generated from the
+    /// module's target and options and those of the compilation)
+    builtin: ?FileId = null,
+};
+
+/// What a compilation determines for the files in it, other than the import tables
+pub const Compile = struct {
+    /// Target of `@import("root")`
+    root: ?FileId,
+    /// builtin.zig of the root module, which the standard library uses
     builtin: ?FileId = null,
 };
 
@@ -55,8 +66,8 @@ pub const FileEntry = struct {
     /// modules, the one with the highest priority (modules in the diagnostics step and in compile
     /// steps for the native target come first).
     module: u32,
-    /// Target module of `@import("root")` (the root module of the compile step that `module` is in)
-    root_module: u32,
+    /// Index into `compiles`: the compilation that reached the file first
+    compile: u32,
     /// Other modules the file also belongs to, in priority order (excluding `module`)
     others: []const u32 = &.{},
 };
@@ -74,6 +85,8 @@ pub const Builder = struct {
     vfs: *Vfs,
     arena: std.heap.ArenaAllocator,
     modules: std.ArrayList(Module) = .empty,
+    /// Distinct compilations (`ModuleGraph.compiles`)
+    compiles: std.AutoArrayHashMapUnmanaged(Compile, void) = .empty,
     files: std.AutoArrayHashMapUnmanaged(FileId, FileEntry) = .empty,
     /// Other memberships of files, in the order added (i.e. priority order); grouped by file into
     /// `FileEntry.others` in `finish`
@@ -91,6 +104,7 @@ pub const Builder = struct {
 
     /// Need not be called after `finish`
     pub fn deinit(b: *Builder) void {
+        b.compiles.deinit(b.gpa);
         b.files.deinit(b.gpa);
         b.others.deinit(b.gpa);
         b.arena.deinit();
@@ -102,15 +116,20 @@ pub const Builder = struct {
     pub fn add(b: *Builder, model: *const ProjectModel, compile_set: *const CompileSet.Result, extra: ?*const CompileSet.Result) Allocator.Error!void {
         const a = b.arena.allocator();
         const offset: u32 = @intCast(b.modules.items.len);
-        for (model.modules) |m| {
+        for (model.modules, 0..) |m, i| {
             const imports = try a.alloc(Import, m.imports.len);
             for (m.imports, imports) |src, *dst| dst.* = .{ .name = try a.dupe(u8, src.name), .module = offset + src.module };
+            // The builtin of the compilation that reaches the module first
+            const step = compile_set.modules.get(@intCast(i)) orelse if (extra) |e| e.modules.get(@intCast(i)) else null;
             try b.modules.append(a, .{
                 .root = if (m.root_file) |p| try b.vfs.intern(p) else null,
                 .imports = imports,
-                .builtin = if (m.builtin_file) |p| try b.vfs.intern(p) else null,
+                .builtin = if (step) |s| try b.builtinFile(model, s, @intCast(i)) else null,
             });
         }
+        // Compile step → index into `compiles`
+        var compiles: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer compiles.deinit(b.gpa);
         for ([_]?*const CompileSet.Result{ compile_set, extra }) |set| {
             const cs = set orelse continue;
             for (cs.files.keys(), cs.files.values()) |file, mem| {
@@ -118,13 +137,30 @@ pub const Builder = struct {
                 const gop = try b.files.getOrPut(b.gpa, file);
                 if (gop.found_existing) {
                     try b.addOther(gop.index, module);
-                } else {
-                    gop.value_ptr.* = .{ .file = file, .module = module, .root_module = offset + mem.root_module };
+                    continue;
                 }
+                const compile = try compiles.getOrPut(b.gpa, mem.step);
+                if (!compile.found_existing) compile.value_ptr.* = try b.addCompile(model, mem.step);
+                gop.value_ptr.* = .{ .file = file, .module = module, .compile = compile.value_ptr.* };
             }
             // The memberships from when these files were first reached were already added above
             for (cs.others.keys()) |o| try b.addOther(b.files.getIndex(o.file).?, if (o.module == std_module) std_module else offset + o.module);
         }
+    }
+
+    fn builtinFile(b: *Builder, model: *const ProjectModel, step: u32, module: u32) Allocator.Error!?FileId {
+        const builtin = model.builtinOf(step, module) orelse return null;
+        return if (model.builtins[builtin].file) |p| try b.vfs.intern(p) else null;
+    }
+
+    fn addCompile(b: *Builder, model: *const ProjectModel, step: u32) Allocator.Error!u32 {
+        const c = model.steps[step].kind.compile;
+        const root = model.modules[c.root_module].root_file;
+        const gop = try b.compiles.getOrPut(b.gpa, .{
+            .root = if (root) |p| try b.vfs.intern(p) else null,
+            .builtin = try b.builtinFile(model, step, c.root_module),
+        });
+        return @intCast(gop.index);
     }
 
     fn addOther(b: *Builder, index: usize, module: u32) Allocator.Error!void {
@@ -160,7 +196,9 @@ pub const Builder = struct {
         }.lt);
         b.files.deinit(b.gpa);
         b.others.deinit(b.gpa);
-        return .{ .arena = b.arena.state, .std_root = std_root, .default_builtin = default_builtin, .modules = b.modules.items, .files = entries };
+        const compiles = try a.dupe(Compile, b.compiles.keys());
+        b.compiles.deinit(b.gpa);
+        return .{ .arena = b.arena.state, .std_root = std_root, .default_builtin = default_builtin, .modules = b.modules.items, .compiles = compiles, .files = entries };
     }
 };
 
@@ -179,14 +217,14 @@ pub fn entry(g: *const ModuleGraph, file: FileId) ?FileEntry {
 pub fn importTarget(g: *const ModuleGraph, file: FileId, name: []const u8) ?FileId {
     if (std.mem.eql(u8, name, "std")) return g.std_root;
     if (std.mem.eql(u8, name, "builtin")) {
-        // The standard library uses the builtin of the root module of its compile step (matching
+        // The standard library uses the builtin of the root module of its compilation (matching
         // the compiler); files that belong to no module use the default one
         const e = g.entry(file) orelse return g.default_builtin;
-        const m = if (e.module == std_module) e.root_module else e.module;
-        return g.modules[m].builtin orelse g.default_builtin;
+        const builtin = if (e.module == std_module) g.compiles[e.compile].builtin else g.modules[e.module].builtin;
+        return builtin orelse g.default_builtin;
     }
     const e = g.entry(file) orelse return null;
-    if (std.mem.eql(u8, name, "root")) return g.modules[e.root_module].root;
+    if (std.mem.eql(u8, name, "root")) return g.compiles[e.compile].root;
     // For a file in several modules, look the name up in each in turn; when several modules import
     // the same name (possibly pointing to different modules), take the one from the
     // highest-priority module
@@ -238,7 +276,7 @@ pub fn importNames(g: *const ModuleGraph, arena: Allocator, file: FileId) Alloca
 }
 
 pub fn eql(a: *const ModuleGraph, b: *const ModuleGraph) bool {
-    return deepEql(a.std_root, b.std_root) and deepEql(a.default_builtin, b.default_builtin) and deepEql(a.modules, b.modules) and deepEql(a.files, b.files);
+    return deepEql(a.std_root, b.std_root) and deepEql(a.default_builtin, b.default_builtin) and deepEql(a.modules, b.modules) and deepEql(a.compiles, b.compiles) and deepEql(a.files, b.files);
 }
 
 /// Query engine input; null when not set (no project and no zig environment information)
@@ -349,20 +387,24 @@ test "a file in several modules resolves imports from each of them" {
         .{ .root_file = native("/p/a.zig"), .imports = &.{} },
         .{ .root_file = native("/p/b.zig"), .imports = &.{} },
     };
-    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &.{}, .modules = &modules, .default_step = 0 };
+    const steps = [_]ProjectModel.Step{
+        .{ .name = "exe", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
+        .{ .name = "test", .kind = .{ .compile = .{ .root_module = 1 } }, .deps = &.{} },
+    };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
     const main = try vfs.intern(native("/p/src/main.zig"));
     const a = try vfs.intern(native("/p/a.zig"));
     const b = try vfs.intern(native("/p/b.zig"));
     // The compile set (the diagnostics step is exe) and the set of all compile steps (exe first)
     var cs: CompileSet.Result = .{};
     defer cs.deinit(gpa);
-    try cs.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
-    try cs.files.put(gpa, a, .{ .module = 2, .root_module = 0 });
+    try cs.files.put(gpa, main, .{ .module = 0, .step = 0 });
+    try cs.files.put(gpa, a, .{ .module = 2, .step = 0 });
     var extra: CompileSet.Result = .{};
     defer extra.deinit(gpa);
-    try extra.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
-    try extra.files.put(gpa, a, .{ .module = 2, .root_module = 0 });
-    try extra.files.put(gpa, b, .{ .module = 3, .root_module = 1 });
+    try extra.files.put(gpa, main, .{ .module = 0, .step = 0 });
+    try extra.files.put(gpa, a, .{ .module = 2, .step = 0 });
+    try extra.files.put(gpa, b, .{ .module = 3, .step = 1 });
     try extra.others.put(gpa, .{ .file = main, .module = 1 }, {});
 
     var builder: Builder = .init(gpa, &vfs);
@@ -400,16 +442,20 @@ test "importTargets lists the targets of every module of a file in priority orde
         .{ .root_file = native("/p/b.zig"), .imports = &.{} },
         .{ .root_file = native("/p/src/main.zig"), .imports = &.{ .{ .name = "dep", .module = 2 }, .{ .name = "opt", .module = 3 } } },
     };
-    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &.{}, .modules = &modules, .default_step = 0 };
+    const steps = [_]ProjectModel.Step{
+        .{ .name = "exe", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
+        .{ .name = "test", .kind = .{ .compile = .{ .root_module = 1 } }, .deps = &.{} },
+    };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
     const main = try vfs.intern(native("/p/src/main.zig"));
     const a = try vfs.intern(native("/p/a.zig"));
     const b = try vfs.intern(native("/p/b.zig"));
     const std_root = try vfs.intern(native("/zig/std/std.zig"));
     var cs: CompileSet.Result = .{};
     defer cs.deinit(gpa);
-    try cs.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
-    try cs.files.put(gpa, a, .{ .module = 2, .root_module = 0 });
-    try cs.files.put(gpa, b, .{ .module = 3, .root_module = 1 });
+    try cs.files.put(gpa, main, .{ .module = 0, .step = 0 });
+    try cs.files.put(gpa, a, .{ .module = 2, .step = 0 });
+    try cs.files.put(gpa, b, .{ .module = 3, .step = 1 });
     try cs.others.put(gpa, .{ .file = main, .module = 1 }, {});
     try cs.others.put(gpa, .{ .file = main, .module = 4 }, {});
 
@@ -447,11 +493,12 @@ test "a file in many modules keeps its other modules in linear space" {
     const k = 1000;
     var modules: [k]ProjectModel.Module = undefined;
     for (&modules) |*m| m.* = .{ .root_file = native("/p/src/main.zig"), .imports = &.{} };
-    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &.{}, .modules = &modules, .default_step = 0 };
+    const steps = [_]ProjectModel.Step{.{ .name = "exe", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} }};
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
     const main = try vfs.intern(native("/p/src/main.zig"));
     var cs: CompileSet.Result = .{};
     defer cs.deinit(gpa);
-    try cs.files.put(gpa, main, .{ .module = 0, .root_module = 0 });
+    try cs.files.put(gpa, main, .{ .module = 0, .step = 0 });
     for (1..k) |m| try cs.others.put(gpa, .{ .file = main, .module = @intCast(m) }, {});
 
     var builder: Builder = .init(gpa, &vfs);

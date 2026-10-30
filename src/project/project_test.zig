@@ -3,6 +3,7 @@ const testing = std.testing;
 const bsp = @import("bsp.zig");
 const configuration = @import("configuration.zig");
 const fixture = @import("fixture.zig");
+const ProjectModel = @import("../base/ProjectModel.zig");
 
 test "build system protocol: read build graph and get compile errors" {
     var project = try fixture.Project.create(&fixture.basic);
@@ -79,6 +80,95 @@ test "build system protocol: read build graph and get compile errors" {
     try testing.expect(std.mem.indexOf(u8, errors.items[0], "lib.zig:2: unused local variable") != null);
     try testing.expect(std.mem.indexOf(u8, errors.items[1], "main.zig:3: expected type 'u32'") != null);
     try testing.expect(std.mem.indexOf(u8, errors.items[2], "orphan.zig:2: unused local variable") != null);
+}
+
+/// Runs `zig build` on `files` with `args` until the build graph arrives and converts it
+fn loadModel(files: []const fixture.File, args: []const []const u8) !ProjectModel {
+    var project = try fixture.Project.create(files);
+    defer project.deinit();
+    const client = try bsp.Client.start(testing.allocator, testing.io, &project.env, project.root, args);
+    defer client.deinit();
+    while (true) {
+        var event = try client.next();
+        defer event.deinit(testing.allocator);
+        switch (event) {
+            .configuration => |path| return configuration.load(testing.allocator, testing.io, project.root, path, &project.env),
+            .configuration_failed => return error.ConfigurationFailed,
+            else => {},
+        }
+    }
+}
+
+/// Arguments of the builtin of the module rooted at `root` (a path suffix) in the compile step
+/// whose name starts with `step`
+fn builtinArgs(m: *const ProjectModel, step: []const u8, root: []const u8) ![]const []const u8 {
+    for (m.steps, 0..) |s, si| {
+        if (s.kind != .compile or !std.mem.startsWith(u8, s.name, step)) continue;
+        for (s.kind.compile.modules) |cm| {
+            const file = m.modules[cm.module].root_file orelse continue;
+            if (std.mem.endsWith(u8, file, root)) return m.builtins[m.builtinOf(@intCast(si), cm.module).?].args;
+        }
+    }
+    return error.NotFound;
+}
+
+fn joined(args: []const []const u8) ![]u8 {
+    return std.mem.join(testing.allocator, " ", args);
+}
+
+test "build graph: an imported module inherits the options it does not set from its importer and the compilation" {
+    var model = try loadModel(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const target = b.standardTargetOptions(.{});
+        \\    const optimize = b.standardOptimizeOption(.{});
+        \\    const leaf = b.createModule(.{ .root_source_file = b.path("leaf.zig") });
+        \\    const util = b.createModule(.{
+        \\        .root_source_file = b.path("util.zig"),
+        \\        .optimize = .ReleaseSmall,
+        \\        .imports = &.{.{ .name = "leaf", .module = leaf }},
+        \\    });
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("main.zig"),
+        \\        .target = target,
+        \\        .optimize = optimize,
+        \\        .link_libc = true,
+        \\        .imports = &.{ .{ .name = "util", .module = util }, .{ .name = "leaf", .module = leaf } },
+        \\    }) });
+        \\    b.installArtifact(exe);
+        \\    const tool = b.addObject(.{ .name = "tool", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("tool.zig"),
+        \\        .target = b.graph.host,
+        \\        .imports = &.{.{ .name = "leaf", .module = leaf }},
+        \\    }) });
+        \\    b.step("tool", "Build the tool").dependOn(&tool.step);
+        \\}
+        \\
+        },
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "tool.zig", .text = "" },
+        .{ .path = "util.zig", .text = "" },
+        .{ .path = "leaf.zig", .text = "" },
+    }, &.{ "-Dtarget=x86-linux-musl", "-Doptimize=ReleaseFast" });
+    defer model.deinit(testing.allocator);
+    const main = try joined(try builtinArgs(&model, "compile exe app", "main.zig"));
+    defer testing.allocator.free(main);
+    try testing.expect(std.mem.startsWith(u8, main, "build-exe -Ofast -target x86-linux-musl "));
+    try testing.expect(std.mem.endsWith(u8, main, " -lc"));
+    // In the executable, `util` and `leaf` take the target and libc of the compilation; `leaf` is
+    // reached first through `util`, so it takes util's optimize mode
+    const small = try std.mem.replaceOwned(u8, testing.allocator, main, "-Ofast", "-Osmall");
+    defer testing.allocator.free(small);
+    for ([_][]const u8{ "util.zig", "leaf.zig" }) |root| {
+        const args = try joined(try builtinArgs(&model, "compile exe app", root));
+        defer testing.allocator.free(args);
+        try testing.expectEqualStrings(small, args);
+    }
+    // The same module in an object for the host
+    const leaf = try joined(try builtinArgs(&model, "compile obj tool", "leaf.zig"));
+    defer testing.allocator.free(leaf);
+    try testing.expectEqualStrings("build-obj", leaf);
 }
 
 fn stopAfter(io: std.Io, client: *bsp.Client, fired: *bool) std.Io.Cancelable!void {

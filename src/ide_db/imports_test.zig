@@ -226,8 +226,8 @@ test "auto import graph changes update named module availability" {
         .{ .root = dep.file, .imports = &.{} },
     };
     const files = [_]database.ModuleGraph.FileEntry{
-        .{ .file = main.file, .module = 0, .root_module = 0 },
-        .{ .file = dep.file, .module = 1, .root_module = 0 },
+        .{ .file = main.file, .module = 0, .compile = 0 },
+        .{ .file = dep.file, .module = 1, .compile = 0 },
     };
     try w.setGraph(null, &modules, &files);
     try testing.expect(editContaining(try run(&w, main.file, main.cursor, "Avail", 128), "@import(\"dependency\").Available") != null);
@@ -253,11 +253,11 @@ test "auto imports use safe parent relative paths and the primary module only" {
         .{ .root = other.file, .imports = &.{} },
     };
     const files = [_]database.ModuleGraph.FileEntry{
-        .{ .file = root.file, .module = 0, .root_module = 0 },
-        .{ .file = current.file, .module = 0, .root_module = 0, .others = &.{1} },
-        .{ .file = target.file, .module = 0, .root_module = 0 },
-        .{ .file = other.file, .module = 1, .root_module = 1 },
-        .{ .file = foreign.file, .module = 1, .root_module = 1 },
+        .{ .file = root.file, .module = 0, .compile = 0 },
+        .{ .file = current.file, .module = 0, .compile = 0, .others = &.{1} },
+        .{ .file = target.file, .module = 0, .compile = 0 },
+        .{ .file = other.file, .module = 1, .compile = 1 },
+        .{ .file = foreign.file, .module = 1, .compile = 1 },
     };
     try w.setGraph(null, &modules, &files);
     const server = find(try run(&w, current.file, current.cursor, "Server", 128), "Server").?;
@@ -545,9 +545,9 @@ test "canonical direct aliases update when a named module target changes" {
         .{ .root = replacement.file, .imports = &.{} },
     };
     const files = [_]database.ModuleGraph.FileEntry{
-        .{ .file = main.file, .module = 0, .root_module = 0 },
-        .{ .file = previous.file, .module = 1, .root_module = 0 },
-        .{ .file = replacement.file, .module = 2, .root_module = 0 },
+        .{ .file = main.file, .module = 0, .compile = 0 },
+        .{ .file = previous.file, .module = 1, .compile = 0 },
+        .{ .file = replacement.file, .module = 2, .compile = 0 },
     };
     try w.setGraph(null, &modules, &files);
     const original = try run(&w, main.file, main.cursor, "EdgeW", 128);
@@ -765,7 +765,7 @@ test "auto import uses the builtin of the file's module" {
     const added = try w.add("/p/main.zig", "fn main() void { _ = st<|>; }\n");
     const builtin = (try w.add("/gen/builtin.zig", "pub const Type = u32;\n")).file;
     const modules = [_]database.ModuleGraph.Module{.{ .root = added.file, .builtin = builtin, .imports = &.{} }};
-    const files = [_]database.ModuleGraph.FileEntry{.{ .file = added.file, .module = 0, .root_module = 0 }};
+    const files = [_]database.ModuleGraph.FileEntry{.{ .file = added.file, .module = 0, .compile = 0 }};
     try w.setGraph(null, &modules, &files);
     const module = find(try run(&w, added.file, added.cursor, "buil", 128), "builtin") orelse return error.MissingBuiltinModule;
     try testing.expect(module.import_edit != null);

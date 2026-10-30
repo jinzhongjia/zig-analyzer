@@ -16,6 +16,8 @@ pub const Result = struct {
     /// in different compile steps the same file can belong to modules with different import tables
     /// (e.g. exe and test each create their own module but share the root file)
     others: std.AutoArrayHashMapUnmanaged(FileModule, void) = .empty,
+    /// Module → the compile step that first reached it (the standard library is not included)
+    modules: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty,
     /// Reachable files whose contents are not loaded yet; the caller should recompute after
     /// loading them
     missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
@@ -23,6 +25,7 @@ pub const Result = struct {
     pub fn deinit(r: *Result, gpa: Allocator) void {
         r.files.deinit(gpa);
         r.others.deinit(gpa);
+        r.modules.deinit(gpa);
         r.missing.deinit(gpa);
     }
 
@@ -43,8 +46,8 @@ pub const FileModule = struct {
 pub const Membership = struct {
     /// Index into `ProjectModel.modules`; `std_module` for the standard library
     module: u32,
-    /// Root module of the containing compile step (the target of `@import("root")`)
-    root_module: u32,
+    /// The compile step that reached the file first (index into `ProjectModel.steps`)
+    step: u32,
 };
 
 /// `resolver` must provide:
@@ -76,9 +79,10 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
 
         while (stack.pop()) |node| {
             if ((try visited.getOrPut(gpa, node)).found_existing) continue;
+            if (node.module != std_module) _ = try result.modules.getOrPutValue(gpa, node.module, step);
             const gop = try result.files.getOrPut(gpa, node.file);
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{ .module = node.module, .root_module = root_module };
+                gop.value_ptr.* = .{ .module = node.module, .step = step };
             } else if (gop.value_ptr.module != node.module) {
                 try result.others.put(gpa, node, {});
             }
@@ -252,7 +256,11 @@ test compute {
     try testing.expectEqual(0, member(&r, &fs, native("/p/src/util.zig")).module);
     try testing.expectEqual(1, member(&r, &fs, native("/p/lib/nested/deep.zig")).module);
     try testing.expectEqual(std_module, member(&r, &fs, native("/zig/std/std.zig")).module);
-    try testing.expectEqual(0, member(&r, &fs, native("/p/lib/lib.zig")).root_module);
+    try testing.expectEqual(1, member(&r, &fs, native("/p/lib/lib.zig")).step);
+    // The first compile step reaching each module
+    try testing.expectEqual(1, r.modules.get(0).?);
+    try testing.expectEqual(1, r.modules.get(1).?);
+    try testing.expectEqual(2, r.modules.count());
 }
 
 test buildScripts {
@@ -342,6 +350,8 @@ test "a file shared by modules of different compile steps records every module" 
     try testing.expectEqual(2, r.others.count());
     try testing.expect(r.others.contains(.{ .file = main, .module = 1 }));
     try testing.expect(r.others.contains(.{ .file = util, .module = 1 }));
+    // The compile step that reaches a module first (its builtin comes from that compilation)
+    for ([_]u32{ 0, 1, 1, 0 }, 0..) |step, module| try testing.expectEqual(step, r.modules.get(@intCast(module)).?);
 }
 
 test "relative imports leaving the module directory are not followed" {

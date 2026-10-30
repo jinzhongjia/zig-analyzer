@@ -292,7 +292,7 @@ const test_main =
     \\
 ;
 
-test "a module that is also the root of a test step is analyzed as a test" {
+test "a module that is also the root of a test step is analyzed as the executable that diagnostics build" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = test_build },
         .{ .path = "src/main.zig", .text = test_main },
@@ -308,7 +308,9 @@ test "a module that is also the root of a test step is analyzed as a test" {
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = test_main } });
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    try testing.expectEqualStrings("```zig\nconst t: u8 = 1\n```", try hoverText(&h, uri, test_main, "t ="));
+    // The default install step builds the executable: `builtin.is_test` is false, and the testing
+    // allocator used in a test block is still inferred
+    try testing.expectEqualStrings("```zig\nconst t: u16 = 2\n```", try hoverText(&h, uri, test_main, "t ="));
     try testing.expectEqualStrings("```zig\nconst gpa: Allocator\n```", try hoverText(&h, uri, test_main, "gpa ="));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
