@@ -586,15 +586,44 @@ fn errorMemberTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Tar
         .field_access => try context.defOfKey(r, a.member(fa.lhs) orelse return null) orelse return null,
         else => return null,
     };
-    for ([_]Def{ lhs_def, try r.aliasTarget(lhs_def) }) |def| {
-        const it = switch (def) {
+    return errorInDecl(r, lhs_def, name, 0);
+}
+
+/// The error `name` in the declaration of the error set `def` (or of the declaration it aliases):
+/// in an `error{ ... }` written in it, else in the declarations of the named operands of a merge
+/// `A || B` that it is initialized with, left to right
+fn errorInDecl(r: *Resolver, def: Def, name: []const u8, depth: u32) resolve.Error!?Target {
+    if (depth > 16) return null;
+    for ([_]Def{ def, try r.aliasTarget(def) }) |d| {
+        const it = switch (d) {
             .item => |x| x,
             else => continue,
         };
         const decl = try r.itemNode(it.file, it.item) orelse continue;
         if (try findErrorName(r.arena, decl, name, 0)) |at| return .{ .file = it.file, .start = at.start, .end = at.end };
+        const body = try r.body(it.file, it.item);
+        var operands: std.ArrayList(Body.ExprId) = .empty;
+        try mergeOperands(r, body, body.value orelse continue, &operands);
+        for (operands.items) |op| {
+            const od = try declOf(r, it.file, it.item, body, op) orelse continue;
+            if (try errorInDecl(r, .{ .item = od }, name, depth + 1)) |t| return t;
+        }
     }
     return null;
+}
+
+/// The operands of the error set merge `e` (`A || B || C`), left to right; `e` itself when it is
+/// not a merge
+fn mergeOperands(r: *Resolver, body: *const Body, e: Body.ExprId, out: *std.ArrayList(Body.ExprId)) resolve.Error!void {
+    switch (body.expr(e)) {
+        .binary => |x| if (x.op == .pipe_pipe) {
+            try mergeOperands(r, body, x.lhs, out);
+            try mergeOperands(r, body, x.rhs, out);
+            return;
+        },
+        else => {},
+    }
+    try out.append(r.arena, e);
 }
 
 /// Position and documentation of the `Foo` of `error.Foo` in an error set declaration

@@ -3534,6 +3534,46 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "goto on a member of a merged error set reaches the operand that declares it" {
+    // Prevents an empty result when the name comes from a named operand of `||`
+    const text =
+        \\const ReadErr = error{ EndOfStream, Timeout };
+        \\const WriteErr = error{ DiskFull, Timeout };
+        \\const IoErr = ReadErr || WriteErr;
+        \\const AllErr = IoErr || error{Closed};
+        \\fn io(x: u32) AllErr!void {
+        \\    if (x == 0) return IoErr.DiskFull;
+        \\    if (x == 1) return AllErr.DiskFull;
+        \\    if (x == 2) return AllErr.Closed;
+        \\}
+        \\test {
+        \\    io(3) catch {};
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "DiskFull;\n    if (x == 1)", "DiskFull, Timeout" },
+        .{ "DiskFull;\n    if (x == 2)", "DiskFull, Timeout" },
+        .{ "Closed;", "Closed}" },
+    }) |c| {
+        const at: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        for ([_]*const fn (*resolve.Resolver, FileId, u32) resolve.Error!?definition.Target{ definition.definition, definition.declaration }) |find| {
+            const t = try find(&r, file, at) orelse {
+                std.debug.print("`{s}`: no target\n", .{c[0]});
+                return error.NoTarget;
+            };
+            try testing.expect(std.mem.startsWith(u8, text[t.start..], c[1]));
+        }
+    }
+}
+
 test "goto on a member of a container does not jump to an error of the same name inside it" {
     // Prevents `Http.NotFound` from jumping to `error{NotFound}` in a function of `Http`
     const text =
