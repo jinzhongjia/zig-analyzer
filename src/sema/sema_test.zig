@@ -2405,6 +2405,55 @@ test "builtin arguments of std types get their result types" {
     });
 }
 
+test "containers named inside a generic instance are qualified by it" {
+    // Prevents displaying `Outer(u8).Inner` as `Inner(u8)`, which reads like a call of `Inner`
+    try expectTypes(
+        \\fn Outer(comptime T: type) type {
+        \\    return struct {
+        \\        pub const Inner = struct { v: T };
+        \\        pub const Deep = struct { pub const Leaf = struct { t: T }; };
+        \\        pub fn Gen(comptime U: type) type {
+        \\            return struct { pub const X = struct { u: U, t: T }; };
+        \\        }
+        \\        pub fn make() type {
+        \\            return struct { t: T };
+        \\        }
+        \\    };
+        \\}
+        \\fn Local(comptime T: type) type {
+        \\    const S = struct { t: T };
+        \\    return struct { s: S };
+        \\}
+        \\fn Returned(comptime T: type) type {
+        \\    const S = struct { v: T };
+        \\    return S;
+        \\}
+        \\fn f() void {
+        \\    const x: Outer(u8).Inner = .{ .v = 1 };
+        \\    const leaf: Outer(u8).Deep.Leaf = .{ .t = 1 };
+        \\    const g: Outer(u8).Gen(u16).X = .{ .u = 1, .t = 2 };
+        \\    const gen: Outer(u8).Gen(u16) = .{};
+        \\    const m: Outer(u8).make() = .{ .t = 1 };
+        \\    const o: Outer(u8) = .{};
+        \\    var lv: Local(i8) = undefined;
+        \\    const ls = lv.s;
+        \\    var rv: Returned(i8) = undefined;
+        \\    const rs = rv;
+        \\    _ = .{ x, leaf, g, gen, m, o, ls, &lv, rs, &rv };
+        \\}
+    , &.{
+        .{ "x", "Outer(u8).Inner" },
+        .{ "leaf", "Outer(u8).Deep.Leaf" },
+        .{ "g", "Outer(u8).Gen(u16).X" },
+        .{ "gen", "Outer(u8).Gen(u16)" },
+        .{ "m", "Outer(u8).make()" },
+        .{ "o", "Outer(u8)" },
+        // A local constant of a function is named after the function without arguments
+        .{ "ls", "Local.S" },
+        .{ "rs", "Returned.S" },
+    });
+}
+
 test "std generic containers" {
     try expectStdTypes(
         \\const std = @import("std");
@@ -2443,7 +2492,7 @@ test "std generic containers" {
         // FieldEnum-constructed enums, @FieldType and @tagName
         .{ "xs", "[]i32" },
         .{ "flag", "?bool" },
-        .{ "entry", "GetOrPutResult(u32, []const u8, AutoContext(u32), 80)" },
+        .{ "entry", "Custom(u32, []const u8, AutoContext(u32), 80).GetOrPutResult" },
         // The result of @typeInfo is comptime-known and shown in full
         .{ "fs", "[]const [:0]const u8 = &.{ \"x\", \"y\" }" },
         .{ "info", "Type = .{ .@\"struct\" = .{ .is_tuple = false, .layout = .auto, .backing_integer = null, .field_names = &.{ \"x\", \"y\" }, .field_types = &.{ i32, i32 }, .field_attrs = &.{ .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null }, .{ .@\"comptime\" = false, .@\"align\" = null, .default_value_ptr = null } }, .decl_names = &.{} } }" },

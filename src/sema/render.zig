@@ -48,10 +48,54 @@ const ContainerNames = struct {
     }
 
     pub fn write(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
-        const found = n.name(c) catch null;
-        try w.writeAll(found orelse return n.writeContent(c, w));
-        // Generic instance: `List(u8)`, listing only the arguments known at comptime
-        try n.writeArgs(n.shownInst(c.inst) orelse return, w);
+        if (c.kind == .file) {
+            const base = std.fs.path.basename(n.r.ctx.db.env.vfs.path(c.file));
+            return w.writeAll(if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else base);
+        }
+        const found = n.name(c) catch null orelse return n.writeContent(c, w);
+        // Only the type a generic function returns carries the arguments (`List(u8)`); a container
+        // named inside a generic instance is qualified by the named container or function, as the
+        // compiler names it: `Outer(u8).Inner`, `Outer(u8).Gen(u16)`, and `Local.S` for a local
+        // constant (the function without arguments)
+        const inst = n.shownInst(c.inst) orelse return w.writeAll(found.name);
+        switch (found.by) {
+            .member => {
+                try n.writeQualifier(c, found.item, w);
+                try w.writeAll(found.name);
+            },
+            .local => {
+                try n.writeOwner(c, found.item, null, w);
+                try w.print(".{s}", .{found.name});
+            },
+            .returned => try n.writeOwner(c, found.item, inst, w),
+        }
+    }
+
+    /// The member `item` whose body names the container: qualified as in `writeQualifier`, with
+    /// the arguments when `inst` is the instance of `item` itself (a generic function)
+    fn writeOwner(n: ContainerNames, c: InternPool.Container, item: u32, inst: ?Index, w: *Io.Writer) Io.Writer.Error!void {
+        const tree = n.r.itemTree(c.file) catch return;
+        const it = tree.items[item];
+        try n.writeQualifier(c, item, w);
+        try w.writeAll(it.name orelse "_");
+        const i = inst orelse return;
+        const key = n.r.ctx.db.env.ip.key(i).instance;
+        if (key.file == c.file and key.decl == it.ast_id) try n.writeArgs(i, w);
+    }
+
+    /// `Q.` when the container `Q` that declares `item` is named and lies in a generic function
+    /// body (its name carries the instance arguments); nothing otherwise
+    fn writeQualifier(n: ContainerNames, c: InternPool.Container, item: u32, w: *Io.Writer) Io.Writer.Error!void {
+        const ip = n.r.ctx.db.env.ip;
+        const tree = n.r.itemTree(c.file) catch return;
+        const parent = queries.containerType(n.r, .{ .file = c.file, .container = tree.items[item].container }, c.inst) catch return;
+        const p = switch (ip.key(parent)) {
+            .container_type => |p| p,
+            else => return,
+        };
+        if (p.inst == null or p.kind == .file or (n.name(p) catch null) == null) return;
+        try n.write(p, w);
+        try w.writeAll(".");
     }
 
     /// Contents of an anonymous container: layout, kind and fields (only names for enums)
@@ -184,18 +228,16 @@ const ContainerNames = struct {
         try w.writeAll(")");
     }
 
-    /// A container that is the value of a member is named after the member:
-    /// `const S = struct {...}` is `S`, in a function body it is named after the local constant,
-    /// and a `return`ed container is named after the function (`List(u8)`); the same naming
-    /// applies when the value is an `if` / `switch` choosing among several containers (the
-    /// compiler names it `S__struct_1` here; naming after the member is more readable).
+    /// How a container is named: after the member whose value it is (`const S = struct {...}` is
+    /// `S`), after the local constant of a function body, or after the function that `return`s it
+    /// (`List(u8)`); the same naming applies when the value is an `if` / `switch` choosing among
+    /// several containers (the compiler names it `S__struct_1` here; naming after the member is
+    /// more readable). `item` is the member whose name or body names it.
+    const Naming = struct { name: []const u8, item: u32, by: enum { member, local, returned } };
+
     /// Containers in type annotations of fields and variables, in arguments, and in
-    /// `?struct {...}` have no name; returns null.
-    fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?[]const u8 {
-        if (c.kind == .file) {
-            const base = std.fs.path.basename(n.r.ctx.db.env.vfs.path(c.file));
-            return if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - 4] else base;
-        }
+    /// `?struct {...}` have no name; returns null. Files are not handled here (see `write`).
+    fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?Naming {
         const tree = try n.r.itemTree(c.file);
         for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
             const parent = x.parent_item orelse return null;
@@ -205,15 +247,16 @@ const ContainerNames = struct {
             const b = try n.r.body(c.file, parent);
             if (item.kind == .@"const" or item.kind == .@"var") {
                 const value = b.value orelse return null;
-                return if (yields(b, value, rel)) item.name else null;
+                if (!yields(b, value, rel)) return null;
+                return .{ .name = item.name orelse return null, .item = parent, .by = .member };
             }
             for (b.bindings) |binding| {
                 const init = binding.init orelse continue;
-                if (yields(b, init, rel)) return binding.name;
+                if (yields(b, init, rel)) return .{ .name = binding.name, .item = parent, .by = .local };
             }
             if (item.kind != .@"fn") return null;
             for (b.exprs) |e| switch (e) {
-                .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return item.name,
+                .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return .{ .name = item.name orelse return null, .item = parent, .by = .returned },
                 else => {},
             };
             return null;
