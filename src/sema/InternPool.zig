@@ -161,10 +161,13 @@ pub const Key = union(enum) {
     int_type: struct { signedness: std.builtin.Signedness, bits: u16 },
     ptr_type: struct { child: Index, size: PtrSize, is_const: bool = false, sentinel: ?Index = null },
     array_type: struct { len: u64, child: Index, sentinel: ?Index = null },
-    /// An array whose length depends on an abstract parameter (in a generic function body without
-    /// a concrete instance, e.g. `[block_length]u8`): the element type is known, the length is
-    /// not; `len` is the source text of the length expression, used only for display
-    abstract_array_type: struct { len: []const u8, child: Index, sentinel: ?Index = null },
+    /// An array whose length is not known: the element type and sentinel are. With `len`, the
+    /// length depends on an abstract parameter (in a generic function body without a concrete
+    /// instance, e.g. `[block_length]u8`), and `len` is the source text of the length expression,
+    /// used only for display. Without `len`, the length depends on no abstract parameter but
+    /// cannot be evaluated (`count(fmt, args)` in an instance of `std.fmt.comptimePrint`): no
+    /// instance determines it, and it is displayed as `_`.
+    abstract_array_type: struct { len: ?[]const u8, child: Index, sentinel: ?Index = null },
     optional_type: Index,
     error_union_type: struct { err: Index, payload: Index },
     error_set_type: ErrorSet,
@@ -710,7 +713,7 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         },
         .fn_type => |f| .{ .fn_type = .{ .params = try a.dupe(Index, f.params), .ret = f.ret, .varargs = f.varargs } },
         .enum_literal => |n| .{ .enum_literal = try a.dupe(u8, n) },
-        .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = try a.dupe(u8, t.len), .child = t.child, .sentinel = t.sentinel } },
+        .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = if (t.len) |l| try a.dupe(u8, l) else null, .child = t.child, .sentinel = t.sentinel } },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
         .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .parent = i.parent, .iteration = i.iteration } },
@@ -884,7 +887,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(a.child, w, container_name);
         },
         .abstract_array_type => |a| {
-            try w.print("[{s}", .{a.len});
+            try w.print("[{s}", .{a.len orelse "_"});
             if (a.sentinel) |s| {
                 try w.writeAll(":");
                 try ip.print(s, w, container_name);

@@ -816,34 +816,46 @@ fn allPrecise(ip: *InternPool, items: []const Index) bool {
 /// A type without abstract parameters or unknown parts: it can be used outside the instance that
 /// defines it (e.g. as the caller's expected type)
 pub fn isConcrete(ip: *InternPool, t: Index) bool {
+    return concrete(ip, t, false);
+}
+
+/// A type or instance without abstract parameters: inferring it under another instance gives the
+/// same result. Unlike `isConcrete`, an array whose length cannot be evaluated but depends on no
+/// abstract parameter (`InternPool.Key.abstract_array_type` without `len`) counts.
+pub fn isSettled(ip: *InternPool, t: Index) bool {
+    return concrete(ip, t, true);
+}
+
+fn concrete(ip: *InternPool, t: Index, unknown_len: bool) bool {
     if (t == .unknown) return false;
     return switch (ip.key(t)) {
-        .unknown, .opaque_param, .abstract_array_type => false,
-        .ptr_type => |p| isConcrete(ip, p.child),
-        .array_type => |a| isConcrete(ip, a.child),
-        .optional_type => |c| isConcrete(ip, c),
-        .error_union_type => |e| isConcrete(ip, e.err) and isConcrete(ip, e.payload),
+        .unknown, .opaque_param => false,
+        .abstract_array_type => |a| unknown_len and a.len == null and concrete(ip, a.child, true) and (a.sentinel == null or concrete(ip, a.sentinel.?, true)),
+        .ptr_type => |p| concrete(ip, p.child, unknown_len),
+        .array_type => |a| concrete(ip, a.child, unknown_len),
+        .optional_type => |c| concrete(ip, c, unknown_len),
+        .error_union_type => |e| concrete(ip, e.err, unknown_len) and concrete(ip, e.payload, unknown_len),
         .fn_type => |f| blk: {
-            for (f.params) |p| if (!isConcrete(ip, p)) break :blk false;
-            break :blk isConcrete(ip, f.ret);
+            for (f.params) |p| if (!concrete(ip, p, unknown_len)) break :blk false;
+            break :blk concrete(ip, f.ret, unknown_len);
         },
-        .container_type => |c| c.inst == null or isConcrete(ip, c.inst.?),
-        .tuple_type => |tt| allConcrete(ip, tt.types) and allConcrete(ip, tt.values),
-        .vector_type => |v| isConcrete(ip, v.child),
-        .anon_struct_type => |a| allConcrete(ip, a.types) and allConcrete(ip, a.values),
-        .reified_type => |r| allConcrete(ip, r.types) and (r.inst == null or isConcrete(ip, r.inst.?)),
-        .union_tag_type => |u| isConcrete(ip, u),
+        .container_type => |c| c.inst == null or concrete(ip, c.inst.?, unknown_len),
+        .tuple_type => |tt| allConcrete(ip, tt.types, unknown_len) and allConcrete(ip, tt.values, unknown_len),
+        .vector_type => |v| concrete(ip, v.child, unknown_len),
+        .anon_struct_type => |a| allConcrete(ip, a.types, unknown_len) and allConcrete(ip, a.values, unknown_len),
+        .reified_type => |r| allConcrete(ip, r.types, unknown_len) and (r.inst == null or concrete(ip, r.inst.?, unknown_len)),
+        .union_tag_type => |u| concrete(ip, u, unknown_len),
         .instance => |i| blk: {
             if (i.iteration) |it| if (it.index == InternPool.Instance.Iteration.unknown_index) break :blk false;
-            for (i.args) |a| if (a != .runtime and !isConcrete(ip, a)) break :blk false;
-            break :blk i.parent == null or isConcrete(ip, i.parent.?);
+            for (i.args) |a| if (a != .runtime and !concrete(ip, a, unknown_len)) break :blk false;
+            break :blk i.parent == null or concrete(ip, i.parent.?, unknown_len);
         },
         else => true,
     };
 }
 
-fn allConcrete(ip: *InternPool, items: []const Index) bool {
-    for (items) |x| if (!isConcrete(ip, x)) return false;
+fn allConcrete(ip: *InternPool, items: []const Index, unknown_len: bool) bool {
+    for (items) |x| if (!concrete(ip, x, unknown_len)) return false;
     return true;
 }
 

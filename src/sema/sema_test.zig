@@ -2848,6 +2848,63 @@ test "arrays whose length depends on abstract parameters keep their element type
     });
 }
 
+test "an array length that a call instance cannot evaluate is unknown, not the callee's text" {
+    // `print` returned `*const [measure(fmt):0]u8` at concrete call sites
+    try expectTypes(
+        \\extern fn external(n: usize) usize;
+        \\fn measure(comptime fmt: []const u8) usize { return external(fmt.len); }
+        \\fn print(comptime fmt: []const u8) *const [measure(fmt):0]u8 { return undefined; }
+        \\fn mk(comptime n: usize) *const [n:0]u8 { return "abcdefgh"[0..n]; }
+        \\fn abstract(comptime fmt: []const u8) void {
+        \\    const inner = print(fmt);
+        \\    _ = inner;
+        \\}
+        \\fn probe() void {
+        \\    const s = print("{d}");
+        \\    const m = mk(3);
+        \\    const n = s.len;
+        \\    const c = s[0];
+        \\    const p = s.ptr;
+        \\    const sl: []const u8 = s;
+        \\    const z: [:0]const u8 = s;
+        \\    const part = s[0..1];
+        \\    const same = @TypeOf(s) == *const [3:0]u8;
+        \\    const self = @TypeOf(s) == @TypeOf(s);
+        \\    _ = .{ m, n, c, p, sl, z, part, same, self };
+        \\}
+    , &.{
+        .{ "s", "*const [_:0]u8" },
+        .{ "m", "*const [3:0]u8" },
+        .{ "inner", "*const [measure(fmt):0]u8" },
+        .{ "n", "usize" },
+        .{ "c", "u8" },
+        .{ "p", "[*:0]const u8" },
+        .{ "sl", "[]const u8" },
+        .{ "z", "[:0]const u8" },
+        .{ "part", "*const [1]u8" },
+        // A type with an unknown length is never known to equal another type, itself included
+        .{ "same", "bool" },
+        .{ "self", "bool" },
+    });
+}
+
+test "std.fmt.comptimePrint results keep their pointer, element and sentinel types" {
+    // The results were shown with the callee's length text `count(fmt, args)`
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\pub const version = std.fmt.comptimePrint("{d}.{d}.{d}", .{ 1, 22, 3 });
+        \\fn probe() void {
+        \\    const s = std.fmt.comptimePrint("{d}", .{3});
+        \\    const n = s.len;
+        \\    _ = n;
+        \\}
+    , &.{
+        .{ "s", "*const [_:0]u8" },
+        .{ "version", "*const [_:0]u8" },
+        .{ "n", "usize" },
+    });
+}
+
 test "loops over types bind an abstract type" {
     try expectTypes(
         \\fn gamma(comptime T: type, x: T) T { return x; }

@@ -1129,9 +1129,13 @@ const Inferrer = struct {
                     .int_value => |iv| std.math.cast(u64, iv.value) orelse return typeUnknown(),
                     else => return typeUnknown(),
                 } else {
-                    // The length cannot be evaluated (e.g. it depends on an abstract parameter):
-                    // the element type is known, and the length is shown as in the source
+                    // The length cannot be evaluated; the element type is known. When the length
+                    // depends on an abstract parameter, it is shown as in the source; otherwise
+                    // (in a concrete instance, where the source text would belong to the
+                    // declaration, not to the instance) no instance determines it, and it is
+                    // unknown
                     if (child == .unknown or (arr.sentinel != null and sentinel == null)) return typeUnknown();
+                    if (!try inf.dependsOnAbstract(arr.len, 0)) return TypedValue.ofType(try ip.get(.{ .abstract_array_type = .{ .len = null, .child = child, .sentinel = sentinel } }));
                     var text: std.ArrayList(u8) = .empty;
                     if (!try inf.exprText(arr.len, &text, 0)) return typeUnknown();
                     return TypedValue.ofType(try ip.get(.{ .abstract_array_type = .{ .len = text.items, .child = child, .sentinel = sentinel } }));
@@ -3069,6 +3073,56 @@ const Inferrer = struct {
             .field_access => |fa| return inf.addressKnownness(fa.lhs, depth + 1),
             else => return inf.anyRuntime(&.{e}, depth),
         }
+    }
+
+    /// Whether the inferred expression `e` depends on an abstract parameter: a parameter of this
+    /// member without a settled argument in the instance, a type that is not settled (such as an
+    /// abstract type parameter or a type loop variable), or a name of an enclosing scope without a
+    /// value outside a settled instance (see `value.isSettled`)
+    fn dependsOnAbstract(inf: *Inferrer, e: ExprId, depth: u32) Error!bool {
+        if (depth > 8) return true;
+        const b = inf.body;
+        const tv = inf.get(e);
+        if (tv.val) |v| return tv.isType() and !value.isSettled(inf.ip, v);
+        switch (b.expr(e)) {
+            .name_ref => |name| {
+                if (!b.nameRefIsEscaped(e)) if (try primitive(inf.ip, name) != null) return false;
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
+                const l = switch (def) {
+                    .local => |l| l,
+                    .item, .file => return !inf.concreteContext(),
+                };
+                if (l.file != inf.file or l.item != inf.item) return !inf.concreteContext();
+                const binding = b.binding(l.binding);
+                switch (binding.kind) {
+                    .param => {
+                        const own = inf.ownInstance() orelse return true;
+                        const i = std.mem.indexOfScalar(Body.BindingId, b.params, l.binding) orelse return true;
+                        return i >= own.args.len or (own.args[i] != .runtime and !value.isSettled(inf.ip, own.args[i]));
+                    },
+                    .local_const, .local_var => return if (binding.init) |init| inf.dependsOnAbstract(init, depth + 1) else false,
+                    .capture => return false,
+                }
+            },
+            .field_access => |fa| return inf.dependsOnAbstract(fa.lhs, depth + 1),
+            .call => |c| {
+                if (try inf.dependsOnAbstract(c.callee, depth + 1)) return true;
+                for (c.args) |x| if (try inf.dependsOnAbstract(x, depth + 1)) return true;
+                return false;
+            },
+            .builtin_call => |c| {
+                for (c.args) |x| if (try inf.dependsOnAbstract(x, depth + 1)) return true;
+                return false;
+            },
+            .binary => |x| return try inf.dependsOnAbstract(x.lhs, depth + 1) or try inf.dependsOnAbstract(x.rhs, depth + 1),
+            else => return false,
+        }
+    }
+
+    /// Every parameter of the enclosing instances has a settled argument
+    fn concreteContext(inf: *Inferrer) bool {
+        const i = inf.inst orelse return false;
+        return value.isSettled(inf.ip, i);
     }
 
     /// Source form of an expression (used to display arrays of unknown length): names, field

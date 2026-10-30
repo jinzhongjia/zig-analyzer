@@ -2729,6 +2729,42 @@ test "build.zig.zon paths go to the files they name" {
     try testing.expectEqual(null, try w.vfs.lookup(try std.fs.path.join(w.arena.allocator(), &.{ root.dir, "README.md" })));
 }
 
+test "hover in generic bodies does not seed an array length no instance determines" {
+    const text =
+        \\extern fn external(n: usize) usize;
+        \\fn measure(comptime fmt: []const u8) usize { return external(fmt.len); }
+        \\fn print(comptime fmt: []const u8) *const [measure(fmt):0]u8 { return undefined; }
+        \\fn gen(comptime T: type) void {
+        \\    const s = print("{d}");
+        \\    const t: T = undefined;
+        \\    _ = .{ s, t };
+        \\}
+        \\test {
+        \\    gen(u8);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        // The length depends on no parameter of `gen`: the same in every instance
+        .{ "s =", "```zig\nconst s: *const [_:0]u8\n```" },
+        .{ "t: T", "```zig\nconst t: u8 = undefined\n```\n\ninferred from the call at main.zig:10" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "hover in generic bodies is inferred from a call site" {
     const text =
         \\fn List(comptime T: type) type {
