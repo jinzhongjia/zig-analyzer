@@ -3534,6 +3534,37 @@ test "goto declaration, definition through aliases and type definition" {
     }
 }
 
+test "names in the alignment of destructuring targets are references" {
+    // Prevents goto, hover and references from missing names in `align(...)` of a destructuring
+    // target
+    const text =
+        \\const n: u29 = 8;
+        \\pub fn main() void {
+        \\    const k: u29 = 16;
+        \\    const a: u32 align(n), const b: u8 align(k) = .{ 1, 2 };
+        \\    _ = .{ a, b };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, []const u8 }{ .{ "n), const", "n: u29" }, .{ "k) =", "k: u29" } }) |c| {
+        const use: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const t = try definition.definition(&r, file, use) orelse return error.NoTarget;
+        try testing.expect(std.mem.startsWith(u8, text[t.start..], c[1]));
+        _ = try hover.hover(&r, file, use, &.{}) orelse return error.NoHover;
+        const def = try definition.defAt(&r, file, @intCast(std.mem.indexOf(u8, text, c[1]).?)) orelse return error.NoDefinition;
+        const refs = try search.findReferences(&r, def, .{ .scope = &.{file} });
+        try testing.expectEqual(2, refs.len);
+        try testing.expectEqual(use, refs[1].start);
+    }
+}
+
 test "goto on a member of a merged error set reaches the operand that declares it" {
     // Prevents an empty result when the name comes from a named operand of `||`
     const text =
