@@ -12,8 +12,13 @@ const Configuration = std.Build.Configuration;
 const ProjectModel = @import("../base/ProjectModel.zig");
 const ZigEnv = @import("ZigEnv.zig");
 
+/// The build graph file does not match the format: lengths in the header that disagree with the
+/// size of the file, or indices, tags, or strings out of range
+const InvalidError = error{InvalidBuildGraph};
+
 /// Reads the build graph file given by the maker (`path` is relative to the build root) and
-/// converts it
+/// converts it. The file comes from another process and is read as raw structs: it is checked
+/// before anything in it is used, so a malformed file is an error instead of a crash.
 pub fn load(gpa: Allocator, io: Io, build_root: []const u8, path: []const u8, env: *const ZigEnv) !ProjectModel {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
@@ -21,8 +26,329 @@ pub fn load(gpa: Allocator, io: Io, build_root: []const u8, path: []const u8, en
     defer dir.close(io);
     var file = try dir.openFile(io, path, .{});
     defer file.close(io);
+    var header: [@sizeOf(Configuration.Header)]u8 = undefined;
+    if (try file.readPositionalAll(io, &header, 0) != header.len) return error.InvalidBuildGraph;
+    try checkLengths(std.mem.bytesToValue(Configuration.Header, &header), try file.length(io));
     const conf = try Configuration.loadFile(scratch.allocator(), io, file);
+    try validate(scratch.allocator(), &conf);
     return convert(gpa, &conf, build_root, try localCacheRoot(scratch.allocator(), build_root, path), env);
+}
+
+/// The lengths in the header must add up to the size of the file (the maker writes the header
+/// and then exactly these arrays); otherwise loading would allocate and read by arbitrary lengths
+fn checkLengths(h: Configuration.Header, file_len: u64) InvalidError!void {
+    const size: u64 = @sizeOf(Configuration.Header) +
+        @as(u64, h.string_bytes_len) +
+        @as(u64, h.steps_len) * @sizeOf(Configuration.Step) +
+        @as(u64, h.path_deps_len) * @sizeOf(Configuration.PathDep) +
+        @as(u64, h.unlazy_deps_len) * @sizeOf(Configuration.String) +
+        @as(u64, h.system_integrations_len) * @sizeOf(Configuration.SystemIntegration) +
+        @as(u64, h.available_options_len) * @sizeOf(Configuration.AvailableOption) +
+        @as(u64, h.search_prefixes_len) * @sizeOf(Configuration.String) +
+        @as(u64, h.extra_len) * @sizeOf(u32);
+    if (size != file_len) return error.InvalidBuildGraph;
+}
+
+/// Checks everything `convert` reads (and the indices `ProjectModel` follows) so that it stays in
+/// bounds and meets the preconditions of the standard library accessors it uses: the extra data of
+/// every step and of every module reachable from compile steps, strings, step indices, packages,
+/// lazy paths, and target queries
+fn validate(arena: Allocator, c: *const Configuration) (InvalidError || Allocator.Error)!void {
+    const k: Checker = .{ .c = c };
+    if (@backingInt(c.default_step) >= c.steps.len) return error.InvalidBuildGraph;
+    var modules: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    for (c.steps) |*s| {
+        try k.string(s.name);
+        for ((try k.data(@backingInt(s.deps), Configuration.Deps)).steps.slice) |d| {
+            if (@backingInt(d) >= c.steps.len) return error.InvalidBuildGraph;
+        }
+        var i: usize = @backingInt(s.extended);
+        switch (try k.unionAt(&i, StepUnion, Configuration.Step.Flags)) {
+            .top_level => |t| try k.string(t.description),
+            .compile => |comp| try modules.put(arena, @backingInt(comp.root_module), {}),
+            .run => |run| for (run.args.slice) |arg| {
+                _ = try k.data(@backingInt(arg), Configuration.Step.Run.Arg);
+            },
+            else => {},
+        }
+    }
+    // `modules` grows while it is walked: the modules each import table refers to
+    var mi: usize = 0;
+    while (mi < modules.count()) : (mi += 1) {
+        const m = try k.data(modules.keys()[mi], Configuration.Module);
+        if (m.import_table == .invalid) return error.InvalidBuildGraph;
+        const table = (try k.data(@backingInt(m.import_table), Configuration.ImportTable)).imports.mal;
+        for (table.items(.name), table.items(.module)) |name, target| {
+            try k.string(name);
+            try modules.put(arena, @backingInt(target), {});
+        }
+        if (m.root_source_file.unwrap()) |lp| try k.lazyPath(lp);
+        if (m.resolved_target.unwrap()) |rt| try k.resolvedTarget(rt);
+    }
+    for (c.path_deps) |*dep| {
+        if (!valid(Configuration.PathDep, dep.*)) return error.InvalidBuildGraph;
+        try k.string(dep.sub);
+        if (dep.pkg.unwrap()) |p| try k.package(p);
+    }
+}
+
+/// The union of step kinds stored in `extra` (see `Configuration.Step.extended`)
+const StepUnion = @typeInfo(@TypeOf(@FieldType(Configuration.Step, "extended").get)).@"fn".return_type.?;
+
+/// Bounds-checked decoding of the extra data of the build graph: the same layout as
+/// `Configuration.Storage.data`, but an index, length, or tag out of range is an error
+const Checker = struct {
+    c: *const Configuration,
+
+    fn words(k: Checker, i: usize, n: u64) InvalidError![]const u32 {
+        if (i > k.c.extra.len or n > k.c.extra.len - i) return error.InvalidBuildGraph;
+        return k.c.extra[i..][0..@intCast(n)];
+    }
+
+    fn word(k: Checker, i: usize) InvalidError!u32 {
+        return (try k.words(i, 1))[0];
+    }
+
+    fn string(k: Checker, s: Configuration.String) InvalidError!void {
+        const start = @backingInt(s);
+        if (start >= k.c.string_bytes.len) return error.InvalidBuildGraph;
+        if (std.mem.findScalar(u8, k.c.string_bytes[start..], 0) == null) return error.InvalidBuildGraph;
+    }
+
+    fn data(k: Checker, index: usize, comptime T: type) InvalidError!T {
+        var i = index;
+        return k.dataAt(&i, T);
+    }
+
+    fn dataAt(k: Checker, i: *usize, comptime T: type) InvalidError!T {
+        switch (@typeInfo(T)) {
+            .@"struct" => |info| {
+                var result: T = undefined;
+                inline for (info.field_names, info.field_types) |name, F| {
+                    @field(result, name) = try k.field(i, &result, F);
+                }
+                return result;
+            },
+            .@"union" => return k.unionAt(i, T, T.Flags),
+            else => comptime unreachable,
+        }
+    }
+
+    /// A union whose first word is `Flags`, a packed struct holding the tag
+    fn unionAt(k: Checker, i: *usize, comptime U: type, comptime Flags: type) InvalidError!U {
+        const flags = try bitsAs(Flags, try k.word(i.*));
+        return switch (flags.tag) {
+            inline else => |tag| @unionInit(U, @tagName(tag), try k.dataAt(i, @typeInfo(U).@"union".field_types[@backingInt(tag)])),
+        };
+    }
+
+    fn list(k: Checker, i: *usize, start: usize, len: u32, comptime Elem: type) InvalidError![]const Elem {
+        const n = @divExact(@sizeOf(Elem), @sizeOf(u32));
+        const ws = try k.words(start, @as(u64, len) * n);
+        const elems: []const Elem = @ptrCast(ws);
+        for (elems) |e| if (!valid(Elem, e)) return error.InvalidBuildGraph;
+        i.* = start + ws.len;
+        return elems;
+    }
+
+    fn field(k: Checker, i: *usize, container: anytype, comptime F: type) InvalidError!F {
+        switch (@typeInfo(F)) {
+            .void => return {},
+            .int => |info| switch (info.bits) {
+                32 => {
+                    defer i.* += 1;
+                    return k.word(i.*);
+                },
+                64 => {
+                    const ws = try k.words(i.*, 2);
+                    i.* += 2;
+                    return @bitCast(ws[0..2].*);
+                },
+                else => comptime unreachable,
+            },
+            .@"enum" => {
+                const v = std.enums.fromInt(F, try k.word(i.*)) orelse return error.InvalidBuildGraph;
+                i.* += 1;
+                return v;
+            },
+            .@"struct" => |info| switch (info.layout) {
+                .@"packed" => switch (info.backing_integer.?) {
+                    u32 => {
+                        const v = try bitsAs(F, try k.word(i.*));
+                        i.* += 1;
+                        return v;
+                    },
+                    u64 => {
+                        const ws = try k.words(i.*, 2);
+                        i.* += 2;
+                        return bitsAs(F, @as(u64, @bitCast(ws[0..2].*)));
+                    },
+                    else => comptime unreachable,
+                },
+                .auto => switch (F) {
+                    std.Target.Cpu.Feature.Set => {
+                        const n = (F.usize_count * @sizeOf(usize)) / @sizeOf(u32);
+                        const ws = try k.words(i.*, n);
+                        i.* += n;
+                        return .{ .ints = @as(*align(@alignOf(u32)) const [F.usize_count]usize, @ptrCast(ws[0..n])).* };
+                    },
+                    else => switch (F.storage) {
+                        .flag_optional => {
+                            const flag = @field(@field(container, @tagName(F.flags)), @tagName(F.flag));
+                            return .{ .value = if (flag) try k.field(i, container, F.Value) else null };
+                        },
+                        .flag_union => {
+                            const tag: F.Tag = @field(@field(container, @tagName(F.flags)), @tagName(F.flag));
+                            return .{ .u = switch (tag) {
+                                inline else => |t| @unionInit(F.Union, @tagName(t), try k.field(i, container, @typeInfo(F.Union).@"union".field_types[@backingInt(t)])),
+                            } };
+                        },
+                        .enum_optional => {
+                            const tag = @field(@field(container, @tagName(F.flags)), @tagName(F.flag));
+                            return .{ .value = if (tag == F.tag) try k.field(i, container, F.Value) else null };
+                        },
+                        .extended => @compileError("unimplemented"),
+                        .length_prefixed_list => return .{ .slice = try k.list(i, i.* + 1, try k.word(i.*), F.Elem) },
+                        .flag_length_prefixed_list => {
+                            if (!@field(@field(container, @tagName(F.flags)), @tagName(F.flag))) return .{ .slice = &.{} };
+                            return .{ .slice = try k.list(i, i.* + 1, try k.word(i.*), F.Elem) };
+                        },
+                        .flag_list => {
+                            const len: u32 = @field(@field(container, @tagName(F.flags)), @tagName(F.flag));
+                            return .{ .slice = try k.list(i, i.*, len, F.Elem) };
+                        },
+                        .multi_list => {
+                            const len = try k.word(i.*);
+                            const columns = @typeInfo(F.Elem).@"struct".field_types;
+                            const ws = try k.words(i.* + 1, @as(u64, len) * columns.len);
+                            inline for (columns, 0..) |Column, ci| {
+                                for (ws[ci * len ..][0..len]) |w| if (std.enums.fromInt(Column, w) == null) return error.InvalidBuildGraph;
+                            }
+                            i.* += 1 + ws.len;
+                            return .{ .mal = .{ .bytes = @ptrCast(@constCast(ws.ptr)), .len = len, .capacity = len } };
+                        },
+                        .union_list => {
+                            if (!@field(@field(container, @tagName(F.flags)), @tagName(F.flag))) return .{ .data = null, .len = 0 };
+                            const meta_start = i.*;
+                            var len: u32 = 0;
+                            var bit_offset: usize = 0;
+                            while (true) : (bit_offset += @bitSizeOf(F.Meta)) {
+                                const meta_words = try k.words(meta_start, (bit_offset + @bitSizeOf(F.Meta) + 31) / 32);
+                                const meta = try bitsAs(F.Meta, Configuration.loadBits(u32, meta_words, bit_offset, F.MetaInt));
+                                len += 1;
+                                if (meta.last) break;
+                            }
+                            const n = len + (len * @bitSizeOf(F.Meta) + 31) / 32;
+                            _ = try k.words(meta_start, n);
+                            i.* = meta_start + n;
+                            return .{ .data = @ptrFromInt(i.* - len), .len = len };
+                        },
+                    },
+                },
+                .@"extern" => {
+                    const n = @divExact(@sizeOf(F), @sizeOf(u32));
+                    const ws = try k.words(i.*, n);
+                    const v = @as(*align(@alignOf(u32)) const F, @ptrCast(ws)).*;
+                    if (!valid(F, v)) return error.InvalidBuildGraph;
+                    i.* += n;
+                    return v;
+                },
+            },
+            else => comptime unreachable,
+        }
+    }
+
+    fn package(k: Checker, index: Configuration.Package.Index) InvalidError!void {
+        if (index == .root) return;
+        const p = try k.data(@backingInt(index), Configuration.Package);
+        try k.string(p.dep_prefix);
+        try k.string(p.hash);
+        try k.string(p.root_path);
+    }
+
+    fn lazyPath(k: Checker, index: Configuration.LazyPath.Index) InvalidError!void {
+        switch (try k.data(@backingInt(index), Configuration.LazyPath)) {
+            .source_path => |sp| {
+                try k.string(sp.sub_path);
+                try k.package(sp.owner);
+            },
+            .relative => |rel| try k.string(rel.sub_path),
+            .generated => |g| try k.string(g.sub_path),
+        }
+    }
+
+    /// Also checks the preconditions of `ResolvedTarget.unwrapQuery`, `Target.Query.zigTriple`,
+    /// and `Target.Query.serializeCpuAlloc`
+    fn resolvedTarget(k: Checker, index: Configuration.ResolvedTarget.Index) InvalidError!void {
+        const rt = try k.data(@backingInt(index), Configuration.ResolvedTarget);
+        const result = try k.targetQuery(rt.result);
+        const query_index = rt.query.unwrap() orelse return;
+        const q = try k.targetQuery(query_index);
+        const arch = q.flags.cpu_arch.unwrap() orelse result.flags.cpu_arch.unwrap() orelse return error.InvalidBuildGraph;
+        if (q.cpu_name.value) |name| {
+            if (arch.parseCpuModel(name.slice(k.c)) == null) return error.InvalidBuildGraph;
+        }
+        if ((q.glibc_version.value != null or q.android_api_level.value != null) and q.flags.abi.unwrap() == null) return error.InvalidBuildGraph;
+        if (q.dynamic_linker.value) |s| {
+            if (s.slice(k.c).len > @typeInfo(@FieldType(std.Target.DynamicLinker, "buffer")).array.len) return error.InvalidBuildGraph;
+        }
+    }
+
+    /// A target query whose strings are in range and whose versions parse
+    fn targetQuery(k: Checker, index: Configuration.TargetQuery.Index) InvalidError!Configuration.TargetQuery {
+        const q = try k.data(@backingInt(index), Configuration.TargetQuery);
+        if (q.cpu_name.value) |s| try k.string(s);
+        if (q.dynamic_linker.value) |s| try k.string(s);
+        if (q.glibc_version.value) |s| try k.semver(s);
+        for ([_]Configuration.TargetQuery.OsVersion{ q.os_version_min.u, q.os_version_max.u }) |v| switch (v) {
+            .semver => |s| try k.semver(s),
+            else => {},
+        };
+        return q;
+    }
+
+    fn semver(k: Checker, s: Configuration.String) InvalidError!void {
+        try k.string(s);
+        _ = std.SemanticVersion.parse(s.slice(k.c)) catch return error.InvalidBuildGraph;
+    }
+};
+
+/// Converts a packed struct from its bits when every enum in it holds a declared tag
+fn bitsAs(comptime T: type, bits: @typeInfo(T).@"struct".backing_integer.?) InvalidError!T {
+    if (!packedValid(T, bits)) return error.InvalidBuildGraph;
+    return @bitCast(bits);
+}
+
+fn packedValid(comptime T: type, bits: @typeInfo(T).@"struct".backing_integer.?) bool {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, F| {
+        const raw: @Int(.unsigned, @bitSizeOf(F)) = @truncate(bits >> @bitOffsetOf(T, name));
+        switch (@typeInfo(F)) {
+            .@"enum" => if (std.enums.fromInt(F, raw) == null) return false,
+            .@"struct" => if (!packedValid(F, raw)) return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Whether a value read from the file as raw memory holds only declared enum tags
+fn valid(comptime T: type, v: T) bool {
+    switch (@typeInfo(T)) {
+        .int => return true,
+        .@"enum" => return std.enums.fromInt(T, @backingInt(v)) != null,
+        .@"struct" => |info| switch (info.layout) {
+            .@"packed" => return packedValid(T, @bitCast(v)),
+            .@"extern" => {
+                inline for (info.field_names, info.field_types) |name, F| {
+                    if (!valid(F, @field(v, name))) return false;
+                }
+                return true;
+            },
+            .auto => comptime unreachable,
+        },
+        else => comptime unreachable,
+    }
 }
 
 /// The local cache directory used by the maker (absolute path), derived from the path of the build
@@ -497,6 +823,82 @@ const Ctx = struct {
 /// directory the user specifies
 fn isFetched(root: []const u8, hash: []const u8) bool {
     return hash.len != 0 and std.mem.eql(u8, std.fs.path.basename(root), hash);
+}
+
+/// One word of a test build graph replaced: `index` counts words from the start of the header, of
+/// the first step (name, owner, deps, max_rss, extended), or of `extra`
+const TestCorruption = struct {
+    region: enum { header, step, extra },
+    index: usize,
+    value: u32,
+};
+
+/// Writes a build graph of two top-level steps, `install` depending on `check`, with one word
+/// replaced by `corrupt`
+fn writeTestGraph(dir: Io.Dir, sub_path: []const u8, corrupt: ?TestCorruption) !void {
+    // `Wip.deinit` does not free its tables: an arena holds everything
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var wip: Configuration.Wip = .init(gpa);
+    const no_deps = try wip.addExtra(Configuration.Deps, .{ .steps = .{ .slice = &.{} } });
+    const check_deps = try wip.addExtra(Configuration.Deps, .{ .steps = .{ .slice = &.{@fromBackingInt(1)} } });
+    for ([_][]const u8{ "install", "check" }, [_]Configuration.Deps.Index{ check_deps, no_deps }) |name, deps| {
+        const top = try wip.addExtraErased(Configuration.Step.TopLevel, .{ .description = try wip.addString(name) });
+        try wip.steps.append(gpa, .{ .name = try wip.addString(name), .owner = .root, .deps = deps, .max_rss = .none, .extended = @fromBackingInt(top) });
+    }
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try wip.write(&out.writer, .{ .default_step = @fromBackingInt(0), .generated_files_len = 0, .poisoned = false });
+    const bytes = out.writer.buffered();
+    if (corrupt) |c| {
+        const start = switch (c.region) {
+            .header => 0,
+            .step => @sizeOf(Configuration.Header) + wip.string_bytes.items.len,
+            .extra => bytes.len - wip.extra.items.len * 4,
+        };
+        std.mem.writeInt(u32, bytes[start + c.index * 4 ..][0..4], c.value, .native);
+    }
+    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = bytes });
+}
+
+test "load: a malformed build graph is an error, not a crash" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const env: ZigEnv = .{ .arena = .{}, .zig_exe = "zig", .lib_dir = root, .std_dir = root, .global_cache_dir = root, .version = "0.17.0" };
+
+    try writeTestGraph(tmp.dir, "good", null);
+    var model = try load(gpa, io, root, "good", &env);
+    defer model.deinit(gpa);
+    try std.testing.expectEqual(2, model.steps.len);
+    try std.testing.expectEqualStrings("check", model.steps[1].name);
+    try std.testing.expectEqualSlices(u32, &.{1}, model.steps[0].deps);
+
+    // `extra` holds the empty deps (0), the deps of `install` (1: length, 2: step), then the
+    // top-level data of `install` (3: flags with the tag, 4: description)
+    for ([_]TestCorruption{
+        // A length far beyond the file
+        .{ .region = .header, .index = 0, .value = std.math.maxInt(u32) },
+        // The default step
+        .{ .region = .header, .index = 8, .value = 2 },
+        // The name, the deps, the step data out of range
+        .{ .region = .step, .index = 0, .value = 0xffffff },
+        .{ .region = .step, .index = 2, .value = 0xffffff },
+        .{ .region = .step, .index = 4, .value = 0x123456 },
+        // A dependency that is not a step, a deps list longer than `extra`
+        .{ .region = .extra, .index = 2, .value = 2 },
+        .{ .region = .extra, .index = 1, .value = 0xffffff },
+        // A step tag out of range, a description out of range
+        .{ .region = .extra, .index = 3, .value = 31 },
+        .{ .region = .extra, .index = 4, .value = 0xffffff },
+    }) |corrupt| {
+        try writeTestGraph(tmp.dir, "bad", corrupt);
+        try std.testing.expectError(error.InvalidBuildGraph, load(gpa, io, root, "bad", &env));
+    }
 }
 
 test isFetched {
