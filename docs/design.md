@@ -456,7 +456,7 @@ Naming checks (the Names section of the Zig 0.17.0 style guide; enabled by `nami
 | `zig fmt --check`, no diff after `zig build gen` | Formatting and generated code |
 
 - `zig build test`: runs only the tests that need no external tools, for quick checks during development. Under this step, zig is not found (`ZigEnv.query` returns `ZigNotFound` in this case), so the tests that depend on it (example projects, the real standard library) are skipped, and the server starts no projects or compiles.
-- `zig build test-stress -Dstress-filter=<part of the full test name> [-Dstress-runs=<count>]`: runs the selected tests repeatedly, one after another, in server mode (50 times by default, each one actually run), to verify concurrency-related changes.
+- `zig build test-stress -Dstress-filter=<part of the full test name> [-Dstress-runs=<count>]`: runs the selected tests repeatedly, one after another, in server mode (50 times by default, each one actually run), to verify concurrency-related changes. A filter that matches no test fails.
 - `zig build sema-corpus`: runs full type inference over the standard library, checking that nothing crashes and reporting the share of known types.
 - When tests write logs to stderr, `zig build test` and `test-all` also print `failed command: ...`; exit code 0 means they passed. Real failures come with "N pass, M fail" and the test names.
 

@@ -5778,6 +5778,13 @@ fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {
 }
 
 test {
+    // Files reached only through functions: a filter that selects only their tests analyzes no
+    // function that imports them, so they are referenced here
+    _ = Progress;
+    _ = Config;
+    _ = SemanticCache;
+    _ = watch;
+    _ = client_process;
     _ = origin;
     _ = workspace_files;
     _ = Workspace;

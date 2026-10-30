@@ -93,6 +93,7 @@ pub const util = struct {
     pub const SharedAllocator = @import("util/SharedAllocator.zig");
     pub const panic_context = @import("util/panic_context.zig");
     pub const assert = @import("util/assert.zig");
+    pub const watchdog = @import("util/watchdog.zig");
     /// Test-only: converts posix-style paths to native paths
     pub const test_path = @import("util/test_path.zig");
 };
@@ -119,4 +120,13 @@ test {
     std.testing.refAllDecls(project);
     std.testing.refAllDecls(lsp);
     _ = @import("lsp/types_test.zig");
+}
+
+test {
+    // A test filter (`zig build test-stress -Dstress-filter=...`) keeps only the unnamed tests
+    // when it matches no test: fail instead of passing without running anything
+    const std = @import("std");
+    for (@import("builtin").test_functions) |t| {
+        if (std.mem.find(u8, t.name, ".test.") != null or std.mem.find(u8, t.name, ".decltest.") != null) break;
+    } else return error.NoTestMatchesTheFilter;
 }
