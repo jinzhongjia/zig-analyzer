@@ -1662,3 +1662,38 @@ test "a folder renamed on disk is registered with the client and its files follo
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+// Prevents leaving files unwatched when the client rejects the registration of file watchers
+test "a client that rejects the registration of file watchers leaves the watching to the server" {
+    const main_text = "const util = @import(\"util.zig\");\npub fn main() void {\n    util.add(1, 2);\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "util.zig", .text = "pub fn add(a: u32, b: u32) void {\n    _ = a + b;\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    h.hold_requests = true;
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+    try h.notify("initialized", Empty{});
+    const id = while (true) {
+        const m = try h.next();
+        const method = m.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "client/registerCapability")) break m.object.get("id").?;
+    };
+    h.hold_requests = false;
+    try h.write(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = -32603, .message = "cannot watch files" } });
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "util.ad"));
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "util.zig"), .data = "// one\n// two\npub fn add(a: u32, b: u32) void {\n    _ = a + b;\n}\n" });
+    try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "util.ad", .want = 2 });
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

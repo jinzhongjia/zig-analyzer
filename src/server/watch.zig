@@ -108,6 +108,9 @@ pub const Watcher = struct {
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
 
+    /// Ids of the requests sent by `registerClientGlobs` start with this
+    pub const registration_prefix = "zig-analyzer/didChangeWatchedFiles/";
+
     /// Created on the main loop, so later `wake` / `stop` calls are not lost. Falls back to polling
     /// when native notifications are unavailable.
     pub fn create(server: *Server) Allocator.Error!*Watcher {
@@ -174,7 +177,7 @@ pub const Watcher = struct {
                 // Clear first, then check: new files interned during the check wake the task
                 // again (see `onNewPath`)
                 w.resync_requested.store(false, .release);
-                if (w.server.register_watch) w.registerClientGlobs() catch |err| switch (err) {
+                if (w.server.clientWatches()) w.registerClientGlobs() catch |err| switch (err) {
                     error.OutOfMemory => log.err("out of memory while registering file watchers", .{}),
                 };
                 w.backend.wait(null);
@@ -243,7 +246,7 @@ pub const Watcher = struct {
         out.writer.writeAll("]}") catch return error.OutOfMemory;
         const options = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{}) catch return error.OutOfMemory;
         w.client_registrations += 1;
-        const id = try std.fmt.allocPrint(a, "zig-analyzer/didChangeWatchedFiles/{d}", .{w.client_registrations});
+        const id = try std.fmt.allocPrint(a, registration_prefix ++ "{d}", .{w.client_registrations});
         server.sendRequest(.{ .string = id }, "client/registerCapability", types.RegistrationParams{ .registrations = &.{.{ .id = id, .method = "workspace/didChangeWatchedFiles", .registerOptions = options }} });
     }
 

@@ -197,6 +197,8 @@ register_config: bool = false,
 /// The client supports dynamically registering `workspace/didChangeWatchedFiles` (watching
 /// external changes on disk)
 register_watch: bool = false,
+/// The client answered a registration of file watchers with an error: it does not watch files
+watch_registration_failed: std.atomic.Value(bool) = .init(false),
 /// The client supports `workspace/inlayHint/refresh` (when the inlay hints settings or results of
 /// other documents change, the client is asked to request them again); at most one refresh
 /// response is awaited at a time.
@@ -513,6 +515,8 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
                     server.semanticRefreshFinished();
                 } else if (std.mem.eql(u8, s, inlay_refresh_id)) {
                     server.inlayRefreshFinished();
+                } else if (resp.@"error" != null and (std.mem.eql(u8, s, register_id) or std.mem.startsWith(u8, s, watch.Watcher.registration_prefix))) {
+                    server.watchRegistrationFailed();
                 },
             };
         },
@@ -2101,10 +2105,28 @@ pub fn watchScope(server: *Server) WatchScope {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return switch (server.config.files_watcher) {
-        .auto => if (server.register_watch) .outside_roots else .all,
+        .auto => if (server.clientWatches()) .outside_roots else .all,
         .client => .none,
         .server => .all,
     };
+}
+
+/// The client watches files: it supports registering file watchers, and has not rejected a
+/// registration
+pub fn clientWatches(server: *Server) bool {
+    return server.register_watch and !server.watch_registration_failed.load(.acquire);
+}
+
+/// Id of the registration request sent after `initialized`
+const register_id = "zig-analyzer/register";
+
+/// The client answered a registration of file watchers with an error (an error answers a
+/// registration request as a whole): with `files.watcher` set to `auto`, the server watches the
+/// files itself instead
+fn watchRegistrationFailed(server: *Server) void {
+    if (server.watch_registration_failed.swap(true, .acq_rel)) return;
+    log.info("the client cannot watch files, watching them on the server instead", .{});
+    server.resyncWatcher();
 }
 
 /// Rules for classifying file origins (see `origin.classify`), copied into `arena`: the zig
@@ -2465,7 +2487,7 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
         try registrations.append(arena, .{ .id = "zig-analyzer/didChangeWatchedFiles", .method = "workspace/didChangeWatchedFiles", .registerOptions = options });
     }
     if (registrations.items.len != 0) {
-        server.sendRequest(.{ .string = "zig-analyzer/register" }, "client/registerCapability", types.RegistrationParams{ .registrations = registrations.items });
+        server.sendRequest(.{ .string = register_id }, "client/registerCapability", types.RegistrationParams{ .registrations = registrations.items });
     }
     if (server.pull_config) {
         // Start projects once the configuration has been pulled
