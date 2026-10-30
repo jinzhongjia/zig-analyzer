@@ -541,6 +541,10 @@ const Mode = enum {
     background,
     /// Like `read`, but the handler does name resolution and type queries through a Resolver
     semantic,
+    /// Like `read`, for handlers whose results depend only on the text of documents: write
+    /// transactions that change no text (such as the module graph after a build) wait for them
+    /// instead of canceling them
+    syntax,
 };
 
 const request_handlers = .{
@@ -549,13 +553,13 @@ const request_handlers = .{
     .{ "zig-analyzer/waitIdle", Mode.background, waitIdleRequest },
     .{ "zig-analyzer/status", Mode.read, status },
     .{ "zig-analyzer/fileStatus", Mode.read, fileStatus },
-    .{ "zig-analyzer/syntaxTree", Mode.read, syntaxTree },
+    .{ "zig-analyzer/syntaxTree", Mode.syntax, syntaxTree },
     .{ "zig-analyzer/moduleGraph", Mode.read, moduleGraph },
     .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
-    .{ "textDocument/formatting", Mode.read, formatting },
-    .{ "textDocument/documentSymbol", Mode.read, documentSymbol },
-    .{ "textDocument/foldingRange", Mode.read, foldingRange },
-    .{ "textDocument/selectionRange", Mode.read, selectionRange },
+    .{ "textDocument/formatting", Mode.syntax, formatting },
+    .{ "textDocument/documentSymbol", Mode.syntax, documentSymbol },
+    .{ "textDocument/foldingRange", Mode.syntax, foldingRange },
+    .{ "textDocument/selectionRange", Mode.syntax, selectionRange },
     .{ "textDocument/semanticTokens/full", Mode.semantic, semanticTokensFull },
     .{ "textDocument/semanticTokens/full/delta", Mode.semantic, semanticTokensDelta },
     .{ "textDocument/semanticTokens/range", Mode.semantic, semanticTokensRange },
@@ -606,13 +610,14 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     const result = func(server, a, params) catch |err| return server.sendHandlerError(id, err, false);
                     server.sendResponse(id, result);
                 },
-                .read, .semantic => {
-                    const pending = server.addPending(a, id) catch |err| {
+                .read, .semantic, .syntax => {
+                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{FileText}) else null;
+                    const pending = server.addPending(a, id, inputs) catch |err| {
                         defer server.destroyArena(arena);
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
                         return err;
                     };
-                    const Task = if (h[1] == .read) ReadTask(func, h[0]) else SemanticTask(func, h[0]);
+                    const Task = if (h[1] == .semantic) SemanticTask(func, h[0]) else ReadTask(func, h[0]);
                     // semantic must run on a separate thread: when the thread count reaches the
                     // limit (CPU core count - 1; long-blocking project tasks also take slots),
                     // `async` runs synchronously on the main loop, while background requests wait
@@ -633,10 +638,11 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
 }
 
 /// Registers an in-flight request (can be canceled by `$/cancelRequest`); the Pending is allocated
-/// in the request's arena. Called on the main loop when the request is received.
-fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id) !*Pending {
+/// in the request's arena. Called on the main loop when the request is received; `inputs` are the
+/// inputs its result may depend on (null: all).
+fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id, inputs: ?Db.Inputs) !*Pending {
     const pending = try a.create(Pending);
-    pending.* = .{ .id = id, .since = server.db.mark() };
+    pending.* = .{ .id = id, .since = server.db.mark(inputs) };
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
     try server.pending.append(server.gpa, pending);
@@ -975,8 +981,9 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     // every build that finishes gets here, and a write transaction cancels in-flight computations
     // and requests (the requests fail with ContentModified)
     if (try server.moduleGraphUnchanged(graph, t)) return;
-    // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it
-    server.db.beginWrite();
+    // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it.
+    // Requests that read only text cannot change with the module graph: they are not canceled.
+    server.db.beginWriteOf(comptime Db.inputSet(&.{ ModuleGraph.Input, za.sema.queries.TargetAbi }));
     defer server.db.endWrite();
     // `set` allocates only when the key is not interned yet: ensure both keys first, so that
     // the two set calls afterwards cannot fail and cannot leave a partial update either
@@ -1125,7 +1132,7 @@ fn scanOnce(server: *Server) Allocator.Error!void {
     };
     if (unchanged) return;
     {
-        server.db.beginWrite();
+        server.db.beginWriteOf(comptime Db.inputSet(&.{WorkspaceFiles}));
         defer server.db.endWrite();
         // The engine takes ownership of the value, also when it fails
         try server.db.set(WorkspaceFiles, {}, try server.gpa.dupe(Vfs.FileId, files), .low);
@@ -2392,7 +2399,7 @@ fn startup(server: *Server) Io.Cancelable!void {
         defer if (message) |m| server.gpa.free(m);
         server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
-        server.db.beginWrite();
+        server.db.beginWriteOf(comptime Db.inputSet(&.{live.LiveBackend}));
         defer server.db.endWrite();
         server.db.set(live.LiveBackend, {}, .{ .subprocess = exe }, .high) catch {};
     }

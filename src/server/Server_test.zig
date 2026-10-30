@@ -817,6 +817,63 @@ test "exit and the end of input cancel the requests in flight instead of waiting
     }
 }
 
+test "a module graph update does not cancel the outline, folding and selection requests in flight" {
+    // Guards against server writes that change no text (the module graph after the zig
+    // environment query or a build) answering the syntax requests in flight with ContentModified,
+    // although their results cannot change
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-6";
+    const text =
+        \\const S = struct {
+        \\    a: u32,
+        \\    fn f(s: S) u32 {
+        \\        return s.a;
+        \\    }
+        \\};
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const doc = .{ .textDocument = .{ .uri = uri } };
+    const positions = .{ .textDocument = .{ .uri = uri }, .positions = &[_]struct { line: u32, character: u32 }{.{ .line = 3, .character = 17 }} };
+    inline for (.{ .{ "textDocument/documentSymbol", doc }, .{ "textDocument/foldingRange", doc }, .{ "textDocument/selectionRange", positions } }, 0..) |r, i| {
+        const expected = try std.json.Stringify.valueAlloc(a, (try h.request(r[0], r[1])).object.get("result").?, .{});
+
+        var gate: Server.TestGate = .{ .method = r[0], .point = .in_read };
+        h.server.test_gate = &gate;
+        defer h.server.test_gate = null;
+        defer gate.release.set(testing.io);
+        const held = try h.send(r[0], r[1]);
+        try gate.entered.wait(testing.io);
+        // Another default builtin.zig changes the module graph, as a zig environment query does
+        {
+            h.server.env_mutex.lockUncancelable(testing.io);
+            defer h.server.env_mutex.unlock(testing.io);
+            if (h.server.default_builtin) |p| testing.allocator.free(p);
+            h.server.default_builtin = try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i});
+        }
+        const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+        defer update.join();
+        // The update waits for the held request
+        while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+        gate.release.set(testing.io);
+        const response = try h.response(held);
+        try testing.expect(response.object.get("error") == null);
+        try testing.expectEqualStrings(expected, try std.json.Stringify.valueAlloc(a, response.object.get("result").?, .{}));
+    }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "function completions carry no signature in the list and resolve to the signature and doc" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

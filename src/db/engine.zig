@@ -60,6 +60,7 @@
 //! old values are freed only at the next write transaction.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -208,6 +209,29 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         pub const query_types = queries;
 
+        /// A set of input queries, by index in `queries`: the inputs a write transaction may change
+        /// (`beginWriteOf`), or the inputs the results of a read transaction may depend on (`mark`)
+        pub const Inputs = std.bit_set.Static(queries.len);
+
+        /// All input queries
+        pub const all_inputs: Inputs = blk: {
+            var all: Inputs = .empty;
+            for (queries, 0..) |Q, qi| if (Q.kind == .input) all.set(qi);
+            break :blk all;
+        };
+
+        pub fn inputSet(comptime list: []const type) Inputs {
+            const inputs = comptime blk: {
+                var s: Inputs = .empty;
+                for (list) |Q| {
+                    assert(Q.kind == .input);
+                    s.set(queryIndex(Q));
+                }
+                break :blk s;
+            };
+            return inputs;
+        }
+
         io: Io,
         gpa: Allocator,
         env: Env,
@@ -216,16 +240,26 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         rw: Io.RwLock = .init,
         /// Protects the metadata of all tables (key interning, slots, memos, garbage list)
         mutex: Io.Mutex = .init,
-        /// Number of write transactions waiting for the exclusive lock; while nonzero, read queries
-        /// exit with `error.Canceled`. A write transaction decrements it only after acquiring the
-        /// lock: when several write transactions are queued, the first one to get the lock does not
-        /// clear the registrations of the ones after it, so read transactions that get the shared
-        /// lock in between are canceled as well.
+        /// Number of write transactions waiting for the exclusive lock; while nonzero, the queries of
+        /// read transactions that may depend on any input exit with `error.Canceled` (a read
+        /// transaction restricted to some inputs checks `pending_inputs` instead, see
+        /// `Ctx.inputs`). A write transaction decrements it only after acquiring the lock: when
+        /// several write transactions are queued, the first one to get the lock does not clear the
+        /// registrations of the ones after it, so read transactions that get the shared lock in
+        /// between are canceled as well.
         pending_write: std.atomic.Value(u32) = .init(0),
+        /// Like `pending_write`, per input query (indexed like `queries`): the write transactions
+        /// waiting for the exclusive lock that may change it
+        pending_inputs: [queries.len]std.atomic.Value(u32) = @splat(.init(0)),
+        /// Per input query (indexed like `queries`): the number of write transactions begun that may
+        /// change it, the position of a `Mark` restricted to some inputs
+        input_writes: [queries.len]std.atomic.Value(u64) = @splat(.init(0)),
         /// Number of in-flight read transactions. It must be 0 when memo values are freed
         /// (eviction, garbage collection, `resetQueries`), which is checked by assertions.
         active_readers: std.atomic.Value(u32) = .init(0),
         writing: bool = false,
+        /// The inputs the current write transaction may set
+        write_inputs: Inputs = .empty,
         bumped_in_write: bool = false,
 
         revision: Revision = 1,
@@ -422,14 +456,30 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         // ── Write transactions ─────────────────────────────────────────────
 
-        /// Begins a write transaction: cancels in-flight read queries and waits for all read
-        /// transactions to finish.
+        /// Begins a write transaction that may set any input: cancels in-flight read queries and
+        /// waits for all read transactions to finish.
         pub fn beginWrite(db: *Db) void {
+            db.beginWriteOf(all_inputs);
+        }
+
+        /// Begins a write transaction that sets only the inputs in `changes`: cancels the in-flight
+        /// queries of the read transactions that may depend on them, and waits for all read
+        /// transactions to finish (those that cannot depend on them run to completion, since the
+        /// write cannot change their results).
+        pub fn beginWriteOf(db: *Db, changes: Inputs) void {
             _ = db.writes.fetchAdd(1, .monotonic);
+            var it = changes.iterator(.{});
+            while (it.next()) |qi| {
+                _ = db.input_writes[qi].fetchAdd(1, .monotonic);
+                _ = db.pending_inputs[qi].fetchAdd(1, .release);
+            }
             _ = db.pending_write.fetchAdd(1, .release);
             db.rw.lockUncancelable(db.io);
             _ = db.pending_write.fetchSub(1, .release);
+            it = changes.iterator(.{});
+            while (it.next()) |qi| _ = db.pending_inputs[qi].fetchSub(1, .release);
             db.writing = true;
+            db.write_inputs = changes;
             db.bumped_in_write = false;
             db.collectGarbage();
             db.evictLocked();
@@ -444,6 +494,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         pub fn tryBeginWrite(db: *Db) bool {
             if (!db.rw.tryLock(db.io)) return false;
             db.writing = true;
+            db.write_inputs = .empty;
             db.bumped_in_write = false;
             db.collectGarbage();
             db.evictLocked();
@@ -609,15 +660,16 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// two sets.
         pub fn ensureInput(db: *Db, comptime Q: type, key: Q.Key) Allocator.Error!void {
             comptime assert(Q.kind == .input);
-            assert(db.writing);
+            assert(db.writing and db.write_inputs.isSet(comptime queryIndex(Q)));
             _ = try db.internLocked(Q, key);
         }
 
         /// Sets an input; the engine takes ownership of `value`. Does not advance the revision when
-        /// the value equals the old value.
+        /// the value equals the old value. The write transaction must have declared the input (see
+        /// `beginWriteOf`).
         pub fn set(db: *Db, comptime Q: type, key: Q.Key, value: Q.Value, durability: Durability) Allocator.Error!void {
             comptime assert(Q.kind == .input);
-            assert(db.writing);
+            assert(db.writing and db.write_inputs.isSet(comptime queryIndex(Q)));
             const table = &db.tables[comptime queryIndex(Q)];
             const index = db.internLocked(Q, key) catch |err| {
                 var v = value;
@@ -674,26 +726,44 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return db.beginReadAt(gpa, null);
         }
 
-        /// A point in the sequence of write transactions (see `beginReadAt`)
-        pub const Mark = struct { writes: u64 };
+        /// A point in the sequence of write transactions that may change some inputs (see
+        /// `beginReadAt`)
+        pub const Mark = struct {
+            /// The inputs the read may depend on; null means all
+            inputs: ?Inputs,
+            writes: u64,
+        };
 
-        /// The current point in the sequence of write transactions
-        pub fn mark(db: *Db) Mark {
-            return .{ .writes = db.writes.load(.acquire) };
+        /// The current point in the sequence of write transactions that may change `inputs` (null
+        /// means all inputs)
+        pub fn mark(db: *Db, inputs: ?Inputs) Mark {
+            return .{ .inputs = inputs, .writes = db.writesTo(inputs) };
+        }
+
+        /// Number of write transactions begun that may change any of `inputs` (null: all), counted
+        /// once per input: it grows exactly when such a write transaction begins
+        fn writesTo(db: *Db, inputs: ?Inputs) u64 {
+            const some = inputs orelse return db.writes.load(.acquire);
+            var n: u64 = 0;
+            var it = some.iterator(.{});
+            while (it.next()) |qi| n += db.input_writes[qi].load(.acquire);
+            return n;
         }
 
         /// Begins a read transaction for a read that must see the inputs as they were at `since`
         /// (taken earlier with `mark`), such as a request that is answered on the state it was
-        /// received in: when a write transaction has begun after the mark, even one that has
-        /// already finished, the read transaction is canceled (its reads return
-        /// `error.Canceled`). Null reads the current state.
+        /// received in: when a write transaction that may change the inputs of the mark has begun
+        /// after the mark, even one that has already finished, the read transaction is canceled
+        /// (its reads return `error.Canceled`). Write transactions that cannot change those inputs
+        /// do not cancel it at all (see `Ctx.inputs`). Null reads the current state of all inputs.
         pub fn beginReadAt(db: *Db, gpa: Allocator, since: ?Mark) Ctx {
             db.rw.lockSharedUncancelable(db.io);
             _ = db.active_readers.fetchAdd(1, .acq_rel);
             const main = db.stack_budget.main orelse std.Thread.getCurrentId();
             const budget = if (std.Thread.getCurrentId() == main) max_stack_bytes else db.stack_budget.worker_bytes;
-            const stale = if (since) |m| db.writes.load(.acquire) != m.writes else false;
-            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget, .stale = stale };
+            const m = since orelse return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget };
+            const stale = db.writesTo(m.inputs) != m.writes;
+            return .{ .db = db, .gpa = gpa, .stack_base = @frameAddress(), .stack_budget = budget, .inputs = m.inputs, .stale = stale };
         }
 
         pub const Ctx = struct {
@@ -703,6 +773,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             cancel: ?*const std.atomic.Value(bool) = null,
             /// Records the executed queries (slow-request log); nothing is recorded when null
             trace: ?*Trace = null,
+            /// The inputs the results of this read transaction may depend on (null: all). Write
+            /// transactions that cannot change any of them do not cancel it: they wait for it to
+            /// finish, as its results stay valid. Reading another input is a bug, checked in Debug
+            /// builds.
+            inputs: ?Inputs = null,
             /// A write transaction began after the point this read transaction must see (see
             /// `beginReadAt`): all its reads are canceled
             stale: bool = false,
@@ -810,7 +885,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             /// Long-running computes should call this periodically.
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
-                if (ctx.stale or ctx.db.pending_write.load(.acquire) != 0) return error.Canceled;
+                if (ctx.stale) return error.Canceled;
+                const db = ctx.db;
+                if (ctx.inputs) |inputs| {
+                    var it = inputs.iterator(.{});
+                    while (it.next()) |qi| if (db.pending_inputs[qi].load(.acquire) != 0) return error.Canceled;
+                } else if (db.pending_write.load(.acquire) != 0) return error.Canceled;
                 if (ctx.cancel) |c| if (c.load(.acquire)) return error.Canceled;
             }
 
@@ -889,6 +969,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 try ctx.checkCanceled();
                 const qi = comptime queryIndex(Q);
                 const db = ctx.db;
+                if (Q.kind == .input and builtin.mode == .debug) if (ctx.inputs) |inputs| if (!inputs.isSet(qi)) {
+                    std.debug.panic("{s} read in a read transaction that does not declare it", .{@typeName(Q)});
+                };
 
                 db.mutex.lockUncancelable(db.io);
                 const index = db.internLocked(Q, key) catch |err| {

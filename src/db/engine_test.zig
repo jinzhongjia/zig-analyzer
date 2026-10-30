@@ -958,7 +958,7 @@ test "cancellation: a read bound to a mark is canceled by any write transaction 
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
     try setNumber(&d, Number, 1, 7, .low);
-    const m = d.mark();
+    const m = d.mark(null);
     // A write that sets no input and cancels nothing does not move the mark
     try testing.expect(d.tryBeginWrite());
     d.endWrite();
@@ -974,9 +974,49 @@ test "cancellation: a read bound to a mark is canceled by any write transaction 
         defer ctx.end();
         try testing.expectError(error.Canceled, ctx.get(Plus, 1));
     }
-    var ctx = d.beginReadAt(testing.allocator, d.mark());
+    var ctx = d.beginReadAt(testing.allocator, d.mark(null));
     defer ctx.end();
     try testing.expectEqual(8, try ctx.get(Plus, 1));
+}
+
+test "cancellation: a write transaction cancels only the reads that may depend on the inputs it changes" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    const numbers = Db.inputSet(&.{Number});
+    const before_any = d.mark(null);
+    const before_numbers = d.mark(numbers);
+    const Writer = struct {
+        fn run(dd: *Db) void {
+            dd.beginWriteOf(Db.inputSet(&.{Stable}));
+            defer dd.endWrite();
+            dd.set(Stable, 1, 5, .low) catch unreachable;
+        }
+    };
+    {
+        var ctx = d.beginReadAt(testing.allocator, d.mark(numbers));
+        const writer = std.Thread.spawn(.{}, Writer.run, .{&d}) catch |err| {
+            ctx.end();
+            return err;
+        };
+        while (d.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+        // The write of another input waits for this read transaction instead of canceling it
+        const value = ctx.get(Plus, 1);
+        const canceled = ctx.checkCanceled();
+        ctx.end();
+        writer.join();
+        try testing.expectEqual(1, try value);
+        try canceled;
+    }
+    // Marks taken before the write: it moved only the one that covers all inputs
+    {
+        var ctx = d.beginReadAt(testing.allocator, before_numbers);
+        defer ctx.end();
+        try testing.expectEqual(1, try ctx.get(Plus, 1));
+    }
+    var ctx = d.beginReadAt(testing.allocator, before_any);
+    defer ctx.end();
+    try testing.expectError(error.Canceled, ctx.get(Plus, 1));
 }
 
 test "tryBeginWrite neither cancels nor waits for read transactions" {
