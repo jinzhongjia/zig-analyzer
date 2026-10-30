@@ -1502,3 +1502,40 @@ const Restarted = struct {
         return visibleInstance(h) != c.from;
     }
 };
+
+// Prevents a deleted file that was only read from disk (imported in single-file mode) from keeping
+// its old text: its absence equals the never-set text, which must still replace the read
+test "a deleted imported file of a single file is no longer resolved" {
+    const main_text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    const n = lib.compute(3);\n    _ = n;\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "lib.zig", .text = "pub fn compute(x: u32) u32 {\n    return x * 2;\n}\npub const answer: u8 = 42;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{
+        .rootUri = root_uri,
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("lib.zig", try gotoFile(&h, main_uri, main_text, "lib.comp"));
+    try testing.expectEqualStrings("compute answer", try completionLabels(&h, main_uri, main_text, "= lib."));
+
+    const lib_path = try project.path(a, "lib.zig");
+    try std.Io.Dir.cwd().deleteFile(testing.io, lib_path);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, lib_path), .type = 3 }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("null", try gotoFile(&h, main_uri, main_text, "lib.comp"));
+    try testing.expectEqualStrings("", try completionLabels(&h, main_uri, main_text, "= lib."));
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}

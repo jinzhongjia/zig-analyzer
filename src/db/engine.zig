@@ -938,6 +938,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 return n > 0 and ctx.stack.items[n - 1].in_cycle;
             }
 
+            /// Whether input `Q` has ever been set for `key` (one never set reads as `Q.default`).
+            /// Records no dependency.
+            pub fn isSet(ctx: *Ctx, comptime Q: type, key: Q.Key) bool {
+                comptime assert(Q.kind == .input);
+                const db = ctx.db;
+                const table = &db.tables[comptime queryIndex(Q)];
+                table.mutex.lockUncancelable(db.io);
+                defer table.mutex.unlock(db.io);
+                const index = table.keys.getIndex(key) orelse return false;
+                return table.slots.items[index].is_set;
+            }
+
             /// Long-running computes should call this periodically.
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
                 if (ctx.stale) return error.Canceled;
