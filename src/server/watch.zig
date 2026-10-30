@@ -464,8 +464,10 @@ pub const Watcher = struct {
         if (w.fallback.items.len == 0) {
             w.next_poll = null;
             w.poller.reset();
-        } else if (w.next_poll == null) {
-            w.schedulePoll();
+        } else {
+            // Like adding a watch, from now on: changes before the first poll are reported too
+            try w.poller.track(server.io, a, w.fallback.items);
+            if (w.next_poll == null) w.schedulePoll();
         }
         log.debug("watching {d} directories for {d} files ({d} checked periodically)", .{ dirs.count(), w.files.count(), w.fallback.items.len });
     }
@@ -614,8 +616,8 @@ fn stat(io: Io, path: []const u8) ?Stamp {
     return .{ .size = st.size, .mtime = st.mtime.nanoseconds };
 }
 
-/// Polling: checks the size and modification time of a set of files. The first check of a file
-/// only records its state; only later changes count.
+/// Polling: checks the size and modification time of a set of files. The state of a file is
+/// recorded when it starts being polled (`track`, or its first check); only later changes count.
 const Poller = struct {
     gpa: Allocator,
     /// Path (owned by `gpa`) → state at the last check
@@ -631,17 +633,43 @@ const Poller = struct {
         p.seen.clearRetainingCapacity();
     }
 
-    /// Checks `paths` and records changes in `pending`; files not in `paths` are no longer tracked
-    fn poll(p: *Poller, io: Io, a: Allocator, paths: []const []const u8, pending: *Pending) Allocator.Error!void {
-        var current: std.StringArrayHashMapUnmanaged(?Stamp) = .empty;
-        for (paths) |path| try current.put(a, path, stat(io, path));
+    /// Starts tracking the files in `paths` not tracked yet, recording their current state, so
+    /// their changes from now on count; files not in `paths` are no longer tracked
+    fn track(p: *Poller, io: Io, a: Allocator, paths: []const []const u8) Allocator.Error!void {
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (paths) |path| try wanted.put(a, path, {});
+        p.retain(&wanted);
+        for (paths) |path| {
+            const gop = try p.seen.getOrPut(p.gpa, path);
+            if (gop.found_existing) continue;
+            gop.key_ptr.* = p.gpa.dupe(u8, path) catch |err| {
+                p.seen.swapRemoveAt(gop.index);
+                return err;
+            };
+            gop.value_ptr.* = stat(io, path);
+        }
+    }
+
+    /// Stops tracking the files not in `wanted`
+    fn retain(p: *Poller, wanted: *const std.StringHashMapUnmanaged(void)) void {
         var i: usize = p.seen.count();
         while (i > 0) {
             i -= 1;
-            if (current.contains(p.seen.keys()[i])) continue;
+            if (wanted.contains(p.seen.keys()[i])) continue;
             p.gpa.free(p.seen.keys()[i]);
             p.seen.swapRemoveAt(i);
         }
+    }
+
+    /// Checks `paths` and records changes in `pending`; files not in `paths` are no longer tracked
+    fn poll(p: *Poller, io: Io, a: Allocator, paths: []const []const u8, pending: *Pending) Allocator.Error!void {
+        var current: std.StringArrayHashMapUnmanaged(?Stamp) = .empty;
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (paths) |path| {
+            try current.put(a, path, stat(io, path));
+            try wanted.put(a, path, {});
+        }
+        p.retain(&wanted);
         for (current.keys(), current.values()) |path, now| {
             const gop = try p.seen.getOrPut(p.gpa, path);
             if (!gop.found_existing) {
@@ -1681,4 +1709,35 @@ test "FSEvents: changes held back by a replaced stream are still reported" {
     try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &failed);
     try testing.expectEqual(0, failed.items.len);
     try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
+}
+
+// Prevents losing a change made after a file starts being polled but before its first check:
+// the state is recorded when the file joins the polled files, not at the first check
+test "poller: a change before the first check of a tracked file is reported" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const a_path = try std.fs.path.join(a, &.{ dir, "a.zig" });
+    const b_path = try std.fs.path.join(a, &.{ dir, "b.zig" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "a" });
+
+    var poller: Poller = .{ .gpa = testing.allocator };
+    defer poller.deinit();
+    const paths = [_][]const u8{ a_path, b_path };
+    try poller.track(testing.io, a, &paths);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "aa" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = "b" });
+    // Tracking again keeps the recorded states
+    try poller.track(testing.io, a, &paths);
+    var pending: Pending = .{};
+    try poller.poll(testing.io, a, &paths, &pending);
+    try testing.expectEqual(Pending.Hint.changed, pending.paths.get(a_path).?);
+    try testing.expectEqual(Pending.Hint.created, pending.paths.get(b_path).?);
+    // Files no longer tracked are forgotten
+    try poller.track(testing.io, a, paths[0..1]);
+    try testing.expectEqual(1, poller.seen.count());
 }
