@@ -1016,6 +1016,99 @@ test "add missing switch prongs of a non-exhaustive enum" {
     ));
 }
 
+test "add missing switch prongs counts qualified and aliased items as covered" {
+    // Covered tags written through their type or an alias are not added again (duplicate
+    // switch value)
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u32 {
+        \\    <|>switch (e) {
+        \\        E.a => return 1,
+        \\    }
+        \\    return 0;
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u32 {
+        \\    switch (e) {
+        \\        E.a => return 1,
+        \\        .b => {},
+        \\        .c => {},
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        .a, E.b => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        .a, E.b => {},
+        \\        .c => {},
+        \\    }
+        \\}
+    );
+    try expectAction(
+        \\const E = enum { a, b, c };
+        \\const first = E.a;
+        \\fn f(e: E) void {
+        \\    <|>switch (e) {
+        \\        first => {},
+        \\    }
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b, c };
+        \\const first = E.a;
+        \\fn f(e: E) void {
+        \\    switch (e) {
+        \\        first => {},
+        \\        .b => {},
+        \\        .c => {},
+        \\    }
+        \\}
+    );
+    try expectAction(
+        \\const T = enum { a, b };
+        \\const U = union(T) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    <|>switch (u) {
+        \\        T.a => |v| return v,
+        \\    }
+        \\    return 0;
+        \\}
+    , "add missing switch prongs",
+        \\const T = enum { a, b };
+        \\const U = union(T) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    switch (u) {
+        \\        T.a => |v| return v,
+        \\        .b => {},
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    // Every tag is covered
+    try testing.expectEqualStrings("no action", try applyNone(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) u32 {
+        \\    return <|>switch (e) { E.a => 1, E.b => 2, E.c => 3 };
+        \\}
+    ));
+    // An item whose value is unknown may cover any tag
+    try testing.expectEqualStrings("no action", try applyNone(
+        \\const E = enum { a, b, c };
+        \\fn f(e: E) void {
+        \\    <|>switch (e) { missing => {} }
+        \\}
+    ));
+}
+
 fn applyNone(text: []const u8) ![]const u8 {
     const got = try apply(text, "add missing switch prongs");
     defer testing.allocator.free(got);

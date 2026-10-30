@@ -702,25 +702,31 @@ fn innermost(r: *Resolver, file: FileId, offset: u32, comptime tag: std.meta.Tag
 }
 
 /// Adds `.name => {}` for the enum or union tags that no prong covers, and `_ => {}` for a
-/// non-exhaustive enum without a `_` prong (Sema requires both even with a `_` prong)
+/// non-exhaustive enum without a `_` prong (Sema requires both even with a `_` prong). An item
+/// other than an enum literal or `_` (`E.a`, an alias) covers the tag it evaluates to; not offered
+/// when the value of such an item is unknown.
 fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Action {
     const at = try innermost(r, file, offset, .@"switch") orelse return null;
     const sw = at.body.expr(at.expr).@"switch";
-    var covered: std.StringHashMapUnmanaged(void) = .empty;
-    var has_underscore = false;
-    for (sw.prongs) |p| {
-        if (p.is_else) return null;
-        for (p.items) |i| switch (at.body.expr(i)) {
-            .enum_literal => |n| try covered.put(r.arena, ast.identName(n), {}),
-            .name_ref => |n| if (std.mem.eql(u8, n, "_") and !at.body.nameRefIsEscaped(i)) {
-                has_underscore = true;
-            },
-            else => {},
-        };
-    }
+    for (sw.prongs) |p| if (p.is_else) return null;
     const res = try r.ctx.get(queries.Infer, .{ .owner = try r.ownerKey(file, at.item), .mode = .full });
     if (res.exprs.len != at.body.exprs.len) return null;
     const ip = r.ctx.db.env.ip;
+    var covered: std.StringHashMapUnmanaged(void) = .empty;
+    var has_underscore = false;
+    for (sw.prongs) |p| for (p.items) |i| switch (at.body.expr(i)) {
+        .enum_literal => |n| try covered.put(r.arena, ast.identName(n), {}),
+        else => |e| if (e == .name_ref and std.mem.eql(u8, e.name_ref, "_") and !at.body.nameRefIsEscaped(i)) {
+            has_underscore = true;
+        } else {
+            const val = res.exprs[@backingInt(i)].val orelse return null;
+            switch (ip.key(val)) {
+                .enum_tag => |t| try covered.put(r.arena, t.name, {}),
+                .enum_literal => |n| try covered.put(r.arena, n, {}),
+                else => return null,
+            }
+        },
+    };
     var ty = res.exprs[@backingInt(sw.operand)].ty;
     if (ip.key(ty) == .union_tag_type) ty = ip.key(ty).union_tag_type;
     const kind = switch (ip.key(ty)) {
