@@ -1578,12 +1578,15 @@ const Inferrer = struct {
         }
         if (eq(u8, name, "@Int")) {
             if (args.len != 2) return typeUnknown();
-            const sign = switch (inf.body.expr(args[0])) {
+            // The signedness is any known `std.lang.Signedness` value (or an enum literal), the
+            // bit count a `u16`
+            const sign_tv = try inf.infer(args[0], null);
+            const sign: ?std.builtin.Signedness = if (sign_tv.val) |v| switch (ip.key(v)) {
                 .enum_literal => |n| std.meta.stringToEnum(std.builtin.Signedness, n),
+                .enum_tag => |t| std.meta.stringToEnum(std.builtin.Signedness, t.name),
                 else => null,
-            };
-            _ = try inf.infer(args[0], null);
-            const bits = try inf.infer(args[1], .u8_type);
+            } else null;
+            const bits = try inf.infer(args[1], try ip.intType(.unsigned, 16));
             const n: ?u16 = if (bits.val) |v| switch (ip.key(v)) {
                 .int_value => |iv| std.math.cast(u16, iv.value),
                 else => null,

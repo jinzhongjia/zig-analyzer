@@ -2271,6 +2271,34 @@ test "std.meta type functions" {
     });
 }
 
+test "@Int in function bodies takes any known signedness and u16 bit counts" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\fn f() void {
+        \\    const L256 = @Int(.unsigned, 256);
+        \\    const W = @Int(.unsigned, 2 * @bitSizeOf(u128));
+        \\    var w: W = 0;
+        \\    const s: std.lang.Signedness = .signed;
+        \\    const N = @Int(s, 16);
+        \\    const G = @Int(@typeInfo(i32).int.signedness, @typeInfo(i32).int.bits * 2);
+        \\    const y: G = 3;
+        \\    const cb = 256;
+        \\    const C = @Int(.unsigned, cb);
+        \\    const T300 = @Int(.unsigned, 300);
+        \\    _ = .{ L256, &w, N, y, C, T300 };
+        \\}
+    , &.{
+        .{ "L256", "type = u256" },
+        .{ "W", "type = u256" },
+        .{ "w", "u256" },
+        .{ "N", "type = i16" },
+        .{ "G", "type = i64" },
+        .{ "y", "i64 = 3" },
+        .{ "C", "type = u256" },
+        .{ "T300", "type = u300" },
+    });
+}
+
 test "type reflection and reification" {
     try expectStdTypes(
         \\const std = @import("std");
