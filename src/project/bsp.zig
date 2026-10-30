@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Watchdog = @import("../util/watchdog.zig").Watchdog;
+const child_process = @import("../util/child_process.zig");
 const native_os = @import("builtin").os.tag;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -221,7 +222,7 @@ pub const Client = struct {
         errdefer gpa.destroy(c);
         var group: Group = .create(io);
         errdefer group.destroy(io);
-        var child = try std.process.spawn(io, .{
+        var child = try child_process.spawn(io, .{
             .argv = argv.items,
             .cwd = .{ .path = build_root },
             .environ_map = env.childEnviron(),
@@ -555,7 +556,7 @@ const Group = switch (native_os) {
         pgid: std.posix.pid_t = 0,
 
         fn create(io: Io) @This() {
-            const watchdog = std.process.spawn(io, .{
+            const watchdog = child_process.spawn(io, .{
                 .argv = &.{ "/bin/sh", "-c", "read _; kill -9 0" },
                 .stdin = .pipe,
                 .stdout = .ignore,
@@ -657,7 +658,7 @@ pub const SingleFileResult = struct {
 /// zig of `env` and requests one compilation
 pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
-    var child = try std.process.spawn(io, .{
+    var child = try child_process.spawn(io, .{
         .argv = &.{ env.zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path) },
         .cwd = .{ .path = dir },
         .environ_map = env.childEnviron(),
