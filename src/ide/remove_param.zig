@@ -402,6 +402,8 @@ const ListItem = struct {
 ///   before it for the last item, the comma after it for the others. Next to a multiline string
 ///   literal, only the text up to the comma is removed, keeping the line breaks before and
 ///   after the multiline string literal
+/// - A `//` comment after the separator before the item (`(` or the previous comma) on the same
+///   line belongs to the previous item or to the call, and is kept with its line break
 /// - When only whitespace is left between the parentheses after the removal, everything between
 ///   them is removed: `f()`
 ///
@@ -451,18 +453,56 @@ pub fn removeItem(arena: Allocator, text: []const u8, list: SyntaxNode, index: u
     const x = all[index];
     const n = all.len;
     const limit = if (index + 1 < n) all[index + 1].start else r;
-    const span: [2]u32 = if (ownLines(text, x, limit)) |lines|
-        lines
-    else if (n == 1)
-        .{ l, r }
+    if (ownLines(text, x, limit)) |lines| return removal(text, l, r, lines);
+    const kept = separatorComment(text, if (index == 0) l else all[index - 1].comma.?.end, x.start);
+    // With a kept comment, the removal starts after the indentation of the line following it
+    const after_kept = if (kept) |nl| indentEnd(text, nl + 1) else null;
+    if (index + 1 == n and n > 1) {
+        // The comma before the last item goes too; the comment stays, and the closing parenthesis
+        // goes on the next line with the indentation of the line where the list starts
+        const comma = all[index - 1].comma.?;
+        const nl = kept orelse return removal(text, l, r, .{ comma.start, r });
+        const list_line = lineStart(text, l - 1);
+        const indent = text[list_line..indentEnd(text, list_line)];
+        return .{ .start = comma.start, .end = r, .text = try std.mem.concat(arena, u8, &.{ text[comma.end .. nl + 1], indent }) };
+    }
+    const span: [2]u32 = if (n == 1)
+        .{ after_kept orelse l, r }
     else if (index == 0)
-        .{ l, if (all[1].multiline) x.comma.?.end else all[1].start }
-    else if (index + 1 < n)
-        (if (x.multiline or all[index + 1].multiline) .{ all[index - 1].comma.?.end, x.comma.?.end } else .{ x.start, all[index + 1].start })
+        .{ after_kept orelse l, if (all[1].multiline) x.comma.?.end else all[1].start }
+    else if (x.multiline or all[index + 1].multiline)
+        .{ after_kept orelse all[index - 1].comma.?.end, x.comma.?.end }
     else
-        .{ all[index - 1].comma.?.start, r };
+        .{ x.start, all[index + 1].start };
+    return removal(text, l, r, span);
+}
+
+/// The edit that removes `span` from the list between `l` and `r`, or everything between the
+/// parentheses when only whitespace would be left
+fn removal(text: []const u8, l: u32, r: u32, span: [2]u32) rename.Edit {
     if (isBlank(text[l..span[0]]) and isBlank(text[span[1]..r])) return .{ .start = l, .end = r, .text = "" };
     return .{ .start = span[0], .end = span[1], .text = "" };
+}
+
+/// When the line of the separator ending at `sep_end` continues with a `//` comment before the
+/// item at `item_start`, the offset of the line break ending that line
+fn separatorComment(text: []const u8, sep_end: u32, item_start: u32) ?u32 {
+    const nl = std.mem.indexOfScalarPos(u8, text[0..item_start], sep_end, '\n') orelse return null;
+    if (std.mem.indexOf(u8, text[sep_end..nl], "//") == null) return null;
+    return @intCast(nl);
+}
+
+fn lineStart(text: []const u8, pos: u32) u32 {
+    var i = pos;
+    while (i > 0 and text[i - 1] != '\n') i -= 1;
+    return i;
+}
+
+/// The end of the indentation of the line starting at `line_start`
+fn indentEnd(text: []const u8, line_start: u32) u32 {
+    var i = line_start;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+    return i;
 }
 
 /// When item `x` is on lines of its own, the range of those lines (including the final newline):
