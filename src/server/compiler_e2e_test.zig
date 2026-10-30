@@ -345,13 +345,15 @@ test "build scripts: live diagnostics in build.zig, build.zig.zon and files buil
     try waitIdle(&h);
     try expectDiagnostics(try h.diagnostics(), "helper.zig", &.{"zig: expected type '[]const u8', found 'bool'"});
 
-    // Errors in build.zig.zon are not among the errors maker sends: the user is notified
+    // Errors in build.zig.zon are not among the errors maker sends: they are taken from its
+    // stderr and published on build.zig.zon
     const bad_zon = try std.mem.replaceOwned(u8, a, scripts_zon, "0xd642dfa0858809cc", "0x1");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = zon_path, .data = bad_zon });
     try change(&h, zon_uri, 4, bad_zon);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = zon_uri } });
     try waitIdle(&h);
-    try testing.expect(anyContains(try shownMessages(&h), "zig build cannot load"));
+    try testing.expect(anyContains((try h.diagnostics()).get("build.zig.zon").?, "0:1 zig: invalid fingerprint: 0x1;"));
+    try testing.expect(!anyContains(try shownMessages(&h), "zig build cannot load"));
     try shutdown(&h);
 }
 

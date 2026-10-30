@@ -335,6 +335,147 @@ pub fn failureSummary(stderr: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A message header as `ErrorBundle.renderToStderr` writes it:
+/// `<path>:<line>:<column>: <kind>: <message>` (line and column 1-based)
+const RenderedHeader = struct {
+    path: []const u8,
+    line: u32,
+    column: u32,
+    is_note: bool,
+    msg: []const u8,
+};
+
+fn parseRenderedHeader(line: []const u8) ?RenderedHeader {
+    inline for (.{ false, true }) |is_note| {
+        const marker = if (is_note) ": note: " else ": error: ";
+        if (std.mem.indexOf(u8, line, marker)) |at| parse: {
+            const loc = line[0..at];
+            const c2 = std.mem.lastIndexOfScalar(u8, loc, ':') orelse break :parse;
+            const c1 = std.mem.lastIndexOfScalar(u8, loc[0..c2], ':') orelse break :parse;
+            const ln = std.fmt.parseInt(u32, loc[c1 + 1 .. c2], 10) catch break :parse;
+            const col = std.fmt.parseInt(u32, loc[c2 + 1 ..], 10) catch break :parse;
+            if (c1 == 0 or ln == 0 or col == 0) break :parse;
+            return .{ .path = loc[0..c1], .line = ln, .column = col, .is_note = is_note, .msg = line[at + marker.len ..] };
+        }
+    }
+    return null;
+}
+
+/// A note without a location: `note: <message>`, indented like the message it belongs to
+fn unlocatedNote(line: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, line, " ");
+    return if (std.mem.startsWith(u8, trimmed, "note: ")) trimmed["note: ".len..] else null;
+}
+
+/// The marker line under a source line: `~` before and after the `^` of the main position
+const CaretMarker = struct { before: u32, after: u32 };
+
+fn caretMarker(line: []const u8) ?CaretMarker {
+    const marks = std.mem.trimStart(u8, line, " ");
+    const caret = std.mem.indexOfScalar(u8, marks, '^') orelse return null;
+    for (marks, 0..) |ch, k| if (ch != '~' and !(ch == '^' and k == caret)) return null;
+    return .{ .before = @intCast(caret), .after = @intCast(marks.len - caret - 1) };
+}
+
+/// The located errors the maker wrote to stderr (problems in a `build.zig.zon` or in fetching a
+/// dependency package, which `bsp_configuration_failed` does not carry), with their notes, as an
+/// error bundle. Paths are resolved against `cwd` (the build root) and source locations are
+/// computed on the files' current text; an error whose file cannot be read is left out, as are
+/// lines that are not part of a located error.
+pub fn stderrErrors(gpa: Allocator, io: Io, cwd: []const u8, stderr: []const u8) Allocator.Error!ErrorBundle {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |line| try lines.append(arena, std.mem.trimEnd(u8, line, "\r"));
+    var parser: StderrParser = .{ .arena = arena, .io = io, .cwd = cwd, .lines = lines.items, .wip = try .init(gpa) };
+    defer parser.wip.deinit();
+
+    var i: usize = 0;
+    while (i < lines.items.len) {
+        const header = parseRenderedHeader(lines.items[i]) orelse {
+            i += 1;
+            continue;
+        };
+        var err = try parser.located(&i, header);
+        var notes: std.ArrayList(ErrorBundle.ErrorMessage) = .empty;
+        while (i < lines.items.len) {
+            if (parseRenderedHeader(lines.items[i])) |h| {
+                if (!h.is_note) break;
+                try notes.append(arena, try parser.located(&i, h));
+            } else if (unlocatedNote(lines.items[i])) |msg| {
+                try notes.append(arena, .{ .msg = try parser.wip.addString(msg) });
+                i += 1;
+            } else break;
+        }
+        if (header.is_note or err.src_loc == .none) continue;
+        err.notes_len = @intCast(notes.items.len);
+        try parser.wip.addRootErrorMessageWithNotes(err, notes.items);
+    }
+    return parser.wip.toOwnedBundle("");
+}
+
+const StderrParser = struct {
+    arena: Allocator,
+    io: Io,
+    cwd: []const u8,
+    lines: []const []const u8,
+    wip: ErrorBundle.Wip,
+    /// Texts of the files read so far (absolute path → text; null when unreadable)
+    texts: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+
+    /// The message whose header is at `i.*`, advancing `i` past it: continuation lines of the
+    /// message, then the source line and its marker line, follow the header when there is a
+    /// source line
+    fn located(p: *StderrParser, i: *usize, header: RenderedHeader) Allocator.Error!ErrorBundle.ErrorMessage {
+        var marker: ?usize = null;
+        var k = i.* + 2;
+        while (k < p.lines.len and parseRenderedHeader(p.lines[k - 1]) == null) : (k += 1) {
+            if (caretMarker(p.lines[k]) != null) {
+                marker = k;
+                break;
+            }
+        }
+        var msg: std.ArrayList(u8) = .empty;
+        try msg.appendSlice(p.arena, header.msg);
+        if (marker) |m| for (p.lines[i.* + 1 .. m - 1]) |continuation| {
+            try msg.append(p.arena, '\n');
+            try msg.appendSlice(p.arena, std.mem.trimStart(u8, continuation, " "));
+        };
+        i.* = if (marker) |m| m + 1 else i.* + 1;
+        return .{
+            .msg = try p.wip.addString(msg.items),
+            .src_loc = try p.sourceLocation(header, if (marker) |m| caretMarker(p.lines[m]) else null),
+        };
+    }
+
+    fn sourceLocation(p: *StderrParser, header: RenderedHeader, marker: ?CaretMarker) Allocator.Error!ErrorBundle.SourceLocationIndex {
+        const path = try Vfs.resolve(.native, p.arena, p.cwd, header.path) orelse return .none;
+        const gop = try p.texts.getOrPut(p.arena, path);
+        if (!gop.found_existing) gop.value_ptr.* = Io.Dir.cwd().readFileAlloc(p.io, path, p.arena, .limited(std.math.maxInt(u32))) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        const text = gop.value_ptr.* orelse return .none;
+        var line_start: usize = 0;
+        for (1..header.line) |_| line_start = (std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse return .none) + 1;
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const main = line_start + header.column - 1;
+        if (main > line_end) return .none;
+        const before: u32, const after: u32 = if (marker) |m| .{ m.before, m.after } else .{ 0, 0 };
+        return p.wip.addSourceLocation(.{
+            .src_path = try p.wip.addString(path),
+            .line = header.line - 1,
+            .column = header.column - 1,
+            .span_start = @intCast(@max(line_start, main -| before)),
+            .span_main = @intCast(main),
+            .span_end = @intCast(if (marker == null) main else @min(text.len, main + 1 + after)),
+            .source_line = try p.wip.addString(std.mem.trimEnd(u8, text[line_start..line_end], "\r")),
+        });
+    }
+};
+
 /// The maker and its child processes as a whole.
 ///
 /// POSIX: the maker joins the process group whose leader is a watchdog process (`sh`). The
@@ -841,4 +982,47 @@ test failureSummary {
     try testing.expectEqualStrings("error: invalid option: \"nope\"", failureSummary("info: x\n\nerror: invalid option: \"nope\"\r\ninfo: y\nerror: configure command exited\n").?);
     try testing.expectEqualStrings("panic: boom", failureSummary("warning: w\npanic: boom\n/a/build.zig:1:1: 0x1 in build\n").?);
     try testing.expectEqual(null, failureSummary("info: only\n\n"));
+}
+
+test stderrErrors {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const zon = ".{\n    .name = \"mtest\",\n    .paths = .{\"\"},\n}\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig.zon", .data = zon });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const stderr =
+        \\info: unrelated
+        \\./build.zig.zon:2:13: error: expected enum literal
+        \\    .name = "mtest",
+        \\            ^~~~~~~
+        \\build.zig.zon:3:5: note: a located note
+        \\    .paths = .{""},
+        \\    ^~~~~~
+        \\    note: an unlocated note
+        \\missing.zon:1:1: error: in a file that cannot be read
+        \\error: configure command exited with code 1
+        \\
+    ;
+    var eb = try stderrErrors(gpa, io, root, stderr);
+    defer eb.deinit(gpa);
+    try testing.expectEqual(1, eb.errorMessageCount());
+    const msg = eb.getErrorMessage(eb.getMessages()[0]);
+    try testing.expectEqualStrings("expected enum literal", eb.nullTerminatedString(msg.msg));
+    const loc = eb.getSourceLocation(msg.src_loc);
+    try testing.expectEqual(1, loc.line);
+    try testing.expectEqual(12, loc.column);
+    const main = std.mem.indexOf(u8, zon, "\"mtest\"").?;
+    try testing.expectEqual(main, loc.span_start);
+    try testing.expectEqual(main, loc.span_main);
+    try testing.expectEqual(main + 7, loc.span_end);
+    try testing.expectEqualStrings("    .name = \"mtest\",", eb.nullTerminatedString(loc.source_line));
+    const notes = eb.getNotes(eb.getMessages()[0]);
+    try testing.expectEqual(2, notes.len);
+    const located = eb.getErrorMessage(notes[0]);
+    try testing.expectEqualStrings("a located note", eb.nullTerminatedString(located.msg));
+    try testing.expectEqual(std.mem.indexOf(u8, zon, ".paths").?, eb.getSourceLocation(located.src_loc).span_main);
+    try testing.expectEqualStrings("an unlocated note", eb.nullTerminatedString(eb.getErrorMessage(notes[1]).msg));
 }

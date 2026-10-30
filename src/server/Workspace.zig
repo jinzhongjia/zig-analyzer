@@ -659,12 +659,29 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         },
         .configuration_failed => |*eb| {
             // build.zig itself has errors: publish them as a build result. When build.zig.zon is
-            // wrong or fetching a dependency package fails, maker only writes the errors to its
-            // stderr and the errors it sends are empty: notify the user
+            // wrong or fetching a dependency package fails, the errors maker sends are empty and
+            // it writes them only to its stderr, just before exiting: they are taken from there
+            // (located in build.zig.zon), and when none can be located the user is notified
             if (eb.errorMessageCount() == 0) {
-                var buf: [512]u8 = undefined;
-                ws.server.showWarning(std.fmt.bufPrint(&buf, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root}) catch
-                    "zig build cannot load the project (build.zig.zon or a dependency may have errors), run zig build to see why");
+                ws.mutex.lockUncancelable(io);
+                const client = ws.client;
+                ws.mutex.unlock(io);
+                const output = if (client) |c| try c.stderrOutput(ws.gpa) else try ws.gpa.dupe(u8, "");
+                defer ws.gpa.free(output);
+                const located = try bsp.stderrErrors(ws.gpa, io, ws.root, output);
+                if (located.errorMessageCount() != 0) {
+                    eb.* = located;
+                } else {
+                    var empty = located;
+                    empty.deinit(ws.gpa);
+                    log.info("{s}: zig build cannot load the project:\n{s}", .{ ws.root, output });
+                    const message = if (bsp.failureSummary(output)) |summary|
+                        try std.fmt.allocPrint(ws.gpa, "zig build cannot load {s}: {s}", .{ ws.root, summary })
+                    else
+                        try std.fmt.allocPrint(ws.gpa, "zig build cannot load {s} (build.zig.zon or a dependency may have errors), run zig build there to see why", .{ws.root});
+                    defer ws.gpa.free(message);
+                    ws.server.showWarning(message);
+                }
             }
             try ws.bundles.append(ws.gpa, eb.*);
             eb.* = .empty;

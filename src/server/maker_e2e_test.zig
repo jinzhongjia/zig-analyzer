@@ -581,3 +581,59 @@ test "a configure phase that fails without errors is reported with its cause, no
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
+
+test "errors zig build reports for build.zig.zon are published on it" {
+    // The maker sends no configuration errors for an invalid manifest or a failed fetch and writes
+    // them only to its stderr
+    const zon =
+        \\.{
+        \\    .name = "mtest",
+        \\    .version = "0.0.1",
+        \\    .fingerprint = 0x5ebbe5f15ebbe5f1,
+        \\    .paths = .{""},
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = options_build },
+        .{ .path = "build.zig.zon", .text = zon },
+        .{ .path = "src/main.zig", .text = options_main },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root);
+    const zon_path = try project.path(a, "build.zig.zon");
+    const zon_uri = try za.base.uri.fromPath(a, zon_path);
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = zon_uri, .languageId = "zig", .version = 1, .text = zon } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const diags = blk: {
+        var last: ?[]const std.json.Value = null;
+        for (try h.notifications("textDocument/publishDiagnostics")) |m| {
+            const params = m.object.get("params").?.object;
+            if (std.mem.eql(u8, params.get("uri").?.string, zon_uri)) last = params.get("diagnostics").?.array.items;
+        }
+        break :blk last orelse return error.NoDiagnostics;
+    };
+    try testing.expectEqual(1, diags.len);
+    const d = diags[0].object;
+    try testing.expectEqualStrings("expected enum literal", d.get("message").?.string);
+    try testing.expectEqual(1, d.get("severity").?.integer);
+    const range = d.get("range").?.object;
+    for ([_][]const u8{ "start", "end" }, [_]i64{ 12, 19 }) |end, character| {
+        try testing.expectEqual(1, range.get(end).?.object.get("line").?.integer);
+        try testing.expectEqual(character, range.get(end).?.object.get("character").?.integer);
+    }
+
+    // Fixed: the error is cleared
+    const fixed = try std.mem.replaceOwned(u8, a, zon, "\"mtest\"", ".mtest");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = zon_path, .data = fixed });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = zon_uri, .version = 2 }, .contentChanges = &.{.{ .text = fixed }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = zon_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(!try lastHas(&h, zon_uri, "expected enum literal"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
