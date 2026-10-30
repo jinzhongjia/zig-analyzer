@@ -1178,7 +1178,7 @@ fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index 
             .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
             .binary => |s| {
                 if (isComparison(s.op) and (s.lhs == e or s.rhs == e)) {
-                    return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty);
+                    return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty, s.op);
                 }
                 if (s.op == .keyword_orelse and s.rhs == e) return expectedOf(r, a, id);
             },
@@ -1262,19 +1262,33 @@ fn isComparison(op: SyntaxKind) bool {
 }
 
 /// The type of one side of a comparison as the expected type of the other side: a tagged union is
-/// compared with its tag (`u == .none`); comptime numbers, enum literals, null, and undefined have
-/// no definite type
-fn comparedType(r: *Resolver, t: Index) resolve.Error!?Index {
+/// compared with its tag (`u == .none`), and an error union only with an error set (`eu ==
+/// error.X`, by `==` and `!=`); comptime numbers, enum literals, null, and undefined have no
+/// definite type, and types whose values cannot be compared (see `comparable`) have none either
+fn comparedType(r: *Resolver, t: Index, op: SyntaxKind) resolve.Error!?Index {
     switch (t) {
         .unknown, .comptime_int_type, .comptime_float_type, .enum_literal_type, .null_type, .undefined_type => return null,
         else => {},
     }
-    const is_union = switch (r.ctx.db.env.ip.key(t)) {
-        .container_type => |c| c.kind == .@"union",
-        .reified_type => |rt| rt.kind == .@"union",
-        else => false,
+    const ip = r.ctx.db.env.ip;
+    switch (ip.key(t)) {
+        .container_type => |c| if (c.kind == .@"union") return eval.unionTag(r, t),
+        .reified_type => |rt| if (rt.kind == .@"union") return eval.unionTag(r, t),
+        .error_union_type => |eu| return if (op == .equal_equal or op == .bang_equal) eu.err else null,
+        else => {},
+    }
+    return if (comparable(ip, t)) t else null;
+}
+
+/// Whether values of type `t` can be compared with each other: not slices, arrays, and tuples (or
+/// optionals of them), as in the compiler
+fn comparable(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .slice,
+        .array_type, .abstract_array_type, .tuple_type, .anon_struct_type => false,
+        .optional_type => |child| comparable(ip, child),
+        else => true,
     };
-    return if (is_union) eval.unionTag(r, t) else t;
 }
 
 /// Whether the structure of the statement at the cursor (the innermost item of a block, file, or

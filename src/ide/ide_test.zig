@@ -1128,6 +1128,36 @@ test "function pointer values rank by the expected type only as what they are" {
     }
 }
 
+test "comparisons expect what the other side can be compared with" {
+    // An error union compares only with an error set, and slices do not compare at all, so the
+    // payload type and slices rank as without an expected type
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "    _ = fail<|>;", "fail_total fail_kind" },
+        .{ "    _ = outcome == fail<|>;", "fail_kind fail_total" },
+        .{ "    _ = fail_total == fail<|>;", "fail_total fail_kind" },
+        .{ "    _ = txt<|>;", "txt_n txt_other txt_other.len txt_other.ptr text text.len text.ptr" },
+        .{ "    _ = text == txt<|>;", "txt_n txt_other txt_other.len txt_other.ptr text text.len text.ptr" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\fn probe(outcome: anyerror!u32, fail_kind: anyerror, fail_total: u32, text: []const u8, txt_other: []const u8, txt_n: u8) void {{
+            \\    _ = .{{ outcome, fail_kind, fail_total, text, txt_other, txt_n }};
+            \\{s}
+            \\}}
+            \\comptime {{ _ = &probe; }}
+            \\
+        , .{c[0]});
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "expected types are not used where the syntax tree may be wrong" {
     try expectRanked(expected_decls ++ "const cd_t = u8;\n", &.{
         // An unclosed call takes the next line as its arguments `x` and `cd`; the type of `x`,
