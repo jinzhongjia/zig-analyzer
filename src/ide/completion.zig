@@ -748,8 +748,9 @@ fn typedMembers(r: *Resolver, out: *Collector, tv: TypedValue, mutable: bool, fr
         const ns = try queries.namespaceOfType(r, t) orelse return;
         return members(r, out, ns, ns.file == from);
     }
-    // A single pointer is dereferenced automatically once: len of `*[N]T`, fields and methods of
-    // `*S`, len and ptr of `*[]T`; whether the value can be modified then depends on the pointer
+    // A single pointer is dereferenced automatically once: fields and methods of `*S`, len and ptr
+    // of `*[]T`; whether the value can be modified then depends on the pointer. A pointer to an
+    // array keeps its own members (see `valueMembers`)
     const holder = (Place{ .ty = tv.ty, .mutable = mutable }).deref(ip);
     for (try valueMembers(r, from, holder.ty)) |m| switch (m.what) {
         .typed => |ty| try out.add(.{ .label = m.name, .kind = .field, .detail = if (ty != .unknown) try render.typeAlloc(r, ty) else null }),
@@ -1013,14 +1014,24 @@ const Place = struct {
     mutable: bool,
 
     /// A single-item pointer is dereferenced once automatically; whether the value it points to can
-    /// be modified depends on the pointer
+    /// be modified depends on the pointer. A pointer to an array is kept: it has a `ptr` that the
+    /// array does not have (see `valueMembers`)
     fn deref(p: Place, ip: *InternPool) Place {
         return switch (ip.key(p.ty)) {
-            .ptr_type => |ptr| if (ptr.size == .one) .{ .ty = ptr.child, .mutable = !ptr.is_const } else p,
+            .ptr_type => |ptr| if (ptr.size == .one and arrayElem(ip, ptr.child) == null) .{ .ty = ptr.child, .mutable = !ptr.is_const } else p,
             else => p,
         };
     }
 };
+
+/// The element type and sentinel of an array type
+fn arrayElem(ip: *InternPool, t: Index) ?struct { child: Index, sentinel: ?Index } {
+    return switch (ip.key(t)) {
+        .array_type => |a| .{ .child = a.child, .sentinel = a.sentinel },
+        .abstract_array_type => |a| .{ .child = a.child, .sentinel = a.sentinel },
+        else => null,
+    };
+}
 
 /// A member of a value; the types of container fields and the signatures of methods are computed
 /// only when used
@@ -1043,16 +1054,22 @@ const Member = struct {
 
 /// Members of a value (dereferenced): fields, and the functions and consts in `from` or pub
 /// (whether a const is a function is known only when it is used). Enum and opaque values have no
-/// fields: enum members are accessed through the type. Values that are not containers, tuples,
-/// slices, or arrays have no members (`?T`, `E!T`, single-item pointers to pointers, many-item
-/// pointers, and so on)
+/// fields: enum members are accessed through the type. A slice and a single-item pointer to an
+/// array have `len` and `ptr` (a many-item pointer with the sentinel of the slice or array), an
+/// array only `len`. Values that are not containers, tuples, slices, arrays, or pointers to arrays
+/// have no members (`?T`, `E!T`, single-item pointers to pointers, many-item pointers, and so on)
 fn valueMembers(r: *Resolver, from: FileId, t: Index) resolve.Error![]const Member {
     const ip = r.ctx.db.env.ip;
     var out: std.ArrayList(Member) = .empty;
     switch (ip.key(t)) {
-        .ptr_type => |p| if (p.size == .slice) {
+        .ptr_type => |p| {
+            const child: Index, const sentinel: ?Index = switch (p.size) {
+                .slice => .{ p.child, p.sentinel },
+                .one => if (arrayElem(ip, p.child)) |a| .{ a.child, a.sentinel } else return &.{},
+                .many, .c => return &.{},
+            };
             try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } });
-            const many = try ip.get(.{ .ptr_type = .{ .child = p.child, .size = .many, .is_const = p.is_const, .sentinel = p.sentinel } });
+            const many = try ip.get(.{ .ptr_type = .{ .child = child, .size = .many, .is_const = p.is_const, .sentinel = sentinel } });
             try out.append(r.arena, .{ .name = "ptr", .what = .{ .typed = many } });
         },
         .array_type => try out.append(r.arena, .{ .name = "len", .what = .{ .typed = .usize_type } }),
@@ -1188,7 +1205,7 @@ const MemberSearch = struct {
                 };
                 if (sig.params.len != 1 or sig.varargs or !receives(ip, sig.params[0], holder)) return null;
                 return switch (ip.key(sig.ret)) {
-                    .ptr_type => |p| if (p.size == .one) .{ .ty = p.child, .mutable = !p.is_const } else null,
+                    .ptr_type => |p| if (p.size == .one) (Place{ .ty = sig.ret, .mutable = false }).deref(ip) else null,
                     .container_type, .tuple_type, .anon_struct_type, .reified_type => .{ .ty = sig.ret, .mutable = false },
                     else => null,
                 };

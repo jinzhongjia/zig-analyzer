@@ -1321,6 +1321,16 @@ const Inferrer = struct {
         var t = lhs.ty;
         switch (ip.key(t)) {
             .ptr_type => |p| if (p.size == .one) {
+                // `ptr` of a pointer to an array: a many-item pointer to its elements, with the
+                // sentinel of the array and the constness of the pointer
+                if (std.mem.eql(u8, name, "ptr")) {
+                    const elem: ?struct { Index, ?Index } = switch (ip.key(p.child)) {
+                        .array_type => |arr| .{ arr.child, arr.sentinel },
+                        .abstract_array_type => |arr| .{ arr.child, arr.sentinel },
+                        else => null,
+                    };
+                    if (elem) |el| return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = el[0], .size = .many, .is_const = p.is_const, .sentinel = el[1] } }) };
+                }
                 t = p.child;
             },
             else => {},

@@ -3311,6 +3311,40 @@ test "completion after `.` with a union result type lists only the tags that coe
     });
 }
 
+test "completion and inference of `ptr` on pointers to arrays" {
+    try expectCompletions("", &.{
+        .{ "fn f() void {\n    var arr = [_]u8{ 1, 2, 3 };\n    const pa: *[3]u8 = &arr;\n    _ = pa.<|>;\n}", "len ptr" },
+        .{ "fn f() void {\n    _ = \"abc\".<|>;\n}", "len ptr" },
+        .{ "fn f() void {\n    var arr = [_]u8{ 1, 2, 3 };\n    _ = arr[0..2].<|>;\n}", "len ptr" },
+        // An array value has no `ptr`
+        .{ "fn f() void {\n    var arr = [_]u8{ 1, 2, 3 };\n    _ = &arr;\n    _ = arr.<|>;\n}", "len" },
+    });
+    const text =
+        \\fn f() void {
+        \\    var arr = [_]u8{ 1, 2, 3 };
+        \\    const pa: *[3]u8 = &arr;
+        \\    const x = pa.ptr;
+        \\    const y = "abc".ptr;
+        \\    _ = .{ x, y };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings(
+        \\fn f() void {
+        \\    var arr: [3]u8 = [_]u8{ 1, 2, 3 };
+        \\    const pa: *[3]u8 = &arr;
+        \\    const x: [*]u8 = pa.ptr;
+        \\    const y: [*:0]const u8 = "abc".ptr;
+        \\    _ = .{ x, y };
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .parameters = false }));
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;
@@ -5701,7 +5735,7 @@ test "completion through single pointers to arrays, tuples and slices" {
     // After dereferencing a single pointer, the namespace used to be looked up directly: completion
     // was empty for pointers to arrays or tuples (such as `.len` of a string constant)
     const cases = [_]struct { []const u8, []const u8 }{
-        .{ "fn f() void {\n    const prefix = \"file://\";\n    _ = prefix.<|>;\n}\n", "len" },
+        .{ "fn f() void {\n    const prefix = \"file://\";\n    _ = prefix.<|>;\n}\n", "len ptr" },
         .{ "fn f() void {\n    const t = .{ 1, 2 };\n    const p = &t;\n    _ = p.<|>;\n}\n", "@\"0\" @\"1\" len" },
         .{ "fn f(s: *[]const u8) void {\n    _ = s.<|>;\n}\n", "len ptr" },
     };
