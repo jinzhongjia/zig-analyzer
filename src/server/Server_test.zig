@@ -500,6 +500,53 @@ test "error responses keep string request ids" {
     try testing.expectEqual(-32602, errorCode(msgs[4]));
 }
 
+test "unknown methods and messages that are not requests get the error code of their case" {
+    // Unknown methods got MethodNotFound before initialize and after shutdown, and valid JSON
+    // that is not a request got ParseError
+    var s: Session = undefined;
+    try s.run(frame(
+        \\{"jsonrpc":"2.0","id":1,"method":"foo/bar","params":{}}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":2,"method":"$/foo"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"capabilities":{}}}
+    ) ++ frame(
+        \\[]
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":1,"params":"bar"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":true,"method":"zig-analyzer/status"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":4,"method":"foo/bar"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":5,"method":"$/foo"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":6,"method":"shutdown"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":7,"method":"foo/bar"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","id":8,"method":"$/foo"}
+    ) ++ frame(
+        \\{"jsonrpc":"2.0","method":"exit"}
+    ));
+    defer s.deinit();
+    try testing.expectEqual(0, s.exit_code);
+    const msgs = try s.messages();
+    try testing.expectEqual(11, msgs.len);
+    try testing.expectEqual(-32002, errorCode(msgs[0]));
+    try testing.expectEqual(-32601, errorCode(msgs[1]));
+    try testing.expect(msgs[2].object.get("result").? == .object);
+    for (msgs[3..6]) |msg| {
+        try testing.expectEqual(-32600, errorCode(msg));
+        try testing.expect(msg.object.get("id").? == .null);
+    }
+    try testing.expectEqual(-32601, errorCode(msgs[6]));
+    try testing.expectEqual(-32601, errorCode(msgs[7]));
+    try testing.expect(msgs[8].object.get("result").? == .null);
+    try testing.expectEqual(-32600, errorCode(msgs[9]));
+    try testing.expectEqual(-32601, errorCode(msgs[10]));
+}
+
 test "malformed params return InvalidParams" {
     var s: Session = undefined;
     try s.run(frame(

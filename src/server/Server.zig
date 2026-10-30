@@ -517,8 +517,11 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
     const a = arena.allocator();
     const message = jsonrpc.parse(a, body) catch |err| {
         server.destroyArena(arena);
-        if (err == error.OutOfMemory) return err;
-        server.sendError(null, jsonrpc.error_codes.parse_error, "failed to parse JSON-RPC message");
+        switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidJson => server.sendError(null, jsonrpc.error_codes.parse_error, "failed to parse JSON-RPC message"),
+            error.InvalidMessage => server.sendError(null, jsonrpc.error_codes.invalid_request, "not a JSON-RPC request, notification or response"),
+        }
         return .@"continue";
     };
     server.write_mutex.lockUncancelable(server.io);
@@ -687,7 +690,17 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
         }
     }
     defer server.destroyArena(arena);
-    server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
+    // LSP: requests starting with `$/` are answered with MethodNotFound in every state; other
+    // methods get the same error for the state as known ones
+    if (std.mem.startsWith(u8, method, "$/")) {
+        server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
+    } else if (server.state == .uninitialized) {
+        server.sendError(id, jsonrpc.error_codes.server_not_initialized, "server not initialized");
+    } else if (server.state == .shutdown) {
+        server.sendError(id, jsonrpc.error_codes.invalid_request, "request not allowed in current state");
+    } else {
+        server.sendError(id, jsonrpc.error_codes.method_not_found, "method not supported");
+    }
 }
 
 /// Registers an in-flight request (can be canceled by `$/cancelRequest`); the Pending is allocated

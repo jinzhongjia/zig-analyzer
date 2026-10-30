@@ -34,7 +34,13 @@ pub const Message = union(enum) {
     response: struct { id: ?Id, result: json.Value, @"error": ?ResponseError },
 };
 
-pub const ParseError = error{ InvalidMessage, OutOfMemory };
+pub const ParseError = error{
+    /// The body is not valid JSON
+    InvalidJson,
+    /// The body is valid JSON but not a request, notification or response
+    InvalidMessage,
+    OutOfMemory,
+};
 
 /// Parses the outer structure of a message; `params` / `result` are kept as `json.Value` and
 /// parsed into concrete types per method by the handlers.
@@ -42,7 +48,7 @@ pub const ParseError = error{ InvalidMessage, OutOfMemory };
 pub fn parse(arena: Allocator, body: []const u8) ParseError!Message {
     const value = json.parseFromSliceLeaky(json.Value, arena, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidMessage,
+        else => return error.InvalidJson,
     };
     if (value != .object) return error.InvalidMessage;
     const obj = value.object;
@@ -200,7 +206,13 @@ test "classify requests, notifications and responses" {
     try testing.expectEqual(-32601, resp.response.@"error".?.code);
 
     try testing.expectError(error.InvalidMessage, parse(a, "[1]"));
-    try testing.expectError(error.InvalidMessage, parse(a, "{"));
+    try testing.expectError(error.InvalidMessage, parse(a,
+        \\{"jsonrpc":"2.0","id":true,"method":"x"}
+    ));
+    try testing.expectError(error.InvalidMessage, parse(a,
+        \\{"jsonrpc":"2.0","method":1}
+    ));
+    try testing.expectError(error.InvalidJson, parse(a, "{"));
 }
 
 test request {
