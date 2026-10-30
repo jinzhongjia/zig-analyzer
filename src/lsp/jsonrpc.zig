@@ -124,7 +124,8 @@ pub fn errorResponse(gpa: Allocator, id: ?Id, code: i32, message: []const u8) Al
     return error.OutOfMemory;
 }
 
-/// A request from the server to the client
+/// A request from the server to the client; `params` of type `void` omits the member (for
+/// methods without parameters: JSON-RPC allows only a structured value there)
 pub fn request(gpa: Allocator, id: Id, method: []const u8, params: anytype) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -233,6 +234,11 @@ test request {
     try testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":7,"method":"window/workDoneProgress/create","params":{"token":"t"}}
     , a);
+    const b = try request(gpa, .{ .string = "r" }, "workspace/inlayHint/refresh", {});
+    defer gpa.free(b);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":"r","method":"workspace/inlayHint/refresh"}
+    , b);
 }
 
 test "build response: void result is null, optional fields omitted" {

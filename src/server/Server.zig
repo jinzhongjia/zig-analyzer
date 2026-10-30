@@ -1587,7 +1587,7 @@ fn requestSemanticRefresh(server: *Server) void {
     }
     server.semantic_refresh_pending = true;
     server.semantic_refresh_mutex.unlock(server.io);
-    const bytes = jsonrpc.request(server.gpa, .{ .string = semantic_refresh_id }, "workspace/semanticTokens/refresh", null) catch {
+    const bytes = jsonrpc.request(server.gpa, .{ .string = semantic_refresh_id }, "workspace/semanticTokens/refresh", {}) catch {
         server.semantic_refresh_mutex.lockUncancelable(server.io);
         server.semantic_refresh_pending = false;
         server.semantic_refresh_mutex.unlock(server.io);
@@ -1622,7 +1622,7 @@ fn requestInlayRefresh(server: *Server) void {
     }
     server.inlay_refresh_pending = true;
     server.inlay_refresh_mutex.unlock(server.io);
-    const bytes = jsonrpc.request(server.gpa, .{ .string = inlay_refresh_id }, "workspace/inlayHint/refresh", null) catch {
+    const bytes = jsonrpc.request(server.gpa, .{ .string = inlay_refresh_id }, "workspace/inlayHint/refresh", {}) catch {
         server.inlay_refresh_mutex.lockUncancelable(server.io);
         server.inlay_refresh_pending = false;
         server.inlay_refresh_mutex.unlock(server.io);

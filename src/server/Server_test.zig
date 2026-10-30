@@ -1306,6 +1306,43 @@ test "inlay hint settings apply to requests and refresh the client when they cha
     try h.notify("exit", {});
 }
 
+test "refresh requests carry no params and at most one of each awaits the client" {
+    // Refresh requests were sent with `"params": null`, which JSON-RPC does not allow
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .workspace = .{
+        .inlayHint = .{ .refreshSupport = true },
+        .semanticTokens = .{ .refreshSupport = true },
+    } } });
+    // The client never answers the refreshes
+    h.hold_requests = true;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = "untitled:refresh.zig", .languageId = "zig", .version = 1, .text = "pub fn f(x: u32) u32 {\n    const y = x + 1;\n    return y;\n}\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    for ([_]bool{ false, true }) |on| {
+        try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{
+            .inlay_hints = .{ .types = on },
+            .semantic_tokens = .{ .mode = if (on) "full" else "partial" },
+        } } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+    }
+    var inlay: usize = 0;
+    var semantic: usize = 0;
+    for (h.received.items) |message| if (message.object.get("method")) |method| {
+        const is_inlay = std.mem.eql(u8, method.string, "workspace/inlayHint/refresh");
+        const is_semantic = std.mem.eql(u8, method.string, "workspace/semanticTokens/refresh");
+        if (!is_inlay and !is_semantic) continue;
+        try testing.expect(message.object.get("params") == null);
+        if (is_inlay) inlay += 1 else semantic += 1;
+    };
+    try testing.expectEqual(1, inlay);
+    try testing.expectEqual(1, semantic);
+    h.hold_requests = false;
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "cache settings from initialization and later configuration limit the retained syntax trees" {
     // Guards against the cache capacity being set only when configuration is pushed, while the
     // configuration at initialization has no effect
