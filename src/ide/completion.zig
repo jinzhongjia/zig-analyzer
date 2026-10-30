@@ -1172,8 +1172,13 @@ fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index 
                 if (f.value == e) return initFieldType(r, a, id, f.name orelse return null);
             },
             .@"return" => |v| if (v == e) {
-                if ((try r.itemTree(a.file)).items[a.item].kind != .@"fn") return null;
-                return a.exprType(b.type_expr orelse return null).asType();
+                const it = (try r.itemTree(a.file)).items[a.item];
+                if (it.kind != .@"fn") return null;
+                const ret = a.exprType(b.type_expr orelse return null).asType() orelse return null;
+                // `!T`: `T` with the error set inferred from the body (see `queries.returnType`)
+                if (!it.flags.inferred_error_set or ret == .unknown) return ret;
+                const set = try a.ip.get(.{ .inferred_error_set = .{ .file = a.file, .decl = it.ast_id, .inst = if (a.seeded) |s| s.inst else null } });
+                return try a.ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
             },
             .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
             .binary => |s| {
@@ -1351,15 +1356,67 @@ fn coerces(ip: *InternPool, want: Index, have: Index) bool {
     if (value.eqlTypes(ip, want, have) orelse false) return true;
     switch (ip.key(want)) {
         .optional_type => |child| return coerces(ip, child, have),
-        .error_union_type => |eu| return coerces(ip, eu.payload, have),
+        .error_union_type => |eu| {
+            if (coerces(ip, eu.payload, have)) return true;
+            // An error set that fits in `E`, and `E'!T` whose error set fits in `E`
+            if (isErrorSet(ip, have)) return errorSetFits(ip, eu.err, have);
+            const h = switch (ip.key(have)) {
+                .error_union_type => |h| h,
+                else => return false,
+            };
+            return errorSetFits(ip, eu.err, h.err) and (value.eqlTypes(ip, eu.payload, h.payload) orelse false);
+        },
         .ptr_type => |w| {
             const h = switch (ip.key(have)) {
                 .ptr_type => |h| h,
+                // A function as a pointer to it
+                .fn_type => return w.size == .one and (value.eqlTypes(ip, w.child, have) orelse false),
                 else => return false,
             };
+            if (h.size == .one and (w.size == .slice or w.size == .many)) {
+                // A pointer to an array as a slice or a many-item pointer (`*const [5:0]u8` as
+                // `[]const u8`)
+                const array = switch (ip.key(h.child)) {
+                    .array_type => |array| array,
+                    else => return false,
+                };
+                if (h.is_const and !w.is_const) return false;
+                if (w.sentinel) |s| if (array.sentinel != s) return false;
+                return value.eqlTypes(ip, w.child, array.child) orelse false;
+            }
             if (w.size != h.size or (w.size != .one and w.size != .slice)) return false;
             if (!w.is_const or h.is_const or !std.meta.eql(w.sentinel, h.sentinel)) return false;
             return value.eqlTypes(ip, w.child, h.child) orelse false;
+        },
+        else => return false,
+    }
+}
+
+fn isErrorSet(ip: *InternPool, t: Index) bool {
+    return t == .anyerror_type or switch (ip.key(t)) {
+        .error_set_type, .inferred_error_set => true,
+        else => false,
+    };
+}
+
+/// Whether every error of the error set `have` is in the error set `want`: always for `anyerror`
+/// and for an inferred error set (the one of the function being written, which takes in the
+/// errors returned to it); for a written set, when `have` is a written set with no other names
+fn errorSetFits(ip: *InternPool, want: Index, have: Index) bool {
+    if (want == .anyerror_type) return isErrorSet(ip, have);
+    switch (ip.key(want)) {
+        .inferred_error_set => return isErrorSet(ip, have),
+        .error_set_type => |names| {
+            const own = switch (ip.key(have)) {
+                .error_set_type => |own| own,
+                else => return false,
+            };
+            for (own) |name| {
+                for (names) |n| {
+                    if (std.mem.eql(u8, n, name)) break;
+                } else return false;
+            }
+            return true;
         },
         else => return false,
     }

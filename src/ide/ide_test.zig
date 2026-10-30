@@ -1063,6 +1063,16 @@ test "candidates fit the expected type only by exact rules" {
         .{ "*const Want", "const cd_b: *Want = undefined;", true },
         .{ "[]const u8", "const cd_b: []u8 = undefined;", true },
         .{ "type", "const cd_b = u8;", true },
+        // A string constant (a pointer to an array) as a slice or a many-item pointer
+        .{ "[]const u8", "const cd_b = \"hello\";", true },
+        .{ "[:0]const u8", "const cd_b = \"hello\";", true },
+        .{ "[*]const u8", "const cd_b = \"hello\";", true },
+        // Error sets and error unions whose error set fits
+        .{ "anyerror!Want", "const cd_b: anyerror = error.X;", true },
+        .{ "error{ X, Y }!Want", "const cd_b: error{X}!Want = .a;", true },
+        .{ "anyerror!Want", "const cd_b: error{X}!Want = .a;", true },
+        // A function as a pointer to it
+        .{ "*const fn () Want", "fn cd_b() Want { return .a; }", true },
         // Functions whose return value fits; a function pointer is not its return value, and it
         // does not complete as a call
         .{ "Want", "fn cd_b() Want { return .a; }", true },
@@ -1074,6 +1084,10 @@ test "candidates fit the expected type only by exact rules" {
         .{ "[]u8", "const cd_b: []const u8 = undefined;", false },
         .{ "Want", "const cd_b: ?Want = .a;", false },
         .{ "Want", "fn cd_b() ?Want { return .a; }", false },
+        .{ "[]u8", "const cd_b = \"hello\";", false },
+        .{ "[:1]const u8", "const cd_b = \"hello\";", false },
+        .{ "error{X}!Want", "const cd_b: error{ X, Y } = error.X;", false },
+        .{ "error{X}!Want", "const cd_b: error{X}!Other = .{};", false },
     };
     for (cases) |c| {
         const source = try std.fmt.allocPrint(testing.allocator,
@@ -1146,6 +1160,34 @@ test "comparisons expect what the other side can be compared with" {
             \\{s}
             \\}}
             \\comptime {{ _ = &probe; }}
+            \\
+        , .{c[0]});
+        defer testing.allocator.free(source);
+        const got = try rankedLabels(source, false);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "string constants and calls returning error unions fit by coercion" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn greet() void { const motto_len: u32 = 1; _ = &motto_len; _ = mott<|>; }", "motto_len motto" },
+        .{ "fn greet() void { const motto_len: u32 = 1; _ = &motto_len; show(mott<|>); }", "motto motto_len" },
+        .{ "fn load(s: []const u8) !Tone { _ = &s; _ = read<|>; return .warm; }", "readCount readTone" },
+        .{ "fn load(s: []const u8) !Tone { _ = &s; return read<|>; }", "readTone readCount" },
+    };
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator,
+            \\//- /p/main.zig module:app
+            \\const Tone = enum {{ warm, cool }};
+            \\const motto = "hello";
+            \\fn show(text: []const u8) void {{ _ = text; }}
+            \\fn readCount(s: []const u8) u32 {{ return @intCast(s.len); }}
+            \\fn readTone(s: []const u8) !Tone {{ if (s.len == 0) return error.Empty; return .warm; }}
+            \\{s}
             \\
         , .{c[0]});
         defer testing.allocator.free(source);
