@@ -3224,6 +3224,18 @@ test "completion inside a quoted identifier offers the candidates of a plain pre
     }
 }
 
+test "completion on the name of an existing initializer field lists the fields" {
+    try expectCompletions(
+        \\const S = struct { alpha: u32 = 0, beta: u32 = 0 };
+        \\
+    , &.{
+        .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .al<|> = 1 };\n    _ = .{ s1, local };\n}", "alpha beta" },
+        .{ "fn f() void {\n    const local = 5;\n    const s1 = S{ .be<|> = 2 };\n    _ = .{ s1, local };\n}", "alpha beta" },
+        .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .a<|>lpha = 1 };\n    _ = .{ s1, local };\n}", "alpha beta" },
+        .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .alpha = 1, .b<|> = 2 };\n    _ = .{ s1, local };\n}", "beta" },
+    });
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;

@@ -418,6 +418,21 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
 
+    // The name of a field already written in an initializer (`.{ .al| = 1 }`): the fields that the
+    // other names do not assign
+    if (rel > 0) if (b.exprAt(rel - 1)) |e| if (b.expr(e) == .init) {
+        const x = b.expr(e).init;
+        for (x.fields, 0..) |f, i| {
+            if (f.name == null or rel - 1 < f.name_range.start or rel - 1 >= f.name_range.end) continue;
+            out.member_mode = true;
+            const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .init_field };
+            const ty = if (x.ty == null) a.literalExpected(e) orelse return .{ .context = .init_field } else a.exprType(e).ty;
+            const t = fieldsType(r.ctx.db.env.ip, ty) orelse return .{ .context = .init_field };
+            try initFields(r, &out, t, try std.mem.concat(r.arena, Body.FieldInit, &.{ x.fields[0..i], x.fields[i + 1 ..] }));
+            return .{ .items = out.items.items, .context = .init_field };
+        }
+    };
+
     // Names in scope: when the cursor immediately follows a name, use the scope of that name
     const scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
         .name_ref => b.expr_scopes[@backingInt(e)],
