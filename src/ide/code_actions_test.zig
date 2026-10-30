@@ -1174,6 +1174,80 @@ test "add missing switch prongs counts qualified and aliased items as covered" {
     ));
 }
 
+test "add missing switch prongs whose value is used" {
+    // A `{}` body would fail with `expected type 'u32', found 'void'`
+    try expectAction(
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    const x: u32 = <|>switch (e) {
+        \\        .a => 1,
+        \\    };
+        \\    return x;
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    const x: u32 = switch (e) {
+        \\        .a => 1,
+        \\        .b => @panic("TODO"),
+        \\    };
+        \\    return x;
+        \\}
+    );
+    try expectAction(
+        \\const U = union(enum) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    return <|>switch (u) {
+        \\        .a => |v| v,
+        \\    };
+        \\}
+    , "add missing switch prongs",
+        \\const U = union(enum) { a: u32, b: u8 };
+        \\fn f(u: U) u32 {
+        \\    return switch (u) {
+        \\        .a => |v| v,
+        \\        .b => @panic("TODO"),
+        \\    };
+        \\}
+    );
+    // A statement switch, even when its prongs do not return
+    try expectAction(
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    <|>switch (e) {
+        \\        .a => return 1,
+        \\    }
+        \\    return 0;
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b };
+        \\fn f(e: E) u32 {
+        \\    switch (e) {
+        \\        .a => return 1,
+        \\        .b => {},
+        \\    }
+        \\    return 0;
+        \\}
+    );
+    // A value switch of type void
+    try expectAction(
+        \\const E = enum { a, b };
+        \\fn f(e: E, c: bool) void {
+        \\    if (c) <|>switch (e) {
+        \\        .a => {},
+        \\    };
+        \\}
+    , "add missing switch prongs",
+        \\const E = enum { a, b };
+        \\fn f(e: E, c: bool) void {
+        \\    if (c) switch (e) {
+        \\        .a => {},
+        \\        .b => {},
+        \\    };
+        \\}
+    );
+}
+
 fn applyNone(text: []const u8) ![]const u8 {
     const got = try apply(text, "add missing switch prongs");
     defer testing.allocator.free(got);

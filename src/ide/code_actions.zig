@@ -9,7 +9,7 @@
 //! - Local variables that are never mutated (`local variable is never mutated`): change `var` to
 //!   `const`
 //! - Enum / union prongs missing from a switch: add `.name => {},` (and `_ => {},` for a
-//!   non-exhaustive enum)
+//!   non-exhaustive enum), with `@panic("TODO")` instead of `{}` where the switch value is used
 //! - Fields missing from a struct initializer (those without a default value): add
 //!   `.name = undefined`
 //!
@@ -762,18 +762,34 @@ fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
     if (kind != .@"enum" and kind != .@"union") return null;
     const ns = try queries.namespaceOfType(r, ty) orelse return null;
     const tree = try r.itemTree(ns.file);
+    // `{}` is void; where the value of the switch is used, `@panic` coerces to any result type
+    const body = if (isStatement(at.body, at.expr) or res.exprs[@backingInt(at.expr)].ty == .void_type) "{}" else "@panic(\"TODO\")";
     var items: std.ArrayList([]const u8) = .empty;
     for (tree.containerMembers(ns.container)) |m| {
         const it = tree.items[m];
         if (it.kind != .field) continue;
         const name = it.name orelse continue;
         if (covered.contains(ast.identName(name))) continue;
-        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} => {{}}", .{std.zig.fmtIdP(ast.identName(name))}));
+        try items.append(r.arena, try std.fmt.allocPrint(r.arena, ".{f} => {s}", .{ std.zig.fmtIdP(ast.identName(name)), body }));
     }
-    if (kind == .@"enum" and tree.containers[ns.container].nonexhaustive and !has_underscore) try items.append(r.arena, "_ => {}");
+    if (kind == .@"enum" and tree.containers[ns.container].nonexhaustive and !has_underscore) try items.append(r.arena, try std.fmt.allocPrint(r.arena, "_ => {s}", .{body}));
     if (items.items.len == 0) return null;
     const edit = try appendBeforeClose(r.arena, text, at.base + at.body.range(at.expr).start, at.base + at.body.range(at.expr).end, items.items, true) orelse return null;
     return .{ .title = "add missing switch prongs", .edits = try r.arena.dupe(Edit, &.{edit}) };
+}
+
+/// The expression is a statement of a block (or the body of a `defer` / `errdefer`), where its
+/// value must be void
+fn isStatement(b: *const Body, e: Body.ExprId) bool {
+    for (b.exprs) |x| switch (x) {
+        .block => |blk| for (blk.stmts) |s| switch (s.kind) {
+            .expr, .@"defer" => |y| if (y == e) return true,
+            .@"errdefer" => |y| if (y.body == e) return true,
+            else => {},
+        },
+        else => {},
+    };
+    return false;
 }
 
 fn missingFields(r: *Resolver, file: FileId, text: []const u8, offset: u32) resolve.Error!?Action {
