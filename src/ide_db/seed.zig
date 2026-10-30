@@ -739,7 +739,7 @@ const Closure = struct {
     fn reachesInner(c: *Closure, x: Index) resolve.Error!bool {
         const ip = c.r.ctx.db.env.ip;
         return switch (ip.key(x)) {
-            .simple_type, .int_type, .error_set_type, .simple_value, .int_value, .float_value, .enum_literal, .error_value, .runtime => false,
+            .simple_type, .int_type, .error_set_type, .simple_value, .int_value, .float_value, .enum_literal, .error_value, .runtime, .context => false,
             .unknown, .opaque_param => true,
             .ptr_type => |p| c.reaches(p.child),
             .array_type => |a| c.reaches(a.child),
@@ -1131,7 +1131,7 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?F
     const g = try infer.genericCallee(r, r.arena, callee, f) orelse return null;
     if (g.body.params.len == 0) return null;
     const receiver: TypedValue = .{ .ty = try queries.containerType(r, .{ .file = file, .container = container }, null) };
-    const std_root = try r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return null;
+    const std_root = try r.ctx.get(database.ModuleGraph.StdRoot, null) orelse return null;
     for (dispatchers) |d| {
         var t = try queries.containerType(r, .{ .file = std_root, .container = 0 }, null);
         for (d.path) |part| {
@@ -1173,7 +1173,7 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?F
             for (args, 0..) |*a, ai| a.* = if (ai == 0) receiver else if (ai - 1 < c.args.len) res.exprs[@backingInt(c.args[ai - 1])] else .unknown;
             const inst = try infer.instanceOf(r, r.arena, g, f, args);
             if (!value.isConcrete(ip, inst)) continue;
-            const norm = try queries.normalizeInst(r, file, item, inst);
+            const norm = queries.genericInst(ip, try queries.normalizeInst(r, file, item, inst));
             return .{ .inst = norm, .owner = owner, .expr = @fromBackingInt(@as(u32, @intCast(ei))) };
         }
     }
@@ -1562,7 +1562,7 @@ const Site = struct {
         const r = s.r;
         const inst = (try calleeInstance(r, s.res, callee, receiver, args, s.root_key) orelse return null).inst;
         const site_owner = try r.ownerKey(s.in, s.i);
-        const norm = try queries.normalizeInst(r, s.file, s.item, inst);
+        const norm = queries.genericInst(r.ctx.db.env.ip, try queries.normalizeInst(r, s.file, s.item, inst));
         if (s.all) |c| {
             try c.add(r.arena, .{ .inst = norm, .owner = site_owner, .expr = @fromBackingInt(s.expr) });
             return null;

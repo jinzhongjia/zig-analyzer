@@ -93,7 +93,8 @@ const ContainerNames = struct {
             .container_type => |p| p,
             else => return,
         };
-        if (p.inst == null or p.kind == .file or (n.name(p) catch null) == null) return;
+        const generic = if (p.inst) |i| ip.key(i) != .context else false;
+        if (!generic or p.kind == .file or (n.name(p) catch null) == null) return;
         try n.write(p, w);
         try w.writeAll(".");
     }
@@ -139,10 +140,13 @@ const ContainerNames = struct {
 
     /// The instance whose arguments are displayed: for the per-iteration instance (see
     /// `InternPool.Instance.iteration`) of a member that has no instance, the enclosing instance
-    /// is displayed
+    /// is displayed; null outside generic functions (a compilation context is not displayed)
     fn shownInst(n: ContainerNames, inst: ?Index) ?Index {
         const i = inst orelse return null;
-        const key = n.r.ctx.db.env.ip.key(i).instance;
+        const key = switch (n.r.ctx.db.env.ip.key(i)) {
+            .instance => |key| key,
+            else => return null,
+        };
         if (key.iteration) |it| if (it.abstract) return n.shownInst(key.parent);
         return i;
     }
@@ -153,11 +157,14 @@ const ContainerNames = struct {
     /// otherwise displayed by their contents
     pub fn writeReified(n: ContainerNames, t: InternPool.Reified, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
-        const inst = t.inst orelse {
-            const decl_name = n.constNaming(t) catch null orelse return ip.printReified(t, w, n);
-            return w.writeAll(decl_name);
+        const i = switch (ip.key(t.inst orelse .unknown)) {
+            .instance => |i| i,
+            else => {
+                const decl_name = n.constNaming(t) catch null orelse return ip.printReified(t, w, n);
+                return w.writeAll(decl_name);
+            },
         };
-        const i = ip.key(inst).instance;
+        const inst = t.inst.?;
         const tree = n.r.itemTree(i.file) catch return ip.printReified(t, w, n);
         for (tree.items) |it| if (it.ast_id == i.decl) {
             try w.writeAll(it.name orelse return ip.printReified(t, w, n));
@@ -174,10 +181,10 @@ const ContainerNames = struct {
         for (tree.items) |it| {
             if (it.ast_id != t.owner) continue;
             if (it.kind != .@"const") return null;
-            const decl = try n.r.ctx.get(queries.DeclType, .{ .owner = .{ .file = t.file, .item = it.ast_id } });
+            const decl = try n.r.ctx.get(queries.DeclType, .{ .owner = .{ .file = t.file, .item = it.ast_id }, .inst = t.inst });
             const v = decl.val orelse return null;
             const same = switch (ip.key(v)) {
-                .reified_type => |x| x.file == t.file and x.owner == t.owner and x.expr == t.expr and x.inst == null,
+                .reified_type => |x| x.file == t.file and x.owner == t.owner and x.expr == t.expr and x.inst == t.inst,
                 else => false,
             };
             return if (same) it.name else null;

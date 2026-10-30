@@ -112,14 +112,15 @@ pub fn bodyQuota(r: *Resolver, body: *const Body, exprs: []const TypedValue) u32
 
 /// Computation of `CallEval`
 pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
-    _ = try ctx.get(queries.TargetAbi, {});
     var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
     defer scratch.deinit();
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-    var ev: Evaluator = .{ .r = &r, .ip = ctx.db.env.ip, .a = scratch.allocator(), .arena = &scratch, .quota = key.quota };
-    defer ev.deinit();
-    const ip = ev.ip;
+    const ip = ctx.db.env.ip;
     const inst = ip.key(key.inst).instance;
+    const scope = try queries.enterContext(&r, inst.file, key.inst);
+    defer scope.leave();
+    var ev: Evaluator = .{ .r = &r, .ip = ip, .a = scratch.allocator(), .arena = &scratch, .quota = key.quota };
+    defer ev.deinit();
     const args = switch (ip.key(key.values)) {
         .aggregate => |agg| agg.elems,
         else => &.{},
@@ -133,6 +134,8 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
 /// comptime value of the body of a member (container-level constant, field default value).
 /// `want` is the type annotation.
 pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index) Error!TypedValue {
+    const scope = if (r.context == null) try queries.enterContext(r, owner.file, inst) else null;
+    defer if (scope) |s| s.leave();
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
@@ -149,6 +152,10 @@ pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index)
 /// evaluate a value in a comptime context. `quota` is the backward branch quota (see
 /// `bodyQuota`).
 pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index, quota: u32) Error!TypedValue {
+    // Evaluations started outside a computation in a compilation (such as by goto) run in the
+    // compilation of `file` and `inst`
+    const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
+    defer if (scope) |s| s.leave();
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena, .quota = quota };
@@ -1599,7 +1606,7 @@ const Evaluator = struct {
     /// count, and the call site's quota), and the result is cached within this evaluation. The
     /// arguments are not interned, so repeated calls in a loop do not bloat the InternPool.
     fn scalarCall(ev: *Evaluator, owner: hir.OwnerKey, inst: Index, args: []const Val) EvalError!Val {
-        _ = try ev.r.ctx.get(queries.TargetAbi, {});
+        _ = try if (ev.r.context) |c| ev.r.ctx.get(queries.ContextTarget, c) else ev.r.ctx.get(queries.TargetAbi, {});
         const memo = ev.calls orelse blk: {
             const gpa = ev.r.ctx.db.gpa;
             const m = try gpa.create(CallMemo);
@@ -3643,7 +3650,7 @@ const Evaluator = struct {
 
     /// Type in the standard library looked up by path (e.g. `builtin.Type`)
     fn stdType(ev: *Evaluator, path: []const []const u8) EvalError!Index {
-        const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return error.Abort;
+        const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, ev.r.context) orelse return error.Abort;
         var t = try queries.containerType(ev.r, .{ .file = std_root, .container = 0 }, null);
         for (path) |name| t = try asType(try ev.typeMember(t, name));
         return t;

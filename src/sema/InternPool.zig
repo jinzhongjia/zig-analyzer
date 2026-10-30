@@ -21,11 +21,16 @@ gpa: Allocator,
 io: Io,
 /// Protects `map`, `arena`, and appending to `items`
 mutex: SpinMutex = .{},
-/// Target-dependent parameters for value computations. Set in the same write transaction as the
+/// Target-dependent parameters for value computations outside every compilation: the parts the
+/// targets of all compilations agree on. Set in the same write transaction as the
 /// `queries.TargetAbi` input; every query that reads it reads that input first to record the
 /// dependency. Read and write transactions are mutually exclusive, so it is never modified while
 /// being read.
 target: Target = .{},
+/// Target-dependent parameters of each compilation (indexed like `ModuleGraph.compiles`, the
+/// value of a `context` key), set in the same write transaction as the `queries.ContextTarget`
+/// inputs. A computation running in a compilation selects its entry with `enterContext`.
+targets: []const Target = &.{},
 /// Storage for the slices in Keys
 arena: std.heap.ArenaAllocator,
 items: Items = .{},
@@ -208,8 +213,15 @@ pub const Key = union(enum) {
     /// argument value for comptime parameters, unknown when it is not known; the argument type
     /// for anytype parameters; `runtime` for non-comptime parameters).
     /// `parent` is the instance the function itself belongs to (for a function defined in another
-    /// instantiated container).
+    /// instantiated container), or the `context` of a function outside every generic function.
     instance: Instance,
+    /// The compilation (an index into `ModuleGraph.compiles`) code is analyzed in when it is not
+    /// its file's own compilation (`ModuleGraph.home`): a file shared by several compilations,
+    /// such as the standard library, is analyzed once per compilation that uses it. It takes the
+    /// place of an instance where code is outside every generic function (`inst` of declarations,
+    /// container types and function values) and ends the `parent` chain of instances, so values
+    /// from different compilations never share an identity. Neither a type nor a value.
+    context: u32,
     /// A comptime type parameter without a concrete instance (abstract instance), displayed as the
     /// parameter name
     opaque_param: struct { file: FileId, owner: AstId, binding: u32, name: []const u8 },
@@ -384,6 +396,7 @@ pub fn init(gpa: Allocator, io: Io) Allocator.Error!InternPool {
 }
 
 pub fn deinit(ip: *InternPool) void {
+    ip.gpa.free(ip.targets);
     ip.items.deinit(ip.gpa);
     ip.map.deinit(ip.gpa);
     ip.arena.deinit();
@@ -419,16 +432,26 @@ pub fn bytes(ip: *InternPool) usize {
     return ip.items.capacity() * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
 }
 
+/// The target parameters value computations on this thread use: those of the compilation the
+/// innermost computation in progress runs in (see `enterContext`); null outside every compilation,
+/// where the parameters common to all compilations (`target`) apply. A computation runs entirely
+/// on one thread, and nested computations restore it when they return.
+threadlocal var active_target: ?*const Target = null;
+
+fn currentTarget(ip: *const InternPool) *const Target {
+    return active_target orelse &ip.target;
+}
+
 pub fn pointerBits(ip: *const InternPool) ?u16 {
-    return ip.target.pointer_bits;
+    return ip.currentTarget().pointer_bits;
 }
 
 pub fn vectorAbi(ip: *const InternPool) VectorAbi {
-    return ip.target.vector_abi;
+    return ip.currentTarget().vector_abi;
 }
 
 pub fn scalarAbi(ip: *const InternPool) *const ScalarAbi {
-    return &ip.target.scalar_abi;
+    return &ip.currentTarget().scalar_abi;
 }
 
 /// May only be called in a write transaction
@@ -436,10 +459,28 @@ pub fn setTarget(ip: *InternPool, t: Target) void {
     ip.target = t;
 }
 
-/// Target-dependent parameters for value computations (the parts consistent across modules);
-/// defaults to the native target
+/// Replaces the target parameters of the compilations. May only be called in a write transaction.
+pub fn setTargets(ip: *InternPool, targets: []const Target) Allocator.Error!void {
+    const copy = try ip.gpa.dupe(Target, targets);
+    ip.gpa.free(ip.targets);
+    ip.targets = copy;
+}
+
+/// Makes value computations on this thread use the target of compilation `context` (null: the
+/// parameters common to all compilations) until `leaveContext` is called with the returned value
+pub fn enterContext(ip: *const InternPool, context: ?u32) ?*const Target {
+    const prev = active_target;
+    active_target = if (context) |c| (if (c < ip.targets.len) &ip.targets[c] else null) else null;
+    return prev;
+}
+
+pub fn leaveContext(prev: ?*const Target) void {
+    active_target = prev;
+}
+
+/// Target-dependent parameters for value computations; defaults to the native target
 pub const Target = struct {
-    /// Pointer bit width; null when the modules disagree
+    /// Pointer bit width; null when unknown (the targets the parameters are common to disagree)
     pointer_bits: ?u16 = @bitSizeOf(usize),
     vector_abi: VectorAbi = .unknown,
     scalar_abi: ScalarAbi = .native,
@@ -902,7 +943,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("&");
             try ip.print(v.pointee, w, container_name);
         },
-        .instance => try w.writeAll("instance"),
+        .instance, .context => try w.writeAll("instance"),
         .opaque_param => |o| try w.writeAll(o.name),
         .runtime => try w.writeAll("_"),
     }

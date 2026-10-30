@@ -888,10 +888,10 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
     }
 }
 
-/// Target-dependent parameters of value operations (pointer bit width, layout rules of vector and
-/// scalar types): taken from the parts the builtins of all modules and compilations agree on;
-/// parts that disagree are unknown (values depending on them are unknown); without project
-/// modules, the default builtin (native) is used
+/// Target-dependent parameters of value operations outside every compilation (pointer bit width,
+/// layout rules of vector and scalar types): taken from the parts the builtins of all modules and
+/// compilations agree on; parts that disagree are unknown (values depending on them are unknown);
+/// without project modules, the default builtin (native) is used
 fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema.InternPool.Target {
     var result: za.sema.InternPool.Target = .{};
     // Modules with the same parameters share the same builtin, and merging the same target again
@@ -978,30 +978,38 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     var graph_owned = true;
     defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
     const t = try server.targetAbi(graph);
-    // Do not open a write transaction when neither the module graph nor the target has changed:
+    // Each compilation uses the target of its builtin (the root module's); when that is unknown,
+    // the parameters common to all compilations
+    const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
+    defer server.gpa.free(targets);
+    for (graph.compiles, targets) |c, *ct| ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
+    // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
     // and requests (the requests fail with ContentModified)
-    if (try server.moduleGraphUnchanged(graph, t)) return;
+    if (try server.moduleGraphUnchanged(graph, t, targets)) return;
     // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it.
     // Requests that read only text cannot change with the module graph: they are not canceled.
     // The update is not ordered with the requests: one received earlier that starts reading after
     // it reads the new graph.
-    server.db.beginWriteOf(comptime Db.inputSet(&.{ ModuleGraph.Input, za.sema.queries.TargetAbi }), .unordered);
+    server.db.beginWriteOf(comptime Db.inputSet(&.{ ModuleGraph.Input, za.sema.queries.TargetAbi, za.sema.queries.ContextTarget }), .unordered);
     defer server.db.endWrite();
-    // `set` allocates only when the key is not interned yet: ensure both keys first, so that
-    // the two set calls afterwards cannot fail and cannot leave a partial update either
+    // `set` allocates only when the key is not interned yet: ensure every key first, so that the
+    // set calls afterwards cannot fail and cannot leave a partial update either
     try server.db.ensureInput(ModuleGraph.Input, {});
     try server.db.ensureInput(za.sema.queries.TargetAbi, {});
+    for (0..targets.len) |i| try server.db.ensureInput(za.sema.queries.ContextTarget, @intCast(i));
+    try server.ip.setTargets(targets);
     server.db.set(ModuleGraph.Input, {}, graph, .medium) catch unreachable;
     graph_owned = false;
     server.db.set(za.sema.queries.TargetAbi, {}, t, .medium) catch unreachable;
+    for (targets, 0..) |ct, i| server.db.set(za.sema.queries.ContextTarget, @intCast(i), ct, .medium) catch unreachable;
     server.ip.setTarget(t);
 }
 
-/// The current module graph and target already equal `graph` and `t`. Called with graph_mutex
-/// held: the module graph is written only here, so nobody else can change it after the
-/// comparison.
-fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target) Allocator.Error!bool {
+/// The current module graph and targets already equal `graph`, `t` and `targets`. Called with
+/// graph_mutex held: the module graph is written only here, so nobody else can change it after
+/// the comparison.
+fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target, targets: []const za.sema.InternPool.Target) Allocator.Error!bool {
     var ctx = server.db.beginRead(server.gpa);
     defer ctx.end();
     const current = ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
@@ -1013,6 +1021,13 @@ fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.I
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return false,
     };
+    for (targets, 0..) |ct, i| {
+        const cur = ctx.get(za.sema.queries.ContextTarget, @intCast(i)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return false,
+        };
+        if (!std.meta.eql(cur, ct)) return false;
+    }
     return ModuleGraph.Input.eql(current, graph) and std.meta.eql(target, t);
 }
 
@@ -2249,6 +2264,8 @@ fn applyCacheLimits(server: *Server, config: *const Config) void {
 
 /// The query named `name` in `Db`
 fn QueryNamed(comptime name: []const u8) type {
+    // Compares `name` with the names of all queries
+    @setEvalBranchQuota(10_000);
     var found: ?type = null;
     for (Db.query_types) |Q| if (std.mem.endsWith(u8, @typeName(Q), "." ++ name)) {
         if (found != null) @compileError("more than one query named " ++ name);

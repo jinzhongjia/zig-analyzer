@@ -141,6 +141,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+    const scope = try queries.enterContext(&r, owner.file, inst);
+    defer scope.leave();
     const tree = try r.itemTree(owner.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == owner.item) break @intCast(i);
@@ -190,6 +192,8 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
     defer scratch.deinit();
     const a = scratch.allocator();
     var r: Resolver = .{ .ctx = ctx, .arena = a };
+    const scope = try queries.enterContext(&r, owner.file, inst);
+    defer scope.leave();
     const tree = try r.itemTree(owner.file);
     const item: u32 = for (tree.items, 0..) |it, i| {
         if (it.ast_id == owner.item) break @intCast(i);
@@ -448,7 +452,10 @@ const Inferrer = struct {
 
     fn ownInstance(inf: *Inferrer) ?InternPool.Instance {
         const i = inf.inst orelse return null;
-        const key = inf.ip.key(i).instance;
+        const key = switch (inf.ip.key(i)) {
+            .instance => |x| x,
+            else => return null,
+        };
         if (key.file != inf.file) return null;
         const tree = inf.r.itemTree(inf.file) catch return null;
         return if (key.decl == tree.items[inf.item].ast_id) key else null;
@@ -1225,7 +1232,7 @@ const Inferrer = struct {
         const field = for (init.fields) |f| {
             if (f.name != null and std.mem.eql(u8, f.name.?, name)) break f;
         } else return null;
-        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+        const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = try queries.rootInst(inf.r, owner.file, inf.inst) });
         if (res.exprs.len != body.exprs.len) return null;
         const fv = res.exprs[@backingInt(field.value)];
         return if (fv.val != null) fv else null;
@@ -1372,7 +1379,7 @@ const Inferrer = struct {
 
     /// A type in the standard library looked up by path (e.g. `builtin.Type`)
     fn stdType(inf: *Inferrer, path: []const []const u8) Error!?Index {
-        var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, {}) orelse return null, .container = 0 };
+        var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, inf.r.context) orelse return null, .container = 0 };
         var t: Index = .unknown;
         for (path, 0..) |name, i| {
             const def = try inf.r.memberDef(ns, name) orelse return null;
@@ -3735,7 +3742,10 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
 /// other instances are returned as is
 fn splitIteration(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) Error!struct { inst: ?Index, seed: ?LoopSeed } {
     const i = inst orelse return .{ .inst = null, .seed = null };
-    const key = ip.key(i).instance;
+    const key = switch (ip.key(i)) {
+        .instance => |x| x,
+        else => return .{ .inst = i, .seed = null },
+    };
     const it = key.iteration orelse return .{ .inst = i, .seed = null };
     if (key.file != owner.file or key.decl != owner.item) return .{ .inst = i, .seed = null };
     const seed: LoopSeed = .{ .binding = it.binding, .index = it.index };

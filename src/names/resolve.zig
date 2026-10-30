@@ -43,9 +43,26 @@ const max_depth = 100;
 pub const Resolver = struct {
     ctx: *Db.Ctx,
     arena: Allocator,
+    /// The compilation the current computation runs in (an index into `ModuleGraph.compiles`):
+    /// `@import("std")`, `@import("builtin")` and `@import("root")` resolve in it, whichever file
+    /// they are in. Null: each file resolves them in its own compilation (`ModuleGraph.home`).
+    context: ?u32 = null,
+    /// `fileContext` results already read by this resolver. A resolver belongs to one computation
+    /// (or one request), whose first read records the dependency.
+    file_contexts: std.AutoHashMapUnmanaged(FileId, ?u32) = .empty,
 
     fn vfs(r: *Resolver) *Vfs {
         return r.ctx.db.env.vfs;
+    }
+
+    /// The compilation `file` is analyzed in by itself (`ModuleGraph.FileContext`)
+    pub fn fileContext(r: *Resolver, file: FileId) Error!?u32 {
+        const gop = try r.file_contexts.getOrPut(r.arena, file);
+        if (!gop.found_existing) gop.value_ptr.* = r.ctx.get(ModuleGraph.FileContext, file) catch |err| {
+            _ = r.file_contexts.remove(file);
+            return err;
+        };
+        return gop.value_ptr.*;
     }
 
     /// `.zon` files: `@import` of one yields the value in it, not a namespace
@@ -289,6 +306,10 @@ pub const Resolver = struct {
             const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
             return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, name }));
         }
+        if (r.context) |c| if (ModuleGraph.isContextName(name)) {
+            const targets = try r.ctx.get(ModuleGraph.ContextImports, .{ .file = file, .context = c });
+            for (ModuleGraph.ContextImports.names, targets) |n, t| if (std.mem.eql(u8, n, name)) return t;
+        };
         // Through the file's import table: depends only on the part relevant to this file
         // (see `FileImports`)
         if ((try r.ctx.get(ModuleGraph.FileImports, file)).get(name)) |target| return target;

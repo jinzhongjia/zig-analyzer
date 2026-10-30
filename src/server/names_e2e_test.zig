@@ -506,10 +506,10 @@ test "pointer width follows the project's target" {
     // wasm32 uses the LLVM backend by default: vectors are aligned to their byte size
     try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", wasm.vec);
 
-    // Two targets at once, x86_64 (self-hosted backend) and wasm32 (LLVM): both the pointer width
-    // and the vector rules differ, so size-related values are unknown (no possibly wrong value is
-    // given). The host target is not used: x86_64-windows also uses LLVM by default in Debug, with
-    // the same vector rules as wasm32.
+    // Two targets at once, x86_64 (self-hosted backend) and wasm32 (LLVM), with different pointer
+    // widths and vector rules: by itself, the file is analyzed in the first compilation that
+    // reaches it, the wasm32 one (as its `builtin` is), with exactly that compilation's layout
+    // rather than a mixture of both
     const mixed = try sizesHover(&.{
         .{ .path = "build.zig", .text =
         \\const std = @import("std");
@@ -533,9 +533,9 @@ test "pointer width follows the project's target" {
     defer testing.allocator.free(mixed.size);
     defer testing.allocator.free(mixed.max);
     defer testing.allocator.free(mixed.vec);
-    try testing.expectEqualStrings("```zig\nconst size: comptime_int\n```", mixed.size);
-    try testing.expectEqualStrings("```zig\nconst max: comptime_int\n```", mixed.max);
-    try testing.expectEqualStrings("```zig\nconst vec: comptime_int\n```", mixed.vec);
+    try testing.expectEqualStrings("```zig\nconst size: comptime_int = 4\n```", mixed.size);
+    try testing.expectEqualStrings("```zig\nconst max: comptime_int = 4294967295\n```", mixed.max);
+    try testing.expectEqualStrings("```zig\nconst vec: comptime_int = 2\n```", mixed.vec);
 
     // Single-file mode: the native target
     const single = try sizesHover(&.{.{ .path = "main.zig", .text = sizes_main }}, null);
