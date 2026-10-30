@@ -3,6 +3,7 @@
 //!
 //! Threading model: each Workspace has a dedicated background task that blocks reading BSP events
 //! and handles them; the LSP main loop interacts with it only through `requestBuild` / `stop`.
+//! Edits of files in the compile set may recompute it from other tasks (see `refreshImports`).
 //!
 //! Lifecycle: when maker crashes, or build.zig or the build configuration changes, the project is
 //! restarted as a new instance. The new instance is invisible until its first build completes (or
@@ -15,6 +16,8 @@
 //! Lock order: never begin a write transaction of the query engine while holding `mutex`. The
 //! diagnostics publishing task acquires `mutex` inside a read transaction, and a write transaction
 //! waits for all read transactions to finish, so acquiring them in opposite orders deadlocks.
+//! `set_mutex` is acquired before `mutex` and outside any transaction; transactions may begin
+//! while holding it.
 
 const std = @import("std");
 const Io = std.Io;
@@ -75,6 +78,10 @@ successor: ?*Workspace = null,
 placed: Io.Event = .unset,
 
 mutex: Io.Mutex = .init,
+/// Serializes the computations of the compile set (by the background task, and by the tasks that
+/// check edited files, see `refreshImports`) with changes to `model`, whose pointer the
+/// computations use outside `mutex`
+set_mutex: Io.Mutex = .init,
 // ── The following fields are protected by mutex ──
 client: ?*bsp.Client = null,
 model: ?ProjectModel = null,
@@ -127,9 +134,14 @@ diag_steps: std.DynamicBitSetUnmanaged = .{},
 
 // ── The following fields are accessed only by the background task ──
 bundles: std.ArrayList(ErrorBundle) = .empty,
+
+// ── The following fields are protected by set_mutex ──
 /// Files whose loading from disk has already been attempted (nonexistent files are recorded too,
 /// to avoid repeated attempts)
 loaded: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+/// Hash of the imports (see `importsHash`) of each file the latest compile set computation read;
+/// null when the computation read different imports at different times
+read_imports: std.AutoHashMapUnmanaged(FileId, ?u64) = .empty,
 
 /// Recomputing the compile set during a build because of generated file paths: at least
 /// `generated_recompute_interval_ms` after the previous recompute ended, and no less than
@@ -231,6 +243,7 @@ fn destroy(ws: *Workspace) void {
     for (ws.bundles.items) |*eb| eb.deinit(gpa);
     ws.bundles.deinit(gpa);
     ws.loaded.deinit(gpa);
+    ws.read_imports.deinit(gpa);
     gpa.free(ws.root);
     gpa.destroy(ws);
 }
@@ -491,6 +504,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 }
             }
             {
+                ws.set_mutex.lockUncancelable(io);
+                defer ws.set_mutex.unlock(io);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
                 if (ws.model) |*old| old.deinit(ws.gpa);
@@ -533,6 +548,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         .step_completed => |*sc| {
             var roots_changed = false;
             {
+                ws.set_mutex.lockUncancelable(io);
+                defer ws.set_mutex.unlock(io);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
                 ws.build_done += 1;
@@ -802,6 +819,8 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 const Resolver = struct {
     ws: *Workspace,
     ctx: *database.Db.Ctx,
+    /// Records the hash of the imports read for each file (see `importsHash`)
+    read: ?*std.AutoHashMapUnmanaged(FileId, u64) = null,
 
     pub fn intern(r: Resolver, file_path: []const u8) !FileId {
         return r.ws.server.vfs.intern(file_path);
@@ -813,10 +832,25 @@ const Resolver = struct {
 
     pub fn imports(r: Resolver, file: FileId) !?[]const []const u8 {
         const text = try r.ctx.get(FileText, file);
-        if (text == null) return if (r.ws.loaded.contains(file)) &.{} else null;
-        return try syntaxImports(r.ws.server, r.ctx, file);
+        const list = if (text != null)
+            try syntaxImports(r.ws.server, r.ctx, file)
+        else if (r.ws.loaded.contains(file))
+            &.{}
+        else
+            return null;
+        if (r.read) |read| try read.put(r.ws.gpa, file, importsHash(list));
+        return list;
     }
 };
+
+fn importsHash(list: []const []const u8) u64 {
+    var h: std.hash.Wyhash = .init(0);
+    for (list) |s| {
+        h.update(std.mem.asBytes(&s.len));
+        h.update(s);
+    }
+    return h.final();
+}
 
 /// The `@import` strings of a file in its syntax tree. The compiler follows the imports recorded in
 /// ZIR, but a file with a parse error or a duplicate member name has no ZIR: while such a file is
@@ -831,6 +865,52 @@ fn syntaxImports(server: *Server, ctx: *database.Db.Ctx, file: FileId) za.db.Err
 /// Computes the compile set; on encountering files that are not loaded, loads them from disk and
 /// recomputes, until nothing is missing
 pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
+    ws.set_mutex.lockUncancelable(ws.server.io);
+    defer ws.set_mutex.unlock(ws.server.io);
+    try ws.recomputeLocked();
+}
+
+/// Recomputes the compile set when the imports of one of `files` (whose text has changed) differ
+/// from those the latest computation read: the compile set and the module membership follow
+/// imports added and removed by edits without waiting for a build, which with compiler
+/// diagnostics off never runs. Files the computation did not read cannot change the result.
+pub fn refreshImports(ws: *Workspace, files: []const FileId) Allocator.Error!void {
+    const io = ws.server.io;
+    ws.set_mutex.lockUncancelable(io);
+    defer ws.set_mutex.unlock(io);
+    {
+        ws.mutex.lockUncancelable(io);
+        defer ws.mutex.unlock(io);
+        if (ws.stopping or ws.model == null or ws.compile_set == null) return;
+    }
+    for (files) |f| {
+        if (ws.read_imports.contains(f)) break;
+    } else return;
+    const changed = while (true) {
+        var arena: std.heap.ArenaAllocator = .init(ws.gpa);
+        defer arena.deinit();
+        var ctx = ws.server.db.beginRead(arena.allocator());
+        defer ctx.end();
+        break ws.importsChanged(&ctx, files) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Interrupted by an edit: retry
+            error.Canceled => continue,
+        };
+    };
+    if (changed) try ws.recomputeLocked();
+}
+
+fn importsChanged(ws: *Workspace, ctx: *database.Db.Ctx, files: []const FileId) za.db.Error!bool {
+    for (files) |f| {
+        const read = ws.read_imports.get(f) orelse continue;
+        const list = if (try ctx.get(FileText, f) != null) try syntaxImports(ws.server, ctx, f) else &.{};
+        if (read != importsHash(list)) return true;
+    }
+    return false;
+}
+
+/// `recomputeCompileSet` with `set_mutex` held
+fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
     const io = ws.server.io;
     var steps: []u32 = &.{};
     defer ws.gpa.free(steps);
@@ -864,11 +944,14 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
         std.mem.sort(u32, all.items, model, Native.lt);
     }
 
-    var result = try ws.computeSet(steps) orelse return;
+    var read: std.AutoHashMapUnmanaged(FileId, ?u64) = .empty;
+    defer read.deinit(ws.gpa);
+    var result = try ws.computeSet(steps, &read) orelse return;
     errdefer result.deinit(ws.gpa);
     // Files reachable from the other compile steps (tests, examples, etc.): used only to determine
     // which modules files belong to and to resolve imports; no live diagnostics are published
-    const extra: ?CompileSet.Result = if (all.items.len > steps.len) try ws.computeSet(all.items) else null;
+    const extra: ?CompileSet.Result = if (all.items.len > steps.len) try ws.computeSet(all.items, &read) else null;
+    std.mem.swap(std.AutoHashMapUnmanaged(FileId, ?u64), &ws.read_imports, &read);
     ws.mutex.lockUncancelable(io);
     if (ws.compile_set) |*old| old.deinit(ws.gpa);
     ws.compile_set = result;
@@ -886,6 +969,8 @@ pub fn recomputeCompileSet(ws: *Workspace) Allocator.Error!void {
 
 /// Computes the build scripts; missing files are read in and the computation repeated
 fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
+    ws.set_mutex.lockUncancelable(ws.server.io);
+    defer ws.set_mutex.unlock(ws.server.io);
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
         var arena: std.heap.ArenaAllocator = .init(ws.gpa);
@@ -914,27 +999,41 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
 }
 
 /// Files reachable through imports from the root modules of these compile steps; missing files
-/// are read in and the computation repeated. Returns null when it does not converge.
-fn computeSet(ws: *Workspace, steps: []const u32) Allocator.Error!?CompileSet.Result {
+/// are read in and the computation repeated. Returns null when it does not converge. The hashes of
+/// the imports read in the final round are added to `read`, with null for a file whose imports
+/// differ from those an earlier computation added (the file changed in between).
+fn computeSet(ws: *Workspace, steps: []const u32, read: *std.AutoHashMapUnmanaged(FileId, ?u64)) Allocator.Error!?CompileSet.Result {
     const io = ws.server.io;
+    var round_read: std.AutoHashMapUnmanaged(FileId, u64) = .empty;
+    defer round_read.deinit(ws.gpa);
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
         var arena: std.heap.ArenaAllocator = .init(ws.gpa);
         defer arena.deinit();
+        round_read.clearRetainingCapacity();
         var result = blk: {
             var ctx = ws.server.db.beginRead(arena.allocator());
             defer ctx.end();
             ws.mutex.lockUncancelable(io);
-            // model is replaced only in this task, so its pointer is safe to use outside the lock
+            // model is replaced or changed only with set_mutex held, which the caller holds, so its
+            // pointer is safe to use outside the lock
             const model = &ws.model.?;
             ws.mutex.unlock(io);
-            break :blk CompileSet.compute(ws.gpa, model, steps, Resolver{ .ws = ws, .ctx = &ctx }) catch |err| switch (err) {
+            break :blk CompileSet.compute(ws.gpa, model, steps, Resolver{ .ws = ws, .ctx = &ctx, .read = &round_read }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // Interrupted by an edit: retry
                 error.Canceled => continue,
             };
         };
-        if (result.missing.count() == 0) return result;
+        if (result.missing.count() == 0) {
+            errdefer result.deinit(ws.gpa);
+            var it = round_read.iterator();
+            while (it.next()) |e| {
+                const gop = try read.getOrPut(ws.gpa, e.key_ptr.*);
+                gop.value_ptr.* = if (gop.found_existing and gop.value_ptr.* != e.value_ptr.*) null else e.value_ptr.*;
+            }
+            return result;
+        }
         defer result.deinit(ws.gpa);
         var buf: [64]u8 = undefined;
         ws.reportLoading(std.fmt.bufPrint(&buf, "Analyzing compile set ({d} files)", .{result.files.count()}) catch null);

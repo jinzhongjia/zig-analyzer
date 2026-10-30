@@ -654,9 +654,12 @@ test "files of a package that only exports modules resolve module imports" {
     try h.notify("exit", {});
 }
 
-/// Modules the file belongs to (from `zig-analyzer/fileStatus`), as their root file paths
+/// Modules the file belongs to (from `zig-analyzer/fileStatus`), as their root file paths; empty
+/// when the server does not know the file
 fn fileModules(h: *Harness, uri: []const u8) ![]const []const u8 {
-    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = uri } })).object.get("result").?.object;
+    const result = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = uri } })).object.get("result").?;
+    if (result == .null) return &.{};
+    const status = result.object;
     var modules: std.ArrayList([]const u8) = .empty;
     for (status.get("modules").?.array.items) |m| try modules.append(h.arena.allocator(), m.string);
     return modules.items;
@@ -704,6 +707,61 @@ test "files imported only through a file with a syntax error keep their module m
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expectEqualStrings("answer", try completionLabels(&h, core_uri, core_text, "util."));
     try testing.expectEqual(1, (try fileModules(&h, util_uri)).len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a new @import adds the file to the compile set without a build" {
+    // With compiler diagnostics off no build ever runs: the edit alone must bring b.zig into
+    // main.zig's module, so references and rename of `a.Point` include the closed b.zig
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "app", .root_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host }) });
+        \\    b.step("check", "Check").dependOn(&exe.step);
+        \\}
+        \\
+        },
+        .{ .path = "src/a.zig", .text = "pub const Point = struct { x: u32 };\n" },
+        .{ .path = "src/b.zig", .text = "const a = @import(\"a.zig\");\npub fn getX(p: a.Point) u32 {\n    return p.x;\n}\n" },
+        .{ .path = "src/main.zig", .text = "const a = @import(\"a.zig\");\npub fn main() void {\n    const p: a.Point = .{ .x = 1 };\n    _ = p;\n}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    const options = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"diagnostics\": {\"compiler\": false}}", .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = options });
+    try h.notify("initialized", Empty{});
+    const main_path = try project.path(a, "src/main.zig");
+    const main_uri = try za.base.uri.fromPath(a, main_path);
+    const a_uri = try za.base.uri.fromPath(a, try project.path(a, "src/a.zig"));
+    const b_uri = try za.base.uri.fromPath(a, try project.path(a, "src/b.zig"));
+    try open(&h, main_uri, "const a = @import(\"a.zig\");\npub fn main() void {\n    const p: a.Point = .{ .x = 1 };\n    _ = p;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = "const a = @import(\"a.zig\");\nconst b = @import(\"b.zig\");\npub fn main() void {\n    const p: a.Point = .{ .x = 1 };\n    _ = b.getX(p);\n}\n" }} });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const modules = try fileModules(&h, b_uri);
+    try testing.expectEqual(1, modules.len);
+    try testing.expectEqualStrings(main_path, modules[0]);
+    const refs = (try h.request("textDocument/references", .{ .textDocument = .{ .uri = a_uri }, .position = .{ .line = 0, .character = 10 }, .context = .{ .includeDeclaration = true } })).object.get("result").?.array.items;
+    var in_b: usize = 0;
+    for (refs) |r| {
+        if (std.mem.eql(u8, r.object.get("uri").?.string, b_uri)) in_b += 1;
+    }
+    try testing.expectEqual(1, in_b);
+    try testing.expectEqual(3, refs.len);
+
+    // The newly imported file gets live diagnostics
+    try open(&h, b_uri, "const a = @import(\"a.zig\");\npub fn getX(p: a.Point) u32 {\n    return p.x +;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const diags = (try lastDiagnostics(&h, b_uri)) orelse return error.NoDiagnostics;
+    try testing.expectEqual(1, diags.len);
+    try testing.expect(std.mem.indexOf(u8, diags[0], "whitespace") != null);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

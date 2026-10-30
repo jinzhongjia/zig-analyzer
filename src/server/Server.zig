@@ -1508,6 +1508,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     server.publishFiles(&.{id}, false);
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
     server.compileSingle(id);
+    server.scheduleCompileSetRefresh(&.{id});
 }
 
 fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextDocumentParams) !void {
@@ -1543,6 +1544,7 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
     server.requestSemanticRefresh();
+    server.scheduleCompileSetRefresh(&.{id});
     // When a single-file mode root file was deleted from disk while open (notifications of
     // external changes skip open files), drop its compile results on close and republish the files
     // it imports as well
@@ -1754,6 +1756,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     if (edited.items.len != 0) {
         server.publishFiles(edited.items, true);
         server.requestSemanticRefresh();
+        server.scheduleCompileSetRefresh(edited.items);
     }
     if (rebuilt.items.len == 0) return;
     // Single-file mode: files imported by open files may have changed
@@ -3282,7 +3285,29 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     }
     server.publishNow(file, false, seen);
     if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
+    server.refreshCompileSets(&.{file});
     server.maybeResetSema();
+}
+
+/// The text of these files has changed: each project whose compile set read their imports
+/// recomputes it if the imports differ (see `Workspace.refreshImports`)
+fn refreshCompileSets(server: *Server, files: []const Vfs.FileId) void {
+    const list = server.workspaceList(server.gpa) catch return log.err("out of memory while updating compile sets", .{});
+    defer server.releaseList(server.gpa, list);
+    for (list) |ws| ws.refreshImports(files) catch log.err("{s}: out of memory while updating the compile set", .{ws.root});
+}
+
+/// `refreshCompileSets` in a background task: a recompute can take a while in a large project
+fn scheduleCompileSetRefresh(server: *Server, files: []const Vfs.FileId) void {
+    const owned = server.gpa.dupe(Vfs.FileId, files) catch return log.err("out of memory while updating compile sets", .{});
+    server.busyBegin();
+    spawn(server.io, &server.bg_group, compileSetRefreshTask, .{ server, owned });
+}
+
+fn compileSetRefreshTask(server: *Server, files: []const Vfs.FileId) Io.Cancelable!void {
+    defer server.busyEnd();
+    defer server.gpa.free(files);
+    server.refreshCompileSets(files);
 }
 
 fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
