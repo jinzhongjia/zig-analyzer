@@ -197,9 +197,13 @@ register_config: bool = false,
 /// The client supports dynamically registering `workspace/didChangeWatchedFiles` (watching
 /// external changes on disk)
 register_watch: bool = false,
-/// The client supports `workspace/inlayHint/refresh` (after the inlay hints settings change, the
-/// client is asked to request them again)
+/// The client supports `workspace/inlayHint/refresh` (when the inlay hints settings or results of
+/// other documents change, the client is asked to request them again); at most one refresh
+/// response is awaited at a time.
 inlay_refresh: bool = false,
+inlay_refresh_mutex: Io.Mutex = .init,
+inlay_refresh_pending: bool = false,
+inlay_refresh_dirty: bool = false,
 /// The client supports deferring `edit` to `codeAction/resolve` (and sends `data` back unchanged):
 /// naming fixes look up references only after the user has chosen them
 code_action_resolve: bool = false,
@@ -507,6 +511,8 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
                     try server.handleConfigResponse(s, resp.result, resp.@"error" != null);
                 } else if (std.mem.eql(u8, s, semantic_refresh_id)) {
                     server.semanticRefreshFinished();
+                } else if (std.mem.eql(u8, s, inlay_refresh_id)) {
+                    server.inlayRefreshFinished();
                 },
             };
         },
@@ -1096,7 +1102,7 @@ fn indexTask(server: *Server) Io.Cancelable!void {
         server.indexing.store(false, .release);
         // Updated again after the flag was released, and no other task took over: continue
         if (server.index_generation.load(.monotonic) == generation) {
-            server.requestSemanticRefresh();
+            server.requestRefresh();
             return;
         }
         if (server.indexing.swap(true, .acq_rel)) return;
@@ -1452,6 +1458,15 @@ fn cancelAllPending(server: *Server) void {
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
+const inlay_refresh_id = "zig-analyzer/inlayHintRefresh";
+
+/// Results of other documents may have changed in ways the client cannot see (another document
+/// edited, files changed on disk, the module graph loaded): semantic tokens and inlay hints are
+/// pulled by the client, which is asked to pull both again
+fn requestRefresh(server: *Server) void {
+    server.requestSemanticRefresh();
+    server.requestInlayRefresh();
+}
 
 fn openDocumentCount(server: *Server) usize {
     server.docs_mutex.lockUncancelable(server.io);
@@ -1493,6 +1508,36 @@ fn semanticRefreshFinished(server: *Server) void {
     server.semantic_refresh_dirty = false;
     server.semantic_refresh_mutex.unlock(server.io);
     if (dirty) server.requestSemanticRefresh();
+}
+
+/// Like `requestSemanticRefresh`: at most one refresh awaits the client's response, and requests
+/// made meanwhile are merged into one more refresh after it
+fn requestInlayRefresh(server: *Server) void {
+    if (!server.inlay_refresh or server.isShuttingDown() or server.openDocumentCount() == 0) return;
+    server.inlay_refresh_mutex.lockUncancelable(server.io);
+    if (server.inlay_refresh_pending) {
+        server.inlay_refresh_dirty = true;
+        server.inlay_refresh_mutex.unlock(server.io);
+        return;
+    }
+    server.inlay_refresh_pending = true;
+    server.inlay_refresh_mutex.unlock(server.io);
+    const bytes = jsonrpc.request(server.gpa, .{ .string = inlay_refresh_id }, "workspace/inlayHint/refresh", null) catch {
+        server.inlay_refresh_mutex.lockUncancelable(server.io);
+        server.inlay_refresh_pending = false;
+        server.inlay_refresh_mutex.unlock(server.io);
+        return log.err("out of memory while building inlay hint refresh", .{});
+    };
+    server.send(bytes);
+}
+
+fn inlayRefreshFinished(server: *Server) void {
+    server.inlay_refresh_mutex.lockUncancelable(server.io);
+    const dirty = server.inlay_refresh_dirty;
+    server.inlay_refresh_pending = false;
+    server.inlay_refresh_dirty = false;
+    server.inlay_refresh_mutex.unlock(server.io);
+    if (dirty) server.requestInlayRefresh();
 }
 
 // ── Notifications ────────────────────────────────────────────────────
@@ -1604,7 +1649,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     }
     server.publishFiles(&.{id}, false);
     server.publishDependents(&.{id});
-    if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
+    if (server.openDocumentCount() > 1) server.requestRefresh();
     server.compileSingle(id);
     server.scheduleCompileSetRefresh(&.{id});
 }
@@ -1661,7 +1706,7 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
         if (server.open_docs.fetchSwapRemove(id)) |kv| server.gpa.free(kv.value);
     }
     server.publishDependents(&.{id});
-    server.requestSemanticRefresh();
+    server.requestRefresh();
     server.scheduleCompileSetRefresh(&.{id});
     // When a single-file mode root file was deleted from disk while open (notifications of
     // external changes skip open files), drop its compile results on close and republish the files
@@ -1885,7 +1930,7 @@ fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidCha
     if (edited.items.len != 0) {
         server.publishFiles(edited.items, true);
         server.publishDependents(edited.items);
-        server.requestSemanticRefresh();
+        server.requestRefresh();
         server.scheduleCompileSetRefresh(edited.items);
     }
     if (rebuilt.items.len == 0) return;
@@ -2106,7 +2151,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         spawn(server.io, &server.bg_group, reloadZigPathsTask, .{server});
     }
     if (compiler_disabled) server.clearSingleFileResults();
-    if (inlay_changed and server.inlay_refresh) server.sendRequest(.{ .string = "zig-analyzer/inlayHintRefresh" }, "workspace/inlayHint/refresh", null);
+    if (inlay_changed) server.requestInlayRefresh();
     if (semantic_changed) server.requestSemanticRefresh();
     if (imports_enabled and server.imports_wanted.load(.acquire)) server.scheduleIndexing();
     if (build_changed) {
@@ -3480,7 +3525,7 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
     }
     server.publishNow(file, false, true, seen);
     server.publishDependents(&.{file});
-    if (server.openDocumentCount() > 1) server.requestSemanticRefresh();
+    if (server.openDocumentCount() > 1) server.requestRefresh();
     server.refreshCompileSets(&.{file});
     server.maybeResetSema();
 }

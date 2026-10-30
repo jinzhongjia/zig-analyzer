@@ -1934,3 +1934,49 @@ test "inactive code hints of other open files follow the comptime values they re
     try testing.expectEqualStrings(f64_hint, (try inactiveHints(&h, shapes_uri))[0]);
     try shutdown(&h);
 }
+
+test "inlay hint refresh after changes the client cannot see: other documents, disk, module graph" {
+    const dep_text = "pub fn make(width: u32, height: u32) u32 {\n    return width * height;\n}\n";
+    const extra_text = "pub const scale: u32 = 2;\n";
+    const main_text = "const dep = @import(\"dep.zig\");\nconst extra = @import(\"extra.zig\");\npub fn main() void {\n    _ = dep.make(1, extra.scale);\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "dep.zig", .text = dep_text },
+        .{ .path = "extra.zig", .text = extra_text },
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, project.root),
+        .capabilities = .{ .workspace = .{ .inlayHint = .{ .refreshSupport = true } } },
+        .initializationOptions = try jsonValue(&h,
+            \\{"diagnostics": {"debounce_ms": 0}}
+        ),
+    });
+    try h.notify("initialized", Empty{});
+    // A single document: its hints may have been pulled before the standard library and the
+    // module graph were loaded. Guards against asking only for semantic tokens again.
+    _ = try open(&h, try project.path(a, "main.zig"), main_text);
+    try waitIdle(&h);
+    var before = countRequests(&h, "workspace/inlayHint/refresh");
+    try testing.expect(before > 0);
+
+    // Another document is edited
+    const dep_uri = try open(&h, try project.path(a, "dep.zig"), dep_text);
+    try waitIdle(&h);
+    before = countRequests(&h, "workspace/inlayHint/refresh");
+    try change(&h, dep_uri, 2, "pub fn make(w2: u32, h2: u32) u32 {\n    return w2 * h2;\n}\n");
+    try waitIdle(&h);
+    try testing.expect(countRequests(&h, "workspace/inlayHint/refresh") > before);
+    before = countRequests(&h, "workspace/inlayHint/refresh");
+
+    const extra_path = try project.path(a, "extra.zig");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = extra_path, .data = "pub const scale: u32 = 3;\n" });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, extra_path), .type = 2 }} });
+    try waitIdle(&h);
+    try testing.expect(countRequests(&h, "workspace/inlayHint/refresh") > before);
+    try shutdown(&h);
+}
