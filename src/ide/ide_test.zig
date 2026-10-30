@@ -2804,6 +2804,50 @@ test "hover in generic bodies is inferred from a call site" {
     }
 }
 
+test "hover on @This() in generic bodies is inferred from a call site like the written instance" {
+    // `@This()` was the bare function name and counted as concrete, so it was never seeded
+    const text =
+        \\fn Pair(comptime A: type, comptime B: type) type {
+        \\    return struct {
+        \\        a: A,
+        \\        b: B,
+        \\        const Self = @This();
+        \\        fn swap(p: @This(), s: Self) void {
+        \\            const me = p;
+        \\            const q: Pair(A, B) = p;
+        \\            _ = .{ me, q, s };
+        \\        }
+        \\    };
+        \\}
+        \\test {
+        \\    const x: Pair(u8, u16) = .{ .a = 1, .b = 2 };
+        \\    x.swap(x);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    // The instance is that of the type constructor call `Pair(u8, u16)`
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "p: @This()", "```zig\np: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+        .{ "s: Self", "```zig\ns: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+        .{ "me =", "```zig\nconst me: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+        .{ "q:", "```zig\nconst q: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "goto declaration through comptime anytype parameters" {
     // Instances of `comptime H: anytype` record the argument value: members of type arguments can
     // be resolved (previously only the argument's type, `type`, was recorded)

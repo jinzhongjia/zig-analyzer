@@ -460,6 +460,38 @@ test "generic bodies without an instance use abstract parameters" {
     });
 }
 
+test "@This() in a generic body is the abstract instance, like the written call" {
+    // `@This()` was the bare function name `Pair` and counted as a concrete type
+    try expectTypes(
+        \\fn Pair(comptime A: type, comptime B: type) type {
+        \\    return struct {
+        \\        a: A,
+        \\        b: B,
+        \\        const Self = @This();
+        \\        fn swap(p: @This(), s: Self) Pair(B, A) {
+        \\            const r: Pair(B, A) = .{ .a = p.b, .b = p.a };
+        \\            const me = p;
+        \\            const q: Pair(A, B) = p;
+        \\            const same = @This() == Pair(A, B);
+        \\            const tn = @typeName(@This());
+        \\            _ = .{ me, q, s, same, tn };
+        \\            return r;
+        \\        }
+        \\    };
+        \\}
+    , &.{
+        .{ "p", "Pair(A, B)" },
+        .{ "s", "Pair(A, B)" },
+        .{ "me", "Pair(A, B)" },
+        .{ "q", "Pair(A, B)" },
+        .{ "r", "Pair(B, A)" },
+        // As in the compiler
+        .{ "same", "bool = true" },
+        // The name depends on the instance
+        .{ "tn", "unknown" },
+    });
+}
+
 test "unknown parts stay unknown" {
     try expectTypes(
         \\fn opaqueFn(x: u8) type { _ = x; return u8; }
