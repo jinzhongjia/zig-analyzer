@@ -120,7 +120,8 @@ pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: o
 
 /// Replaces only complete string literals; the multiline form is decoded token by token, so that
 /// source indentation and CRLF are not counted in the string value. The layout matches `zig fmt`
-/// (see `zigFmtEdit`).
+/// (see `zigFmtEdit`). A multiline string literal is not offered where Zig requires an ordinary
+/// one: the operand of `@import` and the strings of a `build.zig.zon` manifest.
 fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, sel_end: u32) resolve.Error!?Action {
     var start = sel_start;
     var end = @min(sel_end, @as(u32, @intCast(text.len)));
@@ -129,14 +130,21 @@ fn convertString(r: *Resolver, file: FileId, text: []const u8, sel_start: u32, s
     while (end > start and std.ascii.isWhitespace(text[end - 1])) end -= 1;
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const path = try root.coveringPath(r.arena, start);
-    var literal: ?ast.SyntaxNode = null;
-    for (path) |n| if (n.kind() == .literal) {
-        literal = n;
+    var literal: ?usize = null;
+    for (path, 0..) |n, i| if (n.kind() == .literal) {
+        literal = i;
     };
-    const node = literal orelse return null;
+    const node = path[literal orelse return null];
     const first = node.firstToken() orelse return null;
     const multiline = first.kind == .multiline_string_literal_line;
     if (!multiline and first.kind != .string_literal) return null;
+    if (!multiline) {
+        if (std.mem.eql(u8, std.fs.path.basename(r.ctx.db.env.vfs.path(file)), "build.zig.zon")) return null;
+        if (literal.? >= 2 and path[literal.? - 1].kind() == .arg_list and path[literal.? - 2].kind() == .builtin_call) {
+            const name = path[literal.? - 2].childToken(.builtin) orelse return null;
+            if (std.mem.eql(u8, name.text, "@import")) return null;
+        }
+    }
     var last = first;
     var bytes: std.ArrayList(u8) = .empty;
     var children = node.children();

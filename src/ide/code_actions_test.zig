@@ -6,6 +6,11 @@ const code_actions = @import("code_actions.zig");
 
 /// Applies the fix titled `title` at `<|>` (or on the `«...»` selection) and returns the new text
 fn apply(text: []const u8, title_prefix: []const u8) ![]const u8 {
+    return applyIn("/p/main.zig", text, title_prefix);
+}
+
+/// `apply` in the file at `path`
+fn applyIn(comptime path: []const u8, text: []const u8, title_prefix: []const u8) ![]const u8 {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -19,7 +24,7 @@ fn apply(text: []const u8, title_prefix: []const u8) ![]const u8 {
         end = @intCast(close - "«".len);
         break :blk try std.mem.concat(w.arena.allocator(), u8, &.{ text[0..open], text[open + "«".len .. close], text[close + "»".len ..] });
     };
-    const added = try w.add("/p/main.zig", plain);
+    const added = try w.add(path, plain);
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
@@ -1812,4 +1817,28 @@ test "string conversion rejects unrepresentable bytes and invalid selections" {
         defer testing.allocator.free(converted);
         try testing.expectEqualStrings("no action", converted);
     }
+}
+
+test "conversion to a multiline string literal is not offered where Zig requires an ordinary one" {
+    // A multiline `@import` operand or manifest string is rejected by Zig
+    inline for (.{
+        .{ "/p/main.zig", "const std = @import(\"s<|>td\");" },
+        .{ "/p/build.zig.zon", ".{ .version = \"0.0<|>.0\" }" },
+    }) |c| {
+        const converted = try applyIn(c[0], c[1], "convert to");
+        defer testing.allocator.free(converted);
+        try testing.expectEqualStrings("no action", converted);
+    }
+    // Elsewhere, including other `.zon` files and other builtins, it is offered
+    inline for (.{
+        .{ "/p/main.zig", "const s = \"a<|>bc\";" },
+        .{ "/p/data.zon", ".{ .version = \"0.0<|>.0\" }" },
+        .{ "/p/main.zig", "const s = @embedFile(\"a<|>.txt\");" },
+    }) |c| {
+        const converted = try applyIn(c[0], c[1], "convert to a multiline");
+        defer testing.allocator.free(converted);
+        try testing.expect(std.mem.indexOf(u8, converted, "\\\\") != null);
+    }
+    // Converting back is still offered in an `@import` operand
+    try expectAction("const std = @import(\n    \\\\s<|>td\n);", "convert to a string literal", "const std = @import(\n    \"std\"\n);");
 }
