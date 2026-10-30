@@ -301,6 +301,54 @@ test "recovery: unwinding deep unclosed nesting and long else-if chains" {
     try expectLossless(src.items);
 }
 
+test "recovery: errdefer takes no capture, like defer" {
+    // An `errdefer |e|` capture was accepted without an error and bound `e`
+    for ([_][]const u8{ "defer", "errdefer" }) |keyword| {
+        const source = try std.fmt.allocPrint(testing.allocator, "test {{ {s} |e| {{}} }}", .{keyword});
+        defer testing.allocator.free(source);
+        const actual = try dumpTree(source);
+        defer testing.allocator.free(actual);
+        // `zig ast-check`: `expected block or expression, found '|'` at the `|`
+        const pipe = 8 + keyword.len;
+        const expected = try std.fmt.allocPrint(testing.allocator,
+            \\source_file@0..{[end]d}
+            \\  test_decl@0..{[end]d}
+            \\    keyword_test "test"
+            \\    block@5..{[end]d}
+            \\      l_brace "{{"
+            \\      {[kw]s}_stmt@7..{[kw_end]d}
+            \\        keyword_{[kw]s} "{[kw]s}"
+            \\      error_node@{[pipe]d}..{[e]d}
+            \\        pipe "|"
+            \\      expr_stmt@{[e]d}..{[body_end]d}
+            \\        binary_expr@{[e]d}..{[body_end]d}
+            \\          name_ref@{[e]d}..{[e_end]d}
+            \\            identifier "e"
+            \\          pipe "|"
+            \\          block@{[body]d}..{[body_end]d}
+            \\            l_brace "{{"
+            \\            r_brace "}}"
+            \\      r_brace "}}"
+            \\error@{[pipe]d}: expected block or expression
+            \\error@{[pipe]d}: expected statement
+            \\error@{[semi]d}: expected ';'
+            \\
+        , .{
+            .kw = keyword,
+            .kw_end = 7 + keyword.len,
+            .pipe = pipe,
+            .e = pipe + 1,
+            .e_end = pipe + 2,
+            .body = pipe + 4,
+            .body_end = pipe + 6,
+            .semi = pipe + 7,
+            .end = source.len,
+        });
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, actual);
+    }
+}
+
 /// Depth of the syntax tree (computed iteratively)
 fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     const Entry = struct { node: @import("tree.zig").SyntaxNode, depth: usize };

@@ -689,10 +689,6 @@ fn captureBody(b: *const Body, id: Body.BindingId) ?Body.ExprId {
         },
         .@"switch" => |x| for (x.prongs) |p| if (has(p.capture, id)) return p.body,
         .@"catch" => |x| if (x.capture == id) return x.rhs,
-        .block => |blk| for (blk.stmts) |s| switch (s.kind) {
-            .@"errdefer" => |x| if (x.capture == id) return x.body,
-            else => {},
-        },
         else => {},
     };
     return null;
@@ -791,8 +787,7 @@ fn missingProngs(r: *Resolver, file: FileId, text: []const u8, offset: u32) reso
 fn isStatement(b: *const Body, e: Body.ExprId) bool {
     for (b.exprs) |x| switch (x) {
         .block => |blk| for (blk.stmts) |s| switch (s.kind) {
-            .expr, .@"defer" => |y| if (y == e) return true,
-            .@"errdefer" => |y| if (y.body == e) return true,
+            .expr, .@"defer", .@"errdefer" => |y| if (y == e) return true,
             else => {},
         },
         else => {},

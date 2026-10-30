@@ -129,7 +129,7 @@ pub const Stmt = struct {
         /// Local variable declaration
         local: BindingId,
         @"defer": ExprId,
-        @"errdefer": struct { capture: ?BindingId, body: ExprId },
+        @"errdefer": ExprId,
         /// `a, const b = expr;`
         destructure: struct { targets: []const DestructureTarget, value: ExprId },
     },

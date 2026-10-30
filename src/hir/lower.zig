@@ -434,15 +434,7 @@ const Lowerer = struct {
         switch (n.kind()) {
             .var_decl => return .{ .local = try l.localDecl(n) },
             .defer_stmt => return .{ .@"defer" = try l.exprOrMissing(firstChild(n)) },
-            .errdefer_stmt => {
-                const saved = l.scope;
-                defer l.scope = saved;
-                const caps = try l.captures(if (n.childNode(.payload)) |p| ast.Payload{ .syntax = p } else null);
-                if (caps.len != 0) _ = try l.pushScope(caps);
-                var it = ast.childNodes(n);
-                it.skip = .payload;
-                return .{ .@"errdefer" = .{ .capture = if (caps.len != 0) caps[0] else null, .body = try l.exprOrMissing(it.next()) } };
-            },
+            .errdefer_stmt => return .{ .@"errdefer" = try l.exprOrMissing(firstChild(n)) },
             .comptime_stmt => {
                 // `comptime var x = ...;` or `comptime { ... }` / `comptime expr;`
                 const inner = firstChild(n) orelse return .{ .expr = try l.add(.missing, .none) };

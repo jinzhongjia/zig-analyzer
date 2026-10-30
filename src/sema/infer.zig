@@ -2096,13 +2096,8 @@ const Inferrer = struct {
                 }
                 return .void_type;
             },
-            .@"defer" => |e| {
+            .@"defer", .@"errdefer" => |e| {
                 _ = try inf.infer(e, null);
-                return .void_type;
-            },
-            .@"errdefer" => |d| {
-                if (d.capture) |c| inf.bindings[@backingInt(c)] = .{ .ty = .anyerror_type };
-                _ = try inf.infer(d.body, null);
                 return .void_type;
             },
             .destructure => |d| {

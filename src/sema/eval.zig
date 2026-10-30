@@ -1773,7 +1773,7 @@ const Evaluator = struct {
                 f.slots[@backingInt(bid)] = try ev.copy(.{ .ty = ty orelse init.ty, .v = init.v });
             },
             .@"defer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = false }),
-            .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x.body, .on_error = true }),
+            .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = true }),
             .destructure => |d| {
                 const v = try ev.eval(f, d.value, null);
                 for (d.targets, 0..) |t, i| {

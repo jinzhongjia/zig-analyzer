@@ -609,7 +609,7 @@ test "semantic tokens retain lexical uses in captures deferred blocks and loop c
         \\fn run(fallible: anyerror!u32, values: []u32) void {
         \\    const deferred = 1;
         \\    defer { _ = deferred; }
-        \\    errdefer |failure| { _ = failure; }
+        \\    errdefer { _ = deferred; }
         \\    const value = fallible catch |caught| { _ = caught; return; };
         \\    switch (value) { 0 => {}, else => |tag| { _ = tag; } }
         \\    for (values) |*entry| { entry.* = 0; }
@@ -627,8 +627,7 @@ test "semantic tokens retain lexical uses in captures deferred blocks and loop c
     const data = try tokens(&w, file, text, .utf16, null);
     try check(data, text, .utf16, &.{
         .{ .needle = "deferred =", .ty = .variable, .mods = M.declaration | M.readonly },
-        .{ .needle = "failure|", .ty = .variable, .mods = M.declaration | M.readonly },
-        .{ .needle = "failure;", .ty = .variable, .mods = M.readonly },
+        .{ .needle = "deferred;", .nth = 1, .ty = .variable, .mods = M.readonly },
         .{ .needle = "caught|", .ty = .variable, .mods = M.declaration | M.readonly },
         .{ .needle = "caught;", .ty = .variable, .mods = M.readonly },
         .{ .needle = "tag|", .ty = .variable, .mods = M.declaration | M.readonly },
