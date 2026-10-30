@@ -3354,6 +3354,59 @@ test "label completion after `continue :` lists only loop and switch labels" {
     });
 }
 
+test "name completion inside a struct declared in a function lists only the values it can access" {
+    try expectCompletions("", &.{
+        .{
+            \\fn outer(n: u32, comptime k: u32) u32 {
+            \\    var counter: u32 = 0;
+            \\    _ = &counter;
+            \\    const limit: u32 = 10;
+            \\    const sum = n + 1;
+            \\    const Ctx = struct {
+            \\        fn get() u32 {
+            \\            return <|>;
+            \\        }
+            \\    };
+            \\    _ = .{ sum, limit };
+            \\    return Ctx.get();
+            \\}
+            ,
+            "get limit k outer",
+        },
+        // Runtime values are accessible inside `@TypeOf`
+        .{
+            \\fn outer(n: u32) u32 {
+            \\    var counter: u32 = 0;
+            \\    _ = &counter;
+            \\    const Ctx = struct {
+            \\        fn get() u32 {
+            \\            return @sizeOf(@TypeOf(<|>));
+            \\        }
+            \\    };
+            \\    return Ctx.get();
+            \\}
+            ,
+            "get counter n outer",
+        },
+        // The calls of a function returning `type` are evaluated at comptime: only `var`s are not
+        // accessible
+        .{
+            \\fn Outer(n: u32) type {
+            \\    var counter: u32 = 0;
+            \\    _ = &counter;
+            \\    const sum = n + 1;
+            \\    return struct {
+            \\        fn get() u32 {
+            \\            return <|>;
+            \\        }
+            \\    };
+            \\}
+            ,
+            "get sum n Outer",
+        },
+    });
+}
+
 test "branches excluded by comptime conditions are inactive" {
     const text =
         \\const debug = false;

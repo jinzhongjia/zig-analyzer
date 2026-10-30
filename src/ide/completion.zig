@@ -450,9 +450,11 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     const types: BindingTypes = if (at) |a| .{ .at = a } else .none;
     // Local values that are not shadowed are the roots of member paths
     var roots: std.ArrayList(Root) = .empty;
-    try locals(r, &out, b, scope, null, types, &roots);
+    try locals(r, &out, b, scope, null, types, .all, &roots);
 
     const tree = try r.itemTree(file);
+    // Inside `@TypeOf`, only the types of the values are used: every binding is accessible
+    const in_typeof = inTypeOf(b, rel);
     var container = tree.items[item].container;
     var level: f32 = 0;
     while (true) : (level += 1) {
@@ -466,7 +468,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         const c_node = try r.containerNode(.{ .file = file, .container = container }) orelse break;
         const pb = try r.body(file, parent);
         const parent_res = try r.ctx.get(database.sema.Infer, .{ .owner = try r.ownerKey(file, parent), .mode = .full });
-        try locals(r, &out, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res }, &roots);
+        const access: Access = if (in_typeof or tree.items[parent].kind != .@"fn") .all else if (returnsType(pb, parent_res)) .no_vars else .comptime_known;
+        try locals(r, &out, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res }, access, &roots);
         container = tree.items[parent].container;
     }
     return .{ .items = out.items.items, .context = .scope, .item = item, .scope = scope, .at = at, .roots = roots.items };
@@ -644,15 +647,57 @@ const BindingTypes = union(enum) {
     }
 };
 
+/// Which bindings of an enclosing function a function in a container declared in its body can
+/// access (as in the compiler: AstGen rejects non-comptime `var`s, Sema runtime values)
+const Access = enum {
+    /// Every binding: the function at the cursor, a comptime initializer (not a function), or
+    /// inside `@TypeOf`, where only the types are used
+    all,
+    /// A function returning `type`, whose calls are all evaluated at comptime: every binding but
+    /// the non-comptime `var`s
+    no_vars,
+    /// Comptime parameters, `comptime var`s, and the values known at comptime; a binding whose
+    /// type is unknown counts as accessible
+    comptime_known,
+
+    fn allows(access: Access, binding: Body.Binding, tv: TypedValue) bool {
+        if (access == .all or binding.is_comptime) return true;
+        if (binding.kind == .local_var) return false;
+        if (access == .no_vars or tv.ty == .unknown) return true;
+        const v = tv.val orelse return false;
+        return v != .runtime;
+    }
+};
+
+/// Whether the body of the function `fb` returns `type`
+fn returnsType(fb: *const Body, res: *const infer.Result) bool {
+    const t = fb.type_expr orelse return false;
+    if (@backingInt(t) >= res.exprs.len) return false;
+    return res.exprs[@backingInt(t)].asType() == .type_type;
+}
+
+/// The position `rel` is inside the parentheses of `@TypeOf(...)`
+fn inTypeOf(b: *const Body, rel: u32) bool {
+    for (b.exprs, 0..) |x, i| switch (x) {
+        .builtin_call => |c| if (std.mem.eql(u8, c.name, "@TypeOf")) {
+            const range = b.range(@fromBackingInt(@as(u32, @intCast(i))));
+            if (rel > range.start + c.name.len and rel < range.end) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
 /// When `weight` is null, the weight follows the kind of the binding; otherwise every name gets
-/// `weight` (names in an enclosing function). Local values that are not shadowed are recorded in
-/// `roots` (see `rootOf`)
-fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes, roots: *std.ArrayList(Root)) resolve.Error!void {
+/// `weight` (names in an enclosing function). Only the bindings that `access` allows are listed.
+/// Local values that are not shadowed are recorded in `roots` (see `rootOf`)
+fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, weight: ?f32, types: BindingTypes, access: Access, roots: *std.ArrayList(Root)) resolve.Error!void {
     var s: ?Body.ScopeId = from;
     while (s) |id| : (s = b.scope(id).parent) {
         for (b.scope(id).bindings) |bid| {
             const binding = b.binding(bid);
             const tv = types.of(bid);
+            if (!access.allows(binding, tv)) continue;
             if (!out.seen.contains(binding.name)) if (rootOf(binding, tv, weight != null)) |root| try roots.append(out.arena, root);
             const kind = kindOf(symbol_kind.ofBinding(r.ctx.db.env.ip, binding, tv));
             try out.add(.{
