@@ -66,6 +66,24 @@ const sizes = blk: {
 };
 const class_count = sizes.len;
 
+/// Pages are grouped by occupancy: bin `i` holds the pages whose blocks in use are at least
+/// `i / bins` and less than `(i + 1) / bins` of the blocks they can hold, so bin `bins` holds the
+/// full pages
+const bins = 8;
+
+/// `ceil(2^32 * bins / blocks per page)` of each class, so that `binOf` needs no division; the
+/// product is exact because the fraction `live * bins / blocks` stays at least `1 / blocks` away
+/// from the next integer, which is more than the rounding adds
+const bin_factors = blk: {
+    var f: [class_count]u64 = undefined;
+    for (sizes, &f) |size, *x| x.* = ((@as(u64, bins) << 32) + page_len / size - 1) / (page_len / size);
+    break :blk f;
+};
+
+fn binOf(live: u32, ci: usize) u8 {
+    return @intCast((live * bin_factors[ci]) >> 32);
+}
+
 /// The smallest class whose size is at least `len` and a multiple of the alignment, so that the
 /// blocks carved from the start of a page are aligned; `class_count` for allocations that are
 /// mapped directly
@@ -95,6 +113,8 @@ const Page = struct {
     /// Blocks handed out and not freed yet
     live: u32,
     class: u8,
+    /// Occupancy bin (see `bins`)
+    bin: u8,
     state: enum(u8) { with_room, full, pooled },
     /// Links in the list of the class's pages with room, or in a pool list (`next` only)
     prev: ?*Page,
@@ -191,6 +211,8 @@ const Class = struct {
     live: usize = 0,
     /// Allocations served so far
     allocs: u64 = 0,
+    /// Pages assigned to the class by occupancy bin
+    occupancy: [bins + 1]u32 = @splat(0),
 
     fn push(c: *Class, page: *Page) void {
         page.prev = null;
@@ -204,6 +226,15 @@ const Class = struct {
         if (page.prev) |p| p.next = page.next else c.head = page.next;
         if (page.next) |n| n.prev = page.prev;
         c.with_room -= 1;
+    }
+
+    /// Moves a page to the bin of its count of blocks in use
+    fn rebin(c: *Class, page: *Page) void {
+        const bin = binOf(page.live, page.class);
+        if (bin == page.bin) return;
+        c.occupancy[page.bin] -= 1;
+        c.occupancy[bin] += 1;
+        page.bin = bin;
     }
 };
 
@@ -258,9 +289,10 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     defer Threaded.mutexUnlock(&c.mutex);
     const page = c.head orelse page: {
         const p = takePage() orelse return null;
-        p.* = .{ .free = 0, .carved = 0, .touched = p.touched, .live = 0, .class = @intCast(ci), .state = .with_room, .prev = null, .next = null };
+        p.* = .{ .free = 0, .carved = 0, .touched = p.touched, .live = 0, .class = @intCast(ci), .bin = 0, .state = .with_room, .prev = null, .next = null };
         c.push(p);
         c.pages += 1;
+        c.occupancy[0] += 1;
         break :page p;
     };
     var block = page.free;
@@ -279,6 +311,7 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     page.live += 1;
     c.live += 1;
     c.allocs += 1;
+    c.rebin(page);
     if (page.free == 0 and page.carved + size > page_len) {
         c.remove(page);
         page.state = .full;
@@ -373,6 +406,7 @@ fn free(_: *anyopaque, memory: []u8, alignment: Alignment, _: usize) void {
         page.free = @intFromPtr(node);
         page.live -= 1;
         c.live -= 1;
+        c.rebin(page);
         if (page.state == .full) {
             page.state = .with_room;
             c.push(page);
@@ -382,6 +416,7 @@ fn free(_: *anyopaque, memory: []u8, alignment: Alignment, _: usize) void {
         if (page.live != 0 or c.with_room == 1) return;
         c.remove(page);
         c.pages -= 1;
+        c.occupancy[0] -= 1;
     }
     releasePage(page);
 }
@@ -433,6 +468,10 @@ pub const Stats = struct {
     recommits: u64,
     /// Live large allocations, mapped directly (rounded up to whole system pages)
     large: usize,
+    /// Pages assigned to size classes by occupancy (see `bins`): element `i` counts the pages
+    /// whose blocks in use are at least `i / 8` of the blocks they can hold and less than
+    /// `(i + 1) / 8`, the last one the full pages
+    occupancy: [bins + 1]usize,
     classes: []const SizeClass,
 
     pub const SizeClass = struct {
@@ -443,6 +482,8 @@ pub const Stats = struct {
         live: usize,
         /// Allocations served so far
         allocs: u64,
+        /// Pages of the class by occupancy, as `Stats.occupancy`
+        occupancy: [bins + 1]u32,
     };
 };
 
@@ -450,12 +491,14 @@ pub fn stats(arena: Allocator) Allocator.Error!Stats {
     const out = try arena.alloc(Stats.SizeClass, class_count);
     var small: usize = 0;
     var live_slots: usize = 0;
+    var occupancy: [bins + 1]usize = @splat(0);
     for (&classes, sizes, out) |*c, size, *o| {
         Threaded.mutexLockUncancelable(&c.mutex);
         defer Threaded.mutexUnlock(&c.mutex);
-        o.* = .{ .size = size, .pages = c.pages * page_len, .live = c.live, .allocs = c.allocs };
+        o.* = .{ .size = size, .pages = c.pages * page_len, .live = c.live, .allocs = c.allocs, .occupancy = c.occupancy };
         small += c.pages * page_len;
         live_slots += c.live * size;
+        for (&occupancy, c.occupancy) |*t, n| t.* += n;
     }
     Threaded.mutexLockUncancelable(&pool.mutex);
     defer Threaded.mutexUnlock(&pool.mutex);
@@ -470,6 +513,7 @@ pub fn stats(arena: Allocator) Allocator.Error!Stats {
         .decommits = decommits.load(.monotonic),
         .recommits = recommits.load(.monotonic),
         .large = large.load(.monotonic),
+        .occupancy = occupancy,
         .classes = out,
     };
 }
@@ -528,6 +572,26 @@ test "concurrent allocation and free keep blocks intact" {
     try testing.expectEqual(0, s.live_slots);
     // Each class keeps at most its last page with room; the pool holds the others
     try testing.expect(s.small <= class_count * page_len);
+}
+
+test "the occupancy bin of a page is the share of its blocks in use, in eighths" {
+    for (sizes, 0..) |size, ci| {
+        const blocks = page_len / size;
+        for (0..blocks + 1) |live| {
+            try testing.expectEqual(live * bins / blocks, binOf(@intCast(live), ci));
+        }
+    }
+    // Three blocks of 20 KiB fill a page
+    const ci = classIndex(20 * 1024, .@"1");
+    const c = &classes[ci];
+    const before = c.occupancy;
+    var b: [3]*[20 * 1024]u8 = undefined;
+    for (&b) |*x| x.* = try allocator.create([20 * 1024]u8);
+    try testing.expectEqual(before[bins] + 1, c.occupancy[bins]);
+    allocator.destroy(b[0]);
+    try testing.expectEqual(before[bins], c.occupancy[bins]);
+    try testing.expectEqual(before[5] + 1, c.occupancy[5]);
+    for (b[1..]) |x| allocator.destroy(x);
 }
 
 test "pages emptied by one size class serve another" {
