@@ -804,8 +804,8 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
 
 /// Long session (BENCH_SESSION=<rounds>): each round opens 25 files of the project (rotating
 /// forward each round), runs hover, member and name completion, and edits, then closes them;
-/// afterwards prints the memory of the heap, the InternPool, and the main queries, to watch memory
-/// growth over a long run
+/// afterwards prints the memory of the heap, the InternPool, the main queries, and the allocator
+/// (`ZA_ALLOC` selects the server's allocator), to watch memory growth over a long run
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     const a = c.arena.allocator();
     const io = c.io;
@@ -823,7 +823,7 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     if (files.items.len == 0) return;
     const per_round = 25;
     std.debug.print("long session: {d} rounds × {d} files (of {d})\n", .{ rounds, per_round, files.items.len });
-    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s" });
+    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s", "peak MB", "small MB", "touch MB", "slot MB", "empty MB", "decom MB", "large MB" });
     const t0 = Io.Clock.awake.now(io);
     var version: i64 = 1;
     for (0..rounds) |round| {
@@ -875,7 +875,8 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
                 return @as(f64, @floatFromInt(x)) / (1024 * 1024);
             }
         }.f;
-        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0}\n", .{
+        const al = o.get("alloc").?.object;
+        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0} {d:>8.0} {d:>8.0} {d:>8.0} {d:>8.0} {d:>8.0} {d:>8.0} {d:>8.0}\n", .{
             round + 1,
             (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
             mb(o.get("heap_bytes").?.integer),
@@ -888,7 +889,24 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             @as(u64, @intCast(keys)),
             @as(u64, @intCast(deps)),
             @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s,
+            @as(f64, @floatFromInt(o.get("max_rss_kb").?.integer)) / 1024,
+            mb(al.get("small_bytes").?.integer),
+            mb(al.get("touched_bytes").?.integer),
+            mb(al.get("slot_bytes").?.integer),
+            mb(al.get("empty_bytes").?.integer),
+            mb(al.get("decommitted_bytes").?.integer),
+            mb(al.get("large_bytes").?.integer),
         });
+        if (round + 1 == rounds) {
+            // Last round: memory of each size class of the allocator
+            std.debug.print("  size classes (last round): size, MB assigned, MB live, allocations\n", .{});
+            for (al.get("classes").?.array.items) |cl| {
+                const co = cl.object;
+                const size: u64 = @intCast(co.get("size").?.integer);
+                const live: u64 = @intCast(co.get("live").?.integer);
+                std.debug.print("    {d:>6} {d:>8.1} {d:>8.1} {d:>12}\n", .{ size, mb(co.get("bytes").?.integer), mb(@intCast(live * size)), @as(u64, @intCast(co.get("allocs").?.integer)) });
+            }
+        }
         if (round + 1 == rounds) {
             // Last round: list the queries by bytes; the rest is unattributed (engine tables,
             // dependencies, Vfs, ...)
