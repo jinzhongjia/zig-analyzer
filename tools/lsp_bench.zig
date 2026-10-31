@@ -38,6 +38,8 @@
 //!   generic function body that point to a same-named declaration under another instance are
 //!   counted separately)
 //! - `BENCH_SESSION=<rounds>`: a long session, to watch memory growth
+//! - `BENCH_CONCURRENT=<n>`: throughput: open the n largest files of the project at once and
+//!   request their semantic tokens without waiting for the answers (see `concurrentTokens`)
 
 const std = @import("std");
 const Io = std.Io;
@@ -1014,6 +1016,82 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     Stats.print("waitIdle", idle_times.items);
 }
 
+/// Throughput (BENCH_CONCURRENT=<n>): opens the n largest files of the project (other than the
+/// measured ones) and requests their full semantic tokens right away, as an editor restoring n
+/// tabs does, without waiting for the answers; reports the time from the first open to the last
+/// answer, then until background work is done, the latency of each request, and the memory
+/// afterwards
+fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []const u8) !void {
+    const a = c.arena.allocator();
+    const io = c.io;
+    const File = struct { path: []const u8, size: u64 };
+    var files: std.ArrayList(File) = .empty;
+    next_file: for (try projectFiles(c, root)) |path| {
+        for (measured) |m| if (std.mem.endsWith(u8, path, m)) continue :next_file;
+        const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
+        try files.append(a, .{ .path = path, .size = st.size });
+    }
+    std.mem.sort(File, files.items, {}, struct {
+        fn gt(_: void, x: File, y: File) bool {
+            return x.size > y.size or (x.size == y.size and std.mem.lessThan(u8, x.path, y.path));
+        }
+    }.gt);
+    const picked = files.items[0..@min(n, files.items.len)];
+    const texts = try a.alloc([:0]const u8, picked.len);
+    const uris = try a.alloc([]const u8, picked.len);
+    var bytes: u64 = 0;
+    for (picked, texts, uris) |f, *text, *uri| {
+        text.* = try Io.Dir.cwd().readFileAllocOptions(io, f.path, a, .limited(64 * 1024 * 1024), .of(u8), 0);
+        uri.* = try za.base.uri.fromPath(a, f.path);
+        bytes += f.size;
+    }
+    const t0 = Io.Clock.awake.now(io);
+    for (texts, uris) |text, uri| try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    const first_id = c.next_id;
+    for (uris) |uri| {
+        const id = c.next_id;
+        c.next_id += 1;
+        try c.send(.{ .jsonrpc = "2.0", .id = id, .method = "textDocument/semanticTokens/full", .params = .{ .textDocument = .{ .uri = uri } } });
+    }
+    const times = try a.alloc(f64, uris.len);
+    var answered: usize = 0;
+    var tokens: usize = 0;
+    var errors: usize = 0;
+    while (answered < uris.len) {
+        const msg = try c.next();
+        if (msg.object.get("method") != null) continue;
+        const id = msg.object.get("id") orelse continue;
+        if (id != .integer or id.integer < first_id or id.integer - first_id >= @as(i64, @intCast(uris.len))) continue;
+        times[@intCast(id.integer - first_id)] = ms(io, t0);
+        answered += 1;
+        if (msg.object.get("error") != null) errors += 1;
+        if (msg.object.get("result")) |r| if (r == .object) {
+            tokens += r.object.get("data").?.array.items.len / 5;
+        };
+    }
+    const all_answered = ms(io, t0);
+    _ = try c.request("zig-analyzer/waitIdle", {});
+    const idle = ms(io, t0);
+    for (uris) |uri| try c.notify("textDocument/didClose", .{ .textDocument = .{ .uri = uri } });
+    std.debug.print("concurrent semantic tokens: {d} files ({d:.1} MB) opened at once; all answered {d:.0}ms, idle {d:.0}ms; {d} tokens, {d} errors\n", .{ uris.len, @as(f64, @floatFromInt(bytes)) / (1024 * 1024), all_answered, idle, tokens, errors });
+    Stats.print("sem tokens", times);
+    const st, _ = try c.request("zig-analyzer/status", {});
+    const o = st.object.get("result").?.object;
+    const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
+    std.debug.print("  memory {d:.0} MB, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB\n", .{
+        (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
+        @as(f64, @floatFromInt(o.get("max_rss_kb").?.integer)) / 1024,
+        @as(f64, @floatFromInt(o.get("heap_bytes").?.integer)) / (1024 * 1024),
+        allocatorMb(al, "small"),
+        allocatorMb(al, "resident"),
+        allocatorMb(al, "live_slots"),
+        allocatorMb(al, "retained"),
+        allocatorMb(al, "returned"),
+        allocatorMb(al, "large"),
+    });
+    if (commitMb(c.child.id.?)) |v| std.debug.print("  private commit {d:.0} MB (peak {d:.0} MB), peak working set {d:.0} MB\n", .{ v[0], v[1], v[2] });
+}
+
 /// Line-end offset of the first function body statement (indented by at least 8 spaces, ending
 /// with `;`) in the second half of the file
 fn bodyLine(text: []const u8) ?usize {
@@ -1306,6 +1384,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
+    if (init.environ_map.get("BENCH_CONCURRENT")) |v| try concurrentTokens(&c, root, try std.fmt.parseInt(usize, v, 10), args[3..]);
     if (init.environ_map.get("BENCH_SESSION")) |v| try longSession(&c, root, try std.fmt.parseInt(usize, v, 10));
     if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("resident memory {d:.0} MB\n", .{mb});
     try printQueryTable(&c);
