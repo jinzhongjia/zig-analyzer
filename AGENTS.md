@@ -4,8 +4,6 @@
 
 - No commit message may carry LLM co-author information (such as `Co-authored-by: ...` or `Generated with ...`).
 - Split the work into multiple commits by the content of the code changes; do not combine unrelated changes in one commit.
-- When there is a PR, watch its CI status and make sure every CI run passes.
-- When the user asks to handle the comments on a PR, keep watching the PR comments in a loop until all of them are handled.
 
 ## Language
 
