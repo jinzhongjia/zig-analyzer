@@ -21,6 +21,7 @@ const Alignment = std.mem.Alignment;
 const PageAllocator = std.heap.PageAllocator;
 const Mutex = std.Io.Mutex;
 const Threaded = std.Io.Threaded;
+const alloc_stats = @import("alloc_stats.zig");
 
 const slab_len: usize = @max(std.heap.page_size_max, 64 * 1024);
 /// The free-list pointer is stored in the block, so the smallest class is one pointer in size
@@ -33,6 +34,27 @@ var mutex: Mutex = .init;
 var next_addrs: [size_class_count]usize = @splat(0);
 /// Head of the free list of each class
 var frees: [size_class_count]usize = @splat(0);
+var slabs: [size_class_count]std.atomic.Value(usize) = @splat(.init(0));
+var live: [size_class_count]std.atomic.Value(usize) = @splat(.init(0));
+var allocs: [size_class_count]std.atomic.Value(u64) = @splat(.init(0));
+var large_bytes: std.atomic.Value(usize) = .init(0);
+
+pub fn stats(arena: Allocator) !alloc_stats.Stats {
+    const out = try arena.alloc(alloc_stats.Class, size_class_count);
+    var s: alloc_stats.Stats = .{ .classes = out };
+    for (out, 0..) |*o, class| {
+        o.* = .{
+            .size = slotSize(class),
+            .bytes = slabs[class].load(.monotonic) * slab_len,
+            .live = live[class].load(.monotonic),
+            .allocs = allocs[class].load(.monotonic),
+        };
+        s.small_bytes += o.bytes;
+        s.slot_bytes += o.live * o.size;
+    }
+    s.large_bytes = large_bytes.load(.monotonic);
+    return s;
+}
 
 pub const allocator: Allocator = .{ .ptr = undefined, .vtable = &vtable };
 
@@ -47,11 +69,15 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     const class = sizeClassIndex(len, alignment);
     if (class >= size_class_count) {
         @branchHint(.unlikely);
-        return PageAllocator.map(len, alignment);
+        const p = PageAllocator.map(len, alignment) orelse return null;
+        _ = large_bytes.fetchAdd(len, .monotonic);
+        return p;
     }
     const slot_size = slotSize(class);
     Threaded.mutexLockUncancelable(&mutex);
     defer Threaded.mutexUnlock(&mutex);
+    _ = live[class].fetchAdd(1, .monotonic);
+    _ = allocs[class].fetchAdd(1, .monotonic);
     const top = frees[class];
     if (top != 0) {
         @branchHint(.likely);
@@ -66,7 +92,11 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     }
     // Slabs are aligned to slab_len: the remainder check above tells whether carving has reached
     // the end of the slab
-    const slab = PageAllocator.map(slab_len, .fromByteUnits(slab_len)) orelse return null;
+    const slab = PageAllocator.map(slab_len, .fromByteUnits(slab_len)) orelse {
+        _ = live[class].fetchSub(1, .monotonic);
+        return null;
+    };
+    _ = slabs[class].fetchAdd(1, .monotonic);
     next_addrs[class] = @intFromPtr(slab) + slot_size;
     return slab;
 }
@@ -76,7 +106,9 @@ fn resize(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, _: 
     const new_class = sizeClassIndex(new_len, alignment);
     if (class >= size_class_count) {
         if (new_class < size_class_count) return false;
-        return PageAllocator.realloc(memory, alignment, new_len, false) != null;
+        if (PageAllocator.realloc(memory, alignment, new_len, false) == null) return false;
+        adjustLarge(memory.len, new_len);
+        return true;
     }
     return new_class == class;
 }
@@ -86,7 +118,9 @@ fn remap(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, _: u
     const new_class = sizeClassIndex(new_len, alignment);
     if (class >= size_class_count) {
         if (new_class < size_class_count) return null;
-        return PageAllocator.realloc(memory, alignment, new_len, true);
+        const p = PageAllocator.realloc(memory, alignment, new_len, true) orelse return null;
+        adjustLarge(memory.len, new_len);
+        return p;
     }
     return if (new_class == class) memory.ptr else null;
 }
@@ -95,13 +129,19 @@ fn free(_: *anyopaque, memory: []u8, alignment: Alignment, _: usize) void {
     const class = sizeClassIndex(memory.len, alignment);
     if (class >= size_class_count) {
         @branchHint(.unlikely);
+        _ = large_bytes.fetchSub(memory.len, .monotonic);
         return PageAllocator.unmap(@alignCast(memory));
     }
     const node: *usize = @ptrCast(@alignCast(memory.ptr));
     Threaded.mutexLockUncancelable(&mutex);
     defer Threaded.mutexUnlock(&mutex);
+    _ = live[class].fetchSub(1, .monotonic);
     node.* = frees[class];
     frees[class] = @intFromPtr(node);
+}
+
+fn adjustLarge(old: usize, new: usize) void {
+    if (new > old) _ = large_bytes.fetchAdd(new - old, .monotonic) else _ = large_bytes.fetchSub(old - new, .monotonic);
 }
 
 fn sizeClassIndex(len: usize, alignment: Alignment) usize {
