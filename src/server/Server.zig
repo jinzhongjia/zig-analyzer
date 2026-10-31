@@ -5382,6 +5382,7 @@ const StatusResult = struct {
     /// Bytes allocated through the server's allocator and not yet freed (when the executable wraps
     /// the allocator with `mem.Counting`; 0 otherwise)
     heap_bytes: usize,
+    alloc: za.util.alloc_stats.Stats,
     queries: []const struct {
         name: []const u8,
         executions: u64,
@@ -6600,6 +6601,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         .intern_pool_items = server.ip.count(),
         .intern_pool_bytes = server.ip.bytes(),
         .heap_bytes = if (server.heap) |h| h.liveBytes() else 0,
+        .alloc = try za.util.alloc_stats.get(arena),
         .queries = queries,
         .incomplete_causes = .{
             .cycle = summary.incomplete_causes.get(.cycle),

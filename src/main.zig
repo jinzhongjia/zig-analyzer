@@ -44,7 +44,15 @@ pub fn main(init: std.process.Init) !u8 {
     // values are allocated on worker threads but freed on the sweeping thread, so the allocating
     // side cannot get the freed blocks back, and the resident memory keeps growing over the
     // session (see `SharedAllocator`)
-    const backing = if (builtin.mode == .debug) init.gpa else za.util.SharedAllocator.allocator;
+    // The environment variable `ZA_ALLOC` (`shared`, `paged`, `paged_fine`) selects the allocator
+    // of release builds, to compare them (see `PagedAllocator`)
+    const kind: za.util.alloc_stats.Kind = if (init.environ_map.get("ZA_ALLOC")) |v| std.meta.stringToEnum(za.util.alloc_stats.Kind, v) orelse .shared else .shared;
+    const backing = if (builtin.mode == .debug) init.gpa else switch (kind) {
+        .shared => za.util.SharedAllocator.allocator,
+        .paged => za.util.PagedAllocator.Pow2.allocator,
+        .paged_fine => za.util.PagedAllocator.Fine.allocator,
+    };
+    if (builtin.mode != .debug) za.util.alloc_stats.kind = kind;
     // `init.io` is not used: its worker threads have the default stack size, so a very deep
     // dependency chain would have to be interrupted many times and computed in segments
     var threaded: std.Io.Threaded = .init(backing, .{
