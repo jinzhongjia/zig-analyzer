@@ -125,7 +125,14 @@ fn headerLen() usize {
 
 /// Maps a segment aligned to its size; on Windows only its header is committed
 fn mapSegment() ?usize {
-    if (native_os != .windows) return @intFromPtr(PageAllocator.map(segment_len, .fromByteUnits(segment_len)) orelse return null);
+    if (native_os != .windows) {
+        const segment = PageAllocator.map(segment_len, .fromByteUnits(segment_len)) orelse return null;
+        // With transparent huge pages set to `always`, the first touch of a page would back the
+        // whole 2 MiB around it: pages are handed out one by one, so resident memory would stay
+        // far above what they use, and returning a page would split the huge page first
+        if (native_os == .linux) posix.madvise(@alignCast(segment), segment_len, posix.MADV.NOHUGEPAGE) catch {};
+        return @intFromPtr(segment);
+    }
     // The segment is reserved rather than committed as `PageAllocator` would do: its pages are
     // committed one by one when the pool hands them out. To find a range aligned to the segment
     // size, reserve twice the size, release it and reserve the aligned part; another thread may
