@@ -809,12 +809,18 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     const a = c.arena.allocator();
     const io = c.io;
-    const found = try std.process.run(c.gpa, io, .{ .argv = &.{ "find", root, "-name", "*.zig", "-not", "-path", "*/.zig-cache/*", "-not", "-path", "*/zig-out/*" } });
-    defer c.gpa.free(found.stdout);
-    defer c.gpa.free(found.stderr);
     var files: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, found.stdout, '\n');
-    while (lines.next()) |l| try files.append(a, try a.dupe(u8, l));
+    {
+        var dir = try Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walkSelectively(c.gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |e| switch (e.kind) {
+            .directory => if (!std.mem.eql(u8, e.basename, ".zig-cache") and !std.mem.eql(u8, e.basename, "zig-out")) try walker.enter(io, e),
+            .file => if (std.mem.endsWith(u8, e.basename, ".zig")) try files.append(a, try std.fs.path.join(a, &.{ root, e.path })),
+            else => {},
+        };
+    }
     std.mem.sort([]const u8, files.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);
