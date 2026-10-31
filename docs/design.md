@@ -44,7 +44,7 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 | | keystroke → hover (continuous typing) | — | `Sema.zig` p50 97 ms; other projects 5-21 ms | — |
 | | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
-| | resident memory (long session) | does not grow over the session | Zig compiler source, 720 rounds (cycling through all 2940 files about six times): flat at 1.5-1.6 GB from round 120 on, heap 280-500 MB | ✅ |
+| | resident memory (long session) | does not grow over the session | Zig compiler source, 240 rounds on Linux: 1.3-1.6 GB from round 120 on, heap about 520 MB. The allocator's memory stays flat (0.46 GB of pages for 0.18 GB of live small blocks, and 0.36 GB of large allocations); the rest, mostly worker stacks (0.75 GB at round 240), grows in steps as deeper recursions touch more of them. The rounds that compute the largest type graphs peak at 10.3 GB, which is returned to the system afterwards | ⚠️ worker stacks |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
 | | open file → syntax features | < 200 ms | 53 ms (`Sema.zig`) | ✅ |
 | | open file → hover / goto / completion | < 3 s | project loading 1.5-4.4 s; hover is available before loading finishes (with incomplete name resolution) | ✅ |
