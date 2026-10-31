@@ -432,6 +432,62 @@ fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     return @as(f64, @floatFromInt(kb)) / 1024;
 }
 
+/// Resident memory in transparent huge pages (`AnonHugePages` of /proc/<pid>/smaps_rollup; Linux)
+fn hugePagesMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) ?f64 {
+    if (@import("builtin").os.tag != .linux) return null;
+    var buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "/proc/{d}/smaps_rollup", .{pid}) catch return null;
+    const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return null;
+    defer gpa.free(text);
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |l| {
+        if (!std.mem.startsWith(u8, l, "AnonHugePages:")) continue;
+        var it = std.mem.tokenizeScalar(u8, l["AnonHugePages:".len..], ' ');
+        const kb = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+        return @as(f64, @floatFromInt(kb)) / 1024;
+    }
+    return null;
+}
+
+/// Windows: private committed memory, its peak, and the peak working set of the process (MB)
+fn commitMb(pid: std.process.Child.Id) ?[3]f64 {
+    if (@import("builtin").os.tag != .windows) return null;
+    const w = std.os.windows;
+    var c: w.PROCESS.VM_COUNTERS = undefined;
+    if (w.ntdll.NtQueryInformationProcess(pid, .VmCounters, &c, @sizeOf(w.PROCESS.VM_COUNTERS), null) != .SUCCESS) return null;
+    const mb = 1024 * 1024;
+    return .{ @as(f64, @floatFromInt(c.PagefileUsage)) / mb, @as(f64, @floatFromInt(c.PeakPagefileUsage)) / mb, @as(f64, @floatFromInt(c.PeakWorkingSetSize)) / mb };
+}
+
+/// The project's .zig files, sorted, outside `.zig-cache` and `zig-out`. The directory is walked
+/// rather than searched with `find`, which on Windows is an unrelated program
+fn projectFiles(c: *Client, root: []const u8) ![]const []const u8 {
+    const a = c.arena.allocator();
+    const io = c.io;
+    var files: std.ArrayList([]const u8) = .empty;
+    var dir = try Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walkSelectively(c.gpa);
+    defer walker.deinit();
+    while (try walker.next(io)) |e| switch (e.kind) {
+        .directory => if (!std.mem.eql(u8, e.basename, ".zig-cache") and !std.mem.eql(u8, e.basename, "zig-out")) try walker.enter(io, e),
+        .file => if (std.mem.endsWith(u8, e.basename, ".zig")) try files.append(a, try std.fs.path.join(a, &.{ root, e.path })),
+        else => {},
+    };
+    std.mem.sort([]const u8, files.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return files.items;
+}
+
+/// MB of an integer field of the `allocator` object of `zig-analyzer/status` (0 without it)
+fn allocatorMb(al: ?json.ObjectMap, key: []const u8) f64 {
+    const v = (al orelse return 0).get(key) orelse return 0;
+    return @as(f64, @floatFromInt(v.integer)) / (1024 * 1024);
+}
+
 /// Byte offset of a position (line and UTF-16 column; equal to the byte column when the sample
 /// files are all ASCII)
 fn offsetOf(text: []const u8, p: Position) ?usize {
@@ -804,37 +860,25 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
 
 /// Long session (BENCH_SESSION=<rounds>): each round opens 25 files of the project (rotating
 /// forward each round), runs hover, member and name completion, and edits, then closes them;
-/// afterwards prints the memory of the heap, the InternPool, and the main queries, to watch memory
-/// growth over a long run
+/// afterwards prints the memory of the heap, the InternPool, the main queries and the allocator,
+/// to watch memory growth over a long run, and at the end the latencies of the session's requests
 fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     const a = c.arena.allocator();
     const io = c.io;
-    var files: std.ArrayList([]const u8) = .empty;
-    {
-        var dir = try Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
-        defer dir.close(io);
-        var walker = try dir.walkSelectively(c.gpa);
-        defer walker.deinit();
-        while (try walker.next(io)) |e| switch (e.kind) {
-            .directory => if (!std.mem.eql(u8, e.basename, ".zig-cache") and !std.mem.eql(u8, e.basename, "zig-out")) try walker.enter(io, e),
-            .file => if (std.mem.endsWith(u8, e.basename, ".zig")) try files.append(a, try std.fs.path.join(a, &.{ root, e.path })),
-            else => {},
-        };
-    }
-    std.mem.sort([]const u8, files.items, {}, struct {
-        fn lt(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.lessThan(u8, x, y);
-        }
-    }.lt);
-    if (files.items.len == 0) return;
+    const files = try projectFiles(c, root);
+    if (files.len == 0) return;
     const per_round = 25;
-    std.debug.print("long session: {d} rounds × {d} files (of {d})\n", .{ rounds, per_round, files.items.len });
-    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s" });
+    std.debug.print("long session: {d} rounds × {d} files (of {d})\n", .{ rounds, per_round, files.len });
+    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s", "small", "resid", "slots", "kept", "ret", "large", "dec k", "thp", "commit" });
     const t0 = Io.Clock.awake.now(io);
     var version: i64 = 1;
+    var hover_times: std.ArrayList(f64) = .empty;
+    var member_times: std.ArrayList(f64) = .empty;
+    var name_times: std.ArrayList(f64) = .empty;
+    var idle_times: std.ArrayList(f64) = .empty;
     for (0..rounds) |round| {
         for (0..per_round) |k| {
-            const path = files.items[(round * per_round + k) % files.items.len];
+            const path = files[(round * per_round + k) % files.len];
             const text = Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(8 * 1024 * 1024), .of(u8), 0) catch continue;
             const uri = try za.base.uri.fromPath(a, path);
             const doc = .{ .uri = uri };
@@ -843,21 +887,29 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             const idents = try samplePositions(a, text, false);
             const step = @max(1, idents.len / 10);
             var i: usize = 0;
-            while (i < idents.len) : (i += step) _ = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i] });
+            while (i < idents.len) : (i += step) {
+                _, const t = try c.request("textDocument/hover", .{ .textDocument = doc, .position = idents[i] });
+                try hover_times.append(a, t);
+            }
             const dots = try samplePositions(a, text, true);
-            if (dots.len > 0) _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
+            if (dots.len > 0) {
+                _, const t = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
+                try member_times.append(a, t);
+            }
             // Completion after two characters of a name are typed: the auto-import index (built
             // only after the first completion at a name) also counts toward the session's memory
             if (idents.len > 0) {
                 const at = idents[idents.len / 3];
-                _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = .{ .line = at.line, .character = at.character + 2 } });
+                _, const t = try c.request("textDocument/completion", .{ .textDocument = doc, .position = .{ .line = at.line, .character = at.character + 2 } });
+                try name_times.append(a, t);
             }
             const end = positionOf(text, text.len);
             try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = end, .end = end }, .text = "// x" }} });
             version += 1;
             try c.notify("textDocument/didClose", .{ .textDocument = doc });
         }
-        _ = try c.request("zig-analyzer/waitIdle", {});
+        _, const idle_t = try c.request("zig-analyzer/waitIdle", {});
+        try idle_times.append(a, idle_t);
         const st, _ = try c.request("zig-analyzer/status", {});
         const o = st.object.get("result").?.object;
         var infer_b: i64 = 0;
@@ -881,7 +933,12 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
                 return @as(f64, @floatFromInt(x)) / (1024 * 1024);
             }
         }.f;
-        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0}\n", .{
+        // `small`: pages assigned to size classes; `resid`: their backed part with the segment
+        // headers and retained pages; `slots`: live small blocks by class size; `kept` and `ret`:
+        // empty pages retained and returned to the system; `dec k`: pages returned so far
+        const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
+        const vm = commitMb(c.child.id.?);
+        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7} {d:>7.0} {d:>7.0}\n", .{
             round + 1,
             (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
             mb(o.get("heap_bytes").?.integer),
@@ -894,6 +951,15 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             @as(u64, @intCast(keys)),
             @as(u64, @intCast(deps)),
             @as(f64, @floatFromInt(t0.durationTo(Io.Clock.awake.now(io)).nanoseconds)) / std.time.ns_per_s,
+            allocatorMb(al, "small"),
+            allocatorMb(al, "resident"),
+            allocatorMb(al, "live_slots"),
+            allocatorMb(al, "retained"),
+            allocatorMb(al, "returned"),
+            allocatorMb(al, "large"),
+            if (al) |obj| @as(u64, @intCast(obj.get("decommits").?.integer)) / 1000 else 0,
+            hugePagesMb(c.gpa, io, c.child.id.?) orelse 0,
+            if (vm) |v| v[0] else 0,
         });
         if (round + 1 == rounds) {
             // Last round: list the queries by bytes; the rest is unattributed (engine tables,
@@ -915,8 +981,37 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             for (rows.items[0..@min(12, rows.items.len)]) |r| std.debug.print("    {s:<28} {d:>8.1} MB  memos {d:>7}  keys {d:>7}\n", .{ r.name, mb(r.bytes), r.memos, r.keys });
             std.debug.print("    {s:<28} {d:>8.1} MB\n", .{ "InternPool", mb(o.get("intern_pool_bytes").?.integer) });
             std.debug.print("    {s:<28} {d:>8.1} MB\n", .{ "unattributed", mb(o.get("heap_bytes").?.integer - attributed) });
+            std.debug.print("  peak resident memory {d:.0} MB\n", .{@as(f64, @floatFromInt(o.get("max_rss_kb").?.integer)) / 1024});
+            if (vm) |v| std.debug.print("  peak private commit {d:.0} MB, peak working set {d:.0} MB\n", .{ v[1], v[2] });
+            if (al) |obj| {
+                std.debug.print("  allocator: {d} segments, at most {d:.0} MB assigned to size classes, {d} pages returned to the system, {d} taken back\n", .{
+                    obj.get("segments").?.integer,
+                    allocatorMb(al, "peak_small"),
+                    obj.get("decommits").?.integer,
+                    obj.get("recommits").?.integer,
+                });
+                std.debug.print("    {s:>6} {s:>9} {s:>9} {s:>6} {s:>12}\n", .{ "size", "pages MB", "live MB", "use %", "allocs" });
+                for (obj.get("classes").?.array.items) |cl| {
+                    const size: u64 = @intCast(cl.object.get("size").?.integer);
+                    const pages: u64 = @intCast(cl.object.get("pages").?.integer);
+                    const live = @as(u64, @intCast(cl.object.get("live").?.integer)) * size;
+                    const allocs: u64 = @intCast(cl.object.get("allocs").?.integer);
+                    std.debug.print("    {d:>6} {d:>9.1} {d:>9.1} {d:>6.1} {d:>12}\n", .{
+                        size,
+                        mb(@intCast(pages)),
+                        mb(@intCast(live)),
+                        if (pages == 0) 0 else @as(f64, @floatFromInt(live)) * 100 / @as(f64, @floatFromInt(pages)),
+                        allocs,
+                    });
+                }
+            }
         }
     }
+    std.debug.print("  session latencies:\n", .{});
+    Stats.print("hover", hover_times.items);
+    Stats.print("member compl", member_times.items);
+    Stats.print("name compl", name_times.items);
+    Stats.print("waitIdle", idle_times.items);
 }
 
 /// Line-end offset of the first function body statement (indented by at least 8 spaces, ending
