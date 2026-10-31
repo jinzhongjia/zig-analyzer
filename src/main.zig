@@ -43,8 +43,8 @@ pub fn main(init: std.process.Init) !u8 {
     // `std.heap.smp_allocator` is not used: its free lists are split by thread slot, and cached
     // values are allocated on worker threads but freed on the sweeping thread, so the allocating
     // side cannot get the freed blocks back, and the resident memory keeps growing over the
-    // session (see `SharedAllocator`)
-    const backing = if (builtin.mode == .debug) init.gpa else za.util.SharedAllocator.allocator;
+    // session (see `PagedAllocator`)
+    const backing = if (builtin.mode == .debug) init.gpa else za.util.PagedAllocator.allocator;
     // `init.io` is not used: its worker threads have the default stack size, so a very deep
     // dependency chain would have to be interrupted many times and computed in segments
     var threaded: std.Io.Threaded = .init(backing, .{
@@ -70,6 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
     // stack limit
     server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = za.util.worker_stack.budget };
     server.heap = &counting;
+    if (builtin.mode != .debug) server.allocator_stats = &za.util.PagedAllocator.stats;
     server.environ = init.minimal.environ;
     defer server.deinit();
     return server.run(&stdin.interface);
