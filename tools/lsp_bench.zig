@@ -1024,10 +1024,19 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
 fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []const u8) !void {
     const a = c.arena.allocator();
     const io = c.io;
+    // The measured files are already open. They are compared by full path with native separators:
+    // on Windows the project's files are listed with `\`, while the command line names them as
+    // given (e.g. `src/Sema.zig`)
+    const skip = try a.alloc([]const u8, measured.len);
+    for (measured, skip) |m, *s| {
+        const path = try std.fs.path.join(a, &.{ root, m });
+        std.mem.replaceScalar(u8, path, '/', std.fs.path.sep);
+        s.* = path;
+    }
     const File = struct { path: []const u8, size: u64 };
     var files: std.ArrayList(File) = .empty;
     next_file: for (try projectFiles(c, root)) |path| {
-        for (measured) |m| if (std.mem.endsWith(u8, path, m)) continue :next_file;
+        for (skip) |s| if (std.mem.eql(u8, path, s)) continue :next_file;
         const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
         try files.append(a, .{ .path = path, .size = st.size });
     }
