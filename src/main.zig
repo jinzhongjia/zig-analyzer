@@ -70,6 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
     // stack limit
     server.db.stack_budget = .{ .main = std.Thread.getCurrentId(), .worker_bytes = za.util.worker_stack.budget };
     server.heap = &counting;
+    if (builtin.mode != .debug) server.allocator_stats = &za.util.PagedAllocator.stats;
     server.environ = init.minimal.environ;
     defer server.deinit();
     return server.run(&stdin.interface);

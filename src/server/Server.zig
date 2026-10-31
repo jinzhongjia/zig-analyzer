@@ -147,6 +147,9 @@ index_generation: std.atomic.Value(u64) = .init(0),
 callsite_seeding: std.atomic.Value(bool) = .init(true),
 /// Counting allocator (set by the executable; used for `heap_bytes` in `zig-analyzer/status`)
 heap: ?*const za.util.mem.Counting = null,
+/// Statistics of the release allocator (set by the executable; `allocator` in
+/// `zig-analyzer/status`)
+allocator_stats: ?*const fn (Allocator) Allocator.Error!za.util.PagedAllocator.Stats = null,
 /// Slow request log threshold (ms, 0 disables it), from the config option `log.slow_request_ms`
 slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
@@ -5382,6 +5385,8 @@ const StatusResult = struct {
     /// Bytes allocated through the server's allocator and not yet freed (when the executable wraps
     /// the allocator with `mem.Counting`; 0 otherwise)
     heap_bytes: usize,
+    /// Memory held by the release allocator (null in builds that do not use it)
+    allocator: ?za.util.PagedAllocator.Stats,
     queries: []const struct {
         name: []const u8,
         executions: u64,
@@ -6600,6 +6605,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         .intern_pool_items = server.ip.count(),
         .intern_pool_bytes = server.ip.bytes(),
         .heap_bytes = if (server.heap) |h| h.liveBytes() else 0,
+        .allocator = if (server.allocator_stats) |f| try f(arena) else null,
         .queries = queries,
         .incomplete_causes = .{
             .cycle = summary.incomplete_causes.get(.cycle),
