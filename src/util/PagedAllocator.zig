@@ -12,8 +12,8 @@
 //! The server's cached values are allocated on worker threads and freed on the threads that run
 //! sweeps and write transactions. A heap split by thread (`std.heap.SmpAllocator`) leaves the freed
 //! blocks out of reach of the allocating threads, so here a block freed by any thread can be reused
-//! by any thread: each size class has a lock and a list of its pages with room, and the pool has
-//! its own lock, taken after a class lock. Pages are returned to the system and backed again
+//! by any thread: each size class has a lock and lists of its pages with room (see `Class`), and
+//! the pool has its own lock, taken after a class lock. Pages are returned to the system and backed again
 //! without the pool lock, so that these system calls do not hold up the classes that need a page.
 //! A thread that cannot get a lock sleeps (futex). Allocations larger than `max_small` are mapped
 //! directly and unmapped when they are freed.
@@ -201,9 +201,15 @@ fn decommit(addr: usize) void {
 
 const Class = struct {
     mutex: Mutex align(std.atomic.cache_line) = .init,
-    /// Pages with room, the one to allocate from first
+    /// Pages with room, the one to allocate from first: the page that most recently got room, so
+    /// that the blocks freed last, which are likely still cached, are reused first
     head: ?*Page = null,
-    /// Length of the `head` list
+    /// Pages with room that are in bin 0 (less than an eighth of their blocks in use), used only
+    /// when `head` is empty. After a transient peak, most pages keep only a few long-lived
+    /// blocks; allocating into them would keep them from becoming empty when those blocks are
+    /// freed, while sparing them lets them go back to the pool
+    sparse: ?*Page = null,
+    /// Length of the `head` and `sparse` lists
     with_room: u32 = 0,
     /// Pages assigned to the class, with room or full
     pages: usize = 0,
@@ -214,27 +220,37 @@ const Class = struct {
     /// Pages assigned to the class by occupancy bin
     occupancy: [bins + 1]u32 = @splat(0),
 
+    /// The list a page with room belongs to
+    fn listOf(c: *Class, page: *const Page) *?*Page {
+        return if (page.bin == 0) &c.sparse else &c.head;
+    }
+
     fn push(c: *Class, page: *Page) void {
+        const head = c.listOf(page);
         page.prev = null;
-        page.next = c.head;
-        if (c.head) |h| h.prev = page;
-        c.head = page;
+        page.next = head.*;
+        if (head.*) |h| h.prev = page;
+        head.* = page;
         c.with_room += 1;
     }
 
     fn remove(c: *Class, page: *Page) void {
-        if (page.prev) |p| p.next = page.next else c.head = page.next;
+        if (page.prev) |p| p.next = page.next else c.listOf(page).* = page.next;
         if (page.next) |n| n.prev = page.prev;
         c.with_room -= 1;
     }
 
-    /// Moves a page to the bin of its count of blocks in use
+    /// Moves a page to the bin of its count of blocks in use, and a page with room to the list
+    /// of that bin
     fn rebin(c: *Class, page: *Page) void {
         const bin = binOf(page.live, page.class);
         if (bin == page.bin) return;
         c.occupancy[page.bin] -= 1;
         c.occupancy[bin] += 1;
+        const moves = page.state == .with_room and (bin == 0) != (page.bin == 0);
+        if (moves) c.remove(page);
         page.bin = bin;
+        if (moves) c.push(page);
     }
 };
 
@@ -287,7 +303,7 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     const c = &classes[ci];
     Threaded.mutexLockUncancelable(&c.mutex);
     defer Threaded.mutexUnlock(&c.mutex);
-    const page = c.head orelse page: {
+    const page = c.head orelse c.sparse orelse page: {
         const p = takePage() orelse return null;
         p.* = .{ .free = 0, .carved = 0, .touched = p.touched, .live = 0, .class = @intCast(ci), .bin = 0, .state = .with_room, .prev = null, .next = null };
         c.push(p);
@@ -592,6 +608,35 @@ test "the occupancy bin of a page is the share of its blocks in use, in eighths"
     try testing.expectEqual(before[bins], c.occupancy[bins]);
     try testing.expectEqual(before[5] + 1, c.occupancy[5]);
     for (b[1..]) |x| allocator.destroy(x);
+}
+
+test "a page with less than an eighth of its blocks in use gets new blocks only when no other page has room" {
+    // 51 blocks of 1280 B fill a page: two pages, filled one after the other
+    const Block = [1280]u8;
+    var b: [102]*Block = undefined;
+    for (&b) |*x| x.* = try allocator.create(Block);
+    var by_page: [2][51]*Block = undefined;
+    var counts: [2]usize = @splat(0);
+    const first = pageOf(@intFromPtr(b[0]));
+    for (b) |x| {
+        const i: usize = if (pageOf(@intFromPtr(x)) == first) 0 else 1;
+        by_page[i][counts[i]] = x;
+        counts[i] += 1;
+    }
+    try testing.expectEqual([2]usize{ 51, 51 }, counts);
+    // The second page gets room first, then the first page keeps 5 blocks: the next block goes to
+    // the second page, although the first got room last
+    allocator.destroy(by_page[1][0]);
+    for (by_page[0][0..46]) |x| allocator.destroy(x);
+    const again = try allocator.create(Block);
+    try testing.expectEqual(pageOf(@intFromPtr(by_page[1][1])), pageOf(@intFromPtr(again)));
+    // With the second page full, the first gets blocks again
+    const next = try allocator.create(Block);
+    try testing.expectEqual(first, pageOf(@intFromPtr(next)));
+    allocator.destroy(again);
+    allocator.destroy(next);
+    for (by_page[0][46..]) |x| allocator.destroy(x);
+    for (by_page[1][1..]) |x| allocator.destroy(x);
 }
 
 test "pages emptied by one size class serve another" {
