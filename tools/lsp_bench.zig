@@ -1105,7 +1105,7 @@ fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []
     const st, _ = try c.request("zig-analyzer/status", {});
     const o = st.object.get("result").?.object;
     const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
-    std.debug.print("  memory {d:.0} MB, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB\n", .{
+    std.debug.print("  memory {d:.0} MB, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB; {d} pages returned to the system, {d} taken back\n", .{
         (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
         @as(f64, @floatFromInt(o.get("max_rss_kb").?.integer)) / 1024,
         @as(f64, @floatFromInt(o.get("heap_bytes").?.integer)) / (1024 * 1024),
@@ -1115,6 +1115,8 @@ fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []
         allocatorMb(al, "retained"),
         allocatorMb(al, "returned"),
         allocatorMb(al, "large"),
+        if (al) |obj| obj.get("decommits").?.integer else 0,
+        if (al) |obj| obj.get("recommits").?.integer else 0,
     });
     if (commitMb(c.child.id.?)) |v| std.debug.print("  private commit {d:.0} MB (peak {d:.0} MB), peak working set {d:.0} MB\n", .{ v[0], v[1], v[2] });
 }
