@@ -7670,6 +7670,11 @@ test "selected auto-import candidates describe the signature, docs and where the
         \\/// Offsets of line starts.
         \\pub const LineIndex = struct {};
         \\pub fn lineOf(offset: u32) u32 { return offset; }
+        \\/// Text helpers.
+        \\pub const txt = @import("text.zig");
+        \\//- /p/src/util/text.zig in:app
+        \\//! Text utilities.
+        \\pub const max = 4;
         \\//- /dep/src/root.zig module:dep
         \\pub const Header = struct {};
         \\//- /zig/std/std.zig std
@@ -7685,6 +7690,8 @@ test "selected auto-import candidates describe the signature, docs and where the
     const cases = [_]struct { prefix: []const u8, label: []const u8, detail: []const u8, doc: []const u8 }{
         .{ .prefix = "LineIn", .label = "LineIndex", .detail = "const LineIndex = struct", .doc = "Offsets of line starts.\n\nDefined in `util/lines.zig:4`" },
         .{ .prefix = "lineO", .label = "lineOf", .detail = "pub fn lineOf(offset: u32) u32", .doc = "Defined in `util/lines.zig:5`" },
+        // A constant whose value is a file: its own doc, then the `//!` doc of that file
+        .{ .prefix = "tx", .label = "txt", .detail = "const txt: type = text", .doc = "Text helpers.\n\nText utilities.\n\nDefined in `util/lines.zig:7`" },
         // The file itself: the import expression and the `//!` docs at the start of the file
         .{ .prefix = "lines", .label = "lines", .detail = "@import(\"util/lines.zig\")", .doc = "Line utilities.\n\nFile `util/lines.zig`" },
         // The standard library by its path under `std/`; other modules by the name the current file
