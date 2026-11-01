@@ -155,6 +155,14 @@ slow_request_ms: std.atomic.Value(u32) = .init(100),
 /// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
 /// generation (0 disables reclaiming); from the config option `sema.max_intern_pool_mb`
 max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
+/// The most type information that one request or diagnostics publish has added (InternPool bytes
+/// and keys of the type-information queries, see `maybeResetSema`). A reclaim waits until the
+/// type information is at least twice that: one that discards what a single request needs makes
+/// every following request that needs it start from nothing and exceed the limit again.
+sema_peak_growth: struct {
+    bytes: std.atomic.Value(usize) = .init(0),
+    keys: std.atomic.Value(usize) = .init(0),
+} = .{},
 /// Debounce (ms) of diagnostic publishing triggered by edits, from the config option
 /// `diagnostics.debounce_ms`
 debounce_ms: std.atomic.Value(u32) = .init(50),
@@ -362,6 +370,8 @@ const Pending = struct {
     /// the server's own updates are not ordered with requests, see `Db.WriteOrder`). A workspace
     /// symbol request that waited for the index moves it to the end of the wait.
     since: Db.Mark,
+    /// Type information when the task started (see `maybeResetSema`)
+    sema_start: SemaUsage = .{},
 };
 
 /// Test hook: a read or semantic request of `method` stops at `point` until `release` is set or
@@ -771,6 +781,7 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
             defer server.finishRequest(arena, pending);
+            pending.sema_start = server.semaUsage();
             const a = arena.allocator();
             server.testGate(method, .before_read, pending);
             var ctx = server.db.beginReadAt(a, pending.since);
@@ -804,6 +815,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
             defer server.finishRequest(arena, pending);
+            pending.sema_start = server.semaUsage();
             const a = arena.allocator();
             if (comptime std.mem.eql(u8, method, "workspace/symbol")) {
                 // After a wait, reads the state at its end: the request has no position that
@@ -845,7 +857,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
 /// then
 fn finishRequest(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending) void {
     if (server.db.wantsSweep()) _ = server.db.trySweep();
-    server.maybeResetSema();
+    server.maybeResetSema(pending.sema_start);
     server.removePending(pending);
     server.destroyArena(arena);
 }
@@ -3977,9 +3989,10 @@ fn publishWorker(server: *Server) Io.Cancelable!void {
             }
             break :blk job;
         };
+        const start = server.semaUsage();
         server.publishNow(job.file, job.clear, job.always, null);
         if (job.tracked) server.publishDone(job.file);
-        server.maybeResetSema();
+        server.maybeResetSema(start);
     }
 }
 
@@ -4051,11 +4064,12 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
         const ms = server.debounce_ms.load(.monotonic);
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
+    const start = server.semaUsage();
     server.publishNow(file, false, true, seen);
     server.publishDependents(&.{file});
     if (server.openDocumentCount() > 1) server.requestRefresh();
     server.refreshCompileSets(&.{file});
-    server.maybeResetSema();
+    server.maybeResetSema(start);
 }
 
 /// The text of these files has changed: each project whose compile set read their imports
@@ -4085,18 +4099,33 @@ fn editGeneration(server: *Server, file: Vfs.FileId) u64 {
     return if (server.edits.get(file)) |e| e.generation else 0;
 }
 
+/// Size of the type information: the InternPool's bytes and the keys of the type-information
+/// queries (see `sema_queries`)
+const SemaUsage = struct { bytes: usize = 0, keys: usize = 0 };
+
+fn semaUsage(server: *Server) SemaUsage {
+    return .{ .bytes = server.ip.bytes(), .keys = server.semaKeys() };
+}
+
 /// Reclaims type information (see `resetSema`) when the InternPool exceeds
 /// `sema.max_intern_pool_mb` or the type-information queries have more than `sema_reset_keys`
-/// keys. Called when a request or a diagnostics publish finishes, outside read transactions.
-fn maybeResetSema(server: *Server) void {
+/// keys, and in both cases twice the most that one request or publish has added (see
+/// `sema_peak_growth`). Called when a request or a diagnostics publish that started at `start`
+/// finishes, outside read transactions.
+fn maybeResetSema(server: *Server, start: SemaUsage) void {
     const limit = server.max_intern_pool_mb.load(.monotonic);
     if (limit == 0) return;
-    const limit_bytes = @as(usize, limit) * 1024 * 1024;
-    if (server.ip.bytes() < limit_bytes and server.semaKeys() < sema_reset_keys) return;
+    const now = server.semaUsage();
+    // A reclaim in the meantime counts as no growth
+    const peak_bytes = server.sema_peak_growth.bytes.fetchMax(now.bytes -| start.bytes, .monotonic);
+    const peak_keys = server.sema_peak_growth.keys.fetchMax(now.keys -| start.keys, .monotonic);
+    const limit_bytes = @max(@as(usize, limit) * 1024 * 1024, 2 * @max(peak_bytes, now.bytes -| start.bytes));
+    const limit_keys = @max(sema_reset_keys, 2 * @max(peak_keys, now.keys -| start.keys));
+    if (now.bytes < limit_bytes and now.keys < limit_keys) return;
     if (!server.db.tryBeginWrite()) return;
     defer server.db.endWrite();
     // Another thread may have reclaimed since the check above
-    if (server.ip.bytes() < limit_bytes and server.semaKeysLocked() < sema_reset_keys) return;
+    if (server.ip.bytes() < limit_bytes and server.semaKeysLocked() < limit_keys) return;
     server.resetSemaLocked();
 }
 

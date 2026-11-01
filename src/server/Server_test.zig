@@ -922,17 +922,20 @@ test "reclaiming type information does not cancel in-flight requests and runs on
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const doc = .{ .textDocument = .{ .uri = uri } };
-    const expected = (try h.request("textDocument/semanticTokens/full", doc)).object.get("result").?.object.get("data").?.array.items;
+    const first = try h.send("textDocument/semanticTokens/full", doc);
+    const expected = (try h.response(first)).object.get("result").?.object.get("data").?.array.items;
+    while (inFlight(&h.server, first)) std.Thread.yield() catch {};
 
+    // Push the InternPool over the limit outside every request, so that no request counts it as
+    // what it needs (see `Server.sema_peak_growth`)
+    var bits: u16 = 1;
+    while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
     var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
     h.server.test_gate = &gate;
     defer h.server.test_gate = null;
     defer gate.release.set(testing.io);
     const held = try h.send("textDocument/semanticTokens/full", doc);
     try gate.entered.wait(testing.io);
-    // Push the InternPool over the limit while the request holds its read transaction
-    var bits: u16 = 1;
-    while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
     const items = h.server.ip.count();
     // Another request finishes in the meantime and checks whether to reclaim
     const other = try h.send("textDocument/documentSymbol", doc);
@@ -946,6 +949,65 @@ test "reclaiming type information does not cancel in-flight requests and runs on
     try testing.expectEqualDeep(expected, tokens.object.get("result").?.object.get("data").?.array.items);
     // No read transaction is left once the held request finishes: it reclaims
     while (inFlight(&h.server, held)) std.Thread.yield() catch {};
+    try testing.expect(h.server.ip.count() < items);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "type information that one request needs is not reclaimed until it is twice that" {
+    // Guards against reclaiming right after a request whose own inference exceeds the limit: every
+    // request that needed the same information started from nothing and exceeded it again
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .sema = .{ .max_intern_pool_mb = 1 } } });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-7";
+    const text =
+        \\fn List(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\const L = List(u8);
+        \\pub fn main() void {
+        \\    const l: L = undefined;
+        \\    _ = l.items;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const at = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 6, .character = 11 } };
+
+    // The request itself pushes the InternPool to twice the limit
+    var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
+    h.server.test_gate = &gate;
+    const big = try h.send("textDocument/hover", at);
+    try gate.entered.wait(testing.io);
+    var bits: u16 = 1;
+    while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
+    gate.release.set(testing.io);
+    h.server.test_gate = null;
+    _ = try h.response(big);
+    while (inFlight(&h.server, big)) std.Thread.yield() catch {};
+    const items = h.server.ip.count();
+
+    // Neither that request nor a later one that adds nothing reclaims it
+    const next = try h.send("textDocument/hover", at);
+    _ = try h.response(next);
+    while (inFlight(&h.server, next)) std.Thread.yield() catch {};
+    try testing.expectEqual(items, h.server.ip.count());
+
+    // Past twice what the request added, the next request reclaims
+    const peak = h.server.sema_peak_growth.bytes.load(.monotonic);
+    try testing.expect(peak >= 1024 * 1024);
+    var signed_bits: u16 = 1;
+    while (h.server.ip.bytes() < 2 * peak + 1024 * 1024) : (signed_bits += 1) _ = try h.server.ip.intType(.signed, signed_bits);
+    const last = try h.send("textDocument/hover", at);
+    _ = try h.response(last);
+    while (inFlight(&h.server, last)) std.Thread.yield() catch {};
     try testing.expect(h.server.ip.count() < items);
 
     _ = try h.request("shutdown", {});
