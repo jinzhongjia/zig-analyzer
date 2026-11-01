@@ -19,6 +19,7 @@ const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const seed = @import("../ide_db/seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
+const isTrivia = @import("../syntax/kind.zig").isTrivia;
 
 pub const At = struct {
     file: FileId,
@@ -158,6 +159,51 @@ pub fn doc(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
         .item => |it| (try r.itemTree(it.file)).items[it.item].doc,
         else => null,
     };
+}
+
+/// Documentation of a definition whose value is `tv`: its doc comment, followed by the `//!` doc of
+/// the file when it is a constant whose value is a file (`const x = @import("x.zig");`, a module);
+/// null when there is neither
+pub fn docOf(r: *Resolver, def: Def, tv: TypedValue) resolve.Error!?[]const u8 {
+    const own = try doc(r, def);
+    const is_const = switch (def) {
+        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .@"const",
+        .local => |l| (try r.body(l.file, l.item)).binding(l.binding).kind == .local_const,
+        else => false,
+    };
+    const file_doc = if (is_const) try valueFileDoc(r, tv) else null;
+    const d = file_doc orelse return own;
+    return if (own) |o| try std.fmt.allocPrint(r.arena, "{s}\n\n{s}", .{ o, d }) else d;
+}
+
+/// The `//!` doc of the file when `tv` is the type of a file; null otherwise or when the file has
+/// none
+pub fn valueFileDoc(r: *Resolver, tv: TypedValue) resolve.Error!?[]const u8 {
+    const ty = tv.asType() orelse return null;
+    return switch (r.ctx.db.env.ip.key(ty)) {
+        .container_type => |c| if (c.kind == .file) try fileDoc(r, c.file) else null,
+        else => null,
+    };
+}
+
+/// The `//!` doc at the start of the file, cleaned up the same way as `///` docs (see
+/// `ItemTree`); null when there is none
+pub fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    var out: std.ArrayList(u8) = .empty;
+    var it = root.children();
+    while (it.next()) |e| {
+        if (e != .token) break;
+        if (e.token.kind != .container_doc_comment) {
+            if (isTrivia(e.token.kind)) continue;
+            break;
+        }
+        var line = e.token.text["//!".len..];
+        if (std.mem.startsWith(u8, line, " ")) line = line[1..];
+        if (out.items.len != 0) try out.append(r.arena, '\n');
+        try out.appendSlice(r.arena, std.mem.trimEnd(u8, line, "\r"));
+    }
+    return if (out.items.len == 0) null else out.items;
 }
 
 /// Signature of a definition: the prototype for functions (see `ast.FnProto.writeSignature`), the
