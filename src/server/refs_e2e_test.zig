@@ -131,7 +131,7 @@ test "references, highlight, rename and workspace symbol" {
         try testing.expectEqualStrings("cannot rename: the cursor is on the import of a file, and files cannot be renamed", import_rename.object.get("error").?.object.get("message").?.string);
         // std calls `root.main`: renaming it in the root source file used to break the build
         const main_rename = try h.request("textDocument/rename", .{ .textDocument = doc, .position = position(main_text, "main"), .newName = "run" });
-        try testing.expectEqualStrings("cannot rename `main` to `run`: the standard library looks up `root.main` by this name in the root source file (src/main.zig:3:8)", main_rename.object.get("error").?.object.get("message").?.string);
+        try testing.expectEqualStrings(fixture.separators("cannot rename `main` to `run`: the standard library looks up `root.main` by this name in the root source file (src/main.zig:3:8)"), main_rename.object.get("error").?.object.get("message").?.string);
     }
 
     // workspace symbol
@@ -352,7 +352,7 @@ test "rename refuses when a reference cannot be confirmed" {
     // other: a rename returned only the declaration and broke the build
     {
         const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = impls_uri }, .position = position(impls_text, "Close"), .newName = "close" });
-        try testing.expectEqualStrings("cannot rename `Close` to `close`: this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations (src/conn.zig:7:33)", resp.object.get("error").?.object.get("message").?.string);
+        try testing.expectEqualStrings(fixture.separators("cannot rename `Close` to `close`: this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations (src/conn.zig:7:33)"), resp.object.get("error").?.object.get("message").?.string);
     }
     // A file that mentions the name but has syntax errors may hide references
     {
@@ -363,7 +363,7 @@ test "rename refuses when a reference cannot be confirmed" {
         try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = broken } });
         _ = try h.request("zig-analyzer/waitIdle", {});
         const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = conn_uri }, .position = position(conn_text, "close"), .newName = "shut" });
-        try testing.expectEqualStrings("cannot rename `close` to `shut`: the file has syntax errors, so references in it may be missed (src/main.zig)", resp.object.get("error").?.object.get("message").?.string);
+        try testing.expectEqualStrings(fixture.separators("cannot rename `close` to `shut`: the file has syntax errors, so references in it may be missed (src/main.zig)"), resp.object.get("error").?.object.get("message").?.string);
     }
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

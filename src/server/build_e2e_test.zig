@@ -80,12 +80,14 @@ const Session = struct {
         return s.label(target.object.get("uri").?.string, target.object.get("range").?);
     }
 
-    /// The path of the file `uri` relative to the project root (or the file name when it is
-    /// outside), with the 0-based line of `range`
+    /// The path of the file `uri` relative to the project root, separated by `/` (or the file
+    /// name when it is outside), with the 0-based line of `range`
     fn label(s: *Session, target_uri: []const u8, range: std.json.Value) ![]const u8 {
         const a = s.h.arena.allocator();
         const path = try za.base.uri.toPath(a, target_uri);
-        const rel = if (std.mem.startsWith(u8, path, s.project.root)) path[s.project.root.len + 1 ..] else std.fs.path.basename(path);
+        const from = if (std.mem.startsWith(u8, path, s.project.root)) s.project.root.len + 1 else path.len - std.fs.path.basename(path).len;
+        const rel = path[from..];
+        std.mem.replaceScalar(u8, rel, std.fs.path.sep, '/');
         const line = range.object.get("start").?.object.get("line").?.integer;
         return std.fmt.allocPrint(a, "{s}:{d}", .{ rel, line });
     }
