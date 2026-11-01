@@ -2165,7 +2165,22 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
 
 /// Files in a project root directory whose changes require restarting the project
 fn isProjectFile(base: []const u8) bool {
-    return std.mem.eql(u8, base, "build.zig") or std.mem.eql(u8, base, "build.zig.zon") or std.mem.eql(u8, base, Config.project_file);
+    for (Workspace.project_files) |name| if (std.mem.eql(u8, base, name)) return true;
+    return false;
+}
+
+/// Whether the project file at `path` has the disk contents `disk` (hash; null when absent) that
+/// the newest instance of the project of its directory started with (see `Workspace.startedWith`):
+/// FSEvents reports writes made shortly before the stream started, which do not change what that
+/// maker read
+fn projectStartedWith(server: *Server, path: []const u8, disk: ?u64) bool {
+    const dir = std.fs.path.dirname(path) orelse return false;
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, dir)) {
+        return (w.successor orelse w).startedWith(std.fs.path.basename(path), disk);
+    };
+    return false;
 }
 
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
@@ -2242,10 +2257,15 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         const dir = std.fs.path.dirname(path) orelse "";
         if (std.mem.eql(u8, base, "build.zig")) try build_zig_dirs.append(arena, dir);
         // Files never seen before have no known contents to update (a new file is loaded when it
-        // is imported); project files have no contents to compare against and count as changed
+        // is imported); project files count as changed unless the project started with these
+        // contents
         const file = try server.vfs.lookup(path) orelse {
-            if (source == .verified) continue;
-            if (isProjectFile(base)) try build_files.append(arena, dir);
+            if (source == .verified or !isProjectFile(base)) continue;
+            const read = if (kind == .Deleted) null else Io.Dir.cwd().readFileAlloc(server.io, path, arena, .limited(Vfs.max_file_size)) catch |err| switch (err) {
+                error.OutOfMemory, error.Canceled => |e| return e,
+                else => null,
+            };
+            if (!server.projectStartedWith(path, if (read) |t| std.hash.Wyhash.hash(0, t) else null)) try build_files.append(arena, dir);
             continue;
         };
         const is_open = blk: {
@@ -2288,7 +2308,12 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         var kept: usize = 0;
         for (changes.items) |*c| {
             c.edited = !c.open and !sameText(&ctx, c.file, c.text);
-            c.rebuild = if (source == .verified) c.edited else if (server.watched_built.get(c.file)) |built| !std.meta.eql(built, c.disk) else true;
+            c.rebuild = if (source == .verified)
+                c.edited
+            else if (server.watched_built.get(c.file)) |built|
+                !std.meta.eql(built, c.disk)
+            else
+                !(isProjectFile(std.fs.path.basename(c.path)) and server.projectStartedWith(c.path, c.disk));
             if (!c.edited and !c.rebuild) {
                 if (c.text) |t| server.gpa.free(t);
                 continue;
