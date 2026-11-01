@@ -289,7 +289,7 @@ test "naming fixes: resolve, conflicts, public names and the project still build
         const fix = actionWithTitle(try codeActions(&h, lib_uri, lib_text, "MakeThing() void"), "rename public `MakeThing`").?;
         try testing.expectEqual(null, fix.object.get("edit"));
         const reason = fix.object.get("disabled").?.object.get("reason").?.string;
-        try testing.expectEqualStrings("cannot rename `MakeThing` to `makeThing`: `makeThing` is already declared in the same container (src/lib.zig:6:4)", reason);
+        try testing.expectEqualStrings(fixture.separators("cannot rename `MakeThing` to `makeThing`: `makeThing` is already declared in the same container (src/lib.zig:6:4)"), reason);
     }
     // An access whose type is unknown may be a reference: refused, rather than returning a partial
     // edit
@@ -297,7 +297,7 @@ test "naming fixes: resolve, conflicts, public names and the project still build
         const fix = actionWithTitle(try codeActions(&h, lib_uri, lib_text, "FieldName: u32"), "rename field `FieldName` to `field_name`").?;
         const resp = try h.request("codeAction/resolve", fix);
         const message = resp.object.get("error").?.object.get("message").?.string;
-        try testing.expectEqualStrings("cannot rename `FieldName` to `field_name`: the type here is unknown, so whether this refers to the same declaration cannot be confirmed (src/lib.zig:9:12)", message);
+        try testing.expectEqualStrings(fixture.separators("cannot rename `FieldName` to `field_name`: the type here is unknown, so whether this refers to the same declaration cannot be confirmed (src/lib.zig:9:12)"), message);
     }
 
     var texts: std.StringArrayHashMapUnmanaged([]const u8) = .empty;

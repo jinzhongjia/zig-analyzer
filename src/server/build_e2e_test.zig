@@ -80,12 +80,14 @@ const Session = struct {
         return s.label(target.object.get("uri").?.string, target.object.get("range").?);
     }
 
-    /// The path of the file `uri` relative to the project root (or the file name when it is
-    /// outside), with the 0-based line of `range`
+    /// The path of the file `uri` relative to the project root, separated by `/` (or the file
+    /// name when it is outside), with the 0-based line of `range`
     fn label(s: *Session, target_uri: []const u8, range: std.json.Value) ![]const u8 {
         const a = s.h.arena.allocator();
         const path = try za.base.uri.toPath(a, target_uri);
-        const rel = if (std.mem.startsWith(u8, path, s.project.root)) path[s.project.root.len + 1 ..] else std.fs.path.basename(path);
+        const from = if (std.mem.startsWith(u8, path, s.project.root)) s.project.root.len + 1 else path.len - std.fs.path.basename(path).len;
+        const rel = path[from..];
+        std.mem.replaceScalar(u8, rel, std.fs.path.sep, '/');
         const line = range.object.get("start").?.object.get("line").?.integer;
         return std.fmt.allocPrint(a, "{s}:{d}", .{ rel, line });
     }
@@ -558,7 +560,7 @@ test "build integration: the standard library is analyzed in the compilation of 
     // The branch the Windows compilation takes is not inactive
     try testing.expectEqualSlices(i64, &.{11}, try s.inactiveLines(main_uri));
     // The host generator keeps the host's standard library and its own root
-    try testing.expectEqualStrings("```zig\nconst sep: u8 = 47\n```", try s.hover(gen_uri, cross_gen, "sep ="));
+    try testing.expectEqualStrings(std.fmt.comptimePrint("```zig\nconst sep: u8 = {d}\n```", .{std.fs.path.sep}), try s.hover(gen_uri, cross_gen, "sep ="));
     try testing.expectEqualStrings("```zig\nconst log_level: Level = .debug\n```", try s.hover(gen_uri, cross_gen, "log_level ="));
 }
 
@@ -667,11 +669,11 @@ test "build integration: files in no compile step get the layout of the host, no
     // The build runner compiles build.zig for the host
     try testing.expectEqualStrings("```zig\nconst bz_usize: comptime_int = 8\n```", try s.hover(build_uri, layout_build, "bz_usize ="));
     // An unreferenced file and a detached file are compiled for the host too (`zig build-obj`
-    // logs 8, 64 and 8 for them); the layout must match their own builtin
+    // logs 8, 64 and the host's `c_long` size for them); the layout must match their own builtin
     for ([_][]const u8{ orphan_uri, solo_uri }) |u| {
         try testing.expectEqualStrings("```zig\nconst s_usize: comptime_int = 8\n```", try s.hover(u, layout_orphan, "s_usize ="));
         try testing.expectEqualStrings("```zig\nconst ptr_bits: u16 = 64\n```", try s.hover(u, layout_orphan, "ptr_bits ="));
-        try testing.expectEqualStrings("```zig\nconst s_c_long: comptime_int = 8\n```", try s.hover(u, layout_orphan, "s_c_long ="));
+        try testing.expectEqualStrings(std.fmt.comptimePrint("```zig\nconst s_c_long: comptime_int = {d}\n```", .{@sizeOf(c_long)}), try s.hover(u, layout_orphan, "s_c_long ="));
         try testing.expectEqualSlices(i64, &.{7}, try s.inactiveLines(u));
     }
 }
@@ -827,5 +829,5 @@ test "build integration: results for code analyzed in several compilations map t
     try testing.expectEqualStrings("path.zig:135 path.zig:141 path.zig:161 path.zig:27 src/common.zig:3 src/main.zig:3 tools/gen.zig:2", try s.references(main_uri, shared_main, "sep;"));
     // Each use shows the value of its own compilation
     try testing.expect(std.mem.indexOf(u8, try s.hover(main_uri, shared_main, "sep;"), "= 92") != null);
-    try testing.expect(std.mem.indexOf(u8, try s.hover(gen_uri, shared_gen, "sep;"), "= 47") != null);
+    try testing.expect(std.mem.indexOf(u8, try s.hover(gen_uri, shared_gen, "sep;"), std.fmt.comptimePrint("= {d}", .{std.fs.path.sep})) != null);
 }

@@ -183,7 +183,7 @@ test "remove parameter: resolve, calls in other files, refusals and the project 
         const resp = try h.request("codeAction/resolve", fix);
         const message = resp.object.get("error").?.object.get("message").?.string;
         const at = position(lib_text, "handler}");
-        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "cannot remove parameter `b`: the function is used here other than in a call, so this use cannot be updated (src/lib.zig:{d}:{d})", .{ at.line + 1, at.character + 1 }), message);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, fixture.separators("cannot remove parameter `b`: the function is used here other than in a call, so this use cannot be updated (src/lib.zig:{d}:{d})"), .{ at.line + 1, at.character + 1 }), message);
         try testing.expectEqual(1, try applyEdit(&h, &texts, actionWithTitle(actions, "discard `b`").?.object.get("edit").?));
         try sync(&h, &texts, 2);
     }

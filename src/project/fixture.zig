@@ -41,10 +41,24 @@ pub const Project = struct {
         p.tmp.cleanup();
     }
 
+    /// The absolute path of `sub` (separated by `/`), with the native separators
     pub fn path(p: *const Project, a: Allocator, sub: []const u8) ![]u8 {
-        return std.fs.path.join(a, &.{ p.root, sub });
+        const joined = try std.fs.path.join(a, &.{ p.root, sub });
+        std.mem.replaceScalar(u8, joined, '/', std.fs.path.sep);
+        return joined;
     }
 };
+
+/// `text` with each `/` replaced by the native path separator: for expected messages that contain
+/// relative paths
+pub inline fn separators(comptime text: []const u8) []const u8 {
+    comptime {
+        var out = text[0..text.len].*;
+        std.mem.replaceScalar(u8, &out, '/', std.fs.path.sep);
+        const final = out;
+        return &final;
+    }
+}
 
 /// Sample project with one AstGen error, one Sema error, two modules, and a check step
 pub const basic = [_]File{
