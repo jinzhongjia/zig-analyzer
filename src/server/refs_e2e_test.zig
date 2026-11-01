@@ -398,7 +398,9 @@ test "references and rename reach closed files outside any build graph" {
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    // The client watches the files: a server-side notification of the file created below could
+    // arrive after waitIdle and start another scan, during which rename is refused
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
     try h.notify("initialized", Empty{});
     const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib.zig"));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
