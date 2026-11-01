@@ -136,8 +136,9 @@
     //       // Inside generic functions with no concrete types, infer with the instances from call
     //       // sites (hover, completion, inlay hints, ...).
     //       .callsite_seeding = true,
-    //       // Discard all cached type information when the intern pool exceeds this many MB; it
-    //       // is recomputed on demand. 0 never discards.
+    //       // Discard all cached type information when the intern pool exceeds this many MB and
+    //       // twice the most that one request has added; it is recomputed on demand. 0 never
+    //       // discards.
     //       .max_intern_pool_mb = 64,
     //   },
 

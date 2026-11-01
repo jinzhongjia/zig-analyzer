@@ -120,8 +120,9 @@ completion_argument_placeholders: bool = true,
 /// Inside a generic function body without concrete types, infer from the instances at call sites
 /// (hover, completion, inlay hints, ...)
 callsite_seeding: bool = true,
-/// When the InternPool exceeds this many MB, type information is reclaimed as a whole generation
-/// (then inferred again on demand); 0 means never reclaim
+/// When the InternPool exceeds this many MB, and twice the most that one request has added, type
+/// information is reclaimed as a whole generation (then inferred again on demand); 0 means never
+/// reclaim
 max_intern_pool_mb: u32 = 64,
 /// Number of syntax trees retained (`ParseFile` and `FileAstIdMap`; evicted ones are reparsed on
 /// demand); 0 means no limit
