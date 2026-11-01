@@ -485,6 +485,20 @@ fn projectFiles(c: *Client, root: []const u8) ![]const []const u8 {
 }
 
 /// MB of an integer field of the `allocator` object of `zig-analyzer/status` (0 without it)
+/// Shares of the pages in each occupancy bin of `zig-analyzer/status`, in percent, separated by `/`
+fn occupancyText(a: Allocator, v: ?json.Value) ![]const u8 {
+    const items = (v orelse return "").array.items;
+    var total: i64 = 0;
+    for (items) |x| total += x.integer;
+    if (total == 0) return "";
+    var out: std.ArrayList(u8) = .empty;
+    for (items, 0..) |x, i| {
+        if (i != 0) try out.append(a, '/');
+        try out.print(a, "{d}", .{@divTrunc(x.integer * 100 + @divTrunc(total, 2), total)});
+    }
+    return out.items;
+}
+
 fn allocatorMb(al: ?json.ObjectMap, key: []const u8) f64 {
     const v = (al orelse return 0).get(key) orelse return 0;
     return @as(f64, @floatFromInt(v.integer)) / (1024 * 1024);
@@ -871,7 +885,7 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
     if (files.len == 0) return;
     const per_round = 25;
     std.debug.print("long session: {d} rounds × {d} files (of {d})\n", .{ rounds, per_round, files.len });
-    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s", "small", "resid", "slots", "kept", "ret", "large", "dec k", "thp", "commit" });
+    std.debug.print("  {s:>5} {s:>8} {s:>8} {s:>9} {s:>8} {s:>8} {s:>8} {s:>8} {s:>8} {s:>9} {s:>9} {s:>6} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7} {s:>7}  {s}\n", .{ "round", "rss MB", "heap MB", "ip items", "ip MB", "infer MB", "body MB", "parse MB", "imp MB", "keys", "deps", "s", "small", "resid", "slots", "kept", "ret", "large", "dec k", "thp", "commit", "occupancy %" });
     const t0 = Io.Clock.awake.now(io);
     var version: i64 = 1;
     var hover_times: std.ArrayList(f64) = .empty;
@@ -937,10 +951,12 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
         }.f;
         // `small`: pages assigned to size classes; `resid`: their backed part with the segment
         // headers and retained pages; `slots`: live small blocks by class size; `kept` and `ret`:
-        // empty pages retained and returned to the system; `dec k`: pages returned so far
+        // empty pages retained and returned to the system; `dec k`: pages returned so far;
+        // `occupancy %`: share of the assigned pages by the eighth of their blocks in use, the
+        // last one full
         const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
         const vm = commitMb(c.child.id.?);
-        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7} {d:>7.0} {d:>7.0}\n", .{
+        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7} {d:>7.0} {d:>7.0}  {s}\n", .{
             round + 1,
             (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
             mb(o.get("heap_bytes").?.integer),
@@ -962,6 +978,7 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
             if (al) |obj| @as(u64, @intCast(obj.get("decommits").?.integer)) / 1000 else 0,
             hugePagesMb(c.gpa, io, c.child.id.?) orelse 0,
             if (vm) |v| v[0] else 0,
+            try occupancyText(a, if (al) |obj| obj.get("occupancy") else null),
         });
         if (round + 1 == rounds) {
             // Last round: list the queries by bytes; the rest is unattributed (engine tables,
@@ -992,18 +1009,19 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
                     obj.get("decommits").?.integer,
                     obj.get("recommits").?.integer,
                 });
-                std.debug.print("    {s:>6} {s:>9} {s:>9} {s:>6} {s:>12}\n", .{ "size", "pages MB", "live MB", "use %", "allocs" });
+                std.debug.print("    {s:>6} {s:>9} {s:>9} {s:>6} {s:>12}  {s}\n", .{ "size", "pages MB", "live MB", "use %", "allocs", "occupancy %" });
                 for (obj.get("classes").?.array.items) |cl| {
                     const size: u64 = @intCast(cl.object.get("size").?.integer);
                     const pages: u64 = @intCast(cl.object.get("pages").?.integer);
                     const live = @as(u64, @intCast(cl.object.get("live").?.integer)) * size;
                     const allocs: u64 = @intCast(cl.object.get("allocs").?.integer);
-                    std.debug.print("    {d:>6} {d:>9.1} {d:>9.1} {d:>6.1} {d:>12}\n", .{
+                    std.debug.print("    {d:>6} {d:>9.1} {d:>9.1} {d:>6.1} {d:>12}  {s}\n", .{
                         size,
                         mb(@intCast(pages)),
                         mb(@intCast(live)),
                         if (pages == 0) 0 else @as(f64, @floatFromInt(live)) * 100 / @as(f64, @floatFromInt(pages)),
                         allocs,
+                        try occupancyText(a, cl.object.get("occupancy")),
                     });
                 }
             }
@@ -1087,7 +1105,7 @@ fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []
     const st, _ = try c.request("zig-analyzer/status", {});
     const o = st.object.get("result").?.object;
     const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
-    std.debug.print("  memory {d:.0} MB, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB\n", .{
+    std.debug.print("  memory {d:.0} MB, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB; {d} pages returned to the system, {d} taken back\n", .{
         (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
         @as(f64, @floatFromInt(o.get("max_rss_kb").?.integer)) / 1024,
         @as(f64, @floatFromInt(o.get("heap_bytes").?.integer)) / (1024 * 1024),
@@ -1097,6 +1115,8 @@ fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []
         allocatorMb(al, "retained"),
         allocatorMb(al, "returned"),
         allocatorMb(al, "large"),
+        if (al) |obj| obj.get("decommits").?.integer else 0,
+        if (al) |obj| obj.get("recommits").?.integer else 0,
     });
     if (commitMb(c.child.id.?)) |v| std.debug.print("  private commit {d:.0} MB (peak {d:.0} MB), peak working set {d:.0} MB\n", .{ v[0], v[1], v[2] });
 }
