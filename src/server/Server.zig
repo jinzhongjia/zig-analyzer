@@ -2442,12 +2442,19 @@ fn changesWorkspaceFiles(server: *Server, arena: Allocator, rules: origin.Rules,
 }
 
 /// The file's known text is the same as `text` (including both being absent); a failed read counts
-/// as different. A text never set is not known: the file is then read from disk on demand
-/// (`SourceText`), and that read is kept until the text is set, even to absent.
+/// as different. When the text was never set, the file is read from disk on demand (`SourceText`)
+/// and that read is kept until the text is set, even to absent: the known text is then that read,
+/// and a file never read has no text that anything was computed from. FSEvents reports writes
+/// made shortly before the stream started, which are not changes to such files.
 fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
     const current = ctx.get(FileText, file) catch return false;
-    const known = current orelse return text == null and ctx.isSet(FileText, file);
-    return std.mem.eql(u8, known, text orelse return false);
+    if (current) |known| return std.mem.eql(u8, known, text orelse return false);
+    if (ctx.isSet(FileText, file)) return text == null;
+    return switch (ctx.memoized(syntax_q.SourceText, file)) {
+        .none => true,
+        .unknown => false,
+        .value => |read| if (read.owned) std.mem.eql(u8, read.text, text orelse return false) else text == null,
+    };
 }
 
 /// External changes discovered by the server: handled the same way as the client's
