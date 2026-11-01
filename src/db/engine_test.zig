@@ -472,6 +472,27 @@ test "isSet tells an input never set from one set to its default" {
     try testing.expect(ctx.isSet(Number, 1));
 }
 
+test "memoized: what a derived query last computed, without computing it" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    for (1..4) |k| try setText(&d, @intCast(k), "abc");
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expect(ctx.memoized(Cached, 1) == .none);
+    }
+    try testing.expectEqual(0, executions(&d, Cached));
+    for (1..4) |k| _ = try read(&d, Cached, @intCast(k));
+    // Capacity 2: the least recently used 1 and 2 are evicted
+    try testing.expect(d.trySweep());
+    // Not verified: the value computed before the input changed
+    try setText(&d, 3, "x");
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expect(ctx.memoized(Cached, 1) == .unknown);
+    try testing.expectEqualStrings("abc", ctx.memoized(Cached, 3).value);
+}
+
 test "memo reused across read transactions" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

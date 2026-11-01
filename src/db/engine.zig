@@ -368,6 +368,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             };
         }
 
+        /// See `Ctx.memoized`
+        pub fn Memoized(comptime Q: type) type {
+            return union(enum) {
+                /// Never computed (or its memo was discarded together with everything computed
+                /// from it)
+                none,
+                /// Being computed by a read transaction, or computed with its value evicted
+                unknown,
+                value: Q.Value,
+            };
+        }
+
         /// Old values whose release is deferred (read transactions may still hold pointers to them)
         const Garbage = union(enum) {
             deps: []const DepKey,
@@ -948,6 +960,22 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
                 const index = table.keys.getIndex(key) orelse return false;
                 return table.slots.items[index].is_set;
+            }
+
+            /// What derived query `Q` holds for `key`, as last computed: neither verified nor
+            /// computed here, and no dependency is recorded. A returned value is valid until this
+            /// read transaction ends.
+            pub fn memoized(ctx: *Ctx, comptime Q: type, key: Q.Key) Memoized(Q) {
+                comptime assert(Q.kind == .derived);
+                const db = ctx.db;
+                const table = &db.tables[comptime queryIndex(Q)];
+                table.mutex.lockUncancelable(db.io);
+                defer table.mutex.unlock(db.io);
+                const index = table.keys.getIndex(key) orelse return .none;
+                const slot = table.slots.items[index];
+                if (slot.owner != null) return .unknown;
+                const memo = slot.memo orelse return .none;
+                return if (memo.evicted) .unknown else .{ .value = memo.value };
             }
 
             /// Long-running computes should call this periodically.
