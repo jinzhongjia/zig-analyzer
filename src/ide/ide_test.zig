@@ -13,6 +13,7 @@ const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Vfs = @import("../base/Vfs.zig");
+const test_path = @import("../util/test_path.zig");
 const seed = database.ide_db.seed;
 const search = @import("../ide_db/search.zig");
 
@@ -4932,10 +4933,10 @@ test "hover and completion details bound large comptime values and mark the cut"
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const roots: []const []const u8 = &.{"/p"};
+    const roots: []const []const u8 = &.{test_path.native("/p")};
 
     // The value of `@embedFile` is shown as the call, with the file and its size
-    const blob_code = "*const [1048576:0]u8 = @embedFile(\"assets/blob.bin\")\n```\n\nEmbedded file `assets/blob.bin`: 1048576 bytes";
+    const blob_code = std.fmt.comptimePrint("*const [1048576:0]u8 = @embedFile(\"assets/blob.bin\")\n```\n\nEmbedded file `assets{c}blob.bin`: 1048576 bytes", .{std.fs.path.sep});
     for ([_][]const u8{ "blob =", "blob.len" }) |needle| {
         const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, needle).?), roots)).?;
         try testing.expectEqualStrings("```zig\nconst blob: " ++ blob_code, info.text);
@@ -5002,7 +5003,7 @@ test "hover shows the file and size of @embedFile values, and the content of sho
     var ctx = w.db.beginRead(arena);
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const roots: []const []const u8 = &.{"/p"};
+    const roots: []const []const u8 = &.{test_path.native("/p")};
 
     // Text: the content follows, in a fence longer than its backtick runs
     const notes_hover = "```zig\nconst notes: *const [31:0]u8 = @embedFile(\"notes.txt\")\n```\n\nEmbedded file `notes.txt`: 31 bytes\n\n````text\n" ++ notes ++ "````";
@@ -5011,7 +5012,7 @@ test "hover shows the file and size of @embedFile values, and the content of sho
     try testing.expectEqualStrings(notes_hover, (try hover.hover(&r, other, @intCast(std.mem.indexOf(u8, other_text, "notes.len").?), roots)).?.text);
     // Outside the workspace folders, the absolute path
     const outside = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "notes =").?), &.{})).?.text;
-    try testing.expect(std.mem.indexOf(u8, outside, "Embedded file `/p/notes.txt`: 31 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, outside, "Embedded file `" ++ comptime test_path.native("/p/notes.txt") ++ "`: 31 bytes") != null);
     // The type annotation is kept
     try testing.expectEqualStrings(
         "```zig\nconst typed: []const u8 = @embedFile(\"notes.txt\")\n```\n\nEmbedded file `notes.txt`: 31 bytes\n\n````text\n" ++ notes ++ "````",
