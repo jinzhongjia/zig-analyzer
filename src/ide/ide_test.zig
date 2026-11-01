@@ -144,6 +144,19 @@ test "hover and completion on a constant that imports a file show the file's doc
             "```zig\nconst ws: type = ws\n```\n\nWorkers.",
             "Workers.",
         },
+        // `@This()` at the top level is the file itself: the doc of the file it is in
+        .{
+            \\//- /p/ws.zig
+            \\//! Workers.
+            \\const Self = @This();
+            \\fn run() void {
+            \\    _ = Self<|>;
+            \\}
+            ,
+            "Self",
+            "```zig\nconst Self: type = ws\n```\n\nWorkers.",
+            "Workers.",
+        },
     };
     for (cases) |c| {
         const docs = try importedDocs(c[0], c[1]);
