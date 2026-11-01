@@ -1816,6 +1816,52 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     try shutdown(&h);
 }
 
+test "notifications of project files with the contents the project started with do not restart it" {
+    // FSEvents reports writes made shortly before the stream started: each restarted the project
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = simple_build },
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // Script zigw wrapping the user's zig: records the subcommand of each command
+    const zig = project.env.zig_exe;
+    const calls = try project.path(a, "zig-calls");
+    const zigw = try project.path(a, "zigw");
+    const script = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\echo "$1 " >> "{s}"
+        \\case "$1" in
+        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}"|' ;;
+        \\*) exec "{s}" "$@" ;;
+        \\esac
+        \\
+    , .{ calls, zig, zigw, zig });
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
+    try initializeWith(&h, project.root, false, try settingsValue(&h, .{ .zig = .{ .path = zigw } }));
+    try waitIdle(&h);
+    const before = try zigCalls(&h, calls);
+    try testing.expect(hasLine(before, "build "));
+
+    var changes: std.ArrayList(struct { uri: []const u8, type: u32 }) = .empty;
+    for ([_][]const u8{ "build.zig", "main.zig" }) |name| try changes.append(a, .{ .uri = try za.base.uri.fromPath(a, try project.path(a, name)), .type = 1 });
+    for ([_][]const u8{ "build.zig.zon", "zig-analyzer.zon" }) |name| try changes.append(a, .{ .uri = try za.base.uri.fromPath(a, try project.path(a, name)), .type = 3 });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = changes.items });
+    try waitIdle(&h);
+    for ((try zigCalls(&h, calls))[before.len..]) |line| try testing.expect(!std.mem.eql(u8, line, "build "));
+
+    // A change still restarts it
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = simple_build ++ "\n" });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = changes.items[0..1] });
+    try waitIdle(&h);
+    try testing.expect(hasLine((try zigCalls(&h, calls))[before.len..], "build "));
+    try shutdown(&h);
+}
+
 const builtin_main = "const builtin = @import(\"builtin\");\npub const mode = builtin.mode;\n";
 
 test "settings: invalid zig paths fall back to zig env with a message, zig.builtin_path applies to standalone files" {

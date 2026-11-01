@@ -67,6 +67,9 @@ config: Server.Config,
 /// `Config.parseProject`); null when there is none. Unchanged after startup; a change of the file
 /// restarts and replaces the whole instance.
 project: ?Server.Config = null,
+/// Disk contents (hash; null when absent) of the files in `project_files`, taken before the maker
+/// started, which reads them afterwards. Unchanged after startup.
+started_with: [project_files.len]?u64 = @splat(null),
 /// This instance is the Nth automatic restart after consecutive maker crashes (0: normal start)
 crash_restarts: u8 = 0,
 /// Reference count; the instance is freed when it drops to zero (see `acquire` / `release`)
@@ -188,6 +191,16 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     // One reference belongs to the background task, one to the caller
     ws.* = .{ .server = server, .gpa = gpa, .root = try gpa.dupe(u8, root), .env = env, .config = undefined, .crash_restarts = crash_restarts, .refs = .init(2) };
     errdefer gpa.free(ws.root);
+    for (project_files, &ws.started_with) |name, *hash| {
+        const path = try std.fs.path.join(gpa, &.{ root, name });
+        defer gpa.free(path);
+        const text = Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            else => continue,
+        };
+        defer gpa.free(text);
+        hash.* = std.hash.Wyhash.hash(0, text);
+    }
     ws.config = try server.configSnapshot();
     errdefer ws.config.deinit(gpa);
     ws.project = try loadProjectConfig(server, root);
@@ -205,6 +218,19 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
     try server.bg_group.concurrent(server.io, run, .{ws});
     _ = server.live_workspaces.fetchAdd(1, .monotonic);
     return ws;
+}
+
+/// The files in the root directory whose change reconfigures the project
+pub const project_files = [_][]const u8{ "build.zig", "build.zig.zon", Server.Config.project_file };
+
+/// Whether the file `name` in the root directory had the disk contents `disk` (hash; null when
+/// absent) when this instance started: the maker read that or later contents, and a later change
+/// reports other contents
+pub fn startedWith(ws: *const Workspace, name: []const u8, disk: ?u64) bool {
+    for (project_files, ws.started_with) |n, hash| {
+        if (std.mem.eql(u8, n, name)) return std.meta.eql(hash, disk);
+    }
+    return false;
 }
 
 pub fn acquire(ws: *Workspace) void {
