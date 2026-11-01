@@ -77,6 +77,85 @@ test "hover shows signature, type and doc" {
     }
 }
 
+/// The hover text at the character before the cursor and the doc of the completion item `label` at
+/// the cursor (both owned by the caller)
+fn importedDocs(source: []const u8, label: []const u8) ![2][]const u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const info = try hover.hover(&r, at.file, at.offset - 1, &.{}) orelse return error.NoHover;
+    const item = for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
+        if (std.mem.eql(u8, it.label, label)) break it;
+    } else return error.NoItem;
+    return .{ try testing.allocator.dupe(u8, info.text), try testing.allocator.dupe(u8, item.doc orelse "") };
+}
+
+test "hover and completion on a constant that imports a file show the file's doc" {
+    const cases = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
+        // A top-level constant importing a file
+        .{
+            \\//- /p/main.zig
+            \\const worker_stack = @import("util/worker_stack.zig");
+            \\fn run() void {
+            \\    _ = worker_stack<|>;
+            \\}
+            \\//- /p/util/worker_stack.zig
+            \\//! A stack of workers.
+            \\//! Second line.
+            \\pub const max = 4;
+            ,
+            "worker_stack",
+            "```zig\nconst worker_stack: type = worker_stack\n```\n\nA stack of workers.\nSecond line.",
+            "A stack of workers.\nSecond line.",
+        },
+        // The declaration's own doc comes before the file's
+        .{
+            \\//- /p/main.zig
+            \\/// Imported here.
+            \\const ws = @import("ws.zig");
+            \\fn run() void {
+            \\    _ = ws<|>;
+            \\}
+            \\//- /p/ws.zig
+            \\//! Workers.
+            \\pub const max = 4;
+            ,
+            "ws",
+            "```zig\nconst ws: type = ws\n```\n\nImported here.\n\nWorkers.",
+            "Imported here.\n\nWorkers.",
+        },
+        // A local constant importing a file
+        .{
+            \\//- /p/main.zig
+            \\fn run() void {
+            \\    const ws = @import("ws.zig");
+            \\    _ = ws<|>;
+            \\}
+            \\//- /p/ws.zig
+            \\//! Workers.
+            \\pub const max = 4;
+            ,
+            "ws",
+            "```zig\nconst ws: type = ws\n```\n\nWorkers.",
+            "Workers.",
+        },
+    };
+    for (cases) |c| {
+        const docs = try importedDocs(c[0], c[1]);
+        defer for (docs) |d| testing.allocator.free(d);
+        testing.expectEqualStrings(c[2], docs[0]) catch |err| {
+            std.debug.print("hover in\n{s}\n", .{c[0]});
+            return err;
+        };
+        try testing.expectEqualStrings(c[3], docs[1]);
+    }
+}
+
 test "hover on field names in initializers shows the field" {
     // Prevents a null hover on `.name` in `.{ .name = x }` while goto resolves the field
     const text =

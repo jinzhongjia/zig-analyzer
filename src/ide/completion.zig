@@ -253,7 +253,7 @@ pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Erro
             const def: resolve.Def = .{ .item = .{ .file = d.file, .item = d.item } };
             const tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(d.file, d.item) });
             const detail = try context.signature(r, def, tv);
-            if (try context.doc(r, def)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
+            if (try context.docOf(r, def, tv)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
             const text = (try r.ctx.get(database.syntax.SourceText, d.file)).text;
             var offset: usize = 0;
             if (try r.itemNode(d.file, d.item)) |node| {
@@ -266,31 +266,11 @@ pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Erro
         .file => |f| {
             const path = try imports.displayPath(r, from, f);
             const spec = try imports.importPath(r, from, f) orelse path;
-            if (try fileDoc(r, f)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
+            if (try context.fileDoc(r, f)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
             w.print("File `{s}`", .{path}) catch return error.OutOfMemory;
             return .{ .detail = try std.fmt.allocPrint(r.arena, "@import(\"{f}\")", .{std.zig.fmtString(spec)}), .doc = out.written() };
         },
     }
-}
-
-/// The `//!` doc at the start of the file, cleaned up the same way as `///` docs (see
-/// `ItemTree`); null when there is none
-fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
-    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
-    var out: std.ArrayList(u8) = .empty;
-    var it = root.children();
-    while (it.next()) |e| {
-        if (e != .token) break;
-        if (e.token.kind != .container_doc_comment) {
-            if (isTrivia(e.token.kind)) continue;
-            break;
-        }
-        var line = e.token.text["//!".len..];
-        if (std.mem.startsWith(u8, line, " ")) line = line[1..];
-        if (out.items.len != 0) try out.append(r.arena, '\n');
-        try out.appendSlice(r.arena, std.mem.trimEnd(u8, line, "\r"));
-    }
-    return if (out.items.len == 0) null else out.items;
 }
 
 /// The completion items at the cursor and the context of the cursor
@@ -781,6 +761,7 @@ fn locals(r: *Resolver, out: *Collector, b: *const Body, from: Body.ScopeId, wei
             try out.add(.{
                 .label = binding.name,
                 .kind = kind,
+                .doc = if (binding.kind == .local_const) try context.valueFileDoc(r, tv) else null,
                 .weight = weight orelse if (binding.kind == .param) param_weight else local_weight,
                 .target = if (kind == .function) try fnTarget(r, tv) else null,
                 .origin = .{ .value = tv },
@@ -823,7 +804,13 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
             .@"const" => if (kind == .function) try fnTarget(r, try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = file, .item = it.ast_id } })) else null,
             else => null,
         };
-        try out.add(.{ .label = name, .kind = kind, .doc = it.doc, .target = target, .weight = weight, .origin = .{ .target = .{ .decl = .{ .file = file, .item = m } } } });
+        // A namespace or struct constant may be a file: its doc comment and the file's (the type of
+        // the declaration has already been computed for the kind)
+        const doc = if (it.kind == .@"const" and (kind == .namespace or kind == .@"struct"))
+            try context.docOf(r, .{ .item = .{ .file = file, .item = m } }, try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = file, .item = it.ast_id } }))
+        else
+            it.doc;
+        try out.add(.{ .label = name, .kind = kind, .doc = doc, .target = target, .weight = weight, .origin = .{ .target = .{ .decl = .{ .file = file, .item = m } } } });
     }
 }
 
