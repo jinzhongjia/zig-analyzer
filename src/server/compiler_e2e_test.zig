@@ -393,6 +393,89 @@ fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
 }
 
+const loading_files = [_]fixture.File{
+    .{ .path = "build.zig", .text = simple_build },
+    .{ .path = "main.zig", .text = loading_main },
+};
+const loading_main = "const std = @import(\"std\");\npub fn main() void {\n    _ = std;\n}\n";
+const loading_note = "The project is still loading";
+
+/// Hover on the `std` declaration of `loading_main`: the text of the answer
+fn hoverStd(h: *Harness, uri: []const u8) ![]const u8 {
+    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    return resp.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+}
+
+test "a hover answered while the project loads says so, one answered after does not" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&loading_files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try slowZig(&h, &project));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
+    try testing.expect(std.mem.indexOf(u8, try hoverStd(&h, uri), loading_note) != null);
+    try waitIdle(&h);
+    const loaded = try hoverStd(&h, uri);
+    try testing.expect(std.mem.indexOf(u8, loaded, loading_note) == null);
+    try testing.expect(std.mem.indexOf(u8, loaded, "const std: type") != null);
+    try shutdown(&h);
+}
+
+/// `slowZig` with `sema.wait_for_project` enabled
+fn waitingOptions(h: *Harness, project: *fixture.Project) !std.json.Value {
+    var options = try slowZig(h, project);
+    try options.object.put(h.arena.allocator(), "sema", try jsonValue(h, "{\"wait_for_project\": true}"));
+    return options;
+}
+
+test "wait_for_project: a request sent while the project loads gets the complete answer" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&loading_files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try waitingOptions(&h, &project));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
+    const text = try hoverStd(&h, uri);
+    try testing.expect(std.mem.indexOf(u8, text, loading_note) == null);
+    try testing.expect(std.mem.indexOf(u8, text, "const std: type") != null);
+    try shutdown(&h);
+}
+
+test "wait_for_project: canceling or shutting down ends the wait" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&loading_files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try waitingOptions(&h, &project));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
+    const at = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } };
+    const canceled = try h.send("textDocument/hover", at);
+    try h.notify("$/cancelRequest", .{ .id = canceled });
+    try testing.expect((try h.response(canceled)).object.get("error") != null);
+    const held = try h.send("textDocument/hover", at);
+    try shutdown(&h);
+    _ = try h.response(held);
+}
+
+test "wait_for_project: requests do not wait forever when zig cannot be run" {
+    var project = try fixture.Project.create(&loading_files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const options = try jsonValue(&h, "{\"zig\": {\"path\": \"/nonexistent/zig\"}, \"sema\": {\"wait_for_project\": true}}");
+    try initializeWith(&h, project.root, false, options);
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
+    _ = try hoverStd(&h, uri);
+    try shutdown(&h);
+}
+
 test "single-file mode: compile one file without build.zig, with progress" {
     const text =
         \\pub fn main() void {

@@ -1352,6 +1352,9 @@ fn earlyAnswers(c: *Client, uri: []const u8, idents: []const Position, dots: []c
     return out.items;
 }
 
+/// Start of the note a hover has while a project is loading, as a markdown client gets it
+const hover_loading_marker = "\n\n---\n\n_The project is still loading";
+
 const EarlyDifference = enum { same, incomplete, different };
 
 /// How an answer given while loading relates to the one after loading: `incomplete` means it only
@@ -1365,6 +1368,11 @@ fn compareEarly(a: Allocator, method: []const u8, before: json.Value, after: jso
         return if (items.len < labels.count()) .incomplete else .same;
     }
     const before_result = before.object.get("result") orelse .null;
+    // The note saying that the project is loading is not part of the result being compared
+    if (before_result == .object) if (before_result.object.get("contents")) |contents| {
+        const value = contents.object.getPtr("value").?;
+        if (std.mem.indexOf(u8, value.string, hover_loading_marker)) |end| value.string = value.string[0..end];
+    };
     const after_result = after.object.get("result") orelse .null;
     if (before_result == .null) return if (after_result == .null) .same else .incomplete;
     const x = try json.Stringify.valueAlloc(a, before_result, .{});

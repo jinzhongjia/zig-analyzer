@@ -120,6 +120,9 @@ zig_paths_mutex: Io.Mutex = .init,
 /// when startup finishes): until projects start loading, compiling files that belong to a
 /// project cannot be deferred yet (see `projectsLoading`).
 startup_done: std.atomic.Value(bool) = .init(false),
+/// The startup task has ended, also when it gave up early (zig cannot be run). Until then the
+/// zig environment and the projects may still be unknown (see `projectsPending`)
+startup_ended: std.atomic.Value(bool) = .init(false),
 /// builtin.zig for files that belong to no project (native target, Debug); protected by env_mutex
 default_builtin: ?[]u8 = null,
 warned: bool = false,
@@ -660,6 +663,9 @@ const request_handlers = .{
     .{ "codeAction/resolve", Mode.semantic, codeActionResolve },
 };
 
+/// How often a request held back by `sema.wait_for_project` checks whether it can run
+const project_wait_poll_ms = 10;
+
 /// Maximum nesting depth of request params (see `processRequest`)
 const max_params_depth = 128;
 
@@ -817,11 +823,12 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             defer server.finishRequest(arena, pending);
             pending.sema_start = server.semaUsage();
             const a = arena.allocator();
+            const waited_for_projects = server.waitForProjects(pending);
             if (comptime std.mem.eql(u8, method, "workspace/symbol")) {
                 // After a wait, reads the state at its end: the request has no position that
                 // refers to the text it was sent on, and an edit during the wait would otherwise
                 // answer it with `ContentModified`
-                if (server.waitSymbolIndex(pending)) pending.since = server.db.mark(pending.since.inputs);
+                if (server.waitSymbolIndex(pending) or waited_for_projects) pending.since = server.db.mark(pending.since.inputs);
             }
             server.testGate(method, .before_read, pending);
             var ctx = server.db.beginReadAt(a, pending.since);
@@ -2972,6 +2979,7 @@ fn startProjects(server: *Server) void {
     server.started = true;
     server.busyBegin();
     server.bg_group.concurrent(server.io, startup, .{server}) catch |err| {
+        server.startup_ended.store(true, .release);
         server.busyEnd();
         log.err("failed to start project loading task: {t}", .{err});
     };
@@ -3006,6 +3014,7 @@ const version_mismatch_message = "zig {s} differs from zig {s} that zig-analyzer
 /// system protocol for each workspace with a build.zig
 fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
+    defer server.startup_ended.store(true, .release);
     // The origin rules (the Zig installation and the global cache) are known from here on, also
     // when the zig environment cannot be queried
     defer server.scheduleScan();
@@ -3282,6 +3291,30 @@ fn projectsLoading(server: *Server) bool {
     defer server.workspaces_mutex.unlock(server.io);
     for (server.workspaces.items) |ws| if (ws.isLoading()) return true;
     return false;
+}
+
+/// The zig environment or a project's first load is still pending: name resolution and types may
+/// be incomplete
+fn projectsPending(server: *Server) bool {
+    return !server.startup_ended.load(.acquire) or server.projectsLoading();
+}
+
+/// With `sema.wait_for_project`, holds a semantic request back until no project is pending, or
+/// until it is canceled or the server shuts down. Polls because the wait ends on any of these, set
+/// from different places. Returns whether it waited.
+fn waitForProjects(server: *Server, pending: *const Pending) bool {
+    const enabled = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.wait_for_project;
+    };
+    if (!enabled) return false;
+    var waited = false;
+    while (server.projectsPending() and !pending.cancel.load(.acquire) and !server.isShuttingDown()) {
+        waited = true;
+        (Io.Clock.Duration{ .raw = .fromMilliseconds(project_wait_poll_ms), .clock = .awake }).sleep(server.io) catch break;
+    }
+    return waited;
 }
 
 /// Compiles a detached file in the background with `zig build-obj -fno-emit-bin`; when requested
@@ -5724,12 +5757,19 @@ fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: [
     return .{ .file = file, .text = text, .offset = @intCast(offsets.positionToOffset(text, pos, server.encoding)) };
 }
 
+/// Shown under a hover answered while a project is pending, so that a less precise type or an
+/// `unknown` is not taken for the final result
+const hover_loading_note = "The project is still loading, so this result may be incomplete.";
+
 fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverParams) HandlerError!types.ResultType("textDocument/hover") {
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    // Checked before computing: a load that ends during the computation cancels this read
+    const incomplete = server.projectsPending();
     const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
+    const text = if (!incomplete) info.text else try std.mem.concat(arena, u8, &.{ info.text, if (server.hover_markdown) "\n\n---\n\n_" ++ hover_loading_note ++ "_" else "\n\n" ++ hover_loading_note });
     return .{
-        .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, info.text) },
+        .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, text) },
         .range = lines.range(info.start, info.end, server.encoding),
     };
 }
