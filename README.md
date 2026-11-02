@@ -52,6 +52,8 @@ zig build -Doptimize=ReleaseSafe
 
 The binary is `zig-out/bin/zig-analyzer`. Put it in `PATH`, or point your editor at it.
 
+`zig-analyzer --version` prints the output of `git describe --tags` at build time (`v0.17.0-12-gd8b0905`), or `0.0.0-dev+d8b0905` when no tag is reachable. Building without git or outside a git repository prints a warning, and the version is `0.0.0-dev`.
+
 ## Editor setup
 
 Any LSP client works: run `zig-analyzer` over stdio. The arguments clients commonly pass, `--stdio` and `--clientProcessId <pid>`, are accepted; other transports (`--pipe`, `--socket`, `--port`, `--node-ipc`) are not supported.
