@@ -30,7 +30,7 @@ zig-analyzer is a language server (LSP) for Zig 0.17. Current stage: feature-com
 
 ## 2. Performance targets and current status
 
-Measurement tool: `zig build bench -Doptimize=ReleaseSafe -- <project> <file>...` (see §5.2).
+Measurement tool: `zig build bench -Doptimize=ReleaseSafe -- <project> <file>...` (see §5.2). Its output marks each latency in §2.1 as `met` or `MISSED`, except memory.
 
 ### 2.1 Targets and results
 
@@ -503,7 +503,11 @@ Naming checks (the Names section of the Zig 0.17.0 style guide; enabled by `nami
 zig build bench -Doptimize=ReleaseSafe -- <project root> <file (relative to the project root)>...
 ```
 
-The benchmark starts the server as a child process and talks to it the way an editor does (like common editors, it declares `snippetSupport` for completion), measuring cold start, hover / goto / completion latency, edit → diagnostics, continuous typing, and memory. Environment variables enable the individual checks (see the header of `tools/lsp_bench.zig` for details):
+The benchmark starts the server as a child process and talks to it the way an editor does (like common editors, it declares `snippetSupport` for completion), measuring cold start (with `initialize` sampled over 5 server processes), hover / goto / completion latency, edit → diagnostics, continuous typing, warm semantic tokens (full, range, and delta), and memory. Environment variables enable the individual checks (see the header of `tools/lsp_bench.zig` for details).
+
+The exit code is 1 when a check below fails its pass criterion or when the semantic token deltas do not add up to a full result; `BENCH_SESSION` has no automatic verdict. Missed latency targets do not affect the exit code, because they apply to the benchmark project and §2.3 lists the known gaps.
+
+The answers to 20 hover, goto, and completion requests each, sent right after the first file is opened, are compared with the answers once the project is loaded, and the output counts those given before the first load ended as `same`, `incomplete` (null, or fewer completion labels), or `different`. This is reported without a verdict: name resolution is incomplete during loading.
 
 | Variable | Check | Pass criterion |
 |---|---|---|
@@ -511,7 +515,7 @@ The benchmark starts the server as a child process and talks to it the way an ed
 | `BENCH_COMPLETE=<n>` | Completes each `a.b` in the source after the `.`; the list must contain `b` | Recall ≥ 95% |
 | `BENCH_CONCURRENT=<n>` | Throughput: opens the n largest files of the project at once and requests their full semantic tokens without waiting for the answers, as an editor restoring n tabs does; reports the time until the last answer, the latency of each request, and the memory afterwards | Timing covers the opens and all the answers |
 | `BENCH_REFS=<n>` | Find references and rename; references in a generic function body that point to a same-named declaration under another call site's instance are counted separately | Name mismatches, false positives, misses, and rename inconsistencies all 0 |
-| `BENCH_SAVE=1` | Save → compiler diagnostics, compared one by one with `zig build` | Identical |
+| `BENCH_SAVE=1` | Save → compiler diagnostics. Published errors are compared with the output of `zig build` for the same steps and the arguments in `BENCH_CONFIG`: file, message, the printed location within the published range, and notes. Reference traces are not compared, and a project with a `zig-analyzer.zon` is not compared, because it may set other arguments | Identical |
 | `BENCH_SESSION=<rounds>` | Memory over a long session (`imp MB` is the value for the auto-import index; `small`, `resid`, `slots`, `kept`, `ret`, `large` and `dec k` are the allocator's figures from `zig-analyzer/status`, `occupancy %` the share of its pages by the eighth of their blocks in use, `thp` the memory in transparent huge pages on Linux, and `commit` the private commit on Windows), and the latencies of the session's requests | Stable, within budget |
 | `BENCH_TYPE_COMPLETE=<n>` | Completion while typing: insert a character in a name expression → complete → undo, also reporting the number of auto-import candidates and the changes in index queries (auto-import is on by default; disable it with `BENCH_CONFIG='{"completion":{"auto_import":false}}'` to compare the cost) | Timing includes the edit and the completion |
 | `BENCH_TYPE_WORDS=<line>:<word>,<word>...` | Types each word character by character in a new statement after line `<line>`, requesting completion after each character; waits for background work to finish before each keystroke, so the timing covers only that edit and completion; also reports the number of candidates and how many of them are member paths of local values | Timing includes the edit and the completion |
