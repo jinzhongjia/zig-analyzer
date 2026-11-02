@@ -1,4 +1,5 @@
-pub const version = "0.0.0-dev";
+/// Derived from git by the build (see `gitVersion` in build.zig)
+pub const version = @import("build_options").version;
 
 pub const db = @import("db/engine.zig");
 /// Text report of query statistics

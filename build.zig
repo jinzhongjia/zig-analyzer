@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "tracy", tracy != null);
     build_options.addOption(bool, "zig_tests", false);
+    build_options.addOption([]const u8, "version", gitVersion(b));
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/zig_analyzer.zig"),
@@ -222,6 +223,32 @@ pub fn build(b: *std.Build) void {
     } else stress_step.dependOn(&b.addFail("test-stress needs -Dstress-filter=<part of the full test names>").step);
 }
 
+/// The version when the repository has no tag to name it, or when git cannot tell the commit
+const fallback_version = @import("build.zig.zon").version ++ "-dev";
+
+/// The output of `git describe --tags`: the latest tag reachable from HEAD, followed, when HEAD is
+/// not the tagged commit itself, by the number of commits since the tag and the current commit
+/// (`v0.17.0-12-gd8b0905`). Without a reachable tag, `fallback_version` with the current commit
+/// (`0.0.0-dev+d8b0905`). Without git or a repository, `fallback_version` and a warning.
+fn gitVersion(b: *std.Build) []const u8 {
+    // Commits and tags change what git prints without changing anything the configure cache tracks
+    b.graph.poisonCache();
+    if (gitOutput(b, &.{ "git", "describe", "--tags" })) |described| return described;
+    if (gitOutput(b, &.{ "git", "rev-parse", "--short", "HEAD" })) |commit|
+        return b.fmt("{s}+{s}", .{ fallback_version, commit });
+    std.log.warn("no version information from git (not installed, or not a git repository): the version is {s}", .{fallback_version});
+    return fallback_version;
+}
+
+/// The trimmed standard output of `argv` run in the build root; null when it fails in any way
+fn gitOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {
+    const root = b.root.toString(b.graph.arena) catch @panic("OOM");
+    return switch (b.runFallible(argv, .{ .stderr_behavior = .ignore, .cwd = .{ .path = root } })) {
+        .success => |stdout| std.mem.trim(u8, stdout, " \t\r\n"),
+        .spawn_failed, .bad_exit_code, .crashed => null,
+    };
+}
+
 /// Tests of the analyzer itself. With `zig_tests`, the tests that depend on a real zig run too;
 /// when `filter` is not null, only tests whose full name contains it are compiled
 fn analyzerTests(
@@ -236,6 +263,8 @@ fn analyzerTests(
     const options = b.addOptions();
     options.addOption(bool, "tracy", tracy);
     options.addOption(bool, "zig_tests", zig_tests);
+    // Fixed, so that a new commit alone does not rebuild the tests
+    options.addOption([]const u8, "version", fallback_version);
     const module = b.createModule(.{
         .root_source_file = b.path("src/zig_analyzer.zig"),
         .target = target,
