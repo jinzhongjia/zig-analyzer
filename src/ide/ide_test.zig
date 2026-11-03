@@ -2557,6 +2557,42 @@ test "references do not look into zon files without a result type" {
     try testing.expectEqual(null, uncertain);
 }
 
+test "zon files complete only what the compiler parses, not declarations" {
+    // `.default` is a decl literal in a `.zig` file; the compiler rejects it in ZON, where only an
+    // enum's names and the tags of a union without a payload are enum literals
+    const decls =
+        \\const Level = enum { debug, info, pub const default: Level = .info; pub fn make() Level { return .info; } };
+        \\const Inner = struct { n: u8 = 0, pub const zero: Inner = .{}; pub fn init() Inner { return .{}; } };
+        \\const Tag = union(enum) { a: u8, b: void, pub const none: Tag = .b; };
+        \\const Cfg = struct { level: Level = .info, inner: Inner = .{}, tag: Tag = .b, opt: ?Level = null, ptr: *const Level = &.info, arr: [1]Level = .{.info}, pub const shared: Cfg = .{}; };
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .level = .<|> }", "debug info" },
+        .{ ".{ .opt = .<|> }", "debug info" },
+        .{ ".{ .ptr = .<|> }", "debug info" },
+        .{ ".{ .arr = .{ .<|> } }", "debug info" },
+        .{ ".{ .tag = .<|> }", "b" },
+        .{ ".{ .inner = .<|> }", "" },
+        .{ ".<|>", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture("//- /p/main.zig module:app\n" ++ decls ++ "const cfg: Cfg = @import(\"cfg.zon\");\n");
+        testing.expectEqualStrings(c[1], try completionAt(&w, try w.add("/p/cfg.zon", c[0]))) catch |err| {
+            std.debug.print("`{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // The same literals in a `.zig` file still offer declarations
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try testing.expectEqualStrings("debug info default make", try completionAt(&w, try w.add("/p/main.zig", decls ++ "const level: Level = .<|>;\n")));
+}
+
 test "zon files have no result type unless their typed imports agree" {
     const cases = [_]struct { []const u8, []const u8 }{
         // No import site; only an import without a result type
