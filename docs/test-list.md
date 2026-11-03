@@ -1,6 +1,6 @@
 # Projects used for batch validation
 
-The 97 Zig 0.17.0 projects used for the batch validation in `docs/design.md` §5.3. The commit is the latest commit of the default branch when the project was cloned on 2026-10-19. The measured file is the file with the most member accesses in the root project (excluding subdirectories with their own `build.zig`, tests, and examples); for C libraries that consist only of a build script, it is `build.zig`.
+The 97 Zig 0.17.0 projects used for the batch validation in `docs/perf.md` (Current acceptance results). The commit is the latest commit of the default branch when the project was cloned on 2026-10-19. The measured file is the file with the most member accesses in the root project (excluding subdirectories with their own `build.zig`, tests, and examples); for C libraries that consist only of a build script, it is `build.zig`.
 
 To reproduce: clone each project and check out the commit in the table, run `zig build --fetch` in the project root to fetch the dependencies, and then run the following in this repository for each project:
 

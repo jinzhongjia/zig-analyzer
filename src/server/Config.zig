@@ -62,8 +62,6 @@ zig_global_cache_path: ?[]const u8 = null,
 build_enable: bool = true,
 /// Extra arguments passed to `zig build` (such as `-Dtarget=...`)
 build_args: []const []const u8 = &.{},
-/// Step used for diagnostics (`diagnostics.step`, merged with `diagnostics.steps`)
-diagnostics_step: ?[]const u8 = null,
 /// Steps used for diagnostics; when empty, `check` is used, or the default step if there is none
 diagnostics_steps: []const []const u8 = &.{},
 /// Whether to run the compiler to get diagnostics; when disabled, there are only live
@@ -238,7 +236,6 @@ const settings = [_]Setting{
     .{ .section = "zig", .key = "global_cache_path", .field = "zig_global_cache_path" },
     .{ .section = "build", .key = "enable", .field = "build_enable" },
     .{ .section = "build", .key = "args", .field = "build_args" },
-    .{ .section = "diagnostics", .key = "step", .field = "diagnostics_step" },
     .{ .section = "diagnostics", .key = "steps", .field = "diagnostics_steps" },
     .{ .section = "diagnostics", .key = "compiler", .field = "compiler_diagnostics" },
     .{ .section = "diagnostics", .key = "inactive_code", .field = "inactive_code" },
@@ -278,9 +275,9 @@ const settings = [_]Setting{
 
 /// Settings that can be set in the project configuration file
 const project_settings = [_][]const u8{
-    "build_args",      "diagnostics_step", "diagnostics_steps", "compiler_diagnostics",
-    "naming_enable",   "naming_ignore",    "naming_exclude",    "naming_rules",
-    "imports_derived", "imports_sort",
+    "build_args",    "diagnostics_steps", "compiler_diagnostics",
+    "naming_enable", "naming_ignore",     "naming_exclude",
+    "naming_rules",  "imports_derived",   "imports_sort",
 };
 
 fn isProjectSetting(comptime field: []const u8) bool {
@@ -574,17 +571,6 @@ pub fn clone(c: *const Config, gpa: Allocator) Allocator.Error!Config {
     return out;
 }
 
-/// Steps used for diagnostics: `diagnostics.steps` merged with `diagnostics.step`; when empty,
-/// the project decides (`check` or the default step)
-pub fn diagnosticsSteps(c: *const Config, a: Allocator) Allocator.Error![]const []const u8 {
-    if (c.diagnostics_step == null) return c.diagnostics_steps;
-    for (c.diagnostics_steps) |s| if (std.mem.eql(u8, s, c.diagnostics_step.?)) return c.diagnostics_steps;
-    const out = try a.alloc([]const u8, c.diagnostics_steps.len + 1);
-    out[0] = c.diagnostics_step.?;
-    @memcpy(out[1..], c.diagnostics_steps);
-    return out;
-}
-
 /// Layout rules of the import block (organize imports, auto-import)
 pub fn importOptions(c: *const Config) ImportOptions {
     return .{ .derived = c.imports_derived, .sort = c.imports_sort };
@@ -594,7 +580,6 @@ pub fn importOptions(c: *const Config) ImportOptions {
 /// differ, the project needs to be restarted)
 pub fn sameBuild(a: *const Config, b: *const Config) bool {
     if (a.build_enable != b.build_enable or a.compiler_diagnostics != b.compiler_diagnostics) return false;
-    if (!eqlOptional(a.diagnostics_step, b.diagnostics_step)) return false;
     return eqlList(a.build_args, b.build_args) and eqlList(a.diagnostics_steps, b.diagnostics_steps);
 }
 
@@ -636,17 +621,15 @@ fn parseText(text: []const u8) !Config {
 
 test "parse: nested fields, optional wrapper" {
     var c = try parseText(
-        \\{"zig-analyzer": {"zig": {"path": "/z/zig"}, "build": {"args": ["-Da=1", "-Db"]}, "diagnostics": {"step": "test", "steps": ["check"]}}}
+        \\{"zig-analyzer": {"zig": {"path": "/z/zig"}, "build": {"args": ["-Da=1", "-Db"]}, "diagnostics": {"steps": ["test", "check"]}}}
     );
     defer c.deinit(testing.allocator);
     try testing.expectEqualStrings("/z/zig", c.zig_path.?);
     try testing.expectEqual(2, c.build_args.len);
     try testing.expectEqualStrings("-Db", c.build_args[1]);
     try testing.expectEqual(0, c.warnings.len);
-    const steps = try c.diagnosticsSteps(testing.allocator);
-    defer testing.allocator.free(steps);
-    try testing.expectEqualStrings("test", steps[0]);
-    try testing.expectEqualStrings("check", steps[1]);
+    try testing.expectEqualStrings("test", c.diagnostics_steps[0]);
+    try testing.expectEqualStrings("check", c.diagnostics_steps[1]);
 
     var copy = try c.clone(testing.allocator);
     defer copy.deinit(testing.allocator);
@@ -655,7 +638,7 @@ test "parse: nested fields, optional wrapper" {
     var empty = try parseText("{}");
     defer empty.deinit(testing.allocator);
     try testing.expect(empty.zig_path == null and empty.build_args.len == 0 and !empty.inactive_code and empty.build_enable and empty.callsite_seeding);
-    try testing.expectEqual(0, (try empty.diagnosticsSteps(testing.allocator)).len);
+    try testing.expectEqual(0, empty.diagnostics_steps.len);
     try testing.expect(!c.sameBuild(&empty) and !c.sameZig(&empty));
 
     var no_compiler = try parseText(

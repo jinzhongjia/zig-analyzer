@@ -478,6 +478,23 @@ test "rename reaches build scripts and their helpers" {
     try h.notify("exit", {});
 }
 
+/// The error message of a request sent while the project loads: a read interrupted by a write
+/// transaction of the load itself (the module graph update after the zig environment query, the
+/// workspace scan) is answered with ContentModified, which asks for a retry; the request is sent
+/// again, and since the load is still blocked, the refusal that explains why the results are not
+/// available comes back at once. Fails when the request is answered instead.
+fn loadingError(h: *Harness, method: []const u8, params: anytype) ![]const u8 {
+    // A load whose writes keep interrupting the request fails the test instead of looping forever
+    for (0..50) |_| {
+        const resp = try h.request(method, params);
+        if (resp.object.get("result") != null) return error.TestUnexpectedResult;
+        const e = resp.object.get("error").?.object;
+        if (e.get("code").?.integer == za.lsp.jsonrpc.error_codes.content_modified) continue;
+        return e.get("message").?.string;
+    }
+    return error.ContentModified;
+}
+
 test "references and rename fail instead of returning partial results while the project loads" {
     const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
     const files = [_]fixture.File{
@@ -517,10 +534,10 @@ test "references and rename fail instead of returning partial results while the 
     // Only the open file is known while loading: answering would have returned one reference and a
     // rename editing lib.zig alone
     {
-        const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
-        try testing.expect(std.mem.startsWith(u8, refs.object.get("error").?.object.get("message").?.string, "cannot find all references: "));
-        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
-        try testing.expect(std.mem.startsWith(u8, renamed.object.get("error").?.object.get("message").?.string, "cannot rename `scale` to `double`: "));
+        const refs = try loadingError(&h, "textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+        try testing.expect(std.mem.startsWith(u8, refs, "cannot find all references: "));
+        const renamed = try loadingError(&h, "textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
+        try testing.expect(std.mem.startsWith(u8, renamed, "cannot rename `scale` to `double`: "));
     }
     try project.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "go", .data = "" });
     _ = try h.request("zig-analyzer/waitIdle", {});

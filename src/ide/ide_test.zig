@@ -2732,7 +2732,7 @@ test "zig-analyzer.zon settings are completed from the schema" {
         // Settings already given are not listed again
         .{ ".{ .build = .{}, .<|> }", "diagnostics imports naming" },
         .{ ".{ .build = .{ .<|> } }", "args" },
-        .{ ".{ .diagnostics = .{ .steps = .{}, .<|> } }", "step compiler" },
+        .{ ".{ .diagnostics = .{ .steps = .{}, .<|> } }", "compiler" },
         .{ ".{ .naming = .{ .rules = .{ .type = false, .<|> } } }", "type_function function namespace value field" },
         // Values: the names of an enum, and booleans
         .{ ".{ .imports = .{ .derived = .<|> } }", "with_import separate" },

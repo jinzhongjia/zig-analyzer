@@ -1,4 +1,4 @@
-//! LSP benchmark (the performance goals in docs/design.md): starts zig-analyzer as a child
+//! LSP benchmark (the performance goals in docs/perf.md): starts zig-analyzer as a child
 //! process and talks to it over stdin/stdout the way a real editor does, measuring the phases of
 //! a cold start, the latency distribution of hover / goto / completion in a warm state, the
 //! latency from an edit to diagnostics, and resident memory.
@@ -8,7 +8,7 @@
 //! Request positions are sampled evenly over the identifiers of a file (at most `samples` per
 //! file); completion uses the position after a `.`.
 //!
-//! The exit code is 1 when a check enabled below fails its pass criterion in docs/design.md, or
+//! The exit code is 1 when a check enabled below fails its pass criterion in docs/perf.md, or
 //! when the server's semantic token deltas do not add up to its full result. Latency targets are
 //! marked `met` / `MISSED` in the output and do not affect the exit code: they apply to the
 //! benchmark project, and missing them on a very large file is a known gap.
@@ -77,7 +77,7 @@ fn checkFailed(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("  FAILED: " ++ fmt ++ "\n", args);
 }
 
-/// Prints a latency against its target in docs/design.md
+/// Prints a latency against its target in docs/perf.md
 fn reportTarget(name: []const u8, value: f64, limit: f64) void {
     const met = value < limit;
     if (!met) targets_missed += 1;

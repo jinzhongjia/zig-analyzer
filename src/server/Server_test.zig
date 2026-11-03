@@ -383,6 +383,9 @@ test "files under a build.zig outside the workspace belong to a project that is 
     const Empty = struct {};
     _ = try h.request("initialize", .{ .capabilities = Empty{} });
     try h.notify("initialized", Empty{});
+    // Wait for startup to finish: the write transaction that updates the module graph after the
+    // zig environment query cancels in-flight requests (answered with ContentModified)
+    _ = try h.request("zig-analyzer/waitIdle", {});
     const cases = [_]struct { []const []const u8, []const u8 }{
         .{ &.{ "proj", "src", "main.zig" }, "unloaded_project" },
         // The temporary directory is in this repository's .zig-cache: the search for the owning
