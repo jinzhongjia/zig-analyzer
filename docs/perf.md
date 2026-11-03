@@ -91,7 +91,7 @@ On `Sema.zig`, edit → diagnostics p50 is 170 ms (169 ms when disabled), codeAc
 
 ## Analysis per compilation
 
-Analyzing shared files per compilation costs a project with one exe and `build.zig`: open `build.zig` → idle 84-89 ms, about 7% more `Infer` / `DeclType` results (the parts of std `build.zig` uses), hover / goto p50 in `build.zig` of 0.1-0.3 ms, and resident memory of 156-165 MB. A project with one compilation has unchanged keys and results in its own files.
+On a project with one exe and `build.zig`, analyzing shared files per compilation rather than once per file takes open `build.zig` → idle from 49 ms to 84-89 ms and adds about 7% `Infer` / `DeclType` results (the parts of std `build.zig` uses). Hover / goto p50 in `build.zig` is 0.1-0.3 ms, and resident memory stays at about 156-165 MB. A project with one compilation uses the same keys and gets the same results in its own files as with one analysis per file.
 
 ## Benchmark tooling and cross-checks
 

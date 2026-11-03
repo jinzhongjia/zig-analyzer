@@ -43,10 +43,10 @@ Checked in this order (`server/origin.zig`):
 
 1. Fetched dependency packages: packages fetched by hash that contain modules (`<hash>` subdirectories of the package directory).
 2. Generated files: the global cache and each project's local cache.
-3. User code: files under a workspace root, excluding its `.zig-cache` and `zig-pkg`. A Zig installation under a root is user code, because Zig itself is being developed.
+3. User code: files under a workspace root, excluding its `.zig-cache` and `zig-pkg`. A Zig installation under a root is user code, because Zig itself is being developed; a root inside the installation, such as its `std` opened as a folder, does not count.
 4. The Zig installation directory.
 5. User code: modules outside the roots that belong to some project (added by path, `--fork`).
-6. Other files are the user's files outside the workspace; which other files use them is not known.
+6. Other files outside the roots, in no project, are the user's files outside the workspace once the Zig installation's location is known; which other files use them is not known. Stale copies in a root's `.zig-cache` or `zig-pkg` are neither user code nor files outside the workspace.
 
 Fetched packages, generated files, and the Zig installation are **dependency libraries**. The compile context, durability levels, rename and workspace symbol scopes, and server-side watching all derive from this classification.
 

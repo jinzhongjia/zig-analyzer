@@ -271,10 +271,13 @@ Triggers:
 - the maker crashes: restarted at once, at most 3 times in a row without a completed build, since the crashes it recovers from are races waiting would not avoid;
 - the local cache or its `h` directory is deleted or replaced, because the maker writes through handles opened at startup and would otherwise fail silently (checked by inode around each build).
 
+Creating or deleting `build.zig` in a root starts or stops the project.
+
 Failures:
 
 - Configuration failing while the old instance has a model drops the new instance: the model stays, and the configuration errors replace its compiler diagnostics until `build.zig` is saved.
 - An abandoned instance (too many crashes, protocol mismatch) clears the old diagnostics and keeps the model until the next save.
+- A build graph that cannot be read stops the maker until `build.zig` is saved, and the user is told.
 - A maker that exits before sending a build graph failed configure, so it is not restarted; the user is shown the stderr line with the cause (the last 64 KiB of stderr is always kept).
 - `bsp_configuration_failed` without errors (a `build.zig.zon` or package problem) takes the located errors from stderr and publishes them on `build.zig.zon`.
 
@@ -310,7 +313,7 @@ Writes (document sync, configuration, workspace and file events) run serially: r
 
 Requests using name resolution are answered at once on what is known so far while the zig environment or a project's first load is pending; a hover says the project is still loading, and other answers may lack results.
 
-With `sema.wait_for_project`, they are held until the load ends and every answer is complete; only a change to the request's own document text cancels a held request. While the configuration that starts projects is in flight they are held either way. A restart does not end a first load. Syntax features never wait.
+With `sema.wait_for_project`, they are held until the load ends and every answer is complete; besides explicit cancellation and shutdown, only a change to the request's own document text ends the wait. While the configuration that starts projects is in flight they are held either way. A restart does not end a first load. Syntax features never wait.
 
 ### Read requests
 
@@ -321,7 +324,7 @@ Reads run concurrently on snapshots and are canceled by `$/cancelRequest` and wr
 Edit-triggered publishing is debounced per file; live diagnostics are computed outside read transactions. During a compile the previous results are kept, then replaced atomically; compile results are immutable and reference counted.
 
 - The queue coalesces by file, and a file being computed is published once more after it finishes.
-- A file's diagnostics may depend on other files' text, so other open files are recomputed on edits and sent only when they differ.
+- A file's diagnostics may depend on other files' text, so other open files are recomputed when a document is edited, opened, or closed or a file changes on disk, and sent only when they differ.
 - Edit-triggered publishes bypass the queue: each takes an increasing sequence number before reading state, and only results no older than the last sent are sent.
 
 ### Configuration
@@ -334,7 +337,7 @@ On `exit` and end of input, in-flight reads are canceled rather than awaited (`s
 
 ### External changes
 
-The server registers `workspace/didChangeWatchedFiles` when the client supports it. Otherwise, with `files.watcher = server`, or for files outside the workspace folders (which clients do not watch), it watches files itself. Clients report folder changes by the folder's path only, so such an event applies to every known file under it. When the server takes over watching, it compares known files with the disk once.
+The server registers `workspace/didChangeWatchedFiles` when the client supports it. With `files.watcher = auto`, it watches every file itself when the client cannot register or rejects the registration, and otherwise only files outside the workspace folders, which clients do not watch. `server` always watches on the server, and `client` never does. Clients report folder changes by the folder's path only, so such an event applies to every known file under it. When the server takes over watching, it compares known files with the disk once.
 
 Files of interest are interned files, configure inputs, and root build files, excluding dependency libraries. Open documents are included: buffers win over disk, but builds read the disk.
 
@@ -344,7 +347,7 @@ Files of interest are interned files, configure inputs, and root build files, ex
 - Rebuilding compares against a hash of the disk contents at the last rebuild, because builds read the disk while the known text may come from elsewhere. The first unchanged rewrite therefore still rebuilds once.
 - Root build files without a record compare with their contents just before the newest maker started, so such a late notification does not restart the project.
 
-**Watching**: native notifications (inotify, FSEvents, Windows directory changes), batched by 50 ms of quiet, at most 500 ms. Missing directories are watched through their nearest ancestor. A reported name with files of interest under it is a directory, since Windows notifications do not distinguish them. Polling is the last resort, at most every second and 20 times one check's duration.
+**Watching**: native notifications (inotify, FSEvents, Windows directory changes), batched by 50 ms of quiet, at most 500 ms. Missing directories are watched through their nearest ancestor. A reported name with files of interest under it is a directory, since Windows notifications do not distinguish them. Polling is the last resort, only for directories that cannot be watched natively, at intervals of at least 1 second and at least 20 times one check's duration.
 
 **Known limitation**: on network file systems, `/mnt/c` in WSL2, and directories shared with containers or VMs, native watches succeed but miss remote changes, so there is no fallback to polling and these go unnoticed (as in rust-analyzer).
 
@@ -354,7 +357,7 @@ Results follow the capabilities: `rename.prepareSupport`, `codeActionLiteralSupp
 
 ### Observability
 
-Slow requests are logged (`log.slow_request_ms`), and `-Dtracy=<dir>` enables tracy. Custom requests are prefixed with `zig-analyzer/`, with result fields in `server/Server.zig`: `status`, `fileStatus`, `syntaxTree`, `moduleGraph`, `reloadWorkspace`, and `waitIdle`.
+Slow requests are logged (`log.slow_request_ms`), and `-Dtracy=<dir>` enables tracy. Custom requests are prefixed with `zig-analyzer/`, with result fields in `server/Server.zig`: `status` (query execution counts, hit rates, time, and memory; InternPool and heap usage), `fileStatus`, `syntaxTree`, `moduleGraph`, `reloadWorkspace`, and `waitIdle` (returns once background tasks have finished; used by tests and benchmarks).
 
 ### Crashes
 

@@ -20,7 +20,7 @@ Until a walk finishes and during a project's first load, references, rename, and
 
 Only user code is modified. A rename whose references reach a dependency library or a stale copy in `.zig-cache` / `zig-pkg` is refused: a fetched package is restored from its hash, and the Zig installation is shared.
 
-- Outside the workspace folders, only local names and non-`pub` declarations other than fields can be renamed, since other users are unknown.
+- Outside the workspace folders, only local names and non-`pub` declarations other than fields can be renamed or lose a parameter, since other users are unknown.
 - Declarations std looks up through `@import("root")` (`main`, `panic`, `std_options`, and so on) cannot be renamed in a compilation's root file: std would silently fall back to its defaults.
 - Tags of an enum built from a container's members (`std.meta.FieldEnum(T)`) refer to the member they are named after.
 
